@@ -1,0 +1,216 @@
+/**
+ * LLM provider interface - provider-agnostic abstraction.
+ */
+
+import { require, requireNonEmpty } from '../core/contracts.js';
+
+export interface LLMMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+export interface LLMCompletionOptions {
+  temperature?: number;
+  maxTokens?: number;
+  stopSequences?: string[];
+  stream?: boolean;
+}
+
+export interface LLMCompletionResult {
+  content: string;
+  finishReason: 'stop' | 'length' | 'error';
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+  };
+}
+
+export interface LLMStreamChunk {
+  content: string;
+  done: boolean;
+}
+
+/**
+ * Abstract LLM provider interface.
+ */
+export interface LLMProvider {
+  /**
+   * Provider name for identification.
+   */
+  readonly name: string;
+
+  /**
+   * Check if the provider is available and configured.
+   */
+  isAvailable(): Promise<boolean>;
+
+  /**
+   * Complete a conversation.
+   */
+  complete(
+    messages: LLMMessage[],
+    options?: LLMCompletionOptions
+  ): Promise<LLMCompletionResult>;
+
+  /**
+   * Stream a completion (optional).
+   */
+  stream?(
+    messages: LLMMessage[],
+    options?: LLMCompletionOptions
+  ): AsyncIterable<LLMStreamChunk>;
+}
+
+/**
+ * Base class for LLM providers with common functionality.
+ */
+export abstract class BaseLLMProvider implements LLMProvider {
+  abstract readonly name: string;
+  protected apiKey?: string;
+  protected baseUrl?: string;
+
+  constructor(config: { apiKey?: string; baseUrl?: string } = {}) {
+    this.apiKey = config.apiKey;
+    this.baseUrl = config.baseUrl;
+  }
+
+  abstract isAvailable(): Promise<boolean>;
+  abstract complete(
+    messages: LLMMessage[],
+    options?: LLMCompletionOptions
+  ): Promise<LLMCompletionResult>;
+
+  /**
+   * Make an HTTP request to the API.
+   */
+  protected async fetch(
+    url: string,
+    options: RequestInit
+  ): Promise<Response> {
+    const response = await fetch(url, options);
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => 'Unknown error');
+      throw new Error(`LLM API error (${response.status}): ${errorText}`);
+    }
+
+    return response;
+  }
+
+  /**
+   * Build headers for API requests.
+   */
+  protected buildHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+
+    if (this.apiKey) {
+      headers['Authorization'] = `Bearer ${this.apiKey}`;
+    }
+
+    return headers;
+  }
+}
+
+/**
+ * LLM provider registry.
+ */
+export class LLMProviderRegistry {
+  private providers: Map<string, LLMProvider> = new Map();
+  private defaultProvider?: string;
+
+  /**
+   * Register a provider.
+   */
+  register(provider: LLMProvider): void {
+    requireNonEmpty(provider.name, 'provider.name');
+    this.providers.set(provider.name, provider);
+
+    // First provider becomes default
+    if (!this.defaultProvider) {
+      this.defaultProvider = provider.name;
+    }
+  }
+
+  /**
+   * Get a provider by name.
+   */
+  get(name: string): LLMProvider | undefined {
+    return this.providers.get(name);
+  }
+
+  /**
+   * Get the default provider.
+   */
+  getDefault(): LLMProvider | undefined {
+    if (!this.defaultProvider) {
+      return undefined;
+    }
+    return this.providers.get(this.defaultProvider);
+  }
+
+  /**
+   * Set the default provider.
+   */
+  setDefault(name: string): void {
+    require(this.providers.has(name), `Provider '${name}' not registered`);
+    this.defaultProvider = name;
+  }
+
+  /**
+   * Get all provider names.
+   */
+  list(): string[] {
+    return Array.from(this.providers.keys());
+  }
+
+  /**
+   * Find an available provider.
+   */
+  async findAvailable(): Promise<LLMProvider | undefined> {
+    for (const provider of this.providers.values()) {
+      if (await provider.isAvailable()) {
+        return provider;
+      }
+    }
+    return undefined;
+  }
+}
+
+// Global provider registry
+const globalRegistry = new LLMProviderRegistry();
+
+export function getProviderRegistry(): LLMProviderRegistry {
+  return globalRegistry;
+}
+
+/**
+ * Helper to format messages for display/debugging.
+ */
+export function formatMessages(messages: LLMMessage[]): string {
+  return messages
+    .map((m) => `[${m.role}] ${m.content.slice(0, 100)}${m.content.length > 100 ? '...' : ''}`)
+    .join('\n');
+}
+
+/**
+ * Create a system message.
+ */
+export function systemMessage(content: string): LLMMessage {
+  return { role: 'system', content };
+}
+
+/**
+ * Create a user message.
+ */
+export function userMessage(content: string): LLMMessage {
+  return { role: 'user', content };
+}
+
+/**
+ * Create an assistant message.
+ */
+export function assistantMessage(content: string): LLMMessage {
+  return { role: 'assistant', content };
+}
