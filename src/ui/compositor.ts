@@ -24,7 +24,7 @@ export interface Surface {
 }
 
 export interface DrawCommand {
-  type: 'rect' | 'text' | 'line' | 'image' | 'clear' | 'path';
+  type: 'rect' | 'text' | 'line' | 'image' | 'clear' | 'path' | 'save' | 'restore' | 'clip';
   surfaceId: string;
   params: unknown;
 }
@@ -317,6 +317,22 @@ export class Compositor {
           ctx.lineWidth = p.lineWidth ?? 1;
           ctx.stroke(path);
         }
+        break;
+      }
+
+      case 'save':
+        ctx.save();
+        break;
+
+      case 'restore':
+        ctx.restore();
+        break;
+
+      case 'clip': {
+        const p = command.params as RectParams;
+        ctx.beginPath();
+        ctx.rect(p.x, p.y, p.width, p.height);
+        ctx.clip();
         break;
       }
     }

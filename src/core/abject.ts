@@ -96,9 +96,10 @@ export abstract class Abject {
     this._bus = bus;
     this._mailbox = bus.register(this.id, this.handleMessage.bind(this));
 
+    this._status = 'ready';
+
     await this.onInit();
 
-    this._status = 'ready';
     this.checkInvariants();
   }
 

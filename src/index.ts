@@ -16,6 +16,7 @@ import { Timer } from './objects/capabilities/timer.js';
 import { Clipboard } from './objects/capabilities/clipboard.js';
 import { Console } from './objects/capabilities/console.js';
 import { FileSystem } from './objects/capabilities/filesystem.js';
+import { Settings } from './objects/settings.js';
 
 // Export public API
 export { App, createApp } from './ui/app.js';
@@ -31,6 +32,7 @@ export { ObjectCreator, OBJECT_CREATOR_ID } from './objects/object-creator.js';
 export { ProxyGenerator, PROXY_GENERATOR_ID } from './objects/proxy-generator.js';
 export { Negotiator, NEGOTIATOR_ID } from './protocol/negotiator.js';
 export { HealthMonitor, HEALTH_MONITOR_ID } from './protocol/health-monitor.js';
+export { Settings, SETTINGS_ID } from './objects/settings.js';
 
 // Export capability objects
 export { HttpClient, HTTP_CLIENT_ID } from './objects/capabilities/http-client.js';
@@ -100,30 +102,6 @@ function showError(container: HTMLElement, err: unknown): void {
     ${stack ? `<pre style="margin: 0; padding: 12px; background: #1a1a2e; border-radius: 4px; overflow-x: auto; font-size: 12px; color: #888;">${escapeHtml(stack)}</pre>` : ''}
   `;
 
-  container.appendChild(el);
-}
-
-/**
- * Display a status message in the DOM.
- */
-function showStatus(container: HTMLElement, message: string, isWarning = false): void {
-  const el = document.createElement('div');
-  el.style.cssText = [
-    'position: fixed',
-    'bottom: 16px',
-    'right: 16px',
-    'padding: 12px 16px',
-    'background: ' + (isWarning ? '#2d2b1b' : '#1b2d1b'),
-    'border: 1px solid ' + (isWarning ? '#aaaa44' : '#44aa44'),
-    'border-radius: 6px',
-    'color: ' + (isWarning ? '#dddd88' : '#88dd88'),
-    'font-family: system-ui, -apple-system, sans-serif',
-    'font-size: 13px',
-    'z-index: 9999',
-    'max-width: 400px',
-  ].join(';');
-
-  el.textContent = message;
   container.appendChild(el);
 }
 
@@ -198,32 +176,20 @@ async function main(): Promise<App> {
   objectCreator.setDependencies(llm, runtime.objectRegistry, runtime.objectFactory);
   await runtime.spawn(objectCreator);
 
+  // Create settings (loads saved keys or shows config UI)
+  const settings = new Settings();
+  settings.setDependencies(llm, storage, app.appUIServer);
+  await runtime.spawn(settings);
+
   console.log('[ABJECTS] System ready');
   console.log(`[ABJECTS] ${runtime.objectRegistry.objectCount} objects registered`);
-
-  // Show system status in the DOM
-  const statusContainer = document.querySelector('#app') as HTMLElement;
-  if (statusContainer) {
-    const providers = llm.listProviders();
-    if (providers.length === 0) {
-      showStatus(
-        statusContainer,
-        'Abjects running. No LLM providers configured \u2014 set ANTHROPIC_API_KEY or OPENAI_API_KEY to enable AI features.',
-        true
-      );
-    } else {
-      showStatus(
-        statusContainer,
-        `Abjects running. ${runtime.objectRegistry.objectCount} objects. LLM: ${providers.join(', ')}.`
-      );
-    }
-  }
 
   // Make app available globally for debugging
   (window as unknown as Record<string, unknown>).abjects = {
     app,
     runtime,
     llm,
+    settings,
     objectCreator,
     registry: runtime.objectRegistry,
     factory: runtime.objectFactory,
