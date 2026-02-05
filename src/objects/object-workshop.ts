@@ -8,6 +8,7 @@ import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { UIServer, WidgetEventPayload } from './ui-server.js';
 import { ObjectCreator, CreationResult } from './object-creator.js';
+import { EDITABLE_INTERFACE_ID } from './scriptable-abject.js';
 
 const WORKSHOP_INTERFACE: InterfaceId = 'abjects:object-workshop';
 const UI_INTERFACE: InterfaceId = 'abjects:ui';
@@ -20,6 +21,7 @@ export class ObjectWorkshop extends Abject {
   private uiServer?: UIServer;
   private objectCreator?: ObjectCreator;
   private windowId?: string;
+  private lastCreatedObjectId?: AbjectId;
 
   constructor() {
     super({
@@ -95,6 +97,7 @@ export class ObjectWorkshop extends Abject {
         title: 'Object Workshop',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
+        resizable: true,
       })
     );
 
@@ -189,6 +192,12 @@ export class ObjectWorkshop extends Abject {
   }
 
   private async handleWidgetEvent(payload: WidgetEventPayload): Promise<void> {
+    // Handle modify button
+    if (payload.widgetId === 'modify-btn' && payload.type === 'click' && this.lastCreatedObjectId) {
+      await this.handleModify();
+      return;
+    }
+
     const isCreate =
       (payload.widgetId === 'create-btn' && payload.type === 'click') ||
       (payload.widgetId === 'prompt-input' && payload.type === 'submit');
@@ -223,11 +232,16 @@ export class ObjectWorkshop extends Abject {
       );
 
       if (result.success && result.manifest) {
+        this.lastCreatedObjectId = result.objectId;
         await this.updateStatus(`Created: ${result.manifest.name}`);
         await this.updateResult(
           `Name: ${result.manifest.name}`,
           `Description: ${result.manifest.description}`
         );
+        // Show Modify button if object was spawned
+        if (result.objectId) {
+          await this.showModifyButton();
+        }
       } else {
         await this.updateStatus(`Error: ${result.error ?? 'Unknown error'}`);
       }
@@ -245,6 +259,69 @@ export class ObjectWorkshop extends Abject {
         text,
       })
     );
+  }
+
+  private async showModifyButton(): Promise<void> {
+    if (!this.windowId) return;
+    const btnW = 100;
+    await this.request(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        windowId: this.windowId,
+        id: 'modify-btn',
+        type: 'button',
+        rect: { x: PAD, y: WIN_H - 30 - 36 - 8, width: btnW, height: 36 },
+        text: 'Modify',
+      })
+    );
+  }
+
+  private async handleModify(): Promise<void> {
+    if (!this.windowId || !this.lastCreatedObjectId || !this.objectCreator) return;
+
+    const prompt = await this.request<string>(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'getWidgetValue', {
+        widgetId: 'prompt-input',
+      })
+    );
+
+    if (!prompt.trim()) {
+      await this.updateStatus('Enter a modification description.');
+      return;
+    }
+
+    await this.updateStatus('Modifying...');
+
+    try {
+      const result = await this.request<CreationResult>(
+        request(
+          this.id,
+          this.objectCreator.id,
+          'abjects:object-creator' as InterfaceId,
+          'modify',
+          { objectId: this.lastCreatedObjectId, prompt }
+        )
+      );
+
+      if (result.success && result.code) {
+        // Send updateSource to the ScriptableAbject
+        const updateResult = await this.request<{ success: boolean; error?: string }>(
+          request(this.id, this.lastCreatedObjectId, EDITABLE_INTERFACE_ID, 'updateSource', {
+            source: result.code,
+          })
+        );
+
+        if (updateResult.success) {
+          await this.updateStatus('Modified successfully');
+        } else {
+          await this.updateStatus(`Compile error: ${updateResult.error ?? 'Unknown'}`);
+        }
+      } else {
+        await this.updateStatus(`Error: ${result.error ?? 'Unknown'}`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await this.updateStatus(`Error: ${msg}`);
+    }
   }
 
   private async updateResult(name: string, desc: string): Promise<void> {

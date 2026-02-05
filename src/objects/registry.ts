@@ -161,12 +161,14 @@ export class Registry extends Abject {
 
   private setupHandlers(): void {
     this.on('register', async (msg: AbjectMessage) => {
-      const { objectId, manifest, status } = msg.payload as {
+      const { objectId, manifest, status, owner, source } = msg.payload as {
         objectId: AbjectId;
         manifest: AbjectManifest;
         status?: AbjectStatus;
+        owner?: AbjectId;
+        source?: string;
       };
-      return this.registerObject(objectId, manifest, status);
+      return this.registerObject(objectId, manifest, status, owner, source);
     });
 
     this.on('unregister', async (msg: AbjectMessage) => {
@@ -203,6 +205,19 @@ export class Registry extends Abject {
       const reg = this.objects.get(objectId);
       return reg?.manifest ?? null;
     });
+
+    this.on('getSource', async (msg: AbjectMessage) => {
+      const { objectId } = msg.payload as { objectId: AbjectId };
+      return this.getObjectSource(objectId);
+    });
+
+    this.on('updateSource', async (msg: AbjectMessage) => {
+      const { objectId, source } = msg.payload as { objectId: AbjectId; source: string };
+      const reg = this.objects.get(objectId);
+      if (!reg) return false;
+      reg.source = source;
+      return true;
+    });
   }
 
   /**
@@ -211,7 +226,9 @@ export class Registry extends Abject {
   registerObject(
     objectId: AbjectId,
     manifest: AbjectManifest,
-    status?: AbjectStatus
+    status?: AbjectStatus,
+    owner?: AbjectId,
+    source?: string
   ): boolean {
     require(objectId !== '', 'objectId must not be empty');
     require(manifest !== undefined, 'manifest is required');
@@ -229,6 +246,8 @@ export class Registry extends Abject {
         lastActivity: Date.now(),
       },
       registeredAt: Date.now(),
+      owner,
+      source,
     };
 
     this.objects.set(objectId, registration);
@@ -368,6 +387,14 @@ export class Registry extends Abject {
    */
   listObjects(): ObjectRegistration[] {
     return Array.from(this.objects.values());
+  }
+
+  /**
+   * Get the source code for an object, if it's scriptable.
+   */
+  getObjectSource(objectId: AbjectId): string | null {
+    const reg = this.objects.get(objectId);
+    return reg?.source ?? null;
   }
 
   /**

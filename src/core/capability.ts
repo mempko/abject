@@ -35,6 +35,7 @@ export const Capabilities = {
   FILESYSTEM_READ: 'abjects:filesystem:read' as CapabilityId,
   FILESYSTEM_WRITE: 'abjects:filesystem:write' as CapabilityId,
   CONSOLE: 'abjects:console' as CapabilityId,
+  EDIT_OBJECT: 'abjects:object:edit' as CapabilityId,
 } as const;
 
 // =============================================================================

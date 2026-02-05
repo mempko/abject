@@ -16,6 +16,7 @@ import { Capabilities } from '../core/capability.js';
 import { request } from '../core/message.js';
 import { MessageBus } from '../runtime/message-bus.js';
 import { Registry } from './registry.js';
+import { ScriptableAbject } from './scriptable-abject.js';
 
 const FACTORY_INTERFACE = 'abjects:factory';
 
@@ -148,6 +149,13 @@ export class Factory extends Abject {
         capabilities: req.grantedCapabilities,
         initialState: req.initialState,
       });
+    } else if (req.source) {
+      // Spawn a ScriptableAbject from handler source
+      obj = new ScriptableAbject(
+        req.manifest,
+        req.source,
+        req.owner ?? ('' as AbjectId)
+      );
     } else if (req.code) {
       // TODO: Load WASM object
       throw new Error('WASM object spawning not yet implemented');
@@ -165,7 +173,11 @@ export class Factory extends Abject {
 
     // Register with registry if available
     if (this._factoryRegistry) {
-      this._factoryRegistry.registerObject(obj.id, obj.manifest, obj.status);
+      if (obj instanceof ScriptableAbject) {
+        this._factoryRegistry.registerObject(obj.id, obj.manifest, obj.status, obj.owner, obj.source);
+      } else {
+        this._factoryRegistry.registerObject(obj.id, obj.manifest, obj.status);
+      }
     }
 
     this.checkInvariants();
@@ -190,7 +202,11 @@ export class Factory extends Abject {
 
     // Register with registry if available
     if (this._factoryRegistry) {
-      this._factoryRegistry.registerObject(obj.id, obj.manifest, obj.status);
+      if (obj instanceof ScriptableAbject) {
+        this._factoryRegistry.registerObject(obj.id, obj.manifest, obj.status, obj.owner, obj.source);
+      } else {
+        this._factoryRegistry.registerObject(obj.id, obj.manifest, obj.status);
+      }
     }
 
     this.checkInvariants();

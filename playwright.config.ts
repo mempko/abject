@@ -1,4 +1,8 @@
 import { defineConfig, devices } from '@playwright/test';
+import { config } from 'dotenv';
+
+// Load .env.test for API keys
+config({ path: '.env.test' });
 
 export default defineConfig({
   testDir: './tests',

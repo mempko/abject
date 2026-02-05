@@ -6,6 +6,7 @@ import {
   AbjectId,
   AbjectManifest,
   AbjectMessage,
+  InterfaceId,
   ObjectRegistration,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
@@ -14,6 +15,7 @@ import { require } from '../core/contracts.js';
 import { LLMObject } from './llm-object.js';
 import { Registry } from './registry.js';
 import { Factory } from './factory.js';
+import { ScriptableAbject } from './scriptable-abject.js';
 import { systemMessage, userMessage, LLMMessage } from '../llm/provider.js';
 
 
@@ -227,13 +229,52 @@ export class ObjectCreator extends Abject {
         };
       }
 
-      // TODO: Compile and spawn the object
-      // For now, return the generated code
+      // Validate the code compiles before spawning
+      let code = parsed.code;
+      const compileError = ScriptableAbject.tryCompile(code);
+      if (compileError) {
+        // Ask LLM to fix the code — one retry
+        const fixResult = await this.llm!.complete([
+          systemMessage(
+            'The following JavaScript handler map failed to compile with `new Function()`. ' +
+            'Fix it so it is valid plain JavaScript. No TypeScript annotations, no type casts, no interfaces. ' +
+            'Output ONLY the corrected handler map in a ```javascript code block. Nothing else.'
+          ),
+          userMessage(`Handler map:\n\`\`\`javascript\n${code}\n\`\`\`\n\nError: ${compileError}`),
+        ]);
+        const fixMatch = fixResult.content.match(/```(?:javascript|js)\s*([\s\S]*?)\s*```/);
+        if (fixMatch) {
+          const retryError = ScriptableAbject.tryCompile(fixMatch[1]);
+          if (!retryError) {
+            code = fixMatch[1];
+          } else {
+            return { success: false, error: `Compilation failed after retry: ${retryError}`, code };
+          }
+        } else {
+          return { success: false, error: `Compilation failed: ${compileError}`, code };
+        }
+      }
+
+      // Spawn the ScriptableAbject via Factory
+      if (this._factory) {
+        const spawnResult = await this._factory.spawn({
+          manifest: parsed.manifest,
+          source: code,
+          owner: this.id,
+        });
+        return {
+          success: true,
+          objectId: spawnResult.objectId,
+          manifest: parsed.manifest,
+          code,
+          usedObjects: parsed.usedObjects,
+        };
+      }
 
       return {
         success: true,
         manifest: parsed.manifest,
-        code: parsed.code,
+        code,
         usedObjects: parsed.usedObjects,
       };
     } catch (err) {
@@ -256,17 +297,23 @@ export class ObjectCreator extends Abject {
       return { success: false, error: 'Object not found' };
     }
 
+    const currentSource = this.registry!.getObjectSource(objectId);
+
     try {
+      const sourceBlock = currentSource
+        ? `\nCurrent handler source:\n\`\`\`javascript\n${currentSource}\n\`\`\`\n`
+        : '';
+
       const messages: LLMMessage[] = [
         systemMessage(this.getModificationSystemPrompt()),
         userMessage(`Current manifest:
 \`\`\`json
 ${JSON.stringify(registration.manifest, null, 2)}
 \`\`\`
-
+${sourceBlock}
 Modification request: ${prompt}
 
-Generate the updated object code that implements this change.`),
+Generate the updated manifest and handler map that implements this change.`),
       ];
 
       const result = await this.llm!.complete(messages);
@@ -439,8 +486,11 @@ Generate a new Abjects object that fulfills this request. Use the available obje
       }
     }
 
-    // Extract code
-    const codeMatch = content.match(/```(?:typescript|ts)\s*([\s\S]*?)\s*```/);
+    // Extract code (handler map) — prefer javascript blocks over typescript
+    let codeMatch = content.match(/```(?:javascript|js)\s*([\s\S]*?)\s*```/);
+    if (!codeMatch) {
+      codeMatch = content.match(/```(?:typescript|ts)\s*([\s\S]*?)\s*```/);
+    }
     const code = codeMatch?.[1];
 
     // Extract used objects
@@ -457,19 +507,26 @@ Generate a new Abjects object that fulfills this request. Use the available obje
    * Get the system prompt for object creation.
    */
   private getCreationSystemPrompt(): string {
-    return `You are an Abjects object creator. You generate TypeScript code for objects in a distributed message-passing system.
+    return `You are an Abjects object creator. You generate handler maps for ScriptableAbjects in a distributed message-passing system.
 
-Objects must:
-1. Extend the Abject base class
-2. Define a manifest with name, description, version, interfaces, and requiredCapabilities
-3. Implement message handlers using this.on('methodName', handler)
-4. Use this.send() to send messages to other objects
-5. Use this.request() to send and await replies
+Each handler is a method that receives a message object (msg) with msg.payload containing parameters.
+Return a value from a handler to auto-reply.
+
+IMPORTANT: The handler map must be plain JavaScript (NOT TypeScript). No type annotations, no "as" casts, no interfaces. It will be compiled with new Function() at runtime.
 
 Output format:
 1. First, output the manifest as JSON in a \`\`\`json code block
-2. Then, output the TypeScript code in a \`\`\`typescript code block
-3. Finally, list which available objects you used (if any)
+2. Then, output the handler map as plain JavaScript in a \`\`\`javascript code block
+   The handler map is a parenthesized object expression:
+   ({
+     methodName(msg) {
+       const { param } = msg.payload;
+       return { result: 'value' };
+     }
+   })
+   Each method receives a message object with msg.payload containing parameters.
+   Return a value to auto-reply.
+3. List which available objects you used (if any)
 
 Example manifest:
 \`\`\`json
@@ -492,22 +549,33 @@ Example manifest:
 }
 \`\`\`
 
-Generate clean, well-documented code that follows best practices.`;
+Example handler map:
+\`\`\`javascript
+({
+  doSomething(msg) {
+    return { result: 'Hello from MyObject!' };
+  }
+})
+\`\`\`
+
+Generate clean, well-structured handler maps.`;
   }
 
   /**
    * Get the system prompt for object modification.
    */
   private getModificationSystemPrompt(): string {
-    return `You are an Abjects object modifier. You update existing object code while preserving its core functionality.
+    return `You are an Abjects object modifier. You update existing handler maps while preserving core functionality.
 
 When modifying objects:
 1. Preserve the object's ID and registration
 2. Update the manifest if interfaces change
 3. Maintain backward compatibility where possible
-4. Document breaking changes
 
-Output the updated manifest and code in the same format as object creation.`;
+Output format:
+1. Output the updated manifest as JSON in a \`\`\`json code block
+2. Output the updated handler map as JavaScript in a \`\`\`javascript code block
+   The handler map is a parenthesized object expression: ({ method(msg) { ... } })`;
   }
 }
 

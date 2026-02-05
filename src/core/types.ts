@@ -188,6 +188,8 @@ export interface ObjectRegistration {
   manifest: AbjectManifest;
   status: AbjectStatus;
   registeredAt: number;
+  owner?: AbjectId;
+  source?: string;
 }
 
 export interface DiscoveryQuery {
@@ -204,6 +206,8 @@ export interface DiscoveryQuery {
 export interface SpawnRequest {
   manifest: AbjectManifest;
   code?: ArrayBuffer;
+  source?: string;
+  owner?: AbjectId;
   initialState?: unknown;
   grantedCapabilities?: CapabilityGrant[];
 }

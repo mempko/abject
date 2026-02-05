@@ -13,6 +13,8 @@ import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { UIServer, WidgetEventPayload } from './ui-server.js';
 import { Registry } from './registry.js';
+import { ObjectCreator, CreationResult } from './object-creator.js';
+import { EDITABLE_INTERFACE_ID } from './scriptable-abject.js';
 
 const REGISTRY_BROWSER_INTERFACE: InterfaceId = 'abjects:registry-browser';
 const UI_INTERFACE: InterfaceId = 'abjects:ui';
@@ -25,9 +27,12 @@ const PAD = 16;
 export class RegistryBrowser extends Abject {
   private uiServer?: UIServer;
   private registry?: Registry;
+  private objectCreator?: ObjectCreator;
   private windowId?: string;
   private currentPage = 0;
   private cachedObjects: ObjectRegistration[] = [];
+  private editingObjectId?: AbjectId;
+  private detailIndex?: number;
 
   constructor() {
     super({
@@ -68,9 +73,10 @@ export class RegistryBrowser extends Abject {
     this.setupHandlers();
   }
 
-  setDependencies(uiServer: UIServer, registry: Registry): void {
+  setDependencies(uiServer: UIServer, registry: Registry, objectCreator?: ObjectCreator): void {
     this.uiServer = uiServer;
     this.registry = registry;
+    this.objectCreator = objectCreator;
   }
 
   private setupHandlers(): void {
@@ -133,6 +139,7 @@ export class RegistryBrowser extends Abject {
         title: 'Registry Browser',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
+        resizable: true,
       })
     );
 
@@ -227,6 +234,7 @@ export class RegistryBrowser extends Abject {
         title: obj.manifest.name,
         rect: { x: winX, y: winY, width: WIN_W, height: detailH },
         zIndex: 200,
+        resizable: true,
       })
     );
 
@@ -288,7 +296,7 @@ export class RegistryBrowser extends Abject {
       await addLabel(`Requires: ${reqNames.join(', ')}`);
     }
 
-    // Back button at bottom
+    // Buttons at bottom
     const btnY = detailH - 30 - 36 - 8;
     await this.request(
       request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
@@ -299,10 +307,167 @@ export class RegistryBrowser extends Abject {
         text: 'Back',
       })
     );
+
+    // Show "Edit Source" button if the object is scriptable
+    const isEditable = obj.source !== undefined;
+    if (isEditable) {
+      this.detailIndex = index;
+      await this.request(
+        request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+          windowId: this.windowId,
+          id: 'edit-source-btn',
+          type: 'button',
+          rect: { x: PAD + 90, y: btnY, width: 110, height: 32 },
+          text: 'Edit Source',
+        })
+      );
+    }
+  }
+
+  private async showEditView(obj: ObjectRegistration): Promise<void> {
+    // Destroy existing window
+    if (this.windowId) {
+      await this.request(
+        request(this.id, this.uiServer!.id, UI_INTERFACE, 'destroyWindow', {
+          windowId: this.windowId,
+        })
+      );
+      this.windowId = undefined;
+    }
+
+    this.editingObjectId = obj.id;
+
+    const displayInfo = await this.request<{ width: number; height: number }>(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'getDisplayInfo', {})
+    );
+
+    const editW = 600;
+    const editH = 500;
+    const winX = Math.max(20, Math.floor((displayInfo.width - editW) / 2));
+    const winY = Math.max(20, Math.floor((displayInfo.height - editH) / 2));
+
+    this.windowId = await this.request<string>(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'createWindow', {
+        title: `Edit: ${obj.manifest.name}`,
+        rect: { x: winX, y: winY, width: editW, height: editH },
+        zIndex: 200,
+        resizable: true,
+      })
+    );
+
+    const innerW = editW - PAD * 2;
+    let y = 8;
+
+    // Object name label
+    await this.request(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        windowId: this.windowId,
+        id: 'edit-name-label',
+        type: 'label',
+        rect: { x: PAD, y, width: innerW, height: 20 },
+        text: `Source: ${obj.manifest.name}`,
+      })
+    );
+    y += 28;
+
+    // textArea with source code
+    const textAreaH = editH - 30 - y - 80; // room for buttons + status
+    await this.request(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        windowId: this.windowId,
+        id: 'source-editor',
+        type: 'textArea',
+        rect: { x: PAD, y, width: innerW, height: textAreaH },
+        text: obj.source ?? '',
+        monospace: true,
+      })
+    );
+    y += textAreaH + 8;
+
+    // Button row
+    const btnW = 80;
+    const btnH = 32;
+    const btnGap = 8;
+
+    await this.request(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        windowId: this.windowId,
+        id: 'save-btn',
+        type: 'button',
+        rect: { x: PAD, y, width: btnW, height: btnH },
+        text: 'Save',
+      })
+    );
+
+    await this.request(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        windowId: this.windowId,
+        id: 'cancel-btn',
+        type: 'button',
+        rect: { x: PAD + btnW + btnGap, y, width: btnW, height: btnH },
+        text: 'Cancel',
+      })
+    );
+
+    await this.request(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        windowId: this.windowId,
+        id: 'ai-edit-btn',
+        type: 'button',
+        rect: { x: PAD + (btnW + btnGap) * 2, y, width: btnW, height: btnH },
+        text: 'AI Edit',
+      })
+    );
+
+    y += btnH + 8;
+
+    // AI edit prompt input (hidden until AI Edit is clicked, but always present)
+    await this.request(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        windowId: this.windowId,
+        id: 'ai-prompt-input',
+        type: 'textInput',
+        rect: { x: PAD, y, width: innerW - btnW - btnGap, height: 30 },
+        placeholder: 'Describe what to change...',
+      })
+    );
+
+    await this.request(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        windowId: this.windowId,
+        id: 'ai-go-btn',
+        type: 'button',
+        rect: { x: PAD + innerW - btnW, y, width: btnW, height: 30 },
+        text: 'Go',
+      })
+    );
+
+    y += 38;
+
+    // Status label
+    await this.request(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        windowId: this.windowId,
+        id: 'edit-status',
+        type: 'label',
+        rect: { x: PAD, y, width: innerW, height: 20 },
+        text: '',
+      })
+    );
+  }
+
+  private async updateEditStatus(text: string): Promise<void> {
+    if (!this.windowId) return;
+    await this.request(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+        widgetId: 'edit-status',
+        text,
+      })
+    );
   }
 
   private async handleWidgetEvent(payload: WidgetEventPayload): Promise<void> {
-    if (payload.type !== 'click') return;
+    if (payload.type !== 'click' && payload.type !== 'submit') return;
 
     if (payload.widgetId === 'back-btn') {
       this.cachedObjects = this.registry?.listObjects() ?? [];
@@ -323,6 +488,108 @@ export class RegistryBrowser extends Abject {
       if (this.currentPage < totalPages - 1) {
         this.currentPage++;
         await this.showListView();
+      }
+      return;
+    }
+
+    // Edit Source button in detail view
+    if (payload.widgetId === 'edit-source-btn' && this.detailIndex !== undefined) {
+      const absIndex = this.currentPage * PAGE_SIZE + this.detailIndex;
+      const obj = this.cachedObjects[absIndex];
+      if (obj) {
+        await this.showEditView(obj);
+      }
+      return;
+    }
+
+    // Save button in edit view
+    if (payload.widgetId === 'save-btn' && this.editingObjectId) {
+      const source = await this.request<string>(
+        request(this.id, this.uiServer!.id, UI_INTERFACE, 'getWidgetValue', {
+          widgetId: 'source-editor',
+        })
+      );
+
+      try {
+        // Send updateSource to the ScriptableAbject
+        const result = await this.request<{ success: boolean; error?: string }>(
+          request(this.id, this.editingObjectId, EDITABLE_INTERFACE_ID, 'updateSource', {
+            source,
+          })
+        );
+
+        if (result.success) {
+          // Also update registry
+          if (this.registry) {
+            const reg = this.registry.lookupObject(this.editingObjectId);
+            if (reg) reg.source = source;
+          }
+          await this.updateEditStatus('Saved successfully');
+        } else {
+          await this.updateEditStatus(`Error: ${result.error ?? 'Unknown'}`);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await this.updateEditStatus(`Error: ${msg}`);
+      }
+      return;
+    }
+
+    // Cancel button in edit view
+    if (payload.widgetId === 'cancel-btn') {
+      if (this.detailIndex !== undefined) {
+        this.editingObjectId = undefined;
+        await this.showDetailView(this.detailIndex);
+      } else {
+        this.editingObjectId = undefined;
+        this.cachedObjects = this.registry?.listObjects() ?? [];
+        await this.showListView();
+      }
+      return;
+    }
+
+    // AI Edit: Go button or submit from prompt input
+    if ((payload.widgetId === 'ai-go-btn' || (payload.widgetId === 'ai-prompt-input' && payload.type === 'submit'))
+        && this.editingObjectId && this.objectCreator) {
+      const prompt = await this.request<string>(
+        request(this.id, this.uiServer!.id, UI_INTERFACE, 'getWidgetValue', {
+          widgetId: 'ai-prompt-input',
+        })
+      );
+
+      if (!prompt.trim()) {
+        await this.updateEditStatus('Enter a description of changes');
+        return;
+      }
+
+      await this.updateEditStatus('AI editing...');
+
+      try {
+        const result = await this.request<CreationResult>(
+          request(
+            this.id,
+            this.objectCreator.id,
+            'abjects:object-creator' as InterfaceId,
+            'modify',
+            { objectId: this.editingObjectId, prompt }
+          )
+        );
+
+        if (result.success && result.code) {
+          // Update the textArea with new source
+          await this.request(
+            request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+              widgetId: 'source-editor',
+              text: result.code,
+            })
+          );
+          await this.updateEditStatus('AI edit applied (review and Save)');
+        } else {
+          await this.updateEditStatus(`AI error: ${result.error ?? 'Unknown'}`);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await this.updateEditStatus(`AI error: ${msg}`);
       }
       return;
     }

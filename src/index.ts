@@ -39,6 +39,7 @@ export { Settings, SETTINGS_ID } from './objects/settings.js';
 export { Taskbar, TASKBAR_ID } from './objects/taskbar.js';
 export { RegistryBrowser, REGISTRY_BROWSER_ID } from './objects/registry-browser.js';
 export { ObjectWorkshop, OBJECT_WORKSHOP_ID } from './objects/object-workshop.js';
+export { ScriptableAbject, EDITABLE_INTERFACE_ID } from './objects/scriptable-abject.js';
 
 // Export capability objects
 export { HttpClient, HTTP_CLIENT_ID } from './objects/capabilities/http-client.js';
@@ -189,7 +190,7 @@ async function main(): Promise<App> {
 
   // Create registry browser
   const registryBrowser = new RegistryBrowser();
-  registryBrowser.setDependencies(app.appUIServer, runtime.objectRegistry);
+  registryBrowser.setDependencies(app.appUIServer, runtime.objectRegistry, objectCreator);
   await runtime.spawn(registryBrowser);
 
   // Create object workshop

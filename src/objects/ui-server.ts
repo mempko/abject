@@ -23,6 +23,8 @@ const UI_INTERFACE: InterfaceId = 'abjects:ui';
 const TITLE_BAR_HEIGHT = 30;
 const WIDGET_FONT = '14px system-ui';
 const TITLE_FONT = 'bold 13px system-ui';
+const CODE_FONT = '13px monospace';
+const DEFAULT_LINE_HEIGHT = 18;
 const EDGE_SIZE = 6;
 
 export interface InputEvent {
@@ -64,13 +66,19 @@ interface WindowState {
 interface WidgetState {
   id: string;
   windowId: string;
-  type: 'label' | 'textInput' | 'button';
+  type: 'label' | 'textInput' | 'button' | 'textArea';
   rect: Rect;
   text: string;
   placeholder?: string;
   masked?: boolean;
   focused?: boolean;
   cursorPos?: number;
+  // textArea-specific fields
+  cursorLine?: number;
+  cursorCol?: number;
+  scrollTop?: number;
+  lineHeight?: number;
+  monospace?: boolean;
 }
 
 /**
@@ -484,11 +492,13 @@ export class UIServer extends Abject {
       const payload = msg.payload as {
         windowId: string;
         id: string;
-        type: 'label' | 'textInput' | 'button';
+        type: 'label' | 'textInput' | 'button' | 'textArea';
         rect: Rect;
         text?: string;
         placeholder?: string;
         masked?: boolean;
+        monospace?: boolean;
+        lineHeight?: number;
       };
       return this.addWidget(msg.routing.from, payload);
     });
@@ -711,11 +721,13 @@ export class UIServer extends Abject {
     config: {
       windowId: string;
       id: string;
-      type: 'label' | 'textInput' | 'button';
+      type: 'label' | 'textInput' | 'button' | 'textArea';
       rect: Rect;
       text?: string;
       placeholder?: string;
       masked?: boolean;
+      monospace?: boolean;
+      lineHeight?: number;
     }
   ): boolean {
     const win = this.windows.get(config.windowId);
@@ -731,6 +743,11 @@ export class UIServer extends Abject {
       masked: config.masked,
       focused: false,
       cursorPos: 0,
+      cursorLine: config.type === 'textArea' ? 0 : undefined,
+      cursorCol: config.type === 'textArea' ? 0 : undefined,
+      scrollTop: config.type === 'textArea' ? 0 : undefined,
+      lineHeight: config.type === 'textArea' ? (config.lineHeight ?? DEFAULT_LINE_HEIGHT) : undefined,
+      monospace: config.monospace,
     };
 
     this.widgets.set(config.id, widget);
@@ -992,6 +1009,76 @@ export class UIServer extends Abject {
         break;
       }
 
+      case 'textArea': {
+        const lineHeight = widget.lineHeight ?? DEFAULT_LINE_HEIGHT;
+        const borderColor = widget.focused ? '#6a6aff' : '#555';
+
+        // Background
+        this.compositor.draw({
+          type: 'rect',
+          surfaceId,
+          params: {
+            x: ox, y: oy, width: w, height: h,
+            fill: '#151520', stroke: borderColor, radius: 4,
+          },
+        });
+
+        // Clip to widget bounds
+        this.compositor.draw({ type: 'save', surfaceId, params: {} });
+        this.compositor.draw({
+          type: 'clip',
+          surfaceId,
+          params: { x: ox + 1, y: oy + 1, width: w - 2, height: h - 2 },
+        });
+
+        const font = widget.monospace ? CODE_FONT : WIDGET_FONT;
+        const textPadding = 8;
+        const lines = widget.text.split('\n');
+        const scrollTop = widget.scrollTop ?? 0;
+        const visibleLines = Math.floor(h / lineHeight);
+
+        // Measure char width for cursor positioning
+        const charWidth = this.measureTextWidthWithFont(surfaceId, 'M', font);
+
+        for (let i = scrollTop; i < Math.min(lines.length, scrollTop + visibleLines); i++) {
+          const lineY = oy + (i - scrollTop) * lineHeight + lineHeight * 0.7;
+          this.compositor.draw({
+            type: 'text',
+            surfaceId,
+            params: {
+              x: ox + textPadding,
+              y: lineY,
+              text: lines[i],
+              font,
+              fill: '#ddd',
+              baseline: 'alphabetic',
+            },
+          });
+        }
+
+        // Cursor
+        if (widget.focused) {
+          const cursorLine = widget.cursorLine ?? 0;
+          const cursorCol = widget.cursorCol ?? 0;
+          if (cursorLine >= scrollTop && cursorLine < scrollTop + visibleLines) {
+            const cursorX = ox + textPadding + charWidth * cursorCol;
+            const cursorY = oy + (cursorLine - scrollTop) * lineHeight + 2;
+            this.compositor.draw({
+              type: 'line',
+              surfaceId,
+              params: {
+                x1: cursorX, y1: cursorY,
+                x2: cursorX, y2: cursorY + lineHeight - 4,
+                stroke: '#8888ff',
+              },
+            });
+          }
+        }
+
+        this.compositor.draw({ type: 'restore', surfaceId, params: {} });
+        break;
+      }
+
       case 'button':
         this.compositor.draw({
           type: 'rect',
@@ -1026,6 +1113,17 @@ export class UIServer extends Abject {
     const surface = this.compositor.getSurface(surfaceId);
     if (!surface) return 0;
     surface.ctx.font = WIDGET_FONT;
+    return surface.ctx.measureText(text).width;
+  }
+
+  /**
+   * Measure text width with a specific font.
+   */
+  private measureTextWidthWithFont(surfaceId: string, text: string, font: string): number {
+    if (!this.compositor || !text) return 0;
+    const surface = this.compositor.getSurface(surfaceId);
+    if (!surface) return 0;
+    surface.ctx.font = font;
     return surface.ctx.measureText(text).width;
   }
 
@@ -1207,6 +1305,23 @@ export class UIServer extends Abject {
             widget,
             cx - wr.x - 8
           );
+        } else if (widget.type === 'textArea') {
+          widget.focused = true;
+          this.focusedWidget = widget.id;
+          const lineHeight = widget.lineHeight ?? DEFAULT_LINE_HEIGHT;
+          const scrollTop = widget.scrollTop ?? 0;
+          const clickLine = Math.min(
+            scrollTop + Math.floor((cy - wr.y) / lineHeight),
+            widget.text.split('\n').length - 1
+          );
+          const font = widget.monospace ? CODE_FONT : WIDGET_FONT;
+          const charWidth = this.measureTextWidthWithFont(win.surfaceId, 'M', font);
+          const clickCol = Math.min(
+            Math.round((cx - wr.x - 8) / charWidth),
+            widget.text.split('\n')[clickLine]?.length ?? 0
+          );
+          widget.cursorLine = Math.max(0, clickLine);
+          widget.cursorCol = Math.max(0, clickCol);
         } else if (widget.type === 'button') {
           this.sendWidgetEvent(win.owner, {
             windowId: win.id,
@@ -1252,6 +1367,34 @@ export class UIServer extends Abject {
     const surface = this.compositor?.surfaceAt(x, y);
 
     if (surface) {
+      // Check if this is a UIServer-owned window with a textArea
+      const win = this.findWindowBySurface(surface.id);
+      if (win) {
+        const localX = x - surface.rect.x;
+        const localY = y - surface.rect.y;
+        const cy = win.chromeless ? localY : localY - TITLE_BAR_HEIGHT;
+        const cx = localX;
+
+        for (const widgetId of win.widgets) {
+          const widget = this.widgets.get(widgetId);
+          if (!widget || widget.type !== 'textArea') continue;
+          const wr = widget.rect;
+          if (cx >= wr.x && cx < wr.x + wr.width && cy >= wr.y && cy < wr.y + wr.height) {
+            const lineHeight = widget.lineHeight ?? DEFAULT_LINE_HEIGHT;
+            const totalLines = widget.text.split('\n').length;
+            const visibleLines = Math.floor(wr.height / lineHeight);
+            const maxScroll = Math.max(0, totalLines - visibleLines);
+            let scrollTop = widget.scrollTop ?? 0;
+            scrollTop += Math.sign(e.deltaY);
+            scrollTop = Math.max(0, Math.min(scrollTop, maxScroll));
+            widget.scrollTop = scrollTop;
+            this.renderWindow(win.id);
+            e.preventDefault();
+            return;
+          }
+        }
+      }
+
       const owner = this.surfaceOwners.get(surface.id);
       if (owner && owner !== this.id) {
         this.sendInputEvent(owner, {
@@ -1281,6 +1424,12 @@ export class UIServer extends Abject {
       const widget = this.widgets.get(this.focusedWidget);
       if (widget && widget.type === 'textInput') {
         if (this.handleTextInputKey(widget, e)) {
+          e.preventDefault();
+          return;
+        }
+      }
+      if (widget && widget.type === 'textArea') {
+        if (this.handleTextAreaKey(widget, e)) {
           e.preventDefault();
           return;
         }
@@ -1391,23 +1540,224 @@ export class UIServer extends Abject {
   }
 
   /**
+   * Handle a keydown event for a focused textArea widget.
+   * Returns true if the event was consumed.
+   */
+  private handleTextAreaKey(widget: WidgetState, e: KeyboardEvent): boolean {
+    const lines = widget.text.split('\n');
+    let line = widget.cursorLine ?? 0;
+    let col = widget.cursorCol ?? 0;
+    const lineHeight = widget.lineHeight ?? DEFAULT_LINE_HEIGHT;
+    const h = widget.rect.height;
+    const visibleLines = Math.floor(h / lineHeight);
+
+    const autoScroll = () => {
+      let scrollTop = widget.scrollTop ?? 0;
+      if (line < scrollTop) scrollTop = line;
+      if (line >= scrollTop + visibleLines) scrollTop = line - visibleLines + 1;
+      widget.scrollTop = scrollTop;
+    };
+
+    if (e.key === 'Backspace') {
+      if (col > 0) {
+        lines[line] = lines[line].substring(0, col - 1) + lines[line].substring(col);
+        col--;
+      } else if (line > 0) {
+        col = lines[line - 1].length;
+        lines[line - 1] += lines[line];
+        lines.splice(line, 1);
+        line--;
+      }
+      widget.text = lines.join('\n');
+      widget.cursorLine = line;
+      widget.cursorCol = col;
+      autoScroll();
+      this.rerenderWidgetWindow(widget);
+      this.emitTextChange(widget);
+      return true;
+    }
+
+    if (e.key === 'Delete') {
+      if (col < lines[line].length) {
+        lines[line] = lines[line].substring(0, col) + lines[line].substring(col + 1);
+      } else if (line < lines.length - 1) {
+        lines[line] += lines[line + 1];
+        lines.splice(line + 1, 1);
+      }
+      widget.text = lines.join('\n');
+      widget.cursorLine = line;
+      widget.cursorCol = col;
+      this.rerenderWidgetWindow(widget);
+      this.emitTextChange(widget);
+      return true;
+    }
+
+    if (e.key === 'Enter') {
+      const before = lines[line].substring(0, col);
+      const after = lines[line].substring(col);
+      lines[line] = before;
+      lines.splice(line + 1, 0, after);
+      line++;
+      col = 0;
+      widget.text = lines.join('\n');
+      widget.cursorLine = line;
+      widget.cursorCol = col;
+      autoScroll();
+      this.rerenderWidgetWindow(widget);
+      this.emitTextChange(widget);
+      return true;
+    }
+
+    if (e.key === 'Tab') {
+      const indent = '  ';
+      lines[line] = lines[line].substring(0, col) + indent + lines[line].substring(col);
+      col += indent.length;
+      widget.text = lines.join('\n');
+      widget.cursorCol = col;
+      this.rerenderWidgetWindow(widget);
+      this.emitTextChange(widget);
+      return true;
+    }
+
+    if (e.key === 'ArrowLeft') {
+      if (col > 0) {
+        col--;
+      } else if (line > 0) {
+        line--;
+        col = lines[line].length;
+      }
+      widget.cursorLine = line;
+      widget.cursorCol = col;
+      autoScroll();
+      this.rerenderWidgetWindow(widget);
+      return true;
+    }
+
+    if (e.key === 'ArrowRight') {
+      if (col < lines[line].length) {
+        col++;
+      } else if (line < lines.length - 1) {
+        line++;
+        col = 0;
+      }
+      widget.cursorLine = line;
+      widget.cursorCol = col;
+      autoScroll();
+      this.rerenderWidgetWindow(widget);
+      return true;
+    }
+
+    if (e.key === 'ArrowUp') {
+      if (line > 0) {
+        line--;
+        col = Math.min(col, lines[line].length);
+      }
+      widget.cursorLine = line;
+      widget.cursorCol = col;
+      autoScroll();
+      this.rerenderWidgetWindow(widget);
+      return true;
+    }
+
+    if (e.key === 'ArrowDown') {
+      if (line < lines.length - 1) {
+        line++;
+        col = Math.min(col, lines[line].length);
+      }
+      widget.cursorLine = line;
+      widget.cursorCol = col;
+      autoScroll();
+      this.rerenderWidgetWindow(widget);
+      return true;
+    }
+
+    if (e.key === 'Home') {
+      widget.cursorCol = 0;
+      this.rerenderWidgetWindow(widget);
+      return true;
+    }
+
+    if (e.key === 'End') {
+      widget.cursorCol = lines[line].length;
+      this.rerenderWidgetWindow(widget);
+      return true;
+    }
+
+    // Printable character
+    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+      lines[line] = lines[line].substring(0, col) + e.key + lines[line].substring(col);
+      col++;
+      widget.text = lines.join('\n');
+      widget.cursorLine = line;
+      widget.cursorCol = col;
+      autoScroll();
+      this.rerenderWidgetWindow(widget);
+      this.emitTextChange(widget);
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
    * Handle paste events.
    */
   private handlePasteEvent(e: ClipboardEvent): void {
     if (!this.focusedWidget) return;
 
     const widget = this.widgets.get(this.focusedWidget);
-    if (!widget || widget.type !== 'textInput') return;
+    if (!widget) return;
 
-    const text = e.clipboardData?.getData('text') ?? '';
-    if (!text) return;
+    if (widget.type === 'textInput') {
+      const text = e.clipboardData?.getData('text') ?? '';
+      if (!text) return;
 
-    e.preventDefault();
-    const pos = widget.cursorPos ?? 0;
-    widget.text = widget.text.substring(0, pos) + text + widget.text.substring(pos);
-    widget.cursorPos = pos + text.length;
-    this.rerenderWidgetWindow(widget);
-    this.emitTextChange(widget);
+      e.preventDefault();
+      const pos = widget.cursorPos ?? 0;
+      widget.text = widget.text.substring(0, pos) + text + widget.text.substring(pos);
+      widget.cursorPos = pos + text.length;
+      this.rerenderWidgetWindow(widget);
+      this.emitTextChange(widget);
+    } else if (widget.type === 'textArea') {
+      const pasteText = e.clipboardData?.getData('text') ?? '';
+      if (!pasteText) return;
+
+      e.preventDefault();
+      const lines = widget.text.split('\n');
+      let line = widget.cursorLine ?? 0;
+      let col = widget.cursorCol ?? 0;
+      const lineHeight = widget.lineHeight ?? DEFAULT_LINE_HEIGHT;
+      const visibleLines = Math.floor(widget.rect.height / lineHeight);
+
+      const before = lines[line].substring(0, col);
+      const after = lines[line].substring(col);
+      const pasteLines = pasteText.split('\n');
+
+      if (pasteLines.length === 1) {
+        lines[line] = before + pasteLines[0] + after;
+        col += pasteLines[0].length;
+      } else {
+        lines[line] = before + pasteLines[0];
+        for (let i = 1; i < pasteLines.length - 1; i++) {
+          lines.splice(line + i, 0, pasteLines[i]);
+        }
+        const lastPasteLine = pasteLines[pasteLines.length - 1];
+        lines.splice(line + pasteLines.length - 1, 0, lastPasteLine + after);
+        line += pasteLines.length - 1;
+        col = lastPasteLine.length;
+      }
+
+      widget.text = lines.join('\n');
+      widget.cursorLine = line;
+      widget.cursorCol = col;
+
+      let scrollTop = widget.scrollTop ?? 0;
+      if (line >= scrollTop + visibleLines) scrollTop = line - visibleLines + 1;
+      widget.scrollTop = scrollTop;
+
+      this.rerenderWidgetWindow(widget);
+      this.emitTextChange(widget);
+    }
   }
 
   /**
@@ -1419,7 +1769,7 @@ export class UIServer extends Abject {
 
     const textInputs = win.widgets
       .map((id) => this.widgets.get(id))
-      .filter((w): w is WidgetState => w !== undefined && w.type === 'textInput');
+      .filter((w): w is WidgetState => w !== undefined && (w.type === 'textInput' || w.type === 'textArea'));
 
     const idx = textInputs.findIndex((w) => w.id === current.id);
     const next = textInputs[(idx + 1) % textInputs.length];

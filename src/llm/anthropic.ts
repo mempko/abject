@@ -53,11 +53,15 @@ export class AnthropicProvider extends BaseLLMProvider {
   private model: string;
 
   constructor(config: AnthropicConfig) {
+    // Use Vite proxy in dev to avoid CORS
+    const defaultBase = typeof window !== 'undefined' && window.location?.hostname === 'localhost'
+      ? '/api/anthropic'
+      : 'https://api.anthropic.com';
     super({
       apiKey: config.apiKey,
-      baseUrl: config.baseUrl ?? 'https://api.anthropic.com',
+      baseUrl: config.baseUrl ?? defaultBase,
     });
-    this.model = config.model ?? 'claude-3-5-sonnet-20241022';
+    this.model = config.model ?? 'claude-sonnet-4-5-20250929';
   }
 
   async isAvailable(): Promise<boolean> {
@@ -100,6 +104,7 @@ export class AnthropicProvider extends BaseLLMProvider {
         ...this.buildHeaders(),
         'x-api-key': this.apiKey!,
         'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
       },
       body: JSON.stringify(request),
     });
@@ -157,6 +162,7 @@ export class AnthropicProvider extends BaseLLMProvider {
         ...this.buildHeaders(),
         'x-api-key': this.apiKey!,
         'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
       },
       body: JSON.stringify(request),
     });

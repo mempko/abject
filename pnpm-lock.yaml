@@ -24,6 +24,9 @@ importers:
       assemblyscript:
         specifier: ^0.27.0
         version: 0.27.37
+      dotenv:
+        specifier: ^17.2.4
+        version: 17.2.4
       typescript:
         specifier: ^5.3.0
         version: 5.9.3
@@ -319,6 +322,10 @@ packages:
     resolution: {integrity: sha512-0GZrojJnuhoe+hiwji7QFaL3tBlJoA+KFUN7ouYSDGZLSo9CKM8swQX8n/UcbR0d1VuZKU+nhogNzv423JEu5A==}
     hasBin: true
 
+  dotenv@17.2.4:
+    resolution: {integrity: sha512-mudtfb4zRB4bVvdj0xRo+e6duH1csJRM8IukBqfTRvHotn9+LBXB8ynAidP9zHqoRC/fsllXgk4kCKlR21fIhw==}
+    engines: {node: '>=12'}
+
   esbuild@0.21.5:
     resolution: {integrity: sha512-mg3OPMV4hXywwpoDxu3Qda5xCKQi+vCTZq8S9J/EpkhB2HzKXq4SNFZE3+NK93JYxc8VMSep+lOUSC/RVKaBqw==}
     engines: {node: '>=12'}
@@ -588,6 +595,8 @@ snapshots:
       long: 5.3.2
 
   binaryen@116.0.0-nightly.20240114: {}
+
+  dotenv@17.2.4: {}
 
   esbuild@0.21.5:
     optionalDependencies:

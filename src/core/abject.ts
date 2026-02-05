@@ -145,6 +145,13 @@ export abstract class Abject {
   }
 
   /**
+   * Remove a message handler for a method.
+   */
+  protected off(method: string): void {
+    this.handlers.delete(method);
+  }
+
+  /**
    * Send a message to another object.
    */
   protected async send(message: AbjectMessage): Promise<void> {
