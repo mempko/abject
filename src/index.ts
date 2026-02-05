@@ -17,6 +17,9 @@ import { Clipboard } from './objects/capabilities/clipboard.js';
 import { Console } from './objects/capabilities/console.js';
 import { FileSystem } from './objects/capabilities/filesystem.js';
 import { Settings } from './objects/settings.js';
+import { Taskbar } from './objects/taskbar.js';
+import { RegistryBrowser } from './objects/registry-browser.js';
+import { ObjectWorkshop } from './objects/object-workshop.js';
 
 // Export public API
 export { App, createApp } from './ui/app.js';
@@ -33,6 +36,9 @@ export { ProxyGenerator, PROXY_GENERATOR_ID } from './objects/proxy-generator.js
 export { Negotiator, NEGOTIATOR_ID } from './protocol/negotiator.js';
 export { HealthMonitor, HEALTH_MONITOR_ID } from './protocol/health-monitor.js';
 export { Settings, SETTINGS_ID } from './objects/settings.js';
+export { Taskbar, TASKBAR_ID } from './objects/taskbar.js';
+export { RegistryBrowser, REGISTRY_BROWSER_ID } from './objects/registry-browser.js';
+export { ObjectWorkshop, OBJECT_WORKSHOP_ID } from './objects/object-workshop.js';
 
 // Export capability objects
 export { HttpClient, HTTP_CLIENT_ID } from './objects/capabilities/http-client.js';
@@ -181,6 +187,21 @@ async function main(): Promise<App> {
   settings.setDependencies(llm, storage, app.appUIServer);
   await runtime.spawn(settings);
 
+  // Create registry browser
+  const registryBrowser = new RegistryBrowser();
+  registryBrowser.setDependencies(app.appUIServer, runtime.objectRegistry);
+  await runtime.spawn(registryBrowser);
+
+  // Create object workshop
+  const objectWorkshop = new ObjectWorkshop();
+  objectWorkshop.setDependencies(app.appUIServer, objectCreator);
+  await runtime.spawn(objectWorkshop);
+
+  // Create taskbar (must be last — needs references to other UI objects)
+  const taskbar = new Taskbar();
+  taskbar.setDependencies(app.appUIServer, settings, registryBrowser, objectWorkshop);
+  await runtime.spawn(taskbar);
+
   console.log('[ABJECTS] System ready');
   console.log(`[ABJECTS] ${runtime.objectRegistry.objectCount} objects registered`);
 
@@ -191,6 +212,9 @@ async function main(): Promise<App> {
     llm,
     settings,
     objectCreator,
+    registryBrowser,
+    objectWorkshop,
+    taskbar,
     registry: runtime.objectRegistry,
     factory: runtime.objectFactory,
   };

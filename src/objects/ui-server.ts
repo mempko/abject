@@ -23,6 +23,7 @@ const UI_INTERFACE: InterfaceId = 'abjects:ui';
 const TITLE_BAR_HEIGHT = 30;
 const WIDGET_FONT = '14px system-ui';
 const TITLE_FONT = 'bold 13px system-ui';
+const EDGE_SIZE = 6;
 
 export interface InputEvent {
   type: 'mousedown' | 'mouseup' | 'mousemove' | 'keydown' | 'keyup' | 'wheel';
@@ -56,6 +57,8 @@ interface WindowState {
   title: string;
   rect: Rect;
   widgets: string[];
+  chromeless?: boolean;
+  resizable?: boolean;
 }
 
 interface WidgetState {
@@ -81,6 +84,15 @@ export class UIServer extends Abject {
   private windows: Map<string, WindowState> = new Map();
   private widgets: Map<string, WidgetState> = new Map();
   private focusedWidget?: string;
+
+  private dragState?: {
+    windowId: string;
+    type: 'move' | 'resize';
+    edge: string;
+    startMouseX: number;
+    startMouseY: number;
+    startRect: Rect;
+  };
 
   constructor() {
     super({
@@ -245,6 +257,18 @@ export class UIServer extends Abject {
                     description: 'Z-ordering',
                     optional: true,
                   },
+                  {
+                    name: 'chromeless',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'Skip title bar and window chrome',
+                    optional: true,
+                  },
+                  {
+                    name: 'resizable',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'Allow user to resize the window by dragging edges',
+                    optional: true,
+                  },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -358,6 +382,30 @@ export class UIServer extends Abject {
                 description: 'Widget interaction event',
                 payload: { kind: 'reference', reference: 'WidgetEventPayload' },
               },
+              {
+                name: 'windowMoved',
+                description: 'Window was moved by the user',
+                payload: {
+                  kind: 'object',
+                  properties: {
+                    windowId: { kind: 'primitive', primitive: 'string' },
+                    x: { kind: 'primitive', primitive: 'number' },
+                    y: { kind: 'primitive', primitive: 'number' },
+                  },
+                },
+              },
+              {
+                name: 'windowResized',
+                description: 'Window was resized by the user',
+                payload: {
+                  kind: 'object',
+                  properties: {
+                    windowId: { kind: 'primitive', primitive: 'string' },
+                    width: { kind: 'primitive', primitive: 'number' },
+                    height: { kind: 'primitive', primitive: 'number' },
+                  },
+                },
+              },
             ],
           },
         ],
@@ -422,12 +470,14 @@ export class UIServer extends Abject {
     });
 
     this.on('createWindow', async (msg: AbjectMessage) => {
-      const { title, rect, zIndex } = msg.payload as {
+      const { title, rect, zIndex, chromeless, resizable } = msg.payload as {
         title: string;
         rect: Rect;
         zIndex?: number;
+        chromeless?: boolean;
+        resizable?: boolean;
       };
-      return this.createWindow(msg.routing.from, title, rect, zIndex);
+      return this.createWindow(msg.routing.from, title, rect, zIndex, chromeless, resizable);
     });
 
     this.on('addWidget', async (msg: AbjectMessage) => {
@@ -627,7 +677,9 @@ export class UIServer extends Abject {
     owner: AbjectId,
     title: string,
     rect: Rect,
-    zIndex?: number
+    zIndex?: number,
+    chromeless?: boolean,
+    resizable?: boolean
   ): string {
     require(this.compositor !== undefined, 'Compositor not set');
 
@@ -642,6 +694,8 @@ export class UIServer extends Abject {
       title,
       rect,
       widgets: [],
+      chromeless,
+      resizable,
     };
     this.windows.set(windowId, win);
 
@@ -776,45 +830,61 @@ export class UIServer extends Abject {
       params: { x: 0, y: 0, width: w, height: h, fill: '#1e1e2e', stroke: '#444', radius: 6 },
     });
 
-    // Title bar
-    this.compositor.draw({
-      type: 'rect',
-      surfaceId: sid,
-      params: { x: 0, y: 0, width: w, height: TITLE_BAR_HEIGHT, fill: '#2a2a3e', radius: 6 },
-    });
-    // Cover bottom corners of title bar so they're square where content meets
-    this.compositor.draw({
-      type: 'rect',
-      surfaceId: sid,
-      params: { x: 0, y: TITLE_BAR_HEIGHT - 6, width: w, height: 6, fill: '#2a2a3e' },
-    });
+    if (!win.chromeless) {
+      // Title bar
+      this.compositor.draw({
+        type: 'rect',
+        surfaceId: sid,
+        params: { x: 0, y: 0, width: w, height: TITLE_BAR_HEIGHT, fill: '#2a2a3e', radius: 6 },
+      });
+      // Cover bottom corners of title bar so they're square where content meets
+      this.compositor.draw({
+        type: 'rect',
+        surfaceId: sid,
+        params: { x: 0, y: TITLE_BAR_HEIGHT - 6, width: w, height: 6, fill: '#2a2a3e' },
+      });
 
-    // Title text
-    this.compositor.draw({
-      type: 'text',
-      surfaceId: sid,
-      params: {
-        x: 12,
-        y: TITLE_BAR_HEIGHT / 2,
-        text: win.title,
-        font: TITLE_FONT,
-        fill: '#ccc',
-        baseline: 'middle',
-      },
-    });
+      // Title text
+      this.compositor.draw({
+        type: 'text',
+        surfaceId: sid,
+        params: {
+          x: 12,
+          y: TITLE_BAR_HEIGHT / 2,
+          text: win.title,
+          font: TITLE_FONT,
+          fill: '#ccc',
+          baseline: 'middle',
+        },
+      });
 
-    // Separator line
-    this.compositor.draw({
-      type: 'line',
-      surfaceId: sid,
-      params: { x1: 0, y1: TITLE_BAR_HEIGHT, x2: w, y2: TITLE_BAR_HEIGHT, stroke: '#444' },
-    });
+      // Separator line
+      this.compositor.draw({
+        type: 'line',
+        surfaceId: sid,
+        params: { x1: 0, y1: TITLE_BAR_HEIGHT, x2: w, y2: TITLE_BAR_HEIGHT, stroke: '#444' },
+      });
+    }
+
+    // Resize grip (bottom-right corner)
+    if (win.resizable) {
+      this.compositor.draw({
+        type: 'line',
+        surfaceId: sid,
+        params: { x1: w - 3, y1: h - 8, x2: w - 8, y2: h - 3, stroke: '#666' },
+      });
+      this.compositor.draw({
+        type: 'line',
+        surfaceId: sid,
+        params: { x1: w - 3, y1: h - 4, x2: w - 4, y2: h - 3, stroke: '#666' },
+      });
+    }
 
     // Render widgets
     for (const widgetId of win.widgets) {
       const widget = this.widgets.get(widgetId);
       if (widget) {
-        this.renderWidget(sid, widget);
+        this.renderWidget(sid, widget, win.chromeless);
       }
     }
   }
@@ -822,12 +892,12 @@ export class UIServer extends Abject {
   /**
    * Render a single widget onto a surface.
    */
-  private renderWidget(surfaceId: string, widget: WidgetState): void {
+  private renderWidget(surfaceId: string, widget: WidgetState, chromeless?: boolean): void {
     if (!this.compositor) return;
 
-    // Widget coordinates are relative to content area (below title bar)
+    // Widget coordinates are relative to content area (below title bar unless chromeless)
     const ox = widget.rect.x;
-    const oy = widget.rect.y + TITLE_BAR_HEIGHT;
+    const oy = chromeless ? widget.rect.y : widget.rect.y + TITLE_BAR_HEIGHT;
     const w = widget.rect.width;
     const h = widget.rect.height;
 
@@ -962,27 +1032,122 @@ export class UIServer extends Abject {
   // ── Input Handling ───────────────────────────────────────────────────
 
   /**
-   * Handle mouse events.
+   * Handle mouse events — supports drag-to-move (title bar) and drag-to-resize (edges).
    */
   private handleMouseEvent(
     e: MouseEvent,
     type: 'mousedown' | 'mouseup' | 'mousemove'
   ): void {
-    const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    const canvasRect = (e.target as HTMLCanvasElement).getBoundingClientRect();
+    const x = e.clientX - canvasRect.left;
+    const y = e.clientY - canvasRect.top;
 
+    // ── mousemove while dragging ──
+    if (type === 'mousemove' && this.dragState) {
+      const win = this.windows.get(this.dragState.windowId);
+      if (!win) { this.dragState = undefined; return; }
+
+      const dx = x - this.dragState.startMouseX;
+      const dy = y - this.dragState.startMouseY;
+
+      if (this.dragState.type === 'move') {
+        const newX = this.dragState.startRect.x + dx;
+        const newY = this.dragState.startRect.y + dy;
+        this.compositor!.moveSurface(win.surfaceId, newX, newY);
+        win.rect.x = newX;
+        win.rect.y = newY;
+      } else {
+        // resize
+        const sr = this.dragState.startRect;
+        let newX = sr.x;
+        let newY = sr.y;
+        let newW = sr.width;
+        let newH = sr.height;
+        const edge = this.dragState.edge;
+
+        if (edge.includes('e')) newW = sr.width + dx;
+        if (edge.includes('w')) { newW = sr.width - dx; newX = sr.x + dx; }
+        if (edge.includes('s')) newH = sr.height + dy;
+        if (edge.includes('n')) { newH = sr.height - dy; newY = sr.y + dy; }
+
+        // Enforce minimum size
+        if (newW < 100) { if (edge.includes('w')) newX = sr.x + sr.width - 100; newW = 100; }
+        if (newH < 60) { if (edge.includes('n')) newY = sr.y + sr.height - 60; newH = 60; }
+
+        const moved = newX !== win.rect.x || newY !== win.rect.y;
+        const resized = newW !== win.rect.width || newH !== win.rect.height;
+
+        win.rect.x = newX;
+        win.rect.y = newY;
+        win.rect.width = newW;
+        win.rect.height = newH;
+
+        if (moved) this.compositor!.moveSurface(win.surfaceId, newX, newY);
+        if (resized) this.compositor!.resizeSurface(win.surfaceId, newW, newH);
+        if (resized) this.renderWindow(win.id);
+      }
+      return;
+    }
+
+    // ── mouseup while dragging ──
+    if (type === 'mouseup' && this.dragState) {
+      const win = this.windows.get(this.dragState.windowId);
+      if (win) {
+        if (this.dragState.type === 'move') {
+          this.sendWindowMovedEvent(win.owner, win.id, win.rect.x, win.rect.y);
+        } else {
+          this.sendWindowResizedEvent(win.owner, win.id, win.rect.width, win.rect.height);
+        }
+      }
+      this.dragState = undefined;
+      return;
+    }
+
+    // ── mousedown ──
     const surface = this.compositor?.surfaceAt(x, y);
 
     if (surface && type === 'mousedown') {
-      // Check if click is inside a window managed by widget system
       const win = this.findWindowBySurface(surface.id);
       if (win) {
-        this.handleWindowClick(win, x - surface.rect.x, y - surface.rect.y);
+        const localX = x - surface.rect.x;
+        const localY = y - surface.rect.y;
+
+        // Check resize edges first (higher priority at edges)
+        const edge = this.detectResizeEdge(win, localX, localY);
+        if (edge) {
+          this.dragState = {
+            windowId: win.id,
+            type: 'resize',
+            edge,
+            startMouseX: x,
+            startMouseY: y,
+            startRect: { ...win.rect },
+          };
+          this.focusedSurface = win.surfaceId;
+          return;
+        }
+
+        // Title bar drag (non-chromeless only)
+        if (!win.chromeless && localY < TITLE_BAR_HEIGHT) {
+          this.dragState = {
+            windowId: win.id,
+            type: 'move',
+            edge: '',
+            startMouseX: x,
+            startMouseY: y,
+            startRect: { ...win.rect },
+          };
+          this.focusedSurface = win.surfaceId;
+          return;
+        }
+
+        // Widget hit-testing
+        this.handleWindowClick(win, localX, localY);
         return;
       }
     }
 
+    // ── Forward to surface owner ──
     const inputEvent: InputEvent = {
       type,
       surfaceId: surface?.id,
@@ -1013,9 +1178,9 @@ export class UIServer extends Abject {
    * Handle click inside a window — hit-test widgets.
    */
   private handleWindowClick(win: WindowState, localX: number, localY: number): void {
-    // Convert to content-area coordinates
+    // Convert to content-area coordinates (no title bar offset for chromeless windows)
     const cx = localX;
-    const cy = localY - TITLE_BAR_HEIGHT;
+    const cy = win.chromeless ? localY : localY - TITLE_BAR_HEIGHT;
 
     // Unfocus previous widget
     if (this.focusedWidget) {
@@ -1299,6 +1464,29 @@ export class UIServer extends Abject {
     return undefined;
   }
 
+  /**
+   * Detect if a local position is near a resize edge/corner of a window.
+   */
+  private detectResizeEdge(win: WindowState, localX: number, localY: number): string | null {
+    if (win.chromeless || !win.resizable) return null;
+
+    const n = localY < EDGE_SIZE;
+    const s = localY > win.rect.height - EDGE_SIZE;
+    const w = localX < EDGE_SIZE;
+    const e = localX > win.rect.width - EDGE_SIZE;
+
+    if (n && w) return 'nw';
+    if (n && e) return 'ne';
+    if (s && w) return 'sw';
+    if (s && e) return 'se';
+    if (n) return 'n';
+    if (s) return 's';
+    if (w) return 'w';
+    if (e) return 'e';
+
+    return null;
+  }
+
   // ── Event Sending ────────────────────────────────────────────────────
 
   /**
@@ -1335,6 +1523,34 @@ export class UIServer extends Abject {
   ): Promise<void> {
     await this.send(
       event(this.id, objectId, UI_INTERFACE, 'widgetEvent', payload)
+    );
+  }
+
+  /**
+   * Send windowMoved event to a window owner.
+   */
+  private async sendWindowMovedEvent(
+    owner: AbjectId,
+    windowId: string,
+    x: number,
+    y: number
+  ): Promise<void> {
+    await this.send(
+      event(this.id, owner, UI_INTERFACE, 'windowMoved', { windowId, x, y })
+    );
+  }
+
+  /**
+   * Send windowResized event to a window owner.
+   */
+  private async sendWindowResizedEvent(
+    owner: AbjectId,
+    windowId: string,
+    width: number,
+    height: number
+  ): Promise<void> {
+    await this.send(
+      event(this.id, owner, UI_INTERFACE, 'windowResized', { windowId, width, height })
     );
   }
 
