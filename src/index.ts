@@ -61,6 +61,73 @@ export { WebSocketTransport } from './network/websocket.js';
 export { Compositor } from './ui/compositor.js';
 
 /**
+ * Escape HTML special characters for safe DOM insertion.
+ */
+function escapeHtml(text: string): string {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+/**
+ * Display a fatal error message in the DOM.
+ */
+function showError(container: HTMLElement, err: unknown): void {
+  const message = err instanceof Error ? err.message : String(err);
+  const stack = err instanceof Error ? err.stack : undefined;
+
+  const el = document.createElement('div');
+  el.style.cssText = [
+    'position: fixed',
+    'top: 50%',
+    'left: 50%',
+    'transform: translate(-50%, -50%)',
+    'max-width: 600px',
+    'width: 90%',
+    'padding: 24px',
+    'background: #2d1b1b',
+    'border: 1px solid #ff4444',
+    'border-radius: 8px',
+    'color: #ff8888',
+    'font-family: system-ui, -apple-system, sans-serif',
+    'font-size: 14px',
+    'z-index: 10000',
+  ].join(';');
+
+  el.innerHTML = `
+    <h2 style="margin: 0 0 12px 0; color: #ff4444; font-size: 18px;">Abjects failed to start</h2>
+    <p style="margin: 0 0 12px 0; color: #ffaaaa;">${escapeHtml(message)}</p>
+    ${stack ? `<pre style="margin: 0; padding: 12px; background: #1a1a2e; border-radius: 4px; overflow-x: auto; font-size: 12px; color: #888;">${escapeHtml(stack)}</pre>` : ''}
+  `;
+
+  container.appendChild(el);
+}
+
+/**
+ * Display a status message in the DOM.
+ */
+function showStatus(container: HTMLElement, message: string, isWarning = false): void {
+  const el = document.createElement('div');
+  el.style.cssText = [
+    'position: fixed',
+    'bottom: 16px',
+    'right: 16px',
+    'padding: 12px 16px',
+    'background: ' + (isWarning ? '#2d2b1b' : '#1b2d1b'),
+    'border: 1px solid ' + (isWarning ? '#aaaa44' : '#44aa44'),
+    'border-radius: 6px',
+    'color: ' + (isWarning ? '#dddd88' : '#88dd88'),
+    'font-family: system-ui, -apple-system, sans-serif',
+    'font-size: 13px',
+    'z-index: 9999',
+    'max-width: 400px',
+  ].join(';');
+
+  el.textContent = message;
+  container.appendChild(el);
+}
+
+/**
  * Initialize and start the Abjects system in the browser.
  */
 async function main(): Promise<App> {
@@ -134,6 +201,24 @@ async function main(): Promise<App> {
   console.log('[ABJECTS] System ready');
   console.log(`[ABJECTS] ${runtime.objectRegistry.objectCount} objects registered`);
 
+  // Show system status in the DOM
+  const statusContainer = document.querySelector('#app') as HTMLElement;
+  if (statusContainer) {
+    const providers = llm.listProviders();
+    if (providers.length === 0) {
+      showStatus(
+        statusContainer,
+        'Abjects running. No LLM providers configured \u2014 set ANTHROPIC_API_KEY or OPENAI_API_KEY to enable AI features.',
+        true
+      );
+    } else {
+      showStatus(
+        statusContainer,
+        `Abjects running. ${runtime.objectRegistry.objectCount} objects. LLM: ${providers.join(', ')}.`
+      );
+    }
+  }
+
   // Make app available globally for debugging
   (window as unknown as Record<string, unknown>).abjects = {
     app,
@@ -148,10 +233,18 @@ async function main(): Promise<App> {
 }
 
 // Auto-start if in browser
-if (typeof window !== 'undefined' && document.readyState !== 'loading') {
-  main().catch(console.error);
-} else if (typeof window !== 'undefined') {
-  document.addEventListener('DOMContentLoaded', () => {
-    main().catch(console.error);
+function startWithErrorHandling(): void {
+  main().catch((err) => {
+    console.error('[ABJECTS] Fatal startup error:', err);
+    const container = document.querySelector('#app') as HTMLElement;
+    if (container) {
+      showError(container, err);
+    }
   });
+}
+
+if (typeof window !== 'undefined' && document.readyState !== 'loading') {
+  startWithErrorHandling();
+} else if (typeof window !== 'undefined') {
+  document.addEventListener('DOMContentLoaded', startWithErrorHandling);
 }

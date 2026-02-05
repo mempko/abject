@@ -68,8 +68,6 @@ export abstract class Abject {
       ...(options.capabilities ?? []),
     ];
     this.capabilities = new CapabilitySet(grants);
-
-    this.checkInvariants();
   }
 
   /**
