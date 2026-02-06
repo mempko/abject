@@ -280,9 +280,13 @@ export class ObjectCreator extends Abject {
 
       // If verification found unfixable issues, try LLM-assisted fix
       if (verified.mismatches.length > 0) {
-        const llmFixed = await this.llmVerifyAndFix(manifest, code, verified.mismatches);
-        manifest = llmFixed.manifest;
-        code = llmFixed.code;
+        try {
+          const llmFixed = await this.llmVerifyAndFix(manifest, code, verified.mismatches);
+          manifest = llmFixed.manifest;
+          code = llmFixed.code;
+        } catch (err) {
+          console.warn('[OBJECT-CREATOR] LLM verify/fix failed, continuing with unverified code:', err);
+        }
       }
 
       // Validate the code compiles before spawning
@@ -731,7 +735,7 @@ CRITICAL RULES:
 
 ## UI Capabilities
 
-Handler functions are bound to the object instance. Use these methods:
+Handler functions are bound to the object instance. These are the ONLY available methods on \`this\`:
 
 - this.createWindow(title, {x,y,width,height}, {resizable?}) → windowId
 - this.addWidget(windowId, widgetId, type, {x,y,width,height}, {text?, placeholder?})
@@ -742,6 +746,8 @@ Handler functions are bound to the object instance. Use these methods:
 - this.getDisplayInfo() → {width, height}
 - this.call(objectId, interfaceId, method, payload) → result
 - this.id — this object's ID
+
+NEVER use this.services, this.api, this.ctx, or any other property not listed above. Call UI methods directly on this (e.g. this.createWindow, NOT this.services.window).
 
 ### Show/Hide Pattern
 Objects with a UI MUST implement show and hide methods. They get a taskbar button automatically.
@@ -807,8 +813,9 @@ Output format:
 2. Output the updated handler map as JavaScript in a \`\`\`javascript code block
    The handler map is a parenthesized object expression: ({ method(msg) { ... } })
 
-UI methods available: this.createWindow(), this.addWidget(), this.updateWidget(),
-this.getWidgetValue(), this.destroyWindow(), this.getDisplayInfo(), this.call()
+The ONLY methods available on \`this\` are: this.createWindow(), this.addWidget(), this.updateWidget(),
+this.getWidgetValue(), this.destroyWindow(), this.getDisplayInfo(), this.call(), this.id
+NEVER use this.services, this.api, this.ctx, or any other property not listed above.
 Objects with show/hide methods get taskbar buttons automatically.`;
   }
 }

@@ -4,6 +4,7 @@
 
 import {
   BaseLLMProvider,
+  FetchDelegate,
   LLMMessage,
   LLMCompletionOptions,
   LLMCompletionResult,
@@ -15,6 +16,7 @@ export interface OpenAIConfig {
   apiKey: string;
   model?: string;
   baseUrl?: string;
+  fetchFn?: FetchDelegate;
 }
 
 interface OpenAIMessage {
@@ -62,6 +64,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     super({
       apiKey: config.apiKey,
       baseUrl: config.baseUrl ?? 'https://api.openai.com',
+      fetchFn: config.fetchFn,
     });
     this.model = config.model ?? 'gpt-4-turbo-preview';
   }
@@ -93,7 +96,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       body: JSON.stringify(request),
     });
 
-    const data = (await response.json()) as OpenAIResponse;
+    const data = JSON.parse(response.body) as OpenAIResponse;
 
     const choice = data.choices[0];
     if (!choice) {
@@ -115,6 +118,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     options: LLMCompletionOptions = {}
   ): AsyncIterable<LLMStreamChunk> {
     require(this.apiKey !== undefined, 'API key is required');
+    require(!this.fetchFn, 'Streaming is not supported when using HttpClient delegate');
 
     const request: OpenAIRequest = {
       model: this.model,

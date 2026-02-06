@@ -194,7 +194,7 @@ export class HttpClient extends Abject {
   }
 
   /**
-   * Make an HTTP request.
+   * Make an HTTP request with retry for transient errors.
    */
   async makeRequest(req: HttpRequest): Promise<HttpResponse> {
     // Validate URL
@@ -212,34 +212,53 @@ export class HttpClient extends Abject {
         typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
     }
 
-    // Set timeout
-    const controller = new AbortController();
+    const maxAttempts = 3;
     const timeout = req.timeout ?? 30000;
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
-    options.signal = controller.signal;
 
-    try {
-      const response = await fetch(req.url, options);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeout);
 
-      // Extract headers
-      const headers: Record<string, string> = {};
-      response.headers.forEach((value, key) => {
-        headers[key] = value;
-      });
+      try {
+        const response = await fetch(req.url, { ...options, signal: controller.signal });
+        clearTimeout(timeoutId);
 
-      // Read body
-      const body = await response.text();
+        // Retry on 429 (rate limit) or 5xx (server error)
+        if ((response.status === 429 || response.status >= 500) && attempt < maxAttempts) {
+          const delay = Math.pow(2, attempt - 1) * 1000;
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
 
-      return {
-        status: response.status,
-        statusText: response.statusText,
-        headers,
-        body,
-        ok: response.ok,
-      };
-    } finally {
-      clearTimeout(timeoutId);
+        // Extract headers
+        const headers: Record<string, string> = {};
+        response.headers.forEach((value, key) => {
+          headers[key] = value;
+        });
+
+        // Read body
+        const body = await response.text();
+
+        return {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+          body,
+          ok: response.ok,
+        };
+      } catch (err) {
+        clearTimeout(timeoutId);
+        if (attempt < maxAttempts) {
+          const delay = Math.pow(2, attempt - 1) * 1000;
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+        throw err;
+      }
     }
+
+    // Unreachable but satisfies TypeScript
+    throw new Error('HttpClient: max retries exceeded');
   }
 
   /**

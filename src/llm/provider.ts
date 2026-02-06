@@ -30,6 +30,20 @@ export interface LLMStreamChunk {
   done: boolean;
 }
 
+export interface FetchResult {
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  body: string;
+  ok: boolean;
+}
+
+export type FetchDelegate = (
+  url: string,
+  init: RequestInit,
+  options?: { timeout?: number }
+) => Promise<FetchResult>;
+
 /**
  * Abstract LLM provider interface.
  */
@@ -68,10 +82,12 @@ export abstract class BaseLLMProvider implements LLMProvider {
   abstract readonly name: string;
   protected apiKey?: string;
   protected baseUrl?: string;
+  protected fetchFn?: FetchDelegate;
 
-  constructor(config: { apiKey?: string; baseUrl?: string } = {}) {
+  constructor(config: { apiKey?: string; baseUrl?: string; fetchFn?: FetchDelegate } = {}) {
     this.apiKey = config.apiKey;
     this.baseUrl = config.baseUrl;
+    this.fetchFn = config.fetchFn;
   }
 
   abstract isAvailable(): Promise<boolean>;
@@ -82,11 +98,21 @@ export abstract class BaseLLMProvider implements LLMProvider {
 
   /**
    * Make an HTTP request to the API.
+   * Returns FetchResult. Uses fetchFn delegate when available, falls back to native fetch.
    */
   protected async fetch(
     url: string,
-    options: RequestInit
-  ): Promise<Response> {
+    options: RequestInit,
+    fetchOptions?: { timeout?: number }
+  ): Promise<FetchResult> {
+    if (this.fetchFn) {
+      const result = await this.fetchFn(url, options, fetchOptions);
+      if (!result.ok) {
+        throw new Error(`LLM API error (${result.status}): ${result.body}`);
+      }
+      return result;
+    }
+
     const response = await fetch(url, options);
 
     if (!response.ok) {
@@ -94,7 +120,20 @@ export abstract class BaseLLMProvider implements LLMProvider {
       throw new Error(`LLM API error (${response.status}): ${errorText}`);
     }
 
-    return response;
+    const headers: Record<string, string> = {};
+    response.headers.forEach((value, key) => {
+      headers[key] = value;
+    });
+
+    const body = await response.text();
+
+    return {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+      body,
+      ok: response.ok,
+    };
   }
 
   /**

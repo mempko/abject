@@ -228,7 +228,8 @@ export class ObjectWorkshop extends Abject {
           'abjects:object-creator' as InterfaceId,
           'create',
           { prompt }
-        )
+        ),
+        120000
       );
 
       if (result.success && result.manifest) {
@@ -299,7 +300,8 @@ export class ObjectWorkshop extends Abject {
           'abjects:object-creator' as InterfaceId,
           'modify',
           { objectId: this.lastCreatedObjectId, prompt }
-        )
+        ),
+        120000
       );
 
       if (result.success && result.code) {

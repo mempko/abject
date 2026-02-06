@@ -4,6 +4,7 @@
 
 import {
   BaseLLMProvider,
+  FetchDelegate,
   LLMMessage,
   LLMCompletionOptions,
   LLMCompletionResult,
@@ -15,6 +16,7 @@ export interface AnthropicConfig {
   apiKey: string;
   model?: string;
   baseUrl?: string;
+  fetchFn?: FetchDelegate;
 }
 
 interface AnthropicMessage {
@@ -60,6 +62,7 @@ export class AnthropicProvider extends BaseLLMProvider {
     super({
       apiKey: config.apiKey,
       baseUrl: config.baseUrl ?? defaultBase,
+      fetchFn: config.fetchFn,
     });
     this.model = config.model ?? 'claude-sonnet-4-5-20250929';
   }
@@ -109,7 +112,7 @@ export class AnthropicProvider extends BaseLLMProvider {
       body: JSON.stringify(request),
     });
 
-    const data = (await response.json()) as AnthropicResponse;
+    const data = JSON.parse(response.body) as AnthropicResponse;
 
     // Extract text content
     const content = data.content
@@ -132,6 +135,7 @@ export class AnthropicProvider extends BaseLLMProvider {
     options: LLMCompletionOptions = {}
   ): AsyncIterable<LLMStreamChunk> {
     require(this.apiKey !== undefined, 'API key is required');
+    require(!this.fetchFn, 'Streaming is not supported when using HttpClient delegate');
 
     const systemMessage = messages.find((m) => m.role === 'system');
     const conversationMessages = messages.filter((m) => m.role !== 'system');

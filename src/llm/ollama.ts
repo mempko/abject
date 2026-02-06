@@ -4,15 +4,18 @@
 
 import {
   BaseLLMProvider,
+  FetchDelegate,
   LLMMessage,
   LLMCompletionOptions,
   LLMCompletionResult,
   LLMStreamChunk,
 } from './provider.js';
+import { require } from '../core/contracts.js';
 
 export interface OllamaConfig {
   model?: string;
   baseUrl?: string;
+  fetchFn?: FetchDelegate;
 }
 
 interface OllamaMessage {
@@ -55,12 +58,21 @@ export class OllamaProvider extends BaseLLMProvider {
   constructor(config: OllamaConfig = {}) {
     super({
       baseUrl: config.baseUrl ?? 'http://localhost:11434',
+      fetchFn: config.fetchFn,
     });
     this.model = config.model ?? 'llama3.2';
   }
 
   async isAvailable(): Promise<boolean> {
     try {
+      if (this.fetchFn) {
+        const result = await this.fetchFn(
+          `${this.baseUrl}/api/tags`,
+          { method: 'GET' },
+          { timeout: 5000 }
+        );
+        return result.ok;
+      }
       const response = await fetch(`${this.baseUrl}/api/tags`, {
         method: 'GET',
         signal: AbortSignal.timeout(2000),
@@ -95,7 +107,7 @@ export class OllamaProvider extends BaseLLMProvider {
       body: JSON.stringify(request),
     });
 
-    const data = (await response.json()) as OllamaResponse;
+    const data = JSON.parse(response.body) as OllamaResponse;
 
     return {
       content: data.message.content,
@@ -111,6 +123,8 @@ export class OllamaProvider extends BaseLLMProvider {
     messages: LLMMessage[],
     options: LLMCompletionOptions = {}
   ): AsyncIterable<LLMStreamChunk> {
+    require(!this.fetchFn, 'Streaming is not supported when using HttpClient delegate');
+
     const request: OllamaRequest = {
       model: this.model,
       messages: messages.map((m) => ({
@@ -186,7 +200,7 @@ export class OllamaProvider extends BaseLLMProvider {
         headers: this.buildHeaders(),
       });
 
-      const data = (await response.json()) as {
+      const data = JSON.parse(response.body) as {
         models: { name: string }[];
       };
 

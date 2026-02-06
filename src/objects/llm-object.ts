@@ -2,22 +2,26 @@
  * LLM Service object - provides LLM capabilities to other objects.
  */
 
-import { AbjectId, AbjectMessage } from '../core/types.js';
+import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
 import { Capabilities } from '../core/capability.js';
+import * as msg from '../core/message.js';
 import {
   LLMProvider,
+  FetchDelegate,
+  FetchResult,
   LLMMessage,
   LLMCompletionOptions,
   LLMCompletionResult,
-  
+
   systemMessage,
   userMessage,
 } from '../llm/provider.js';
 import { AnthropicProvider } from '../llm/anthropic.js';
 import { OpenAIProvider } from '../llm/openai.js';
 import { OllamaProvider } from '../llm/ollama.js';
+import type { HttpRequest, HttpResponse } from './capabilities/http-client.js';
 
 const LLM_INTERFACE = 'abjects:llm';
 
@@ -44,6 +48,7 @@ export interface LLMAnalyzePayload {
 export class LLMObject extends Abject {
   private providers: Map<string, LLMProvider> = new Map();
   private defaultProvider?: string;
+  private httpClientId?: AbjectId;
 
   constructor() {
     super({
@@ -199,6 +204,56 @@ export class LLMObject extends Abject {
   }
 
   /**
+   * Set the HttpClient abject ID for routing HTTP requests.
+   */
+  setHttpClientId(id: AbjectId): void {
+    this.httpClientId = id;
+  }
+
+  /**
+   * Create a FetchDelegate that routes HTTP requests through the HttpClient abject.
+   */
+  private createFetchDelegate(): FetchDelegate {
+    const self = this;
+    return async (url: string, init: RequestInit, options?: { timeout?: number }): Promise<FetchResult> => {
+      require(self.httpClientId !== undefined, 'httpClientId not set');
+
+      const timeout = options?.timeout ?? 120000;
+
+      // Resolve relative URLs (e.g. /api/anthropic/v1/messages) to absolute
+      const resolvedUrl = url.startsWith('/') && typeof window !== 'undefined'
+        ? new URL(url, window.location.origin).href
+        : url;
+
+      const httpRequest: HttpRequest = {
+        method: (init.method as HttpRequest['method']) ?? 'GET',
+        url: resolvedUrl,
+        headers: init.headers as Record<string, string> | undefined,
+        body: init.body as string | undefined,
+        timeout,
+      };
+
+      const requestMsg = msg.request(
+        self.id,
+        self.httpClientId!,
+        'abjects:http' as InterfaceId,
+        'request',
+        httpRequest
+      );
+
+      const response = await self.request<HttpResponse>(requestMsg, timeout + 5000);
+
+      return {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+        body: response.body,
+        ok: response.ok,
+      };
+    };
+  }
+
+  /**
    * Configure from API keys.
    */
   configure(config: {
@@ -206,21 +261,23 @@ export class LLMObject extends Abject {
     openaiApiKey?: string;
     ollamaUrl?: string;
   }): void {
+    const fetchFn = this.httpClientId ? this.createFetchDelegate() : undefined;
+
     if (config.anthropicApiKey) {
       this.registerProvider(
-        new AnthropicProvider({ apiKey: config.anthropicApiKey })
+        new AnthropicProvider({ apiKey: config.anthropicApiKey, fetchFn })
       );
     }
 
     if (config.openaiApiKey) {
       this.registerProvider(
-        new OpenAIProvider({ apiKey: config.openaiApiKey })
+        new OpenAIProvider({ apiKey: config.openaiApiKey, fetchFn })
       );
     }
 
     if (config.ollamaUrl) {
       this.registerProvider(
-        new OllamaProvider({ baseUrl: config.ollamaUrl })
+        new OllamaProvider({ baseUrl: config.ollamaUrl, fetchFn })
       );
     }
   }

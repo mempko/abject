@@ -40,6 +40,7 @@ export class ScriptableAbject extends Abject {
   private _source: string;
   private _owner: AbjectId;
   private _userMethods: Set<string> = new Set();
+  private _userProps: Set<string> = new Set();
   private _systemCtx?: SystemContext;
 
   constructor(manifest: AbjectManifest, source: string, owner: AbjectId) {
@@ -246,6 +247,8 @@ export class ScriptableAbject extends Abject {
   /**
    * Compile source and install handlers. Throws on failure (used during construction).
    * Handler functions are bound to this instance so they can call convenience methods.
+   * Non-function properties (e.g. _windowId: null) are set on the instance so handlers
+   * can share state via `this`.
    */
   private compileAndInstall(source: string): void {
     const handlerMap = new Function('return ' + source)() as Record<string, MessageHandlerFn>;
@@ -254,11 +257,16 @@ export class ScriptableAbject extends Abject {
       'Handler source must evaluate to a non-null object'
     );
 
-    for (const [method, fn] of Object.entries(handlerMap)) {
-      if (typeof fn === 'function') {
-        this.on(method, fn.bind(this));
-        this._userMethods.add(method);
+    for (const [key, value] of Object.entries(handlerMap)) {
+      if (typeof value === 'function') {
+        const bound = value.bind(this);
+        this.on(key, bound);
+        (this as Record<string, unknown>)[key] = bound;
+        this._userMethods.add(key);
+      } else {
+        (this as Record<string, unknown>)[key] = value;
       }
+      this._userProps.add(key);
     }
   }
 
@@ -282,18 +290,27 @@ export class ScriptableAbject extends Abject {
       return { success: false, error: 'Source must evaluate to a non-null object' };
     }
 
-    // Remove old user handlers
+    // Remove old user handlers and properties
     for (const method of this._userMethods) {
       this.off(method);
     }
+    for (const prop of this._userProps) {
+      delete (this as Record<string, unknown>)[prop];
+    }
     this._userMethods.clear();
+    this._userProps.clear();
 
-    // Install new handlers bound to this instance
-    for (const [method, fn] of Object.entries(handlerMap)) {
-      if (typeof fn === 'function') {
-        this.on(method, fn.bind(this));
-        this._userMethods.add(method);
+    // Install new handlers and properties bound to this instance
+    for (const [key, value] of Object.entries(handlerMap)) {
+      if (typeof value === 'function') {
+        const bound = value.bind(this);
+        this.on(key, bound);
+        (this as Record<string, unknown>)[key] = bound;
+        this._userMethods.add(key);
+      } else {
+        (this as Record<string, unknown>)[key] = value;
       }
+      this._userProps.add(key);
     }
 
     this._source = source;
