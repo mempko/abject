@@ -13,10 +13,10 @@ test.describe('Capabilities', () => {
     }, { timeout: 10000 });
 
     const result = await page.evaluate(async () => {
-      const { Storage } = await import('/src/objects/capabilities/storage.js');
+      const abjects = (window as Record<string, unknown>).abjects as any;
+      const storage = abjects.storage;
 
-      const storage = new Storage();
-      // Use memory fallback for test
+      // Use the already-initialized storage instance
       await storage.setValue('testKey', { hello: 'world' });
       const value = await storage.getValue('testKey');
       const exists = await storage.hasKey('testKey');
@@ -42,7 +42,8 @@ test.describe('Capabilities', () => {
     }, { timeout: 10000 });
 
     const result = await page.evaluate(async () => {
-      const { Timer } = await import('/src/objects/capabilities/timer.js');
+      const abjects = (window as Record<string, unknown>).abjects as any;
+      const { Timer } = abjects.modules;
 
       const timer = new Timer();
       const objectId = 'test-object';
@@ -77,7 +78,8 @@ test.describe('Capabilities', () => {
     }, { timeout: 10000 });
 
     const result = await page.evaluate(async () => {
-      const { Console } = await import('/src/objects/capabilities/console.js');
+      const abjects = (window as Record<string, unknown>).abjects as any;
+      const { Console } = abjects.modules;
 
       const console = new Console();
       console.log('info', 'test-object', 'Test message', { data: 123 });
@@ -104,7 +106,8 @@ test.describe('Capabilities', () => {
     }, { timeout: 10000 });
 
     const result = await page.evaluate(async () => {
-      const { FileSystem } = await import('/src/objects/capabilities/filesystem.js');
+      const abjects = (window as Record<string, unknown>).abjects as any;
+      const { FileSystem } = abjects.modules;
 
       const fs = new FileSystem();
 

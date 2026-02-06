@@ -30,7 +30,8 @@ test.describe('Self-Healing', () => {
 
     // Verify health monitor starts with no tracked connections
     const connectionCount = await page.evaluate(async () => {
-      const { HealthMonitor } = await import('/src/protocol/health-monitor.js');
+      const abjects = (window as Record<string, unknown>).abjects as any;
+      const { HealthMonitor } = abjects.modules;
 
       // Create a new health monitor instance for testing
       const monitor = new HealthMonitor();
@@ -53,7 +54,8 @@ test.describe('Self-Healing', () => {
     }, { timeout: 10000 });
 
     const status = await page.evaluate(async () => {
-      const { HealthMonitor } = await import('/src/protocol/health-monitor.js');
+      const abjects = (window as Record<string, unknown>).abjects as any;
+      const { HealthMonitor } = abjects.modules;
 
       const monitor = new HealthMonitor({ minMessages: 5 });
       monitor.trackConnection('test-agreement');

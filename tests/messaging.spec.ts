@@ -17,9 +17,9 @@ test.describe('Messaging', () => {
       const abjects = (window as Record<string, unknown>).abjects as Record<string, unknown>;
       const runtime = abjects.runtime as { spawn: (obj: unknown) => Promise<void>, messageBus: unknown };
 
-      // Import types (simplified for test)
-      const { SimpleAbject } = await import('/src/core/abject.js');
-      const { request } = await import('/src/core/message.js');
+      // Get constructors from exposed modules
+      const { SimpleAbject, message } = abjects.modules as any;
+      const { request } = message;
 
       let receivedMessage = '';
 

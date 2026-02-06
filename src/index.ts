@@ -16,6 +16,9 @@ import { Timer } from './objects/capabilities/timer.js';
 import { Clipboard } from './objects/capabilities/clipboard.js';
 import { Console } from './objects/capabilities/console.js';
 import { FileSystem } from './objects/capabilities/filesystem.js';
+import { SimpleAbject } from './core/abject.js';
+import * as message from './core/message.js';
+import { MockTransport } from './network/transport.js';
 import { Settings } from './objects/settings.js';
 import { Taskbar } from './objects/taskbar.js';
 import { RegistryBrowser } from './objects/registry-browser.js';
@@ -132,17 +135,18 @@ async function main(): Promise<App> {
 
   const runtime = app.appRuntime;
 
+  // Create and spawn HttpClient first (LLM providers route through it)
+  const httpClient = new HttpClient();
+  await runtime.spawn(httpClient);
+
   // Create and spawn LLM object
   const llm = new LLMObject();
+  llm.setHttpClientId(httpClient.id);
   llm.configure({
     anthropicApiKey: anthropicKey,
     openaiApiKey: openaiKey,
   });
   await runtime.spawn(llm);
-
-  // Create and spawn capability objects
-  const httpClient = new HttpClient();
-  await runtime.spawn(httpClient);
 
   const storage = new Storage();
   await runtime.spawn(storage);
@@ -223,6 +227,22 @@ async function main(): Promise<App> {
     taskbar,
     registry: runtime.objectRegistry,
     factory: runtime.objectFactory,
+    httpClient,
+    storage,
+    timer,
+    clipboard,
+    console: consoleObj,
+    filesystem,
+    modules: {
+      SimpleAbject,
+      Storage,
+      Timer,
+      Console,
+      FileSystem,
+      HealthMonitor,
+      MockTransport,
+      message,
+    },
   };
 
   return app;

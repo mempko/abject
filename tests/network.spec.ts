@@ -13,8 +13,9 @@ test.describe('Network', () => {
     }, { timeout: 10000 });
 
     const result = await page.evaluate(async () => {
-      const { MockTransport } = await import('/src/network/transport.js');
-      const { request } = await import('/src/core/message.js');
+      const abjects = (window as Record<string, unknown>).abjects as any;
+      const { MockTransport, message } = abjects.modules;
+      const { request } = message;
 
       // Create pair of mock transports
       const [transportA, transportB] = MockTransport.pair();
@@ -57,7 +58,8 @@ test.describe('Network', () => {
     }, { timeout: 10000 });
 
     const result = await page.evaluate(async () => {
-      const { MockTransport } = await import('/src/network/transport.js');
+      const abjects = (window as Record<string, unknown>).abjects as any;
+      const { MockTransport } = abjects.modules;
 
       const transport = new MockTransport();
 
