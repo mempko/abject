@@ -6,9 +6,9 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { UIServer, WidgetEventPayload } from './ui-server.js';
 
 const SETTINGS_INTERFACE: InterfaceId = 'abjects:settings';
+const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 
 const STORAGE_KEY_ANTHROPIC = 'settings:anthropicApiKey';
 const STORAGE_KEY_OPENAI = 'settings:openaiApiKey';
@@ -19,7 +19,7 @@ const STORAGE_KEY_OPENAI = 'settings:openaiApiKey';
 export class Settings extends Abject {
   private llmId?: AbjectId;
   private storageId?: AbjectId;
-  private uiServer?: UIServer;
+  private widgetManagerId?: AbjectId;
   private windowId?: string;
   private unmasked: Set<string> = new Set();
 
@@ -67,10 +67,10 @@ export class Settings extends Abject {
   /**
    * Set dependencies.
    */
-  setDependencies(llmId: AbjectId, storageId: AbjectId, uiServer: UIServer): void {
+  setDependencies(llmId: AbjectId, storageId: AbjectId, widgetManagerId: AbjectId): void {
     this.llmId = llmId;
     this.storageId = storageId;
-    this.uiServer = uiServer;
+    this.widgetManagerId = widgetManagerId;
   }
 
   protected async onInit(): Promise<void> {
@@ -114,7 +114,7 @@ export class Settings extends Abject {
     });
 
     this.on('widgetEvent', async (msg: AbjectMessage) => {
-      const payload = msg.payload as WidgetEventPayload;
+      const payload = msg.payload as { windowId: string; widgetId: string; type: string; value?: string };
       await this.handleWidgetEvent(payload);
     });
   }
@@ -127,7 +127,7 @@ export class Settings extends Abject {
 
     // Get display dimensions
     const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.uiServer!.id, 'abjects:ui' as InterfaceId, 'getDisplayInfo', {})
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
     );
 
     const winW = 420;
@@ -137,7 +137,7 @@ export class Settings extends Abject {
 
     // Create window
     this.windowId = await this.request<string>(
-      request(this.id, this.uiServer!.id, 'abjects:ui' as InterfaceId, 'createWindow', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindow', {
         title: 'Settings',
         rect: { x: winX, y: winY, width: winW, height: winH },
         zIndex: 200,
@@ -153,7 +153,7 @@ export class Settings extends Abject {
 
     // Anthropic label
     await this.request(
-      request(this.id, this.uiServer!.id, 'abjects:ui' as InterfaceId, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'anthropic-label',
         type: 'label',
@@ -165,7 +165,7 @@ export class Settings extends Abject {
 
     // Anthropic text input + show/hide button
     await this.request(
-      request(this.id, this.uiServer!.id, 'abjects:ui' as InterfaceId, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'anthropic-key',
         type: 'textInput',
@@ -175,7 +175,7 @@ export class Settings extends Abject {
       })
     );
     await this.request(
-      request(this.id, this.uiServer!.id, 'abjects:ui' as InterfaceId, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'anthropic-toggle',
         type: 'button',
@@ -187,7 +187,7 @@ export class Settings extends Abject {
 
     // OpenAI label
     await this.request(
-      request(this.id, this.uiServer!.id, 'abjects:ui' as InterfaceId, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'openai-label',
         type: 'label',
@@ -199,7 +199,7 @@ export class Settings extends Abject {
 
     // OpenAI text input + show/hide button
     await this.request(
-      request(this.id, this.uiServer!.id, 'abjects:ui' as InterfaceId, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'openai-key',
         type: 'textInput',
@@ -209,7 +209,7 @@ export class Settings extends Abject {
       })
     );
     await this.request(
-      request(this.id, this.uiServer!.id, 'abjects:ui' as InterfaceId, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'openai-toggle',
         type: 'button',
@@ -222,7 +222,7 @@ export class Settings extends Abject {
     // Save button
     const btnW = 100;
     await this.request(
-      request(this.id, this.uiServer!.id, 'abjects:ui' as InterfaceId, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'save-btn',
         type: 'button',
@@ -241,7 +241,7 @@ export class Settings extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.uiServer!.id, 'abjects:ui' as InterfaceId, 'destroyWindow', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
         windowId: this.windowId,
       })
     );
@@ -253,7 +253,7 @@ export class Settings extends Abject {
   /**
    * Handle widget interaction events.
    */
-  private async handleWidgetEvent(payload: WidgetEventPayload): Promise<void> {
+  private async handleWidgetEvent(payload: { windowId: string; widgetId: string; type: string; value?: string }): Promise<void> {
     if (payload.widgetId === 'save-btn' && payload.type === 'click') {
       await this.saveSettings();
     }
@@ -288,13 +288,13 @@ export class Settings extends Abject {
     const nowMasked = !this.unmasked.has(inputId);
 
     await this.request(
-      request(this.id, this.uiServer!.id, 'abjects:ui' as InterfaceId, 'updateWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
         widgetId: inputId,
         masked: nowMasked,
       })
     );
     await this.request(
-      request(this.id, this.uiServer!.id, 'abjects:ui' as InterfaceId, 'updateWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
         widgetId: toggleId,
         text: nowMasked ? 'Show' : 'Hide',
       })
@@ -308,13 +308,13 @@ export class Settings extends Abject {
     if (!this.windowId) return;
 
     const anthropicKey = await this.request<string>(
-      request(this.id, this.uiServer!.id, 'abjects:ui' as InterfaceId, 'getWidgetValue', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
         widgetId: 'anthropic-key',
       })
     );
 
     const openaiKey = await this.request<string>(
-      request(this.id, this.uiServer!.id, 'abjects:ui' as InterfaceId, 'getWidgetValue', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
         widgetId: 'openai-key',
       })
     );

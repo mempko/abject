@@ -11,13 +11,12 @@ import {
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { UIServer, WidgetEventPayload } from './ui-server.js';
 import { CreationResult } from './object-creator.js';
 import { EDITABLE_INTERFACE_ID } from './scriptable-abject.js';
 import { LLMMessage, LLMCompletionResult } from '../llm/provider.js';
 
 const REGISTRY_BROWSER_INTERFACE: InterfaceId = 'abjects:registry-browser';
-const UI_INTERFACE: InterfaceId = 'abjects:ui';
+const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 
 const PAGE_SIZE = 8;
 const WIN_W = 500;
@@ -25,7 +24,7 @@ const WIN_H = 400;
 const PAD = 16;
 
 export class RegistryBrowser extends Abject {
-  private uiServer?: UIServer;
+  private widgetManagerId?: AbjectId;
   private registryId?: AbjectId;
   private objectCreatorId?: AbjectId;
   private llmId?: AbjectId;
@@ -76,8 +75,8 @@ export class RegistryBrowser extends Abject {
     this.setupHandlers();
   }
 
-  setDependencies(uiServer: UIServer, registryId: AbjectId, objectCreatorId?: AbjectId, llmId?: AbjectId): void {
-    this.uiServer = uiServer;
+  setDependencies(widgetManagerId: AbjectId, registryId: AbjectId, objectCreatorId?: AbjectId, llmId?: AbjectId): void {
+    this.widgetManagerId = widgetManagerId;
     this.registryId = registryId;
     this.objectCreatorId = objectCreatorId;
     this.llmId = llmId;
@@ -113,7 +112,7 @@ export class RegistryBrowser extends Abject {
     });
 
     this.on('widgetEvent', async (msg: AbjectMessage) => {
-      const payload = msg.payload as WidgetEventPayload;
+      const payload = msg.payload as { windowId: string; widgetId: string; type: string; value?: string };
       await this.handleWidgetEvent(payload);
     });
   }
@@ -131,7 +130,7 @@ export class RegistryBrowser extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'destroyWindow', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
         windowId: this.windowId,
       })
     );
@@ -144,7 +143,7 @@ export class RegistryBrowser extends Abject {
     // Destroy existing window if any
     if (this.windowId) {
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'destroyWindow', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
           windowId: this.windowId,
         })
       );
@@ -152,14 +151,14 @@ export class RegistryBrowser extends Abject {
     }
 
     const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'getDisplayInfo', {})
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
     );
 
     const winX = Math.max(20, Math.floor((displayInfo.width - WIN_W) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2));
 
     this.windowId = await this.request<string>(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'createWindow', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindow', {
         title: 'Registry Browser',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
@@ -173,7 +172,7 @@ export class RegistryBrowser extends Abject {
     if (this.llmId) {
       const cmdInputW = WIN_W - PAD * 2 - 70;
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
           windowId: this.windowId,
           id: 'cmd-input',
           type: 'textInput',
@@ -182,7 +181,7 @@ export class RegistryBrowser extends Abject {
         })
       );
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
           windowId: this.windowId,
           id: 'cmd-run-btn',
           type: 'button',
@@ -193,7 +192,7 @@ export class RegistryBrowser extends Abject {
       y += 34;
 
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
           windowId: this.windowId,
           id: 'cmd-status',
           type: 'label',
@@ -218,7 +217,7 @@ export class RegistryBrowser extends Abject {
       const label = `${obj.manifest.name} — ${desc.length > 40 ? desc.slice(0, 40) + '...' : desc}`;
 
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
           windowId: this.windowId,
           id: `obj-${i}`,
           type: 'button',
@@ -235,7 +234,7 @@ export class RegistryBrowser extends Abject {
 
     if (totalPages > 1) {
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
           windowId: this.windowId,
           id: 'prev-page',
           type: 'button',
@@ -245,7 +244,7 @@ export class RegistryBrowser extends Abject {
       );
 
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
           windowId: this.windowId,
           id: 'page-label',
           type: 'label',
@@ -255,7 +254,7 @@ export class RegistryBrowser extends Abject {
       );
 
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
           windowId: this.windowId,
           id: 'next-page',
           type: 'button',
@@ -278,7 +277,7 @@ export class RegistryBrowser extends Abject {
     // Destroy list window
     if (this.windowId) {
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'destroyWindow', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
           windowId: this.windowId,
         })
       );
@@ -286,7 +285,7 @@ export class RegistryBrowser extends Abject {
     }
 
     const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'getDisplayInfo', {})
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
     );
 
     const detailH = 600;
@@ -294,7 +293,7 @@ export class RegistryBrowser extends Abject {
     const winY = Math.max(20, Math.floor((displayInfo.height - detailH) / 2));
 
     this.windowId = await this.request<string>(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'createWindow', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindow', {
         title: obj.manifest.name,
         rect: { x: winX, y: winY, width: WIN_W, height: detailH },
         zIndex: 200,
@@ -310,7 +309,7 @@ export class RegistryBrowser extends Abject {
     const addLabel = async (text: string) => {
       const id = `detail-lbl-${labelIdx++}`;
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
           windowId: this.windowId,
           id,
           type: 'label',
@@ -374,7 +373,7 @@ export class RegistryBrowser extends Abject {
       for (const method of iface.methods) {
         const bx = PAD + col * (methodBtnW + 8);
         await this.request(
-          request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
             windowId: this.windowId,
             id: `method-btn::${iface.id}::${method.name}`,
             type: 'button',
@@ -397,7 +396,7 @@ export class RegistryBrowser extends Abject {
     // Payload input
     const payloadInputW = WIN_W - PAD * 2 - 70;
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'msg-payload',
         type: 'textInput',
@@ -406,7 +405,7 @@ export class RegistryBrowser extends Abject {
       })
     );
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'msg-send-btn',
         type: 'button',
@@ -418,7 +417,7 @@ export class RegistryBrowser extends Abject {
 
     // Response label
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'msg-response',
         type: 'label',
@@ -431,7 +430,7 @@ export class RegistryBrowser extends Abject {
     // ── Bottom buttons ──
     const btnY = detailH - 30 - 36 - 8;
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'back-btn',
         type: 'button',
@@ -445,7 +444,7 @@ export class RegistryBrowser extends Abject {
     if (isEditable) {
       this.detailIndex = index;
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
           windowId: this.windowId,
           id: 'edit-source-btn',
           type: 'button',
@@ -460,7 +459,7 @@ export class RegistryBrowser extends Abject {
     // Destroy existing window
     if (this.windowId) {
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'destroyWindow', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
           windowId: this.windowId,
         })
       );
@@ -470,7 +469,7 @@ export class RegistryBrowser extends Abject {
     this.editingObjectId = obj.id;
 
     const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'getDisplayInfo', {})
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
     );
 
     const editW = 600;
@@ -479,7 +478,7 @@ export class RegistryBrowser extends Abject {
     const winY = Math.max(20, Math.floor((displayInfo.height - editH) / 2));
 
     this.windowId = await this.request<string>(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'createWindow', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindow', {
         title: `Edit: ${obj.manifest.name}`,
         rect: { x: winX, y: winY, width: editW, height: editH },
         zIndex: 200,
@@ -492,7 +491,7 @@ export class RegistryBrowser extends Abject {
 
     // Object name label
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'edit-name-label',
         type: 'label',
@@ -505,7 +504,7 @@ export class RegistryBrowser extends Abject {
     // textArea with source code
     const textAreaH = editH - 30 - y - 80; // room for buttons + status
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'source-editor',
         type: 'textArea',
@@ -522,7 +521,7 @@ export class RegistryBrowser extends Abject {
     const btnGap = 8;
 
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'save-btn',
         type: 'button',
@@ -532,7 +531,7 @@ export class RegistryBrowser extends Abject {
     );
 
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'cancel-btn',
         type: 'button',
@@ -542,7 +541,7 @@ export class RegistryBrowser extends Abject {
     );
 
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'ai-edit-btn',
         type: 'button',
@@ -555,7 +554,7 @@ export class RegistryBrowser extends Abject {
 
     // AI edit prompt input (hidden until AI Edit is clicked, but always present)
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'ai-prompt-input',
         type: 'textInput',
@@ -565,7 +564,7 @@ export class RegistryBrowser extends Abject {
     );
 
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'ai-go-btn',
         type: 'button',
@@ -578,7 +577,7 @@ export class RegistryBrowser extends Abject {
 
     // Status label
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'edit-status',
         type: 'label',
@@ -591,14 +590,14 @@ export class RegistryBrowser extends Abject {
   private async updateEditStatus(text: string): Promise<void> {
     if (!this.windowId) return;
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
         widgetId: 'edit-status',
         text,
       })
     );
   }
 
-  private async handleWidgetEvent(payload: WidgetEventPayload): Promise<void> {
+  private async handleWidgetEvent(payload: { windowId: string; widgetId: string; type: string; value?: string }): Promise<void> {
     if (payload.type !== 'click' && payload.type !== 'submit') return;
 
     if (payload.widgetId === 'back-btn') {
@@ -637,7 +636,7 @@ export class RegistryBrowser extends Abject {
     // Save button in edit view
     if (payload.widgetId === 'save-btn' && this.editingObjectId) {
       const source = await this.request<string>(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'getWidgetValue', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
           widgetId: 'source-editor',
         })
       );
@@ -687,7 +686,7 @@ export class RegistryBrowser extends Abject {
     if ((payload.widgetId === 'ai-go-btn' || (payload.widgetId === 'ai-prompt-input' && payload.type === 'submit'))
         && this.editingObjectId && this.objectCreatorId) {
       const prompt = await this.request<string>(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'getWidgetValue', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
           widgetId: 'ai-prompt-input',
         })
       );
@@ -713,7 +712,7 @@ export class RegistryBrowser extends Abject {
         if (result.success && result.code) {
           // Update the textArea with new source
           await this.request(
-            request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+            request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
               widgetId: 'source-editor',
               text: result.code,
             })
@@ -736,7 +735,7 @@ export class RegistryBrowser extends Abject {
       // Update response label to show selection
       if (this.windowId) {
         await this.request(
-          request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
             widgetId: 'msg-response',
             text: `Selected: ${parts[2]}`,
           })
@@ -774,7 +773,7 @@ export class RegistryBrowser extends Abject {
     if (!this.selectedMethod || !this.detailObjectId || !this.windowId) return;
 
     const payloadText = await this.request<string>(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'getWidgetValue', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
         widgetId: 'msg-payload',
       })
     );
@@ -785,7 +784,7 @@ export class RegistryBrowser extends Abject {
         msgPayload = JSON.parse(payloadText);
       } catch {
         await this.request(
-          request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
             widgetId: 'msg-response',
             text: 'Error: Invalid JSON payload',
           })
@@ -802,7 +801,7 @@ export class RegistryBrowser extends Abject {
       const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
       const display = resultStr.length > 60 ? resultStr.slice(0, 60) + '...' : resultStr;
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
           widgetId: 'msg-response',
           text: `Result: ${display}`,
         })
@@ -810,7 +809,7 @@ export class RegistryBrowser extends Abject {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
           widgetId: 'msg-response',
           text: `Error: ${msg.slice(0, 60)}`,
         })
@@ -825,14 +824,14 @@ export class RegistryBrowser extends Abject {
     if (!this.llmId || !this.windowId) return;
 
     const commandText = await this.request<string>(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'getWidgetValue', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
         widgetId: 'cmd-input',
       })
     );
 
     if (!commandText.trim()) {
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
           widgetId: 'cmd-status', text: 'Enter a command',
         })
       );
@@ -840,7 +839,7 @@ export class RegistryBrowser extends Abject {
     }
 
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
         widgetId: 'cmd-status', text: 'Thinking...',
       })
     );
@@ -904,7 +903,7 @@ Respond with ONLY valid JSON (no markdown fences, no explanation):
       const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
       const display = resultStr.length > 50 ? resultStr.slice(0, 50) + '...' : resultStr;
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
           widgetId: 'cmd-status',
           text: `${parsed.method} → ${display}`,
         })
@@ -912,7 +911,7 @@ Respond with ONLY valid JSON (no markdown fences, no explanation):
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
           widgetId: 'cmd-status',
           text: `Error: ${msg.slice(0, 60)}`,
         })

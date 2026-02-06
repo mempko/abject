@@ -6,13 +6,12 @@ import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../cor
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { UIServer, WidgetEventPayload } from './ui-server.js';
 
 const TASKBAR_INTERFACE: InterfaceId = 'abjects:taskbar';
-const UI_INTERFACE: InterfaceId = 'abjects:ui';
+const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 
 export class Taskbar extends Abject {
-  private uiServer?: UIServer;
+  private widgetManagerId?: AbjectId;
   private settingsId?: AbjectId;
   private registryBrowserId?: AbjectId;
   private objectWorkshopId?: AbjectId;
@@ -59,13 +58,13 @@ export class Taskbar extends Abject {
   }
 
   setDependencies(
-    uiServer: UIServer,
+    widgetManagerId: AbjectId,
     settingsId: AbjectId,
     registryBrowserId: AbjectId,
     objectWorkshopId: AbjectId,
     registryId: AbjectId
   ): void {
-    this.uiServer = uiServer;
+    this.widgetManagerId = widgetManagerId;
     this.settingsId = settingsId;
     this.registryBrowserId = registryBrowserId;
     this.objectWorkshopId = objectWorkshopId;
@@ -118,7 +117,7 @@ export class Taskbar extends Abject {
     });
 
     this.on('widgetEvent', async (msg: AbjectMessage) => {
-      const payload = msg.payload as WidgetEventPayload;
+      const payload = msg.payload as { windowId: string; widgetId: string; type: string; value?: string };
       await this.handleWidgetEvent(payload);
     });
 
@@ -132,7 +131,7 @@ export class Taskbar extends Abject {
     // Always destroy and rebuild to pick up new objects
     if (this.windowId) {
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'destroyWindow', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
           windowId: this.windowId,
         })
       );
@@ -140,7 +139,7 @@ export class Taskbar extends Abject {
     }
 
     const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'getDisplayInfo', {})
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
     );
 
     const barHeight = 40;
@@ -148,7 +147,7 @@ export class Taskbar extends Abject {
     const displayH = displayInfo.height;
 
     this.windowId = await this.request<string>(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'createWindow', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindow', {
         title: '',
         rect: { x: 0, y: displayH - barHeight, width: displayW, height: barHeight },
         zIndex: 999,
@@ -169,7 +168,7 @@ export class Taskbar extends Abject {
     let btnX = Math.max(10, Math.floor((displayW - totalW) / 2));
 
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'settings-btn',
         type: 'button',
@@ -180,7 +179,7 @@ export class Taskbar extends Abject {
     btnX += btnW + gap;
 
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'registry-btn',
         type: 'button',
@@ -191,7 +190,7 @@ export class Taskbar extends Abject {
     btnX += btnW + gap;
 
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'workshop-btn',
         type: 'button',
@@ -204,7 +203,7 @@ export class Taskbar extends Abject {
     for (const obj of showableObjects) {
       btnX += btnW + gap;
       await this.request(
-        request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
           windowId: this.windowId,
           id: `user-obj::${obj.id}`,
           type: 'button',
@@ -221,7 +220,7 @@ export class Taskbar extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'destroyWindow', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
         windowId: this.windowId,
       })
     );
@@ -230,7 +229,7 @@ export class Taskbar extends Abject {
     return true;
   }
 
-  private async handleWidgetEvent(payload: WidgetEventPayload): Promise<void> {
+  private async handleWidgetEvent(payload: { windowId: string; widgetId: string; type: string; value?: string }): Promise<void> {
     if (payload.type !== 'click') return;
 
     if (payload.widgetId === 'settings-btn') {

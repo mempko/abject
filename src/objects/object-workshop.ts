@@ -6,19 +6,18 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { UIServer, WidgetEventPayload } from './ui-server.js';
 import { CreationResult } from './object-creator.js';
 import { EDITABLE_INTERFACE_ID } from './scriptable-abject.js';
 
 const WORKSHOP_INTERFACE: InterfaceId = 'abjects:object-workshop';
-const UI_INTERFACE: InterfaceId = 'abjects:ui';
+const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 
 const WIN_W = 500;
 const WIN_H = 350;
 const PAD = 16;
 
 export class ObjectWorkshop extends Abject {
-  private uiServer?: UIServer;
+  private widgetManagerId?: AbjectId;
   private objectCreatorId?: AbjectId;
   private windowId?: string;
   private lastCreatedObjectId?: AbjectId;
@@ -62,8 +61,8 @@ export class ObjectWorkshop extends Abject {
     this.setupHandlers();
   }
 
-  setDependencies(uiServer: UIServer, objectCreatorId: AbjectId): void {
-    this.uiServer = uiServer;
+  setDependencies(widgetManagerId: AbjectId, objectCreatorId: AbjectId): void {
+    this.widgetManagerId = widgetManagerId;
     this.objectCreatorId = objectCreatorId;
   }
 
@@ -77,7 +76,7 @@ export class ObjectWorkshop extends Abject {
     });
 
     this.on('widgetEvent', async (msg: AbjectMessage) => {
-      const payload = msg.payload as WidgetEventPayload;
+      const payload = msg.payload as { windowId: string; widgetId: string; type: string; value?: string };
       await this.handleWidgetEvent(payload);
     });
   }
@@ -86,14 +85,14 @@ export class ObjectWorkshop extends Abject {
     if (this.windowId) return true;
 
     const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'getDisplayInfo', {})
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
     );
 
     const winX = Math.max(20, Math.floor((displayInfo.width - WIN_W) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2));
 
     this.windowId = await this.request<string>(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'createWindow', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindow', {
         title: 'Object Workshop',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
@@ -106,7 +105,7 @@ export class ObjectWorkshop extends Abject {
 
     // Prompt label
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'prompt-label',
         type: 'label',
@@ -118,7 +117,7 @@ export class ObjectWorkshop extends Abject {
 
     // Text input
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'prompt-input',
         type: 'textInput',
@@ -131,7 +130,7 @@ export class ObjectWorkshop extends Abject {
     // Create button
     const btnW = 100;
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'create-btn',
         type: 'button',
@@ -143,7 +142,7 @@ export class ObjectWorkshop extends Abject {
 
     // Status label
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'status-label',
         type: 'label',
@@ -155,7 +154,7 @@ export class ObjectWorkshop extends Abject {
 
     // Result labels (hidden until creation succeeds)
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'result-name',
         type: 'label',
@@ -166,7 +165,7 @@ export class ObjectWorkshop extends Abject {
     y += 24;
 
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'result-desc',
         type: 'label',
@@ -182,7 +181,7 @@ export class ObjectWorkshop extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'destroyWindow', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
         windowId: this.windowId,
       })
     );
@@ -191,7 +190,7 @@ export class ObjectWorkshop extends Abject {
     return true;
   }
 
-  private async handleWidgetEvent(payload: WidgetEventPayload): Promise<void> {
+  private async handleWidgetEvent(payload: { windowId: string; widgetId: string; type: string; value?: string }): Promise<void> {
     // Handle modify button
     if (payload.widgetId === 'modify-btn' && payload.type === 'click' && this.lastCreatedObjectId) {
       await this.handleModify();
@@ -206,7 +205,7 @@ export class ObjectWorkshop extends Abject {
 
     // Read prompt text
     const prompt = await this.request<string>(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'getWidgetValue', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
         widgetId: 'prompt-input',
       })
     );
@@ -255,7 +254,7 @@ export class ObjectWorkshop extends Abject {
   private async updateStatus(text: string): Promise<void> {
     if (!this.windowId) return;
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
         widgetId: 'status-label',
         text,
       })
@@ -266,7 +265,7 @@ export class ObjectWorkshop extends Abject {
     if (!this.windowId) return;
     const btnW = 100;
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
         windowId: this.windowId,
         id: 'modify-btn',
         type: 'button',
@@ -280,7 +279,7 @@ export class ObjectWorkshop extends Abject {
     if (!this.windowId || !this.lastCreatedObjectId || !this.objectCreatorId) return;
 
     const prompt = await this.request<string>(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'getWidgetValue', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
         widgetId: 'prompt-input',
       })
     );
@@ -329,13 +328,13 @@ export class ObjectWorkshop extends Abject {
   private async updateResult(name: string, desc: string): Promise<void> {
     if (!this.windowId) return;
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
         widgetId: 'result-name',
         text: name,
       })
     );
     await this.request(
-      request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
         widgetId: 'result-desc',
         text: desc,
       })

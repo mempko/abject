@@ -23,6 +23,7 @@ import { Settings } from './objects/settings.js';
 import { Taskbar } from './objects/taskbar.js';
 import { RegistryBrowser } from './objects/registry-browser.js';
 import { ObjectWorkshop } from './objects/object-workshop.js';
+import { WidgetManager } from './objects/widget-manager.js';
 
 // Export public API
 export { App, createApp } from './ui/app.js';
@@ -42,6 +43,7 @@ export { Settings, SETTINGS_ID } from './objects/settings.js';
 export { Taskbar, TASKBAR_ID } from './objects/taskbar.js';
 export { RegistryBrowser, REGISTRY_BROWSER_ID } from './objects/registry-browser.js';
 export { ObjectWorkshop, OBJECT_WORKSHOP_ID } from './objects/object-workshop.js';
+export { WidgetManager, WIDGET_MANAGER_ID } from './objects/widget-manager.js';
 export { ScriptableAbject, EDITABLE_INTERFACE_ID } from './objects/scriptable-abject.js';
 
 // Export capability objects
@@ -163,10 +165,16 @@ async function main(): Promise<App> {
   const filesystem = new FileSystem();
   await runtime.spawn(filesystem);
 
+  // Create and spawn WidgetManager
+  const widgetManager = new WidgetManager();
+  widgetManager.setDependencies(app.appUIServer.id);
+  await runtime.spawn(widgetManager);
+
   // Set base dependencies for ScriptableAbjects
   runtime.objectFactory.setBaseDeps({
     Registry: runtime.objectRegistry.id,
     UIServer: app.appUIServer.id,
+    WidgetManager: widgetManager.id,
   });
 
   // Create proxy generator
@@ -200,22 +208,22 @@ async function main(): Promise<App> {
 
   // Create settings (loads saved keys or shows config UI)
   const settings = new Settings();
-  settings.setDependencies(llm.id, storage.id, app.appUIServer);
+  settings.setDependencies(llm.id, storage.id, widgetManager.id);
   await runtime.spawn(settings);
 
   // Create registry browser
   const registryBrowser = new RegistryBrowser();
-  registryBrowser.setDependencies(app.appUIServer, runtime.objectRegistry.id, objectCreator.id, llm.id);
+  registryBrowser.setDependencies(widgetManager.id, runtime.objectRegistry.id, objectCreator.id, llm.id);
   await runtime.spawn(registryBrowser);
 
   // Create object workshop
   const objectWorkshop = new ObjectWorkshop();
-  objectWorkshop.setDependencies(app.appUIServer, objectCreator.id);
+  objectWorkshop.setDependencies(widgetManager.id, objectCreator.id);
   await runtime.spawn(objectWorkshop);
 
   // Create taskbar (must be last — needs references to other UI objects)
   const taskbar = new Taskbar();
-  taskbar.setDependencies(app.appUIServer, settings.id, registryBrowser.id, objectWorkshop.id, runtime.objectRegistry.id);
+  taskbar.setDependencies(widgetManager.id, settings.id, registryBrowser.id, objectWorkshop.id, runtime.objectRegistry.id);
   await runtime.spawn(taskbar);
 
   console.log('[ABJECTS] System ready');
@@ -238,6 +246,7 @@ async function main(): Promise<App> {
     timer,
     clipboard,
     console: consoleObj,
+    widgetManager,
     filesystem,
     modules: {
       SimpleAbject,

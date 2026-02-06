@@ -919,24 +919,27 @@ This is a complete, minimal, working UI object. Study it carefully — it shows 
 
   async show(msg) {
     if (this._windowId) return true;
-    const display = await this.call(this.dep('UIServer'), 'abjects:ui', 'getDisplayInfo', {});
-    this._windowId = await this.call(this.dep('UIServer'), 'abjects:ui', 'createWindow', {
+    this._windowId = await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'createWindow', {
       title: 'My Object',
       rect: { x: 100, y: 100, width: 300, height: 200 },
     });
-    await this.call(this.dep('UIServer'), 'abjects:ui', 'addWidget', {
-      windowId: this._windowId,
-      id: 'my-label',
-      type: 'label',
-      rect: { x: 16, y: 16, width: 260, height: 20 },
+    await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'addWidget', {
+      windowId: this._windowId, id: 'title', type: 'label',
+      rect: { x: 16, y: 8, width: 260, height: 28 },
       text: 'Hello!',
+      style: { fontSize: 20, fontWeight: 'bold', color: '#fff' },
+    });
+    await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'addWidget', {
+      windowId: this._windowId, id: 'my-button', type: 'button',
+      rect: { x: 16, y: 50, width: 120, height: 32 },
+      text: 'Click Me',
     });
     return true;
   },
 
   async hide(msg) {
     if (!this._windowId) return true;
-    await this.call(this.dep('UIServer'), 'abjects:ui', 'destroyWindow', {
+    await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'destroyWindow', {
       windowId: this._windowId,
     });
     this._windowId = null;
@@ -951,6 +954,18 @@ This is a complete, minimal, working UI object. Study it carefully — it shows 
   }
 })
 \`\`\`
+
+## Widget Types Reference
+
+WidgetManager supports 8 widget types via addWidget (type field):
+- **label**: Static text. Key props: text, style (color, fontSize, fontWeight, align, background)
+- **button**: Clickable button. Emits widgetEvent with type='click'. Key props: text, style
+- **textInput**: Single-line text field. Emits 'change' on typing, 'submit' on Enter. Key props: text, placeholder, style
+- **checkbox**: Toggle checkbox. Emits 'change' with value 'true'/'false'. Key props: text (label), checked
+- **progress**: Read-only progress bar. Key props: value (0-1), text (optional overlay), style (color=fill, background=track)
+- **divider**: Horizontal or vertical line separator. Orientation determined by rect aspect ratio. Key props: style (color)
+- **select**: Dropdown select. Emits 'change' with selected option text. Key props: options (string[]), selectedIndex
+- **textArea**: Multi-line text editor. Emits 'change' on typing. Key props: text, monospace, placeholder, style
 
 ## Calling Other Dependencies
 
