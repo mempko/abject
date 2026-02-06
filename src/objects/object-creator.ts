@@ -8,15 +8,15 @@ import {
   AbjectMessage,
   InterfaceId,
   ObjectRegistration,
+  SpawnRequest,
+  SpawnResult,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
+import { request } from '../core/message.js';
 
-import { LLMObject } from './llm-object.js';
-import { Registry } from './registry.js';
-import { Factory } from './factory.js';
 import { ScriptableAbject } from './scriptable-abject.js';
-import { systemMessage, userMessage, LLMMessage } from '../llm/provider.js';
+import { systemMessage, userMessage, LLMMessage, LLMCompletionResult } from '../llm/provider.js';
 
 
 const OBJECT_CREATOR_INTERFACE = 'abjects:object-creator';
@@ -44,9 +44,9 @@ export interface CreationResult {
  * The Object Creator allows users to create objects via natural language prompts.
  */
 export class ObjectCreator extends Abject {
-  private llm?: LLMObject;
-  private registry?: Registry;
-  private _factory?: Factory;
+  private llmId?: AbjectId;
+  private registryId?: AbjectId;
+  private factoryId?: AbjectId;
 
   constructor() {
     super({
@@ -194,47 +194,102 @@ export class ObjectCreator extends Abject {
   }
 
   /**
-   * Set dependencies.
+   * Set dependencies via AbjectIds for message passing.
    */
-  setDependencies(llm: LLMObject, registry: Registry, factory: Factory): void {
-    this.llm = llm;
-    this.registry = registry;
-    this._factory = factory;
+  setDependencies(llmId: AbjectId, registryId: AbjectId, factoryId: AbjectId): void {
+    this.llmId = llmId;
+    this.registryId = registryId;
+    this.factoryId = factoryId;
+  }
+
+  /**
+   * Call LLM complete via message passing.
+   */
+  private async llmComplete(messages: LLMMessage[]): Promise<LLMCompletionResult> {
+    return this.request<LLMCompletionResult>(
+      request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', { messages })
+    );
+  }
+
+  /**
+   * List objects from registry via message passing.
+   */
+  private async registryList(): Promise<ObjectRegistration[]> {
+    return this.request<ObjectRegistration[]>(
+      request(this.id, this.registryId!, 'abjects:registry' as InterfaceId, 'list', {})
+    );
+  }
+
+  /**
+   * Look up an object in the registry via message passing.
+   */
+  private async registryLookup(objectId: AbjectId): Promise<ObjectRegistration | null> {
+    return this.request<ObjectRegistration | null>(
+      request(this.id, this.registryId!, 'abjects:registry' as InterfaceId, 'lookup', { objectId })
+    );
+  }
+
+  /**
+   * Get object source from registry via message passing.
+   */
+  private async registryGetSource(objectId: AbjectId): Promise<string | null> {
+    return this.request<string | null>(
+      request(this.id, this.registryId!, 'abjects:registry' as InterfaceId, 'getSource', { objectId })
+    );
+  }
+
+  /**
+   * Spawn an object via factory message passing.
+   */
+  private async factorySpawn(spawnReq: SpawnRequest): Promise<SpawnResult> {
+    return this.request<SpawnResult>(
+      request(this.id, this.factoryId!, 'abjects:factory' as InterfaceId, 'spawn', spawnReq)
+    );
   }
 
   /**
    * Create a new object from a natural language prompt.
+   * Uses 3 phases: manifest generation, code generation, verification.
    */
   async createObject(prompt: string, context?: string): Promise<CreationResult> {
-    require(this.llm !== undefined, 'LLM not set');
-    require(this.registry !== undefined, 'Registry not set');
+    require(this.llmId !== undefined, 'LLM not set');
+    require(this.registryId !== undefined, 'Registry not set');
 
     try {
       // Discover available objects
       const availableObjects = await this.discoverRelevantObjects(prompt);
 
-      // Build creation prompt
-      const messages = this.buildCreationPrompt(prompt, availableObjects, context);
+      // Phase 1: Generate manifest only
+      const phase1 = await this.generateManifest(prompt, availableObjects, context);
+      if (!phase1.manifest) {
+        return { success: false, error: 'Phase 1: Failed to generate valid manifest' };
+      }
 
-      // Generate object code
-      const result = await this.llm!.complete(messages);
+      // Phase 2: Generate handler code given the manifest
+      let code = await this.generateHandlerCode(
+        phase1.manifest, prompt, availableObjects, phase1.usedObjects, context
+      );
+      if (!code) {
+        return { success: false, error: 'Phase 2: Failed to generate handler code' };
+      }
 
-      // Parse the response
-      const parsed = this.parseCreationResponse(result.content);
+      // Phase 3: Verify manifest/code consistency and fix mismatches
+      const verified = this.verifyAndFix(phase1.manifest, code);
+      let manifest = verified.manifest;
+      code = verified.code;
 
-      if (!parsed.manifest || !parsed.code) {
-        return {
-          success: false,
-          error: 'Failed to generate valid object',
-        };
+      // If verification found unfixable issues, try LLM-assisted fix
+      if (verified.mismatches.length > 0) {
+        const llmFixed = await this.llmVerifyAndFix(manifest, code, verified.mismatches);
+        manifest = llmFixed.manifest;
+        code = llmFixed.code;
       }
 
       // Validate the code compiles before spawning
-      let code = parsed.code;
       const compileError = ScriptableAbject.tryCompile(code);
       if (compileError) {
         // Ask LLM to fix the code — one retry
-        const fixResult = await this.llm!.complete([
+        const fixResult = await this.llmComplete([
           systemMessage(
             'The following JavaScript handler map failed to compile with `new Function()`. ' +
             'Fix it so it is valid plain JavaScript. No TypeScript annotations, no type casts, no interfaces. ' +
@@ -256,26 +311,26 @@ export class ObjectCreator extends Abject {
       }
 
       // Spawn the ScriptableAbject via Factory
-      if (this._factory) {
-        const spawnResult = await this._factory.spawn({
-          manifest: parsed.manifest,
+      if (this.factoryId) {
+        const spawnResult = await this.factorySpawn({
+          manifest,
           source: code,
           owner: this.id,
         });
         return {
           success: true,
           objectId: spawnResult.objectId,
-          manifest: parsed.manifest,
+          manifest,
           code,
-          usedObjects: parsed.usedObjects,
+          usedObjects: phase1.usedObjects,
         };
       }
 
       return {
         success: true,
-        manifest: parsed.manifest,
+        manifest,
         code,
-        usedObjects: parsed.usedObjects,
+        usedObjects: phase1.usedObjects,
       };
     } catch (err) {
       return {
@@ -289,15 +344,15 @@ export class ObjectCreator extends Abject {
    * Modify an existing object.
    */
   async modifyObject(objectId: AbjectId, prompt: string): Promise<CreationResult> {
-    require(this.llm !== undefined, 'LLM not set');
-    require(this.registry !== undefined, 'Registry not set');
+    require(this.llmId !== undefined, 'LLM not set');
+    require(this.registryId !== undefined, 'Registry not set');
 
-    const registration = this.registry!.lookupObject(objectId);
+    const registration = await this.registryLookup(objectId);
     if (!registration) {
       return { success: false, error: 'Object not found' };
     }
 
-    const currentSource = this.registry!.getObjectSource(objectId);
+    const currentSource = await this.registryGetSource(objectId);
 
     try {
       const sourceBlock = currentSource
@@ -316,7 +371,7 @@ Modification request: ${prompt}
 Generate the updated manifest and handler map that implements this change.`),
       ];
 
-      const result = await this.llm!.complete(messages);
+      const result = await this.llmComplete(messages);
       const parsed = this.parseCreationResponse(result.content);
 
       return {
@@ -337,12 +392,12 @@ Generate the updated manifest and handler map that implements this change.`),
    * Get suggestions for objects to create.
    */
   async suggestObjects(context: string): Promise<string[]> {
-    require(this.llm !== undefined, 'LLM not set');
+    require(this.llmId !== undefined, 'LLM not set');
 
     const available = await this.listAvailableObjects();
     const availableList = available.map((o) => `- ${o.manifest.name}: ${o.manifest.description}`).join('\n');
 
-    const result = await this.llm!.complete([
+    const result = await this.llmComplete([
       systemMessage(
         'You suggest objects that would be useful to create in an Abjects system. Keep suggestions practical and composable with existing objects.'
       ),
@@ -364,10 +419,10 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
    * List available objects for composition.
    */
   async listAvailableObjects(): Promise<ObjectRegistration[]> {
-    if (!this.registry) {
+    if (!this.registryId) {
       return [];
     }
-    return this.registry.listObjects();
+    return this.registryList();
   }
 
   /**
@@ -377,11 +432,11 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
     nodes: Array<{ id: string; name: string }>;
     edges: Array<{ from: string; to: string }>;
   }> {
-    if (!this.registry) {
+    if (!this.registryId) {
       return { nodes: [], edges: [] };
     }
 
-    const objects = this.registry.listObjects();
+    const objects = await this.registryList();
     const nodes = objects.map((o) => ({
       id: o.id,
       name: o.manifest.name,
@@ -397,18 +452,18 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
    * Discover objects relevant to a prompt.
    */
   private async discoverRelevantObjects(prompt: string): Promise<ObjectRegistration[]> {
-    if (!this.registry || !this.llm) {
+    if (!this.registryId || !this.llmId) {
       return [];
     }
 
-    const allObjects = this.registry.listObjects();
+    const allObjects = await this.registryList();
 
     // Use LLM to filter relevant objects
     const objectDescriptions = allObjects
       .map((o) => `${o.manifest.name}: ${o.manifest.description}`)
       .join('\n');
 
-    const result = await this.llm.complete([
+    const result = await this.llmComplete([
       systemMessage(
         'You identify which objects would be useful for a given task. Return only the names of relevant objects, one per line.'
       ),
@@ -432,14 +487,11 @@ Which objects would be useful? Return only names.`),
   }
 
   /**
-   * Build the prompt for object creation.
+   * Format available objects as context text for prompts.
    */
-  private buildCreationPrompt(
-    prompt: string,
-    availableObjects: ObjectRegistration[],
-    context?: string
-  ): LLMMessage[] {
-    const objectContext = availableObjects
+  private formatObjectContext(availableObjects: ObjectRegistration[]): string {
+    if (availableObjects.length === 0) return 'None';
+    return availableObjects
       .map((o) => {
         const interfaces = o.manifest.interfaces
           .map((i) => {
@@ -449,32 +501,135 @@ Which objects would be useful? Return only names.`),
             return `  Interface ${i.id}:\n${methods}`;
           })
           .join('\n');
-        return `Object: ${o.manifest.name} (${o.id})
-${o.manifest.description}
-${interfaces}`;
+        return `Object: ${o.manifest.name} (${o.id})\n${o.manifest.description}\n${interfaces}`;
       })
       .join('\n\n');
-
-    return [
-      systemMessage(this.getCreationSystemPrompt()),
-      userMessage(`Available objects for composition:
-${objectContext || 'None'}
-
-${context ? `Additional context: ${context}\n\n` : ''}User request: ${prompt}
-
-Generate a new Abjects object that fulfills this request. Use the available objects where appropriate.`),
-    ];
   }
 
   /**
-   * Parse the LLM response for object creation.
+   * Phase 1: Generate only the manifest JSON from user prompt.
    */
-  private parseCreationResponse(content: string): {
+  private async generateManifest(
+    prompt: string,
+    availableObjects: ObjectRegistration[],
+    context?: string
+  ): Promise<{ manifest?: AbjectManifest; usedObjects: string[] }> {
+    const objectContext = this.formatObjectContext(availableObjects);
+    const messages: LLMMessage[] = [
+      systemMessage(this.getPhase1SystemPrompt()),
+      userMessage(`Available objects for composition:\n${objectContext}\n\n${context ? `Additional context: ${context}\n\n` : ''}User request: ${prompt}\n\nDesign the manifest for this object.`),
+    ];
+
+    const result = await this.llmComplete(messages);
+    return this.parseManifestResponse(result.content);
+  }
+
+  /**
+   * Phase 2: Generate handler code given a manifest as spec.
+   */
+  private async generateHandlerCode(
+    manifest: AbjectManifest,
+    prompt: string,
+    availableObjects: ObjectRegistration[],
+    usedObjects: string[],
+    context?: string
+  ): Promise<string | undefined> {
+    const methodList = manifest.interfaces
+      .flatMap((i) => i.methods.map((m) => m.name));
+    const objectContext = this.formatObjectContext(availableObjects);
+
+    const messages: LLMMessage[] = [
+      systemMessage(this.getPhase2SystemPrompt()),
+      userMessage(`Manifest:\n\`\`\`json\n${JSON.stringify(manifest, null, 2)}\n\`\`\`\n\nYou MUST implement handlers for these methods: ${methodList.join(', ')}\n\nAvailable objects for composition:\n${objectContext}\n\nUsed objects: ${usedObjects.length > 0 ? usedObjects.join(', ') : 'None'}\n\n${context ? `Additional context: ${context}\n\n` : ''}Original user request: ${prompt}\n\nGenerate the handler map.`),
+    ];
+
+    const result = await this.llmComplete(messages);
+    return this.parseCodeResponse(result.content);
+  }
+
+  /**
+   * Phase 3: Programmatic verification of manifest/code consistency.
+   * Returns mismatches if any; does NOT call LLM.
+   */
+  private verifyAndFix(
+    manifest: AbjectManifest,
+    code: string
+  ): { manifest: AbjectManifest; code: string; mismatches: string[] } {
+    const mismatches: string[] = [];
+
+    // Extract declared method names from manifest
+    const declaredMethods = new Set(
+      manifest.interfaces.flatMap((i) => i.methods.map((m) => m.name))
+    );
+
+    // Try to extract handler names from compiled code
+    let handlerNames: string[] = [];
+    try {
+      const handlerMap = new Function('return ' + code)();
+      if (typeof handlerMap === 'object' && handlerMap !== null) {
+        handlerNames = Object.keys(handlerMap).filter((k) => !k.startsWith('_'));
+      }
+    } catch {
+      // If code doesn't compile, skip verification — compile step will catch it
+      return { manifest, code, mismatches: [] };
+    }
+
+    const implementedMethods = new Set(handlerNames);
+
+    // Find missing handlers (in manifest but not in code)
+    for (const method of declaredMethods) {
+      if (!implementedMethods.has(method)) {
+        mismatches.push(`Missing handler: '${method}' declared in manifest but not implemented`);
+      }
+    }
+
+    // Find extra handlers (in code but not in manifest)
+    for (const handler of implementedMethods) {
+      if (!declaredMethods.has(handler)) {
+        mismatches.push(`Extra handler: '${handler}' implemented but not declared in manifest`);
+      }
+    }
+
+    return { manifest, code, mismatches };
+  }
+
+  /**
+   * Phase 3 LLM fallback: Ask LLM to fix manifest/code mismatches.
+   */
+  private async llmVerifyAndFix(
+    manifest: AbjectManifest,
+    code: string,
+    mismatches: string[]
+  ): Promise<{ manifest: AbjectManifest; code: string }> {
+    const messages: LLMMessage[] = [
+      systemMessage(this.getPhase3SystemPrompt()),
+      userMessage(`Manifest:\n\`\`\`json\n${JSON.stringify(manifest, null, 2)}\n\`\`\`\n\nHandler code:\n\`\`\`javascript\n${code}\n\`\`\`\n\nMismatches found:\n${mismatches.map((m) => `- ${m}`).join('\n')}\n\nFix the mismatches. Output the corrected manifest in a \`\`\`json block and the corrected handler code in a \`\`\`javascript block. If no changes are needed, respond with just "VERIFIED".`),
+    ];
+
+    const result = await this.llmComplete(messages);
+    const content = result.content.trim();
+
+    if (content === 'VERIFIED') {
+      return { manifest, code };
+    }
+
+    // Try to extract corrected manifest and/or code
+    const manifestParsed = this.parseManifestResponse(content);
+    const codeParsed = this.parseCodeResponse(content);
+
+    return {
+      manifest: manifestParsed.manifest ?? manifest,
+      code: codeParsed ?? code,
+    };
+  }
+
+  /**
+   * Parse LLM response for manifest + used objects (Phase 1).
+   */
+  private parseManifestResponse(content: string): {
     manifest?: AbjectManifest;
-    code?: string;
-    usedObjects?: string[];
+    usedObjects: string[];
   } {
-    // Extract JSON manifest
     const manifestMatch = content.match(/```json\s*([\s\S]*?)\s*```/);
     let manifest: AbjectManifest | undefined;
 
@@ -482,51 +637,57 @@ Generate a new Abjects object that fulfills this request. Use the available obje
       try {
         manifest = JSON.parse(manifestMatch[1]);
       } catch {
-        // Try to extract from other formats
+        // Invalid JSON
       }
     }
 
-    // Extract code (handler map) — prefer javascript blocks over typescript
-    let codeMatch = content.match(/```(?:javascript|js)\s*([\s\S]*?)\s*```/);
-    if (!codeMatch) {
-      codeMatch = content.match(/```(?:typescript|ts)\s*([\s\S]*?)\s*```/);
-    }
-    const code = codeMatch?.[1];
-
-    // Extract used objects
     const usedMatch = content.match(/Used objects?:\s*([\s\S]*?)(?:\n\n|$)/i);
     const usedObjects = usedMatch?.[1]
       .split(/[,\n]/)
       .map((s) => s.trim())
-      .filter((s) => s.length > 0);
+      .filter((s) => s.length > 0) ?? [];
 
-    return { manifest, code, usedObjects };
+    return { manifest, usedObjects };
   }
 
   /**
-   * Get the system prompt for object creation.
+   * Parse LLM response for handler code (Phase 2).
    */
-  private getCreationSystemPrompt(): string {
-    return `You are an Abjects object creator. You generate handler maps for ScriptableAbjects in a distributed message-passing system.
+  private parseCodeResponse(content: string): string | undefined {
+    let codeMatch = content.match(/```(?:javascript|js)\s*([\s\S]*?)\s*```/);
+    if (!codeMatch) {
+      codeMatch = content.match(/```(?:typescript|ts)\s*([\s\S]*?)\s*```/);
+    }
+    return codeMatch?.[1];
+  }
 
-Each handler is a method that receives a message object (msg) with msg.payload containing parameters.
-Return a value from a handler to auto-reply.
+  /**
+   * Parse the LLM response for object creation/modification (manifest + code + usedObjects).
+   * Used by modifyObject().
+   */
+  private parseCreationResponse(content: string): {
+    manifest?: AbjectManifest;
+    code?: string;
+    usedObjects?: string[];
+  } {
+    const { manifest, usedObjects } = this.parseManifestResponse(content);
+    const code = this.parseCodeResponse(content);
+    return { manifest, code, usedObjects: usedObjects.length > 0 ? usedObjects : undefined };
+  }
 
-IMPORTANT: The handler map must be plain JavaScript (NOT TypeScript). No type annotations, no "as" casts, no interfaces. It will be compiled with new Function() at runtime.
+  /**
+   * Phase 1 system prompt: generate manifest only.
+   */
+  private getPhase1SystemPrompt(): string {
+    return `You are an Abjects manifest designer. You design manifests for ScriptableAbjects in a distributed message-passing system.
 
-Output format:
-1. First, output the manifest as JSON in a \`\`\`json code block
-2. Then, output the handler map as plain JavaScript in a \`\`\`javascript code block
-   The handler map is a parenthesized object expression:
-   ({
-     methodName(msg) {
-       const { param } = msg.payload;
-       return { result: 'value' };
-     }
-   })
-   Each method receives a message object with msg.payload containing parameters.
-   Return a value to auto-reply.
-3. List which available objects you used (if any)
+Output ONLY a manifest JSON in a \`\`\`json code block, followed by a "Used objects:" line listing which available objects the implementation will need.
+
+CRITICAL RULES:
+- Only declare methods that WILL actually be implemented in the handler code.
+- If the object has a UI (window, display, visual output), you MUST include these methods: show, hide, widgetEvent.
+- Do NOT declare methods you are unsure about implementing.
+- Each method needs: name, description, parameters array, and returns type.
 
 Example manifest:
 \`\`\`json
@@ -549,16 +710,85 @@ Example manifest:
 }
 \`\`\`
 
-Example handler map:
+Used objects: None`;
+  }
+
+  /**
+   * Phase 2 system prompt: generate handler code only.
+   */
+  private getPhase2SystemPrompt(): string {
+    return `You are an Abjects code generator. Given a manifest, you generate the handler map (plain JavaScript) for a ScriptableAbject.
+
+Output ONLY the handler map in a \`\`\`javascript code block. Nothing else.
+
+CRITICAL RULES:
+- You MUST implement a handler for EVERY method listed in the manifest. No exceptions.
+- You MUST NOT add public methods that are not in the manifest. Private properties prefixed with _ are OK.
+- The handler map is a parenthesized object expression: ({ method(msg) { ... } })
+- Each handler receives a message object (msg) with msg.payload containing parameters.
+- Return a value from a handler to auto-reply.
+- MUST be plain JavaScript (NOT TypeScript). No type annotations, no "as" casts, no interfaces. It will be compiled with new Function() at runtime.
+
+## UI Capabilities
+
+Handler functions are bound to the object instance. Use these methods:
+
+- this.createWindow(title, {x,y,width,height}, {resizable?}) → windowId
+- this.addWidget(windowId, widgetId, type, {x,y,width,height}, {text?, placeholder?})
+  Types: 'label', 'textInput', 'button', 'textArea'
+- this.updateWidget(widgetId, text)
+- this.getWidgetValue(widgetId) → string
+- this.destroyWindow(windowId)
+- this.getDisplayInfo() → {width, height}
+- this.call(objectId, interfaceId, method, payload) → result
+- this.id — this object's ID
+
+### Show/Hide Pattern
+Objects with a UI MUST implement show and hide methods. They get a taskbar button automatically.
+
+Example:
 \`\`\`javascript
 ({
-  doSomething(msg) {
-    return { result: 'Hello from MyObject!' };
+  _windowId: null,
+  async show(msg) {
+    if (this._windowId) return true;
+    const display = await this.getDisplayInfo();
+    this._windowId = await this.createWindow('My App', {
+      x: Math.floor((display.width - 300) / 2),
+      y: Math.floor((display.height - 200) / 2),
+      width: 300, height: 200
+    }, { resizable: true });
+    await this.addWidget(this._windowId, 'lbl', 'label',
+      { x: 16, y: 10, width: 268, height: 20 }, { text: 'Hello!' });
+    return true;
+  },
+  async hide(msg) {
+    if (!this._windowId) return true;
+    await this.destroyWindow(this._windowId);
+    this._windowId = null;
+    return true;
+  },
+  async widgetEvent(msg) {
+    const { widgetId, type } = msg.payload;
+    // Handle button clicks etc.
   }
 })
-\`\`\`
+\`\`\``;
+  }
 
-Generate clean, well-structured handler maps.`;
+  /**
+   * Phase 3 system prompt: verify and fix manifest/code consistency.
+   */
+  private getPhase3SystemPrompt(): string {
+    return `You are an Abjects consistency checker. You verify that a manifest and handler code match exactly.
+
+Rules:
+- Every method declared in the manifest MUST have a corresponding handler in the code.
+- Every public handler (not prefixed with _) in the code MUST be declared in the manifest.
+- If there are mismatches, fix them by updating BOTH the manifest and code as needed.
+
+If everything is consistent, respond with just "VERIFIED".
+Otherwise, output the corrected manifest in a \`\`\`json block and the corrected handler code in a \`\`\`javascript block.`;
   }
 
   /**
@@ -575,7 +805,11 @@ When modifying objects:
 Output format:
 1. Output the updated manifest as JSON in a \`\`\`json code block
 2. Output the updated handler map as JavaScript in a \`\`\`javascript code block
-   The handler map is a parenthesized object expression: ({ method(msg) { ... } })`;
+   The handler map is a parenthesized object expression: ({ method(msg) { ... } })
+
+UI methods available: this.createWindow(), this.addWidget(), this.updateWidget(),
+this.getWidgetValue(), this.destroyWindow(), this.getDisplayInfo(), this.call()
+Objects with show/hide methods get taskbar buttons automatically.`;
   }
 }
 
