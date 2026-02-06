@@ -16,16 +16,17 @@ import { EDITABLE_INTERFACE_ID } from './scriptable-abject.js';
 const WORKSHOP_INTERFACE: InterfaceId = 'abjects:object-workshop';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
+const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 
 const WIN_W = 500;
 const WIN_H = 350;
-const PAD = 16;
 
 export class ObjectWorkshop extends Abject {
   private widgetManagerId?: AbjectId;
   private objectCreatorId?: AbjectId;
   private windowId?: AbjectId;
   private lastCreatedObjectId?: AbjectId;
+  private rootLayoutId?: AbjectId;
 
   // Widget AbjectIds
   private promptLabelId?: AbjectId;
@@ -115,67 +116,120 @@ export class ObjectWorkshop extends Abject {
       })
     );
 
-    let y = 8;
-    const inputW = WIN_W - PAD * 2;
+    // Create root VBox layout
+    this.rootLayoutId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+        windowId: this.windowId,
+        margins: { top: 8, right: 16, bottom: 8, left: 16 },
+        spacing: 8,
+      })
+    );
+
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
 
     // Prompt label
     this.promptLabelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
-        rect: { x: PAD, y, width: inputW, height: 20 },
+        rect: r0,
         text: 'Describe the object you want to create:',
       })
     );
-    y += 28;
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.promptLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
 
-    // Text input
+    // Text input (expanding horizontally, fixed height)
     this.promptInputId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
         windowId: this.windowId,
-        rect: { x: PAD, y, width: inputW, height: 36 },
+        rect: r0,
         placeholder: 'e.g., A counter that tracks page views...',
       })
     );
-    y += 48;
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.promptInputId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 36 },
+    }));
+
+    // HBox for Create button (spacer pushes it right)
+    const createRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: createRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 36 },
+    }));
+
+    // Spacer pushes button right
+    await this.request(request(this.id, createRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
 
     // Create button
-    const btnW = 100;
     this.createBtnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        rect: { x: WIN_W - PAD - btnW, y, width: btnW, height: 36 },
+        rect: r0,
         text: 'Create',
       })
     );
-    y += 52;
+    await this.request(request(this.id, createRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.createBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 100, height: 36 },
+    }));
 
     // Status label
     this.statusLabelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
-        rect: { x: PAD, y, width: inputW, height: 20 },
+        rect: r0,
         text: '',
       })
     );
-    y += 28;
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.statusLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
 
-    // Result labels (hidden until creation succeeds)
+    // Result name label
     this.resultNameId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
-        rect: { x: PAD, y, width: inputW, height: 20 },
+        rect: r0,
         text: '',
       })
     );
-    y += 24;
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.resultNameId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
 
+    // Result description label
     this.resultDescId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
-        rect: { x: PAD, y, width: inputW, height: 20 },
+        rect: r0,
         text: '',
       })
     );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.resultDescId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // Spacer pushes modify button to bottom
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
 
     // Register as dependent of interactive widgets to receive 'changed' events
     await this.request(
@@ -198,6 +252,7 @@ export class ObjectWorkshop extends Abject {
     );
 
     this.windowId = undefined;
+    this.rootLayoutId = undefined;
     this.promptLabelId = undefined;
     this.promptInputId = undefined;
     this.createBtnId = undefined;
@@ -275,15 +330,19 @@ export class ObjectWorkshop extends Abject {
   }
 
   private async showModifyButton(): Promise<void> {
-    if (!this.windowId) return;
-    const btnW = 100;
+    if (!this.windowId || !this.rootLayoutId) return;
     this.modifyBtnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        rect: { x: PAD, y: WIN_H - 30 - 36 - 8, width: btnW, height: 36 },
+        rect: { x: 0, y: 0, width: 0, height: 0 },
         text: 'Modify',
       })
     );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.modifyBtnId,
+      sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+      preferredSize: { width: 100, height: 36 },
+    }));
 
     // Register as dependent to receive click events
     await this.request(

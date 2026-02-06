@@ -34,12 +34,16 @@ import { ProgressWidget, ProgressWidgetConfig } from './widgets/progress-widget.
 import { DividerWidget } from './widgets/divider-widget.js';
 import { SelectWidget, SelectWidgetConfig } from './widgets/select-widget.js';
 import { WidgetAbject, WidgetConfig } from './widgets/widget-abject.js';
+import { VBoxLayout } from './widgets/vbox-layout.js';
+import { HBoxLayout } from './widgets/hbox-layout.js';
+import { LayoutAbject, LayoutMargins } from './widgets/layout-abject.js';
 import {
   WidgetType,
   WidgetStyle,
   Rect,
   WIDGET_INTERFACE,
   WINDOW_INTERFACE,
+  LAYOUT_INTERFACE,
 } from './widgets/widget-types.js';
 
 export type { WidgetStyle } from './widgets/widget-types.js';
@@ -341,6 +345,64 @@ export class WidgetManager extends Abject {
       }), payload.rect);
     });
 
+    // ── Layout factory methods ──
+
+    this.on('createVBox', async (msg: AbjectMessage) => {
+      const payload = msg.payload as {
+        windowId: AbjectId;
+        margins?: Partial<LayoutMargins>;
+        spacing?: number;
+      };
+      return this.createLayoutWidget(payload.windowId, new VBoxLayout({
+        ownerId: payload.windowId,
+        uiServerId: this.uiServerId!,
+        margins: payload.margins,
+        spacing: payload.spacing,
+      }));
+    });
+
+    this.on('createHBox', async (msg: AbjectMessage) => {
+      const payload = msg.payload as {
+        windowId: AbjectId;
+        margins?: Partial<LayoutMargins>;
+        spacing?: number;
+      };
+      return this.createLayoutWidget(payload.windowId, new HBoxLayout({
+        ownerId: payload.windowId,
+        uiServerId: this.uiServerId!,
+        margins: payload.margins,
+        spacing: payload.spacing,
+      }));
+    });
+
+    this.on('createNestedVBox', async (msg: AbjectMessage) => {
+      const payload = msg.payload as {
+        parentLayoutId: AbjectId;
+        margins?: Partial<LayoutMargins>;
+        spacing?: number;
+      };
+      return this.createNestedLayout(payload.parentLayoutId, new VBoxLayout({
+        ownerId: payload.parentLayoutId,
+        uiServerId: this.uiServerId!,
+        margins: payload.margins,
+        spacing: payload.spacing,
+      }));
+    });
+
+    this.on('createNestedHBox', async (msg: AbjectMessage) => {
+      const payload = msg.payload as {
+        parentLayoutId: AbjectId;
+        margins?: Partial<LayoutMargins>;
+        spacing?: number;
+      };
+      return this.createNestedLayout(payload.parentLayoutId, new HBoxLayout({
+        ownerId: payload.parentLayoutId,
+        uiServerId: this.uiServerId!,
+        margins: payload.margins,
+        spacing: payload.spacing,
+      }));
+    });
+
     // ── Shim methods (backward compat) ──
 
     this.on('addWidget', async (msg: AbjectMessage) => {
@@ -525,6 +587,43 @@ export class WidgetManager extends Abject {
     return true;
   }
 
+  // ── Factory: createLayoutWidget — init layout and add as window child ──
+
+  private async createLayoutWidget(
+    windowId: AbjectId,
+    layout: LayoutAbject
+  ): Promise<AbjectId> {
+    require(this.uiServerId !== undefined, 'UIServer not set');
+
+    await layout.init(this.bus);
+    this.spawnedWidgets.add(layout.id);
+
+    // Add the layout as the window's child with a full-content rect
+    // The window will update this rect on resize
+    await this.request(
+      request(this.id, windowId, WINDOW_INTERFACE, 'addChild', {
+        widgetId: layout.id,
+        rect: { x: 0, y: 0, width: 0, height: 0 },
+      })
+    );
+
+    return layout.id;
+  }
+
+  // ── Factory: createNestedLayout — init layout and add to parent layout ──
+
+  private async createNestedLayout(
+    parentLayoutId: AbjectId,
+    layout: LayoutAbject
+  ): Promise<AbjectId> {
+    require(this.uiServerId !== undefined, 'UIServer not set');
+
+    await layout.init(this.bus);
+    this.spawnedWidgets.add(layout.id);
+
+    return layout.id;
+  }
+
   // ── Factory: createTypedWidget (shared helper for factory methods) ───
 
   private async createTypedWidget(
@@ -537,13 +636,16 @@ export class WidgetManager extends Abject {
     await widget.init(this.bus);
     this.spawnedWidgets.add(widget.id);
 
-    // Tell the WindowAbject to add this child
-    await this.request(
-      request(this.id, windowId, WINDOW_INTERFACE, 'addChild', {
-        widgetId: widget.id,
-        rect,
-      })
-    );
+    // Only add to window if rect is non-zero.
+    // Layout-managed widgets pass {0,0,0,0} and are positioned by their layout.
+    if (rect.width > 0 || rect.height > 0) {
+      await this.request(
+        request(this.id, windowId, WINDOW_INTERFACE, 'addChild', {
+          widgetId: widget.id,
+          rect,
+        })
+      );
+    }
 
     return widget.id;
   }

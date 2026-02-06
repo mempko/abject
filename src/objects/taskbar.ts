@@ -14,6 +14,7 @@ import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 
 const TASKBAR_INTERFACE: InterfaceId = 'abjects:taskbar';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
+const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 
 export class Taskbar extends Abject {
   private widgetManagerId?: AbjectId;
@@ -22,6 +23,7 @@ export class Taskbar extends Abject {
   private objectWorkshopId?: AbjectId;
   private registryId?: AbjectId;
   private windowId?: AbjectId;
+  private rootLayoutId?: AbjectId;
 
   // Button AbjectIds for system buttons
   private settingsBtnId?: AbjectId;
@@ -189,6 +191,7 @@ export class Taskbar extends Abject {
     this.settingsBtnId = undefined;
     this.registryBtnId = undefined;
     this.workshopBtnId = undefined;
+    this.rootLayoutId = undefined;
     this.userObjButtons.clear();
 
     const displayInfo = await this.request<{ width: number; height: number }>(
@@ -208,71 +211,55 @@ export class Taskbar extends Abject {
       })
     );
 
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
     const btnW = 100;
     const btnH = 30;
-    const btnY = 5;
-    const gap = 10;
 
-    // System buttons start centered for 3 buttons; dynamic ones extend to the right
-    const systemBtnCount = 3;
+    // Create root HBox layout (centers buttons with spacers on each side)
+    this.rootLayoutId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createHBox', {
+        windowId: this.windowId,
+        margins: { top: 5, right: 10, bottom: 5, left: 10 },
+        spacing: 10,
+      })
+    );
+
+    // Left spacer
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+
     const showableObjects = await this.discoverShowableObjects();
-    const totalBtnCount = systemBtnCount + showableObjects.length;
-    const totalW = btnW * totalBtnCount + gap * (totalBtnCount - 1);
-    let btnX = Math.max(10, Math.floor((displayW - totalW) / 2));
 
-    // Create Settings button
-    this.settingsBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId,
-        rect: { x: btnX, y: btnY, width: btnW, height: btnH },
-        text: 'Settings',
-      })
-    );
-    await this.request(
-      request(this.id, this.settingsBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
-    );
-    btnX += btnW + gap;
-
-    // Create Registry button
-    this.registryBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId,
-        rect: { x: btnX, y: btnY, width: btnW, height: btnH },
-        text: 'Registry',
-      })
-    );
-    await this.request(
-      request(this.id, this.registryBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
-    );
-    btnX += btnW + gap;
-
-    // Create Workshop button
-    this.workshopBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId,
-        rect: { x: btnX, y: btnY, width: btnW, height: btnH },
-        text: 'Workshop',
-      })
-    );
-    await this.request(
-      request(this.id, this.workshopBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
-    );
-
-    // Dynamic buttons for user-created objects with show/hide
-    for (const obj of showableObjects) {
-      btnX += btnW + gap;
+    // Helper to add a fixed-size button to the layout
+    const addBtn = async (text: string): Promise<AbjectId> => {
       const btnId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-          windowId: this.windowId,
-          rect: { x: btnX, y: btnY, width: btnW, height: btnH },
-          text: obj.manifest.name,
+          windowId: this.windowId, rect: r0, text,
         })
       );
       await this.request(
         request(this.id, btnId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
       );
+      await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: btnId,
+        sizePolicy: { horizontal: 'fixed' },
+        preferredSize: { width: btnW, height: btnH },
+      }));
+      return btnId;
+    };
+
+    // System buttons
+    this.settingsBtnId = await addBtn('Settings');
+    this.registryBtnId = await addBtn('Registry');
+    this.workshopBtnId = await addBtn('Workshop');
+
+    // Dynamic buttons for user-created objects with show/hide
+    for (const obj of showableObjects) {
+      const btnId = await addBtn(obj.manifest.name);
       this.userObjButtons.set(btnId, obj.id);
     }
+
+    // Right spacer
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
 
     return true;
   }
@@ -287,6 +274,7 @@ export class Taskbar extends Abject {
     );
 
     this.windowId = undefined;
+    this.rootLayoutId = undefined;
     this.settingsBtnId = undefined;
     this.registryBtnId = undefined;
     this.workshopBtnId = undefined;

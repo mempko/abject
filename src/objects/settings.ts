@@ -14,6 +14,7 @@ import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 const SETTINGS_INTERFACE: InterfaceId = 'abjects:settings';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
+const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 
 const STORAGE_KEY_ANTHROPIC = 'settings:anthropicApiKey';
 const STORAGE_KEY_OPENAI = 'settings:openaiApiKey';
@@ -30,6 +31,7 @@ export class Settings extends Abject {
   private storageId?: AbjectId;
   private widgetManagerId?: AbjectId;
   private windowId?: AbjectId;
+  private rootLayoutId?: AbjectId;
 
   // Widget AbjectIds
   private anthropicLabelId?: AbjectId;
@@ -181,89 +183,149 @@ export class Settings extends Abject {
       })
     );
 
-    const pad = 16;
-    const toggleW = 56;
-    const gap = 8;
-    const inputW = winW - pad * 2 - toggleW - gap;
-    const inputH = 32;
-    let y = 16;
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+
+    // Create root VBox layout
+    this.rootLayoutId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+        windowId: this.windowId,
+        margins: { top: 16, right: 16, bottom: 16, left: 16 },
+        spacing: 8,
+      })
+    );
 
     // Anthropic label
     this.anthropicLabelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId,
-        rect: { x: pad, y, width: inputW, height: 20 },
-        text: 'Anthropic API Key',
+        windowId: this.windowId, rect: r0, text: 'Anthropic API Key',
       })
     );
     await this.request(request(this.id, this.anthropicLabelId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    y += 24;
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.anthropicLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
 
-    // Anthropic text input
+    // Anthropic input row (HBox: input + toggle)
+    const anthropicRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: anthropicRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
     this.anthropicKeyId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
-        windowId: this.windowId,
-        rect: { x: pad, y, width: inputW, height: inputH },
-        placeholder: 'sk-ant-...',
-        masked: true,
+        windowId: this.windowId, rect: r0, placeholder: 'sk-ant-...', masked: true,
       })
     );
     await this.request(request(this.id, this.anthropicKeyId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+    await this.request(request(this.id, anthropicRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.anthropicKeyId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
 
-    // Anthropic show/hide toggle button
     this.anthropicToggleId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId,
-        rect: { x: pad + inputW + gap, y, width: toggleW, height: inputH },
-        text: 'Show',
+        windowId: this.windowId, rect: r0, text: 'Show',
       })
     );
     await this.request(request(this.id, this.anthropicToggleId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    y += inputH + 20;
+    await this.request(request(this.id, anthropicRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.anthropicToggleId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 56, height: 32 },
+    }));
 
     // OpenAI label
     this.openaiLabelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId,
-        rect: { x: pad, y, width: inputW, height: 20 },
-        text: 'OpenAI API Key',
+        windowId: this.windowId, rect: r0, text: 'OpenAI API Key',
       })
     );
     await this.request(request(this.id, this.openaiLabelId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    y += 24;
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.openaiLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
 
-    // OpenAI text input
+    // OpenAI input row (HBox: input + toggle)
+    const openaiRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: openaiRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
     this.openaiKeyId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
-        windowId: this.windowId,
-        rect: { x: pad, y, width: inputW, height: inputH },
-        placeholder: 'sk-...',
-        masked: true,
+        windowId: this.windowId, rect: r0, placeholder: 'sk-...', masked: true,
       })
     );
     await this.request(request(this.id, this.openaiKeyId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+    await this.request(request(this.id, openaiRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.openaiKeyId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
 
-    // OpenAI show/hide toggle button
     this.openaiToggleId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId,
-        rect: { x: pad + inputW + gap, y, width: toggleW, height: inputH },
-        text: 'Show',
+        windowId: this.windowId, rect: r0, text: 'Show',
       })
     );
     await this.request(request(this.id, this.openaiToggleId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    y += inputH + 24;
+    await this.request(request(this.id, openaiRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.openaiToggleId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 56, height: 32 },
+    }));
 
-    // Save button
-    const btnW = 100;
+    // Spacer pushes save button to bottom
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+
+    // Save button row (HBox: spacer + button)
+    const saveRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: saveRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 36 },
+    }));
+
+    await this.request(request(this.id, saveRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+
     this.saveBtnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId,
-        rect: { x: winW - pad - btnW, y, width: btnW, height: 36 },
-        text: 'Save',
+        windowId: this.windowId, rect: r0, text: 'Save',
       })
     );
     await this.request(request(this.id, this.saveBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+    await this.request(request(this.id, saveRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.saveBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 100, height: 36 },
+    }));
 
     return true;
   }
@@ -281,6 +343,7 @@ export class Settings extends Abject {
     );
 
     this.windowId = undefined;
+    this.rootLayoutId = undefined;
     this.anthropicLabelId = undefined;
     this.anthropicKeyId = undefined;
     this.anthropicToggleId = undefined;

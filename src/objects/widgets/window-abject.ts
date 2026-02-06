@@ -17,6 +17,7 @@ import {
   Rect,
   WIDGET_INTERFACE,
   WINDOW_INTERFACE,
+  LAYOUT_INTERFACE,
   TITLE_BAR_HEIGHT,
   TITLE_FONT,
   EDGE_SIZE,
@@ -142,7 +143,26 @@ export class WindowAbject extends Abject {
     this.on('addChild', async (msg: AbjectMessage) => {
       const { widgetId, rect } = msg.payload as { widgetId: AbjectId; rect: Rect };
       this.children.push(widgetId);
-      this.childRects.set(widgetId, rect);
+
+      // If rect is {0,0,0,0}, fill the full content area (typical for layout children)
+      const contentW = this.rect.width;
+      const contentH = this.rect.height - (this.chromeless ? 0 : TITLE_BAR_HEIGHT);
+      const effectiveRect = (rect.width === 0 && rect.height === 0)
+        ? { x: 0, y: 0, width: contentW, height: contentH }
+        : rect;
+      this.childRects.set(widgetId, effectiveRect);
+
+      // Update the child widget's own rect so it knows its dimensions
+      if (rect.width === 0 && rect.height === 0) {
+        try {
+          await this.request(
+            request(this.id, widgetId, WIDGET_INTERFACE, 'update', { rect: effectiveRect })
+          );
+        } catch {
+          // Widget setup may not be complete yet
+        }
+      }
+
       await this.renderWindow();
       return true;
     });
@@ -414,16 +434,17 @@ export class WindowAbject extends Abject {
       if (cx >= childRect.x && cx < childRect.x + childRect.width &&
           cy >= childRect.y && cy < childRect.y + childRect.height) {
         try {
-          const result = await this.request<{ consumed: boolean }>(
+          const result = await this.request<{ consumed: boolean; focusWidgetId?: AbjectId }>(
             request(this.id, childId, WIDGET_INTERFACE, 'handleInput', {
               type: 'mousedown', x: cx, y: cy,
             })
           );
           if (result.consumed) {
-            // Widget consumed the event — it may need focus
-            this.focusedChildId = childId;
+            // Use focusWidgetId if returned (layout routing), otherwise the child itself
+            const focusTarget = result.focusWidgetId ?? childId;
+            this.focusedChildId = focusTarget;
             await this.request(
-              request(this.id, childId, WIDGET_INTERFACE, 'setFocused', { focused: true })
+              request(this.id, focusTarget, WIDGET_INTERFACE, 'setFocused', { focused: true })
             );
           }
         } catch {
@@ -472,6 +493,7 @@ export class WindowAbject extends Abject {
         if (moved) await this.uiMoveSurface(newX, newY);
         if (resized) {
           await this.uiResizeSurface(newW, newH);
+          await this.updateChildrenOnResize();
           await this.renderWindow();
         }
       }
@@ -579,14 +601,16 @@ export class WindowAbject extends Abject {
   private async focusNextWidget(): Promise<void> {
     if (!this.focusedChildId) return;
 
-    // Find all focusable children (we consider all children potentially focusable;
-    // non-focusable widgets will return consumed: false and we skip them)
-    const idx = this.children.indexOf(this.focusedChildId);
+    // Get flat list of focusable widgets (supports layouts via getFocusableWidgets)
+    const focusableWidgets = await this.getFocusableWidgetList();
+    if (focusableWidgets.length === 0) return;
+
+    const idx = focusableWidgets.indexOf(this.focusedChildId);
     if (idx === -1) return;
 
-    // Try the next children in order
-    for (let i = 1; i < this.children.length; i++) {
-      const nextId = this.children[(idx + i) % this.children.length];
+    // Try the next focusable widget in order
+    for (let i = 1; i < focusableWidgets.length; i++) {
+      const nextId = focusableWidgets[(idx + i) % focusableWidgets.length];
       if (nextId === this.focusedChildId) break;
 
       // Unfocus current
@@ -610,6 +634,60 @@ export class WindowAbject extends Abject {
 
       await this.renderWindow();
       return;
+    }
+  }
+
+  /**
+   * Get a flat list of all focusable widgets across all children,
+   * recursing into layout children via getFocusableWidgets.
+   */
+  private async getFocusableWidgetList(): Promise<AbjectId[]> {
+    const result: AbjectId[] = [];
+    for (const childId of this.children) {
+      try {
+        const nested = await this.request<AbjectId[]>(
+          request(this.id, childId, LAYOUT_INTERFACE, 'getFocusableWidgets', {})
+        );
+        if (Array.isArray(nested) && nested.length > 0) {
+          result.push(...nested);
+          continue;
+        }
+      } catch {
+        // Not a layout — treat as regular widget
+      }
+      result.push(childId);
+    }
+    return result;
+  }
+
+  /**
+   * Update children rects on window resize. For layout children,
+   * send the full content area rect. For non-layout children, keep existing rects.
+   */
+  private async updateChildrenOnResize(): Promise<void> {
+    const contentW = this.rect.width;
+    const contentH = this.rect.height - (this.chromeless ? 0 : TITLE_BAR_HEIGHT);
+
+    for (const childId of this.children) {
+      const childRect = this.childRects.get(childId);
+      if (!childRect) continue;
+
+      // Update layout children to fill the full content area
+      const newRect = {
+        x: 0,
+        y: 0,
+        width: contentW,
+        height: contentH,
+      };
+      this.childRects.set(childId, newRect);
+
+      try {
+        await this.request(
+          request(this.id, childId, WIDGET_INTERFACE, 'update', { rect: newRect })
+        );
+      } catch {
+        // Widget gone
+      }
     }
   }
 

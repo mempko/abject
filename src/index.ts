@@ -58,9 +58,14 @@ export { CheckboxWidget } from './objects/widgets/checkbox-widget.js';
 export { ProgressWidget } from './objects/widgets/progress-widget.js';
 export { DividerWidget } from './objects/widgets/divider-widget.js';
 export { SelectWidget } from './objects/widgets/select-widget.js';
+export { LayoutAbject, isSpacer, LAYOUT_INTERFACE_DECL } from './objects/widgets/layout-abject.js';
+export type { LayoutConfig, LayoutMargins, ChildRect } from './objects/widgets/layout-abject.js';
+export { VBoxLayout } from './objects/widgets/vbox-layout.js';
+export { HBoxLayout } from './objects/widgets/hbox-layout.js';
 export {
   WIDGET_INTERFACE,
   WINDOW_INTERFACE,
+  LAYOUT_INTERFACE,
   WIDGET_FONT,
   TITLE_FONT,
   CODE_FONT,
@@ -68,7 +73,7 @@ export {
   TITLE_BAR_HEIGHT,
   EDGE_SIZE,
 } from './objects/widgets/widget-types.js';
-export type { WidgetType, Rect, WidgetStyle as WidgetAbjectStyle } from './objects/widgets/widget-types.js';
+export type { WidgetType, Rect, WidgetStyle as WidgetAbjectStyle, SizePolicy, LayoutChildConfig, SpacerConfig } from './objects/widgets/widget-types.js';
 
 // Export capability objects
 export { HttpClient, HTTP_CLIENT_ID } from './objects/capabilities/http-client.js';

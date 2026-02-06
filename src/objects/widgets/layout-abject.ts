@@ -1,0 +1,337 @@
+/**
+ * LayoutAbject — abstract base class for layout containers (VBox, HBox).
+ *
+ * A layout is a WidgetAbject that manages children's geometry. It is invisible —
+ * its buildDrawCommands delegates to children at computed positions. Mouse events
+ * are routed through hit-testing; keyboard events bypass layouts entirely.
+ */
+
+import {
+  AbjectId,
+  AbjectMessage,
+  InterfaceId,
+  InterfaceDeclaration,
+} from '../../core/types.js';
+import { request } from '../../core/message.js';
+import { WidgetAbject, WidgetConfig } from './widget-abject.js';
+import {
+  Rect,
+  LayoutChildConfig,
+  SpacerConfig,
+  WIDGET_INTERFACE,
+  LAYOUT_INTERFACE,
+} from './widget-types.js';
+
+export interface ChildRect {
+  widgetId: AbjectId;
+  rect: Rect;
+}
+
+export interface LayoutMargins {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
+export const LAYOUT_INTERFACE_DECL: InterfaceDeclaration = {
+  id: LAYOUT_INTERFACE,
+  name: 'Layout',
+  description: 'Layout container that manages children geometry',
+  methods: [
+    {
+      name: 'addLayoutChild',
+      description: 'Add a widget to this layout',
+      parameters: [
+        { name: 'widgetId', type: { kind: 'primitive', primitive: 'string' }, description: 'Widget AbjectId' },
+        { name: 'sizePolicy', type: { kind: 'reference', reference: 'SizePolicyConfig' }, description: 'Size policy' },
+        { name: 'preferredSize', type: { kind: 'reference', reference: 'PreferredSize' }, description: 'Preferred size' },
+        { name: 'alignment', type: { kind: 'primitive', primitive: 'string' }, description: 'Cross-axis alignment' },
+        { name: 'stretch', type: { kind: 'primitive', primitive: 'number' }, description: 'Stretch factor' },
+      ],
+      returns: { kind: 'primitive', primitive: 'boolean' },
+    },
+    {
+      name: 'addLayoutSpacer',
+      description: 'Add a spacer to this layout',
+      parameters: [
+        { name: 'stretch', type: { kind: 'primitive', primitive: 'number' }, description: 'Stretch factor' },
+      ],
+      returns: { kind: 'primitive', primitive: 'boolean' },
+    },
+    {
+      name: 'removeLayoutChild',
+      description: 'Remove a widget from this layout',
+      parameters: [
+        { name: 'widgetId', type: { kind: 'primitive', primitive: 'string' }, description: 'Widget AbjectId to remove' },
+      ],
+      returns: { kind: 'primitive', primitive: 'boolean' },
+    },
+    {
+      name: 'getFocusableWidgets',
+      description: 'Return flat ordered list of all focusable widget AbjectIds',
+      parameters: [],
+      returns: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+    },
+  ],
+};
+
+export interface LayoutConfig {
+  ownerId: AbjectId;
+  uiServerId: AbjectId;
+  margins?: Partial<LayoutMargins>;
+  spacing?: number;
+}
+
+/**
+ * Abstract base class for layout containers.
+ */
+export abstract class LayoutAbject extends WidgetAbject {
+  protected layoutChildren: (LayoutChildConfig | SpacerConfig)[] = [];
+  protected margins: LayoutMargins;
+  protected spacing: number;
+
+  constructor(config: LayoutConfig, layoutType: 'vbox' | 'hbox') {
+    super({
+      type: 'label', // layouts render nothing themselves
+      rect: { x: 0, y: 0, width: 0, height: 0 },
+      ownerId: config.ownerId,
+      uiServerId: config.uiServerId,
+    });
+
+    // Override manifest for layout
+    (this as unknown as { manifest: unknown }).manifest = {
+      name: layoutType === 'vbox' ? 'VBoxLayout' : 'HBoxLayout',
+      description: `${layoutType === 'vbox' ? 'Vertical' : 'Horizontal'} layout container`,
+      version: '1.0.0',
+      interfaces: [LAYOUT_INTERFACE_DECL],
+      requiredCapabilities: [],
+      providedCapabilities: [],
+      tags: ['widget', 'layout'],
+    };
+
+    this.margins = {
+      top: config.margins?.top ?? 8,
+      right: config.margins?.right ?? 16,
+      bottom: config.margins?.bottom ?? 8,
+      left: config.margins?.left ?? 16,
+    };
+    this.spacing = config.spacing ?? 8;
+
+    this.setupLayoutHandlers();
+  }
+
+  private setupLayoutHandlers(): void {
+    this.on('addLayoutChild', async (msg: AbjectMessage) => {
+      const { widgetId, sizePolicy, preferredSize, alignment, stretch } = msg.payload as {
+        widgetId: AbjectId;
+        sizePolicy?: { horizontal?: string; vertical?: string };
+        preferredSize?: { width?: number; height?: number };
+        alignment?: 'left' | 'center' | 'right';
+        stretch?: number;
+      };
+      this.layoutChildren.push({
+        widgetId,
+        sizePolicy: sizePolicy as LayoutChildConfig['sizePolicy'],
+        preferredSize,
+        alignment,
+        stretch,
+      });
+      if (this.rect.width > 0 && this.rect.height > 0) {
+        await this.updateChildRects();
+      }
+      await this.requestRedraw();
+      return true;
+    });
+
+    this.on('addLayoutSpacer', async (msg: AbjectMessage) => {
+      const { stretch } = msg.payload as { stretch?: number };
+      this.layoutChildren.push({
+        type: 'spacer',
+        stretch: stretch ?? 1,
+      });
+      if (this.rect.width > 0 && this.rect.height > 0) {
+        await this.updateChildRects();
+      }
+      await this.requestRedraw();
+      return true;
+    });
+
+    this.on('removeLayoutChild', async (msg: AbjectMessage) => {
+      const { widgetId } = msg.payload as { widgetId: AbjectId };
+      this.layoutChildren = this.layoutChildren.filter(
+        (c) => isSpacer(c) || c.widgetId !== widgetId
+      );
+      if (this.rect.width > 0 && this.rect.height > 0) {
+        await this.updateChildRects();
+      }
+      await this.requestRedraw();
+      return true;
+    });
+
+    this.on('getFocusableWidgets', async () => {
+      return this.getFocusableWidgets();
+    });
+  }
+
+  /**
+   * Get the content rect (rect minus margins).
+   */
+  protected getContentRect(): Rect {
+    return {
+      x: this.rect.x + this.margins.left,
+      y: this.rect.y + this.margins.top,
+      width: Math.max(0, this.rect.width - this.margins.left - this.margins.right),
+      height: Math.max(0, this.rect.height - this.margins.top - this.margins.bottom),
+    };
+  }
+
+  /**
+   * Calculate child rects — implemented by VBox/HBox.
+   */
+  protected abstract calculateChildRects(contentRect: Rect): ChildRect[];
+
+  // ── WidgetAbject implementation ───────────────────────────────────
+
+  protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
+    const contentRect = this.getContentRect();
+    const childRects = this.calculateChildRects(contentRect);
+    const commands: unknown[] = [];
+
+    for (const cr of childRects) {
+      // Render child at computed position
+      const childOx = ox + cr.rect.x;
+      const childOy = oy + cr.rect.y;
+      try {
+        const childCmds = await this.request<unknown[]>(
+          request(this.id, cr.widgetId, WIDGET_INTERFACE, 'render', {
+            surfaceId,
+            ox: childOx,
+            oy: childOy,
+          })
+        );
+        if (Array.isArray(childCmds)) {
+          commands.push(...childCmds);
+        }
+      } catch {
+        // Widget may have been destroyed
+      }
+    }
+
+    return commands;
+  }
+
+  protected async processInput(input: Record<string, unknown>): Promise<{ consumed: boolean; focusWidgetId?: AbjectId }> {
+    const inputType = input.type as string;
+
+    // Only route mouse events through layout
+    if (inputType !== 'mousedown' && inputType !== 'mousemove' && inputType !== 'wheel') {
+      return { consumed: false };
+    }
+
+    const mx = input.x as number;
+    const my = input.y as number;
+
+    const contentRect = this.getContentRect();
+    const childRects = this.calculateChildRects(contentRect);
+
+    for (const cr of childRects) {
+      if (mx >= cr.rect.x && mx < cr.rect.x + cr.rect.width &&
+          my >= cr.rect.y && my < cr.rect.y + cr.rect.height) {
+        try {
+          const result = await this.request<{ consumed: boolean; focusWidgetId?: AbjectId }>(
+            request(this.id, cr.widgetId, WIDGET_INTERFACE, 'handleInput', {
+              ...input,
+              x: mx - cr.rect.x,
+              y: my - cr.rect.y,
+            })
+          );
+          if (result.consumed) {
+            return {
+              consumed: true,
+              focusWidgetId: result.focusWidgetId ?? cr.widgetId,
+            };
+          }
+        } catch {
+          // Widget gone
+        }
+      }
+    }
+
+    return { consumed: false };
+  }
+
+  protected getWidgetValue(): string {
+    return '';
+  }
+
+  protected applyUpdate(updates: Record<string, unknown>): void {
+    if (updates.margins !== undefined) {
+      const m = updates.margins as Partial<LayoutMargins>;
+      this.margins = { ...this.margins, ...m };
+    }
+    if (updates.spacing !== undefined) {
+      this.spacing = updates.spacing as number;
+    }
+
+    // When rect changes, cascade rect updates to children
+    if (updates.rect !== undefined) {
+      this.updateChildRects();
+    }
+  }
+
+  /**
+   * Recalculate child rects and update each child widget's rect.
+   * Called when the layout's own rect changes (e.g. from window resize).
+   */
+  private async updateChildRects(): Promise<void> {
+    const contentRect = this.getContentRect();
+    const childRects = this.calculateChildRects(contentRect);
+
+    for (const cr of childRects) {
+      try {
+        await this.request(
+          request(this.id, cr.widgetId, WIDGET_INTERFACE, 'update', {
+            rect: { x: 0, y: 0, width: cr.rect.width, height: cr.rect.height },
+          })
+        );
+      } catch {
+        // Widget may have been destroyed
+      }
+    }
+  }
+
+  /**
+   * Return flat ordered list of all focusable widget AbjectIds,
+   * recursing into nested layouts.
+   */
+  private async getFocusableWidgets(): Promise<AbjectId[]> {
+    const result: AbjectId[] = [];
+    for (const child of this.layoutChildren) {
+      if (isSpacer(child)) continue;
+
+      // Try to get focusable widgets from this child (if it's a layout)
+      try {
+        const nested = await this.request<AbjectId[]>(
+          request(this.id, child.widgetId, LAYOUT_INTERFACE, 'getFocusableWidgets', {})
+        );
+        if (Array.isArray(nested) && nested.length > 0) {
+          result.push(...nested);
+          continue;
+        }
+      } catch {
+        // Not a layout — it's a regular widget
+      }
+
+      result.push(child.widgetId);
+    }
+    return result;
+  }
+}
+
+/**
+ * Type guard for SpacerConfig.
+ */
+export function isSpacer(item: LayoutChildConfig | SpacerConfig): item is SpacerConfig {
+  return (item as SpacerConfig).type === 'spacer';
+}

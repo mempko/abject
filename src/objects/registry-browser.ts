@@ -22,11 +22,11 @@ import { LLMMessage, LLMCompletionResult } from '../llm/provider.js';
 const REGISTRY_BROWSER_INTERFACE: InterfaceId = 'abjects:registry-browser';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
+const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 
 const PAGE_SIZE = 8;
 const WIN_W = 500;
-const WIN_H = 400;
-const PAD = 16;
+const WIN_H = 500;
 
 export class RegistryBrowser extends Abject {
   private widgetManagerId?: AbjectId;
@@ -34,6 +34,7 @@ export class RegistryBrowser extends Abject {
   private objectCreatorId?: AbjectId;
   private llmId?: AbjectId;
   private windowId?: AbjectId;
+  private rootLayoutId?: AbjectId;
   private currentPage = 0;
   private cachedObjects: ObjectRegistration[] = [];
   private editingObjectId?: AbjectId;
@@ -145,6 +146,7 @@ export class RegistryBrowser extends Abject {
    * The window destroy takes care of actual widget cleanup.
    */
   private clearViewTracking(): void {
+    this.rootLayoutId = undefined;
     // List view
     this.objButtons.clear();
     this.prevPageBtnId = undefined;
@@ -240,49 +242,73 @@ export class RegistryBrowser extends Abject {
       })
     );
 
-    let y = 8;
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+
+    // Create root VBox layout
+    this.rootLayoutId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+        windowId: this.windowId,
+        margins: { top: 8, right: 16, bottom: 8, left: 16 },
+        spacing: 4,
+      })
+    );
 
     // LLM command bar (only when LLM is available)
     if (this.llmId) {
-      const cmdInputW = WIN_W - PAD * 2 - 70;
+      const cmdRowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+          parentLayoutId: this.rootLayoutId,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 8,
+        })
+      );
+      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: cmdRowId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 30 },
+      }));
+
       this.cmdInputId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
-          windowId: this.windowId,
-          rect: { x: PAD, y, width: cmdInputW, height: 30 },
-          placeholder: 'Type a command...',
+          windowId: this.windowId, rect: r0, placeholder: 'Type a command...',
         })
       );
       await this.addDep(this.cmdInputId);
+      await this.request(request(this.id, cmdRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: this.cmdInputId,
+        sizePolicy: { horizontal: 'expanding' },
+        preferredSize: { height: 30 },
+      }));
 
       this.cmdRunBtnId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-          windowId: this.windowId,
-          rect: { x: PAD + cmdInputW + 8, y, width: 60, height: 30 },
-          text: 'Run',
+          windowId: this.windowId, rect: r0, text: 'Run',
         })
       );
       await this.addDep(this.cmdRunBtnId);
-
-      y += 34;
+      await this.request(request(this.id, cmdRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: this.cmdRunBtnId,
+        sizePolicy: { horizontal: 'fixed' },
+        preferredSize: { width: 60, height: 30 },
+      }));
 
       this.cmdStatusId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-          windowId: this.windowId,
-          rect: { x: PAD, y, width: WIN_W - PAD * 2, height: 20 },
-          text: '',
+          windowId: this.windowId, rect: r0, text: '',
         })
       );
-      y += 24;
+      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: this.cmdStatusId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 20 },
+      }));
     }
 
     const totalPages = Math.max(1, Math.ceil(this.cachedObjects.length / PAGE_SIZE));
     const start = this.currentPage * PAGE_SIZE;
     const pageItems = this.cachedObjects.slice(start, start + PAGE_SIZE);
 
-    const itemW = WIN_W - PAD * 2;
-    const itemH = 32;
-    const gap = 4;
-
+    // Object buttons (expanding horizontally)
     for (let i = 0; i < pageItems.length; i++) {
       const obj = pageItems[i];
       const desc = obj.manifest.description;
@@ -290,47 +316,72 @@ export class RegistryBrowser extends Abject {
 
       const btnId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-          windowId: this.windowId,
-          rect: { x: PAD, y, width: itemW, height: itemH },
-          text: label,
+          windowId: this.windowId, rect: r0, text: label,
         })
       );
       await this.addDep(btnId);
       this.objButtons.set(btnId, i);
 
-      y += itemH + gap;
+      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: btnId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 32 },
+      }));
     }
 
-    // Navigation row
-    y = WIN_H - 30 - 36 - 8; // account for title bar
-    const navBtnW = 70;
+    // Spacer pushes nav to bottom
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
 
+    // Navigation row
     if (totalPages > 1) {
+      const navRowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+          parentLayoutId: this.rootLayoutId,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 10,
+        })
+      );
+      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: navRowId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 30 },
+      }));
+
       this.prevPageBtnId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-          windowId: this.windowId,
-          rect: { x: PAD, y, width: navBtnW, height: 30 },
-          text: 'Prev',
+          windowId: this.windowId, rect: r0, text: 'Prev',
         })
       );
       await this.addDep(this.prevPageBtnId);
+      await this.request(request(this.id, navRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: this.prevPageBtnId,
+        sizePolicy: { horizontal: 'fixed' },
+        preferredSize: { width: 70, height: 30 },
+      }));
 
-      await this.request<AbjectId>(
+      const pageLabelId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-          windowId: this.windowId,
-          rect: { x: PAD + navBtnW + 10, y, width: 200, height: 30 },
+          windowId: this.windowId, rect: r0,
           text: `Page ${this.currentPage + 1} of ${totalPages}`,
         })
       );
+      await this.request(request(this.id, navRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: pageLabelId,
+        sizePolicy: { horizontal: 'expanding' },
+        preferredSize: { height: 30 },
+      }));
 
       this.nextPageBtnId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-          windowId: this.windowId,
-          rect: { x: WIN_W - PAD - navBtnW, y, width: navBtnW, height: 30 },
-          text: 'Next',
+          windowId: this.windowId, rect: r0, text: 'Next',
         })
       );
       await this.addDep(this.nextPageBtnId);
+      await this.request(request(this.id, navRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: this.nextPageBtnId,
+        sizePolicy: { horizontal: 'fixed' },
+        preferredSize: { width: 70, height: 30 },
+      }));
     }
   }
 
@@ -372,30 +423,36 @@ export class RegistryBrowser extends Abject {
       })
     );
 
-    let y = 8;
-    const labelH = 20;
-    const lineGap = 4;
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+
+    // Create root VBox layout
+    this.rootLayoutId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+        windowId: this.windowId,
+        margins: { top: 8, right: 16, bottom: 8, left: 16 },
+        spacing: 4,
+      })
+    );
 
     const addLabel = async (text: string): Promise<AbjectId> => {
       const id = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-          windowId: this.windowId,
-          rect: { x: PAD, y, width: WIN_W - PAD * 2, height: labelH },
-          text,
+          windowId: this.windowId, rect: r0, text,
         })
       );
-      y += labelH + lineGap;
+      await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: id,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 20 },
+      }));
       return id;
     };
 
     await addLabel(`Name: ${obj.manifest.name}`);
     await addLabel(`Version: ${obj.manifest.version}`);
 
-    // Description (may be long, truncate)
     const desc = obj.manifest.description;
     await addLabel(`Description: ${desc.length > 60 ? desc.slice(0, 60) + '...' : desc}`);
-
-    y += 4;
 
     // Interfaces
     for (const iface of obj.manifest.interfaces) {
@@ -405,8 +462,6 @@ export class RegistryBrowser extends Abject {
         await addLabel(`  ${method.name}(${params}) — ${method.description.slice(0, 40)}`);
       }
     }
-
-    y += 4;
 
     // Tags
     const tags = obj.manifest.tags ?? [];
@@ -428,81 +483,117 @@ export class RegistryBrowser extends Abject {
       await addLabel(`Requires: ${reqNames.join(', ')}`);
     }
 
-    y += 8;
-
     // ── Send Message section ──
     await addLabel('Send Message:');
 
-    // Method buttons (compact, 2 per row)
-    const methodBtnW = Math.floor((WIN_W - PAD * 2 - 8) / 2);
-    const methodBtnH = 26;
-    let col = 0;
+    // Method buttons in 2-col HBox rows
+    const allMethods: { interfaceId: InterfaceId; method: string }[] = [];
     for (const iface of obj.manifest.interfaces) {
       for (const method of iface.methods) {
-        const bx = PAD + col * (methodBtnW + 8);
+        allMethods.push({ interfaceId: iface.id, method: method.name });
+      }
+    }
+
+    for (let i = 0; i < allMethods.length; i += 2) {
+      const rowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+          parentLayoutId: this.rootLayoutId,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 8,
+        })
+      );
+      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: rowId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 26 },
+      }));
+
+      for (let j = i; j < Math.min(i + 2, allMethods.length); j++) {
+        const m = allMethods[j];
         const btnId = await this.request<AbjectId>(
           request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-            windowId: this.windowId,
-            rect: { x: bx, y, width: methodBtnW, height: methodBtnH },
-            text: method.name,
+            windowId: this.windowId, rect: r0, text: m.method,
           })
         );
         await this.addDep(btnId);
-        this.methodButtons.set(btnId, { interfaceId: iface.id, method: method.name });
-        col++;
-        if (col >= 2) {
-          col = 0;
-          y += methodBtnH + 4;
-        }
+        this.methodButtons.set(btnId, m);
+        await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          widgetId: btnId,
+          sizePolicy: { horizontal: 'expanding' },
+          preferredSize: { height: 26 },
+        }));
       }
     }
-    if (col !== 0) {
-      y += methodBtnH + 4;
-    }
-    y += 4;
 
-    // Payload input
-    const payloadInputW = WIN_W - PAD * 2 - 70;
+    // Payload row (HBox: input + Send)
+    const payloadRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: payloadRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 30 },
+    }));
+
     this.msgPayloadId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
-        windowId: this.windowId,
-        rect: { x: PAD, y, width: payloadInputW, height: 30 },
-        placeholder: 'JSON payload (optional)',
+        windowId: this.windowId, rect: r0, placeholder: 'JSON payload (optional)',
       })
     );
     await this.addDep(this.msgPayloadId);
+    await this.request(request(this.id, payloadRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.msgPayloadId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: 30 },
+    }));
 
     this.msgSendBtnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId,
-        rect: { x: PAD + payloadInputW + 8, y, width: 60, height: 30 },
-        text: 'Send',
+        windowId: this.windowId, rect: r0, text: 'Send',
       })
     );
     await this.addDep(this.msgSendBtnId);
-
-    y += 38;
+    await this.request(request(this.id, payloadRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.msgSendBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 60, height: 30 },
+    }));
 
     // Response label
-    this.msgResponseId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId,
-        rect: { x: PAD, y, width: WIN_W - PAD * 2, height: labelH },
-        text: '',
+    this.msgResponseId = await addLabel('');
+
+    // Spacer pushes bottom buttons down
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+
+    // Bottom buttons row
+    const bottomRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 10,
       })
     );
-    y += labelH + 8;
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: bottomRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
 
-    // ── Bottom buttons ──
-    const btnY = detailH - 30 - 36 - 8;
     this.backBtnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId,
-        rect: { x: PAD, y: btnY, width: 80, height: 32 },
-        text: 'Back',
+        windowId: this.windowId, rect: r0, text: 'Back',
       })
     );
     await this.addDep(this.backBtnId);
+    await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.backBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 80, height: 32 },
+    }));
 
     // Show "Edit Source" button if the object is scriptable
     const isEditable = obj.source !== undefined;
@@ -510,13 +601,19 @@ export class RegistryBrowser extends Abject {
       this.detailIndex = index;
       this.editSourceBtnId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-          windowId: this.windowId,
-          rect: { x: PAD + 90, y: btnY, width: 110, height: 32 },
-          text: 'Edit Source',
+          windowId: this.windowId, rect: r0, text: 'Edit Source',
         })
       );
       await this.addDep(this.editSourceBtnId);
+      await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: this.editSourceBtnId,
+        sizePolicy: { horizontal: 'fixed' },
+        preferredSize: { width: 110, height: 32 },
+      }));
     }
+
+    // Right spacer in bottom row
+    await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
   }
 
   private async showEditView(obj: ObjectRegistration): Promise<void> {
@@ -551,94 +648,142 @@ export class RegistryBrowser extends Abject {
       })
     );
 
-    const innerW = editW - PAD * 2;
-    let y = 8;
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+
+    // Create root VBox layout
+    this.rootLayoutId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+        windowId: this.windowId,
+        margins: { top: 8, right: 16, bottom: 8, left: 16 },
+        spacing: 8,
+      })
+    );
 
     // Object name label
-    await this.request<AbjectId>(
+    const nameLabelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId,
-        rect: { x: PAD, y, width: innerW, height: 20 },
-        text: `Source: ${obj.manifest.name}`,
+        windowId: this.windowId, rect: r0, text: `Source: ${obj.manifest.name}`,
       })
     );
-    y += 28;
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: nameLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
 
-    // textArea with source code
-    const textAreaH = editH - 30 - y - 80; // room for buttons + status
+    // TextArea with source code (expanding both axes)
     this.sourceEditorId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextArea', {
-        windowId: this.windowId,
-        rect: { x: PAD, y, width: innerW, height: textAreaH },
-        text: obj.source ?? '',
-        monospace: true,
+        windowId: this.windowId, rect: r0, text: obj.source ?? '', monospace: true,
       })
     );
-    y += textAreaH + 8;
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.sourceEditorId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+      stretch: 1,
+    }));
 
-    // Button row
-    const btnW = 80;
-    const btnH = 32;
-    const btnGap = 8;
+    // Button row (HBox: Save, Cancel, AI Edit)
+    const btnRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: btnRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
 
     this.saveBtnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId,
-        rect: { x: PAD, y, width: btnW, height: btnH },
-        text: 'Save',
+        windowId: this.windowId, rect: r0, text: 'Save',
       })
     );
     await this.addDep(this.saveBtnId);
+    await this.request(request(this.id, btnRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.saveBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 80, height: 32 },
+    }));
 
     this.cancelBtnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId,
-        rect: { x: PAD + btnW + btnGap, y, width: btnW, height: btnH },
-        text: 'Cancel',
+        windowId: this.windowId, rect: r0, text: 'Cancel',
       })
     );
     await this.addDep(this.cancelBtnId);
+    await this.request(request(this.id, btnRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.cancelBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 80, height: 32 },
+    }));
 
     this.aiEditBtnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId,
-        rect: { x: PAD + (btnW + btnGap) * 2, y, width: btnW, height: btnH },
-        text: 'AI Edit',
+        windowId: this.windowId, rect: r0, text: 'AI Edit',
       })
     );
     await this.addDep(this.aiEditBtnId);
+    await this.request(request(this.id, btnRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.aiEditBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 80, height: 32 },
+    }));
 
-    y += btnH + 8;
+    await this.request(request(this.id, btnRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
 
-    // AI edit prompt input (hidden until AI Edit is clicked, but always present)
+    // AI edit prompt row (HBox: input + Go)
+    const aiRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: aiRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 30 },
+    }));
+
     this.aiPromptInputId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
-        windowId: this.windowId,
-        rect: { x: PAD, y, width: innerW - btnW - btnGap, height: 30 },
-        placeholder: 'Describe what to change...',
+        windowId: this.windowId, rect: r0, placeholder: 'Describe what to change...',
       })
     );
     await this.addDep(this.aiPromptInputId);
+    await this.request(request(this.id, aiRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.aiPromptInputId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: 30 },
+    }));
 
     this.aiGoBtnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId,
-        rect: { x: PAD + innerW - btnW, y, width: btnW, height: 30 },
-        text: 'Go',
+        windowId: this.windowId, rect: r0, text: 'Go',
       })
     );
     await this.addDep(this.aiGoBtnId);
-
-    y += 38;
+    await this.request(request(this.id, aiRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.aiGoBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 80, height: 30 },
+    }));
 
     // Status label
     this.editStatusId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId,
-        rect: { x: PAD, y, width: innerW, height: 20 },
-        text: '',
+        windowId: this.windowId, rect: r0, text: '',
       })
     );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.editStatusId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
   }
 
   private async updateEditStatus(text: string): Promise<void> {
