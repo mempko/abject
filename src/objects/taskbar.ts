@@ -1,11 +1,16 @@
 /**
  * Taskbar — persistent bottom bar with launch buttons for system UI.
+ *
+ * Migrated to direct widget Abject interaction: creates windows and buttons
+ * via createWindowAbject/createButton factory methods, registers as dependent
+ * of each button, and listens for 'changed' events with aspect === 'click'.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 
 const TASKBAR_INTERFACE: InterfaceId = 'abjects:taskbar';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
@@ -16,7 +21,15 @@ export class Taskbar extends Abject {
   private registryBrowserId?: AbjectId;
   private objectWorkshopId?: AbjectId;
   private registryId?: AbjectId;
-  private windowId?: string;
+  private windowId?: AbjectId;
+
+  // Button AbjectIds for system buttons
+  private settingsBtnId?: AbjectId;
+  private registryBtnId?: AbjectId;
+  private workshopBtnId?: AbjectId;
+
+  // Dynamic user object buttons: button widget AbjectId → target object AbjectId
+  private userObjButtons: Map<AbjectId, AbjectId> = new Map();
 
   constructor() {
     super({
@@ -116,9 +129,43 @@ export class Taskbar extends Abject {
       return this.hide();
     });
 
-    this.on('widgetEvent', async (msg: AbjectMessage) => {
-      const payload = msg.payload as { windowId: string; widgetId: string; type: string; value?: string };
-      await this.handleWidgetEvent(payload);
+    // Handle 'changed' events from button widget Abjects (dependency protocol)
+    this.on('changed', async (msg: AbjectMessage) => {
+      const { aspect } = msg.payload as { aspect: string; value?: unknown };
+      if (aspect !== 'click') return;
+
+      const fromId = msg.routing.from;
+
+      if (fromId === this.settingsBtnId) {
+        await this.request(
+          request(this.id, this.settingsId!, 'abjects:settings' as InterfaceId, 'show', {})
+        );
+      } else if (fromId === this.registryBtnId) {
+        await this.request(
+          request(this.id, this.registryBrowserId!, 'abjects:registry-browser' as InterfaceId, 'show', {})
+        );
+      } else if (fromId === this.workshopBtnId) {
+        await this.request(
+          request(this.id, this.objectWorkshopId!, 'abjects:object-workshop' as InterfaceId, 'show', {})
+        );
+      } else {
+        // Check dynamic user object buttons
+        const targetId = this.userObjButtons.get(fromId);
+        if (targetId) {
+          const reg = await this.registryLookup(targetId);
+          if (reg) {
+            const iface = reg.manifest.interfaces.find((i) =>
+              i.methods.some((m) => m.name === 'show'));
+            if (iface) {
+              try {
+                await this.request(request(this.id, targetId, iface.id, 'show', {}));
+              } catch (err) {
+                console.warn(`[Taskbar] Failed to show ${reg.manifest.name}:`, err);
+              }
+            }
+          }
+        }
+      }
     });
 
     // Auto-refresh taskbar when new objects are registered
@@ -131,12 +178,18 @@ export class Taskbar extends Abject {
     // Always destroy and rebuild to pick up new objects
     if (this.windowId) {
       await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
           windowId: this.windowId,
         })
       );
       this.windowId = undefined;
     }
+
+    // Reset all button tracking since window is destroyed and rebuilt
+    this.settingsBtnId = undefined;
+    this.registryBtnId = undefined;
+    this.workshopBtnId = undefined;
+    this.userObjButtons.clear();
 
     const displayInfo = await this.request<{ width: number; height: number }>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
@@ -146,8 +199,8 @@ export class Taskbar extends Abject {
     const displayW = displayInfo.width;
     const displayH = displayInfo.height;
 
-    this.windowId = await this.request<string>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindow', {
+    this.windowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
         title: '',
         rect: { x: 0, y: displayH - barHeight, width: displayW, height: barHeight },
         zIndex: 999,
@@ -167,50 +220,58 @@ export class Taskbar extends Abject {
     const totalW = btnW * totalBtnCount + gap * (totalBtnCount - 1);
     let btnX = Math.max(10, Math.floor((displayW - totalW) / 2));
 
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    // Create Settings button
+    this.settingsBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        id: 'settings-btn',
-        type: 'button',
         rect: { x: btnX, y: btnY, width: btnW, height: btnH },
         text: 'Settings',
       })
     );
+    await this.request(
+      request(this.id, this.settingsBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+    );
     btnX += btnW + gap;
 
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    // Create Registry button
+    this.registryBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        id: 'registry-btn',
-        type: 'button',
         rect: { x: btnX, y: btnY, width: btnW, height: btnH },
         text: 'Registry',
       })
     );
+    await this.request(
+      request(this.id, this.registryBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+    );
     btnX += btnW + gap;
 
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    // Create Workshop button
+    this.workshopBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        id: 'workshop-btn',
-        type: 'button',
         rect: { x: btnX, y: btnY, width: btnW, height: btnH },
         text: 'Workshop',
       })
+    );
+    await this.request(
+      request(this.id, this.workshopBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
     );
 
     // Dynamic buttons for user-created objects with show/hide
     for (const obj of showableObjects) {
       btnX += btnW + gap;
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+      const btnId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
           windowId: this.windowId,
-          id: `user-obj::${obj.id}`,
-          type: 'button',
           rect: { x: btnX, y: btnY, width: btnW, height: btnH },
           text: obj.manifest.name,
         })
       );
+      await this.request(
+        request(this.id, btnId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+      );
+      this.userObjButtons.set(btnId, obj.id);
     }
 
     return true;
@@ -220,46 +281,17 @@ export class Taskbar extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
         windowId: this.windowId,
       })
     );
 
     this.windowId = undefined;
+    this.settingsBtnId = undefined;
+    this.registryBtnId = undefined;
+    this.workshopBtnId = undefined;
+    this.userObjButtons.clear();
     return true;
-  }
-
-  private async handleWidgetEvent(payload: { windowId: string; widgetId: string; type: string; value?: string }): Promise<void> {
-    if (payload.type !== 'click') return;
-
-    if (payload.widgetId === 'settings-btn') {
-      await this.request(
-        request(this.id, this.settingsId!, 'abjects:settings' as InterfaceId, 'show', {})
-      );
-    } else if (payload.widgetId === 'registry-btn') {
-      await this.request(
-        request(this.id, this.registryBrowserId!, 'abjects:registry-browser' as InterfaceId, 'show', {})
-      );
-    } else if (payload.widgetId === 'workshop-btn') {
-      await this.request(
-        request(this.id, this.objectWorkshopId!, 'abjects:object-workshop' as InterfaceId, 'show', {})
-      );
-    } else if (payload.widgetId.startsWith('user-obj::')) {
-      // Dynamic user object button — send 'show' to the object
-      const objId = payload.widgetId.slice('user-obj::'.length) as AbjectId;
-      const reg = await this.registryLookup(objId);
-      if (reg) {
-        const iface = reg.manifest.interfaces.find((i) =>
-          i.methods.some((m) => m.name === 'show'));
-        if (iface) {
-          try {
-            await this.request(request(this.id, objId, iface.id, 'show', {}));
-          } catch (err) {
-            console.warn(`[Taskbar] Failed to show ${reg.manifest.name}:`, err);
-          }
-        }
-      }
-    }
   }
 }
 

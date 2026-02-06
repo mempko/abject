@@ -1,27 +1,46 @@
 /**
  * Settings object - provides UI for configuring the system (LLM API keys, etc).
+ *
+ * Uses direct widget Abject interaction (createWindowAbject, createButton, etc.)
+ * instead of the legacy string-based widget ID shim.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 
 const SETTINGS_INTERFACE: InterfaceId = 'abjects:settings';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
+const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
 
 const STORAGE_KEY_ANTHROPIC = 'settings:anthropicApiKey';
 const STORAGE_KEY_OPENAI = 'settings:openaiApiKey';
 
 /**
  * Settings object that provides a configuration UI for LLM API keys.
+ *
+ * Widgets are first-class Abjects identified by AbjectId. This object registers
+ * as a dependent of each widget and listens for 'changed' events to handle
+ * user interactions.
  */
 export class Settings extends Abject {
   private llmId?: AbjectId;
   private storageId?: AbjectId;
   private widgetManagerId?: AbjectId;
-  private windowId?: string;
-  private unmasked: Set<string> = new Set();
+  private windowId?: AbjectId;
+
+  // Widget AbjectIds
+  private anthropicLabelId?: AbjectId;
+  private anthropicKeyId?: AbjectId;
+  private anthropicToggleId?: AbjectId;
+  private openaiLabelId?: AbjectId;
+  private openaiKeyId?: AbjectId;
+  private openaiToggleId?: AbjectId;
+  private saveBtnId?: AbjectId;
+
+  private unmasked: Set<AbjectId> = new Set();
 
   constructor() {
     super({
@@ -113,9 +132,27 @@ export class Settings extends Abject {
       return this.hide();
     });
 
-    this.on('widgetEvent', async (msg: AbjectMessage) => {
-      const payload = msg.payload as { windowId: string; widgetId: string; type: string; value?: string };
-      await this.handleWidgetEvent(payload);
+    // Handle 'changed' events from widget dependents
+    this.on('changed', async (msg: AbjectMessage) => {
+      const { aspect } = msg.payload as { aspect: string; value?: unknown };
+      const fromId = msg.routing.from;
+
+      if (fromId === this.saveBtnId && aspect === 'click') {
+        await this.saveSettings();
+      }
+
+      if (fromId === this.anthropicToggleId && aspect === 'click') {
+        await this.toggleMask(this.anthropicKeyId!, this.anthropicToggleId!);
+      }
+
+      if (fromId === this.openaiToggleId && aspect === 'click') {
+        await this.toggleMask(this.openaiKeyId!, this.openaiToggleId!);
+      }
+
+      // Text input submit triggers save
+      if (aspect === 'submit') {
+        await this.saveSettings();
+      }
     });
   }
 
@@ -135,9 +172,9 @@ export class Settings extends Abject {
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
-    // Create window
-    this.windowId = await this.request<string>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindow', {
+    // Create window — returns an AbjectId
+    this.windowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
         title: 'Settings',
         rect: { x: winX, y: winY, width: winW, height: winH },
         zIndex: 200,
@@ -152,84 +189,81 @@ export class Settings extends Abject {
     let y = 16;
 
     // Anthropic label
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.anthropicLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
-        id: 'anthropic-label',
-        type: 'label',
         rect: { x: pad, y, width: inputW, height: 20 },
         text: 'Anthropic API Key',
       })
     );
+    await this.request(request(this.id, this.anthropicLabelId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     y += 24;
 
-    // Anthropic text input + show/hide button
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    // Anthropic text input
+    this.anthropicKeyId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
         windowId: this.windowId,
-        id: 'anthropic-key',
-        type: 'textInput',
         rect: { x: pad, y, width: inputW, height: inputH },
         placeholder: 'sk-ant-...',
         masked: true,
       })
     );
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    await this.request(request(this.id, this.anthropicKeyId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+
+    // Anthropic show/hide toggle button
+    this.anthropicToggleId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        id: 'anthropic-toggle',
-        type: 'button',
         rect: { x: pad + inputW + gap, y, width: toggleW, height: inputH },
         text: 'Show',
       })
     );
+    await this.request(request(this.id, this.anthropicToggleId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     y += inputH + 20;
 
     // OpenAI label
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.openaiLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
-        id: 'openai-label',
-        type: 'label',
         rect: { x: pad, y, width: inputW, height: 20 },
         text: 'OpenAI API Key',
       })
     );
+    await this.request(request(this.id, this.openaiLabelId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     y += 24;
 
-    // OpenAI text input + show/hide button
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    // OpenAI text input
+    this.openaiKeyId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
         windowId: this.windowId,
-        id: 'openai-key',
-        type: 'textInput',
         rect: { x: pad, y, width: inputW, height: inputH },
         placeholder: 'sk-...',
         masked: true,
       })
     );
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    await this.request(request(this.id, this.openaiKeyId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+
+    // OpenAI show/hide toggle button
+    this.openaiToggleId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        id: 'openai-toggle',
-        type: 'button',
         rect: { x: pad + inputW + gap, y, width: toggleW, height: inputH },
         text: 'Show',
       })
     );
+    await this.request(request(this.id, this.openaiToggleId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     y += inputH + 24;
 
     // Save button
     const btnW = 100;
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.saveBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        id: 'save-btn',
-        type: 'button',
         rect: { x: winW - pad - btnW, y, width: btnW, height: 36 },
         text: 'Save',
       })
     );
+    await this.request(request(this.id, this.saveBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
 
     return true;
   }
@@ -241,44 +275,30 @@ export class Settings extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
         windowId: this.windowId,
       })
     );
 
     this.windowId = undefined;
+    this.anthropicLabelId = undefined;
+    this.anthropicKeyId = undefined;
+    this.anthropicToggleId = undefined;
+    this.openaiLabelId = undefined;
+    this.openaiKeyId = undefined;
+    this.openaiToggleId = undefined;
+    this.saveBtnId = undefined;
+    this.unmasked.clear();
+
     return true;
-  }
-
-  /**
-   * Handle widget interaction events.
-   */
-  private async handleWidgetEvent(payload: { windowId: string; widgetId: string; type: string; value?: string }): Promise<void> {
-    if (payload.widgetId === 'save-btn' && payload.type === 'click') {
-      await this.saveSettings();
-    }
-
-    if (payload.widgetId === 'anthropic-toggle' && payload.type === 'click') {
-      await this.toggleMask('anthropic-key', 'anthropic-toggle');
-    }
-
-    if (payload.widgetId === 'openai-toggle' && payload.type === 'click') {
-      await this.toggleMask('openai-key', 'openai-toggle');
-    }
-
-    if (payload.type === 'submit') {
-      await this.saveSettings();
-    }
   }
 
   /**
    * Toggle masked state on a text input and update its toggle button label.
    */
-  private async toggleMask(inputId: string, toggleId: string): Promise<void> {
+  private async toggleMask(inputId: AbjectId, toggleId: AbjectId): Promise<void> {
     if (!this.windowId) return;
 
-    // Read current masked state via a round-trip: if value looks masked, it's masked.
-    // Instead, track locally which inputs are currently masked.
     const showing = this.unmasked.has(inputId);
     if (showing) {
       this.unmasked.delete(inputId);
@@ -288,14 +308,12 @@ export class Settings extends Abject {
     const nowMasked = !this.unmasked.has(inputId);
 
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
-        widgetId: inputId,
+      request(this.id, inputId, WIDGET_INTERFACE, 'update', {
         masked: nowMasked,
       })
     );
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
-        widgetId: toggleId,
+      request(this.id, toggleId, WIDGET_INTERFACE, 'update', {
         text: nowMasked ? 'Show' : 'Hide',
       })
     );
@@ -308,15 +326,11 @@ export class Settings extends Abject {
     if (!this.windowId) return;
 
     const anthropicKey = await this.request<string>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
-        widgetId: 'anthropic-key',
-      })
+      request(this.id, this.anthropicKeyId!, WIDGET_INTERFACE, 'getValue', {})
     );
 
     const openaiKey = await this.request<string>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
-        widgetId: 'openai-key',
-      })
+      request(this.id, this.openaiKeyId!, WIDGET_INTERFACE, 'getValue', {})
     );
 
     // Save to storage

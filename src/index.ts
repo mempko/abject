@@ -46,6 +46,30 @@ export { ObjectWorkshop, OBJECT_WORKSHOP_ID } from './objects/object-workshop.js
 export { WidgetManager, WIDGET_MANAGER_ID } from './objects/widget-manager.js';
 export { ScriptableAbject, EDITABLE_INTERFACE_ID } from './objects/scriptable-abject.js';
 
+// Export widget Abjects
+export { WidgetAbject, buildFont, WIDGET_INTERFACE_DECL } from './objects/widgets/widget-abject.js';
+export type { WidgetConfig } from './objects/widgets/widget-abject.js';
+export { WindowAbject } from './objects/widgets/window-abject.js';
+export { LabelWidget } from './objects/widgets/label-widget.js';
+export { ButtonWidget } from './objects/widgets/button-widget.js';
+export { TextInputWidget } from './objects/widgets/text-input-widget.js';
+export { TextAreaWidget } from './objects/widgets/text-area-widget.js';
+export { CheckboxWidget } from './objects/widgets/checkbox-widget.js';
+export { ProgressWidget } from './objects/widgets/progress-widget.js';
+export { DividerWidget } from './objects/widgets/divider-widget.js';
+export { SelectWidget } from './objects/widgets/select-widget.js';
+export {
+  WIDGET_INTERFACE,
+  WINDOW_INTERFACE,
+  WIDGET_FONT,
+  TITLE_FONT,
+  CODE_FONT,
+  DEFAULT_LINE_HEIGHT,
+  TITLE_BAR_HEIGHT,
+  EDGE_SIZE,
+} from './objects/widgets/widget-types.js';
+export type { WidgetType, Rect, WidgetStyle as WidgetAbjectStyle } from './objects/widgets/widget-types.js';
+
 // Export capability objects
 export { HttpClient, HTTP_CLIENT_ID } from './objects/capabilities/http-client.js';
 export { Storage, STORAGE_ID } from './objects/capabilities/storage.js';

@@ -1,5 +1,8 @@
 /**
  * Registry Browser — browse all registered objects, view interfaces and methods.
+ *
+ * Uses direct widget Abject interaction (createWindowAbject, createLabel, etc.)
+ * instead of the old string-based widget ID shim.
  */
 
 import {
@@ -11,12 +14,14 @@ import {
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 import { CreationResult } from './object-creator.js';
 import { EDITABLE_INTERFACE_ID } from './scriptable-abject.js';
 import { LLMMessage, LLMCompletionResult } from '../llm/provider.js';
 
 const REGISTRY_BROWSER_INTERFACE: InterfaceId = 'abjects:registry-browser';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
+const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
 
 const PAGE_SIZE = 8;
 const WIN_W = 500;
@@ -28,13 +33,38 @@ export class RegistryBrowser extends Abject {
   private registryId?: AbjectId;
   private objectCreatorId?: AbjectId;
   private llmId?: AbjectId;
-  private windowId?: string;
+  private windowId?: AbjectId;
   private currentPage = 0;
   private cachedObjects: ObjectRegistration[] = [];
   private editingObjectId?: AbjectId;
   private detailIndex?: number;
   private selectedMethod?: { interfaceId: InterfaceId; method: string };
   private detailObjectId?: AbjectId;
+
+  // ── List View widget tracking ──
+  private objButtons: Map<AbjectId, number> = new Map();
+  private prevPageBtnId?: AbjectId;
+  private nextPageBtnId?: AbjectId;
+  private cmdInputId?: AbjectId;
+  private cmdRunBtnId?: AbjectId;
+  private cmdStatusId?: AbjectId;
+
+  // ── Detail View widget tracking ──
+  private backBtnId?: AbjectId;
+  private editSourceBtnId?: AbjectId;
+  private methodButtons: Map<AbjectId, { interfaceId: InterfaceId; method: string }> = new Map();
+  private msgPayloadId?: AbjectId;
+  private msgSendBtnId?: AbjectId;
+  private msgResponseId?: AbjectId;
+
+  // ── Edit View widget tracking ──
+  private sourceEditorId?: AbjectId;
+  private saveBtnId?: AbjectId;
+  private cancelBtnId?: AbjectId;
+  private aiEditBtnId?: AbjectId;
+  private aiPromptInputId?: AbjectId;
+  private aiGoBtnId?: AbjectId;
+  private editStatusId?: AbjectId;
 
   constructor() {
     super({
@@ -102,6 +132,45 @@ export class RegistryBrowser extends Abject {
     );
   }
 
+  /**
+   * Register this RegistryBrowser as a dependent of a widget Abject,
+   * so we receive 'changed' events from it.
+   */
+  private async addDep(widgetId: AbjectId): Promise<void> {
+    await this.request(request(this.id, widgetId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+  }
+
+  /**
+   * Clear all view-specific widget tracking fields.
+   * The window destroy takes care of actual widget cleanup.
+   */
+  private clearViewTracking(): void {
+    // List view
+    this.objButtons.clear();
+    this.prevPageBtnId = undefined;
+    this.nextPageBtnId = undefined;
+    this.cmdInputId = undefined;
+    this.cmdRunBtnId = undefined;
+    this.cmdStatusId = undefined;
+
+    // Detail view
+    this.backBtnId = undefined;
+    this.editSourceBtnId = undefined;
+    this.methodButtons.clear();
+    this.msgPayloadId = undefined;
+    this.msgSendBtnId = undefined;
+    this.msgResponseId = undefined;
+
+    // Edit view
+    this.sourceEditorId = undefined;
+    this.saveBtnId = undefined;
+    this.cancelBtnId = undefined;
+    this.aiEditBtnId = undefined;
+    this.aiPromptInputId = undefined;
+    this.aiGoBtnId = undefined;
+    this.editStatusId = undefined;
+  }
+
   private setupHandlers(): void {
     this.on('show', async () => {
       return this.show();
@@ -111,9 +180,11 @@ export class RegistryBrowser extends Abject {
       return this.hide();
     });
 
-    this.on('widgetEvent', async (msg: AbjectMessage) => {
-      const payload = msg.payload as { windowId: string; widgetId: string; type: string; value?: string };
-      await this.handleWidgetEvent(payload);
+    this.on('changed', async (msg: AbjectMessage) => {
+      const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
+      if (aspect !== 'click' && aspect !== 'submit') return;
+      const fromId = msg.routing.from;
+      await this.handleWidgetEvent(fromId, aspect, value);
     });
   }
 
@@ -130,12 +201,13 @@ export class RegistryBrowser extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
         windowId: this.windowId,
       })
     );
 
     this.windowId = undefined;
+    this.clearViewTracking();
     return true;
   }
 
@@ -143,12 +215,14 @@ export class RegistryBrowser extends Abject {
     // Destroy existing window if any
     if (this.windowId) {
       await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
           windowId: this.windowId,
         })
       );
       this.windowId = undefined;
     }
+
+    this.clearViewTracking();
 
     const displayInfo = await this.request<{ width: number; height: number }>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
@@ -157,8 +231,8 @@ export class RegistryBrowser extends Abject {
     const winX = Math.max(20, Math.floor((displayInfo.width - WIN_W) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2));
 
-    this.windowId = await this.request<string>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindow', {
+    this.windowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
         title: 'Registry Browser',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
@@ -171,31 +245,29 @@ export class RegistryBrowser extends Abject {
     // LLM command bar (only when LLM is available)
     if (this.llmId) {
       const cmdInputW = WIN_W - PAD * 2 - 70;
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+      this.cmdInputId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
           windowId: this.windowId,
-          id: 'cmd-input',
-          type: 'textInput',
           rect: { x: PAD, y, width: cmdInputW, height: 30 },
           placeholder: 'Type a command...',
         })
       );
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+      await this.addDep(this.cmdInputId);
+
+      this.cmdRunBtnId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
           windowId: this.windowId,
-          id: 'cmd-run-btn',
-          type: 'button',
           rect: { x: PAD + cmdInputW + 8, y, width: 60, height: 30 },
           text: 'Run',
         })
       );
+      await this.addDep(this.cmdRunBtnId);
+
       y += 34;
 
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+      this.cmdStatusId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
           windowId: this.windowId,
-          id: 'cmd-status',
-          type: 'label',
           rect: { x: PAD, y, width: WIN_W - PAD * 2, height: 20 },
           text: '',
         })
@@ -216,15 +288,16 @@ export class RegistryBrowser extends Abject {
       const desc = obj.manifest.description;
       const label = `${obj.manifest.name} — ${desc.length > 40 ? desc.slice(0, 40) + '...' : desc}`;
 
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+      const btnId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
           windowId: this.windowId,
-          id: `obj-${i}`,
-          type: 'button',
           rect: { x: PAD, y, width: itemW, height: itemH },
           text: label,
         })
       );
+      await this.addDep(btnId);
+      this.objButtons.set(btnId, i);
+
       y += itemH + gap;
     }
 
@@ -233,35 +306,31 @@ export class RegistryBrowser extends Abject {
     const navBtnW = 70;
 
     if (totalPages > 1) {
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+      this.prevPageBtnId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
           windowId: this.windowId,
-          id: 'prev-page',
-          type: 'button',
           rect: { x: PAD, y, width: navBtnW, height: 30 },
           text: 'Prev',
         })
       );
+      await this.addDep(this.prevPageBtnId);
 
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+      await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
           windowId: this.windowId,
-          id: 'page-label',
-          type: 'label',
           rect: { x: PAD + navBtnW + 10, y, width: 200, height: 30 },
           text: `Page ${this.currentPage + 1} of ${totalPages}`,
         })
       );
 
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+      this.nextPageBtnId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
           windowId: this.windowId,
-          id: 'next-page',
-          type: 'button',
           rect: { x: WIN_W - PAD - navBtnW, y, width: navBtnW, height: 30 },
           text: 'Next',
         })
       );
+      await this.addDep(this.nextPageBtnId);
     }
   }
 
@@ -277,12 +346,14 @@ export class RegistryBrowser extends Abject {
     // Destroy list window
     if (this.windowId) {
       await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
           windowId: this.windowId,
         })
       );
       this.windowId = undefined;
     }
+
+    this.clearViewTracking();
 
     const displayInfo = await this.request<{ width: number; height: number }>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
@@ -292,8 +363,8 @@ export class RegistryBrowser extends Abject {
     const winX = Math.max(20, Math.floor((displayInfo.width - WIN_W) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - detailH) / 2));
 
-    this.windowId = await this.request<string>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindow', {
+    this.windowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
         title: obj.manifest.name,
         rect: { x: winX, y: winY, width: WIN_W, height: detailH },
         zIndex: 200,
@@ -304,20 +375,17 @@ export class RegistryBrowser extends Abject {
     let y = 8;
     const labelH = 20;
     const lineGap = 4;
-    let labelIdx = 0;
 
-    const addLabel = async (text: string) => {
-      const id = `detail-lbl-${labelIdx++}`;
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    const addLabel = async (text: string): Promise<AbjectId> => {
+      const id = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
           windowId: this.windowId,
-          id,
-          type: 'label',
           rect: { x: PAD, y, width: WIN_W - PAD * 2, height: labelH },
           text,
         })
       );
       y += labelH + lineGap;
+      return id;
     };
 
     await addLabel(`Name: ${obj.manifest.name}`);
@@ -372,15 +440,15 @@ export class RegistryBrowser extends Abject {
     for (const iface of obj.manifest.interfaces) {
       for (const method of iface.methods) {
         const bx = PAD + col * (methodBtnW + 8);
-        await this.request(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+        const btnId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
             windowId: this.windowId,
-            id: `method-btn::${iface.id}::${method.name}`,
-            type: 'button',
             rect: { x: bx, y, width: methodBtnW, height: methodBtnH },
             text: method.name,
           })
         );
+        await this.addDep(btnId);
+        this.methodButtons.set(btnId, { interfaceId: iface.id, method: method.name });
         col++;
         if (col >= 2) {
           col = 0;
@@ -395,32 +463,30 @@ export class RegistryBrowser extends Abject {
 
     // Payload input
     const payloadInputW = WIN_W - PAD * 2 - 70;
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.msgPayloadId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
         windowId: this.windowId,
-        id: 'msg-payload',
-        type: 'textInput',
         rect: { x: PAD, y, width: payloadInputW, height: 30 },
         placeholder: 'JSON payload (optional)',
       })
     );
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    await this.addDep(this.msgPayloadId);
+
+    this.msgSendBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        id: 'msg-send-btn',
-        type: 'button',
         rect: { x: PAD + payloadInputW + 8, y, width: 60, height: 30 },
         text: 'Send',
       })
     );
+    await this.addDep(this.msgSendBtnId);
+
     y += 38;
 
     // Response label
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.msgResponseId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
-        id: 'msg-response',
-        type: 'label',
         rect: { x: PAD, y, width: WIN_W - PAD * 2, height: labelH },
         text: '',
       })
@@ -429,29 +495,27 @@ export class RegistryBrowser extends Abject {
 
     // ── Bottom buttons ──
     const btnY = detailH - 30 - 36 - 8;
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.backBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        id: 'back-btn',
-        type: 'button',
         rect: { x: PAD, y: btnY, width: 80, height: 32 },
         text: 'Back',
       })
     );
+    await this.addDep(this.backBtnId);
 
     // Show "Edit Source" button if the object is scriptable
     const isEditable = obj.source !== undefined;
     if (isEditable) {
       this.detailIndex = index;
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+      this.editSourceBtnId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
           windowId: this.windowId,
-          id: 'edit-source-btn',
-          type: 'button',
           rect: { x: PAD + 90, y: btnY, width: 110, height: 32 },
           text: 'Edit Source',
         })
       );
+      await this.addDep(this.editSourceBtnId);
     }
   }
 
@@ -459,13 +523,14 @@ export class RegistryBrowser extends Abject {
     // Destroy existing window
     if (this.windowId) {
       await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
           windowId: this.windowId,
         })
       );
       this.windowId = undefined;
     }
 
+    this.clearViewTracking();
     this.editingObjectId = obj.id;
 
     const displayInfo = await this.request<{ width: number; height: number }>(
@@ -477,8 +542,8 @@ export class RegistryBrowser extends Abject {
     const winX = Math.max(20, Math.floor((displayInfo.width - editW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - editH) / 2));
 
-    this.windowId = await this.request<string>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindow', {
+    this.windowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
         title: `Edit: ${obj.manifest.name}`,
         rect: { x: winX, y: winY, width: editW, height: editH },
         zIndex: 200,
@@ -490,11 +555,9 @@ export class RegistryBrowser extends Abject {
     let y = 8;
 
     // Object name label
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
-        id: 'edit-name-label',
-        type: 'label',
         rect: { x: PAD, y, width: innerW, height: 20 },
         text: `Source: ${obj.manifest.name}`,
       })
@@ -503,11 +566,9 @@ export class RegistryBrowser extends Abject {
 
     // textArea with source code
     const textAreaH = editH - 30 - y - 80; // room for buttons + status
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.sourceEditorId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextArea', {
         windowId: this.windowId,
-        id: 'source-editor',
-        type: 'textArea',
         rect: { x: PAD, y, width: innerW, height: textAreaH },
         text: obj.source ?? '',
         monospace: true,
@@ -520,67 +581,60 @@ export class RegistryBrowser extends Abject {
     const btnH = 32;
     const btnGap = 8;
 
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.saveBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        id: 'save-btn',
-        type: 'button',
         rect: { x: PAD, y, width: btnW, height: btnH },
         text: 'Save',
       })
     );
+    await this.addDep(this.saveBtnId);
 
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.cancelBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        id: 'cancel-btn',
-        type: 'button',
         rect: { x: PAD + btnW + btnGap, y, width: btnW, height: btnH },
         text: 'Cancel',
       })
     );
+    await this.addDep(this.cancelBtnId);
 
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.aiEditBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        id: 'ai-edit-btn',
-        type: 'button',
         rect: { x: PAD + (btnW + btnGap) * 2, y, width: btnW, height: btnH },
         text: 'AI Edit',
       })
     );
+    await this.addDep(this.aiEditBtnId);
 
     y += btnH + 8;
 
     // AI edit prompt input (hidden until AI Edit is clicked, but always present)
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.aiPromptInputId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
         windowId: this.windowId,
-        id: 'ai-prompt-input',
-        type: 'textInput',
         rect: { x: PAD, y, width: innerW - btnW - btnGap, height: 30 },
         placeholder: 'Describe what to change...',
       })
     );
+    await this.addDep(this.aiPromptInputId);
 
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.aiGoBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        id: 'ai-go-btn',
-        type: 'button',
         rect: { x: PAD + innerW - btnW, y, width: btnW, height: 30 },
         text: 'Go',
       })
     );
+    await this.addDep(this.aiGoBtnId);
 
     y += 38;
 
     // Status label
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.editStatusId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
-        id: 'edit-status',
-        type: 'label',
         rect: { x: PAD, y, width: innerW, height: 20 },
         text: '',
       })
@@ -588,25 +642,22 @@ export class RegistryBrowser extends Abject {
   }
 
   private async updateEditStatus(text: string): Promise<void> {
-    if (!this.windowId) return;
+    if (!this.editStatusId) return;
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
-        widgetId: 'edit-status',
-        text,
-      })
+      request(this.id, this.editStatusId, WIDGET_INTERFACE, 'update', { text })
     );
   }
 
-  private async handleWidgetEvent(payload: { windowId: string; widgetId: string; type: string; value?: string }): Promise<void> {
-    if (payload.type !== 'click' && payload.type !== 'submit') return;
-
-    if (payload.widgetId === 'back-btn') {
+  private async handleWidgetEvent(fromId: AbjectId, aspect: string, _value?: unknown): Promise<void> {
+    // ── Back button (detail view) ──
+    if (fromId === this.backBtnId) {
       this.cachedObjects = await this.registryList();
       await this.showListView();
       return;
     }
 
-    if (payload.widgetId === 'prev-page') {
+    // ── Prev page button ──
+    if (fromId === this.prevPageBtnId) {
       if (this.currentPage > 0) {
         this.currentPage--;
         await this.showListView();
@@ -614,7 +665,8 @@ export class RegistryBrowser extends Abject {
       return;
     }
 
-    if (payload.widgetId === 'next-page') {
+    // ── Next page button ──
+    if (fromId === this.nextPageBtnId) {
       const totalPages = Math.ceil(this.cachedObjects.length / PAGE_SIZE);
       if (this.currentPage < totalPages - 1) {
         this.currentPage++;
@@ -623,8 +675,8 @@ export class RegistryBrowser extends Abject {
       return;
     }
 
-    // Edit Source button in detail view
-    if (payload.widgetId === 'edit-source-btn' && this.detailIndex !== undefined) {
+    // ── Edit Source button in detail view ──
+    if (fromId === this.editSourceBtnId && this.detailIndex !== undefined) {
       const absIndex = this.currentPage * PAGE_SIZE + this.detailIndex;
       const obj = this.cachedObjects[absIndex];
       if (obj) {
@@ -633,12 +685,10 @@ export class RegistryBrowser extends Abject {
       return;
     }
 
-    // Save button in edit view
-    if (payload.widgetId === 'save-btn' && this.editingObjectId) {
+    // ── Save button in edit view ──
+    if (fromId === this.saveBtnId && this.editingObjectId) {
       const source = await this.request<string>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
-          widgetId: 'source-editor',
-        })
+        request(this.id, this.sourceEditorId!, WIDGET_INTERFACE, 'getValue', {})
       );
 
       try {
@@ -669,8 +719,8 @@ export class RegistryBrowser extends Abject {
       return;
     }
 
-    // Cancel button in edit view
-    if (payload.widgetId === 'cancel-btn') {
+    // ── Cancel button in edit view ──
+    if (fromId === this.cancelBtnId) {
       if (this.detailIndex !== undefined) {
         this.editingObjectId = undefined;
         await this.showDetailView(this.detailIndex);
@@ -682,13 +732,11 @@ export class RegistryBrowser extends Abject {
       return;
     }
 
-    // AI Edit: Go button or submit from prompt input
-    if ((payload.widgetId === 'ai-go-btn' || (payload.widgetId === 'ai-prompt-input' && payload.type === 'submit'))
+    // ── AI Edit: Go button or submit from prompt input ──
+    if ((fromId === this.aiGoBtnId || (fromId === this.aiPromptInputId && aspect === 'submit'))
         && this.editingObjectId && this.objectCreatorId) {
       const prompt = await this.request<string>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
-          widgetId: 'ai-prompt-input',
-        })
+        request(this.id, this.aiPromptInputId!, WIDGET_INTERFACE, 'getValue', {})
       );
 
       if (!prompt.trim()) {
@@ -712,8 +760,7 @@ export class RegistryBrowser extends Abject {
         if (result.success && result.code) {
           // Update the textArea with new source
           await this.request(
-            request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
-              widgetId: 'source-editor',
+            request(this.id, this.sourceEditorId!, WIDGET_INTERFACE, 'update', {
               text: result.code,
             })
           );
@@ -728,41 +775,39 @@ export class RegistryBrowser extends Abject {
       return;
     }
 
-    // Method button in detail view (for message sending)
-    if (payload.widgetId.startsWith('method-btn::')) {
-      const parts = payload.widgetId.split('::');
-      this.selectedMethod = { interfaceId: parts[1] as InterfaceId, method: parts[2] };
+    // ── Method button in detail view (for message sending) ──
+    const methodInfo = this.methodButtons.get(fromId);
+    if (methodInfo) {
+      this.selectedMethod = methodInfo;
       // Update response label to show selection
-      if (this.windowId) {
+      if (this.msgResponseId) {
         await this.request(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
-            widgetId: 'msg-response',
-            text: `Selected: ${parts[2]}`,
+          request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
+            text: `Selected: ${methodInfo.method}`,
           })
         );
       }
       return;
     }
 
-    // Send button in detail view
-    if (payload.widgetId === 'msg-send-btn' && this.selectedMethod && this.detailObjectId) {
+    // ── Send button in detail view ──
+    if (fromId === this.msgSendBtnId && this.selectedMethod && this.detailObjectId) {
       await this.handleSendMessage();
       return;
     }
 
-    // LLM command bar: Run button or submit from input
-    if ((payload.widgetId === 'cmd-run-btn' ||
-         (payload.widgetId === 'cmd-input' && payload.type === 'submit'))
+    // ── LLM command bar: Run button or submit from input ──
+    if ((fromId === this.cmdRunBtnId ||
+         (fromId === this.cmdInputId && aspect === 'submit'))
         && this.llmId) {
       await this.handleLLMCommand();
       return;
     }
 
-    // Object button: obj-0, obj-1, ...
-    const match = payload.widgetId.match(/^obj-(\d+)$/);
-    if (match) {
-      const index = parseInt(match[1], 10);
-      await this.showDetailView(index);
+    // ── Object button: navigate to detail view ──
+    const objIndex = this.objButtons.get(fromId);
+    if (objIndex !== undefined) {
+      await this.showDetailView(objIndex);
     }
   }
 
@@ -770,12 +815,10 @@ export class RegistryBrowser extends Abject {
    * Send a message to the selected method on the detail object.
    */
   private async handleSendMessage(): Promise<void> {
-    if (!this.selectedMethod || !this.detailObjectId || !this.windowId) return;
+    if (!this.selectedMethod || !this.detailObjectId || !this.msgPayloadId) return;
 
     const payloadText = await this.request<string>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
-        widgetId: 'msg-payload',
-      })
+      request(this.id, this.msgPayloadId, WIDGET_INTERFACE, 'getValue', {})
     );
 
     let msgPayload: unknown = {};
@@ -783,12 +826,13 @@ export class RegistryBrowser extends Abject {
       try {
         msgPayload = JSON.parse(payloadText);
       } catch {
-        await this.request(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
-            widgetId: 'msg-response',
-            text: 'Error: Invalid JSON payload',
-          })
-        );
+        if (this.msgResponseId) {
+          await this.request(
+            request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
+              text: 'Error: Invalid JSON payload',
+            })
+          );
+        }
         return;
       }
     }
@@ -800,20 +844,22 @@ export class RegistryBrowser extends Abject {
       ));
       const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
       const display = resultStr.length > 60 ? resultStr.slice(0, 60) + '...' : resultStr;
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
-          widgetId: 'msg-response',
-          text: `Result: ${display}`,
-        })
-      );
+      if (this.msgResponseId) {
+        await this.request(
+          request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
+            text: `Result: ${display}`,
+          })
+        );
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
-          widgetId: 'msg-response',
-          text: `Error: ${msg.slice(0, 60)}`,
-        })
-      );
+      if (this.msgResponseId) {
+        await this.request(
+          request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
+            text: `Error: ${msg.slice(0, 60)}`,
+          })
+        );
+      }
     }
   }
 
@@ -821,28 +867,30 @@ export class RegistryBrowser extends Abject {
    * Handle LLM command bar: parse natural language and dispatch message.
    */
   private async handleLLMCommand(): Promise<void> {
-    if (!this.llmId || !this.windowId) return;
+    if (!this.llmId || !this.cmdInputId) return;
 
     const commandText = await this.request<string>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
-        widgetId: 'cmd-input',
-      })
+      request(this.id, this.cmdInputId, WIDGET_INTERFACE, 'getValue', {})
     );
 
     if (!commandText.trim()) {
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
-          widgetId: 'cmd-status', text: 'Enter a command',
-        })
-      );
+      if (this.cmdStatusId) {
+        await this.request(
+          request(this.id, this.cmdStatusId, WIDGET_INTERFACE, 'update', {
+            text: 'Enter a command',
+          })
+        );
+      }
       return;
     }
 
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
-        widgetId: 'cmd-status', text: 'Thinking...',
-      })
-    );
+    if (this.cmdStatusId) {
+      await this.request(
+        request(this.id, this.cmdStatusId, WIDGET_INTERFACE, 'update', {
+          text: 'Thinking...',
+        })
+      );
+    }
 
     try {
       // Build object context for the LLM
@@ -902,20 +950,22 @@ Respond with ONLY valid JSON (no markdown fences, no explanation):
 
       const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
       const display = resultStr.length > 50 ? resultStr.slice(0, 50) + '...' : resultStr;
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
-          widgetId: 'cmd-status',
-          text: `${parsed.method} → ${display}`,
-        })
-      );
+      if (this.cmdStatusId) {
+        await this.request(
+          request(this.id, this.cmdStatusId, WIDGET_INTERFACE, 'update', {
+            text: `${parsed.method} → ${display}`,
+          })
+        );
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
-          widgetId: 'cmd-status',
-          text: `Error: ${msg.slice(0, 60)}`,
-        })
-      );
+      if (this.cmdStatusId) {
+        await this.request(
+          request(this.id, this.cmdStatusId, WIDGET_INTERFACE, 'update', {
+            text: `Error: ${msg.slice(0, 60)}`,
+          })
+        );
+      }
     }
   }
 }

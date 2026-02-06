@@ -1,16 +1,21 @@
 /**
  * Object Workshop — create new objects via LLM natural language prompts.
+ *
+ * Uses direct widget Abject interaction (AbjectId-based) instead of string-based
+ * widget ID shims.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 import { CreationResult } from './object-creator.js';
 import { EDITABLE_INTERFACE_ID } from './scriptable-abject.js';
 
 const WORKSHOP_INTERFACE: InterfaceId = 'abjects:object-workshop';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
+const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
 
 const WIN_W = 500;
 const WIN_H = 350;
@@ -19,8 +24,17 @@ const PAD = 16;
 export class ObjectWorkshop extends Abject {
   private widgetManagerId?: AbjectId;
   private objectCreatorId?: AbjectId;
-  private windowId?: string;
+  private windowId?: AbjectId;
   private lastCreatedObjectId?: AbjectId;
+
+  // Widget AbjectIds
+  private promptLabelId?: AbjectId;
+  private promptInputId?: AbjectId;
+  private createBtnId?: AbjectId;
+  private statusLabelId?: AbjectId;
+  private resultNameId?: AbjectId;
+  private resultDescId?: AbjectId;
+  private modifyBtnId?: AbjectId;
 
   constructor() {
     super({
@@ -75,9 +89,10 @@ export class ObjectWorkshop extends Abject {
       return this.hide();
     });
 
-    this.on('widgetEvent', async (msg: AbjectMessage) => {
-      const payload = msg.payload as { windowId: string; widgetId: string; type: string; value?: string };
-      await this.handleWidgetEvent(payload);
+    this.on('changed', async (msg: AbjectMessage) => {
+      const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
+      const fromId = msg.routing.from;
+      await this.handleChanged(fromId, aspect, value);
     });
   }
 
@@ -91,8 +106,8 @@ export class ObjectWorkshop extends Abject {
     const winX = Math.max(20, Math.floor((displayInfo.width - WIN_W) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2));
 
-    this.windowId = await this.request<string>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindow', {
+    this.windowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
         title: 'Object Workshop',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
@@ -104,11 +119,9 @@ export class ObjectWorkshop extends Abject {
     const inputW = WIN_W - PAD * 2;
 
     // Prompt label
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.promptLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
-        id: 'prompt-label',
-        type: 'label',
         rect: { x: PAD, y, width: inputW, height: 20 },
         text: 'Describe the object you want to create:',
       })
@@ -116,11 +129,9 @@ export class ObjectWorkshop extends Abject {
     y += 28;
 
     // Text input
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.promptInputId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
         windowId: this.windowId,
-        id: 'prompt-input',
-        type: 'textInput',
         rect: { x: PAD, y, width: inputW, height: 36 },
         placeholder: 'e.g., A counter that tracks page views...',
       })
@@ -129,11 +140,9 @@ export class ObjectWorkshop extends Abject {
 
     // Create button
     const btnW = 100;
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.createBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        id: 'create-btn',
-        type: 'button',
         rect: { x: WIN_W - PAD - btnW, y, width: btnW, height: 36 },
         text: 'Create',
       })
@@ -141,11 +150,9 @@ export class ObjectWorkshop extends Abject {
     y += 52;
 
     // Status label
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.statusLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
-        id: 'status-label',
-        type: 'label',
         rect: { x: PAD, y, width: inputW, height: 20 },
         text: '',
       })
@@ -153,25 +160,29 @@ export class ObjectWorkshop extends Abject {
     y += 28;
 
     // Result labels (hidden until creation succeeds)
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.resultNameId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
-        id: 'result-name',
-        type: 'label',
         rect: { x: PAD, y, width: inputW, height: 20 },
         text: '',
       })
     );
     y += 24;
 
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.resultDescId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
-        id: 'result-desc',
-        type: 'label',
         rect: { x: PAD, y, width: inputW, height: 20 },
         text: '',
       })
+    );
+
+    // Register as dependent of interactive widgets to receive 'changed' events
+    await this.request(
+      request(this.id, this.createBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+    );
+    await this.request(
+      request(this.id, this.promptInputId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
     );
 
     return true;
@@ -181,33 +192,38 @@ export class ObjectWorkshop extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindow', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
         windowId: this.windowId,
       })
     );
 
     this.windowId = undefined;
+    this.promptLabelId = undefined;
+    this.promptInputId = undefined;
+    this.createBtnId = undefined;
+    this.statusLabelId = undefined;
+    this.resultNameId = undefined;
+    this.resultDescId = undefined;
+    this.modifyBtnId = undefined;
     return true;
   }
 
-  private async handleWidgetEvent(payload: { windowId: string; widgetId: string; type: string; value?: string }): Promise<void> {
-    // Handle modify button
-    if (payload.widgetId === 'modify-btn' && payload.type === 'click' && this.lastCreatedObjectId) {
+  private async handleChanged(fromId: AbjectId, aspect: string, _value?: unknown): Promise<void> {
+    // Handle modify button click
+    if (fromId === this.modifyBtnId && aspect === 'click' && this.lastCreatedObjectId) {
       await this.handleModify();
       return;
     }
 
     const isCreate =
-      (payload.widgetId === 'create-btn' && payload.type === 'click') ||
-      (payload.widgetId === 'prompt-input' && payload.type === 'submit');
+      (fromId === this.createBtnId && aspect === 'click') ||
+      (fromId === this.promptInputId && aspect === 'submit');
 
     if (!isCreate || !this.windowId) return;
 
     // Read prompt text
     const prompt = await this.request<string>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
-        widgetId: 'prompt-input',
-      })
+      request(this.id, this.promptInputId!, WIDGET_INTERFACE, 'getValue', {})
     );
 
     if (!prompt.trim()) {
@@ -252,26 +268,26 @@ export class ObjectWorkshop extends Abject {
   }
 
   private async updateStatus(text: string): Promise<void> {
-    if (!this.windowId) return;
+    if (!this.windowId || !this.statusLabelId) return;
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
-        widgetId: 'status-label',
-        text,
-      })
+      request(this.id, this.statusLabelId, WIDGET_INTERFACE, 'update', { text })
     );
   }
 
   private async showModifyButton(): Promise<void> {
     if (!this.windowId) return;
     const btnW = 100;
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'addWidget', {
+    this.modifyBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
-        id: 'modify-btn',
-        type: 'button',
         rect: { x: PAD, y: WIN_H - 30 - 36 - 8, width: btnW, height: 36 },
         text: 'Modify',
       })
+    );
+
+    // Register as dependent to receive click events
+    await this.request(
+      request(this.id, this.modifyBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
     );
   }
 
@@ -279,9 +295,7 @@ export class ObjectWorkshop extends Abject {
     if (!this.windowId || !this.lastCreatedObjectId || !this.objectCreatorId) return;
 
     const prompt = await this.request<string>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getWidgetValue', {
-        widgetId: 'prompt-input',
-      })
+      request(this.id, this.promptInputId!, WIDGET_INTERFACE, 'getValue', {})
     );
 
     if (!prompt.trim()) {
@@ -327,18 +341,16 @@ export class ObjectWorkshop extends Abject {
 
   private async updateResult(name: string, desc: string): Promise<void> {
     if (!this.windowId) return;
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
-        widgetId: 'result-name',
-        text: name,
-      })
-    );
-    await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'updateWidget', {
-        widgetId: 'result-desc',
-        text: desc,
-      })
-    );
+    if (this.resultNameId) {
+      await this.request(
+        request(this.id, this.resultNameId, WIDGET_INTERFACE, 'update', { text: name })
+      );
+    }
+    if (this.resultDescId) {
+      await this.request(
+        request(this.id, this.resultDescId, WIDGET_INTERFACE, 'update', { text: desc })
+      );
+    }
   }
 }
 

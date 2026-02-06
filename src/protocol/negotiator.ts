@@ -50,7 +50,7 @@ export class Negotiator extends Abject {
   private factoryId?: AbjectId;
   private proxyGeneratorId?: AbjectId;
   private healthMonitorId?: AbjectId;
-  private bus?: MessageBus;
+  private _negotiatorBus?: MessageBus;
   private connections: Map<string, ActiveConnection> = new Map();
 
   constructor() {
@@ -173,7 +173,7 @@ export class Negotiator extends Abject {
     this.registryId = registryId;
     this.factoryId = factoryId;
     this.proxyGeneratorId = proxyGeneratorId;
-    this.bus = bus;
+    this._negotiatorBus = bus;
   }
 
   /**
@@ -244,9 +244,9 @@ export class Negotiator extends Abject {
         agreement.proxyId = proxyId;
 
         // Install proxy interceptor
-        if (this.bus && proxyId) {
+        if (this._negotiatorBus && proxyId) {
           const interceptor = new ProxyInterceptor(sourceId, targetId, proxyId);
-          this.bus.addInterceptor(interceptor);
+          this._negotiatorBus.addInterceptor(interceptor);
           this.connections.set(agreement.agreementId, {
             agreement,
             proxyId,
@@ -300,8 +300,8 @@ export class Negotiator extends Abject {
     }
 
     // Remove interceptor
-    if (connection.interceptor && this.bus) {
-      this.bus.removeInterceptor(connection.interceptor);
+    if (connection.interceptor && this._negotiatorBus) {
+      this._negotiatorBus.removeInterceptor(connection.interceptor);
     }
 
     // Kill proxy via Factory message passing
@@ -358,16 +358,16 @@ export class Negotiator extends Abject {
       connection.agreement.proxyId = proxyId;
 
       // Update interceptor
-      if (this.bus) {
+      if (this._negotiatorBus) {
         if (connection.interceptor) {
-          this.bus.removeInterceptor(connection.interceptor);
+          this._negotiatorBus.removeInterceptor(connection.interceptor);
         }
         const interceptor = new ProxyInterceptor(
           connection.sourceId,
           connection.targetId,
           proxyId
         );
-        this.bus.addInterceptor(interceptor);
+        this._negotiatorBus.addInterceptor(interceptor);
         connection.interceptor = interceptor;
       }
 

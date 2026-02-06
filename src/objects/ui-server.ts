@@ -49,6 +49,7 @@ export class UIServer extends Abject {
   private compositor?: Compositor;
   private surfaceOwners: Map<string, AbjectId> = new Map();
   private focusedSurface?: string;
+  private grabbedSurface?: string;  // Mouse capture: routes events during drag
 
   constructor() {
     super({
@@ -486,7 +487,12 @@ export class UIServer extends Abject {
     const x = e.clientX - canvasRect.left;
     const y = e.clientY - canvasRect.top;
 
-    const surface = this.compositor?.surfaceAt(x, y);
+    // Mouse capture: during drag, route to grabbed surface regardless of position
+    const hitSurface = this.compositor?.surfaceAt(x, y);
+    const grabbed = this.grabbedSurface
+      ? this.compositor?.getSurface(this.grabbedSurface)
+      : undefined;
+    const surface = grabbed ?? hitSurface;
 
     const inputEvent: InputEvent = {
       type,
@@ -509,8 +515,13 @@ export class UIServer extends Abject {
       }
 
       if (type === 'mousedown' && owner) {
+        this.grabbedSurface = surface.id;
         this.setFocus(owner, surface.id);
       }
+    }
+
+    if (type === 'mouseup') {
+      this.grabbedSurface = undefined;
     }
   }
 

@@ -13,7 +13,7 @@ import {
   CapabilityGrant,
 } from './types.js';
 import { require, invariant, requireNonEmpty } from './contracts.js';
-import { reply, error, errorFromException, isRequest, isReply, isError } from './message.js';
+import { reply, error, errorFromException, event, isRequest, isReply, isError } from './message.js';
 import { Mailbox } from '../runtime/mailbox.js';
 import { MessageBus } from '../runtime/message-bus.js';
 import { CapabilitySet, getDefaultCapabilities } from './capability.js';
@@ -47,6 +47,7 @@ export abstract class Abject {
   private _bus?: MessageBus;
   private _mailbox?: Mailbox;
   private handlers: Map<string, MessageHandlerFn> = new Map();
+  private dependents: Set<AbjectId> = new Set();
   private pendingReplies: Map<string, {
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
@@ -97,6 +98,14 @@ export abstract class Abject {
   }
 
   /**
+   * Protected accessor for the message bus (for spawning children).
+   */
+  protected get bus(): MessageBus {
+    require(this._bus !== undefined, 'Object not initialized');
+    return this._bus!;
+  }
+
+  /**
    * Initialize the object. Called after registration with the bus.
    */
   async init(bus: MessageBus): Promise<void> {
@@ -111,6 +120,17 @@ export abstract class Abject {
       manifest: this.manifest,
       description: formatManifestAsDescription(this.manifest),
     }));
+
+    // Universal dependency protocol (Smalltalk addDependent:/removeDependent:/changed:)
+    this.on('addDependent', (msg: AbjectMessage) => {
+      this.dependents.add(msg.routing.from);
+      return true;
+    });
+
+    this.on('removeDependent', (msg: AbjectMessage) => {
+      this.dependents.delete(msg.routing.from);
+      return true;
+    });
 
     this._status = 'ready';
 
@@ -136,6 +156,9 @@ export abstract class Abject {
     if (this._bus) {
       this._bus.unregister(this.id);
     }
+
+    // Clear dependents
+    this.dependents.clear();
 
     // Reject all pending replies
     for (const [, pending] of this.pendingReplies) {
@@ -165,6 +188,19 @@ export abstract class Abject {
    */
   protected off(method: string): void {
     this.handlers.delete(method);
+  }
+
+  /**
+   * Notify all dependents of a change (Smalltalk changed: protocol).
+   * Sends a 'changed' event message to each dependent via the bus.
+   */
+  protected async changed(aspect: string, value?: unknown): Promise<void> {
+    for (const depId of this.dependents) {
+      await this.send(event(this.id, depId, INTROSPECT_INTERFACE_ID, 'changed', {
+        aspect,
+        value,
+      }));
+    }
   }
 
   /**
