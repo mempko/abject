@@ -7,7 +7,7 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { UIServer, WidgetEventPayload } from './ui-server.js';
-import { ObjectCreator, CreationResult } from './object-creator.js';
+import { CreationResult } from './object-creator.js';
 import { EDITABLE_INTERFACE_ID } from './scriptable-abject.js';
 
 const WORKSHOP_INTERFACE: InterfaceId = 'abjects:object-workshop';
@@ -19,7 +19,7 @@ const PAD = 16;
 
 export class ObjectWorkshop extends Abject {
   private uiServer?: UIServer;
-  private objectCreator?: ObjectCreator;
+  private objectCreatorId?: AbjectId;
   private windowId?: string;
   private lastCreatedObjectId?: AbjectId;
 
@@ -62,9 +62,9 @@ export class ObjectWorkshop extends Abject {
     this.setupHandlers();
   }
 
-  setDependencies(uiServer: UIServer, objectCreator: ObjectCreator): void {
+  setDependencies(uiServer: UIServer, objectCreatorId: AbjectId): void {
     this.uiServer = uiServer;
-    this.objectCreator = objectCreator;
+    this.objectCreatorId = objectCreatorId;
   }
 
   private setupHandlers(): void {
@@ -224,7 +224,7 @@ export class ObjectWorkshop extends Abject {
       const result = await this.request<CreationResult>(
         request(
           this.id,
-          this.objectCreator!.id,
+          this.objectCreatorId!,
           'abjects:object-creator' as InterfaceId,
           'create',
           { prompt }
@@ -276,7 +276,7 @@ export class ObjectWorkshop extends Abject {
   }
 
   private async handleModify(): Promise<void> {
-    if (!this.windowId || !this.lastCreatedObjectId || !this.objectCreator) return;
+    if (!this.windowId || !this.lastCreatedObjectId || !this.objectCreatorId) return;
 
     const prompt = await this.request<string>(
       request(this.id, this.uiServer!.id, UI_INTERFACE, 'getWidgetValue', {
@@ -295,7 +295,7 @@ export class ObjectWorkshop extends Abject {
       const result = await this.request<CreationResult>(
         request(
           this.id,
-          this.objectCreator.id,
+          this.objectCreatorId!,
           'abjects:object-creator' as InterfaceId,
           'modify',
           { objectId: this.lastCreatedObjectId, prompt }

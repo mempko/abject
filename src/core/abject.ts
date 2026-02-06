@@ -242,12 +242,17 @@ export abstract class Abject {
         message: err instanceof Error ? err.message : String(err),
         stack: err instanceof Error ? err.stack : undefined,
       };
-      this._status = 'error';
 
+      // Send error reply while status is still 'busy' (send requires 'ready' or 'busy')
       if (isRequest(message)) {
-        await this.send(errorFromException(message, err));
+        try {
+          await this.send(errorFromException(message, err));
+        } catch (sendErr) {
+          console.error(`[${this.id}] Failed to send error reply:`, sendErr);
+        }
       }
 
+      this._status = 'error';
       console.error(`[${this.id}] Error handling message:`, err);
     }
 

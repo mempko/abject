@@ -2,23 +2,21 @@
  * Taskbar — persistent bottom bar with launch buttons for system UI.
  */
 
-import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
+import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { UIServer, WidgetEventPayload } from './ui-server.js';
-import { Settings } from './settings.js';
-import { RegistryBrowser } from './registry-browser.js';
-import { ObjectWorkshop } from './object-workshop.js';
 
 const TASKBAR_INTERFACE: InterfaceId = 'abjects:taskbar';
 const UI_INTERFACE: InterfaceId = 'abjects:ui';
 
 export class Taskbar extends Abject {
   private uiServer?: UIServer;
-  private settings?: Settings;
-  private registryBrowser?: RegistryBrowser;
-  private objectWorkshop?: ObjectWorkshop;
+  private settingsId?: AbjectId;
+  private registryBrowserId?: AbjectId;
+  private objectWorkshopId?: AbjectId;
+  private registryId?: AbjectId;
   private windowId?: string;
 
   constructor() {
@@ -62,18 +60,52 @@ export class Taskbar extends Abject {
 
   setDependencies(
     uiServer: UIServer,
-    settings: Settings,
-    registryBrowser: RegistryBrowser,
-    objectWorkshop: ObjectWorkshop
+    settingsId: AbjectId,
+    registryBrowserId: AbjectId,
+    objectWorkshopId: AbjectId,
+    registryId: AbjectId
   ): void {
     this.uiServer = uiServer;
-    this.settings = settings;
-    this.registryBrowser = registryBrowser;
-    this.objectWorkshop = objectWorkshop;
+    this.settingsId = settingsId;
+    this.registryBrowserId = registryBrowserId;
+    this.objectWorkshopId = objectWorkshopId;
+    this.registryId = registryId;
   }
 
   protected async onInit(): Promise<void> {
+    // Subscribe to registry for auto-refresh when new objects are registered
+    if (this.registryId) {
+      await this.request(request(this.id, this.registryId,
+        'abjects:registry' as InterfaceId, 'subscribe', {}));
+    }
     await this.show();
+  }
+
+  /**
+   * Look up an object in the registry via message passing.
+   */
+  private async registryLookup(objectId: AbjectId): Promise<ObjectRegistration | null> {
+    if (!this.registryId) return null;
+    return this.request<ObjectRegistration | null>(
+      request(this.id, this.registryId, 'abjects:registry' as InterfaceId, 'lookup', { objectId })
+    );
+  }
+
+  /**
+   * Discover registered objects that have both show and hide methods (non-system).
+   */
+  private async discoverShowableObjects(): Promise<ObjectRegistration[]> {
+    if (!this.registryId) return [];
+    const allObjects = await this.request<ObjectRegistration[]>(
+      request(this.id, this.registryId, 'abjects:registry' as InterfaceId, 'list', {})
+    );
+    return allObjects.filter((obj) => {
+      if ((obj.manifest.tags ?? []).includes('system')) return false;
+      return obj.manifest.interfaces.some((iface) => {
+        const names = iface.methods.map((m) => m.name);
+        return names.includes('show') && names.includes('hide');
+      });
+    });
   }
 
   private setupHandlers(): void {
@@ -89,10 +121,23 @@ export class Taskbar extends Abject {
       const payload = msg.payload as WidgetEventPayload;
       await this.handleWidgetEvent(payload);
     });
+
+    // Auto-refresh taskbar when new objects are registered
+    this.on('objectRegistered', async () => {
+      await this.show();
+    });
   }
 
   async show(): Promise<boolean> {
-    if (this.windowId) return true;
+    // Always destroy and rebuild to pick up new objects
+    if (this.windowId) {
+      await this.request(
+        request(this.id, this.uiServer!.id, UI_INTERFACE, 'destroyWindow', {
+          windowId: this.windowId,
+        })
+      );
+      this.windowId = undefined;
+    }
 
     const displayInfo = await this.request<{ width: number; height: number }>(
       request(this.id, this.uiServer!.id, UI_INTERFACE, 'getDisplayInfo', {})
@@ -115,8 +160,13 @@ export class Taskbar extends Abject {
     const btnH = 30;
     const btnY = 5;
     const gap = 10;
-    const totalW = btnW * 3 + gap * 2;
-    let btnX = Math.floor((displayW - totalW) / 2);
+
+    // System buttons start centered for 3 buttons; dynamic ones extend to the right
+    const systemBtnCount = 3;
+    const showableObjects = await this.discoverShowableObjects();
+    const totalBtnCount = systemBtnCount + showableObjects.length;
+    const totalW = btnW * totalBtnCount + gap * (totalBtnCount - 1);
+    let btnX = Math.max(10, Math.floor((displayW - totalW) / 2));
 
     await this.request(
       request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
@@ -150,6 +200,20 @@ export class Taskbar extends Abject {
       })
     );
 
+    // Dynamic buttons for user-created objects with show/hide
+    for (const obj of showableObjects) {
+      btnX += btnW + gap;
+      await this.request(
+        request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+          windowId: this.windowId,
+          id: `user-obj::${obj.id}`,
+          type: 'button',
+          rect: { x: btnX, y: btnY, width: btnW, height: btnH },
+          text: obj.manifest.name,
+        })
+      );
+    }
+
     return true;
   }
 
@@ -171,16 +235,31 @@ export class Taskbar extends Abject {
 
     if (payload.widgetId === 'settings-btn') {
       await this.request(
-        request(this.id, this.settings!.id, 'abjects:settings' as InterfaceId, 'show', {})
+        request(this.id, this.settingsId!, 'abjects:settings' as InterfaceId, 'show', {})
       );
     } else if (payload.widgetId === 'registry-btn') {
       await this.request(
-        request(this.id, this.registryBrowser!.id, 'abjects:registry-browser' as InterfaceId, 'show', {})
+        request(this.id, this.registryBrowserId!, 'abjects:registry-browser' as InterfaceId, 'show', {})
       );
     } else if (payload.widgetId === 'workshop-btn') {
       await this.request(
-        request(this.id, this.objectWorkshop!.id, 'abjects:object-workshop' as InterfaceId, 'show', {})
+        request(this.id, this.objectWorkshopId!, 'abjects:object-workshop' as InterfaceId, 'show', {})
       );
+    } else if (payload.widgetId.startsWith('user-obj::')) {
+      // Dynamic user object button — send 'show' to the object
+      const objId = payload.widgetId.slice('user-obj::'.length) as AbjectId;
+      const reg = await this.registryLookup(objId);
+      if (reg) {
+        const iface = reg.manifest.interfaces.find((i) =>
+          i.methods.some((m) => m.name === 'show'));
+        if (iface) {
+          try {
+            await this.request(request(this.id, objId, iface.id, 'show', {}));
+          } catch (err) {
+            console.warn(`[Taskbar] Failed to show ${reg.manifest.name}:`, err);
+          }
+        }
+      }
     }
   }
 }

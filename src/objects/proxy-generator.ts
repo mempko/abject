@@ -6,13 +6,13 @@ import {
   AbjectId,
   AbjectManifest,
   AbjectMessage,
+  InterfaceId,
   InterfaceDeclaration,
   ProtocolAgreement,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
-// request unused
-import { LLMObject } from './llm-object.js';
+import { request } from '../core/message.js';
 
 const PROXY_GENERATOR_INTERFACE = 'abjects:proxy-generator';
 
@@ -33,7 +33,7 @@ export interface GeneratedProxy {
  * Generates proxy objects that translate between incompatible interfaces.
  */
 export class ProxyGenerator extends Abject {
-  private llm?: LLMObject;
+  private llmId?: AbjectId;
   private generatedProxies: Map<string, GeneratedProxy> = new Map();
 
   constructor() {
@@ -121,10 +121,19 @@ export class ProxyGenerator extends Abject {
   }
 
   /**
-   * Set the LLM object for code generation.
+   * Set the LLM object ID for code generation via message passing.
    */
-  setLLM(llm: LLMObject): void {
-    this.llm = llm;
+  setLLMId(id: AbjectId): void {
+    this.llmId = id;
+  }
+
+  /**
+   * Generate code via LLM message passing.
+   */
+  private async llmGenerateCode(language: string, description: string, context?: string): Promise<string> {
+    return this.request<string>(
+      request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'generateCode', { language, description, context })
+    );
   }
 
   /**
@@ -136,7 +145,7 @@ export class ProxyGenerator extends Abject {
     sourceManifest: AbjectManifest,
     targetManifest: AbjectManifest
   ): Promise<GeneratedProxy> {
-    require(this.llm !== undefined, 'LLM object not set');
+    require(this.llmId !== undefined, 'LLM object not set');
 
     // Build the prompt for the LLM
     const prompt = this.buildProxyPrompt(
@@ -147,7 +156,7 @@ export class ProxyGenerator extends Abject {
     );
 
     // Generate proxy code
-    const proxyCode = await this.llm!.generateCode(
+    const proxyCode = await this.llmGenerateCode(
       'typescript',
       prompt,
       this.getProxyTemplate()
@@ -181,7 +190,7 @@ export class ProxyGenerator extends Abject {
     agreementId: string,
     errorContext: string
   ): Promise<GeneratedProxy> {
-    require(this.llm !== undefined, 'LLM object not set');
+    require(this.llmId !== undefined, 'LLM object not set');
 
     const existing = this.generatedProxies.get(agreementId);
     require(existing !== undefined, 'Agreement not found');
@@ -197,7 +206,7 @@ ${existing!.proxyCode}
 
 Generate a corrected version that handles these issues.`;
 
-    const proxyCode = await this.llm!.generateCode(
+    const proxyCode = await this.llmGenerateCode(
       'typescript',
       prompt,
       this.getProxyTemplate()

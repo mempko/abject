@@ -12,9 +12,9 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { UIServer, WidgetEventPayload } from './ui-server.js';
-import { Registry } from './registry.js';
-import { ObjectCreator, CreationResult } from './object-creator.js';
+import { CreationResult } from './object-creator.js';
 import { EDITABLE_INTERFACE_ID } from './scriptable-abject.js';
+import { LLMMessage, LLMCompletionResult } from '../llm/provider.js';
 
 const REGISTRY_BROWSER_INTERFACE: InterfaceId = 'abjects:registry-browser';
 const UI_INTERFACE: InterfaceId = 'abjects:ui';
@@ -26,13 +26,16 @@ const PAD = 16;
 
 export class RegistryBrowser extends Abject {
   private uiServer?: UIServer;
-  private registry?: Registry;
-  private objectCreator?: ObjectCreator;
+  private registryId?: AbjectId;
+  private objectCreatorId?: AbjectId;
+  private llmId?: AbjectId;
   private windowId?: string;
   private currentPage = 0;
   private cachedObjects: ObjectRegistration[] = [];
   private editingObjectId?: AbjectId;
   private detailIndex?: number;
+  private selectedMethod?: { interfaceId: InterfaceId; method: string };
+  private detailObjectId?: AbjectId;
 
   constructor() {
     super({
@@ -73,10 +76,31 @@ export class RegistryBrowser extends Abject {
     this.setupHandlers();
   }
 
-  setDependencies(uiServer: UIServer, registry: Registry, objectCreator?: ObjectCreator): void {
+  setDependencies(uiServer: UIServer, registryId: AbjectId, objectCreatorId?: AbjectId, llmId?: AbjectId): void {
     this.uiServer = uiServer;
-    this.registry = registry;
-    this.objectCreator = objectCreator;
+    this.registryId = registryId;
+    this.objectCreatorId = objectCreatorId;
+    this.llmId = llmId;
+  }
+
+  /**
+   * List objects from registry via message passing.
+   */
+  private async registryList(): Promise<ObjectRegistration[]> {
+    if (!this.registryId) return [];
+    return this.request<ObjectRegistration[]>(
+      request(this.id, this.registryId, 'abjects:registry' as InterfaceId, 'list', {})
+    );
+  }
+
+  /**
+   * Look up an object in the registry via message passing.
+   */
+  private async registryLookup(objectId: AbjectId): Promise<ObjectRegistration | null> {
+    if (!this.registryId) return null;
+    return this.request<ObjectRegistration | null>(
+      request(this.id, this.registryId, 'abjects:registry' as InterfaceId, 'lookup', { objectId })
+    );
   }
 
   private setupHandlers(): void {
@@ -98,7 +122,7 @@ export class RegistryBrowser extends Abject {
     if (this.windowId) return true;
 
     this.currentPage = 0;
-    this.cachedObjects = this.registry?.listObjects() ?? [];
+    this.cachedObjects = await this.registryList();
     await this.showListView();
     return true;
   }
@@ -143,6 +167,43 @@ export class RegistryBrowser extends Abject {
       })
     );
 
+    let y = 8;
+
+    // LLM command bar (only when LLM is available)
+    if (this.llmId) {
+      const cmdInputW = WIN_W - PAD * 2 - 70;
+      await this.request(
+        request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+          windowId: this.windowId,
+          id: 'cmd-input',
+          type: 'textInput',
+          rect: { x: PAD, y, width: cmdInputW, height: 30 },
+          placeholder: 'Type a command...',
+        })
+      );
+      await this.request(
+        request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+          windowId: this.windowId,
+          id: 'cmd-run-btn',
+          type: 'button',
+          rect: { x: PAD + cmdInputW + 8, y, width: 60, height: 30 },
+          text: 'Run',
+        })
+      );
+      y += 34;
+
+      await this.request(
+        request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+          windowId: this.windowId,
+          id: 'cmd-status',
+          type: 'label',
+          rect: { x: PAD, y, width: WIN_W - PAD * 2, height: 20 },
+          text: '',
+        })
+      );
+      y += 24;
+    }
+
     const totalPages = Math.max(1, Math.ceil(this.cachedObjects.length / PAGE_SIZE));
     const start = this.currentPage * PAGE_SIZE;
     const pageItems = this.cachedObjects.slice(start, start + PAGE_SIZE);
@@ -150,7 +211,6 @@ export class RegistryBrowser extends Abject {
     const itemW = WIN_W - PAD * 2;
     const itemH = 32;
     const gap = 4;
-    let y = 8;
 
     for (let i = 0; i < pageItems.length; i++) {
       const obj = pageItems[i];
@@ -211,6 +271,10 @@ export class RegistryBrowser extends Abject {
     const obj = this.cachedObjects[absIndex];
     if (!obj) return;
 
+    // Store for message sending
+    this.detailObjectId = obj.id;
+    this.selectedMethod = undefined;
+
     // Destroy list window
     if (this.windowId) {
       await this.request(
@@ -225,7 +289,7 @@ export class RegistryBrowser extends Abject {
       request(this.id, this.uiServer!.id, UI_INTERFACE, 'getDisplayInfo', {})
     );
 
-    const detailH = 450;
+    const detailH = 600;
     const winX = Math.max(20, Math.floor((displayInfo.width - WIN_W) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - detailH) / 2));
 
@@ -241,9 +305,10 @@ export class RegistryBrowser extends Abject {
     let y = 8;
     const labelH = 20;
     const lineGap = 4;
+    let labelIdx = 0;
 
     const addLabel = async (text: string) => {
-      const id = `detail-${y}`;
+      const id = `detail-lbl-${labelIdx++}`;
       await this.request(
         request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
           windowId: this.windowId,
@@ -296,7 +361,74 @@ export class RegistryBrowser extends Abject {
       await addLabel(`Requires: ${reqNames.join(', ')}`);
     }
 
-    // Buttons at bottom
+    y += 8;
+
+    // ── Send Message section ──
+    await addLabel('Send Message:');
+
+    // Method buttons (compact, 2 per row)
+    const methodBtnW = Math.floor((WIN_W - PAD * 2 - 8) / 2);
+    const methodBtnH = 26;
+    let col = 0;
+    for (const iface of obj.manifest.interfaces) {
+      for (const method of iface.methods) {
+        const bx = PAD + col * (methodBtnW + 8);
+        await this.request(
+          request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+            windowId: this.windowId,
+            id: `method-btn::${iface.id}::${method.name}`,
+            type: 'button',
+            rect: { x: bx, y, width: methodBtnW, height: methodBtnH },
+            text: method.name,
+          })
+        );
+        col++;
+        if (col >= 2) {
+          col = 0;
+          y += methodBtnH + 4;
+        }
+      }
+    }
+    if (col !== 0) {
+      y += methodBtnH + 4;
+    }
+    y += 4;
+
+    // Payload input
+    const payloadInputW = WIN_W - PAD * 2 - 70;
+    await this.request(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        windowId: this.windowId,
+        id: 'msg-payload',
+        type: 'textInput',
+        rect: { x: PAD, y, width: payloadInputW, height: 30 },
+        placeholder: 'JSON payload (optional)',
+      })
+    );
+    await this.request(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        windowId: this.windowId,
+        id: 'msg-send-btn',
+        type: 'button',
+        rect: { x: PAD + payloadInputW + 8, y, width: 60, height: 30 },
+        text: 'Send',
+      })
+    );
+    y += 38;
+
+    // Response label
+    await this.request(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
+        windowId: this.windowId,
+        id: 'msg-response',
+        type: 'label',
+        rect: { x: PAD, y, width: WIN_W - PAD * 2, height: labelH },
+        text: '',
+      })
+    );
+    y += labelH + 8;
+
+    // ── Bottom buttons ──
     const btnY = detailH - 30 - 36 - 8;
     await this.request(
       request(this.id, this.uiServer!.id, UI_INTERFACE, 'addWidget', {
@@ -470,7 +602,7 @@ export class RegistryBrowser extends Abject {
     if (payload.type !== 'click' && payload.type !== 'submit') return;
 
     if (payload.widgetId === 'back-btn') {
-      this.cachedObjects = this.registry?.listObjects() ?? [];
+      this.cachedObjects = await this.registryList();
       await this.showListView();
       return;
     }
@@ -519,10 +651,13 @@ export class RegistryBrowser extends Abject {
         );
 
         if (result.success) {
-          // Also update registry
-          if (this.registry) {
-            const reg = this.registry.lookupObject(this.editingObjectId);
-            if (reg) reg.source = source;
+          // Also update registry source via message passing
+          if (this.registryId) {
+            await this.request(
+              request(this.id, this.registryId, 'abjects:registry' as InterfaceId, 'updateSource', {
+                objectId: this.editingObjectId, source,
+              })
+            );
           }
           await this.updateEditStatus('Saved successfully');
         } else {
@@ -542,7 +677,7 @@ export class RegistryBrowser extends Abject {
         await this.showDetailView(this.detailIndex);
       } else {
         this.editingObjectId = undefined;
-        this.cachedObjects = this.registry?.listObjects() ?? [];
+        this.cachedObjects = await this.registryList();
         await this.showListView();
       }
       return;
@@ -550,7 +685,7 @@ export class RegistryBrowser extends Abject {
 
     // AI Edit: Go button or submit from prompt input
     if ((payload.widgetId === 'ai-go-btn' || (payload.widgetId === 'ai-prompt-input' && payload.type === 'submit'))
-        && this.editingObjectId && this.objectCreator) {
+        && this.editingObjectId && this.objectCreatorId) {
       const prompt = await this.request<string>(
         request(this.id, this.uiServer!.id, UI_INTERFACE, 'getWidgetValue', {
           widgetId: 'ai-prompt-input',
@@ -568,7 +703,7 @@ export class RegistryBrowser extends Abject {
         const result = await this.request<CreationResult>(
           request(
             this.id,
-            this.objectCreator.id,
+            this.objectCreatorId!,
             'abjects:object-creator' as InterfaceId,
             'modify',
             { objectId: this.editingObjectId, prompt }
@@ -594,11 +729,194 @@ export class RegistryBrowser extends Abject {
       return;
     }
 
+    // Method button in detail view (for message sending)
+    if (payload.widgetId.startsWith('method-btn::')) {
+      const parts = payload.widgetId.split('::');
+      this.selectedMethod = { interfaceId: parts[1] as InterfaceId, method: parts[2] };
+      // Update response label to show selection
+      if (this.windowId) {
+        await this.request(
+          request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+            widgetId: 'msg-response',
+            text: `Selected: ${parts[2]}`,
+          })
+        );
+      }
+      return;
+    }
+
+    // Send button in detail view
+    if (payload.widgetId === 'msg-send-btn' && this.selectedMethod && this.detailObjectId) {
+      await this.handleSendMessage();
+      return;
+    }
+
+    // LLM command bar: Run button or submit from input
+    if ((payload.widgetId === 'cmd-run-btn' ||
+         (payload.widgetId === 'cmd-input' && payload.type === 'submit'))
+        && this.llmId) {
+      await this.handleLLMCommand();
+      return;
+    }
+
     // Object button: obj-0, obj-1, ...
     const match = payload.widgetId.match(/^obj-(\d+)$/);
     if (match) {
       const index = parseInt(match[1], 10);
       await this.showDetailView(index);
+    }
+  }
+
+  /**
+   * Send a message to the selected method on the detail object.
+   */
+  private async handleSendMessage(): Promise<void> {
+    if (!this.selectedMethod || !this.detailObjectId || !this.windowId) return;
+
+    const payloadText = await this.request<string>(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'getWidgetValue', {
+        widgetId: 'msg-payload',
+      })
+    );
+
+    let msgPayload: unknown = {};
+    if (payloadText.trim()) {
+      try {
+        msgPayload = JSON.parse(payloadText);
+      } catch {
+        await this.request(
+          request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+            widgetId: 'msg-response',
+            text: 'Error: Invalid JSON payload',
+          })
+        );
+        return;
+      }
+    }
+
+    try {
+      const result = await this.request<unknown>(request(
+        this.id, this.detailObjectId,
+        this.selectedMethod.interfaceId, this.selectedMethod.method, msgPayload
+      ));
+      const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
+      const display = resultStr.length > 60 ? resultStr.slice(0, 60) + '...' : resultStr;
+      await this.request(
+        request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+          widgetId: 'msg-response',
+          text: `Result: ${display}`,
+        })
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await this.request(
+        request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+          widgetId: 'msg-response',
+          text: `Error: ${msg.slice(0, 60)}`,
+        })
+      );
+    }
+  }
+
+  /**
+   * Handle LLM command bar: parse natural language and dispatch message.
+   */
+  private async handleLLMCommand(): Promise<void> {
+    if (!this.llmId || !this.windowId) return;
+
+    const commandText = await this.request<string>(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'getWidgetValue', {
+        widgetId: 'cmd-input',
+      })
+    );
+
+    if (!commandText.trim()) {
+      await this.request(
+        request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+          widgetId: 'cmd-status', text: 'Enter a command',
+        })
+      );
+      return;
+    }
+
+    await this.request(
+      request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+        widgetId: 'cmd-status', text: 'Thinking...',
+      })
+    );
+
+    try {
+      // Build object context for the LLM
+      const objects = await this.registryList();
+      const objectContext = objects.map((o) => {
+        const methods = o.manifest.interfaces.flatMap((iface) =>
+          iface.methods.map((m) => ({
+            interface: iface.id,
+            method: m.name,
+            params: m.parameters.map((p) => p.name),
+            description: m.description,
+          }))
+        );
+        return { id: o.id, name: o.manifest.name, description: o.manifest.description, methods };
+      });
+
+      const messages: LLMMessage[] = [
+        {
+          role: 'system',
+          content: `You are a command interpreter for the Abjects system.
+Available objects:
+${JSON.stringify(objectContext, null, 2)}
+
+The user will give you a natural language command. Figure out which object and method to call.
+Respond with ONLY valid JSON (no markdown fences, no explanation):
+{"objectId": "...", "interface": "...", "method": "...", "payload": {}}`,
+        },
+        { role: 'user', content: commandText },
+      ];
+
+      const llmResult = await this.request<LLMCompletionResult>(
+        request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', { messages })
+      );
+
+      // Parse LLM response (strip markdown fences if present)
+      let responseText = llmResult.content.trim();
+      const fenceMatch = responseText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+      if (fenceMatch) {
+        responseText = fenceMatch[1];
+      }
+
+      const parsed = JSON.parse(responseText) as {
+        objectId: string;
+        interface: string;
+        method: string;
+        payload: unknown;
+      };
+
+      // Dispatch the message
+      const result = await this.request<unknown>(request(
+        this.id,
+        parsed.objectId as AbjectId,
+        parsed.interface as InterfaceId,
+        parsed.method,
+        parsed.payload ?? {}
+      ));
+
+      const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
+      const display = resultStr.length > 50 ? resultStr.slice(0, 50) + '...' : resultStr;
+      await this.request(
+        request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+          widgetId: 'cmd-status',
+          text: `${parsed.method} → ${display}`,
+        })
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await this.request(
+        request(this.id, this.uiServer!.id, UI_INTERFACE, 'updateWidget', {
+          widgetId: 'cmd-status',
+          text: `Error: ${msg.slice(0, 60)}`,
+        })
+      );
     }
   }
 }

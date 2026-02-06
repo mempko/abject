@@ -6,6 +6,7 @@ import {
   AbjectId,
   AbjectManifest,
   AbjectMessage,
+  InterfaceId,
   SpawnRequest,
   SpawnResult,
   CapabilityGrant,
@@ -15,7 +16,6 @@ import { require, invariant } from '../core/contracts.js';
 import { Capabilities } from '../core/capability.js';
 import { request } from '../core/message.js';
 import { MessageBus } from '../runtime/message-bus.js';
-import { Registry } from './registry.js';
 import { ScriptableAbject } from './scriptable-abject.js';
 
 const FACTORY_INTERFACE = 'abjects:factory';
@@ -33,7 +33,8 @@ export class Factory extends Abject {
   private spawned: Map<AbjectId, Abject> = new Map();
   private constructors: Map<string, ObjectConstructor> = new Map();
   private _factoryBus?: MessageBus;
-  private _factoryRegistry?: Registry;
+  private _registryId?: AbjectId;
+  private _uiServerId?: AbjectId;
 
   constructor() {
     super({
@@ -116,10 +117,17 @@ export class Factory extends Abject {
   }
 
   /**
-   * Set the registry for object registration.
+   * Set the registry ID for object registration via message passing.
    */
-  setRegistry(registry: Registry): void {
-    this._factoryRegistry = registry;
+  setRegistryId(id: AbjectId): void {
+    this._registryId = id;
+  }
+
+  /**
+   * Set the UI server ID for injecting system context into ScriptableAbjects.
+   */
+  setUIServerId(id: AbjectId): void {
+    this._uiServerId = id;
   }
 
   /**
@@ -171,13 +179,28 @@ export class Factory extends Abject {
     // Track spawned object
     this.spawned.set(obj.id, obj);
 
-    // Register with registry if available
-    if (this._factoryRegistry) {
+    // Inject system context into ScriptableAbjects
+    if (obj instanceof ScriptableAbject && this._registryId && this._uiServerId) {
+      obj.setSystemContext({
+        registryId: this._registryId,
+        uiServerId: this._uiServerId,
+      });
+    }
+
+    // Register with registry via message passing
+    if (this._registryId) {
+      const payload: Record<string, unknown> = {
+        objectId: obj.id,
+        manifest: obj.manifest,
+        status: obj.status,
+      };
       if (obj instanceof ScriptableAbject) {
-        this._factoryRegistry.registerObject(obj.id, obj.manifest, obj.status, obj.owner, obj.source);
-      } else {
-        this._factoryRegistry.registerObject(obj.id, obj.manifest, obj.status);
+        payload.owner = obj.owner;
+        payload.source = obj.source;
       }
+      await this.request(
+        request(this.id, this._registryId, 'abjects:registry' as InterfaceId, 'register', payload)
+      );
     }
 
     this.checkInvariants();
@@ -200,13 +223,28 @@ export class Factory extends Abject {
     // Track spawned object
     this.spawned.set(obj.id, obj);
 
-    // Register with registry if available
-    if (this._factoryRegistry) {
+    // Inject system context into ScriptableAbjects
+    if (obj instanceof ScriptableAbject && this._registryId && this._uiServerId) {
+      obj.setSystemContext({
+        registryId: this._registryId,
+        uiServerId: this._uiServerId,
+      });
+    }
+
+    // Register with registry via message passing
+    if (this._registryId) {
+      const payload: Record<string, unknown> = {
+        objectId: obj.id,
+        manifest: obj.manifest,
+        status: obj.status,
+      };
       if (obj instanceof ScriptableAbject) {
-        this._factoryRegistry.registerObject(obj.id, obj.manifest, obj.status, obj.owner, obj.source);
-      } else {
-        this._factoryRegistry.registerObject(obj.id, obj.manifest, obj.status);
+        payload.owner = obj.owner;
+        payload.source = obj.source;
       }
+      await this.request(
+        request(this.id, this._registryId, 'abjects:registry' as InterfaceId, 'register', payload)
+      );
     }
 
     this.checkInvariants();
@@ -229,9 +267,11 @@ export class Factory extends Abject {
     await obj.stop();
     this.spawned.delete(objectId);
 
-    // Unregister from registry
-    if (this._factoryRegistry) {
-      this._factoryRegistry.unregisterObject(objectId);
+    // Unregister from registry via message passing
+    if (this._registryId) {
+      await this.request(
+        request(this.id, this._registryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
+      );
     }
 
     this.checkInvariants();

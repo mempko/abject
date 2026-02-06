@@ -6,8 +6,6 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { LLMObject } from './llm-object.js';
-import { Storage } from './capabilities/storage.js';
 import { UIServer, WidgetEventPayload } from './ui-server.js';
 
 const SETTINGS_INTERFACE: InterfaceId = 'abjects:settings';
@@ -19,8 +17,8 @@ const STORAGE_KEY_OPENAI = 'settings:openaiApiKey';
  * Settings object that provides a configuration UI for LLM API keys.
  */
 export class Settings extends Abject {
-  private llm?: LLMObject;
-  private storage?: Storage;
+  private llmId?: AbjectId;
+  private storageId?: AbjectId;
   private uiServer?: UIServer;
   private windowId?: string;
   private unmasked: Set<string> = new Set();
@@ -69,23 +67,36 @@ export class Settings extends Abject {
   /**
    * Set dependencies.
    */
-  setDependencies(llm: LLMObject, storage: Storage, uiServer: UIServer): void {
-    this.llm = llm;
-    this.storage = storage;
+  setDependencies(llmId: AbjectId, storageId: AbjectId, uiServer: UIServer): void {
+    this.llmId = llmId;
+    this.storageId = storageId;
     this.uiServer = uiServer;
   }
 
   protected async onInit(): Promise<void> {
     // Try to load saved API keys from storage
-    const anthropicKey = await this.storage?.getValue(STORAGE_KEY_ANTHROPIC) as string | null;
-    const openaiKey = await this.storage?.getValue(STORAGE_KEY_OPENAI) as string | null;
+    let anthropicKey: string | null = null;
+    let openaiKey: string | null = null;
+
+    if (this.storageId) {
+      anthropicKey = await this.request<string | null>(
+        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_ANTHROPIC })
+      );
+      openaiKey = await this.request<string | null>(
+        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_OPENAI })
+      );
+    }
 
     if (anthropicKey || openaiKey) {
       // Keys found — configure LLM silently
-      this.llm?.configure({
-        anthropicApiKey: anthropicKey ?? undefined,
-        openaiApiKey: openaiKey ?? undefined,
-      });
+      if (this.llmId) {
+        await this.request(
+          request(this.id, this.llmId, 'abjects:llm' as InterfaceId, 'configure', {
+            anthropicApiKey: anthropicKey ?? undefined,
+            openaiApiKey: openaiKey ?? undefined,
+          })
+        );
+      }
       console.log('[SETTINGS] Loaded saved API keys');
     } else {
       // No keys — show settings UI
@@ -309,21 +320,33 @@ export class Settings extends Abject {
     );
 
     // Save to storage
-    if (anthropicKey) {
-      await this.storage?.setValue(STORAGE_KEY_ANTHROPIC, anthropicKey);
-    }
-    if (openaiKey) {
-      await this.storage?.setValue(STORAGE_KEY_OPENAI, openaiKey);
+    if (this.storageId) {
+      if (anthropicKey) {
+        await this.request(
+          request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'set', { key: STORAGE_KEY_ANTHROPIC, value: anthropicKey })
+        );
+      }
+      if (openaiKey) {
+        await this.request(
+          request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'set', { key: STORAGE_KEY_OPENAI, value: openaiKey })
+        );
+      }
     }
 
     // Configure LLM
-    this.llm?.configure({
-      anthropicApiKey: anthropicKey || undefined,
-      openaiApiKey: openaiKey || undefined,
-    });
+    if (this.llmId) {
+      await this.request(
+        request(this.id, this.llmId, 'abjects:llm' as InterfaceId, 'configure', {
+          anthropicApiKey: anthropicKey || undefined,
+          openaiApiKey: openaiKey || undefined,
+        })
+      );
 
-    const providers = this.llm?.listProviders() ?? [];
-    console.log(`[SETTINGS] Saved. LLM providers: ${providers.join(', ') || 'none'}`);
+      const providers = await this.request<string[]>(
+        request(this.id, this.llmId, 'abjects:llm' as InterfaceId, 'listProviders', {})
+      );
+      console.log(`[SETTINGS] Saved. LLM providers: ${providers.join(', ') || 'none'}`);
+    }
 
     // Close the settings window
     await this.hide();

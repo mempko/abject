@@ -138,9 +138,9 @@ export class Runtime {
    * Bootstrap core system objects.
    */
   private async bootstrapCore(): Promise<void> {
-    // Wire up factory with bus and registry
+    // Wire up factory with bus and registry ID
     this.factory.setBus(this.bus);
-    this.factory.setRegistry(this.registry);
+    this.factory.setRegistryId(this.registry.id);
 
     // Initialize registry first (it registers itself)
     await this.registry.init(this.bus);

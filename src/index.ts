@@ -20,6 +20,7 @@ import { Settings } from './objects/settings.js';
 import { Taskbar } from './objects/taskbar.js';
 import { RegistryBrowser } from './objects/registry-browser.js';
 import { ObjectWorkshop } from './objects/object-workshop.js';
+// SystemContext is re-exported from scriptable-abject.js
 
 // Export public API
 export { App, createApp } from './ui/app.js';
@@ -40,6 +41,7 @@ export { Taskbar, TASKBAR_ID } from './objects/taskbar.js';
 export { RegistryBrowser, REGISTRY_BROWSER_ID } from './objects/registry-browser.js';
 export { ObjectWorkshop, OBJECT_WORKSHOP_ID } from './objects/object-workshop.js';
 export { ScriptableAbject, EDITABLE_INTERFACE_ID } from './objects/scriptable-abject.js';
+export type { SystemContext } from './objects/scriptable-abject.js';
 
 // Export capability objects
 export { HttpClient, HTTP_CLIENT_ID } from './objects/capabilities/http-client.js';
@@ -157,9 +159,12 @@ async function main(): Promise<App> {
   const filesystem = new FileSystem();
   await runtime.spawn(filesystem);
 
+  // Set UI server ID on factory for system context injection
+  runtime.objectFactory.setUIServerId(app.appUIServer.id);
+
   // Create proxy generator
   const proxyGenerator = new ProxyGenerator();
-  proxyGenerator.setLLM(llm);
+  proxyGenerator.setLLMId(llm.id);
   await runtime.spawn(proxyGenerator);
 
   // Create negotiator
@@ -180,27 +185,27 @@ async function main(): Promise<App> {
 
   // Create object creator
   const objectCreator = new ObjectCreator();
-  objectCreator.setDependencies(llm, runtime.objectRegistry, runtime.objectFactory);
+  objectCreator.setDependencies(llm.id, runtime.objectRegistry.id, runtime.objectFactory.id);
   await runtime.spawn(objectCreator);
 
   // Create settings (loads saved keys or shows config UI)
   const settings = new Settings();
-  settings.setDependencies(llm, storage, app.appUIServer);
+  settings.setDependencies(llm.id, storage.id, app.appUIServer);
   await runtime.spawn(settings);
 
   // Create registry browser
   const registryBrowser = new RegistryBrowser();
-  registryBrowser.setDependencies(app.appUIServer, runtime.objectRegistry, objectCreator);
+  registryBrowser.setDependencies(app.appUIServer, runtime.objectRegistry.id, objectCreator.id, llm.id);
   await runtime.spawn(registryBrowser);
 
   // Create object workshop
   const objectWorkshop = new ObjectWorkshop();
-  objectWorkshop.setDependencies(app.appUIServer, objectCreator);
+  objectWorkshop.setDependencies(app.appUIServer, objectCreator.id);
   await runtime.spawn(objectWorkshop);
 
   // Create taskbar (must be last — needs references to other UI objects)
   const taskbar = new Taskbar();
-  taskbar.setDependencies(app.appUIServer, settings, registryBrowser, objectWorkshop);
+  taskbar.setDependencies(app.appUIServer, settings.id, registryBrowser.id, objectWorkshop.id, runtime.objectRegistry.id);
   await runtime.spawn(taskbar);
 
   console.log('[ABJECTS] System ready');

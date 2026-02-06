@@ -176,6 +176,16 @@ export class LLMObject extends Abject {
       const { name } = msg.payload as { name: string };
       return this.setDefaultProvider(name);
     });
+
+    this.on('configure', async (msg: AbjectMessage) => {
+      const config = msg.payload as {
+        anthropicApiKey?: string;
+        openaiApiKey?: string;
+        ollamaUrl?: string;
+      };
+      this.configure(config);
+      return true;
+    });
   }
 
   /**
