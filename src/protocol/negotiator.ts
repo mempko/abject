@@ -1,23 +1,22 @@
 /**
  * Protocol Negotiator - handles connection flow and proxy insertion.
+ *
+ * Uses message passing internally — no direct object references.
+ * Spawns real ScriptableAbject proxies via Factory.
  */
 
 import {
   AbjectId,
-  AbjectManifest,
   AbjectMessage,
+  InterfaceId,
   ProtocolAgreement,
+  SpawnResult,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
-import { event } from '../core/message.js';
-import { Registry } from '../objects/registry.js';
-import { Factory } from '../objects/factory.js';
-import {
-  ProxyGenerator,
-  GeneratedProxy,
-
-} from '../objects/proxy-generator.js';
+import { request, event } from '../core/message.js';
+import { INTROSPECT_INTERFACE_ID, IntrospectResult } from '../core/introspect.js';
+import { GeneratedProxy } from '../objects/proxy-generator.js';
 import { MessageBus, ProxyInterceptor } from '../runtime/message-bus.js';
 
 const NEGOTIATOR_INTERFACE = 'abjects:negotiator';
@@ -38,15 +37,19 @@ interface ActiveConnection {
   agreement: ProtocolAgreement;
   proxyId?: AbjectId;
   interceptor?: ProxyInterceptor;
+  sourceId: AbjectId;
+  targetId: AbjectId;
 }
 
 /**
  * The Negotiator handles the connection flow between objects.
+ * Uses message passing for all dependencies.
  */
 export class Negotiator extends Abject {
-  private registry?: Registry;
-  private factory?: Factory;
-  private proxyGenerator?: ProxyGenerator;
+  private registryId?: AbjectId;
+  private factoryId?: AbjectId;
+  private proxyGeneratorId?: AbjectId;
+  private healthMonitorId?: AbjectId;
   private bus?: MessageBus;
   private connections: Map<string, ActiveConnection> = new Map();
 
@@ -150,44 +153,69 @@ export class Negotiator extends Abject {
       };
       return this.renegotiate(agreementId, errorContext);
     });
+
+    // Listen for sourceUpdated events from ScriptableAbjects (Step 5)
+    this.on('sourceUpdated', async (msg: AbjectMessage) => {
+      const changedId = msg.routing.from;
+      await this.handleSourceUpdated(changedId);
+    });
   }
 
   /**
-   * Set dependencies.
+   * Set dependencies via AbjectIds for message passing.
    */
   setDependencies(
-    registry: Registry,
-    factory: Factory,
-    proxyGenerator: ProxyGenerator,
+    registryId: AbjectId,
+    factoryId: AbjectId,
+    proxyGeneratorId: AbjectId,
     bus: MessageBus
   ): void {
-    this.registry = registry;
-    this.factory = factory;
-    this.proxyGenerator = proxyGenerator;
+    this.registryId = registryId;
+    this.factoryId = factoryId;
+    this.proxyGeneratorId = proxyGeneratorId;
     this.bus = bus;
+  }
+
+  /**
+   * Set health monitor ID for automatic connection tracking.
+   */
+  setHealthMonitorId(id: AbjectId): void {
+    this.healthMonitorId = id;
+  }
+
+  /**
+   * Introspect an object to get its description.
+   */
+  private async introspect(objectId: AbjectId): Promise<IntrospectResult | null> {
+    try {
+      return await this.request<IntrospectResult>(
+        request(this.id, objectId, INTROSPECT_INTERFACE_ID, 'describe', {})
+      );
+    } catch {
+      return null;
+    }
   }
 
   /**
    * Establish a connection between two objects.
    */
   async connect(sourceId: AbjectId, targetId: AbjectId): Promise<ConnectionResult> {
-    require(this.registry !== undefined, 'Registry not set');
-    require(this.proxyGenerator !== undefined, 'ProxyGenerator not set');
+    require(this.proxyGeneratorId !== undefined, 'ProxyGenerator not set');
 
     try {
-      // Fetch manifests
-      const sourceReg = this.registry!.lookupObject(sourceId);
-      const targetReg = this.registry!.lookupObject(targetId);
+      // Introspect both objects to learn their capabilities
+      const sourceResult = await this.introspect(sourceId);
+      const targetResult = await this.introspect(targetId);
 
-      if (!sourceReg) {
-        return { success: false, error: `Source object ${sourceId} not found` };
+      if (!sourceResult) {
+        return { success: false, error: `Source object ${sourceId} not found or not introspectable` };
       }
-      if (!targetReg) {
-        return { success: false, error: `Target object ${targetId} not found` };
+      if (!targetResult) {
+        return { success: false, error: `Target object ${targetId} not found or not introspectable` };
       }
 
-      const sourceManifest = sourceReg.manifest;
-      const targetManifest = targetReg.manifest;
+      const sourceManifest = sourceResult.manifest;
+      const targetManifest = targetResult.manifest;
 
       // Check if interfaces are compatible
       const compatible = this.checkCompatibility(sourceManifest, targetManifest);
@@ -199,17 +227,17 @@ export class Negotiator extends Abject {
         // Direct connection - no proxy needed
         agreement = this.createDirectAgreement(sourceId, targetId);
       } else {
-        // Generate proxy
-        const generated = await this.proxyGenerator!.generateProxy(
-          sourceId,
-          targetId,
-          sourceManifest,
-          targetManifest
+        // Generate proxy via message passing to ProxyGenerator
+        const generated = await this.request<GeneratedProxy>(
+          request(this.id, this.proxyGeneratorId!, 'abjects:proxy-generator' as InterfaceId, 'generateProxy', {
+            sourceId,
+            targetId,
+            sourceDescription: sourceResult.description,
+            targetDescription: targetResult.description,
+          })
         );
 
-        // Spawn proxy object
-        // Note: In a full implementation, we'd compile the generated code to WASM
-        // For now, we create a simple pass-through proxy
+        // Spawn proxy as a real ScriptableAbject via Factory
         proxyId = await this.spawnProxy(generated, sourceId, targetId);
 
         agreement = generated.agreement;
@@ -223,17 +251,32 @@ export class Negotiator extends Abject {
             agreement,
             proxyId,
             interceptor,
+            sourceId,
+            targetId,
           });
         }
       }
 
-      // Store connection
-      this.connections.set(agreement.agreementId, {
-        agreement,
-        proxyId,
-      });
+      // Store connection (may overwrite if already set above with interceptor)
+      if (!this.connections.has(agreement.agreementId)) {
+        this.connections.set(agreement.agreementId, {
+          agreement,
+          proxyId,
+          sourceId,
+          targetId,
+        });
+      }
 
-      // Notify
+      // Notify HealthMonitor to track this connection
+      if (this.healthMonitorId && agreement.agreementId) {
+        this.request(
+          request(this.id, this.healthMonitorId, 'abjects:health-monitor' as InterfaceId, 'trackConnection', {
+            agreementId: agreement.agreementId,
+          })
+        ).catch(() => { /* health monitor tracking is best-effort */ });
+      }
+
+      // Notify participants
       await this.notifyConnectionEstablished(agreement);
 
       return {
@@ -261,9 +304,11 @@ export class Negotiator extends Abject {
       this.bus.removeInterceptor(connection.interceptor);
     }
 
-    // Kill proxy if exists
-    if (connection.proxyId && this.factory) {
-      await this.factory.kill(connection.proxyId);
+    // Kill proxy via Factory message passing
+    if (connection.proxyId && this.factoryId) {
+      await this.request(
+        request(this.id, this.factoryId, 'abjects:factory' as InterfaceId, 'kill', { objectId: connection.proxyId })
+      ).catch(() => { /* proxy may already be dead */ });
     }
 
     this.connections.delete(agreementId);
@@ -277,7 +322,7 @@ export class Negotiator extends Abject {
     agreementId: string,
     errorContext: string
   ): Promise<ConnectionResult> {
-    require(this.proxyGenerator !== undefined, 'ProxyGenerator not set');
+    require(this.proxyGeneratorId !== undefined, 'ProxyGenerator not set');
 
     const connection = this.connections.get(agreementId);
     if (!connection) {
@@ -285,21 +330,26 @@ export class Negotiator extends Abject {
     }
 
     try {
-      // Regenerate proxy
-      const regenerated = await this.proxyGenerator!.regenerateProxy(
-        agreementId,
-        errorContext
+      // Regenerate proxy via message passing
+      const regenerated = await this.request<GeneratedProxy>(
+        request(this.id, this.proxyGeneratorId!, 'abjects:proxy-generator' as InterfaceId, 'regenerateProxy', {
+          agreementId,
+          errorContext,
+        })
       );
 
-      // Hot-swap proxy
-      if (connection.proxyId && this.factory) {
-        await this.factory.kill(connection.proxyId);
+      // Kill old proxy
+      if (connection.proxyId && this.factoryId) {
+        await this.request(
+          request(this.id, this.factoryId, 'abjects:factory' as InterfaceId, 'kill', { objectId: connection.proxyId })
+        ).catch(() => {});
       }
 
+      // Spawn new proxy
       const proxyId = await this.spawnProxy(
         regenerated,
-        connection.agreement.participants[0],
-        connection.agreement.participants[1]
+        connection.sourceId,
+        connection.targetId
       );
 
       // Update connection
@@ -313,8 +363,8 @@ export class Negotiator extends Abject {
           this.bus.removeInterceptor(connection.interceptor);
         }
         const interceptor = new ProxyInterceptor(
-          connection.agreement.participants[0],
-          connection.agreement.participants[1],
+          connection.sourceId,
+          connection.targetId,
           proxyId
         );
         this.bus.addInterceptor(interceptor);
@@ -333,13 +383,29 @@ export class Negotiator extends Abject {
   }
 
   /**
+   * Handle a sourceUpdated event — regenerate proxies for affected connections.
+   */
+  private async handleSourceUpdated(changedId: AbjectId): Promise<void> {
+    for (const [agreementId, connection] of this.connections) {
+      if (connection.sourceId === changedId || connection.targetId === changedId) {
+        console.log(`[NEGOTIATOR] Source updated for ${changedId}, regenerating proxy for ${agreementId}`);
+        // Re-introspect the changed object to learn its new interface
+        const result = await this.introspect(changedId);
+        const errorContext = result
+          ? `Object ${changedId} interface changed. New description:\n${result.description}`
+          : `Object ${changedId} interface changed.`;
+        await this.renegotiate(agreementId, errorContext);
+      }
+    }
+  }
+
+  /**
    * Check if two manifests have compatible interfaces.
    */
   private checkCompatibility(
-    source: AbjectManifest,
-    target: AbjectManifest
+    source: { interfaces: Array<{ id: string }> },
+    target: { interfaces: Array<{ id: string }> }
   ): boolean {
-    // Simple compatibility check: do they share any interface IDs?
     const sourceIds = new Set(source.interfaces.map((i) => i.id));
     return target.interfaces.some((i) => sourceIds.has(i.id));
   }
@@ -364,22 +430,28 @@ export class Negotiator extends Abject {
   }
 
   /**
-   * Spawn a proxy object.
+   * Spawn a proxy ScriptableAbject via Factory message passing.
    */
   private async spawnProxy(
     generated: GeneratedProxy,
     sourceId: AbjectId,
     targetId: AbjectId
   ): Promise<AbjectId> {
-    // In a full implementation, we'd compile the generated TypeScript to WASM
-    // For now, create a simple pass-through proxy using a built-in class
-    const proxyId = `proxy-${sourceId}-${targetId}-${Date.now()}` as AbjectId;
+    if (!this.factoryId) {
+      // Fallback: return a placeholder ID
+      return `proxy-${sourceId}-${targetId}-${Date.now()}` as AbjectId;
+    }
 
-    // The proxy would be spawned through the factory
-    // For demonstration, we'll just return the ID
-    // The actual proxy behavior is handled by the ProxyInterceptor
+    const spawnResult = await this.request<SpawnResult>(
+      request(this.id, this.factoryId, 'abjects:factory' as InterfaceId, 'spawn', {
+        manifest: generated.proxyManifest,
+        source: generated.handlerSource,
+        owner: this.id,
+        deps: { source: sourceId, target: targetId },
+      })
+    );
 
-    return proxyId;
+    return spawnResult.objectId;
   }
 
   /**
@@ -388,13 +460,12 @@ export class Negotiator extends Abject {
   private async notifyConnectionEstablished(
     agreement: ProtocolAgreement
   ): Promise<void> {
-    // Notify both participants
     for (const participantId of agreement.participants) {
       await this.send(
         event(
           this.id,
           participantId,
-          NEGOTIATOR_INTERFACE,
+          NEGOTIATOR_INTERFACE as InterfaceId,
           'connectionEstablished',
           agreement
         )

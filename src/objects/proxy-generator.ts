@@ -1,5 +1,8 @@
 /**
- * Proxy Generator - creates LLM-generated proxy objects for protocol translation.
+ * Proxy Generator - creates LLM-generated proxy ScriptableAbjects for protocol translation.
+ *
+ * Generates JavaScript handler maps (not TypeScript classes) that can be spawned
+ * as ScriptableAbjects via the Factory.
  */
 
 import {
@@ -7,30 +10,33 @@ import {
   AbjectManifest,
   AbjectMessage,
   InterfaceId,
-  InterfaceDeclaration,
   ProtocolAgreement,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
 import { request } from '../core/message.js';
+import { INTROSPECT_INTERFACE_ID, IntrospectResult } from '../core/introspect.js';
+import { ScriptableAbject } from './scriptable-abject.js';
+import { systemMessage, userMessage, LLMMessage, LLMCompletionResult } from '../llm/provider.js';
 
 const PROXY_GENERATOR_INTERFACE = 'abjects:proxy-generator';
 
 export interface ProxyGenerationRequest {
   sourceId: AbjectId;
   targetId: AbjectId;
-  sourceManifest: AbjectManifest;
-  targetManifest: AbjectManifest;
+  sourceDescription?: string;
+  targetDescription?: string;
 }
 
 export interface GeneratedProxy {
   proxyCode: string;
+  handlerSource: string;
   proxyManifest: AbjectManifest;
   agreement: ProtocolAgreement;
 }
 
 /**
- * Generates proxy objects that translate between incompatible interfaces.
+ * Generates proxy ScriptableAbjects that translate between incompatible interfaces.
  */
 export class ProxyGenerator extends Abject {
   private llmId?: AbjectId;
@@ -64,14 +70,16 @@ export class ProxyGenerator extends Abject {
                     description: 'Target object ID',
                   },
                   {
-                    name: 'sourceManifest',
-                    type: { kind: 'reference', reference: 'AbjectManifest' },
-                    description: 'Source object manifest',
+                    name: 'sourceDescription',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Source object description (from introspect)',
+                    optional: true,
                   },
                   {
-                    name: 'targetManifest',
-                    type: { kind: 'reference', reference: 'AbjectManifest' },
-                    description: 'Target object manifest',
+                    name: 'targetDescription',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Target object description (from introspect)',
+                    optional: true,
                   },
                 ],
                 returns: { kind: 'reference', reference: 'GeneratedProxy' },
@@ -106,9 +114,9 @@ export class ProxyGenerator extends Abject {
 
   private setupHandlers(): void {
     this.on('generateProxy', async (msg: AbjectMessage) => {
-      const { sourceId, targetId, sourceManifest, targetManifest } =
+      const { sourceId, targetId, sourceDescription, targetDescription } =
         msg.payload as ProxyGenerationRequest;
-      return this.generateProxy(sourceId, targetId, sourceManifest, targetManifest);
+      return this.generateProxy(sourceId, targetId, sourceDescription, targetDescription);
     });
 
     this.on('regenerateProxy', async (msg: AbjectMessage) => {
@@ -128,12 +136,25 @@ export class ProxyGenerator extends Abject {
   }
 
   /**
-   * Generate code via LLM message passing.
+   * Call LLM complete via message passing.
    */
-  private async llmGenerateCode(language: string, description: string, context?: string): Promise<string> {
-    return this.request<string>(
-      request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'generateCode', { language, description, context })
+  private async llmComplete(messages: LLMMessage[]): Promise<LLMCompletionResult> {
+    return this.request<LLMCompletionResult>(
+      request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', { messages })
     );
+  }
+
+  /**
+   * Ask an object to describe itself via introspect protocol.
+   */
+  private async introspect(objectId: AbjectId): Promise<IntrospectResult | null> {
+    try {
+      return await this.request<IntrospectResult>(
+        request(this.id, objectId, INTROSPECT_INTERFACE_ID, 'describe', {})
+      );
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -142,37 +163,35 @@ export class ProxyGenerator extends Abject {
   async generateProxy(
     sourceId: AbjectId,
     targetId: AbjectId,
-    sourceManifest: AbjectManifest,
-    targetManifest: AbjectManifest
+    sourceDescription?: string,
+    targetDescription?: string
   ): Promise<GeneratedProxy> {
     require(this.llmId !== undefined, 'LLM object not set');
 
-    // Build the prompt for the LLM
-    const prompt = this.buildProxyPrompt(
-      sourceManifest,
-      targetManifest,
-      sourceId,
-      targetId
-    );
+    // If descriptions not provided, introspect the objects directly
+    if (!sourceDescription) {
+      const result = await this.introspect(sourceId);
+      sourceDescription = result?.description ?? `Object ${sourceId}`;
+    }
+    if (!targetDescription) {
+      const result = await this.introspect(targetId);
+      targetDescription = result?.description ?? `Object ${targetId}`;
+    }
 
-    // Generate proxy code
-    const proxyCode = await this.llmGenerateCode(
-      'typescript',
-      prompt,
-      this.getProxyTemplate()
+    // Generate handler map via LLM
+    const handlerSource = await this.generateHandlerMap(
+      sourceId, targetId, sourceDescription, targetDescription
     );
 
     // Create proxy manifest
-    const proxyManifest = this.createProxyManifest(
-      sourceManifest,
-      targetManifest
-    );
+    const proxyManifest = this.createProxyManifest(sourceDescription, targetDescription);
 
     // Create protocol agreement
     const agreement = this.createAgreement(sourceId, targetId);
 
     const generated: GeneratedProxy = {
-      proxyCode,
+      proxyCode: handlerSource,
+      handlerSource,
       proxyManifest,
       agreement,
     };
@@ -195,25 +214,31 @@ export class ProxyGenerator extends Abject {
     const existing = this.generatedProxies.get(agreementId);
     require(existing !== undefined, 'Agreement not found');
 
-    // Build regeneration prompt
-    const prompt = `The previous proxy implementation had issues:
+    const result = await this.llmComplete([
+      systemMessage(this.getProxySystemPrompt()),
+      userMessage(`The previous proxy implementation had issues:
 ${errorContext}
 
-Please fix the proxy code. The previous implementation was:
-\`\`\`typescript
-${existing!.proxyCode}
+Previous handler map:
+\`\`\`javascript
+${existing!.handlerSource}
 \`\`\`
 
-Generate a corrected version that handles these issues.`;
+Generate a corrected handler map that fixes these issues. Output ONLY the handler map in a \`\`\`javascript code block.`),
+    ]);
 
-    const proxyCode = await this.llmGenerateCode(
-      'typescript',
-      prompt,
-      this.getProxyTemplate()
-    );
+    let handlerSource = this.parseCodeResponse(result.content) ?? existing!.handlerSource;
+
+    // Validate compilation
+    const compileError = ScriptableAbject.tryCompile(handlerSource);
+    if (compileError) {
+      console.warn('[PROXY-GEN] Regenerated code failed to compile:', compileError);
+      handlerSource = existing!.handlerSource;
+    }
 
     const regenerated: GeneratedProxy = {
-      proxyCode,
+      proxyCode: handlerSource,
+      handlerSource,
       proxyManifest: existing!.proxyManifest,
       agreement: {
         ...existing!.agreement,
@@ -227,133 +252,130 @@ Generate a corrected version that handles these issues.`;
   }
 
   /**
-   * Build the prompt for proxy generation.
+   * Generate a handler map for the proxy via LLM.
    */
-  private buildProxyPrompt(
-    sourceManifest: AbjectManifest,
-    targetManifest: AbjectManifest,
+  private async generateHandlerMap(
     sourceId: AbjectId,
-    targetId: AbjectId
-  ): string {
-    const sourceInterfaces = this.formatInterfaces(sourceManifest.interfaces);
-    const targetInterfaces = this.formatInterfaces(targetManifest.interfaces);
+    targetId: AbjectId,
+    sourceDescription: string,
+    targetDescription: string
+  ): Promise<string> {
+    const result = await this.llmComplete([
+      systemMessage(this.getProxySystemPrompt()),
+      userMessage(`Generate a JavaScript handler map for a proxy that translates messages between two objects.
 
-    return `Generate a proxy object that translates messages between two objects.
+SOURCE OBJECT:
+${sourceDescription}
 
-SOURCE OBJECT (${sourceManifest.name}):
-${sourceManifest.description}
-Interfaces:
-${sourceInterfaces}
+TARGET OBJECT:
+${targetDescription}
 
-TARGET OBJECT (${targetManifest.name}):
-${targetManifest.description}
-Interfaces:
-${targetInterfaces}
+The proxy receives messages from the source, translates them, and forwards to the target.
+Use this.call(this.dep('target'), interfaceId, method, payload) to forward.
+Use this.dep('source') and this.dep('target') for object IDs.
 
-The proxy must:
-1. Receive messages from the source object
-2. Transform the message format to match the target's interface
-3. Forward to the target
-4. Transform responses back to the source's expected format
-5. Handle errors gracefully
+Output ONLY the handler map in a \`\`\`javascript code block.`),
+    ]);
 
-Source ID: ${sourceId}
-Target ID: ${targetId}
+    let handlerSource = this.parseCodeResponse(result.content);
 
-Generate a TypeScript class that extends the Abject base class and handles this translation.`;
+    if (!handlerSource) {
+      // Fallback: generate a simple pass-through proxy
+      handlerSource = this.getFallbackHandlerMap();
+    }
+
+    // Validate compilation
+    const compileError = ScriptableAbject.tryCompile(handlerSource);
+    if (compileError) {
+      console.warn('[PROXY-GEN] Generated code failed to compile, using fallback:', compileError);
+      handlerSource = this.getFallbackHandlerMap();
+    }
+
+    return handlerSource;
   }
 
   /**
-   * Format interfaces for the prompt.
+   * System prompt for proxy handler map generation.
    */
-  private formatInterfaces(interfaces: InterfaceDeclaration[]): string {
-    return interfaces
-      .map((iface) => {
-        const methods = iface.methods
-          .map((m) => {
-            const params = m.parameters
-              .map((p) => `${p.name}: ${this.formatType(p.type)}`)
-              .join(', ');
-            const returns = m.returns ? `: ${this.formatType(m.returns)}` : '';
-            return `  ${m.name}(${params})${returns} - ${m.description}`;
-          })
-          .join('\n');
-        return `Interface: ${iface.name} (${iface.id})
-${iface.description}
-Methods:
-${methods}`;
-      })
-      .join('\n\n');
+  private getProxySystemPrompt(): string {
+    return `You generate JavaScript handler maps for proxy ScriptableAbjects that translate messages between two objects.
+
+The handler map is a parenthesized object expression:
+({
+  async methodName(msg) {
+    // translate and forward
+    const result = await this.call(this.dep('target'), 'interface:id', 'method', payload);
+    return result;
+  }
+})
+
+RULES:
+- MUST be plain JavaScript (NOT TypeScript). No type annotations.
+- Format: parenthesized object expression ({ ... })
+- Each handler receives msg with msg.payload containing parameters
+- Use this.call(this.dep('target'), interfaceId, method, payload) to forward to target
+- Use this.dep('source') and this.dep('target') for object IDs
+- Include a wildcard handler '*' as catch-all for unmatched methods
+- Handle errors gracefully with try/catch
+- Return values from handlers to auto-reply`;
   }
 
   /**
-   * Format a type declaration.
+   * Fallback handler map for when LLM generation fails.
    */
-  private formatType(type: { kind: string; primitive?: string; reference?: string; elementType?: unknown }): string {
-    switch (type.kind) {
-      case 'primitive':
-        return type.primitive ?? 'unknown';
-      case 'reference':
-        return type.reference ?? 'unknown';
-      case 'array':
-        return `Array<${this.formatType(type.elementType as { kind: string; primitive?: string; reference?: string; elementType?: unknown })}>`;
-      default:
-        return 'unknown';
+  private getFallbackHandlerMap(): string {
+    return `({
+  async ['*'](msg) {
+    try {
+      const method = msg.routing.method;
+      const iface = msg.routing.interface;
+      return await this.call(this.dep('target'), iface, method, msg.payload);
+    } catch (err) {
+      return { error: err.message || String(err) };
     }
   }
+})`;
+  }
 
   /**
-   * Get the proxy template code.
+   * Parse code from LLM response.
    */
-  private getProxyTemplate(): string {
-    return `
-import { Abject, AbjectOptions } from '../core/abject.js';
-import { AbjectMessage, AbjectId } from '../core/types.js';
-import { request, reply, error, isRequest } from '../core/message.js';
-
-export class GeneratedProxy extends Abject {
-  private sourceId: AbjectId;
-  private targetId: AbjectId;
-
-  constructor(sourceId: AbjectId, targetId: AbjectId, options: AbjectOptions) {
-    super(options);
-    this.sourceId = sourceId;
-    this.targetId = targetId;
-    this.setupHandlers();
-  }
-
-  private setupHandlers(): void {
-    // Handle all incoming messages
-    this.on('*', async (msg: AbjectMessage) => {
-      return this.translate(msg);
-    });
-  }
-
-  private async translate(msg: AbjectMessage): Promise<unknown> {
-    // Transform and forward message
-    // Return transformed response
-  }
-}
-`;
+  private parseCodeResponse(content: string): string | undefined {
+    let match = content.match(/```(?:javascript|js)\s*([\s\S]*?)\s*```/);
+    if (!match) {
+      match = content.match(/```\s*([\s\S]*?)\s*```/);
+    }
+    return match?.[1];
   }
 
   /**
    * Create a manifest for the generated proxy.
    */
   private createProxyManifest(
-    sourceManifest: AbjectManifest,
-    targetManifest: AbjectManifest
+    sourceDescription: string,
+    targetDescription: string
   ): AbjectManifest {
+    // Extract names from descriptions (first line before " — " or "(")
+    const sourceName = sourceDescription.split(/\s*[—(]/)[0].trim();
+    const targetName = targetDescription.split(/\s*[—(]/)[0].trim();
+
     return {
-      name: `Proxy_${sourceManifest.name}_${targetManifest.name}`,
-      description: `LLM-generated proxy that translates between ${sourceManifest.name} and ${targetManifest.name}`,
+      name: `Proxy_${sourceName}_${targetName}`,
+      description: `LLM-generated proxy that translates between ${sourceName} and ${targetName}`,
       version: '1.0.0',
       interfaces: [
-        // Expose both source and target interfaces
-        ...sourceManifest.interfaces.map((i) => ({
-          ...i,
-          id: `proxy:${i.id}`,
-        })),
+        {
+          id: `proxy:${sourceName.toLowerCase()}-${targetName.toLowerCase()}` as InterfaceId,
+          name: `Proxy`,
+          description: `Translates between ${sourceName} and ${targetName}`,
+          methods: [
+            {
+              name: '*',
+              description: 'Wildcard handler that translates and forwards all messages',
+              parameters: [],
+            },
+          ],
+        },
       ],
       requiredCapabilities: [],
       tags: ['proxy', 'generated'],

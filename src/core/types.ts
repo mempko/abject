@@ -210,6 +210,7 @@ export interface SpawnRequest {
   owner?: AbjectId;
   initialState?: unknown;
   grantedCapabilities?: CapabilityGrant[];
+  deps?: Record<string, AbjectId>;
 }
 
 export interface SpawnResult {

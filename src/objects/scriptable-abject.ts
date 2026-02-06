@@ -10,7 +10,8 @@
  *   })
  *
  * Handler functions are bound to the ScriptableAbject instance, giving them
- * access to convenience methods like createWindow(), addWidget(), call(), etc.
+ * access to this.call() for inter-object communication and this.dep() for
+ * dependency lookup.
  */
 
 import {
@@ -18,19 +19,13 @@ import {
   AbjectManifest,
   AbjectMessage,
   InterfaceId,
+  ObjectRegistration,
 } from '../core/types.js';
 import { Abject, MessageHandlerFn } from '../core/abject.js';
 import { require as contractRequire } from '../core/contracts.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 
 export const EDITABLE_INTERFACE_ID = 'abjects:editable' as InterfaceId;
-
-const UI_INTERFACE: InterfaceId = 'abjects:ui' as InterfaceId;
-
-export interface SystemContext {
-  registryId: AbjectId;
-  uiServerId: AbjectId;
-}
 
 /**
  * An Abject whose handlers are compiled from a JavaScript source string.
@@ -41,7 +36,7 @@ export class ScriptableAbject extends Abject {
   private _owner: AbjectId;
   private _userMethods: Set<string> = new Set();
   private _userProps: Set<string> = new Set();
-  private _systemCtx?: SystemContext;
+  private _deps: Record<string, AbjectId> = {};
 
   constructor(manifest: AbjectManifest, source: string, owner: AbjectId) {
     // Append the editable interface and 'scriptable' tag
@@ -106,10 +101,32 @@ export class ScriptableAbject extends Abject {
   }
 
   /**
-   * Set the system context (registry and UI server IDs) for convenience methods.
+   * Set dependency IDs for inter-object communication.
    */
-  setSystemContext(ctx: SystemContext): void {
-    this._systemCtx = ctx;
+  setDeps(deps: Record<string, AbjectId>): void {
+    this._deps = { ...deps };
+  }
+
+  /**
+   * Get a dependency ID by name. Throws if not found.
+   */
+  dep(name: string): AbjectId {
+    contractRequire(
+      name in this._deps,
+      `Dependency '${name}' not found. Available: ${Object.keys(this._deps).join(', ')}`
+    );
+    return this._deps[name];
+  }
+
+  /**
+   * Find an object by name via Registry discovery.
+   */
+  async find(name: string): Promise<AbjectId | null> {
+    contractRequire('Registry' in this._deps, 'Registry dependency not set');
+    const results = await this.call<ObjectRegistration[]>(
+      this._deps['Registry'], 'abjects:registry' as InterfaceId, 'discover', { name }
+    );
+    return results.length > 0 ? results[0].id as AbjectId : null;
   }
 
   private setupEditableHandlers(): void {
@@ -136,94 +153,6 @@ export class ScriptableAbject extends Abject {
   async call<T>(to: AbjectId | string, interfaceId: InterfaceId | string, method: string, payload: unknown = {}): Promise<T> {
     return this.request<T>(
       request(this.id, to as AbjectId, interfaceId as InterfaceId, method, payload)
-    );
-  }
-
-  /**
-   * Create a window via UIServer.
-   */
-  async createWindow(
-    title: string,
-    rect: { x: number; y: number; width: number; height: number },
-    options?: { resizable?: boolean }
-  ): Promise<string> {
-    contractRequire(this._systemCtx !== undefined, 'System context not set');
-    return this.request<string>(
-      request(this.id, this._systemCtx!.uiServerId, UI_INTERFACE, 'createWindow', {
-        title,
-        rect,
-        zIndex: 200,
-        resizable: options?.resizable ?? false,
-      })
-    );
-  }
-
-  /**
-   * Add a widget to a window.
-   */
-  async addWidget(
-    windowId: string,
-    id: string,
-    type: string,
-    rect: { x: number; y: number; width: number; height: number },
-    options?: { text?: string; placeholder?: string; monospace?: boolean; masked?: boolean }
-  ): Promise<boolean> {
-    contractRequire(this._systemCtx !== undefined, 'System context not set');
-    return this.request<boolean>(
-      request(this.id, this._systemCtx!.uiServerId, UI_INTERFACE, 'addWidget', {
-        windowId,
-        id,
-        type,
-        rect,
-        ...options,
-      })
-    );
-  }
-
-  /**
-   * Update a widget's text or other properties.
-   */
-  async updateWidget(widgetId: string, text: string): Promise<boolean> {
-    contractRequire(this._systemCtx !== undefined, 'System context not set');
-    return this.request<boolean>(
-      request(this.id, this._systemCtx!.uiServerId, UI_INTERFACE, 'updateWidget', {
-        widgetId,
-        text,
-      })
-    );
-  }
-
-  /**
-   * Get a widget's current value (for text inputs).
-   */
-  async getWidgetValue(widgetId: string): Promise<string> {
-    contractRequire(this._systemCtx !== undefined, 'System context not set');
-    return this.request<string>(
-      request(this.id, this._systemCtx!.uiServerId, UI_INTERFACE, 'getWidgetValue', {
-        widgetId,
-      })
-    );
-  }
-
-  /**
-   * Destroy a window.
-   */
-  async destroyWindow(windowId: string): Promise<boolean> {
-    contractRequire(this._systemCtx !== undefined, 'System context not set');
-    return this.request<boolean>(
-      request(this.id, this._systemCtx!.uiServerId, UI_INTERFACE, 'destroyWindow', {
-        windowId,
-      })
-    );
-  }
-
-  /**
-   * Get display info (width, height).
-   */
-  async getDisplayInfo(): Promise<{ width: number; height: number }> {
-    contractRequire(this._systemCtx !== undefined, 'System context not set');
-    return this.request<{ width: number; height: number }>(
-      request(this.id, this._systemCtx!.uiServerId, UI_INTERFACE, 'getDisplayInfo', {})
     );
   }
 
@@ -314,6 +243,19 @@ export class ScriptableAbject extends Abject {
     }
 
     this._source = source;
+
+    // Emit sourceUpdated event so Negotiator can regenerate affected proxies
+    const newMethods = Array.from(this._userMethods);
+    this.send(
+      event(
+        this.id,
+        this.id, // sent to self; Negotiator listens via bus subscription or handler
+        EDITABLE_INTERFACE_ID,
+        'sourceUpdated',
+        { objectId: this.id, methods: newMethods }
+      )
+    ).catch(() => { /* best-effort notification */ });
+
     return { success: true };
   }
 }

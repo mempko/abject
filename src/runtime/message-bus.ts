@@ -2,8 +2,9 @@
  * Message bus for routing messages between local objects.
  */
 
-import { AbjectMessage, AbjectId } from '../core/types.js';
+import { AbjectMessage, AbjectId, AbjectError, InterfaceId } from '../core/types.js';
 import { require, ensure, invariant, requireNonEmpty } from '../core/contracts.js';
+import { request as createRequest } from '../core/message.js';
 import { Mailbox } from './mailbox.js';
 
 export type MessageHandler = (message: AbjectMessage) => void | Promise<void>;
@@ -278,6 +279,70 @@ export class ProxyInterceptor implements MessageInterceptor {
         },
       };
     }
+    return 'pass';
+  }
+}
+
+/**
+ * Health interceptor that passively watches for error messages on tracked connections
+ * and reports them to the HealthMonitor via message passing.
+ */
+export class HealthInterceptor implements MessageInterceptor {
+  private trackedPairs: Map<string, string> = new Map(); // "from-to" → agreementId
+
+  constructor(
+    private readonly healthMonitorId: AbjectId,
+    private readonly bus: MessageBus
+  ) {}
+
+  /**
+   * Track a connection pair for health monitoring.
+   */
+  track(sourceId: AbjectId, targetId: AbjectId, agreementId: string): void {
+    this.trackedPairs.set(`${sourceId}-${targetId}`, agreementId);
+    this.trackedPairs.set(`${targetId}-${sourceId}`, agreementId);
+  }
+
+  /**
+   * Stop tracking a connection pair.
+   */
+  untrack(sourceId: AbjectId, targetId: AbjectId): void {
+    this.trackedPairs.delete(`${sourceId}-${targetId}`);
+    this.trackedPairs.delete(`${targetId}-${sourceId}`);
+  }
+
+  async intercept(message: AbjectMessage): Promise<'pass'> {
+    const pairKey = `${message.routing.from}-${message.routing.to}`;
+    const agreementId = this.trackedPairs.get(pairKey);
+
+    if (agreementId) {
+      if (message.header.type === 'error') {
+        // Report error to HealthMonitor
+        const errorPayload = message.payload as AbjectError;
+        this.bus.send(
+          createRequest(
+            'health-interceptor' as AbjectId,
+            this.healthMonitorId,
+            'abjects:health-monitor' as InterfaceId,
+            'recordError',
+            { agreementId, error: errorPayload }
+          )
+        ).catch(() => { /* best-effort */ });
+      } else if (message.header.type === 'reply') {
+        // Report success to HealthMonitor
+        this.bus.send(
+          createRequest(
+            'health-interceptor' as AbjectId,
+            this.healthMonitorId,
+            'abjects:health-monitor' as InterfaceId,
+            'recordSuccess',
+            { agreementId }
+          )
+        ).catch(() => { /* best-effort */ });
+      }
+    }
+
+    // Always pass — we're just observing
     return 'pass';
   }
 }

@@ -34,7 +34,7 @@ export class Factory extends Abject {
   private constructors: Map<string, ObjectConstructor> = new Map();
   private _factoryBus?: MessageBus;
   private _registryId?: AbjectId;
-  private _uiServerId?: AbjectId;
+  private _baseDeps: Record<string, AbjectId> = {};
 
   constructor() {
     super({
@@ -124,10 +124,10 @@ export class Factory extends Abject {
   }
 
   /**
-   * Set the UI server ID for injecting system context into ScriptableAbjects.
+   * Set base dependencies injected into every ScriptableAbject.
    */
-  setUIServerId(id: AbjectId): void {
-    this._uiServerId = id;
+  setBaseDeps(deps: Record<string, AbjectId>): void {
+    this._baseDeps = { ...deps };
   }
 
   /**
@@ -179,12 +179,9 @@ export class Factory extends Abject {
     // Track spawned object
     this.spawned.set(obj.id, obj);
 
-    // Inject system context into ScriptableAbjects
-    if (obj instanceof ScriptableAbject && this._registryId && this._uiServerId) {
-      obj.setSystemContext({
-        registryId: this._registryId,
-        uiServerId: this._uiServerId,
-      });
+    // Inject dependencies into ScriptableAbjects
+    if (obj instanceof ScriptableAbject) {
+      obj.setDeps({ ...this._baseDeps, ...(req.deps ?? {}) });
     }
 
     // Register with registry via message passing
@@ -223,12 +220,9 @@ export class Factory extends Abject {
     // Track spawned object
     this.spawned.set(obj.id, obj);
 
-    // Inject system context into ScriptableAbjects
-    if (obj instanceof ScriptableAbject && this._registryId && this._uiServerId) {
-      obj.setSystemContext({
-        registryId: this._registryId,
-        uiServerId: this._uiServerId,
-      });
+    // Inject base dependencies into ScriptableAbjects
+    if (obj instanceof ScriptableAbject) {
+      obj.setDeps({ ...this._baseDeps });
     }
 
     // Register with registry via message passing

@@ -23,12 +23,11 @@ import { Settings } from './objects/settings.js';
 import { Taskbar } from './objects/taskbar.js';
 import { RegistryBrowser } from './objects/registry-browser.js';
 import { ObjectWorkshop } from './objects/object-workshop.js';
-// SystemContext is re-exported from scriptable-abject.js
 
 // Export public API
 export { App, createApp } from './ui/app.js';
 export { Runtime, getRuntime } from './runtime/runtime.js';
-export { MessageBus } from './runtime/message-bus.js';
+export { MessageBus, HealthInterceptor } from './runtime/message-bus.js';
 export { Mailbox } from './runtime/mailbox.js';
 export { Abject, SimpleAbject } from './core/abject.js';
 export { Registry, REGISTRY_ID } from './objects/registry.js';
@@ -44,7 +43,6 @@ export { Taskbar, TASKBAR_ID } from './objects/taskbar.js';
 export { RegistryBrowser, REGISTRY_BROWSER_ID } from './objects/registry-browser.js';
 export { ObjectWorkshop, OBJECT_WORKSHOP_ID } from './objects/object-workshop.js';
 export { ScriptableAbject, EDITABLE_INTERFACE_ID } from './objects/scriptable-abject.js';
-export type { SystemContext } from './objects/scriptable-abject.js';
 
 // Export capability objects
 export { HttpClient, HTTP_CLIENT_ID } from './objects/capabilities/http-client.js';
@@ -59,6 +57,8 @@ export * from './core/types.js';
 export * from './core/message.js';
 export * from './core/capability.js';
 export * from './core/contracts.js';
+export { INTROSPECT_INTERFACE_ID, INTROSPECT_INTERFACE, formatManifestAsDescription } from './core/introspect.js';
+export type { IntrospectResult } from './core/introspect.js';
 
 // Export LLM providers
 export type { LLMProvider, LLMMessage, LLMCompletionResult } from './llm/provider.js';
@@ -163,8 +163,11 @@ async function main(): Promise<App> {
   const filesystem = new FileSystem();
   await runtime.spawn(filesystem);
 
-  // Set UI server ID on factory for system context injection
-  runtime.objectFactory.setUIServerId(app.appUIServer.id);
+  // Set base dependencies for ScriptableAbjects
+  runtime.objectFactory.setBaseDeps({
+    Registry: runtime.objectRegistry.id,
+    UIServer: app.appUIServer.id,
+  });
 
   // Create proxy generator
   const proxyGenerator = new ProxyGenerator();
@@ -174,22 +177,25 @@ async function main(): Promise<App> {
   // Create negotiator
   const negotiator = new Negotiator();
   negotiator.setDependencies(
-    runtime.objectRegistry,
-    runtime.objectFactory,
-    proxyGenerator,
+    runtime.objectRegistry.id,
+    runtime.objectFactory.id,
+    proxyGenerator.id,
     runtime.messageBus
   );
   await runtime.spawn(negotiator);
 
   // Create health monitor
   const healthMonitor = new HealthMonitor();
-  healthMonitor.setNegotiator(negotiator);
+  healthMonitor.setNegotiatorId(negotiator.id);
   healthMonitor.startMonitoring();
   await runtime.spawn(healthMonitor);
 
+  // Wire negotiator → health monitor
+  negotiator.setHealthMonitorId(healthMonitor.id);
+
   // Create object creator
   const objectCreator = new ObjectCreator();
-  objectCreator.setDependencies(llm.id, runtime.objectRegistry.id, runtime.objectFactory.id);
+  objectCreator.setDependencies(llm.id, runtime.objectRegistry.id, runtime.objectFactory.id, negotiator.id);
   await runtime.spawn(objectCreator);
 
   // Create settings (loads saved keys or shows config UI)

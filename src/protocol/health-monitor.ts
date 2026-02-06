@@ -1,17 +1,20 @@
 /**
  * Health Monitor - tracks error rates and triggers proxy regeneration.
+ *
+ * Uses message passing for all dependencies — no direct object references.
+ * Exposes message handlers for error tracking so the HealthInterceptor
+ * can report errors passively.
  */
 
 import {
   AbjectId,
   AbjectMessage,
+  InterfaceId,
   AgreementId,
   AbjectError,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { require, invariant } from '../core/contracts.js';
-import { event } from '../core/message.js';
-import { Negotiator } from './negotiator.js';
+import { request, event } from '../core/message.js';
 
 const HEALTH_MONITOR_INTERFACE = 'abjects:health-monitor';
 
@@ -41,10 +44,11 @@ export interface HealthStatus {
 
 /**
  * Monitors connection health and triggers self-healing.
+ * Uses message passing to Negotiator for renegotiation.
  */
 export class HealthMonitor extends Abject {
   private health: Map<AgreementId, ConnectionHealth> = new Map();
-  private negotiator?: Negotiator;
+  private negotiatorId?: AbjectId;
   private checkTimer?: ReturnType<typeof setInterval>;
   private readonly config: HealthConfig;
 
@@ -94,6 +98,47 @@ export class HealthMonitor extends Abject {
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              {
+                name: 'trackConnection',
+                description: 'Start tracking a connection',
+                parameters: [
+                  {
+                    name: 'agreementId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Agreement to track',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'recordSuccess',
+                description: 'Record a successful message on a connection',
+                parameters: [
+                  {
+                    name: 'agreementId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Agreement ID',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'recordError',
+                description: 'Record an error on a connection',
+                parameters: [
+                  {
+                    name: 'agreementId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Agreement ID',
+                  },
+                  {
+                    name: 'error',
+                    type: { kind: 'reference', reference: 'AbjectError' },
+                    description: 'The error that occurred',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
             ],
             events: [
               {
@@ -138,13 +183,31 @@ export class HealthMonitor extends Abject {
       const { agreementId } = msg.payload as { agreementId: AgreementId };
       return this.triggerRenegotiation(agreementId, 'Forced by request');
     });
+
+    this.on('trackConnection', async (msg: AbjectMessage) => {
+      const { agreementId } = msg.payload as { agreementId: AgreementId };
+      this.trackConnection(agreementId);
+      return true;
+    });
+
+    this.on('recordSuccess', async (msg: AbjectMessage) => {
+      const { agreementId } = msg.payload as { agreementId: AgreementId };
+      this.recordSuccess(agreementId);
+      return true;
+    });
+
+    this.on('recordError', async (msg: AbjectMessage) => {
+      const { agreementId, error } = msg.payload as { agreementId: AgreementId; error: AbjectError };
+      this.recordError(agreementId, error);
+      return true;
+    });
   }
 
   /**
-   * Set the negotiator for triggering renegotiations.
+   * Set the negotiator ID for triggering renegotiations via message passing.
    */
-  setNegotiator(negotiator: Negotiator): void {
-    this.negotiator = negotiator;
+  setNegotiatorId(id: AbjectId): void {
+    this.negotiatorId = id;
   }
 
   /**
@@ -310,13 +373,13 @@ export class HealthMonitor extends Abject {
   }
 
   /**
-   * Trigger renegotiation for a connection.
+   * Trigger renegotiation for a connection via message passing.
    */
   private async triggerRenegotiation(
     agreementId: AgreementId,
     errorContext: string
   ): Promise<boolean> {
-    if (!this.negotiator) {
+    if (!this.negotiatorId) {
       console.error('[HEALTH] No negotiator set, cannot renegotiate');
       return false;
     }
@@ -328,14 +391,19 @@ export class HealthMonitor extends Abject {
       event(
         this.id,
         this.id, // Self-notification for logging
-        HEALTH_MONITOR_INTERFACE,
+        HEALTH_MONITOR_INTERFACE as InterfaceId,
         'renegotiationTriggered',
         agreementId
       )
     );
 
     try {
-      const result = await this.negotiator.renegotiate(agreementId, errorContext);
+      const result = await this.request<{ success: boolean }>(
+        request(this.id, this.negotiatorId, 'abjects:negotiator' as InterfaceId, 'renegotiate', {
+          agreementId,
+          errorContext,
+        })
+      );
       return result.success;
     } catch (err) {
       console.error('[HEALTH] Renegotiation failed:', err);

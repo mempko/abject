@@ -17,6 +17,7 @@ import { reply, error, errorFromException, isRequest, isReply, isError } from '.
 import { Mailbox } from '../runtime/mailbox.js';
 import { MessageBus } from '../runtime/message-bus.js';
 import { CapabilitySet, getDefaultCapabilities } from './capability.js';
+import { INTROSPECT_INTERFACE, INTROSPECT_INTERFACE_ID, formatManifestAsDescription } from './introspect.js';
 
 export type MessageHandlerFn = (
   message: AbjectMessage
@@ -57,7 +58,16 @@ export abstract class Abject {
     requireNonEmpty(options.manifest.name, 'manifest.name');
 
     this.id = uuidv4();
-    this.manifest = options.manifest;
+    // Append the introspect interface to every Abject's manifest
+    const hasIntrospect = options.manifest.interfaces.some(
+      (i) => i.id === INTROSPECT_INTERFACE_ID
+    );
+    this.manifest = hasIntrospect
+      ? options.manifest
+      : {
+          ...options.manifest,
+          interfaces: [...options.manifest.interfaces, INTROSPECT_INTERFACE],
+        };
     this.state = options.initialState;
     this.startedAt = Date.now();
     this.lastActivity = this.startedAt;
@@ -95,6 +105,12 @@ export abstract class Abject {
 
     this._bus = bus;
     this._mailbox = bus.register(this.id, this.handleMessage.bind(this));
+
+    // Register the introspect handler on every Abject
+    this.on('describe', () => ({
+      manifest: this.manifest,
+      description: formatManifestAsDescription(this.manifest),
+    }));
 
     this._status = 'ready';
 
