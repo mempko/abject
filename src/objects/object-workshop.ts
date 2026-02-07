@@ -24,6 +24,7 @@ const WIN_H = 350;
 export class ObjectWorkshop extends Abject {
   private widgetManagerId?: AbjectId;
   private objectCreatorId?: AbjectId;
+  private consoleId?: AbjectId;
   private windowId?: AbjectId;
   private lastCreatedObjectId?: AbjectId;
   private rootLayoutId?: AbjectId;
@@ -79,6 +80,16 @@ export class ObjectWorkshop extends Abject {
   protected override async onInit(): Promise<void> {
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.objectCreatorId = await this.requireDep('ObjectCreator');
+    this.consoleId = await this.discoverDep('Console') ?? undefined;
+  }
+
+  private async log(level: string, message: string, data?: unknown): Promise<void> {
+    if (!this.consoleId) return;
+    try {
+      await this.send(
+        request(this.id, this.consoleId, 'abjects:console' as InterfaceId, level, { message, data })
+      );
+    } catch { /* logging should never break the caller */ }
   }
 
   private setupHandlers(): void {
@@ -287,6 +298,7 @@ export class ObjectWorkshop extends Abject {
     }
 
     // Show creating status
+    await this.log('info', 'ObjectWorkshop: creating object', { prompt });
     await this.updateStatus('Creating...');
     await this.updateResult('', '');
 
@@ -304,6 +316,7 @@ export class ObjectWorkshop extends Abject {
 
       if (result.success && result.manifest) {
         this.lastCreatedObjectId = result.objectId;
+        await this.log('info', 'ObjectWorkshop: object created', { name: result.manifest.name, objectId: result.objectId });
         await this.updateStatus(`Created: ${result.manifest.name}`);
         await this.updateResult(
           `Name: ${result.manifest.name}`,
@@ -314,10 +327,12 @@ export class ObjectWorkshop extends Abject {
           await this.showModifyButton();
         }
       } else {
+        await this.log('error', 'ObjectWorkshop: creation failed', { error: result.error });
         await this.updateStatus(`Error: ${result.error ?? 'Unknown error'}`);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      await this.log('error', 'ObjectWorkshop: creation error', { error: msg });
       await this.updateStatus(`Error: ${msg}`);
     }
   }
@@ -362,6 +377,7 @@ export class ObjectWorkshop extends Abject {
       return;
     }
 
+    await this.log('info', 'ObjectWorkshop: modifying object', { objectId: this.lastCreatedObjectId, prompt });
     await this.updateStatus('Modifying...');
 
     try {

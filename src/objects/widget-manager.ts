@@ -56,6 +56,7 @@ const UI_INTERFACE: InterfaceId = 'abjects:ui';
  */
 export class WidgetManager extends Abject {
   private uiServerId?: AbjectId;
+  private consoleId?: AbjectId;
 
   // Tracking spawned Abjects (Set<AbjectId>, NOT references — network transparent)
   private spawnedWindows: Set<AbjectId> = new Set();
@@ -85,12 +86,16 @@ export class WidgetManager extends Abject {
             name: 'Widgets',
             description: 'Widget factory — spawns WindowAbject and WidgetAbject instances on the bus. ' +
               'Workflow: 1) createWindowAbject to get a window ID, 2) createVBox/createHBox to get a layout ID, ' +
-              '3) create widgets (createLabel, createButton, etc.) inside the layout, 4) add widgets to layout ' +
-              'via the layout\'s addChild method. For legacy ScriptableAbjects: createWindow, addWidget, updateWidget.',
+              '3) create widgets (createLabel, createButton, etc.) with rect {0,0,0,0} since layout manages positioning, ' +
+              '4) add widgets to layout via this.call(layoutId, "abjects:layout", "addLayoutChild", { widgetId, sizePolicy, preferredSize }), ' +
+              '5) register for events via this.call(widgetId, "abjects:introspect", "addDependent", {}), ' +
+              '6) handle events in a "changed" handler: { aspect, value } where aspect is "click", "change", or "submit". ' +
+              'Update widgets via this.call(widgetId, "abjects:widget", "update", { text: "new text" }). ' +
+              'Get values via this.call(widgetId, "abjects:widget", "getValue", {}).',
             methods: [
               {
                 name: 'createWindowAbject',
-                description: 'Create a window and return its AbjectId. Send messages directly to the window for further control.',
+                description: 'Create a window and return its AbjectId. Example: const winId = await this.call(this.dep("WidgetManager"), "abjects:widgets", "createWindowAbject", { title: "My Window", rect: { x: 100, y: 100, width: 400, height: 300 }, resizable: true })',
                 parameters: [
                   { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Window title' },
                   { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height } — position and size' },
@@ -110,7 +115,7 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'createLabel',
-                description: 'Create a label widget inside a window. Returns the widget AbjectId.',
+                description: 'Create a label widget inside a window. Returns the widget AbjectId. Update text via this.call(labelId, "abjects:widget", "update", { text: "New text" })',
                 parameters: [
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
                   { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height }' },
@@ -121,7 +126,7 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'createButton',
-                description: 'Create a button widget. Returns the widget AbjectId. Listen for "changed" events with aspect "click".',
+                description: 'Create a button widget. Returns the widget AbjectId. Register via this.call(btnId, "abjects:introspect", "addDependent", {}), then handle "changed" events with aspect "click" in your changed handler.',
                 parameters: [
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
                   { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height }' },
@@ -132,7 +137,7 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'createTextInput',
-                description: 'Create a single-line text input. Returns the widget AbjectId. Listen for "changed" events with aspect "change" or "submit".',
+                description: 'Create a single-line text input. Returns the widget AbjectId. Register via addDependent, listen for "changed" with aspect "change" or "submit". Get value via this.call(inputId, "abjects:widget", "getValue", {})',
                 parameters: [
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
                   { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height }' },
@@ -204,7 +209,7 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'createVBox',
-                description: 'Create a vertical box layout inside a window. Add children via the layout\'s addChild method. Returns the layout AbjectId.',
+                description: 'Create a vertical box layout inside a window. Returns the layout AbjectId. Add children via this.call(layoutId, "abjects:layout", "addLayoutChild", { widgetId, sizePolicy: { vertical: "fixed" }, preferredSize: { height: 36 } }). Add spacers via this.call(layoutId, "abjects:layout", "addLayoutSpacer", {}).',
                 parameters: [
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
@@ -214,7 +219,7 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'createHBox',
-                description: 'Create a horizontal box layout inside a window. Add children via the layout\'s addChild method. Returns the layout AbjectId.',
+                description: 'Create a horizontal box layout inside a window. Returns the layout AbjectId. Add children via this.call(layoutId, "abjects:layout", "addLayoutChild", { widgetId, sizePolicy: { horizontal: "expanding" }, preferredSize: { width: 100, height: 36 } }).',
                 parameters: [
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
@@ -665,6 +670,112 @@ export class WidgetManager extends Abject {
 
   protected override async onInit(): Promise<void> {
     this.uiServerId = await this.requireDep('UIServer');
+    this.consoleId = await this.discoverDep('Console') ?? undefined;
+  }
+
+  private async log(level: string, message: string, data?: unknown): Promise<void> {
+    if (!this.consoleId) return;
+    try {
+      await this.send(
+        request(this.id, this.consoleId, 'abjects:console' as InterfaceId, level, { message, data })
+      );
+    } catch { /* logging should never break the caller */ }
+  }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## WidgetManager Usage Guide
+
+### Complete Workflow Example
+
+// 1. Create a window
+const winId = await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'createWindowAbject', {
+  title: 'My Window', rect: { x: 100, y: 100, width: 400, height: 300 }, resizable: true
+});
+
+// 2. Create a vertical layout
+const layoutId = await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'createVBox', {
+  windowId: winId, margins: { top: 8, right: 16, bottom: 8, left: 16 }, spacing: 8
+});
+
+// 3. Create widgets
+const labelId = await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'createLabel', {
+  windowId: winId, rect: { x: 0, y: 0, width: 0, height: 0 }, text: 'Hello World'
+});
+
+const btnId = await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'createButton', {
+  windowId: winId, rect: { x: 0, y: 0, width: 0, height: 0 }, text: 'Click Me'
+});
+
+const inputId = await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'createTextInput', {
+  windowId: winId, rect: { x: 0, y: 0, width: 0, height: 0 }, placeholder: 'Type here...'
+});
+
+// 4. Add widgets to layout (rect can be {0,0,0,0} — layout manages positioning)
+await this.call(layoutId, 'abjects:layout', 'addLayoutChild', {
+  widgetId: labelId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 }
+});
+await this.call(layoutId, 'abjects:layout', 'addLayoutChild', {
+  widgetId: inputId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 36 }
+});
+await this.call(layoutId, 'abjects:layout', 'addLayoutChild', {
+  widgetId: btnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 100, height: 36 }
+});
+
+// Add a spacer to push widgets apart:
+await this.call(layoutId, 'abjects:layout', 'addLayoutSpacer', {});
+
+// 5. Register for button click events
+await this.call(btnId, 'abjects:introspect', 'addDependent', {});
+
+// 6. Handle events — implement a 'changed' handler in your handler map:
+async changed(msg) {
+  const { aspect, value } = msg.payload;
+  const fromId = msg.routing.from;
+  if (fromId === this._btnId && aspect === 'click') {
+    // Button was clicked
+  }
+  if (fromId === this._inputId && aspect === 'submit') {
+    // Enter pressed in text input
+  }
+}
+
+### Updating Widgets
+
+// Update label text:
+await this.call(labelId, 'abjects:widget', 'update', { text: 'New text' });
+
+// Get text input value:
+const value = await this.call(inputId, 'abjects:widget', 'getValue', {});
+
+### Destroying a Window
+
+await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'destroyWindowAbject', { windowId: winId });
+
+### Available Widget Types
+
+createLabel - Static text display
+createButton - Clickable button (listen for 'changed' with aspect 'click')
+createTextInput - Single-line text input (aspects: 'change', 'submit')
+createTextArea - Multi-line text area (params: monospace?)
+createCheckbox - Toggle checkbox (aspect: 'change', value: boolean)
+createProgress - Progress bar (update with { value: 0-100 })
+createDivider - Horizontal divider line
+createSelect - Dropdown select (params: options[], selectedIndex)
+
+### Layout Types
+
+createVBox - Vertical stack layout
+createHBox - Horizontal row layout
+createNestedVBox - Nested vertical layout inside another layout
+createNestedHBox - Nested horizontal layout inside another layout
+
+### Interface IDs
+
+'abjects:widgets' - WidgetManager factory methods
+'abjects:widget' - Widget instance methods (update, getValue)
+'abjects:layout' - Layout methods (addLayoutChild, addLayoutSpacer)
+'abjects:window' - Window methods
+'abjects:introspect' - For addDependent (event registration)`;
   }
 
   // ── Factory: createWindow ─────────────────────────────────────────────
@@ -722,6 +833,7 @@ export class WidgetManager extends Abject {
 
     await win.init(this.bus, this.id);
     this.spawnedWindows.add(win.id);
+    this.log('debug', 'createWindowAbject', { windowId: win.id, title });
     return win.id;
   }
 
@@ -790,6 +902,7 @@ export class WidgetManager extends Abject {
 
     await widget.init(this.bus, this.id);
     this.spawnedWidgets.add(widget.id);
+    this.log('debug', 'createWidget', { widgetId: widget.id, windowId, type: widget.manifest.name });
 
     // Only add to window if rect is non-zero.
     // Layout-managed widgets pass {0,0,0,0} and are positioned by their layout.

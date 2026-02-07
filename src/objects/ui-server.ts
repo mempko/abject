@@ -10,7 +10,7 @@ import {
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
-import { event } from '../core/message.js';
+import { event, request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import {
   Compositor,
@@ -50,6 +50,7 @@ export class UIServer extends Abject {
   private surfaceOwners: Map<string, AbjectId> = new Map();
   private focusedSurface?: string;
   private grabbedSurface?: string;  // Mouse capture: routes events during drag
+  private consoleId?: AbjectId;
 
   constructor() {
     super({
@@ -66,7 +67,7 @@ export class UIServer extends Abject {
             methods: [
               {
                 name: 'createSurface',
-                description: 'Create a new drawing surface',
+                description: 'Create a new drawing surface. Example: const surfaceId = await this.call(this.dep("UIServer"), "abjects:ui", "createSurface", { rect: { x: 100, y: 100, width: 300, height: 200 }, zIndex: 100 })',
                 parameters: [
                   {
                     name: 'rect',
@@ -84,7 +85,7 @@ export class UIServer extends Abject {
               },
               {
                 name: 'destroySurface',
-                description: 'Destroy a surface',
+                description: 'Destroy a surface. Example: await this.call(this.dep("UIServer"), "abjects:ui", "destroySurface", { surfaceId })',
                 parameters: [
                   {
                     name: 'surfaceId',
@@ -96,7 +97,12 @@ export class UIServer extends Abject {
               },
               {
                 name: 'draw',
-                description: 'Execute draw commands on a surface',
+                description: 'Execute draw commands on a surface. Each command has exactly 3 fields: { type, surfaceId, params }. ' +
+                  'Valid types: "clear" (params: {}), "rect" (params: { x, y, width, height, fill?, stroke?, lineWidth?, radius? }), ' +
+                  '"text" (params: { x, y, text, font?, fill?, align?, baseline? }), "line" (params: { x1, y1, x2, y2, stroke?, lineWidth? }), ' +
+                  '"path" (params: { path (SVG path string), fill?, stroke?, lineWidth? }). ' +
+                  'IMPORTANT: Use "fill" for fill color (NOT "color"), "stroke" for stroke color, "rect" (NOT "fillRect"), "text" (NOT "fillText"). ' +
+                  'Always nest parameters inside "params", NOT as flat top-level fields.',
                 parameters: [
                   {
                     name: 'commands',
@@ -104,14 +110,14 @@ export class UIServer extends Abject {
                       kind: 'array',
                       elementType: { kind: 'reference', reference: 'DrawCommand' },
                     },
-                    description: 'Draw commands to execute',
+                    description: 'Array of { type, surfaceId, params } draw commands',
                   },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'moveSurface',
-                description: 'Move a surface',
+                description: 'Move a surface. Example: await this.call(uiId, "abjects:ui", "moveSurface", { surfaceId, x: 200, y: 100 })',
                 parameters: [
                   {
                     name: 'surfaceId',
@@ -133,7 +139,7 @@ export class UIServer extends Abject {
               },
               {
                 name: 'resizeSurface',
-                description: 'Resize a surface',
+                description: 'Resize a surface. Example: await this.call(uiId, "abjects:ui", "resizeSurface", { surfaceId, width: 400, height: 300 })',
                 parameters: [
                   {
                     name: 'surfaceId',
@@ -308,6 +314,78 @@ export class UIServer extends Abject {
     });
   }
 
+  protected override async onInit(): Promise<void> {
+    this.consoleId = await this.discoverDep('Console') ?? undefined;
+  }
+
+  private async log(level: string, message: string, data?: unknown): Promise<void> {
+    if (!this.consoleId) return;
+    try {
+      await this.send(
+        request(this.id, this.consoleId, 'abjects:console' as InterfaceId, level, { message, data })
+      );
+    } catch { /* logging should never break the caller */ }
+  }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## UIServer Usage Guide
+
+### Creating and Using Surfaces
+
+Create a surface:
+  const surfaceId = await this.call(this.dep('UIServer'), 'abjects:ui', 'createSurface',
+    { rect: { x: 100, y: 100, width: 300, height: 200 }, zIndex: 100 });
+
+Destroy a surface:
+  await this.call(this.dep('UIServer'), 'abjects:ui', 'destroySurface', { surfaceId });
+
+### Drawing
+
+Each draw command has exactly 3 fields: { type, surfaceId, params }
+
+  await this.call(this.dep('UIServer'), 'abjects:ui', 'draw', {
+    commands: [
+      { type: 'clear', surfaceId, params: {} },
+      { type: 'rect', surfaceId, params: { x: 0, y: 0, width: 300, height: 200, fill: '#1e1e2e' } },
+      { type: 'rect', surfaceId, params: { x: 10, y: 10, width: 80, height: 30, fill: '#4a4a6e', stroke: '#666', radius: 4 } },
+      { type: 'text', surfaceId, params: { x: 150, y: 100, text: 'Hello', font: '24px system-ui', fill: '#ffffff', align: 'center', baseline: 'middle' } },
+      { type: 'line', surfaceId, params: { x1: 0, y1: 50, x2: 300, y2: 50, stroke: '#444', lineWidth: 1 } },
+      { type: 'path', surfaceId, params: { path: 'M10 10 L50 50 L10 50 Z', fill: '#ff0000' } },
+    ]
+  });
+
+### Draw Command Types
+
+'clear' - Clear entire surface. params: {}
+'rect'  - Rectangle. params: { x, y, width, height, fill?, stroke?, lineWidth?, radius? }
+'text'  - Text. params: { x, y, text, font?, fill?, align?, baseline? }
+'line'  - Line. params: { x1, y1, x2, y2, stroke?, lineWidth? }
+'path'  - SVG path. params: { path (SVG path string), fill?, stroke?, lineWidth? }
+
+IMPORTANT:
+- Use 'fill' for fill color, NOT 'color'
+- Use 'stroke' for stroke color, NOT 'strokeColor'
+- Use 'rect' NOT 'fillRect'
+- Use 'text' NOT 'fillText'
+- Always nest parameters inside 'params', NOT as flat top-level fields
+
+### Other Methods
+
+Move surface: this.call(uiId, 'abjects:ui', 'moveSurface', { surfaceId, x: 200, y: 100 })
+Resize: this.call(uiId, 'abjects:ui', 'resizeSurface', { surfaceId, width: 400, height: 300 })
+Set z-index: this.call(uiId, 'abjects:ui', 'setZIndex', { surfaceId, zIndex: 200 })
+Get display size: const { width, height } = await this.call(uiId, 'abjects:ui', 'getDisplayInfo', {})
+Measure text: const w = await this.call(uiId, 'abjects:ui', 'measureText', { surfaceId, text: 'Hello', font: '14px system-ui' })
+
+### Input Events
+
+UIServer sends 'input' events to surface owners. Implement an 'input' handler:
+  async input(msg) {
+    const { type, surfaceId, x, y, button, key, code } = msg.payload;
+    // type: 'mousedown', 'mouseup', 'mousemove', 'keydown', 'keyup', 'wheel', 'paste'
+  }`;
+  }
+
   /**
    * Set the compositor.
    */
@@ -351,6 +429,7 @@ export class UIServer extends Abject {
 
     const surfaceId = this.compositor!.createSurface(objectId, rect, zIndex);
     this.surfaceOwners.set(surfaceId, objectId);
+    this.log('debug', 'createSurface', { surfaceId, objectId, rect, zIndex });
 
     return surfaceId;
   }
@@ -364,6 +443,7 @@ export class UIServer extends Abject {
     }
 
     this.surfaceOwners.delete(surfaceId);
+    this.log('debug', 'destroySurface', { surfaceId, objectId });
     return this.compositor?.destroySurface(surfaceId) ?? false;
   }
 
@@ -372,6 +452,7 @@ export class UIServer extends Abject {
    */
   private executeDraw(objectId: AbjectId, commands: DrawCommand[]): boolean {
     require(this.compositor !== undefined, 'Compositor not set');
+    this.log('debug', 'draw', { objectId, commandCount: commands.length });
 
     for (const cmd of commands) {
       if (this.surfaceOwners.get(cmd.surfaceId) !== objectId) {
