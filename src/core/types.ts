@@ -210,7 +210,9 @@ export interface SpawnRequest {
   owner?: AbjectId;
   initialState?: unknown;
   grantedCapabilities?: CapabilityGrant[];
+  /** Dependencies for ScriptableAbjects (injected via setDeps()). */
   deps?: Record<string, AbjectId>;
+  parentId?: AbjectId;
 }
 
 export interface SpawnResult {

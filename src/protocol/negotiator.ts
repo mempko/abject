@@ -17,7 +17,7 @@ import { require } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { INTROSPECT_INTERFACE_ID, IntrospectResult } from '../core/introspect.js';
 import { GeneratedProxy } from '../objects/proxy-generator.js';
-import { MessageBus, ProxyInterceptor } from '../runtime/message-bus.js';
+import { ProxyInterceptor } from '../runtime/message-bus.js';
 
 const NEGOTIATOR_INTERFACE = 'abjects:negotiator';
 
@@ -50,7 +50,6 @@ export class Negotiator extends Abject {
   private factoryId?: AbjectId;
   private proxyGeneratorId?: AbjectId;
   private healthMonitorId?: AbjectId;
-  private _negotiatorBus?: MessageBus;
   private connections: Map<string, ActiveConnection> = new Map();
 
   constructor() {
@@ -161,26 +160,11 @@ export class Negotiator extends Abject {
     });
   }
 
-  /**
-   * Set dependencies via AbjectIds for message passing.
-   */
-  setDependencies(
-    registryId: AbjectId,
-    factoryId: AbjectId,
-    proxyGeneratorId: AbjectId,
-    bus: MessageBus
-  ): void {
-    this.registryId = registryId;
-    this.factoryId = factoryId;
-    this.proxyGeneratorId = proxyGeneratorId;
-    this._negotiatorBus = bus;
-  }
-
-  /**
-   * Set health monitor ID for automatic connection tracking.
-   */
-  setHealthMonitorId(id: AbjectId): void {
-    this.healthMonitorId = id;
+  protected override async onInit(): Promise<void> {
+    this.registryId = await this.requireDep('Registry');
+    this.factoryId = await this.requireDep('Factory');
+    this.proxyGeneratorId = await this.requireDep('ProxyGenerator');
+    // HealthMonitor discovered lazily (circular dep — may not exist yet at init time)
   }
 
   /**
@@ -244,9 +228,9 @@ export class Negotiator extends Abject {
         agreement.proxyId = proxyId;
 
         // Install proxy interceptor
-        if (this._negotiatorBus && proxyId) {
+        if (this.bus && proxyId) {
           const interceptor = new ProxyInterceptor(sourceId, targetId, proxyId);
-          this._negotiatorBus.addInterceptor(interceptor);
+          this.bus.addInterceptor(interceptor);
           this.connections.set(agreement.agreementId, {
             agreement,
             proxyId,
@@ -267,7 +251,10 @@ export class Negotiator extends Abject {
         });
       }
 
-      // Notify HealthMonitor to track this connection
+      // Notify HealthMonitor to track this connection (lazily discovered)
+      if (!this.healthMonitorId) {
+        this.healthMonitorId = await this.discoverDep('HealthMonitor') ?? undefined;
+      }
       if (this.healthMonitorId && agreement.agreementId) {
         this.request(
           request(this.id, this.healthMonitorId, 'abjects:health-monitor' as InterfaceId, 'trackConnection', {
@@ -300,8 +287,8 @@ export class Negotiator extends Abject {
     }
 
     // Remove interceptor
-    if (connection.interceptor && this._negotiatorBus) {
-      this._negotiatorBus.removeInterceptor(connection.interceptor);
+    if (connection.interceptor && this.bus) {
+      this.bus.removeInterceptor(connection.interceptor);
     }
 
     // Kill proxy via Factory message passing
@@ -358,16 +345,16 @@ export class Negotiator extends Abject {
       connection.agreement.proxyId = proxyId;
 
       // Update interceptor
-      if (this._negotiatorBus) {
+      if (this.bus) {
         if (connection.interceptor) {
-          this._negotiatorBus.removeInterceptor(connection.interceptor);
+          this.bus.removeInterceptor(connection.interceptor);
         }
         const interceptor = new ProxyInterceptor(
           connection.sourceId,
           connection.targetId,
           proxyId
         );
-        this._negotiatorBus.addInterceptor(interceptor);
+        this.bus.addInterceptor(interceptor);
         connection.interceptor = interceptor;
       }
 

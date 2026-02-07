@@ -201,13 +201,15 @@ export class HealthMonitor extends Abject {
       this.recordError(agreementId, error);
       return true;
     });
+
+    this.on('startMonitoring', async () => {
+      this.startMonitoring();
+      return true;
+    });
   }
 
-  /**
-   * Set the negotiator ID for triggering renegotiations via message passing.
-   */
-  setNegotiatorId(id: AbjectId): void {
-    this.negotiatorId = id;
+  protected override async onInit(): Promise<void> {
+    this.negotiatorId = await this.requireDep('Negotiator');
   }
 
   /**

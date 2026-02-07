@@ -203,11 +203,8 @@ export class LLMObject extends Abject {
     }
   }
 
-  /**
-   * Set the HttpClient abject ID for routing HTTP requests.
-   */
-  setHttpClientId(id: AbjectId): void {
-    this.httpClientId = id;
+  protected override async onInit(): Promise<void> {
+    this.httpClientId = await this.discoverDep('HttpClient') ?? undefined;
   }
 
   /**

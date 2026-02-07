@@ -76,9 +76,9 @@ export class ObjectWorkshop extends Abject {
     this.setupHandlers();
   }
 
-  setDependencies(widgetManagerId: AbjectId, objectCreatorId: AbjectId): void {
-    this.widgetManagerId = widgetManagerId;
-    this.objectCreatorId = objectCreatorId;
+  protected override async onInit(): Promise<void> {
+    this.widgetManagerId = await this.requireDep('WidgetManager');
+    this.objectCreatorId = await this.requireDep('ObjectCreator');
   }
 
   private setupHandlers(): void {

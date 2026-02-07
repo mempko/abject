@@ -122,9 +122,9 @@ export class Runtime {
   /**
    * Spawn a new object through the factory.
    */
-  async spawn(obj: Abject): Promise<void> {
+  async spawn(obj: Abject, parentId?: AbjectId): Promise<void> {
     require(this.state === 'running', 'Runtime not running');
-    await this.factory.spawnInstance(obj);
+    await this.factory.spawnInstance(obj, parentId);
   }
 
   /**

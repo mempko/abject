@@ -83,58 +83,162 @@ export class WidgetManager extends Abject {
           {
             id: WIDGETS_INTERFACE,
             name: 'Widgets',
-            description: 'Window and widget management (factory + shim)',
+            description: 'Widget factory — spawns WindowAbject and WidgetAbject instances on the bus. ' +
+              'Workflow: 1) createWindowAbject to get a window ID, 2) createVBox/createHBox to get a layout ID, ' +
+              '3) create widgets (createLabel, createButton, etc.) inside the layout, 4) add widgets to layout ' +
+              'via the layout\'s addChild method. For legacy ScriptableAbjects: createWindow, addWidget, updateWidget.',
             methods: [
               {
-                name: 'createWindow',
-                description: 'Create a managed window (spawns WindowAbject)',
+                name: 'createWindowAbject',
+                description: 'Create a window and return its AbjectId. Send messages directly to the window for further control.',
                 parameters: [
                   { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Window title' },
-                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: 'Window position and size' },
+                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height } — position and size' },
+                  { name: 'zIndex', type: { kind: 'primitive', primitive: 'number' }, description: 'Z-index for stacking order', optional: true },
+                  { name: 'chromeless', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, no title bar', optional: true },
+                  { name: 'resizable', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, window is resizable', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
               {
-                name: 'destroyWindow',
-                description: 'Destroy a window and all its widgets',
+                name: 'destroyWindowAbject',
+                description: 'Destroy a window by its AbjectId and all its child widgets.',
                 parameters: [
-                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window to destroy' },
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window AbjectId to destroy' },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
-                name: 'addWidget',
-                description: 'Add a widget to a window (backward-compatible shim)',
+                name: 'createLabel',
+                description: 'Create a label widget inside a window. Returns the widget AbjectId.',
                 parameters: [
-                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target window' },
-                  { name: 'id', type: { kind: 'primitive', primitive: 'string' }, description: 'Widget identifier' },
-                  { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: 'Widget type' },
-                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: 'Widget position' },
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height }' },
+                  { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Label text', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'WidgetStyle' }, description: 'Visual style overrides', optional: true },
                 ],
-                returns: { kind: 'primitive', primitive: 'boolean' },
+                returns: { kind: 'primitive', primitive: 'string' },
               },
               {
-                name: 'updateWidget',
-                description: 'Update widget properties (backward-compatible shim)',
+                name: 'createButton',
+                description: 'Create a button widget. Returns the widget AbjectId. Listen for "changed" events with aspect "click".',
                 parameters: [
-                  { name: 'widgetId', type: { kind: 'primitive', primitive: 'string' }, description: 'Widget ID' },
-                  { name: 'updates', type: { kind: 'reference', reference: 'WidgetUpdates' }, description: 'Properties to update' },
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height }' },
+                  { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Button label', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'WidgetStyle' }, description: 'Visual style overrides', optional: true },
                 ],
-                returns: { kind: 'primitive', primitive: 'boolean' },
+                returns: { kind: 'primitive', primitive: 'string' },
               },
               {
-                name: 'removeWidget',
-                description: 'Remove a single widget',
+                name: 'createTextInput',
+                description: 'Create a single-line text input. Returns the widget AbjectId. Listen for "changed" events with aspect "change" or "submit".',
                 parameters: [
-                  { name: 'widgetId', type: { kind: 'primitive', primitive: 'string' }, description: 'Widget to remove' },
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height }' },
+                  { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Initial text', optional: true },
+                  { name: 'placeholder', type: { kind: 'primitive', primitive: 'string' }, description: 'Placeholder text', optional: true },
+                  { name: 'masked', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, shows dots (for passwords)', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'WidgetStyle' }, description: 'Visual style overrides', optional: true },
                 ],
-                returns: { kind: 'primitive', primitive: 'boolean' },
+                returns: { kind: 'primitive', primitive: 'string' },
               },
               {
-                name: 'getWidgetValue',
-                description: 'Get the current value of a widget (backward-compatible shim)',
+                name: 'createTextArea',
+                description: 'Create a multi-line text area. Returns the widget AbjectId.',
                 parameters: [
-                  { name: 'widgetId', type: { kind: 'primitive', primitive: 'string' }, description: 'Widget ID' },
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height }' },
+                  { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Initial text', optional: true },
+                  { name: 'monospace', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, use monospace font', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'WidgetStyle' }, description: 'Visual style overrides', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createCheckbox',
+                description: 'Create a checkbox widget. Returns the widget AbjectId. Listen for "changed" events with aspect "change".',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height }' },
+                  { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Checkbox label', optional: true },
+                  { name: 'checked', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Initial checked state', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'WidgetStyle' }, description: 'Visual style overrides', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createProgress',
+                description: 'Create a progress bar widget. Returns the widget AbjectId.',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height }' },
+                  { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Label text', optional: true },
+                  { name: 'value', type: { kind: 'primitive', primitive: 'number' }, description: 'Progress value (0-100)', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'WidgetStyle' }, description: 'Visual style overrides', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createDivider',
+                description: 'Create a horizontal divider line. Returns the widget AbjectId.',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height }' },
+                  { name: 'style', type: { kind: 'reference', reference: 'WidgetStyle' }, description: 'Visual style overrides', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createSelect',
+                description: 'Create a dropdown select widget. Returns the widget AbjectId. Listen for "changed" events with aspect "change".',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height }' },
+                  { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Label text', optional: true },
+                  { name: 'options', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Available options', optional: true },
+                  { name: 'selectedIndex', type: { kind: 'primitive', primitive: 'number' }, description: 'Initially selected index', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'WidgetStyle' }, description: 'Visual style overrides', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createVBox',
+                description: 'Create a vertical box layout inside a window. Add children via the layout\'s addChild method. Returns the layout AbjectId.',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
+                  { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createHBox',
+                description: 'Create a horizontal box layout inside a window. Add children via the layout\'s addChild method. Returns the layout AbjectId.',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
+                  { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createNestedVBox',
+                description: 'Create a nested vertical box layout inside a parent layout. Returns the layout AbjectId.',
+                parameters: [
+                  { name: 'parentLayoutId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent layout AbjectId' },
+                  { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
+                  { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createNestedHBox',
+                description: 'Create a nested horizontal box layout inside a parent layout. Returns the layout AbjectId.',
+                parameters: [
+                  { name: 'parentLayoutId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent layout AbjectId' },
+                  { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
+                  { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -149,6 +253,60 @@ export class WidgetManager extends Abject {
                     height: { kind: 'primitive', primitive: 'number' },
                   },
                 },
+              },
+              // Legacy shim methods for backward compatibility
+              {
+                name: 'createWindow',
+                description: '[Legacy] Create a window and return a shim string ID',
+                parameters: [
+                  { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Window title' },
+                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: 'Window position and size' },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'destroyWindow',
+                description: '[Legacy] Destroy a window by shim string ID',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window shim ID' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'addWidget',
+                description: '[Legacy] Add a widget to a window by shim IDs',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target window shim ID' },
+                  { name: 'id', type: { kind: 'primitive', primitive: 'string' }, description: 'Widget identifier' },
+                  { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: 'Widget type' },
+                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: 'Widget position' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'updateWidget',
+                description: '[Legacy] Update widget properties by shim ID',
+                parameters: [
+                  { name: 'widgetId', type: { kind: 'primitive', primitive: 'string' }, description: 'Widget shim ID' },
+                  { name: 'updates', type: { kind: 'reference', reference: 'WidgetUpdates' }, description: 'Properties to update' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'removeWidget',
+                description: '[Legacy] Remove a widget by shim ID',
+                parameters: [
+                  { name: 'widgetId', type: { kind: 'primitive', primitive: 'string' }, description: 'Widget shim ID' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'getWidgetValue',
+                description: '[Legacy] Get widget value by shim ID',
+                parameters: [
+                  { name: 'widgetId', type: { kind: 'primitive', primitive: 'string' }, description: 'Widget shim ID' },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
               },
             ],
             events: [
@@ -505,11 +663,8 @@ export class WidgetManager extends Abject {
     });
   }
 
-  /**
-   * Set the UIServer dependency.
-   */
-  setDependencies(uiServerId: AbjectId): void {
-    this.uiServerId = uiServerId;
+  protected override async onInit(): Promise<void> {
+    this.uiServerId = await this.requireDep('UIServer');
   }
 
   // ── Factory: createWindow ─────────────────────────────────────────────
@@ -531,7 +686,7 @@ export class WidgetManager extends Abject {
       zIndex: options?.zIndex ?? 100,
     });
 
-    await win.init(this.bus);
+    await win.init(this.bus, this.id);
     this.spawnedWindows.add(win.id);
 
     // Register as dependent of the window (for windowMoved/windowResized events)
@@ -565,7 +720,7 @@ export class WidgetManager extends Abject {
       zIndex: options?.zIndex ?? 100,
     });
 
-    await win.init(this.bus);
+    await win.init(this.bus, this.id);
     this.spawnedWindows.add(win.id);
     return win.id;
   }
@@ -595,7 +750,7 @@ export class WidgetManager extends Abject {
   ): Promise<AbjectId> {
     require(this.uiServerId !== undefined, 'UIServer not set');
 
-    await layout.init(this.bus);
+    await layout.init(this.bus, this.id);
     this.spawnedWidgets.add(layout.id);
 
     // Add the layout as the window's child with a full-content rect
@@ -618,7 +773,7 @@ export class WidgetManager extends Abject {
   ): Promise<AbjectId> {
     require(this.uiServerId !== undefined, 'UIServer not set');
 
-    await layout.init(this.bus);
+    await layout.init(this.bus, this.id);
     this.spawnedWidgets.add(layout.id);
 
     return layout.id;
@@ -633,7 +788,7 @@ export class WidgetManager extends Abject {
   ): Promise<AbjectId> {
     require(this.uiServerId !== undefined, 'UIServer not set');
 
-    await widget.init(this.bus);
+    await widget.init(this.bus, this.id);
     this.spawnedWidgets.add(widget.id);
 
     // Only add to window if rect is non-zero.
@@ -770,7 +925,7 @@ export class WidgetManager extends Abject {
         return false;
     }
 
-    await widget.init(this.bus);
+    await widget.init(this.bus, this.id);
     this.spawnedWidgets.add(widget.id);
 
     // Register WidgetManager as dependent of the widget (for event translation)

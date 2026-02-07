@@ -106,11 +106,16 @@ export class RegistryBrowser extends Abject {
     this.setupHandlers();
   }
 
-  setDependencies(widgetManagerId: AbjectId, registryId: AbjectId, objectCreatorId?: AbjectId, llmId?: AbjectId): void {
-    this.widgetManagerId = widgetManagerId;
-    this.registryId = registryId;
-    this.objectCreatorId = objectCreatorId;
-    this.llmId = llmId;
+  protected override async onInit(): Promise<void> {
+    this.widgetManagerId = await this.requireDep('WidgetManager');
+    this.registryId = await this.requireDep('Registry');
+    this.objectCreatorId = await this.discoverDep('ObjectCreator') ?? undefined;
+    this.llmId = await this.discoverDep('LLM') ?? undefined;
+
+    if (this.registryId) {
+      await this.request(request(this.id, this.registryId,
+        'abjects:registry' as InterfaceId, 'subscribe', {}));
+    }
   }
 
   /**
@@ -187,6 +192,13 @@ export class RegistryBrowser extends Abject {
       if (aspect !== 'click' && aspect !== 'submit') return;
       const fromId = msg.routing.from;
       await this.handleWidgetEvent(fromId, aspect, value);
+    });
+
+    this.on('objectRegistered', async () => {
+      this.cachedObjects = await this.registryList();
+      if (this.windowId) {
+        await this.showListView();
+      }
     });
   }
 

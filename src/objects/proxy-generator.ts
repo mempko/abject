@@ -128,11 +128,8 @@ export class ProxyGenerator extends Abject {
     });
   }
 
-  /**
-   * Set the LLM object ID for code generation via message passing.
-   */
-  setLLMId(id: AbjectId): void {
-    this.llmId = id;
+  protected override async onInit(): Promise<void> {
+    this.llmId = await this.requireDep('LLM');
   }
 
   /**

@@ -13,11 +13,12 @@ import {
   CapabilityGrant,
 } from './types.js';
 import { require, invariant, requireNonEmpty } from './contracts.js';
-import { reply, error, errorFromException, event, isRequest, isReply, isError } from './message.js';
+import { reply, error, errorFromException, event, request, isRequest, isReply, isError } from './message.js';
 import { Mailbox } from '../runtime/mailbox.js';
 import { MessageBus } from '../runtime/message-bus.js';
 import { CapabilitySet, getDefaultCapabilities } from './capability.js';
 import { INTROSPECT_INTERFACE, INTROSPECT_INTERFACE_ID, formatManifestAsDescription } from './introspect.js';
+import type { InterfaceId } from './types.js';
 
 export type MessageHandlerFn = (
   message: AbjectMessage
@@ -46,6 +47,8 @@ export abstract class Abject {
 
   private _bus?: MessageBus;
   private _mailbox?: Mailbox;
+  private _parentId?: AbjectId;
+  private _registryId?: AbjectId;
   private handlers: Map<string, MessageHandlerFn> = new Map();
   private dependents: Set<AbjectId> = new Set();
   private pendingReplies: Map<string, {
@@ -108,11 +111,12 @@ export abstract class Abject {
   /**
    * Initialize the object. Called after registration with the bus.
    */
-  async init(bus: MessageBus): Promise<void> {
+  async init(bus: MessageBus, parentId?: AbjectId): Promise<void> {
     require(this._status === 'initializing', 'Object must be initializing');
     require(this._bus === undefined, 'Object already initialized');
 
     this._bus = bus;
+    this._parentId = parentId;
     this._mailbox = bus.register(this.id, this.handleMessage.bind(this));
 
     // Register the introspect handler on every Abject
@@ -132,11 +136,46 @@ export abstract class Abject {
       return true;
     });
 
+    // Pull-based registry discovery chain
+    this.on('getRegistry', async () => {
+      const known = this.getRegistryId();
+      if (known) return known;
+      if (this._parentId) {
+        try {
+          const id = await this.request<string>(
+            request(this.id, this._parentId, INTROSPECT_INTERFACE_ID, 'getRegistry', {})
+          );
+          if (id) this._registryId = id as AbjectId;
+          return id;
+        } catch {
+          return null;
+        }
+      }
+      return null;
+    });
+
+    // LLM-powered ask handler
+    this.on('ask', async (msg: AbjectMessage) => {
+      const { question } = msg.payload as { question: string };
+      return this.handleAsk(question);
+    });
+
     this._status = 'ready';
 
     await this.onInit();
 
     this.checkInvariants();
+
+    // Notify parent after full initialization
+    if (this._parentId) {
+      try {
+        await this.send(event(this.id, this._parentId, INTROSPECT_INTERFACE_ID, 'childReady', {
+          childId: this.id, name: this.manifest.name,
+        }));
+      } catch {
+        // Parent may not handle childReady — that's OK
+      }
+    }
   }
 
   /**
@@ -144,6 +183,121 @@ export abstract class Abject {
    */
   protected async onInit(): Promise<void> {
     // Default: no-op
+  }
+
+  /**
+   * Get the cached Registry ID. Override in subclasses that know the Registry directly.
+   */
+  protected getRegistryId(): AbjectId | undefined {
+    return this._registryId;
+  }
+
+  /**
+   * Resolve and cache the Registry ID (via parent chain).
+   */
+  protected async resolveRegistryId(): Promise<AbjectId | null> {
+    const known = this.getRegistryId();
+    if (known) return known;
+    if (this._parentId) {
+      try {
+        const id = await this.request<string>(
+          request(this.id, this._parentId, INTROSPECT_INTERFACE_ID, 'getRegistry', {})
+        );
+        if (id) {
+          this._registryId = id as AbjectId;
+          return this._registryId;
+        }
+      } catch { /* no registry available */ }
+    }
+    return null;
+  }
+
+  /**
+   * Discover a dependency by manifest name via Registry.
+   * Returns null if not found.
+   */
+  protected async discoverDep(name: string): Promise<AbjectId | null> {
+    const regId = await this.resolveRegistryId();
+    if (!regId) return null;
+    const results = await this.request<Array<{ id: AbjectId }>>(
+      request(this.id, regId, 'abjects:registry' as InterfaceId, 'discover', { name })
+    );
+    return results.length > 0 ? results[0].id : null;
+  }
+
+  /**
+   * Discover a dependency by manifest name. Throws if not found.
+   */
+  protected async requireDep(name: string): Promise<AbjectId> {
+    const id = await this.discoverDep(name);
+    if (!id) throw new Error(`Required dependency '${name}' not found in Registry`);
+    return id;
+  }
+
+  /**
+   * Return source code for the ask handler. Override in ScriptableAbject.
+   */
+  protected getSourceForAsk(): string | undefined {
+    return undefined;
+  }
+
+  /**
+   * Handle an 'ask' request: use LLM if available, else fall back to manifest description.
+   */
+  private async handleAsk(question: string): Promise<string> {
+    const manifestDesc = formatManifestAsDescription(this.manifest);
+    const source = this.getSourceForAsk();
+
+    // Try to discover LLM via Registry
+    try {
+      let regId = this.getRegistryId();
+      if (!regId && this._parentId) {
+        try {
+          const id = await this.request<string>(
+            request(this.id, this._parentId, INTROSPECT_INTERFACE_ID, 'getRegistry', {})
+          );
+          if (id) {
+            regId = id as AbjectId;
+            this._registryId = regId;
+          }
+        } catch {
+          // No registry available
+        }
+      }
+
+      if (regId) {
+        // Discover LLM via Registry
+        const results = await this.request<Array<{ id: AbjectId }>>(
+          request(this.id, regId, 'abjects:registry' as InterfaceId, 'discover', { name: 'LLM' })
+        );
+
+        if (results && results.length > 0) {
+          const llmId = results[0].id;
+
+          // Build context for LLM
+          let context = `Object manifest:\n${manifestDesc}`;
+          if (source) {
+            context += `\n\nObject source code:\n${source}`;
+          }
+
+          const llmResult = await this.request<{ content: string }>(
+            request(this.id, llmId, 'abjects:llm' as InterfaceId, 'complete', {
+              messages: [
+                { role: 'system', content: `You are answering questions about an object in the Abjects system. Use the provided manifest and source code to give accurate, concise answers.\n\n${context}` },
+                { role: 'user', content: question },
+              ],
+            }),
+            60000
+          );
+
+          return llmResult.content;
+        }
+      }
+    } catch {
+      // LLM not available or failed — fall back
+    }
+
+    return `[No LLM available] ${manifestDesc}`;
   }
 
   /**

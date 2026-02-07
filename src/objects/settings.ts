@@ -85,16 +85,11 @@ export class Settings extends Abject {
     this.setupHandlers();
   }
 
-  /**
-   * Set dependencies.
-   */
-  setDependencies(llmId: AbjectId, storageId: AbjectId, widgetManagerId: AbjectId): void {
-    this.llmId = llmId;
-    this.storageId = storageId;
-    this.widgetManagerId = widgetManagerId;
-  }
+  protected override async onInit(): Promise<void> {
+    this.llmId = await this.requireDep('LLM');
+    this.storageId = await this.requireDep('Storage');
+    this.widgetManagerId = await this.requireDep('WidgetManager');
 
-  protected async onInit(): Promise<void> {
     // Try to load saved API keys from storage
     let anthropicKey: string | null = null;
     let openaiKey: string | null = null;

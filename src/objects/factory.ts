@@ -20,20 +20,16 @@ import { ScriptableAbject } from './scriptable-abject.js';
 
 const FACTORY_INTERFACE = 'abjects:factory';
 
-export type ObjectConstructor = new (options: {
-  manifest: AbjectManifest;
-  capabilities?: CapabilityGrant[];
-  initialState?: unknown;
-}) => Abject;
+export type ObjectFactory = () => Abject;
 
 /**
  * The Factory object creates and manages object lifecycles.
  */
 export class Factory extends Abject {
   private spawned: Map<AbjectId, Abject> = new Map();
-  private constructors: Map<string, ObjectConstructor> = new Map();
+  private constructors: Map<string, ObjectFactory> = new Map();
   private _factoryBus?: MessageBus;
-  private _registryId?: AbjectId;
+  private _factoryRegistryId?: AbjectId;
   private _baseDeps: Record<string, AbjectId> = {};
 
   constructor() {
@@ -120,7 +116,7 @@ export class Factory extends Abject {
    * Set the registry ID for object registration via message passing.
    */
   setRegistryId(id: AbjectId): void {
-    this._registryId = id;
+    this._factoryRegistryId = id;
   }
 
   /**
@@ -133,9 +129,9 @@ export class Factory extends Abject {
   /**
    * Register a constructor for a named object type.
    */
-  registerConstructor(name: string, constructor: ObjectConstructor): void {
+  registerConstructor(name: string, factory: ObjectFactory): void {
     require(name !== '', 'name must not be empty');
-    this.constructors.set(name, constructor);
+    this.constructors.set(name, factory);
   }
 
   /**
@@ -145,18 +141,14 @@ export class Factory extends Abject {
     require(this._factoryBus !== undefined, 'Factory must have a message bus');
     require(req.manifest !== undefined, 'manifest is required');
 
-    // Check if we have a registered constructor
-    const Constructor = this.constructors.get(req.manifest.name);
+    // Check if we have a registered factory
+    const factory = this.constructors.get(req.manifest.name);
 
     let obj: Abject;
 
-    if (Constructor) {
-      // Use registered constructor
-      obj = new Constructor({
-        manifest: req.manifest,
-        capabilities: req.grantedCapabilities,
-        initialState: req.initialState,
-      });
+    if (factory) {
+      // Use registered factory function
+      obj = factory();
     } else if (req.source) {
       // Spawn a ScriptableAbject from handler source
       obj = new ScriptableAbject(
@@ -173,19 +165,19 @@ export class Factory extends Abject {
       );
     }
 
-    // Initialize the object
-    await obj.init(this._factoryBus!);
+    // Initialize the object with parentId (default to Factory)
+    await obj.init(this._factoryBus!, req.parentId ?? this.id);
 
     // Track spawned object
     this.spawned.set(obj.id, obj);
 
-    // Inject dependencies into ScriptableAbjects
+    // Inject dependencies into ScriptableAbjects (for the this.dep() runtime API)
     if (obj instanceof ScriptableAbject) {
       obj.setDeps({ ...this._baseDeps, ...(req.deps ?? {}) });
     }
 
     // Register with registry via message passing
-    if (this._registryId) {
+    if (this._factoryRegistryId) {
       const payload: Record<string, unknown> = {
         objectId: obj.id,
         manifest: obj.manifest,
@@ -196,7 +188,7 @@ export class Factory extends Abject {
         payload.source = obj.source;
       }
       await this.request(
-        request(this.id, this._registryId, 'abjects:registry' as InterfaceId, 'register', payload)
+        request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'register', payload)
       );
     }
 
@@ -211,11 +203,11 @@ export class Factory extends Abject {
   /**
    * Spawn an existing object instance.
    */
-  async spawnInstance(obj: Abject): Promise<SpawnResult> {
+  async spawnInstance(obj: Abject, parentId?: AbjectId): Promise<SpawnResult> {
     require(this._factoryBus !== undefined, 'Factory must have a message bus');
 
     // Initialize the object
-    await obj.init(this._factoryBus!);
+    await obj.init(this._factoryBus!, parentId);
 
     // Track spawned object
     this.spawned.set(obj.id, obj);
@@ -226,7 +218,7 @@ export class Factory extends Abject {
     }
 
     // Register with registry via message passing
-    if (this._registryId) {
+    if (this._factoryRegistryId) {
       const payload: Record<string, unknown> = {
         objectId: obj.id,
         manifest: obj.manifest,
@@ -237,7 +229,7 @@ export class Factory extends Abject {
         payload.source = obj.source;
       }
       await this.request(
-        request(this.id, this._registryId, 'abjects:registry' as InterfaceId, 'register', payload)
+        request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'register', payload)
       );
     }
 
@@ -262,9 +254,9 @@ export class Factory extends Abject {
     this.spawned.delete(objectId);
 
     // Unregister from registry via message passing
-    if (this._registryId) {
+    if (this._factoryRegistryId) {
       await this.request(
-        request(this.id, this._registryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
+        request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
       );
     }
 
@@ -291,6 +283,13 @@ export class Factory extends Abject {
    */
   get objectCount(): number {
     return this.spawned.size;
+  }
+
+  /**
+   * Factory knows the Registry directly.
+   */
+  protected override getRegistryId(): AbjectId | undefined {
+    return this._factoryRegistryId ?? super.getRegistryId();
   }
 
   /**

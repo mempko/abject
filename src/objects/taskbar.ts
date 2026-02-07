@@ -72,21 +72,13 @@ export class Taskbar extends Abject {
     this.setupHandlers();
   }
 
-  setDependencies(
-    widgetManagerId: AbjectId,
-    settingsId: AbjectId,
-    registryBrowserId: AbjectId,
-    objectWorkshopId: AbjectId,
-    registryId: AbjectId
-  ): void {
-    this.widgetManagerId = widgetManagerId;
-    this.settingsId = settingsId;
-    this.registryBrowserId = registryBrowserId;
-    this.objectWorkshopId = objectWorkshopId;
-    this.registryId = registryId;
-  }
+  protected override async onInit(): Promise<void> {
+    this.widgetManagerId = await this.requireDep('WidgetManager');
+    this.settingsId = await this.requireDep('Settings');
+    this.registryBrowserId = await this.requireDep('RegistryBrowser');
+    this.objectWorkshopId = await this.requireDep('ObjectWorkshop');
+    this.registryId = await this.requireDep('Registry');
 
-  protected async onInit(): Promise<void> {
     // Subscribe to registry for auto-refresh when new objects are registered
     if (this.registryId) {
       await this.request(request(this.id, this.registryId,
@@ -164,7 +156,11 @@ export class Taskbar extends Abject {
               } catch (err) {
                 console.warn(`[Taskbar] Failed to show ${reg.manifest.name}:`, err);
               }
+            } else {
+              console.warn(`[Taskbar] No show interface found for ${reg.manifest.name}`);
             }
+          } else {
+            console.warn(`[Taskbar] Registry lookup failed for ${targetId}`);
           }
         }
       }

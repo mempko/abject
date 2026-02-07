@@ -5,6 +5,7 @@
  */
 
 import { createApp, App } from './ui/app.js';
+import { AbjectId, AbjectMessage, InterfaceId, SpawnResult } from './core/types.js';
 import { LLMObject } from './objects/llm-object.js';
 import { ObjectCreator } from './objects/object-creator.js';
 import { ProxyGenerator } from './objects/proxy-generator.js';
@@ -150,6 +151,9 @@ function showError(container: HTMLElement, err: unknown): void {
 
 /**
  * Initialize and start the Abjects system in the browser.
+ *
+ * All system objects are spawned via Factory messages. Each object discovers
+ * its own dependencies via Registry self-discovery in `onInit()`.
  */
 async function main(): Promise<App> {
   console.log('[ABJECTS] Initializing...');
@@ -165,118 +169,152 @@ async function main(): Promise<App> {
   });
 
   const runtime = app.appRuntime;
+  const bus = runtime.messageBus;
+  const factoryId = runtime.objectFactory.id;
+  const registryId = runtime.objectRegistry.id;
+  const FACTORY_IFACE = 'abjects:factory' as InterfaceId;
+  const BOOTSTRAP_ID = 'bootstrap' as AbjectId;
 
-  // Create and spawn HttpClient first (LLM providers route through it)
-  const httpClient = new HttpClient();
-  await runtime.spawn(httpClient);
+  // Register a temporary bootstrap sender on the bus to enable request-reply
+  const pendingReplies = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  bus.register(BOOTSTRAP_ID, async (msg: AbjectMessage) => {
+    const pending = pendingReplies.get(msg.header.correlationId!);
+    if (pending) {
+      pendingReplies.delete(msg.header.correlationId!);
+      if (msg.header.type === 'error') {
+        pending.reject(new Error((msg.payload as { message: string }).message));
+      } else {
+        pending.resolve(msg.payload);
+      }
+    }
+  });
 
-  // Create and spawn LLM object
-  const llm = new LLMObject();
-  llm.setHttpClientId(httpClient.id);
-  llm.configure({
+  function bootstrapRequest<T>(target: AbjectId, iface: InterfaceId, method: string, payload: unknown): Promise<T> {
+    return new Promise((resolve, reject) => {
+      const msg = message.request(BOOTSTRAP_ID, target, iface, method, payload);
+      pendingReplies.set(msg.header.messageId, {
+        resolve: resolve as (v: unknown) => void, reject,
+      });
+      bus.send(msg);
+    });
+  }
+
+  // Helper: spawn via Factory message, return spawned object ID
+  async function factorySpawn(name: string): Promise<AbjectId> {
+    const result = await bootstrapRequest<SpawnResult>(factoryId, FACTORY_IFACE, 'spawn', {
+      manifest: { name, description: '', version: '1.0.0', interfaces: [],
+                  requiredCapabilities: [], tags: ['system'] },
+    });
+    return result.objectId;
+  }
+
+  // Register constructors with Factory (local calls — Factory is in-process)
+  runtime.objectFactory.registerConstructor('HttpClient', () => new HttpClient());
+  runtime.objectFactory.registerConstructor('LLMObject', () => new LLMObject());
+  runtime.objectFactory.registerConstructor('Storage', () => new Storage());
+  runtime.objectFactory.registerConstructor('Timer', () => new Timer());
+  runtime.objectFactory.registerConstructor('Clipboard', () => new Clipboard());
+  runtime.objectFactory.registerConstructor('Console', () => new Console());
+  runtime.objectFactory.registerConstructor('FileSystem', () => new FileSystem());
+  runtime.objectFactory.registerConstructor('WidgetManager', () => new WidgetManager());
+  runtime.objectFactory.registerConstructor('ProxyGenerator', () => new ProxyGenerator());
+  runtime.objectFactory.registerConstructor('Negotiator', () => new Negotiator());
+  runtime.objectFactory.registerConstructor('HealthMonitor', () => new HealthMonitor());
+  runtime.objectFactory.registerConstructor('ObjectCreator', () => new ObjectCreator());
+  runtime.objectFactory.registerConstructor('Settings', () => new Settings());
+  runtime.objectFactory.registerConstructor('RegistryBrowser', () => new RegistryBrowser());
+  runtime.objectFactory.registerConstructor('ObjectWorkshop', () => new ObjectWorkshop());
+  runtime.objectFactory.registerConstructor('Taskbar', () => new Taskbar());
+
+  // Spawn in dependency order via Factory messages
+  // Each object discovers its own dependencies via Registry self-discovery
+  const httpClientId = await factorySpawn('HttpClient');
+  const llmId = await factorySpawn('LLMObject');
+
+  // Configure LLM with API keys (still needed — this isn't a dep)
+  await bootstrapRequest(llmId, 'abjects:llm' as InterfaceId, 'configure', {
     anthropicApiKey: anthropicKey,
     openaiApiKey: openaiKey,
   });
-  await runtime.spawn(llm);
 
-  const storage = new Storage();
-  await runtime.spawn(storage);
+  const storageId = await factorySpawn('Storage');
+  const timerId = await factorySpawn('Timer');
+  const clipboardId = await factorySpawn('Clipboard');
+  const consoleId = await factorySpawn('Console');
+  const filesystemId = await factorySpawn('FileSystem');
+  const widgetManagerId = await factorySpawn('WidgetManager');
 
-  const timer = new Timer();
-  await runtime.spawn(timer);
-
-  const clipboard = new Clipboard();
-  await runtime.spawn(clipboard);
-
-  const consoleObj = new Console();
-  await runtime.spawn(consoleObj);
-
-  const filesystem = new FileSystem();
-  await runtime.spawn(filesystem);
-
-  // Create and spawn WidgetManager
-  const widgetManager = new WidgetManager();
-  widgetManager.setDependencies(app.appUIServer.id);
-  await runtime.spawn(widgetManager);
-
-  // Set base dependencies for ScriptableAbjects
+  // Set base deps for ScriptableAbjects (unchanged — they use setDeps())
   runtime.objectFactory.setBaseDeps({
-    Registry: runtime.objectRegistry.id,
+    Registry: registryId,
     UIServer: app.appUIServer.id,
-    WidgetManager: widgetManager.id,
+    WidgetManager: widgetManagerId,
   });
 
-  // Create proxy generator
-  const proxyGenerator = new ProxyGenerator();
-  proxyGenerator.setLLMId(llm.id);
-  await runtime.spawn(proxyGenerator);
+  const proxyGenId = await factorySpawn('ProxyGenerator');
+  const negotiatorId = await factorySpawn('Negotiator');
+  const healthMonitorId = await factorySpawn('HealthMonitor');
 
-  // Create negotiator
-  const negotiator = new Negotiator();
-  negotiator.setDependencies(
-    runtime.objectRegistry.id,
-    runtime.objectFactory.id,
-    proxyGenerator.id,
-    runtime.messageBus
-  );
-  await runtime.spawn(negotiator);
+  // Start monitoring (via message)
+  await bootstrapRequest(healthMonitorId,
+    'abjects:health-monitor' as InterfaceId, 'startMonitoring', {});
 
-  // Create health monitor
-  const healthMonitor = new HealthMonitor();
-  healthMonitor.setNegotiatorId(negotiator.id);
-  healthMonitor.startMonitoring();
-  await runtime.spawn(healthMonitor);
+  const objectCreatorId = await factorySpawn('ObjectCreator');
+  const settingsId = await factorySpawn('Settings');
+  const registryBrowserId = await factorySpawn('RegistryBrowser');
+  const objectWorkshopId = await factorySpawn('ObjectWorkshop');
+  const taskbarId = await factorySpawn('Taskbar');
 
-  // Wire negotiator → health monitor
-  negotiator.setHealthMonitorId(healthMonitor.id);
-
-  // Create object creator
-  const objectCreator = new ObjectCreator();
-  objectCreator.setDependencies(llm.id, runtime.objectRegistry.id, runtime.objectFactory.id, negotiator.id);
-  await runtime.spawn(objectCreator);
-
-  // Create settings (loads saved keys or shows config UI)
-  const settings = new Settings();
-  settings.setDependencies(llm.id, storage.id, widgetManager.id);
-  await runtime.spawn(settings);
-
-  // Create registry browser
-  const registryBrowser = new RegistryBrowser();
-  registryBrowser.setDependencies(widgetManager.id, runtime.objectRegistry.id, objectCreator.id, llm.id);
-  await runtime.spawn(registryBrowser);
-
-  // Create object workshop
-  const objectWorkshop = new ObjectWorkshop();
-  objectWorkshop.setDependencies(widgetManager.id, objectCreator.id);
-  await runtime.spawn(objectWorkshop);
-
-  // Create taskbar (must be last — needs references to other UI objects)
-  const taskbar = new Taskbar();
-  taskbar.setDependencies(widgetManager.id, settings.id, registryBrowser.id, objectWorkshop.id, runtime.objectRegistry.id);
-  await runtime.spawn(taskbar);
+  // Clean up bootstrap handler
+  bus.unregister(BOOTSTRAP_ID);
 
   console.log('[ABJECTS] System ready');
   console.log(`[ABJECTS] ${runtime.objectRegistry.objectCount} objects registered`);
 
   // Make app available globally for debugging
+  // Retrieve spawned object references from Factory for backward-compatible debug access
+  const getObj = (id: AbjectId) => runtime.objectFactory.getObject(id);
+
   (window as unknown as Record<string, unknown>).abjects = {
     app,
     runtime,
-    llm,
-    settings,
-    objectCreator,
-    registryBrowser,
-    objectWorkshop,
-    taskbar,
+    // Direct object references (for debugging and tests)
+    llm: getObj(llmId),
+    settings: getObj(settingsId),
+    objectCreator: getObj(objectCreatorId),
+    registryBrowser: getObj(registryBrowserId),
+    objectWorkshop: getObj(objectWorkshopId),
+    taskbar: getObj(taskbarId),
     registry: runtime.objectRegistry,
     factory: runtime.objectFactory,
-    httpClient,
-    storage,
-    timer,
-    clipboard,
-    console: consoleObj,
-    widgetManager,
-    filesystem,
+    httpClient: getObj(httpClientId),
+    storage: getObj(storageId),
+    timer: getObj(timerId),
+    clipboard: getObj(clipboardId),
+    console: getObj(consoleId),
+    widgetManager: getObj(widgetManagerId),
+    filesystem: getObj(filesystemId),
+    // Object IDs for message-based interaction
+    ids: {
+      llm: llmId,
+      settings: settingsId,
+      objectCreator: objectCreatorId,
+      registryBrowser: registryBrowserId,
+      objectWorkshop: objectWorkshopId,
+      taskbar: taskbarId,
+      registry: registryId,
+      factory: factoryId,
+      httpClient: httpClientId,
+      storage: storageId,
+      timer: timerId,
+      clipboard: clipboardId,
+      console: consoleId,
+      widgetManager: widgetManagerId,
+      filesystem: filesystemId,
+      proxyGenerator: proxyGenId,
+      negotiator: negotiatorId,
+      healthMonitor: healthMonitorId,
+    },
     modules: {
       SimpleAbject,
       Storage,

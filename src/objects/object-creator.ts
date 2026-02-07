@@ -222,14 +222,11 @@ export class ObjectCreator extends Abject {
     });
   }
 
-  /**
-   * Set dependencies via AbjectIds for message passing.
-   */
-  setDependencies(llmId: AbjectId, registryId: AbjectId, factoryId: AbjectId, negotiatorId?: AbjectId): void {
-    this.llmId = llmId;
-    this.registryId = registryId;
-    this.factoryId = factoryId;
-    this.negotiatorId = negotiatorId;
+  protected override async onInit(): Promise<void> {
+    this.llmId = await this.requireDep('LLM');
+    this.registryId = await this.requireDep('Registry');
+    this.factoryId = await this.requireDep('Factory');
+    this.negotiatorId = await this.requireDep('Negotiator');
   }
 
   /**
@@ -366,15 +363,56 @@ export class ObjectCreator extends Abject {
   }
 
   /**
-   * Format full manifest context for LLM prompts using introspect descriptions.
-   * Objects describe themselves — no manual formatting needed.
+   * Ask a dependency about its usage via the introspect 'ask' protocol.
+   * Returns null on failure (LLM not available, timeout, etc.).
    */
-  private formatFullManifestContext(deps: SelectedDependency[]): string {
+  private async askDependency(objectId: AbjectId, question: string): Promise<string | null> {
+    try {
+      return await this.request<string>(
+        request(this.id, objectId, INTROSPECT_INTERFACE_ID, 'ask', { question }),
+        60000
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Ask each dependency in parallel for a usage guide via the 'ask' protocol.
+   */
+  private async fetchUsageGuides(deps: SelectedDependency[]): Promise<Map<string, string>> {
+    const guides = new Map<string, string>();
+    if (deps.length === 0) return guides;
+
+    const promises = deps.map(async (dep) => {
+      const guide = await this.askDependency(
+        dep.id,
+        'How should another object use your methods? Give a concise guide with example this.call() invocations, event handler patterns, and any important constraints.'
+      );
+      if (guide) {
+        guides.set(dep.name, guide);
+      }
+    });
+
+    await Promise.all(promises);
+    return guides;
+  }
+
+  /**
+   * Format full manifest context for LLM prompts using introspect descriptions
+   * and LLM-powered usage guides from the 'ask' protocol.
+   */
+  private formatFullManifestContext(deps: SelectedDependency[], usageGuides?: Map<string, string>): string {
     if (deps.length === 0) return 'None';
 
     return deps
       .map((dep) => {
-        return `## ${dep.name} (id available as this.dep('${dep.name}'))\n${dep.description}\n\n  Usage: this.call(this.dep('${dep.name}'), interfaceId, methodName, payload)`;
+        let text = `## ${dep.name} (id available as this.dep('${dep.name}'))\n${dep.description}\n\n  Usage: this.call(this.dep('${dep.name}'), interfaceId, methodName, payload)`;
+        const guide = usageGuides?.get(dep.name);
+        if (guide) {
+          text += `\n\n### Usage Guide (from ${dep.name} itself):\n${guide}`;
+        }
+        return text;
       })
       .join('\n\n---\n\n');
   }
@@ -401,7 +439,11 @@ export class ObjectCreator extends Abject {
       const deps = await this.fetchFullManifests(selectedNames, summaries);
       console.log('[OBJECT-CREATOR] Fetched manifests for:', deps.map((d) => d.name));
 
-      const depContext = this.formatFullManifestContext(deps);
+      // Phase 0d: Ask each dependency for usage guides via 'ask' protocol
+      const usageGuides = await this.fetchUsageGuides(deps);
+      console.log('[OBJECT-CREATOR] Got usage guides from:', Array.from(usageGuides.keys()));
+
+      const depContext = this.formatFullManifestContext(deps, usageGuides);
 
       // Phase 1: Generate manifest
       const phase1 = await this.generateManifest(prompt, depContext, context);
@@ -470,6 +512,7 @@ export class ObjectCreator extends Abject {
           source: code,
           owner: this.id,
           deps: depsMap,
+          parentId: this.id,
         });
 
         // Phase 6: Connect to dependencies via Negotiator (fire-and-forget)
@@ -527,7 +570,8 @@ export class ObjectCreator extends Abject {
       const summaries = await this.discoverObjectSummaries();
       const selectedNames = await this.llmSelectDependencies(prompt, summaries);
       const deps = await this.fetchFullManifests(selectedNames, summaries);
-      const depContext = this.formatFullManifestContext(deps);
+      const usageGuides = await this.fetchUsageGuides(deps);
+      const depContext = this.formatFullManifestContext(deps, usageGuides);
 
       const sourceBlock = currentSource
         ? `\nCurrent handler source:\n\`\`\`javascript\n${currentSource}\n\`\`\`\n`
@@ -850,7 +894,10 @@ If the new object needs a visible window, its manifest MUST include these method
 The system Taskbar automatically discovers objects with show + hide and adds launch buttons for them. Without these methods, the user has no way to open the object.
 
 ### Non-UI Objects
-Objects that only perform background work (data processing, scheduling, etc.) do NOT need show/hide/widgetEvent.`;
+Objects that only perform background work (data processing, scheduling, etc.) do NOT need show/hide/widgetEvent.
+
+### Using Dependency Information
+Study the dependency descriptions and their "Usage Guide" sections carefully. They contain working examples of how to call each dependency's methods and handle its events.`;
   }
 
   /**
@@ -909,74 +956,11 @@ For runtime discovery of objects not in the dependency list:
 
 this.id — this object's own ID
 
-## Concrete Example: UI Object Handler Map
+## Using Dependencies
 
-This is a complete, minimal, working UI object. Study it carefully — it shows every critical pattern:
+Each dependency's description lists its interfaces, methods, and events. If a dependency also has a "Usage Guide" section, study it carefully — it contains working this.call() examples and event handler patterns provided by the object itself.
 
-\`\`\`javascript
-({
-  _windowId: null,
-
-  async show(msg) {
-    if (this._windowId) return true;
-    this._windowId = await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'createWindow', {
-      title: 'My Object',
-      rect: { x: 100, y: 100, width: 300, height: 200 },
-    });
-    await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'addWidget', {
-      windowId: this._windowId, id: 'title', type: 'label',
-      rect: { x: 16, y: 8, width: 260, height: 28 },
-      text: 'Hello!',
-      style: { fontSize: 20, fontWeight: 'bold', color: '#fff' },
-    });
-    await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'addWidget', {
-      windowId: this._windowId, id: 'my-button', type: 'button',
-      rect: { x: 16, y: 50, width: 120, height: 32 },
-      text: 'Click Me',
-    });
-    return true;
-  },
-
-  async hide(msg) {
-    if (!this._windowId) return true;
-    await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'destroyWindow', {
-      windowId: this._windowId,
-    });
-    this._windowId = null;
-    return true;
-  },
-
-  async widgetEvent(msg) {
-    const { widgetId, type, value } = msg.payload;
-    if (widgetId === 'my-button' && type === 'click') {
-      // handle click
-    }
-  }
-})
-\`\`\`
-
-## Widget Types Reference
-
-WidgetManager supports 8 widget types via addWidget (type field):
-- **label**: Static text. Key props: text, style (color, fontSize, fontWeight, align, background)
-- **button**: Clickable button. Emits widgetEvent with type='click'. Key props: text, style
-- **textInput**: Single-line text field. Emits 'change' on typing, 'submit' on Enter. Key props: text, placeholder, style
-- **checkbox**: Toggle checkbox. Emits 'change' with value 'true'/'false'. Key props: text (label), checked
-- **progress**: Read-only progress bar. Key props: value (0-1), text (optional overlay), style (color=fill, background=track)
-- **divider**: Horizontal or vertical line separator. Orientation determined by rect aspect ratio. Key props: style (color)
-- **select**: Dropdown select. Emits 'change' with selected option text. Key props: options (string[]), selectedIndex
-- **textArea**: Multi-line text editor. Emits 'change' on typing. Key props: text, monospace, placeholder, style
-
-## Calling Other Dependencies
-
-Each dependency description lists its interfaces and methods. Translate them into this.call() invocations:
-
-If a dependency named "SomeService" has:
-  Interface: abjects:some-service
-  Methods: doThing(x: string) -> { result: string }
-  Events: thingHappened — Payload: { data: string }
-
-Then:
+Translate dependency descriptions into this.call() invocations:
 \`\`\`javascript
 // Calling a method:
 const result = await this.call(this.dep('SomeService'), 'abjects:some-service', 'doThing', { x: 'hello' });
@@ -985,16 +969,6 @@ const result = await this.call(this.dep('SomeService'), 'abjects:some-service', 
 async thingHappened(msg) {
   const { data } = msg.payload;
   // handle the event
-}
-\`\`\`
-
-## Timer Events
-
-If your object uses a Timer dependency, handle timer events like this:
-\`\`\`javascript
-async timerFired(msg) {
-  const { timerId, data } = msg.payload;
-  // update state, refresh UI, etc.
 }
 \`\`\`
 
