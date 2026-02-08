@@ -3,7 +3,7 @@
     "target": "ES2022",
     "useDefineForClassFields": true,
     "module": "ESNext",
-    "lib": ["ES2022", "DOM", "DOM.Iterable", "WebWorker"],
+    "lib": ["ES2022"],
     "skipLibCheck": true,
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
@@ -17,5 +17,6 @@
     "forceConsistentCasingInFileNames": true,
     "esModuleInterop": true
   },
-  "include": ["src/**/*.ts", "workers/**/*.ts", "client/**/*.ts", "server/**/*.ts"]
+  "include": ["src/core/**/*.ts", "src/runtime/**/*.ts", "src/objects/**/*.ts", "src/protocol/**/*.ts", "src/llm/**/*.ts", "src/network/**/*.ts", "server/**/*.ts"],
+  "exclude": ["src/ui/**/*.ts", "client/**/*.ts"]
 }

@@ -35,6 +35,24 @@ export const INTROSPECT_INTERFACE: InterfaceDeclaration = {
       parameters: [],
       returns: { kind: 'reference', reference: 'IntrospectResult' },
     },
+    {
+      name: 'ask',
+      description: 'Ask this object a question about its capabilities, usage, or behavior.',
+      parameters: [
+        {
+          name: 'question',
+          type: { kind: 'primitive', primitive: 'string' },
+          description: 'A question about this object',
+        },
+      ],
+      returns: { kind: 'primitive', primitive: 'string' },
+    },
+    {
+      name: 'getRegistry',
+      description: 'Ask this object for the Registry ID. If unknown, asks its own parent (chains up).',
+      parameters: [],
+      returns: { kind: 'primitive', primitive: 'string' },
+    },
   ],
 };
 

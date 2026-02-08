@@ -107,6 +107,14 @@ export class ScriptableAbject extends Abject {
     this._deps = { ...deps };
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return this._source;
+  }
+
+  protected override getRegistryId(): AbjectId | undefined {
+    return this._deps['Registry'] ?? super.getRegistryId();
+  }
+
   /**
    * Get a dependency ID by name. Throws if not found.
    */

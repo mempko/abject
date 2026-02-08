@@ -11,7 +11,11 @@ const CLIPBOARD_INTERFACE = 'abjects:clipboard';
 /**
  * Clipboard capability object.
  */
+const isNode = typeof navigator === 'undefined';
+
 export class Clipboard extends Abject {
+  private memoryClipboard = '';
+
   constructor() {
     super({
       manifest: {
@@ -83,6 +87,10 @@ export class Clipboard extends Abject {
    * Read text from clipboard.
    */
   async readClipboard(): Promise<string> {
+    if (isNode) {
+      return this.memoryClipboard;
+    }
+
     if (!navigator.clipboard) {
       throw new Error('Clipboard API not available');
     }
@@ -100,6 +108,11 @@ export class Clipboard extends Abject {
    * Write text to clipboard.
    */
   async writeClipboard(text: string): Promise<boolean> {
+    if (isNode) {
+      this.memoryClipboard = text;
+      return true;
+    }
+
     if (!navigator.clipboard) {
       throw new Error('Clipboard API not available');
     }
@@ -118,6 +131,10 @@ export class Clipboard extends Abject {
    * Check if clipboard has text.
    */
   async hasClipboardText(): Promise<boolean> {
+    if (isNode) {
+      return this.memoryClipboard.length > 0;
+    }
+
     if (!navigator.clipboard) {
       return false;
     }
