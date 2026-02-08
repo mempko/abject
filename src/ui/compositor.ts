@@ -121,12 +121,13 @@ export class Compositor {
   createSurface(
     objectId: AbjectId,
     rect: Rect,
-    zIndex = 0
+    zIndex = 0,
+    surfaceId?: string
   ): string {
     require(objectId !== '', 'objectId is required');
     require(rect.width > 0 && rect.height > 0, 'Surface must have positive dimensions');
 
-    const id = `surface-${objectId}-${Date.now()}`;
+    const id = surfaceId ?? `surface-${objectId}-${Date.now()}`;
 
     const offscreen = new OffscreenCanvas(rect.width, rect.height);
     const ctx = offscreen.getContext('2d');
@@ -161,6 +162,15 @@ export class Compositor {
       this.needsRender = true;
     }
     return deleted;
+  }
+
+  /**
+   * Destroy all surfaces. Used when reconnecting to backend.
+   */
+  clearAllSurfaces(): void {
+    this.surfaces.clear();
+    this.sortedSurfaces = [];
+    this.needsRender = true;
   }
 
   /**
