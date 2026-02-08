@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "demo": "vite",
-    "server": "tsx --watch server/index.ts",
+    "serve": "tsx --watch server/index.ts",
     "client": "vite --config vite.client.config.ts",
     "build": "tsc && vite build",
     "preview": "vite preview",
