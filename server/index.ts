@@ -40,7 +40,7 @@ async function main(): Promise<void> {
   resetRuntime();
 
   // Create runtime
-  const runtime = getRuntime({ debug: true });
+  const runtime = getRuntime({ debug: !!process.env.DEBUG });
 
   // Create BackendUI (replaces UIServer)
   const backendUI = new BackendUI();
@@ -148,9 +148,6 @@ async function main(): Promise<void> {
   // Clean up bootstrap handler
   bus.unregister(BOOTSTRAP_ID);
 
-  console.log('[ABJECTS] System ready');
-  console.log(`[ABJECTS] ${runtime.objectRegistry.objectCount} objects registered`);
-
   // Start WebSocket server
   const wsServer = new NodeWebSocketServer({ port: WS_PORT });
 
@@ -159,7 +156,14 @@ async function main(): Promise<void> {
     backendUI.setWebSocket(ws);
   });
 
-  console.log(`[ABJECTS] Backend running on ws://localhost:${WS_PORT}`);
+  console.log('');
+  console.log(`  ABJECTS server running`);
+  console.log('');
+  console.log(`  WebSocket:  ws://localhost:${WS_PORT}`);
+  console.log(`  Objects:    ${runtime.objectRegistry.objectCount}`);
+  console.log(`  Surfaces:   ${backendUI.surfaceCount}`);
+  console.log('');
+  console.log(`  Waiting for frontend connection...`);
 
   // Handle graceful shutdown
   const shutdown = async () => {
