@@ -401,6 +401,11 @@ export abstract class Abject {
 
     this.lastActivity = Date.now();
 
+    // Save status to handle re-entrant message delivery (the message bus
+    // may call handleMessage recursively when a handler sends a message
+    // whose recipient sends a message back to this object).
+    const prevStatus = this._status;
+
     try {
       // Check for reply to pending request
       if (isReply(message) || isError(message)) {
@@ -435,7 +440,7 @@ export abstract class Abject {
       // Execute handler
       this._status = 'busy';
       const result = await handler(message);
-      this._status = 'ready';
+      this._status = prevStatus === 'busy' ? 'busy' : 'ready';
 
       // Send reply if this was a request
       if (isRequest(message) && result !== undefined) {
@@ -458,7 +463,10 @@ export abstract class Abject {
         }
       }
 
-      this._status = 'error';
+      // Only set error status if this is the outermost handler (not re-entrant)
+      if (prevStatus !== 'busy') {
+        this._status = 'error';
+      }
       console.error(`[${this.id}] Error handling message:`, err);
     }
 

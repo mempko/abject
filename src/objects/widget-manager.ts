@@ -1101,9 +1101,9 @@ createNestedHBox - Nested horizontal layout inside another layout
       }
     }
 
-    // Destroy the widget
+    // Destroy the widget (must use request() so the reply is consumed)
     try {
-      await this.send(request(this.id, abjectId, WIDGET_INTERFACE, 'destroy', {}));
+      await this.request(request(this.id, abjectId, WIDGET_INTERFACE, 'destroy', {}));
     } catch {
       // Widget may be gone
     }

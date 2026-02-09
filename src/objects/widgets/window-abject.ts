@@ -51,6 +51,9 @@ export class WindowAbject extends Abject {
   private expandedSelects: Set<AbjectId> = new Set();
   private focusedChildId?: AbjectId;
 
+  private destroying = false;
+  private rendering = false;
+
   private dragState?: {
     type: 'move' | 'resize';
     edge: string;
@@ -213,6 +216,7 @@ export class WindowAbject extends Abject {
 
     // Child dirty notification — triggers re-render
     this.on('childDirty', async () => {
+      if (this.destroying || this.rendering) return;
       await this.renderWindow();
     });
 
@@ -248,9 +252,18 @@ export class WindowAbject extends Abject {
   // ── Rendering (Morphic drawOn:) ──────────────────────────────────────
 
   private async renderWindow(): Promise<void> {
-    if (!this.surfaceId) return;
+    if (!this.surfaceId || this.destroying || this.rendering) return;
 
-    const sid = this.surfaceId;
+    this.rendering = true;
+    try {
+      await this.renderWindowInner();
+    } finally {
+      this.rendering = false;
+    }
+  }
+
+  private async renderWindowInner(): Promise<void> {
+    const sid = this.surfaceId!;
     const w = this.rect.width;
     const h = this.rect.height;
     const commands: unknown[] = [];
@@ -323,6 +336,10 @@ export class WindowAbject extends Abject {
         // Widget may have been destroyed — skip silently
       }
     }
+
+    // Window may have been destroyed mid-render (e.g., destroy arrived
+    // re-entrantly during a child render await).
+    if (this.destroying || !this.surfaceId) return;
 
     // Draw all commands to surface
     await this.request<boolean>(
@@ -736,10 +753,13 @@ export class WindowAbject extends Abject {
   // ── Lifecycle ──────────────────────────────────────────────────────────
 
   private async destroyWindow(): Promise<void> {
-    // Send destroy message to all children
+    this.destroying = true;
+    // Send destroy message to all children (must use request() so the reply
+    // is consumed; using send() with a request message causes the reply to
+    // fall through as a new handler invocation).
     for (const childId of this.children) {
       try {
-        await this.send(request(this.id, childId, WIDGET_INTERFACE, 'destroy', {}));
+        await this.request(request(this.id, childId, WIDGET_INTERFACE, 'destroy', {}));
       } catch {
         // Child may already be gone
       }
