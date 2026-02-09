@@ -21,8 +21,8 @@ export interface StorageEntry {
  */
 export class Storage extends Abject {
   private db?: IDBDatabase;
-  private memoryFallback: Map<string, StorageEntry> = new Map();
-  private useMemory = false;
+  protected memoryFallback: Map<string, StorageEntry> = new Map();
+  protected useMemory = false;
 
   constructor() {
     super({

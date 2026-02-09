@@ -15,7 +15,7 @@ import { ProxyGenerator } from '../src/objects/proxy-generator.js';
 import { Negotiator } from '../src/protocol/negotiator.js';
 import { HealthMonitor } from '../src/protocol/health-monitor.js';
 import { HttpClient } from '../src/objects/capabilities/http-client.js';
-import { Storage } from '../src/objects/capabilities/storage.js';
+import { NodeStorage } from './node-storage.js';
 import { Timer } from '../src/objects/capabilities/timer.js';
 import { Clipboard } from '../src/objects/capabilities/clipboard.js';
 import { Console } from '../src/objects/capabilities/console.js';
@@ -90,7 +90,7 @@ async function main(): Promise<void> {
   // Register constructors with Factory
   runtime.objectFactory.registerConstructor('HttpClient', () => new HttpClient());
   runtime.objectFactory.registerConstructor('LLMObject', () => new LLMObject());
-  runtime.objectFactory.registerConstructor('Storage', () => new Storage());
+  runtime.objectFactory.registerConstructor('Storage', () => new NodeStorage());
   runtime.objectFactory.registerConstructor('Timer', () => new Timer());
   runtime.objectFactory.registerConstructor('Clipboard', () => new Clipboard());
   runtime.objectFactory.registerConstructor('Console', () => new Console());

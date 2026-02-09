@@ -234,7 +234,8 @@ export class ObjectCreator extends Abject {
    */
   private async llmComplete(messages: LLMMessage[]): Promise<LLMCompletionResult> {
     return this.request<LLMCompletionResult>(
-      request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', { messages })
+      request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', { messages }),
+      120000
     );
   }
 
