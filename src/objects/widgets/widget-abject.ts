@@ -18,6 +18,8 @@ import {
   Rect,
   WidgetStyle,
   WidgetType,
+  ThemeData,
+  MIDNIGHT_BLOOM,
   WIDGET_INTERFACE,
   WINDOW_INTERFACE,
   WIDGET_FONT,
@@ -31,7 +33,7 @@ const UI_INTERFACE: InterfaceId = 'abjects:ui' as InterfaceId;
 export function buildFont(style: WidgetStyle): string {
   const weight = style.fontWeight ?? 'normal';
   const size = style.fontSize ?? 14;
-  return `${weight} ${size}px system-ui`;
+  return `${weight} ${size}px "Inter", system-ui, sans-serif`;
 }
 
 /**
@@ -98,6 +100,7 @@ export interface WidgetConfig {
   style?: WidgetStyle;
   ownerId: AbjectId;
   uiServerId: AbjectId;
+  theme?: ThemeData;
 }
 
 /**
@@ -111,6 +114,7 @@ export abstract class WidgetAbject extends Abject {
   protected uiServerId: AbjectId;
   protected focused = false;
   protected widgetType: WidgetType;
+  protected theme: ThemeData;
 
   constructor(config: WidgetConfig) {
     super({
@@ -131,6 +135,7 @@ export abstract class WidgetAbject extends Abject {
     this.text = config.text ?? '';
     this.ownerId = config.ownerId;
     this.uiServerId = config.uiServerId;
+    this.theme = config.theme ?? MIDNIGHT_BLOOM;
 
     this.setupWidgetHandlers();
   }
@@ -163,6 +168,12 @@ export abstract class WidgetAbject extends Abject {
     this.on('handleInput', async (msg: AbjectMessage) => {
       const input = msg.payload as Record<string, unknown>;
       return this.processInput(input);
+    });
+
+    this.on('updateTheme', async (msg: AbjectMessage) => {
+      this.theme = msg.payload as ThemeData;
+      await this.requestRedraw();
+      return true;
     });
 
     this.on('destroy', async () => {

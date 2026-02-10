@@ -16,7 +16,7 @@ export class DividerWidget extends WidgetAbject {
     const commands: unknown[] = [];
     const w = this.rect.width;
     const h = this.rect.height;
-    const divColor = this.style.color ?? '#444';
+    const divColor = this.style.color ?? this.theme.divider;
 
     if (w > h) {
       // Horizontal divider

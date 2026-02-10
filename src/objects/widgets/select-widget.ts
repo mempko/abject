@@ -34,7 +34,7 @@ export class SelectWidget extends WidgetAbject {
     const h = this.rect.height;
     const style = this.style;
     const font = buildFont(style);
-    const radius = style.radius ?? 4;
+    const radius = style.radius ?? this.theme.widgetRadius;
     const options = this.options;
     const selectedIndex = this.selectedIndex;
     const selectedText = options[selectedIndex] ?? '';
@@ -45,8 +45,8 @@ export class SelectWidget extends WidgetAbject {
       surfaceId,
       params: {
         x: ox, y: oy, width: w, height: h,
-        fill: style.background ?? '#2a2a3e',
-        stroke: style.borderColor ?? '#555',
+        fill: style.background ?? this.theme.selectBg,
+        stroke: style.borderColor ?? this.theme.buttonBorder,
         radius,
       },
     });
@@ -60,7 +60,7 @@ export class SelectWidget extends WidgetAbject {
         y: oy + h / 2,
         text: selectedText,
         font,
-        fill: style.color ?? '#ddd',
+        fill: style.color ?? this.theme.textSecondary,
         baseline: 'middle',
       },
     });
@@ -74,7 +74,7 @@ export class SelectWidget extends WidgetAbject {
         y: oy + h / 2,
         text: '\u25be',
         font,
-        fill: style.color ?? '#888',
+        fill: this.theme.selectArrow,
         baseline: 'middle',
       },
     });
@@ -90,8 +90,8 @@ export class SelectWidget extends WidgetAbject {
         surfaceId,
         params: {
           x: ox, y: oy + h, width: w, height: dropdownH,
-          fill: style.background ?? '#2a2a3e',
-          stroke: style.borderColor ?? '#555',
+          fill: style.background ?? this.theme.selectBg,
+          stroke: style.borderColor ?? this.theme.buttonBorder,
           radius: 2,
         },
       });
@@ -106,7 +106,7 @@ export class SelectWidget extends WidgetAbject {
             surfaceId,
             params: {
               x: ox + 1, y: optY, width: w - 2, height: optionHeight,
-              fill: '#4a4a6e',
+              fill: this.theme.selectHover,
             },
           });
         }
@@ -119,7 +119,7 @@ export class SelectWidget extends WidgetAbject {
             y: optY + optionHeight / 2,
             text: options[i],
             font,
-            fill: style.color ?? '#ddd',
+            fill: style.color ?? this.theme.textSecondary,
             baseline: 'middle',
           },
         });

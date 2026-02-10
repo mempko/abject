@@ -18,7 +18,7 @@ export class ButtonWidget extends WidgetAbject {
     const h = this.rect.height;
     const style = this.style;
     const font = buildFont(style);
-    const radius = style.radius ?? 4;
+    const radius = style.radius ?? this.theme.widgetRadius;
 
     commands.push({
       type: 'rect',
@@ -28,8 +28,8 @@ export class ButtonWidget extends WidgetAbject {
         y: oy,
         width: w,
         height: h,
-        fill: style.background ?? '#4a4a6e',
-        stroke: style.borderColor ?? '#666',
+        fill: style.background ?? this.theme.buttonBg,
+        stroke: style.borderColor ?? this.theme.buttonBorder,
         radius,
       },
     });
@@ -42,7 +42,7 @@ export class ButtonWidget extends WidgetAbject {
         y: oy + h / 2,
         text: this.text,
         font,
-        fill: style.color ?? '#eee',
+        fill: style.color ?? this.theme.buttonText,
         align: 'center',
         baseline: 'middle',
       },

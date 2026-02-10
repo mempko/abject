@@ -25,6 +25,7 @@ import { Taskbar } from '../src/objects/taskbar.js';
 import { RegistryBrowser } from '../src/objects/registry-browser.js';
 import { ObjectWorkshop } from '../src/objects/object-workshop.js';
 import { WidgetManager } from '../src/objects/widget-manager.js';
+import { ThemeAbject } from '../src/objects/theme.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
 
 const WS_PORT = parseInt(process.env.WS_PORT ?? '7719', 10);
@@ -95,6 +96,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('Clipboard', () => new Clipboard());
   runtime.objectFactory.registerConstructor('Console', () => new Console());
   runtime.objectFactory.registerConstructor('FileSystem', () => new FileSystem());
+  runtime.objectFactory.registerConstructor('Theme', () => new ThemeAbject());
   runtime.objectFactory.registerConstructor('WidgetManager', () => new WidgetManager());
   runtime.objectFactory.registerConstructor('ProxyGenerator', () => new ProxyGenerator());
   runtime.objectFactory.registerConstructor('Negotiator', () => new Negotiator());
@@ -118,6 +120,7 @@ async function main(): Promise<void> {
   }
 
   const storageId = await factorySpawn('Storage');
+  const themeId = await factorySpawn('Theme');
   const timerId = await factorySpawn('Timer');
   const clipboardId = await factorySpawn('Clipboard');
   const consoleId = await factorySpawn('Console');

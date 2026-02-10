@@ -37,8 +37,8 @@ export class CheckboxWidget extends WidgetAbject {
         y: boxY,
         width: boxSize,
         height: boxSize,
-        fill: this.checked ? (style.background ?? '#4a4a6e') : 'transparent',
-        stroke: style.borderColor ?? '#555',
+        fill: this.checked ? (style.background ?? this.theme.checkboxCheckedBg) : 'transparent',
+        stroke: style.borderColor ?? this.theme.checkboxBorder,
         radius: 2,
       },
     });
@@ -53,7 +53,7 @@ export class CheckboxWidget extends WidgetAbject {
         params: {
           x1: cx + 3, y1: cy + 8,
           x2: cx + 6, y2: cy + 12,
-          stroke: style.color ?? '#fff',
+          stroke: this.theme.checkmarkColor,
         },
       });
       commands.push({
@@ -62,7 +62,7 @@ export class CheckboxWidget extends WidgetAbject {
         params: {
           x1: cx + 6, y1: cy + 12,
           x2: cx + 13, y2: cy + 4,
-          stroke: style.color ?? '#fff',
+          stroke: this.theme.checkmarkColor,
         },
       });
     }
@@ -76,7 +76,7 @@ export class CheckboxWidget extends WidgetAbject {
         y: oy + h / 2,
         text: this.text,
         font,
-        fill: style.color ?? '#aaa',
+        fill: style.color ?? this.theme.textTertiary,
         baseline: 'middle',
       },
     });

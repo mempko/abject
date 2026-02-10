@@ -34,19 +34,19 @@ export class TextAreaWidget extends WidgetAbject {
     const h = this.rect.height;
     const style = this.style;
     const font = buildFont(style);
-    const radius = style.radius ?? 4;
+    const radius = style.radius ?? this.theme.widgetRadius;
     const focused = this.focused;
     const lineHeight = this.lineHeight;
     const taFont = this.monospace ? CODE_FONT : (style.fontSize ? font : WIDGET_FONT);
 
     // Border rect
-    const borderColor = style.borderColor ?? (focused ? '#6a6aff' : '#555');
+    const borderColor = style.borderColor ?? (focused ? this.theme.inputBorderFocus : this.theme.inputBorder);
     commands.push({
       type: 'rect',
       surfaceId,
       params: {
         x: ox, y: oy, width: w, height: h,
-        fill: style.background ?? '#151520',
+        fill: style.background ?? this.theme.inputBg,
         stroke: borderColor,
         radius,
       },
@@ -76,7 +76,7 @@ export class TextAreaWidget extends WidgetAbject {
           y: lineY,
           text: lines[i],
           font: taFont,
-          fill: style.color ?? '#ddd',
+          fill: style.color ?? this.theme.textSecondary,
           baseline: 'alphabetic',
         },
       });
@@ -98,7 +98,7 @@ export class TextAreaWidget extends WidgetAbject {
           params: {
             x1: cursorX, y1: cursorY,
             x2: cursorX, y2: cursorY + lineHeight - 4,
-            stroke: '#8888ff',
+            stroke: this.theme.cursor,
           },
         });
       }

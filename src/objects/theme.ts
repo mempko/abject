@@ -1,0 +1,131 @@
+/**
+ * ThemeAbject — stores the active UI theme and broadcasts changes to dependents.
+ *
+ * All communication is via message passing:
+ *   getTheme  → returns the current ThemeData
+ *   setTheme  → merges partial theme, persists to Storage, broadcasts themeChanged
+ *   resetTheme → resets to MIDNIGHT_BLOOM default
+ */
+
+import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
+import { Abject } from '../core/abject.js';
+import { request } from '../core/message.js';
+import { require as contractRequire } from '../core/contracts.js';
+import { ThemeData, MIDNIGHT_BLOOM } from './widgets/widget-types.js';
+
+const THEME_INTERFACE: InterfaceId = 'abjects:theme' as InterfaceId;
+const STORAGE_INTERFACE: InterfaceId = 'abjects:storage' as InterfaceId;
+const STORAGE_KEY = 'theme:active';
+
+export const THEME_ID = 'abjects:theme' as AbjectId;
+
+export class ThemeAbject extends Abject {
+  private currentTheme: ThemeData = { ...MIDNIGHT_BLOOM };
+  private storageId?: AbjectId;
+
+  constructor() {
+    super({
+      manifest: {
+        name: 'Theme',
+        description: 'Stores the active UI theme and broadcasts changes to dependents via message passing',
+        version: '1.0.0',
+        interfaces: [
+          {
+            id: THEME_INTERFACE,
+            name: 'Theme',
+            description: 'Theme management — get, set, and reset the UI theme',
+            methods: [
+              {
+                name: 'getTheme',
+                description: 'Get the current theme data',
+                parameters: [],
+                returns: { kind: 'reference', reference: 'ThemeData' },
+              },
+              {
+                name: 'setTheme',
+                description: 'Merge partial theme data into the current theme, persist, and broadcast',
+                parameters: [
+                  { name: 'theme', type: { kind: 'reference', reference: 'Partial<ThemeData>' }, description: 'Partial theme to merge' },
+                ],
+                returns: { kind: 'reference', reference: 'ThemeData' },
+              },
+              {
+                name: 'resetTheme',
+                description: 'Reset to the default Midnight Bloom theme',
+                parameters: [],
+                returns: { kind: 'reference', reference: 'ThemeData' },
+              },
+            ],
+          },
+        ],
+        requiredCapabilities: [],
+        providedCapabilities: [],
+        tags: ['system', 'ui', 'theme'],
+      },
+    });
+
+    this.setupHandlers();
+  }
+
+  private setupHandlers(): void {
+    this.on('getTheme', async () => {
+      return { ...this.currentTheme };
+    });
+
+    this.on('setTheme', async (msg: AbjectMessage) => {
+      const partial = msg.payload as Partial<ThemeData>;
+      this.currentTheme = { ...this.currentTheme, ...partial };
+      this.applyBodyBackground();
+      await this.persistTheme();
+      await this.changed('themeChanged', { ...this.currentTheme });
+      return { ...this.currentTheme };
+    });
+
+    this.on('resetTheme', async () => {
+      this.currentTheme = { ...MIDNIGHT_BLOOM };
+      this.applyBodyBackground();
+      await this.persistTheme();
+      await this.changed('themeChanged', { ...this.currentTheme });
+      return { ...this.currentTheme };
+    });
+  }
+
+  protected override async onInit(): Promise<void> {
+    this.storageId = await this.discoverDep('Storage') ?? undefined;
+
+    if (this.storageId) {
+      try {
+        const saved = await this.request<ThemeData | null>(
+          request(this.id, this.storageId, STORAGE_INTERFACE, 'get', { key: STORAGE_KEY })
+        );
+        if (saved && typeof saved === 'object' && 'canvasBg' in saved) {
+          this.currentTheme = { ...MIDNIGHT_BLOOM, ...saved };
+        }
+      } catch {
+        // Storage not available or key not found — use default
+      }
+    }
+
+    this.applyBodyBackground();
+  }
+
+  private applyBodyBackground(): void {
+    if (typeof document !== 'undefined') {
+      document.body.style.background = this.currentTheme.canvasBg;
+    }
+  }
+
+  private async persistTheme(): Promise<void> {
+    if (!this.storageId) return;
+    try {
+      await this.request(
+        request(this.id, this.storageId, STORAGE_INTERFACE, 'set', {
+          key: STORAGE_KEY,
+          value: this.currentTheme,
+        })
+      );
+    } catch {
+      // Storage failure should not break theme operations
+    }
+  }
+}

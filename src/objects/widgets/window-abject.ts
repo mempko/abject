@@ -15,6 +15,8 @@ import { Abject } from '../../core/abject.js';
 import { request, event } from '../../core/message.js';
 import {
   Rect,
+  ThemeData,
+  MIDNIGHT_BLOOM,
   WIDGET_INTERFACE,
   WINDOW_INTERFACE,
   LAYOUT_INTERFACE,
@@ -33,6 +35,7 @@ export interface WindowConfig {
   resizable?: boolean;
   draggable?: boolean;
   zIndex?: number;
+  theme?: ThemeData;
 }
 
 /**
@@ -47,6 +50,7 @@ export class WindowAbject extends Abject {
   private resizable: boolean;
   private draggable: boolean;
   private zIndex: number;
+  private theme: ThemeData;
 
   private children: AbjectId[] = [];
   private childRects: Map<AbjectId, Rect> = new Map();
@@ -141,6 +145,7 @@ export class WindowAbject extends Abject {
     this.resizable = config.resizable ?? false;
     this.draggable = config.draggable ?? false;
     this.zIndex = config.zIndex ?? 100;
+    this.theme = config.theme ?? MIDNIGHT_BLOOM;
 
     this.setupHandlers();
   }
@@ -234,6 +239,12 @@ export class WindowAbject extends Abject {
         }
       }
     });
+
+    this.on('updateTheme', async (msg: AbjectMessage) => {
+      this.theme = msg.payload as ThemeData;
+      await this.renderWindow();
+      return true;
+    });
   }
 
   protected async onInit(): Promise<void> {
@@ -278,7 +289,7 @@ export class WindowAbject extends Abject {
     commands.push({
       type: 'rect',
       surfaceId: sid,
-      params: { x: 0, y: 0, width: w, height: h, fill: '#1e1e2e', stroke: '#444', radius: 6 },
+      params: { x: 0, y: 0, width: w, height: h, fill: this.theme.windowBg, stroke: this.theme.windowBorder, radius: this.theme.windowRadius },
     });
 
     if (!this.chromeless) {
@@ -286,25 +297,26 @@ export class WindowAbject extends Abject {
       commands.push({
         type: 'rect',
         surfaceId: sid,
-        params: { x: 0, y: 0, width: w, height: TITLE_BAR_HEIGHT, fill: '#2a2a3e', radius: 6 },
+        params: { x: 0, y: 0, width: w, height: TITLE_BAR_HEIGHT, fill: this.theme.titleBarBg, radius: this.theme.windowRadius },
       });
       commands.push({
         type: 'rect',
         surfaceId: sid,
-        params: { x: 0, y: TITLE_BAR_HEIGHT - 6, width: w, height: 6, fill: '#2a2a3e' },
+        params: { x: 0, y: TITLE_BAR_HEIGHT - 6, width: w, height: 6, fill: this.theme.titleBarBg },
       });
       commands.push({
         type: 'text',
         surfaceId: sid,
         params: {
           x: 12, y: TITLE_BAR_HEIGHT / 2,
-          text: this.title, font: TITLE_FONT, fill: '#ccc', baseline: 'middle',
+          text: this.title, font: TITLE_FONT, fill: this.theme.textPrimary, baseline: 'middle',
         },
       });
+      // Signature amber accent line under title bar
       commands.push({
         type: 'line',
         surfaceId: sid,
-        params: { x1: 0, y1: TITLE_BAR_HEIGHT, x2: w, y2: TITLE_BAR_HEIGHT, stroke: '#444' },
+        params: { x1: 0, y1: TITLE_BAR_HEIGHT, x2: w, y2: TITLE_BAR_HEIGHT, stroke: this.theme.accent },
       });
     }
 
@@ -312,11 +324,11 @@ export class WindowAbject extends Abject {
     if (this.resizable) {
       commands.push({
         type: 'line', surfaceId: sid,
-        params: { x1: w - 3, y1: h - 8, x2: w - 8, y2: h - 3, stroke: '#666' },
+        params: { x1: w - 3, y1: h - 8, x2: w - 8, y2: h - 3, stroke: this.theme.resizeGrip },
       });
       commands.push({
         type: 'line', surfaceId: sid,
-        params: { x1: w - 3, y1: h - 4, x2: w - 4, y2: h - 3, stroke: '#666' },
+        params: { x1: w - 3, y1: h - 4, x2: w - 4, y2: h - 3, stroke: this.theme.resizeGrip },
       });
     }
 

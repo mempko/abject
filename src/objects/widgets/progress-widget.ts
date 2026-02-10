@@ -25,10 +25,10 @@ export class ProgressWidget extends WidgetAbject {
     const h = this.rect.height;
     const style = this.style;
     const font = buildFont(style);
-    const radius = style.radius ?? 4;
+    const radius = style.radius ?? this.theme.widgetRadius;
 
-    const trackColor = style.background ?? '#252535';
-    const fillColor = style.color ?? '#6a6aff';
+    const trackColor = style.background ?? this.theme.progressTrack;
+    const fillColor = style.color ?? this.theme.progressFill;
 
     // Track
     commands.push({
@@ -57,7 +57,7 @@ export class ProgressWidget extends WidgetAbject {
           y: oy + h / 2,
           text: this.text,
           font,
-          fill: '#eee',
+          fill: this.theme.textPrimary,
           align: 'center',
           baseline: 'middle',
         },

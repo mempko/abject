@@ -18,7 +18,7 @@ export class LabelWidget extends WidgetAbject {
     const h = this.rect.height;
     const style = this.style;
     const font = buildFont(style);
-    const radius = style.radius ?? 4;
+    const radius = style.radius ?? this.theme.widgetRadius;
 
     if (style.background) {
       commands.push({
@@ -46,7 +46,7 @@ export class LabelWidget extends WidgetAbject {
         y: oy + h / 2,
         text: this.text,
         font,
-        fill: style.color ?? '#aaa',
+        fill: style.color ?? this.theme.textTertiary,
         align,
         baseline: 'middle',
       },

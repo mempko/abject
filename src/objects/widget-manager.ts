@@ -41,6 +41,8 @@ import {
   WidgetType,
   WidgetStyle,
   Rect,
+  ThemeData,
+  MIDNIGHT_BLOOM,
   WIDGET_INTERFACE,
   WINDOW_INTERFACE,
   LAYOUT_INTERFACE,
@@ -57,6 +59,8 @@ const UI_INTERFACE: InterfaceId = 'abjects:ui';
 export class WidgetManager extends Abject {
   private uiServerId?: AbjectId;
   private consoleId?: AbjectId;
+  private cachedTheme: ThemeData = MIDNIGHT_BLOOM;
+  private themeId?: AbjectId;
 
   // Tracking spawned Abjects (Set<AbjectId>, NOT references — network transparent)
   private spawnedWindows: Set<AbjectId> = new Set();
@@ -403,7 +407,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new LabelWidget({
         type: 'label', rect: payload.rect, text: payload.text, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
       }), payload.rect);
     });
 
@@ -416,7 +420,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new ButtonWidget({
         type: 'button', rect: payload.rect, text: payload.text, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
       }), payload.rect);
     });
 
@@ -431,7 +435,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new TextInputWidget({
         type: 'textInput', rect: payload.rect, text: payload.text, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
         placeholder: payload.placeholder, masked: payload.masked,
       }), payload.rect);
     });
@@ -446,7 +450,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new TextAreaWidget({
         type: 'textArea', rect: payload.rect, text: payload.text, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
         monospace: payload.monospace,
       }), payload.rect);
     });
@@ -461,7 +465,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new CheckboxWidget({
         type: 'checkbox', rect: payload.rect, text: payload.text, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
         checked: payload.checked,
       }), payload.rect);
     });
@@ -476,7 +480,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new ProgressWidget({
         type: 'progress', rect: payload.rect, text: payload.text, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
         value: payload.value,
       }), payload.rect);
     });
@@ -489,7 +493,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new DividerWidget({
         type: 'divider', rect: payload.rect, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
       }), payload.rect);
     });
 
@@ -504,7 +508,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new SelectWidget({
         type: 'select', rect: payload.rect, text: payload.text, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
         options: payload.options, selectedIndex: payload.selectedIndex,
       }), payload.rect);
     });
@@ -625,6 +629,28 @@ export class WidgetManager extends Abject {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
 
+      // Handle theme changes from ThemeAbject
+      if (aspect === 'themeChanged' && fromId === this.themeId) {
+        this.cachedTheme = value as ThemeData;
+        // Propagate to all spawned widgets
+        for (const id of this.spawnedWidgets) {
+          try {
+            await this.send(
+              request(this.id, id, WIDGET_INTERFACE, 'updateTheme', this.cachedTheme)
+            );
+          } catch { /* widget gone */ }
+        }
+        // Propagate to all spawned windows
+        for (const id of this.spawnedWindows) {
+          try {
+            await this.send(
+              request(this.id, id, WINDOW_INTERFACE, 'updateTheme', this.cachedTheme)
+            );
+          } catch { /* window gone */ }
+        }
+        return;
+      }
+
       // Translate widget changed events to old-style widgetEvent messages
       const shimId = this.widgetIdToShimId.get(fromId);
       const windowShimId = this.widgetToWindowShimId.get(fromId);
@@ -672,6 +698,30 @@ export class WidgetManager extends Abject {
   protected override async onInit(): Promise<void> {
     this.uiServerId = await this.requireDep('UIServer');
     this.consoleId = await this.discoverDep('Console') ?? undefined;
+
+    // Query ThemeAbject for the current theme
+    this.themeId = await this.discoverDep('Theme') ?? undefined;
+    if (this.themeId) {
+      try {
+        const theme = await this.request<ThemeData>(
+          request(this.id, this.themeId, 'abjects:theme' as InterfaceId, 'getTheme', {})
+        );
+        if (theme && typeof theme === 'object' && 'canvasBg' in theme) {
+          this.cachedTheme = theme;
+        }
+      } catch {
+        // Theme not available — use default
+      }
+
+      // Register as dependent to receive theme change notifications
+      try {
+        await this.request(
+          request(this.id, this.themeId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+        );
+      } catch {
+        // Theme may not support dependents
+      }
+    }
   }
 
   private async log(level: string, message: string, data?: unknown): Promise<void> {
@@ -796,6 +846,7 @@ createNestedHBox - Nested horizontal layout inside another layout
       chromeless: options?.chromeless,
       resizable: options?.resizable,
       zIndex: options?.zIndex ?? 100,
+      theme: this.cachedTheme,
     });
 
     await win.init(this.bus, this.id);
@@ -831,6 +882,7 @@ createNestedHBox - Nested horizontal layout inside another layout
       resizable: options?.resizable,
       draggable: options?.draggable,
       zIndex: options?.zIndex ?? 100,
+      theme: this.cachedTheme,
     });
 
     await win.init(this.bus, this.id);
@@ -990,6 +1042,7 @@ createNestedHBox - Nested horizontal layout inside another layout
       style: config.style,
       ownerId: winAbjectId,
       uiServerId: this.uiServerId!,
+      theme: this.cachedTheme,
     };
 
     let widget: WidgetAbject;

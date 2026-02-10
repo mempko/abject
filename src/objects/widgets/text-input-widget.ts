@@ -33,17 +33,17 @@ export class TextInputWidget extends WidgetAbject {
     const h = this.rect.height;
     const style = this.style;
     const font = buildFont(style);
-    const radius = style.radius ?? 4;
+    const radius = style.radius ?? this.theme.widgetRadius;
     const focused = this.focused;
 
     // Border rect
-    const borderColor = style.borderColor ?? (focused ? '#6a6aff' : '#555');
+    const borderColor = style.borderColor ?? (focused ? this.theme.inputBorderFocus : this.theme.inputBorder);
     commands.push({
       type: 'rect',
       surfaceId,
       params: {
         x: ox, y: oy, width: w, height: h,
-        fill: style.background ?? '#151520',
+        fill: style.background ?? this.theme.inputBg,
         stroke: borderColor,
         radius,
       },
@@ -72,7 +72,7 @@ export class TextInputWidget extends WidgetAbject {
           y: oy + h / 2,
           text: displayText,
           font: textFont,
-          fill: style.color ?? '#ddd',
+          fill: style.color ?? this.theme.textSecondary,
           baseline: 'middle',
         },
       });
@@ -85,7 +85,7 @@ export class TextInputWidget extends WidgetAbject {
           y: oy + h / 2,
           text: this.placeholder,
           font: textFont,
-          fill: '#555',
+          fill: this.theme.textPlaceholder,
           baseline: 'middle',
         },
       });
@@ -108,7 +108,7 @@ export class TextInputWidget extends WidgetAbject {
         params: {
           x1: cursorX, y1: oy + 4,
           x2: cursorX, y2: oy + h - 4,
-          stroke: '#8888ff',
+          stroke: this.theme.cursor,
         },
       });
     }

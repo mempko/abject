@@ -25,6 +25,7 @@ import { Taskbar } from './objects/taskbar.js';
 import { RegistryBrowser } from './objects/registry-browser.js';
 import { ObjectWorkshop } from './objects/object-workshop.js';
 import { WidgetManager } from './objects/widget-manager.js';
+import { ThemeAbject } from './objects/theme.js';
 
 // Export public API
 export { App, createApp } from './ui/app.js';
@@ -45,6 +46,7 @@ export { Taskbar, TASKBAR_ID } from './objects/taskbar.js';
 export { RegistryBrowser, REGISTRY_BROWSER_ID } from './objects/registry-browser.js';
 export { ObjectWorkshop, OBJECT_WORKSHOP_ID } from './objects/object-workshop.js';
 export { WidgetManager, WIDGET_MANAGER_ID } from './objects/widget-manager.js';
+export { ThemeAbject, THEME_ID } from './objects/theme.js';
 export { ScriptableAbject, EDITABLE_INTERFACE_ID } from './objects/scriptable-abject.js';
 
 // Export widget Abjects
@@ -73,8 +75,9 @@ export {
   DEFAULT_LINE_HEIGHT,
   TITLE_BAR_HEIGHT,
   EDGE_SIZE,
+  MIDNIGHT_BLOOM,
 } from './objects/widgets/widget-types.js';
-export type { WidgetType, Rect, WidgetStyle as WidgetAbjectStyle, SizePolicy, LayoutChildConfig, SpacerConfig } from './objects/widgets/widget-types.js';
+export type { WidgetType, Rect, WidgetStyle as WidgetAbjectStyle, SizePolicy, LayoutChildConfig, SpacerConfig, ThemeData } from './objects/widgets/widget-types.js';
 
 // Export capability objects
 export { HttpClient, HTTP_CLIENT_ID } from './objects/capabilities/http-client.js';
@@ -216,6 +219,7 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('Clipboard', () => new Clipboard());
   runtime.objectFactory.registerConstructor('Console', () => new Console());
   runtime.objectFactory.registerConstructor('FileSystem', () => new FileSystem());
+  runtime.objectFactory.registerConstructor('Theme', () => new ThemeAbject());
   runtime.objectFactory.registerConstructor('WidgetManager', () => new WidgetManager());
   runtime.objectFactory.registerConstructor('ProxyGenerator', () => new ProxyGenerator());
   runtime.objectFactory.registerConstructor('Negotiator', () => new Negotiator());
@@ -238,6 +242,7 @@ async function main(): Promise<App> {
   });
 
   const storageId = await factorySpawn('Storage');
+  const themeId = await factorySpawn('Theme');
   const timerId = await factorySpawn('Timer');
   const clipboardId = await factorySpawn('Clipboard');
   const consoleId = await factorySpawn('Console');
@@ -292,6 +297,7 @@ async function main(): Promise<App> {
     timer: getObj(timerId),
     clipboard: getObj(clipboardId),
     console: getObj(consoleId),
+    theme: getObj(themeId),
     widgetManager: getObj(widgetManagerId),
     filesystem: getObj(filesystemId),
     // Object IDs for message-based interaction
@@ -309,6 +315,7 @@ async function main(): Promise<App> {
       timer: timerId,
       clipboard: clipboardId,
       console: consoleId,
+      theme: themeId,
       widgetManager: widgetManagerId,
       filesystem: filesystemId,
       proxyGenerator: proxyGenId,

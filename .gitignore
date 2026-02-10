@@ -3,3 +3,4 @@ dist/
 .env*
 playwright-report/
 test-results/
+.abjects/
