@@ -375,14 +375,15 @@ export class WidgetManager extends Abject {
 
     // Direct factory: create window, return AbjectId (not shim string)
     this.on('createWindowAbject', async (msg: AbjectMessage) => {
-      const { title, rect, zIndex, chromeless, resizable } = msg.payload as {
+      const { title, rect, zIndex, chromeless, resizable, draggable } = msg.payload as {
         title: string;
         rect: { x: number; y: number; width: number; height: number };
         zIndex?: number;
         chromeless?: boolean;
         resizable?: boolean;
+        draggable?: boolean;
       };
-      return this.createWindowDirect(title, rect, { chromeless, resizable, zIndex });
+      return this.createWindowDirect(title, rect, { chromeless, resizable, draggable, zIndex });
     });
 
     // Direct factory: destroy window by AbjectId (not shim string)
@@ -818,7 +819,7 @@ createNestedHBox - Nested horizontal layout inside another layout
   private async createWindowDirect(
     title: string,
     rect: { x: number; y: number; width: number; height: number },
-    options?: { chromeless?: boolean; resizable?: boolean; zIndex?: number }
+    options?: { chromeless?: boolean; resizable?: boolean; draggable?: boolean; zIndex?: number }
   ): Promise<AbjectId> {
     require(this.uiServerId !== undefined, 'UIServer not set');
 
@@ -828,6 +829,7 @@ createNestedHBox - Nested horizontal layout inside another layout
       uiServerId: this.uiServerId!,
       chromeless: options?.chromeless,
       resizable: options?.resizable,
+      draggable: options?.draggable,
       zIndex: options?.zIndex ?? 100,
     });
 

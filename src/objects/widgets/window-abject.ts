@@ -31,6 +31,7 @@ export interface WindowConfig {
   uiServerId: AbjectId;
   chromeless?: boolean;
   resizable?: boolean;
+  draggable?: boolean;
   zIndex?: number;
 }
 
@@ -44,6 +45,7 @@ export class WindowAbject extends Abject {
   private rect: Rect;
   private chromeless: boolean;
   private resizable: boolean;
+  private draggable: boolean;
   private zIndex: number;
 
   private children: AbjectId[] = [];
@@ -137,6 +139,7 @@ export class WindowAbject extends Abject {
     this.rect = { ...config.rect };
     this.chromeless = config.chromeless ?? false;
     this.resizable = config.resizable ?? false;
+    this.draggable = config.draggable ?? false;
     this.zIndex = config.zIndex ?? 100;
 
     this.setupHandlers();
@@ -444,6 +447,7 @@ export class WindowAbject extends Abject {
     }
 
     // Hit-test children
+    let childConsumed = false;
     for (const childId of this.children) {
       const childRect = this.childRects.get(childId);
       if (!childRect) continue;
@@ -457,6 +461,7 @@ export class WindowAbject extends Abject {
             })
           );
           if (result.consumed) {
+            childConsumed = true;
             // Use focusWidgetId if returned (layout routing), otherwise the child itself
             const focusTarget = result.focusWidgetId ?? childId;
             this.focusedChildId = focusTarget;
@@ -469,6 +474,18 @@ export class WindowAbject extends Abject {
         }
         break;
       }
+    }
+
+    // Chromeless draggable: if no child consumed the click, start move drag
+    if (!childConsumed && this.chromeless && this.draggable) {
+      this.dragState = {
+        type: 'move',
+        edge: '',
+        startMouseX: localX + this.rect.x,
+        startMouseY: localY + this.rect.y,
+        startRect: { ...this.rect },
+      };
+      return;
     }
 
     await this.renderWindow();

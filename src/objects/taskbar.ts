@@ -38,7 +38,7 @@ export class Taskbar extends Abject {
       manifest: {
         name: 'Taskbar',
         description:
-          'Persistent bottom bar with launch buttons for Settings, Registry Browser, and Object Workshop.',
+          'Persistent vertical toolbar in the top-left with launch buttons for Settings, Registry Browser, and Object Workshop.',
         version: '1.0.0',
         interfaces: [
           {
@@ -190,40 +190,37 @@ export class Taskbar extends Abject {
     this.rootLayoutId = undefined;
     this.userObjButtons.clear();
 
-    const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
-    );
+    const showableObjects = await this.discoverShowableObjects();
 
-    const barHeight = 40;
-    const displayW = displayInfo.width;
-    const displayH = displayInfo.height;
+    const btnW = 100;
+    const btnH = 30;
+    const padding = 16;
+    const spacing = 6;
+    const systemBtnCount = 3;
+    const totalBtnCount = systemBtnCount + showableObjects.length;
+    const barWidth = btnW + padding * 2;
+    const barHeight = padding + totalBtnCount * (btnH + spacing) - spacing + padding;
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
         title: '',
-        rect: { x: 0, y: displayH - barHeight, width: displayW, height: barHeight },
+        rect: { x: 8, y: 8, width: barWidth, height: barHeight },
         zIndex: 999,
         chromeless: true,
+        draggable: true,
       })
     );
 
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
-    const btnW = 100;
-    const btnH = 30;
 
-    // Create root HBox layout (centers buttons with spacers on each side)
+    // Create root VBox layout (vertical stack)
     this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createHBox', {
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 5, right: 10, bottom: 5, left: 10 },
-        spacing: 10,
+        margins: { top: padding, right: padding, bottom: padding, left: padding },
+        spacing,
       })
     );
-
-    // Left spacer
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
-
-    const showableObjects = await this.discoverShowableObjects();
 
     // Helper to add a fixed-size button to the layout
     const addBtn = async (text: string): Promise<AbjectId> => {
@@ -237,7 +234,7 @@ export class Taskbar extends Abject {
       );
       await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
         widgetId: btnId,
-        sizePolicy: { horizontal: 'fixed' },
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { width: btnW, height: btnH },
       }));
       return btnId;
@@ -253,9 +250,6 @@ export class Taskbar extends Abject {
       const btnId = await addBtn(obj.manifest.name);
       this.userObjButtons.set(btnId, obj.id);
     }
-
-    // Right spacer
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
 
     return true;
   }
