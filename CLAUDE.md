@@ -116,7 +116,7 @@ Every system service follows this pattern:
 5. Override `checkInvariants()` calling `super.checkInvariants()` first
 6. Export well-known ID constant
 7. Add to `src/index.ts` exports
-8. Spawn in `src/index.ts` `main()` if it's a system object
+8. Spawn in **both** `src/index.ts` `main()` **and** `server/index.ts` `main()` if it's a system object — these two bootstrap files must stay in sync
 
 ### New Capability Object
 
@@ -149,6 +149,7 @@ Every system service follows this pattern:
 - **Compositor**: Needs a real `HTMLCanvasElement`; tests using compositor need browser context
 - **Sequence numbers**: Per-sender, tracked in module-level state in `message.ts`; use `resetSequence()` in tests
 - **Import extensions**: Always use `.js` in imports even though source files are `.ts`
+- **Dual bootstrap**: System objects must be registered and spawned in both `src/index.ts` and `server/index.ts`. Missing one causes the object to not appear in server/client mode.
 
 ## Bootstrap Order
 
@@ -157,6 +158,12 @@ Every system service follows this pattern:
 3. `main()` spawns: LLMObject, HttpClient, Storage, Timer, Clipboard, Console, FileSystem
 4. `main()` spawns: ProxyGenerator (with LLM ref), Negotiator (with dependencies), HealthMonitor, ObjectCreator
 5. System exposes `window.abjects` for debugging
+
+**Important:** There are two bootstrap paths that must stay in sync:
+- `src/index.ts` — standalone browser mode (`pnpm dev`)
+- `server/index.ts` — server/client mode (`pnpm serve` + `pnpm client`)
+
+When adding a new system object, register its constructor and spawn it in **both** files.
 
 ## Dependencies
 

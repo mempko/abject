@@ -15,8 +15,6 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
-import { CreationResult } from './object-creator.js';
-import { EDITABLE_INTERFACE_ID } from './scriptable-abject.js';
 import { LLMMessage, LLMCompletionResult } from '../llm/provider.js';
 
 const REGISTRY_BROWSER_INTERFACE: InterfaceId = 'abjects:registry-browser';
@@ -25,7 +23,7 @@ const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
 const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 
 const PAGE_SIZE = 8;
-const WIN_W = 500;
+const WIN_W = 550;
 const WIN_H = 500;
 
 export class RegistryBrowser extends Abject {
@@ -37,7 +35,7 @@ export class RegistryBrowser extends Abject {
   private rootLayoutId?: AbjectId;
   private currentPage = 0;
   private cachedObjects: ObjectRegistration[] = [];
-  private editingObjectId?: AbjectId;
+  private abjectEditorId?: AbjectId;
   private detailIndex?: number;
   private selectedMethod?: { interfaceId: InterfaceId; method: string };
   private detailObjectId?: AbjectId;
@@ -57,15 +55,6 @@ export class RegistryBrowser extends Abject {
   private msgPayloadId?: AbjectId;
   private msgSendBtnId?: AbjectId;
   private msgResponseId?: AbjectId;
-
-  // ── Edit View widget tracking ──
-  private sourceEditorId?: AbjectId;
-  private saveBtnId?: AbjectId;
-  private cancelBtnId?: AbjectId;
-  private aiEditBtnId?: AbjectId;
-  private aiPromptInputId?: AbjectId;
-  private aiGoBtnId?: AbjectId;
-  private editStatusId?: AbjectId;
 
   constructor() {
     super({
@@ -111,6 +100,7 @@ export class RegistryBrowser extends Abject {
     this.registryId = await this.requireDep('Registry');
     this.objectCreatorId = await this.discoverDep('ObjectCreator') ?? undefined;
     this.llmId = await this.discoverDep('LLM') ?? undefined;
+    this.abjectEditorId = await this.discoverDep('AbjectEditor') ?? undefined;
 
     if (this.registryId) {
       await this.request(request(this.id, this.registryId,
@@ -167,15 +157,6 @@ export class RegistryBrowser extends Abject {
     this.msgPayloadId = undefined;
     this.msgSendBtnId = undefined;
     this.msgResponseId = undefined;
-
-    // Edit view
-    this.sourceEditorId = undefined;
-    this.saveBtnId = undefined;
-    this.cancelBtnId = undefined;
-    this.aiEditBtnId = undefined;
-    this.aiPromptInputId = undefined;
-    this.aiGoBtnId = undefined;
-    this.editStatusId = undefined;
   }
 
   private setupHandlers(): void {
@@ -261,7 +242,7 @@ export class RegistryBrowser extends Abject {
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
         windowId: this.windowId,
         margins: { top: 8, right: 16, bottom: 8, left: 16 },
-        spacing: 4,
+        spacing: 6,
       })
     );
 
@@ -295,6 +276,7 @@ export class RegistryBrowser extends Abject {
       this.cmdRunBtnId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
           windowId: this.windowId, rect: r0, text: 'Run',
+          style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
         })
       );
       await this.addDep(this.cmdRunBtnId);
@@ -314,6 +296,18 @@ export class RegistryBrowser extends Abject {
         sizePolicy: { vertical: 'fixed' },
         preferredSize: { height: 20 },
       }));
+
+      // Divider after command bar section
+      const cmdDividerId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
+          windowId: this.windowId, rect: r0,
+        })
+      );
+      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: cmdDividerId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 12 },
+      }));
     }
 
     const totalPages = Math.max(1, Math.ceil(this.cachedObjects.length / PAGE_SIZE));
@@ -324,11 +318,12 @@ export class RegistryBrowser extends Abject {
     for (let i = 0; i < pageItems.length; i++) {
       const obj = pageItems[i];
       const desc = obj.manifest.description;
-      const label = `${obj.manifest.name} — ${desc.length > 40 ? desc.slice(0, 40) + '...' : desc}`;
+      const label = `${obj.manifest.name} — ${desc.length > 55 ? desc.slice(0, 55) + '...' : desc}`;
 
       const btnId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
           windowId: this.windowId, rect: r0, text: label,
+          style: { fontSize: 13 },
         })
       );
       await this.addDep(btnId);
@@ -446,10 +441,11 @@ export class RegistryBrowser extends Abject {
       })
     );
 
-    const addLabel = async (text: string): Promise<AbjectId> => {
+    const addLabel = async (text: string, style?: Record<string, unknown>): Promise<AbjectId> => {
       const id = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
           windowId: this.windowId, rect: r0, text,
+          ...(style ? { style } : {}),
         })
       );
       await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
@@ -460,8 +456,8 @@ export class RegistryBrowser extends Abject {
       return id;
     };
 
-    await addLabel(`Name: ${obj.manifest.name}`);
-    await addLabel(`Version: ${obj.manifest.version}`);
+    await addLabel(`Name: ${obj.manifest.name}`, { color: '#e2e4e9' });
+    await addLabel(`Version: ${obj.manifest.version}`, { color: '#e2e4e9' });
 
     const desc = obj.manifest.description;
     await addLabel(`Description: ${desc.length > 60 ? desc.slice(0, 60) + '...' : desc}`);
@@ -496,7 +492,7 @@ export class RegistryBrowser extends Abject {
     }
 
     // ── Send Message section ──
-    await addLabel('Send Message:');
+    await addLabel('Send Message:', { color: '#e2e4e9', fontWeight: 'bold' });
 
     // Method buttons in 2-col HBox rows
     const allMethods: { interfaceId: InterfaceId; method: string }[] = [];
@@ -566,6 +562,7 @@ export class RegistryBrowser extends Abject {
     this.msgSendBtnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Send',
+        style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
       })
     );
     await this.addDep(this.msgSendBtnId);
@@ -628,183 +625,6 @@ export class RegistryBrowser extends Abject {
     await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
   }
 
-  private async showEditView(obj: ObjectRegistration): Promise<void> {
-    // Destroy existing window
-    if (this.windowId) {
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
-          windowId: this.windowId,
-        })
-      );
-      this.windowId = undefined;
-    }
-
-    this.clearViewTracking();
-    this.editingObjectId = obj.id;
-
-    const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
-    );
-
-    const editW = 600;
-    const editH = 500;
-    const winX = Math.max(20, Math.floor((displayInfo.width - editW) / 2));
-    const winY = Math.max(20, Math.floor((displayInfo.height - editH) / 2));
-
-    this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
-        title: `Edit: ${obj.manifest.name}`,
-        rect: { x: winX, y: winY, width: editW, height: editH },
-        zIndex: 200,
-        resizable: true,
-      })
-    );
-
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-
-    // Create root VBox layout
-    this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
-        windowId: this.windowId,
-        margins: { top: 8, right: 16, bottom: 8, left: 16 },
-        spacing: 8,
-      })
-    );
-
-    // Object name label
-    const nameLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: `Source: ${obj.manifest.name}`,
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: nameLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-
-    // TextArea with source code (expanding both axes)
-    this.sourceEditorId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextArea', {
-        windowId: this.windowId, rect: r0, text: obj.source ?? '', monospace: true,
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.sourceEditorId,
-      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
-      stretch: 1,
-    }));
-
-    // Button row (HBox: Save, Cancel, AI Edit)
-    const btnRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: btnRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-
-    this.saveBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Save',
-      })
-    );
-    await this.addDep(this.saveBtnId);
-    await this.request(request(this.id, btnRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.saveBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 80, height: 32 },
-    }));
-
-    this.cancelBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Cancel',
-      })
-    );
-    await this.addDep(this.cancelBtnId);
-    await this.request(request(this.id, btnRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.cancelBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 80, height: 32 },
-    }));
-
-    this.aiEditBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'AI Edit',
-      })
-    );
-    await this.addDep(this.aiEditBtnId);
-    await this.request(request(this.id, btnRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.aiEditBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 80, height: 32 },
-    }));
-
-    await this.request(request(this.id, btnRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
-
-    // AI edit prompt row (HBox: input + Go)
-    const aiRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: aiRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 30 },
-    }));
-
-    this.aiPromptInputId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
-        windowId: this.windowId, rect: r0, placeholder: 'Describe what to change...',
-      })
-    );
-    await this.addDep(this.aiPromptInputId);
-    await this.request(request(this.id, aiRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.aiPromptInputId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: 30 },
-    }));
-
-    this.aiGoBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Go',
-      })
-    );
-    await this.addDep(this.aiGoBtnId);
-    await this.request(request(this.id, aiRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.aiGoBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 80, height: 30 },
-    }));
-
-    // Status label
-    this.editStatusId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: '',
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.editStatusId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-  }
-
-  private async updateEditStatus(text: string): Promise<void> {
-    if (!this.editStatusId) return;
-    await this.request(
-      request(this.id, this.editStatusId, WIDGET_INTERFACE, 'update', { text })
-    );
-  }
-
   private async handleWidgetEvent(fromId: AbjectId, aspect: string, _value?: unknown): Promise<void> {
     // ── Back button (detail view) ──
     if (fromId === this.backBtnId) {
@@ -836,98 +656,9 @@ export class RegistryBrowser extends Abject {
     if (fromId === this.editSourceBtnId && this.detailIndex !== undefined) {
       const absIndex = this.currentPage * PAGE_SIZE + this.detailIndex;
       const obj = this.cachedObjects[absIndex];
-      if (obj) {
-        await this.showEditView(obj);
-      }
-      return;
-    }
-
-    // ── Save button in edit view ──
-    if (fromId === this.saveBtnId && this.editingObjectId) {
-      const source = await this.request<string>(
-        request(this.id, this.sourceEditorId!, WIDGET_INTERFACE, 'getValue', {})
-      );
-
-      try {
-        // Send updateSource to the ScriptableAbject
-        const result = await this.request<{ success: boolean; error?: string }>(
-          request(this.id, this.editingObjectId, EDITABLE_INTERFACE_ID, 'updateSource', {
-            source,
-          })
-        );
-
-        if (result.success) {
-          // Also update registry source via message passing
-          if (this.registryId) {
-            await this.request(
-              request(this.id, this.registryId, 'abjects:registry' as InterfaceId, 'updateSource', {
-                objectId: this.editingObjectId, source,
-              })
-            );
-          }
-          await this.updateEditStatus('Saved successfully');
-        } else {
-          await this.updateEditStatus(`Error: ${result.error ?? 'Unknown'}`);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await this.updateEditStatus(`Error: ${msg}`);
-      }
-      return;
-    }
-
-    // ── Cancel button in edit view ──
-    if (fromId === this.cancelBtnId) {
-      if (this.detailIndex !== undefined) {
-        this.editingObjectId = undefined;
-        await this.showDetailView(this.detailIndex);
-      } else {
-        this.editingObjectId = undefined;
-        this.cachedObjects = await this.registryList();
-        await this.showListView();
-      }
-      return;
-    }
-
-    // ── AI Edit: Go button or submit from prompt input ──
-    if ((fromId === this.aiGoBtnId || (fromId === this.aiPromptInputId && aspect === 'submit'))
-        && this.editingObjectId && this.objectCreatorId) {
-      const prompt = await this.request<string>(
-        request(this.id, this.aiPromptInputId!, WIDGET_INTERFACE, 'getValue', {})
-      );
-
-      if (!prompt.trim()) {
-        await this.updateEditStatus('Enter a description of changes');
-        return;
-      }
-
-      await this.updateEditStatus('AI editing...');
-
-      try {
-        const result = await this.request<CreationResult>(
-          request(
-            this.id,
-            this.objectCreatorId!,
-            'abjects:object-creator' as InterfaceId,
-            'modify',
-            { objectId: this.editingObjectId, prompt }
-          )
-        );
-
-        if (result.success && result.code) {
-          // Update the textArea with new source
-          await this.request(
-            request(this.id, this.sourceEditorId!, WIDGET_INTERFACE, 'update', {
-              text: result.code,
-            })
-          );
-          await this.updateEditStatus('AI edit applied (review and Save)');
-        } else {
-          await this.updateEditStatus(`AI error: ${result.error ?? 'Unknown'}`);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await this.updateEditStatus(`AI error: ${msg}`);
+      if (obj && this.abjectEditorId) {
+        await this.request(request(this.id, this.abjectEditorId,
+          'abjects:abject-editor' as InterfaceId, 'show', { objectId: obj.id }));
       }
       return;
     }

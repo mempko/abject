@@ -90,6 +90,7 @@ export abstract class LayoutAbject extends WidgetAbject {
   protected layoutChildren: (LayoutChildConfig | SpacerConfig)[] = [];
   protected margins: LayoutMargins;
   protected spacing: number;
+  private hoveredLayoutChildId?: AbjectId;
 
   constructor(config: LayoutConfig, layoutType: 'vbox' | 'hbox') {
     super({
@@ -224,6 +225,23 @@ export abstract class LayoutAbject extends WidgetAbject {
   protected async processInput(input: Record<string, unknown>): Promise<{ consumed: boolean; focusWidgetId?: AbjectId }> {
     const inputType = input.type as string;
 
+    // Handle mouseleave by propagating to hovered child
+    if (inputType === 'mouseleave') {
+      if (this.hoveredLayoutChildId) {
+        try {
+          await this.request<{ consumed: boolean }>(
+            request(this.id, this.hoveredLayoutChildId, WIDGET_INTERFACE, 'handleInput', {
+              type: 'mouseleave',
+            })
+          );
+        } catch {
+          // Widget gone
+        }
+        this.hoveredLayoutChildId = undefined;
+      }
+      return { consumed: true };
+    }
+
     // Only route mouse events through layout
     if (inputType !== 'mousedown' && inputType !== 'mousemove' && inputType !== 'wheel') {
       return { consumed: false };
@@ -234,6 +252,62 @@ export abstract class LayoutAbject extends WidgetAbject {
 
     const contentRect = this.getContentRect();
     const childRects = this.calculateChildRects(contentRect);
+
+    // For mousemove, track hover and send mouseleave to old child
+    if (inputType === 'mousemove') {
+      let hitChildId: AbjectId | undefined;
+      for (const cr of childRects) {
+        if (mx >= cr.rect.x && mx < cr.rect.x + cr.rect.width &&
+            my >= cr.rect.y && my < cr.rect.y + cr.rect.height) {
+          hitChildId = cr.widgetId;
+
+          if (hitChildId !== this.hoveredLayoutChildId) {
+            // Send mouseleave to old hovered child
+            if (this.hoveredLayoutChildId) {
+              try {
+                await this.request<{ consumed: boolean }>(
+                  request(this.id, this.hoveredLayoutChildId, WIDGET_INTERFACE, 'handleInput', {
+                    type: 'mouseleave',
+                  })
+                );
+              } catch {
+                // Widget gone
+              }
+            }
+            this.hoveredLayoutChildId = hitChildId;
+          }
+
+          // Forward mousemove to hit child
+          try {
+            await this.request<{ consumed: boolean }>(
+              request(this.id, cr.widgetId, WIDGET_INTERFACE, 'handleInput', {
+                ...input,
+                x: mx - cr.rect.x,
+                y: my - cr.rect.y,
+              })
+            );
+          } catch {
+            // Widget gone
+          }
+          return { consumed: true };
+        }
+      }
+
+      // No child hit — send mouseleave to previous hovered child
+      if (!hitChildId && this.hoveredLayoutChildId) {
+        try {
+          await this.request<{ consumed: boolean }>(
+            request(this.id, this.hoveredLayoutChildId, WIDGET_INTERFACE, 'handleInput', {
+              type: 'mouseleave',
+            })
+          );
+        } catch {
+          // Widget gone
+        }
+        this.hoveredLayoutChildId = undefined;
+      }
+      return { consumed: false };
+    }
 
     for (const cr of childRects) {
       if (mx >= cr.rect.x && mx < cr.rect.x + cr.rect.width &&

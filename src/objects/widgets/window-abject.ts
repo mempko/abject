@@ -22,7 +22,6 @@ import {
   LAYOUT_INTERFACE,
   TITLE_BAR_HEIGHT,
   TITLE_FONT,
-  EDGE_SIZE,
 } from './widget-types.js';
 
 const UI_INTERFACE: InterfaceId = 'abjects:ui' as InterfaceId;
@@ -52,21 +51,17 @@ export class WindowAbject extends Abject {
   private zIndex: number;
   private theme: ThemeData;
 
+  /** Expose surfaceId so WidgetManager can register with WindowManager. */
+  get surface(): string | undefined { return this.surfaceId; }
+
   private children: AbjectId[] = [];
   private childRects: Map<AbjectId, Rect> = new Map();
   private expandedSelects: Set<AbjectId> = new Set();
   private focusedChildId?: AbjectId;
+  private hoveredChildId?: AbjectId;
 
   private destroying = false;
   private rendering = false;
-
-  private dragState?: {
-    type: 'move' | 'resize';
-    edge: string;
-    startMouseX: number;
-    startMouseY: number;
-    startRect: Rect;
-  };
 
   constructor(config: WindowConfig) {
     super({
@@ -245,6 +240,18 @@ export class WindowAbject extends Abject {
       await this.renderWindow();
       return true;
     });
+
+    // WindowManager sends rect updates during drag/resize
+    this.on('windowRect', async (msg: AbjectMessage) => {
+      const { x, y, width, height } = msg.payload as { x: number; y: number; width: number; height: number };
+      const sizeChanged = width !== this.rect.width || height !== this.rect.height;
+      this.rect = { x, y, width, height };
+      if (sizeChanged) {
+        await this.updateChildrenOnResize();
+        await this.renderWindow();
+      }
+      await this.changed('windowRect', { x, y, width, height });
+    });
   }
 
   protected async onInit(): Promise<void> {
@@ -396,31 +403,6 @@ export class WindowAbject extends Abject {
     const localX = e.x ?? 0;
     const localY = e.y ?? 0;
 
-    // Check resize edges first
-    const edge = this.detectResizeEdge(localX, localY);
-    if (edge) {
-      this.dragState = {
-        type: 'resize',
-        edge,
-        startMouseX: localX + this.rect.x,
-        startMouseY: localY + this.rect.y,
-        startRect: { ...this.rect },
-      };
-      return;
-    }
-
-    // Title bar drag
-    if (!this.chromeless && localY < TITLE_BAR_HEIGHT) {
-      this.dragState = {
-        type: 'move',
-        edge: '',
-        startMouseX: localX + this.rect.x,
-        startMouseY: localY + this.rect.y,
-        startRect: { ...this.rect },
-      };
-      return;
-    }
-
     // Content-area coordinates
     const cx = localX;
     const cy = this.chromeless ? localY : localY - TITLE_BAR_HEIGHT;
@@ -488,68 +470,25 @@ export class WindowAbject extends Abject {
       }
     }
 
-    // Chromeless draggable: if no child consumed the click, start move drag
-    if (!childConsumed && this.chromeless && this.draggable) {
-      this.dragState = {
-        type: 'move',
-        edge: '',
-        startMouseX: localX + this.rect.x,
-        startMouseY: localY + this.rect.y,
-        startRect: { ...this.rect },
-      };
-      return;
+    // If no child consumed the click and this window is draggable,
+    // request a drag from UIServer (two-phase grab for chromeless+draggable windows)
+    if (!childConsumed && this.draggable) {
+      await this.send(
+        event(this.id, this.uiServerId, UI_INTERFACE, 'requestDrag', {
+          surfaceId: this.surfaceId,
+        })
+      );
     }
 
     await this.renderWindow();
   }
 
   private async handleMouseMove(e: { surfaceId?: string; x?: number; y?: number }): Promise<void> {
-    if (this.dragState) {
-      const globalX = (e.x ?? 0) + this.rect.x;
-      const globalY = (e.y ?? 0) + this.rect.y;
-      const dx = globalX - this.dragState.startMouseX;
-      const dy = globalY - this.dragState.startMouseY;
-
-      if (this.dragState.type === 'move') {
-        this.rect.x = this.dragState.startRect.x + dx;
-        this.rect.y = this.dragState.startRect.y + dy;
-        await this.uiMoveSurface(this.rect.x, this.rect.y);
-      } else {
-        // Resize
-        const sr = this.dragState.startRect;
-        let newX = sr.x;
-        let newY = sr.y;
-        let newW = sr.width;
-        let newH = sr.height;
-        const dragEdge = this.dragState.edge;
-
-        if (dragEdge.includes('e')) newW = sr.width + dx;
-        if (dragEdge.includes('w')) { newW = sr.width - dx; newX = sr.x + dx; }
-        if (dragEdge.includes('s')) newH = sr.height + dy;
-        if (dragEdge.includes('n')) { newH = sr.height - dy; newY = sr.y + dy; }
-
-        if (newW < 100) { if (dragEdge.includes('w')) newX = sr.x + sr.width - 100; newW = 100; }
-        if (newH < 60) { if (dragEdge.includes('n')) newY = sr.y + sr.height - 60; newH = 60; }
-
-        const moved = newX !== this.rect.x || newY !== this.rect.y;
-        const resized = newW !== this.rect.width || newH !== this.rect.height;
-
-        this.rect = { x: newX, y: newY, width: newW, height: newH };
-
-        if (moved) await this.uiMoveSurface(newX, newY);
-        if (resized) {
-          await this.uiResizeSurface(newW, newH);
-          await this.updateChildrenOnResize();
-          await this.renderWindow();
-        }
-      }
-      return;
-    }
-
-    // Forward mousemove to expanded selects for hover
+    // Content-area coordinates
     const cx = e.x ?? 0;
     const cy = (e.y ?? 0) - (this.chromeless ? 0 : TITLE_BAR_HEIGHT);
 
+    // Forward mousemove to expanded selects for hover
     for (const childId of this.expandedSelects) {
       try {
         await this.request<{ consumed: boolean }>(
@@ -561,17 +500,64 @@ export class WindowAbject extends Abject {
         // Widget gone
       }
     }
+
+    // Hit-test children to forward mousemove/mouseleave for hover tracking
+    let hitChildId: AbjectId | undefined;
+    for (const childId of this.children) {
+      const childRect = this.childRects.get(childId);
+      if (!childRect) continue;
+
+      if (cx >= childRect.x && cx < childRect.x + childRect.width &&
+          cy >= childRect.y && cy < childRect.y + childRect.height) {
+        hitChildId = childId;
+        break;
+      }
+    }
+
+    if (hitChildId !== this.hoveredChildId) {
+      // Send mouseleave to old hovered child
+      if (this.hoveredChildId) {
+        try {
+          await this.request<{ consumed: boolean }>(
+            request(this.id, this.hoveredChildId, WIDGET_INTERFACE, 'handleInput', {
+              type: 'mouseleave',
+            })
+          );
+        } catch {
+          // Widget gone
+        }
+      }
+
+      this.hoveredChildId = hitChildId;
+
+      // Send mousemove to new child
+      if (hitChildId) {
+        try {
+          await this.request<{ consumed: boolean }>(
+            request(this.id, hitChildId, WIDGET_INTERFACE, 'handleInput', {
+              type: 'mousemove', x: cx, y: cy,
+            })
+          );
+        } catch {
+          // Widget gone
+        }
+      }
+    } else if (hitChildId) {
+      // Same child — forward mousemove with local coords
+      try {
+        await this.request<{ consumed: boolean }>(
+          request(this.id, hitChildId, WIDGET_INTERFACE, 'handleInput', {
+            type: 'mousemove', x: cx, y: cy,
+          })
+        );
+      } catch {
+        // Widget gone
+      }
+    }
   }
 
   private async handleMouseUp(_e: { x?: number; y?: number }): Promise<void> {
-    if (this.dragState) {
-      if (this.dragState.type === 'move') {
-        await this.changed('windowMoved', { x: this.rect.x, y: this.rect.y });
-      } else {
-        await this.changed('windowResized', { width: this.rect.width, height: this.rect.height });
-      }
-      this.dragState = undefined;
-    }
+    // No-op — drag/resize is handled by WindowManager
   }
 
   private async handleKeyDown(e: {
@@ -735,48 +721,6 @@ export class WindowAbject extends Abject {
         // Widget gone
       }
     }
-  }
-
-  // ── Helpers ────────────────────────────────────────────────────────────
-
-  private detectResizeEdge(localX: number, localY: number): string | null {
-    if (this.chromeless || !this.resizable) return null;
-
-    const n = localY < EDGE_SIZE;
-    const s = localY > this.rect.height - EDGE_SIZE;
-    const w = localX < EDGE_SIZE;
-    const e = localX > this.rect.width - EDGE_SIZE;
-
-    if (n && w) return 'nw';
-    if (n && e) return 'ne';
-    if (s && w) return 'sw';
-    if (s && e) return 'se';
-    if (n) return 'n';
-    if (s) return 's';
-    if (w) return 'w';
-    if (e) return 'e';
-
-    return null;
-  }
-
-  // ── UIServer Calls ────────────────────────────────────────────────────
-
-  private async uiMoveSurface(x: number, y: number): Promise<void> {
-    if (!this.surfaceId) return;
-    await this.request<boolean>(
-      request(this.id, this.uiServerId, UI_INTERFACE, 'moveSurface', {
-        surfaceId: this.surfaceId, x, y,
-      })
-    );
-  }
-
-  private async uiResizeSurface(width: number, height: number): Promise<void> {
-    if (!this.surfaceId) return;
-    await this.request<boolean>(
-      request(this.id, this.uiServerId, UI_INTERFACE, 'resizeSurface', {
-        surfaceId: this.surfaceId, width, height,
-      })
-    );
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────

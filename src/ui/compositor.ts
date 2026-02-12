@@ -237,6 +237,19 @@ export class Compositor {
   }
 
   /**
+   * Get the maximum z-index among surfaces, optionally only considering
+   * surfaces below a given threshold.
+   */
+  getMaxZIndex(belowThreshold?: number): number {
+    let max = 0;
+    for (const surface of this.surfaces.values()) {
+      if (belowThreshold !== undefined && surface.zIndex >= belowThreshold) continue;
+      if (surface.zIndex > max) max = surface.zIndex;
+    }
+    return max;
+  }
+
+  /**
    * Set surface visibility.
    */
   setVisible(surfaceId: string, visible: boolean): void {

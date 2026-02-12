@@ -50,7 +50,12 @@ export class UIServer extends Abject {
   private surfaceOwners: Map<string, AbjectId> = new Map();
   private focusedSurface?: string;
   private grabbedSurface?: string;  // Mouse capture: routes events during drag
+  private mouseGrabAbject?: AbjectId;  // WindowManager grabs mouse during drag
   private consoleId?: AbjectId;
+  private windowManagerId?: AbjectId;
+  private currentSelectedText = '';
+  private lastMouseX = 0;
+  private lastMouseY = 0;
 
   constructor() {
     super({
@@ -312,6 +317,33 @@ export class UIServer extends Abject {
       };
       return this.measureTextWidthWithFont(surfaceId, text, font ?? WIDGET_FONT);
     });
+
+    this.on('selectionChanged', async (msg: AbjectMessage) => {
+      const { selectedText } = msg.payload as { selectedText: string };
+      this.currentSelectedText = selectedText;
+    });
+
+    this.on('registerWindowManager', async (msg: AbjectMessage) => {
+      this.windowManagerId = msg.routing.from;
+      return true;
+    });
+
+    // Two-phase drag: WindowAbject sends requestDrag when a chromeless+draggable
+    // window's empty area is clicked. We set the mouse grab and tell WindowManager
+    // to start the drag using the last known mouse position.
+    this.on('requestDrag', async (msg: AbjectMessage) => {
+      const { surfaceId } = msg.payload as { surfaceId: string };
+      if (!this.windowManagerId || !surfaceId) return;
+      const surface = this.compositor?.getSurface(surfaceId);
+      if (!surface) return;
+      this.mouseGrabAbject = this.windowManagerId;
+      this.send(event(this.id, this.windowManagerId,
+        'abjects:window-manager' as InterfaceId, 'startDrag', {
+          surfaceId,
+          globalX: this.lastMouseX,
+          globalY: this.lastMouseY,
+        }));
+    });
   }
 
   protected override async onInit(): Promise<void> {
@@ -413,6 +445,8 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
     document.addEventListener('keyup', (e) => this.handleKeyEvent(e, 'keyup'));
 
     document.addEventListener('paste', (e) => this.handlePasteEvent(e));
+    document.addEventListener('copy', (e) => this.handleCopyEvent(e));
+    document.addEventListener('cut', (e) => this.handleCutEvent(e));
   }
 
   // ── Surface API ──────────────────────────────────────────────────────
@@ -473,7 +507,7 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
     x: number,
     y: number
   ): boolean {
-    if (this.surfaceOwners.get(surfaceId) !== objectId) {
+    if (this.surfaceOwners.get(surfaceId) !== objectId && objectId !== this.windowManagerId) {
       return false;
     }
     this.compositor?.moveSurface(surfaceId, x, y);
@@ -489,7 +523,7 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
     width: number,
     height: number
   ): boolean {
-    if (this.surfaceOwners.get(surfaceId) !== objectId) {
+    if (this.surfaceOwners.get(surfaceId) !== objectId && objectId !== this.windowManagerId) {
       return false;
     }
     this.compositor?.resizeSurface(surfaceId, width, height);
@@ -504,7 +538,7 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
     surfaceId: string,
     zIndex: number
   ): boolean {
-    if (this.surfaceOwners.get(surfaceId) !== objectId) {
+    if (this.surfaceOwners.get(surfaceId) !== objectId && objectId !== this.windowManagerId) {
       return false;
     }
     this.compositor?.setZIndex(surfaceId, zIndex);
@@ -559,14 +593,36 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
 
   /**
    * Handle mouse events — find surface and forward input event to owner.
+   * Async because mousedown may send a request to WindowManager.
    */
-  private handleMouseEvent(
+  private async handleMouseEvent(
     e: MouseEvent,
     type: 'mousedown' | 'mouseup' | 'mousemove'
-  ): void {
+  ): Promise<void> {
     const canvasRect = (e.target as HTMLCanvasElement).getBoundingClientRect();
     const x = e.clientX - canvasRect.left;
     const y = e.clientY - canvasRect.top;
+
+    // Track last mouse position for requestDrag
+    this.lastMouseX = x;
+    this.lastMouseY = y;
+
+    // ── WindowManager grab: route drag events to WindowManager ──
+    if (this.mouseGrabAbject) {
+      if (type === 'mousemove') {
+        this.send(event(this.id, this.mouseGrabAbject, UI_INTERFACE, 'dragMove', {
+          globalX: x, globalY: y,
+        }));
+        return;
+      }
+      if (type === 'mouseup') {
+        this.send(event(this.id, this.mouseGrabAbject, UI_INTERFACE, 'dragEnd', {
+          globalX: x, globalY: y,
+        }));
+        this.mouseGrabAbject = undefined;
+        return;
+      }
+    }
 
     // Mouse capture: during drag, route to grabbed surface regardless of position
     const hitSurface = this.compositor?.surfaceAt(x, y);
@@ -574,6 +630,56 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
       ? this.compositor?.getSurface(this.grabbedSurface)
       : undefined;
     const surface = grabbed ?? hitSurface;
+
+    if (type === 'mousedown' && surface && this.windowManagerId) {
+      const owner = this.surfaceOwners.get(surface.id);
+
+      // Ask WindowManager if it wants to grab the mouse (drag/resize)
+      try {
+        const localX = x - surface.rect.x;
+        const localY = y - surface.rect.y;
+        const reply = await this.request<{ grab: boolean }>(
+          request(this.id, this.windowManagerId,
+            'abjects:window-manager' as InterfaceId, 'surfaceMouseDown', {
+              surfaceId: surface.id, localX, localY,
+            })
+        );
+
+        if (reply.grab) {
+          // WindowManager claimed the grab — it handles drag/resize
+          this.mouseGrabAbject = this.windowManagerId;
+          if (owner) {
+            this.setFocus(owner, surface.id);
+          }
+          return;
+        }
+      } catch {
+        // WindowManager not available — fall through to original behavior
+      }
+
+      // WindowManager didn't grab — proceed with normal input routing
+      if (owner) {
+        const inputEvent: InputEvent = {
+          type,
+          surfaceId: surface.id,
+          x: x - surface.rect.x,
+          y: y - surface.rect.y,
+          button: e.button,
+          modifiers: {
+            shift: e.shiftKey,
+            ctrl: e.ctrlKey,
+            alt: e.altKey,
+            meta: e.metaKey,
+          },
+        };
+        this.sendInputEvent(owner, inputEvent);
+        this.grabbedSurface = surface.id;
+        this.setFocus(owner, surface.id);
+      }
+      return;
+    }
+
+    // ── Normal mousemove / mouseup path ──
 
     const inputEvent: InputEvent = {
       type,
@@ -593,11 +699,6 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
       const owner = this.surfaceOwners.get(surface.id);
       if (owner) {
         this.sendInputEvent(owner, inputEvent);
-      }
-
-      if (type === 'mousedown' && owner) {
-        this.grabbedSurface = surface.id;
-        this.setFocus(owner, surface.id);
       }
     }
 
@@ -679,6 +780,36 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
       surfaceId: this.focusedSurface,
       pasteText,
     });
+  }
+
+  /**
+   * Handle copy events — write selected text to clipboard.
+   */
+  private handleCopyEvent(e: ClipboardEvent): void {
+    if (!this.currentSelectedText) return;
+    e.preventDefault();
+    e.clipboardData?.setData('text/plain', this.currentSelectedText);
+  }
+
+  /**
+   * Handle cut events — write selected text to clipboard and forward cut to widget.
+   */
+  private handleCutEvent(e: ClipboardEvent): void {
+    if (!this.currentSelectedText || !this.focusedSurface) return;
+    e.preventDefault();
+    e.clipboardData?.setData('text/plain', this.currentSelectedText);
+    // Forward cut as a keydown so widget deletes the selection
+    const owner = this.surfaceOwners.get(this.focusedSurface);
+    if (owner) {
+      this.sendInputEvent(owner, {
+        type: 'keydown',
+        surfaceId: this.focusedSurface,
+        key: 'x',
+        code: 'KeyX',
+        modifiers: { shift: false, ctrl: true, alt: false, meta: false },
+      });
+    }
+    this.currentSelectedText = '';
   }
 
   // ── Event Sending ────────────────────────────────────────────────────

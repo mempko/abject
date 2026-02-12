@@ -26,6 +26,8 @@ import { RegistryBrowser } from './objects/registry-browser.js';
 import { ObjectWorkshop } from './objects/object-workshop.js';
 import { WidgetManager } from './objects/widget-manager.js';
 import { ThemeAbject } from './objects/theme.js';
+import { WindowManager } from './objects/window-manager.js';
+import { AbjectEditor } from './objects/abject-editor.js';
 
 // Export public API
 export { App, createApp } from './ui/app.js';
@@ -47,6 +49,8 @@ export { RegistryBrowser, REGISTRY_BROWSER_ID } from './objects/registry-browser
 export { ObjectWorkshop, OBJECT_WORKSHOP_ID } from './objects/object-workshop.js';
 export { WidgetManager, WIDGET_MANAGER_ID } from './objects/widget-manager.js';
 export { ThemeAbject, THEME_ID } from './objects/theme.js';
+export { WindowManager, WINDOW_MANAGER_ID } from './objects/window-manager.js';
+export { AbjectEditor, ABJECT_EDITOR_ID } from './objects/abject-editor.js';
 export { ScriptableAbject, EDITABLE_INTERFACE_ID } from './objects/scriptable-abject.js';
 
 // Export widget Abjects
@@ -220,11 +224,13 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('Console', () => new Console());
   runtime.objectFactory.registerConstructor('FileSystem', () => new FileSystem());
   runtime.objectFactory.registerConstructor('Theme', () => new ThemeAbject());
+  runtime.objectFactory.registerConstructor('WindowManager', () => new WindowManager());
   runtime.objectFactory.registerConstructor('WidgetManager', () => new WidgetManager());
   runtime.objectFactory.registerConstructor('ProxyGenerator', () => new ProxyGenerator());
   runtime.objectFactory.registerConstructor('Negotiator', () => new Negotiator());
   runtime.objectFactory.registerConstructor('HealthMonitor', () => new HealthMonitor());
   runtime.objectFactory.registerConstructor('ObjectCreator', () => new ObjectCreator());
+  runtime.objectFactory.registerConstructor('AbjectEditor', () => new AbjectEditor());
   runtime.objectFactory.registerConstructor('Settings', () => new Settings());
   runtime.objectFactory.registerConstructor('RegistryBrowser', () => new RegistryBrowser());
   runtime.objectFactory.registerConstructor('ObjectWorkshop', () => new ObjectWorkshop());
@@ -247,6 +253,7 @@ async function main(): Promise<App> {
   const clipboardId = await factorySpawn('Clipboard');
   const consoleId = await factorySpawn('Console');
   const filesystemId = await factorySpawn('FileSystem');
+  const windowManagerId = await factorySpawn('WindowManager');
   const widgetManagerId = await factorySpawn('WidgetManager');
 
   // Set base deps for ScriptableAbjects (unchanged — they use setDeps())
@@ -265,6 +272,7 @@ async function main(): Promise<App> {
     'abjects:health-monitor' as InterfaceId, 'startMonitoring', {});
 
   const objectCreatorId = await factorySpawn('ObjectCreator');
+  const abjectEditorId = await factorySpawn('AbjectEditor');
   const settingsId = await factorySpawn('Settings');
   const registryBrowserId = await factorySpawn('RegistryBrowser');
   const objectWorkshopId = await factorySpawn('ObjectWorkshop');
@@ -287,6 +295,7 @@ async function main(): Promise<App> {
     llm: getObj(llmId),
     settings: getObj(settingsId),
     objectCreator: getObj(objectCreatorId),
+    abjectEditor: getObj(abjectEditorId),
     registryBrowser: getObj(registryBrowserId),
     objectWorkshop: getObj(objectWorkshopId),
     taskbar: getObj(taskbarId),
@@ -299,12 +308,14 @@ async function main(): Promise<App> {
     console: getObj(consoleId),
     theme: getObj(themeId),
     widgetManager: getObj(widgetManagerId),
+    windowManager: getObj(windowManagerId),
     filesystem: getObj(filesystemId),
     // Object IDs for message-based interaction
     ids: {
       llm: llmId,
       settings: settingsId,
       objectCreator: objectCreatorId,
+      abjectEditor: abjectEditorId,
       registryBrowser: registryBrowserId,
       objectWorkshop: objectWorkshopId,
       taskbar: taskbarId,
@@ -317,6 +328,7 @@ async function main(): Promise<App> {
       console: consoleId,
       theme: themeId,
       widgetManager: widgetManagerId,
+      windowManager: windowManagerId,
       filesystem: filesystemId,
       proxyGenerator: proxyGenId,
       negotiator: negotiatorId,

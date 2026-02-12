@@ -26,6 +26,8 @@ import { RegistryBrowser } from '../src/objects/registry-browser.js';
 import { ObjectWorkshop } from '../src/objects/object-workshop.js';
 import { WidgetManager } from '../src/objects/widget-manager.js';
 import { ThemeAbject } from '../src/objects/theme.js';
+import { WindowManager } from '../src/objects/window-manager.js';
+import { AbjectEditor } from '../src/objects/abject-editor.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
 
 const WS_PORT = parseInt(process.env.WS_PORT ?? '7719', 10);
@@ -97,11 +99,13 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('Console', () => new Console());
   runtime.objectFactory.registerConstructor('FileSystem', () => new FileSystem());
   runtime.objectFactory.registerConstructor('Theme', () => new ThemeAbject());
+  runtime.objectFactory.registerConstructor('WindowManager', () => new WindowManager());
   runtime.objectFactory.registerConstructor('WidgetManager', () => new WidgetManager());
   runtime.objectFactory.registerConstructor('ProxyGenerator', () => new ProxyGenerator());
   runtime.objectFactory.registerConstructor('Negotiator', () => new Negotiator());
   runtime.objectFactory.registerConstructor('HealthMonitor', () => new HealthMonitor());
   runtime.objectFactory.registerConstructor('ObjectCreator', () => new ObjectCreator());
+  runtime.objectFactory.registerConstructor('AbjectEditor', () => new AbjectEditor());
   runtime.objectFactory.registerConstructor('Settings', () => new Settings());
   runtime.objectFactory.registerConstructor('RegistryBrowser', () => new RegistryBrowser());
   runtime.objectFactory.registerConstructor('ObjectWorkshop', () => new ObjectWorkshop());
@@ -125,6 +129,7 @@ async function main(): Promise<void> {
   const clipboardId = await factorySpawn('Clipboard');
   const consoleId = await factorySpawn('Console');
   const filesystemId = await factorySpawn('FileSystem');
+  const windowManagerId = await factorySpawn('WindowManager');
   const widgetManagerId = await factorySpawn('WidgetManager');
 
   // Set base deps with BackendUI acting as UIServer
@@ -143,6 +148,7 @@ async function main(): Promise<void> {
     'abjects:health-monitor' as InterfaceId, 'startMonitoring', {});
 
   const objectCreatorId = await factorySpawn('ObjectCreator');
+  const abjectEditorId = await factorySpawn('AbjectEditor');
   const settingsId = await factorySpawn('Settings');
   const registryBrowserId = await factorySpawn('RegistryBrowser');
   const objectWorkshopId = await factorySpawn('ObjectWorkshop');

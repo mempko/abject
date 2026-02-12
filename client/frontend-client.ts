@@ -13,6 +13,7 @@ import type {
   FrontendToBackendMsg,
   CreateSurfaceMsg,
   DrawMsg,
+  SetSelectedTextMsg,
 } from '../server/ws-protocol.js';
 
 /**
@@ -24,6 +25,7 @@ export class FrontendClient {
   private ws: WebSocket | null = null;
   private focusedSurface?: string;
   private grabbedSurface?: string;
+  private currentSelectedText = '';
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -121,6 +123,10 @@ export class FrontendClient {
       case 'displayInfoRequest':
         this.handleDisplayInfoRequest(msg.requestId!);
         break;
+
+      case 'setSelectedText':
+        this.currentSelectedText = (msg as SetSelectedTextMsg).text;
+        break;
     }
   }
 
@@ -191,6 +197,8 @@ export class FrontendClient {
     document.addEventListener('keyup', (e) => this.handleKeyEvent(e, 'keyup'));
 
     document.addEventListener('paste', (e) => this.handlePasteEvent(e));
+    document.addEventListener('copy', (e) => this.handleCopyEvent(e));
+    document.addEventListener('cut', (e) => this.handleCutEvent(e));
   }
 
   private handleMouseEvent(
@@ -293,6 +301,28 @@ export class FrontendClient {
       surfaceId: this.focusedSurface,
       pasteText,
     });
+  }
+
+  private handleCopyEvent(e: ClipboardEvent): void {
+    if (!this.currentSelectedText) return;
+    e.preventDefault();
+    e.clipboardData?.setData('text/plain', this.currentSelectedText);
+  }
+
+  private handleCutEvent(e: ClipboardEvent): void {
+    if (!this.currentSelectedText || !this.focusedSurface) return;
+    e.preventDefault();
+    e.clipboardData?.setData('text/plain', this.currentSelectedText);
+    // Forward cut as keydown so widget deletes the selection via normal input routing
+    this.sendToBackend({
+      type: 'input',
+      inputType: 'keydown',
+      surfaceId: this.focusedSurface,
+      key: 'x',
+      code: 'KeyX',
+      modifiers: { shift: false, ctrl: true, alt: false, meta: false },
+    });
+    this.currentSelectedText = '';
   }
 
   // ── Send to backend ────────────────────────────────────────────────────

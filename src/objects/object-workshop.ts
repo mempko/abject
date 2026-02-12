@@ -18,8 +18,8 @@ const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
 const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 
-const WIN_W = 500;
-const WIN_H = 350;
+const WIN_W = 520;
+const WIN_H = 420;
 
 export class ObjectWorkshop extends Abject {
   private widgetManagerId?: AbjectId;
@@ -131,19 +131,20 @@ export class ObjectWorkshop extends Abject {
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 8, right: 16, bottom: 8, left: 16 },
+        margins: { top: 16, right: 20, bottom: 16, left: 20 },
         spacing: 8,
       })
     );
 
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
 
-    // Prompt label
+    // Prompt label (styled as section header)
     this.promptLabelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
         rect: r0,
         text: 'Describe the object you want to create:',
+        style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 14 },
       })
     );
     await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
@@ -152,18 +153,33 @@ export class ObjectWorkshop extends Abject {
       preferredSize: { height: 20 },
     }));
 
-    // Text input (expanding horizontally, fixed height)
-    this.promptInputId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
+    // Subtitle
+    const subtitleId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
         rect: r0,
-        placeholder: 'e.g., A counter that tracks page views...',
+        text: 'Use natural language to describe any object.',
+        style: { color: '#b4b8c8', fontSize: 12 },
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: subtitleId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
+
+    // TextArea for prompt (expanding to fill available space)
+    this.promptInputId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextArea', {
+        windowId: this.windowId,
+        rect: r0,
+        text: '',
       })
     );
     await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.promptInputId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 36 },
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+      stretch: 1,
     }));
 
     // HBox for Create button (spacer pushes it right)
@@ -183,12 +199,13 @@ export class ObjectWorkshop extends Abject {
     // Spacer pushes button right
     await this.request(request(this.id, createRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
 
-    // Create button
+    // Create button (accent styling)
     this.createBtnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId,
         rect: r0,
         text: 'Create',
+        style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
       })
     );
     await this.request(request(this.id, createRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
@@ -282,8 +299,7 @@ export class ObjectWorkshop extends Abject {
     }
 
     const isCreate =
-      (fromId === this.createBtnId && aspect === 'click') ||
-      (fromId === this.promptInputId && aspect === 'submit');
+      (fromId === this.createBtnId && aspect === 'click');
 
     if (!isCreate || !this.windowId) return;
 
@@ -351,6 +367,7 @@ export class ObjectWorkshop extends Abject {
         windowId: this.windowId,
         rect: { x: 0, y: 0, width: 0, height: 0 },
         text: 'Modify',
+        style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
       })
     );
     await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {

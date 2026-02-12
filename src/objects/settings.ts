@@ -41,6 +41,7 @@ export class Settings extends Abject {
   private openaiKeyId?: AbjectId;
   private openaiToggleId?: AbjectId;
   private saveBtnId?: AbjectId;
+  private statusLabelId?: AbjectId;
 
   private unmasked: Set<AbjectId> = new Set();
 
@@ -159,13 +160,25 @@ export class Settings extends Abject {
   async show(): Promise<boolean> {
     if (this.windowId) return true;
 
+    // Load saved keys to populate inputs
+    let savedAnthropicKey: string | null = null;
+    let savedOpenaiKey: string | null = null;
+    if (this.storageId) {
+      savedAnthropicKey = await this.request<string | null>(
+        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_ANTHROPIC })
+      );
+      savedOpenaiKey = await this.request<string | null>(
+        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_OPENAI })
+      );
+    }
+
     // Get display dimensions
     const displayInfo = await this.request<{ width: number; height: number }>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
     );
 
-    const winW = 420;
-    const winH = 300;
+    const winW = 440;
+    const winH = 340;
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
@@ -184,15 +197,42 @@ export class Settings extends Abject {
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 16, right: 16, bottom: 16, left: 16 },
+        margins: { top: 20, right: 20, bottom: 20, left: 20 },
         spacing: 8,
       })
     );
+
+    // Section header: "API Keys"
+    const sectionHeaderId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'API Keys',
+        style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: sectionHeaderId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 24 },
+    }));
+
+    // Description
+    const descLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Enter your API keys to enable LLM features.',
+        style: { color: '#b4b8c8', fontSize: 12 },
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: descLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
 
     // Anthropic label
     this.anthropicLabelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Anthropic API Key',
+        style: { color: '#e2e4e9', fontSize: 13 },
       })
     );
     await this.request(request(this.id, this.anthropicLabelId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
@@ -219,6 +259,7 @@ export class Settings extends Abject {
     this.anthropicKeyId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
         windowId: this.windowId, rect: r0, placeholder: 'sk-ant-...', masked: true,
+        text: savedAnthropicKey ?? undefined,
       })
     );
     await this.request(request(this.id, this.anthropicKeyId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
@@ -240,10 +281,23 @@ export class Settings extends Abject {
       preferredSize: { width: 56, height: 32 },
     }));
 
+    // Divider between Anthropic and OpenAI sections
+    const dividerId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
+        windowId: this.windowId, rect: r0,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: dividerId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 12 },
+    }));
+
     // OpenAI label
     this.openaiLabelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'OpenAI API Key',
+        style: { color: '#e2e4e9', fontSize: 13 },
       })
     );
     await this.request(request(this.id, this.openaiLabelId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
@@ -270,6 +324,7 @@ export class Settings extends Abject {
     this.openaiKeyId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
         windowId: this.windowId, rect: r0, placeholder: 'sk-...', masked: true,
+        text: savedOpenaiKey ?? undefined,
       })
     );
     await this.request(request(this.id, this.openaiKeyId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
@@ -313,6 +368,7 @@ export class Settings extends Abject {
     this.saveBtnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Save',
+        style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
       })
     );
     await this.request(request(this.id, this.saveBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
@@ -320,6 +376,19 @@ export class Settings extends Abject {
       widgetId: this.saveBtnId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 100, height: 36 },
+    }));
+
+    // Status label (for save feedback)
+    this.statusLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: '',
+        style: { color: '#b4b8c8', fontSize: 12, align: 'right' },
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.statusLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
     }));
 
     return true;
@@ -346,6 +415,7 @@ export class Settings extends Abject {
     this.openaiKeyId = undefined;
     this.openaiToggleId = undefined;
     this.saveBtnId = undefined;
+    this.statusLabelId = undefined;
     this.unmasked.clear();
 
     return true;
@@ -420,7 +490,13 @@ export class Settings extends Abject {
       console.log(`[SETTINGS] Saved. LLM providers: ${providers.join(', ') || 'none'}`);
     }
 
-    // Close the settings window
+    // Show save feedback, then close
+    if (this.statusLabelId) {
+      await this.request(
+        request(this.id, this.statusLabelId, WIDGET_INTERFACE, 'update', { text: 'Settings saved!' })
+      );
+      await new Promise((resolve) => setTimeout(resolve, 800));
+    }
     await this.hide();
   }
 }

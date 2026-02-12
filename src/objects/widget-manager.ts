@@ -61,6 +61,7 @@ export class WidgetManager extends Abject {
   private consoleId?: AbjectId;
   private cachedTheme: ThemeData = MIDNIGHT_BLOOM;
   private themeId?: AbjectId;
+  private windowManagerId?: AbjectId;
 
   // Tracking spawned Abjects (Set<AbjectId>, NOT references — network transparent)
   private spawnedWindows: Set<AbjectId> = new Set();
@@ -680,6 +681,15 @@ export class WidgetManager extends Abject {
       }
 
       // Forward window events
+      if (aspect === 'windowRect') {
+        const { x, y, width, height } = value as { x: number; y: number; width: number; height: number };
+        await this.send(
+          event(this.id, ownerId, WIDGETS_INTERFACE, 'windowMoved', { windowId: windowShimId, x, y })
+        );
+        await this.send(
+          event(this.id, ownerId, WIDGETS_INTERFACE, 'windowResized', { windowId: windowShimId, width, height })
+        );
+      }
       if (aspect === 'windowMoved') {
         const { x, y } = value as { x: number; y: number };
         await this.send(
@@ -698,6 +708,7 @@ export class WidgetManager extends Abject {
   protected override async onInit(): Promise<void> {
     this.uiServerId = await this.requireDep('UIServer');
     this.consoleId = await this.discoverDep('Console') ?? undefined;
+    this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
 
     // Query ThemeAbject for the current theme
     this.themeId = await this.discoverDep('Theme') ?? undefined;
@@ -857,6 +868,18 @@ createNestedHBox - Nested horizontal layout inside another layout
       request(this.id, win.id, INTROSPECT_INTERFACE_ID, 'addDependent', {})
     );
 
+    // Register with WindowManager for z-order and drag/resize management
+    if (this.windowManagerId && win.surface) {
+      try {
+        await this.request(request(this.id, this.windowManagerId,
+          'abjects:window-manager' as InterfaceId, 'registerWindow', {
+            surfaceId: win.surface, windowId: win.id, zIndex: options?.zIndex ?? 100,
+            rect, chromeless: options?.chromeless ?? false,
+            draggable: false,
+          }));
+      } catch { /* WindowManager may not be ready */ }
+    }
+
     // Generate a shim window ID for backward compat
     const shimWindowId = `wm-win-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     this.shimWindowMap.set(shimWindowId, win.id);
@@ -888,6 +911,19 @@ createNestedHBox - Nested horizontal layout inside another layout
     await win.init(this.bus, this.id);
     this.spawnedWindows.add(win.id);
     this.log('debug', 'createWindowAbject', { windowId: win.id, title });
+
+    // Register with WindowManager for z-order and drag/resize management
+    if (this.windowManagerId && win.surface) {
+      try {
+        await this.request(request(this.id, this.windowManagerId,
+          'abjects:window-manager' as InterfaceId, 'registerWindow', {
+            surfaceId: win.surface, windowId: win.id, zIndex: options?.zIndex ?? 100,
+            rect, chromeless: options?.chromeless ?? false,
+            draggable: options?.draggable ?? false,
+          }));
+      } catch { /* WindowManager may not be ready */ }
+    }
+
     return win.id;
   }
 
@@ -895,6 +931,14 @@ createNestedHBox - Nested horizontal layout inside another layout
 
   private async destroyWindowDirect(windowId: AbjectId): Promise<boolean> {
     if (!this.spawnedWindows.has(windowId)) return false;
+
+    // Unregister from WindowManager
+    if (this.windowManagerId) {
+      try {
+        this.send(event(this.id, this.windowManagerId,
+          'abjects:window-manager' as InterfaceId, 'unregisterWindow', { windowId }));
+      } catch { /* WM may be gone */ }
+    }
 
     try {
       await this.request(
@@ -980,6 +1024,14 @@ createNestedHBox - Nested horizontal layout inside another layout
 
     // Verify ownership
     if (this.windowOwners.get(winAbjectId) !== owner) return false;
+
+    // Unregister from WindowManager
+    if (this.windowManagerId) {
+      try {
+        this.send(event(this.id, this.windowManagerId,
+          'abjects:window-manager' as InterfaceId, 'unregisterWindow', { windowId: winAbjectId }));
+      } catch { /* WM may be gone */ }
+    }
 
     // Send destroy message to WindowAbject (it will destroy all children)
     try {

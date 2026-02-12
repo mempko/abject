@@ -60,6 +60,7 @@ export interface ThemeData {
   selectBg: string;
   selectHover: string;
   selectArrow: string;
+  selectionBg: string;
   windowRadius: number;
   widgetRadius: number;
   titleBarHeight: number;
@@ -92,6 +93,7 @@ export const MIDNIGHT_BLOOM: ThemeData = {
   selectBg: '#1e2030',
   selectHover: '#252840',
   selectArrow: '#6b7084',
+  selectionBg: 'rgba(232, 168, 76, 0.3)',
   windowRadius: 8,
   widgetRadius: 6,
   titleBarHeight: 34,

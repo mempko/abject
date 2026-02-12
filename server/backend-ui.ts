@@ -61,11 +61,16 @@ export interface InputEvent {
 export class BackendUI extends Abject {
   private surfaces: Map<string, SurfaceState> = new Map();
   private focusedSurface?: string;
+  private mouseGrabAbject?: AbjectId;  // WindowManager grabs mouse during drag
   private pendingRequests: Map<string, { resolve: (value: unknown) => void }> = new Map();
   private ws: WebSocket | null = null;
   private surfaceCounter = 0;
   private consoleId?: AbjectId;
+  private windowManagerId?: AbjectId;
+  private currentSelectedText = '';
   private lastDisplayInfo: { width: number; height: number } = { width: 1280, height: 720 };
+  private lastMouseX = 0;
+  private lastMouseY = 0;
 
   constructor() {
     super({
@@ -332,6 +337,34 @@ export class BackendUI extends Abject {
       };
       return this.handleMeasureText(surfaceId, text, font ?? WIDGET_FONT);
     });
+
+    this.on('selectionChanged', async (msg: AbjectMessage) => {
+      const { selectedText } = msg.payload as { selectedText: string };
+      this.currentSelectedText = selectedText;
+      this.sendToFrontend({ type: 'setSelectedText', text: selectedText });
+    });
+
+    this.on('registerWindowManager', async (msg: AbjectMessage) => {
+      this.windowManagerId = msg.routing.from;
+      return true;
+    });
+
+    // Two-phase drag: WindowAbject sends requestDrag when a chromeless+draggable
+    // window's empty area is clicked. We set the mouse grab and tell WindowManager
+    // to start the drag using the last known mouse position.
+    this.on('requestDrag', async (msg: AbjectMessage) => {
+      const { surfaceId } = msg.payload as { surfaceId: string };
+      if (!this.windowManagerId || !surfaceId) return;
+      const state = this.surfaces.get(surfaceId);
+      if (!state) return;
+      this.mouseGrabAbject = this.windowManagerId;
+      this.send(event(this.id, this.windowManagerId,
+        'abjects:window-manager' as InterfaceId, 'startDrag', {
+          surfaceId,
+          globalX: this.lastMouseX,
+          globalY: this.lastMouseY,
+        }));
+    });
   }
 
   protected override async onInit(): Promise<void> {
@@ -470,7 +503,7 @@ export class BackendUI extends Abject {
     y: number
   ): boolean {
     const state = this.surfaces.get(surfaceId);
-    if (!state || state.objectId !== objectId) {
+    if (!state || (state.objectId !== objectId && objectId !== this.windowManagerId)) {
       return false;
     }
 
@@ -494,7 +527,7 @@ export class BackendUI extends Abject {
     height: number
   ): boolean {
     const state = this.surfaces.get(surfaceId);
-    if (!state || state.objectId !== objectId) {
+    if (!state || (state.objectId !== objectId && objectId !== this.windowManagerId)) {
       return false;
     }
 
@@ -517,7 +550,7 @@ export class BackendUI extends Abject {
     zIndex: number
   ): boolean {
     const state = this.surfaces.get(surfaceId);
-    if (!state || state.objectId !== objectId) {
+    if (!state || (state.objectId !== objectId && objectId !== this.windowManagerId)) {
       return false;
     }
 
@@ -652,6 +685,37 @@ export class BackendUI extends Abject {
   }
 
   private async handleFrontendInput(msg: InputMsg): Promise<void> {
+    // Track last mouse position (global coords) for requestDrag
+    if (msg.inputType === 'mousedown' || msg.inputType === 'mousemove') {
+      const surfState = msg.surfaceId ? this.surfaces.get(msg.surfaceId) : undefined;
+      this.lastMouseX = (msg.x ?? 0) + (surfState?.rect.x ?? 0);
+      this.lastMouseY = (msg.y ?? 0) + (surfState?.rect.y ?? 0);
+    }
+
+    // ── WindowManager grab: route drag events to WindowManager ──
+    if (this.mouseGrabAbject) {
+      if (msg.inputType === 'mousemove') {
+        // Reconstruct global coords from local + surface rect
+        const state = msg.surfaceId ? this.surfaces.get(msg.surfaceId) : undefined;
+        const globalX = (msg.x ?? 0) + (state?.rect.x ?? 0);
+        const globalY = (msg.y ?? 0) + (state?.rect.y ?? 0);
+        this.send(event(this.id, this.mouseGrabAbject, UI_INTERFACE, 'dragMove', {
+          globalX, globalY,
+        }));
+        return;
+      }
+      if (msg.inputType === 'mouseup') {
+        const state = msg.surfaceId ? this.surfaces.get(msg.surfaceId) : undefined;
+        const globalX = (msg.x ?? 0) + (state?.rect.x ?? 0);
+        const globalY = (msg.y ?? 0) + (state?.rect.y ?? 0);
+        this.send(event(this.id, this.mouseGrabAbject, UI_INTERFACE, 'dragEnd', {
+          globalX, globalY,
+        }));
+        this.mouseGrabAbject = undefined;
+        return;
+      }
+    }
+
     const inputEvent: InputEvent = {
       type: msg.inputType,
       surfaceId: msg.surfaceId,
@@ -669,6 +733,34 @@ export class BackendUI extends Abject {
     if (msg.surfaceId) {
       const state = this.surfaces.get(msg.surfaceId);
       if (state) {
+        if (msg.inputType === 'mousedown' && this.windowManagerId) {
+          // Ask WindowManager if it wants to grab the mouse (drag/resize)
+          const localX = msg.x ?? 0;
+          const localY = msg.y ?? 0;
+          try {
+            const reply = await this.request<{ grab: boolean }>(
+              request(this.id, this.windowManagerId,
+                'abjects:window-manager' as InterfaceId, 'surfaceMouseDown', {
+                  surfaceId: msg.surfaceId, localX, localY,
+                })
+            );
+
+            if (reply.grab) {
+              // WindowManager claimed the grab — it handles drag/resize
+              this.mouseGrabAbject = this.windowManagerId;
+              this.handleFocus(state.objectId, msg.surfaceId);
+              return;
+            }
+          } catch {
+            // WindowManager not available — fall through to original behavior
+          }
+
+          // WindowManager didn't grab — proceed with normal input routing
+          await this.sendInputEvent(state.objectId, inputEvent);
+          this.handleFocus(state.objectId, msg.surfaceId);
+          return;
+        }
+
         await this.sendInputEvent(state.objectId, inputEvent);
       }
     }
