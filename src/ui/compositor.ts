@@ -18,6 +18,7 @@ export interface Surface {
   rect: Rect;
   zIndex: number;
   visible: boolean;
+  inputPassthrough: boolean;
   canvas: OffscreenCanvas;
   ctx: OffscreenCanvasRenderingContext2D;
   dirty: boolean;
@@ -122,7 +123,8 @@ export class Compositor {
     objectId: AbjectId,
     rect: Rect,
     zIndex = 0,
-    surfaceId?: string
+    surfaceId?: string,
+    inputPassthrough = false
   ): string {
     require(objectId !== '', 'objectId is required');
     require(rect.width > 0 && rect.height > 0, 'Surface must have positive dimensions');
@@ -139,6 +141,7 @@ export class Compositor {
       rect,
       zIndex,
       visible: true,
+      inputPassthrough,
       canvas: offscreen,
       ctx: ctx!,
       dirty: true,
@@ -454,6 +457,7 @@ export class Compositor {
     for (let i = this.sortedSurfaces.length - 1; i >= 0; i--) {
       const surface = this.sortedSurfaces[i];
       if (!surface.visible) continue;
+      if (surface.inputPassthrough) continue;
 
       const { rect } = surface;
       if (

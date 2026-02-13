@@ -10,7 +10,7 @@
  *   Phase 3:  verifyAndFix()             — programmatic consistency check
  *   Phase 3b: llmVerifyAndFix()          — optional LLM-assisted fix
  *   Phase 4:  compile check
- *   Phase 5:  factory.spawn({ ..., deps })
+ *   Phase 5:  factory.spawn()
  *   Phase 6:  negotiator.connect()       — optional, connects to deps
  */
 
@@ -25,14 +25,14 @@ import {
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { INTROSPECT_INTERFACE_ID, IntrospectResult } from '../core/introspect.js';
 
 import { ScriptableAbject } from './scriptable-abject.js';
 import { systemMessage, userMessage, LLMMessage, LLMCompletionResult } from '../llm/provider.js';
 
 
-const OBJECT_CREATOR_INTERFACE = 'abjects:object-creator';
+const OBJECT_CREATOR_INTERFACE = 'abjects:object-creator' as InterfaceId;
 
 export interface CreateObjectRequest {
   prompt: string;
@@ -185,6 +185,17 @@ export class ObjectCreator extends Abject {
                 description: 'Object was modified',
                 payload: { kind: 'reference', reference: 'CreationResult' },
               },
+              {
+                name: 'progress',
+                description: 'Progress update during object creation',
+                payload: {
+                  kind: 'object',
+                  properties: {
+                    phase: { kind: 'primitive', primitive: 'string' },
+                    message: { kind: 'primitive', primitive: 'string' },
+                  },
+                },
+              },
             ],
           },
         ],
@@ -200,7 +211,7 @@ export class ObjectCreator extends Abject {
   private setupHandlers(): void {
     this.on('create', async (msg: AbjectMessage) => {
       const { prompt, context } = msg.payload as CreateObjectRequest;
-      return this.createObject(prompt, context);
+      return this.createObject(prompt, context, msg.routing.from);
     });
 
     this.on('modify', async (msg: AbjectMessage) => {
@@ -273,6 +284,14 @@ export class ObjectCreator extends Abject {
     return this.request<SpawnResult>(
       request(this.id, this.factoryId!, 'abjects:factory' as InterfaceId, 'spawn', spawnReq)
     );
+  }
+
+  private async reportProgress(callerId: AbjectId, phase: string, message: string): Promise<void> {
+    try {
+      await this.send(
+        event(this.id, callerId, OBJECT_CREATOR_INTERFACE, 'progress', { phase, message })
+      );
+    } catch { /* best-effort */ }
   }
 
   // ── Multi-Phase Discovery Pipeline ────────────────────────────────
@@ -424,99 +443,154 @@ export class ObjectCreator extends Abject {
    * Create a new object from a natural language prompt.
    * Uses multi-phase pipeline: discovery → manifest → code → verify → spawn.
    */
-  async createObject(prompt: string, context?: string): Promise<CreationResult> {
+  async createObject(prompt: string, context?: string, callerId?: AbjectId): Promise<CreationResult> {
     require(this.llmId !== undefined, 'LLM not set');
     require(this.registryId !== undefined, 'Registry not set');
 
     try {
       // Phase 0a: Get object summaries
+      if (callerId) await this.reportProgress(callerId, '0a', 'Discovering available objects...');
       const summaries = await this.discoverObjectSummaries();
 
       // Phase 0b: LLM selects dependencies
+      if (callerId) await this.reportProgress(callerId, '0b', 'Choosing dependencies...');
       const selectedNames = await this.llmSelectDependencies(prompt, summaries);
       console.log('[OBJECT-CREATOR] Selected dependencies:', selectedNames);
 
       // Phase 0c: Fetch full manifests for selected dependencies
+      const depNames = selectedNames.join(', ') || 'none';
+      if (callerId) await this.reportProgress(callerId, '0c', `Learning about ${depNames}...`);
       const deps = await this.fetchFullManifests(selectedNames, summaries);
       console.log('[OBJECT-CREATOR] Fetched manifests for:', deps.map((d) => d.name));
 
       // Phase 0d: Ask each dependency for usage guides via 'ask' protocol
+      const fetchedNames = deps.map((d) => d.name).join(', ') || 'none';
+      if (callerId) await this.reportProgress(callerId, '0d', `Asking ${fetchedNames} for usage guides...`);
       const usageGuides = await this.fetchUsageGuides(deps);
       console.log('[OBJECT-CREATOR] Got usage guides from:', Array.from(usageGuides.keys()));
 
       const depContext = this.formatFullManifestContext(deps, usageGuides);
 
       // Phase 1: Generate manifest
+      if (callerId) await this.reportProgress(callerId, '1', 'Designing object manifest...');
       const phase1 = await this.generateManifest(prompt, depContext, context);
       if (!phase1.manifest) {
         return { success: false, error: 'Phase 1: Failed to generate valid manifest' };
       }
 
-      // Phase 2: Generate handler code
-      let code = await this.generateHandlerCode(
-        phase1.manifest, prompt, depContext, phase1.usedObjects, context
-      );
-      if (!code) {
-        return { success: false, error: 'Phase 2: Failed to generate handler code' };
-      }
+      // Phases 2–4: Generate handler code, verify, compile — with retry loop
+      const MAX_CODE_ATTEMPTS = 3;
+      let code: string | undefined;
+      let manifest = phase1.manifest;
+      let lastError = '';
 
-      // Phase 3: Verify manifest/code consistency
-      const verified = this.verifyAndFix(phase1.manifest, code);
-      let manifest = verified.manifest;
-      code = verified.code;
-
-      // Phase 3b: LLM-assisted fix if needed
-      if (verified.mismatches.length > 0) {
-        try {
-          const llmFixed = await this.llmVerifyAndFix(manifest, code, verified.mismatches);
-          manifest = llmFixed.manifest;
-          code = llmFixed.code;
-        } catch (err) {
-          console.warn('[OBJECT-CREATOR] LLM verify/fix failed, continuing:', err);
+      for (let attempt = 1; attempt <= MAX_CODE_ATTEMPTS; attempt++) {
+        // Phase 2: Generate handler code (with feedback on retry)
+        if (attempt === 1) {
+          if (callerId) await this.reportProgress(callerId, '2', 'Generating handler code...');
+          code = await this.generateHandlerCode(
+            manifest, prompt, depContext, phase1.usedObjects, context
+          );
+        } else {
+          if (callerId) await this.reportProgress(callerId, '2', `Generating handler code (retry ${attempt}/${MAX_CODE_ATTEMPTS})...`);
+          console.log(`[OBJECT-CREATOR] Retry ${attempt}/${MAX_CODE_ATTEMPTS}: regenerating code`);
+          code = await this.regenerateHandlerCode(
+            manifest, prompt, depContext, phase1.usedObjects, code ?? '', lastError, context
+          );
         }
-      }
+        if (!code) {
+          lastError = 'Failed to generate handler code';
+          continue;
+        }
 
-      // Phase 4: Compile check
-      const compileError = ScriptableAbject.tryCompile(code);
-      if (compileError) {
-        const fixResult = await this.llmComplete([
-          systemMessage(
-            'The following JavaScript handler map failed to compile with `new Function()`. ' +
-            'Fix it so it is valid plain JavaScript. No TypeScript annotations, no type casts, no interfaces. ' +
-            'Output ONLY the corrected handler map in a ```javascript code block. Nothing else.'
-          ),
-          userMessage(`Handler map:\n\`\`\`javascript\n${code}\n\`\`\`\n\nError: ${compileError}`),
-        ]);
-        const fixMatch = fixResult.content.match(/```(?:javascript|js)\s*([\s\S]*?)\s*```/);
-        if (fixMatch) {
-          const retryError = ScriptableAbject.tryCompile(fixMatch[1]);
-          if (!retryError) {
+        // Phase 3: Verify manifest/code consistency
+        if (callerId) await this.reportProgress(callerId, '3', 'Verifying code...');
+        const verified = this.verifyAndFix(manifest, code);
+        manifest = verified.manifest;
+        code = verified.code;
+
+        // Phase 3b: LLM-assisted fix if needed
+        if (verified.mismatches.length > 0) {
+          try {
+            const llmFixed = await this.llmVerifyAndFix(manifest, code, verified.mismatches);
+            manifest = llmFixed.manifest;
+            code = llmFixed.code;
+          } catch (err) {
+            console.warn('[OBJECT-CREATOR] LLM verify/fix failed, continuing:', err);
+          }
+        }
+
+        // Phase 3c: Re-verify after fixes
+        const recheck = this.verifyAndFix(manifest, code);
+        manifest = recheck.manifest;
+        code = recheck.code;
+        const missingHandlers = recheck.mismatches.filter((m) => m.startsWith('Missing handler:'));
+        if (missingHandlers.length > 0) {
+          lastError = `Handler code is missing required methods: ${missingHandlers.join('; ')}`;
+          console.warn(`[OBJECT-CREATOR] Attempt ${attempt}: ${lastError}`);
+          if (attempt < MAX_CODE_ATTEMPTS) continue;
+          return { success: false, error: lastError, code };
+        }
+
+        // Phase 4: Compile check
+        if (callerId) await this.reportProgress(callerId, '4', 'Compiling...');
+        const compileError = ScriptableAbject.tryCompile(code);
+        if (compileError) {
+          // Try a single LLM compile fix
+          const fixResult = await this.llmComplete([
+            systemMessage(
+              'The following JavaScript handler map failed to compile with `new Function()`. ' +
+              'Fix it so it is valid plain JavaScript. No TypeScript annotations, no type casts, no interfaces. ' +
+              'You MUST keep ALL handler methods — do not remove any. ' +
+              'Output ONLY the corrected handler map in a ```javascript code block. Nothing else.'
+            ),
+            userMessage(`Handler map:\n\`\`\`javascript\n${code}\n\`\`\`\n\nError: ${compileError}`),
+          ]);
+          const fixMatch = fixResult.content.match(/```(?:javascript|js)\s*([\s\S]*?)\s*```/);
+          if (fixMatch && !ScriptableAbject.tryCompile(fixMatch[1])) {
             code = fixMatch[1];
           } else {
-            return { success: false, error: `Compilation failed after retry: ${retryError}`, code };
+            lastError = `Compilation failed: ${compileError}`;
+            console.warn(`[OBJECT-CREATOR] Attempt ${attempt}: ${lastError}`);
+            if (attempt < MAX_CODE_ATTEMPTS) continue;
+            return { success: false, error: lastError, code };
           }
-        } else {
-          return { success: false, error: `Compilation failed: ${compileError}`, code };
+
+          // Re-verify after compile fix — the LLM may have dropped methods
+          const postCompileCheck = this.verifyAndFix(manifest, code);
+          const postMissing = postCompileCheck.mismatches.filter((m) => m.startsWith('Missing handler:'));
+          if (postMissing.length > 0) {
+            lastError = `Compile fix dropped required methods: ${postMissing.join('; ')}`;
+            console.warn(`[OBJECT-CREATOR] Attempt ${attempt}: ${lastError}`);
+            if (attempt < MAX_CODE_ATTEMPTS) continue;
+            return { success: false, error: lastError, code };
+          }
         }
+
+        // All checks passed
+        lastError = '';
+        break;
       }
 
-      // Phase 5: Spawn via Factory with deps
-      if (this.factoryId) {
-        // Build deps map: name → AbjectId
-        const depsMap: Record<string, AbjectId> = {};
-        for (const dep of deps) {
-          depsMap[dep.name] = dep.id;
-        }
+      if (lastError) {
+        return { success: false, error: lastError, code };
+      }
 
+      // Phase 5: Spawn via Factory
+      if (callerId) await this.reportProgress(callerId, '5', 'Spawning object...');
+      if (this.factoryId) {
         const spawnResult = await this.factorySpawn({
           manifest,
           source: code,
           owner: this.id,
-          deps: depsMap,
           parentId: this.id,
         });
 
         // Phase 6: Connect to dependencies via Negotiator (fire-and-forget)
+        if (callerId && deps.length > 0) {
+          const connectNames = deps.map((d) => d.name).join(', ');
+          await this.reportProgress(callerId, '6', `Connecting to ${connectNames}...`);
+        }
         if (this.negotiatorId && spawnResult.objectId) {
           for (const dep of deps) {
             this.request(request(
@@ -709,6 +783,31 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
   }
 
   /**
+   * Phase 2 retry: Regenerate handler code with feedback about what went wrong.
+   */
+  private async regenerateHandlerCode(
+    manifest: AbjectManifest,
+    prompt: string,
+    depContext: string,
+    usedObjects: string[],
+    previousCode: string,
+    errorFeedback: string,
+    context?: string
+  ): Promise<string | undefined> {
+    const methodList = manifest.interfaces
+      .flatMap((i) => i.methods.map((m) => m.name));
+
+    const messages: LLMMessage[] = [
+      systemMessage(this.getPhase2SystemPrompt()),
+      userMessage(`Manifest:\n\`\`\`json\n${JSON.stringify(manifest, null, 2)}\n\`\`\`\n\nYou MUST implement handlers for these methods: ${methodList.join(', ')}\n\nAvailable dependencies:\n${depContext}\n\nUsed objects: ${usedObjects.length > 0 ? usedObjects.join(', ') : 'None'}\n\n${context ? `Additional context: ${context}\n\n` : ''}Original user request: ${prompt}\n\nGenerate the handler map.`),
+      systemMessage(`Your previous attempt failed with this error:\n${errorFeedback}\n\n${previousCode ? `Previous code:\n\`\`\`javascript\n${previousCode}\n\`\`\`\n\n` : ''}Fix these issues. Remember:\n- The handler map MUST be a FLAT parenthesized object: ({ method(msg) { ... } })\n- You MUST implement ALL methods listed above: ${methodList.join(', ')}\n- Each handler takes a single msg argument\n- MUST be plain JavaScript, NOT TypeScript\n- Do NOT nest handlers under interface keys\n\nGenerate the corrected handler map.`),
+    ];
+
+    const result = await this.llmComplete(messages);
+    return this.parseCodeResponse(result.content);
+  }
+
+  /**
    * Phase 3: Programmatic verification of manifest/code consistency.
    */
   private verifyAndFix(
@@ -886,19 +985,49 @@ Used objects: None
 
 ## Common Patterns
 
-### UI Objects (objects that display a window)
-If the new object needs a visible window, its manifest MUST include these methods:
-- show: creates and displays the window with widgets
-- hide: destroys/closes the window
-- widgetEvent: receives UI interaction events (clicks, text input) from widgets
+There are TWO UI patterns. Choose the right one based on the user's request.
 
-The system Taskbar automatically discovers objects with show + hide and adds launch buttons for them. Without these methods, the user has no way to open the object.
+### Canvas Surface Objects (custom drawing, games, animations, visualizations)
+Use when the object draws graphics directly (games, charts, custom visuals).
+Dependencies needed: UIServer (required), Timer (if animation needed)
+Manifest MUST include these methods:
+- show: creates a canvas surface via UIServer and starts rendering
+- hide: destroys the surface and stops timers
+- input: receives mouse/keyboard events from UIServer (type, surfaceId, x, y, button, key, code, modifiers)
+- timerFired: receives timer callbacks if using animation (timerId, data)
+- If your object does NOT need mouse/keyboard input (e.g. it reacts to other objects' state), set inputPassthrough: true when creating the surface. This lets input events pass through to surfaces behind it.
+
+### Widget Objects (standard UI: forms, buttons, text inputs, lists)
+Use when the object needs standard UI controls.
+Dependencies needed: WidgetManager (required)
+Manifest MUST include these methods:
+- show: creates a window with widgets via WidgetManager
+- hide: destroys the window
+- changed: receives widget interaction events (aspect, value) from widget dependencies
+
+### Both patterns
+The system Taskbar automatically discovers objects with show + hide and adds launch buttons for them.
 
 ### Non-UI Objects
-Objects that only perform background work (data processing, scheduling, etc.) do NOT need show/hide/widgetEvent.
+Objects that only perform background work do NOT need show/hide.
 
 ### Using Dependency Information
-Study the dependency descriptions and their "Usage Guide" sections carefully. They contain working examples of how to call each dependency's methods and handle its events.`;
+Study the dependency descriptions and their "Usage Guide" sections carefully. They contain working examples of how to call each dependency's methods and handle its events.
+
+### Inspectability & Interactibility
+
+Objects MUST NOT be opaque. Design every object to be a visible, queryable, controllable participant in the system:
+
+1. **State query method**: Every object with internal state MUST include a \`getState\` method that returns the object's current state as a plain object. This lets other objects inspect it at any time.
+
+2. **Control methods**: Think about what actions make sense for this object beyond the user's explicit request. For example:
+   - A game object should have \`reset\`, \`pause\`, \`resume\`
+   - A data object should have \`clear\`, \`configure\`
+   - A timer-based object should have \`start\`, \`stop\`
+
+3. **State broadcasting**: The implementation will call this.changed(aspect, value) to notify any observing objects when state changes. Keep this in mind when designing — any interesting state transition should be observable.
+
+The goal is maximum flexibility and emergent behavior: objects you create today should be composable with objects created tomorrow.`;
   }
 
   /**
@@ -913,7 +1042,10 @@ CRITICAL RULES:
 - You MUST implement a handler for EVERY method listed in the manifest. No exceptions.
 - You MUST NOT add public methods that are not in the manifest. Private properties prefixed with _ are OK.
 - The handler map is a FLAT parenthesized object expression: ({ method(msg) { ... } })
-- Each handler receives a SINGLE argument: a message object (msg) with msg.payload containing parameters.
+- Each handler receives a SINGLE argument: a message object (msg).
+- msg.payload IS the parameters directly — destructure from it: const { x, y } = msg.payload;
+- msg.routing.from is the sender's ID.
+- NEVER wrap payload access: msg.payload.event, msg.payload.data, msg.payload.params are ALL WRONG.
 - Handlers are method shorthand directly on the top-level object. NOT nested under interface keys.
 - Return a value from a handler to auto-reply.
 - MUST be plain JavaScript (NOT TypeScript). No type annotations, no "as" casts, no interfaces. It will be compiled with new Function() at runtime.
@@ -973,12 +1105,200 @@ async thingHappened(msg) {
 }
 \`\`\`
 
+## Observer Protocol & State Broadcasting
+
+Every object in the system can be observed by other objects. When your object's state changes, broadcast it:
+
+  this.changed(aspect, value)
+
+- \`aspect\` is a string naming what changed (e.g. 'score', 'position', 'status')
+- \`value\` is the new value (any serializable data)
+- All objects that called addDependent on your object will receive a \`changed\` event
+
+Call this.changed() whenever meaningful state changes occur. This is how emergent behavior happens — objects you don't know about yet can observe and react to your state changes.
+
+### getState handler
+
+Every object with internal state MUST implement a \`getState\` handler that returns the object's current state as a plain object. This makes the object inspectable by any other object in the system.
+
+\`\`\`javascript
+async getState(msg) {
+  return {
+    score: this._score,
+    position: { x: this._x, y: this._y },
+    running: this._timerId !== null,
+  };
+}
+\`\`\`
+
+## Complete Example: Canvas Surface Object
+
+\`\`\`javascript
+({
+  _surfaceId: null,
+  _timerId: null,
+  _mouseX: 200,
+  _mouseY: 150,
+
+  async show(msg) {
+    if (this._surfaceId) return true;
+
+    const { width, height } = await this.call(
+      this.dep('UIServer'), 'abjects:ui', 'getDisplayInfo', {});
+
+    this._surfaceId = await this.call(
+      this.dep('UIServer'), 'abjects:ui', 'createSurface',
+      { rect: { x: 50, y: 50, width: 400, height: 300 }, zIndex: 100 });
+
+    this._timerId = await this.call(
+      this.dep('Timer'), 'abjects:timer', 'setInterval',
+      { intervalMs: 16, data: { type: 'animate' } });
+
+    await this._draw();
+    return true;
+  },
+
+  async hide(msg) {
+    if (!this._surfaceId) return true;
+    if (this._timerId) {
+      await this.call(this.dep('Timer'), 'abjects:timer', 'clearTimer',
+        { timerId: this._timerId });
+      this._timerId = null;
+    }
+    await this.call(this.dep('UIServer'), 'abjects:ui', 'destroySurface',
+      { surfaceId: this._surfaceId });
+    this._surfaceId = null;
+    return true;
+  },
+
+  async input(msg) {
+    // msg.payload IS the event directly — never msg.payload.event
+    const { type, x, y, key } = msg.payload;
+    if (type === 'mousemove') {
+      this._mouseX = x;
+      this._mouseY = y;
+      this.changed('position', { x: this._mouseX, y: this._mouseY });
+    }
+  },
+
+  async getState(msg) {
+    return {
+      mouseX: this._mouseX,
+      mouseY: this._mouseY,
+      visible: !!this._surfaceId,
+    };
+  },
+
+  async timerFired(msg) {
+    // msg.payload IS { timerId, data } directly
+    const { data } = msg.payload;
+    if (data && data.type === 'animate') {
+      await this._draw();
+    }
+  },
+
+  async _draw() {
+    if (!this._surfaceId) return;
+    await this.call(this.dep('UIServer'), 'abjects:ui', 'draw', {
+      commands: [
+        { type: 'clear', surfaceId: this._surfaceId, params: {} },
+        { type: 'rect', surfaceId: this._surfaceId,
+          params: { x: 0, y: 0, width: 400, height: 300, fill: '#1e1e2e' } },
+        { type: 'rect', surfaceId: this._surfaceId,
+          params: { x: this._mouseX - 10, y: this._mouseY - 10,
+                    width: 20, height: 20, fill: '#e8a84c', radius: 4 } },
+      ]
+    });
+  }
+})
+\`\`\`
+
+## Complete Example: Widget Object
+
+\`\`\`javascript
+({
+  _windowId: null,
+  _inputId: null,
+  _buttonId: null,
+  _labelId: null,
+
+  async show(msg) {
+    if (this._windowId) return true;
+
+    this._windowId = await this.call(
+      this.dep('WidgetManager'), 'abjects:widgets', 'createWindowAbject',
+      { title: 'Greeter', rect: { x: 100, y: 100, width: 350, height: 200 }, resizable: true });
+
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+
+    const layoutId = await this.call(
+      this.dep('WidgetManager'), 'abjects:widgets', 'createVBox',
+      { windowId: this._windowId, margins: { top: 16, right: 16, bottom: 16, left: 16 }, spacing: 8 });
+
+    this._inputId = await this.call(
+      this.dep('WidgetManager'), 'abjects:widgets', 'createTextInput',
+      { windowId: this._windowId, rect: r0, placeholder: 'Enter your name...' });
+    await this.call(layoutId, 'abjects:layout', 'addLayoutChild',
+      { widgetId: this._inputId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 36 } });
+
+    this._buttonId = await this.call(
+      this.dep('WidgetManager'), 'abjects:widgets', 'createButton',
+      { windowId: this._windowId, rect: r0, text: 'Greet' });
+    await this.call(this._buttonId, 'abjects:introspect', 'addDependent', {});
+    await this.call(layoutId, 'abjects:layout', 'addLayoutChild',
+      { widgetId: this._buttonId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+        preferredSize: { width: 100, height: 36 } });
+
+    this._labelId = await this.call(
+      this.dep('WidgetManager'), 'abjects:widgets', 'createLabel',
+      { windowId: this._windowId, rect: r0, text: '' });
+    await this.call(layoutId, 'abjects:layout', 'addLayoutChild',
+      { widgetId: this._labelId, sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 20 } });
+
+    return true;
+  },
+
+  async hide(msg) {
+    if (!this._windowId) return true;
+    await this.call(this.dep('WidgetManager'), 'abjects:widgets',
+      'destroyWindowAbject', { windowId: this._windowId });
+    this._windowId = null;
+    this._inputId = null;
+    this._buttonId = null;
+    this._labelId = null;
+    return true;
+  },
+
+  async getState(msg) {
+    return {
+      visible: !!this._windowId,
+    };
+  },
+
+  async changed(msg) {
+    // msg.payload IS { aspect, value } directly — never msg.payload.event
+    const { aspect } = msg.payload;
+    if (aspect !== 'click') return;
+
+    if (msg.routing.from === this._buttonId) {
+      const name = await this.call(this._inputId, 'abjects:widget', 'getValue', {});
+      await this.call(this._labelId, 'abjects:widget', 'update',
+        { text: 'Hello, ' + (name || 'world') + '!' });
+      this.changed('greeted', { name });
+    }
+  }
+})
+\`\`\`
+
 ## IMPORTANT
-- The ONLY methods available on \`this\` are: call(), dep(), find(), and this.id
+- The methods available on \`this\` are: call(), dep(), find(), changed(), and this.id
 - Study the dependency descriptions to learn their interface IDs, method names, and event names
 - Do NOT invent wrapper APIs — no api.*, no Host.*, no this.services.*, no this.ui.*, no window.*, no document.*
 - The ONLY way to call another object is: this.call(this.dep('Name'), interfaceId, method, payload)
-- There are NO shortcuts, wrappers, or helper objects. Always use this.call() directly.`;
+- There are NO shortcuts, wrappers, or helper objects. Always use this.call() directly.
+- When creating a display-only surface (no input needed), pass inputPassthrough: true to createSurface. This prevents your surface from stealing input from surfaces behind it.`;
   }
 
   /**
@@ -1031,7 +1351,21 @@ this.id — this object's own ID
 The ONLY methods available on \`this\` are: call(), dep(), find(), and this.id.
 Study the dependency descriptions to learn their interface IDs, method names, and parameters.
 Do NOT invent methods — no Host.*, no this.services.*, no this.ui.*
-ALL interaction with dependencies MUST go through this.call(this.dep('Name'), interfaceId, method, payload).`;
+ALL interaction with dependencies MUST go through this.call(this.dep('Name'), interfaceId, method, payload).
+
+## Message Handling Rules
+- msg.payload IS the data directly. Destructure: const { x, y } = msg.payload;
+- msg.routing.from is the sender's ID.
+- NEVER use nested access like msg.payload.event, msg.payload.data, or msg.payload.params.
+- For input events: const { type, surfaceId, x, y, key } = msg.payload;
+- For timer events: const { timerId, data } = msg.payload;
+- For widget changed events: const { aspect, value } = msg.payload;
+
+## Observer Protocol
+- this.changed(aspect, value) broadcasts state changes to all observing objects.
+- Call it whenever meaningful state changes: this.changed('score', newScore)
+- Always include a getState handler that returns the object's current internal state.
+- Objects should be inspectable and interactible, not opaque.`;
   }
 }
 

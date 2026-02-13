@@ -33,10 +33,12 @@ export class ObjectWorkshop extends Abject {
   private promptLabelId?: AbjectId;
   private promptInputId?: AbjectId;
   private createBtnId?: AbjectId;
-  private statusLabelId?: AbjectId;
-  private resultNameId?: AbjectId;
-  private resultDescId?: AbjectId;
   private modifyBtnId?: AbjectId;
+
+  // Progress log state
+  private progressLogId?: AbjectId;
+  private progressLabelIds: AbjectId[] = [];
+  private activeProgressLabelId?: AbjectId;
 
   constructor() {
     super({
@@ -105,6 +107,17 @@ export class ObjectWorkshop extends Abject {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
       await this.handleChanged(fromId, aspect, value);
+    });
+
+    this.on('progress', async (msg: AbjectMessage) => {
+      const { message } = msg.payload as { phase: string; message: string };
+      if (msg.routing.from === this.objectCreatorId) {
+        // Mark previous active step as completed
+        await this.markActiveCompleted();
+        // Append new active step
+        const labelId = await this.appendLogEntry(`▸ ${message}`, { color: '#e8a84c' });
+        this.activeProgressLabelId = labelId;
+      }
     });
   }
 
@@ -214,50 +227,19 @@ export class ObjectWorkshop extends Abject {
       preferredSize: { width: 100, height: 36 },
     }));
 
-    // Status label
-    this.statusLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId,
-        rect: r0,
-        text: '',
+    // Progress log container (nested VBox, expanding to fill available space)
+    this.progressLogId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedVBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 2,
       })
     );
     await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.statusLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
+      widgetId: this.progressLogId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+      stretch: 1,
     }));
-
-    // Result name label
-    this.resultNameId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId,
-        rect: r0,
-        text: '',
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.resultNameId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-
-    // Result description label
-    this.resultDescId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId,
-        rect: r0,
-        text: '',
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.resultDescId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-
-    // Spacer pushes modify button to bottom
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
 
     // Register as dependent of interactive widgets to receive 'changed' events
     await this.request(
@@ -284,10 +266,10 @@ export class ObjectWorkshop extends Abject {
     this.promptLabelId = undefined;
     this.promptInputId = undefined;
     this.createBtnId = undefined;
-    this.statusLabelId = undefined;
-    this.resultNameId = undefined;
-    this.resultDescId = undefined;
     this.modifyBtnId = undefined;
+    this.progressLogId = undefined;
+    this.progressLabelIds = [];
+    this.activeProgressLabelId = undefined;
     return true;
   }
 
@@ -309,14 +291,14 @@ export class ObjectWorkshop extends Abject {
     );
 
     if (!prompt.trim()) {
-      await this.updateStatus('Please enter a description.');
+      await this.clearProgressLog();
+      await this.appendLogEntry('Please enter a description.', { color: '#b4b8c8' });
       return;
     }
 
-    // Show creating status
+    // Clear previous log and start fresh
+    await this.clearProgressLog();
     await this.log('info', 'ObjectWorkshop: creating object', { prompt });
-    await this.updateStatus('Creating...');
-    await this.updateResult('', '');
 
     try {
       const result = await this.request<CreationResult>(
@@ -333,31 +315,101 @@ export class ObjectWorkshop extends Abject {
       if (result.success && result.manifest) {
         this.lastCreatedObjectId = result.objectId;
         await this.log('info', 'ObjectWorkshop: object created', { name: result.manifest.name, objectId: result.objectId });
-        await this.updateStatus(`Created: ${result.manifest.name}`);
-        await this.updateResult(
-          `Name: ${result.manifest.name}`,
-          `Description: ${result.manifest.description}`
-        );
+        // Mark last active step as completed
+        await this.markActiveCompleted();
+        // Append success entries
+        await this.appendLogEntry(`✓ Created: ${result.manifest.name}`, { color: '#a8cc8c' });
+        await this.appendLogEntry(`  ${result.manifest.description}`, { color: '#6b7084', fontSize: 12 });
         // Show Modify button if object was spawned
         if (result.objectId) {
           await this.showModifyButton();
         }
       } else {
         await this.log('error', 'ObjectWorkshop: creation failed', { error: result.error });
-        await this.updateStatus(`Error: ${result.error ?? 'Unknown error'}`);
+        await this.markActiveError();
+        await this.appendLogEntry(`✗ ${result.error ?? 'Unknown error'}`, { color: '#e05561' });
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await this.log('error', 'ObjectWorkshop: creation error', { error: msg });
-      await this.updateStatus(`Error: ${msg}`);
+      await this.markActiveError();
+      await this.appendLogEntry(`✗ ${msg}`, { color: '#e05561' });
     }
   }
 
-  private async updateStatus(text: string): Promise<void> {
-    if (!this.windowId || !this.statusLabelId) return;
-    await this.request(
-      request(this.id, this.statusLabelId, WIDGET_INTERFACE, 'update', { text })
+  /** Append a styled label to the progress log VBox. Returns the label's AbjectId. */
+  private async appendLogEntry(
+    text: string,
+    style: { color?: string; fontSize?: number; fontWeight?: string } = {},
+  ): Promise<AbjectId> {
+    const labelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId,
+        rect: { x: 0, y: 0, width: 0, height: 0 },
+        text,
+        style: { color: style.color ?? '#b4b8c8', fontSize: style.fontSize ?? 13, fontWeight: style.fontWeight },
+      })
     );
+    await this.request(request(this.id, this.progressLogId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: labelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
+    this.progressLabelIds.push(labelId);
+    return labelId;
+  }
+
+  /** Clear all labels from the progress log. */
+  private async clearProgressLog(): Promise<void> {
+    if (!this.progressLogId) return;
+    for (const labelId of this.progressLabelIds) {
+      try {
+        await this.request(request(this.id, this.progressLogId, LAYOUT_INTERFACE, 'removeLayoutChild', {
+          widgetId: labelId,
+        }));
+        await this.request(request(this.id, labelId, WIDGET_INTERFACE, 'destroy', {}));
+      } catch { /* widget may already be gone */ }
+    }
+    this.progressLabelIds = [];
+    this.activeProgressLabelId = undefined;
+  }
+
+  /** Mark the current active progress step as completed (checkmark, dim). */
+  private async markActiveCompleted(): Promise<void> {
+    if (!this.activeProgressLabelId) return;
+    const labelId = this.activeProgressLabelId;
+    this.activeProgressLabelId = undefined;
+    try {
+      const currentText = await this.request<string>(
+        request(this.id, labelId, WIDGET_INTERFACE, 'getValue', {})
+      );
+      const stepText = currentText.replace(/^▸\s*/, '');
+      await this.request(
+        request(this.id, labelId, WIDGET_INTERFACE, 'update', {
+          text: `✓ ${stepText}`,
+          style: { color: '#6b7084', fontSize: 13 },
+        })
+      );
+    } catch { /* label may be gone */ }
+  }
+
+  /** Mark the current active progress step as errored (✗, red). */
+  private async markActiveError(): Promise<void> {
+    if (!this.activeProgressLabelId) return;
+    const labelId = this.activeProgressLabelId;
+    this.activeProgressLabelId = undefined;
+    try {
+      const currentText = await this.request<string>(
+        request(this.id, labelId, WIDGET_INTERFACE, 'getValue', {})
+      );
+      const stepText = currentText.replace(/^▸\s*/, '');
+      await this.request(
+        request(this.id, labelId, WIDGET_INTERFACE, 'update', {
+          text: `✗ ${stepText}`,
+          style: { color: '#e05561', fontSize: 13 },
+        })
+      );
+    } catch { /* label may be gone */ }
   }
 
   private async showModifyButton(): Promise<void> {
@@ -390,12 +442,13 @@ export class ObjectWorkshop extends Abject {
     );
 
     if (!prompt.trim()) {
-      await this.updateStatus('Enter a modification description.');
+      await this.clearProgressLog();
+      await this.appendLogEntry('Enter a modification description.', { color: '#b4b8c8' });
       return;
     }
 
+    await this.clearProgressLog();
     await this.log('info', 'ObjectWorkshop: modifying object', { objectId: this.lastCreatedObjectId, prompt });
-    await this.updateStatus('Modifying...');
 
     try {
       const result = await this.request<CreationResult>(
@@ -418,32 +471,23 @@ export class ObjectWorkshop extends Abject {
         );
 
         if (updateResult.success) {
-          await this.updateStatus('Modified successfully');
+          await this.markActiveCompleted();
+          await this.appendLogEntry('✓ Modified successfully', { color: '#a8cc8c' });
         } else {
-          await this.updateStatus(`Compile error: ${updateResult.error ?? 'Unknown'}`);
+          await this.markActiveError();
+          await this.appendLogEntry(`✗ Compile error: ${updateResult.error ?? 'Unknown'}`, { color: '#e05561' });
         }
       } else {
-        await this.updateStatus(`Error: ${result.error ?? 'Unknown'}`);
+        await this.markActiveError();
+        await this.appendLogEntry(`✗ ${result.error ?? 'Unknown'}`, { color: '#e05561' });
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      await this.updateStatus(`Error: ${msg}`);
+      await this.markActiveError();
+      await this.appendLogEntry(`✗ ${msg}`, { color: '#e05561' });
     }
   }
 
-  private async updateResult(name: string, desc: string): Promise<void> {
-    if (!this.windowId) return;
-    if (this.resultNameId) {
-      await this.request(
-        request(this.id, this.resultNameId, WIDGET_INTERFACE, 'update', { text: name })
-      );
-    }
-    if (this.resultDescId) {
-      await this.request(
-        request(this.id, this.resultDescId, WIDGET_INTERFACE, 'update', { text: desc })
-      );
-    }
-  }
 }
 
 export const OBJECT_WORKSHOP_ID = 'abjects:object-workshop' as AbjectId;

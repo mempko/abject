@@ -78,7 +78,7 @@ async function main(): Promise<void> {
       pendingReplies.set(msg.header.messageId, {
         resolve: resolve as (v: unknown) => void, reject,
       });
-      bus.send(msg);
+      bus.send(msg).catch(reject);
     });
   }
 
@@ -132,13 +132,6 @@ async function main(): Promise<void> {
   const windowManagerId = await factorySpawn('WindowManager');
   const widgetManagerId = await factorySpawn('WidgetManager');
 
-  // Set base deps with BackendUI acting as UIServer
-  runtime.objectFactory.setBaseDeps({
-    Registry: registryId,
-    UIServer: backendUI.id,
-    WidgetManager: widgetManagerId,
-  });
-
   const proxyGenId = await factorySpawn('ProxyGenerator');
   const negotiatorId = await factorySpawn('Negotiator');
   const healthMonitorId = await factorySpawn('HealthMonitor');
@@ -185,6 +178,10 @@ async function main(): Promise<void> {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 }
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[ABJECTS] Unhandled rejection (server stayed up):', reason);
+});
 
 main().catch((err) => {
   console.error('[ABJECTS] Fatal startup error:', err);

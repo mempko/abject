@@ -30,7 +30,6 @@ export class Factory extends Abject {
   private constructors: Map<string, ObjectFactory> = new Map();
   private _factoryBus?: MessageBus;
   private _factoryRegistryId?: AbjectId;
-  private _baseDeps: Record<string, AbjectId> = {};
 
   constructor() {
     super({
@@ -120,13 +119,6 @@ export class Factory extends Abject {
   }
 
   /**
-   * Set base dependencies injected into every ScriptableAbject.
-   */
-  setBaseDeps(deps: Record<string, AbjectId>): void {
-    this._baseDeps = { ...deps };
-  }
-
-  /**
    * Register a constructor for a named object type.
    */
   registerConstructor(name: string, factory: ObjectFactory): void {
@@ -171,11 +163,6 @@ export class Factory extends Abject {
     // Track spawned object
     this.spawned.set(obj.id, obj);
 
-    // Inject dependencies into ScriptableAbjects (for the this.dep() runtime API)
-    if (obj instanceof ScriptableAbject) {
-      obj.setDeps({ ...this._baseDeps, ...(req.deps ?? {}) });
-    }
-
     // Register with registry via message passing
     if (this._factoryRegistryId) {
       const payload: Record<string, unknown> = {
@@ -211,11 +198,6 @@ export class Factory extends Abject {
 
     // Track spawned object
     this.spawned.set(obj.id, obj);
-
-    // Inject base dependencies into ScriptableAbjects
-    if (obj instanceof ScriptableAbject) {
-      obj.setDeps({ ...this._baseDeps });
-    }
 
     // Register with registry via message passing
     if (this._factoryRegistryId) {

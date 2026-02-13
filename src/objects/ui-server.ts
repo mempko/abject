@@ -85,6 +85,12 @@ export class UIServer extends Abject {
                     description: 'Z-ordering (higher = on top)',
                     optional: true,
                   },
+                  {
+                    name: 'inputPassthrough',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'If true, surface is display-only — input events pass through to surfaces behind it',
+                    optional: true,
+                  },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -260,8 +266,10 @@ export class UIServer extends Abject {
 
   private setupHandlers(): void {
     this.on('createSurface', async (msg: AbjectMessage) => {
-      const { rect, zIndex } = msg.payload as { rect: Rect; zIndex?: number };
-      return this.createSurface(msg.routing.from, rect, zIndex);
+      const { rect, zIndex, inputPassthrough } = msg.payload as {
+        rect: Rect; zIndex?: number; inputPassthrough?: boolean;
+      };
+      return this.createSurface(msg.routing.from, rect, zIndex, inputPassthrough);
     });
 
     this.on('destroySurface', async (msg: AbjectMessage) => {
@@ -368,6 +376,10 @@ Create a surface:
   const surfaceId = await this.call(this.dep('UIServer'), 'abjects:ui', 'createSurface',
     { rect: { x: 100, y: 100, width: 300, height: 200 }, zIndex: 100 });
 
+Create a display-only surface (input events pass through to surfaces behind it):
+  const surfaceId = await this.call(this.dep('UIServer'), 'abjects:ui', 'createSurface',
+    { rect: { x: 0, y: 0, width, height }, zIndex: 50, inputPassthrough: true });
+
 Destroy a surface:
   await this.call(this.dep('UIServer'), 'abjects:ui', 'destroySurface', { surfaceId });
 
@@ -457,13 +469,16 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
   private createSurface(
     objectId: AbjectId,
     rect: Rect,
-    zIndex?: number
+    zIndex?: number,
+    inputPassthrough?: boolean
   ): string {
     require(this.compositor !== undefined, 'Compositor not set');
 
-    const surfaceId = this.compositor!.createSurface(objectId, rect, zIndex);
+    const surfaceId = this.compositor!.createSurface(
+      objectId, rect, zIndex, undefined, inputPassthrough
+    );
     this.surfaceOwners.set(surfaceId, objectId);
-    this.log('debug', 'createSurface', { surfaceId, objectId, rect, zIndex });
+    this.log('debug', 'createSurface', { surfaceId, objectId, rect, zIndex, inputPassthrough });
 
     return surfaceId;
   }

@@ -323,6 +323,14 @@ export abstract class Abject {
   }
 
   /**
+   * Recover from error state, returning to ready.
+   */
+  recover(): void {
+    require(this._status === 'error', 'Can only recover from error state');
+    this._status = 'ready';
+  }
+
+  /**
    * Override this to perform custom cleanup.
    */
   protected async onStop(): Promise<void> {
@@ -397,7 +405,10 @@ export abstract class Abject {
    * Handle an incoming message.
    */
   private async handleMessage(message: AbjectMessage): Promise<void> {
-    require(message !== undefined, 'message is required');
+    if (message === undefined) {
+      console.error(`[${this.id}] handleMessage called with undefined message`);
+      return;
+    }
 
     this.lastActivity = Date.now();
 
@@ -470,7 +481,15 @@ export abstract class Abject {
       console.error(`[${this.id}] Error handling message:`, err);
     }
 
-    this.checkInvariants();
+    try {
+      this.checkInvariants();
+    } catch (err) {
+      console.error(`[${this.id}] Invariant violation after message handling:`, err);
+      this.errorCount++;
+      if (this._status !== 'stopped') {
+        this._status = 'error';
+      }
+    }
   }
 
   /**

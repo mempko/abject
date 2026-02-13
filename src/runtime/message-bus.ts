@@ -117,7 +117,11 @@ export class MessageBus {
     if (handler) {
       const msg = mailbox.tryReceive();
       if (msg) {
-        await handler(msg);
+        try {
+          await handler(msg);
+        } catch (err) {
+          console.error(`[BUS] Handler error for ${recipient}:`, err);
+        }
       }
     }
 

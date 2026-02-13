@@ -19,7 +19,6 @@ import {
   AbjectManifest,
   AbjectMessage,
   InterfaceId,
-  ObjectRegistration,
 } from '../core/types.js';
 import { Abject, MessageHandlerFn } from '../core/abject.js';
 import { require as contractRequire } from '../core/contracts.js';
@@ -36,7 +35,7 @@ export class ScriptableAbject extends Abject {
   private _owner: AbjectId;
   private _userMethods: Set<string> = new Set();
   private _userProps: Set<string> = new Set();
-  private _deps: Record<string, AbjectId> = {};
+  private _depCache: Record<string, AbjectId> = {};
 
   constructor(manifest: AbjectManifest, source: string, owner: AbjectId) {
     // Append the editable interface and 'scriptable' tag
@@ -100,41 +99,26 @@ export class ScriptableAbject extends Abject {
     return this._owner;
   }
 
-  /**
-   * Set dependency IDs for inter-object communication.
-   */
-  setDeps(deps: Record<string, AbjectId>): void {
-    this._deps = { ...deps };
-  }
-
   protected override getSourceForAsk(): string | undefined {
     return this._source;
   }
 
-  protected override getRegistryId(): AbjectId | undefined {
-    return this._deps['Registry'] ?? super.getRegistryId();
-  }
-
   /**
-   * Get a dependency ID by name. Throws if not found.
+   * Get a dependency ID by name via Registry discovery.
+   * Results are cached so subsequent calls for the same name are instant.
    */
-  dep(name: string): AbjectId {
-    contractRequire(
-      name in this._deps,
-      `Dependency '${name}' not found. Available: ${Object.keys(this._deps).join(', ')}`
-    );
-    return this._deps[name];
+  async dep(name: string): Promise<AbjectId> {
+    if (name in this._depCache) return this._depCache[name];
+    const id = await this.requireDep(name);
+    this._depCache[name] = id;
+    return id;
   }
 
   /**
-   * Find an object by name via Registry discovery.
+   * Find an object by name via Registry discovery. Returns null if not found.
    */
   async find(name: string): Promise<AbjectId | null> {
-    contractRequire('Registry' in this._deps, 'Registry dependency not set');
-    const results = await this.call<ObjectRegistration[]>(
-      this._deps['Registry'], 'abjects:registry' as InterfaceId, 'discover', { name }
-    );
-    return results.length > 0 ? results[0].id as AbjectId : null;
+    return this.discoverDep(name);
   }
 
   private setupEditableHandlers(): void {
@@ -157,10 +141,12 @@ export class ScriptableAbject extends Abject {
 
   /**
    * Call a method on another object via message passing.
+   * The `to` parameter accepts a Promise (from this.dep()) or a plain ID.
    */
-  async call<T>(to: AbjectId | string, interfaceId: InterfaceId | string, method: string, payload: unknown = {}): Promise<T> {
+  async call<T>(to: AbjectId | string | Promise<AbjectId>, interfaceId: InterfaceId | string, method: string, payload: unknown = {}): Promise<T> {
+    const resolvedTo = await to;
     return this.request<T>(
-      request(this.id, to as AbjectId, interfaceId as InterfaceId, method, payload)
+      request(this.id, resolvedTo as AbjectId, interfaceId as InterfaceId, method, payload)
     );
   }
 
@@ -197,10 +183,16 @@ export class ScriptableAbject extends Abject {
     for (const [key, value] of Object.entries(handlerMap)) {
       if (typeof value === 'function') {
         const bound = value.bind(this);
-        this.on(key, bound);
-        (this as Record<string, unknown>)[key] = bound;
-        this._userMethods.add(key);
+        if (key.startsWith('_')) {
+          // Internal helper — direct property only, NOT a message handler
+          (this as Record<string, unknown>)[key] = bound;
+        } else {
+          // Message handler — registered on bus, NOT a direct property
+          this.on(key, bound);
+          this._userMethods.add(key);
+        }
       } else {
+        // State property
         (this as Record<string, unknown>)[key] = value;
       }
       this._userProps.add(key);
@@ -241,10 +233,16 @@ export class ScriptableAbject extends Abject {
     for (const [key, value] of Object.entries(handlerMap)) {
       if (typeof value === 'function') {
         const bound = value.bind(this);
-        this.on(key, bound);
-        (this as Record<string, unknown>)[key] = bound;
-        this._userMethods.add(key);
+        if (key.startsWith('_')) {
+          // Internal helper — direct property only, NOT a message handler
+          (this as Record<string, unknown>)[key] = bound;
+        } else {
+          // Message handler — registered on bus, NOT a direct property
+          this.on(key, bound);
+          this._userMethods.add(key);
+        }
       } else {
+        // State property
         (this as Record<string, unknown>)[key] = value;
       }
       this._userProps.add(key);

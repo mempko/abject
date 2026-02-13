@@ -202,7 +202,7 @@ async function main(): Promise<App> {
       pendingReplies.set(msg.header.messageId, {
         resolve: resolve as (v: unknown) => void, reject,
       });
-      bus.send(msg);
+      bus.send(msg).catch(reject);
     });
   }
 
@@ -255,13 +255,6 @@ async function main(): Promise<App> {
   const filesystemId = await factorySpawn('FileSystem');
   const windowManagerId = await factorySpawn('WindowManager');
   const widgetManagerId = await factorySpawn('WidgetManager');
-
-  // Set base deps for ScriptableAbjects (unchanged — they use setDeps())
-  runtime.objectFactory.setBaseDeps({
-    Registry: registryId,
-    UIServer: app.appUIServer.id,
-    WidgetManager: widgetManagerId,
-  });
 
   const proxyGenId = await factorySpawn('ProxyGenerator');
   const negotiatorId = await factorySpawn('Negotiator');

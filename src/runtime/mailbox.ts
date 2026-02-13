@@ -10,7 +10,7 @@ import { require, ensure, invariant, requirePositive } from '../core/contracts.j
  */
 export class Mailbox {
   private queue: AbjectMessage[] = [];
-  private waiters: ((msg: AbjectMessage) => void)[] = [];
+  private waiters: { resolve: (msg: AbjectMessage) => void; reject: (err: Error) => void }[] = [];
   private closed = false;
 
   constructor(private readonly maxSize: number = 1000) {
@@ -30,7 +30,7 @@ export class Mailbox {
 
     const waiter = this.waiters.shift();
     if (waiter) {
-      waiter(message);
+      waiter.resolve(message);
     } else {
       this.queue.push(message);
     }
@@ -49,8 +49,8 @@ export class Mailbox {
       return msg;
     }
 
-    return new Promise((resolve) => {
-      this.waiters.push(resolve);
+    return new Promise((resolve, reject) => {
+      this.waiters.push({ resolve, reject });
     });
   }
 
@@ -79,10 +79,27 @@ export class Mailbox {
     return new Promise((resolve) => {
       let resolved = false;
 
+      const waiterObj = {
+        resolve: (m: AbjectMessage) => {
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timer);
+            resolve(m);
+          }
+        },
+        reject: (_err: Error) => {
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timer);
+            resolve(undefined);
+          }
+        },
+      };
+
       const timer = setTimeout(() => {
         if (!resolved) {
           resolved = true;
-          const idx = this.waiters.indexOf(waiterFn);
+          const idx = this.waiters.indexOf(waiterObj);
           if (idx >= 0) {
             this.waiters.splice(idx, 1);
           }
@@ -90,15 +107,7 @@ export class Mailbox {
         }
       }, timeoutMs);
 
-      const waiterFn = (m: AbjectMessage) => {
-        if (!resolved) {
-          resolved = true;
-          clearTimeout(timer);
-          resolve(m);
-        }
-      };
-
-      this.waiters.push(waiterFn);
+      this.waiters.push(waiterObj);
     });
   }
 
@@ -151,9 +160,8 @@ export class Mailbox {
   close(): void {
     this.closed = true;
     const waiters = this.waiters.splice(0);
-    for (const _waiter of waiters) {
-      // Resolve with a special "closed" indication
-      // In practice, they'll get rejected
+    for (const waiter of waiters) {
+      waiter.reject(new Error('Mailbox closed'));
     }
     ensure(this.waiters.length === 0, 'All waiters must be cleared');
   }
