@@ -7,6 +7,7 @@ import {
   AbjectManifest,
   AbjectMessage,
   InterfaceId,
+  ObjectRegistration,
   SpawnRequest,
   SpawnResult,
   CapabilityGrant,
@@ -86,6 +87,18 @@ export class Factory extends Abject {
                 returns: { kind: 'reference', reference: 'SpawnResult' },
               },
               {
+                name: 'clone',
+                description: 'Clone an existing object (new instance with same manifest/source)',
+                parameters: [
+                  {
+                    name: 'objectId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'The ID of the object to clone',
+                  },
+                ],
+                returns: { kind: 'reference', reference: 'SpawnResult' },
+              },
+              {
                 name: 'registerConstructor',
                 description: 'Register a constructor for a named object type',
                 parameters: [
@@ -118,6 +131,11 @@ export class Factory extends Abject {
     this.on('kill', async (msg: AbjectMessage) => {
       const { objectId } = msg.payload as { objectId: AbjectId };
       return this.kill(objectId);
+    });
+
+    this.on('clone', async (msg: AbjectMessage) => {
+      const { objectId } = msg.payload as { objectId: AbjectId };
+      return this.clone(objectId);
     });
 
     this.on('respawn', async (msg: AbjectMessage) => {
@@ -157,6 +175,28 @@ export class Factory extends Abject {
    */
   getConstructor(name: string): ObjectFactory | undefined {
     return this.constructors.get(name);
+  }
+
+  /**
+   * Clone an existing object — creates a new instance with the same manifest/source but a new ID.
+   */
+  async clone(objectId: AbjectId): Promise<SpawnResult> {
+    require(this._factoryBus !== undefined, 'Factory must have a message bus');
+    require(this._factoryRegistryId !== undefined, 'Factory must have a registry');
+
+    // Look up registration from Registry
+    const reg = await this.request<ObjectRegistration | null>(
+      request(this.id, this._factoryRegistryId!, 'abjects:registry' as InterfaceId, 'lookup', { objectId })
+    );
+    require(reg !== null, `Object '${objectId}' not found in registry`);
+
+    // Delegate to spawn with the same manifest and source
+    const spawnReq: SpawnRequest = { manifest: reg!.manifest };
+    if (reg!.source) {
+      spawnReq.source = reg!.source;
+      spawnReq.owner = reg!.owner;
+    }
+    return this.spawn(spawnReq);
   }
 
   /**
@@ -410,6 +450,16 @@ export function createSpawnRequest(
     initialState,
     grantedCapabilities,
   } as SpawnRequest);
+}
+
+/**
+ * Create a clone request message.
+ */
+export function createCloneRequest(
+  fromId: AbjectId,
+  objectId: AbjectId
+): AbjectMessage {
+  return request(fromId, FACTORY_ID, FACTORY_INTERFACE, 'clone', { objectId });
 }
 
 /**

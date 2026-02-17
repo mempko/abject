@@ -1,6 +1,9 @@
 /**
  * Registry Browser — browse all registered objects, view interfaces and methods.
  *
+ * Three-level navigation:
+ *   Kind List  →  Instance List  →  Detail View
+ *
  * Uses direct widget Abject interaction (createWindowAbject, createLabel, etc.)
  * instead of the old string-based widget ID shim.
  */
@@ -21,6 +24,7 @@ const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
 const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 const WINDOW_INTERFACE: InterfaceId = 'abjects:window';
+const FACTORY_INTERFACE: InterfaceId = 'abjects:factory';
 
 const WIN_W = 550;
 const WIN_H = 500;
@@ -39,15 +43,25 @@ export class RegistryBrowser extends Abject {
   private selectedMethod?: { interfaceId: InterfaceId; method: string };
   private detailObjectId?: AbjectId;
 
-  // ── List View widget tracking ──
-  private objButtons: Map<AbjectId, number> = new Map();
+  // ── Navigation state ──
+  private currentView: 'kindList' | 'instanceList' | 'detail' = 'kindList';
+  private selectedKindName?: string;
+  private kindInstances: ObjectRegistration[] = [];
+
+  // ── Kind List View widget tracking ──
+  private kindButtons: Map<AbjectId, string> = new Map();  // btnId → kind name
   private searchInputId?: AbjectId;
   private scrollableListId?: AbjectId;
+
+  // ── Instance List View widget tracking ──
+  private instanceButtons: Map<AbjectId, number> = new Map();  // btnId → index in kindInstances
+  private instanceCloneButtons: Map<AbjectId, number> = new Map();  // clone btnId → index
 
   // ── Detail View widget tracking ──
   private backBtnId?: AbjectId;
   private editSourceBtnId?: AbjectId;
   private deleteBtnId?: AbjectId;
+  private cloneBtnId?: AbjectId;
   private methodButtons: Map<AbjectId, { interfaceId: InterfaceId; method: string }> = new Map();
   private msgPayloadId?: AbjectId;
   private msgSendBtnId?: AbjectId;
@@ -116,16 +130,6 @@ export class RegistryBrowser extends Abject {
   }
 
   /**
-   * Look up an object in the registry via message passing.
-   */
-  private async registryLookup(objectId: AbjectId): Promise<ObjectRegistration | null> {
-    if (!this.registryId) return null;
-    return this.request<ObjectRegistration | null>(
-      request(this.id, this.registryId, 'abjects:registry' as InterfaceId, 'lookup', { objectId })
-    );
-  }
-
-  /**
    * Register this RegistryBrowser as a dependent of a widget Abject,
    * so we receive 'changed' events from it.
    */
@@ -139,15 +143,20 @@ export class RegistryBrowser extends Abject {
    */
   private clearViewTracking(): void {
     this.rootLayoutId = undefined;
-    // List view
-    this.objButtons.clear();
+    // Kind list view
+    this.kindButtons.clear();
     this.searchInputId = undefined;
     this.scrollableListId = undefined;
+
+    // Instance list view
+    this.instanceButtons.clear();
+    this.instanceCloneButtons.clear();
 
     // Detail view
     this.backBtnId = undefined;
     this.editSourceBtnId = undefined;
     this.deleteBtnId = undefined;
+    this.cloneBtnId = undefined;
     this.methodButtons.clear();
     this.msgPayloadId = undefined;
     this.msgSendBtnId = undefined;
@@ -177,6 +186,24 @@ export class RegistryBrowser extends Abject {
     this.clearViewTracking();
   }
 
+  /**
+   * Group cachedObjects by manifest.name.
+   * Returns a map of kindName → array of ObjectRegistration.
+   */
+  private groupByKind(): Map<string, ObjectRegistration[]> {
+    const groups = new Map<string, ObjectRegistration[]>();
+    for (const obj of this.cachedObjects) {
+      const name = obj.manifest.name;
+      const group = groups.get(name);
+      if (group) {
+        group.push(obj);
+      } else {
+        groups.set(name, [obj]);
+      }
+    }
+    return groups;
+  }
+
   private setupHandlers(): void {
     this.on('show', async () => {
       return this.show();
@@ -196,7 +223,12 @@ export class RegistryBrowser extends Abject {
     this.on('objectRegistered', async () => {
       this.cachedObjects = await this.registryList();
       if (this.windowId) {
-        await this.populateListView();
+        if (this.currentView === 'kindList') {
+          await this.populateKindListView();
+        } else if (this.currentView === 'instanceList' && this.selectedKindName) {
+          await this.showInstanceListView(this.selectedKindName);
+        }
+        // Don't refresh detail view on registration — it would be disruptive
       }
     });
   }
@@ -205,8 +237,10 @@ export class RegistryBrowser extends Abject {
     if (this.windowId) return true;
 
     this.searchText = '';
+    this.currentView = 'kindList';
+    this.selectedKindName = undefined;
     this.cachedObjects = await this.registryList();
-    await this.showListView();
+    await this.showKindListView();
     return true;
   }
 
@@ -220,14 +254,24 @@ export class RegistryBrowser extends Abject {
     );
 
     this.windowId = undefined;
+    this.currentView = 'kindList';
+    this.selectedKindName = undefined;
+    this.kindInstances = [];
     this.clearViewTracking();
     return true;
   }
 
+  // ═══════════════════════════════════════════════════════════════════
+  // Kind List View
+  // ═══════════════════════════════════════════════════════════════════
+
   /**
-   * Show the list view — creates window if needed, then populates content.
+   * Show the kind list view — creates window if needed, then populates content.
    */
-  private async showListView(): Promise<void> {
+  private async showKindListView(): Promise<void> {
+    this.currentView = 'kindList';
+    this.selectedKindName = undefined;
+
     if (!this.windowId) {
       const displayInfo = await this.request<{ width: number; height: number }>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
@@ -245,7 +289,6 @@ export class RegistryBrowser extends Abject {
         })
       );
     } else {
-      // Update window title when switching back from detail view
       await this.request(
         request(this.id, this.windowId, WINDOW_INTERFACE, 'setTitle', {
           title: 'Registry Browser',
@@ -253,13 +296,13 @@ export class RegistryBrowser extends Abject {
       );
     }
 
-    await this.populateListView();
+    await this.populateKindListView();
   }
 
   /**
-   * Populate or repopulate the list view content without recreating the window.
+   * Populate or repopulate the kind list view content without recreating the window.
    */
-  private async populateListView(): Promise<void> {
+  private async populateKindListView(): Promise<void> {
     await this.destroyRootLayout();
 
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
@@ -276,7 +319,7 @@ export class RegistryBrowser extends Abject {
     // Search input at the top
     this.searchInputId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
-        windowId: this.windowId!, rect: r0, placeholder: 'Search objects...',
+        windowId: this.windowId!, rect: r0, placeholder: 'Search kinds...',
       })
     );
     await this.addDep(this.searchInputId);
@@ -295,7 +338,7 @@ export class RegistryBrowser extends Abject {
       );
     }
 
-    // Scrollable VBox for the object list
+    // Scrollable VBox for the kind list
     this.scrollableListId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedScrollableVBox', {
         parentLayoutId: this.rootLayoutId,
@@ -308,19 +351,19 @@ export class RegistryBrowser extends Abject {
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
 
-    // Populate buttons for matching objects
-    await this.rebuildFilteredButtons();
+    // Populate buttons for matching kinds
+    await this.rebuildKindButtons();
   }
 
   /**
-   * Rebuild the object buttons inside the scrollable list,
+   * Rebuild the kind buttons inside the scrollable list,
    * filtered by the current searchText.
    */
-  private async rebuildFilteredButtons(): Promise<void> {
+  private async rebuildKindButtons(): Promise<void> {
     if (!this.scrollableListId) return;
 
     // Destroy existing buttons
-    for (const [btnId] of this.objButtons) {
+    for (const [btnId] of this.kindButtons) {
       try {
         await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'removeLayoutChild', {
           widgetId: btnId,
@@ -330,19 +373,25 @@ export class RegistryBrowser extends Abject {
         await this.request(request(this.id, btnId, WIDGET_INTERFACE, 'destroy', {}));
       } catch { /* already gone */ }
     }
-    this.objButtons.clear();
+    this.kindButtons.clear();
 
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
     const query = this.searchText.toLowerCase();
+    const groups = this.groupByKind();
 
-    for (let i = 0; i < this.cachedObjects.length; i++) {
-      const obj = this.cachedObjects[i];
-      const name = obj.manifest.name.toLowerCase();
-      const desc = obj.manifest.description.toLowerCase();
-      if (query && !name.includes(query) && !desc.includes(query)) continue;
+    // Sort kind names alphabetically
+    const sortedNames = Array.from(groups.keys()).sort();
 
-      const descText = obj.manifest.description;
-      const label = `${obj.manifest.name} — ${descText.length > 55 ? descText.slice(0, 55) + '...' : descText}`;
+    for (const kindName of sortedNames) {
+      const instances = groups.get(kindName)!;
+      const desc = instances[0].manifest.description;
+      const nameLower = kindName.toLowerCase();
+      const descLower = desc.toLowerCase();
+      if (query && !nameLower.includes(query) && !descLower.includes(query)) continue;
+
+      const count = instances.length;
+      const descTrunc = desc.length > 45 ? desc.slice(0, 45) + '...' : desc;
+      const label = `${kindName} (${count}) — ${descTrunc}`;
 
       const btnId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
@@ -351,7 +400,7 @@ export class RegistryBrowser extends Abject {
         })
       );
       await this.addDep(btnId);
-      this.objButtons.set(btnId, i); // absolute index into cachedObjects
+      this.kindButtons.set(btnId, kindName);
 
       await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'addLayoutChild', {
         widgetId: btnId,
@@ -361,6 +410,143 @@ export class RegistryBrowser extends Abject {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════
+  // Instance List View
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Show the instance list view for a given kind name.
+   */
+  private async showInstanceListView(kindName: string): Promise<void> {
+    this.currentView = 'instanceList';
+    this.selectedKindName = kindName;
+    this.searchText = '';
+
+    // Compute instances of this kind from cachedObjects
+    this.kindInstances = this.cachedObjects.filter(o => o.manifest.name === kindName);
+
+    await this.destroyRootLayout();
+
+    // Update window title
+    const count = this.kindInstances.length;
+    if (this.windowId) {
+      await this.request(
+        request(this.id, this.windowId, WINDOW_INTERFACE, 'setTitle', {
+          title: `${kindName} (${count})`,
+        })
+      );
+    }
+
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+
+    // Create root VBox layout
+    this.rootLayoutId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+        windowId: this.windowId!,
+        margins: { top: 8, right: 16, bottom: 8, left: 16 },
+        spacing: 6,
+      })
+    );
+
+    // Scrollable VBox for instance rows
+    this.scrollableListId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedScrollableVBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 4,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.scrollableListId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
+    // Create instance rows (HBox: instance button + clone button)
+    for (let i = 0; i < this.kindInstances.length; i++) {
+      const inst = this.kindInstances[i];
+      const shortId = inst.id.slice(0, 8);
+
+      const rowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+          parentLayoutId: this.scrollableListId,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 6,
+        })
+      );
+      await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: rowId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 32 },
+      }));
+
+      // Instance button (click to show detail)
+      const instBtnId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+          windowId: this.windowId!, rect: r0,
+          text: `${kindName} [${shortId}...]`,
+          style: { fontSize: 13 },
+        })
+      );
+      await this.addDep(instBtnId);
+      this.instanceButtons.set(instBtnId, i);
+      await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: instBtnId,
+        sizePolicy: { horizontal: 'expanding' },
+        preferredSize: { height: 32 },
+      }));
+
+      // Clone button
+      if (this.factoryId) {
+        const cloneBtnId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+            windowId: this.windowId!, rect: r0, text: 'Clone',
+            style: { fontSize: 12 },
+          })
+        );
+        await this.addDep(cloneBtnId);
+        this.instanceCloneButtons.set(cloneBtnId, i);
+        await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          widgetId: cloneBtnId,
+          sizePolicy: { horizontal: 'fixed' },
+          preferredSize: { width: 60, height: 32 },
+        }));
+      }
+    }
+
+    // ── Fixed bottom bar ──
+    const bottomRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 4, right: 0, bottom: 0, left: 0 },
+        spacing: 10,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: bottomRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    this.backBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+        windowId: this.windowId!, rect: r0, text: 'Back',
+      })
+    );
+    await this.addDep(this.backBtnId);
+    await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.backBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 80, height: 32 },
+    }));
+
+    // Right spacer
+    await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Detail View
+  // ═══════════════════════════════════════════════════════════════════
+
   private async showDetailView(index: number): Promise<void> {
     const obj = this.cachedObjects[index];
     if (!obj) return;
@@ -368,16 +554,18 @@ export class RegistryBrowser extends Abject {
     // Store for message sending
     this.detailObjectId = obj.id;
     this.detailIndex = index;
+    this.currentView = 'detail';
     this.selectedMethod = undefined;
 
     // Destroy old layout content, keep window
     await this.destroyRootLayout();
 
     // Update window title
+    const shortId = obj.id.slice(0, 8);
     if (this.windowId) {
       await this.request(
         request(this.id, this.windowId, WINDOW_INTERFACE, 'setTitle', {
-          title: obj.manifest.name,
+          title: `${obj.manifest.name} [${shortId}...]`,
         })
       );
     }
@@ -598,29 +786,47 @@ export class RegistryBrowser extends Abject {
       }
     }
 
+    // Clone button (always available if factory exists)
+    if (this.factoryId) {
+      this.cloneBtnId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+          windowId: this.windowId!, rect: r0, text: 'Clone',
+        })
+      );
+      await this.addDep(this.cloneBtnId);
+      await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: this.cloneBtnId,
+        sizePolicy: { horizontal: 'fixed' },
+        preferredSize: { width: 80, height: 32 },
+      }));
+    }
+
     // Right spacer in bottom row
     await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
   }
 
+  // ═══════════════════════════════════════════════════════════════════
+  // Event Handling
+  // ═══════════════════════════════════════════════════════════════════
+
   private async handleWidgetEvent(fromId: AbjectId, aspect: string, _value?: unknown): Promise<void> {
-    // ── Search input (list view) ──
+    // ── Search input (kind list view) ──
     if (fromId === this.searchInputId && aspect === 'change') {
       this.searchText = (_value as string) ?? '';
-      await this.rebuildFilteredButtons();
+      await this.rebuildKindButtons();
       return;
     }
 
-    // ── Back button (detail view) ──
+    // ── Back button ──
     if (fromId === this.backBtnId) {
-      this.cachedObjects = await this.registryList();
-      await this.populateListView();
-      // Update window title back to list view
-      if (this.windowId) {
-        await this.request(
-          request(this.id, this.windowId, WINDOW_INTERFACE, 'setTitle', {
-            title: 'Registry Browser',
-          })
-        );
+      if (this.currentView === 'detail' && this.selectedKindName) {
+        // Detail → Instance List
+        this.cachedObjects = await this.registryList();
+        await this.showInstanceListView(this.selectedKindName);
+      } else {
+        // Instance List → Kind List (or detail without kind → kind list)
+        this.cachedObjects = await this.registryList();
+        await this.showKindListView();
       }
       return;
     }
@@ -639,18 +845,20 @@ export class RegistryBrowser extends Abject {
     if (fromId === this.deleteBtnId && this.detailObjectId && this.factoryId) {
       try {
         await this.request(request(this.id, this.factoryId,
-          'abjects:factory' as InterfaceId, 'kill', { objectId: this.detailObjectId }));
+          FACTORY_INTERFACE, 'kill', { objectId: this.detailObjectId }));
       } catch { /* object may already be gone */ }
       this.cachedObjects = await this.registryList();
-      await this.populateListView();
-      // Update window title back to list view
-      if (this.windowId) {
-        await this.request(
-          request(this.id, this.windowId, WINDOW_INTERFACE, 'setTitle', {
-            title: 'Registry Browser',
-          })
-        );
+      if (this.selectedKindName) {
+        await this.showInstanceListView(this.selectedKindName);
+      } else {
+        await this.showKindListView();
       }
+      return;
+    }
+
+    // ── Clone button in detail view ──
+    if (fromId === this.cloneBtnId && this.detailObjectId && this.factoryId) {
+      await this.cloneObject(this.detailObjectId);
       return;
     }
 
@@ -676,10 +884,75 @@ export class RegistryBrowser extends Abject {
       return;
     }
 
-    // ── Object button: navigate to detail view ──
-    const objIndex = this.objButtons.get(fromId);
-    if (objIndex !== undefined) {
-      await this.showDetailView(objIndex);
+    // ── Kind button: navigate to instance list view ──
+    const kindName = this.kindButtons.get(fromId);
+    if (kindName !== undefined) {
+      await this.showInstanceListView(kindName);
+      return;
+    }
+
+    // ── Instance clone button: clone the instance ──
+    const cloneIdx = this.instanceCloneButtons.get(fromId);
+    if (cloneIdx !== undefined && this.factoryId) {
+      const inst = this.kindInstances[cloneIdx];
+      if (inst) {
+        await this.cloneObject(inst.id);
+      }
+      return;
+    }
+
+    // ── Instance button: navigate to detail view ──
+    const instIdx = this.instanceButtons.get(fromId);
+    if (instIdx !== undefined) {
+      const inst = this.kindInstances[instIdx];
+      if (inst) {
+        // Find the global index in cachedObjects
+        const globalIndex = this.cachedObjects.findIndex(o => o.id === inst.id);
+        if (globalIndex >= 0) {
+          await this.showDetailView(globalIndex);
+        }
+      }
+    }
+  }
+
+  /**
+   * Clone an object via Factory, refresh caches, and refresh the current view.
+   */
+  private async cloneObject(objectId: AbjectId): Promise<void> {
+    if (!this.factoryId) return;
+
+    try {
+      await this.request(request(this.id, this.factoryId,
+        FACTORY_INTERFACE, 'clone', { objectId }));
+    } catch (err) {
+      // Best-effort: show error in detail view if available
+      if (this.msgResponseId) {
+        const msg = err instanceof Error ? err.message : String(err);
+        try {
+          await this.request(
+            request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
+              text: `Clone error: ${msg.slice(0, 50)}`,
+            })
+          );
+        } catch { /* widget may be gone */ }
+      }
+      return;
+    }
+
+    // Refresh and rebuild current view
+    this.cachedObjects = await this.registryList();
+    if (this.currentView === 'instanceList' && this.selectedKindName) {
+      await this.showInstanceListView(this.selectedKindName);
+    } else if (this.currentView === 'detail' && this.selectedKindName) {
+      // Stay on detail but refresh instance list will happen on next back
+      // Show feedback in response label
+      if (this.msgResponseId) {
+        await this.request(
+          request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
+            text: 'Cloned successfully',
+          })
+        );
+      }
     }
   }
 

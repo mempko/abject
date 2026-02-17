@@ -41,6 +41,7 @@ export interface GeneratedProxy {
 export class ProxyGenerator extends Abject {
   private llmId?: AbjectId;
   private generatedProxies: Map<string, GeneratedProxy> = new Map();
+  private proxyMeta: Map<string, { sourceId: AbjectId; targetId: AbjectId }> = new Map();
 
   constructor() {
     super({
@@ -155,6 +156,20 @@ export class ProxyGenerator extends Abject {
   }
 
   /**
+   * Ask an object for a usage guide via the ask protocol.
+   */
+  private async askObject(objectId: AbjectId, question: string): Promise<string | null> {
+    try {
+      return await this.request<string>(
+        request(this.id, objectId, INTROSPECT_INTERFACE_ID, 'ask', { question }),
+        60000
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Generate a proxy between two objects.
    */
   async generateProxy(
@@ -175,9 +190,17 @@ export class ProxyGenerator extends Abject {
       targetDescription = result?.description ?? `Object ${targetId}`;
     }
 
+    // Ask both objects for usage guides via the ask protocol
+    const askQuestion = 'How should a proxy use your methods? Give a concise guide with example this.call() invocations and any important constraints.';
+    const [sourceGuide, targetGuide] = await Promise.all([
+      this.askObject(sourceId, askQuestion),
+      this.askObject(targetId, askQuestion),
+    ]);
+
     // Generate handler map via LLM
     const handlerSource = await this.generateHandlerMap(
-      sourceId, targetId, sourceDescription, targetDescription
+      sourceId, targetId, sourceDescription, targetDescription,
+      sourceGuide, targetGuide
     );
 
     // Create proxy manifest
@@ -195,6 +218,7 @@ export class ProxyGenerator extends Abject {
 
     // Cache for regeneration
     this.generatedProxies.set(agreement.agreementId, generated);
+    this.proxyMeta.set(agreement.agreementId, { sourceId, targetId });
 
     return generated;
   }
@@ -211,10 +235,27 @@ export class ProxyGenerator extends Abject {
     const existing = this.generatedProxies.get(agreementId);
     require(existing !== undefined, 'Agreement not found');
 
+    // Re-ask both objects for updated usage guides
+    const meta = this.proxyMeta.get(agreementId);
+    let sourceGuide: string | null = null;
+    let targetGuide: string | null = null;
+    if (meta) {
+      const askQuestion = 'How should a proxy use your methods? Give a concise guide with example this.call() invocations and any important constraints.';
+      [sourceGuide, targetGuide] = await Promise.all([
+        this.askObject(meta.sourceId, askQuestion),
+        this.askObject(meta.targetId, askQuestion),
+      ]);
+    }
+
+    const guideSection = sourceGuide || targetGuide
+      ? `\n\nSOURCE USAGE GUIDE (from the object itself):\n${sourceGuide ?? 'Not available'}\n\nTARGET USAGE GUIDE (from the object itself):\n${targetGuide ?? 'Not available'}`
+      : '';
+
     const result = await this.llmComplete([
       systemMessage(this.getProxySystemPrompt()),
       userMessage(`The previous proxy implementation had issues:
 ${errorContext}
+${guideSection}
 
 Previous handler map:
 \`\`\`javascript
@@ -255,8 +296,14 @@ Generate a corrected handler map that fixes these issues. Output ONLY the handle
     sourceId: AbjectId,
     targetId: AbjectId,
     sourceDescription: string,
-    targetDescription: string
+    targetDescription: string,
+    sourceGuide?: string | null,
+    targetGuide?: string | null
   ): Promise<string> {
+    const guideSection = sourceGuide || targetGuide
+      ? `\n\nSOURCE USAGE GUIDE (from the object itself):\n${sourceGuide ?? 'Not available'}\n\nTARGET USAGE GUIDE (from the object itself):\n${targetGuide ?? 'Not available'}\n`
+      : '';
+
     const result = await this.llmComplete([
       systemMessage(this.getProxySystemPrompt()),
       userMessage(`Generate a JavaScript handler map for a proxy that translates messages between two objects.
@@ -266,7 +313,7 @@ ${sourceDescription}
 
 TARGET OBJECT:
 ${targetDescription}
-
+${guideSection}
 The proxy receives messages from the source, translates them, and forwards to the target.
 Use this.call(this.dep('target'), interfaceId, method, payload) to forward.
 Use this.dep('source') and this.dep('target') for object IDs.
@@ -412,6 +459,7 @@ RULES:
    */
   clearCache(): void {
     this.generatedProxies.clear();
+    this.proxyMeta.clear();
   }
 }
 

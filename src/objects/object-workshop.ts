@@ -495,7 +495,7 @@ export class ObjectWorkshop extends Abject {
           'create',
           { prompt }
         ),
-        120000
+        300000
       );
 
       // Window may have been closed while we were waiting
