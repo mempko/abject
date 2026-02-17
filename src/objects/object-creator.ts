@@ -861,7 +861,7 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
       userMessage(`Manifest:\n\`\`\`json\n${JSON.stringify(manifest, null, 2)}\n\`\`\`\n\nYou MUST implement handlers for these methods: ${methodList.join(', ')}\n\nAvailable dependencies:\n${depContext}\n\nUsed objects: ${usedObjects.length > 0 ? usedObjects.join(', ') : 'None'}\n\n${context ? `Additional context: ${context}\n\n` : ''}Original user request: ${prompt}\n\nGenerate the handler map.`),
     ];
 
-    const result = await this.llmComplete(messages, { tier: 'smart' });
+    const result = await this.llmComplete(messages, { tier: 'balanced' });
     return this.parseCodeResponse(result.content);
   }
 
@@ -886,7 +886,7 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
       systemMessage(`Your previous attempt failed with this error:\n${errorFeedback}\n\n${previousCode ? `Previous code:\n\`\`\`javascript\n${previousCode}\n\`\`\`\n\n` : ''}Fix these issues. Remember:\n- The handler map MUST be a FLAT parenthesized object: ({ method(msg) { ... } })\n- You MUST implement ALL methods listed above: ${methodList.join(', ')}\n- Each handler takes a single msg argument\n- MUST be plain JavaScript, NOT TypeScript\n- Do NOT nest handlers under interface keys\n\nGenerate the corrected handler map.`),
     ];
 
-    const result = await this.llmComplete(messages, { tier: 'smart' });
+    const result = await this.llmComplete(messages, { tier: 'balanced' });
     return this.parseCodeResponse(result.content);
   }
 

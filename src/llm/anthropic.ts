@@ -57,7 +57,7 @@ export class AnthropicProvider extends BaseLLMProvider {
 
   private static readonly TIER_MODELS: Record<ModelTier, string> = {
     smart: 'claude-opus-4-6',
-    balanced: 'claude-sonnet-4-5-20250929',
+    balanced: 'claude-sonnet-4-6',
     fast: 'claude-haiku-4-5-20251001',
   };
 
