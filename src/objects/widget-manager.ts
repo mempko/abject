@@ -66,6 +66,8 @@ export class WidgetManager extends Abject {
   // Tracking spawned Abjects (Set<AbjectId>, NOT references — network transparent)
   private spawnedWindows: Set<AbjectId> = new Set();
   private spawnedWidgets: Set<AbjectId> = new Set();
+  // Maps windowId → surfaceId for raiseWindow support
+  private windowSurfaces: Map<AbjectId, string> = new Map();
 
   // Backward-compat shim: maps old string widget IDs → AbjectIds
   private shimWidgetMap: Map<string, AbjectId> = new Map();
@@ -625,6 +627,15 @@ export class WidgetManager extends Abject {
       );
     });
 
+    this.on('raiseWindow', async (msg: AbjectMessage) => {
+      const { windowId } = msg.payload as { windowId: AbjectId };
+      if (!this.windowManagerId) return false;
+      const surfaceId = this.windowSurfaces.get(windowId);
+      if (!surfaceId) return false;
+      return this.request(request(this.id, this.windowManagerId,
+        'abjects:window-manager' as InterfaceId, 'raiseWindow', { surfaceId }));
+    });
+
     // Handle 'changed' events from widget Abjects (dependency protocol)
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
@@ -910,6 +921,7 @@ createNestedHBox - Nested horizontal layout inside another layout
 
     await win.init(this.bus, this.id);
     this.spawnedWindows.add(win.id);
+    if (win.surface) this.windowSurfaces.set(win.id, win.surface);
     this.log('debug', 'createWindowAbject', { windowId: win.id, title });
 
     // Register with WindowManager for z-order and drag/resize management
@@ -931,6 +943,7 @@ createNestedHBox - Nested horizontal layout inside another layout
 
   private async destroyWindowDirect(windowId: AbjectId): Promise<boolean> {
     if (!this.spawnedWindows.has(windowId)) return false;
+    console.debug(`[WidgetManager] destroyWindowDirect(${windowId})`);
 
     // Unregister from WindowManager
     if (this.windowManagerId) {
@@ -941,14 +954,17 @@ createNestedHBox - Nested horizontal layout inside another layout
     }
 
     try {
+      console.debug(`[WidgetManager] sending destroy request to WindowAbject ${windowId}`);
       await this.request(
         request(this.id, windowId, WINDOW_INTERFACE, 'destroy', {})
       );
+      console.debug(`[WidgetManager] WindowAbject ${windowId} destroyed`);
     } catch {
       // Window may already be stopped
     }
 
     this.spawnedWindows.delete(windowId);
+    this.windowSurfaces.delete(windowId);
     return true;
   }
 

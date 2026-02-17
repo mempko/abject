@@ -17,7 +17,7 @@ import { require } from '../core/contracts.js';
 import { request } from '../core/message.js';
 import { INTROSPECT_INTERFACE_ID, IntrospectResult } from '../core/introspect.js';
 import { ScriptableAbject } from './scriptable-abject.js';
-import { systemMessage, userMessage, LLMMessage, LLMCompletionResult } from '../llm/provider.js';
+import { systemMessage, userMessage, LLMMessage, LLMCompletionResult, LLMCompletionOptions } from '../llm/provider.js';
 
 const PROXY_GENERATOR_INTERFACE = 'abjects:proxy-generator';
 
@@ -135,9 +135,9 @@ export class ProxyGenerator extends Abject {
   /**
    * Call LLM complete via message passing.
    */
-  private async llmComplete(messages: LLMMessage[]): Promise<LLMCompletionResult> {
+  private async llmComplete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
     return this.request<LLMCompletionResult>(
-      request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', { messages })
+      request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', { messages, options })
     );
   }
 
@@ -222,7 +222,7 @@ ${existing!.handlerSource}
 \`\`\`
 
 Generate a corrected handler map that fixes these issues. Output ONLY the handler map in a \`\`\`javascript code block.`),
-    ]);
+    ], { tier: 'smart' });
 
     let handlerSource = this.parseCodeResponse(result.content) ?? existing!.handlerSource;
 
@@ -272,7 +272,7 @@ Use this.call(this.dep('target'), interfaceId, method, payload) to forward.
 Use this.dep('source') and this.dep('target') for object IDs.
 
 Output ONLY the handler map in a \`\`\`javascript code block.`),
-    ]);
+    ], { tier: 'smart' });
 
     let handlerSource = this.parseCodeResponse(result.content);
 

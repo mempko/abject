@@ -1,13 +1,18 @@
 /**
  * Message bus for routing messages between local objects.
+ *
+ * Non-blocking design: send() enqueues messages in the recipient's mailbox
+ * and returns immediately. Each object runs its own processing loop.
+ * Replies bypass the mailbox via a fast-path to avoid deadlocks.
  */
 
 import { AbjectMessage, AbjectId, AbjectError, InterfaceId } from '../core/types.js';
 import { require, ensure, invariant, requireNonEmpty } from '../core/contracts.js';
-import { request as createRequest } from '../core/message.js';
+import { request as createRequest, error as createError } from '../core/message.js';
 import { Mailbox } from './mailbox.js';
 
 export type MessageHandler = (message: AbjectMessage) => void | Promise<void>;
+export type ReplyHandler = (message: AbjectMessage) => void;
 
 interface Subscription {
   id: string;
@@ -17,28 +22,45 @@ interface Subscription {
 
 /**
  * Central message routing for local objects.
+ *
+ * Non-blocking: send() enqueues in mailbox, never awaits handler completion.
+ * Reply fast-path: replies resolve pending Promises directly, bypassing mailbox.
  */
 export class MessageBus {
   private mailboxes: Map<AbjectId, Mailbox> = new Map();
-  private handlers: Map<AbjectId, MessageHandler> = new Map();
+  private replyHandlers: Map<AbjectId, ReplyHandler> = new Map();
   private subscriptions: Subscription[] = [];
   private interceptors: MessageInterceptor[] = [];
   private messageCount = 0;
   private _running = false;
 
   /**
-   * Register an object with the bus.
+   * Register an object with the bus. Creates a mailbox for the object.
    */
-  register(objectId: AbjectId, handler: MessageHandler): Mailbox {
+  register(objectId: AbjectId): Mailbox {
     requireNonEmpty(objectId, 'objectId');
     require(!this.mailboxes.has(objectId), `Object ${objectId} already registered`);
 
     const mailbox = new Mailbox();
     this.mailboxes.set(objectId, mailbox);
-    this.handlers.set(objectId, handler);
 
     this.checkInvariants();
     return mailbox;
+  }
+
+  /**
+   * Set a reply handler for an object (fast-path for reply/error messages).
+   */
+  setReplyHandler(objectId: AbjectId, handler: ReplyHandler): void {
+    requireNonEmpty(objectId, 'objectId');
+    this.replyHandlers.set(objectId, handler);
+  }
+
+  /**
+   * Remove the reply handler for an object.
+   */
+  removeReplyHandler(objectId: AbjectId): void {
+    this.replyHandlers.delete(objectId);
   }
 
   /**
@@ -53,7 +75,7 @@ export class MessageBus {
     }
 
     this.mailboxes.delete(objectId);
-    this.handlers.delete(objectId);
+    this.replyHandlers.delete(objectId);
 
     // Remove subscriptions for this object
     this.subscriptions = this.subscriptions.filter(
@@ -78,7 +100,11 @@ export class MessageBus {
   }
 
   /**
-   * Send a message to a target object.
+   * Send a message to a target object (non-blocking).
+   *
+   * Reply fast-path: reply/error messages with correlationId resolve the
+   * recipient's pending Promise directly, bypassing the mailbox.
+   * Normal path: message is enqueued in the recipient's mailbox.
    */
   async send(message: AbjectMessage): Promise<void> {
     const oldCount = this.messageCount;
@@ -102,28 +128,43 @@ export class MessageBus {
 
     // Check if recipient exists locally
     if (!this.mailboxes.has(recipient)) {
+      console.warn(`[MessageBus] UNDELIVERABLE: ${message.header.type} ${message.routing.method ?? '?'} from=${message.routing.from.slice(0,8)} to=${recipient.slice(0,8)} (not registered)`);
+
+      // For undeliverable requests, immediately send an error reply via the
+      // fast-path so the sender's request() rejects instantly instead of
+      // waiting for a 30s timeout.
+      if (message.header.type === 'request') {
+        const replyHandler = this.replyHandlers.get(message.routing.from);
+        if (replyHandler) {
+          replyHandler(createError(
+            message,
+            'RECIPIENT_NOT_FOUND',
+            `Recipient ${recipient} is not registered`,
+          ));
+          this.messageCount++;
+        }
+      }
+
       // Could be a remote object - emit event for network layer
       this.notifyUndeliverable(message);
       return;
     }
 
-    // Deliver to mailbox
+    // Reply fast-path: resolve pending Promise directly, bypass mailbox
+    if ((message.header.type === 'reply' || message.header.type === 'error')
+        && message.header.correlationId) {
+      const replyHandler = this.replyHandlers.get(recipient);
+      if (replyHandler) {
+        replyHandler(message);
+        this.messageCount++;
+        return;
+      }
+    }
+
+    // Normal path: enqueue in mailbox (non-blocking)
     const mailbox = this.mailboxes.get(recipient)!;
     mailbox.send(message);
     this.messageCount++;
-
-    // Invoke handler directly if available
-    const handler = this.handlers.get(recipient);
-    if (handler) {
-      const msg = mailbox.tryReceive();
-      if (msg) {
-        try {
-          await handler(msg);
-        } catch (err) {
-          console.error(`[BUS] Handler error for ${recipient}:`, err);
-        }
-      }
-    }
 
     // Postconditions
     ensure(this.messageCount > oldCount, 'message count must increase');
@@ -206,10 +247,6 @@ export class MessageBus {
    */
   private checkInvariants(): void {
     invariant(this.mailboxes.size >= 0, 'mailbox count must be non-negative');
-    invariant(
-      this.mailboxes.size === this.handlers.size,
-      'mailbox and handler counts must match'
-    );
     invariant(this.messageCount >= 0, 'message count must be non-negative');
   }
 }

@@ -69,6 +69,23 @@ export class Factory extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
+                name: 'respawn',
+                description: 'Kill an object and respawn a fresh instance with the same ID',
+                parameters: [
+                  {
+                    name: 'objectId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'The ID of the object to respawn',
+                  },
+                  {
+                    name: 'constructorName',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'The registered constructor name',
+                  },
+                ],
+                returns: { kind: 'reference', reference: 'SpawnResult' },
+              },
+              {
                 name: 'registerConstructor',
                 description: 'Register a constructor for a named object type',
                 parameters: [
@@ -102,6 +119,15 @@ export class Factory extends Abject {
       const { objectId } = msg.payload as { objectId: AbjectId };
       return this.kill(objectId);
     });
+
+    this.on('respawn', async (msg: AbjectMessage) => {
+      const { objectId, constructorName, parentId } = msg.payload as {
+        objectId: AbjectId;
+        constructorName: string;
+        parentId?: AbjectId;
+      };
+      return this.respawn(objectId, constructorName, parentId);
+    });
   }
 
   /**
@@ -124,6 +150,78 @@ export class Factory extends Abject {
   registerConstructor(name: string, factory: ObjectFactory): void {
     require(name !== '', 'name must not be empty');
     this.constructors.set(name, factory);
+  }
+
+  /**
+   * Get a registered constructor by name.
+   */
+  getConstructor(name: string): ObjectFactory | undefined {
+    return this.constructors.get(name);
+  }
+
+  /**
+   * Kill an old instance and spawn a fresh one with the same ID.
+   * Used by Supervisor for same-ID restart.
+   */
+  async respawn(objectId: AbjectId, constructorName: string, parentId?: AbjectId): Promise<SpawnResult> {
+    require(this._factoryBus !== undefined, 'Factory must have a message bus');
+
+    // Kill old instance if still tracked
+    const old = this.spawned.get(objectId);
+    if (old) {
+      try {
+        await old.stop();
+      } catch {
+        // Object may already be stopped/dead
+      }
+      this.spawned.delete(objectId);
+
+      // Unregister from registry
+      if (this._factoryRegistryId) {
+        try {
+          await this.request(
+            request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
+          );
+        } catch { /* may not be registered */ }
+      }
+    }
+
+    // Create fresh instance with same ID
+    const factory = this.constructors.get(constructorName);
+    if (!factory) throw new Error(`No constructor for '${constructorName}'`);
+    const obj = factory();
+    obj.setId(objectId);
+
+    // Pre-seed registry ID to avoid deadlock (child asking parent during init)
+    if (this._factoryRegistryId) {
+      obj.setRegistryHint(this._factoryRegistryId);
+    }
+
+    // Initialize and register
+    await obj.init(this._factoryBus!, parentId ?? this.id);
+    this.spawned.set(obj.id, obj);
+
+    if (this._factoryRegistryId) {
+      const payload: Record<string, unknown> = {
+        objectId: obj.id,
+        manifest: obj.manifest,
+        status: obj.status,
+      };
+      if (obj instanceof ScriptableAbject) {
+        payload.owner = obj.owner;
+        payload.source = obj.source;
+      }
+      await this.request(
+        request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'register', payload)
+      );
+    }
+
+    this.checkInvariants();
+
+    return {
+      objectId: obj.id,
+      status: obj.status,
+    };
   }
 
   /**
@@ -155,6 +253,11 @@ export class Factory extends Abject {
       throw new Error(
         `No constructor registered for '${req.manifest.name}' and no code provided`
       );
+    }
+
+    // Pre-seed registry ID to avoid deadlock (child asking parent during init)
+    if (this._factoryRegistryId) {
+      obj.setRegistryHint(this._factoryRegistryId);
     }
 
     // Initialize the object with parentId (default to Factory)
@@ -192,6 +295,11 @@ export class Factory extends Abject {
    */
   async spawnInstance(obj: Abject, parentId?: AbjectId): Promise<SpawnResult> {
     require(this._factoryBus !== undefined, 'Factory must have a message bus');
+
+    // Pre-seed registry ID to avoid deadlock (child asking parent during init)
+    if (this._factoryRegistryId) {
+      obj.setRegistryHint(this._factoryRegistryId);
+    }
 
     // Initialize the object
     await obj.init(this._factoryBus!, parentId);

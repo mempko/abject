@@ -679,16 +679,18 @@ export class RegistryBrowser extends Abject {
     }
 
     // ── Send button in detail view ──
+    // Don't await — let the processing loop stay free for other widget events.
     if (fromId === this.msgSendBtnId && this.selectedMethod && this.detailObjectId) {
-      await this.handleSendMessage();
+      this.handleSendMessage();
       return;
     }
 
     // ── LLM command bar: Run button or submit from input ──
+    // Don't await — let the processing loop stay free for other widget events.
     if ((fromId === this.cmdRunBtnId ||
          (fromId === this.cmdInputId && aspect === 'submit'))
         && this.llmId) {
-      await this.handleLLMCommand();
+      this.handleLLMCommand();
       return;
     }
 
@@ -725,6 +727,15 @@ export class RegistryBrowser extends Abject {
       }
     }
 
+    // Show "Sending..." before the (potentially slow) request
+    if (this.msgResponseId) {
+      await this.request(
+        request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
+          text: 'Sending...',
+        })
+      );
+    }
+
     try {
       const result = await this.request<unknown>(request(
         this.id, this.detailObjectId,
@@ -740,14 +751,17 @@ export class RegistryBrowser extends Abject {
         );
       }
     } catch (err) {
+      // Object may have been stopped while we were waiting — UI updates are best-effort
       const msg = err instanceof Error ? err.message : String(err);
-      if (this.msgResponseId) {
-        await this.request(
-          request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
-            text: `Error: ${msg.slice(0, 60)}`,
-          })
-        );
-      }
+      try {
+        if (this.msgResponseId) {
+          await this.request(
+            request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
+              text: `Error: ${msg.slice(0, 60)}`,
+            })
+          );
+        }
+      } catch { /* object may be stopped */ }
     }
   }
 
@@ -810,7 +824,7 @@ Respond with ONLY valid JSON (no markdown fences, no explanation):
       ];
 
       const llmResult = await this.request<LLMCompletionResult>(
-        request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', { messages })
+        request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', { messages, options: { tier: 'fast' } })
       );
 
       // Parse LLM response (strip markdown fences if present)
@@ -846,14 +860,17 @@ Respond with ONLY valid JSON (no markdown fences, no explanation):
         );
       }
     } catch (err) {
+      // Object may have been stopped while we were waiting — UI updates are best-effort
       const msg = err instanceof Error ? err.message : String(err);
-      if (this.cmdStatusId) {
-        await this.request(
-          request(this.id, this.cmdStatusId, WIDGET_INTERFACE, 'update', {
-            text: `Error: ${msg.slice(0, 60)}`,
-          })
-        );
-      }
+      try {
+        if (this.cmdStatusId) {
+          await this.request(
+            request(this.id, this.cmdStatusId, WIDGET_INTERFACE, 'update', {
+              text: `Error: ${msg.slice(0, 60)}`,
+            })
+          );
+        }
+      } catch { /* object may be stopped */ }
     }
   }
 }

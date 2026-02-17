@@ -62,6 +62,7 @@ export class WindowAbject extends Abject {
 
   private destroying = false;
   private rendering = false;
+  private renderScheduled = false;
 
   constructor(config: WindowConfig) {
     super({
@@ -148,6 +149,7 @@ export class WindowAbject extends Abject {
   private setupHandlers(): void {
     this.on('addChild', async (msg: AbjectMessage) => {
       const { widgetId, rect } = msg.payload as { widgetId: AbjectId; rect: Rect };
+      console.debug(`[Window:${this.id}] addChild — widgetId=${widgetId}`);
       this.children.push(widgetId);
 
       // If rect is {0,0,0,0}, fill the full content area (typical for layout children)
@@ -179,6 +181,7 @@ export class WindowAbject extends Abject {
       this.childRects.delete(widgetId);
       this.expandedSelects.delete(widgetId);
       if (this.focusedChildId === widgetId) this.focusedChildId = undefined;
+      if (this.hoveredChildId === widgetId) this.hoveredChildId = undefined;
       await this.renderWindow();
       return true;
     });
@@ -217,10 +220,20 @@ export class WindowAbject extends Abject {
       await this.handleInputEvent(inputEvent);
     });
 
-    // Child dirty notification — triggers re-render
+    // Child dirty notification — coalesce N events into 1 deferred render via self-message
     this.on('childDirty', async () => {
-      if (this.destroying || this.rendering) return;
-      await this.renderWindow();
+      if (this.destroying) return;
+      if (this.renderScheduled) return;
+      this.renderScheduled = true;
+      await this.send(event(this.id, this.id, WINDOW_INTERFACE, 'deferredRender', {}));
+    });
+
+    this.on('deferredRender', async () => {
+      if (!this.renderScheduled) return;
+      this.renderScheduled = false;
+      if (!this.destroying) {
+        await this.renderWindow();
+      }
     });
 
     // Receive changed events from children (e.g., select expanded/collapsed)
@@ -246,9 +259,11 @@ export class WindowAbject extends Abject {
       const { x, y, width, height } = msg.payload as { x: number; y: number; width: number; height: number };
       const sizeChanged = width !== this.rect.width || height !== this.rect.height;
       this.rect = { x, y, width, height };
+      console.debug(`[Window:${this.id}] windowRect — sizeChanged=${sizeChanged} w=${width} h=${height}`);
       if (sizeChanged) {
         await this.updateChildrenOnResize();
         await this.renderWindow();
+        this.renderScheduled = false;
       }
       await this.changed('windowRect', { x, y, width, height });
     });
@@ -273,13 +288,22 @@ export class WindowAbject extends Abject {
   // ── Rendering (Morphic drawOn:) ──────────────────────────────────────
 
   private async renderWindow(): Promise<void> {
-    if (!this.surfaceId || this.destroying || this.rendering) return;
+    if (!this.surfaceId || this.destroying) return;
+    if (this.rendering) {
+      this.renderScheduled = true;
+      return;
+    }
 
     this.rendering = true;
+    this.renderScheduled = false;
     try {
       await this.renderWindowInner();
     } finally {
       this.rendering = false;
+      if (this.renderScheduled) {
+        this.send(event(this.id, this.id, WINDOW_INTERFACE, 'deferredRender', {}))
+          .catch(() => { /* object may be stopping */ });
+      }
     }
   }
 
@@ -355,7 +379,7 @@ export class WindowAbject extends Abject {
           commands.push(...childCmds);
         }
       } catch {
-        // Widget may have been destroyed — skip silently
+        // Child may have been destroyed
       }
     }
 
@@ -727,11 +751,13 @@ export class WindowAbject extends Abject {
 
   private async destroyWindow(): Promise<void> {
     this.destroying = true;
+    console.debug(`[WindowAbject:${this.id}] destroyWindow — ${this.children.length} children`);
     // Send destroy message to all children (must use request() so the reply
     // is consumed; using send() with a request message causes the reply to
     // fall through as a new handler invocation).
     for (const childId of this.children) {
       try {
+        console.debug(`[WindowAbject:${this.id}] destroying child ${childId}`);
         await this.request(request(this.id, childId, WIDGET_INTERFACE, 'destroy', {}));
       } catch {
         // Child may already be gone
@@ -744,6 +770,7 @@ export class WindowAbject extends Abject {
 
     // Destroy surface
     if (this.surfaceId) {
+      console.debug(`[WindowAbject:${this.id}] destroying surface ${this.surfaceId}`);
       await this.request<boolean>(
         request(this.id, this.uiServerId, UI_INTERFACE, 'destroySurface', {
           surfaceId: this.surfaceId,
@@ -752,6 +779,7 @@ export class WindowAbject extends Abject {
       this.surfaceId = undefined;
     }
 
+    console.debug(`[WindowAbject:${this.id}] calling stop()`);
     await this.stop();
   }
 }

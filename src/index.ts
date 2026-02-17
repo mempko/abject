@@ -28,6 +28,8 @@ import { WidgetManager } from './objects/widget-manager.js';
 import { ThemeAbject } from './objects/theme.js';
 import { WindowManager } from './objects/window-manager.js';
 import { AbjectEditor } from './objects/abject-editor.js';
+import { Supervisor } from './runtime/supervisor.js';
+import type { RestartType } from './runtime/supervisor.js';
 
 // Export public API
 export { App, createApp } from './ui/app.js';
@@ -52,6 +54,8 @@ export { ThemeAbject, THEME_ID } from './objects/theme.js';
 export { WindowManager, WINDOW_MANAGER_ID } from './objects/window-manager.js';
 export { AbjectEditor, ABJECT_EDITOR_ID } from './objects/abject-editor.js';
 export { ScriptableAbject, EDITABLE_INTERFACE_ID } from './objects/scriptable-abject.js';
+export { Supervisor, SUPERVISOR_ID, SUPERVISOR_INTERFACE_ID } from './runtime/supervisor.js';
+export type { ChildSpec, RestartType, RestartStrategy, SupervisorConfig } from './runtime/supervisor.js';
 
 // Export widget Abjects
 export { WidgetAbject, buildFont, WIDGET_INTERFACE_DECL } from './objects/widgets/widget-abject.js';
@@ -100,7 +104,7 @@ export { INTROSPECT_INTERFACE_ID, INTROSPECT_INTERFACE, formatManifestAsDescript
 export type { IntrospectResult } from './core/introspect.js';
 
 // Export LLM providers
-export type { LLMProvider, LLMMessage, LLMCompletionResult } from './llm/provider.js';
+export type { LLMProvider, LLMMessage, LLMCompletionResult, ModelTier } from './llm/provider.js';
 export { AnthropicProvider } from './llm/anthropic.js';
 export { OpenAIProvider } from './llm/openai.js';
 export { OllamaProvider } from './llm/ollama.js';
@@ -184,7 +188,8 @@ async function main(): Promise<App> {
 
   // Register a temporary bootstrap sender on the bus to enable request-reply
   const pendingReplies = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
-  bus.register(BOOTSTRAP_ID, async (msg: AbjectMessage) => {
+  bus.register(BOOTSTRAP_ID);
+  bus.setReplyHandler(BOOTSTRAP_ID, (msg: AbjectMessage) => {
     const pending = pendingReplies.get(msg.header.correlationId!);
     if (pending) {
       pendingReplies.delete(msg.header.correlationId!);
@@ -234,12 +239,27 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('Settings', () => new Settings());
   runtime.objectFactory.registerConstructor('RegistryBrowser', () => new RegistryBrowser());
   runtime.objectFactory.registerConstructor('ObjectWorkshop', () => new ObjectWorkshop());
+  runtime.objectFactory.registerConstructor('Supervisor', () => new Supervisor());
   runtime.objectFactory.registerConstructor('Taskbar', () => new Taskbar());
+
+  // Spawn Supervisor early so it can supervise other objects
+  const supervisorId = await factorySpawn('Supervisor');
+  const SUPERVISOR_IFACE = 'abjects:supervisor' as InterfaceId;
+  const HEALTH_IFACE = 'abjects:health-monitor' as InterfaceId;
+
+  // Helper: spawn via Factory, register with Supervisor, return ID
+  async function supervisedSpawn(name: string, restart: RestartType = 'permanent'): Promise<AbjectId> {
+    const id = await factorySpawn(name);
+    await bootstrapRequest(supervisorId, SUPERVISOR_IFACE, 'addChild', {
+      id, constructorName: name, restart,
+    });
+    return id;
+  }
 
   // Spawn in dependency order via Factory messages
   // Each object discovers its own dependencies via Registry self-discovery
-  const httpClientId = await factorySpawn('HttpClient');
-  const llmId = await factorySpawn('LLMObject');
+  const httpClientId = await supervisedSpawn('HttpClient');
+  const llmId = await supervisedSpawn('LLMObject');
 
   // Configure LLM with API keys (still needed — this isn't a dep)
   await bootstrapRequest(llmId, 'abjects:llm' as InterfaceId, 'configure', {
@@ -247,31 +267,41 @@ async function main(): Promise<App> {
     openaiApiKey: openaiKey,
   });
 
-  const storageId = await factorySpawn('Storage');
-  const themeId = await factorySpawn('Theme');
-  const timerId = await factorySpawn('Timer');
-  const clipboardId = await factorySpawn('Clipboard');
-  const consoleId = await factorySpawn('Console');
-  const filesystemId = await factorySpawn('FileSystem');
-  const windowManagerId = await factorySpawn('WindowManager');
-  const widgetManagerId = await factorySpawn('WidgetManager');
+  const storageId = await supervisedSpawn('Storage');
+  const themeId = await supervisedSpawn('Theme');
+  const timerId = await supervisedSpawn('Timer');
+  const clipboardId = await supervisedSpawn('Clipboard');
+  const consoleId = await supervisedSpawn('Console');
+  const filesystemId = await supervisedSpawn('FileSystem');
+  const windowManagerId = await supervisedSpawn('WindowManager');
+  const widgetManagerId = await supervisedSpawn('WidgetManager');
 
-  const proxyGenId = await factorySpawn('ProxyGenerator');
-  const negotiatorId = await factorySpawn('Negotiator');
-  const healthMonitorId = await factorySpawn('HealthMonitor');
+  const proxyGenId = await supervisedSpawn('ProxyGenerator');
+  const negotiatorId = await supervisedSpawn('Negotiator');
+  const healthMonitorId = await supervisedSpawn('HealthMonitor');
+  const objectCreatorId = await supervisedSpawn('ObjectCreator');
+  const abjectEditorId = await supervisedSpawn('AbjectEditor');
+  const settingsId = await supervisedSpawn('Settings');
+  const registryBrowserId = await supervisedSpawn('RegistryBrowser');
+  const objectWorkshopId = await supervisedSpawn('ObjectWorkshop');
+  const taskbarId = await supervisedSpawn('Taskbar');
 
-  // Start monitoring (via message)
-  await bootstrapRequest(healthMonitorId,
-    'abjects:health-monitor' as InterfaceId, 'startMonitoring', {});
-
-  const objectCreatorId = await factorySpawn('ObjectCreator');
-  const abjectEditorId = await factorySpawn('AbjectEditor');
-  const settingsId = await factorySpawn('Settings');
-  const registryBrowserId = await factorySpawn('RegistryBrowser');
-  const objectWorkshopId = await factorySpawn('ObjectWorkshop');
-  const taskbarId = await factorySpawn('Taskbar');
+  // ALL objects are now spawned and init'd — safe to start health monitoring.
+  // The ready gate ensures HealthMonitor won't ping objects prematurely.
+  const monitoredIds = [
+    httpClientId, llmId, storageId, themeId, timerId, clipboardId,
+    consoleId, filesystemId, windowManagerId, widgetManagerId,
+    proxyGenId, negotiatorId, objectCreatorId, abjectEditorId,
+    settingsId, registryBrowserId, objectWorkshopId, taskbarId,
+  ];
+  for (const objId of monitoredIds) {
+    await bootstrapRequest(healthMonitorId, HEALTH_IFACE, 'monitorObject', { objectId: objId });
+    await bootstrapRequest(healthMonitorId, HEALTH_IFACE, 'markObjectReady', { objectId: objId });
+  }
+  await bootstrapRequest(healthMonitorId, HEALTH_IFACE, 'startMonitoring', {});
 
   // Clean up bootstrap handler
+  bus.removeReplyHandler(BOOTSTRAP_ID);
   bus.unregister(BOOTSTRAP_ID);
 
   console.log('[ABJECTS] System ready');
@@ -303,6 +333,7 @@ async function main(): Promise<App> {
     widgetManager: getObj(widgetManagerId),
     windowManager: getObj(windowManagerId),
     filesystem: getObj(filesystemId),
+    supervisor: getObj(supervisorId),
     // Object IDs for message-based interaction
     ids: {
       llm: llmId,
@@ -326,6 +357,7 @@ async function main(): Promise<App> {
       proxyGenerator: proxyGenId,
       negotiator: negotiatorId,
       healthMonitor: healthMonitorId,
+      supervisor: supervisorId,
     },
     modules: {
       SimpleAbject,

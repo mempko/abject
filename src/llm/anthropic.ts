@@ -9,6 +9,7 @@ import {
   LLMCompletionOptions,
   LLMCompletionResult,
   LLMStreamChunk,
+  ModelTier,
 } from './provider.js';
 import { require } from '../core/contracts.js';
 
@@ -54,6 +55,16 @@ export class AnthropicProvider extends BaseLLMProvider {
   readonly name = 'anthropic';
   private model: string;
 
+  private static readonly TIER_MODELS: Record<ModelTier, string> = {
+    smart: 'claude-opus-4-6',
+    balanced: 'claude-sonnet-4-5-20250929',
+    fast: 'claude-haiku-4-5-20251001',
+  };
+
+  private resolveModel(tier?: ModelTier): string {
+    return tier ? AnthropicProvider.TIER_MODELS[tier] : this.model;
+  }
+
   constructor(config: AnthropicConfig) {
     // Use Vite proxy in dev to avoid CORS
     const defaultBase = typeof window !== 'undefined' && window.location?.hostname === 'localhost'
@@ -90,7 +101,7 @@ export class AnthropicProvider extends BaseLLMProvider {
     );
 
     const request: AnthropicRequest = {
-      model: this.model,
+      model: this.resolveModel(options.tier),
       max_tokens: options.maxTokens ?? 4096,
       messages: anthropicMessages,
       temperature: options.temperature,
@@ -148,7 +159,7 @@ export class AnthropicProvider extends BaseLLMProvider {
     );
 
     const request: AnthropicRequest = {
-      model: this.model,
+      model: this.resolveModel(options.tier),
       max_tokens: options.maxTokens ?? 4096,
       messages: anthropicMessages,
       temperature: options.temperature,

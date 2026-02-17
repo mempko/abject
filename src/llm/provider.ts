@@ -9,11 +9,14 @@ export interface LLMMessage {
   content: string;
 }
 
+export type ModelTier = 'smart' | 'balanced' | 'fast';
+
 export interface LLMCompletionOptions {
   temperature?: number;
   maxTokens?: number;
   stopSequences?: string[];
   stream?: boolean;
+  tier?: ModelTier;
 }
 
 export interface LLMCompletionResult {

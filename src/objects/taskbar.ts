@@ -168,18 +168,22 @@ export class Taskbar extends Abject {
 
     // Auto-refresh taskbar when new objects are registered
     this.on('objectRegistered', async () => {
+      console.debug('[Taskbar] objectRegistered — rebuilding taskbar');
       await this.show();
+      console.debug('[Taskbar] objectRegistered — done');
     });
   }
 
   async show(): Promise<boolean> {
     // Always destroy and rebuild to pick up new objects
     if (this.windowId) {
+      console.debug(`[Taskbar] show() — destroying old window ${this.windowId}`);
       await this.request(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
           windowId: this.windowId,
         })
       );
+      console.debug('[Taskbar] show() — old window destroyed');
       this.windowId = undefined;
     }
 

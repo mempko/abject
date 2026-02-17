@@ -9,6 +9,7 @@ import {
   LLMCompletionOptions,
   LLMCompletionResult,
   LLMStreamChunk,
+  ModelTier,
 } from './provider.js';
 import { require } from '../core/contracts.js';
 
@@ -60,6 +61,16 @@ export class OpenAIProvider extends BaseLLMProvider {
   readonly name = 'openai';
   private model: string;
 
+  private static readonly TIER_MODELS: Record<ModelTier, string> = {
+    smart: 'gpt-4o',
+    balanced: 'gpt-4-turbo-preview',
+    fast: 'gpt-4o-mini',
+  };
+
+  private resolveModel(tier?: ModelTier): string {
+    return tier ? OpenAIProvider.TIER_MODELS[tier] : this.model;
+  }
+
   constructor(config: OpenAIConfig) {
     super({
       apiKey: config.apiKey,
@@ -80,7 +91,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     require(this.apiKey !== undefined, 'API key is required');
 
     const request: OpenAIRequest = {
-      model: this.model,
+      model: this.resolveModel(options.tier),
       messages: messages.map((m) => ({
         role: m.role,
         content: m.content,
@@ -121,7 +132,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     require(!this.fetchFn, 'Streaming is not supported when using HttpClient delegate');
 
     const request: OpenAIRequest = {
-      model: this.model,
+      model: this.resolveModel(options.tier),
       messages: messages.map((m) => ({
         role: m.role,
         content: m.content,

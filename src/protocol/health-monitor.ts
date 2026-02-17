@@ -1,9 +1,13 @@
 /**
- * Health Monitor - tracks error rates and triggers proxy regeneration.
+ * Health Monitor - tracks error rates, triggers proxy regeneration,
+ * and monitors object liveness via periodic ping.
  *
  * Uses message passing for all dependencies — no direct object references.
  * Exposes message handlers for error tracking so the HealthInterceptor
  * can report errors passively.
+ *
+ * Object liveness: periodically pings monitored objects. After N consecutive
+ * failures, notifies the Supervisor to restart the dead object.
  */
 
 import {
@@ -15,6 +19,7 @@ import {
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
+import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 
 const HEALTH_MONITOR_INTERFACE = 'abjects:health-monitor';
 
@@ -23,6 +28,8 @@ export interface HealthConfig {
   windowSize: number; // Rolling window size in ms
   minMessages: number; // Minimum messages before calculating rate
   checkInterval: number; // How often to check health in ms
+  pingTimeout: number; // Timeout for liveness pings in ms
+  maxPingFailures: number; // Consecutive failures before declaring dead
 }
 
 interface ConnectionHealth {
@@ -42,14 +49,35 @@ export interface HealthStatus {
   lastError?: AbjectError;
 }
 
+interface ObjectLiveness {
+  objectId: AbjectId;
+  ready: boolean;
+  consecutiveFailures: number;
+  maxFailures: number;
+  lastPingAt: number;
+  lastPongAt: number;
+}
+
+export interface ObjectLivenessStatus {
+  objectId: AbjectId;
+  alive: boolean;
+  consecutiveFailures: number;
+  maxFailures: number;
+  lastPingAt: number;
+  lastPongAt: number;
+}
+
 /**
- * Monitors connection health and triggers self-healing.
- * Uses message passing to Negotiator for renegotiation.
+ * Monitors connection health and object liveness, triggers self-healing.
+ * Uses message passing to Negotiator for renegotiation and Supervisor for restarts.
  */
 export class HealthMonitor extends Abject {
   private health: Map<AgreementId, ConnectionHealth> = new Map();
+  private monitoredObjects: Map<AbjectId, ObjectLiveness> = new Map();
   private negotiatorId?: AbjectId;
+  private supervisorId?: AbjectId;
   private checkTimer?: ReturnType<typeof setInterval>;
+  private _checkingLiveness = false;
   private readonly config: HealthConfig;
 
   constructor(config: Partial<HealthConfig> = {}) {
@@ -57,13 +85,13 @@ export class HealthMonitor extends Abject {
       manifest: {
         name: 'HealthMonitor',
         description:
-          'Monitors connection health and triggers proxy regeneration when error rates exceed threshold.',
+          'Monitors connection health and object liveness. Triggers proxy regeneration when error rates exceed threshold and notifies Supervisor when objects stop responding to pings.',
         version: '1.0.0',
         interfaces: [
           {
             id: HEALTH_MONITOR_INTERFACE,
             name: 'HealthMonitor',
-            description: 'Connection health monitoring',
+            description: 'Connection health and object liveness monitoring',
             methods: [
               {
                 name: 'getStatus',
@@ -139,6 +167,69 @@ export class HealthMonitor extends Abject {
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              {
+                name: 'monitorObject',
+                description: 'Start monitoring an object for liveness',
+                parameters: [
+                  {
+                    name: 'objectId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Object to monitor',
+                  },
+                  {
+                    name: 'maxFailures',
+                    type: { kind: 'primitive', primitive: 'number' },
+                    description: 'Consecutive ping failures before declaring dead',
+                    optional: true,
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'unmonitorObject',
+                description: 'Stop monitoring an object for liveness',
+                parameters: [
+                  {
+                    name: 'objectId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Object to stop monitoring',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'getObjectLiveness',
+                description: 'Get liveness status for a monitored object',
+                parameters: [
+                  {
+                    name: 'objectId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Object to check',
+                  },
+                ],
+                returns: { kind: 'reference', reference: 'ObjectLivenessStatus' },
+              },
+              {
+                name: 'getAllObjectLiveness',
+                description: 'Get liveness status for all monitored objects',
+                parameters: [],
+                returns: {
+                  kind: 'array',
+                  elementType: { kind: 'reference', reference: 'ObjectLivenessStatus' },
+                },
+              },
+              {
+                name: 'markObjectReady',
+                description: 'Mark a monitored object as ready for liveness pings',
+                parameters: [
+                  {
+                    name: 'objectId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Object to mark as ready',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
             ],
             events: [
               {
@@ -149,6 +240,11 @@ export class HealthMonitor extends Abject {
               {
                 name: 'renegotiationTriggered',
                 description: 'Automatic renegotiation was triggered',
+                payload: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'objectDead',
+                description: 'A monitored object stopped responding to pings',
                 payload: { kind: 'primitive', primitive: 'string' },
               },
             ],
@@ -164,6 +260,8 @@ export class HealthMonitor extends Abject {
       windowSize: config.windowSize ?? 60000, // 1 minute
       minMessages: config.minMessages ?? 10,
       checkInterval: config.checkInterval ?? 5000, // 5 seconds
+      pingTimeout: config.pingTimeout ?? 5000, // 5 second ping timeout
+      maxPingFailures: config.maxPingFailures ?? 36,
     };
 
     this.setupHandlers();
@@ -206,14 +304,58 @@ export class HealthMonitor extends Abject {
       this.startMonitoring();
       return true;
     });
+
+    // Object liveness handlers
+    this.on('monitorObject', async (msg: AbjectMessage) => {
+      const { objectId, maxFailures } = msg.payload as {
+        objectId: AbjectId;
+        maxFailures?: number;
+      };
+      this.monitorObject(objectId, maxFailures);
+      return true;
+    });
+
+    this.on('unmonitorObject', async (msg: AbjectMessage) => {
+      const { objectId } = msg.payload as { objectId: AbjectId };
+      this.unmonitorObject(objectId);
+      return true;
+    });
+
+    this.on('getObjectLiveness', async (msg: AbjectMessage) => {
+      const { objectId } = msg.payload as { objectId: AbjectId };
+      return this.getObjectLiveness(objectId);
+    });
+
+    this.on('getAllObjectLiveness', async () => {
+      return this.getAllObjectLiveness();
+    });
+
+    this.on('markObjectReady', async (msg: AbjectMessage) => {
+      const { objectId } = msg.payload as { objectId: AbjectId };
+      this.markObjectReady(objectId);
+      return true;
+    });
   }
 
   protected override async onInit(): Promise<void> {
-    this.negotiatorId = await this.requireDep('Negotiator');
+    // Discover Negotiator (for connection renegotiation)
+    try {
+      this.negotiatorId = await this.requireDep('Negotiator');
+    } catch {
+      // Negotiator may not be spawned yet — that's OK
+    }
+
+    // Discover Supervisor (for liveness failure escalation)
+    try {
+      const sid = await this.discoverDep('Supervisor');
+      if (sid) this.supervisorId = sid;
+    } catch {
+      // Supervisor may not be spawned yet — that's OK
+    }
   }
 
   /**
-   * Start monitoring.
+   * Start monitoring (connection health + object liveness).
    */
   startMonitoring(): void {
     if (this.checkTimer) {
@@ -222,6 +364,7 @@ export class HealthMonitor extends Abject {
 
     this.checkTimer = setInterval(() => {
       this.checkAllHealth();
+      this.checkObjectLiveness();
     }, this.config.checkInterval);
 
     console.log('[HEALTH] Monitoring started');
@@ -280,6 +423,66 @@ export class HealthMonitor extends Abject {
       health.errorCount++;
       health.errors.push({ timestamp: Date.now(), error });
     }
+  }
+
+  /**
+   * Start monitoring an object for liveness.
+   */
+  monitorObject(objectId: AbjectId, maxFailures?: number): void {
+    if (this.monitoredObjects.has(objectId)) return;
+
+    this.monitoredObjects.set(objectId, {
+      objectId,
+      ready: false,
+      consecutiveFailures: 0,
+      maxFailures: maxFailures ?? this.config.maxPingFailures,
+      lastPingAt: 0,
+      lastPongAt: 0,
+    });
+  }
+
+  /**
+   * Mark a monitored object as ready for liveness pings.
+   */
+  markObjectReady(objectId: AbjectId): void {
+    const liveness = this.monitoredObjects.get(objectId);
+    if (liveness) liveness.ready = true;
+  }
+
+  /**
+   * Stop monitoring an object for liveness.
+   */
+  unmonitorObject(objectId: AbjectId): void {
+    this.monitoredObjects.delete(objectId);
+  }
+
+  /**
+   * Get liveness status for a monitored object.
+   */
+  getObjectLiveness(objectId: AbjectId): ObjectLivenessStatus | undefined {
+    const liveness = this.monitoredObjects.get(objectId);
+    if (!liveness) return undefined;
+
+    return {
+      objectId: liveness.objectId,
+      alive: liveness.consecutiveFailures < liveness.maxFailures,
+      consecutiveFailures: liveness.consecutiveFailures,
+      maxFailures: liveness.maxFailures,
+      lastPingAt: liveness.lastPingAt,
+      lastPongAt: liveness.lastPongAt,
+    };
+  }
+
+  /**
+   * Get liveness status for all monitored objects.
+   */
+  getAllObjectLiveness(): ObjectLivenessStatus[] {
+    const statuses: ObjectLivenessStatus[] = [];
+    for (const objectId of this.monitoredObjects.keys()) {
+      const status = this.getObjectLiveness(objectId);
+      if (status) statuses.push(status);
+    }
+    return statuses;
   }
 
   /**
@@ -361,6 +564,84 @@ export class HealthMonitor extends Abject {
   }
 
   /**
+   * Check liveness of all monitored objects via ping.
+   * Guarded against concurrent invocations from overlapping setInterval callbacks.
+   */
+  private async checkObjectLiveness(): Promise<void> {
+    if (this._checkingLiveness) return;
+    this._checkingLiveness = true;
+    try {
+      await this.checkObjectLivenessInner();
+    } finally {
+      this._checkingLiveness = false;
+    }
+  }
+
+  private async checkObjectLivenessInner(): Promise<void> {
+    for (const [objectId, liveness] of this.monitoredObjects) {
+      // Don't ping ourselves
+      if (objectId === this.id) continue;
+      // Skip objects that haven't confirmed readiness yet
+      if (!liveness.ready) continue;
+
+      liveness.lastPingAt = Date.now();
+      try {
+        await this.request(
+          request(this.id, objectId, INTROSPECT_INTERFACE_ID, 'ping', {}),
+          this.config.pingTimeout
+        );
+        liveness.lastPongAt = Date.now();
+        liveness.consecutiveFailures = 0;
+      } catch {
+        liveness.consecutiveFailures++;
+        if (liveness.consecutiveFailures >= liveness.maxFailures) {
+          console.warn(
+            `[HEALTH] Object ${objectId} did not respond to ${liveness.maxFailures} consecutive pings`
+          );
+          // Gate the object so it won't be pinged again until
+          // markObjectReady is called after the restart completes.
+          liveness.ready = false;
+          await this.notifySupervisor(objectId, liveness.maxFailures);
+          liveness.consecutiveFailures = 0; // reset after notification
+        }
+      }
+    }
+  }
+
+  /**
+   * Notify Supervisor that an object is dead.
+   */
+  private async notifySupervisor(objectId: AbjectId, maxFailures: number): Promise<void> {
+    // Lazily discover Supervisor if not found at init time
+    if (!this.supervisorId) {
+      try {
+        const sid = await this.discoverDep('Supervisor');
+        if (sid) this.supervisorId = sid;
+      } catch {
+        // Still no Supervisor
+      }
+    }
+
+    if (!this.supervisorId) {
+      console.warn('[HEALTH] No Supervisor available to handle dead object');
+      return;
+    }
+
+    try {
+      await this.send(event(this.id, this.supervisorId,
+        'abjects:supervisor' as InterfaceId, 'childFailed', {
+          childId: objectId,
+          error: {
+            code: 'LIVENESS_FAILURE',
+            message: `Object ${objectId} did not respond to ${maxFailures} consecutive pings`,
+          },
+        }));
+    } catch {
+      // best effort
+    }
+  }
+
+  /**
    * Prune errors outside the rolling window.
    */
   private pruneOldErrors(health: ConnectionHealth): void {
@@ -429,10 +710,21 @@ export class HealthMonitor extends Abject {
   }
 
   /**
+   * Get monitored object count.
+   */
+  get monitoredObjectCount(): number {
+    return this.monitoredObjects.size;
+  }
+
+  /**
    * Clear all health data.
    */
   clear(): void {
     this.health.clear();
+  }
+
+  protected override async onStop(): Promise<void> {
+    this.stopMonitoring();
   }
 }
 

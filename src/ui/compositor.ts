@@ -212,6 +212,8 @@ export class Compositor {
 
     const surface = this.surfaces.get(surfaceId);
     if (surface) {
+      const oldCanvas = surface.canvas;
+
       surface.rect.width = width;
       surface.rect.height = height;
 
@@ -219,6 +221,10 @@ export class Compositor {
       const offscreen = new OffscreenCanvas(width, height);
       const ctx = offscreen.getContext('2d');
       require(ctx !== null, 'Failed to get offscreen context');
+
+      // Preserve old content so the surface is never blank between
+      // resize and the next draw cycle (avoids flash-of-blank during resize)
+      ctx!.drawImage(oldCanvas, 0, 0);
 
       surface.canvas = offscreen;
       surface.ctx = ctx!;
@@ -466,6 +472,14 @@ export class Compositor {
         y >= rect.y &&
         y < rect.y + rect.height
       ) {
+        // Transparent pixels pass input through to surfaces below
+        const pixel = surface.ctx.getImageData(
+          Math.floor(x - rect.x),
+          Math.floor(y - rect.y),
+          1, 1
+        ).data;
+        if (pixel[3] === 0) continue;
+
         return surface;
       }
     }

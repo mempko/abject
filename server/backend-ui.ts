@@ -62,8 +62,9 @@ export class BackendUI extends Abject {
   private surfaces: Map<string, SurfaceState> = new Map();
   private focusedSurface?: string;
   private mouseGrabAbject?: AbjectId;  // WindowManager grabs mouse during drag
-  private pendingRequests: Map<string, { resolve: (value: unknown) => void }> = new Map();
+  private pendingRequests: Map<string, { resolve: (value: unknown) => void; reject: (e: Error) => void }> = new Map();
   private ws: WebSocket | null = null;
+  private frontendReady = false;
   private surfaceCounter = 0;
   private consoleId?: AbjectId;
   private windowManagerId?: AbjectId;
@@ -386,6 +387,13 @@ export class BackendUI extends Abject {
    * Set the WebSocket connection to the frontend.
    */
   setWebSocket(ws: WebSocket): void {
+    // Clean up state from previous connection
+    this.frontendReady = false;
+    for (const [, pending] of this.pendingRequests) {
+      pending.reject(new Error('Frontend reconnected'));
+    }
+    this.pendingRequests.clear();
+
     this.ws = ws;
     ws.on('message', (data: Buffer | string) => {
       const str = typeof data === 'string' ? data : data.toString();
@@ -399,6 +407,12 @@ export class BackendUI extends Abject {
     ws.on('close', () => {
       if (this.ws === ws) {
         this.ws = null;
+        this.frontendReady = false;
+        // Reject any pending frontend requests so they don't hang forever
+        for (const [reqId, pending] of this.pendingRequests) {
+          pending.reject(new Error('Frontend disconnected'));
+        }
+        this.pendingRequests.clear();
       }
     });
   }
@@ -595,15 +609,19 @@ export class BackendUI extends Abject {
   }
 
   private async handleGetDisplayInfo(): Promise<{ width: number; height: number }> {
-    if (!this.ws || this.ws.readyState !== 1) {
+    if (!this.ws || this.ws.readyState !== 1 || !this.frontendReady) {
       return { ...this.lastDisplayInfo };
     }
-    const info = await this.requestFromFrontend<{ width: number; height: number }>({
-      type: 'displayInfoRequest',
-      requestId: this.nextRequestId(),
-    });
-    this.lastDisplayInfo = { width: info.width, height: info.height };
-    return info;
+    try {
+      const info = await this.requestFromFrontend<{ width: number; height: number }>({
+        type: 'displayInfoRequest',
+        requestId: this.nextRequestId(),
+      });
+      this.lastDisplayInfo = { width: info.width, height: info.height };
+      return info;
+    } catch {
+      return { ...this.lastDisplayInfo };
+    }
   }
 
   private async handleMeasureText(
@@ -613,20 +631,23 @@ export class BackendUI extends Abject {
   ): Promise<number> {
     if (!text) return 0;
 
-    if (!this.ws || this.ws.readyState !== 1) {
+    if (!this.ws || this.ws.readyState !== 1 || !this.frontendReady) {
       // Rough estimate: ~7.5px per character at 14px font
       return text.length * 7.5;
     }
 
-    const result = await this.requestFromFrontend<{ width: number }>({
-      type: 'measureTextRequest',
-      requestId: this.nextRequestId(),
-      surfaceId,
-      text,
-      font,
-    });
-
-    return result.width;
+    try {
+      const result = await this.requestFromFrontend<{ width: number }>({
+        type: 'measureTextRequest',
+        requestId: this.nextRequestId(),
+        surfaceId,
+        text,
+        font,
+      });
+      return result.width;
+    } catch {
+      return text.length * 7.5;
+    }
   }
 
   // ── Request/reply with frontend ─────────────────────────────────────
@@ -637,10 +658,22 @@ export class BackendUI extends Abject {
     return `req-${++this.requestIdCounter}`;
   }
 
-  private requestFromFrontend<T>(msg: BackendToFrontendMsg & { requestId: string }): Promise<T> {
-    return new Promise((resolve) => {
+  private requestFromFrontend<T>(msg: BackendToFrontendMsg & { requestId: string }, timeoutMs = 10000): Promise<T> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(msg.requestId);
+        reject(new Error(`Frontend request ${msg.type} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
       this.pendingRequests.set(msg.requestId, {
-        resolve: resolve as (value: unknown) => void,
+        resolve: (value: unknown) => {
+          clearTimeout(timer);
+          resolve(value as T);
+        },
+        reject: (err: Error) => {
+          clearTimeout(timer);
+          reject(err);
+        },
       });
       this.sendToFrontend(msg);
     });
@@ -675,6 +708,7 @@ export class BackendUI extends Abject {
 
       case 'ready':
         console.log('[BackendUI] Frontend connected and ready');
+        this.frontendReady = true;
         this.replayStateToFrontend();
         break;
 

@@ -5,6 +5,8 @@
  *   Phase 0a: discoverObjectSummaries() — registry.list() → name + description
  *   Phase 0b: llmSelectDependencies()   — LLM picks relevant objects from summaries
  *   Phase 0c: fetchFullManifests()       — registry.lookup() for selected objects
+ *   Phase 0c5: generateTargetedQuestions() — LLM generates goal-specific questions per dep
+ *   Phase 0d: fetchUsageGuides()         — ask each dep with targeted (or generic) questions
  *   Phase 1:  generateManifest()         — LLM designs manifest with full dependency context
  *   Phase 2:  generateHandlerCode()      — LLM generates this.call() code
  *   Phase 3:  verifyAndFix()             — programmatic consistency check
@@ -29,7 +31,7 @@ import { request, event } from '../core/message.js';
 import { INTROSPECT_INTERFACE_ID, IntrospectResult } from '../core/introspect.js';
 
 import { ScriptableAbject } from './scriptable-abject.js';
-import { systemMessage, userMessage, LLMMessage, LLMCompletionResult } from '../llm/provider.js';
+import { systemMessage, userMessage, LLMMessage, LLMCompletionResult, LLMCompletionOptions } from '../llm/provider.js';
 
 
 const OBJECT_CREATOR_INTERFACE = 'abjects:object-creator' as InterfaceId;
@@ -243,9 +245,9 @@ export class ObjectCreator extends Abject {
   /**
    * Call LLM complete via message passing.
    */
-  private async llmComplete(messages: LLMMessage[]): Promise<LLMCompletionResult> {
+  private async llmComplete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
     return this.request<LLMCompletionResult>(
-      request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', { messages }),
+      request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', { messages, options }),
       120000
     );
   }
@@ -329,7 +331,7 @@ export class ObjectCreator extends Abject {
         'Return one name per line, nothing else. If no dependencies are needed, return "None".'
       ),
       userMessage(`Available objects:\n${summaryText}\n\nNew object to create: ${prompt}\n\nWhich objects does it need?`),
-    ]);
+    ], { tier: 'balanced' });
 
     const content = result.content.trim();
     if (content.toLowerCase() === 'none') return [];
@@ -398,17 +400,95 @@ export class ObjectCreator extends Abject {
   }
 
   /**
-   * Ask each dependency in parallel for a usage guide via the 'ask' protocol.
+   * Phase 0c5: Generate targeted questions for each dependency based on the user's prompt.
+   * Returns a Map of dep name → targeted question. On failure, returns an empty Map
+   * so Phase 0d falls back to generic questions.
    */
-  private async fetchUsageGuides(deps: SelectedDependency[]): Promise<Map<string, string>> {
+  private async generateTargetedQuestions(
+    prompt: string,
+    deps: SelectedDependency[]
+  ): Promise<Map<string, string>> {
+    if (deps.length === 0 || !this.llmId) return new Map();
+
+    try {
+      const depList = deps
+        .map((d) => `- ${d.name}: ${d.description.slice(0, 300)}`)
+        .join('\n');
+
+      const result = await this.llmComplete([
+        systemMessage(
+          'You are helping build a new object in a distributed system. ' +
+          'Given the user\'s goal and a list of dependency objects, generate ONE targeted question per dependency. ' +
+          'Each question should ask the dependency specifically how to accomplish what the user needs, referencing concrete methods or events.\n\n' +
+          'Format: one line per dependency, exactly like this:\n' +
+          '[DepName]: Your targeted question here?\n\n' +
+          'Output ONLY the questions, one per line. Nothing else.'
+        ),
+        userMessage(
+          `User wants to create: ${prompt}\n\nDependencies:\n${depList}\n\n` +
+          `Generate a targeted question for each dependency.`
+        ),
+      ], { tier: 'balanced' });
+
+      return this.parseTargetedQuestions(result.content, deps.map((d) => d.name));
+    } catch (err) {
+      console.warn('[OBJECT-CREATOR] Failed to generate targeted questions, falling back to generic:', err);
+      return new Map();
+    }
+  }
+
+  /**
+   * Parse LLM response for targeted questions. Matches lines like "[Name]: question" or "Name: question".
+   * Uses case-insensitive fuzzy matching against known dep names.
+   */
+  private parseTargetedQuestions(
+    content: string,
+    depNames: string[]
+  ): Map<string, string> {
+    const questions = new Map<string, string>();
+    const nameMap = new Map(depNames.map((n) => [n.toLowerCase(), n]));
+
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      // Match "[Name]: question" or "Name: question" (with optional leading "- ")
+      const match = trimmed.match(/^-?\s*\[?([^\]:\n]+)\]?\s*:\s*(.+)/);
+      if (!match) continue;
+
+      const rawName = match[1].trim();
+      const question = match[2].trim();
+      if (!question) continue;
+
+      const canonical = nameMap.get(rawName.toLowerCase());
+      if (canonical) {
+        questions.set(canonical, question);
+      }
+    }
+
+    return questions;
+  }
+
+  /**
+   * Ask each dependency in parallel for a usage guide via the 'ask' protocol.
+   * If customQuestions is provided, uses targeted questions per dep; otherwise falls back to generic.
+   * Reports per-dependency progress when callerId is provided.
+   */
+  private async fetchUsageGuides(
+    deps: SelectedDependency[],
+    customQuestions?: Map<string, string>,
+    callerId?: AbjectId
+  ): Promise<Map<string, string>> {
     const guides = new Map<string, string>();
     if (deps.length === 0) return guides;
 
+    const genericQuestion =
+      'How should another object use your methods? Give a concise guide with example this.call() invocations, event handler patterns, and any important constraints.';
+
     const promises = deps.map(async (dep) => {
-      const guide = await this.askDependency(
-        dep.id,
-        'How should another object use your methods? Give a concise guide with example this.call() invocations, event handler patterns, and any important constraints.'
-      );
+      const question = customQuestions?.get(dep.name) ?? genericQuestion;
+      if (callerId) await this.reportProgress(callerId, '0d', `Asking ${dep.name}: ${question}`);
+      const guide = await this.askDependency(dep.id, question);
       if (guide) {
         guides.set(dep.name, guide);
       }
@@ -463,10 +543,13 @@ export class ObjectCreator extends Abject {
       const deps = await this.fetchFullManifests(selectedNames, summaries);
       console.log('[OBJECT-CREATOR] Fetched manifests for:', deps.map((d) => d.name));
 
-      // Phase 0d: Ask each dependency for usage guides via 'ask' protocol
-      const fetchedNames = deps.map((d) => d.name).join(', ') || 'none';
-      if (callerId) await this.reportProgress(callerId, '0d', `Asking ${fetchedNames} for usage guides...`);
-      const usageGuides = await this.fetchUsageGuides(deps);
+      // Phase 0c5: Generate targeted questions for each dependency
+      if (callerId) await this.reportProgress(callerId, '0c5', 'Formulating questions...');
+      const targetedQuestions = await this.generateTargetedQuestions(prompt, deps);
+      console.log('[OBJECT-CREATOR] Generated targeted questions for:', Array.from(targetedQuestions.keys()));
+
+      // Phase 0d: Ask each dependency for usage guides (with targeted questions)
+      const usageGuides = await this.fetchUsageGuides(deps, targetedQuestions, callerId);
       console.log('[OBJECT-CREATOR] Got usage guides from:', Array.from(usageGuides.keys()));
 
       const depContext = this.formatFullManifestContext(deps, usageGuides);
@@ -545,7 +628,7 @@ export class ObjectCreator extends Abject {
               'Output ONLY the corrected handler map in a ```javascript code block. Nothing else.'
             ),
             userMessage(`Handler map:\n\`\`\`javascript\n${code}\n\`\`\`\n\nError: ${compileError}`),
-          ]);
+          ], { tier: 'balanced' });
           const fixMatch = fixResult.content.match(/```(?:javascript|js)\s*([\s\S]*?)\s*```/);
           if (fixMatch && !ScriptableAbject.tryCompile(fixMatch[1])) {
             code = fixMatch[1];
@@ -664,7 +747,7 @@ Modification request: ${prompt}
 Generate the updated manifest and handler map that implements this change.`),
       ];
 
-      const result = await this.llmComplete(messages);
+      const result = await this.llmComplete(messages, { tier: 'smart' });
       const parsed = this.parseCreationResponse(result.content);
 
       return {
@@ -700,7 +783,7 @@ ${availableList}
 User's goal: ${context}
 
 Suggest 3-5 objects that would help achieve this goal. Format: one suggestion per line.`),
-    ]);
+    ], { tier: 'fast' });
 
     return result.content
       .split('\n')
@@ -756,7 +839,7 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
       userMessage(`Available dependencies:\n${depContext}\n\n${context ? `Additional context: ${context}\n\n` : ''}User request: ${prompt}\n\nDesign the manifest for this object.`),
     ];
 
-    const result = await this.llmComplete(messages);
+    const result = await this.llmComplete(messages, { tier: 'smart' });
     return this.parseManifestResponse(result.content);
   }
 
@@ -778,7 +861,7 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
       userMessage(`Manifest:\n\`\`\`json\n${JSON.stringify(manifest, null, 2)}\n\`\`\`\n\nYou MUST implement handlers for these methods: ${methodList.join(', ')}\n\nAvailable dependencies:\n${depContext}\n\nUsed objects: ${usedObjects.length > 0 ? usedObjects.join(', ') : 'None'}\n\n${context ? `Additional context: ${context}\n\n` : ''}Original user request: ${prompt}\n\nGenerate the handler map.`),
     ];
 
-    const result = await this.llmComplete(messages);
+    const result = await this.llmComplete(messages, { tier: 'smart' });
     return this.parseCodeResponse(result.content);
   }
 
@@ -803,7 +886,7 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
       systemMessage(`Your previous attempt failed with this error:\n${errorFeedback}\n\n${previousCode ? `Previous code:\n\`\`\`javascript\n${previousCode}\n\`\`\`\n\n` : ''}Fix these issues. Remember:\n- The handler map MUST be a FLAT parenthesized object: ({ method(msg) { ... } })\n- You MUST implement ALL methods listed above: ${methodList.join(', ')}\n- Each handler takes a single msg argument\n- MUST be plain JavaScript, NOT TypeScript\n- Do NOT nest handlers under interface keys\n\nGenerate the corrected handler map.`),
     ];
 
-    const result = await this.llmComplete(messages);
+    const result = await this.llmComplete(messages, { tier: 'smart' });
     return this.parseCodeResponse(result.content);
   }
 
@@ -875,7 +958,7 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
       userMessage(`Manifest:\n\`\`\`json\n${JSON.stringify(manifest, null, 2)}\n\`\`\`\n\nHandler code:\n\`\`\`javascript\n${code}\n\`\`\`\n\nMismatches found:\n${mismatches.map((m) => `- ${m}`).join('\n')}\n\nFix the mismatches. Output the corrected manifest in a \`\`\`json block and the corrected handler code in a \`\`\`javascript block. If no changes are needed, respond with just "VERIFIED".`),
     ];
 
-    const result = await this.llmComplete(messages);
+    const result = await this.llmComplete(messages, { tier: 'balanced' });
     const content = result.content.trim();
 
     if (content === 'VERIFIED') {

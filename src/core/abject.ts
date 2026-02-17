@@ -1,5 +1,8 @@
 /**
  * Base Abject class - the fundamental object in the system.
+ *
+ * Each Abject runs its own processing loop, pulling messages from its mailbox.
+ * Replies bypass the mailbox via a fast-path to avoid deadlocks.
  */
 
 import { v4 as uuidv4 } from 'uuid';
@@ -32,6 +35,9 @@ export interface AbjectOptions {
 
 /**
  * Base class for all objects in the system.
+ *
+ * Each object runs its own processing loop that pulls messages from its mailbox.
+ * Replies are delivered via a fast-path that bypasses the mailbox to avoid deadlocks.
  */
 export abstract class Abject {
   readonly id: AbjectId;
@@ -49,6 +55,9 @@ export abstract class Abject {
   private _mailbox?: Mailbox;
   private _parentId?: AbjectId;
   private _registryId?: AbjectId;
+  private _processingLoop?: Promise<void>;
+  private _insideHandler = false;
+  private _stoppedDuringHandler = false;
   private handlers: Map<string, MessageHandlerFn> = new Map();
   private dependents: Set<AbjectId> = new Set();
   private pendingReplies: Map<string, {
@@ -109,7 +118,24 @@ export abstract class Abject {
   }
 
   /**
+   * Override ID before initialization. Used by Supervisor for same-ID restart.
+   */
+  setId(id: AbjectId): void {
+    require(this._status === 'initializing', 'Can only set ID before initialization');
+    (this as { id: AbjectId }).id = id;
+  }
+
+  /**
+   * Pre-seed the registry ID before initialization.
+   * Avoids the need to ask the parent chain during onInit().
+   */
+  setRegistryHint(registryId: AbjectId): void {
+    this._registryId = registryId;
+  }
+
+  /**
    * Initialize the object. Called after registration with the bus.
+   * Starts the per-object processing loop.
    */
   async init(bus: MessageBus, parentId?: AbjectId): Promise<void> {
     require(this._status === 'initializing', 'Object must be initializing');
@@ -117,13 +143,21 @@ export abstract class Abject {
 
     this._bus = bus;
     this._parentId = parentId;
-    this._mailbox = bus.register(this.id, this.handleMessage.bind(this));
+    this._mailbox = bus.register(this.id);
+
+    // Set up reply fast-path handler
+    bus.setReplyHandler(this.id, this.handleReply.bind(this));
 
     // Register the introspect handler on every Abject
     this.on('describe', () => ({
       manifest: this.manifest,
       description: formatManifestAsDescription(this.manifest),
     }));
+
+    // Universal ping handler for liveness checks (don't overwrite if subclass defined one)
+    if (!this.handlers.has('ping')) {
+      this.on('ping', () => ({ alive: true, timestamp: Date.now() }));
+    }
 
     // Universal dependency protocol (Smalltalk addDependent:/removeDependent:/changed:)
     this.on('addDependent', (msg: AbjectMessage) => {
@@ -161,6 +195,9 @@ export abstract class Abject {
     });
 
     this._status = 'ready';
+
+    // Start the per-object processing loop
+    this._processingLoop = this.processMessages();
 
     await this.onInit();
 
@@ -286,6 +323,7 @@ export abstract class Abject {
                 { role: 'system', content: `You are answering questions about an object in the Abjects system. Use the provided manifest and source code to give accurate, concise answers.\n\n${context}` },
                 { role: 'user', content: question },
               ],
+              options: { tier: 'fast' },
             }),
             60000
           );
@@ -301,18 +339,52 @@ export abstract class Abject {
   }
 
   /**
+   * Per-object processing loop. Pulls messages from mailbox and handles them.
+   * Runs until the object is stopped.
+   */
+  private async processMessages(): Promise<void> {
+    const isStopped = () => (this._status as string) === 'stopped';
+    while (!isStopped()) {
+      let msg: AbjectMessage;
+      try {
+        msg = await this._mailbox!.receive();
+      } catch {
+        break; // Mailbox closed — exit loop
+      }
+      if (isStopped()) break;
+      try {
+        await this.handleMessage(msg);
+      } catch (err) {
+        console.error(`[${this.id}] Processing loop error:`, err);
+      }
+    }
+  }
+
+  /**
+   * Handle a reply/error message via the fast-path (called by bus, not via mailbox).
+   * Resolves the pending Promise for the corresponding request.
+   */
+  private handleReply(message: AbjectMessage): void {
+    const pending = this.pendingReplies.get(message.header.correlationId!);
+    if (pending) {
+      clearTimeout(pending.timeout);
+      this.pendingReplies.delete(message.header.correlationId!);
+
+      if (isError(message)) {
+        const err = message.payload as AbjectError;
+        pending.reject(new Error(`${err.code}: ${err.message}`));
+      } else {
+        pending.resolve(message.payload);
+      }
+    }
+  }
+
+  /**
    * Stop the object.
    */
   async stop(): Promise<void> {
     this._status = 'stopped';
     await this.onStop();
-
-    if (this._bus) {
-      this._bus.unregister(this.id);
-    }
-
-    // Clear dependents
-    this.dependents.clear();
 
     // Reject all pending replies
     for (const [, pending] of this.pendingReplies) {
@@ -320,6 +392,29 @@ export abstract class Abject {
       pending.reject(new Error('Object stopped'));
     }
     this.pendingReplies.clear();
+
+    // Always unregister from bus immediately — this is safe and idempotent.
+    if (this._bus) {
+      this._bus.unregister(this.id);
+    }
+
+    // If called from inside a handler, defer only the processing-loop await
+    // to avoid a circular Promise chain (stop awaits processingLoop which
+    // awaits handleMessage which called stop).
+    if (this._insideHandler) {
+      this._stoppedDuringHandler = true;
+      this.dependents.clear();
+      return;
+    }
+
+    // Wait for processing loop to finish
+    if (this._processingLoop) {
+      await this._processingLoop;
+      this._processingLoop = undefined;
+    }
+
+    // Clear dependents
+    this.dependents.clear();
   }
 
   /**
@@ -388,7 +483,12 @@ export abstract class Abject {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pendingReplies.delete(message.header.messageId);
-        reject(new Error(`Request timeout after ${timeoutMs}ms`));
+        const target = message.routing.to;
+        const method = message.routing.method ?? '?';
+        const iface = message.routing.interface ?? '?';
+        reject(new Error(
+          `Request timeout after ${timeoutMs}ms: ${this.manifest.name}(${this.id}) → ${target} ${iface}.${method}`
+        ));
       }, timeoutMs);
 
       this.pendingReplies.set(message.header.messageId, {
@@ -402,7 +502,8 @@ export abstract class Abject {
   }
 
   /**
-   * Handle an incoming message.
+   * Handle an incoming message from the processing loop.
+   * Replies are handled via handleReply() fast-path, not here.
    */
   private async handleMessage(message: AbjectMessage): Promise<void> {
     if (message === undefined) {
@@ -412,29 +513,10 @@ export abstract class Abject {
 
     this.lastActivity = Date.now();
 
-    // Save status to handle re-entrant message delivery (the message bus
-    // may call handleMessage recursively when a handler sends a message
-    // whose recipient sends a message back to this object).
+    // Save status to handle re-entrant message delivery
     const prevStatus = this._status;
 
     try {
-      // Check for reply to pending request
-      if (isReply(message) || isError(message)) {
-        const pending = this.pendingReplies.get(message.header.correlationId!);
-        if (pending) {
-          clearTimeout(pending.timeout);
-          this.pendingReplies.delete(message.header.correlationId!);
-
-          if (isError(message)) {
-            const err = message.payload as AbjectError;
-            pending.reject(new Error(`${err.code}: ${err.message}`));
-          } else {
-            pending.resolve(message.payload);
-          }
-          return;
-        }
-      }
-
       // Find handler
       const method = message.routing.method ?? '';
       const handler = this.handlers.get(method) ?? this.handlers.get('*');
@@ -448,9 +530,34 @@ export abstract class Abject {
         return;
       }
 
-      // Execute handler
+      // Execute handler (track _insideHandler for stop() deadlock avoidance)
       this._status = 'busy';
-      const result = await handler(message);
+      this._insideHandler = true;
+      let result: unknown;
+      try {
+        result = await handler(message);
+      } finally {
+        this._insideHandler = false;
+      }
+
+      // If stop() was called during the handler, finalize deferred cleanup
+      if (this._stoppedDuringHandler) {
+        this._stoppedDuringHandler = false;
+
+        // Send the reply directly via the bus (this.send() rejects on stopped status)
+        if (isRequest(message) && result !== undefined && this._bus) {
+          try {
+            await this._bus.send(reply(message, result));
+          } catch {
+            // Bus may already have unregistered — that's OK
+          }
+        }
+
+        // Finalize deferred cleanup (bus.unregister already done in stop())
+        this._processingLoop = undefined;
+        return; // Skip invariant check — the object is dead
+      }
+
       this._status = prevStatus === 'busy' ? 'busy' : 'ready';
 
       // Send reply if this was a request
@@ -465,6 +572,25 @@ export abstract class Abject {
         stack: err instanceof Error ? err.stack : undefined,
       };
 
+      // If stop() was called during the handler that threw, finalize deferred cleanup
+      if (this._stoppedDuringHandler) {
+        this._stoppedDuringHandler = false;
+
+        // Send error reply directly via bus
+        if (isRequest(message) && this._bus) {
+          try {
+            await this._bus.send(errorFromException(message, err));
+          } catch {
+            // Bus may already have unregistered
+          }
+        }
+
+        // Finalize deferred cleanup (bus.unregister already done in stop())
+        this._processingLoop = undefined;
+        console.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
+        return;
+      }
+
       // Send error reply while status is still 'busy' (send requires 'ready' or 'busy')
       if (isRequest(message)) {
         try {
@@ -478,7 +604,7 @@ export abstract class Abject {
       if (prevStatus !== 'busy') {
         this._status = 'error';
       }
-      console.error(`[${this.id}] Error handling message:`, err);
+      console.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
     }
 
     try {

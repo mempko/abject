@@ -163,6 +163,10 @@ export abstract class LayoutAbject extends WidgetAbject {
       this.layoutChildren = this.layoutChildren.filter(
         (c) => isSpacer(c) || c.widgetId !== widgetId
       );
+      // Clear stale hover reference to prevent handleInput to destroyed widgets
+      if (this.hoveredLayoutChildId === widgetId) {
+        this.hoveredLayoutChildId = undefined;
+      }
       if (this.rect.width > 0 && this.rect.height > 0) {
         await this.updateChildRects();
       }
@@ -172,6 +176,11 @@ export abstract class LayoutAbject extends WidgetAbject {
 
     this.on('getFocusableWidgets', async () => {
       return this.getFocusableWidgets();
+    });
+
+    // Forward child dirty notifications up the layout chain
+    this.on('childDirty', async () => {
+      await this.requestRedraw();
     });
   }
 
@@ -339,7 +348,7 @@ export abstract class LayoutAbject extends WidgetAbject {
     return '';
   }
 
-  protected applyUpdate(updates: Record<string, unknown>): void {
+  protected async applyUpdate(updates: Record<string, unknown>): Promise<void> {
     if (updates.margins !== undefined) {
       const m = updates.margins as Partial<LayoutMargins>;
       this.margins = { ...this.margins, ...m };
@@ -350,7 +359,7 @@ export abstract class LayoutAbject extends WidgetAbject {
 
     // When rect changes, cascade rect updates to children
     if (updates.rect !== undefined) {
-      this.updateChildRects();
+      await this.updateChildRects();
     }
   }
 

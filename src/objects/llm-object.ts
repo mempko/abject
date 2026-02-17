@@ -312,7 +312,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     const result = await this.complete([
       systemMessage(systemPrompt),
       userMessage(userPrompt),
-    ]);
+    ], { tier: 'smart' });
 
     // Extract code from markdown if present
     return this.extractCode(result.content, language);
@@ -327,7 +327,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
         'You are an expert analyst. Provide clear, structured analysis.'
       ),
       userMessage(`${task}\n\nContent:\n${content}`),
-    ]);
+    ], { tier: 'balanced' });
 
     return result.content;
   }

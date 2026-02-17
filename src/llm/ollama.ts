@@ -9,6 +9,7 @@ import {
   LLMCompletionOptions,
   LLMCompletionResult,
   LLMStreamChunk,
+  ModelTier,
 } from './provider.js';
 import { require } from '../core/contracts.js';
 
@@ -55,6 +56,10 @@ export class OllamaProvider extends BaseLLMProvider {
   readonly name = 'ollama';
   private model: string;
 
+  private resolveModel(_tier?: ModelTier): string {
+    return this.model;  // Ollama: single local model for all tiers
+  }
+
   constructor(config: OllamaConfig = {}) {
     super({
       baseUrl: config.baseUrl ?? 'http://localhost:11434',
@@ -88,7 +93,7 @@ export class OllamaProvider extends BaseLLMProvider {
     options: LLMCompletionOptions = {}
   ): Promise<LLMCompletionResult> {
     const request: OllamaRequest = {
-      model: this.model,
+      model: this.resolveModel(options.tier),
       messages: messages.map((m) => ({
         role: m.role,
         content: m.content,
@@ -126,7 +131,7 @@ export class OllamaProvider extends BaseLLMProvider {
     require(!this.fetchFn, 'Streaming is not supported when using HttpClient delegate');
 
     const request: OllamaRequest = {
-      model: this.model,
+      model: this.resolveModel(options.tier),
       messages: messages.map((m) => ({
         role: m.role,
         content: m.content,

@@ -152,8 +152,9 @@ export abstract class WidgetAbject extends Abject {
 
     this.on('update', async (msg: AbjectMessage) => {
       const updates = msg.payload as Record<string, unknown>;
+      console.debug(`[Widget:${this.id}] update — hasRect=${updates.rect !== undefined}`);
       this.applyCommonUpdates(updates);
-      this.applyUpdate(updates);
+      await this.applyUpdate(updates);
       await this.requestRedraw();
       return true;
     });
@@ -226,5 +227,5 @@ export abstract class WidgetAbject extends Abject {
   protected abstract getWidgetValue(): string;
 
   /** Apply type-specific updates. */
-  protected abstract applyUpdate(updates: Record<string, unknown>): void;
+  protected abstract applyUpdate(updates: Record<string, unknown>): void | Promise<void>;
 }

@@ -1,13 +1,35 @@
 /**
- * Supervision tree for managing object lifecycles and failures.
+ * Erlang-style Supervisor — manages object lifecycles using child specs.
+ *
+ * Objects are described declaratively via ChildSpec (constructor name, restart type).
+ * When a child fails, the Supervisor asks Factory to respawn it with the same ID
+ * so existing references remain valid.
+ *
+ * Restart types:
+ *   permanent  — always restart
+ *   transient  — restart only on abnormal exit (error)
+ *   temporary  — never restart
  */
 
-import { AbjectId, AbjectMessage, AbjectError } from '../core/types.js';
-import { invariant } from '../core/contracts.js';
+import { AbjectId, AbjectMessage, AbjectError, InterfaceId } from '../core/types.js';
+import { invariant, require as contractRequire } from '../core/contracts.js';
 import { Abject } from '../core/abject.js';
-import { Factory } from '../objects/factory.js';
+import { request, event } from '../core/message.js';
 
 export type RestartStrategy = 'one_for_one' | 'one_for_all' | 'rest_for_one';
+export type RestartType = 'permanent' | 'transient' | 'temporary';
+
+export interface ChildSpec {
+  id: AbjectId;
+  constructorName: string;
+  restart: RestartType;
+  parentId?: AbjectId;
+}
+
+interface ChildState {
+  spec: ChildSpec;
+  restarts: number[]; // timestamps of recent restarts
+}
 
 export interface SupervisorConfig {
   strategy: RestartStrategy;
@@ -15,20 +37,19 @@ export interface SupervisorConfig {
   maxTime: number; // Time window in ms
 }
 
-interface ChildState {
-  object: Abject;
-  restarts: number[];
-}
+const SUPERVISOR_INTERFACE = 'abjects:supervisor';
+export const SUPERVISOR_INTERFACE_ID = SUPERVISOR_INTERFACE as InterfaceId;
 
 /**
  * Supervises a group of objects and handles failures.
+ * Uses child specs and Factory respawn for same-ID restart.
  */
 export class Supervisor extends Abject {
   private children: Map<AbjectId, ChildState> = new Map();
-  private factory?: Factory;
+  private factoryId?: AbjectId;
+  private healthMonitorId?: AbjectId;
 
   constructor(
-    name: string,
     private readonly config: SupervisorConfig = {
       strategy: 'one_for_one',
       maxRestarts: 3,
@@ -37,10 +58,85 @@ export class Supervisor extends Abject {
   ) {
     super({
       manifest: {
-        name,
-        description: `Supervisor using ${config.strategy} strategy`,
+        name: 'Supervisor',
+        description: `Erlang-style supervisor using ${config.strategy} strategy. Monitors child objects and restarts them on failure.`,
         version: '1.0.0',
-        interfaces: [],
+        interfaces: [
+          {
+            id: SUPERVISOR_INTERFACE,
+            name: 'Supervisor',
+            description: 'Object supervision and restart management',
+            methods: [
+              {
+                name: 'addChild',
+                description: 'Register a child spec for supervision',
+                parameters: [
+                  {
+                    name: 'spec',
+                    type: { kind: 'reference', reference: 'ChildSpec' },
+                    description: 'The child specification',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'removeChild',
+                description: 'Remove a child from supervision',
+                parameters: [
+                  {
+                    name: 'childId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'The ID of the child to remove',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'getChildren',
+                description: 'List all supervised children',
+                parameters: [],
+                returns: {
+                  kind: 'array',
+                  elementType: { kind: 'reference', reference: 'ChildSpec' },
+                },
+              },
+            ],
+            events: [
+              {
+                name: 'childFailed',
+                description: 'Notification that a supervised child has failed',
+                payload: {
+                  kind: 'object',
+                  properties: {
+                    childId: { kind: 'primitive', primitive: 'string' },
+                    error: { kind: 'reference', reference: 'AbjectError' },
+                  },
+                },
+              },
+              {
+                name: 'childRestarted',
+                description: 'Notification that a child was successfully restarted',
+                payload: {
+                  kind: 'object',
+                  properties: {
+                    childId: { kind: 'primitive', primitive: 'string' },
+                    constructorName: { kind: 'primitive', primitive: 'string' },
+                  },
+                },
+              },
+              {
+                name: 'childGaveUp',
+                description: 'Notification that restart limit was exceeded for a child',
+                payload: {
+                  kind: 'object',
+                  properties: {
+                    childId: { kind: 'primitive', primitive: 'string' },
+                  },
+                },
+              },
+            ],
+          },
+        ],
         requiredCapabilities: [],
         tags: ['system', 'supervisor'],
       },
@@ -50,6 +146,20 @@ export class Supervisor extends Abject {
   }
 
   private setupHandlers(): void {
+    this.on('addChild', async (msg: AbjectMessage) => {
+      const spec = msg.payload as ChildSpec;
+      return this.addChild(spec);
+    });
+
+    this.on('removeChild', async (msg: AbjectMessage) => {
+      const { childId } = msg.payload as { childId: AbjectId };
+      return this.removeChild(childId);
+    });
+
+    this.on('getChildren', async () => {
+      return this.getChildren();
+    });
+
     this.on('childFailed', async (msg: AbjectMessage) => {
       const { childId, error } = msg.payload as {
         childId: AbjectId;
@@ -59,31 +169,58 @@ export class Supervisor extends Abject {
     });
   }
 
-  /**
-   * Set the factory for restarting children.
-   */
-  setFactory(factory: Factory): void {
-    this.factory = factory;
+  protected override async onInit(): Promise<void> {
+    // Discover Factory via Registry
+    try {
+      this.factoryId = await this.requireDep('Factory');
+    } catch {
+      console.warn('[SUPERVISOR] Could not discover Factory — restarts will fail');
+    }
+
+    // Discover HealthMonitor (to re-mark objects ready after restart)
+    try {
+      this.healthMonitorId = await this.discoverDep('HealthMonitor') ?? undefined;
+    } catch {
+      // HealthMonitor may not be spawned yet
+    }
   }
 
   /**
-   * Add a child object to supervise.
+   * Add a child spec to supervision.
    */
-  addChild(obj: Abject): void {
-    this.children.set(obj.id, {
-      object: obj,
+  addChild(spec: ChildSpec): boolean {
+    contractRequire(spec.id !== '', 'child spec must have an id');
+    contractRequire(spec.constructorName !== '', 'child spec must have a constructorName');
+
+    if (this.children.has(spec.id)) {
+      // Update the spec if child already registered
+      this.children.get(spec.id)!.spec = spec;
+      return true;
+    }
+
+    this.children.set(spec.id, {
+      spec,
       restarts: [],
     });
+
     this.checkInvariants();
+    return true;
   }
 
   /**
    * Remove a child from supervision.
    */
-  removeChild(objectId: AbjectId): boolean {
-    const removed = this.children.delete(objectId);
+  removeChild(childId: AbjectId): boolean {
+    const removed = this.children.delete(childId);
     this.checkInvariants();
     return removed;
+  }
+
+  /**
+   * Get all supervised child specs.
+   */
+  getChildren(): ChildSpec[] {
+    return Array.from(this.children.values()).map(c => c.spec);
   }
 
   /**
@@ -98,7 +235,14 @@ export class Supervisor extends Abject {
       return;
     }
 
-    console.log(`[SUPERVISOR] Child ${childId} failed: ${error.message}`);
+    console.log(`[SUPERVISOR] Child ${childId} (${child.spec.constructorName}) failed: ${error.message}`);
+
+    // Temporary children are never restarted
+    if (child.spec.restart === 'temporary') {
+      console.log(`[SUPERVISOR] Child ${childId} is temporary — not restarting`);
+      this.children.delete(childId);
+      return;
+    }
 
     // Check if we should restart
     const now = Date.now();
@@ -108,7 +252,7 @@ export class Supervisor extends Abject {
 
     if (child.restarts.length >= this.config.maxRestarts) {
       console.error(
-        `[SUPERVISOR] Child ${childId} exceeded max restarts, giving up`
+        `[SUPERVISOR] Child ${childId} exceeded max restarts (${this.config.maxRestarts} in ${this.config.maxTime}ms), giving up`
       );
       await this.handleMaxRestartsExceeded(childId);
       return;
@@ -131,41 +275,46 @@ export class Supervisor extends Abject {
   }
 
   /**
-   * Restart a single child.
+   * Restart a single child via Factory respawn.
    */
   private async restartOne(childId: AbjectId): Promise<void> {
     const child = this.children.get(childId);
-    if (!child || !this.factory) {
+    if (!child || !this.factoryId) {
+      console.error(`[SUPERVISOR] Cannot restart ${childId} — no factory or child spec`);
       return;
     }
 
-    console.log(`[SUPERVISOR] Restarting child ${childId}`);
+    console.log(`[SUPERVISOR] Restarting child ${childId} (${child.spec.constructorName})`);
 
-    // Stop the failed object
-    await child.object.stop();
+    try {
+      await this.request(
+        request(this.id, this.factoryId, 'abjects:factory' as InterfaceId, 'respawn', {
+          objectId: childId,
+          constructorName: child.spec.constructorName,
+          parentId: child.spec.parentId,
+        })
+      );
+      console.log(`[SUPERVISOR] Child ${childId} restarted successfully`);
 
-    // Re-spawn it
-    await this.factory.spawnInstance(child.object);
+      // Notify HealthMonitor the object is ready for pings again
+      await this.notifyHealthMonitorReady(childId);
+    } catch (err) {
+      console.error(`[SUPERVISOR] Failed to restart child ${childId}:`, err);
+    }
   }
 
   /**
    * Restart all children.
    */
   private async restartAll(): Promise<void> {
-    if (!this.factory) {
+    if (!this.factoryId) {
       return;
     }
 
     console.log('[SUPERVISOR] Restarting all children');
 
-    // Stop all children
-    for (const [, child] of this.children) {
-      await child.object.stop();
-    }
-
-    // Restart all children
-    for (const [, child] of this.children) {
-      await this.factory.spawnInstance(child.object);
+    for (const [childId] of this.children) {
+      await this.restartOne(childId);
     }
   }
 
@@ -173,28 +322,44 @@ export class Supervisor extends Abject {
    * Restart children after (and including) the failed one.
    */
   private async restartRest(failedId: AbjectId): Promise<void> {
-    if (!this.factory) {
+    if (!this.factoryId) {
       return;
     }
 
     console.log(`[SUPERVISOR] Restarting children from ${failedId}`);
 
-    // Find the failed child's position
     const ids = Array.from(this.children.keys());
     const failedIndex = ids.indexOf(failedId);
     if (failedIndex < 0) {
       return;
     }
 
-    // Stop and restart from failed child onwards
     for (let i = failedIndex; i < ids.length; i++) {
-      const child = this.children.get(ids[i])!;
-      await child.object.stop();
+      await this.restartOne(ids[i]);
     }
+  }
 
-    for (let i = failedIndex; i < ids.length; i++) {
-      const child = this.children.get(ids[i])!;
-      await this.factory.spawnInstance(child.object);
+  /**
+   * Tell HealthMonitor the restarted child is ready for liveness pings.
+   */
+  private async notifyHealthMonitorReady(childId: AbjectId): Promise<void> {
+    // Lazily discover HealthMonitor if not found at init time
+    if (!this.healthMonitorId) {
+      try {
+        this.healthMonitorId = await this.discoverDep('HealthMonitor') ?? undefined;
+      } catch {
+        // Still no HealthMonitor
+      }
+    }
+    if (!this.healthMonitorId) return;
+
+    try {
+      await this.request(
+        request(this.id, this.healthMonitorId,
+          'abjects:health-monitor' as InterfaceId, 'markObjectReady', { objectId: childId })
+      );
+    } catch {
+      // best effort
     }
   }
 
@@ -205,8 +370,6 @@ export class Supervisor extends Abject {
     // Remove from supervision
     this.children.delete(childId);
 
-    // Escalate to parent supervisor (if any)
-    // For now, just log
     console.error(`[SUPERVISOR] Child ${childId} permanently failed`);
   }
 
@@ -225,3 +388,6 @@ export class Supervisor extends Abject {
     invariant(this.children.size >= 0, 'child count must be non-negative');
   }
 }
+
+// Well-known supervisor ID
+export const SUPERVISOR_ID = 'abjects:supervisor' as AbjectId;
