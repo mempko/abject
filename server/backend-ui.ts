@@ -768,6 +768,19 @@ export class BackendUI extends Abject {
       const state = this.surfaces.get(msg.surfaceId);
       if (state) {
         if (msg.inputType === 'mousedown' && this.windowManagerId) {
+          // ── Ctrl+click: immediately start window drag ──
+          if (msg.modifiers?.ctrl) {
+            this.mouseGrabAbject = this.windowManagerId;
+            const globalX = (msg.x ?? 0) + (state.rect.x ?? 0);
+            const globalY = (msg.y ?? 0) + (state.rect.y ?? 0);
+            this.send(event(this.id, this.windowManagerId,
+              'abjects:window-manager' as InterfaceId, 'startDrag', {
+                surfaceId: msg.surfaceId, globalX, globalY,
+              }));
+            this.handleFocus(state.objectId, msg.surfaceId);
+            return;
+          }
+
           // Ask WindowManager if it wants to grab the mouse (drag/resize)
           const localX = msg.x ?? 0;
           const localY = msg.y ?? 0;

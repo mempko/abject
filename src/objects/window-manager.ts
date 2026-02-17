@@ -200,13 +200,14 @@ export class WindowManager extends Abject {
       await this.raiseWindow(surfaceId);
     });
 
-    // Start a drag on a chromeless+draggable window (initiated by WindowAbject via UIServer)
+    // Start a drag on a window (Ctrl+click from UIServer, or chromeless+draggable from WindowAbject)
     this.on('startDrag', async (msg: AbjectMessage) => {
       const { surfaceId, globalX, globalY } = msg.payload as {
         surfaceId: string; globalX: number; globalY: number;
       };
       const info = this.windows.get(surfaceId);
       if (!info) return;
+      // Set dragState BEFORE raiseWindow so incoming dragMove events work immediately
       this.dragState = {
         surfaceId,
         windowId: info.windowId,
@@ -216,6 +217,7 @@ export class WindowManager extends Abject {
         startMouseY: globalY,
         startRect: { ...info.rect },
       };
+      this.raiseWindow(surfaceId).catch(() => { /* best-effort */ });
     });
   }
 
@@ -233,7 +235,7 @@ export class WindowManager extends Abject {
   private async handleSurfaceMouseDown(
     surfaceId: string,
     localX: number,
-    localY: number
+    localY: number,
   ): Promise<{ grab: boolean }> {
     const info = this.windows.get(surfaceId);
     if (!info) return { grab: false };

@@ -653,6 +653,19 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
     if (type === 'mousedown' && surface && this.windowManagerId) {
       const owner = this.surfaceOwners.get(surface.id);
 
+      // ── Ctrl+click: immediately start window drag (synchronous grab) ──
+      if (e.ctrlKey) {
+        this.mouseGrabAbject = this.windowManagerId;
+        this.send(event(this.id, this.windowManagerId,
+          'abjects:window-manager' as InterfaceId, 'startDrag', {
+            surfaceId: surface.id, globalX: x, globalY: y,
+          }));
+        if (owner) {
+          this.setFocus(owner, surface.id);
+        }
+        return;
+      }
+
       // Ask WindowManager if it wants to grab the mouse (drag/resize)
       try {
         const localX = x - surface.rect.x;
