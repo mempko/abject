@@ -890,6 +890,12 @@ createVBox - Vertical stack layout
 createHBox - Horizontal row layout
 createNestedVBox - Nested vertical layout inside another layout
 createNestedHBox - Nested horizontal layout inside another layout
+createScrollableVBox - Scrollable vertical stack layout (clips overflow, scrolls via mouse wheel)
+createNestedScrollableVBox - Nested scrollable vertical layout inside another layout
+
+### Utility Methods
+
+getDisplayInfo - Returns { width, height } of the display area
 
 ### Interface IDs
 

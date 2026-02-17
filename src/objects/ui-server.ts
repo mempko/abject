@@ -405,6 +405,10 @@ Each draw command has exactly 3 fields: { type, surfaceId, params }
 'text'  - Text. params: { x, y, text, font?, fill?, align?, baseline? }
 'line'  - Line. params: { x1, y1, x2, y2, stroke?, lineWidth? }
 'path'  - SVG path. params: { path (SVG path string), fill?, stroke?, lineWidth? }
+'save'  - Save canvas state. params: {}
+'restore' - Restore canvas state. params: {}
+'clip'  - Set clipping region. params: { x, y, width, height }
+'image' - Draw image. params: { x, y, width?, height?, data (ImageBitmap | HTMLImageElement | ImageData) }
 
 IMPORTANT:
 - Use 'fill' for fill color, NOT 'color'
