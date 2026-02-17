@@ -15,14 +15,13 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
-import { LLMMessage, LLMCompletionResult } from '../llm/provider.js';
 
 const REGISTRY_BROWSER_INTERFACE: InterfaceId = 'abjects:registry-browser';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
 const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
+const WINDOW_INTERFACE: InterfaceId = 'abjects:window';
 
-const PAGE_SIZE = 8;
 const WIN_W = 550;
 const WIN_H = 500;
 
@@ -30,11 +29,11 @@ export class RegistryBrowser extends Abject {
   private widgetManagerId?: AbjectId;
   private registryId?: AbjectId;
   private objectCreatorId?: AbjectId;
-  private llmId?: AbjectId;
+  private factoryId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
-  private currentPage = 0;
   private cachedObjects: ObjectRegistration[] = [];
+  private searchText = '';
   private abjectEditorId?: AbjectId;
   private detailIndex?: number;
   private selectedMethod?: { interfaceId: InterfaceId; method: string };
@@ -42,15 +41,13 @@ export class RegistryBrowser extends Abject {
 
   // ── List View widget tracking ──
   private objButtons: Map<AbjectId, number> = new Map();
-  private prevPageBtnId?: AbjectId;
-  private nextPageBtnId?: AbjectId;
-  private cmdInputId?: AbjectId;
-  private cmdRunBtnId?: AbjectId;
-  private cmdStatusId?: AbjectId;
+  private searchInputId?: AbjectId;
+  private scrollableListId?: AbjectId;
 
   // ── Detail View widget tracking ──
   private backBtnId?: AbjectId;
   private editSourceBtnId?: AbjectId;
+  private deleteBtnId?: AbjectId;
   private methodButtons: Map<AbjectId, { interfaceId: InterfaceId; method: string }> = new Map();
   private msgPayloadId?: AbjectId;
   private msgSendBtnId?: AbjectId;
@@ -99,7 +96,7 @@ export class RegistryBrowser extends Abject {
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.registryId = await this.requireDep('Registry');
     this.objectCreatorId = await this.discoverDep('ObjectCreator') ?? undefined;
-    this.llmId = await this.discoverDep('LLM') ?? undefined;
+    this.factoryId = await this.discoverDep('Factory') ?? undefined;
     this.abjectEditorId = await this.discoverDep('AbjectEditor') ?? undefined;
 
     if (this.registryId) {
@@ -138,25 +135,46 @@ export class RegistryBrowser extends Abject {
 
   /**
    * Clear all view-specific widget tracking fields.
-   * The window destroy takes care of actual widget cleanup.
+   * Does NOT clear windowId — only hide() does that.
    */
   private clearViewTracking(): void {
     this.rootLayoutId = undefined;
     // List view
     this.objButtons.clear();
-    this.prevPageBtnId = undefined;
-    this.nextPageBtnId = undefined;
-    this.cmdInputId = undefined;
-    this.cmdRunBtnId = undefined;
-    this.cmdStatusId = undefined;
+    this.searchInputId = undefined;
+    this.scrollableListId = undefined;
 
     // Detail view
     this.backBtnId = undefined;
     this.editSourceBtnId = undefined;
+    this.deleteBtnId = undefined;
     this.methodButtons.clear();
     this.msgPayloadId = undefined;
     this.msgSendBtnId = undefined;
     this.msgResponseId = undefined;
+  }
+
+  /**
+   * Destroy the current root layout (and all its children) so we can
+   * repopulate in-place without destroying the window.
+   */
+  private async destroyRootLayout(): Promise<void> {
+    if (this.rootLayoutId && this.windowId) {
+      try {
+        // Remove layout from window, then destroy it
+        await this.request(
+          request(this.id, this.windowId, WINDOW_INTERFACE, 'removeChild', {
+            widgetId: this.rootLayoutId,
+          })
+        );
+      } catch { /* layout or window may be gone */ }
+      try {
+        await this.request(
+          request(this.id, this.rootLayoutId, WIDGET_INTERFACE, 'destroy', {})
+        );
+      } catch { /* already gone */ }
+    }
+    this.clearViewTracking();
   }
 
   private setupHandlers(): void {
@@ -170,7 +188,7 @@ export class RegistryBrowser extends Abject {
 
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
-      if (aspect !== 'click' && aspect !== 'submit') return;
+      if (aspect !== 'click' && aspect !== 'submit' && aspect !== 'change') return;
       const fromId = msg.routing.from;
       await this.handleWidgetEvent(fromId, aspect, value);
     });
@@ -178,7 +196,7 @@ export class RegistryBrowser extends Abject {
     this.on('objectRegistered', async () => {
       this.cachedObjects = await this.registryList();
       if (this.windowId) {
-        await this.showListView();
+        await this.populateListView();
       }
     });
   }
@@ -186,7 +204,7 @@ export class RegistryBrowser extends Abject {
   async show(): Promise<boolean> {
     if (this.windowId) return true;
 
-    this.currentPage = 0;
+    this.searchText = '';
     this.cachedObjects = await this.registryList();
     await this.showListView();
     return true;
@@ -206,249 +224,196 @@ export class RegistryBrowser extends Abject {
     return true;
   }
 
+  /**
+   * Show the list view — creates window if needed, then populates content.
+   */
   private async showListView(): Promise<void> {
-    // Destroy existing window if any
-    if (this.windowId) {
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
-          windowId: this.windowId,
+    if (!this.windowId) {
+      const displayInfo = await this.request<{ width: number; height: number }>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
+      );
+
+      const winX = Math.max(20, Math.floor((displayInfo.width - WIN_W) / 2));
+      const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2));
+
+      this.windowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
+          title: 'Registry Browser',
+          rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
+          zIndex: 200,
+          resizable: true,
         })
       );
-      this.windowId = undefined;
+    } else {
+      // Update window title when switching back from detail view
+      await this.request(
+        request(this.id, this.windowId, WINDOW_INTERFACE, 'setTitle', {
+          title: 'Registry Browser',
+        })
+      );
     }
 
-    this.clearViewTracking();
+    await this.populateListView();
+  }
 
-    const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
-    );
-
-    const winX = Math.max(20, Math.floor((displayInfo.width - WIN_W) / 2));
-    const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2));
-
-    this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
-        title: 'Registry Browser',
-        rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
-        zIndex: 200,
-        resizable: true,
-      })
-    );
+  /**
+   * Populate or repopulate the list view content without recreating the window.
+   */
+  private async populateListView(): Promise<void> {
+    await this.destroyRootLayout();
 
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
 
-    // Create root VBox layout
+    // Create root VBox layout (non-scrollable outer container)
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
-        windowId: this.windowId,
+        windowId: this.windowId!,
         margins: { top: 8, right: 16, bottom: 8, left: 16 },
         spacing: 6,
       })
     );
 
-    // LLM command bar (only when LLM is available)
-    if (this.llmId) {
-      const cmdRowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-          parentLayoutId: this.rootLayoutId,
-          margins: { top: 0, right: 0, bottom: 0, left: 0 },
-          spacing: 8,
-        })
-      );
-      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: cmdRowId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 30 },
-      }));
+    // Search input at the top
+    this.searchInputId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
+        windowId: this.windowId!, rect: r0, placeholder: 'Search objects...',
+      })
+    );
+    await this.addDep(this.searchInputId);
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.searchInputId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
 
-      this.cmdInputId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
-          windowId: this.windowId, rect: r0, placeholder: 'Type a command...',
+    // Restore search text if non-empty (e.g. after objectRegistered rebuild)
+    if (this.searchText) {
+      await this.request(
+        request(this.id, this.searchInputId, WIDGET_INTERFACE, 'update', {
+          text: this.searchText,
         })
       );
-      await this.addDep(this.cmdInputId);
-      await this.request(request(this.id, cmdRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: this.cmdInputId,
-        sizePolicy: { horizontal: 'expanding' },
-        preferredSize: { height: 30 },
-      }));
-
-      this.cmdRunBtnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-          windowId: this.windowId, rect: r0, text: 'Run',
-          style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
-        })
-      );
-      await this.addDep(this.cmdRunBtnId);
-      await this.request(request(this.id, cmdRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: this.cmdRunBtnId,
-        sizePolicy: { horizontal: 'fixed' },
-        preferredSize: { width: 60, height: 30 },
-      }));
-
-      this.cmdStatusId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-          windowId: this.windowId, rect: r0, text: '',
-        })
-      );
-      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: this.cmdStatusId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 20 },
-      }));
-
-      // Divider after command bar section
-      const cmdDividerId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
-          windowId: this.windowId, rect: r0,
-        })
-      );
-      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: cmdDividerId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 12 },
-      }));
     }
 
-    const totalPages = Math.max(1, Math.ceil(this.cachedObjects.length / PAGE_SIZE));
-    const start = this.currentPage * PAGE_SIZE;
-    const pageItems = this.cachedObjects.slice(start, start + PAGE_SIZE);
+    // Scrollable VBox for the object list
+    this.scrollableListId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedScrollableVBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 4,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.scrollableListId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
 
-    // Object buttons (expanding horizontally)
-    for (let i = 0; i < pageItems.length; i++) {
-      const obj = pageItems[i];
-      const desc = obj.manifest.description;
-      const label = `${obj.manifest.name} — ${desc.length > 55 ? desc.slice(0, 55) + '...' : desc}`;
+    // Populate buttons for matching objects
+    await this.rebuildFilteredButtons();
+  }
+
+  /**
+   * Rebuild the object buttons inside the scrollable list,
+   * filtered by the current searchText.
+   */
+  private async rebuildFilteredButtons(): Promise<void> {
+    if (!this.scrollableListId) return;
+
+    // Destroy existing buttons
+    for (const [btnId] of this.objButtons) {
+      try {
+        await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'removeLayoutChild', {
+          widgetId: btnId,
+        }));
+      } catch { /* may already be gone */ }
+      try {
+        await this.request(request(this.id, btnId, WIDGET_INTERFACE, 'destroy', {}));
+      } catch { /* already gone */ }
+    }
+    this.objButtons.clear();
+
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+    const query = this.searchText.toLowerCase();
+
+    for (let i = 0; i < this.cachedObjects.length; i++) {
+      const obj = this.cachedObjects[i];
+      const name = obj.manifest.name.toLowerCase();
+      const desc = obj.manifest.description.toLowerCase();
+      if (query && !name.includes(query) && !desc.includes(query)) continue;
+
+      const descText = obj.manifest.description;
+      const label = `${obj.manifest.name} — ${descText.length > 55 ? descText.slice(0, 55) + '...' : descText}`;
 
       const btnId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-          windowId: this.windowId, rect: r0, text: label,
+          windowId: this.windowId!, rect: r0, text: label,
           style: { fontSize: 13 },
         })
       );
       await this.addDep(btnId);
-      this.objButtons.set(btnId, i);
+      this.objButtons.set(btnId, i); // absolute index into cachedObjects
 
-      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'addLayoutChild', {
         widgetId: btnId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: 32 },
       }));
     }
-
-    // Spacer pushes nav to bottom
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
-
-    // Navigation row
-    if (totalPages > 1) {
-      const navRowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-          parentLayoutId: this.rootLayoutId,
-          margins: { top: 0, right: 0, bottom: 0, left: 0 },
-          spacing: 10,
-        })
-      );
-      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: navRowId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 30 },
-      }));
-
-      this.prevPageBtnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-          windowId: this.windowId, rect: r0, text: 'Prev',
-        })
-      );
-      await this.addDep(this.prevPageBtnId);
-      await this.request(request(this.id, navRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: this.prevPageBtnId,
-        sizePolicy: { horizontal: 'fixed' },
-        preferredSize: { width: 70, height: 30 },
-      }));
-
-      const pageLabelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-          windowId: this.windowId, rect: r0,
-          text: `Page ${this.currentPage + 1} of ${totalPages}`,
-        })
-      );
-      await this.request(request(this.id, navRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: pageLabelId,
-        sizePolicy: { horizontal: 'expanding' },
-        preferredSize: { height: 30 },
-      }));
-
-      this.nextPageBtnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-          windowId: this.windowId, rect: r0, text: 'Next',
-        })
-      );
-      await this.addDep(this.nextPageBtnId);
-      await this.request(request(this.id, navRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: this.nextPageBtnId,
-        sizePolicy: { horizontal: 'fixed' },
-        preferredSize: { width: 70, height: 30 },
-      }));
-    }
   }
 
   private async showDetailView(index: number): Promise<void> {
-    const absIndex = this.currentPage * PAGE_SIZE + index;
-    const obj = this.cachedObjects[absIndex];
+    const obj = this.cachedObjects[index];
     if (!obj) return;
 
     // Store for message sending
     this.detailObjectId = obj.id;
+    this.detailIndex = index;
     this.selectedMethod = undefined;
 
-    // Destroy list window
+    // Destroy old layout content, keep window
+    await this.destroyRootLayout();
+
+    // Update window title
     if (this.windowId) {
       await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
-          windowId: this.windowId,
+        request(this.id, this.windowId, WINDOW_INTERFACE, 'setTitle', {
+          title: obj.manifest.name,
         })
       );
-      this.windowId = undefined;
     }
-
-    this.clearViewTracking();
-
-    const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
-    );
-
-    const detailH = 600;
-    const winX = Math.max(20, Math.floor((displayInfo.width - WIN_W) / 2));
-    const winY = Math.max(20, Math.floor((displayInfo.height - detailH) / 2));
-
-    this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
-        title: obj.manifest.name,
-        rect: { x: winX, y: winY, width: WIN_W, height: detailH },
-        zIndex: 200,
-        resizable: true,
-      })
-    );
 
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
 
-    // Create root VBox layout
+    // Create root VBox layout (non-scrollable outer container)
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
-        windowId: this.windowId,
+        windowId: this.windowId!,
         margins: { top: 8, right: 16, bottom: 8, left: 16 },
         spacing: 4,
       })
     );
 
+    // Scrollable VBox for detail content
+    const scrollVBoxId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedScrollableVBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 4,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: scrollVBoxId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
     const addLabel = async (text: string, style?: Record<string, unknown>): Promise<AbjectId> => {
       const id = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-          windowId: this.windowId, rect: r0, text,
+          windowId: this.windowId!, rect: r0, text,
           ...(style ? { style } : {}),
         })
       );
-      await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, scrollVBoxId, LAYOUT_INTERFACE, 'addLayoutChild', {
         widgetId: id,
         sizePolicy: { vertical: 'fixed' },
         preferredSize: { height: 20 },
@@ -505,12 +470,12 @@ export class RegistryBrowser extends Abject {
     for (let i = 0; i < allMethods.length; i += 2) {
       const rowId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-          parentLayoutId: this.rootLayoutId,
+          parentLayoutId: scrollVBoxId,
           margins: { top: 0, right: 0, bottom: 0, left: 0 },
           spacing: 8,
         })
       );
-      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, scrollVBoxId, LAYOUT_INTERFACE, 'addLayoutChild', {
         widgetId: rowId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: 26 },
@@ -520,7 +485,7 @@ export class RegistryBrowser extends Abject {
         const m = allMethods[j];
         const btnId = await this.request<AbjectId>(
           request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-            windowId: this.windowId, rect: r0, text: m.method,
+            windowId: this.windowId!, rect: r0, text: m.method,
           })
         );
         await this.addDep(btnId);
@@ -536,12 +501,12 @@ export class RegistryBrowser extends Abject {
     // Payload row (HBox: input + Send)
     const payloadRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
+        parentLayoutId: scrollVBoxId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, scrollVBoxId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: payloadRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 30 },
@@ -549,7 +514,7 @@ export class RegistryBrowser extends Abject {
 
     this.msgPayloadId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
-        windowId: this.windowId, rect: r0, placeholder: 'JSON payload (optional)',
+        windowId: this.windowId!, rect: r0, placeholder: 'JSON payload (optional)',
       })
     );
     await this.addDep(this.msgPayloadId);
@@ -561,7 +526,7 @@ export class RegistryBrowser extends Abject {
 
     this.msgSendBtnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Send',
+        windowId: this.windowId!, rect: r0, text: 'Send',
         style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
       })
     );
@@ -575,14 +540,11 @@ export class RegistryBrowser extends Abject {
     // Response label
     this.msgResponseId = await addLabel('');
 
-    // Spacer pushes bottom buttons down
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
-
-    // Bottom buttons row
+    // ── Fixed bottom buttons row (outside scrollable area) ──
     const bottomRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        margins: { top: 4, right: 0, bottom: 0, left: 0 },
         spacing: 10,
       })
     );
@@ -594,7 +556,7 @@ export class RegistryBrowser extends Abject {
 
     this.backBtnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Back',
+        windowId: this.windowId!, rect: r0, text: 'Back',
       })
     );
     await this.addDep(this.backBtnId);
@@ -607,10 +569,9 @@ export class RegistryBrowser extends Abject {
     // Show "Edit Source" button if the object is scriptable
     const isEditable = obj.source !== undefined;
     if (isEditable) {
-      this.detailIndex = index;
       this.editSourceBtnId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-          windowId: this.windowId, rect: r0, text: 'Edit Source',
+          windowId: this.windowId!, rect: r0, text: 'Edit Source',
         })
       );
       await this.addDep(this.editSourceBtnId);
@@ -619,6 +580,22 @@ export class RegistryBrowser extends Abject {
         sizePolicy: { horizontal: 'fixed' },
         preferredSize: { width: 110, height: 32 },
       }));
+
+      // Show "Delete" button for workshop-created objects
+      if (this.factoryId) {
+        this.deleteBtnId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+            windowId: this.windowId!, rect: r0, text: 'Delete',
+            style: { background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' },
+          })
+        );
+        await this.addDep(this.deleteBtnId);
+        await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          widgetId: this.deleteBtnId,
+          sizePolicy: { horizontal: 'fixed' },
+          preferredSize: { width: 80, height: 32 },
+        }));
+      }
     }
 
     // Right spacer in bottom row
@@ -626,39 +603,53 @@ export class RegistryBrowser extends Abject {
   }
 
   private async handleWidgetEvent(fromId: AbjectId, aspect: string, _value?: unknown): Promise<void> {
+    // ── Search input (list view) ──
+    if (fromId === this.searchInputId && aspect === 'change') {
+      this.searchText = (_value as string) ?? '';
+      await this.rebuildFilteredButtons();
+      return;
+    }
+
     // ── Back button (detail view) ──
     if (fromId === this.backBtnId) {
       this.cachedObjects = await this.registryList();
-      await this.showListView();
-      return;
-    }
-
-    // ── Prev page button ──
-    if (fromId === this.prevPageBtnId) {
-      if (this.currentPage > 0) {
-        this.currentPage--;
-        await this.showListView();
-      }
-      return;
-    }
-
-    // ── Next page button ──
-    if (fromId === this.nextPageBtnId) {
-      const totalPages = Math.ceil(this.cachedObjects.length / PAGE_SIZE);
-      if (this.currentPage < totalPages - 1) {
-        this.currentPage++;
-        await this.showListView();
+      await this.populateListView();
+      // Update window title back to list view
+      if (this.windowId) {
+        await this.request(
+          request(this.id, this.windowId, WINDOW_INTERFACE, 'setTitle', {
+            title: 'Registry Browser',
+          })
+        );
       }
       return;
     }
 
     // ── Edit Source button in detail view ──
     if (fromId === this.editSourceBtnId && this.detailIndex !== undefined) {
-      const absIndex = this.currentPage * PAGE_SIZE + this.detailIndex;
-      const obj = this.cachedObjects[absIndex];
+      const obj = this.cachedObjects[this.detailIndex];
       if (obj && this.abjectEditorId) {
         await this.request(request(this.id, this.abjectEditorId,
           'abjects:abject-editor' as InterfaceId, 'show', { objectId: obj.id }));
+      }
+      return;
+    }
+
+    // ── Delete button in detail view ──
+    if (fromId === this.deleteBtnId && this.detailObjectId && this.factoryId) {
+      try {
+        await this.request(request(this.id, this.factoryId,
+          'abjects:factory' as InterfaceId, 'kill', { objectId: this.detailObjectId }));
+      } catch { /* object may already be gone */ }
+      this.cachedObjects = await this.registryList();
+      await this.populateListView();
+      // Update window title back to list view
+      if (this.windowId) {
+        await this.request(
+          request(this.id, this.windowId, WINDOW_INTERFACE, 'setTitle', {
+            title: 'Registry Browser',
+          })
+        );
       }
       return;
     }
@@ -682,15 +673,6 @@ export class RegistryBrowser extends Abject {
     // Don't await — let the processing loop stay free for other widget events.
     if (fromId === this.msgSendBtnId && this.selectedMethod && this.detailObjectId) {
       this.handleSendMessage();
-      return;
-    }
-
-    // ── LLM command bar: Run button or submit from input ──
-    // Don't await — let the processing loop stay free for other widget events.
-    if ((fromId === this.cmdRunBtnId ||
-         (fromId === this.cmdInputId && aspect === 'submit'))
-        && this.llmId) {
-      this.handleLLMCommand();
       return;
     }
 
@@ -757,115 +739,6 @@ export class RegistryBrowser extends Abject {
         if (this.msgResponseId) {
           await this.request(
             request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
-              text: `Error: ${msg.slice(0, 60)}`,
-            })
-          );
-        }
-      } catch { /* object may be stopped */ }
-    }
-  }
-
-  /**
-   * Handle LLM command bar: parse natural language and dispatch message.
-   */
-  private async handleLLMCommand(): Promise<void> {
-    if (!this.llmId || !this.cmdInputId) return;
-
-    const commandText = await this.request<string>(
-      request(this.id, this.cmdInputId, WIDGET_INTERFACE, 'getValue', {})
-    );
-
-    if (!commandText.trim()) {
-      if (this.cmdStatusId) {
-        await this.request(
-          request(this.id, this.cmdStatusId, WIDGET_INTERFACE, 'update', {
-            text: 'Enter a command',
-          })
-        );
-      }
-      return;
-    }
-
-    if (this.cmdStatusId) {
-      await this.request(
-        request(this.id, this.cmdStatusId, WIDGET_INTERFACE, 'update', {
-          text: 'Thinking...',
-        })
-      );
-    }
-
-    try {
-      // Build object context for the LLM
-      const objects = await this.registryList();
-      const objectContext = objects.map((o) => {
-        const methods = o.manifest.interfaces.flatMap((iface) =>
-          iface.methods.map((m) => ({
-            interface: iface.id,
-            method: m.name,
-            params: m.parameters.map((p) => p.name),
-            description: m.description,
-          }))
-        );
-        return { id: o.id, name: o.manifest.name, description: o.manifest.description, methods };
-      });
-
-      const messages: LLMMessage[] = [
-        {
-          role: 'system',
-          content: `You are a command interpreter for the Abjects system.
-Available objects:
-${JSON.stringify(objectContext, null, 2)}
-
-The user will give you a natural language command. Figure out which object and method to call.
-Respond with ONLY valid JSON (no markdown fences, no explanation):
-{"objectId": "...", "interface": "...", "method": "...", "payload": {}}`,
-        },
-        { role: 'user', content: commandText },
-      ];
-
-      const llmResult = await this.request<LLMCompletionResult>(
-        request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', { messages, options: { tier: 'fast' } })
-      );
-
-      // Parse LLM response (strip markdown fences if present)
-      let responseText = llmResult.content.trim();
-      const fenceMatch = responseText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-      if (fenceMatch) {
-        responseText = fenceMatch[1];
-      }
-
-      const parsed = JSON.parse(responseText) as {
-        objectId: string;
-        interface: string;
-        method: string;
-        payload: unknown;
-      };
-
-      // Dispatch the message
-      const result = await this.request<unknown>(request(
-        this.id,
-        parsed.objectId as AbjectId,
-        parsed.interface as InterfaceId,
-        parsed.method,
-        parsed.payload ?? {}
-      ));
-
-      const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
-      const display = resultStr.length > 50 ? resultStr.slice(0, 50) + '...' : resultStr;
-      if (this.cmdStatusId) {
-        await this.request(
-          request(this.id, this.cmdStatusId, WIDGET_INTERFACE, 'update', {
-            text: `${parsed.method} → ${display}`,
-          })
-        );
-      }
-    } catch (err) {
-      // Object may have been stopped while we were waiting — UI updates are best-effort
-      const msg = err instanceof Error ? err.message : String(err);
-      try {
-        if (this.cmdStatusId) {
-          await this.request(
-            request(this.id, this.cmdStatusId, WIDGET_INTERFACE, 'update', {
               text: `Error: ${msg.slice(0, 60)}`,
             })
           );

@@ -36,6 +36,7 @@ import { SelectWidget, SelectWidgetConfig } from './widgets/select-widget.js';
 import { WidgetAbject, WidgetConfig } from './widgets/widget-abject.js';
 import { VBoxLayout } from './widgets/vbox-layout.js';
 import { HBoxLayout } from './widgets/hbox-layout.js';
+import { ScrollableVBoxLayout } from './widgets/scrollable-vbox-layout.js';
 import { LayoutAbject, LayoutMargins } from './widgets/layout-abject.js';
 import {
   WidgetType,
@@ -247,6 +248,26 @@ export class WidgetManager extends Abject {
               {
                 name: 'createNestedHBox',
                 description: 'Create a nested horizontal box layout inside a parent layout. Returns the layout AbjectId.',
+                parameters: [
+                  { name: 'parentLayoutId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent layout AbjectId' },
+                  { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
+                  { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createScrollableVBox',
+                description: 'Create a scrollable vertical box layout inside a window. Returns the layout AbjectId. Content that overflows is clipped and scrollable via mouse wheel.',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
+                  { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createNestedScrollableVBox',
+                description: 'Create a nested scrollable vertical box layout inside a parent layout. Returns the layout AbjectId.',
                 parameters: [
                   { name: 'parentLayoutId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent layout AbjectId' },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
@@ -567,6 +588,34 @@ export class WidgetManager extends Abject {
         spacing?: number;
       };
       return this.createNestedLayout(payload.parentLayoutId, new HBoxLayout({
+        ownerId: payload.parentLayoutId,
+        uiServerId: this.uiServerId!,
+        margins: payload.margins,
+        spacing: payload.spacing,
+      }));
+    });
+
+    this.on('createScrollableVBox', async (msg: AbjectMessage) => {
+      const payload = msg.payload as {
+        windowId: AbjectId;
+        margins?: Partial<LayoutMargins>;
+        spacing?: number;
+      };
+      return this.createLayoutWidget(payload.windowId, new ScrollableVBoxLayout({
+        ownerId: payload.windowId,
+        uiServerId: this.uiServerId!,
+        margins: payload.margins,
+        spacing: payload.spacing,
+      }));
+    });
+
+    this.on('createNestedScrollableVBox', async (msg: AbjectMessage) => {
+      const payload = msg.payload as {
+        parentLayoutId: AbjectId;
+        margins?: Partial<LayoutMargins>;
+        spacing?: number;
+      };
+      return this.createNestedLayout(payload.parentLayoutId, new ScrollableVBoxLayout({
         ownerId: payload.parentLayoutId,
         uiServerId: this.uiServerId!,
         margins: payload.margins,

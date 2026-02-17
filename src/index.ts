@@ -73,6 +73,7 @@ export { LayoutAbject, isSpacer, LAYOUT_INTERFACE_DECL } from './objects/widgets
 export type { LayoutConfig, LayoutMargins, ChildRect } from './objects/widgets/layout-abject.js';
 export { VBoxLayout } from './objects/widgets/vbox-layout.js';
 export { HBoxLayout } from './objects/widgets/hbox-layout.js';
+export { ScrollableVBoxLayout } from './objects/widgets/scrollable-vbox-layout.js';
 export {
   WIDGET_INTERFACE,
   WINDOW_INTERFACE,

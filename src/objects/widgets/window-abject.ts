@@ -259,7 +259,6 @@ export class WindowAbject extends Abject {
       const { x, y, width, height } = msg.payload as { x: number; y: number; width: number; height: number };
       const sizeChanged = width !== this.rect.width || height !== this.rect.height;
       this.rect = { x, y, width, height };
-      console.debug(`[Window:${this.id}] windowRect — sizeChanged=${sizeChanged} w=${width} h=${height}`);
       if (sizeChanged) {
         await this.updateChildrenOnResize();
         await this.renderWindow();

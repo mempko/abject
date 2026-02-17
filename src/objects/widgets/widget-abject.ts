@@ -152,7 +152,6 @@ export abstract class WidgetAbject extends Abject {
 
     this.on('update', async (msg: AbjectMessage) => {
       const updates = msg.payload as Record<string, unknown>;
-      console.debug(`[Widget:${this.id}] update — hasRect=${updates.rect !== undefined}`);
       this.applyCommonUpdates(updates);
       await this.applyUpdate(updates);
       await this.requestRedraw();
