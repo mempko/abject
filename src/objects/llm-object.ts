@@ -383,6 +383,53 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     return content.trim();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## LLM Usage Guide
+
+### Basic Completion (chat-style)
+
+  const result = await this.call(
+    this.dep('LLM'), 'abjects:llm', 'complete',
+    {
+      messages: [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: 'Summarize this text: ...' }
+      ],
+      options: { tier: 'balanced' }
+    });
+  // result: { content: string, finishReason: 'stop'|'length'|'error',
+  //           usage?: { inputTokens: number, outputTokens: number } }
+
+### Code Generation Shorthand
+
+  const code = await this.call(
+    this.dep('LLM'), 'abjects:llm', 'generateCode',
+    { language: 'typescript', description: 'sort an array of numbers', context: 'optional existing code' });
+  // Returns the generated code as a plain string
+
+### Content Analysis Shorthand
+
+  const analysis = await this.call(
+    this.dep('LLM'), 'abjects:llm', 'analyze',
+    { content: 'some text to analyze', task: 'identify the main themes' });
+  // Returns the analysis as a plain string
+
+### Completion Options
+
+The \`options\` object in \`complete\` accepts:
+- tier: 'smart' | 'balanced' | 'fast' — model quality tier (default: 'balanced')
+- temperature: number — controls randomness (0-1)
+- maxTokens: number — limit response length
+- stopSequences: string[] — stop generation at these strings
+
+### IMPORTANT
+- The interface ID is 'abjects:llm' (NOT 'abjects:llm-object').
+- Message roles MUST be 'system', 'user', or 'assistant' — no other values.
+- The messages array must contain at least one message.
+- generateCode returns only the code string, not a completion result object.
+- analyze returns only the analysis string, not a completion result object.`;
+  }
+
   /**
    * Check if any provider is available.
    */

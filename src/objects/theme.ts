@@ -128,4 +128,75 @@ export class ThemeAbject extends Abject {
       // Storage failure should not break theme operations
     }
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## Theme Usage Guide
+
+### Getting the Current Theme
+
+  const theme = await this.call(
+    this.dep('Theme'), 'abjects:theme', 'getTheme', {});
+  // Returns a ThemeData object with all color and layout fields
+
+### ThemeData Fields
+
+Colors (all strings, e.g. '#1a1b2e'):
+  canvasBg, windowBg, titleBarBg, accent,
+  textPrimary, textSecondary, textTertiary, textPlaceholder,
+  buttonBg, buttonBorder, buttonText,
+  inputBg, inputBorder, inputBorderFocus,
+  windowBorder, divider, resizeGrip,
+  progressTrack, progressFill, cursor,
+  checkboxCheckedBg, checkboxBorder, checkmarkColor,
+  selectBg, selectHover, selectArrow, selectionBg
+
+Numeric fields:
+  windowRadius: number   — border radius for windows
+  widgetRadius: number   — border radius for widgets (buttons, inputs)
+  titleBarHeight: number — height of window title bars in pixels
+
+### Common Color Mapping
+- Background: theme.windowBg (panels), theme.canvasBg (canvas behind windows)
+- Text: theme.textPrimary (main), theme.textSecondary (muted), theme.textTertiary (disabled)
+- Accents/highlights: theme.accent
+- Buttons: theme.buttonBg, theme.buttonBorder, theme.buttonText
+- Inputs: theme.inputBg, theme.inputBorder, theme.inputBorderFocus
+
+### Updating the Theme (partial)
+
+  const updated = await this.call(
+    this.dep('Theme'), 'abjects:theme', 'setTheme',
+    { accent: '#ff6b6b', buttonBg: '#2a2b3e' });
+  // Only pass the fields you want to change — others are preserved
+
+### Resetting to Defaults
+
+  const defaults = await this.call(
+    this.dep('Theme'), 'abjects:theme', 'resetTheme', {});
+
+### Subscribing to Theme Changes
+
+Register as a dependent so you receive live updates when the theme changes:
+
+  await this.call(
+    this.dep('Theme'), 'abjects:theme:introspect', 'addDependent',
+    { dependentId: this.id });
+
+Then handle the change notification:
+
+  async changed(msg) {
+    const { aspect, data } = msg.payload;
+    if (aspect === 'themeChanged') {
+      // data is the full updated ThemeData object
+      this._theme = data;
+      await this._draw();
+    }
+  }
+
+### IMPORTANT
+- The interface ID is 'abjects:theme' (NOT 'abjects:theme-abject').
+- ALWAYS fetch the theme at startup AND subscribe to changes — the theme can change at any time.
+- setTheme merges partial data; you do not need to pass the full ThemeData object.
+- The changed event sends the complete ThemeData, not just the changed fields.`;
+  }
 }
