@@ -385,7 +385,7 @@ export class Chat extends Abject {
       const llmResult = await this.request<{ content: string }>(
         request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', {
           messages,
-          options: { tier: 'balanced' },
+          options: { tier: 'balanced', maxTokens: 16384 },
         }),
         120000,
       );
@@ -406,17 +406,38 @@ export class Chat extends Abject {
           this.enrichedObjectContext = enrichedContext;
 
           const enrichedMessages = this.buildLLMMessages(true);
+
+          // Include Pass 1's plan so Pass 2 refines rather than regenerates
+          enrichedMessages.push({
+            role: 'assistant',
+            content: llmResult.content,
+          });
+          enrichedMessages.push({
+            role: 'user',
+            content:
+              'Refine your plan using the enriched object guides above. ' +
+              'You MUST include the "steps" array in your JSON response. ' +
+              'Preserve all steps from your previous plan, adjusting code ' +
+              'to use the correct method signatures and interface IDs from the guides.',
+          });
+
           const pass2Result = await this.request<{ content: string }>(
             request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', {
               messages: enrichedMessages,
-              options: { tier: 'balanced' },
+              options: { tier: 'balanced', maxTokens: 16384 },
             }),
             120000,
           );
 
           if (!this.isClosed) {
-            agentResponse = this.parseAgentResponse(pass2Result.content);
-            finalContent = pass2Result.content;
+            const pass2Response = this.parseAgentResponse(pass2Result.content);
+
+            // Only use Pass 2 if it preserved the steps;
+            // otherwise fall back to Pass 1 (safety net for truncation/parse failures)
+            if (pass2Response.steps && pass2Response.steps.length > 0) {
+              agentResponse = pass2Response;
+              finalContent = pass2Result.content;
+            }
           }
         }
       }
@@ -515,7 +536,7 @@ export class Chat extends Abject {
         const followUp = await this.request<{ content: string }>(
           request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', {
             messages,
-            options: { tier: 'balanced' },
+            options: { tier: 'balanced', maxTokens: 16384 },
           }),
           120000,
         );
@@ -934,23 +955,31 @@ ${this.enrichedObjectContext}
   // ═══════════════════════════════════════════════════════════════════
 
   private parseAgentResponse(content: string): AgentResponse {
-    // Try to extract JSON from ```json ... ``` block
+    // Try to extract JSON from ```json ... ``` block (closed)
     const jsonMatch = content.match(/```json\s*([\s\S]*?)```/);
     if (jsonMatch) {
-      try {
-        const parsed = JSON.parse(jsonMatch[1].trim());
-        return {
-          reply: typeof parsed.reply === 'string' ? parsed.reply : content,
-          steps: Array.isArray(parsed.steps) ? parsed.steps : undefined,
-        };
-      } catch {
-        // JSON parse failed — fall through
-      }
+      const parsed = this.tryParseAgentJson(jsonMatch[1].trim());
+      if (parsed) return parsed;
+    }
+
+    // Fallback: unclosed ```json block (truncated LLM response)
+    const unclosedMatch = content.match(/```json\s*([\s\S]*)/);
+    if (unclosedMatch && !jsonMatch) {
+      const parsed = this.tryParseAgentJson(unclosedMatch[1].trim());
+      if (parsed) return parsed;
     }
 
     // Try parsing the whole content as JSON
+    const parsed = this.tryParseAgentJson(content);
+    if (parsed) return parsed;
+
+    // Fallback: treat entire content as plain text reply
+    return { reply: content, steps: undefined };
+  }
+
+  private tryParseAgentJson(raw: string): AgentResponse | null {
     try {
-      const parsed = JSON.parse(content);
+      const parsed = JSON.parse(raw);
       if (typeof parsed.reply === 'string') {
         return {
           reply: parsed.reply,
@@ -958,11 +987,13 @@ ${this.enrichedObjectContext}
         };
       }
     } catch {
-      // Not JSON — use as plain text reply
+      // Not valid JSON — try to salvage the reply field
+      const replyMatch = raw.match(/"reply"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+      if (replyMatch) {
+        return { reply: replyMatch[1].replace(/\\"/g, '"'), steps: undefined };
+      }
     }
-
-    // Fallback: treat entire content as plain text reply
-    return { reply: content, steps: undefined };
+    return null;
   }
 
   // ═══════════════════════════════════════════════════════════════════
