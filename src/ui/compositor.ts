@@ -19,6 +19,7 @@ export interface Surface {
   zIndex: number;
   visible: boolean;
   inputPassthrough: boolean;
+  inputMonitor: boolean;
   canvas: OffscreenCanvas;
   ctx: OffscreenCanvasRenderingContext2D;
   dirty: boolean;
@@ -124,7 +125,8 @@ export class Compositor {
     rect: Rect,
     zIndex = 0,
     surfaceId?: string,
-    inputPassthrough = false
+    inputPassthrough = false,
+    inputMonitor = false
   ): string {
     require(objectId !== '', 'objectId is required');
     require(rect.width > 0 && rect.height > 0, 'Surface must have positive dimensions');
@@ -142,6 +144,7 @@ export class Compositor {
       zIndex,
       visible: true,
       inputPassthrough,
+      inputMonitor,
       canvas: offscreen,
       ctx: ctx!,
       dirty: true,
@@ -189,6 +192,15 @@ export class Compositor {
   getSurfacesForObject(objectId: AbjectId): Surface[] {
     return Array.from(this.surfaces.values()).filter(
       (s) => s.objectId === objectId
+    );
+  }
+
+  /**
+   * Get all visible surfaces with inputMonitor enabled.
+   */
+  getInputMonitors(): Surface[] {
+    return Array.from(this.surfaces.values()).filter(
+      (s) => s.visible && s.inputMonitor
     );
   }
 
@@ -281,9 +293,15 @@ export class Compositor {
     const ctx = surface.ctx;
 
     switch (command.type) {
-      case 'clear':
+      case 'clear': {
         ctx.clearRect(0, 0, surface.rect.width, surface.rect.height);
+        const p = command.params as { color?: string };
+        if (p?.color) {
+          ctx.fillStyle = p.color;
+          ctx.fillRect(0, 0, surface.rect.width, surface.rect.height);
+        }
         break;
+      }
 
       case 'rect': {
         const p = command.params as RectParams;

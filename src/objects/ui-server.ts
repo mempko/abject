@@ -56,6 +56,7 @@ export class UIServer extends Abject {
   private currentSelectedText = '';
   private lastMouseX = 0;
   private lastMouseY = 0;
+  private lastMonitorMoveTime = 0;
 
   constructor() {
     super({
@@ -89,6 +90,12 @@ export class UIServer extends Abject {
                     name: 'inputPassthrough',
                     type: { kind: 'primitive', primitive: 'boolean' },
                     description: 'If true, surface is display-only — input events pass through to surfaces behind it',
+                    optional: true,
+                  },
+                  {
+                    name: 'inputMonitor',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'If true, surface receives a copy of all mouse/wheel events (in surface-local coordinates) before normal hit-test routing. Use with inputPassthrough for cursor-following overlays.',
                     optional: true,
                   },
                 ],
@@ -266,10 +273,10 @@ export class UIServer extends Abject {
 
   private setupHandlers(): void {
     this.on('createSurface', async (msg: AbjectMessage) => {
-      const { rect, zIndex, inputPassthrough } = msg.payload as {
-        rect: Rect; zIndex?: number; inputPassthrough?: boolean;
+      const { rect, zIndex, inputPassthrough, inputMonitor } = msg.payload as {
+        rect: Rect; zIndex?: number; inputPassthrough?: boolean; inputMonitor?: boolean;
       };
-      return this.createSurface(msg.routing.from, rect, zIndex, inputPassthrough);
+      return this.createSurface(msg.routing.from, rect, zIndex, inputPassthrough, inputMonitor);
     });
 
     this.on('destroySurface', async (msg: AbjectMessage) => {
@@ -380,6 +387,10 @@ Create a display-only surface (input events pass through to surfaces behind it):
   const surfaceId = await this.call(this.dep('UIServer'), 'abjects:ui', 'createSurface',
     { rect: { x: 0, y: 0, width, height }, zIndex: 50, inputPassthrough: true });
 
+Create a cursor-following overlay (receives all mouse events without blocking input to surfaces behind):
+  const surfaceId = await this.call(this.dep('UIServer'), 'abjects:ui', 'createSurface',
+    { rect: { x: 0, y: 0, width, height }, zIndex: 9999, inputPassthrough: true, inputMonitor: true });
+
 Destroy a surface:
   await this.call(this.dep('UIServer'), 'abjects:ui', 'destroySurface', { surfaceId });
 
@@ -400,7 +411,9 @@ Each draw command has exactly 3 fields: { type, surfaceId, params }
 
 ### Draw Command Types
 
-'clear' - Clear entire surface. params: {}
+'clear' - Clear surface. params: {} (transparent) or { color: '#rrggbb' } (opaque fill)
+          IMPORTANT: Transparent pixels do NOT receive mouse input. Use { color: '#rrggbb' } or
+          draw an opaque 'rect' background immediately after clearing.
 'rect'  - Rectangle. params: { x, y, width, height, fill?, stroke?, lineWidth?, radius? }
 'text'  - Text. params: { x, y, text, font?, fill?, align?, baseline? }
 'line'  - Line. params: { x1, y1, x2, y2, stroke?, lineWidth? }
@@ -419,11 +432,35 @@ IMPORTANT:
 
 ### Other Methods
 
-Move surface: this.call(uiId, 'abjects:ui', 'moveSurface', { surfaceId, x: 200, y: 100 })
-Resize: this.call(uiId, 'abjects:ui', 'resizeSurface', { surfaceId, width: 400, height: 300 })
-Set z-index: this.call(uiId, 'abjects:ui', 'setZIndex', { surfaceId, zIndex: 200 })
-Get display size: const { width, height } = await this.call(uiId, 'abjects:ui', 'getDisplayInfo', {})
-Measure text: const w = await this.call(uiId, 'abjects:ui', 'measureText', { surfaceId, text: 'Hello', font: '14px system-ui' })
+Move surface: this.call(this.dep('UIServer'), 'abjects:ui', 'moveSurface', { surfaceId, x: 200, y: 100 })
+Resize: this.call(this.dep('UIServer'), 'abjects:ui', 'resizeSurface', { surfaceId, width: 400, height: 300 })
+Set z-index: this.call(this.dep('UIServer'), 'abjects:ui', 'setZIndex', { surfaceId, zIndex: 200 })
+Get display size: const { width, height } = await this.call(this.dep('UIServer'), 'abjects:ui', 'getDisplayInfo', {})
+Measure text: const w = await this.call(this.dep('UIServer'), 'abjects:ui', 'measureText', { surfaceId, text: 'Hello', font: '14px system-ui' })
+
+### Drawing Circles
+
+There is NO 'circle' draw command. To draw a circle, use 'rect' with equal width/height and radius set to half:
+
+  // Circle at (cx, cy) with radius r
+  { type: 'rect', surfaceId, params: { x: cx - r, y: cy - r, width: r * 2, height: r * 2, fill: '#ff0000', radius: r } }
+
+Or use 'path' with an SVG arc:
+
+  // Circle at (cx, cy) with radius r using SVG path
+  { type: 'path', surfaceId, params: { path: \`M\${cx-r},\${cy} a\${r},\${r} 0 1,0 \${r*2},0 a\${r},\${r} 0 1,0 -\${r*2},0\`, fill: '#ff0000' } }
+
+### Background Pattern for Interactive Surfaces
+
+Transparent pixels do NOT receive mouse input. For interactive surfaces, ALWAYS draw an opaque
+background right after clearing:
+
+  { type: 'clear', surfaceId, params: { color: '#1a1a2e' } }
+
+Or equivalently:
+
+  { type: 'clear', surfaceId, params: {} },
+  { type: 'rect', surfaceId, params: { x: 0, y: 0, width: W, height: H, fill: '#1a1a2e' } },
 
 ### Input Events
 
@@ -474,15 +511,16 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
     objectId: AbjectId,
     rect: Rect,
     zIndex?: number,
-    inputPassthrough?: boolean
+    inputPassthrough?: boolean,
+    inputMonitor?: boolean
   ): string {
     require(this.compositor !== undefined, 'Compositor not set');
 
     const surfaceId = this.compositor!.createSurface(
-      objectId, rect, zIndex, undefined, inputPassthrough
+      objectId, rect, zIndex, undefined, inputPassthrough, inputMonitor
     );
     this.surfaceOwners.set(surfaceId, objectId);
-    this.log('debug', 'createSurface', { surfaceId, objectId, rect, zIndex, inputPassthrough });
+    this.log('debug', 'createSurface', { surfaceId, objectId, rect, zIndex, inputPassthrough, inputMonitor });
 
     return surfaceId;
   }
@@ -626,6 +664,33 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
     this.lastMouseX = x;
     this.lastMouseY = y;
 
+    // ── Input monitors: broadcast mouse events to all monitor surfaces ──
+    // Throttle mousemove to ~60fps to avoid flooding monitor mailboxes
+    const now = performance.now();
+    const shouldBroadcast = type !== 'mousemove' || (now - this.lastMonitorMoveTime >= 16);
+    if (shouldBroadcast) {
+      if (type === 'mousemove') this.lastMonitorMoveTime = now;
+      const monitors = this.compositor?.getInputMonitors() ?? [];
+      for (const mon of monitors) {
+        const owner = this.surfaceOwners.get(mon.id);
+        if (owner) {
+          this.sendInputEvent(owner, {
+            type,
+            surfaceId: mon.id,
+            x: x - mon.rect.x,
+            y: y - mon.rect.y,
+            button: e.button,
+            modifiers: {
+              shift: e.shiftKey,
+              ctrl: e.ctrlKey,
+              alt: e.altKey,
+              meta: e.metaKey,
+            },
+          });
+        }
+      }
+    }
+
     // ── WindowManager grab: route drag events to WindowManager ──
     if (this.mouseGrabAbject) {
       if (type === 'mousemove') {
@@ -746,6 +811,28 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
     const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
+
+    // ── Input monitors: broadcast wheel events to all monitor surfaces ──
+    const monitors = this.compositor?.getInputMonitors() ?? [];
+    for (const mon of monitors) {
+      const owner = this.surfaceOwners.get(mon.id);
+      if (owner) {
+        this.sendInputEvent(owner, {
+          type: 'wheel',
+          surfaceId: mon.id,
+          x: x - mon.rect.x,
+          y: y - mon.rect.y,
+          deltaX: e.deltaX,
+          deltaY: e.deltaY,
+          modifiers: {
+            shift: e.shiftKey,
+            ctrl: e.ctrlKey,
+            alt: e.altKey,
+            meta: e.metaKey,
+          },
+        });
+      }
+    }
 
     const surface = this.compositor?.surfaceAt(x, y);
 

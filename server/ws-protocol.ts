@@ -26,6 +26,7 @@ export interface CreateSurfaceMsg extends WsEnvelope {
   objectId: AbjectId;
   rect: { x: number; y: number; width: number; height: number };
   zIndex: number;
+  inputPassthrough?: boolean;
 }
 
 export interface DestroySurfaceMsg extends WsEnvelope {

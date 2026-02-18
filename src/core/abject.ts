@@ -545,9 +545,9 @@ export abstract class Abject {
         this._stoppedDuringHandler = false;
 
         // Send the reply directly via the bus (this.send() rejects on stopped status)
-        if (isRequest(message) && result !== undefined && this._bus) {
+        if (isRequest(message) && this._bus) {
           try {
-            await this._bus.send(reply(message, result));
+            await this._bus.send(reply(message, result !== undefined ? result : null));
           } catch {
             // Bus may already have unregistered — that's OK
           }
@@ -561,8 +561,8 @@ export abstract class Abject {
       this._status = prevStatus === 'busy' ? 'busy' : 'ready';
 
       // Send reply if this was a request
-      if (isRequest(message) && result !== undefined) {
-        await this.send(reply(message, result));
+      if (isRequest(message)) {
+        await this.send(reply(message, result !== undefined ? result : null));
       }
     } catch (err) {
       this.errorCount++;

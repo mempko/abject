@@ -697,7 +697,7 @@ export class WidgetManager extends Abject {
         for (const id of this.spawnedWidgets) {
           try {
             await this.send(
-              request(this.id, id, WIDGET_INTERFACE, 'updateTheme', this.cachedTheme)
+              event(this.id, id, WIDGET_INTERFACE, 'updateTheme', this.cachedTheme)
             );
           } catch { /* widget gone */ }
         }
@@ -705,7 +705,7 @@ export class WidgetManager extends Abject {
         for (const id of this.spawnedWindows) {
           try {
             await this.send(
-              request(this.id, id, WINDOW_INTERFACE, 'updateTheme', this.cachedTheme)
+              event(this.id, id, WINDOW_INTERFACE, 'updateTheme', this.cachedTheme)
             );
           } catch { /* window gone */ }
         }
@@ -1020,6 +1020,30 @@ getDisplayInfo - Returns { width, height } of the display area
 
     this.spawnedWindows.delete(windowId);
     this.windowSurfaces.delete(windowId);
+
+    // Clean up child widget shim entries for this window
+    // Reverse-lookup shimWindowMap to find the window's shim ID
+    let windowShimId: string | undefined;
+    for (const [shimId, abjectId] of this.shimWindowMap.entries()) {
+      if (abjectId === windowId) {
+        windowShimId = shimId;
+        this.shimWindowMap.delete(shimId);
+        break;
+      }
+    }
+    this.windowOwners.delete(windowId);
+
+    if (windowShimId) {
+      for (const [shimId, abjectId] of this.shimWidgetMap.entries()) {
+        if (this.widgetToWindowShimId.get(abjectId) === windowShimId) {
+          this.shimWidgetMap.delete(shimId);
+          this.widgetIdToShimId.delete(abjectId);
+          this.widgetToWindowShimId.delete(abjectId);
+          this.spawnedWidgets.delete(abjectId);
+        }
+      }
+    }
+
     return true;
   }
 

@@ -146,6 +146,30 @@ export class Clipboard extends Abject {
       return false;
     }
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## Clipboard Usage Guide
+
+### Write Text to Clipboard
+
+  await this.call(
+    this.dep('Clipboard'), 'abjects:clipboard', 'write',
+    { text: 'Hello, world!' });
+
+### Read Text from Clipboard
+
+  const text = await this.call(
+    this.dep('Clipboard'), 'abjects:clipboard', 'read', {});
+
+### Check if Clipboard Has Text
+
+  const hasText = await this.call(
+    this.dep('Clipboard'), 'abjects:clipboard', 'hasText', {});
+
+### IMPORTANT
+- May fail if the browser denies clipboard permissions.
+- Do NOT use navigator.clipboard directly — always go through the Clipboard object.`;
+  }
 }
 
 // Well-known clipboard ID

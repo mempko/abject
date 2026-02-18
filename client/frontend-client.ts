@@ -135,7 +135,8 @@ export class FrontendClient {
       msg.objectId as AbjectId,
       msg.rect,
       msg.zIndex,
-      msg.surfaceId
+      msg.surfaceId,
+      msg.inputPassthrough ?? false
     );
 
     this.sendToBackend({

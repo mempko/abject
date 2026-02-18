@@ -443,6 +443,60 @@ export class FileSystem extends Abject {
   exists(path: string): boolean {
     return this.getEntry(path) !== undefined;
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## FileSystem Usage Guide
+
+### Write a File
+
+  await this.call(
+    this.dep('FileSystem'), 'abjects:filesystem', 'writeFile',
+    { path: '/data/config.json', content: JSON.stringify({ key: 'value' }) });
+
+### Read a File
+
+  const content = await this.call(
+    this.dep('FileSystem'), 'abjects:filesystem', 'readFile',
+    { path: '/data/config.json' });
+
+### Create a Directory
+
+  await this.call(
+    this.dep('FileSystem'), 'abjects:filesystem', 'mkdir',
+    { path: '/data' });
+
+### List Directory Contents
+
+  const entries = await this.call(
+    this.dep('FileSystem'), 'abjects:filesystem', 'readdir',
+    { path: '/' });
+  // Returns array of { path, name, isDirectory, size, createdAt, modifiedAt }
+
+### Check if Path Exists
+
+  const exists = await this.call(
+    this.dep('FileSystem'), 'abjects:filesystem', 'exists',
+    { path: '/data/config.json' });
+
+### Get File Info
+
+  const info = await this.call(
+    this.dep('FileSystem'), 'abjects:filesystem', 'stat',
+    { path: '/data/config.json' });
+  // Returns { path, name, isDirectory, size, createdAt, modifiedAt } or null
+
+### Delete a File
+
+  await this.call(
+    this.dep('FileSystem'), 'abjects:filesystem', 'deleteFile',
+    { path: '/data/config.json' });
+
+### IMPORTANT
+- Paths use '/' separator, root is '/'.
+- This is an in-memory filesystem — data does NOT persist across page reloads. Use Storage for persistence.
+- Create parent directories before writing files (e.g. mkdir '/data' before writeFile '/data/file.txt').
+- Do NOT use the browser File API directly — always go through the FileSystem object.`;
+  }
 }
 
 // Well-known filesystem ID

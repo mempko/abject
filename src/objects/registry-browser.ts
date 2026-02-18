@@ -56,6 +56,7 @@ export class RegistryBrowser extends Abject {
   // ── Instance List View widget tracking ──
   private instanceButtons: Map<AbjectId, number> = new Map();  // btnId → index in kindInstances
   private instanceCloneButtons: Map<AbjectId, number> = new Map();  // clone btnId → index
+  private instanceDeleteButtons: Map<AbjectId, number> = new Map();  // delete btnId → index
 
   // ── Detail View widget tracking ──
   private backBtnId?: AbjectId;
@@ -151,6 +152,7 @@ export class RegistryBrowser extends Abject {
     // Instance list view
     this.instanceButtons.clear();
     this.instanceCloneButtons.clear();
+    this.instanceDeleteButtons.clear();
 
     // Detail view
     this.backBtnId = undefined;
@@ -507,6 +509,21 @@ export class RegistryBrowser extends Abject {
         this.instanceCloneButtons.set(cloneBtnId, i);
         await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
           widgetId: cloneBtnId,
+          sizePolicy: { horizontal: 'fixed' },
+          preferredSize: { width: 60, height: 32 },
+        }));
+
+        // Delete button
+        const delBtnId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+            windowId: this.windowId!, rect: r0, text: 'Delete',
+            style: { fontSize: 12, background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' },
+          })
+        );
+        await this.addDep(delBtnId);
+        this.instanceDeleteButtons.set(delBtnId, i);
+        await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          widgetId: delBtnId,
           sizePolicy: { horizontal: 'fixed' },
           preferredSize: { width: 60, height: 32 },
         }));
@@ -901,6 +918,16 @@ export class RegistryBrowser extends Abject {
       return;
     }
 
+    // ── Instance delete button: delete the instance ──
+    const deleteIdx = this.instanceDeleteButtons.get(fromId);
+    if (deleteIdx !== undefined && this.factoryId) {
+      const inst = this.kindInstances[deleteIdx];
+      if (inst) {
+        await this.deleteObject(inst.id);
+      }
+      return;
+    }
+
     // ── Instance button: navigate to detail view ──
     const instIdx = this.instanceButtons.get(fromId);
     if (instIdx !== undefined) {
@@ -952,6 +979,29 @@ export class RegistryBrowser extends Abject {
             text: 'Cloned successfully',
           })
         );
+      }
+    }
+  }
+
+  /**
+   * Delete an object via Factory, refresh caches, and refresh the current view.
+   */
+  private async deleteObject(objectId: AbjectId): Promise<void> {
+    if (!this.factoryId) return;
+
+    try {
+      await this.request(request(this.id, this.factoryId,
+        FACTORY_INTERFACE, 'kill', { objectId }));
+    } catch { /* object may already be gone */ }
+
+    this.cachedObjects = await this.registryList();
+    if (this.currentView === 'instanceList' && this.selectedKindName) {
+      // Check if any instances of this kind remain
+      const remaining = this.cachedObjects.filter(o => o.manifest.name === this.selectedKindName);
+      if (remaining.length === 0) {
+        await this.showKindListView();
+      } else {
+        await this.showInstanceListView(this.selectedKindName);
       }
     }
   }

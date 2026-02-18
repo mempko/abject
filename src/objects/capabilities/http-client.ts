@@ -293,6 +293,49 @@ export class HttpClient extends Abject {
     }
     this.deniedDomains.add(domain);
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## HttpClient Usage Guide
+
+### GET Request
+
+  const result = await this.call(
+    this.dep('HttpClient'), 'abjects:http', 'get',
+    { url: 'https://api.example.com/data' });
+  const data = JSON.parse(result.body);
+
+### POST Request
+
+  const result = await this.call(
+    this.dep('HttpClient'), 'abjects:http', 'post',
+    { url: 'https://api.example.com/items', body: '{"name":"foo"}',
+      headers: { 'Content-Type': 'application/json' } });
+
+### POST JSON (shorthand)
+
+  const result = await this.call(
+    this.dep('HttpClient'), 'abjects:http', 'postJson',
+    { url: 'https://api.example.com/items', data: { name: 'foo', count: 42 } });
+
+### Generic Request
+
+  const result = await this.call(
+    this.dep('HttpClient'), 'abjects:http', 'request',
+    { method: 'PUT', url: 'https://api.example.com/items/1',
+      headers: { 'Authorization': 'Bearer token' },
+      body: '{"name":"updated"}', timeout: 10000 });
+
+### Response Structure
+
+Every response has: { status, statusText, headers, body, ok }
+- body is always a string. Use JSON.parse(result.body) to parse JSON responses.
+- ok is true when status is 200-299.
+
+### IMPORTANT
+- Do NOT use fetch() directly — always go through the HttpClient object.
+- Supported methods: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS.
+- Requests auto-retry on 429 and 5xx errors (up to 3 attempts).`;
+  }
 }
 
 // Well-known HTTP client ID

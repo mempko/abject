@@ -315,6 +315,46 @@ export class Timer extends Abject {
     this.timers.clear();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## Timer Usage Guide
+
+### Setting Up an Animation Timer (setInterval)
+
+  this._timerId = await this.call(
+    this.dep('Timer'), 'abjects:timer', 'setInterval',
+    { intervalMs: 16, data: { type: 'animate' } });
+
+### One-Shot Timer (setTimeout)
+
+  const timerId = await this.call(
+    this.dep('Timer'), 'abjects:timer', 'setTimeout',
+    { delayMs: 1000, data: { type: 'delayed-action' } });
+
+### Clearing a Timer
+
+  await this.call(
+    this.dep('Timer'), 'abjects:timer', 'clearTimer',
+    { timerId: this._timerId });
+  this._timerId = null;
+
+### Handling Timer Events
+
+When a timer fires, the Timer object sends a 'timerFired' event to the object that created it.
+Implement a handler for it:
+
+  async timerFired(msg) {
+    const { timerId, data } = msg.payload;
+    if (data && data.type === 'animate') {
+      await this._draw();
+    }
+  }
+
+### IMPORTANT
+- ALWAYS clear timers in your hide() handler. Leaking timers causes errors after the surface is destroyed.
+- Do NOT use native setTimeout/setInterval directly — they won't work. Always go through the Timer object.
+- The 'data' field in setInterval/setTimeout is passed back in the timerFired event, use it to distinguish timer types.`;
+  }
+
   protected async onStop(): Promise<void> {
     this.clearAllTimers();
   }

@@ -31,6 +31,8 @@ export interface SurfaceState {
   objectId: AbjectId;
   rect: { x: number; y: number; width: number; height: number };
   zIndex: number;
+  inputPassthrough: boolean;
+  inputMonitor: boolean;
   lastDrawCommands: Array<{ type: string; surfaceId: string; params: unknown }>;
 }
 
@@ -72,6 +74,7 @@ export class BackendUI extends Abject {
   private lastDisplayInfo: { width: number; height: number } = { width: 1280, height: 720 };
   private lastMouseX = 0;
   private lastMouseY = 0;
+  private lastMonitorMoveTime = 0;
 
   constructor() {
     super({
@@ -99,6 +102,18 @@ export class BackendUI extends Abject {
                     name: 'zIndex',
                     type: { kind: 'primitive', primitive: 'number' },
                     description: 'Z-ordering (higher = on top)',
+                    optional: true,
+                  },
+                  {
+                    name: 'inputPassthrough',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'If true, surface is display-only — input events pass through to surfaces behind it',
+                    optional: true,
+                  },
+                  {
+                    name: 'inputMonitor',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'If true, surface receives a copy of all mouse/wheel events (in surface-local coordinates) before normal hit-test routing. Use with inputPassthrough for cursor-following overlays.',
                     optional: true,
                   },
                 ],
@@ -276,11 +291,13 @@ export class BackendUI extends Abject {
 
   private setupHandlers(): void {
     this.on('createSurface', async (msg: AbjectMessage) => {
-      const { rect, zIndex } = msg.payload as {
+      const { rect, zIndex, inputPassthrough, inputMonitor } = msg.payload as {
         rect: { x: number; y: number; width: number; height: number };
         zIndex?: number;
+        inputPassthrough?: boolean;
+        inputMonitor?: boolean;
       };
-      return this.handleCreateSurface(msg.routing.from, rect, zIndex);
+      return this.handleCreateSurface(msg.routing.from, rect, zIndex, inputPassthrough, inputMonitor);
     });
 
     this.on('destroySurface', async (msg: AbjectMessage) => {
@@ -431,7 +448,9 @@ export class BackendUI extends Abject {
   private handleCreateSurface(
     objectId: AbjectId,
     rect: { x: number; y: number; width: number; height: number },
-    zIndex?: number
+    zIndex?: number,
+    inputPassthrough?: boolean,
+    inputMonitor?: boolean
   ): string {
     const surfaceId = `surface-${objectId}-${this.surfaceCounter++}`;
     const z = zIndex ?? 0;
@@ -441,6 +460,8 @@ export class BackendUI extends Abject {
       objectId,
       rect: { ...rect },
       zIndex: z,
+      inputPassthrough: inputPassthrough ?? false,
+      inputMonitor: inputMonitor ?? false,
       lastDrawCommands: [],
     });
 
@@ -450,6 +471,7 @@ export class BackendUI extends Abject {
       objectId,
       rect,
       zIndex: z,
+      inputPassthrough: inputPassthrough ?? false,
     });
 
     this.log('debug', 'createSurface', { surfaceId, objectId, rect, zIndex });
@@ -726,6 +748,34 @@ export class BackendUI extends Abject {
       this.lastMouseY = (msg.y ?? 0) + (surfState?.rect.y ?? 0);
     }
 
+    // ── Input monitors: broadcast mouse/wheel events to all monitor surfaces ──
+    // Throttle mousemove to ~60fps to avoid flooding monitor mailboxes
+    const now = Date.now();
+    const isMouseMove = msg.inputType === 'mousemove';
+    const shouldBroadcast = !isMouseMove || (now - this.lastMonitorMoveTime >= 16);
+    if (shouldBroadcast && (msg.inputType === 'mousedown' || msg.inputType === 'mouseup' ||
+        msg.inputType === 'mousemove' || msg.inputType === 'wheel')) {
+      if (isMouseMove) this.lastMonitorMoveTime = now;
+      // Reconstruct global coords
+      const surfState = msg.surfaceId ? this.surfaces.get(msg.surfaceId) : undefined;
+      const globalX = (msg.x ?? 0) + (surfState?.rect.x ?? 0);
+      const globalY = (msg.y ?? 0) + (surfState?.rect.y ?? 0);
+
+      for (const state of this.surfaces.values()) {
+        if (!state.inputMonitor) continue;
+        this.sendInputEvent(state.objectId, {
+          type: msg.inputType,
+          surfaceId: state.surfaceId,
+          x: globalX - state.rect.x,
+          y: globalY - state.rect.y,
+          button: msg.button,
+          deltaX: msg.deltaX,
+          deltaY: msg.deltaY,
+          modifiers: msg.modifiers,
+        });
+      }
+    }
+
     // ── WindowManager grab: route drag events to WindowManager ──
     if (this.mouseGrabAbject) {
       if (msg.inputType === 'mousemove') {
@@ -828,6 +878,7 @@ export class BackendUI extends Abject {
         objectId: state.objectId,
         rect: { ...state.rect },
         zIndex: state.zIndex,
+        inputPassthrough: state.inputPassthrough,
       });
     }
 

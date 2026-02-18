@@ -1076,9 +1076,12 @@ Dependencies needed: UIServer (required), Timer (if animation needed)
 Manifest MUST include these methods:
 - show: creates a canvas surface via UIServer and starts rendering
 - hide: destroys the surface and stops timers
-- input: receives mouse/keyboard events from UIServer (type, surfaceId, x, y, button, key, code, modifiers)
-- timerFired: receives timer callbacks if using animation (timerId, data)
+- input: receives mouse/keyboard events from UIServer. Handler signature is \`async input(msg)\`.
+  msg.payload contains: { type, surfaceId, x, y, button, key, code, modifiers }
+- timerFired: receives timer callbacks if using animation. Handler signature is \`async timerFired(msg)\`.
+  msg.payload contains: { timerId, data }
 - If your object does NOT need mouse/keyboard input (e.g. it reacts to other objects' state), set inputPassthrough: true when creating the surface. This lets input events pass through to surfaces behind it.
+- If your object needs to track the mouse globally (e.g. cursor-following overlay, full-screen visual effect) without blocking clicks on windows behind it, set BOTH inputPassthrough: true AND inputMonitor: true. The surface will receive a copy of all mouse/wheel events in surface-local coordinates.
 
 ### Widget Objects (standard UI: forms, buttons, text inputs, lists)
 Use when the object needs standard UI controls.
@@ -1123,7 +1126,13 @@ Output ONLY the handler map in a \`\`\`javascript code block. Nothing else.
 
 CRITICAL RULES:
 - You MUST implement a handler for EVERY method listed in the manifest. No exceptions.
-- You MUST NOT add public methods that are not in the manifest. Private properties prefixed with _ are OK.
+- FUNCTION NAME PREFIX RULE:
+  - Functions WITHOUT '_' prefix become MESSAGE HANDLERS only — NOT callable as this.foo().
+    Calling this.foo() where foo has no '_' prefix will throw "this.foo is not a function".
+  - Functions WITH '_' prefix become direct properties — callable as this._foo().
+  - THEREFORE: helper functions (drawing, physics, etc.) MUST be prefixed with '_'.
+    Example: _draw(), _update(), _createBall(), _renderFrame()
+  - Only manifest methods should be unprefixed (show, hide, input, timerFired, getState, etc.)
 - The handler map is a FLAT parenthesized object expression: ({ method(msg) { ... } })
 - Each handler receives a SINGLE argument: a message object (msg).
 - msg.payload IS the parameters directly — destructure from it: const { x, y } = msg.payload;
@@ -1280,6 +1289,8 @@ async getState(msg) {
     }
   },
 
+  // _draw has '_' prefix so it's callable as this._draw().
+  // Without the prefix, calling this.draw() would throw "not a function".
   async _draw() {
     if (!this._surfaceId) return;
     await this.call(this.dep('UIServer'), 'abjects:ui', 'draw', {
@@ -1381,7 +1392,8 @@ async getState(msg) {
 - Do NOT invent wrapper APIs — no api.*, no Host.*, no this.services.*, no this.ui.*, no window.*, no document.*
 - The ONLY way to call another object is: this.call(this.dep('Name'), interfaceId, method, payload)
 - There are NO shortcuts, wrappers, or helper objects. Always use this.call() directly.
-- When creating a display-only surface (no input needed), pass inputPassthrough: true to createSurface. This prevents your surface from stealing input from surfaces behind it.`;
+- When creating a display-only surface (no input needed), pass inputPassthrough: true to createSurface. This prevents your surface from stealing input from surfaces behind it.
+- For cursor-following overlays that need mouse events without blocking clicks, pass BOTH inputPassthrough: true AND inputMonitor: true. The surface receives a copy of all mouse/wheel events (in surface-local coords) before normal routing.`;
   }
 
   /**

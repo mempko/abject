@@ -313,6 +313,50 @@ export class Storage extends Abject {
       request.onerror = () => reject(request.error);
     });
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## Storage Usage Guide
+
+### Store a Value
+
+  await this.call(
+    this.dep('Storage'), 'abjects:storage', 'set',
+    { key: 'myKey', value: { name: 'foo', count: 42 } });
+
+### Retrieve a Value
+
+  const value = await this.call(
+    this.dep('Storage'), 'abjects:storage', 'get',
+    { key: 'myKey' });
+  // Returns the stored value, or null if not found
+
+### Check if a Key Exists
+
+  const exists = await this.call(
+    this.dep('Storage'), 'abjects:storage', 'has',
+    { key: 'myKey' });
+
+### Delete a Value
+
+  await this.call(
+    this.dep('Storage'), 'abjects:storage', 'delete',
+    { key: 'myKey' });
+
+### List All Keys
+
+  const keys = await this.call(
+    this.dep('Storage'), 'abjects:storage', 'keys', {});
+
+### Clear All Data
+
+  await this.call(
+    this.dep('Storage'), 'abjects:storage', 'clear', {});
+
+### IMPORTANT
+- Values can be any JSON-serializable data (objects, arrays, strings, numbers, booleans).
+- Data persists across sessions (backed by IndexedDB).
+- Do NOT use localStorage or IndexedDB directly — always go through the Storage object.`;
+  }
 }
 
 // Well-known storage ID

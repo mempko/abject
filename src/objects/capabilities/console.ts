@@ -274,6 +274,37 @@ export class Console extends Abject {
   get logCount(): number {
     return this.logs.length;
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## Console Usage Guide
+
+### Log at Different Levels
+
+  await this.call(
+    this.dep('Console'), 'abjects:console', 'info',
+    { message: 'Operation completed', data: { result: 42 } });
+
+  await this.call(
+    this.dep('Console'), 'abjects:console', 'debug',
+    { message: 'Processing item', data: { id: 'abc' } });
+
+  await this.call(
+    this.dep('Console'), 'abjects:console', 'warn',
+    { message: 'Rate limit approaching', data: { remaining: 5 } });
+
+  await this.call(
+    this.dep('Console'), 'abjects:console', 'error',
+    { message: 'Request failed', data: { status: 500 } });
+
+### Log Levels
+
+Available levels: 'debug', 'info', 'warn', 'error'
+The 'data' field is optional — pass any JSON-serializable value for structured context.
+
+### IMPORTANT
+- Do NOT use console.log() directly — always go through the Console object.
+- Logs are stored in memory (up to 1000 entries) and also forwarded to the browser console.`;
+  }
 }
 
 // Well-known console ID
