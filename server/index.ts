@@ -28,6 +28,9 @@ import { WidgetManager } from '../src/objects/widget-manager.js';
 import { ThemeAbject } from '../src/objects/theme.js';
 import { WindowManager } from '../src/objects/window-manager.js';
 import { AbjectEditor } from '../src/objects/abject-editor.js';
+import { JobManager } from '../src/objects/job-manager.js';
+import { JobBrowser } from '../src/objects/job-browser.js';
+import { Chat } from '../src/objects/chat.js';
 import { Supervisor } from '../src/runtime/supervisor.js';
 import type { RestartType } from '../src/runtime/supervisor.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
@@ -112,6 +115,9 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('Settings', () => new Settings());
   runtime.objectFactory.registerConstructor('RegistryBrowser', () => new RegistryBrowser());
   runtime.objectFactory.registerConstructor('ObjectWorkshop', () => new ObjectWorkshop());
+  runtime.objectFactory.registerConstructor('JobManager', () => new JobManager());
+  runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
+  runtime.objectFactory.registerConstructor('Chat', () => new Chat());
   runtime.objectFactory.registerConstructor('Supervisor', () => new Supervisor());
   runtime.objectFactory.registerConstructor('Taskbar', () => new Taskbar());
 
@@ -158,6 +164,9 @@ async function main(): Promise<void> {
   const settingsId = await supervisedSpawn('Settings');
   const registryBrowserId = await supervisedSpawn('RegistryBrowser');
   const objectWorkshopId = await supervisedSpawn('ObjectWorkshop');
+  const jobManagerId = await supervisedSpawn('JobManager');
+  const jobBrowserId = await supervisedSpawn('JobBrowser');
+  const chatId = await supervisedSpawn('Chat');
   const taskbarId = await supervisedSpawn('Taskbar');
 
   // ALL objects are now spawned and init'd — safe to start health monitoring.
@@ -166,7 +175,8 @@ async function main(): Promise<void> {
     httpClientId, llmId, storageId, themeId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
     proxyGenId, negotiatorId, objectCreatorId, abjectEditorId,
-    settingsId, registryBrowserId, objectWorkshopId, taskbarId,
+    settingsId, registryBrowserId, objectWorkshopId,
+    jobManagerId, jobBrowserId, chatId, taskbarId,
   ];
   for (const objId of monitoredIds) {
     await bootstrapRequest(healthMonitorId, HEALTH_IFACE, 'monitorObject', { objectId: objId });

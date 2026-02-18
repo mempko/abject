@@ -28,6 +28,9 @@ import { WidgetManager } from './objects/widget-manager.js';
 import { ThemeAbject } from './objects/theme.js';
 import { WindowManager } from './objects/window-manager.js';
 import { AbjectEditor } from './objects/abject-editor.js';
+import { JobManager } from './objects/job-manager.js';
+import { JobBrowser } from './objects/job-browser.js';
+import { Chat } from './objects/chat.js';
 import { Supervisor } from './runtime/supervisor.js';
 import type { RestartType } from './runtime/supervisor.js';
 
@@ -53,6 +56,9 @@ export { WidgetManager, WIDGET_MANAGER_ID } from './objects/widget-manager.js';
 export { ThemeAbject, THEME_ID } from './objects/theme.js';
 export { WindowManager, WINDOW_MANAGER_ID } from './objects/window-manager.js';
 export { AbjectEditor, ABJECT_EDITOR_ID } from './objects/abject-editor.js';
+export { JobManager, JOBMANAGER_ID } from './objects/job-manager.js';
+export { JobBrowser, JOB_BROWSER_ID } from './objects/job-browser.js';
+export { Chat, CHAT_ID } from './objects/chat.js';
 export { ScriptableAbject, EDITABLE_INTERFACE_ID } from './objects/scriptable-abject.js';
 export { Supervisor, SUPERVISOR_ID, SUPERVISOR_INTERFACE_ID } from './runtime/supervisor.js';
 export type { ChildSpec, RestartType, RestartStrategy, SupervisorConfig } from './runtime/supervisor.js';
@@ -240,6 +246,9 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('Settings', () => new Settings());
   runtime.objectFactory.registerConstructor('RegistryBrowser', () => new RegistryBrowser());
   runtime.objectFactory.registerConstructor('ObjectWorkshop', () => new ObjectWorkshop());
+  runtime.objectFactory.registerConstructor('JobManager', () => new JobManager());
+  runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
+  runtime.objectFactory.registerConstructor('Chat', () => new Chat());
   runtime.objectFactory.registerConstructor('Supervisor', () => new Supervisor());
   runtime.objectFactory.registerConstructor('Taskbar', () => new Taskbar());
 
@@ -285,6 +294,9 @@ async function main(): Promise<App> {
   const settingsId = await supervisedSpawn('Settings');
   const registryBrowserId = await supervisedSpawn('RegistryBrowser');
   const objectWorkshopId = await supervisedSpawn('ObjectWorkshop');
+  const jobManagerId = await supervisedSpawn('JobManager');
+  const jobBrowserId = await supervisedSpawn('JobBrowser');
+  const chatId = await supervisedSpawn('Chat');
   const taskbarId = await supervisedSpawn('Taskbar');
 
   // ALL objects are now spawned and init'd — safe to start health monitoring.
@@ -293,7 +305,8 @@ async function main(): Promise<App> {
     httpClientId, llmId, storageId, themeId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
     proxyGenId, negotiatorId, objectCreatorId, abjectEditorId,
-    settingsId, registryBrowserId, objectWorkshopId, taskbarId,
+    settingsId, registryBrowserId, objectWorkshopId,
+    jobManagerId, jobBrowserId, chatId, taskbarId,
   ];
   for (const objId of monitoredIds) {
     await bootstrapRequest(healthMonitorId, HEALTH_IFACE, 'monitorObject', { objectId: objId });
@@ -334,6 +347,9 @@ async function main(): Promise<App> {
     widgetManager: getObj(widgetManagerId),
     windowManager: getObj(windowManagerId),
     filesystem: getObj(filesystemId),
+    jobManager: getObj(jobManagerId),
+    jobBrowser: getObj(jobBrowserId),
+    chat: getObj(chatId),
     supervisor: getObj(supervisorId),
     // Object IDs for message-based interaction
     ids: {
@@ -358,6 +374,9 @@ async function main(): Promise<App> {
       proxyGenerator: proxyGenId,
       negotiator: negotiatorId,
       healthMonitor: healthMonitorId,
+      jobManager: jobManagerId,
+      jobBrowser: jobBrowserId,
+      chat: chatId,
       supervisor: supervisorId,
     },
     modules: {

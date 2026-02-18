@@ -21,6 +21,8 @@ export class Taskbar extends Abject {
   private settingsId?: AbjectId;
   private registryBrowserId?: AbjectId;
   private objectWorkshopId?: AbjectId;
+  private chatId?: AbjectId;
+  private jobBrowserId?: AbjectId;
   private registryId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
@@ -29,6 +31,8 @@ export class Taskbar extends Abject {
   private settingsBtnId?: AbjectId;
   private registryBtnId?: AbjectId;
   private workshopBtnId?: AbjectId;
+  private chatBtnId?: AbjectId;
+  private jobsBtnId?: AbjectId;
 
   // Dynamic user object buttons: button widget AbjectId → target object AbjectId
   private userObjButtons: Map<AbjectId, AbjectId> = new Map();
@@ -77,6 +81,8 @@ export class Taskbar extends Abject {
     this.settingsId = await this.requireDep('Settings');
     this.registryBrowserId = await this.requireDep('RegistryBrowser');
     this.objectWorkshopId = await this.requireDep('ObjectWorkshop');
+    this.chatId = await this.requireDep('Chat');
+    this.jobBrowserId = await this.requireDep('JobBrowser');
     this.registryId = await this.requireDep('Registry');
 
     // Subscribe to registry for auto-refresh when new objects are registered
@@ -142,6 +148,14 @@ export class Taskbar extends Abject {
         await this.request(
           request(this.id, this.objectWorkshopId!, 'abjects:object-workshop' as InterfaceId, 'show', {})
         );
+      } else if (fromId === this.chatBtnId) {
+        await this.request(
+          request(this.id, this.chatId!, 'abjects:chat' as InterfaceId, 'show', {})
+        );
+      } else if (fromId === this.jobsBtnId) {
+        await this.request(
+          request(this.id, this.jobBrowserId!, 'abjects:job-browser' as InterfaceId, 'show', {})
+        );
       } else {
         // Check dynamic user object buttons
         const targetId = this.userObjButtons.get(fromId);
@@ -191,6 +205,8 @@ export class Taskbar extends Abject {
     this.settingsBtnId = undefined;
     this.registryBtnId = undefined;
     this.workshopBtnId = undefined;
+    this.chatBtnId = undefined;
+    this.jobsBtnId = undefined;
     this.rootLayoutId = undefined;
     this.userObjButtons.clear();
 
@@ -200,7 +216,7 @@ export class Taskbar extends Abject {
     const btnH = 30;
     const padding = 16;
     const spacing = 6;
-    const systemBtnCount = 3;
+    const systemBtnCount = 5;
     const totalBtnCount = systemBtnCount + showableObjects.length;
     const barWidth = btnW + padding * 2;
     const barHeight = padding + totalBtnCount * (btnH + spacing) - spacing + padding;
@@ -248,6 +264,8 @@ export class Taskbar extends Abject {
     this.settingsBtnId = await addBtn('Settings');
     this.registryBtnId = await addBtn('Registry');
     this.workshopBtnId = await addBtn('Workshop');
+    this.chatBtnId = await addBtn('Chat');
+    this.jobsBtnId = await addBtn('Jobs');
 
     // Dynamic buttons for user-created objects with show/hide
     for (const obj of showableObjects) {
@@ -272,6 +290,8 @@ export class Taskbar extends Abject {
     this.settingsBtnId = undefined;
     this.registryBtnId = undefined;
     this.workshopBtnId = undefined;
+    this.chatBtnId = undefined;
+    this.jobsBtnId = undefined;
     this.userObjButtons.clear();
     return true;
   }
