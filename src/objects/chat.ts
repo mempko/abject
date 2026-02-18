@@ -442,6 +442,36 @@ export class Chat extends Abject {
         }
       }
 
+      // Safety net: if reply promises action but has no steps, re-prompt once
+      if ((!agentResponse.steps || agentResponse.steps.length === 0) &&
+          agentResponse.reply && this.replyIndicatesAction(agentResponse.reply)) {
+        await this.updateLabel(thinkingLabelId, 'Generating steps...', '#6b7084');
+
+        try {
+          const retryMessages = this.buildLLMMessages(!!this.enrichedObjectContext);
+          retryMessages.push({ role: 'assistant', content: finalContent });
+          retryMessages.push({ role: 'user', content:
+            'You said you would take action but didn\'t include any "steps". ' +
+            'Please respond again with the "steps" array containing the code to execute what you promised.' });
+
+          const retry = await this.request<{ content: string }>(
+            request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', {
+              messages: retryMessages,
+              options: { tier: 'balanced', maxTokens: 16384 },
+            }),
+            120000,
+          );
+
+          if (!this.isClosed) {
+            const retryParsed = this.parseAgentResponse(retry.content);
+            if (retryParsed.steps && retryParsed.steps.length > 0) {
+              agentResponse = retryParsed;
+              finalContent = retry.content;
+            }
+          }
+        } catch { /* If retry fails, proceed with original reply */ }
+      }
+
       // Remove thinking indicator
       await this.removeLabel(thinkingLabelId);
 
@@ -884,11 +914,29 @@ All code runs inside an async IIFE. Use \`await\` freely. Always \`return\` the 
 
 ## When to Use Steps
 
-- Use steps when the user asks you to DO something (create objects, query registry, send messages, show/hide windows)
-- Do NOT use steps for simple conversation, greetings, or explanations
-- Each step should be self-contained and have a clear description
+- CRITICAL: If the user asks you to create, build, make, show, hide, open, delete, or DO anything — you MUST include "steps" with executable code. Never just promise to do something without including the steps.
+- If your reply says "I'll create..." or "Let me build..." there MUST be a corresponding step.
+- Do NOT use steps for simple conversation, greetings, or explanations.
+- Each step should be self-contained and have a clear description.
+
+### WRONG — promising without acting
+\`\`\`json
+{ "reply": "I'll create a counter for you!", "steps": [] }
+\`\`\`
+
+### RIGHT — include the steps
+\`\`\`json
+{ "reply": "I'll create a counter for you!", "steps": [{ "description": "Create the counter object", "code": "const creatorId = await dep('ObjectCreator'); return await call(creatorId, 'abjects:object-creator', 'create', { prompt: 'a simple counter widget' });" }] }
+\`\`\`
 
 ## Key Patterns
+
+### Create a new object
+\`\`\`
+const creatorId = await dep('ObjectCreator');
+const result = await call(creatorId, 'abjects:object-creator', 'create', { prompt: 'a simple counter widget' });
+return result;
+\`\`\`
 
 ### Query the registry
 \`\`\`
@@ -914,13 +962,6 @@ if (results.length > 0) {
   await call(results[0].id, 'abjects:registry-browser', 'show', {});
 }
 return true;
-\`\`\`
-
-### Create a new object
-\`\`\`
-const creatorId = await dep('ObjectCreator');
-const result = await call(creatorId, 'abjects:object-creator', 'create', { prompt: 'a simple counter widget' });
-return result;
 \`\`\`
 
 ### Send a message to any object
@@ -987,13 +1028,47 @@ ${this.enrichedObjectContext}
         };
       }
     } catch {
-      // Not valid JSON — try to salvage the reply field
+      // Try to repair truncated JSON by closing brackets
+      const repaired = this.tryRepairJson(raw);
+      if (repaired) return repaired;
+
+      // Last resort: regex-extract reply only
       const replyMatch = raw.match(/"reply"\s*:\s*"((?:[^"\\]|\\.)*)"/);
       if (replyMatch) {
         return { reply: replyMatch[1].replace(/\\"/g, '"'), steps: undefined };
       }
     }
     return null;
+  }
+
+  private tryRepairJson(raw: string): AgentResponse | null {
+    // Try progressively closing brackets to recover truncated JSON
+    const suffixes = ['"}]}', '"}]', '"]}}', ']}', '}}', '}]', '}'];
+    for (const suffix of suffixes) {
+      try {
+        const parsed = JSON.parse(raw + suffix);
+        if (typeof parsed.reply === 'string') {
+          return {
+            reply: parsed.reply,
+            steps: Array.isArray(parsed.steps) ? parsed.steps : undefined,
+          };
+        }
+      } catch { /* try next suffix */ }
+    }
+    return null;
+  }
+
+  /** Detect if a reply promises action that should have corresponding steps. */
+  private replyIndicatesAction(reply: string): boolean {
+    const actionPhrases = [
+      /\bI'll\s+(create|build|make|generate|spawn|set up|show|open|launch)/i,
+      /\bLet me\s+(create|build|make|generate|spawn|set up|show|open|launch)/i,
+      /\bI will\s+(create|build|make|generate|spawn|set up|show|open|launch)/i,
+      /\bI'm going to\s+(create|build|make|generate|spawn|set up|show|open|launch)/i,
+      /\bCreating\b/i,
+      /\bBuilding\b/i,
+    ];
+    return actionPhrases.some(p => p.test(reply));
   }
 
   // ═══════════════════════════════════════════════════════════════════
