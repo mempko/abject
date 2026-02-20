@@ -23,6 +23,12 @@ import { CapabilitySet, getDefaultCapabilities } from './capability.js';
 import { INTROSPECT_INTERFACE, INTROSPECT_INTERFACE_ID, formatManifestAsDescription } from './introspect.js';
 import type { InterfaceId } from './types.js';
 
+/**
+ * Return this from a request handler to suppress the auto-reply.
+ * The handler is responsible for sending the reply manually later via sendDeferredReply().
+ */
+export const DEFERRED_REPLY = Symbol('DEFERRED_REPLY');
+
 export type MessageHandlerFn = (
   message: AbjectMessage
 ) => Promise<unknown> | unknown;
@@ -64,6 +70,8 @@ export abstract class Abject {
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
     timeout: ReturnType<typeof setTimeout>;
+    timeoutMs: number;
+    timeoutMsg: string;
   }> = new Map();
 
   constructor(options: AbjectOptions) {
@@ -188,10 +196,17 @@ export abstract class Abject {
       return null;
     });
 
-    // LLM-powered ask handler
-    this.on('ask', async (msg: AbjectMessage) => {
+    // LLM-powered ask handler (non-blocking via DEFERRED_REPLY)
+    this.on('ask', (msg: AbjectMessage) => {
       const { question } = msg.payload as { question: string };
-      return this.handleAsk(question);
+
+      // Fire off the LLM work async, send deferred reply when done
+      this.handleAsk(question).then(
+        (result) => this.sendDeferredReply(msg, result).catch(() => {}),
+        () => this.sendDeferredReply(msg, `[No LLM available] ${formatManifestAsDescription(this.manifest)}`).catch(() => {}),
+      );
+
+      return DEFERRED_REPLY;
     });
 
     this._status = 'ready';
@@ -481,24 +496,49 @@ export abstract class Abject {
     require(message.header.type === 'request', 'Must be a request message');
 
     return new Promise((resolve, reject) => {
+      const target = message.routing.to;
+      const method = message.routing.method ?? '?';
+      const iface = message.routing.interface ?? '?';
+      const timeoutMsg =
+        `Request timeout after ${timeoutMs}ms: ${this.manifest.name}(${this.id}) → ${target} ${iface}.${method}`;
+
       const timeout = setTimeout(() => {
         this.pendingReplies.delete(message.header.messageId);
-        const target = message.routing.to;
-        const method = message.routing.method ?? '?';
-        const iface = message.routing.interface ?? '?';
-        reject(new Error(
-          `Request timeout after ${timeoutMs}ms: ${this.manifest.name}(${this.id}) → ${target} ${iface}.${method}`
-        ));
+        reject(new Error(timeoutMsg));
       }, timeoutMs);
 
       this.pendingReplies.set(message.header.messageId, {
         resolve: resolve as (value: unknown) => void,
         reject,
         timeout,
+        timeoutMs,
+        timeoutMsg,
       });
 
       this.send(message).catch(reject);
     });
+  }
+
+  /**
+   * Reset the timeout on a pending request. Used for heartbeat-style keep-alive
+   * when the callee sends progress events during long-running operations.
+   */
+  protected resetRequestTimeout(messageId: string): boolean {
+    const entry = this.pendingReplies.get(messageId);
+    if (!entry) return false;
+    clearTimeout(entry.timeout);
+    entry.timeout = setTimeout(() => {
+      this.pendingReplies.delete(messageId);
+      entry.reject(new Error(entry.timeoutMsg));
+    }, entry.timeoutMs);
+    return true;
+  }
+
+  /**
+   * Send a deferred reply to a request whose auto-reply was suppressed via DEFERRED_REPLY.
+   */
+  protected async sendDeferredReply(originalMessage: AbjectMessage, result: unknown): Promise<void> {
+    await this.send(reply(originalMessage, result !== undefined ? result : null));
   }
 
   /**
@@ -545,7 +585,7 @@ export abstract class Abject {
         this._stoppedDuringHandler = false;
 
         // Send the reply directly via the bus (this.send() rejects on stopped status)
-        if (isRequest(message) && this._bus) {
+        if (isRequest(message) && this._bus && result !== DEFERRED_REPLY) {
           try {
             await this._bus.send(reply(message, result !== undefined ? result : null));
           } catch {
@@ -560,8 +600,8 @@ export abstract class Abject {
 
       this._status = prevStatus === 'busy' ? 'busy' : 'ready';
 
-      // Send reply if this was a request
-      if (isRequest(message)) {
+      // Send reply if this was a request (skip if handler returned DEFERRED_REPLY)
+      if (isRequest(message) && result !== DEFERRED_REPLY) {
         await this.send(reply(message, result !== undefined ? result : null));
       }
     } catch (err) {
