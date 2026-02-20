@@ -43,26 +43,22 @@ export class CheckboxWidget extends WidgetAbject {
       },
     });
 
-    // Checkmark (two angled lines)
+    // Checkmark (polygon)
     if (this.checked) {
       const cx = ox;
       const cy = boxY;
       commands.push({
-        type: 'line',
+        type: 'polygon',
         surfaceId,
         params: {
-          x1: cx + 3, y1: cy + 8,
-          x2: cx + 6, y2: cy + 12,
+          points: [
+            { x: cx + 3, y: cy + 8 },
+            { x: cx + 6, y: cy + 12 },
+            { x: cx + 13, y: cy + 4 },
+          ],
           stroke: this.theme.checkmarkColor,
-        },
-      });
-      commands.push({
-        type: 'line',
-        surfaceId,
-        params: {
-          x1: cx + 6, y1: cy + 12,
-          x2: cx + 13, y2: cy + 4,
-          stroke: this.theme.checkmarkColor,
+          lineWidth: 2,
+          closePath: false,
         },
       });
     }

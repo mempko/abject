@@ -91,8 +91,29 @@ export class TextInputWidget extends WidgetAbject {
     const radius = style.radius ?? this.theme.widgetRadius;
     const focused = this.focused;
 
-    // Border rect
+    // Focus glow shadow
     const borderColor = style.borderColor ?? (focused ? this.theme.inputBorderFocus : this.theme.inputBorder);
+    if (focused) {
+      commands.push({ type: 'save', surfaceId, params: {} });
+      commands.push({
+        type: 'shadow',
+        surfaceId,
+        params: { color: this.theme.inputBorderFocus, blur: 6 },
+      });
+      commands.push({
+        type: 'rect',
+        surfaceId,
+        params: {
+          x: ox, y: oy, width: w, height: h,
+          fill: style.background ?? this.theme.inputBg,
+          stroke: borderColor,
+          radius,
+        },
+      });
+      commands.push({ type: 'restore', surfaceId, params: {} });
+    }
+
+    // Border rect (drawn without shadow)
     commands.push({
       type: 'rect',
       surfaceId,

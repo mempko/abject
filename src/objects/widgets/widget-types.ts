@@ -9,6 +9,7 @@ import { AbjectId, InterfaceId } from '../../core/types.js';
 export const WIDGET_INTERFACE: InterfaceId = 'abjects:widget' as InterfaceId;
 export const WINDOW_INTERFACE: InterfaceId = 'abjects:window' as InterfaceId;
 export const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout' as InterfaceId;
+export const CANVAS_INTERFACE: InterfaceId = 'abjects:canvas' as InterfaceId;
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -22,7 +23,7 @@ export interface WidgetStyle {
   radius?: number;
 }
 
-export type WidgetType = 'label' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select';
+export type WidgetType = 'label' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas';
 
 export interface Rect {
   x: number;
@@ -123,4 +124,28 @@ export interface LayoutChildConfig {
 export interface SpacerConfig {
   type: 'spacer';
   stretch?: number;
+}
+
+// ── Color Utilities ───────────────────────────────────────────────────
+
+/**
+ * Lighten a hex color by bumping each RGB channel.
+ */
+export function lightenColor(hex: string, amount = 20): string {
+  const c = hex.replace('#', '');
+  const r = Math.min(255, parseInt(c.substring(0, 2), 16) + amount);
+  const g = Math.min(255, parseInt(c.substring(2, 4), 16) + amount);
+  const b = Math.min(255, parseInt(c.substring(4, 6), 16) + amount);
+  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+}
+
+/**
+ * Darken a hex color by reducing each RGB channel.
+ */
+export function darkenColor(hex: string, amount = 20): string {
+  const c = hex.replace('#', '');
+  const r = Math.max(0, parseInt(c.substring(0, 2), 16) - amount);
+  const g = Math.max(0, parseInt(c.substring(2, 4), 16) - amount);
+  const b = Math.max(0, parseInt(c.substring(4, 6), 16) - amount);
+  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
 }

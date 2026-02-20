@@ -132,6 +132,23 @@ export class Registry extends Abject {
                   elementType: { kind: 'reference', reference: 'ObjectRegistration' },
                 },
               },
+              {
+                name: 'updateManifest',
+                description: 'Update an object\'s manifest and re-index it',
+                parameters: [
+                  {
+                    name: 'objectId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'The ID of the object to update',
+                  },
+                  {
+                    name: 'manifest',
+                    type: { kind: 'reference', reference: 'AbjectManifest' },
+                    description: 'The new manifest',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
             ],
             events: [
               {
@@ -216,6 +233,40 @@ export class Registry extends Abject {
       const reg = this.objects.get(objectId);
       if (!reg) return false;
       reg.source = source;
+      return true;
+    });
+
+    this.on('updateManifest', async (msg: AbjectMessage) => {
+      const { objectId, manifest } = msg.payload as { objectId: AbjectId; manifest: AbjectManifest };
+      const reg = this.objects.get(objectId);
+      if (!reg) return false;
+
+      const old = reg.manifest;
+
+      // Remove old indices
+      for (const iface of old.interfaces) {
+        this.byInterface.get(iface.id)?.delete(objectId);
+      }
+      for (const cap of old.providedCapabilities ?? []) {
+        this.byCapability.get(cap)?.delete(objectId);
+      }
+      this.byName.get(old.name)?.delete(objectId);
+
+      // Update
+      reg.manifest = manifest;
+
+      // Re-index
+      for (const iface of manifest.interfaces) {
+        if (!this.byInterface.has(iface.id)) this.byInterface.set(iface.id, new Set());
+        this.byInterface.get(iface.id)!.add(objectId);
+      }
+      for (const cap of manifest.providedCapabilities ?? []) {
+        if (!this.byCapability.has(cap)) this.byCapability.set(cap, new Set());
+        this.byCapability.get(cap)!.add(objectId);
+      }
+      if (!this.byName.has(manifest.name)) this.byName.set(manifest.name, new Set());
+      this.byName.get(manifest.name)!.add(objectId);
+
       return true;
     });
   }

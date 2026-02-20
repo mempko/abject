@@ -6,6 +6,7 @@
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
+import { lightenColor } from './widget-types.js';
 
 export interface ProgressWidgetConfig extends WidgetConfig {
   value?: number;
@@ -37,14 +38,24 @@ export class ProgressWidget extends WidgetAbject {
       params: { x: ox, y: oy, width: w, height: h, fill: trackColor, radius },
     });
 
-    // Fill
+    // Fill with left-to-right gradient
     if (this.progressValue > 0) {
       const fillWidth = Math.max(radius * 2, w * this.progressValue);
+      commands.push({ type: 'save', surfaceId, params: {} });
+      commands.push({
+        type: 'linearGradient',
+        surfaceId,
+        params: { x0: ox, y0: 0, x1: ox + fillWidth, y1: 0, stops: [
+          { offset: 0, color: fillColor },
+          { offset: 1, color: lightenColor(fillColor, 30) },
+        ] },
+      });
       commands.push({
         type: 'rect',
         surfaceId,
         params: { x: ox, y: oy, width: fillWidth, height: h, fill: fillColor, radius },
       });
+      commands.push({ type: 'restore', surfaceId, params: {} });
     }
 
     // Optional percentage text

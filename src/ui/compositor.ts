@@ -26,7 +26,9 @@ export interface Surface {
 }
 
 export interface DrawCommand {
-  type: 'rect' | 'text' | 'line' | 'image' | 'clear' | 'path' | 'save' | 'restore' | 'clip';
+  type: 'rect' | 'text' | 'line' | 'image' | 'clear' | 'path' | 'save' | 'restore' | 'clip' | 'translate'
+    | 'circle' | 'arc' | 'ellipse' | 'polygon' | 'rotate' | 'scale'
+    | 'globalAlpha' | 'shadow' | 'setLineDash' | 'linearGradient' | 'radialGradient';
   surfaceId: string;
   params: unknown;
 }
@@ -48,6 +50,8 @@ export interface TextParams {
   text: string;
   font?: string;
   fill?: string;
+  stroke?: string;
+  strokeWidth?: number;
   align?: CanvasTextAlign;
   baseline?: CanvasTextBaseline;
 }
@@ -74,6 +78,76 @@ export interface PathParams {
   fill?: string;
   stroke?: string;
   lineWidth?: number;
+}
+
+export interface CircleParams {
+  cx: number;
+  cy: number;
+  radius: number;
+  fill?: string;
+  stroke?: string;
+  lineWidth?: number;
+}
+
+export interface ArcParams {
+  cx: number;
+  cy: number;
+  radius: number;
+  startAngle: number;
+  endAngle: number;
+  fill?: string;
+  stroke?: string;
+  lineWidth?: number;
+  counterclockwise?: boolean;
+}
+
+export interface EllipseParams {
+  cx: number;
+  cy: number;
+  radiusX: number;
+  radiusY: number;
+  rotation?: number;
+  fill?: string;
+  stroke?: string;
+  lineWidth?: number;
+}
+
+export interface PolygonParams {
+  points: Array<{ x: number; y: number }>;
+  fill?: string;
+  stroke?: string;
+  lineWidth?: number;
+  closePath?: boolean;
+}
+
+export interface ShadowParams {
+  color: string;
+  blur: number;
+  offsetX?: number;
+  offsetY?: number;
+}
+
+export interface GradientStop {
+  offset: number;
+  color: string;
+}
+
+export interface LinearGradientParams {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  stops: GradientStop[];
+}
+
+export interface RadialGradientParams {
+  cx0: number;
+  cy0: number;
+  r0: number;
+  cx1: number;
+  cy1: number;
+  r1: number;
+  stops: GradientStop[];
 }
 
 /**
@@ -326,10 +400,21 @@ export class Compositor {
       case 'text': {
         const p = command.params as TextParams;
         ctx.font = p.font ?? '14px system-ui';
-        ctx.fillStyle = p.fill ?? '#000';
         ctx.textAlign = p.align ?? 'left';
         ctx.textBaseline = p.baseline ?? 'top';
-        ctx.fillText(p.text, p.x, p.y);
+        if (p.fill) {
+          ctx.fillStyle = p.fill;
+          ctx.fillText(p.text, p.x, p.y);
+        }
+        if (p.stroke) {
+          ctx.strokeStyle = p.stroke;
+          ctx.lineWidth = p.strokeWidth ?? 1;
+          ctx.strokeText(p.text, p.x, p.y);
+        }
+        if (!p.fill && !p.stroke) {
+          ctx.fillStyle = '#000';
+          ctx.fillText(p.text, p.x, p.y);
+        }
         break;
       }
 
@@ -383,6 +468,142 @@ export class Compositor {
         ctx.beginPath();
         ctx.rect(p.x, p.y, p.width, p.height);
         ctx.clip();
+        break;
+      }
+
+      case 'translate': {
+        const p = command.params as { x: number; y: number };
+        ctx.translate(p.x ?? 0, p.y ?? 0);
+        break;
+      }
+
+      case 'circle': {
+        const p = command.params as CircleParams;
+        ctx.beginPath();
+        ctx.arc(p.cx, p.cy, p.radius, 0, Math.PI * 2);
+        if (p.fill) {
+          ctx.fillStyle = p.fill;
+          ctx.fill();
+        }
+        if (p.stroke) {
+          ctx.strokeStyle = p.stroke;
+          ctx.lineWidth = p.lineWidth ?? 1;
+          ctx.stroke();
+        }
+        break;
+      }
+
+      case 'arc': {
+        const p = command.params as ArcParams;
+        ctx.beginPath();
+        if (p.fill) {
+          ctx.moveTo(p.cx, p.cy);
+        }
+        ctx.arc(p.cx, p.cy, p.radius, p.startAngle, p.endAngle, p.counterclockwise ?? false);
+        if (p.fill) {
+          ctx.closePath();
+          ctx.fillStyle = p.fill;
+          ctx.fill();
+        }
+        if (p.stroke) {
+          ctx.strokeStyle = p.stroke;
+          ctx.lineWidth = p.lineWidth ?? 1;
+          ctx.stroke();
+        }
+        break;
+      }
+
+      case 'ellipse': {
+        const p = command.params as EllipseParams;
+        ctx.beginPath();
+        ctx.ellipse(p.cx, p.cy, p.radiusX, p.radiusY, p.rotation ?? 0, 0, Math.PI * 2);
+        if (p.fill) {
+          ctx.fillStyle = p.fill;
+          ctx.fill();
+        }
+        if (p.stroke) {
+          ctx.strokeStyle = p.stroke;
+          ctx.lineWidth = p.lineWidth ?? 1;
+          ctx.stroke();
+        }
+        break;
+      }
+
+      case 'polygon': {
+        const p = command.params as PolygonParams;
+        if (p.points.length < 2) break;
+        ctx.beginPath();
+        ctx.moveTo(p.points[0].x, p.points[0].y);
+        for (let i = 1; i < p.points.length; i++) {
+          ctx.lineTo(p.points[i].x, p.points[i].y);
+        }
+        if (p.closePath !== false) {
+          ctx.closePath();
+        }
+        if (p.fill) {
+          ctx.fillStyle = p.fill;
+          ctx.fill();
+        }
+        if (p.stroke) {
+          ctx.strokeStyle = p.stroke;
+          ctx.lineWidth = p.lineWidth ?? 1;
+          ctx.stroke();
+        }
+        break;
+      }
+
+      case 'rotate': {
+        const p = command.params as { angle: number };
+        ctx.rotate(p.angle);
+        break;
+      }
+
+      case 'scale': {
+        const p = command.params as { x: number; y: number };
+        ctx.scale(p.x, p.y);
+        break;
+      }
+
+      case 'globalAlpha': {
+        const p = command.params as { alpha: number };
+        ctx.globalAlpha = p.alpha;
+        break;
+      }
+
+      case 'shadow': {
+        const p = command.params as ShadowParams;
+        ctx.shadowColor = p.color;
+        ctx.shadowBlur = p.blur;
+        ctx.shadowOffsetX = p.offsetX ?? 0;
+        ctx.shadowOffsetY = p.offsetY ?? 0;
+        break;
+      }
+
+      case 'setLineDash': {
+        const p = command.params as { segments: number[] };
+        ctx.setLineDash(p.segments);
+        break;
+      }
+
+      case 'linearGradient': {
+        const p = command.params as LinearGradientParams;
+        const grad = ctx.createLinearGradient(p.x0, p.y0, p.x1, p.y1);
+        for (const stop of p.stops) {
+          grad.addColorStop(stop.offset, stop.color);
+        }
+        ctx.fillStyle = grad;
+        ctx.strokeStyle = grad;
+        break;
+      }
+
+      case 'radialGradient': {
+        const p = command.params as RadialGradientParams;
+        const grad = ctx.createRadialGradient(p.cx0, p.cy0, p.r0, p.cx1, p.cy1, p.r1);
+        for (const stop of p.stops) {
+          grad.addColorStop(stop.offset, stop.color);
+        }
+        ctx.fillStyle = grad;
+        ctx.strokeStyle = grad;
         break;
       }
     }

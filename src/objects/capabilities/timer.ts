@@ -2,10 +2,10 @@
  * Timer capability object - provides timing and scheduling capabilities.
  */
 
-import { AbjectId, AbjectMessage } from '../../core/types.js';
+import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
 import { require } from '../../core/contracts.js';
-import { event } from '../../core/message.js';
+import { event, request } from '../../core/message.js';
 import { Capabilities } from '../../core/capability.js';
 
 const TIMER_INTERFACE = 'abjects:timer';
@@ -106,6 +106,18 @@ export class Timer extends Abject {
                 },
               },
               {
+                name: 'clearTimersForObject',
+                description: 'Cancel all timers belonging to a specific object',
+                parameters: [
+                  {
+                    name: 'objectId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Object whose timers to cancel',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'number' },
+              },
+              {
                 name: 'delay',
                 description: 'Wait for a specified duration (returns immediately, fires event later)',
                 parameters: [
@@ -173,6 +185,42 @@ export class Timer extends Abject {
       const { ms } = msg.payload as { ms: number };
       return this.scheduleTimeout(msg.routing.from, ms);
     });
+
+    this.on('clearTimersForObject', async (msg: AbjectMessage) => {
+      const { objectId } = msg.payload as { objectId: AbjectId };
+      return this.clearTimersForObject(objectId);
+    });
+
+    this.on('objectUnregistered', async (msg: AbjectMessage) => {
+      const objectId = msg.payload as AbjectId;
+      this.clearTimersForObject(objectId);
+    });
+  }
+
+  protected override async onInit(): Promise<void> {
+    const registryId = await this.discoverDep('Registry');
+    if (registryId) {
+      try {
+        await this.request(request(this.id, registryId,
+          'abjects:registry' as InterfaceId, 'subscribe', {}));
+      } catch { /* best effort */ }
+    }
+  }
+
+  /**
+   * Cancel all timers belonging to a specific object.
+   */
+  clearTimersForObject(objectId: AbjectId): number {
+    let count = 0;
+    for (const [timerId, timer] of this.timers.entries()) {
+      if (timer.info.objectId === objectId) {
+        if (timer.info.interval) clearInterval(timer.handle);
+        else clearTimeout(timer.handle);
+        this.timers.delete(timerId);
+        count++;
+      }
+    }
+    return count;
   }
 
   /**

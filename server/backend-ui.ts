@@ -383,10 +383,23 @@ export class BackendUI extends Abject {
           globalY: this.lastMouseY,
         }));
     });
+
+    this.on('objectUnregistered', async (msg: AbjectMessage) => {
+      const objectId = msg.payload as AbjectId;
+      this.destroySurfacesForObject(objectId);
+    });
   }
 
   protected override async onInit(): Promise<void> {
     this.consoleId = await this.discoverDep('Console') ?? undefined;
+
+    const registryId = await this.discoverDep('Registry') ?? undefined;
+    if (registryId) {
+      try {
+        await this.request(request(this.id, registryId,
+          'abjects:registry' as InterfaceId, 'subscribe', {}));
+      } catch { /* best effort */ }
+    }
   }
 
   private async log(level: string, message: string, data?: unknown): Promise<void> {
@@ -493,6 +506,22 @@ export class BackendUI extends Abject {
 
     this.log('debug', 'destroySurface', { surfaceId, objectId });
     return true;
+  }
+
+  /**
+   * Destroy all surfaces owned by a given object (cleanup on unregister).
+   */
+  private destroySurfacesForObject(objectId: AbjectId): number {
+    let count = 0;
+    for (const [surfaceId, state] of this.surfaces.entries()) {
+      if (state.objectId === objectId) {
+        this.surfaces.delete(surfaceId);
+        this.sendToFrontend({ type: 'destroySurface', surfaceId });
+        if (this.focusedSurface === surfaceId) this.focusedSurface = undefined;
+        count++;
+      }
+    }
+    return count;
   }
 
   private handleDraw(

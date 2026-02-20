@@ -209,14 +209,8 @@ export class Factory extends Abject {
     // Kill old instance if still tracked
     const old = this.spawned.get(objectId);
     if (old) {
-      try {
-        await old.stop();
-      } catch {
-        // Object may already be stopped/dead
-      }
-      this.spawned.delete(objectId);
-
-      // Unregister from registry
+      // Unregister from registry BEFORE stopping so cleanup notifications
+      // fire while the object is still on the bus
       if (this._factoryRegistryId) {
         try {
           await this.request(
@@ -224,6 +218,13 @@ export class Factory extends Abject {
           );
         } catch { /* may not be registered */ }
       }
+
+      try {
+        await old.stop();
+      } catch {
+        // Object may already be stopped/dead
+      }
+      this.spawned.delete(objectId);
     }
 
     // Create fresh instance with same ID
@@ -380,15 +381,25 @@ export class Factory extends Abject {
       return false;
     }
 
-    await obj.stop();
-    this.spawned.delete(objectId);
+    // Remove from Supervisor BEFORE stopping (prevents restart race)
+    try {
+      const supervisorId = await this.discoverDep('Supervisor');
+      if (supervisorId) {
+        await this.request(request(this.id, supervisorId,
+          'abjects:supervisor' as InterfaceId, 'removeChild', { childId: objectId }));
+      }
+    } catch { /* Supervisor may not be tracking this object */ }
 
-    // Unregister from registry via message passing
+    // Unregister from registry BEFORE stopping so cleanup notifications
+    // fire while the object is still on the bus
     if (this._factoryRegistryId) {
       await this.request(
         request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
       );
     }
+
+    await obj.stop();
+    this.spawned.delete(objectId);
 
     this.checkInvariants();
     return true;

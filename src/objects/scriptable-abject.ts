@@ -180,14 +180,16 @@ export class ScriptableAbject extends Abject {
       'Handler source must evaluate to a non-null object'
     );
 
+    const proto = Object.getPrototypeOf(this);
     for (const [key, value] of Object.entries(handlerMap)) {
       if (typeof value === 'function') {
         const bound = value.bind(this);
-        if (key.startsWith('_')) {
-          // Internal helper — direct property only, NOT a message handler
+        // Don't overwrite base class methods (e.g. changed, call, dep)
+        if (!(key in proto)) {
           (this as Record<string, unknown>)[key] = bound;
-        } else {
-          // Message handler — registered on bus, NOT a direct property
+        }
+        if (!key.startsWith('_')) {
+          // Message handler — also registered on bus
           this.on(key, bound);
           this._userMethods.add(key);
         }
@@ -230,14 +232,16 @@ export class ScriptableAbject extends Abject {
     this._userProps.clear();
 
     // Install new handlers and properties bound to this instance
+    const proto = Object.getPrototypeOf(this);
     for (const [key, value] of Object.entries(handlerMap)) {
       if (typeof value === 'function') {
         const bound = value.bind(this);
-        if (key.startsWith('_')) {
-          // Internal helper — direct property only, NOT a message handler
+        // Don't overwrite base class methods (e.g. changed, call, dep)
+        if (!(key in proto)) {
           (this as Record<string, unknown>)[key] = bound;
-        } else {
-          // Message handler — registered on bus, NOT a direct property
+        }
+        if (!key.startsWith('_')) {
+          // Message handler — also registered on bus
           this.on(key, bound);
           this._userMethods.add(key);
         }

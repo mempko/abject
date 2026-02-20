@@ -33,6 +33,7 @@ import { CheckboxWidget, CheckboxWidgetConfig } from './widgets/checkbox-widget.
 import { ProgressWidget, ProgressWidgetConfig } from './widgets/progress-widget.js';
 import { DividerWidget } from './widgets/divider-widget.js';
 import { SelectWidget, SelectWidgetConfig } from './widgets/select-widget.js';
+import { CanvasWidget, CanvasWidgetConfig } from './widgets/canvas-widget.js';
 import { WidgetAbject, WidgetConfig } from './widgets/widget-abject.js';
 import { VBoxLayout } from './widgets/vbox-layout.js';
 import { HBoxLayout } from './widgets/hbox-layout.js';
@@ -276,6 +277,23 @@ export class WidgetManager extends Abject {
                 returns: { kind: 'primitive', primitive: 'string' },
               },
               {
+                name: 'createCanvas',
+                description: 'Create a canvas drawing widget inside a window. Returns the canvas widget AbjectId. Draw to it via this.call(canvasId, "abjects:canvas", "draw", { commands: [...] }). Get size via this.call(canvasId, "abjects:canvas", "getCanvasSize", {}).',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'inputTargetId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId that receives input events (defaults to caller)', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'destroyWindowsForOwner',
+                description: 'Destroy all windows owned by a specific object',
+                parameters: [
+                  { name: 'ownerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Owner object AbjectId' },
+                ],
+                returns: { kind: 'primitive', primitive: 'number' },
+              },
+              {
                 name: 'getDisplayInfo',
                 description: 'Get display dimensions (proxied from UIServer)',
                 parameters: [],
@@ -411,7 +429,7 @@ export class WidgetManager extends Abject {
         resizable?: boolean;
         draggable?: boolean;
       };
-      return this.createWindowDirect(title, rect, { chromeless, resizable, draggable, zIndex });
+      return this.createWindowDirect(msg.routing.from, title, rect, { chromeless, resizable, draggable, zIndex });
     });
 
     // Direct factory: destroy window by AbjectId (not shim string)
@@ -623,6 +641,37 @@ export class WidgetManager extends Abject {
       }));
     });
 
+    // ── Canvas widget factory ──
+
+    this.on('createCanvas', async (msg: AbjectMessage) => {
+      const { windowId, inputTargetId } = msg.payload as {
+        windowId: AbjectId;
+        inputTargetId?: AbjectId;
+      };
+      const targetId = (inputTargetId ?? msg.routing.from) as AbjectId;
+      const widget = new CanvasWidget({
+        type: 'canvas' as WidgetType,
+        rect: { x: 0, y: 0, width: 0, height: 0 },
+        ownerId: windowId,
+        uiServerId: this.uiServerId!,
+        theme: this.cachedTheme,
+        inputTargetId: targetId,
+      });
+      const widgetId = await this.createTypedWidget(windowId, widget, { x: 0, y: 0, width: 0, height: 0 });
+
+      // createTypedWidget skips adding 0x0 widgets to the window (they're
+      // normally positioned by a layout). Canvas widgets always start at 0x0
+      // and should fill the window content area when used without a layout.
+      await this.request(
+        request(this.id, windowId, WINDOW_INTERFACE, 'addChild', {
+          widgetId,
+          rect: { x: 0, y: 0, width: 0, height: 0 },
+        })
+      );
+
+      return widgetId;
+    });
+
     // ── Shim methods (backward compat) ──
 
     this.on('addWidget', async (msg: AbjectMessage) => {
@@ -683,6 +732,11 @@ export class WidgetManager extends Abject {
       if (!surfaceId) return false;
       return this.request(request(this.id, this.windowManagerId,
         'abjects:window-manager' as InterfaceId, 'raiseWindow', { surfaceId }));
+    });
+
+    this.on('objectUnregistered', async (msg: AbjectMessage) => {
+      const objectId = msg.payload as AbjectId;
+      await this.destroyWindowsForOwner(objectId);
     });
 
     // Handle 'changed' events from widget Abjects (dependency protocol)
@@ -769,6 +823,15 @@ export class WidgetManager extends Abject {
     this.uiServerId = await this.requireDep('UIServer');
     this.consoleId = await this.discoverDep('Console') ?? undefined;
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
+
+    // Subscribe to Registry for object-deletion cleanup
+    const registryId = await this.discoverDep('Registry') ?? undefined;
+    if (registryId) {
+      try {
+        await this.request(request(this.id, registryId,
+          'abjects:registry' as InterfaceId, 'subscribe', {}));
+      } catch { /* best effort */ }
+    }
 
     // Query ThemeAbject for the current theme
     this.themeId = await this.discoverDep('Theme') ?? undefined;
@@ -893,6 +956,35 @@ createNestedHBox - Nested horizontal layout inside another layout
 createScrollableVBox - Scrollable vertical stack layout (clips overflow, scrolls via mouse wheel)
 createNestedScrollableVBox - Nested scrollable vertical layout inside another layout
 
+### Canvas Drawing (games, animations, visualizations)
+
+createCanvas - Drawing area inside a window. Returns canvasId (AbjectId).
+
+const canvasId = await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'createCanvas', {
+  windowId: winId
+});
+
+// Get canvas dimensions (set by layout or window content area):
+const { width, height } = await this.call(canvasId, 'abjects:canvas', 'getCanvasSize', {});
+
+// Available draw command types:
+// Shapes: clear, rect, text, line, path, circle, arc, ellipse, polygon, image
+// State: save, restore, clip
+// Transforms: translate, rotate, scale
+// Effects: globalAlpha, shadow, setLineDash, linearGradient, radialGradient
+
+// Draw using standard draw commands (coordinates are canvas-local, starting at 0,0):
+await this.call(canvasId, 'abjects:canvas', 'draw', {
+  commands: [
+    { type: 'clear', surfaceId: 'c', params: { color: '#1a1a2e' } },
+    { type: 'rect', surfaceId: 'c', params: { x: 10, y: 10, width: 50, height: 50, fill: '#ff0' } },
+    { type: 'circle', surfaceId: 'c', params: { cx: 100, cy: 100, radius: 30, fill: '#e8a84c' } },
+  ]
+});
+
+// Input events arrive in your 'input' handler (coordinates are canvas-local).
+// Keyboard input works after clicking the canvas.
+
 ### Utility Methods
 
 getDisplayInfo - Returns { width, height } of the display area
@@ -904,6 +996,21 @@ getDisplayInfo - Returns { width, height } of the display area
 'abjects:layout' - Layout methods (addLayoutChild, addLayoutSpacer)
 'abjects:window' - Window methods
 'abjects:introspect' - For addDependent (event registration)`;
+  }
+
+  /**
+   * Destroy all windows owned by a specific object.
+   */
+  private async destroyWindowsForOwner(ownerId: AbjectId): Promise<number> {
+    const windowIds: AbjectId[] = [];
+    for (const [windowId, owner] of this.windowOwners.entries()) {
+      if (owner === ownerId) windowIds.push(windowId);
+    }
+    let count = 0;
+    for (const windowId of windowIds) {
+      if (await this.destroyWindowDirect(windowId)) count++;
+    }
+    return count;
   }
 
   // ── Factory: createWindow ─────────────────────────────────────────────
@@ -957,6 +1064,7 @@ getDisplayInfo - Returns { width, height } of the display area
   // ── Factory: createWindowDirect — returns AbjectId ──────────────────
 
   private async createWindowDirect(
+    owner: AbjectId,
     title: string,
     rect: { x: number; y: number; width: number; height: number },
     options?: { chromeless?: boolean; resizable?: boolean; draggable?: boolean; zIndex?: number }
@@ -976,6 +1084,7 @@ getDisplayInfo - Returns { width, height } of the display area
 
     await win.init(this.bus, this.id);
     this.spawnedWindows.add(win.id);
+    this.windowOwners.set(win.id, owner);
     if (win.surface) this.windowSurfaces.set(win.id, win.surface);
     this.log('debug', 'createWindowAbject', { windowId: win.id, title });
 

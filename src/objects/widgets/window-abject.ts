@@ -22,6 +22,7 @@ import {
   LAYOUT_INTERFACE,
   TITLE_BAR_HEIGHT,
   TITLE_FONT,
+  lightenColor,
 } from './widget-types.js';
 
 const UI_INTERFACE: InterfaceId = 'abjects:ui' as InterfaceId;
@@ -315,7 +316,21 @@ export class WindowAbject extends Abject {
     // Clear
     commands.push({ type: 'clear', surfaceId: sid, params: {} });
 
-    // Window background
+    // Window shadow
+    commands.push({ type: 'save', surfaceId: sid, params: {} });
+    commands.push({
+      type: 'shadow',
+      surfaceId: sid,
+      params: { color: 'rgba(0,0,0,0.5)', blur: 12, offsetY: 4 },
+    });
+    commands.push({
+      type: 'rect',
+      surfaceId: sid,
+      params: { x: 0, y: 0, width: w, height: h, fill: this.theme.windowBg, radius: this.theme.windowRadius },
+    });
+    commands.push({ type: 'restore', surfaceId: sid, params: {} });
+
+    // Window background (drawn without shadow)
     commands.push({
       type: 'rect',
       surfaceId: sid,
@@ -323,12 +338,22 @@ export class WindowAbject extends Abject {
     });
 
     if (!this.chromeless) {
-      // Title bar
+      // Title bar with gradient
+      commands.push({ type: 'save', surfaceId: sid, params: {} });
+      commands.push({
+        type: 'linearGradient',
+        surfaceId: sid,
+        params: { x0: 0, y0: 0, x1: 0, y1: TITLE_BAR_HEIGHT, stops: [
+          { offset: 0, color: this.theme.titleBarBg },
+          { offset: 1, color: lightenColor(this.theme.titleBarBg, 8) },
+        ] },
+      });
       commands.push({
         type: 'rect',
         surfaceId: sid,
         params: { x: 0, y: 0, width: w, height: TITLE_BAR_HEIGHT, fill: this.theme.titleBarBg, radius: this.theme.windowRadius },
       });
+      commands.push({ type: 'restore', surfaceId: sid, params: {} });
       commands.push({
         type: 'rect',
         surfaceId: sid,

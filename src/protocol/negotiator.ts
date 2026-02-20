@@ -134,6 +134,37 @@ export class Negotiator extends Abject {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## Negotiator Usage Guide
+
+### Connect two objects
+
+  const result = await this.call(this.dep('Negotiator'), 'abjects:negotiator', 'connect',
+    { sourceId: objectA, targetId: objectB });
+  // result: { success, agreementId?, proxyId?, error? }
+
+The Negotiator introspects both objects, generates a proxy if their interfaces don't match, and establishes a tracked connection. This is how objects with different protocols can communicate.
+
+### Disconnect
+
+  await this.call(this.dep('Negotiator'), 'abjects:negotiator', 'disconnect',
+    { agreementId: 'the-agreement-id' });
+
+### Renegotiate (on errors)
+
+  await this.call(this.dep('Negotiator'), 'abjects:negotiator', 'renegotiate',
+    { agreementId: 'the-agreement-id', errorContext: 'method not found' });
+
+### When to use
+- After creating an object that depends on others (ObjectCreator does this automatically)
+- When you want two independently-created objects to talk to each other
+- When a connection fails and needs repair
+
+### Events
+- connectionEstablished: a new connection was set up
+- connectionFailed: connection attempt failed`;
+  }
+
   private setupHandlers(): void {
     this.on('connect', async (msg: AbjectMessage) => {
       const { sourceId, targetId } = msg.payload as ConnectionRequest;

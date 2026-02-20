@@ -135,6 +135,16 @@ export class ScrollableVBoxLayout extends VBoxLayout {
       const scrollRatio = this.maxScroll > 0 ? this.scrollTop / this.maxScroll : 0;
       const thumbY = trackY + scrollRatio * (trackH - thumbHeight);
 
+      // Scrollbar thumb with gradient
+      commands.push({ type: 'save', surfaceId, params: {} });
+      commands.push({
+        type: 'linearGradient',
+        surfaceId,
+        params: { x0: trackX, y0: 0, x1: trackX + SCROLLBAR_WIDTH, y1: 0, stops: [
+          { offset: 0, color: 'rgba(255,255,255,0.15)' },
+          { offset: 1, color: 'rgba(255,255,255,0.3)' },
+        ] },
+      });
       commands.push({
         type: 'rect',
         surfaceId,
@@ -147,6 +157,7 @@ export class ScrollableVBoxLayout extends VBoxLayout {
           fill: 'rgba(255, 255, 255, 0.2)',
         },
       });
+      commands.push({ type: 'restore', surfaceId, params: {} });
     }
 
     return commands;

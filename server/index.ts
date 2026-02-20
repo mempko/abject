@@ -23,7 +23,6 @@ import { FileSystem } from '../src/objects/capabilities/filesystem.js';
 import { Settings } from '../src/objects/settings.js';
 import { Taskbar } from '../src/objects/taskbar.js';
 import { RegistryBrowser } from '../src/objects/registry-browser.js';
-import { ObjectWorkshop } from '../src/objects/object-workshop.js';
 import { WidgetManager } from '../src/objects/widget-manager.js';
 import { ThemeAbject } from '../src/objects/theme.js';
 import { WindowManager } from '../src/objects/window-manager.js';
@@ -114,7 +113,6 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('AbjectEditor', () => new AbjectEditor());
   runtime.objectFactory.registerConstructor('Settings', () => new Settings());
   runtime.objectFactory.registerConstructor('RegistryBrowser', () => new RegistryBrowser());
-  runtime.objectFactory.registerConstructor('ObjectWorkshop', () => new ObjectWorkshop());
   runtime.objectFactory.registerConstructor('JobManager', () => new JobManager());
   runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
   runtime.objectFactory.registerConstructor('Chat', () => new Chat());
@@ -163,7 +161,6 @@ async function main(): Promise<void> {
   const abjectEditorId = await supervisedSpawn('AbjectEditor');
   const settingsId = await supervisedSpawn('Settings');
   const registryBrowserId = await supervisedSpawn('RegistryBrowser');
-  const objectWorkshopId = await supervisedSpawn('ObjectWorkshop');
   const jobManagerId = await supervisedSpawn('JobManager');
   const jobBrowserId = await supervisedSpawn('JobBrowser');
   const chatId = await supervisedSpawn('Chat');
@@ -175,7 +172,7 @@ async function main(): Promise<void> {
     httpClientId, llmId, storageId, themeId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
     proxyGenId, negotiatorId, objectCreatorId, abjectEditorId,
-    settingsId, registryBrowserId, objectWorkshopId,
+    settingsId, registryBrowserId,
     jobManagerId, jobBrowserId, chatId, taskbarId,
   ];
   for (const objId of monitoredIds) {

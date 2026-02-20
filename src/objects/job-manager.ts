@@ -6,8 +6,8 @@
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
-import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { Abject, DEFERRED_REPLY } from '../core/abject.js';
+import { request, event } from '../core/message.js';
 import { require as contractRequire, requireNonEmpty } from '../core/contracts.js';
 import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 
@@ -41,6 +41,8 @@ export class JobManager extends Abject {
   private pendingResolvers: Map<string, (job: Job) => void> = new Map();
   private processing = false;
   private consoleId?: AbjectId;
+  private _currentCallMsgId?: string;
+  private _currentJobCallerId?: AbjectId;
 
   constructor() {
     super({
@@ -118,6 +120,19 @@ export class JobManager extends Abject {
   }
 
   private setupHandlers(): void {
+    // Reset call-level timeout on callee progress AND forward upstream to job submitter
+    this.on('progress', (msg: AbjectMessage) => {
+      if (this._currentCallMsgId) {
+        this.resetRequestTimeout(this._currentCallMsgId);
+      }
+      if (this._currentJobCallerId) {
+        this.send(
+          event(this.id, this._currentJobCallerId, JOBMANAGER_INTERFACE, 'progress',
+            msg.payload ?? {})
+        ).catch(() => {});
+      }
+    });
+
     this.on('submitJob', async (msg: AbjectMessage) => {
       const { description, code } = msg.payload as { description: string; code: string };
       requireNonEmpty(description, 'description');
@@ -149,15 +164,20 @@ export class JobManager extends Abject {
       // Kick off queue processing (fire-and-forget)
       this.processQueue();
 
-      // Block until this job completes
-      const finished = await jobDone;
+      // Send the reply when the job completes (non-blocking)
+      jobDone.then(async (finished) => {
+        try {
+          await this.sendDeferredReply(msg, {
+            jobId: finished.id,
+            status: finished.status,
+            result: finished.result,
+            error: finished.error,
+          } as JobResult);
+        } catch { /* caller may be gone */ }
+      });
 
-      return {
-        jobId: finished.id,
-        status: finished.status,
-        result: finished.result,
-        error: finished.error,
-      } as JobResult;
+      // Return DEFERRED_REPLY to suppress auto-reply and free the processing loop
+      return DEFERRED_REPLY;
     });
 
     this.on('listJobs', async () => {
@@ -227,7 +247,7 @@ export class JobManager extends Abject {
       await this.log('info', `Job started: ${job.description}`, { jobId });
 
       try {
-        const result = await this.executeCode(job.code);
+        const result = await this.executeCode(job.code, job.callerId);
         job.status = 'completed';
         job.result = result;
         await this.changed('jobCompleted', { jobId, description: job.description, result });
@@ -253,7 +273,10 @@ export class JobManager extends Abject {
     this.processing = false;
   }
 
-  private async executeCode(code: string): Promise<unknown> {
+  private async executeCode(code: string, callerId?: AbjectId): Promise<unknown> {
+    this._currentJobCallerId = callerId;
+    console.log(`[JobManager] Executing job code:\n${code}`);
+
     const callFn = async (
       to: AbjectId | string | Promise<AbjectId>,
       iface: string,
@@ -261,21 +284,38 @@ export class JobManager extends Abject {
       payload: unknown = {},
     ) => {
       const resolved = await to;
-      return this.request<unknown>(
-        request(this.id, resolved as AbjectId, iface as InterfaceId, method, payload),
-        60000,
-      );
+      const msg = request(this.id, resolved as AbjectId, iface as InterfaceId, method, payload);
+      this._currentCallMsgId = msg.header.messageId;
+      try {
+        return await this.request<unknown>(msg, 120000);
+      } finally {
+        this._currentCallMsgId = undefined;
+      }
+    };
+
+    const progressFn = async (message?: string) => {
+      if (this._currentJobCallerId) {
+        await this.send(
+          event(this.id, this._currentJobCallerId, JOBMANAGER_INTERFACE, 'progress',
+            { message: message ?? 'working' })
+        ).catch(() => {});
+      }
     };
 
     const depFn = async (name: string) => this.requireDep(name);
     const findFn = async (name: string) => this.discoverDep(name);
 
     const fn = new Function(
-      'call', 'dep', 'find', 'id',
+      'call', 'dep', 'find', 'id', 'progress',
       `return (async () => { ${code} })()`,
     );
 
-    return fn(callFn, depFn, findFn, this.id);
+    try {
+      return await fn(callFn, depFn, findFn, this.id, progressFn);
+    } finally {
+      this._currentJobCallerId = undefined;
+      this._currentCallMsgId = undefined;
+    }
   }
 
   protected override checkInvariants(): void {

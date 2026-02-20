@@ -335,6 +335,11 @@ export class HealthMonitor extends Abject {
       this.markObjectReady(objectId);
       return true;
     });
+
+    this.on('objectUnregistered', async (msg: AbjectMessage) => {
+      const objectId = msg.payload as AbjectId;
+      this.unmonitorObject(objectId);
+    });
   }
 
   protected override async onInit(): Promise<void> {
@@ -351,6 +356,15 @@ export class HealthMonitor extends Abject {
       if (sid) this.supervisorId = sid;
     } catch {
       // Supervisor may not be spawned yet — that's OK
+    }
+
+    // Subscribe to Registry for object-deletion cleanup
+    const registryId = await this.discoverDep('Registry');
+    if (registryId) {
+      try {
+        await this.request(request(this.id, registryId,
+          'abjects:registry' as InterfaceId, 'subscribe', {}));
+      } catch { /* best effort */ }
     }
   }
 
@@ -721,6 +735,38 @@ export class HealthMonitor extends Abject {
    */
   clear(): void {
     this.health.clear();
+  }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## HealthMonitor Usage Guide
+
+### Monitor an object's liveness
+
+  await this.call(this.dep('HealthMonitor'), 'abjects:health-monitor', 'monitorObject',
+    { objectId: targetId });
+
+HealthMonitor pings monitored objects periodically. After ${this.config.maxPingFailures} consecutive failures, it emits an 'objectDead' event and notifies the Supervisor to restart the object.
+
+### Check object liveness
+
+  const status = await this.call(this.dep('HealthMonitor'), 'abjects:health-monitor', 'getObjectLiveness',
+    { objectId: targetId });
+  // status: { objectId, alive, consecutiveFailures, lastPingAt, lastSuccessAt }
+
+### Track connection health
+
+  await this.call(this.dep('HealthMonitor'), 'abjects:health-monitor', 'trackConnection',
+    { agreementId: 'agreement-id' });
+
+### Get health status
+
+  const allStatus = await this.call(this.dep('HealthMonitor'), 'abjects:health-monitor', 'getAllStatus', {});
+  const allLiveness = await this.call(this.dep('HealthMonitor'), 'abjects:health-monitor', 'getAllObjectLiveness', {});
+
+### Events
+- healthWarning: connection error rate exceeded ${this.config.errorThreshold}%
+- renegotiationTriggered: automatic renegotiation started
+- objectDead: monitored object stopped responding to pings`;
   }
 
   protected override async onStop(): Promise<void> {

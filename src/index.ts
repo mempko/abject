@@ -23,7 +23,6 @@ import { MockTransport } from './network/transport.js';
 import { Settings } from './objects/settings.js';
 import { Taskbar } from './objects/taskbar.js';
 import { RegistryBrowser } from './objects/registry-browser.js';
-import { ObjectWorkshop } from './objects/object-workshop.js';
 import { WidgetManager } from './objects/widget-manager.js';
 import { ThemeAbject } from './objects/theme.js';
 import { WindowManager } from './objects/window-manager.js';
@@ -39,7 +38,7 @@ export { App, createApp } from './ui/app.js';
 export { Runtime, getRuntime } from './runtime/runtime.js';
 export { MessageBus, HealthInterceptor } from './runtime/message-bus.js';
 export { Mailbox } from './runtime/mailbox.js';
-export { Abject, SimpleAbject } from './core/abject.js';
+export { Abject, SimpleAbject, DEFERRED_REPLY } from './core/abject.js';
 export { Registry, REGISTRY_ID } from './objects/registry.js';
 export { Factory, FACTORY_ID } from './objects/factory.js';
 export { UIServer, UI_SERVER_ID } from './objects/ui-server.js';
@@ -51,7 +50,6 @@ export { HealthMonitor, HEALTH_MONITOR_ID } from './protocol/health-monitor.js';
 export { Settings, SETTINGS_ID } from './objects/settings.js';
 export { Taskbar, TASKBAR_ID } from './objects/taskbar.js';
 export { RegistryBrowser, REGISTRY_BROWSER_ID } from './objects/registry-browser.js';
-export { ObjectWorkshop, OBJECT_WORKSHOP_ID } from './objects/object-workshop.js';
 export { WidgetManager, WIDGET_MANAGER_ID } from './objects/widget-manager.js';
 export { ThemeAbject, THEME_ID } from './objects/theme.js';
 export { WindowManager, WINDOW_MANAGER_ID } from './objects/window-manager.js';
@@ -75,6 +73,8 @@ export { CheckboxWidget } from './objects/widgets/checkbox-widget.js';
 export { ProgressWidget } from './objects/widgets/progress-widget.js';
 export { DividerWidget } from './objects/widgets/divider-widget.js';
 export { SelectWidget } from './objects/widgets/select-widget.js';
+export { CanvasWidget } from './objects/widgets/canvas-widget.js';
+export type { CanvasWidgetConfig } from './objects/widgets/canvas-widget.js';
 export { LayoutAbject, isSpacer, LAYOUT_INTERFACE_DECL } from './objects/widgets/layout-abject.js';
 export type { LayoutConfig, LayoutMargins, ChildRect } from './objects/widgets/layout-abject.js';
 export { VBoxLayout } from './objects/widgets/vbox-layout.js';
@@ -84,6 +84,7 @@ export {
   WIDGET_INTERFACE,
   WINDOW_INTERFACE,
   LAYOUT_INTERFACE,
+  CANVAS_INTERFACE,
   WIDGET_FONT,
   TITLE_FONT,
   CODE_FONT,
@@ -245,7 +246,6 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('AbjectEditor', () => new AbjectEditor());
   runtime.objectFactory.registerConstructor('Settings', () => new Settings());
   runtime.objectFactory.registerConstructor('RegistryBrowser', () => new RegistryBrowser());
-  runtime.objectFactory.registerConstructor('ObjectWorkshop', () => new ObjectWorkshop());
   runtime.objectFactory.registerConstructor('JobManager', () => new JobManager());
   runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
   runtime.objectFactory.registerConstructor('Chat', () => new Chat());
@@ -293,7 +293,6 @@ async function main(): Promise<App> {
   const abjectEditorId = await supervisedSpawn('AbjectEditor');
   const settingsId = await supervisedSpawn('Settings');
   const registryBrowserId = await supervisedSpawn('RegistryBrowser');
-  const objectWorkshopId = await supervisedSpawn('ObjectWorkshop');
   const jobManagerId = await supervisedSpawn('JobManager');
   const jobBrowserId = await supervisedSpawn('JobBrowser');
   const chatId = await supervisedSpawn('Chat');
@@ -305,7 +304,7 @@ async function main(): Promise<App> {
     httpClientId, llmId, storageId, themeId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
     proxyGenId, negotiatorId, objectCreatorId, abjectEditorId,
-    settingsId, registryBrowserId, objectWorkshopId,
+    settingsId, registryBrowserId,
     jobManagerId, jobBrowserId, chatId, taskbarId,
   ];
   for (const objId of monitoredIds) {
@@ -334,7 +333,6 @@ async function main(): Promise<App> {
     objectCreator: getObj(objectCreatorId),
     abjectEditor: getObj(abjectEditorId),
     registryBrowser: getObj(registryBrowserId),
-    objectWorkshop: getObj(objectWorkshopId),
     taskbar: getObj(taskbarId),
     registry: runtime.objectRegistry,
     factory: runtime.objectFactory,
@@ -358,7 +356,6 @@ async function main(): Promise<App> {
       objectCreator: objectCreatorId,
       abjectEditor: abjectEditorId,
       registryBrowser: registryBrowserId,
-      objectWorkshop: objectWorkshopId,
       taskbar: taskbarId,
       registry: registryId,
       factory: factoryId,

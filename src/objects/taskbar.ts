@@ -20,7 +20,6 @@ export class Taskbar extends Abject {
   private widgetManagerId?: AbjectId;
   private settingsId?: AbjectId;
   private registryBrowserId?: AbjectId;
-  private objectWorkshopId?: AbjectId;
   private chatId?: AbjectId;
   private jobBrowserId?: AbjectId;
   private registryId?: AbjectId;
@@ -30,7 +29,6 @@ export class Taskbar extends Abject {
   // Button AbjectIds for system buttons
   private settingsBtnId?: AbjectId;
   private registryBtnId?: AbjectId;
-  private workshopBtnId?: AbjectId;
   private chatBtnId?: AbjectId;
   private jobsBtnId?: AbjectId;
 
@@ -42,7 +40,7 @@ export class Taskbar extends Abject {
       manifest: {
         name: 'Taskbar',
         description:
-          'Persistent vertical toolbar in the top-left with launch buttons for Settings, Registry Browser, and Object Workshop.',
+          'Persistent vertical toolbar in the top-left with launch buttons for Settings, Registry Browser, Chat, and Jobs.',
         version: '1.0.0',
         interfaces: [
           {
@@ -80,7 +78,6 @@ export class Taskbar extends Abject {
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.settingsId = await this.requireDep('Settings');
     this.registryBrowserId = await this.requireDep('RegistryBrowser');
-    this.objectWorkshopId = await this.requireDep('ObjectWorkshop');
     this.chatId = await this.requireDep('Chat');
     this.jobBrowserId = await this.requireDep('JobBrowser');
     this.registryId = await this.requireDep('Registry');
@@ -144,10 +141,6 @@ export class Taskbar extends Abject {
         await this.request(
           request(this.id, this.registryBrowserId!, 'abjects:registry-browser' as InterfaceId, 'show', {})
         );
-      } else if (fromId === this.workshopBtnId) {
-        await this.request(
-          request(this.id, this.objectWorkshopId!, 'abjects:object-workshop' as InterfaceId, 'show', {})
-        );
       } else if (fromId === this.chatBtnId) {
         await this.request(
           request(this.id, this.chatId!, 'abjects:chat' as InterfaceId, 'show', {})
@@ -204,7 +197,6 @@ export class Taskbar extends Abject {
     // Reset all button tracking since window is destroyed and rebuilt
     this.settingsBtnId = undefined;
     this.registryBtnId = undefined;
-    this.workshopBtnId = undefined;
     this.chatBtnId = undefined;
     this.jobsBtnId = undefined;
     this.rootLayoutId = undefined;
@@ -216,7 +208,7 @@ export class Taskbar extends Abject {
     const btnH = 30;
     const padding = 16;
     const spacing = 6;
-    const systemBtnCount = 5;
+    const systemBtnCount = 4;
     const totalBtnCount = systemBtnCount + showableObjects.length;
     const barWidth = btnW + padding * 2;
     const barHeight = padding + totalBtnCount * (btnH + spacing) - spacing + padding;
@@ -263,7 +255,6 @@ export class Taskbar extends Abject {
     // System buttons
     this.settingsBtnId = await addBtn('Settings');
     this.registryBtnId = await addBtn('Registry');
-    this.workshopBtnId = await addBtn('Workshop');
     this.chatBtnId = await addBtn('Chat');
     this.jobsBtnId = await addBtn('Jobs');
 
@@ -289,7 +280,6 @@ export class Taskbar extends Abject {
     this.rootLayoutId = undefined;
     this.settingsBtnId = undefined;
     this.registryBtnId = undefined;
-    this.workshopBtnId = undefined;
     this.chatBtnId = undefined;
     this.jobsBtnId = undefined;
     this.userObjButtons.clear();

@@ -77,6 +77,7 @@ export class Chat extends Abject {
   private readonly GUIDE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
   private enrichedObjectContext = '';
   private phase: ChatPhase = 'closed';
+  private _currentJobMsgId?: string;
 
   /** Check if phase is 'closed'. Separate method to avoid TS narrowing issues across async boundaries. */
   private get isClosed(): boolean { return this.phase === 'closed'; }
@@ -192,6 +193,12 @@ export class Chat extends Abject {
         await this.appendMessageLabel('Agent', 'How can I help you?', '#a8cc8c');
       }
       return true;
+    });
+
+    this.on('progress', () => {
+      if (this._currentJobMsgId) {
+        this.resetRequestTimeout(this._currentJobMsgId);
+      }
     });
 
     this.on('changed', async (msg: AbjectMessage) => {
@@ -508,6 +515,7 @@ export class Chat extends Abject {
 
     for (const step of steps) {
       if (this.isClosed) return;
+      console.log(`[Chat] Step: ${step.description}\n  Code: ${step.code}`);
 
       // Show step indicator
       const stepLabelId = await this.appendMessageLabel('', `  ▸ ${step.description}...`, '#e8a84c');
@@ -516,13 +524,17 @@ export class Chat extends Abject {
         // Wrap code to inject previousResult
         const wrappedCode = `const previousResult = ${JSON.stringify(previousResult)};\n${step.code}`;
 
-        const jobResult = await this.request<JobResult>(
-          request(this.id, this.jobManagerId!, JOBMANAGER_INTERFACE, 'submitJob', {
-            description: step.description,
-            code: wrappedCode,
-          }),
-          120000,
-        );
+        const submitMsg = request(this.id, this.jobManagerId!, JOBMANAGER_INTERFACE, 'submitJob', {
+          description: step.description,
+          code: wrappedCode,
+        });
+        this._currentJobMsgId = submitMsg.header.messageId;
+        let jobResult: JobResult;
+        try {
+          jobResult = await this.request<JobResult>(submitMsg, 120000);
+        } finally {
+          this._currentJobMsgId = undefined;
+        }
 
         if (jobResult.status === 'completed') {
           await this.updateLabel(stepLabelId, `  ✓ ${step.description}`, '#6b7084');
@@ -907,6 +919,7 @@ Inside step code, these functions are available:
 - \`call(objectId, interfaceId, method, payload)\` — Send a request to an object. Returns the result.
 - \`dep(name)\` — Find a dependency by manifest name (throws if not found). Returns AbjectId.
 - \`find(name)\` — Find a dependency by manifest name (returns null if not found). Returns AbjectId or null.
+- \`progress(message)\` — Report progress during long operations. Resets the job timeout. Call before any \`call()\` to ObjectCreator or other long-running operations.
 - \`id\` — The JobManager's own AbjectId.
 - \`previousResult\` — The return value from the previous step (undefined for the first step).
 
@@ -926,17 +939,10 @@ All code runs inside an async IIFE. Use \`await\` freely. Always \`return\` the 
 
 ### RIGHT — include the steps
 \`\`\`json
-{ "reply": "I'll create a counter for you!", "steps": [{ "description": "Create the counter object", "code": "const creatorId = await dep('ObjectCreator'); return await call(creatorId, 'abjects:object-creator', 'create', { prompt: 'a simple counter widget' });" }] }
+{ "reply": "Here are all the objects in the system.", "steps": [{ "description": "List all registered objects", "code": "const objects = await call(await dep('Registry'), 'abjects:registry', 'list', {}); return objects.map(o => o.manifest.name + ': ' + o.manifest.description);" }] }
 \`\`\`
 
 ## Key Patterns
-
-### Create a new object
-\`\`\`
-const creatorId = await dep('ObjectCreator');
-const result = await call(creatorId, 'abjects:object-creator', 'create', { prompt: 'a simple counter widget' });
-return result;
-\`\`\`
 
 ### Query the registry
 \`\`\`
@@ -947,7 +953,7 @@ return objects.map(o => o.manifest.name + ': ' + o.manifest.description);
 ### Describe an object
 \`\`\`
 const regId = await dep('Registry');
-const results = await call(regId, 'abjects:registry', 'discover', { name: 'ObjectWorkshop' });
+const results = await call(regId, 'abjects:registry', 'discover', { name: 'Chat' });
 if (results.length > 0) {
   const desc = await call(results[0].id, 'abjects:introspect', 'describe', {});
   return desc;
@@ -974,6 +980,62 @@ if (results.length > 0) {
 return 'Object not found';
 \`\`\`
 
+### Create a new object (via ObjectCreator)
+\`\`\`
+await progress('Creating object...');
+const result = await call(await dep('ObjectCreator'), 'abjects:object-creator', 'create', { prompt: 'description of the object to create' });
+if (result.success && result.objectId && result.manifest.interfaces.length > 0) {
+  const iface = result.manifest.interfaces[0].id;
+  await call(result.objectId, iface, 'show', {});
+}
+return result;
+\`\`\`
+IMPORTANT: Always use ObjectCreator to create new objects. Do NOT call Factory.spawn directly — it requires pre-registered constructors.
+
+### Modify an existing object
+\`\`\`
+await progress('Modifying object...');
+const results = await call(await dep('Registry'), 'abjects:registry', 'discover', { name: 'TheName' });
+if (results.length > 0) {
+  const r = await call(await dep('ObjectCreator'), 'abjects:object-creator', 'modify',
+    { objectId: results[0].id, prompt: 'add a reset button' });
+  return r;
+}
+\`\`\`
+
+### Make one object observe another
+\`\`\`
+// Object A will receive 'changed' events from Object B
+const aResults = await call(await dep('Registry'), 'abjects:registry', 'discover', { name: 'ObjectA' });
+const bResults = await call(await dep('Registry'), 'abjects:registry', 'discover', { name: 'ObjectB' });
+if (aResults.length > 0 && bResults.length > 0) {
+  // Register A as dependent of B — A will now receive changed(aspect, value) events from B
+  await call(bResults[0].id, 'abjects:introspect', 'addDependent', {});
+  // Note: the call above registers the CALLER (JobManager) as dependent.
+  // To register A as dependent of B, A's code must call addDependent itself.
+}
+\`\`\`
+
+### Ask an object a targeted question
+\`\`\`
+const results = await call(await dep('Registry'), 'abjects:registry', 'discover', { name: 'Timer' });
+if (results.length > 0) {
+  const answer = await call(results[0].id, 'abjects:introspect', 'ask',
+    { question: 'How do I set up a 60fps animation loop?' });
+  return answer;
+}
+\`\`\`
+
+### Get an object's current state
+\`\`\`
+const results = await call(await dep('Registry'), 'abjects:registry', 'discover', { name: 'CatAndMouseGame' });
+if (results.length > 0) {
+  const iface = results[0].manifest.interfaces[0].id;
+  const state = await call(results[0].id, iface, 'getState', {});
+  return state;
+}
+\`\`\`
+
 ## Available Objects (Summary)
 
 ${this.objectSummaries || '(Loading...)'}
@@ -988,7 +1050,9 @@ ${this.enrichedObjectContext}
 2. If you cannot parse or understand the request, just reply with no steps
 3. Never generate infinite loops or recursive calls
 4. Keep code concise — each step should do one thing
-5. When step results come back, summarize them for the user in your follow-up reply`;
+5. When step results come back, summarize them for the user in your follow-up reply
+6. Every object supports the introspect protocol: describe (get manifest), ask (get usage advice), addDependent/removeDependent (observe state changes). Use these to learn about and connect objects.
+7. To make objects interact, consider using ObjectCreator's 'modify' to add observation or reaction logic, rather than just calling methods in steps.`;
   }
 
   // ═══════════════════════════════════════════════════════════════════

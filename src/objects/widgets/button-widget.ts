@@ -6,17 +6,7 @@
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
-
-/**
- * Lighten a hex color by bumping each RGB channel.
- */
-function lightenColor(hex: string, amount = 20): string {
-  const c = hex.replace('#', '');
-  const r = Math.min(255, parseInt(c.substring(0, 2), 16) + amount);
-  const g = Math.min(255, parseInt(c.substring(2, 4), 16) + amount);
-  const b = Math.min(255, parseInt(c.substring(4, 6), 16) + amount);
-  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
-}
+import { lightenColor, darkenColor } from './widget-types.js';
 
 export class ButtonWidget extends WidgetAbject {
   private hovered = false;
@@ -38,6 +28,16 @@ export class ButtonWidget extends WidgetAbject {
       fill = lightenColor(fill);
     }
 
+    // Subtle top-to-bottom gradient for depth
+    commands.push({ type: 'save', surfaceId, params: {} });
+    commands.push({
+      type: 'linearGradient',
+      surfaceId,
+      params: { x0: 0, y0: oy, x1: 0, y1: oy + h, stops: [
+        { offset: 0, color: fill },
+        { offset: 1, color: darkenColor(fill, 15) },
+      ] },
+    });
     commands.push({
       type: 'rect',
       surfaceId,
@@ -51,6 +51,7 @@ export class ButtonWidget extends WidgetAbject {
         radius,
       },
     });
+    commands.push({ type: 'restore', surfaceId, params: {} });
 
     commands.push({
       type: 'text',

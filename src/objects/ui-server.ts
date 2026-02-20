@@ -116,9 +116,16 @@ export class UIServer extends Abject {
               {
                 name: 'draw',
                 description: 'Execute draw commands on a surface. Each command has exactly 3 fields: { type, surfaceId, params }. ' +
-                  'Valid types: "clear" (params: {}), "rect" (params: { x, y, width, height, fill?, stroke?, lineWidth?, radius? }), ' +
-                  '"text" (params: { x, y, text, font?, fill?, align?, baseline? }), "line" (params: { x1, y1, x2, y2, stroke?, lineWidth? }), ' +
-                  '"path" (params: { path (SVG path string), fill?, stroke?, lineWidth? }). ' +
+                  'Valid types: "clear", "rect", "text", "line", "path", "save", "restore", "clip", "translate", "image", ' +
+                  '"circle" (params: { cx, cy, radius, fill?, stroke?, lineWidth? }), ' +
+                  '"arc" (params: { cx, cy, radius, startAngle, endAngle, fill?, stroke?, lineWidth?, counterclockwise? }), ' +
+                  '"ellipse" (params: { cx, cy, radiusX, radiusY, rotation?, fill?, stroke?, lineWidth? }), ' +
+                  '"polygon" (params: { points: [{x,y}...], fill?, stroke?, lineWidth?, closePath? }), ' +
+                  '"rotate" (params: { angle }), "scale" (params: { x, y }), ' +
+                  '"globalAlpha" (params: { alpha }), "shadow" (params: { color, blur, offsetX?, offsetY? }), ' +
+                  '"setLineDash" (params: { segments }), ' +
+                  '"linearGradient" (params: { x0, y0, x1, y1, stops: [{offset, color}...] }), ' +
+                  '"radialGradient" (params: { cx0, cy0, r0, cx1, cy1, r1, stops: [{offset, color}...] }). ' +
                   'IMPORTANT: Use "fill" for fill color (NOT "color"), "stroke" for stroke color, "rect" (NOT "fillRect"), "text" (NOT "fillText"). ' +
                   'Always nest parameters inside "params", NOT as flat top-level fields.',
                 parameters: [
@@ -359,10 +366,23 @@ export class UIServer extends Abject {
           globalY: this.lastMouseY,
         }));
     });
+
+    this.on('objectUnregistered', async (msg: AbjectMessage) => {
+      const objectId = msg.payload as AbjectId;
+      this.destroySurfacesForObject(objectId);
+    });
   }
 
   protected override async onInit(): Promise<void> {
     this.consoleId = await this.discoverDep('Console') ?? undefined;
+
+    const registryId = await this.discoverDep('Registry') ?? undefined;
+    if (registryId) {
+      try {
+        await this.request(request(this.id, registryId,
+          'abjects:registry' as InterfaceId, 'subscribe', {}));
+      } catch { /* best effort */ }
+    }
   }
 
   private async log(level: string, message: string, data?: unknown): Promise<void> {
@@ -411,17 +431,37 @@ Each draw command has exactly 3 fields: { type, surfaceId, params }
 
 ### Draw Command Types
 
+**Basic shapes:**
 'clear' - Clear surface. params: {} (transparent) or { color: '#rrggbb' } (opaque fill)
           IMPORTANT: Transparent pixels do NOT receive mouse input. Use { color: '#rrggbb' } or
           draw an opaque 'rect' background immediately after clearing.
 'rect'  - Rectangle. params: { x, y, width, height, fill?, stroke?, lineWidth?, radius? }
-'text'  - Text. params: { x, y, text, font?, fill?, align?, baseline? }
+'text'  - Text. params: { x, y, text, font?, fill?, stroke?, strokeWidth?, align?, baseline? }
 'line'  - Line. params: { x1, y1, x2, y2, stroke?, lineWidth? }
 'path'  - SVG path. params: { path (SVG path string), fill?, stroke?, lineWidth? }
+'circle' - Circle. params: { cx, cy, radius, fill?, stroke?, lineWidth? }
+'arc'   - Arc/pie slice. params: { cx, cy, radius, startAngle, endAngle, fill?, stroke?, lineWidth?, counterclockwise? }
+          Filled arcs draw as pie slices (lineTo center + closePath).
+'ellipse' - Ellipse. params: { cx, cy, radiusX, radiusY, rotation?, fill?, stroke?, lineWidth? }
+'polygon' - Polygon/polyline. params: { points: [{x,y}...], fill?, stroke?, lineWidth?, closePath? }
+'image' - Draw image. params: { x, y, width?, height?, data (ImageBitmap | HTMLImageElement | ImageData) }
+
+**State management:**
 'save'  - Save canvas state. params: {}
 'restore' - Restore canvas state. params: {}
 'clip'  - Set clipping region. params: { x, y, width, height }
-'image' - Draw image. params: { x, y, width?, height?, data (ImageBitmap | HTMLImageElement | ImageData) }
+
+**Transforms:**
+'translate' - Translate origin. params: { x, y }
+'rotate' - Rotate canvas. params: { angle } (radians)
+'scale'  - Scale canvas. params: { x, y }
+
+**Gradients & effects (state-setters, use with save/restore):**
+'globalAlpha' - Set transparency. params: { alpha } (0-1)
+'shadow' - Set shadow. params: { color, blur, offsetX?, offsetY? }
+'setLineDash' - Set dash pattern. params: { segments } (e.g. [5, 3])
+'linearGradient' - Set fill+stroke to linear gradient. params: { x0, y0, x1, y1, stops: [{offset, color}...] }
+'radialGradient' - Set fill+stroke to radial gradient. params: { cx0, cy0, r0, cx1, cy1, r1, stops: [{offset, color}...] }
 
 IMPORTANT:
 - Use 'fill' for fill color, NOT 'color'
@@ -430,6 +470,27 @@ IMPORTANT:
 - Use 'text' NOT 'fillText'
 - Always nest parameters inside 'params', NOT as flat top-level fields
 
+### Drawing Circles
+
+  // Native circle: { type: 'circle', surfaceId, params: { cx: 100, cy: 100, radius: 30, fill: '#ff0000' } }
+
+### Gradients & Effects Examples
+
+  // Gradient-filled rectangle (use save/restore to scope state):
+  { type: 'save', surfaceId, params: {} },
+  { type: 'linearGradient', surfaceId, params: { x0: 0, y0: 0, x1: 200, y1: 0, stops: [{ offset: 0, color: '#ff0000' }, { offset: 1, color: '#0000ff' }] } },
+  { type: 'rect', surfaceId, params: { x: 10, y: 10, width: 200, height: 50, fill: '#000' } },
+  { type: 'restore', surfaceId, params: {} },
+
+  // Shadow behind a shape:
+  { type: 'save', surfaceId, params: {} },
+  { type: 'shadow', surfaceId, params: { color: 'rgba(0,0,0,0.5)', blur: 10, offsetY: 4 } },
+  { type: 'rect', surfaceId, params: { x: 20, y: 20, width: 100, height: 60, fill: '#333' } },
+  { type: 'restore', surfaceId, params: {} },
+
+  // Pie chart wedge:
+  { type: 'arc', surfaceId, params: { cx: 150, cy: 150, radius: 80, startAngle: 0, endAngle: Math.PI / 2, fill: '#e8a84c' } }
+
 ### Other Methods
 
 Move surface: this.call(this.dep('UIServer'), 'abjects:ui', 'moveSurface', { surfaceId, x: 200, y: 100 })
@@ -437,18 +498,6 @@ Resize: this.call(this.dep('UIServer'), 'abjects:ui', 'resizeSurface', { surface
 Set z-index: this.call(this.dep('UIServer'), 'abjects:ui', 'setZIndex', { surfaceId, zIndex: 200 })
 Get display size: const { width, height } = await this.call(this.dep('UIServer'), 'abjects:ui', 'getDisplayInfo', {})
 Measure text: const w = await this.call(this.dep('UIServer'), 'abjects:ui', 'measureText', { surfaceId, text: 'Hello', font: '14px system-ui' })
-
-### Drawing Circles
-
-There is NO 'circle' draw command. To draw a circle, use 'rect' with equal width/height and radius set to half:
-
-  // Circle at (cx, cy) with radius r
-  { type: 'rect', surfaceId, params: { x: cx - r, y: cy - r, width: r * 2, height: r * 2, fill: '#ff0000', radius: r } }
-
-Or use 'path' with an SVG arc:
-
-  // Circle at (cx, cy) with radius r using SVG path
-  { type: 'path', surfaceId, params: { path: \`M\${cx-r},\${cy} a\${r},\${r} 0 1,0 \${r*2},0 a\${r},\${r} 0 1,0 -\${r*2},0\`, fill: '#ff0000' } }
 
 ### Background Pattern for Interactive Surfaces
 
@@ -536,6 +585,23 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
     this.surfaceOwners.delete(surfaceId);
     this.log('debug', 'destroySurface', { surfaceId, objectId });
     return this.compositor?.destroySurface(surfaceId) ?? false;
+  }
+
+  /**
+   * Destroy all surfaces owned by a given object (cleanup on unregister).
+   */
+  private destroySurfacesForObject(objectId: AbjectId): number {
+    let count = 0;
+    for (const [surfaceId, ownerId] of this.surfaceOwners.entries()) {
+      if (ownerId === objectId) {
+        this.surfaceOwners.delete(surfaceId);
+        this.compositor?.destroySurface(surfaceId);
+        if (this.focusedSurface === surfaceId) this.focusedSurface = undefined;
+        if (this.grabbedSurface === surfaceId) this.grabbedSurface = undefined;
+        count++;
+      }
+    }
+    return count;
   }
 
   /**

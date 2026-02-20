@@ -65,17 +65,17 @@ export class SelectWidget extends WidgetAbject {
       },
     });
 
-    // Down arrow
+    // Down arrow (polygon triangle)
     commands.push({
-      type: 'text',
+      type: 'polygon',
       surfaceId,
       params: {
-        x: ox + w - 20,
-        y: oy + h / 2,
-        text: '\u25be',
-        font,
+        points: [
+          { x: ox + w - 20, y: oy + h / 2 - 3 },
+          { x: ox + w - 10, y: oy + h / 2 - 3 },
+          { x: ox + w - 15, y: oy + h / 2 + 3 },
+        ],
         fill: this.theme.selectArrow,
-        baseline: 'middle',
       },
     });
 
@@ -84,7 +84,25 @@ export class SelectWidget extends WidgetAbject {
       const optionHeight = h;
       const dropdownH = options.length * optionHeight;
 
-      // Dropdown background
+      // Dropdown shadow
+      commands.push({ type: 'save', surfaceId, params: {} });
+      commands.push({
+        type: 'shadow',
+        surfaceId,
+        params: { color: 'rgba(0,0,0,0.4)', blur: 8, offsetY: 2 },
+      });
+      commands.push({
+        type: 'rect',
+        surfaceId,
+        params: {
+          x: ox, y: oy + h, width: w, height: dropdownH,
+          fill: style.background ?? this.theme.selectBg,
+          radius: 2,
+        },
+      });
+      commands.push({ type: 'restore', surfaceId, params: {} });
+
+      // Dropdown background (without shadow)
       commands.push({
         type: 'rect',
         surfaceId,
