@@ -19,6 +19,7 @@ import {
   LayoutChildConfig,
   SpacerConfig,
   WIDGET_INTERFACE,
+  WINDOW_INTERFACE,
   LAYOUT_INTERFACE,
 } from './widget-types.js';
 
@@ -138,6 +139,14 @@ export abstract class LayoutAbject extends WidgetAbject {
         alignment,
         stretch,
       });
+      // Remove widget from window's direct children to prevent double rendering.
+      // When a widget (e.g. canvas) is both a window child and a layout child,
+      // it would be rendered twice — once by the window and once by the layout.
+      // Use fire-and-forget send() to avoid deadlock: the window may be
+      // concurrently requesting this layout to render, creating a circular wait.
+      this.send(
+        request(this.id, this.ownerId, WINDOW_INTERFACE, 'removeChild', { widgetId })
+      );
       if (this.rect.width > 0 && this.rect.height > 0) {
         await this.updateChildRects();
       }

@@ -1472,6 +1472,10 @@ The more observable, inspectable, and controllable your object is, the more emer
 Output ONLY the handler map in a \`\`\`javascript code block. Nothing else.
 
 CRITICAL RULES:
+- RESERVED NAMES: Do NOT use these property names for state — they collide with the base class and will be silently skipped:
+  _status, _bus, _mailbox, _parentId, _registryId, _source, _owner, id, manifest, state,
+  handlers, dependents, pendingReplies, capabilities, errorCount, lastError, startedAt, lastActivity
+  Use descriptive alternatives: _gameState instead of _status, _inputKeys instead of _keys, etc.
 - You MUST implement a handler for EVERY method listed in the manifest. No exceptions.
 - FUNCTION NAME PREFIX RULE:
   - Functions WITHOUT '_' prefix become MESSAGE HANDLERS only — NOT callable as this.foo().

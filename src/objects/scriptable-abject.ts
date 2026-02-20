@@ -180,12 +180,13 @@ export class ScriptableAbject extends Abject {
       'Handler source must evaluate to a non-null object'
     );
 
+    const baseProps = new Set(Object.keys(this));
     const proto = Object.getPrototypeOf(this);
     for (const [key, value] of Object.entries(handlerMap)) {
       if (typeof value === 'function') {
         const bound = value.bind(this);
-        // Don't overwrite base class methods (e.g. changed, call, dep)
-        if (!(key in proto)) {
+        // Don't overwrite base class methods or properties
+        if (!(key in proto) && !baseProps.has(key)) {
           (this as Record<string, unknown>)[key] = bound;
         }
         if (!key.startsWith('_')) {
@@ -194,10 +195,16 @@ export class ScriptableAbject extends Abject {
           this._userMethods.add(key);
         }
       } else {
-        // State property
+        // State property — skip if it collides with a base class field
+        if (baseProps.has(key)) {
+          console.warn(`[ScriptableAbject] Skipping user property '${key}' — collides with base class`);
+          continue;
+        }
         (this as Record<string, unknown>)[key] = value;
       }
-      this._userProps.add(key);
+      if (!baseProps.has(key) && !(key in proto)) {
+        this._userProps.add(key);
+      }
     }
   }
 
@@ -232,12 +239,13 @@ export class ScriptableAbject extends Abject {
     this._userProps.clear();
 
     // Install new handlers and properties bound to this instance
+    const baseProps = new Set(Object.keys(this));
     const proto = Object.getPrototypeOf(this);
     for (const [key, value] of Object.entries(handlerMap)) {
       if (typeof value === 'function') {
         const bound = value.bind(this);
-        // Don't overwrite base class methods (e.g. changed, call, dep)
-        if (!(key in proto)) {
+        // Don't overwrite base class methods or properties
+        if (!(key in proto) && !baseProps.has(key)) {
           (this as Record<string, unknown>)[key] = bound;
         }
         if (!key.startsWith('_')) {
@@ -246,10 +254,16 @@ export class ScriptableAbject extends Abject {
           this._userMethods.add(key);
         }
       } else {
-        // State property
+        // State property — skip if it collides with a base class field
+        if (baseProps.has(key)) {
+          console.warn(`[ScriptableAbject] Skipping user property '${key}' — collides with base class`);
+          continue;
+        }
         (this as Record<string, unknown>)[key] = value;
       }
-      this._userProps.add(key);
+      if (!baseProps.has(key) && !(key in proto)) {
+        this._userProps.add(key);
+      }
     }
 
     this._source = source;
