@@ -65,6 +65,11 @@ export interface ThemeData {
   windowRadius: number;
   widgetRadius: number;
   titleBarHeight: number;
+  titleButtonSize: number;
+  titleButtonMargin: number;
+  titleButtonIconSize: number;
+  titleButtonHoverBg: string;
+  titleCloseHoverBg: string;
 }
 
 export const MIDNIGHT_BLOOM: ThemeData = {
@@ -98,6 +103,11 @@ export const MIDNIGHT_BLOOM: ThemeData = {
   windowRadius: 8,
   widgetRadius: 6,
   titleBarHeight: 34,
+  titleButtonSize: 20,
+  titleButtonMargin: 7,
+  titleButtonIconSize: 10,
+  titleButtonHoverBg: '#353958',
+  titleCloseHoverBg: '#c53030',
 };
 
 // ── Constants ──────────────────────────────────────────────────────────────

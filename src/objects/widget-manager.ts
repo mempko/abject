@@ -766,6 +766,15 @@ export class WidgetManager extends Abject {
         return;
       }
 
+      // Forward window close/minimize/restore events to owners
+      if (aspect === 'windowCloseRequested' || aspect === 'windowMinimized' || aspect === 'windowRestored') {
+        const ownerId = this.windowOwners.get(fromId);
+        if (ownerId) {
+          await this.send(event(this.id, ownerId, WIDGETS_INTERFACE, aspect, { windowId: fromId }));
+        }
+        return;
+      }
+
       // Translate widget changed events to old-style widgetEvent messages
       const shimId = this.widgetIdToShimId.get(fromId);
       const windowShimId = this.widgetToWindowShimId.get(fromId);
@@ -989,6 +998,21 @@ await this.call(canvasId, 'abjects:canvas', 'draw', {
 
 getDisplayInfo - Returns { width, height } of the display area
 
+### Window Close, Minimize, and Restore Events
+
+Windows with title bars have close (X) and minimize (_) buttons. WidgetManager forwards
+these events to the window's owner as method calls on 'abjects:widgets':
+
+- 'windowCloseRequested' — close button clicked. Payload: { windowId }. Owner should call hide() or destroyWindowAbject.
+- 'windowMinimized' — window was minimized to taskbar. Payload: { windowId }. Informational only.
+- 'windowRestored' — window was restored from taskbar. Payload: { windowId }. Informational only.
+
+Handle them in your setupHandlers():
+  this.on('windowCloseRequested', async (msg) => {
+    const { windowId } = msg.payload;
+    await this.hide();
+  });
+
 ### Interface IDs
 
 'abjects:widgets' - WidgetManager factory methods
@@ -1049,6 +1073,10 @@ getDisplayInfo - Returns { width, height } of the display area
             surfaceId: win.surface, windowId: win.id, zIndex: options?.zIndex ?? 100,
             rect, chromeless: options?.chromeless ?? false,
             draggable: false,
+            title,
+            titleBarHeight: this.cachedTheme.titleBarHeight,
+            titleButtonSize: this.cachedTheme.titleButtonSize,
+            titleButtonMargin: this.cachedTheme.titleButtonMargin,
           }));
       } catch { /* WindowManager may not be ready */ }
     }
@@ -1088,6 +1116,11 @@ getDisplayInfo - Returns { width, height } of the display area
     if (win.surface) this.windowSurfaces.set(win.id, win.surface);
     this.log('debug', 'createWindowAbject', { windowId: win.id, title });
 
+    // Register as dependent of the window (for window events)
+    await this.request(
+      request(this.id, win.id, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+    );
+
     // Register with WindowManager for z-order and drag/resize management
     if (this.windowManagerId && win.surface) {
       try {
@@ -1096,6 +1129,10 @@ getDisplayInfo - Returns { width, height } of the display area
             surfaceId: win.surface, windowId: win.id, zIndex: options?.zIndex ?? 100,
             rect, chromeless: options?.chromeless ?? false,
             draggable: options?.draggable ?? false,
+            title,
+            titleBarHeight: this.cachedTheme.titleBarHeight,
+            titleButtonSize: this.cachedTheme.titleButtonSize,
+            titleButtonMargin: this.cachedTheme.titleButtonMargin,
           }));
       } catch { /* WindowManager may not be ready */ }
     }

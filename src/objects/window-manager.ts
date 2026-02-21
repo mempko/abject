@@ -30,6 +30,11 @@ interface WindowInfo {
   rect: Rect;
   chromeless: boolean;
   draggable: boolean;
+  minimized: boolean;
+  title: string;
+  titleBarHeight: number;
+  titleButtonSize: number;
+  titleButtonMargin: number;
 }
 
 interface DragState {
@@ -49,6 +54,7 @@ interface DragState {
 export class WindowManager extends Abject {
   private windows: Map<string, WindowInfo> = new Map();
   private uiServerId?: AbjectId;
+  private taskbarId?: AbjectId;
   private dragState?: DragState;
 
   constructor() {
@@ -74,6 +80,10 @@ export class WindowManager extends Abject {
                   { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: 'Initial window rect' },
                   { name: 'chromeless', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Whether window has no title bar' },
                   { name: 'draggable', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Whether chromeless window is draggable', optional: true },
+                  { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Window title (for taskbar)', optional: true },
+                  { name: 'titleBarHeight', type: { kind: 'primitive', primitive: 'number' }, description: 'Title bar height for hit-testing', optional: true },
+                  { name: 'titleButtonSize', type: { kind: 'primitive', primitive: 'number' }, description: 'Button hit area size', optional: true },
+                  { name: 'titleButtonMargin', type: { kind: 'primitive', primitive: 'number' }, description: 'Margin between buttons and edge', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -100,6 +110,14 @@ export class WindowManager extends Abject {
                 returns: { kind: 'array', elementType: { kind: 'reference', reference: 'WindowInfo' } },
               },
               {
+                name: 'restoreWindow',
+                description: 'Restore a minimized window',
+                parameters: [
+                  { name: 'surfaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Surface ID to restore' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
                 name: 'surfaceMouseDown',
                 description: 'Handle mousedown on a surface — detect drag/resize grab',
                 parameters: [
@@ -123,13 +141,17 @@ export class WindowManager extends Abject {
 
   private setupHandlers(): void {
     this.on('registerWindow', async (msg: AbjectMessage) => {
-      const { surfaceId, windowId, zIndex, rect, chromeless, draggable } = msg.payload as {
+      const { surfaceId, windowId, zIndex, rect, chromeless, draggable, title, titleBarHeight, titleButtonSize, titleButtonMargin } = msg.payload as {
         surfaceId: string;
         windowId: AbjectId;
         zIndex: number;
         rect?: Rect;
         chromeless?: boolean;
         draggable?: boolean;
+        title?: string;
+        titleBarHeight?: number;
+        titleButtonSize?: number;
+        titleButtonMargin?: number;
       };
       this.windows.set(surfaceId, {
         windowId,
@@ -137,21 +159,41 @@ export class WindowManager extends Abject {
         rect: rect ? { ...rect } : { x: 0, y: 0, width: 0, height: 0 },
         chromeless: chromeless ?? false,
         draggable: draggable ?? false,
+        minimized: false,
+        title: title ?? '',
+        titleBarHeight: titleBarHeight ?? TITLE_BAR_HEIGHT,
+        titleButtonSize: titleButtonSize ?? 20,
+        titleButtonMargin: titleButtonMargin ?? 7,
       });
       return true;
     });
 
     this.on('unregisterWindow', async (msg: AbjectMessage) => {
       const { surfaceId } = msg.payload as { surfaceId?: string; windowId?: AbjectId };
+      const removeWindow = async (sid: string, info: WindowInfo) => {
+        // If the window was minimized, notify Taskbar to clean up its entry
+        if (info.minimized && this.taskbarId) {
+          try {
+            await this.send(
+              event(this.id, this.taskbarId, 'abjects:taskbar' as InterfaceId, 'windowRestored', {
+                surfaceId: sid, windowId: info.windowId,
+              })
+            );
+          } catch { /* Taskbar may be gone */ }
+        }
+        this.windows.delete(sid);
+      };
       if (surfaceId) {
-        return this.windows.delete(surfaceId);
+        const info = this.windows.get(surfaceId);
+        if (info) { await removeWindow(surfaceId, info); return true; }
+        return false;
       }
       // Also support unregister by windowId
       const { windowId } = msg.payload as { windowId?: AbjectId };
       if (windowId) {
         for (const [sid, info] of this.windows) {
           if (info.windowId === windowId) {
-            this.windows.delete(sid);
+            await removeWindow(sid, info);
             return true;
           }
         }
@@ -200,6 +242,13 @@ export class WindowManager extends Abject {
       await this.raiseWindow(surfaceId);
     });
 
+    // Restore a minimized window
+    this.on('restoreWindow', async (msg: AbjectMessage) => {
+      const { surfaceId } = msg.payload as { surfaceId: string };
+      await this.restoreWindow(surfaceId);
+      return true;
+    });
+
     // Start a drag on a window (Ctrl+click from UIServer, or chromeless+draggable from WindowAbject)
     this.on('startDrag', async (msg: AbjectMessage) => {
       const { surfaceId, globalX, globalY } = msg.payload as {
@@ -221,8 +270,76 @@ export class WindowManager extends Abject {
     });
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## WindowManager Usage Guide
+
+### Overview
+
+WindowManager is the centralized window behavior policy object. It owns z-order,
+drag, resize, minimize, and restore behavior for all windows in the system.
+
+### Window Registration
+
+WidgetManager registers each window with WindowManager via 'registerWindow':
+
+  await this.call(windowManagerId, 'abjects:window-manager', 'registerWindow', {
+    surfaceId: 'surface-id',  // UIServer surface ID
+    windowId: winAbjectId,    // WindowAbject ID
+    zIndex: 200,              // Initial stacking order
+    rect: { x, y, width, height },
+    chromeless: false,        // true = no title bar
+    draggable: false,         // true = chromeless window can be dragged
+    title: 'My Window',       // Shown in taskbar when minimized
+    titleBarHeight: 32,       // For button hit-testing
+    titleButtonSize: 20,      // Close/minimize button hit area
+    titleButtonMargin: 7,     // Margin between buttons and edge
+  });
+
+### Title Bar Buttons
+
+Non-chromeless windows have close (X) and minimize (_) buttons in the title bar.
+WindowManager hit-tests these on mousedown:
+
+- Close button (rightmost): sends 'titleBarAction' { action: 'close' } to WindowAbject.
+  WindowAbject then emits 'windowCloseRequested' to its dependents (WidgetManager).
+  WidgetManager forwards this to the window's owner.
+
+- Minimize button (left of close): WindowManager hides the surface via UIServer,
+  sends 'titleBarAction' { action: 'minimize' } to WindowAbject, and notifies Taskbar.
+
+### Minimize and Restore Flow
+
+Minimize:
+1. WindowManager hides surface via UIServer setSurfaceVisible(false)
+2. Sends 'titleBarAction' { action: 'minimize' } to WindowAbject
+3. Notifies Taskbar with 'windowMinimized' event
+
+Restore (via 'restoreWindow' method or Taskbar click):
+1. WindowManager shows surface via UIServer setSurfaceVisible(true)
+2. Raises the window to front
+3. Sends 'titleBarAction' { action: 'restore' } to WindowAbject
+4. Notifies Taskbar with 'windowRestored' event
+
+### Programmatic Restore
+
+  await this.call(windowManagerId, 'abjects:window-manager', 'restoreWindow', {
+    surfaceId: 'surface-id',
+  });
+
+### Raising a Window
+
+  await this.call(windowManagerId, 'abjects:window-manager', 'raiseWindow', {
+    surfaceId: 'surface-id',
+  });
+
+### Interface ID
+
+'abjects:window-manager'`;
+  }
+
   protected override async onInit(): Promise<void> {
     this.uiServerId = await this.requireDep('UIServer');
+    this.taskbarId = await this.discoverDep('Taskbar') ?? undefined;
 
     // Register ourselves with UIServer so it sends us surfaceActivated events
     await this.request(
@@ -236,7 +353,7 @@ export class WindowManager extends Abject {
     surfaceId: string,
     localX: number,
     localY: number,
-  ): Promise<{ grab: boolean }> {
+  ): Promise<{ grab: boolean; minimize?: string }> {
     const info = this.windows.get(surfaceId);
     if (!info) return { grab: false };
 
@@ -258,8 +375,21 @@ export class WindowManager extends Abject {
       return { grab: true };
     }
 
-    // Title bar drag (non-chromeless windows)
+    // Title bar: check close/minimize buttons before drag (non-chromeless windows)
     if (!info.chromeless && localY < TITLE_BAR_HEIGHT) {
+      const btn = this.detectTitleButton(info, localX, localY);
+      if (btn === 'close') {
+        await this.send(
+          event(this.id, info.windowId, WINDOW_INTERFACE, 'titleBarAction', { action: 'close' })
+        );
+        return { grab: false };
+      }
+      if (btn === 'minimize') {
+        this.minimizeWindow(surfaceId).catch(() => {});
+        return { grab: false, minimize: surfaceId };
+      }
+
+      // No button hit — start drag
       this.dragState = {
         surfaceId,
         windowId: info.windowId,
@@ -419,6 +549,118 @@ export class WindowManager extends Abject {
     if (newH < 60) { if (edge.includes('n')) newY = sr.y + sr.height - 60; newH = 60; }
 
     return { x: newX, y: newY, width: newW, height: newH };
+  }
+
+  // ── Title bar button detection ───────────────────────────────────────
+
+  private detectTitleButton(
+    info: WindowInfo,
+    localX: number,
+    localY: number,
+  ): 'close' | 'minimize' | null {
+    const btnSize = info.titleButtonSize;
+    const btnMargin = info.titleButtonMargin;
+    const tbHeight = info.titleBarHeight;
+    const w = info.rect.width;
+
+    // Only in title bar vertical range
+    if (localY >= tbHeight) return null;
+
+    // Close button: rightmost
+    const closeCx = w - btnMargin - btnSize / 2;
+    const closeCy = tbHeight / 2;
+    if (Math.abs(localX - closeCx) <= btnSize / 2 && Math.abs(localY - closeCy) <= btnSize / 2) {
+      return 'close';
+    }
+
+    // Minimize button: left of close
+    const minCx = closeCx - btnSize - btnMargin;
+    const minCy = tbHeight / 2;
+    if (Math.abs(localX - minCx) <= btnSize / 2 && Math.abs(localY - minCy) <= btnSize / 2) {
+      return 'minimize';
+    }
+
+    return null;
+  }
+
+  // ── Lazy Taskbar discovery ─────────────────────────────────────────
+
+  private async getTaskbarId(): Promise<AbjectId | undefined> {
+    if (!this.taskbarId) {
+      this.taskbarId = await this.discoverDep('Taskbar') ?? undefined;
+    }
+    return this.taskbarId;
+  }
+
+  // ── Minimize / Restore ──────────────────────────────────────────────
+
+  private async minimizeWindow(surfaceId: string): Promise<void> {
+    const info = this.windows.get(surfaceId);
+    if (!info) return;
+
+    info.minimized = true;
+
+    // Hide the surface via UIServer (fire-and-forget; primary hide is via
+    // the { minimize } field in the surfaceMouseDown reply to UIServer)
+    if (this.uiServerId) {
+      this.send(
+        event(this.id, this.uiServerId, UI_INTERFACE, 'setSurfaceVisible', {
+          surfaceId, visible: false,
+        })
+      ).catch(() => {});
+    }
+
+    // Notify WindowAbject
+    await this.send(
+      event(this.id, info.windowId, WINDOW_INTERFACE, 'titleBarAction', { action: 'minimize' })
+    );
+
+    // Notify Taskbar
+    const taskbarId = await this.getTaskbarId();
+    if (taskbarId) {
+      try {
+        await this.send(
+          event(this.id, taskbarId, 'abjects:taskbar' as InterfaceId, 'windowMinimized', {
+            surfaceId, windowId: info.windowId, title: info.title,
+          })
+        );
+      } catch { /* Taskbar may be gone */ }
+    }
+  }
+
+  private async restoreWindow(surfaceId: string): Promise<void> {
+    const info = this.windows.get(surfaceId);
+    if (!info) return;
+
+    info.minimized = false;
+
+    // Show the surface via UIServer (fire-and-forget, consistent with minimize path)
+    if (this.uiServerId) {
+      this.send(
+        event(this.id, this.uiServerId, UI_INTERFACE, 'setSurfaceVisible', {
+          surfaceId, visible: true,
+        })
+      ).catch(() => {});
+    }
+
+    await this.raiseWindow(surfaceId);
+
+    // Notify WindowAbject
+    await this.send(
+      event(this.id, info.windowId, WINDOW_INTERFACE, 'titleBarAction', { action: 'restore' })
+    );
+
+    // Notify Taskbar
+    const taskbarId = await this.getTaskbarId();
+    if (taskbarId) {
+      try {
+        await this.send(
+          event(this.id, taskbarId, 'abjects:taskbar' as InterfaceId, 'windowRestored', {
+            surfaceId, windowId: info.windowId,
+          })
+        );
+      } catch { /* Taskbar may be gone */ }
+    }
   }
 
   // ── Raise window ─────────────────────────────────────────────────────

@@ -35,6 +35,12 @@ export class Taskbar extends Abject {
   // Dynamic user object buttons: button widget AbjectId → target object AbjectId
   private userObjButtons: Map<AbjectId, AbjectId> = new Map();
 
+  // Minimized window tracking
+  private minimizedWindows: Map<string, { windowId: AbjectId; title: string }> = new Map();
+  // Button widget AbjectId → surfaceId for restore buttons
+  private restoreButtons: Map<AbjectId, string> = new Map();
+  private windowManagerId?: AbjectId;
+
   constructor() {
     super({
       manifest: {
@@ -81,12 +87,19 @@ export class Taskbar extends Abject {
     this.chatId = await this.requireDep('Chat');
     this.jobBrowserId = await this.requireDep('JobBrowser');
     this.registryId = await this.requireDep('Registry');
+    this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
 
     // Subscribe to registry for auto-refresh when new objects are registered
     if (this.registryId) {
       await this.request(request(this.id, this.registryId,
         'abjects:registry' as InterfaceId, 'subscribe', {}));
     }
+
+    // Subscribe as dependent of each system object to receive visibility changes
+    for (const depId of [this.settingsId!, this.registryBrowserId!, this.chatId!, this.jobBrowserId!]) {
+      await this.request(request(this.id, depId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+    }
+
     await this.show();
   }
 
@@ -129,6 +142,13 @@ export class Taskbar extends Abject {
     // Handle 'changed' events from button widget Abjects (dependency protocol)
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect } = msg.payload as { aspect: string; value?: unknown };
+
+      if (aspect === 'visibility') {
+        console.debug('[Taskbar] visibility changed — rebuilding');
+        await this.show(); // rebuild to reflect new state
+        return;
+      }
+
       if (aspect !== 'click') return;
 
       const fromId = msg.routing.from;
@@ -149,6 +169,17 @@ export class Taskbar extends Abject {
         await this.request(
           request(this.id, this.jobBrowserId!, 'abjects:job-browser' as InterfaceId, 'show', {})
         );
+      } else if (this.restoreButtons.has(fromId)) {
+        // Restore a minimized window
+        const surfaceId = this.restoreButtons.get(fromId)!;
+        if (this.windowManagerId) {
+          try {
+            await this.request(request(this.id, this.windowManagerId,
+              'abjects:window-manager' as InterfaceId, 'restoreWindow', { surfaceId }));
+          } catch (err) {
+            console.warn('[Taskbar] Failed to restore window:', err);
+          }
+        }
       } else {
         // Check dynamic user object buttons
         const targetId = this.userObjButtons.get(fromId);
@@ -171,6 +202,22 @@ export class Taskbar extends Abject {
           }
         }
       }
+    });
+
+    // Handle windowMinimized event from WindowManager
+    this.on('windowMinimized', async (msg: AbjectMessage) => {
+      const { surfaceId, windowId, title } = msg.payload as {
+        surfaceId: string; windowId: AbjectId; title: string;
+      };
+      this.minimizedWindows.set(surfaceId, { windowId, title });
+      await this.show();
+    });
+
+    // Handle windowRestored event from WindowManager
+    this.on('windowRestored', async (msg: AbjectMessage) => {
+      const { surfaceId } = msg.payload as { surfaceId: string };
+      this.minimizedWindows.delete(surfaceId);
+      await this.show();
     });
 
     // Auto-refresh taskbar when new objects are registered
@@ -201,17 +248,24 @@ export class Taskbar extends Abject {
     this.jobsBtnId = undefined;
     this.rootLayoutId = undefined;
     this.userObjButtons.clear();
+    this.restoreButtons.clear();
 
     const showableObjects = await this.discoverShowableObjects();
 
     const btnW = 100;
     const btnH = 30;
+    const labelH = 20;
+    const dividerH = 8;
     const padding = 16;
     const spacing = 6;
     const systemBtnCount = 4;
-    const totalBtnCount = systemBtnCount + showableObjects.length;
+    const minimizedCount = this.minimizedWindows.size;
+    const totalBtnCount = systemBtnCount + showableObjects.length + minimizedCount;
+    // Account for "Apps" label, plus divider + "Windows" label when minimized windows exist
+    const extraHeight = (labelH + spacing)
+      + (minimizedCount > 0 ? (dividerH + spacing) + (labelH + spacing) : 0);
     const barWidth = btnW + padding * 2;
-    const barHeight = padding + totalBtnCount * (btnH + spacing) - spacing + padding;
+    const barHeight = padding + extraHeight + totalBtnCount * (btnH + spacing) - spacing + padding;
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
@@ -234,11 +288,24 @@ export class Taskbar extends Abject {
       })
     );
 
+    // Helper to query visibility of a system object
+    const isVisible = async (objectId: AbjectId): Promise<boolean> => {
+      try {
+        const state = await this.request<{ visible?: boolean }>(
+          request(this.id, objectId, INTROSPECT_INTERFACE_ID, 'getState', {})
+        );
+        return !!state?.visible;
+      } catch { return false; }
+    };
+
+    const activeStyle = { background: '#2d3154', borderColor: '#e8a84c' };
+
     // Helper to add a fixed-size button to the layout
-    const addBtn = async (text: string): Promise<AbjectId> => {
+    const addBtn = async (text: string, active = false): Promise<AbjectId> => {
       const btnId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
           windowId: this.windowId, rect: r0, text,
+          ...(active ? { style: activeStyle } : {}),
         })
       );
       await this.request(
@@ -252,16 +319,71 @@ export class Taskbar extends Abject {
       return btnId;
     };
 
+    // Helper to add a section label to the layout
+    const addSectionLabel = async (text: string): Promise<void> => {
+      const labelId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+          windowId: this.windowId, rect: r0, text,
+          style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
+        })
+      );
+      await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: labelId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { width: btnW, height: labelH },
+      }));
+    };
+
+    // Helper to add a divider to the layout
+    const addDivider = async (): Promise<void> => {
+      const divId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
+          windowId: this.windowId, rect: r0,
+        })
+      );
+      await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: divId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { width: btnW, height: dividerH },
+      }));
+    };
+
+    // ── Apps section ──
+    await addSectionLabel('\u25A0 Apps');
+
+    // Query visibility of system objects
+    const [settingsVis, registryVis, chatVis, jobsVis] = await Promise.all([
+      isVisible(this.settingsId!),
+      isVisible(this.registryBrowserId!),
+      isVisible(this.chatId!),
+      isVisible(this.jobBrowserId!),
+    ]);
+
+    console.debug(`[Taskbar] visibility: settings=${settingsVis} registry=${registryVis} chat=${chatVis} jobs=${jobsVis}`);
+
     // System buttons
-    this.settingsBtnId = await addBtn('Settings');
-    this.registryBtnId = await addBtn('Registry');
-    this.chatBtnId = await addBtn('Chat');
-    this.jobsBtnId = await addBtn('Jobs');
+    this.settingsBtnId = await addBtn('Settings', settingsVis);
+    this.registryBtnId = await addBtn('Registry', registryVis);
+    this.chatBtnId = await addBtn('Chat', chatVis);
+    this.jobsBtnId = await addBtn('Jobs', jobsVis);
 
     // Dynamic buttons for user-created objects with show/hide
     for (const obj of showableObjects) {
-      const btnId = await addBtn(obj.manifest.name);
+      const vis = await isVisible(obj.id);
+      const btnId = await addBtn(obj.manifest.name, vis);
       this.userObjButtons.set(btnId, obj.id);
+    }
+
+    // ── Windows section (only when there are minimized windows) ──
+    if (minimizedCount > 0) {
+      await addDivider();
+      await addSectionLabel('\u25A1 Windows');
+    }
+
+    // Minimized window restore buttons
+    for (const [surfaceId, { title }] of this.minimizedWindows) {
+      const btnId = await addBtn(title);
+      this.restoreButtons.set(btnId, surfaceId);
     }
 
     return true;

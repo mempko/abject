@@ -130,6 +130,12 @@ export class Settings extends Abject {
       return this.hide();
     });
 
+    this.on('windowCloseRequested', async () => { await this.hide(); });
+
+    this.on('getState', async () => {
+      return { visible: !!this.windowId };
+    });
+
     // Handle 'changed' events from widget dependents
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect } = msg.payload as { aspect: string; value?: unknown };
@@ -391,6 +397,7 @@ export class Settings extends Abject {
       preferredSize: { height: 18 },
     }));
 
+    await this.changed('visibility', true);
     return true;
   }
 
@@ -418,6 +425,7 @@ export class Settings extends Abject {
     this.statusLabelId = undefined;
     this.unmasked.clear();
 
+    await this.changed('visibility', false);
     return true;
   }
 

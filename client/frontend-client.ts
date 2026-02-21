@@ -127,6 +127,10 @@ export class FrontendClient {
       case 'setSelectedText':
         this.currentSelectedText = (msg as SetSelectedTextMsg).text;
         break;
+
+      case 'setSurfaceVisible':
+        this.compositor.setVisible(msg.surfaceId, msg.visible);
+        break;
     }
   }
 

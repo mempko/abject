@@ -105,6 +105,8 @@ export class AbjectEditor extends Abject {
       return this.hide();
     });
 
+    this.on('windowCloseRequested', async () => { await this.hide(); });
+
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       if (aspect !== 'click' && aspect !== 'submit') return;

@@ -86,6 +86,12 @@ export interface SetSelectedTextMsg extends WsEnvelope {
   text: string;
 }
 
+export interface SetSurfaceVisibleMsg extends WsEnvelope {
+  type: 'setSurfaceVisible';
+  surfaceId: string;
+  visible: boolean;
+}
+
 export type BackendToFrontendMsg =
   | CreateSurfaceMsg
   | DestroySurfaceMsg
@@ -96,7 +102,8 @@ export type BackendToFrontendMsg =
   | SetFocusedMsg
   | MeasureTextRequestMsg
   | DisplayInfoRequestMsg
-  | SetSelectedTextMsg;
+  | SetSelectedTextMsg
+  | SetSurfaceVisibleMsg;
 
 // =============================================================================
 // Frontend -> Backend messages

@@ -195,6 +195,8 @@ export class Chat extends Abject {
       return true;
     });
 
+    this.on('windowCloseRequested', async () => { await this.hide(); });
+
     this.on('progress', () => {
       if (this._currentJobMsgId) {
         this.resetRequestTimeout(this._currentJobMsgId);
@@ -319,6 +321,7 @@ export class Chat extends Abject {
     // Show greeting
     await this.appendMessageLabel('Agent', 'How can I help you?', '#a8cc8c');
 
+    await this.changed('visibility', true);
     return true;
   }
 
@@ -341,6 +344,7 @@ export class Chat extends Abject {
     this.sendBtnId = undefined;
     this.messageLabelIds = [];
     this.enrichedObjectContext = '';
+    await this.changed('visibility', false);
     return true;
   }
 

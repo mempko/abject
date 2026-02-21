@@ -97,6 +97,8 @@ export class JobBrowser extends Abject {
       return { visible: !!this.windowId, jobCount: this.jobLabelMap.size };
     });
 
+    this.on('windowCloseRequested', async () => { await this.hide(); });
+
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
@@ -197,6 +199,7 @@ export class JobBrowser extends Abject {
     // Populate existing jobs
     await this.populateExistingJobs();
 
+    await this.changed('visibility', true);
     return true;
   }
 
@@ -221,6 +224,7 @@ export class JobBrowser extends Abject {
     this.jobListId = undefined;
     this.clearBtnId = undefined;
     this.jobLabelMap.clear();
+    await this.changed('visibility', false);
     return true;
   }
 

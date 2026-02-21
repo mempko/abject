@@ -356,6 +356,12 @@ export class BackendUI extends Abject {
       return this.handleMeasureText(surfaceId, text, font ?? WIDGET_FONT);
     });
 
+    this.on('setSurfaceVisible', async (msg: AbjectMessage) => {
+      const { surfaceId, visible } = msg.payload as { surfaceId: string; visible: boolean };
+      this.sendToFrontend({ type: 'setSurfaceVisible', surfaceId, visible });
+      return true;
+    });
+
     this.on('selectionChanged', async (msg: AbjectMessage) => {
       const { selectedText } = msg.payload as { selectedText: string };
       this.currentSelectedText = selectedText;
@@ -864,12 +870,18 @@ export class BackendUI extends Abject {
           const localX = msg.x ?? 0;
           const localY = msg.y ?? 0;
           try {
-            const reply = await this.request<{ grab: boolean }>(
+            const reply = await this.request<{ grab: boolean; minimize?: string }>(
               request(this.id, this.windowManagerId,
                 'abjects:window-manager' as InterfaceId, 'surfaceMouseDown', {
                   surfaceId: msg.surfaceId, localX, localY,
                 })
             );
+
+            // WindowManager requested a minimize — hide the surface directly
+            if (reply.minimize) {
+              this.sendToFrontend({ type: 'setSurfaceVisible', surfaceId: reply.minimize, visible: false });
+              return;
+            }
 
             if (reply.grab) {
               // WindowManager claimed the grab — it handles drag/resize

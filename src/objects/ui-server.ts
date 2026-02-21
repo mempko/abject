@@ -226,6 +226,23 @@ export class UIServer extends Abject {
                 },
               },
               {
+                name: 'setSurfaceVisible',
+                description: 'Show or hide a surface without destroying it',
+                parameters: [
+                  {
+                    name: 'surfaceId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'The surface to show/hide',
+                  },
+                  {
+                    name: 'visible',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'Whether the surface should be visible',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
                 name: 'measureText',
                 description: 'Measure the pixel width of text on a surface',
                 parameters: [
@@ -338,6 +355,12 @@ export class UIServer extends Abject {
         font?: string;
       };
       return this.measureTextWidthWithFont(surfaceId, text, font ?? WIDGET_FONT);
+    });
+
+    this.on('setSurfaceVisible', async (msg: AbjectMessage) => {
+      const { surfaceId, visible } = msg.payload as { surfaceId: string; visible: boolean };
+      this.compositor?.setVisible(surfaceId, visible);
+      return true;
     });
 
     this.on('selectionChanged', async (msg: AbjectMessage) => {
@@ -801,12 +824,18 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
       try {
         const localX = x - surface.rect.x;
         const localY = y - surface.rect.y;
-        const reply = await this.request<{ grab: boolean }>(
+        const reply = await this.request<{ grab: boolean; minimize?: string }>(
           request(this.id, this.windowManagerId,
             'abjects:window-manager' as InterfaceId, 'surfaceMouseDown', {
               surfaceId: surface.id, localX, localY,
             })
         );
+
+        // WindowManager requested a minimize — hide the surface directly
+        if (reply.minimize) {
+          this.compositor?.setVisible(reply.minimize, false);
+          return;
+        }
 
         if (reply.grab) {
           // WindowManager claimed the grab — it handles drag/resize

@@ -215,6 +215,12 @@ export class RegistryBrowser extends Abject {
       return this.hide();
     });
 
+    this.on('windowCloseRequested', async () => { await this.hide(); });
+
+    this.on('getState', async () => {
+      return { visible: !!this.windowId };
+    });
+
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       if (aspect !== 'click' && aspect !== 'submit' && aspect !== 'change') return;
@@ -243,6 +249,7 @@ export class RegistryBrowser extends Abject {
     this.selectedKindName = undefined;
     this.cachedObjects = await this.registryList();
     await this.showKindListView();
+    await this.changed('visibility', true);
     return true;
   }
 
@@ -260,6 +267,7 @@ export class RegistryBrowser extends Abject {
     this.selectedKindName = undefined;
     this.kindInstances = [];
     this.clearViewTracking();
+    await this.changed('visibility', false);
     return true;
   }
 

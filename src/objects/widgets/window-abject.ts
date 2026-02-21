@@ -126,6 +126,21 @@ export class WindowAbject extends Abject {
                 description: 'Window was resized by user',
                 payload: { kind: 'object', properties: { width: { kind: 'primitive', primitive: 'number' }, height: { kind: 'primitive', primitive: 'number' } } },
               },
+              {
+                name: 'windowCloseRequested',
+                description: 'Close button was clicked — owner should destroy',
+                payload: { kind: 'object', properties: {} },
+              },
+              {
+                name: 'windowMinimized',
+                description: 'Window was minimized',
+                payload: { kind: 'object', properties: {} },
+              },
+              {
+                name: 'windowRestored',
+                description: 'Window was restored from minimized state',
+                payload: { kind: 'object', properties: {} },
+              },
             ],
           },
         ],
@@ -255,6 +270,19 @@ export class WindowAbject extends Abject {
       return true;
     });
 
+    // WindowManager sends titleBarAction when close/minimize buttons are clicked
+    this.on('titleBarAction', async (msg: AbjectMessage) => {
+      const { action } = msg.payload as { action: string };
+      if (action === 'close') {
+        await this.changed('windowCloseRequested', {});
+      } else if (action === 'minimize') {
+        await this.changed('windowMinimized', {});
+      } else if (action === 'restore') {
+        await this.changed('windowRestored', {});
+        await this.renderWindow();
+      }
+    });
+
     // WindowManager sends rect updates during drag/resize
     this.on('windowRect', async (msg: AbjectMessage) => {
       const { x, y, width, height } = msg.payload as { x: number; y: number; width: number; height: number };
@@ -267,6 +295,47 @@ export class WindowAbject extends Abject {
       }
       await this.changed('windowRect', { x, y, width, height });
     });
+  }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## WindowAbject Usage Guide
+
+### Overview
+
+WindowAbject is a composite morph that owns a UIServer surface and contains child widgets.
+It handles rendering (Morphic drawOn:) and routes input events to children.
+
+### Title Bar Actions
+
+WindowManager sends 'titleBarAction' events to WindowAbject when title bar buttons are clicked.
+WindowAbject translates these into dependency-protocol events:
+
+- action: 'close'   → emits 'windowCloseRequested' to dependents
+- action: 'minimize' → emits 'windowMinimized' to dependents
+- action: 'restore'  → emits 'windowRestored' to dependents, then re-renders
+
+### Event Flow
+
+1. User clicks close (X) or minimize (_) button in title bar
+2. WindowManager detects the hit and sends 'titleBarAction' to WindowAbject
+3. WindowAbject calls this.changed(eventName) which notifies all dependents
+4. WidgetManager (registered as dependent) receives the event via 'changed' handler
+5. WidgetManager forwards the event to the window's owner Abject
+6. Owner handles the event (e.g., calls hide() on windowCloseRequested)
+
+### Owner Handling
+
+Window owners do NOT register as dependents of WindowAbject directly.
+Instead, WidgetManager acts as the intermediary. Owners receive events as
+method calls on 'abjects:widgets' interface:
+
+  this.on('windowCloseRequested', async (msg) => {
+    await this.hide();
+  });
+
+### Interface ID
+
+'abjects:window' — for addChild, removeChild, setTitle, getRect, destroy`;
   }
 
   protected async onInit(): Promise<void> {
@@ -367,6 +436,47 @@ export class WindowAbject extends Abject {
           text: this.title, font: TITLE_FONT, fill: this.theme.textPrimary, baseline: 'middle',
         },
       });
+
+      // Close and minimize buttons (right side of title bar)
+      const btnSize = this.theme.titleButtonSize;
+      const btnMargin = this.theme.titleButtonMargin;
+      const iconSize = this.theme.titleButtonIconSize;
+
+      // Close button (rightmost)
+      const closeCx = w - btnMargin - btnSize / 2;
+      const closeCy = TITLE_BAR_HEIGHT / 2;
+      // X icon — two crossing lines
+      const halfIcon = iconSize / 2;
+      commands.push({
+        type: 'line', surfaceId: sid,
+        params: {
+          x1: closeCx - halfIcon, y1: closeCy - halfIcon,
+          x2: closeCx + halfIcon, y2: closeCy + halfIcon,
+          stroke: this.theme.textSecondary, lineWidth: 1.5,
+        },
+      });
+      commands.push({
+        type: 'line', surfaceId: sid,
+        params: {
+          x1: closeCx + halfIcon, y1: closeCy - halfIcon,
+          x2: closeCx - halfIcon, y2: closeCy + halfIcon,
+          stroke: this.theme.textSecondary, lineWidth: 1.5,
+        },
+      });
+
+      // Minimize button (left of close)
+      const minCx = closeCx - btnSize - btnMargin;
+      const minCy = TITLE_BAR_HEIGHT / 2;
+      // Dash icon — horizontal line
+      commands.push({
+        type: 'line', surfaceId: sid,
+        params: {
+          x1: minCx - halfIcon, y1: minCy,
+          x2: minCx + halfIcon, y2: minCy,
+          stroke: this.theme.textSecondary, lineWidth: 1.5,
+        },
+      });
+
       // Signature amber accent line under title bar
       commands.push({
         type: 'line',
