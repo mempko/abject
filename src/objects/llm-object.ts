@@ -290,7 +290,21 @@ export class LLMObject extends Abject {
     const provider = this.getProvider(providerName);
     require(provider !== undefined, 'No LLM provider available');
 
-    return provider!.complete(messages, options);
+    const totalChars = messages.reduce((sum, m) => sum + (m.content?.length ?? 0), 0);
+    console.log(`[LLM] → ${provider!.name} | ${messages.length} msgs | ${totalChars} chars | tier=${options?.tier ?? 'default'} maxTokens=${options?.maxTokens ?? 'default'}`);
+    const start = Date.now();
+
+    try {
+      const result = await provider!.complete(messages, options);
+      const elapsed = Date.now() - start;
+      console.log(`[LLM] ← ${provider!.name} | ${result.content.length} chars | ${elapsed}ms | reason=${result.finishReason} | tokens=${result.usage?.inputTokens ?? '?'}in/${result.usage?.outputTokens ?? '?'}out`);
+      return result;
+    } catch (err) {
+      const elapsed = Date.now() - start;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[LLM] ✗ ${provider!.name} | ${elapsed}ms | ${errMsg}`);
+      throw err;
+    }
   }
 
   /**
