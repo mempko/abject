@@ -28,6 +28,28 @@ export class CheckboxWidget extends WidgetAbject {
     const boxSize = 16;
     const boxY = oy + (h - boxSize) / 2;
 
+    // Reduce opacity when disabled
+    if (this.disabled) {
+      commands.push({ type: 'save', surfaceId, params: {} });
+      commands.push({ type: 'globalAlpha', surfaceId, params: { alpha: 0.5 } });
+    }
+
+    // Focus ring glow
+    if (this.focused && !this.disabled) {
+      commands.push({ type: 'save', surfaceId, params: {} });
+      commands.push({
+        type: 'shadow',
+        surfaceId,
+        params: { color: this.theme.inputBorderFocus, blur: 6 },
+      });
+      commands.push({
+        type: 'rect',
+        surfaceId,
+        params: { x: ox, y: boxY, width: boxSize, height: boxSize, fill: 'transparent', stroke: this.theme.inputBorderFocus, radius: 2 },
+      });
+      commands.push({ type: 'restore', surfaceId, params: {} });
+    }
+
     // Checkbox box
     commands.push({
       type: 'rect',
@@ -77,6 +99,11 @@ export class CheckboxWidget extends WidgetAbject {
       },
     });
 
+    // Close disabled alpha save
+    if (this.disabled) {
+      commands.push({ type: 'restore', surfaceId, params: {} });
+    }
+
     return commands;
   }
 
@@ -85,6 +112,15 @@ export class CheckboxWidget extends WidgetAbject {
       this.checked = !this.checked;
       this.changed('change', this.checked ? 'true' : 'false');
       return { consumed: true };
+    }
+    if (input.type === 'keydown' && this.focused) {
+      const key = input.key as string;
+      if (key === ' ') {
+        this.checked = !this.checked;
+        this.changed('change', this.checked ? 'true' : 'false');
+        await this.requestRedraw();
+        return { consumed: true };
+      }
     }
     return { consumed: false };
   }

@@ -39,6 +39,28 @@ export class SelectWidget extends WidgetAbject {
     const selectedIndex = this.selectedIndex;
     const selectedText = options[selectedIndex] ?? '';
 
+    // Reduce opacity when disabled
+    if (this.disabled) {
+      commands.push({ type: 'save', surfaceId, params: {} });
+      commands.push({ type: 'globalAlpha', surfaceId, params: { alpha: 0.5 } });
+    }
+
+    // Focus ring glow
+    if (this.focused && !this.disabled) {
+      commands.push({ type: 'save', surfaceId, params: {} });
+      commands.push({
+        type: 'shadow',
+        surfaceId,
+        params: { color: this.theme.inputBorderFocus, blur: 6 },
+      });
+      commands.push({
+        type: 'rect',
+        surfaceId,
+        params: { x: ox, y: oy, width: w, height: h, fill: style.background ?? this.theme.selectBg, stroke: this.theme.inputBorderFocus, radius },
+      });
+      commands.push({ type: 'restore', surfaceId, params: {} });
+    }
+
     // Collapsed: button-like appearance
     commands.push({
       type: 'rect',
@@ -144,6 +166,11 @@ export class SelectWidget extends WidgetAbject {
       }
     }
 
+    // Close disabled alpha save
+    if (this.disabled) {
+      commands.push({ type: 'restore', surfaceId, params: {} });
+    }
+
     return commands;
   }
 
@@ -156,6 +183,65 @@ export class SelectWidget extends WidgetAbject {
 
     if (type === 'mousemove') {
       return this.handleMouseMove(input);
+    }
+
+    if (type === 'keydown' && this.focused) {
+      return this.handleKeyDown(input);
+    }
+
+    return { consumed: false };
+  }
+
+  private async handleKeyDown(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
+    const key = input.key as string;
+    const options = this.options;
+
+    if (!this.expanded) {
+      // Collapsed: Enter or Space opens the dropdown
+      if (key === 'Enter' || key === ' ') {
+        this.expanded = true;
+        this.hoveredOption = this.selectedIndex;
+        this.changed('expanded', true);
+        await this.requestRedraw();
+        return { consumed: true };
+      }
+      return { consumed: false };
+    }
+
+    // Expanded: keyboard navigation
+    if (key === 'ArrowDown') {
+      const next = ((this.hoveredOption ?? this.selectedIndex) + 1) % options.length;
+      this.hoveredOption = next;
+      await this.requestRedraw();
+      return { consumed: true };
+    }
+
+    if (key === 'ArrowUp') {
+      const prev = ((this.hoveredOption ?? this.selectedIndex) - 1 + options.length) % options.length;
+      this.hoveredOption = prev;
+      await this.requestRedraw();
+      return { consumed: true };
+    }
+
+    if (key === 'Enter') {
+      const idx = this.hoveredOption ?? this.selectedIndex;
+      if (idx >= 0 && idx < options.length) {
+        this.selectedIndex = idx;
+        this.expanded = false;
+        this.hoveredOption = undefined;
+        this.changed('change', options[idx]);
+        this.changed('expanded', false);
+        await this.requestRedraw();
+      }
+      return { consumed: true };
+    }
+
+    if (key === 'Escape') {
+      this.expanded = false;
+      this.hoveredOption = undefined;
+      this.changed('expanded', false);
+      await this.requestRedraw();
+      return { consumed: true };
     }
 
     return { consumed: false };

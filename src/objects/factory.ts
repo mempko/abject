@@ -148,6 +148,24 @@ export class Factory extends Abject {
     });
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## Factory Usage Guide
+
+### Methods
+- \`spawn({ manifest, source?, code?, owner?, parentId? })\` — Spawn a new object. If a constructor is registered for the manifest name, uses that. If source is provided, creates a ScriptableAbject. Returns { objectId, status }.
+- \`kill({ objectId })\` — Stop and destroy an object. Unregisters from Registry, removes from Supervisor, and stops the object. Returns boolean.
+- \`clone({ objectId })\` — Clone an existing object (new instance with same manifest/source but new ID). Returns { objectId, status }.
+- \`respawn({ objectId, constructorName, parentId? })\` — Kill and re-create an object with the same ID. Used by Supervisor for restart.
+- \`registerConstructor(name, factory)\` — Register a constructor function for a named object type.
+
+### Key Constraints
+- \`spawn()\` only works for pre-registered constructors or objects with source code. Use ObjectCreator to create entirely new objects from natural language prompts.
+- \`clone()\` looks up the original object in the Registry and re-spawns with the same manifest and source.
+
+### Interface ID
+\`abjects:factory\``;
+  }
+
   /**
    * Set the message bus for spawned objects.
    */
@@ -396,6 +414,18 @@ export class Factory extends Abject {
       await this.request(
         request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
       );
+    }
+
+    // Remove from AbjectStore if it's a scriptable object
+    if (obj.manifest.tags?.includes('scriptable')) {
+      try {
+        const abjectStoreId = await this.discoverDep('AbjectStore');
+        if (abjectStoreId) {
+          await this.request(
+            request(this.id, abjectStoreId, 'abjects:abject-store' as InterfaceId, 'remove', { objectId })
+          );
+        }
+      } catch { /* AbjectStore may not exist */ }
     }
 
     await obj.stop();

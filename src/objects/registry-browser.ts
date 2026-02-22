@@ -94,6 +94,14 @@ export class RegistryBrowser extends Abject {
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              {
+                name: 'getState',
+                description: 'Return current state of the registry browser',
+                parameters: [],
+                returns: { kind: 'object', properties: {
+                  visible: { kind: 'primitive', primitive: 'boolean' },
+                }},
+              },
             ],
           },
         ],
@@ -853,6 +861,30 @@ export class RegistryBrowser extends Abject {
     await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## RegistryBrowser Usage Guide
+
+### Methods
+- \`show()\` — Open the registry browser window. If already open, does nothing.
+- \`hide()\` — Close the registry browser window.
+- \`getState()\` — Returns { visible: boolean }.
+
+### Three-Level Navigation
+1. **Kind List** — All registered object types, grouped by manifest name. Shows count and description. Searchable via text input.
+2. **Instance List** — All instances of a selected kind. Each row has Clone and Delete buttons.
+3. **Detail View** — Full manifest for a specific instance: name, version, description, interfaces, methods, tags, capabilities. Includes method buttons for sending messages, a JSON payload input, and Send button for testing.
+
+### Detail View Features
+- **Method buttons** — Click a method to select it, then type JSON payload and click Send.
+- **Edit Source** — Opens AbjectEditor for ScriptableAbjects.
+- **Clone** — Creates a new instance with the same manifest and source.
+- **Delete** — Stops and unregisters the object via Factory.kill().
+- **Back** — Navigates back to the instance list or kind list.
+
+### Interface ID
+\`abjects:registry-browser\``;
+  }
+
   // ═══════════════════════════════════════════════════════════════════
   // Event Handling
   // ═══════════════════════════════════════════════════════════════════
@@ -891,6 +923,8 @@ export class RegistryBrowser extends Abject {
 
     // ── Delete button in detail view ──
     if (fromId === this.deleteBtnId && this.detailObjectId && this.factoryId) {
+      await this.setWidgetDisabled(this.deleteBtnId, true);
+      await this.setWidgetDisabled(this.cloneBtnId, true);
       try {
         await this.request(request(this.id, this.factoryId,
           FACTORY_INTERFACE, 'kill', { objectId: this.detailObjectId }));
@@ -906,6 +940,7 @@ export class RegistryBrowser extends Abject {
 
     // ── Clone button in detail view ──
     if (fromId === this.cloneBtnId && this.detailObjectId && this.factoryId) {
+      await this.setWidgetDisabled(this.cloneBtnId, true);
       await this.cloneObject(this.detailObjectId);
       return;
     }
@@ -1037,6 +1072,13 @@ export class RegistryBrowser extends Abject {
     }
   }
 
+  private async setWidgetDisabled(id: AbjectId | undefined, disabled: boolean): Promise<void> {
+    if (!id) return;
+    try {
+      await this.request(request(this.id, id, WIDGET_INTERFACE, 'update', { style: { disabled } }));
+    } catch { /* widget gone */ }
+  }
+
   /**
    * Send a message to the selected method on the detail object.
    */
@@ -1062,6 +1104,9 @@ export class RegistryBrowser extends Abject {
         return;
       }
     }
+
+    // Disable send button during request
+    await this.setWidgetDisabled(this.msgSendBtnId, true);
 
     // Show "Sending..." before the (potentially slow) request
     if (this.msgResponseId) {
@@ -1099,6 +1144,9 @@ export class RegistryBrowser extends Abject {
         }
       } catch { /* object may be stopped */ }
     }
+
+    // Re-enable send button
+    await this.setWidgetDisabled(this.msgSendBtnId, false);
   }
 }
 

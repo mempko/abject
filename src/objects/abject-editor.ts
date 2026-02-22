@@ -347,9 +347,20 @@ export class AbjectEditor extends Abject {
     );
   }
 
+  private async setAllControlsDisabled(disabled: boolean): Promise<void> {
+    const style = { disabled };
+    const ids = [this.saveBtnId, this.cancelBtnId, this.aiEditBtnId, this.aiGoBtnId, this.aiPromptInputId, this.sourceEditorId];
+    for (const id of ids) {
+      if (id) {
+        try { await this.request(request(this.id, id, WIDGET_INTERFACE, 'update', { style })); } catch { /* widget gone */ }
+      }
+    }
+  }
+
   private async handleWidgetEvent(fromId: AbjectId, aspect: string, _value?: unknown): Promise<void> {
     // ── Save button ──
     if (fromId === this.saveBtnId && this.editingObjectId) {
+      await this.setAllControlsDisabled(true);
       const source = await this.request<string>(
         request(this.id, this.sourceEditorId!, WIDGET_INTERFACE, 'getValue', {})
       );
@@ -377,6 +388,7 @@ export class AbjectEditor extends Abject {
         const msg = err instanceof Error ? err.message : String(err);
         await this.updateEditStatus(`Error: ${msg}`);
       }
+      await this.setAllControlsDisabled(false);
       return;
     }
 
@@ -398,6 +410,7 @@ export class AbjectEditor extends Abject {
         return;
       }
 
+      await this.setAllControlsDisabled(true);
       await this.updateEditStatus('AI editing...');
 
       try {
@@ -425,6 +438,7 @@ export class AbjectEditor extends Abject {
         const msg = err instanceof Error ? err.message : String(err);
         await this.updateEditStatus(`AI error: ${msg}`);
       }
+      await this.setAllControlsDisabled(false);
       return;
     }
   }

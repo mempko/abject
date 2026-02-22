@@ -113,6 +113,8 @@ export abstract class WidgetAbject extends Abject {
   protected ownerId: AbjectId;
   protected uiServerId: AbjectId;
   protected focused = false;
+  protected disabled = false;
+  protected visible = true;
   protected widgetType: WidgetType;
   protected theme: ThemeData;
 
@@ -136,12 +138,14 @@ export abstract class WidgetAbject extends Abject {
     this.ownerId = config.ownerId;
     this.uiServerId = config.uiServerId;
     this.theme = config.theme ?? MIDNIGHT_BLOOM;
+    this.syncDisabledVisible();
 
     this.setupWidgetHandlers();
   }
 
   private setupWidgetHandlers(): void {
     this.on('render', async (msg: AbjectMessage) => {
+      if (!this.visible) return [];
       const { surfaceId, ox, oy } = msg.payload as { surfaceId: string; ox: number; oy: number };
       return this.buildDrawCommands(surfaceId, ox, oy);
     });
@@ -166,6 +170,7 @@ export abstract class WidgetAbject extends Abject {
     });
 
     this.on('handleInput', async (msg: AbjectMessage) => {
+      if (!this.visible || this.disabled) return { consumed: false };
       const input = msg.payload as Record<string, unknown>;
       return this.processInput(input);
     });
@@ -189,6 +194,15 @@ export abstract class WidgetAbject extends Abject {
     if (updates.text !== undefined) this.text = updates.text as string;
     if (updates.style !== undefined) this.style = { ...this.style, ...(updates.style as WidgetStyle) };
     if (updates.rect !== undefined) this.rect = updates.rect as Rect;
+    this.syncDisabledVisible();
+  }
+
+  /**
+   * Sync disabled/visible fields from style.
+   */
+  private syncDisabledVisible(): void {
+    if (this.style.disabled !== undefined) this.disabled = this.style.disabled;
+    if (this.style.visible !== undefined) this.visible = this.style.visible;
   }
 
   /**

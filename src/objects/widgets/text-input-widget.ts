@@ -91,9 +91,15 @@ export class TextInputWidget extends WidgetAbject {
     const radius = style.radius ?? this.theme.widgetRadius;
     const focused = this.focused;
 
-    // Focus glow shadow
-    const borderColor = style.borderColor ?? (focused ? this.theme.inputBorderFocus : this.theme.inputBorder);
-    if (focused) {
+    // Reduce opacity when disabled
+    if (this.disabled) {
+      commands.push({ type: 'save', surfaceId, params: {} });
+      commands.push({ type: 'globalAlpha', surfaceId, params: { alpha: 0.5 } });
+    }
+
+    // Focus glow shadow (skip when disabled)
+    const borderColor = style.borderColor ?? (focused && !this.disabled ? this.theme.inputBorderFocus : this.theme.inputBorder);
+    if (focused && !this.disabled) {
       commands.push({ type: 'save', surfaceId, params: {} });
       commands.push({
         type: 'shadow',
@@ -216,6 +222,12 @@ export class TextInputWidget extends WidgetAbject {
     }
 
     commands.push({ type: 'restore', surfaceId, params: {} });
+
+    // Close disabled alpha save
+    if (this.disabled) {
+      commands.push({ type: 'restore', surfaceId, params: {} });
+    }
+
     return commands;
   }
 

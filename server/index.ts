@@ -30,6 +30,7 @@ import { AbjectEditor } from '../src/objects/abject-editor.js';
 import { JobManager } from '../src/objects/job-manager.js';
 import { JobBrowser } from '../src/objects/job-browser.js';
 import { Chat } from '../src/objects/chat.js';
+import { AbjectStore } from '../src/objects/abject-store.js';
 import { Supervisor } from '../src/runtime/supervisor.js';
 import type { RestartType } from '../src/runtime/supervisor.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
@@ -116,6 +117,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('JobManager', () => new JobManager());
   runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
   runtime.objectFactory.registerConstructor('Chat', () => new Chat());
+  runtime.objectFactory.registerConstructor('AbjectStore', () => new AbjectStore());
   runtime.objectFactory.registerConstructor('Supervisor', () => new Supervisor());
   runtime.objectFactory.registerConstructor('Taskbar', () => new Taskbar());
 
@@ -146,6 +148,7 @@ async function main(): Promise<void> {
   }
 
   const storageId = await supervisedSpawn('Storage');
+  const abjectStoreId = await supervisedSpawn('AbjectStore');
   const themeId = await supervisedSpawn('Theme');
   const timerId = await supervisedSpawn('Timer');
   const clipboardId = await supervisedSpawn('Clipboard');
@@ -166,10 +169,13 @@ async function main(): Promise<void> {
   const chatId = await supervisedSpawn('Chat');
   const taskbarId = await supervisedSpawn('Taskbar');
 
+  // Restore persisted user-created abjects before health monitoring
+  await bootstrapRequest(abjectStoreId, 'abjects:abject-store' as InterfaceId, 'restoreAll', {});
+
   // ALL objects are now spawned and init'd — safe to start health monitoring.
   // The ready gate ensures HealthMonitor won't ping objects prematurely.
   const monitoredIds = [
-    httpClientId, llmId, storageId, themeId, timerId, clipboardId,
+    httpClientId, llmId, storageId, abjectStoreId, themeId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
     proxyGenId, negotiatorId, objectCreatorId, abjectEditorId,
     settingsId, registryBrowserId,

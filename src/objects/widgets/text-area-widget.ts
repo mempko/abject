@@ -138,6 +138,12 @@ export class TextAreaWidget extends WidgetAbject {
     const lineHeight = this.lineHeight;
     const taFont = this.monospace ? CODE_FONT : (style.fontSize ? font : WIDGET_FONT);
 
+    // Reduce opacity when disabled
+    if (this.disabled) {
+      commands.push({ type: 'save', surfaceId, params: {} });
+      commands.push({ type: 'globalAlpha', surfaceId, params: { alpha: 0.5 } });
+    }
+
     // Border rect
     const borderColor = style.borderColor ?? (focused ? this.theme.inputBorderFocus : this.theme.inputBorder);
     commands.push({
@@ -252,6 +258,12 @@ export class TextAreaWidget extends WidgetAbject {
     }
 
     commands.push({ type: 'restore', surfaceId, params: {} });
+
+    // Close disabled alpha save
+    if (this.disabled) {
+      commands.push({ type: 'restore', surfaceId, params: {} });
+    }
+
     return commands;
   }
 

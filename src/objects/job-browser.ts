@@ -107,6 +107,29 @@ export class JobBrowser extends Abject {
     });
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## JobBrowser Usage Guide
+
+### Methods
+- \`show()\` — Open the job browser window. If already open, raises it to front.
+- \`hide()\` — Close the job browser window and unsubscribe from JobManager.
+- \`getState()\` — Returns { visible: boolean, jobCount: number }.
+
+### Real-Time Job Monitoring
+JobBrowser registers as a dependent of JobManager to receive live status updates.
+Job status icons:
+- ○ queued — job is waiting to execute
+- ▸ running — job is currently executing
+- ✓ completed — job finished successfully (shows elapsed time)
+- ✗ failed — job encountered an error (shows error message)
+
+### Clear Button
+Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes the list.
+
+### Interface ID
+\`abjects:job-browser\``;
+  }
+
   async show(): Promise<boolean> {
     if (this.windowId) {
       try {

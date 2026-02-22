@@ -135,6 +135,18 @@ export class ScriptableAbject extends Abject {
       }
       return this.applySource(source);
     });
+
+    this.installDefaultCloseHandler();
+  }
+
+  private installDefaultCloseHandler(): void {
+    if (this._userMethods.has('windowCloseRequested')) return;
+    this.on('windowCloseRequested', async (msg: AbjectMessage) => {
+      const hideFn = (this as Record<string, unknown>)['hide'];
+      if (typeof hideFn === 'function') {
+        await (hideFn as MessageHandlerFn)(msg);
+      }
+    });
   }
 
   // ── Convenience methods for handler code ──────────────────────────
@@ -267,6 +279,7 @@ export class ScriptableAbject extends Abject {
     }
 
     this._source = source;
+    this.installDefaultCloseHandler();
 
     // Emit sourceUpdated event so Negotiator can regenerate affected proxies
     const newMethods = Array.from(this._userMethods);

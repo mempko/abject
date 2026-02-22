@@ -30,6 +30,7 @@ import { AbjectEditor } from './objects/abject-editor.js';
 import { JobManager } from './objects/job-manager.js';
 import { JobBrowser } from './objects/job-browser.js';
 import { Chat } from './objects/chat.js';
+import { AbjectStore } from './objects/abject-store.js';
 import { Supervisor } from './runtime/supervisor.js';
 import type { RestartType } from './runtime/supervisor.js';
 
@@ -57,6 +58,7 @@ export { AbjectEditor, ABJECT_EDITOR_ID } from './objects/abject-editor.js';
 export { JobManager, JOBMANAGER_ID } from './objects/job-manager.js';
 export { JobBrowser, JOB_BROWSER_ID } from './objects/job-browser.js';
 export { Chat, CHAT_ID } from './objects/chat.js';
+export { AbjectStore, ABJECT_STORE_ID } from './objects/abject-store.js';
 export { ScriptableAbject, EDITABLE_INTERFACE_ID } from './objects/scriptable-abject.js';
 export { Supervisor, SUPERVISOR_ID, SUPERVISOR_INTERFACE_ID } from './runtime/supervisor.js';
 export type { ChildSpec, RestartType, RestartStrategy, SupervisorConfig } from './runtime/supervisor.js';
@@ -249,6 +251,7 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('JobManager', () => new JobManager());
   runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
   runtime.objectFactory.registerConstructor('Chat', () => new Chat());
+  runtime.objectFactory.registerConstructor('AbjectStore', () => new AbjectStore());
   runtime.objectFactory.registerConstructor('Supervisor', () => new Supervisor());
   runtime.objectFactory.registerConstructor('Taskbar', () => new Taskbar());
 
@@ -278,6 +281,7 @@ async function main(): Promise<App> {
   });
 
   const storageId = await supervisedSpawn('Storage');
+  const abjectStoreId = await supervisedSpawn('AbjectStore');
   const themeId = await supervisedSpawn('Theme');
   const timerId = await supervisedSpawn('Timer');
   const clipboardId = await supervisedSpawn('Clipboard');
@@ -298,10 +302,13 @@ async function main(): Promise<App> {
   const chatId = await supervisedSpawn('Chat');
   const taskbarId = await supervisedSpawn('Taskbar');
 
+  // Restore persisted user-created abjects before health monitoring
+  await bootstrapRequest(abjectStoreId, 'abjects:abject-store' as InterfaceId, 'restoreAll', {});
+
   // ALL objects are now spawned and init'd — safe to start health monitoring.
   // The ready gate ensures HealthMonitor won't ping objects prematurely.
   const monitoredIds = [
-    httpClientId, llmId, storageId, themeId, timerId, clipboardId,
+    httpClientId, llmId, storageId, abjectStoreId, themeId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
     proxyGenId, negotiatorId, objectCreatorId, abjectEditorId,
     settingsId, registryBrowserId,
@@ -338,6 +345,7 @@ async function main(): Promise<App> {
     factory: runtime.objectFactory,
     httpClient: getObj(httpClientId),
     storage: getObj(storageId),
+    abjectStore: getObj(abjectStoreId),
     timer: getObj(timerId),
     clipboard: getObj(clipboardId),
     console: getObj(consoleId),
@@ -361,6 +369,7 @@ async function main(): Promise<App> {
       factory: factoryId,
       httpClient: httpClientId,
       storage: storageId,
+      abjectStore: abjectStoreId,
       timer: timerId,
       clipboard: clipboardId,
       console: consoleId,

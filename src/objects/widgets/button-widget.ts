@@ -24,8 +24,30 @@ export class ButtonWidget extends WidgetAbject {
     const radius = style.radius ?? this.theme.widgetRadius;
 
     let fill = style.background ?? this.theme.buttonBg;
-    if (this.hovered) {
+    if (this.hovered && !this.disabled) {
       fill = lightenColor(fill);
+    }
+
+    // Reduce opacity when disabled
+    if (this.disabled) {
+      commands.push({ type: 'save', surfaceId, params: {} });
+      commands.push({ type: 'globalAlpha', surfaceId, params: { alpha: 0.5 } });
+    }
+
+    // Focus ring glow
+    if (this.focused && !this.disabled) {
+      commands.push({ type: 'save', surfaceId, params: {} });
+      commands.push({
+        type: 'shadow',
+        surfaceId,
+        params: { color: this.theme.inputBorderFocus, blur: 6 },
+      });
+      commands.push({
+        type: 'rect',
+        surfaceId,
+        params: { x: ox, y: oy, width: w, height: h, fill, stroke: this.theme.inputBorderFocus, radius },
+      });
+      commands.push({ type: 'restore', surfaceId, params: {} });
     }
 
     // Subtle top-to-bottom gradient for depth
@@ -67,6 +89,11 @@ export class ButtonWidget extends WidgetAbject {
       },
     });
 
+    // Close disabled alpha save
+    if (this.disabled) {
+      commands.push({ type: 'restore', surfaceId, params: {} });
+    }
+
     return commands;
   }
 
@@ -88,6 +115,13 @@ export class ButtonWidget extends WidgetAbject {
         await this.requestRedraw();
       }
       return { consumed: true };
+    }
+    if (input.type === 'keydown' && this.focused) {
+      const key = input.key as string;
+      if (key === 'Enter' || key === ' ') {
+        this.changed('click', this.text);
+        return { consumed: true };
+      }
     }
     return { consumed: false };
   }

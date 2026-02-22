@@ -78,6 +78,7 @@ export class ObjectCreator extends Abject {
   private registryId?: AbjectId;
   private factoryId?: AbjectId;
   private negotiatorId?: AbjectId;
+  private abjectStoreId?: AbjectId;
 
   constructor() {
     super({
@@ -240,6 +241,7 @@ export class ObjectCreator extends Abject {
     this.registryId = await this.requireDep('Registry');
     this.factoryId = await this.requireDep('Factory');
     this.negotiatorId = await this.requireDep('Negotiator');
+    this.abjectStoreId = await this.discoverDep('AbjectStore') ?? undefined;
   }
 
   protected override getSourceForAsk(): string | undefined {
@@ -657,8 +659,13 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         if (verified.mismatches.length > 0) {
           try {
             const llmFixed = await this.llmVerifyAndFix(manifest, code, verified.mismatches);
-            manifest = llmFixed.manifest;
-            code = llmFixed.code;
+            // Only accept if the fix still compiles — truncated LLM responses break code
+            if (!ScriptableAbject.tryCompile(llmFixed.code)) {
+              manifest = llmFixed.manifest;
+              code = llmFixed.code;
+            } else {
+              console.warn('[OBJECT-CREATOR] Phase 3b produced non-compiling code, keeping original');
+            }
           } catch (err) {
             console.warn('[OBJECT-CREATOR] LLM verify/fix failed, continuing:', err);
           }
@@ -745,6 +752,15 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
               console.warn(`[OBJECT-CREATOR] Connect to ${dep.name} failed:`, err);
             });
           }
+        }
+
+        // Persist to AbjectStore (fire-and-forget)
+        if (this.abjectStoreId && spawnResult.objectId && code) {
+          this.request(
+            request(this.id, this.abjectStoreId, 'abjects:abject-store' as InterfaceId, 'save', {
+              objectId: spawnResult.objectId, manifest, source: code, owner: this.id as string,
+            })
+          ).catch(err => console.warn('[OBJECT-CREATOR] Failed to persist:', err));
         }
 
         return {
@@ -918,8 +934,13 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         if (verified.mismatches.length > 0) {
           try {
             const llmFixed = await this.llmVerifyAndFix(manifest, code, verified.mismatches);
-            manifest = llmFixed.manifest;
-            code = llmFixed.code;
+            // Only accept if the fix still compiles — truncated LLM responses break code
+            if (!ScriptableAbject.tryCompile(llmFixed.code)) {
+              manifest = llmFixed.manifest;
+              code = llmFixed.code;
+            } else {
+              console.warn('[OBJECT-CREATOR modify] Phase 3b produced non-compiling code, keeping original');
+            }
           } catch (err) {
             console.warn('[OBJECT-CREATOR modify] LLM verify/fix failed, continuing:', err);
           }
@@ -1019,6 +1040,15 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
 
       // 5c: Update manifest in Registry
       await this.registryUpdateManifest(objectId, manifest);
+
+      // 5c2: Persist to AbjectStore (fire-and-forget)
+      if (this.abjectStoreId && code) {
+        this.request(
+          request(this.id, this.abjectStoreId, 'abjects:abject-store' as InterfaceId, 'save', {
+            objectId: objectId as string, manifest, source: code, owner: this.id as string,
+          })
+        ).catch(err => console.warn('[OBJECT-CREATOR modify] Failed to persist:', err));
+      }
 
       // 5d: Re-show if object had show/hide (UI teardown was performed above)
       if (hasHide && hasShow) {

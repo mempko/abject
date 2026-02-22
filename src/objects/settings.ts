@@ -455,11 +455,23 @@ export class Settings extends Abject {
     );
   }
 
+  private async setSaveControlsDisabled(disabled: boolean): Promise<void> {
+    const style = { disabled };
+    const ids = [this.saveBtnId, this.anthropicKeyId, this.openaiKeyId];
+    for (const id of ids) {
+      if (id) {
+        try { await this.request(request(this.id, id, WIDGET_INTERFACE, 'update', { style })); } catch { /* widget gone */ }
+      }
+    }
+  }
+
   /**
    * Read widget values, save to storage, and configure LLM.
    */
   private async saveSettings(): Promise<void> {
     if (!this.windowId) return;
+
+    await this.setSaveControlsDisabled(true);
 
     const anthropicKey = await this.request<string>(
       request(this.id, this.anthropicKeyId!, WIDGET_INTERFACE, 'getValue', {})

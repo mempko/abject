@@ -376,9 +376,20 @@ export class Chat extends Abject {
   // Agent Loop
   // ═══════════════════════════════════════════════════════════════════
 
+  private async setInputDisabled(disabled: boolean): Promise<void> {
+    const style = { disabled };
+    if (this.sendBtnId) {
+      try { await this.request(request(this.id, this.sendBtnId, WIDGET_INTERFACE, 'update', { style })); } catch { /* widget gone */ }
+    }
+    if (this.textInputId) {
+      try { await this.request(request(this.id, this.textInputId, WIDGET_INTERFACE, 'update', { style })); } catch { /* widget gone */ }
+    }
+  }
+
   private async runAgentLoop(userText: string): Promise<void> {
     if (this.phase === 'closed') return;
     this.phase = 'thinking';
+    await this.setInputDisabled(true);
 
     // Show user message
     await this.appendMessageLabel('You', userText, '#e2e4e9');
@@ -500,6 +511,7 @@ export class Chat extends Abject {
         await this.executeStepsLoop(agentResponse.steps, 0);
       } else {
         this.phase = 'idle';
+        await this.setInputDisabled(false);
       }
     } catch (err) {
       // Remove thinking indicator if still there
@@ -508,6 +520,7 @@ export class Chat extends Abject {
       const errMsg = err instanceof Error ? err.message : String(err);
       await this.appendMessageLabel('Error', errMsg.slice(0, 100), '#e05561');
       this.phase = this.windowId ? 'idle' : 'closed';
+      if (this.windowId) await this.setInputDisabled(false);
     }
   }
 
@@ -610,6 +623,7 @@ export class Chat extends Abject {
     }
 
     this.phase = this.windowId ? 'idle' : 'closed';
+    if (this.windowId) await this.setInputDisabled(false);
   }
 
   // ═══════════════════════════════════════════════════════════════════

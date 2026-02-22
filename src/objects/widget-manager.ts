@@ -947,14 +947,40 @@ await this.call(this.dep('WidgetManager'), 'abjects:widgets', 'destroyWindowAbje
 
 ### Available Widget Types
 
-createLabel - Static text display
-createButton - Clickable button (listen for 'changed' with aspect 'click')
+createLabel - Static text display. Style: { wordWrap: true } for multi-line text.
+createButton - Clickable button (listen for 'changed' with aspect 'click'). Keyboard: Enter/Space when focused.
 createTextInput - Single-line text input (aspects: 'change', 'submit')
 createTextArea - Multi-line text area (params: monospace?)
-createCheckbox - Toggle checkbox (aspect: 'change', value: boolean)
+createCheckbox - Toggle checkbox (aspect: 'change', value: boolean). Keyboard: Space when focused.
 createProgress - Progress bar (update with { value: 0-100 })
 createDivider - Horizontal divider line
-createSelect - Dropdown select (params: options[], selectedIndex)
+createSelect - Dropdown select (params: options[], selectedIndex). Keyboard: Enter/Space to open, ArrowUp/Down to navigate, Enter to select, Escape to close.
+
+### Widget Style Properties
+
+All widgets accept a \`style\` object with these optional properties:
+- color, background, borderColor — colors
+- fontSize, fontWeight ('normal' | 'bold'), align ('left' | 'center' | 'right') — typography
+- radius — border radius
+- wordWrap — enable word wrapping on labels
+- disabled — when true, widget renders at 50% opacity and ignores all input
+- visible — when false, widget renders nothing and ignores input (default: true)
+
+### Disabling Widgets During Async Operations
+
+// Disable a button while an operation is in progress:
+await this.call(btnId, 'abjects:widget', 'update', { style: { disabled: true } });
+
+// ... perform async operation ...
+
+// Re-enable when done:
+await this.call(btnId, 'abjects:widget', 'update', { style: { disabled: false } });
+
+### Keyboard Shortcuts (Focus Required)
+
+- Button: Enter or Space → fires 'click'
+- Checkbox: Space → toggles checked state
+- Select: Enter/Space → opens dropdown; ArrowUp/Down → navigate options; Enter → select; Escape → close
 
 ### Layout Types
 
@@ -993,6 +1019,13 @@ await this.call(canvasId, 'abjects:canvas', 'draw', {
 
 // Input events arrive in your 'input' handler (coordinates are canvas-local).
 // Keyboard input works after clicking the canvas.
+
+### Updating Layout Children
+
+// Change a child's size policy or preferred size after initial layout:
+await this.call(layoutId, 'abjects:layout', 'updateLayoutChild', {
+  widgetId: childId, sizePolicy: { vertical: 'expanding' }, preferredSize: { height: 200 }
+});
 
 ### Utility Methods
 

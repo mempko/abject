@@ -176,6 +176,27 @@ export class Registry extends Abject {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## Registry Usage Guide
+
+### Methods
+- \`list()\` — Returns an array of all ObjectRegistration entries. Each has: id, manifest, status, registeredAt, owner?, source?.
+- \`discover({ name?, interface?, capability?, tags? })\` — Find objects matching a query. Returns ObjectRegistration[]. Use \`{ name: 'Chat' }\` to find by manifest name.
+- \`lookup({ objectId })\` — Look up a single object by its AbjectId. Returns ObjectRegistration or null.
+- \`subscribe()\` — Subscribe to registration events. The caller will receive \`objectRegistered\` events when new objects are registered.
+- \`unsubscribe()\` — Unsubscribe from registration events.
+- \`register({ objectId, manifest, status?, owner?, source? })\` — Register an object (normally called by Factory).
+- \`unregister({ objectId })\` — Remove an object (normally called by Factory).
+- \`updateManifest({ objectId, manifest })\` — Update an object's manifest and re-index it.
+
+### Events
+- \`objectRegistered\` — Sent to subscribers when a new object is registered. Payload is the ObjectRegistration.
+- \`objectUnregistered\` — Sent to subscribers when an object is removed. Payload is the objectId string.
+
+### Interface ID
+\`abjects:registry\``;
+  }
+
   private setupHandlers(): void {
     this.on('register', async (msg: AbjectMessage) => {
       const { objectId, manifest, status, owner, source } = msg.payload as {

@@ -22,6 +22,8 @@ export interface WidgetStyle {
   align?: 'left' | 'center' | 'right';
   radius?: number;
   wordWrap?: boolean;
+  disabled?: boolean;
+  visible?: boolean;  // default true; when false, widget renders nothing and ignores input
 }
 
 export type WidgetType = 'label' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas';
