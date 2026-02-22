@@ -21,6 +21,7 @@ export interface WidgetStyle {
   fontWeight?: 'normal' | 'bold';
   align?: 'left' | 'center' | 'right';
   radius?: number;
+  wordWrap?: boolean;
 }
 
 export type WidgetType = 'label' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas';

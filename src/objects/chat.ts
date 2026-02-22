@@ -14,6 +14,7 @@ import { invariant } from '../core/contracts.js';
 import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 import { formatManifestAsDescription } from '../core/introspect.js';
 import type { JobResult } from './job-manager.js';
+import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 
 const CHAT_INTERFACE: InterfaceId = 'abjects:chat';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
@@ -1148,18 +1149,24 @@ ${this.enrichedObjectContext}
 
     const displayText = prefix ? `${prefix}: ${text}` : text;
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
+    const fontSize = 13;
+    const lineHeight = fontSize + 4;
+    const availableWidth = WIN_W - 32 - 8; // margins + scrollbar
+    const lineCount = estimateWrappedLineCount(displayText, availableWidth, fontSize);
+    const estimatedHeight = Math.max(20, lineCount * lineHeight + 4);
+
     const labelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
         rect: r0,
         text: displayText,
-        style: { color, fontSize: 13 },
+        style: { color, fontSize, wordWrap: true },
       })
     );
     await this.request(request(this.id, this.messageLogId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: labelId,
       sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
+      preferredSize: { height: estimatedHeight },
     }));
     this.messageLabelIds.push(labelId);
     return labelId;
@@ -1171,7 +1178,7 @@ ${this.enrichedObjectContext}
       await this.request(
         request(this.id, labelId, WIDGET_INTERFACE, 'update', {
           text,
-          style: { color, fontSize: 13 },
+          style: { color, fontSize: 13, wordWrap: true },
         })
       );
     } catch { /* label may be gone */ }

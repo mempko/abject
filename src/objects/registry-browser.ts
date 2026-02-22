@@ -18,6 +18,7 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
+import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 
 const REGISTRY_BROWSER_INTERFACE: InterfaceId = 'abjects:registry-browser';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
@@ -634,11 +635,33 @@ export class RegistryBrowser extends Abject {
       return id;
     };
 
+    const addWrappedLabel = async (text: string, style?: Record<string, unknown>): Promise<AbjectId> => {
+      const fontSize = 14;
+      const lineHeight = fontSize + 4;
+      const availableWidth = WIN_W - 32 - 8;
+      const lineCount = estimateWrappedLineCount(text, availableWidth, fontSize);
+      const estimatedHeight = Math.max(20, lineCount * lineHeight + 4);
+      const mergedStyle = { wordWrap: true, ...style };
+
+      const id = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+          windowId: this.windowId!, rect: r0, text,
+          style: mergedStyle,
+        })
+      );
+      await this.request(request(this.id, scrollVBoxId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: id,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: estimatedHeight },
+      }));
+      return id;
+    };
+
     await addLabel(`Name: ${obj.manifest.name}`, { color: '#e2e4e9' });
     await addLabel(`Version: ${obj.manifest.version}`, { color: '#e2e4e9' });
 
     const desc = obj.manifest.description;
-    await addLabel(`Description: ${desc.length > 60 ? desc.slice(0, 60) + '...' : desc}`);
+    await addWrappedLabel(`Description: ${desc}`);
 
     // Interfaces
     for (const iface of obj.manifest.interfaces) {

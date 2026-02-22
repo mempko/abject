@@ -69,6 +69,15 @@ export const LAYOUT_INTERFACE_DECL: InterfaceDeclaration = {
       returns: { kind: 'primitive', primitive: 'boolean' },
     },
     {
+      name: 'updateLayoutChild',
+      description: 'Update a child\'s preferredSize in this layout',
+      parameters: [
+        { name: 'widgetId', type: { kind: 'primitive', primitive: 'string' }, description: 'Widget AbjectId' },
+        { name: 'preferredSize', type: { kind: 'reference', reference: 'PreferredSize' }, description: 'New preferred size' },
+      ],
+      returns: { kind: 'primitive', primitive: 'boolean' },
+    },
+    {
       name: 'getFocusableWidgets',
       description: 'Return flat ordered list of all focusable widget AbjectIds',
       parameters: [],
@@ -175,6 +184,24 @@ export abstract class LayoutAbject extends WidgetAbject {
       // Clear stale hover reference to prevent handleInput to destroyed widgets
       if (this.hoveredLayoutChildId === widgetId) {
         this.hoveredLayoutChildId = undefined;
+      }
+      if (this.rect.width > 0 && this.rect.height > 0) {
+        await this.updateChildRects();
+      }
+      await this.requestRedraw();
+      return true;
+    });
+
+    this.on('updateLayoutChild', async (msg: AbjectMessage) => {
+      const { widgetId, preferredSize } = msg.payload as {
+        widgetId: AbjectId;
+        preferredSize: { width?: number; height?: number };
+      };
+      for (const child of this.layoutChildren) {
+        if (!isSpacer(child) && child.widgetId === widgetId) {
+          child.preferredSize = { ...child.preferredSize, ...preferredSize };
+          break;
+        }
       }
       if (this.rect.width > 0 && this.rect.height > 0) {
         await this.updateChildRects();

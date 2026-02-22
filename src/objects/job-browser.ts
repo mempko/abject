@@ -12,6 +12,7 @@ import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 import type { Job } from './job-manager.js';
+import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 
 const JOB_BROWSER_INTERFACE: InterfaceId = 'abjects:job-browser';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
@@ -268,18 +269,24 @@ export class JobBrowser extends Abject {
     if (!this.jobListId || !this.windowId) return;
 
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
+    const fontSize = 13;
+    const lineHeight = fontSize + 4;
+    const availableWidth = WIN_W - 32 - 8;
+    const lineCount = estimateWrappedLineCount(text, availableWidth, fontSize);
+    const estimatedHeight = Math.max(20, lineCount * lineHeight + 4);
+
     const labelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId,
         rect: r0,
         text,
-        style: { color, fontSize: 13 },
+        style: { color, fontSize, wordWrap: true },
       })
     );
     await this.request(request(this.id, this.jobListId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: labelId,
       sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
+      preferredSize: { height: estimatedHeight },
     }));
     this.jobLabelMap.set(jobId, labelId);
   }
@@ -292,7 +299,7 @@ export class JobBrowser extends Abject {
       await this.request(
         request(this.id, labelId, WIDGET_INTERFACE, 'update', {
           text,
-          style: { color, fontSize: 13 },
+          style: { color, fontSize: 13, wordWrap: true },
         })
       );
     } catch { /* label may be gone */ }
