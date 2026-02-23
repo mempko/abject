@@ -17,6 +17,8 @@ import { request } from '../core/message.js';
 const ABJECT_STORE_INTERFACE = 'abjects:abject-store' as InterfaceId;
 const STORAGE_INTERFACE = 'abjects:storage' as InterfaceId;
 const FACTORY_INTERFACE = 'abjects:factory' as InterfaceId;
+const REGISTRY_INTERFACE = 'abjects:registry' as InterfaceId;
+const WIDGETS_INTERFACE = 'abjects:widgets' as InterfaceId;
 
 const STORAGE_KEY = 'abject-store:snapshots';
 
@@ -40,6 +42,9 @@ export interface RestoreResult {
 export class AbjectStore extends Abject {
   private storageId?: AbjectId;
   private factoryId?: AbjectId;
+  private registryId?: AbjectId;
+  private widgetManagerId?: AbjectId;
+  private workspaceId?: string;
   private snapshots: Map<string, AbjectSnapshot> = new Map();
 
   constructor() {
@@ -150,8 +155,35 @@ export class AbjectStore extends Abject {
     this.storageId = await this.requireDep('Storage');
     this.factoryId = await this.requireDep('Factory');
 
+    // Discover workspace Registry so we can register user objects in it
+    this.registryId = await this.discoverDep('Registry') ?? undefined;
+
+    // Discover WidgetManager so we can tag spawned objects with our workspace
+    this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
+
     // Load existing snapshots from Storage
     await this.loadFromStorage();
+  }
+
+  /**
+   * Lazily discover our workspace ID from WidgetManager.
+   * Called at use-time (not init-time) because WorkspaceManager assigns
+   * our workspace after our init completes.
+   */
+  private async ensureWorkspaceId(): Promise<string | undefined> {
+    if (this.workspaceId) return this.workspaceId;
+    if (!this.widgetManagerId) return undefined;
+    try {
+      const ws = await this.request<string | null>(
+        request(this.id, this.widgetManagerId, WIDGETS_INTERFACE, 'getObjectWorkspace', {
+          objectId: this.id,
+        })
+      );
+      this.workspaceId = ws ?? undefined;
+    } catch {
+      // WidgetManager may not be ready
+    }
+    return this.workspaceId;
   }
 
   /**
@@ -212,6 +244,31 @@ export class AbjectStore extends Abject {
     this.snapshots.set(objectId, snapshot);
     await this.persistToStorage();
 
+    // Register the object in the workspace registry so it appears in RegistryBrowser/Taskbar
+    if (this.registryId) {
+      try {
+        await this.request(request(this.id, this.registryId,
+          REGISTRY_INTERFACE, 'register', {
+            objectId, manifest, owner, source,
+          }));
+      } catch { /* best effort — registry may not be ready */ }
+    }
+
+    // Tag the newly-created object with our workspace
+    const wsId = await this.ensureWorkspaceId();
+    if (this.widgetManagerId && wsId) {
+      try {
+        await this.request(
+          request(this.id, this.widgetManagerId, WIDGETS_INTERFACE, 'setObjectWorkspace', {
+            objectId: objectId as AbjectId,
+            workspaceId: wsId,
+          })
+        );
+      } catch {
+        // Best effort — WidgetManager may not be ready
+      }
+    }
+
     console.log(`[ABJECT-STORE] Saved snapshot for '${manifest.name}' (${objectId})`);
     return true;
   }
@@ -243,6 +300,9 @@ export class AbjectStore extends Abject {
 
     console.log(`[ABJECT-STORE] Restoring ${snapshotList.length} abjects...`);
 
+    // Discover our workspace now (after WorkspaceManager has tagged us)
+    const wsId = await this.ensureWorkspaceId();
+
     // Clear old snapshots — we'll rebuild with new IDs
     this.snapshots.clear();
 
@@ -254,6 +314,7 @@ export class AbjectStore extends Abject {
             source: snap.source,
             owner: snap.owner,
             parentId: this.id,
+            registryHint: this.registryId,
           })
         );
 
@@ -264,6 +325,21 @@ export class AbjectStore extends Abject {
             objectId: spawnResult.objectId as string,
             savedAt: Date.now(),
           });
+
+          // Tag the restored object with our workspace
+          if (this.widgetManagerId && wsId) {
+            try {
+              await this.request(
+                request(this.id, this.widgetManagerId, WIDGETS_INTERFACE, 'setObjectWorkspace', {
+                  objectId: spawnResult.objectId,
+                  workspaceId: wsId,
+                })
+              );
+            } catch {
+              // Best effort
+            }
+          }
+
           result.restored++;
           console.log(`[ABJECT-STORE] Restored '${snap.manifest.name}' as ${spawnResult.objectId}`);
         }

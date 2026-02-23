@@ -438,6 +438,22 @@ export class WorkspaceManager extends Abject {
       })
     );
 
+    // Register the global registry in the workspace registry as "SystemRegistry"
+    // so workspace objects (e.g. RegistryBrowser) can discover and query it
+    await this.request(
+      request(this.id, wsRegistryId, REGISTRY_INTERFACE, 'register', {
+        objectId: this.globalRegistryId!,
+        manifest: {
+          name: 'SystemRegistry',
+          description: 'System-wide registry for core objects shared across workspaces',
+          version: '1.0.0',
+          interfaces: [{ id: 'abjects:registry' as InterfaceId, name: 'Registry',
+            description: 'Object registration and discovery', methods: [] }],
+          requiredCapabilities: [], tags: ['system', 'core'],
+        },
+      })
+    );
+
     // Register workspace registry in the global registry so it's discoverable
     await this.request(
       request(this.id, this.globalRegistryId!, REGISTRY_INTERFACE, 'register', {
@@ -560,8 +576,8 @@ export class WorkspaceManager extends Abject {
       );
 
       // Keys that belong to per-workspace objects
+      // settings: keys are now managed by GlobalSettings in global storage
       const migrateKeys = keys.filter((key) =>
-        key.startsWith('settings:') ||
         key.startsWith('theme:') ||
         key.startsWith('abject-store:') ||
         key.startsWith('chat:')

@@ -33,11 +33,13 @@ const WIN_H = 500;
 export class RegistryBrowser extends Abject {
   private widgetManagerId?: AbjectId;
   private registryId?: AbjectId;
+  private systemRegistryId?: AbjectId;
   private objectCreatorId?: AbjectId;
   private factoryId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
   private cachedObjects: ObjectRegistration[] = [];
+  private systemObjects: ObjectRegistration[] = [];
   private searchText = '';
   private abjectEditorId?: AbjectId;
   private detailIndex?: number;
@@ -48,9 +50,11 @@ export class RegistryBrowser extends Abject {
   private currentView: 'kindList' | 'instanceList' | 'detail' = 'kindList';
   private selectedKindName?: string;
   private kindInstances: ObjectRegistration[] = [];
+  private selectedKindIsSystem = false;  // true when viewing a system kind
 
   // ── Kind List View widget tracking ──
   private kindButtons: Map<AbjectId, string> = new Map();  // btnId → kind name
+  private systemKindButtons: Map<AbjectId, string> = new Map();  // btnId → system kind name
   private searchInputId?: AbjectId;
   private scrollableListId?: AbjectId;
 
@@ -123,20 +127,45 @@ export class RegistryBrowser extends Abject {
     this.factoryId = await this.discoverDep('Factory') ?? undefined;
     this.abjectEditorId = await this.discoverDep('AbjectEditor') ?? undefined;
 
+    // Discover the global "SystemRegistry" registered by WorkspaceManager
+    this.systemRegistryId = await this.discoverDep('SystemRegistry') ?? undefined;
+
     if (this.registryId) {
       await this.request(request(this.id, this.registryId,
         'abjects:registry' as InterfaceId, 'subscribe', {}));
     }
+
+    // Subscribe to system registry notifications too
+    if (this.systemRegistryId) {
+      try {
+        await this.request(request(this.id, this.systemRegistryId,
+          'abjects:registry' as InterfaceId, 'subscribe', {}));
+      } catch { /* SystemRegistry may not support subscribe */ }
+    }
   }
 
   /**
-   * List objects from registry via message passing.
+   * List objects from workspace registry via message passing.
    */
   private async registryList(): Promise<ObjectRegistration[]> {
     if (!this.registryId) return [];
     return this.request<ObjectRegistration[]>(
       request(this.id, this.registryId, 'abjects:registry' as InterfaceId, 'list', {})
     );
+  }
+
+  /**
+   * List objects from the global system registry.
+   */
+  private async systemRegistryList(): Promise<ObjectRegistration[]> {
+    if (!this.systemRegistryId) return [];
+    try {
+      return await this.request<ObjectRegistration[]>(
+        request(this.id, this.systemRegistryId, 'abjects:registry' as InterfaceId, 'list', {})
+      );
+    } catch {
+      return [];
+    }
   }
 
   /**
@@ -155,6 +184,7 @@ export class RegistryBrowser extends Abject {
     this.rootLayoutId = undefined;
     // Kind list view
     this.kindButtons.clear();
+    this.systemKindButtons.clear();
     this.searchInputId = undefined;
     this.scrollableListId = undefined;
 
@@ -198,12 +228,12 @@ export class RegistryBrowser extends Abject {
   }
 
   /**
-   * Group cachedObjects by manifest.name.
+   * Group a list of ObjectRegistrations by manifest.name.
    * Returns a map of kindName → array of ObjectRegistration.
    */
-  private groupByKind(): Map<string, ObjectRegistration[]> {
+  private groupByKindFrom(objects: ObjectRegistration[]): Map<string, ObjectRegistration[]> {
     const groups = new Map<string, ObjectRegistration[]>();
-    for (const obj of this.cachedObjects) {
+    for (const obj of objects) {
       const name = obj.manifest.name;
       const group = groups.get(name);
       if (group) {
@@ -213,6 +243,13 @@ export class RegistryBrowser extends Abject {
       }
     }
     return groups;
+  }
+
+  /**
+   * Group cachedObjects by manifest.name.
+   */
+  private groupByKind(): Map<string, ObjectRegistration[]> {
+    return this.groupByKindFrom(this.cachedObjects);
   }
 
   private setupHandlers(): void {
@@ -239,6 +276,7 @@ export class RegistryBrowser extends Abject {
 
     this.on('objectRegistered', async () => {
       this.cachedObjects = await this.registryList();
+      this.systemObjects = await this.systemRegistryList();
       if (this.windowId) {
         if (this.currentView === 'kindList') {
           await this.populateKindListView();
@@ -256,7 +294,9 @@ export class RegistryBrowser extends Abject {
     this.searchText = '';
     this.currentView = 'kindList';
     this.selectedKindName = undefined;
+    this.selectedKindIsSystem = false;
     this.cachedObjects = await this.registryList();
+    this.systemObjects = await this.systemRegistryList();
     await this.showKindListView();
     await this.changed('visibility', true);
     return true;
@@ -274,6 +314,7 @@ export class RegistryBrowser extends Abject {
     this.windowId = undefined;
     this.currentView = 'kindList';
     this.selectedKindName = undefined;
+    this.selectedKindIsSystem = false;
     this.kindInstances = [];
     this.clearViewTracking();
     await this.changed('visibility', false);
@@ -377,11 +418,12 @@ export class RegistryBrowser extends Abject {
   /**
    * Rebuild the kind buttons inside the scrollable list,
    * filtered by the current searchText.
+   * Shows workspace objects first, then a "System" divider, then system objects.
    */
   private async rebuildKindButtons(): Promise<void> {
     if (!this.scrollableListId) return;
 
-    // Destroy existing buttons
+    // Destroy existing workspace kind buttons
     for (const [btnId] of this.kindButtons) {
       try {
         await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'removeLayoutChild', {
@@ -394,15 +436,28 @@ export class RegistryBrowser extends Abject {
     }
     this.kindButtons.clear();
 
+    // Destroy existing system kind buttons
+    for (const [btnId] of this.systemKindButtons) {
+      try {
+        await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'removeLayoutChild', {
+          widgetId: btnId,
+        }));
+      } catch { /* may already be gone */ }
+      try {
+        await this.request(request(this.id, btnId, WIDGET_INTERFACE, 'destroy', {}));
+      } catch { /* already gone */ }
+    }
+    this.systemKindButtons.clear();
+
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
     const query = this.searchText.toLowerCase();
-    const groups = this.groupByKind();
 
-    // Sort kind names alphabetically
-    const sortedNames = Array.from(groups.keys()).sort();
+    // ── Workspace objects ──
+    const wsGroups = this.groupByKind();
+    const wsSortedNames = Array.from(wsGroups.keys()).sort();
 
-    for (const kindName of sortedNames) {
-      const instances = groups.get(kindName)!;
+    for (const kindName of wsSortedNames) {
+      const instances = wsGroups.get(kindName)!;
       const desc = instances[0].manifest.description;
       const nameLower = kindName.toLowerCase();
       const descLower = desc.toLowerCase();
@@ -427,6 +482,63 @@ export class RegistryBrowser extends Abject {
         preferredSize: { height: 32 },
       }));
     }
+
+    // ── System objects (from global registry) ──
+    if (this.systemObjects.length > 0) {
+      const sysGroups = this.groupByKindFrom(this.systemObjects);
+      const sysSortedNames = Array.from(sysGroups.keys()).sort();
+
+      // Filter system kinds that match the search query
+      const matchingSysNames = sysSortedNames.filter((kindName) => {
+        const instances = sysGroups.get(kindName)!;
+        const desc = instances[0].manifest.description;
+        const nameLower = kindName.toLowerCase();
+        const descLower = desc.toLowerCase();
+        return !query || nameLower.includes(query) || descLower.includes(query);
+      });
+
+      if (matchingSysNames.length > 0) {
+        // Add "System" divider label
+        const dividerId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+            windowId: this.windowId!, rect: r0,
+            text: 'System',
+            style: { color: '#6b7084', fontSize: 12, fontWeight: 'bold' },
+          })
+        );
+        // Track divider in systemKindButtons for cleanup (uses a sentinel key)
+        this.systemKindButtons.set(dividerId, '__divider__');
+        await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          widgetId: dividerId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 24 },
+        }));
+
+        for (const kindName of matchingSysNames) {
+          const instances = sysGroups.get(kindName)!;
+          const desc = instances[0].manifest.description;
+
+          const count = instances.length;
+          const descTrunc = desc.length > 45 ? desc.slice(0, 45) + '...' : desc;
+          const label = `${kindName} (${count}) — ${descTrunc}`;
+
+          const btnId = await this.request<AbjectId>(
+            request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+              windowId: this.windowId!, rect: r0, text: label,
+              style: { fontSize: 13, color: '#6b7084' },
+            })
+          );
+          await this.addDep(btnId);
+          this.systemKindButtons.set(btnId, kindName);
+
+          await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'addLayoutChild', {
+            widgetId: btnId,
+            sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+            preferredSize: { height: 32 },
+          }));
+        }
+      }
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -436,13 +548,19 @@ export class RegistryBrowser extends Abject {
   /**
    * Show the instance list view for a given kind name.
    */
-  private async showInstanceListView(kindName: string): Promise<void> {
+  private async showInstanceListView(kindName: string, isSystem?: boolean): Promise<void> {
     this.currentView = 'instanceList';
     this.selectedKindName = kindName;
     this.searchText = '';
 
-    // Compute instances of this kind from cachedObjects
-    this.kindInstances = this.cachedObjects.filter(o => o.manifest.name === kindName);
+    // If isSystem is explicitly passed, use it; otherwise preserve current state
+    if (isSystem !== undefined) {
+      this.selectedKindIsSystem = isSystem;
+    }
+
+    // Compute instances of this kind from the correct source
+    const source = this.selectedKindIsSystem ? this.systemObjects : this.cachedObjects;
+    this.kindInstances = source.filter(o => o.manifest.name === kindName);
 
     await this.destroyRootLayout();
 
@@ -582,7 +700,8 @@ export class RegistryBrowser extends Abject {
   // ═══════════════════════════════════════════════════════════════════
 
   private async showDetailView(index: number): Promise<void> {
-    const obj = this.cachedObjects[index];
+    const source = this.selectedKindIsSystem ? this.systemObjects : this.cachedObjects;
+    const obj = source[index];
     if (!obj) return;
 
     // Store for message sending
@@ -900,12 +1019,15 @@ export class RegistryBrowser extends Abject {
     // ── Back button ──
     if (fromId === this.backBtnId) {
       if (this.currentView === 'detail' && this.selectedKindName) {
-        // Detail → Instance List
+        // Detail → Instance List — refresh both sources
         this.cachedObjects = await this.registryList();
+        this.systemObjects = await this.systemRegistryList();
         await this.showInstanceListView(this.selectedKindName);
       } else {
         // Instance List → Kind List (or detail without kind → kind list)
         this.cachedObjects = await this.registryList();
+        this.systemObjects = await this.systemRegistryList();
+        this.selectedKindIsSystem = false;
         await this.showKindListView();
       }
       return;
@@ -913,7 +1035,8 @@ export class RegistryBrowser extends Abject {
 
     // ── Edit Source button in detail view ──
     if (fromId === this.editSourceBtnId && this.detailIndex !== undefined) {
-      const obj = this.cachedObjects[this.detailIndex];
+      const source = this.selectedKindIsSystem ? this.systemObjects : this.cachedObjects;
+      const obj = source[this.detailIndex];
       if (obj && this.abjectEditorId) {
         await this.request(request(this.id, this.abjectEditorId,
           'abjects:abject-editor' as InterfaceId, 'show', { objectId: obj.id }));
@@ -930,6 +1053,7 @@ export class RegistryBrowser extends Abject {
           FACTORY_INTERFACE, 'kill', { objectId: this.detailObjectId }));
       } catch { /* object may already be gone */ }
       this.cachedObjects = await this.registryList();
+      this.systemObjects = await this.systemRegistryList();
       if (this.selectedKindName) {
         await this.showInstanceListView(this.selectedKindName);
       } else {
@@ -970,7 +1094,14 @@ export class RegistryBrowser extends Abject {
     // ── Kind button: navigate to instance list view ──
     const kindName = this.kindButtons.get(fromId);
     if (kindName !== undefined) {
-      await this.showInstanceListView(kindName);
+      await this.showInstanceListView(kindName, false);
+      return;
+    }
+
+    // ── System kind button: navigate to instance list view (system source) ──
+    const sysKindName = this.systemKindButtons.get(fromId);
+    if (sysKindName !== undefined && sysKindName !== '__divider__') {
+      await this.showInstanceListView(sysKindName, true);
       return;
     }
 
@@ -999,8 +1130,9 @@ export class RegistryBrowser extends Abject {
     if (instIdx !== undefined) {
       const inst = this.kindInstances[instIdx];
       if (inst) {
-        // Find the global index in cachedObjects
-        const globalIndex = this.cachedObjects.findIndex(o => o.id === inst.id);
+        // Find the index in the correct source list
+        const source = this.selectedKindIsSystem ? this.systemObjects : this.cachedObjects;
+        const globalIndex = source.findIndex(o => o.id === inst.id);
         if (globalIndex >= 0) {
           await this.showDetailView(globalIndex);
         }
@@ -1034,6 +1166,7 @@ export class RegistryBrowser extends Abject {
 
     // Refresh and rebuild current view
     this.cachedObjects = await this.registryList();
+    this.systemObjects = await this.systemRegistryList();
     if (this.currentView === 'instanceList' && this.selectedKindName) {
       await this.showInstanceListView(this.selectedKindName);
     } else if (this.currentView === 'detail' && this.selectedKindName) {
@@ -1061,9 +1194,11 @@ export class RegistryBrowser extends Abject {
     } catch { /* object may already be gone */ }
 
     this.cachedObjects = await this.registryList();
+    this.systemObjects = await this.systemRegistryList();
     if (this.currentView === 'instanceList' && this.selectedKindName) {
-      // Check if any instances of this kind remain
-      const remaining = this.cachedObjects.filter(o => o.manifest.name === this.selectedKindName);
+      // Check if any instances of this kind remain (in the correct source)
+      const source = this.selectedKindIsSystem ? this.systemObjects : this.cachedObjects;
+      const remaining = source.filter(o => o.manifest.name === this.selectedKindName);
       if (remaining.length === 0) {
         await this.showKindListView();
       } else {

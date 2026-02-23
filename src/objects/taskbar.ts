@@ -264,7 +264,7 @@ export class Taskbar extends Abject {
     const dividerH = 8;
     const padding = 16;
     const spacing = 6;
-    const systemBtnCount = 4;
+    const systemBtnCount = 3;
     const minimizedCount = this.minimizedWindows.size;
     const totalBtnCount = systemBtnCount + showableObjects.length + minimizedCount;
     const extraHeight = (labelH + spacing) // "Apps" label
@@ -353,21 +353,55 @@ export class Taskbar extends Abject {
       }));
     };
 
-    // ── Apps section ──
-    await addSectionLabel('\u25A0 Apps');
+    // ── Apps section header row: "◼ Apps" label + gear button ──
+    const appsHeaderRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 4,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: appsHeaderRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: labelH },
+    }));
+
+    const appsHeaderLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: '\u25A0 Apps',
+        style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
+      })
+    );
+    await this.request(request(this.id, appsHeaderRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: appsHeaderLabelId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: labelH },
+    }));
+
+    this.settingsBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+        windowId: this.windowId, rect: r0, text: '\u2699',
+        style: { fontSize: 13 },
+      })
+    );
+    await this.request(request(this.id, this.settingsBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+    await this.request(request(this.id, appsHeaderRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.settingsBtnId,
+      sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+      preferredSize: { width: 24, height: labelH },
+    }));
 
     // Query visibility of system objects
-    const [settingsVis, registryVis, chatVis, jobsVis] = await Promise.all([
-      isVisible(this.settingsId!),
+    const [registryVis, chatVis, jobsVis] = await Promise.all([
       isVisible(this.registryBrowserId!),
       isVisible(this.chatId!),
       isVisible(this.jobBrowserId!),
     ]);
 
-    console.debug(`[Taskbar] visibility: settings=${settingsVis} registry=${registryVis} chat=${chatVis} jobs=${jobsVis}`);
+    console.debug(`[Taskbar] visibility: registry=${registryVis} chat=${chatVis} jobs=${jobsVis}`);
 
     // System buttons
-    this.settingsBtnId = await addBtn('Settings', settingsVis);
     this.registryBtnId = await addBtn('Registry', registryVis);
     this.chatBtnId = await addBtn('Chat', chatVis);
     this.jobsBtnId = await addBtn('Jobs', jobsVis);

@@ -36,6 +36,7 @@ import type { RestartType } from './runtime/supervisor.js';
 import { WorkspaceManager } from './objects/workspace-manager.js';
 import { WorkspaceRegistry } from './objects/workspace-registry.js';
 import { WorkspaceSwitcher } from './objects/workspace-switcher.js';
+import { GlobalSettings } from './objects/global-settings.js';
 
 // Export public API
 export { App, createApp } from './ui/app.js';
@@ -70,6 +71,7 @@ export type { ChildSpec, RestartType, RestartStrategy, SupervisorConfig } from '
 export { WorkspaceManager, WORKSPACE_MANAGER_ID } from './objects/workspace-manager.js';
 export { WorkspaceRegistry, WORKSPACE_REGISTRY_ID } from './objects/workspace-registry.js';
 export { WorkspaceSwitcher, WORKSPACE_SWITCHER_ID } from './objects/workspace-switcher.js';
+export { GlobalSettings, GLOBAL_SETTINGS_ID } from './objects/global-settings.js';
 
 // Export widget Abjects
 export { WidgetAbject, buildFont, WIDGET_INTERFACE_DECL } from './objects/widgets/widget-abject.js';
@@ -268,6 +270,7 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('WorkspaceManager', () => new WorkspaceManager());
   runtime.objectFactory.registerConstructor('WorkspaceRegistry', () => new WorkspaceRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
+  runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
 
   // Spawn Supervisor early so it can supervise other objects
   const supervisorId = await factorySpawn('Supervisor');
@@ -304,6 +307,8 @@ async function main(): Promise<App> {
   const windowManagerId = await supervisedSpawn('WindowManager');
   const widgetManagerId = await supervisedSpawn('WidgetManager');
 
+  const globalSettingsId = await supervisedSpawn('GlobalSettings');
+
   const proxyGenId = await supervisedSpawn('ProxyGenerator');
   const negotiatorId = await supervisedSpawn('Negotiator');
   const healthMonitorId = await supervisedSpawn('HealthMonitor');
@@ -324,7 +329,7 @@ async function main(): Promise<App> {
   const monitoredIds = [
     httpClientId, llmId, storageId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
-    proxyGenId, negotiatorId, objectCreatorId, abjectEditorId,
+    globalSettingsId, proxyGenId, negotiatorId, objectCreatorId, abjectEditorId,
     workspaceSwitcherId, workspaceManagerId,
   ];
   for (const objId of monitoredIds) {
@@ -362,6 +367,7 @@ async function main(): Promise<App> {
     windowManager: getObj(windowManagerId),
     filesystem: getObj(filesystemId),
     supervisor: getObj(supervisorId),
+    globalSettings: getObj(globalSettingsId),
     workspaceSwitcher: getObj(workspaceSwitcherId),
     workspaceManager: getObj(workspaceManagerId),
     // Object IDs for message-based interaction
@@ -383,6 +389,7 @@ async function main(): Promise<App> {
       negotiator: negotiatorId,
       healthMonitor: healthMonitorId,
       supervisor: supervisorId,
+      globalSettings: globalSettingsId,
       workspaceSwitcher: workspaceSwitcherId,
       workspaceManager: workspaceManagerId,
     },

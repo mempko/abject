@@ -79,6 +79,7 @@ export class ObjectCreator extends Abject {
   private factoryId?: AbjectId;
   private negotiatorId?: AbjectId;
   private abjectStoreId?: AbjectId;
+  private widgetManagerId?: AbjectId;
 
   constructor() {
     super({
@@ -242,6 +243,7 @@ export class ObjectCreator extends Abject {
     this.factoryId = await this.requireDep('Factory');
     this.negotiatorId = await this.requireDep('Negotiator');
     this.abjectStoreId = await this.discoverDep('AbjectStore') ?? undefined;
+    this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
   }
 
   protected override getSourceForAsk(): string | undefined {
@@ -751,6 +753,30 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
             )).catch((err) => {
               console.warn(`[OBJECT-CREATOR] Connect to ${dep.name} failed:`, err);
             });
+          }
+        }
+
+        // Tag the new object with the caller's workspace so its windows
+        // are scoped to the workspace where it was created
+        if (this.widgetManagerId && spawnResult.objectId && callerId) {
+          try {
+            const callerWorkspace = await this.request<string | null>(
+              request(this.id, this.widgetManagerId,
+                'abjects:widgets' as InterfaceId, 'getObjectWorkspace', {
+                  objectId: callerId,
+                })
+            );
+            if (callerWorkspace) {
+              await this.request(
+                request(this.id, this.widgetManagerId,
+                  'abjects:widgets' as InterfaceId, 'setObjectWorkspace', {
+                    objectId: spawnResult.objectId,
+                    workspaceId: callerWorkspace,
+                  })
+              );
+            }
+          } catch {
+            // Best effort — WidgetManager may not be ready
           }
         }
 

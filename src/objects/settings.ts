@@ -1,5 +1,5 @@
 /**
- * Settings object - provides UI for configuring the system (LLM API keys, etc).
+ * Settings object - per-workspace configuration UI for workspace name.
  *
  * Uses direct widget Abject interaction (createWindowAbject, createButton, etc.)
  * instead of the legacy string-based widget ID shim.
@@ -15,48 +15,45 @@ const SETTINGS_INTERFACE: InterfaceId = 'abjects:settings';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
 const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
-
-const STORAGE_KEY_ANTHROPIC = 'settings:anthropicApiKey';
-const STORAGE_KEY_OPENAI = 'settings:openaiApiKey';
+const WORKSPACE_MANAGER_INTERFACE: InterfaceId = 'abjects:workspace-manager';
+const WORKSPACE_SWITCHER_INTERFACE: InterfaceId = 'abjects:workspace-switcher';
 
 /**
- * Settings object that provides a configuration UI for LLM API keys.
+ * Settings object that provides a per-workspace configuration UI for the
+ * workspace name. API key management has moved to GlobalSettings.
  *
  * Widgets are first-class Abjects identified by AbjectId. This object registers
  * as a dependent of each widget and listens for 'changed' events to handle
  * user interactions.
  */
 export class Settings extends Abject {
-  private llmId?: AbjectId;
   private storageId?: AbjectId;
   private widgetManagerId?: AbjectId;
+  private workspaceManagerId?: AbjectId;
+  private workspaceSwitcherId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
 
   // Widget AbjectIds
-  private anthropicLabelId?: AbjectId;
-  private anthropicKeyId?: AbjectId;
-  private anthropicToggleId?: AbjectId;
-  private openaiLabelId?: AbjectId;
-  private openaiKeyId?: AbjectId;
-  private openaiToggleId?: AbjectId;
+  private workspaceNameInputId?: AbjectId;
   private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
 
-  private unmasked: Set<AbjectId> = new Set();
+  /** The workspace ID this Settings instance belongs to (lazy-discovered). */
+  private workspaceId?: string;
 
   constructor() {
     super({
       manifest: {
         name: 'Settings',
         description:
-          'System configuration UI. Manages LLM API keys and persists settings.',
+          'Per-workspace configuration UI. Manages workspace name.',
         version: '1.0.0',
         interfaces: [
           {
             id: SETTINGS_INTERFACE,
             name: 'Settings',
-            description: 'System configuration',
+            description: 'Workspace configuration',
             methods: [
               {
                 name: 'show',
@@ -75,8 +72,6 @@ export class Settings extends Abject {
         ],
         requiredCapabilities: [
           { capability: Capabilities.UI_SURFACE, reason: 'Display settings window', required: true },
-          { capability: Capabilities.STORAGE_READ, reason: 'Load saved settings', required: false },
-          { capability: Capabilities.STORAGE_WRITE, reason: 'Save settings', required: false },
         ],
         providedCapabilities: [],
         tags: ['system', 'ui', 'settings'],
@@ -87,38 +82,26 @@ export class Settings extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
-    this.llmId = await this.requireDep('LLM');
     this.storageId = await this.requireDep('Storage');
     this.widgetManagerId = await this.requireDep('WidgetManager');
+    this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
+    this.workspaceSwitcherId = await this.discoverDep('WorkspaceSwitcher') ?? undefined;
+  }
 
-    // Try to load saved API keys from storage
-    let anthropicKey: string | null = null;
-    let openaiKey: string | null = null;
-
-    if (this.storageId) {
-      anthropicKey = await this.request<string | null>(
-        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_ANTHROPIC })
+  /**
+   * Lazy-discover which workspace this Settings instance belongs to
+   * by querying WidgetManager.getObjectWorkspace (same pattern as AbjectStore).
+   */
+  private async ensureWorkspaceId(): Promise<string | undefined> {
+    if (this.workspaceId) return this.workspaceId;
+    if (!this.widgetManagerId) return undefined;
+    try {
+      const wsId = await this.request<string | null>(
+        request(this.id, this.widgetManagerId, WIDGETS_INTERFACE, 'getObjectWorkspace', { objectId: this.id })
       );
-      openaiKey = await this.request<string | null>(
-        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_OPENAI })
-      );
-    }
-
-    if (anthropicKey || openaiKey) {
-      // Keys found — configure LLM silently
-      if (this.llmId) {
-        await this.request(
-          request(this.id, this.llmId, 'abjects:llm' as InterfaceId, 'configure', {
-            anthropicApiKey: anthropicKey ?? undefined,
-            openaiApiKey: openaiKey ?? undefined,
-          })
-        );
-      }
-      console.log('[SETTINGS] Loaded saved API keys');
-    } else {
-      // No keys — show settings UI
-      await this.show();
-    }
+      if (wsId) this.workspaceId = wsId;
+    } catch { /* not tagged yet */ }
+    return this.workspaceId;
   }
 
   private setupHandlers(): void {
@@ -145,14 +128,6 @@ export class Settings extends Abject {
         await this.saveSettings();
       }
 
-      if (fromId === this.anthropicToggleId && aspect === 'click') {
-        await this.toggleMask(this.anthropicKeyId!, this.anthropicToggleId!);
-      }
-
-      if (fromId === this.openaiToggleId && aspect === 'click') {
-        await this.toggleMask(this.openaiKeyId!, this.openaiToggleId!);
-      }
-
       // Text input submit triggers save
       if (aspect === 'submit') {
         await this.saveSettings();
@@ -166,16 +141,17 @@ export class Settings extends Abject {
   async show(): Promise<boolean> {
     if (this.windowId) return true;
 
-    // Load saved keys to populate inputs
-    let savedAnthropicKey: string | null = null;
-    let savedOpenaiKey: string | null = null;
-    if (this.storageId) {
-      savedAnthropicKey = await this.request<string | null>(
-        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_ANTHROPIC })
-      );
-      savedOpenaiKey = await this.request<string | null>(
-        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_OPENAI })
-      );
+    await this.ensureWorkspaceId();
+
+    // Get current workspace name
+    let currentName = '';
+    if (this.workspaceManagerId) {
+      try {
+        const active = await this.request<{ id: string; name: string } | null>(
+          request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'getActiveWorkspace', {})
+        );
+        if (active) currentName = active.name;
+      } catch { /* use empty */ }
     }
 
     // Get display dimensions
@@ -184,14 +160,14 @@ export class Settings extends Abject {
     );
 
     const winW = 440;
-    const winH = 340;
+    const winH = 220;
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
     // Create window — returns an AbjectId
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
-        title: 'Settings',
+        title: 'Workspace Settings',
         rect: { x: winX, y: winY, width: winW, height: winH },
         zIndex: 200,
       })
@@ -208,10 +184,10 @@ export class Settings extends Abject {
       })
     );
 
-    // Section header: "API Keys"
+    // Section header: "Workspace"
     const sectionHeaderId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'API Keys',
+        windowId: this.windowId, rect: r0, text: 'Workspace',
         style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
       })
     );
@@ -224,7 +200,7 @@ export class Settings extends Abject {
     // Description
     const descLabelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Enter your API keys to enable LLM features.',
+        windowId: this.windowId, rect: r0, text: 'Configure this workspace.',
         style: { color: '#b4b8c8', fontSize: 12 },
       })
     );
@@ -234,122 +210,31 @@ export class Settings extends Abject {
       preferredSize: { height: 18 },
     }));
 
-    // Anthropic label
-    this.anthropicLabelId = await this.request<AbjectId>(
+    // Workspace Name label
+    const nameLabelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Anthropic API Key',
+        windowId: this.windowId, rect: r0, text: 'Workspace Name',
         style: { color: '#e2e4e9', fontSize: 13 },
       })
     );
-    await this.request(request(this.id, this.anthropicLabelId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.anthropicLabelId,
+      widgetId: nameLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
 
-    // Anthropic input row (HBox: input + toggle)
-    const anthropicRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: anthropicRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-
-    this.anthropicKeyId = await this.request<AbjectId>(
+    // Workspace Name input
+    this.workspaceNameInputId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
-        windowId: this.windowId, rect: r0, placeholder: 'sk-ant-...', masked: true,
-        text: savedAnthropicKey ?? undefined,
+        windowId: this.windowId, rect: r0, placeholder: 'Workspace name',
+        text: currentName,
       })
     );
-    await this.request(request(this.id, this.anthropicKeyId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, anthropicRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.anthropicKeyId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-
-    this.anthropicToggleId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Show',
-      })
-    );
-    await this.request(request(this.id, this.anthropicToggleId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, anthropicRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.anthropicToggleId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 56, height: 32 },
-    }));
-
-    // Divider between Anthropic and OpenAI sections
-    const dividerId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
-        windowId: this.windowId, rect: r0,
-      })
-    );
+    await this.request(request(this.id, this.workspaceNameInputId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: dividerId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 12 },
-    }));
-
-    // OpenAI label
-    this.openaiLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'OpenAI API Key',
-        style: { color: '#e2e4e9', fontSize: 13 },
-      })
-    );
-    await this.request(request(this.id, this.openaiLabelId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.openaiLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-
-    // OpenAI input row (HBox: input + toggle)
-    const openaiRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: openaiRowId,
+      widgetId: this.workspaceNameInputId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
-    }));
-
-    this.openaiKeyId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
-        windowId: this.windowId, rect: r0, placeholder: 'sk-...', masked: true,
-        text: savedOpenaiKey ?? undefined,
-      })
-    );
-    await this.request(request(this.id, this.openaiKeyId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, openaiRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.openaiKeyId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-
-    this.openaiToggleId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Show',
-      })
-    );
-    await this.request(request(this.id, this.openaiToggleId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, openaiRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.openaiToggleId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 56, height: 32 },
     }));
 
     // Spacer pushes save button to bottom
@@ -415,49 +300,17 @@ export class Settings extends Abject {
 
     this.windowId = undefined;
     this.rootLayoutId = undefined;
-    this.anthropicLabelId = undefined;
-    this.anthropicKeyId = undefined;
-    this.anthropicToggleId = undefined;
-    this.openaiLabelId = undefined;
-    this.openaiKeyId = undefined;
-    this.openaiToggleId = undefined;
+    this.workspaceNameInputId = undefined;
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
-    this.unmasked.clear();
 
     await this.changed('visibility', false);
     return true;
   }
 
-  /**
-   * Toggle masked state on a text input and update its toggle button label.
-   */
-  private async toggleMask(inputId: AbjectId, toggleId: AbjectId): Promise<void> {
-    if (!this.windowId) return;
-
-    const showing = this.unmasked.has(inputId);
-    if (showing) {
-      this.unmasked.delete(inputId);
-    } else {
-      this.unmasked.add(inputId);
-    }
-    const nowMasked = !this.unmasked.has(inputId);
-
-    await this.request(
-      request(this.id, inputId, WIDGET_INTERFACE, 'update', {
-        masked: nowMasked,
-      })
-    );
-    await this.request(
-      request(this.id, toggleId, WIDGET_INTERFACE, 'update', {
-        text: nowMasked ? 'Show' : 'Hide',
-      })
-    );
-  }
-
   private async setSaveControlsDisabled(disabled: boolean): Promise<void> {
     const style = { disabled };
-    const ids = [this.saveBtnId, this.anthropicKeyId, this.openaiKeyId];
+    const ids = [this.saveBtnId, this.workspaceNameInputId];
     for (const id of ids) {
       if (id) {
         try { await this.request(request(this.id, id, WIDGET_INTERFACE, 'update', { style })); } catch { /* widget gone */ }
@@ -466,54 +319,69 @@ export class Settings extends Abject {
   }
 
   /**
-   * Read widget values, save to storage, and configure LLM.
+   * Read workspace name, validate, rename workspace, and refresh the switcher.
    */
   private async saveSettings(): Promise<void> {
     if (!this.windowId) return;
 
     await this.setSaveControlsDisabled(true);
 
-    const anthropicKey = await this.request<string>(
-      request(this.id, this.anthropicKeyId!, WIDGET_INTERFACE, 'getValue', {})
+    const workspaceName = await this.request<string>(
+      request(this.id, this.workspaceNameInputId!, WIDGET_INTERFACE, 'getValue', {})
     );
 
-    const openaiKey = await this.request<string>(
-      request(this.id, this.openaiKeyId!, WIDGET_INTERFACE, 'getValue', {})
-    );
-
-    // Save to storage
-    if (this.storageId) {
-      if (anthropicKey) {
+    // Validate non-empty
+    if (!workspaceName || workspaceName.trim() === '') {
+      if (this.statusLabelId) {
         await this.request(
-          request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'set', { key: STORAGE_KEY_ANTHROPIC, value: anthropicKey })
+          request(this.id, this.statusLabelId, WIDGET_INTERFACE, 'update', {
+            text: 'Workspace name cannot be empty.',
+            style: { color: '#ff6b6b' },
+          })
         );
       }
-      if (openaiKey) {
-        await this.request(
-          request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'set', { key: STORAGE_KEY_OPENAI, value: openaiKey })
-        );
-      }
+      await this.setSaveControlsDisabled(false);
+      return;
     }
 
-    // Configure LLM
-    if (this.llmId) {
+    // Ensure we know our workspace ID
+    await this.ensureWorkspaceId();
+
+    // Rename the workspace
+    if (this.workspaceManagerId && this.workspaceId) {
       await this.request(
-        request(this.id, this.llmId, 'abjects:llm' as InterfaceId, 'configure', {
-          anthropicApiKey: anthropicKey || undefined,
-          openaiApiKey: openaiKey || undefined,
+        request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'renameWorkspace', {
+          workspaceId: this.workspaceId,
+          name: workspaceName.trim(),
         })
       );
 
-      const providers = await this.request<string[]>(
-        request(this.id, this.llmId, 'abjects:llm' as InterfaceId, 'listProviders', {})
-      );
-      console.log(`[SETTINGS] Saved. LLM providers: ${providers.join(', ') || 'none'}`);
+      // Refresh WorkspaceSwitcher to show updated name
+      if (!this.workspaceSwitcherId) {
+        this.workspaceSwitcherId = await this.discoverDep('WorkspaceSwitcher') ?? undefined;
+      }
+      if (this.workspaceSwitcherId) {
+        try {
+          const workspaces = await this.request<Array<{ id: string; name: string }>>(
+            request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'listWorkspaces', {})
+          );
+          await this.request(
+            request(this.id, this.workspaceSwitcherId, WORKSPACE_SWITCHER_INTERFACE, 'show', {
+              workspaces,
+              activeWorkspaceId: this.workspaceId,
+            })
+          );
+        } catch { /* best effort */ }
+      }
     }
 
     // Show save feedback, then close
     if (this.statusLabelId) {
       await this.request(
-        request(this.id, this.statusLabelId, WIDGET_INTERFACE, 'update', { text: 'Settings saved!' })
+        request(this.id, this.statusLabelId, WIDGET_INTERFACE, 'update', {
+          text: 'Settings saved!',
+          style: { color: '#b4b8c8' },
+        })
       );
       await new Promise((resolve) => setTimeout(resolve, 800));
     }

@@ -36,6 +36,7 @@ import type { RestartType } from '../src/runtime/supervisor.js';
 import { WorkspaceManager } from '../src/objects/workspace-manager.js';
 import { WorkspaceRegistry } from '../src/objects/workspace-registry.js';
 import { WorkspaceSwitcher } from '../src/objects/workspace-switcher.js';
+import { GlobalSettings } from '../src/objects/global-settings.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
 import * as path from 'node:path';
 
@@ -136,6 +137,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('WorkspaceManager', () => new WorkspaceManager());
   runtime.objectFactory.registerConstructor('WorkspaceRegistry', () => new WorkspaceRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
+  runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
 
   // Spawn Supervisor early so it can supervise other objects
   const supervisorId = await factorySpawn('Supervisor');
@@ -172,6 +174,8 @@ async function main(): Promise<void> {
   const windowManagerId = await supervisedSpawn('WindowManager');
   const widgetManagerId = await supervisedSpawn('WidgetManager');
 
+  const globalSettingsId = await supervisedSpawn('GlobalSettings');
+
   const proxyGenId = await supervisedSpawn('ProxyGenerator');
   const negotiatorId = await supervisedSpawn('Negotiator');
   const healthMonitorId = await supervisedSpawn('HealthMonitor');
@@ -192,7 +196,7 @@ async function main(): Promise<void> {
   const monitoredIds = [
     httpClientId, llmId, storageId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
-    proxyGenId, negotiatorId, objectCreatorId, abjectEditorId,
+    globalSettingsId, proxyGenId, negotiatorId, objectCreatorId, abjectEditorId,
     workspaceSwitcherId, workspaceManagerId,
   ];
   for (const objId of monitoredIds) {

@@ -305,6 +305,14 @@ export class WidgetManager extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
+                name: 'getObjectWorkspace',
+                description: 'Get the workspace ID associated with an object, or null if not tagged.',
+                parameters: [
+                  { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'The object to query' },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
                 name: 'getDisplayInfo',
                 description: 'Get display dimensions (proxied from UIServer)',
                 parameters: [],
@@ -757,6 +765,11 @@ export class WidgetManager extends Abject {
           }
         }
       }
+    });
+
+    this.on('getObjectWorkspace', async (msg: AbjectMessage) => {
+      const { objectId } = msg.payload as { objectId: string };
+      return this.objectWorkspaces.get(objectId as AbjectId) ?? null;
     });
 
     this.on('objectUnregistered', async (msg: AbjectMessage) => {
