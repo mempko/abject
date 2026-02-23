@@ -35,6 +35,7 @@ interface WindowInfo {
   titleBarHeight: number;
   titleButtonSize: number;
   titleButtonMargin: number;
+  workspaceId?: string;
 }
 
 interface DragState {
@@ -55,6 +56,7 @@ export class WindowManager extends Abject {
   private windows: Map<string, WindowInfo> = new Map();
   private uiServerId?: AbjectId;
   private taskbarId?: AbjectId;
+  private taskbarsByWorkspace: Map<string, AbjectId> = new Map();
   private dragState?: DragState;
 
   constructor() {
@@ -84,6 +86,7 @@ export class WindowManager extends Abject {
                   { name: 'titleBarHeight', type: { kind: 'primitive', primitive: 'number' }, description: 'Title bar height for hit-testing', optional: true },
                   { name: 'titleButtonSize', type: { kind: 'primitive', primitive: 'number' }, description: 'Button hit area size', optional: true },
                   { name: 'titleButtonMargin', type: { kind: 'primitive', primitive: 'number' }, description: 'Margin between buttons and edge', optional: true },
+                  { name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Workspace this window belongs to', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -118,6 +121,23 @@ export class WindowManager extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
+                name: 'registerTaskbar',
+                description: 'Register a per-workspace Taskbar so minimize/restore events route to the correct one',
+                parameters: [
+                  { name: 'taskbarId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId of the Taskbar' },
+                  { name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Workspace the Taskbar belongs to' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'unregisterTaskbar',
+                description: 'Remove a per-workspace Taskbar registration',
+                parameters: [
+                  { name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Workspace to unregister' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
                 name: 'surfaceMouseDown',
                 description: 'Handle mousedown on a surface — detect drag/resize grab',
                 parameters: [
@@ -141,7 +161,7 @@ export class WindowManager extends Abject {
 
   private setupHandlers(): void {
     this.on('registerWindow', async (msg: AbjectMessage) => {
-      const { surfaceId, windowId, zIndex, rect, chromeless, draggable, title, titleBarHeight, titleButtonSize, titleButtonMargin } = msg.payload as {
+      const { surfaceId, windowId, zIndex, rect, chromeless, draggable, title, titleBarHeight, titleButtonSize, titleButtonMargin, workspaceId } = msg.payload as {
         surfaceId: string;
         windowId: AbjectId;
         zIndex: number;
@@ -152,6 +172,7 @@ export class WindowManager extends Abject {
         titleBarHeight?: number;
         titleButtonSize?: number;
         titleButtonMargin?: number;
+        workspaceId?: string;
       };
       this.windows.set(surfaceId, {
         windowId,
@@ -164,6 +185,7 @@ export class WindowManager extends Abject {
         titleBarHeight: titleBarHeight ?? TITLE_BAR_HEIGHT,
         titleButtonSize: titleButtonSize ?? 20,
         titleButtonMargin: titleButtonMargin ?? 7,
+        workspaceId,
       });
       return true;
     });
@@ -267,6 +289,19 @@ export class WindowManager extends Abject {
         startRect: { ...info.rect },
       };
       this.raiseWindow(surfaceId).catch(() => { /* best-effort */ });
+    });
+
+    // WorkspaceManager registers per-workspace Taskbars
+    this.on('registerTaskbar', async (msg: AbjectMessage) => {
+      const { taskbarId, workspaceId } = msg.payload as { taskbarId: AbjectId; workspaceId: string };
+      this.taskbarsByWorkspace.set(workspaceId, taskbarId);
+      return true;
+    });
+
+    this.on('unregisterTaskbar', async (msg: AbjectMessage) => {
+      const { workspaceId } = msg.payload as { workspaceId: string };
+      this.taskbarsByWorkspace.delete(workspaceId);
+      return true;
     });
   }
 
@@ -583,9 +618,20 @@ Restore (via 'restoreWindow' method or Taskbar click):
     return null;
   }
 
-  // ── Lazy Taskbar discovery ─────────────────────────────────────────
+  // ── Taskbar resolution by workspace ─────────────────────────────────
 
-  private async getTaskbarId(): Promise<AbjectId | undefined> {
+  /**
+   * Resolve the correct Taskbar for a window.
+   * Uses the window's workspace tag to find the per-workspace Taskbar;
+   * falls back to the globally discovered Taskbar for untagged windows.
+   */
+  private async getTaskbarForWindow(surfaceId: string): Promise<AbjectId | undefined> {
+    const info = this.windows.get(surfaceId);
+    if (info?.workspaceId) {
+      const wsTaskbar = this.taskbarsByWorkspace.get(info.workspaceId);
+      if (wsTaskbar) return wsTaskbar;
+    }
+    // Fallback: lazy-discover a global Taskbar (pre-workspace compat)
     if (!this.taskbarId) {
       this.taskbarId = await this.discoverDep('Taskbar') ?? undefined;
     }
@@ -615,8 +661,8 @@ Restore (via 'restoreWindow' method or Taskbar click):
       event(this.id, info.windowId, WINDOW_INTERFACE, 'titleBarAction', { action: 'minimize' })
     );
 
-    // Notify Taskbar
-    const taskbarId = await this.getTaskbarId();
+    // Notify the correct workspace Taskbar
+    const taskbarId = await this.getTaskbarForWindow(surfaceId);
     if (taskbarId) {
       try {
         await this.send(
@@ -650,8 +696,8 @@ Restore (via 'restoreWindow' method or Taskbar click):
       event(this.id, info.windowId, WINDOW_INTERFACE, 'titleBarAction', { action: 'restore' })
     );
 
-    // Notify Taskbar
-    const taskbarId = await this.getTaskbarId();
+    // Notify the correct workspace Taskbar
+    const taskbarId = await this.getTaskbarForWindow(surfaceId);
     if (taskbarId) {
       try {
         await this.send(

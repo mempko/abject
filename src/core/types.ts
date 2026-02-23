@@ -211,6 +211,9 @@ export interface SpawnRequest {
   initialState?: unknown;
   grantedCapabilities?: CapabilityGrant[];
   parentId?: AbjectId;
+  skipGlobalRegistry?: boolean;
+  constructorArgs?: unknown;
+  registryHint?: AbjectId;
 }
 
 export interface SpawnResult {

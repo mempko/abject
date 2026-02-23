@@ -23,6 +23,7 @@ export interface Surface {
   canvas: OffscreenCanvas;
   ctx: OffscreenCanvasRenderingContext2D;
   dirty: boolean;
+  workspaceId?: string;  // undefined = always visible (global objects)
 }
 
 export interface DrawCommand {
@@ -160,6 +161,7 @@ export class Compositor {
   private sortedSurfaces: Surface[] = [];
   private animationFrameId?: number;
   private needsRender = false;
+  private activeWorkspaceId?: string;
 
   constructor(canvas: HTMLCanvasElement) {
     require(canvas !== null, 'canvas is required');
@@ -270,11 +272,19 @@ export class Compositor {
   }
 
   /**
+   * Check if a surface is filtered out by the active workspace.
+   */
+  private isWorkspaceFiltered(surface: Surface): boolean {
+    return !!(this.activeWorkspaceId && surface.workspaceId &&
+      surface.workspaceId !== this.activeWorkspaceId);
+  }
+
+  /**
    * Get all visible surfaces with inputMonitor enabled.
    */
   getInputMonitors(): Surface[] {
     return Array.from(this.surfaces.values()).filter(
-      (s) => s.visible && s.inputMonitor
+      (s) => s.visible && s.inputMonitor && !this.isWorkspaceFiltered(s)
     );
   }
 
@@ -351,6 +361,27 @@ export class Compositor {
     const surface = this.surfaces.get(surfaceId);
     if (surface) {
       surface.visible = visible;
+      this.needsRender = true;
+    }
+  }
+
+  /**
+   * Set the active workspace. Surfaces tagged with a different workspace
+   * will be hidden from rendering and hit-testing.
+   */
+  setActiveWorkspace(workspaceId: string | undefined): void {
+    this.activeWorkspaceId = workspaceId;
+    this.needsRender = true;
+  }
+
+  /**
+   * Tag a surface with a workspace ID. Surfaces without a workspace ID
+   * are always visible (global objects like WorkspaceSwitcher).
+   */
+  setSurfaceWorkspace(surfaceId: string, workspaceId: string): void {
+    const surface = this.surfaces.get(surfaceId);
+    if (surface) {
+      surface.workspaceId = workspaceId;
       this.needsRender = true;
     }
   }
@@ -683,6 +714,7 @@ export class Compositor {
     // Draw surfaces in z-order
     for (const surface of this.sortedSurfaces) {
       if (!surface.visible) continue;
+      if (this.isWorkspaceFiltered(surface)) continue;
 
       this.ctx.drawImage(
         surface.canvas,
@@ -702,6 +734,7 @@ export class Compositor {
     for (let i = this.sortedSurfaces.length - 1; i >= 0; i--) {
       const surface = this.sortedSurfaces[i];
       if (!surface.visible) continue;
+      if (this.isWorkspaceFiltered(surface)) continue;
       if (surface.inputPassthrough) continue;
 
       const { rect } = surface;

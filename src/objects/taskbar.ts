@@ -26,6 +26,9 @@ export class Taskbar extends Abject {
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
 
+  // Y-offset for positioning below WorkspaceSwitcher
+  private yOffset = 8;
+
   // Button AbjectIds for system buttons
   private settingsBtnId?: AbjectId;
   private registryBtnId?: AbjectId;
@@ -100,7 +103,6 @@ export class Taskbar extends Abject {
       await this.request(request(this.id, depId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     }
 
-    await this.show();
   }
 
   /**
@@ -131,7 +133,11 @@ export class Taskbar extends Abject {
   }
 
   private setupHandlers(): void {
-    this.on('show', async () => {
+    this.on('show', async (msg: AbjectMessage) => {
+      const payload = msg.payload as { yOffset?: number } | undefined;
+      if (payload?.yOffset !== undefined) {
+        this.yOffset = payload.yOffset;
+      }
       return this.show();
     });
 
@@ -261,8 +267,7 @@ export class Taskbar extends Abject {
     const systemBtnCount = 4;
     const minimizedCount = this.minimizedWindows.size;
     const totalBtnCount = systemBtnCount + showableObjects.length + minimizedCount;
-    // Account for "Apps" label, plus divider + "Windows" label when minimized windows exist
-    const extraHeight = (labelH + spacing)
+    const extraHeight = (labelH + spacing) // "Apps" label
       + (minimizedCount > 0 ? (dividerH + spacing) + (labelH + spacing) : 0);
     const barWidth = btnW + padding * 2;
     const barHeight = padding + extraHeight + totalBtnCount * (btnH + spacing) - spacing + padding;
@@ -270,7 +275,7 @@ export class Taskbar extends Abject {
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
         title: '',
-        rect: { x: 8, y: 8, width: barWidth, height: barHeight },
+        rect: { x: 8, y: this.yOffset, width: barWidth, height: barHeight },
         zIndex: 999,
         chromeless: true,
         draggable: true,
@@ -301,11 +306,11 @@ export class Taskbar extends Abject {
     const activeStyle = { background: '#2d3154', borderColor: '#e8a84c' };
 
     // Helper to add a fixed-size button to the layout
-    const addBtn = async (text: string, active = false): Promise<AbjectId> => {
+    const addBtn = async (text: string, active = false, style?: Record<string, unknown>): Promise<AbjectId> => {
       const btnId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
           windowId: this.windowId, rect: r0, text,
-          ...(active ? { style: activeStyle } : {}),
+          ...(style ? { style } : active ? { style: activeStyle } : {}),
         })
       );
       await this.request(

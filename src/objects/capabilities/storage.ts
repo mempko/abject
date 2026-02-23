@@ -23,8 +23,10 @@ export class Storage extends Abject {
   private db?: IDBDatabase;
   protected memoryFallback: Map<string, StorageEntry> = new Map();
   protected useMemory = false;
+  private dbName: string;
 
-  constructor() {
+  constructor(dbName?: string) {
+    const resolvedDbName = dbName ?? DB_NAME;
     super({
       manifest: {
         name: 'Storage',
@@ -123,6 +125,7 @@ export class Storage extends Abject {
       },
     });
 
+    this.dbName = resolvedDbName;
     this.setupHandlers();
   }
 
@@ -172,7 +175,7 @@ export class Storage extends Abject {
     }
 
     return new Promise((resolve, reject) => {
-      const request = indexedDB.open(DB_NAME, 1);
+      const request = indexedDB.open(this.dbName, 1);
 
       request.onerror = () => {
         console.warn('[STORAGE] IndexedDB error, using memory fallback');

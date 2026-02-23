@@ -18,10 +18,12 @@ import { Capabilities } from '../core/capability.js';
 import { request } from '../core/message.js';
 import { MessageBus } from '../runtime/message-bus.js';
 import { ScriptableAbject } from './scriptable-abject.js';
+import { CompositeAbject } from './composite-abject.js';
+import type { CompositeSpec } from './composite-abject.js';
 
 const FACTORY_INTERFACE = 'abjects:factory';
 
-export type ObjectFactory = () => Abject;
+export type ObjectFactory = (args?: unknown) => Abject;
 
 /**
  * The Factory object creates and manages object lifecycles.
@@ -152,11 +154,14 @@ export class Factory extends Abject {
     return `## Factory Usage Guide
 
 ### Methods
-- \`spawn({ manifest, source?, code?, owner?, parentId? })\` — Spawn a new object. If a constructor is registered for the manifest name, uses that. If source is provided, creates a ScriptableAbject. Returns { objectId, status }.
+- \`spawn({ manifest, source?, code?, owner?, parentId? })\` — Spawn a new object. If a constructor is registered for the manifest name, uses that. If source is provided and manifest.tags includes 'composite', creates a CompositeAbject from a JSON CompositeSpec. If source is provided without the composite tag, creates a ScriptableAbject. Returns { objectId, status }.
 - \`kill({ objectId })\` — Stop and destroy an object. Unregisters from Registry, removes from Supervisor, and stops the object. Returns boolean.
-- \`clone({ objectId })\` — Clone an existing object (new instance with same manifest/source but new ID). Returns { objectId, status }.
+- \`clone({ objectId })\` — Clone an existing object (new instance with same manifest/source but new ID). Returns { objectId, status }. Works for CompositeAbjects — the clone gets fresh children with new IDs.
 - \`respawn({ objectId, constructorName, parentId? })\` — Kill and re-create an object with the same ID. Used by Supervisor for restart.
 - \`registerConstructor(name, factory)\` — Register a constructor function for a named object type.
+
+### CompositeAbject
+A CompositeAbject groups multiple child ScriptableAbjects behind a single ID with unified interfaces. To spawn one, pass \`source\` as a JSON-serialized CompositeSpec and include \`'composite'\` in \`manifest.tags\`. The spec defines children (role + source + manifest), interfaces, and a routing table mapping "interfaceId::method" to strategies: delegate (single child), fanout (multiple children), or orchestrate (custom handler). Children are managed internally — they are not visible in the Registry unless exposeChildren is set.
 
 ### Key Constraints
 - \`spawn()\` only works for pre-registered constructors or objects with source code. Use ObjectCreator to create entirely new objects from natural language prompts.
@@ -266,7 +271,9 @@ export class Factory extends Abject {
         manifest: obj.manifest,
         status: obj.status,
       };
-      if (obj instanceof ScriptableAbject) {
+      if (obj instanceof CompositeAbject) {
+        payload.source = obj.compositeSource;
+      } else if (obj instanceof ScriptableAbject) {
         payload.owner = obj.owner;
         payload.source = obj.source;
       }
@@ -297,7 +304,11 @@ export class Factory extends Abject {
 
     if (factory) {
       // Use registered factory function
-      obj = factory();
+      obj = factory(req.constructorArgs);
+    } else if (req.source && req.manifest.tags?.includes('composite')) {
+      // Spawn a CompositeAbject from a JSON spec
+      const spec = JSON.parse(req.source) as CompositeSpec;
+      obj = new CompositeAbject(spec);
     } else if (req.source) {
       // Spawn a ScriptableAbject from handler source
       obj = new ScriptableAbject(
@@ -315,8 +326,10 @@ export class Factory extends Abject {
     }
 
     // Pre-seed registry ID to avoid deadlock (child asking parent during init)
-    if (this._factoryRegistryId) {
-      obj.setRegistryHint(this._factoryRegistryId);
+    // Use registryHint from request if provided (workspace objects), else Factory's registry
+    const hint = req.registryHint ?? this._factoryRegistryId;
+    if (hint) {
+      obj.setRegistryHint(hint);
     }
 
     // Initialize the object with parentId (default to Factory)
@@ -325,19 +338,24 @@ export class Factory extends Abject {
     // Track spawned object
     this.spawned.set(obj.id, obj);
 
-    // Register with registry via message passing
-    if (this._factoryRegistryId) {
+    // Register with the appropriate registry:
+    // - If registryHint is specified, register there (workspace objects)
+    // - Otherwise register in the global registry (unless skipGlobalRegistry)
+    const targetRegistry = req.registryHint ?? (req.skipGlobalRegistry ? undefined : this._factoryRegistryId);
+    if (targetRegistry) {
       const payload: Record<string, unknown> = {
         objectId: obj.id,
         manifest: obj.manifest,
         status: obj.status,
       };
-      if (obj instanceof ScriptableAbject) {
+      if (obj instanceof CompositeAbject) {
+        payload.source = obj.compositeSource;
+      } else if (obj instanceof ScriptableAbject) {
         payload.owner = obj.owner;
         payload.source = obj.source;
       }
       await this.request(
-        request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'register', payload)
+        request(this.id, targetRegistry, 'abjects:registry' as InterfaceId, 'register', payload)
       );
     }
 
@@ -373,7 +391,9 @@ export class Factory extends Abject {
         manifest: obj.manifest,
         status: obj.status,
       };
-      if (obj instanceof ScriptableAbject) {
+      if (obj instanceof CompositeAbject) {
+        payload.source = obj.compositeSource;
+      } else if (obj instanceof ScriptableAbject) {
         payload.owner = obj.owner;
         payload.source = obj.source;
       }

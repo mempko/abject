@@ -265,6 +265,35 @@ export class UIServer extends Abject {
                 ],
                 returns: { kind: 'primitive', primitive: 'number' },
               },
+              {
+                name: 'setSurfaceWorkspace',
+                description: 'Tag a surface with a workspace ID for compositor filtering',
+                parameters: [
+                  {
+                    name: 'surfaceId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'The surface to tag',
+                  },
+                  {
+                    name: 'workspaceId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'The workspace ID',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'setActiveWorkspace',
+                description: 'Set the active workspace for compositor filtering',
+                parameters: [
+                  {
+                    name: 'workspaceId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'The workspace ID to activate',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
             ],
             events: [
               {
@@ -360,6 +389,18 @@ export class UIServer extends Abject {
     this.on('setSurfaceVisible', async (msg: AbjectMessage) => {
       const { surfaceId, visible } = msg.payload as { surfaceId: string; visible: boolean };
       this.compositor?.setVisible(surfaceId, visible);
+      return true;
+    });
+
+    this.on('setSurfaceWorkspace', async (msg: AbjectMessage) => {
+      const { surfaceId, workspaceId } = msg.payload as { surfaceId: string; workspaceId: string };
+      this.compositor?.setSurfaceWorkspace(surfaceId, workspaceId);
+      return true;
+    });
+
+    this.on('setActiveWorkspace', async (msg: AbjectMessage) => {
+      const { workspaceId } = msg.payload as { workspaceId: string };
+      this.compositor?.setActiveWorkspace(workspaceId);
       return true;
     });
 

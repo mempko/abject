@@ -31,7 +31,8 @@ test.describe('Capabilities', () => {
 
     expect(result.value).toEqual({ hello: 'world' });
     expect(result.exists).toBe(true);
-    expect(result.keyCount).toBe(1);
+    // Global Storage may also contain workspace metadata keys (workspaces:list, workspaces:active)
+    expect(result.keyCount).toBeGreaterThanOrEqual(1);
   });
 
   test('Timer schedules callbacks', async ({ page }) => {

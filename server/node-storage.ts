@@ -15,9 +15,9 @@ const STORAGE_FILE = 'storage.json';
 export class NodeStorage extends Storage {
   private storagePath: string;
 
-  constructor() {
+  constructor(storagePath?: string) {
     super();
-    this.storagePath = path.join(process.cwd(), STORAGE_DIR, STORAGE_FILE);
+    this.storagePath = storagePath ?? path.join(process.cwd(), STORAGE_DIR, STORAGE_FILE);
   }
 
   protected override async onInit(): Promise<void> {

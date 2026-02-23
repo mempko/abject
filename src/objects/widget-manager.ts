@@ -70,6 +70,8 @@ export class WidgetManager extends Abject {
   private spawnedWidgets: Set<AbjectId> = new Set();
   // Maps windowId → surfaceId for raiseWindow support
   private windowSurfaces: Map<AbjectId, string> = new Map();
+  // Maps objectId → workspaceId for compositor-level workspace filtering
+  private objectWorkspaces: Map<AbjectId, string> = new Map();
 
   // Backward-compat shim: maps old string widget IDs → AbjectIds
   private shimWidgetMap: Map<string, AbjectId> = new Map();
@@ -292,6 +294,15 @@ export class WidgetManager extends Abject {
                   { name: 'ownerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Owner object AbjectId' },
                 ],
                 returns: { kind: 'primitive', primitive: 'number' },
+              },
+              {
+                name: 'setObjectWorkspace',
+                description: 'Associate an object with a workspace. All surfaces owned by this object will be tagged with the workspace ID for compositor-level filtering.',
+                parameters: [
+                  { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'The object to tag' },
+                  { name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'The workspace ID' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'getDisplayInfo',
@@ -734,6 +745,20 @@ export class WidgetManager extends Abject {
         'abjects:window-manager' as InterfaceId, 'raiseWindow', { surfaceId }));
     });
 
+    this.on('setObjectWorkspace', async (msg: AbjectMessage) => {
+      const { objectId, workspaceId } = msg.payload as { objectId: AbjectId; workspaceId: string };
+      this.objectWorkspaces.set(objectId, workspaceId);
+      // Retroactively tag any existing windows owned by this object
+      for (const [windowId, owner] of this.windowOwners.entries()) {
+        if (owner === objectId) {
+          const surfaceId = this.windowSurfaces.get(windowId);
+          if (surfaceId) {
+            await this.request(request(this.id, this.uiServerId!, UI_INTERFACE, 'setSurfaceWorkspace', { surfaceId, workspaceId }));
+          }
+        }
+      }
+    });
+
     this.on('objectUnregistered', async (msg: AbjectMessage) => {
       const objectId = msg.payload as AbjectId;
       await this.destroyWindowsForOwner(objectId);
@@ -1093,6 +1118,12 @@ Handle them in your setupHandlers():
     await win.init(this.bus, this.id);
     this.spawnedWindows.add(win.id);
 
+    // Tag the surface with the owner's workspace (if known)
+    const ownerWs = this.objectWorkspaces.get(owner);
+    if (ownerWs && win.surface) {
+      await this.request(request(this.id, this.uiServerId!, UI_INTERFACE, 'setSurfaceWorkspace', { surfaceId: win.surface, workspaceId: ownerWs }));
+    }
+
     // Register as dependent of the window (for windowMoved/windowResized events)
     await this.request(
       request(this.id, win.id, INTROSPECT_INTERFACE_ID, 'addDependent', {})
@@ -1110,6 +1141,7 @@ Handle them in your setupHandlers():
             titleBarHeight: this.cachedTheme.titleBarHeight,
             titleButtonSize: this.cachedTheme.titleButtonSize,
             titleButtonMargin: this.cachedTheme.titleButtonMargin,
+            workspaceId: ownerWs,
           }));
       } catch { /* WindowManager may not be ready */ }
     }
@@ -1149,6 +1181,12 @@ Handle them in your setupHandlers():
     if (win.surface) this.windowSurfaces.set(win.id, win.surface);
     this.log('debug', 'createWindowAbject', { windowId: win.id, title });
 
+    // Tag the surface with the owner's workspace (if known)
+    const ownerWs = this.objectWorkspaces.get(owner);
+    if (ownerWs && win.surface) {
+      await this.request(request(this.id, this.uiServerId!, UI_INTERFACE, 'setSurfaceWorkspace', { surfaceId: win.surface, workspaceId: ownerWs }));
+    }
+
     // Register as dependent of the window (for window events)
     await this.request(
       request(this.id, win.id, INTROSPECT_INTERFACE_ID, 'addDependent', {})
@@ -1166,6 +1204,7 @@ Handle them in your setupHandlers():
             titleBarHeight: this.cachedTheme.titleBarHeight,
             titleButtonSize: this.cachedTheme.titleButtonSize,
             titleButtonMargin: this.cachedTheme.titleButtonMargin,
+            workspaceId: ownerWs,
           }));
       } catch { /* WindowManager may not be ready */ }
     }

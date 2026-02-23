@@ -33,6 +33,9 @@ import { Chat } from './objects/chat.js';
 import { AbjectStore } from './objects/abject-store.js';
 import { Supervisor } from './runtime/supervisor.js';
 import type { RestartType } from './runtime/supervisor.js';
+import { WorkspaceManager } from './objects/workspace-manager.js';
+import { WorkspaceRegistry } from './objects/workspace-registry.js';
+import { WorkspaceSwitcher } from './objects/workspace-switcher.js';
 
 // Export public API
 export { App, createApp } from './ui/app.js';
@@ -60,8 +63,13 @@ export { JobBrowser, JOB_BROWSER_ID } from './objects/job-browser.js';
 export { Chat, CHAT_ID } from './objects/chat.js';
 export { AbjectStore, ABJECT_STORE_ID } from './objects/abject-store.js';
 export { ScriptableAbject, EDITABLE_INTERFACE_ID } from './objects/scriptable-abject.js';
+export { CompositeAbject, COMPOSITE_ABJECT_ID } from './objects/composite-abject.js';
+export type { CompositeSpec, CompositeChildSpec, RouteEntry } from './objects/composite-abject.js';
 export { Supervisor, SUPERVISOR_ID, SUPERVISOR_INTERFACE_ID } from './runtime/supervisor.js';
 export type { ChildSpec, RestartType, RestartStrategy, SupervisorConfig } from './runtime/supervisor.js';
+export { WorkspaceManager, WORKSPACE_MANAGER_ID } from './objects/workspace-manager.js';
+export { WorkspaceRegistry, WORKSPACE_REGISTRY_ID } from './objects/workspace-registry.js';
+export { WorkspaceSwitcher, WORKSPACE_SWITCHER_ID } from './objects/workspace-switcher.js';
 
 // Export widget Abjects
 export { WidgetAbject, buildFont, WIDGET_INTERFACE_DECL } from './objects/widgets/widget-abject.js';
@@ -233,7 +241,10 @@ async function main(): Promise<App> {
   // Register constructors with Factory (local calls — Factory is in-process)
   runtime.objectFactory.registerConstructor('HttpClient', () => new HttpClient());
   runtime.objectFactory.registerConstructor('LLMObject', () => new LLMObject());
-  runtime.objectFactory.registerConstructor('Storage', () => new Storage());
+  runtime.objectFactory.registerConstructor('Storage', (args?: unknown) => {
+    const opts = args as { dbName?: string } | undefined;
+    return new Storage(opts?.dbName);
+  });
   runtime.objectFactory.registerConstructor('Timer', () => new Timer());
   runtime.objectFactory.registerConstructor('Clipboard', () => new Clipboard());
   runtime.objectFactory.registerConstructor('Console', () => new Console());
@@ -254,6 +265,9 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('AbjectStore', () => new AbjectStore());
   runtime.objectFactory.registerConstructor('Supervisor', () => new Supervisor());
   runtime.objectFactory.registerConstructor('Taskbar', () => new Taskbar());
+  runtime.objectFactory.registerConstructor('WorkspaceManager', () => new WorkspaceManager());
+  runtime.objectFactory.registerConstructor('WorkspaceRegistry', () => new WorkspaceRegistry());
+  runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
 
   // Spawn Supervisor early so it can supervise other objects
   const supervisorId = await factorySpawn('Supervisor');
@@ -271,6 +285,8 @@ async function main(): Promise<App> {
 
   // Spawn in dependency order via Factory messages
   // Each object discovers its own dependencies via Registry self-discovery
+
+  // Global objects (shared across workspaces)
   const httpClientId = await supervisedSpawn('HttpClient');
   const llmId = await supervisedSpawn('LLMObject');
 
@@ -281,8 +297,6 @@ async function main(): Promise<App> {
   });
 
   const storageId = await supervisedSpawn('Storage');
-  const abjectStoreId = await supervisedSpawn('AbjectStore');
-  const themeId = await supervisedSpawn('Theme');
   const timerId = await supervisedSpawn('Timer');
   const clipboardId = await supervisedSpawn('Clipboard');
   const consoleId = await supervisedSpawn('Console');
@@ -295,24 +309,23 @@ async function main(): Promise<App> {
   const healthMonitorId = await supervisedSpawn('HealthMonitor');
   const objectCreatorId = await supervisedSpawn('ObjectCreator');
   const abjectEditorId = await supervisedSpawn('AbjectEditor');
-  const settingsId = await supervisedSpawn('Settings');
-  const registryBrowserId = await supervisedSpawn('RegistryBrowser');
-  const jobManagerId = await supervisedSpawn('JobManager');
-  const jobBrowserId = await supervisedSpawn('JobBrowser');
-  const chatId = await supervisedSpawn('Chat');
-  const taskbarId = await supervisedSpawn('Taskbar');
 
-  // Restore persisted user-created abjects before health monitoring
-  await bootstrapRequest(abjectStoreId, 'abjects:abject-store' as InterfaceId, 'restoreAll', {});
+  // WorkspaceSwitcher is a global UI (never hidden during workspace switch)
+  const workspaceSwitcherId = await supervisedSpawn('WorkspaceSwitcher');
+
+  // WorkspaceManager spawns per-workspace objects (Settings, Taskbar, Chat, etc.)
+  const workspaceManagerId = await supervisedSpawn('WorkspaceManager');
+
+  // Boot workspaces (must be called after spawn — cannot happen during onInit
+  // because Factory would deadlock processing our spawn request)
+  await bootstrapRequest(workspaceManagerId, 'abjects:workspace-manager' as InterfaceId, 'boot', {});
 
   // ALL objects are now spawned and init'd — safe to start health monitoring.
-  // The ready gate ensures HealthMonitor won't ping objects prematurely.
   const monitoredIds = [
-    httpClientId, llmId, storageId, abjectStoreId, themeId, timerId, clipboardId,
+    httpClientId, llmId, storageId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
     proxyGenId, negotiatorId, objectCreatorId, abjectEditorId,
-    settingsId, registryBrowserId,
-    jobManagerId, jobBrowserId, chatId, taskbarId,
+    workspaceSwitcherId, workspaceManagerId,
   ];
   for (const objId of monitoredIds) {
     await bootstrapRequest(healthMonitorId, HEALTH_IFACE, 'monitorObject', { objectId: objId });
@@ -336,54 +349,42 @@ async function main(): Promise<App> {
     runtime,
     // Direct object references (for debugging and tests)
     llm: getObj(llmId),
-    settings: getObj(settingsId),
     objectCreator: getObj(objectCreatorId),
     abjectEditor: getObj(abjectEditorId),
-    registryBrowser: getObj(registryBrowserId),
-    taskbar: getObj(taskbarId),
     registry: runtime.objectRegistry,
     factory: runtime.objectFactory,
     httpClient: getObj(httpClientId),
     storage: getObj(storageId),
-    abjectStore: getObj(abjectStoreId),
     timer: getObj(timerId),
     clipboard: getObj(clipboardId),
     console: getObj(consoleId),
-    theme: getObj(themeId),
     widgetManager: getObj(widgetManagerId),
     windowManager: getObj(windowManagerId),
     filesystem: getObj(filesystemId),
-    jobManager: getObj(jobManagerId),
-    jobBrowser: getObj(jobBrowserId),
-    chat: getObj(chatId),
     supervisor: getObj(supervisorId),
+    workspaceSwitcher: getObj(workspaceSwitcherId),
+    workspaceManager: getObj(workspaceManagerId),
     // Object IDs for message-based interaction
     ids: {
       llm: llmId,
-      settings: settingsId,
       objectCreator: objectCreatorId,
       abjectEditor: abjectEditorId,
-      registryBrowser: registryBrowserId,
-      taskbar: taskbarId,
       registry: registryId,
       factory: factoryId,
       httpClient: httpClientId,
       storage: storageId,
-      abjectStore: abjectStoreId,
       timer: timerId,
       clipboard: clipboardId,
       console: consoleId,
-      theme: themeId,
       widgetManager: widgetManagerId,
       windowManager: windowManagerId,
       filesystem: filesystemId,
       proxyGenerator: proxyGenId,
       negotiator: negotiatorId,
       healthMonitor: healthMonitorId,
-      jobManager: jobManagerId,
-      jobBrowser: jobBrowserId,
-      chat: chatId,
       supervisor: supervisorId,
+      workspaceSwitcher: workspaceSwitcherId,
+      workspaceManager: workspaceManagerId,
     },
     modules: {
       SimpleAbject,

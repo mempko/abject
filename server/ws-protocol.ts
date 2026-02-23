@@ -92,6 +92,17 @@ export interface SetSurfaceVisibleMsg extends WsEnvelope {
   visible: boolean;
 }
 
+export interface SetSurfaceWorkspaceMsg extends WsEnvelope {
+  type: 'setSurfaceWorkspace';
+  surfaceId: string;
+  workspaceId: string;
+}
+
+export interface SetActiveWorkspaceMsg extends WsEnvelope {
+  type: 'setActiveWorkspace';
+  workspaceId: string;
+}
+
 export type BackendToFrontendMsg =
   | CreateSurfaceMsg
   | DestroySurfaceMsg
@@ -103,7 +114,9 @@ export type BackendToFrontendMsg =
   | MeasureTextRequestMsg
   | DisplayInfoRequestMsg
   | SetSelectedTextMsg
-  | SetSurfaceVisibleMsg;
+  | SetSurfaceVisibleMsg
+  | SetSurfaceWorkspaceMsg
+  | SetActiveWorkspaceMsg;
 
 // =============================================================================
 // Frontend -> Backend messages

@@ -131,6 +131,14 @@ export class FrontendClient {
       case 'setSurfaceVisible':
         this.compositor.setVisible(msg.surfaceId, msg.visible);
         break;
+
+      case 'setSurfaceWorkspace':
+        this.compositor.setSurfaceWorkspace(msg.surfaceId, msg.workspaceId);
+        break;
+
+      case 'setActiveWorkspace':
+        this.compositor.setActiveWorkspace(msg.workspaceId);
+        break;
     }
   }
 

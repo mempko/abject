@@ -34,6 +34,7 @@ export interface SurfaceState {
   inputPassthrough: boolean;
   inputMonitor: boolean;
   lastDrawCommands: Array<{ type: string; surfaceId: string; params: unknown }>;
+  workspaceId?: string;
 }
 
 export interface InputEvent {
@@ -75,6 +76,7 @@ export class BackendUI extends Abject {
   private lastMouseX = 0;
   private lastMouseY = 0;
   private lastMonitorMoveTime = 0;
+  private activeWorkspaceId?: string;
 
   constructor() {
     super({
@@ -359,6 +361,23 @@ export class BackendUI extends Abject {
     this.on('setSurfaceVisible', async (msg: AbjectMessage) => {
       const { surfaceId, visible } = msg.payload as { surfaceId: string; visible: boolean };
       this.sendToFrontend({ type: 'setSurfaceVisible', surfaceId, visible });
+      return true;
+    });
+
+    this.on('setSurfaceWorkspace', async (msg: AbjectMessage) => {
+      const { surfaceId, workspaceId } = msg.payload as { surfaceId: string; workspaceId: string };
+      const state = this.surfaces.get(surfaceId);
+      if (state) {
+        state.workspaceId = workspaceId;
+      }
+      this.sendToFrontend({ type: 'setSurfaceWorkspace', surfaceId, workspaceId });
+      return true;
+    });
+
+    this.on('setActiveWorkspace', async (msg: AbjectMessage) => {
+      const { workspaceId } = msg.payload as { workspaceId: string };
+      this.activeWorkspaceId = workspaceId;
+      this.sendToFrontend({ type: 'setActiveWorkspace', workspaceId });
       return true;
     });
 
@@ -933,7 +952,26 @@ export class BackendUI extends Abject {
       }
     }
 
-    // 3. Restore focus
+    // 3. Replay workspace assignments
+    for (const state of this.surfaces.values()) {
+      if (state.workspaceId) {
+        this.sendToFrontend({
+          type: 'setSurfaceWorkspace',
+          surfaceId: state.surfaceId,
+          workspaceId: state.workspaceId,
+        });
+      }
+    }
+
+    // 4. Replay active workspace filter
+    if (this.activeWorkspaceId) {
+      this.sendToFrontend({
+        type: 'setActiveWorkspace',
+        workspaceId: this.activeWorkspaceId,
+      });
+    }
+
+    // 5. Restore focus
     if (this.focusedSurface && this.surfaces.has(this.focusedSurface)) {
       this.sendToFrontend({
         type: 'setFocused',

@@ -221,7 +221,7 @@ export class Registry extends Abject {
 
     this.on('discover', async (msg: AbjectMessage) => {
       const query = msg.payload as DiscoveryQuery;
-      return this.discoverObjects(query);
+      return this.handleDiscover(query);
     });
 
     this.on('subscribe', async (msg: AbjectMessage) => {
@@ -391,6 +391,13 @@ export class Registry extends Abject {
    */
   lookupObject(objectId: AbjectId): ObjectRegistration | null {
     return this.objects.get(objectId) ?? null;
+  }
+
+  /**
+   * Handle a discover request. Override in subclasses to add fallback behavior.
+   */
+  protected async handleDiscover(query: DiscoveryQuery): Promise<ObjectRegistration[]> {
+    return this.discoverObjects(query);
   }
 
   /**
