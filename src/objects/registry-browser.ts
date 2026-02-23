@@ -125,7 +125,6 @@ export class RegistryBrowser extends Abject {
     this.registryId = await this.requireDep('Registry');
     this.objectCreatorId = await this.discoverDep('ObjectCreator') ?? undefined;
     this.factoryId = await this.discoverDep('Factory') ?? undefined;
-    this.abjectEditorId = await this.discoverDep('AbjectEditor') ?? undefined;
 
     // Discover the global "SystemRegistry" registered by WorkspaceManager
     this.systemRegistryId = await this.discoverDep('SystemRegistry') ?? undefined;
@@ -1037,9 +1036,15 @@ export class RegistryBrowser extends Abject {
     if (fromId === this.editSourceBtnId && this.detailIndex !== undefined) {
       const source = this.selectedKindIsSystem ? this.systemObjects : this.cachedObjects;
       const obj = source[this.detailIndex];
-      if (obj && this.abjectEditorId) {
-        await this.request(request(this.id, this.abjectEditorId,
-          'abjects:abject-editor' as InterfaceId, 'show', { objectId: obj.id }));
+      if (obj) {
+        // Lazy-discover AbjectEditor (per-workspace, may not exist at onInit time)
+        if (!this.abjectEditorId) {
+          this.abjectEditorId = await this.discoverDep('AbjectEditor') ?? undefined;
+        }
+        if (this.abjectEditorId) {
+          await this.request(request(this.id, this.abjectEditorId,
+            'abjects:abject-editor' as InterfaceId, 'show', { objectId: obj.id }));
+        }
       }
       return;
     }
