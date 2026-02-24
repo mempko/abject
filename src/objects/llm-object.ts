@@ -7,6 +7,7 @@ import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
 import { Capabilities } from '../core/capability.js';
 import * as msg from '../core/message.js';
+import { event } from '../core/message.js';
 import {
   LLMProvider,
   FetchDelegate,
@@ -160,7 +161,7 @@ export class LLMObject extends Abject {
   private setupHandlers(): void {
     this.on('complete', async (msg: AbjectMessage) => {
       const { messages, options, provider } = msg.payload as LLMQueryPayload;
-      return this.complete(messages, options, provider);
+      return this.complete(messages, options, provider, msg.routing.from);
     });
 
     this.on('generateCode', async (msg: AbjectMessage) => {
@@ -215,7 +216,7 @@ export class LLMObject extends Abject {
     return async (url: string, init: RequestInit, options?: { timeout?: number }): Promise<FetchResult> => {
       require(self.httpClientId !== undefined, 'httpClientId not set');
 
-      const timeout = options?.timeout ?? 120000;
+      const timeout = options?.timeout ?? 300000;
 
       // Resolve relative URLs (e.g. /api/anthropic/v1/messages) to absolute
       const resolvedUrl = url.startsWith('/') && typeof window !== 'undefined'
@@ -285,7 +286,8 @@ export class LLMObject extends Abject {
   async complete(
     messages: LLMMessage[],
     options?: LLMCompletionOptions,
-    providerName?: string
+    providerName?: string,
+    callerId?: AbjectId
   ): Promise<LLMCompletionResult> {
     const provider = this.getProvider(providerName);
     require(provider !== undefined, 'No LLM provider available');
@@ -293,6 +295,20 @@ export class LLMObject extends Abject {
     const totalChars = messages.reduce((sum, m) => sum + (m.content?.length ?? 0), 0);
     console.log(`[LLM] → ${provider!.name} | ${messages.length} msgs | ${totalChars} chars | tier=${options?.tier ?? 'default'} maxTokens=${options?.maxTokens ?? 'default'}`);
     const start = Date.now();
+
+    // Send keep-alive progress events every 30s so upstream timeouts don't fire
+    const KEEPALIVE_MS = 30000;
+    let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+    if (callerId) {
+      keepaliveTimer = setInterval(() => {
+        this.send(
+          event(this.id, callerId, 'abjects:llm' as InterfaceId, 'progress', {
+            phase: 'llm-waiting',
+            message: `LLM request in progress (${Math.round((Date.now() - start) / 1000)}s)`,
+          })
+        ).catch(() => {});
+      }, KEEPALIVE_MS);
+    }
 
     try {
       const result = await provider!.complete(messages, options);
@@ -304,6 +320,8 @@ export class LLMObject extends Abject {
       const errMsg = err instanceof Error ? err.message : String(err);
       console.error(`[LLM] ✗ ${provider!.name} | ${elapsed}ms | ${errMsg}`);
       throw err;
+    } finally {
+      if (keepaliveTimer) clearInterval(keepaliveTimer);
     }
   }
 

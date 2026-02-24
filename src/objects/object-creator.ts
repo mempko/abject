@@ -76,10 +76,12 @@ interface SelectedDependency {
 export class ObjectCreator extends Abject {
   private llmId?: AbjectId;
   private registryId?: AbjectId;
+  private systemRegistryId?: AbjectId;
   private factoryId?: AbjectId;
   private negotiatorId?: AbjectId;
   private abjectStoreId?: AbjectId;
   private widgetManagerId?: AbjectId;
+  private _currentCallerId?: AbjectId;
 
   constructor() {
     super({
@@ -235,6 +237,18 @@ export class ObjectCreator extends Abject {
     this.on('getObjectGraph', async () => {
       return this.getObjectGraph();
     });
+
+    // Forward LLM keep-alive progress events to the upstream caller
+    this.on('progress', async (msg: AbjectMessage) => {
+      if (this._currentCallerId) {
+        const payload = msg.payload as { phase?: string; message?: string };
+        await this.reportProgress(
+          this._currentCallerId,
+          payload.phase ?? 'llm',
+          payload.message ?? 'LLM processing...'
+        );
+      }
+    });
   }
 
   protected override async onInit(): Promise<void> {
@@ -243,6 +257,7 @@ export class ObjectCreator extends Abject {
     this.factoryId = await this.requireDep('Factory');
     this.negotiatorId = await this.requireDep('Negotiator');
     this.abjectStoreId = await this.discoverDep('AbjectStore') ?? undefined;
+    this.systemRegistryId = await this.discoverDep('SystemRegistry') ?? undefined;
     this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
   }
 
@@ -294,7 +309,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
   private async llmComplete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
     return this.request<LLMCompletionResult>(
       request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', { messages, options }),
-      120000
+      310000
     );
   }
 
@@ -304,6 +319,16 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
   private async registryList(): Promise<ObjectRegistration[]> {
     return this.request<ObjectRegistration[]>(
       request(this.id, this.registryId!, 'abjects:registry' as InterfaceId, 'list', {})
+    );
+  }
+
+  /**
+   * List objects from the system (global) registry via message passing.
+   */
+  private async systemRegistryList(): Promise<ObjectRegistration[]> {
+    if (!this.systemRegistryId) return [];
+    return this.request<ObjectRegistration[]>(
+      request(this.id, this.systemRegistryId, 'abjects:registry' as InterfaceId, 'list', {})
     );
   }
 
@@ -364,11 +389,19 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
 
   /**
    * Phase 0a: Get summaries (name + description) of all registered objects.
+   * Queries both the workspace registry and the system registry, deduplicating by ID.
    */
   private async discoverObjectSummaries(): Promise<ObjectSummary[]> {
-    if (!this.registryId) return [];
-    const allObjects = await this.registryList();
-    return allObjects.map((o) => ({
+    const allObjects: ObjectRegistration[] = [];
+    if (this.registryId) allObjects.push(...await this.registryList());
+    if (this.systemRegistryId) allObjects.push(...await this.systemRegistryList());
+    // Deduplicate by ID
+    const seen = new Set<string>();
+    return allObjects.filter(o => {
+      if (seen.has(o.id)) return false;
+      seen.add(o.id);
+      return true;
+    }).map(o => ({
       id: o.id,
       name: o.manifest.name,
       description: o.manifest.description,
@@ -592,6 +625,8 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
     require(this.registryId !== undefined, 'Registry not set');
 
     try {
+      this._currentCallerId = callerId;
+
       // Phase 0a: Get object summaries
       if (callerId) await this.reportProgress(callerId, '0a', 'Discovering available objects...');
       const summaries = await this.discoverObjectSummaries();
@@ -622,6 +657,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
       if (callerId) await this.reportProgress(callerId, '1', 'Designing object manifest...');
       const phase1 = await this.generateManifest(prompt, depContext, context);
       if (!phase1.manifest) {
+        this._currentCallerId = undefined;
         return { success: false, error: 'Phase 1: Failed to generate valid manifest' };
       }
 
@@ -737,6 +773,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           source: code,
           owner: this.id,
           parentId: this.id,
+          registryHint: this.registryId,
         });
 
         // Phase 6: Connect to dependencies via Negotiator (fire-and-forget)
@@ -756,28 +793,24 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           }
         }
 
-        // Tag the new object with the caller's workspace so its windows
+        // Tag the new object with ObjectCreator's own workspace so its windows
         // are scoped to the workspace where it was created
-        if (this.widgetManagerId && spawnResult.objectId && callerId) {
+        if (this.widgetManagerId && spawnResult.objectId) {
           try {
-            const callerWorkspace = await this.request<string | null>(
+            const wsId = await this.request<string | null>(
               request(this.id, this.widgetManagerId,
-                'abjects:widgets' as InterfaceId, 'getObjectWorkspace', {
-                  objectId: callerId,
-                })
+                'abjects:widgets' as InterfaceId, 'getObjectWorkspace', { objectId: this.id })
             );
-            if (callerWorkspace) {
+            if (wsId) {
               await this.request(
                 request(this.id, this.widgetManagerId,
                   'abjects:widgets' as InterfaceId, 'setObjectWorkspace', {
                     objectId: spawnResult.objectId,
-                    workspaceId: callerWorkspace,
+                    workspaceId: wsId,
                   })
               );
             }
-          } catch {
-            // Best effort — WidgetManager may not be ready
-          }
+          } catch { /* best effort */ }
         }
 
         // Persist to AbjectStore (fire-and-forget)
@@ -789,6 +822,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           ).catch(err => console.warn('[OBJECT-CREATOR] Failed to persist:', err));
         }
 
+        this._currentCallerId = undefined;
         return {
           success: true,
           objectId: spawnResult.objectId,
@@ -798,6 +832,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         };
       }
 
+      this._currentCallerId = undefined;
       return {
         success: true,
         manifest,
@@ -805,6 +840,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         usedObjects: phase1.usedObjects,
       };
     } catch (err) {
+      this._currentCallerId = undefined;
       return {
         success: false,
         error: err instanceof Error ? err.message : String(err),
@@ -891,6 +927,8 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
     const currentSource = await this.registryGetSource(objectId);
 
     try {
+      this._currentCallerId = callerId;
+
       // Phase 0a: Get object summaries
       if (callerId) await this.reportProgress(callerId, '0a', 'Discovering available objects...');
       const summaries = await this.discoverObjectSummaries();
@@ -1031,27 +1069,11 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
       // Phase 5: Apply changes to live object and registry
       if (callerId) await this.reportProgress(callerId, '5', 'Applying changes...');
 
-      // 5a0: Tear down existing UI before replacing source (prevents orphaned surfaces/timers)
-      const hasHide = registration.manifest.interfaces.some(
-        i => i.methods.some(m => m.name === 'hide')
-      );
-      const hasShow = registration.manifest.interfaces.some(
-        i => i.methods.some(m => m.name === 'show')
-      );
-      if (hasHide) {
-        try {
-          const iface = registration.manifest.interfaces[0].id;
-          await this.request(
-            request(this.id, objectId, iface as InterfaceId, 'hide', {}),
-            10000
-          );
-        } catch { /* best-effort — object may not be visible */ }
-      }
-
-      // 5a: Update source on the live ScriptableAbject
+      // 5a: Update source on the live ScriptableAbject (hot-reload: hide → swap → show)
       try {
         const updateResult = await this.request<{ success: boolean; error?: string }>(
-          request(this.id, objectId, EDITABLE_INTERFACE_ID, 'updateSource', { source: code })
+          request(this.id, objectId, EDITABLE_INTERFACE_ID, 'updateSource', { source: code }),
+          30000  // generous timeout — hide + applySource + show may take time
         );
         if (!updateResult.success) {
           return { success: false, error: `Failed to apply source to live object: ${updateResult.error}`, code };
@@ -1076,17 +1098,6 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         ).catch(err => console.warn('[OBJECT-CREATOR modify] Failed to persist:', err));
       }
 
-      // 5d: Re-show if object had show/hide (UI teardown was performed above)
-      if (hasHide && hasShow) {
-        try {
-          const newIface = manifest.interfaces[0].id;
-          await this.request(
-            request(this.id, objectId, newIface as InterfaceId, 'show', {}),
-            10000
-          );
-        } catch { /* best-effort — show may fail */ }
-      }
-
       // Phase 6: Connect to any new dependencies via Negotiator
       if (callerId && deps.length > 0) {
         const connectNames = deps.map((d) => d.name).join(', ');
@@ -1104,6 +1115,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         }
       }
 
+      this._currentCallerId = undefined;
       return {
         success: true,
         objectId,
@@ -1112,6 +1124,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         usedObjects: phaseM.usedObjects,
       };
     } catch (err) {
+      this._currentCallerId = undefined;
       return {
         success: false,
         error: err instanceof Error ? err.message : String(err),

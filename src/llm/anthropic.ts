@@ -121,7 +121,7 @@ export class AnthropicProvider extends BaseLLMProvider {
         'anthropic-dangerous-direct-browser-access': 'true',
       },
       body: JSON.stringify(request),
-    });
+    }, { timeout: 300000 });
 
     const data = JSON.parse(response.body) as AnthropicResponse;
 

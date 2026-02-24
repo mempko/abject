@@ -110,7 +110,7 @@ export class OllamaProvider extends BaseLLMProvider {
       method: 'POST',
       headers: this.buildHeaders(),
       body: JSON.stringify(request),
-    });
+    }, { timeout: 300000 });
 
     const data = JSON.parse(response.body) as OllamaResponse;
 
