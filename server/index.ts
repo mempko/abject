@@ -38,7 +38,9 @@ import { WorkspaceRegistry } from '../src/objects/workspace-registry.js';
 import { WorkspaceSwitcher } from '../src/objects/workspace-switcher.js';
 import { GlobalSettings } from '../src/objects/global-settings.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
+import { NodeWorkerAdapter } from './node-worker-adapter.js';
 import * as path from 'node:path';
+import os from 'node:os';
 
 const WS_PORT = parseInt(process.env.WS_PORT ?? '7719', 10);
 
@@ -52,8 +54,25 @@ async function main(): Promise<void> {
   // Reset any stale singleton state
   resetRuntime();
 
+  // Auto-detect worker count from available CPU cores.
+  // Leave 1 core for the main thread; minimum 1 worker.
+  // Set ABJECTS_WORKER_COUNT=N env var to override (0 to disable workers).
+  const cpuCount = os.cpus().length;
+  const defaultWorkerCount = Math.max(1, cpuCount - 1);
+  const envOverride = process.env.ABJECTS_WORKER_COUNT;
+  const workerCount = envOverride !== undefined ? parseInt(envOverride, 10) : defaultWorkerCount;
+  const workerEnabled = workerCount > 0;
+  const workerScriptPath = new URL('../workers/abject-worker-node.ts', import.meta.url);
+
   // Create runtime
-  const runtime = getRuntime({ debug: !!process.env.DEBUG });
+  const runtime = getRuntime({
+    debug: !!process.env.DEBUG,
+    workerEnabled,
+    workerCount,
+    workerFactory: workerEnabled
+      ? () => new NodeWorkerAdapter(workerScriptPath)
+      : undefined,
+  });
 
   // Create BackendUI (replaces UIServer)
   const backendUI = new BackendUI();
@@ -138,6 +157,20 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('WorkspaceRegistry', () => new WorkspaceRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
   runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
+
+  // Mark worker-eligible constructors (only used when workerEnabled).
+  // Only global objects that are spawned top-level (not per-workspace)
+  // should be worker-eligible to avoid dependency-ordering issues.
+  if (runtime.config.workerEnabled) {
+    const workerEligible = [
+      'LLMObject', 'HttpClient', 'Timer',
+      'Console', 'FileSystem', 'ProxyGenerator',
+      'Negotiator', 'HealthMonitor',
+    ];
+    for (const name of workerEligible) {
+      runtime.objectFactory.markWorkerEligible(name);
+    }
+  }
 
   // Spawn Supervisor early so it can supervise other objects
   const supervisorId = await factorySpawn('Supervisor');

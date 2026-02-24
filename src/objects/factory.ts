@@ -12,11 +12,13 @@ import {
   SpawnResult,
   CapabilityGrant,
 } from '../core/types.js';
+import { v4 as uuidv4 } from 'uuid';
 import { Abject } from '../core/abject.js';
 import { require, invariant } from '../core/contracts.js';
 import { Capabilities } from '../core/capability.js';
 import { request } from '../core/message.js';
-import { MessageBus } from '../runtime/message-bus.js';
+import type { MessageBusLike } from '../runtime/message-bus.js';
+import type { WorkerPool } from '../runtime/worker-pool.js';
 import { ScriptableAbject } from './scriptable-abject.js';
 import { CompositeAbject } from './composite-abject.js';
 import type { CompositeSpec } from './composite-abject.js';
@@ -31,8 +33,13 @@ export type ObjectFactory = (args?: unknown) => Abject;
 export class Factory extends Abject {
   private spawned: Map<AbjectId, Abject> = new Map();
   private constructors: Map<string, ObjectFactory> = new Map();
-  private _factoryBus?: MessageBus;
+  private _factoryBus?: MessageBusLike;
   private _factoryRegistryId?: AbjectId;
+
+  // Worker parallelism
+  private _workerPool?: WorkerPool;
+  private workerEligible: Set<string> = new Set();
+  private workerSpawned: Map<AbjectId, string> = new Map(); // objectId → constructorName
 
   constructor() {
     super({
@@ -174,7 +181,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
   /**
    * Set the message bus for spawned objects.
    */
-  setBus(bus: MessageBus): void {
+  setBus(bus: MessageBusLike): void {
     this._factoryBus = bus;
   }
 
@@ -183,6 +190,27 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
    */
   setRegistryId(id: AbjectId): void {
     this._factoryRegistryId = id;
+  }
+
+  /**
+   * Set the worker pool for off-main-thread object execution.
+   */
+  setWorkerPool(pool: WorkerPool): void {
+    this._workerPool = pool;
+  }
+
+  /**
+   * Mark a constructor name as eligible for worker execution.
+   */
+  markWorkerEligible(name: string): void {
+    this.workerEligible.add(name);
+  }
+
+  /**
+   * Check if an object is hosted in a worker.
+   */
+  isWorkerHosted(objectId: AbjectId): boolean {
+    return this.workerSpawned.has(objectId);
   }
 
   /**
@@ -228,6 +256,43 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
    */
   async respawn(objectId: AbjectId, constructorName: string, parentId?: AbjectId): Promise<SpawnResult> {
     require(this._factoryBus !== undefined, 'Factory must have a message bus');
+
+    // Worker path: if the constructor is worker-eligible and pool exists
+    if (this._workerPool && this.workerEligible.has(constructorName)) {
+      // Kill old worker instance if tracked
+      if (this.workerSpawned.has(objectId)) {
+        if (this._factoryRegistryId) {
+          try {
+            await this.request(
+              request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
+            );
+          } catch { /* may not be registered */ }
+        }
+        await this._workerPool.killInWorker(objectId);
+        this.workerSpawned.delete(objectId);
+      }
+
+      // Respawn in worker with same ID
+      await this._workerPool.spawnInWorker(objectId, constructorName);
+      this.workerSpawned.set(objectId, constructorName);
+
+      const manifest = { name: constructorName, description: '', version: '1.0.0',
+        interfaces: [], requiredCapabilities: [] as never[], tags: ['system'] };
+      const status = {
+        id: objectId, state: 'ready' as const, manifest, connections: [] as AbjectId[],
+        errorCount: 0, startedAt: Date.now(), lastActivity: Date.now(),
+      };
+
+      if (this._factoryRegistryId) {
+        await this.request(
+          request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'register', {
+            objectId, manifest, status,
+          })
+        );
+      }
+
+      return { objectId, status };
+    }
 
     // Kill old instance if still tracked
     const old = this.spawned.get(objectId);
@@ -299,6 +364,11 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
 
     // Check if we have a registered factory
     const factory = this.constructors.get(req.manifest.name);
+
+    // Worker path: if the constructor is worker-eligible, delegate to WorkerPool
+    if (factory && this._workerPool && this.workerEligible.has(req.manifest.name)) {
+      return this.spawnInWorker(req);
+    }
 
     let obj: Abject;
 
@@ -411,9 +481,99 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
   }
 
   /**
+   * Spawn an object in a Web Worker via the WorkerPool.
+   * The object runs off-main-thread; the main thread only holds its ID.
+   */
+  private async spawnInWorker(req: SpawnRequest): Promise<SpawnResult> {
+    require(this._workerPool !== undefined, 'WorkerPool must be set');
+
+    // Generate the object ID on the main thread (so we can register with Registry)
+    const objectId = uuidv4() as AbjectId;
+
+    // Create a temporary instance to get the real manifest (constructor name
+    // in the constructors map may differ from manifest.name)
+    const factory = this.constructors.get(req.manifest.name)!;
+    const tempObj = factory(req.constructorArgs);
+    const realManifest = tempObj.manifest;
+
+    // Spawn in worker — pass registryId and parentId so the worker-side
+    // object can discover dependencies and communicate with the bus hub
+    await this._workerPool!.spawnInWorker(objectId, req.manifest.name, {
+      constructorArgs: req.constructorArgs,
+      registryId: this._factoryRegistryId,
+      parentId: req.parentId ?? this.id,
+    });
+
+    // Track as worker-spawned
+    this.workerSpawned.set(objectId, req.manifest.name);
+
+    // Register with registry from main thread using the real manifest
+    const targetRegistry = req.registryHint ?? (req.skipGlobalRegistry ? undefined : this._factoryRegistryId);
+    if (targetRegistry) {
+      const now = Date.now();
+      await this.request(
+        request(this.id, targetRegistry, 'abjects:registry' as InterfaceId, 'register', {
+          objectId,
+          manifest: realManifest,
+          status: {
+            id: objectId,
+            state: 'ready',
+            manifest: realManifest,
+            connections: [] as AbjectId[],
+            errorCount: 0,
+            startedAt: now,
+            lastActivity: now,
+          },
+        })
+      );
+    }
+
+    const now = Date.now();
+    return {
+      objectId,
+      status: {
+        id: objectId,
+        state: 'ready',
+        manifest: realManifest,
+        connections: [] as AbjectId[],
+        errorCount: 0,
+        startedAt: now,
+        lastActivity: now,
+      },
+    };
+  }
+
+  /**
+   * Kill a worker-hosted object.
+   */
+  private async killWorkerObject(objectId: AbjectId): Promise<boolean> {
+    if (!this._workerPool) return false;
+
+    // Unregister from registry
+    if (this._factoryRegistryId) {
+      try {
+        await this.request(
+          request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
+        );
+      } catch { /* may not be registered */ }
+    }
+
+    // Kill in worker
+    await this._workerPool.killInWorker(objectId);
+    this.workerSpawned.delete(objectId);
+
+    return true;
+  }
+
+  /**
    * Kill an object.
    */
   async kill(objectId: AbjectId): Promise<boolean> {
+    // Check if this is a worker-hosted object
+    if (this.workerSpawned.has(objectId)) {
+      return this.killWorkerObject(objectId);
+    }
+
     const obj = this.spawned.get(objectId);
     if (!obj) {
       return false;

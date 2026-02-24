@@ -18,7 +18,7 @@ import {
 import { require, invariant, requireNonEmpty } from './contracts.js';
 import { reply, error, errorFromException, event, request, isRequest, isReply, isError } from './message.js';
 import { Mailbox } from '../runtime/mailbox.js';
-import { MessageBus } from '../runtime/message-bus.js';
+import type { MessageBusLike } from '../runtime/message-bus.js';
 import { CapabilitySet, getDefaultCapabilities } from './capability.js';
 import { INTROSPECT_INTERFACE, INTROSPECT_INTERFACE_ID, formatManifestAsDescription } from './introspect.js';
 import type { InterfaceId } from './types.js';
@@ -57,7 +57,7 @@ export abstract class Abject {
   protected readonly startedAt: number;
   protected lastActivity: number;
 
-  private _bus?: MessageBus;
+  private _bus?: MessageBusLike;
   private _mailbox?: Mailbox;
   private _parentId?: AbjectId;
   private _registryId?: AbjectId;
@@ -120,7 +120,7 @@ export abstract class Abject {
   /**
    * Protected accessor for the message bus (for spawning children).
    */
-  protected get bus(): MessageBus {
+  protected get bus(): MessageBusLike {
     require(this._bus !== undefined, 'Object not initialized');
     return this._bus!;
   }
@@ -145,7 +145,7 @@ export abstract class Abject {
    * Initialize the object. Called after registration with the bus.
    * Starts the per-object processing loop.
    */
-  async init(bus: MessageBus, parentId?: AbjectId): Promise<void> {
+  async init(bus: MessageBusLike, parentId?: AbjectId): Promise<void> {
     require(this._status === 'initializing', 'Object must be initializing');
     require(this._bus === undefined, 'Object already initialized');
 

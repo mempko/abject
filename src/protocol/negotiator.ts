@@ -17,7 +17,7 @@ import { require } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { INTROSPECT_INTERFACE_ID, IntrospectResult } from '../core/introspect.js';
 import { GeneratedProxy } from '../objects/proxy-generator.js';
-import { ProxyInterceptor } from '../runtime/message-bus.js';
+import { ProxyInterceptor, MessageBus } from '../runtime/message-bus.js';
 
 const NEGOTIATOR_INTERFACE = 'abjects:negotiator';
 
@@ -258,10 +258,10 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
         agreement = generated.agreement;
         agreement.proxyId = proxyId;
 
-        // Install proxy interceptor
-        if (this.bus && proxyId) {
+        // Install proxy interceptor (requires main-thread MessageBus)
+        if (this.bus && proxyId && this.bus instanceof MessageBus) {
           const interceptor = new ProxyInterceptor(sourceId, targetId, proxyId);
-          this.bus.addInterceptor(interceptor);
+          (this.bus as MessageBus).addInterceptor(interceptor);
           this.connections.set(agreement.agreementId, {
             agreement,
             proxyId,
@@ -317,9 +317,9 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
       return false;
     }
 
-    // Remove interceptor
-    if (connection.interceptor && this.bus) {
-      this.bus.removeInterceptor(connection.interceptor);
+    // Remove interceptor (requires main-thread MessageBus)
+    if (connection.interceptor && this.bus instanceof MessageBus) {
+      (this.bus as MessageBus).removeInterceptor(connection.interceptor);
     }
 
     // Kill proxy via Factory message passing
@@ -375,17 +375,17 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
       connection.agreement = regenerated.agreement;
       connection.agreement.proxyId = proxyId;
 
-      // Update interceptor
-      if (this.bus) {
+      // Update interceptor (requires main-thread MessageBus)
+      if (this.bus instanceof MessageBus) {
         if (connection.interceptor) {
-          this.bus.removeInterceptor(connection.interceptor);
+          (this.bus as MessageBus).removeInterceptor(connection.interceptor);
         }
         const interceptor = new ProxyInterceptor(
           connection.sourceId,
           connection.targetId,
           proxyId
         );
-        this.bus.addInterceptor(interceptor);
+        (this.bus as MessageBus).addInterceptor(interceptor);
         connection.interceptor = interceptor;
       }
 

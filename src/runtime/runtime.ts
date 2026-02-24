@@ -5,6 +5,8 @@
 import { AbjectId } from '../core/types.js';
 import { require, ensure, invariant } from '../core/contracts.js';
 import { MessageBus, LoggingInterceptor } from './message-bus.js';
+import { WorkerPool, WorkerPoolConfig } from './worker-pool.js';
+import type { WorkerLike } from './worker-bridge.js';
 import { Registry } from '../objects/registry.js';
 import { Factory } from '../objects/factory.js';
 import { Abject } from '../core/abject.js';
@@ -12,6 +14,9 @@ import { Abject } from '../core/abject.js';
 export interface RuntimeConfig {
   debug?: boolean;
   workerEnabled?: boolean;
+  workerCount?: number;
+  /** Factory callback that creates a WorkerLike instance. */
+  workerFactory?: () => WorkerLike;
 }
 
 export type RuntimeState = 'created' | 'starting' | 'running' | 'stopping' | 'stopped';
@@ -25,6 +30,7 @@ export class Runtime {
   private registry: Registry;
   private factory: Factory;
   private coreObjects: Map<AbjectId, Abject> = new Map();
+  private _workerPool?: WorkerPool;
 
   constructor(private readonly _config: RuntimeConfig = {}) {
     this.bus = new MessageBus();
@@ -65,6 +71,20 @@ export class Runtime {
   }
 
   /**
+   * Get the runtime config.
+   */
+  get config(): RuntimeConfig {
+    return this._config;
+  }
+
+  /**
+   * Get the worker pool (undefined if workers not enabled).
+   */
+  get workerPool(): WorkerPool | undefined {
+    return this._workerPool;
+  }
+
+  /**
    * Start the runtime.
    */
   async start(): Promise<void> {
@@ -74,6 +94,19 @@ export class Runtime {
 
     // Bootstrap core objects
     await this.bootstrapCore();
+
+    // Start worker pool if enabled
+    if (this._config.workerEnabled && this._config.workerFactory) {
+      const poolConfig: WorkerPoolConfig = {
+        workerCount: this._config.workerCount ?? 2,
+        workerFactory: this._config.workerFactory,
+      };
+      this._workerPool = new WorkerPool(poolConfig, this.bus);
+      await this._workerPool.start();
+      this.bus.setWorkerPool(this._workerPool);
+      this.factory.setWorkerPool(this._workerPool);
+      console.log(`[RUNTIME] Worker pool started with ${poolConfig.workerCount} workers`);
+    }
 
     this.state = 'running';
 
@@ -93,6 +126,12 @@ export class Runtime {
     );
 
     this.state = 'stopping';
+
+    // Shut down worker pool first (kills all worker-hosted objects)
+    if (this._workerPool) {
+      await this._workerPool.shutdown();
+      this._workerPool = undefined;
+    }
 
     // Stop all spawned objects
     for (const obj of this.factory.getAllObjects()) {

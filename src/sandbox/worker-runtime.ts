@@ -5,7 +5,7 @@
 import { AbjectId, AbjectMessage } from '../core/types.js';
 import { require } from '../core/contracts.js';
 import { serialize, deserialize } from '../core/message.js';
-import { MessageBus } from '../runtime/message-bus.js';
+import type { MessageBusLike } from '../runtime/message-bus.js';
 
 export type WorkerMessageType =
   | 'init'
@@ -39,7 +39,7 @@ export class WorkerRuntime {
   private readyResolve!: () => void;
   private pendingSpawns: Map<AbjectId, PendingSpawn> = new Map();
   private objectStatus: Map<AbjectId, ObjectStatus> = new Map();
-  private bus?: MessageBus;
+  private bus?: MessageBusLike;
 
   constructor(workerUrl: string | URL) {
     this.worker = new Worker(workerUrl, { type: 'module' });
@@ -57,7 +57,7 @@ export class WorkerRuntime {
   /**
    * Set the message bus for routing messages from objects.
    */
-  setBus(bus: MessageBus): void {
+  setBus(bus: MessageBusLike): void {
     this.bus = bus;
   }
 

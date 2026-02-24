@@ -10,9 +10,23 @@ import { AbjectMessage, AbjectId, AbjectError, InterfaceId } from '../core/types
 import { require, ensure, invariant, requireNonEmpty } from '../core/contracts.js';
 import { request as createRequest, error as createError } from '../core/message.js';
 import { Mailbox } from './mailbox.js';
+import type { WorkerPool } from './worker-pool.js';
 
 export type MessageHandler = (message: AbjectMessage) => void | Promise<void>;
 export type ReplyHandler = (message: AbjectMessage) => void;
+
+/**
+ * The subset of MessageBus that Abject.init() depends on.
+ * Both MessageBus (main thread) and WorkerBus (worker thread) implement this.
+ */
+export interface MessageBusLike {
+  register(objectId: AbjectId): Mailbox;
+  setReplyHandler(objectId: AbjectId, handler: ReplyHandler): void;
+  removeReplyHandler(objectId: AbjectId): void;
+  unregister(objectId: AbjectId): void;
+  send(message: AbjectMessage): Promise<void>;
+  isRegistered(objectId: AbjectId): boolean;
+}
 
 interface Subscription {
   id: string;
@@ -26,13 +40,17 @@ interface Subscription {
  * Non-blocking: send() enqueues in mailbox, never awaits handler completion.
  * Reply fast-path: replies resolve pending Promises directly, bypassing mailbox.
  */
-export class MessageBus {
+export class MessageBus implements MessageBusLike {
   private mailboxes: Map<AbjectId, Mailbox> = new Map();
   private replyHandlers: Map<AbjectId, ReplyHandler> = new Map();
   private subscriptions: Subscription[] = [];
   private interceptors: MessageInterceptor[] = [];
   private messageCount = 0;
   private _running = false;
+
+  // Worker parallelism — set of object IDs hosted in workers
+  private workerObjects: Set<AbjectId> = new Set();
+  private _workerPool?: WorkerPool;
 
   /**
    * Register an object with the bus. Creates a mailbox for the object.
@@ -86,10 +104,10 @@ export class MessageBus {
   }
 
   /**
-   * Check if an object is registered.
+   * Check if an object is registered (locally or in a worker).
    */
   isRegistered(objectId: AbjectId): boolean {
-    return this.mailboxes.has(objectId);
+    return this.mailboxes.has(objectId) || this.workerObjects.has(objectId);
   }
 
   /**
@@ -126,6 +144,22 @@ export class MessageBus {
 
     const recipient = message.routing.to;
 
+    // Worker routing: if recipient is in a worker, forward via WorkerPool
+    if (this.workerObjects.has(recipient) && this._workerPool) {
+      const bridge = this._workerPool.getBridgeForObject(recipient);
+      if (bridge) {
+        // Reply fast-path: forward replies directly for fast resolution
+        if ((message.header.type === 'reply' || message.header.type === 'error')
+            && message.header.correlationId) {
+          bridge.deliverReply(message);
+        } else {
+          bridge.deliverMessage(message);
+        }
+        this.messageCount++;
+        return;
+      }
+    }
+
     // Check if recipient exists locally
     if (!this.mailboxes.has(recipient)) {
       console.warn(`[MessageBus] UNDELIVERABLE: ${message.header.type} ${message.routing.method ?? '?'} from=${message.routing.from.slice(0,8)} to=${recipient.slice(0,8)} (not registered)`);
@@ -134,7 +168,8 @@ export class MessageBus {
       // fast-path so the sender's request() rejects instantly instead of
       // waiting for a 30s timeout.
       if (message.header.type === 'request') {
-        const replyHandler = this.replyHandlers.get(message.routing.from);
+        const sender = message.routing.from;
+        const replyHandler = this.replyHandlers.get(sender);
         if (replyHandler) {
           replyHandler(createError(
             message,
@@ -142,6 +177,17 @@ export class MessageBus {
             `Recipient ${recipient} is not registered`,
           ));
           this.messageCount++;
+        } else if (this.workerObjects.has(sender) && this._workerPool) {
+          // Sender is in a worker — route error reply through bridge
+          const senderBridge = this._workerPool.getBridgeForObject(sender);
+          if (senderBridge) {
+            senderBridge.deliverReply(createError(
+              message,
+              'RECIPIENT_NOT_FOUND',
+              `Recipient ${recipient} is not registered`,
+            ));
+            this.messageCount++;
+          }
         }
       }
 
@@ -227,6 +273,34 @@ export class MessageBus {
    */
   get objectCount(): number {
     return this.mailboxes.size;
+  }
+
+  /**
+   * Set the worker pool for cross-worker message routing.
+   */
+  setWorkerPool(pool: WorkerPool): void {
+    this._workerPool = pool;
+  }
+
+  /**
+   * Register an object ID as worker-hosted (lives in a Web Worker, not main thread).
+   */
+  registerWorkerObject(objectId: AbjectId): void {
+    this.workerObjects.add(objectId);
+  }
+
+  /**
+   * Unregister a worker-hosted object.
+   */
+  unregisterWorkerObject(objectId: AbjectId): void {
+    this.workerObjects.delete(objectId);
+  }
+
+  /**
+   * Check if an object is hosted in a worker.
+   */
+  isWorkerObject(objectId: AbjectId): boolean {
+    return this.workerObjects.has(objectId);
   }
 
   /**

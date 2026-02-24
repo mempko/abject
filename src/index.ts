@@ -5,6 +5,7 @@
  */
 
 import { createApp, App } from './ui/app.js';
+import type { WorkerLike } from './runtime/worker-bridge.js';
 import { AbjectId, AbjectMessage, InterfaceId, SpawnResult } from './core/types.js';
 import { LLMObject } from './objects/llm-object.js';
 import { ObjectCreator } from './objects/object-creator.js';
@@ -42,7 +43,12 @@ import { GlobalSettings } from './objects/global-settings.js';
 export { App, createApp } from './ui/app.js';
 export { Runtime, getRuntime } from './runtime/runtime.js';
 export { MessageBus, HealthInterceptor } from './runtime/message-bus.js';
+export type { MessageBusLike } from './runtime/message-bus.js';
 export { Mailbox } from './runtime/mailbox.js';
+export { WorkerBus } from './runtime/worker-bus.js';
+export { WorkerBridge } from './runtime/worker-bridge.js';
+export type { WorkerLike } from './runtime/worker-bridge.js';
+export { WorkerPool, workerIndexForId } from './runtime/worker-pool.js';
 export { Abject, SimpleAbject, DEFERRED_REPLY } from './core/abject.js';
 export { Registry, REGISTRY_ID } from './objects/registry.js';
 export { Factory, FACTORY_ID } from './objects/factory.js';
@@ -193,10 +199,29 @@ async function main(): Promise<App> {
   const anthropicKey = (window as unknown as Record<string, unknown>).ANTHROPIC_API_KEY as string | undefined;
   const openaiKey = (window as unknown as Record<string, unknown>).OPENAI_API_KEY as string | undefined;
 
+  // Auto-detect worker count from available CPU cores.
+  // Leave 1 core for the main thread; minimum 1 worker.
+  // Set window.ABJECTS_WORKER_COUNT = N to override (0 to disable workers).
+  const hwCores = navigator.hardwareConcurrency ?? 4;
+  const defaultWorkerCount = Math.max(1, hwCores - 1);
+  const workerCountOverride = (window as unknown as Record<string, unknown>).ABJECTS_WORKER_COUNT;
+  const workerCount = typeof workerCountOverride === 'number' ? workerCountOverride : defaultWorkerCount;
+  const workerEnabled = workerCount > 0;
+
+  // Worker URL — Vite bundles this via the `?url` import suffix in dev and prod
+  const workerUrl = workerEnabled
+    ? new URL('../workers/abject-worker.ts', import.meta.url)
+    : undefined;
+
   // Create application
   const app = await createApp({
     container: '#app',
     debug: true,
+    workerEnabled,
+    workerCount,
+    workerFactory: workerEnabled && workerUrl
+      ? () => new Worker(workerUrl, { type: 'module' }) as unknown as WorkerLike
+      : undefined,
   });
 
   const runtime = app.appRuntime;
@@ -271,6 +296,20 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('WorkspaceRegistry', () => new WorkspaceRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
   runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
+
+  // Mark worker-eligible constructors (only used when workerEnabled).
+  // Only global objects that are spawned top-level (not per-workspace)
+  // should be worker-eligible to avoid dependency-ordering issues.
+  if (runtime.config.workerEnabled) {
+    const workerEligible = [
+      'LLMObject', 'HttpClient', 'Timer',
+      'Console', 'FileSystem', 'ProxyGenerator',
+      'Negotiator', 'HealthMonitor',
+    ];
+    for (const name of workerEligible) {
+      runtime.objectFactory.markWorkerEligible(name);
+    }
+  }
 
   // Spawn Supervisor early so it can supervise other objects
   const supervisorId = await factorySpawn('Supervisor');

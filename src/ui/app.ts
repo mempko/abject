@@ -3,6 +3,7 @@
  */
 
 import { Runtime, getRuntime } from '../runtime/runtime.js';
+import type { WorkerLike } from '../runtime/worker-bridge.js';
 import { Compositor } from './compositor.js';
 import { UIServer } from '../objects/ui-server.js';
 import { require } from '../core/contracts.js';
@@ -10,6 +11,10 @@ import { require } from '../core/contracts.js';
 export interface AppConfig {
   container: HTMLElement | string;
   debug?: boolean;
+  workerEnabled?: boolean;
+  workerCount?: number;
+  /** Factory callback that creates a WorkerLike instance. */
+  workerFactory?: () => WorkerLike;
 }
 
 /**
@@ -43,7 +48,12 @@ export class App {
     this.uiServer.setCompositor(this.compositor);
 
     // Create runtime
-    this.runtime = getRuntime({ debug: config.debug });
+    this.runtime = getRuntime({
+      debug: config.debug,
+      workerEnabled: config.workerEnabled,
+      workerCount: config.workerCount,
+      workerFactory: config.workerFactory,
+    });
     this.runtime.registerCoreObject(this.uiServer);
   }
 
