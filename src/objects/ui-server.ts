@@ -577,10 +577,28 @@ Or equivalently:
 
 ### Input Events
 
-UIServer sends 'input' events to surface owners. Implement an 'input' handler:
+UIServer sends 'input' events to surface owners. Keyboard events only arrive when the surface is focused
+(user clicked on it). Event types: mousedown, mouseup, mousemove, keydown, keyup, wheel, paste.
+
+Full event payload shape:
+  { type, surfaceId, x, y, button, key, code, modifiers: { shift, ctrl, alt, meta }, deltaX, deltaY, text }
+
+key vs code:
+  key  = logical key produced: 'a', 'A', 'Enter', 'ArrowUp', ' ' (space)
+  code = physical key location: 'KeyA', 'Enter', 'ArrowUp', 'Space'
+  Use 'key' for character/command input. Use 'code' for positional controls (e.g. WASD).
+
+Example handler with keyboard dispatch:
   async input(msg) {
-    const { type, surfaceId, x, y, button, key, code } = msg.payload;
-    // type: 'mousedown', 'mouseup', 'mousemove', 'keydown', 'keyup', 'wheel', 'paste'
+    const { type, surfaceId, x, y, key, code, modifiers } = msg.payload;
+    if (type === 'keydown') {
+      if (key === 'ArrowUp') { /* move up */ }
+      if (key === 'Enter') { /* confirm */ }
+      if (modifiers.ctrl && key === 'z') { /* undo */ }
+    }
+    if (type === 'mousedown') { /* click at surface-local (x, y) */ }
+    if (type === 'wheel') { /* scroll: deltaX, deltaY */ }
+    if (type === 'paste') { /* pasted text in msg.payload.text */ }
   }`;
   }
 
@@ -1001,6 +1019,8 @@ UIServer sends 'input' events to surface owners. Implement an 'input' handler:
 
     const owner = this.surfaceOwners.get(this.focusedSurface);
     if (!owner) return;
+
+    e.preventDefault();
 
     this.sendInputEvent(owner, {
       type,

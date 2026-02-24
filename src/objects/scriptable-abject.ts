@@ -126,14 +126,39 @@ export class ScriptableAbject extends Abject {
       return this._source;
     });
 
-    this.on('updateSource', (msg: AbjectMessage) => {
+    this.on('updateSource', async (msg: AbjectMessage) => {
       const { source } = msg.payload as { source: string };
       if (msg.routing.from !== this._owner) {
         console.warn(
           `[ScriptableAbject] updateSource called by ${msg.routing.from}, owner is ${this._owner}`
         );
       }
-      return this.applySource(source);
+
+      // Hot-reload: tear down current UI via old hide() handler
+      const currentHide = this.handlers.get('hide');
+      if (currentHide) {
+        try {
+          await currentHide(msg);
+        } catch (err) {
+          console.warn(`[ScriptableAbject:${this.manifest.name}] hide() during reload failed:`, err);
+        }
+      }
+
+      // Swap source (removes old handlers, installs new ones)
+      const result = this.applySource(source);
+      if (!result.success) return result;
+
+      // Hot-reload: re-show via new show() handler
+      const newShow = this.handlers.get('show');
+      if (newShow) {
+        try {
+          await newShow(msg);
+        } catch (err) {
+          console.warn(`[ScriptableAbject:${this.manifest.name}] show() during reload failed:`, err);
+        }
+      }
+
+      return result;
     });
 
     this.installDefaultCloseHandler();

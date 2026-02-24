@@ -179,8 +179,6 @@ async function main(): Promise<void> {
   const proxyGenId = await supervisedSpawn('ProxyGenerator');
   const negotiatorId = await supervisedSpawn('Negotiator');
   const healthMonitorId = await supervisedSpawn('HealthMonitor');
-  const objectCreatorId = await supervisedSpawn('ObjectCreator');
-  const abjectEditorId = await supervisedSpawn('AbjectEditor');
 
   // WorkspaceSwitcher is a global UI (never hidden during workspace switch)
   const workspaceSwitcherId = await supervisedSpawn('WorkspaceSwitcher');
@@ -196,7 +194,7 @@ async function main(): Promise<void> {
   const monitoredIds = [
     httpClientId, llmId, storageId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
-    globalSettingsId, proxyGenId, negotiatorId, objectCreatorId, abjectEditorId,
+    globalSettingsId, proxyGenId, negotiatorId,
     workspaceSwitcherId, workspaceManagerId,
   ];
   for (const objId of monitoredIds) {

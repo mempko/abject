@@ -1019,6 +1019,11 @@ await this.call(btnId, 'abjects:widget', 'update', { style: { disabled: false } 
 - Button: Enter or Space → fires 'click'
 - Checkbox: Space → toggles checked state
 - Select: Enter/Space → opens dropdown; ArrowUp/Down → navigate options; Enter → select; Escape → close
+- TextInput: Backspace/Delete (delete chars), ArrowLeft/Right (move cursor), Home/End (jump to start/end),
+  Ctrl+A (select all), Ctrl+C/X (copy/cut), Enter (fires 'submit' aspect), Tab (bubbles — advances focus),
+  Shift+Arrow (extends selection), printable characters insert text at cursor.
+- TextArea: All TextInput keys plus ArrowUp/Down (line navigation), Tab (inserts 2-space indent, consumed),
+  mouse wheel (scrolls content). Enter inserts a newline (does NOT submit).
 
 ### Layout Types
 
@@ -1055,8 +1060,35 @@ await this.call(canvasId, 'abjects:canvas', 'draw', {
   ]
 });
 
-// Input events arrive in your 'input' handler (coordinates are canvas-local).
-// Keyboard input works after clicking the canvas.
+// Input events: click the canvas to focus it, then keydown/keyup arrive via your 'input' handler.
+// Mouse events (mousedown, mouseup, mousemove, wheel) also arrive with canvas-local x, y coordinates.
+// A synthetic 'canvasResize' event fires when the canvas is resized by the layout system.
+
+// Event payload shape:
+// { type, key, code, modifiers: { shift, ctrl, alt, meta }, x, y, button, deltaX, deltaY }
+//
+// key vs code:
+//   key  = logical key produced: 'a', 'A', 'Enter', 'ArrowUp', ' ' (space)
+//   code = physical key location: 'KeyA', 'Enter', 'ArrowUp', 'Space'
+//   Use 'key' for character input, 'code' for game controls (WASD always same physical keys).
+//
+// Modifier keys: check modifiers.shift, modifiers.ctrl, modifiers.alt, modifiers.meta
+
+// Example: canvas keyboard handler for a game/app
+async input(msg) {
+  const { type, key, code, modifiers, x, y } = msg.payload;
+  if (type === 'keydown') {
+    if (code === 'ArrowUp' || code === 'KeyW') { /* move up */ }
+    if (code === 'ArrowDown' || code === 'KeyS') { /* move down */ }
+    if (key === 'Enter') { /* confirm action */ }
+    if (modifiers.ctrl && key === 'z') { /* undo */ }
+  }
+  if (type === 'mousedown') { /* click at canvas-local (x, y) */ }
+  if (type === 'canvasResize') {
+    const { width, height } = msg.payload;
+    // Adjust layout for new canvas dimensions
+  }
+}
 
 ### Updating Layout Children
 

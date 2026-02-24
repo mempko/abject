@@ -312,8 +312,6 @@ async function main(): Promise<App> {
   const proxyGenId = await supervisedSpawn('ProxyGenerator');
   const negotiatorId = await supervisedSpawn('Negotiator');
   const healthMonitorId = await supervisedSpawn('HealthMonitor');
-  const objectCreatorId = await supervisedSpawn('ObjectCreator');
-  const abjectEditorId = await supervisedSpawn('AbjectEditor');
 
   // WorkspaceSwitcher is a global UI (never hidden during workspace switch)
   const workspaceSwitcherId = await supervisedSpawn('WorkspaceSwitcher');
@@ -329,7 +327,7 @@ async function main(): Promise<App> {
   const monitoredIds = [
     httpClientId, llmId, storageId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
-    globalSettingsId, proxyGenId, negotiatorId, objectCreatorId, abjectEditorId,
+    globalSettingsId, proxyGenId, negotiatorId,
     workspaceSwitcherId, workspaceManagerId,
   ];
   for (const objId of monitoredIds) {
@@ -354,8 +352,6 @@ async function main(): Promise<App> {
     runtime,
     // Direct object references (for debugging and tests)
     llm: getObj(llmId),
-    objectCreator: getObj(objectCreatorId),
-    abjectEditor: getObj(abjectEditorId),
     registry: runtime.objectRegistry,
     factory: runtime.objectFactory,
     httpClient: getObj(httpClientId),
@@ -373,8 +369,6 @@ async function main(): Promise<App> {
     // Object IDs for message-based interaction
     ids: {
       llm: llmId,
-      objectCreator: objectCreatorId,
-      abjectEditor: abjectEditorId,
       registry: registryId,
       factory: factoryId,
       httpClient: httpClientId,

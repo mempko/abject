@@ -17,6 +17,7 @@ const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
 const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 const WORKSPACE_MANAGER_INTERFACE: InterfaceId = 'abjects:workspace-manager';
 const WORKSPACE_SWITCHER_INTERFACE: InterfaceId = 'abjects:workspace-switcher';
+const ABJECT_STORE_INTERFACE: InterfaceId = 'abjects:abject-store';
 
 /**
  * Settings object that provides a per-workspace configuration UI for the
@@ -31,6 +32,7 @@ export class Settings extends Abject {
   private widgetManagerId?: AbjectId;
   private workspaceManagerId?: AbjectId;
   private workspaceSwitcherId?: AbjectId;
+  private abjectStoreId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
 
@@ -38,6 +40,9 @@ export class Settings extends Abject {
   private workspaceNameInputId?: AbjectId;
   private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
+
+  /** Maps delete button AbjectId → object ID for "Created Objects" section. */
+  private objectDeleteButtons: Map<AbjectId, string> = new Map();
 
   /** The workspace ID this Settings instance belongs to (lazy-discovered). */
   private workspaceId?: string;
@@ -86,6 +91,7 @@ export class Settings extends Abject {
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
     this.workspaceSwitcherId = await this.discoverDep('WorkspaceSwitcher') ?? undefined;
+    this.abjectStoreId = await this.discoverDep('AbjectStore') ?? undefined;
   }
 
   /**
@@ -132,6 +138,12 @@ export class Settings extends Abject {
       if (aspect === 'submit') {
         await this.saveSettings();
       }
+
+      // Handle delete button clicks for created objects
+      if (aspect === 'click' && this.objectDeleteButtons.has(fromId)) {
+        const objectId = this.objectDeleteButtons.get(fromId)!;
+        await this.deleteCreatedObject(objectId);
+      }
     });
   }
 
@@ -154,13 +166,26 @@ export class Settings extends Abject {
       } catch { /* use empty */ }
     }
 
+    // Get created objects from AbjectStore
+    interface AbjectSnapshot { objectId: string; manifest: { name: string; description: string }; source: string; owner: string; savedAt: number }
+    let snapshots: AbjectSnapshot[] = [];
+    if (this.abjectStoreId) {
+      try {
+        snapshots = await this.request<AbjectSnapshot[]>(
+          request(this.id, this.abjectStoreId, ABJECT_STORE_INTERFACE, 'list', {})
+        );
+      } catch { /* AbjectStore may not be ready */ }
+    }
+
     // Get display dimensions
     const displayInfo = await this.request<{ width: number; height: number }>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
     );
 
     const winW = 440;
-    const winH = 220;
+    // Dynamic height: base (220) + created objects section
+    const objectsSectionHeight = snapshots.length > 0 ? 50 + snapshots.length * 36 : 50;
+    const winH = 220 + objectsSectionHeight;
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
@@ -237,6 +262,90 @@ export class Settings extends Abject {
       preferredSize: { height: 32 },
     }));
 
+    // ── Created Objects Section ──
+
+    // Divider
+    const divId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
+        windowId: this.windowId, rect: r0,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: divId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 1 },
+    }));
+
+    // Section header
+    const objHeaderId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Created Objects',
+        style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: objHeaderId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 24 },
+    }));
+
+    if (snapshots.length === 0) {
+      const emptyLabelId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+          windowId: this.windowId, rect: r0, text: 'No objects created yet.',
+          style: { color: '#b4b8c8', fontSize: 12 },
+        })
+      );
+      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: emptyLabelId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 18 },
+      }));
+    } else {
+      for (const snap of snapshots) {
+        // HBox row: name label + delete button
+        const rowId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+            parentLayoutId: this.rootLayoutId,
+            margins: { top: 0, right: 0, bottom: 0, left: 0 },
+            spacing: 8,
+          })
+        );
+        await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          widgetId: rowId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 30 },
+        }));
+
+        const objNameId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+            windowId: this.windowId, rect: r0, text: snap.manifest.name,
+            style: { color: '#e2e4e9', fontSize: 13 },
+          })
+        );
+        await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          widgetId: objNameId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 30 },
+        }));
+
+        const delBtnId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+            windowId: this.windowId, rect: r0, text: 'Delete',
+            style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 },
+          })
+        );
+        await this.request(request(this.id, delBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+        await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          widgetId: delBtnId,
+          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+          preferredSize: { width: 70, height: 28 },
+        }));
+
+        this.objectDeleteButtons.set(delBtnId, snap.objectId);
+      }
+    }
+
     // Spacer pushes save button to bottom
     await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
 
@@ -303,6 +412,7 @@ export class Settings extends Abject {
     this.workspaceNameInputId = undefined;
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
+    this.objectDeleteButtons.clear();
 
     await this.changed('visibility', false);
     return true;
@@ -386,6 +496,36 @@ export class Settings extends Abject {
       await new Promise((resolve) => setTimeout(resolve, 800));
     }
     await this.hide();
+  }
+
+  /**
+   * Delete a user-created object: remove from AbjectStore, kill it, then rebuild the UI.
+   */
+  private async deleteCreatedObject(objectId: string): Promise<void> {
+    if (!this.abjectStoreId) return;
+
+    try {
+      // Remove from AbjectStore
+      await this.request(
+        request(this.id, this.abjectStoreId, ABJECT_STORE_INTERFACE, 'remove', { objectId })
+      );
+
+      // Kill the live object via Factory
+      const factoryId = await this.discoverDep('Factory');
+      if (factoryId) {
+        try {
+          await this.request(
+            request(this.id, factoryId, 'abjects:factory' as InterfaceId, 'kill', { objectId: objectId as AbjectId })
+          );
+        } catch { /* object may already be dead */ }
+      }
+    } catch (err) {
+      console.warn('[SETTINGS] Failed to delete object:', err);
+    }
+
+    // Rebuild the settings window to reflect the change
+    await this.hide();
+    await this.show();
   }
 }
 

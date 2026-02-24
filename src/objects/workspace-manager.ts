@@ -42,7 +42,7 @@ const STORAGE_KEY_ACTIVE = 'workspaces:active';
 /** Per-workspace objects in dependency order (matches original bootstrap). */
 const PER_WORKSPACE_OBJECTS = [
   'AbjectStore', 'Theme', 'Settings', 'RegistryBrowser',
-  'JobManager', 'JobBrowser', 'Chat', 'Taskbar',
+  'JobManager', 'JobBrowser', 'Chat', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
 ] as const;
 
 export interface WorkspaceInfo {

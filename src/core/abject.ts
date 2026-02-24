@@ -64,7 +64,7 @@ export abstract class Abject {
   private _processingLoop?: Promise<void>;
   private _insideHandler = false;
   private _stoppedDuringHandler = false;
-  private handlers: Map<string, MessageHandlerFn> = new Map();
+  protected handlers: Map<string, MessageHandlerFn> = new Map();
   private dependents: Set<AbjectId> = new Set();
   private pendingReplies: Map<string, {
     resolve: (value: unknown) => void;

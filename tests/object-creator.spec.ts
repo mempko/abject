@@ -13,9 +13,10 @@ test.describe('Object Creator', () => {
     }, { timeout: 10000 });
 
     const hasObjectCreator = await page.evaluate(() => {
-      const abjects = (window as Record<string, unknown>).abjects as Record<string, { listObjects: () => { manifest: { name: string } }[] }>;
-      const objects = abjects.registry?.listObjects() ?? [];
-      return objects.some((o) => o.manifest.name === 'ObjectCreator');
+      const abjects = (window as Record<string, unknown>).abjects as Record<string, unknown>;
+      const factory = abjects.factory as { getAllObjects: () => Array<{ manifest: { name: string } }> };
+      const allObjs = factory.getAllObjects();
+      return allObjs.some((o) => o.manifest.name === 'ObjectCreator');
     });
 
     expect(hasObjectCreator).toBe(true);
@@ -29,8 +30,12 @@ test.describe('Object Creator', () => {
     }, { timeout: 10000 });
 
     const objectCount = await page.evaluate(async () => {
-      const abjects = (window as Record<string, unknown>).abjects as Record<string, { objectCreator: { listAvailableObjects: () => Promise<unknown[]> } }>;
-      const objects = await abjects.objectCreator?.listAvailableObjects();
+      const abjects = (window as Record<string, unknown>).abjects as Record<string, unknown>;
+      const factory = abjects.factory as { getAllObjects: () => Array<{ manifest: { name: string }; listAvailableObjects?: () => Promise<unknown[]> }> };
+      const creator = factory.getAllObjects().find((o) => o.manifest.name === 'ObjectCreator') as
+        { listAvailableObjects: () => Promise<unknown[]> } | undefined;
+      if (!creator) return 0;
+      const objects = await creator.listAvailableObjects();
       return objects?.length ?? 0;
     });
 
@@ -45,12 +50,16 @@ test.describe('Object Creator', () => {
     }, { timeout: 10000 });
 
     const graph = await page.evaluate(async () => {
-      const abjects = (window as Record<string, unknown>).abjects as Record<string, { objectCreator: { getObjectGraph: () => Promise<{ nodes: unknown[] }> } }>;
-      return await abjects.objectCreator?.getObjectGraph();
+      const abjects = (window as Record<string, unknown>).abjects as Record<string, unknown>;
+      const factory = abjects.factory as { getAllObjects: () => Array<{ manifest: { name: string }; getObjectGraph?: () => Promise<{ nodes: unknown[] }> }> };
+      const creator = factory.getAllObjects().find((o) => o.manifest.name === 'ObjectCreator') as
+        { getObjectGraph: () => Promise<{ nodes: unknown[] }> } | undefined;
+      if (!creator) return undefined;
+      return await creator.getObjectGraph();
     });
 
     expect(graph).toBeDefined();
-    expect(graph.nodes.length).toBeGreaterThan(0);
+    expect(graph!.nodes.length).toBeGreaterThan(0);
   });
 
   test('object creator generates ScriptableAbject from prompt', async ({ page }, testInfo) => {
@@ -79,7 +88,8 @@ test.describe('Object Creator', () => {
 
     const result = await page.evaluate(async () => {
       const abjects = (window as Record<string, unknown>).abjects as Record<string, unknown>;
-      const objectCreator = abjects.objectCreator as {
+      const factory = abjects.factory as { getAllObjects: () => Array<{ manifest: { name: string }; createObject?: (prompt: string) => Promise<unknown> }> };
+      const objectCreator = factory.getAllObjects().find((o) => o.manifest.name === 'ObjectCreator') as {
         createObject: (prompt: string) => Promise<{
           success: boolean;
           objectId?: string;
@@ -87,7 +97,18 @@ test.describe('Object Creator', () => {
           code?: string;
           error?: string;
         }>;
-      };
+      } | undefined;
+
+      if (!objectCreator) {
+        return {
+          success: false,
+          error: 'ObjectCreator not found in factory',
+          code: undefined,
+          objectId: undefined,
+          manifest: undefined,
+          _debug: 'ObjectCreator not found',
+        };
+      }
 
       try {
         const r = await objectCreator.createObject(
@@ -120,15 +141,13 @@ test.describe('Object Creator', () => {
     expect(result.manifest).toBeDefined();
     expect(result.code).toBeDefined();
 
-    // Verify the object is registered in the registry
-    const isRegistered = await page.evaluate((objectId) => {
-      const abjects = (window as Record<string, unknown>).abjects as Record<string, {
-        registry: { lookupObject: (id: string) => { source?: string } | null };
-      }>;
-      const reg = abjects.registry?.lookupObject(objectId);
-      return reg !== null && reg?.source !== undefined;
+    // Verify the object exists (spawned via Factory)
+    const isSpawned = await page.evaluate((objectId) => {
+      const abjects = (window as Record<string, unknown>).abjects as Record<string, unknown>;
+      const factory = abjects.factory as { getObject: (id: string) => unknown | undefined };
+      return factory.getObject(objectId) !== undefined;
     }, result.objectId);
 
-    expect(isRegistered).toBe(true);
+    expect(isSpawned).toBe(true);
   });
 });
