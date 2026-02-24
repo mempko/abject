@@ -29,6 +29,11 @@ import { Settings } from '../src/objects/settings.js';
 import { RegistryBrowser } from '../src/objects/registry-browser.js';
 import { JobBrowser } from '../src/objects/job-browser.js';
 import { Chat } from '../src/objects/chat.js';
+import { ThemeAbject } from '../src/objects/theme.js';
+import { Taskbar } from '../src/objects/taskbar.js';
+import { ObjectManager } from '../src/objects/object-manager.js';
+import { GlobalSettings } from '../src/objects/global-settings.js';
+import { ScriptableAbject } from '../src/objects/scriptable-abject.js';
 
 // Constructor registry — same constructors as in src/index.ts, minus DOM objects
 type ObjectFactory = (args?: unknown) => Abject;
@@ -55,6 +60,14 @@ constructors.set('JobManager', () => new JobManager());
 constructors.set('JobBrowser', () => new JobBrowser());
 constructors.set('Chat', () => new Chat());
 constructors.set('AbjectStore', () => new AbjectStore());
+constructors.set('Theme', () => new ThemeAbject());
+constructors.set('Taskbar', () => new Taskbar());
+constructors.set('ObjectManager', () => new ObjectManager());
+constructors.set('GlobalSettings', () => new GlobalSettings());
+constructors.set('ScriptableAbject', (args?: unknown) => {
+  const opts = args as { manifest: import('../src/core/types.js').AbjectManifest; source: string; owner: string };
+  return new ScriptableAbject(opts.manifest, opts.source, opts.owner as import('../src/core/types.js').AbjectId);
+});
 
 // Worker state
 const workerBus = new WorkerBus();

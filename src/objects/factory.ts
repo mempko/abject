@@ -18,7 +18,7 @@ import { require, invariant } from '../core/contracts.js';
 import { Capabilities } from '../core/capability.js';
 import { request } from '../core/message.js';
 import type { MessageBusLike } from '../runtime/message-bus.js';
-import type { WorkerPool } from '../runtime/worker-pool.js';
+import { type WorkerPool, workerIndexForId } from '../runtime/worker-pool.js';
 import { ScriptableAbject } from './scriptable-abject.js';
 import { CompositeAbject } from './composite-abject.js';
 import type { CompositeSpec } from './composite-abject.js';
@@ -119,6 +119,22 @@ export class Factory extends Abject {
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              {
+                name: 'getObjectInfo',
+                description: 'Get worker placement info for an object',
+                parameters: [
+                  {
+                    name: 'objectId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'The ID of the object to query',
+                  },
+                ],
+                returns: { kind: 'object', properties: {
+                  isWorkerHosted: { kind: 'primitive', primitive: 'boolean' },
+                  constructorName: { kind: 'primitive', primitive: 'string' },
+                  workerIndex: { kind: 'primitive', primitive: 'number' },
+                }},
+              },
             ],
           },
         ],
@@ -154,6 +170,16 @@ export class Factory extends Abject {
         parentId?: AbjectId;
       };
       return this.respawn(objectId, constructorName, parentId);
+    });
+
+    this.on('getObjectInfo', async (msg: AbjectMessage) => {
+      const { objectId } = msg.payload as { objectId: AbjectId };
+      const isWorker = this.workerSpawned.has(objectId);
+      const constructorName = this.workerSpawned.get(objectId);
+      const workerIndex = isWorker && this._workerPool
+        ? workerIndexForId(objectId, this._workerPool.workerCount)
+        : undefined;
+      return { isWorkerHosted: isWorker, constructorName, workerIndex };
     });
   }
 
@@ -370,6 +396,11 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
       return this.spawnInWorker(req);
     }
 
+    // Worker path for ScriptableAbjects (user-created objects with source code)
+    if (!factory && req.source && !req.manifest.tags?.includes('composite') && this._workerPool) {
+      return this.spawnScriptableInWorker(req);
+    }
+
     let obj: Abject;
 
     if (factory) {
@@ -500,7 +531,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
     // object can discover dependencies and communicate with the bus hub
     await this._workerPool!.spawnInWorker(objectId, req.manifest.name, {
       constructorArgs: req.constructorArgs,
-      registryId: this._factoryRegistryId,
+      registryId: req.registryHint ?? this._factoryRegistryId,
       parentId: req.parentId ?? this.id,
     });
 
@@ -535,6 +566,66 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         id: objectId,
         state: 'ready',
         manifest: realManifest,
+        connections: [] as AbjectId[],
+        errorCount: 0,
+        startedAt: now,
+        lastActivity: now,
+      },
+    };
+  }
+
+  /**
+   * Spawn a ScriptableAbject in a Web Worker.
+   * Unlike spawnInWorker(), this handles dynamic objects created from source code.
+   */
+  private async spawnScriptableInWorker(req: SpawnRequest): Promise<SpawnResult> {
+    require(this._workerPool !== undefined, 'WorkerPool must be set');
+    require(req.source !== undefined, 'source is required for ScriptableAbject');
+
+    const objectId = uuidv4() as AbjectId;
+
+    await this._workerPool!.spawnInWorker(objectId, 'ScriptableAbject', {
+      constructorArgs: {
+        manifest: req.manifest,
+        source: req.source,
+        owner: req.owner ?? '',
+      },
+      registryId: req.registryHint ?? this._factoryRegistryId,
+      parentId: req.parentId ?? this.id,
+    });
+
+    this.workerSpawned.set(objectId, 'ScriptableAbject');
+
+    // Register with registry including source and owner (for AbjectStore)
+    const targetRegistry = req.registryHint ?? (req.skipGlobalRegistry ? undefined : this._factoryRegistryId);
+    if (targetRegistry) {
+      const now = Date.now();
+      await this.request(
+        request(this.id, targetRegistry, 'abjects:registry' as InterfaceId, 'register', {
+          objectId,
+          manifest: req.manifest,
+          owner: req.owner,
+          source: req.source,
+          status: {
+            id: objectId,
+            state: 'ready',
+            manifest: req.manifest,
+            connections: [] as AbjectId[],
+            errorCount: 0,
+            startedAt: now,
+            lastActivity: now,
+          },
+        })
+      );
+    }
+
+    const now = Date.now();
+    return {
+      objectId,
+      status: {
+        id: objectId,
+        state: 'ready',
+        manifest: req.manifest,
         connections: [] as AbjectId[],
         errorCount: 0,
         startedAt: now,

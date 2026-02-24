@@ -22,6 +22,7 @@ export class Taskbar extends Abject {
   private registryBrowserId?: AbjectId;
   private chatId?: AbjectId;
   private jobBrowserId?: AbjectId;
+  private objectManagerId?: AbjectId;
   private registryId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
@@ -34,6 +35,7 @@ export class Taskbar extends Abject {
   private registryBtnId?: AbjectId;
   private chatBtnId?: AbjectId;
   private jobsBtnId?: AbjectId;
+  private objectManagerBtnId?: AbjectId;
 
   // Dynamic user object buttons: button widget AbjectId → target object AbjectId
   private userObjButtons: Map<AbjectId, AbjectId> = new Map();
@@ -89,6 +91,7 @@ export class Taskbar extends Abject {
     this.registryBrowserId = await this.requireDep('RegistryBrowser');
     this.chatId = await this.requireDep('Chat');
     this.jobBrowserId = await this.requireDep('JobBrowser');
+    this.objectManagerId = await this.requireDep('ObjectManager');
     this.registryId = await this.requireDep('Registry');
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
 
@@ -99,7 +102,7 @@ export class Taskbar extends Abject {
     }
 
     // Subscribe as dependent of each system object to receive visibility changes
-    for (const depId of [this.settingsId!, this.registryBrowserId!, this.chatId!, this.jobBrowserId!]) {
+    for (const depId of [this.settingsId!, this.registryBrowserId!, this.chatId!, this.jobBrowserId!, this.objectManagerId!]) {
       await this.request(request(this.id, depId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     }
 
@@ -174,6 +177,10 @@ export class Taskbar extends Abject {
       } else if (fromId === this.jobsBtnId) {
         await this.request(
           request(this.id, this.jobBrowserId!, 'abjects:job-browser' as InterfaceId, 'show', {})
+        );
+      } else if (fromId === this.objectManagerBtnId) {
+        await this.request(
+          request(this.id, this.objectManagerId!, 'abjects:object-manager' as InterfaceId, 'show', {})
         );
       } else if (this.restoreButtons.has(fromId)) {
         // Restore a minimized window
@@ -252,6 +259,7 @@ export class Taskbar extends Abject {
     this.registryBtnId = undefined;
     this.chatBtnId = undefined;
     this.jobsBtnId = undefined;
+    this.objectManagerBtnId = undefined;
     this.rootLayoutId = undefined;
     this.userObjButtons.clear();
     this.restoreButtons.clear();
@@ -264,7 +272,7 @@ export class Taskbar extends Abject {
     const dividerH = 8;
     const padding = 16;
     const spacing = 6;
-    const systemBtnCount = 3;
+    const systemBtnCount = 4;
     const minimizedCount = this.minimizedWindows.size;
     const totalBtnCount = systemBtnCount + showableObjects.length + minimizedCount;
     const extraHeight = (labelH + spacing) // "Apps" label
@@ -393,18 +401,20 @@ export class Taskbar extends Abject {
     }));
 
     // Query visibility of system objects
-    const [registryVis, chatVis, jobsVis] = await Promise.all([
+    const [registryVis, chatVis, jobsVis, objectManagerVis] = await Promise.all([
       isVisible(this.registryBrowserId!),
       isVisible(this.chatId!),
       isVisible(this.jobBrowserId!),
+      isVisible(this.objectManagerId!),
     ]);
 
-    console.debug(`[Taskbar] visibility: registry=${registryVis} chat=${chatVis} jobs=${jobsVis}`);
+    console.debug(`[Taskbar] visibility: registry=${registryVis} chat=${chatVis} jobs=${jobsVis} processes=${objectManagerVis}`);
 
     // System buttons
     this.registryBtnId = await addBtn('Registry', registryVis);
     this.chatBtnId = await addBtn('Chat', chatVis);
     this.jobsBtnId = await addBtn('Jobs', jobsVis);
+    this.objectManagerBtnId = await addBtn('Processes', objectManagerVis);
 
     // Dynamic buttons for user-created objects with show/hide
     for (const obj of showableObjects) {
@@ -443,6 +453,7 @@ export class Taskbar extends Abject {
     this.registryBtnId = undefined;
     this.chatBtnId = undefined;
     this.jobsBtnId = undefined;
+    this.objectManagerBtnId = undefined;
     this.userObjButtons.clear();
     return true;
   }

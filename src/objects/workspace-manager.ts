@@ -33,6 +33,7 @@ const SETTINGS_INTERFACE = 'abjects:settings' as InterfaceId;
 const CHAT_INTERFACE = 'abjects:chat' as InterfaceId;
 const REGISTRY_BROWSER_INTERFACE = 'abjects:registry-browser' as InterfaceId;
 const JOB_BROWSER_INTERFACE = 'abjects:job-browser' as InterfaceId;
+const OBJECT_MANAGER_INTERFACE = 'abjects:object-manager' as InterfaceId;
 const WORKSPACE_SWITCHER_INTERFACE = 'abjects:workspace-switcher' as InterfaceId;
 
 const STORAGE_KEY_LIST = 'workspaces:list';
@@ -42,7 +43,7 @@ const STORAGE_KEY_ACTIVE = 'workspaces:active';
 /** Per-workspace objects in dependency order (matches original bootstrap). */
 const PER_WORKSPACE_OBJECTS = [
   'AbjectStore', 'Theme', 'Settings', 'RegistryBrowser',
-  'JobManager', 'JobBrowser', 'Chat', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
+  'JobManager', 'JobBrowser', 'ObjectManager', 'Chat', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
 ] as const;
 
 export interface WorkspaceInfo {
@@ -487,6 +488,7 @@ export class WorkspaceManager extends Abject {
       Settings: SETTINGS_INTERFACE,
       RegistryBrowser: REGISTRY_BROWSER_INTERFACE,
       JobBrowser: JOB_BROWSER_INTERFACE,
+      ObjectManager: OBJECT_MANAGER_INTERFACE,
       Chat: CHAT_INTERFACE,
     };
 

@@ -37,6 +37,7 @@ import { WorkspaceManager } from '../src/objects/workspace-manager.js';
 import { WorkspaceRegistry } from '../src/objects/workspace-registry.js';
 import { WorkspaceSwitcher } from '../src/objects/workspace-switcher.js';
 import { GlobalSettings } from '../src/objects/global-settings.js';
+import { ObjectManager } from '../src/objects/object-manager.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
 import { NodeWorkerAdapter } from './node-worker-adapter.js';
 import * as path from 'node:path';
@@ -157,15 +158,21 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('WorkspaceRegistry', () => new WorkspaceRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
   runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
+  runtime.objectFactory.registerConstructor('ObjectManager', () => new ObjectManager());
 
   // Mark worker-eligible constructors (only used when workerEnabled).
-  // Only global objects that are spawned top-level (not per-workspace)
-  // should be worker-eligible to avoid dependency-ordering issues.
+  // Per-workspace objects use registryHint to discover workspace dependencies.
   if (runtime.config.workerEnabled) {
     const workerEligible = [
+      // Global capabilities
       'LLMObject', 'HttpClient', 'Timer',
-      'Console', 'FileSystem', 'ProxyGenerator',
-      'Negotiator', 'HealthMonitor',
+      'Clipboard', 'Console', 'FileSystem',
+      // Global services
+      'GlobalSettings', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
+      // Per-workspace objects (use workspace registry via registryHint)
+      'AbjectStore', 'Theme', 'Settings', 'RegistryBrowser',
+      'JobManager', 'JobBrowser', 'ObjectManager',
+      'Chat', 'AbjectEditor', 'Taskbar',
     ];
     for (const name of workerEligible) {
       runtime.objectFactory.markWorkerEligible(name);

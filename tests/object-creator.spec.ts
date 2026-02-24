@@ -141,11 +141,14 @@ test.describe('Object Creator', () => {
     expect(result.manifest).toBeDefined();
     expect(result.code).toBeDefined();
 
-    // Verify the object exists (spawned via Factory)
+    // Verify the object exists (spawned via Factory — may be on main thread or in a worker)
     const isSpawned = await page.evaluate((objectId) => {
       const abjects = (window as Record<string, unknown>).abjects as Record<string, unknown>;
-      const factory = abjects.factory as { getObject: (id: string) => unknown | undefined };
-      return factory.getObject(objectId) !== undefined;
+      const factory = abjects.factory as {
+        getObject: (id: string) => unknown | undefined;
+        isWorkerHosted: (id: string) => boolean;
+      };
+      return factory.getObject(objectId) !== undefined || factory.isWorkerHosted(objectId);
     }, result.objectId);
 
     expect(isSpawned).toBe(true);

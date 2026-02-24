@@ -38,6 +38,7 @@ import { WorkspaceManager } from './objects/workspace-manager.js';
 import { WorkspaceRegistry } from './objects/workspace-registry.js';
 import { WorkspaceSwitcher } from './objects/workspace-switcher.js';
 import { GlobalSettings } from './objects/global-settings.js';
+import { ObjectManager } from './objects/object-manager.js';
 
 // Export public API
 export { App, createApp } from './ui/app.js';
@@ -78,6 +79,7 @@ export { WorkspaceManager, WORKSPACE_MANAGER_ID } from './objects/workspace-mana
 export { WorkspaceRegistry, WORKSPACE_REGISTRY_ID } from './objects/workspace-registry.js';
 export { WorkspaceSwitcher, WORKSPACE_SWITCHER_ID } from './objects/workspace-switcher.js';
 export { GlobalSettings, GLOBAL_SETTINGS_ID } from './objects/global-settings.js';
+export { ObjectManager, OBJECT_MANAGER_ID } from './objects/object-manager.js';
 
 // Export widget Abjects
 export { WidgetAbject, buildFont, WIDGET_INTERFACE_DECL } from './objects/widgets/widget-abject.js';
@@ -296,15 +298,21 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('WorkspaceRegistry', () => new WorkspaceRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
   runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
+  runtime.objectFactory.registerConstructor('ObjectManager', () => new ObjectManager());
 
   // Mark worker-eligible constructors (only used when workerEnabled).
-  // Only global objects that are spawned top-level (not per-workspace)
-  // should be worker-eligible to avoid dependency-ordering issues.
+  // Per-workspace objects use registryHint to discover workspace dependencies.
   if (runtime.config.workerEnabled) {
     const workerEligible = [
+      // Global capabilities
       'LLMObject', 'HttpClient', 'Timer',
-      'Console', 'FileSystem', 'ProxyGenerator',
-      'Negotiator', 'HealthMonitor',
+      'Clipboard', 'Console', 'FileSystem',
+      // Global services
+      'GlobalSettings', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
+      // Per-workspace objects (use workspace registry via registryHint)
+      'AbjectStore', 'Theme', 'Settings', 'RegistryBrowser',
+      'JobManager', 'JobBrowser', 'ObjectManager',
+      'Chat', 'AbjectEditor', 'Taskbar',
     ];
     for (const name of workerEligible) {
       runtime.objectFactory.markWorkerEligible(name);

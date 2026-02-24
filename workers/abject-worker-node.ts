@@ -6,6 +6,7 @@
  */
 
 import { parentPort } from 'node:worker_threads';
+import * as path from 'node:path';
 import { AbjectId } from '../src/core/types.js';
 import { Abject } from '../src/core/abject.js';
 import { WorkerBus } from '../src/runtime/worker-bus.js';
@@ -29,6 +30,12 @@ import { Settings } from '../src/objects/settings.js';
 import { RegistryBrowser } from '../src/objects/registry-browser.js';
 import { JobBrowser } from '../src/objects/job-browser.js';
 import { Chat } from '../src/objects/chat.js';
+import { ThemeAbject } from '../src/objects/theme.js';
+import { Taskbar } from '../src/objects/taskbar.js';
+import { ObjectManager } from '../src/objects/object-manager.js';
+import { GlobalSettings } from '../src/objects/global-settings.js';
+import { ScriptableAbject } from '../src/objects/scriptable-abject.js';
+import { NodeStorage } from '../server/node-storage.js';
 
 if (!parentPort) {
   throw new Error('abject-worker-node.ts must be run inside a worker_threads Worker');
@@ -42,10 +49,15 @@ type ObjectFactory = (args?: unknown) => Abject;
 const constructors = new Map<string, ObjectFactory>();
 constructors.set('LLMObject', () => new LLMObject());
 constructors.set('HttpClient', () => new HttpClient());
-// Note: Storage in Node.js workers uses the dynamic import approach —
-// the NodeStorage class must be imported at the top level for worker_threads.
-// For now, we only register browser-compatible Storage here.
-// Server-side NodeStorage can be added when needed.
+constructors.set('Storage', (args?: unknown) => {
+  const opts = args as { dbName?: string } | undefined;
+  if (opts?.dbName) {
+    const wsId = opts.dbName.replace('abjects-storage-', '');
+    const storagePath = path.join(process.cwd(), '.abjects', `ws-${wsId}`, 'storage.json');
+    return new NodeStorage(storagePath);
+  }
+  return new NodeStorage();
+});
 constructors.set('Timer', () => new Timer());
 constructors.set('Clipboard', () => new Clipboard());
 constructors.set('Console', () => new Console());
@@ -61,6 +73,14 @@ constructors.set('JobManager', () => new JobManager());
 constructors.set('JobBrowser', () => new JobBrowser());
 constructors.set('Chat', () => new Chat());
 constructors.set('AbjectStore', () => new AbjectStore());
+constructors.set('Theme', () => new ThemeAbject());
+constructors.set('Taskbar', () => new Taskbar());
+constructors.set('ObjectManager', () => new ObjectManager());
+constructors.set('GlobalSettings', () => new GlobalSettings());
+constructors.set('ScriptableAbject', (args?: unknown) => {
+  const opts = args as { manifest: import('../src/core/types.js').AbjectManifest; source: string; owner: string };
+  return new ScriptableAbject(opts.manifest, opts.source, opts.owner as import('../src/core/types.js').AbjectId);
+});
 
 // Worker state — pass parentPort.postMessage so WorkerBus routes via worker_threads
 const workerBus = new WorkerBus((data) => port.postMessage(data));
