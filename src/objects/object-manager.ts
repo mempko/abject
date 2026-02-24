@@ -724,7 +724,7 @@ export class ObjectManager extends Abject {
         const constructorName = row.constructorName ?? row.name;
         try {
           await this.request(request(this.id, this.factoryId,
-            FACTORY_INTERFACE, 'respawn', { objectId: row.id, constructorName }));
+            FACTORY_INTERFACE, 'respawn', { objectId: row.id, constructorName, registryId: this.registryId }));
         } catch (err) {
           console.warn(`[ObjectManager] Failed to restart ${row.name}:`, err);
         }

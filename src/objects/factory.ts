@@ -164,12 +164,13 @@ export class Factory extends Abject {
     });
 
     this.on('respawn', async (msg: AbjectMessage) => {
-      const { objectId, constructorName, parentId } = msg.payload as {
+      const { objectId, constructorName, parentId, registryId } = msg.payload as {
         objectId: AbjectId;
         constructorName: string;
         parentId?: AbjectId;
+        registryId?: AbjectId;
       };
-      return this.respawn(objectId, constructorName, parentId);
+      return this.respawn(objectId, constructorName, parentId, registryId);
     });
 
     this.on('getObjectInfo', async (msg: AbjectMessage) => {
@@ -280,17 +281,39 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
    * Kill an old instance and spawn a fresh one with the same ID.
    * Used by Supervisor for same-ID restart.
    */
-  async respawn(objectId: AbjectId, constructorName: string, parentId?: AbjectId): Promise<SpawnResult> {
+  async respawn(objectId: AbjectId, constructorName: string, parentId?: AbjectId, registryId?: AbjectId): Promise<SpawnResult> {
     require(this._factoryBus !== undefined, 'Factory must have a message bus');
 
-    // Worker path: if the constructor is worker-eligible and pool exists
-    if (this._workerPool && this.workerEligible.has(constructorName)) {
+    // Use caller-provided registryId (e.g. workspace registry) or fall back to global
+    const effectiveRegistryId = registryId ?? this._factoryRegistryId;
+
+    // Worker path: if the constructor is worker-eligible OR the object is currently worker-hosted
+    if (this._workerPool && (this.workerEligible.has(constructorName) || this.workerSpawned.has(objectId))) {
+      // Look up existing registration before killing so we can capture source/manifest/owner
+      let existingReg: ObjectRegistration | null = null;
+      if (effectiveRegistryId) {
+        try {
+          existingReg = await this.request<ObjectRegistration | null>(
+            request(this.id, effectiveRegistryId, 'abjects:registry' as InterfaceId, 'lookup', { objectId })
+          );
+        } catch { /* may not be registered */ }
+      }
+
       // Kill old worker instance if tracked
       if (this.workerSpawned.has(objectId)) {
-        if (this._factoryRegistryId) {
+        // Clear timers before killing so they stop firing immediately
+        try {
+          const timerId = await this.discoverDep('Timer');
+          if (timerId) {
+            await this.request(request(this.id, timerId,
+              'abjects:timer' as InterfaceId, 'clearTimersForObject', { objectId }));
+          }
+        } catch { /* Timer may not be available */ }
+
+        if (effectiveRegistryId) {
           try {
             await this.request(
-              request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
+              request(this.id, effectiveRegistryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
             );
           } catch { /* may not be registered */ }
         }
@@ -298,22 +321,46 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         this.workerSpawned.delete(objectId);
       }
 
-      // Respawn in worker with same ID
-      await this._workerPool.spawnInWorker(objectId, constructorName);
+      // Respawn in worker with same ID, passing constructor args for ScriptableAbjects
+      const isScriptable = constructorName === 'ScriptableAbject';
+      if (isScriptable) {
+        if (!existingReg?.source) {
+          throw new Error(`Cannot respawn ScriptableAbject '${objectId}': registration/source not found in Registry`);
+        }
+        await this._workerPool.spawnInWorker(objectId, constructorName, {
+          constructorArgs: {
+            manifest: existingReg.manifest,
+            source: existingReg.source,
+            owner: existingReg.owner ?? '',
+          },
+          registryId: effectiveRegistryId,
+          parentId: parentId ?? this.id,
+        });
+      } else {
+        await this._workerPool.spawnInWorker(objectId, constructorName, {
+          registryId: effectiveRegistryId,
+          parentId: parentId ?? this.id,
+        });
+      }
       this.workerSpawned.set(objectId, constructorName);
 
-      const manifest = { name: constructorName, description: '', version: '1.0.0',
+      // Use real manifest from the existing registration if available, otherwise build a placeholder
+      const manifest = existingReg?.manifest ?? { name: constructorName, description: '', version: '1.0.0',
         interfaces: [], requiredCapabilities: [] as never[], tags: ['system'] };
+      const now = Date.now();
       const status = {
         id: objectId, state: 'ready' as const, manifest, connections: [] as AbjectId[],
-        errorCount: 0, startedAt: Date.now(), lastActivity: Date.now(),
+        errorCount: 0, startedAt: now, lastActivity: now,
       };
 
-      if (this._factoryRegistryId) {
+      if (effectiveRegistryId) {
+        const regPayload: Record<string, unknown> = { objectId, manifest, status };
+        if (isScriptable && existingReg) {
+          regPayload.source = existingReg.source;
+          regPayload.owner = existingReg.owner;
+        }
         await this.request(
-          request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'register', {
-            objectId, manifest, status,
-          })
+          request(this.id, effectiveRegistryId, 'abjects:registry' as InterfaceId, 'register', regPayload)
         );
       }
 
@@ -325,10 +372,10 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
     if (old) {
       // Unregister from registry BEFORE stopping so cleanup notifications
       // fire while the object is still on the bus
-      if (this._factoryRegistryId) {
+      if (effectiveRegistryId) {
         try {
           await this.request(
-            request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
+            request(this.id, effectiveRegistryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
           );
         } catch { /* may not be registered */ }
       }
@@ -348,15 +395,15 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
     obj.setId(objectId);
 
     // Pre-seed registry ID to avoid deadlock (child asking parent during init)
-    if (this._factoryRegistryId) {
-      obj.setRegistryHint(this._factoryRegistryId);
+    if (effectiveRegistryId) {
+      obj.setRegistryHint(effectiveRegistryId);
     }
 
     // Initialize and register
     await obj.init(this._factoryBus!, parentId ?? this.id);
     this.spawned.set(obj.id, obj);
 
-    if (this._factoryRegistryId) {
+    if (effectiveRegistryId) {
       const payload: Record<string, unknown> = {
         objectId: obj.id,
         manifest: obj.manifest,
@@ -369,7 +416,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         payload.source = obj.source;
       }
       await this.request(
-        request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'register', payload)
+        request(this.id, effectiveRegistryId, 'abjects:registry' as InterfaceId, 'register', payload)
       );
     }
 
@@ -639,6 +686,24 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
    */
   private async killWorkerObject(objectId: AbjectId): Promise<boolean> {
     if (!this._workerPool) return false;
+
+    // Remove from Supervisor BEFORE stopping (prevents restart race)
+    try {
+      const supervisorId = await this.discoverDep('Supervisor');
+      if (supervisorId) {
+        await this.request(request(this.id, supervisorId,
+          'abjects:supervisor' as InterfaceId, 'removeChild', { childId: objectId }));
+      }
+    } catch { /* Supervisor may not be tracking this object */ }
+
+    // Clear any active timers for this object so they stop firing immediately
+    try {
+      const timerId = await this.discoverDep('Timer');
+      if (timerId) {
+        await this.request(request(this.id, timerId,
+          'abjects:timer' as InterfaceId, 'clearTimersForObject', { objectId }));
+      }
+    } catch { /* Timer may not be available */ }
 
     // Unregister from registry
     if (this._factoryRegistryId) {
