@@ -381,6 +381,12 @@ export class BackendUI extends Abject {
       return true;
     });
 
+    this.on('clipboardWrite', async (msg: AbjectMessage) => {
+      const { text } = msg.payload as { text: string };
+      this.sendToFrontend({ type: 'clipboardWrite', text });
+      return true;
+    });
+
     this.on('selectionChanged', async (msg: AbjectMessage) => {
       const { selectedText } = msg.payload as { selectedText: string };
       this.currentSelectedText = selectedText;

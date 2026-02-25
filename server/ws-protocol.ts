@@ -103,6 +103,11 @@ export interface SetActiveWorkspaceMsg extends WsEnvelope {
   workspaceId: string;
 }
 
+export interface ClipboardWriteMsg extends WsEnvelope {
+  type: 'clipboardWrite';
+  text: string;
+}
+
 export type BackendToFrontendMsg =
   | CreateSurfaceMsg
   | DestroySurfaceMsg
@@ -116,7 +121,8 @@ export type BackendToFrontendMsg =
   | SetSelectedTextMsg
   | SetSurfaceVisibleMsg
   | SetSurfaceWorkspaceMsg
-  | SetActiveWorkspaceMsg;
+  | SetActiveWorkspaceMsg
+  | ClipboardWriteMsg;
 
 // =============================================================================
 // Frontend -> Backend messages

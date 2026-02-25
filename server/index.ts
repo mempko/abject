@@ -5,6 +5,21 @@
  * All system objects run here; the browser is a thin rendering client.
  */
 
+// Polyfill WebRTC APIs for Node.js (PeerTransport needs RTCPeerConnection, etc.)
+import {
+  RTCPeerConnection,
+  RTCSessionDescription,
+  RTCIceCandidate,
+  RTCDataChannel,
+} from 'node-datachannel/polyfill';
+
+Object.assign(globalThis, {
+  RTCPeerConnection,
+  RTCSessionDescription,
+  RTCIceCandidate,
+  RTCDataChannel,
+});
+
 import { AbjectId, AbjectMessage, InterfaceId, SpawnResult } from '../src/core/types.js';
 import { getRuntime, resetRuntime } from '../src/runtime/runtime.js';
 import * as message from '../src/core/message.js';
@@ -38,12 +53,17 @@ import { WorkspaceRegistry } from '../src/objects/workspace-registry.js';
 import { WorkspaceSwitcher } from '../src/objects/workspace-switcher.js';
 import { GlobalSettings } from '../src/objects/global-settings.js';
 import { ObjectManager } from '../src/objects/object-manager.js';
+import { IdentityObject } from '../src/objects/identity.js';
+import { PeerRegistry } from '../src/objects/peer-registry.js';
+import { RemoteRegistry } from '../src/objects/remote-registry.js';
+import { NetworkBridge } from '../src/network/network-bridge.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
 import { NodeWorkerAdapter } from './node-worker-adapter.js';
 import * as path from 'node:path';
 import os from 'node:os';
 
 const WS_PORT = parseInt(process.env.WS_PORT ?? '7719', 10);
+const DATA_DIR = process.env.ABJECTS_DATA_DIR ?? '.abjects';
 
 async function main(): Promise<void> {
   console.log('[ABJECTS] Initializing backend...');
@@ -59,7 +79,7 @@ async function main(): Promise<void> {
   // Leave 1 core for the main thread; minimum 1 worker.
   // Set ABJECTS_WORKER_COUNT=N env var to override (0 to disable workers).
   const cpuCount = os.cpus().length;
-  const defaultWorkerCount = Math.max(1, cpuCount - 1);
+  const defaultWorkerCount = Math.min(8, Math.max(1, cpuCount - 1));
   const envOverride = process.env.ABJECTS_WORKER_COUNT;
   const workerCount = envOverride !== undefined ? parseInt(envOverride, 10) : defaultWorkerCount;
   const workerEnabled = workerCount > 0;
@@ -129,10 +149,10 @@ async function main(): Promise<void> {
     // For workspace storage, use a separate file path
     if (opts?.dbName) {
       const wsId = opts.dbName.replace('abjects-storage-', '');
-      const storagePath = path.join(process.cwd(), '.abjects', `ws-${wsId}`, 'storage.json');
+      const storagePath = path.join(process.cwd(), DATA_DIR, `ws-${wsId}`, 'storage.json');
       return new NodeStorage(storagePath);
     }
-    return new NodeStorage();
+    return new NodeStorage(path.join(process.cwd(), DATA_DIR, 'storage.json'));
   });
   runtime.objectFactory.registerConstructor('Timer', () => new Timer());
   runtime.objectFactory.registerConstructor('Clipboard', () => new Clipboard());
@@ -159,6 +179,9 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
   runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
   runtime.objectFactory.registerConstructor('ObjectManager', () => new ObjectManager());
+  runtime.objectFactory.registerConstructor('Identity', () => new IdentityObject());
+  runtime.objectFactory.registerConstructor('PeerRegistry', () => new PeerRegistry());
+  runtime.objectFactory.registerConstructor('RemoteRegistry', () => new RemoteRegistry());
 
   // Mark worker-eligible constructors (only used when workerEnabled).
   // Per-workspace objects use registryHint to discover workspace dependencies.
@@ -214,6 +237,17 @@ async function main(): Promise<void> {
   const windowManagerId = await supervisedSpawn('WindowManager');
   const widgetManagerId = await supervisedSpawn('WidgetManager');
 
+  const identityId = await supervisedSpawn('Identity');
+  const peerRegistryId = await supervisedSpawn('PeerRegistry');
+  const remoteRegistryId = await supervisedSpawn('RemoteRegistry');
+
+  // Install NetworkBridge interceptor for transparent P2P routing
+  const peerRegistryObj = runtime.objectFactory.getObject(peerRegistryId) as PeerRegistry;
+  const remoteRegistryObj = runtime.objectFactory.getObject(remoteRegistryId) as RemoteRegistry;
+  const networkBridge = new NetworkBridge(bus, peerRegistryObj);
+  bus.addInterceptor(networkBridge);
+  remoteRegistryObj.setNetworkBridge(networkBridge);
+
   const globalSettingsId = await supervisedSpawn('GlobalSettings');
 
   const proxyGenId = await supervisedSpawn('ProxyGenerator');
@@ -234,6 +268,7 @@ async function main(): Promise<void> {
   const monitoredIds = [
     httpClientId, llmId, storageId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
+    identityId, peerRegistryId, remoteRegistryId,
     globalSettingsId, proxyGenId, negotiatorId,
     workspaceSwitcherId, workspaceManagerId,
   ];

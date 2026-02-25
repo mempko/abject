@@ -91,7 +91,14 @@ export class WorkerPool {
     this.objectToBridge.set(objectId, bridge);
     this.bus.registerWorkerObject(objectId);
 
-    await bridge.spawnInWorker(objectId, constructorName, options);
+    try {
+      await bridge.spawnInWorker(objectId, constructorName, options);
+    } catch (err) {
+      // Roll back main bus registration on spawn failure
+      this.objectToBridge.delete(objectId);
+      this.bus.unregisterWorkerObject(objectId);
+      throw err;
+    }
   }
 
   /**

@@ -46,9 +46,12 @@ const PER_WORKSPACE_OBJECTS = [
   'JobManager', 'JobBrowser', 'ObjectManager', 'Chat', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
 ] as const;
 
+export type WorkspaceAccessMode = 'local' | 'private' | 'public';
+
 export interface WorkspaceInfo {
   id: string;
   name: string;
+  accessMode: WorkspaceAccessMode;
   childIds: AbjectId[];
   registryId: AbjectId;
   storageId: AbjectId;
@@ -59,6 +62,7 @@ export interface WorkspaceInfo {
 interface PersistedWorkspace {
   id: string;
   name: string;
+  accessMode?: WorkspaceAccessMode;
   createdAt: number;
 }
 
@@ -158,6 +162,35 @@ export class WorkspaceManager extends Abject {
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              {
+                name: 'getAccessMode',
+                description: 'Get the access mode of a workspace',
+                parameters: [
+                  {
+                    name: 'workspaceId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'ID of workspace',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'setAccessMode',
+                description: 'Set the access mode of a workspace (local, private, public)',
+                parameters: [
+                  {
+                    name: 'workspaceId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'ID of workspace',
+                  },
+                  {
+                    name: 'accessMode',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Access mode: local, private, or public',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
             ],
           },
         ],
@@ -199,6 +232,16 @@ export class WorkspaceManager extends Abject {
       return this.renameWorkspace(workspaceId, name);
     });
 
+    this.on('getAccessMode', async (msg: AbjectMessage) => {
+      const { workspaceId } = msg.payload as { workspaceId: string };
+      return this.getAccessMode(workspaceId);
+    });
+
+    this.on('setAccessMode', async (msg: AbjectMessage) => {
+      const { workspaceId, accessMode } = msg.payload as { workspaceId: string; accessMode: string };
+      return this.setAccessMode(workspaceId, accessMode as WorkspaceAccessMode);
+    });
+
     this.on('refreshTaskbar', async () => {
       return this.refreshTaskbar();
     });
@@ -236,7 +279,7 @@ export class WorkspaceManager extends Abject {
     } else {
       // Restore each workspace
       for (const ws of persisted) {
-        await this.restoreWorkspace(ws.id, ws.name);
+        await this.restoreWorkspace(ws.id, ws.name, ws.accessMode ?? 'local');
       }
 
       // Activate the last-active workspace
@@ -405,6 +448,24 @@ export class WorkspaceManager extends Abject {
     return true;
   }
 
+  getAccessMode(workspaceId: string): WorkspaceAccessMode {
+    const ws = this.workspaces.get(workspaceId);
+    if (!ws) return 'local';
+    return ws.accessMode;
+  }
+
+  async setAccessMode(workspaceId: string, accessMode: WorkspaceAccessMode): Promise<boolean> {
+    precondition(
+      accessMode === 'local' || accessMode === 'private' || accessMode === 'public',
+      'accessMode must be local, private, or public',
+    );
+    const ws = this.workspaces.get(workspaceId);
+    if (!ws) return false;
+    ws.accessMode = accessMode;
+    await this.persistWorkspaceList();
+    return true;
+  }
+
   // ── Internal Helpers ──
 
   /**
@@ -548,6 +609,7 @@ export class WorkspaceManager extends Abject {
     return {
       id: workspaceId,
       name,
+      accessMode: 'local',
       childIds,
       registryId: wsRegistryId,
       storageId: wsStorageId,
@@ -559,8 +621,9 @@ export class WorkspaceManager extends Abject {
   /**
    * Restore a previously persisted workspace by re-spawning its objects.
    */
-  private async restoreWorkspace(workspaceId: string, name: string): Promise<void> {
+  private async restoreWorkspace(workspaceId: string, name: string, accessMode: WorkspaceAccessMode = 'local'): Promise<void> {
     const info = await this.spawnWorkspaceObjects(workspaceId, name);
+    info.accessMode = accessMode;
     this.workspaces.set(workspaceId, info);
     console.log(`[WORKSPACE-MANAGER] Restored workspace '${name}' (${workspaceId})`);
   }
@@ -634,6 +697,7 @@ export class WorkspaceManager extends Abject {
     const list: PersistedWorkspace[] = [...this.workspaces.entries()].map(([id, ws]) => ({
       id,
       name: ws.name,
+      accessMode: ws.accessMode,
       createdAt: Date.now(),
     }));
     try {
@@ -672,6 +736,8 @@ export class WorkspaceManager extends Abject {
 - \`listWorkspaces()\` — List all workspaces. Returns [{ id, name }].
 - \`getActiveWorkspace()\` — Get the active workspace. Returns { id, name }.
 - \`renameWorkspace({ workspaceId, name })\` — Rename a workspace.
+- \`getAccessMode({ workspaceId })\` — Get workspace access mode (local, private, public).
+- \`setAccessMode({ workspaceId, accessMode })\` — Set workspace access mode.
 
 ### Interface ID
 \`abjects:workspace-manager\``;

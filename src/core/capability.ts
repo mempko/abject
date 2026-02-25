@@ -36,6 +36,14 @@ export const Capabilities = {
   FILESYSTEM_WRITE: 'abjects:filesystem:write' as CapabilityId,
   CONSOLE: 'abjects:console' as CapabilityId,
   EDIT_OBJECT: 'abjects:object:edit' as CapabilityId,
+
+  // Identity capabilities
+  IDENTITY_SIGN: 'abjects:identity:sign' as CapabilityId,
+  IDENTITY_VERIFY: 'abjects:identity:verify' as CapabilityId,
+
+  // Peer capabilities
+  PEER_CONNECT: 'abjects:peer:connect' as CapabilityId,
+  PEER_DISCOVER: 'abjects:peer:discover' as CapabilityId,
 } as const;
 
 // =============================================================================

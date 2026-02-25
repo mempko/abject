@@ -180,6 +180,7 @@ export class WorkspaceSwitcher extends Abject {
         }
         return;
       }
+
     });
   }
 

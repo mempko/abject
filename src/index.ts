@@ -39,6 +39,10 @@ import { WorkspaceRegistry } from './objects/workspace-registry.js';
 import { WorkspaceSwitcher } from './objects/workspace-switcher.js';
 import { GlobalSettings } from './objects/global-settings.js';
 import { ObjectManager } from './objects/object-manager.js';
+import { IdentityObject } from './objects/identity.js';
+import { PeerRegistry } from './objects/peer-registry.js';
+import { RemoteRegistry } from './objects/remote-registry.js';
+import { NetworkBridge } from './network/network-bridge.js';
 
 // Export public API
 export { App, createApp } from './ui/app.js';
@@ -76,10 +80,14 @@ export type { CompositeSpec, CompositeChildSpec, RouteEntry } from './objects/co
 export { Supervisor, SUPERVISOR_ID, SUPERVISOR_INTERFACE_ID } from './runtime/supervisor.js';
 export type { ChildSpec, RestartType, RestartStrategy, SupervisorConfig } from './runtime/supervisor.js';
 export { WorkspaceManager, WORKSPACE_MANAGER_ID } from './objects/workspace-manager.js';
+export type { WorkspaceAccessMode } from './objects/workspace-manager.js';
 export { WorkspaceRegistry, WORKSPACE_REGISTRY_ID } from './objects/workspace-registry.js';
 export { WorkspaceSwitcher, WORKSPACE_SWITCHER_ID } from './objects/workspace-switcher.js';
 export { GlobalSettings, GLOBAL_SETTINGS_ID } from './objects/global-settings.js';
 export { ObjectManager, OBJECT_MANAGER_ID } from './objects/object-manager.js';
+export { IdentityObject, IDENTITY_ID } from './objects/identity.js';
+export { PeerRegistry, PEER_REGISTRY_ID } from './objects/peer-registry.js';
+export { RemoteRegistry, REMOTE_REGISTRY_ID } from './objects/remote-registry.js';
 
 // Export widget Abjects
 export { WidgetAbject, buildFont, WIDGET_INTERFACE_DECL } from './objects/widgets/widget-abject.js';
@@ -129,6 +137,8 @@ export * from './core/message.js';
 export * from './core/capability.js';
 export * from './core/contracts.js';
 export { INTROSPECT_INTERFACE_ID, INTROSPECT_INTERFACE, formatManifestAsDescription } from './core/introspect.js';
+export type { PeerId, PeerIdentity, PeerContact, PeerConnectionState } from './core/identity.js';
+export { derivePeerId, derivePeerIdFromJwk, deriveSessionKey, aesEncrypt, aesDecrypt } from './core/identity.js';
 export type { IntrospectResult } from './core/introspect.js';
 
 // Export LLM providers
@@ -141,6 +151,9 @@ export { OllamaProvider } from './llm/ollama.js';
 export { Transport } from './network/transport.js';
 export type { TransportConfig } from './network/transport.js';
 export { WebSocketTransport } from './network/websocket.js';
+export { SignalingClient } from './network/signaling.js';
+export { PeerTransport } from './network/peer-transport.js';
+export { NetworkBridge } from './network/network-bridge.js';
 
 // Export compositor
 export { Compositor } from './ui/compositor.js';
@@ -205,7 +218,7 @@ async function main(): Promise<App> {
   // Leave 1 core for the main thread; minimum 1 worker.
   // Set window.ABJECTS_WORKER_COUNT = N to override (0 to disable workers).
   const hwCores = navigator.hardwareConcurrency ?? 4;
-  const defaultWorkerCount = Math.max(1, hwCores - 1);
+  const defaultWorkerCount = Math.min(8, Math.max(1, hwCores - 1));
   const workerCountOverride = (window as unknown as Record<string, unknown>).ABJECTS_WORKER_COUNT;
   const workerCount = typeof workerCountOverride === 'number' ? workerCountOverride : defaultWorkerCount;
   const workerEnabled = workerCount > 0;
@@ -299,6 +312,9 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
   runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
   runtime.objectFactory.registerConstructor('ObjectManager', () => new ObjectManager());
+  runtime.objectFactory.registerConstructor('Identity', () => new IdentityObject());
+  runtime.objectFactory.registerConstructor('PeerRegistry', () => new PeerRegistry());
+  runtime.objectFactory.registerConstructor('RemoteRegistry', () => new RemoteRegistry());
 
   // Mark worker-eligible constructors (only used when workerEnabled).
   // Per-workspace objects use registryHint to discover workspace dependencies.
@@ -354,6 +370,17 @@ async function main(): Promise<App> {
   const windowManagerId = await supervisedSpawn('WindowManager');
   const widgetManagerId = await supervisedSpawn('WidgetManager');
 
+  const identityId = await supervisedSpawn('Identity');
+  const peerRegistryId = await supervisedSpawn('PeerRegistry');
+  const remoteRegistryId = await supervisedSpawn('RemoteRegistry');
+
+  // Install NetworkBridge interceptor for transparent P2P routing
+  const peerRegistryObj = runtime.objectFactory.getObject(peerRegistryId) as PeerRegistry;
+  const remoteRegistryObj = runtime.objectFactory.getObject(remoteRegistryId) as RemoteRegistry;
+  const networkBridge = new NetworkBridge(bus, peerRegistryObj);
+  bus.addInterceptor(networkBridge);
+  remoteRegistryObj.setNetworkBridge(networkBridge);
+
   const globalSettingsId = await supervisedSpawn('GlobalSettings');
 
   const proxyGenId = await supervisedSpawn('ProxyGenerator');
@@ -374,6 +401,7 @@ async function main(): Promise<App> {
   const monitoredIds = [
     httpClientId, llmId, storageId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
+    identityId, peerRegistryId, remoteRegistryId,
     globalSettingsId, proxyGenId, negotiatorId,
     workspaceSwitcherId, workspaceManagerId,
   ];
@@ -410,6 +438,10 @@ async function main(): Promise<App> {
     windowManager: getObj(windowManagerId),
     filesystem: getObj(filesystemId),
     supervisor: getObj(supervisorId),
+    identity: getObj(identityId),
+    peerRegistry: getObj(peerRegistryId),
+    remoteRegistry: getObj(remoteRegistryId),
+    networkBridge,
     globalSettings: getObj(globalSettingsId),
     workspaceSwitcher: getObj(workspaceSwitcherId),
     workspaceManager: getObj(workspaceManagerId),
@@ -430,6 +462,9 @@ async function main(): Promise<App> {
       negotiator: negotiatorId,
       healthMonitor: healthMonitorId,
       supervisor: supervisorId,
+      identity: identityId,
+      peerRegistry: peerRegistryId,
+      remoteRegistry: remoteRegistryId,
       globalSettings: globalSettingsId,
       workspaceSwitcher: workspaceSwitcherId,
       workspaceManager: workspaceManagerId,

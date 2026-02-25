@@ -2,19 +2,21 @@
  * Clipboard capability object - provides clipboard access.
  */
 
-import { AbjectId, AbjectMessage } from '../../core/types.js';
+import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
 import { Capabilities } from '../../core/capability.js';
+import { request } from '../../core/message.js';
 
 const CLIPBOARD_INTERFACE = 'abjects:clipboard';
 
 /**
  * Clipboard capability object.
  */
-const isNode = typeof navigator === 'undefined';
+const isNode = typeof navigator === 'undefined' || typeof navigator.clipboard === 'undefined';
 
 export class Clipboard extends Abject {
   private memoryClipboard = '';
+  private uiServerId?: AbjectId;
 
   constructor() {
     super({
@@ -68,6 +70,10 @@ export class Clipboard extends Abject {
     this.setupHandlers();
   }
 
+  protected override async onInit(): Promise<void> {
+    this.uiServerId = await this.discoverDep('UIServer') ?? undefined;
+  }
+
   private setupHandlers(): void {
     this.on('read', async () => {
       return this.readClipboard();
@@ -110,6 +116,9 @@ export class Clipboard extends Abject {
   async writeClipboard(text: string): Promise<boolean> {
     if (isNode) {
       this.memoryClipboard = text;
+      if (this.uiServerId) {
+        this.send(request(this.id, this.uiServerId, 'abjects:ui' as InterfaceId, 'clipboardWrite', { text }));
+      }
       return true;
     }
 

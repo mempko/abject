@@ -239,6 +239,13 @@ export class Taskbar extends Abject {
       await this.show();
       console.debug('[Taskbar] objectRegistered — done');
     });
+
+    // Auto-refresh taskbar when objects are unregistered (killed)
+    this.on('objectUnregistered', async () => {
+      console.debug('[Taskbar] objectUnregistered — rebuilding taskbar');
+      await this.show();
+      console.debug('[Taskbar] objectUnregistered — done');
+    });
   }
 
   async show(): Promise<boolean> {

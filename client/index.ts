@@ -7,7 +7,8 @@
 
 import { FrontendClient } from './frontend-client.js';
 
-const WS_URL = `ws://${location.hostname}:7719`;
+const wsPort = import.meta.env.VITE_WS_PORT ?? '7719';
+const WS_URL = `ws://${location.hostname}:${wsPort}`;
 
 function start(): void {
   const container = document.querySelector('#app');

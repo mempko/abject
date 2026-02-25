@@ -303,11 +303,34 @@ export class MessageBus implements MessageBusLike {
     return this.workerObjects.has(objectId);
   }
 
+  private _undeliverableHandler?: (message: AbjectMessage) => void;
+
+  /**
+   * Set a handler for undeliverable messages.
+   * Used by NetworkBridge to catch messages for remote objects that aren't
+   * yet in the routing table (late discovery).
+   */
+  setUndeliverableHandler(handler: (message: AbjectMessage) => void): void {
+    this._undeliverableHandler = handler;
+  }
+
+  /**
+   * Remove the undeliverable handler.
+   */
+  removeUndeliverableHandler(): void {
+    this._undeliverableHandler = undefined;
+  }
+
   /**
    * Notify that a message couldn't be delivered locally.
    * Network layer can intercept this.
    */
   private notifyUndeliverable(message: AbjectMessage): void {
+    // Fire dedicated handler (NetworkBridge)
+    if (this._undeliverableHandler) {
+      this._undeliverableHandler(message);
+    }
+
     // Emit to subscriptions
     for (const sub of this.subscriptions) {
       if (sub.objectId === '*' || sub.objectId === 'undeliverable') {

@@ -38,6 +38,7 @@ export class Settings extends Abject {
 
   // Widget AbjectIds
   private workspaceNameInputId?: AbjectId;
+  private accessModeSelectId?: AbjectId;
   private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
 
@@ -155,14 +156,22 @@ export class Settings extends Abject {
 
     await this.ensureWorkspaceId();
 
-    // Get current workspace name
+    // Get current workspace name and access mode
     let currentName = '';
+    let currentAccessMode = 'local';
     if (this.workspaceManagerId) {
       try {
         const active = await this.request<{ id: string; name: string } | null>(
           request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'getActiveWorkspace', {})
         );
-        if (active) currentName = active.name;
+        if (active) {
+          currentName = active.name;
+          try {
+            currentAccessMode = await this.request<string>(
+              request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'getAccessMode', { workspaceId: active.id })
+            );
+          } catch { /* default to local */ }
+        }
       } catch { /* use empty */ }
     }
 
@@ -183,9 +192,9 @@ export class Settings extends Abject {
     );
 
     const winW = 440;
-    // Dynamic height: base (220) + created objects section
+    // Dynamic height: base (220) + access mode section (80) + created objects section
     const objectsSectionHeight = snapshots.length > 0 ? 50 + snapshots.length * 36 : 50;
-    const winH = 220 + objectsSectionHeight;
+    const winH = 300 + objectsSectionHeight;
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
@@ -258,6 +267,62 @@ export class Settings extends Abject {
     await this.request(request(this.id, this.workspaceNameInputId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.workspaceNameInputId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    // ── Access Mode Section ──
+
+    // Divider before access mode
+    const accessDivId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
+        windowId: this.windowId, rect: r0,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: accessDivId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 1 },
+    }));
+
+    // Access Mode label
+    const accessLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Access Mode',
+        style: { color: '#e2e4e9', fontSize: 13 },
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: accessLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // Access Mode description
+    const accessDescId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Control who can access this workspace over the network.',
+        style: { color: '#b4b8c8', fontSize: 12 },
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: accessDescId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
+
+    // Access Mode select dropdown
+    const accessModeIndex = currentAccessMode === 'public' ? 2 : currentAccessMode === 'private' ? 1 : 0;
+    this.accessModeSelectId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createSelect', {
+        windowId: this.windowId, rect: r0,
+        options: ['Local', 'Private', 'Public'],
+        selectedIndex: accessModeIndex,
+      })
+    );
+    await this.request(request(this.id, this.accessModeSelectId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.accessModeSelectId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
@@ -410,6 +475,7 @@ export class Settings extends Abject {
     this.windowId = undefined;
     this.rootLayoutId = undefined;
     this.workspaceNameInputId = undefined;
+    this.accessModeSelectId = undefined;
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
     this.objectDeleteButtons.clear();
@@ -420,7 +486,7 @@ export class Settings extends Abject {
 
   private async setSaveControlsDisabled(disabled: boolean): Promise<void> {
     const style = { disabled };
-    const ids = [this.saveBtnId, this.workspaceNameInputId];
+    const ids = [this.saveBtnId, this.workspaceNameInputId, this.accessModeSelectId];
     for (const id of ids) {
       if (id) {
         try { await this.request(request(this.id, id, WIDGET_INTERFACE, 'update', { style })); } catch { /* widget gone */ }
@@ -456,6 +522,23 @@ export class Settings extends Abject {
 
     // Ensure we know our workspace ID
     await this.ensureWorkspaceId();
+
+    // Save access mode
+    if (this.workspaceManagerId && this.workspaceId && this.accessModeSelectId) {
+      try {
+        const selectedValue = await this.request<string>(
+          request(this.id, this.accessModeSelectId, WIDGET_INTERFACE, 'getValue', {})
+        );
+        const modeMap: Record<string, string> = { 'Local': 'local', 'Private': 'private', 'Public': 'public' };
+        const accessMode = modeMap[selectedValue] ?? 'local';
+        await this.request(
+          request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'setAccessMode', {
+            workspaceId: this.workspaceId,
+            accessMode,
+          })
+        );
+      } catch { /* access mode save failed, continue */ }
+    }
 
     // Rename the workspace
     if (this.workspaceManagerId && this.workspaceId) {

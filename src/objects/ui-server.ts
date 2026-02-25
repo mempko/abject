@@ -1020,6 +1020,11 @@ Example handler with keyboard dispatch:
     const owner = this.surfaceOwners.get(this.focusedSurface);
     if (!owner) return;
 
+    // Let clipboard shortcuts through so browser fires paste/copy/cut events
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'c' || e.key === 'x')) {
+      return;
+    }
+
     e.preventDefault();
 
     this.sendInputEvent(owner, {

@@ -139,6 +139,12 @@ export class FrontendClient {
       case 'setActiveWorkspace':
         this.compositor.setActiveWorkspace(msg.workspaceId);
         break;
+
+      case 'clipboardWrite':
+        navigator.clipboard.writeText(msg.text).catch(err =>
+          console.warn('[Frontend] Clipboard write failed:', err)
+        );
+        break;
     }
   }
 
@@ -284,6 +290,13 @@ export class FrontendClient {
 
   private handleKeyEvent(e: KeyboardEvent, type: 'keydown' | 'keyup'): void {
     if (!this.focusedSurface) return;
+
+    // Let clipboard shortcuts through so browser fires paste/copy/cut events
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'c' || e.key === 'x')) {
+      return;
+    }
+
+    e.preventDefault();
 
     this.sendToBackend({
       type: 'input',

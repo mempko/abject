@@ -11,6 +11,7 @@ export type InterfaceId = string;
 export type MessageId = string;
 export type AgreementId = string;
 export type CapabilityId = string;
+export type PeerId = string;
 
 // =============================================================================
 // Message Types
