@@ -39,6 +39,11 @@ export class PeerRegistry extends Abject {
   private storageId?: AbjectId;
   private localIdentity?: PeerIdentity & { exchangePrivateKey?: CryptoKey };
 
+  // Auto-connect state
+  private manuallyDisconnected: Set<PeerId> = new Set();
+  private autoConnectTimer?: ReturnType<typeof setInterval>;
+  private static readonly AUTO_CONNECT_INTERVAL = 30_000; // 30s
+
   constructor() {
     super({
       manifest: {
@@ -124,6 +129,14 @@ export class PeerRegistry extends Abject {
                   { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer ID' },
                 ],
                 returns: { kind: 'reference', reference: 'PeerTransport' },
+              },
+              {
+                name: 'disconnectSignaling',
+                description: 'Disconnect from a signaling server by URL',
+                parameters: [
+                  { name: 'url', type: { kind: 'primitive', primitive: 'string' }, description: 'WebSocket URL of signaling server' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'getSignalingUrls',
@@ -212,29 +225,38 @@ export class PeerRegistry extends Abject {
       return transport ? { connected: transport.isConnected, encrypted: transport.isEncrypted } : null;
     });
 
+    this.on('disconnectSignaling', async (msg: AbjectMessage) => {
+      const { url } = msg.payload as { url: string };
+      return this.disconnectSignalingImpl(url);
+    });
+
     this.on('getSignalingUrls', async () => {
       return Array.from(this.signalingClients.keys());
     });
   }
 
   protected override async onInit(): Promise<void> {
-    // Discover dependencies
-    this.identityId = (await this.discoverDep('Identity')) ?? undefined;
-    this.storageId = (await this.discoverDep('Storage')) ?? undefined;
+    // Require dependencies — PeerRegistry needs both Identity and Storage
+    this.identityId = await this.requireDep('Identity');
+    this.storageId = await this.requireDep('Storage');
 
     // Load local identity
-    if (this.identityId) {
-      await this.loadLocalIdentity();
-    }
+    await this.loadLocalIdentity();
 
     // Load contacts from storage
     await this.loadContacts();
 
     // Auto-reconnect to saved signaling servers
     await this.loadAndReconnectSignaling();
+
+    // Start auto-connect for contacts
+    this.startAutoConnect();
+    this.autoConnectAll();
   }
 
   protected override async onStop(): Promise<void> {
+    this.stopAutoConnect();
+
     // Disconnect all peers
     for (const [peerId, transport] of this.transports) {
       await transport.disconnect();
@@ -274,7 +296,18 @@ export class PeerRegistry extends Abject {
       addedAt: Date.now(),
     };
     this.contacts.set(peerId, contact);
+
+    // If there's already a connected transport for this peer (e.g. they connected
+    // to us before we added them as a contact), sync the contact state immediately.
+    const existingTransport = this.transports.get(peerId);
+    if (existingTransport?.isConnected) {
+      contact.state = 'connected';
+      contact.lastSeen = Date.now();
+      this.emitEvent('contactConnected', { peerId });
+    }
+
     await this.persistContacts();
+    this.autoConnectAll();
     return true;
   }
 
@@ -288,6 +321,7 @@ export class PeerRegistry extends Abject {
 
     const removed = this.contacts.delete(peerId);
     if (removed) {
+      this.manuallyDisconnected.delete(peerId);
       await this.persistContacts();
     }
     return removed;
@@ -311,6 +345,9 @@ export class PeerRegistry extends Abject {
   // ==========================================================================
 
   private async connectToPeer(peerId: string): Promise<boolean> {
+    // User-initiated connect: remove from manually disconnected
+    this.manuallyDisconnected.delete(peerId);
+
     const contact = this.contacts.get(peerId);
     if (!contact) return false;
     if (this.transports.has(peerId)) return true; // already connected
@@ -354,6 +391,9 @@ export class PeerRegistry extends Abject {
   private async disconnectPeer(peerId: string): Promise<boolean> {
     const transport = this.transports.get(peerId);
     if (!transport) return false;
+
+    // Mark as manually disconnected so auto-connect skips it
+    this.manuallyDisconnected.add(peerId);
 
     await transport.disconnect();
     this.transports.delete(peerId);
@@ -433,11 +473,23 @@ export class PeerRegistry extends Abject {
       await client.connect(url);
       this.signalingClients.set(url, client);
       await this.persistSignalingUrls();
+      // Trigger auto-connect now that we have a signaling server
+      this.autoConnectAll();
       return true;
     } catch (err) {
       console.error(`[PeerRegistry] Failed to connect to signaling: ${url}`, err);
       return false;
     }
+  }
+
+  private async disconnectSignalingImpl(url: string): Promise<boolean> {
+    const client = this.signalingClients.get(url);
+    if (!client) return false;
+
+    await client.disconnect();
+    this.signalingClients.delete(url);
+    await this.persistSignalingUrls();
+    return true;
   }
 
   private findPeerViaSignaling(peerId: string): void {
@@ -476,6 +528,9 @@ export class PeerRegistry extends Abject {
     precondition(this.localIdentity !== undefined, 'Local identity not loaded');
     precondition(this.localIdentity!.exchangePrivateKey !== undefined, 'Exchange private key not loaded');
 
+    // Mark known contacts as 'connecting' for accurate UI feedback
+    this.setContactState(fromPeerId, 'connecting');
+
     // Auto-accept connections from known contacts
     let transport = this.transports.get(fromPeerId);
     if (!transport) {
@@ -492,6 +547,43 @@ export class PeerRegistry extends Abject {
     }
 
     await transport.handleSdpOffer(sdp);
+  }
+
+  // ==========================================================================
+  // Auto-Connect
+  // ==========================================================================
+
+  private startAutoConnect(): void {
+    if (this.autoConnectTimer) return;
+    this.autoConnectTimer = setInterval(() => {
+      this.autoConnectAll();
+    }, PeerRegistry.AUTO_CONNECT_INTERVAL);
+  }
+
+  private stopAutoConnect(): void {
+    if (this.autoConnectTimer) {
+      clearInterval(this.autoConnectTimer);
+      this.autoConnectTimer = undefined;
+    }
+  }
+
+  /**
+   * Try to connect to all offline contacts that haven't been manually disconnected.
+   * Silently catches errors — auto-connect is best-effort.
+   */
+  private autoConnectAll(): void {
+    if (!this.localIdentity) return;
+    if (!this.getActiveSignalingClient()) return;
+
+    for (const [peerId, contact] of this.contacts) {
+      if (contact.state !== 'offline') continue;
+      if (this.manuallyDisconnected.has(peerId)) continue;
+      if (this.transports.has(peerId)) continue;
+
+      this.connectToPeer(peerId).catch(() => {
+        // Silently ignore — will retry on next interval
+      });
+    }
   }
 
   // ==========================================================================

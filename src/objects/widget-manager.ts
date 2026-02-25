@@ -34,6 +34,7 @@ import { ProgressWidget, ProgressWidgetConfig } from './widgets/progress-widget.
 import { DividerWidget } from './widgets/divider-widget.js';
 import { SelectWidget, SelectWidgetConfig } from './widgets/select-widget.js';
 import { CanvasWidget, CanvasWidgetConfig } from './widgets/canvas-widget.js';
+import { TabBarWidget, TabBarConfig } from './widgets/tabbar-widget.js';
 import { WidgetAbject, WidgetConfig } from './widgets/widget-abject.js';
 import { VBoxLayout } from './widgets/vbox-layout.js';
 import { HBoxLayout } from './widgets/hbox-layout.js';
@@ -214,6 +215,18 @@ export class WidgetManager extends Abject {
                   { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Label text', optional: true },
                   { name: 'options', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Available options', optional: true },
                   { name: 'selectedIndex', type: { kind: 'primitive', primitive: 'number' }, description: 'Initially selected index', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'WidgetStyle' }, description: 'Visual style overrides', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createTabBar',
+                description: 'Create a tab bar widget. Returns the widget AbjectId. Listen for "changed" events with aspect "change".',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height }' },
+                  { name: 'tabs', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Tab labels' },
+                  { name: 'selectedIndex', type: { kind: 'primitive', primitive: 'number' }, description: 'Initially selected tab index', optional: true },
                   { name: 'style', type: { kind: 'reference', reference: 'WidgetStyle' }, description: 'Visual style overrides', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
@@ -571,6 +584,21 @@ export class WidgetManager extends Abject {
         type: 'select', rect: payload.rect, text: payload.text, style: payload.style,
         ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
         options: payload.options, selectedIndex: payload.selectedIndex,
+      }), payload.rect);
+    });
+
+    this.on('createTabBar', async (msg: AbjectMessage) => {
+      const payload = msg.payload as {
+        windowId: AbjectId;
+        rect: Rect;
+        tabs?: string[];
+        selectedIndex?: number;
+        style?: WidgetStyle;
+      };
+      return this.createTypedWidget(payload.windowId, new TabBarWidget({
+        type: 'tabBar', rect: payload.rect, style: payload.style,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
+        tabs: payload.tabs, selectedIndex: payload.selectedIndex,
       }), payload.rect);
     });
 

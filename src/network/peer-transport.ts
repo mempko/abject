@@ -23,6 +23,8 @@ import {
 } from '../core/identity.js';
 import type { SignalingClient } from './signaling.js';
 
+const PONG_MISS_LIMIT = 3;
+
 export interface PeerTransportConfig extends TransportConfig {
   localPeerId: PeerId;
   remotePeerId: PeerId;
@@ -53,9 +55,11 @@ export class PeerTransport extends Transport {
   private handshakeState: HandshakeState = 'none';
   private iceServers: RTCIceServer[];
   private pendingCandidates: RTCIceCandidateInit[] = [];
+  private pingInterval?: ReturnType<typeof setInterval>;
+  private lastPongReceived: number = 0;
 
   constructor(config: PeerTransportConfig) {
-    super(config);
+    super({ ...config, heartbeatInterval: config.heartbeatInterval ?? 15_000 });
     this.localPeerId = config.localPeerId;
     this.remotePeerId = config.remotePeerId;
     this.signalingClient = config.signalingClient;
@@ -145,6 +149,7 @@ export class PeerTransport extends Transport {
   }
 
   async disconnect(): Promise<void> {
+    this.stopPing();
     this.sessionKey = undefined;
     this.handshakeState = 'none';
     if (this.dataChannel) {
@@ -225,6 +230,8 @@ export class PeerTransport extends Transport {
       this.handleConnect();
       // Start identity handshake
       this.startHandshake();
+      // Start keepalive pings
+      this.startPing();
     };
 
     dc.onclose = () => {
@@ -260,6 +267,16 @@ export class PeerTransport extends Transport {
   private async handleIncomingData(data: string): Promise<void> {
     try {
       const parsed = JSON.parse(data);
+
+      // Ping/pong keepalive (handled before handshake/encryption checks)
+      if (parsed.ping) {
+        this.dataChannel?.send(JSON.stringify({ pong: true, ts: parsed.ts }));
+        return;
+      }
+      if (parsed.pong) {
+        this.lastPongReceived = Date.now();
+        return;
+      }
 
       // Handshake message
       if (parsed.handshake) {
@@ -313,5 +330,43 @@ export class PeerTransport extends Transport {
     this.sessionKey = await deriveSessionKey(this.localExchangePrivateKey, remoteExchangeKey);
     this.handshakeState = 'encrypted';
     console.log(`[PeerTransport] Handshake complete with ${this.remotePeerId.slice(0, 16)}, AES-256-GCM session established`);
+  }
+
+  /**
+   * Start periodic ping to detect dead connections.
+   */
+  private startPing(): void {
+    this.stopPing();
+    this.lastPongReceived = Date.now();
+
+    this.pingInterval = setInterval(() => {
+      if (Date.now() - this.lastPongReceived > this.config.heartbeatInterval * PONG_MISS_LIMIT) {
+        console.warn(`[PeerTransport] No pong from ${this.remotePeerId.slice(0, 16)} in ${PONG_MISS_LIMIT} intervals, disconnecting`);
+        this.disconnect().catch(console.error);
+        return;
+      }
+
+      if (this.dataChannel?.readyState === 'open') {
+        this.dataChannel.send(JSON.stringify({ ping: true, ts: Date.now() }));
+      }
+    }, this.config.heartbeatInterval);
+  }
+
+  /**
+   * Stop the ping keepalive timer.
+   */
+  private stopPing(): void {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = undefined;
+    }
+  }
+
+  /**
+   * Override to clean up ping timer on any disconnection path.
+   */
+  protected override handleDisconnect(reason?: string): void {
+    this.stopPing();
+    super.handleDisconnect(reason);
   }
 }
