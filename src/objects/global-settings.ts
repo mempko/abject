@@ -79,8 +79,8 @@ export class GlobalSettings extends Abject {
   // Tab state
   private activeTab: 'api-keys' | 'peer-network' = 'api-keys';
   private tabBarId?: AbjectId;
-  /** Maps signaling disconnect button AbjectId -> URL */
-  private signalingDisconnectButtons: Map<AbjectId, string> = new Map();
+  /** Maps signaling remove button AbjectId -> URL */
+  private signalingRemoveButtons: Map<AbjectId, string> = new Map();
 
   constructor() {
     super({
@@ -130,6 +130,11 @@ export class GlobalSettings extends Abject {
     this.identityId = await this.discoverDep('Identity') ?? undefined;
     this.clipboardId = await this.discoverDep('Clipboard') ?? undefined;
     this.peerRegistryId = await this.discoverDep('PeerRegistry') ?? undefined;
+
+    // Subscribe to PeerRegistry events so Peer Network tab auto-refreshes
+    if (this.peerRegistryId) {
+      await this.request(request(this.id, this.peerRegistryId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+    }
 
     // Try to load saved API keys from global storage
     let anthropicKey: string | null = null;
@@ -218,10 +223,10 @@ export class GlobalSettings extends Abject {
         return;
       }
 
-      // Signaling server disconnect buttons
-      if (aspect === 'click' && this.signalingDisconnectButtons.has(fromId)) {
-        const url = this.signalingDisconnectButtons.get(fromId)!;
-        await this.disconnectSignalingServer(url);
+      // Signaling server remove buttons
+      if (aspect === 'click' && this.signalingRemoveButtons.has(fromId)) {
+        const url = this.signalingRemoveButtons.get(fromId)!;
+        await this.removeSignalingServer(url);
         return;
       }
 
@@ -277,6 +282,18 @@ export class GlobalSettings extends Abject {
       if (aspect === 'click' && this.removeButtons.has(fromId)) {
         const peerId = this.removeButtons.get(fromId)!;
         await this.removeContact(peerId);
+        return;
+      }
+
+      // PeerRegistry events — auto-refresh Peer Network tab
+      if (fromId === this.peerRegistryId && (
+        aspect === 'contactConnected' || aspect === 'contactDisconnected' ||
+        aspect === 'contactIntroduced' || aspect === 'signalingStateChanged'
+      )) {
+        if (this.activeTab === 'peer-network' && this.windowId) {
+          await this.hide();
+          await this.show();
+        }
         return;
       }
 
@@ -795,17 +812,17 @@ export class GlobalSettings extends Abject {
       preferredSize: { width: 80, height: 32 },
     }));
 
-    // List connected signaling servers
-    let signalingUrls: string[] = [];
+    // List configured signaling servers with status
+    let signalingServers: Array<{ url: string; status: string }> = [];
     if (this.peerRegistryId) {
       try {
-        signalingUrls = await this.request<string[]>(
-          request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'getSignalingUrls', {})
+        signalingServers = await this.request<Array<{ url: string; status: string }>>(
+          request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'listSignalingServers', {})
         );
       } catch { /* PeerRegistry not ready */ }
     }
 
-    for (const url of signalingUrls) {
+    for (const { url, status } of signalingServers) {
       const serverRowId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
           parentLayoutId: this.rootLayoutId,
@@ -819,11 +836,14 @@ export class GlobalSettings extends Abject {
         preferredSize: { height: 28 },
       }));
 
-      // URL label
+      // URL label — color based on status
+      const urlColor = status === 'connected' ? '#4caf50'
+        : status === 'connecting' ? '#e8a84c'
+        : '#ff6b6b';
       const urlLabelId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
           windowId: this.windowId, rect: r0, text: url,
-          style: { color: '#4caf50', fontSize: 12 },
+          style: { color: urlColor, fontSize: 12 },
         })
       );
       await this.request(request(this.id, serverRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
@@ -832,20 +852,36 @@ export class GlobalSettings extends Abject {
         preferredSize: { height: 28 },
       }));
 
-      // Disconnect button
-      const disconnBtnId = await this.request<AbjectId>(
+      // Status label
+      const statusText = status === 'connected' ? 'connected'
+        : status === 'connecting' ? 'connecting...'
+        : 'offline';
+      const statusLabelId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+          windowId: this.windowId, rect: r0, text: statusText,
+          style: { color: urlColor, fontSize: 11 },
+        })
+      );
+      await this.request(request(this.id, serverRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: statusLabelId,
+        sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+        preferredSize: { width: 80, height: 28 },
+      }));
+
+      // Remove button
+      const removeBtnId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-          windowId: this.windowId, rect: r0, text: 'Disconnect',
+          windowId: this.windowId, rect: r0, text: 'Remove',
           style: { fontSize: 11 },
         })
       );
-      await this.request(request(this.id, disconnBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+      await this.request(request(this.id, removeBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
       await this.request(request(this.id, serverRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: disconnBtnId,
+        widgetId: removeBtnId,
         sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-        preferredSize: { width: 80, height: 26 },
+        preferredSize: { width: 70, height: 26 },
       }));
-      this.signalingDisconnectButtons.set(disconnBtnId, url);
+      this.signalingRemoveButtons.set(removeBtnId, url);
     }
 
     // ========== CONTACTS SECTION ==========
@@ -1057,7 +1093,7 @@ export class GlobalSettings extends Abject {
     this.addContactBtnId = undefined;
     this.connectButtons.clear();
     this.removeButtons.clear();
-    this.signalingDisconnectButtons.clear();
+    this.signalingRemoveButtons.clear();
     this.unmasked.clear();
     // Note: activeTab is NOT reset so tab persists across hide/show
 
@@ -1250,19 +1286,19 @@ export class GlobalSettings extends Abject {
 
   // ========== PEER NETWORK ACTIONS ==========
 
-  private async disconnectSignalingServer(url: string): Promise<void> {
+  private async removeSignalingServer(url: string): Promise<void> {
     if (!this.peerRegistryId) return;
 
     try {
       await this.request(
-        request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'disconnectSignaling', { url })
+        request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'removeSignalingServer', { url })
       );
-      await this.setStatus('Disconnected from signaling server.');
+      await this.setStatus('Removed signaling server.');
       // Rebuild to update server list
       await this.hide();
       await this.show();
     } catch {
-      await this.setStatus('Failed to disconnect.', '#ff6b6b');
+      await this.setStatus('Failed to remove server.', '#ff6b6b');
     }
   }
 

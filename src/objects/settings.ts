@@ -1,5 +1,5 @@
 /**
- * Settings object - per-workspace configuration UI for workspace name.
+ * Settings object - per-workspace configuration UI with General and Access tabs.
  *
  * Uses direct widget Abject interaction (createWindowAbject, createButton, etc.)
  * instead of the legacy string-based widget ID shim.
@@ -18,14 +18,14 @@ const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 const WORKSPACE_MANAGER_INTERFACE: InterfaceId = 'abjects:workspace-manager';
 const WORKSPACE_SWITCHER_INTERFACE: InterfaceId = 'abjects:workspace-switcher';
 const ABJECT_STORE_INTERFACE: InterfaceId = 'abjects:abject-store';
+const PEER_REGISTRY_INTERFACE: InterfaceId = 'abjects:peer-registry';
 
 /**
- * Settings object that provides a per-workspace configuration UI for the
- * workspace name. API key management has moved to GlobalSettings.
+ * Settings object that provides a per-workspace configuration UI with
+ * General and Access tabs.
  *
- * Widgets are first-class Abjects identified by AbjectId. This object registers
- * as a dependent of each widget and listens for 'changed' events to handle
- * user interactions.
+ * General tab: workspace name + created objects.
+ * Access tab: access mode selector + whitelist for private mode.
  */
 export class Settings extends Abject {
   private storageId?: AbjectId;
@@ -33,17 +33,29 @@ export class Settings extends Abject {
   private workspaceManagerId?: AbjectId;
   private workspaceSwitcherId?: AbjectId;
   private abjectStoreId?: AbjectId;
+  private peerRegistryId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
 
-  // Widget AbjectIds
+  // Tab state
+  private activeTab: 'general' | 'access' = 'general';
+  private tabBarId?: AbjectId;
+
+  // Widget AbjectIds (General tab)
   private workspaceNameInputId?: AbjectId;
-  private accessModeSelectId?: AbjectId;
   private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
 
+  // Widget AbjectIds (Access tab)
+  private accessModeSelectId?: AbjectId;
+  private accessSaveBtnId?: AbjectId;
+  private accessStatusLabelId?: AbjectId;
+
   /** Maps delete button AbjectId → object ID for "Created Objects" section. */
   private objectDeleteButtons: Map<AbjectId, string> = new Map();
+
+  /** Maps checkbox AbjectId → peerId for whitelist UI. */
+  private whitelistCheckboxes: Map<AbjectId, string> = new Map();
 
   /** The workspace ID this Settings instance belongs to (lazy-discovered). */
   private workspaceId?: string;
@@ -53,7 +65,7 @@ export class Settings extends Abject {
       manifest: {
         name: 'Settings',
         description:
-          'Per-workspace configuration UI. Manages workspace name.',
+          'Per-workspace configuration UI. Manages workspace name and access settings.',
         version: '1.0.0',
         interfaces: [
           {
@@ -93,6 +105,7 @@ export class Settings extends Abject {
     this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
     this.workspaceSwitcherId = await this.discoverDep('WorkspaceSwitcher') ?? undefined;
     this.abjectStoreId = await this.discoverDep('AbjectStore') ?? undefined;
+    this.peerRegistryId = await this.discoverDep('PeerRegistry') ?? undefined;
   }
 
   /**
@@ -128,22 +141,52 @@ export class Settings extends Abject {
 
     // Handle 'changed' events from widget dependents
     this.on('changed', async (msg: AbjectMessage) => {
-      const { aspect } = msg.payload as { aspect: string; value?: unknown };
+      const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
 
+      // Tab bar change
+      if (fromId === this.tabBarId && aspect === 'change') {
+        const idx = value as number;
+        this.activeTab = idx === 0 ? 'general' : 'access';
+        await this.hide();
+        await this.show();
+        return;
+      }
+
+      // General tab save button
       if (fromId === this.saveBtnId && aspect === 'click') {
-        await this.saveSettings();
+        await this.saveGeneralSettings();
+        return;
+      }
+
+      // Access tab save button
+      if (fromId === this.accessSaveBtnId && aspect === 'click') {
+        await this.saveAccessSettings();
+        return;
       }
 
       // Text input submit triggers save
       if (aspect === 'submit') {
-        await this.saveSettings();
+        if (this.activeTab === 'general') {
+          await this.saveGeneralSettings();
+        } else {
+          await this.saveAccessSettings();
+        }
+        return;
       }
 
       // Handle delete button clicks for created objects
       if (aspect === 'click' && this.objectDeleteButtons.has(fromId)) {
         const objectId = this.objectDeleteButtons.get(fromId)!;
         await this.deleteCreatedObject(objectId);
+        return;
+      }
+
+      // Access mode dropdown change — rebuild access tab to show/hide whitelist
+      if (fromId === this.accessModeSelectId && aspect === 'change') {
+        await this.hide();
+        await this.show();
+        return;
       }
     });
   }
@@ -156,49 +199,17 @@ export class Settings extends Abject {
 
     await this.ensureWorkspaceId();
 
-    // Get current workspace name and access mode
-    let currentName = '';
-    let currentAccessMode = 'local';
-    if (this.workspaceManagerId) {
-      try {
-        const active = await this.request<{ id: string; name: string } | null>(
-          request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'getActiveWorkspace', {})
-        );
-        if (active) {
-          currentName = active.name;
-          try {
-            currentAccessMode = await this.request<string>(
-              request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'getAccessMode', { workspaceId: active.id })
-            );
-          } catch { /* default to local */ }
-        }
-      } catch { /* use empty */ }
-    }
-
-    // Get created objects from AbjectStore
-    interface AbjectSnapshot { objectId: string; manifest: { name: string; description: string }; source: string; owner: string; savedAt: number }
-    let snapshots: AbjectSnapshot[] = [];
-    if (this.abjectStoreId) {
-      try {
-        snapshots = await this.request<AbjectSnapshot[]>(
-          request(this.id, this.abjectStoreId, ABJECT_STORE_INTERFACE, 'list', {})
-        );
-      } catch { /* AbjectStore may not be ready */ }
-    }
-
     // Get display dimensions
     const displayInfo = await this.request<{ width: number; height: number }>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
     );
 
     const winW = 440;
-    // Dynamic height: base (220) + access mode section (80) + created objects section
-    const objectsSectionHeight = snapshots.length > 0 ? 50 + snapshots.length * 36 : 50;
-    const winH = 300 + objectsSectionHeight;
+    const winH = 500;
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
-    // Create window — returns an AbjectId
+    // Create window
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
         title: 'Workspace Settings',
@@ -218,6 +229,58 @@ export class Settings extends Abject {
       })
     );
 
+    // Tab bar
+    this.tabBarId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTabBar', {
+        windowId: this.windowId, rect: r0,
+        tabs: ['General', 'Access'],
+        selectedIndex: this.activeTab === 'general' ? 0 : 1,
+      })
+    );
+    await this.request(request(this.id, this.tabBarId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.tabBarId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    // Build tab content
+    if (this.activeTab === 'general') {
+      await this.buildGeneralTab(r0);
+    } else {
+      await this.buildAccessTab(r0);
+    }
+
+    await this.changed('visibility', true);
+    return true;
+  }
+
+  /**
+   * Build the General tab: workspace name + created objects + save button.
+   */
+  private async buildGeneralTab(r0: { x: number; y: number; width: number; height: number }): Promise<void> {
+    // Get current workspace name
+    let currentName = '';
+    if (this.workspaceManagerId) {
+      try {
+        const active = await this.request<{ id: string; name: string } | null>(
+          request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'getActiveWorkspace', {})
+        );
+        if (active) currentName = active.name;
+      } catch { /* use empty */ }
+    }
+
+    // Get created objects from AbjectStore
+    interface AbjectSnapshot { objectId: string; manifest: { name: string; description: string }; source: string; owner: string; savedAt: number }
+    let snapshots: AbjectSnapshot[] = [];
+    if (this.abjectStoreId) {
+      try {
+        snapshots = await this.request<AbjectSnapshot[]>(
+          request(this.id, this.abjectStoreId, ABJECT_STORE_INTERFACE, 'list', {})
+        );
+      } catch { /* AbjectStore may not be ready */ }
+    }
+
     // Section header: "Workspace"
     const sectionHeaderId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
@@ -225,7 +288,7 @@ export class Settings extends Abject {
         style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: sectionHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 24 },
@@ -238,7 +301,7 @@ export class Settings extends Abject {
         style: { color: '#b4b8c8', fontSize: 12 },
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: descLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
@@ -251,7 +314,7 @@ export class Settings extends Abject {
         style: { color: '#e2e4e9', fontSize: 13 },
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: nameLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -265,64 +328,8 @@ export class Settings extends Abject {
       })
     );
     await this.request(request(this.id, this.workspaceNameInputId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.workspaceNameInputId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-
-    // ── Access Mode Section ──
-
-    // Divider before access mode
-    const accessDivId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
-        windowId: this.windowId, rect: r0,
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: accessDivId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 1 },
-    }));
-
-    // Access Mode label
-    const accessLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Access Mode',
-        style: { color: '#e2e4e9', fontSize: 13 },
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: accessLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-
-    // Access Mode description
-    const accessDescId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Control who can access this workspace over the network.',
-        style: { color: '#b4b8c8', fontSize: 12 },
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: accessDescId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 18 },
-    }));
-
-    // Access Mode select dropdown
-    const accessModeIndex = currentAccessMode === 'public' ? 2 : currentAccessMode === 'private' ? 1 : 0;
-    this.accessModeSelectId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createSelect', {
-        windowId: this.windowId, rect: r0,
-        options: ['Local', 'Private', 'Public'],
-        selectedIndex: accessModeIndex,
-      })
-    );
-    await this.request(request(this.id, this.accessModeSelectId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.accessModeSelectId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
@@ -335,7 +342,7 @@ export class Settings extends Abject {
         windowId: this.windowId, rect: r0,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: divId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 1 },
@@ -348,7 +355,7 @@ export class Settings extends Abject {
         style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: objHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 24 },
@@ -361,7 +368,7 @@ export class Settings extends Abject {
           style: { color: '#b4b8c8', fontSize: 12 },
         })
       );
-      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
         widgetId: emptyLabelId,
         sizePolicy: { vertical: 'fixed' },
         preferredSize: { height: 18 },
@@ -376,7 +383,7 @@ export class Settings extends Abject {
             spacing: 8,
           })
         );
-        await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
           widgetId: rowId,
           sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
           preferredSize: { height: 30 },
@@ -412,9 +419,212 @@ export class Settings extends Abject {
     }
 
     // Spacer pushes save button to bottom
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
 
-    // Save button row (HBox: spacer + button)
+    // Save button row + status label
+    await this.buildSaveRow(r0, 'general');
+  }
+
+  /**
+   * Build the Access tab: access mode selector + whitelist for private mode + save button.
+   */
+  private async buildAccessTab(r0: { x: number; y: number; width: number; height: number }): Promise<void> {
+    // Get current access mode
+    let currentAccessMode = 'local';
+    if (this.workspaceManagerId && this.workspaceId) {
+      try {
+        currentAccessMode = await this.request<string>(
+          request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'getAccessMode', { workspaceId: this.workspaceId })
+        );
+      } catch { /* default to local */ }
+    }
+
+    // Section header
+    const sectionHeaderId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Access Control',
+        style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: sectionHeaderId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 24 },
+    }));
+
+    // Description
+    const descLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Control who can access this workspace over the network.',
+        style: { color: '#b4b8c8', fontSize: 12 },
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: descLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
+
+    // Access Mode label
+    const accessLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Access Mode',
+        style: { color: '#e2e4e9', fontSize: 13 },
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: accessLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // Access Mode select dropdown
+    const accessModeIndex = currentAccessMode === 'public' ? 2 : currentAccessMode === 'private' ? 1 : 0;
+    this.accessModeSelectId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createSelect', {
+        windowId: this.windowId, rect: r0,
+        options: ['Local', 'Private', 'Public'],
+        selectedIndex: accessModeIndex,
+      })
+    );
+    await this.request(request(this.id, this.accessModeSelectId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.accessModeSelectId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    // ── Whitelist Section (only shown for Private mode) ──
+    if (currentAccessMode === 'private') {
+      await this.buildWhitelistSection(r0);
+    }
+
+    // Spacer pushes save button to bottom
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+
+    // Save button row + status label
+    await this.buildSaveRow(r0, 'access');
+  }
+
+  /**
+   * Build the whitelist section showing contacts as checkboxes.
+   */
+  private async buildWhitelistSection(r0: { x: number; y: number; width: number; height: number }): Promise<void> {
+    // Divider
+    const divId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
+        windowId: this.windowId, rect: r0,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: divId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 1 },
+    }));
+
+    // Section header
+    const headerLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Allowed Contacts',
+        style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 },
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: headerLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // Description
+    const descId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Select which contacts can access this workspace.',
+        style: { color: '#b4b8c8', fontSize: 12 },
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: descId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
+
+    // Get contacts from PeerRegistry
+    let contacts: Array<{ peerId: string; name: string; state: string }> = [];
+    if (!this.peerRegistryId) {
+      this.peerRegistryId = await this.discoverDep('PeerRegistry') ?? undefined;
+    }
+    if (this.peerRegistryId) {
+      try {
+        contacts = await this.request<Array<{ peerId: string; name: string; state: string }>>(
+          request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'listContacts', {})
+        );
+      } catch { /* PeerRegistry may not be ready */ }
+    }
+
+    // Get current whitelist
+    let whitelist: string[] = [];
+    if (this.workspaceManagerId && this.workspaceId) {
+      try {
+        whitelist = await this.request<string[]>(
+          request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'getWhitelist', { workspaceId: this.workspaceId })
+        );
+      } catch { /* whitelist not available yet */ }
+    }
+
+    if (contacts.length === 0) {
+      const emptyLabelId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+          windowId: this.windowId, rect: r0, text: 'No contacts available. Add contacts in Global Settings.',
+          style: { color: '#b4b8c8', fontSize: 12 },
+        })
+      );
+      await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: emptyLabelId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 18 },
+      }));
+    } else {
+      for (const contact of contacts) {
+        const isWhitelisted = whitelist.includes(contact.peerId);
+        const displayName = contact.name || contact.peerId.slice(0, 16) + '...';
+
+        // HBox row: checkbox + name label
+        const rowId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+            parentLayoutId: this.rootLayoutId,
+            margins: { top: 0, right: 0, bottom: 0, left: 0 },
+            spacing: 8,
+          })
+        );
+        await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+          widgetId: rowId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 28 },
+        }));
+
+        const checkboxId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createCheckbox', {
+            windowId: this.windowId, rect: r0,
+            checked: isWhitelisted,
+            label: displayName,
+          })
+        );
+        await this.request(request(this.id, checkboxId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+        await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          widgetId: checkboxId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 28 },
+        }));
+
+        this.whitelistCheckboxes.set(checkboxId, contact.peerId);
+      }
+    }
+  }
+
+  /**
+   * Build the save button row and status label at the bottom of a tab.
+   */
+  private async buildSaveRow(r0: { x: number; y: number; width: number; height: number }, tab: 'general' | 'access'): Promise<void> {
     const saveRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
@@ -422,7 +632,7 @@ export class Settings extends Abject {
         spacing: 8,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: saveRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 36 },
@@ -430,34 +640,38 @@ export class Settings extends Abject {
 
     await this.request(request(this.id, saveRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
 
-    this.saveBtnId = await this.request<AbjectId>(
+    const btnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Save',
         style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
       })
     );
-    await this.request(request(this.id, this.saveBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+    await this.request(request(this.id, btnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, saveRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.saveBtnId,
+      widgetId: btnId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 100, height: 36 },
     }));
 
-    // Status label (for save feedback)
-    this.statusLabelId = await this.request<AbjectId>(
+    const statusId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId, rect: r0, text: '',
         style: { color: '#b4b8c8', fontSize: 12, align: 'right' },
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.statusLabelId,
+    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: statusId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
     }));
 
-    await this.changed('visibility', true);
-    return true;
+    if (tab === 'general') {
+      this.saveBtnId = btnId;
+      this.statusLabelId = statusId;
+    } else {
+      this.accessSaveBtnId = btnId;
+      this.accessStatusLabelId = statusId;
+    }
   }
 
   /**
@@ -474,19 +688,22 @@ export class Settings extends Abject {
 
     this.windowId = undefined;
     this.rootLayoutId = undefined;
+    this.tabBarId = undefined;
     this.workspaceNameInputId = undefined;
     this.accessModeSelectId = undefined;
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
+    this.accessSaveBtnId = undefined;
+    this.accessStatusLabelId = undefined;
     this.objectDeleteButtons.clear();
+    this.whitelistCheckboxes.clear();
 
     await this.changed('visibility', false);
     return true;
   }
 
-  private async setSaveControlsDisabled(disabled: boolean): Promise<void> {
+  private async setControlsDisabled(disabled: boolean, ids: (AbjectId | undefined)[]): Promise<void> {
     const style = { disabled };
-    const ids = [this.saveBtnId, this.workspaceNameInputId, this.accessModeSelectId];
     for (const id of ids) {
       if (id) {
         try { await this.request(request(this.id, id, WIDGET_INTERFACE, 'update', { style })); } catch { /* widget gone */ }
@@ -495,12 +712,12 @@ export class Settings extends Abject {
   }
 
   /**
-   * Read workspace name, validate, rename workspace, and refresh the switcher.
+   * Save General tab settings: workspace name.
    */
-  private async saveSettings(): Promise<void> {
+  private async saveGeneralSettings(): Promise<void> {
     if (!this.windowId) return;
 
-    await this.setSaveControlsDisabled(true);
+    await this.setControlsDisabled(true, [this.saveBtnId, this.workspaceNameInputId]);
 
     const workspaceName = await this.request<string>(
       request(this.id, this.workspaceNameInputId!, WIDGET_INTERFACE, 'getValue', {})
@@ -516,29 +733,12 @@ export class Settings extends Abject {
           })
         );
       }
-      await this.setSaveControlsDisabled(false);
+      await this.setControlsDisabled(false, [this.saveBtnId, this.workspaceNameInputId]);
       return;
     }
 
     // Ensure we know our workspace ID
     await this.ensureWorkspaceId();
-
-    // Save access mode
-    if (this.workspaceManagerId && this.workspaceId && this.accessModeSelectId) {
-      try {
-        const selectedValue = await this.request<string>(
-          request(this.id, this.accessModeSelectId, WIDGET_INTERFACE, 'getValue', {})
-        );
-        const modeMap: Record<string, string> = { 'Local': 'local', 'Private': 'private', 'Public': 'public' };
-        const accessMode = modeMap[selectedValue] ?? 'local';
-        await this.request(
-          request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'setAccessMode', {
-            workspaceId: this.workspaceId,
-            accessMode,
-          })
-        );
-      } catch { /* access mode save failed, continue */ }
-    }
 
     // Rename the workspace
     if (this.workspaceManagerId && this.workspaceId) {
@@ -573,6 +773,66 @@ export class Settings extends Abject {
       await this.request(
         request(this.id, this.statusLabelId, WIDGET_INTERFACE, 'update', {
           text: 'Settings saved!',
+          style: { color: '#b4b8c8' },
+        })
+      );
+      await new Promise((resolve) => setTimeout(resolve, 800));
+    }
+    await this.hide();
+  }
+
+  /**
+   * Save Access tab settings: access mode + whitelist.
+   */
+  private async saveAccessSettings(): Promise<void> {
+    if (!this.windowId) return;
+
+    await this.setControlsDisabled(true, [this.accessSaveBtnId, this.accessModeSelectId]);
+
+    await this.ensureWorkspaceId();
+
+    // Save access mode
+    if (this.workspaceManagerId && this.workspaceId && this.accessModeSelectId) {
+      try {
+        const selectedValue = await this.request<string>(
+          request(this.id, this.accessModeSelectId, WIDGET_INTERFACE, 'getValue', {})
+        );
+        const modeMap: Record<string, string> = { 'Local': 'local', 'Private': 'private', 'Public': 'public' };
+        const accessMode = modeMap[selectedValue] ?? 'local';
+        await this.request(
+          request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'setAccessMode', {
+            workspaceId: this.workspaceId,
+            accessMode,
+          })
+        );
+
+        // Save whitelist if in private mode
+        if (accessMode === 'private' && this.whitelistCheckboxes.size > 0) {
+          const whitelist: string[] = [];
+          for (const [checkboxId, peerId] of this.whitelistCheckboxes) {
+            try {
+              const checked = await this.request<boolean>(
+                request(this.id, checkboxId, WIDGET_INTERFACE, 'getValue', {})
+              );
+              if (checked) whitelist.push(peerId);
+            } catch { /* checkbox gone */ }
+          }
+          await this.request(
+            request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'setWhitelist', {
+              workspaceId: this.workspaceId,
+              whitelist,
+            })
+          );
+        }
+      } catch { /* access settings save failed */ }
+    }
+
+    // Show save feedback, then close
+    const statusId = this.accessStatusLabelId;
+    if (statusId) {
+      await this.request(
+        request(this.id, statusId, WIDGET_INTERFACE, 'update', {
+          text: 'Access settings saved!',
           style: { color: '#b4b8c8' },
         })
       );

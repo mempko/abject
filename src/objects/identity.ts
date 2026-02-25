@@ -298,17 +298,15 @@ export class IdentityObject extends Abject {
     if (!this.storageId) return false;
 
     try {
-      const signingData = await this.request<{ value: unknown }>(
+      const signingJwk = await this.request<{ publicKey: string; privateKey: string } | null>(
         createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'get', { key: STORAGE_KEY_SIGNING }),
       );
-      const exchangeData = await this.request<{ value: unknown }>(
+      const exchangeJwk = await this.request<{ publicKey: string; privateKey: string } | null>(
         createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'get', { key: STORAGE_KEY_EXCHANGE }),
       );
 
-      if (!signingData?.value || !exchangeData?.value) return false;
-
-      const signingJwk = signingData.value as { publicKey: string; privateKey: string };
-      const exchangeJwk = exchangeData.value as { publicKey: string; privateKey: string };
+      if (!signingJwk?.publicKey || !signingJwk?.privateKey) return false;
+      if (!exchangeJwk?.publicKey || !exchangeJwk?.privateKey) return false;
 
       this.signingKeyPair = {
         publicKey: await importSigningPublicKey(signingJwk.publicKey),
@@ -351,11 +349,11 @@ export class IdentityObject extends Abject {
   private async loadName(): Promise<void> {
     if (!this.storageId) return;
     try {
-      const result = await this.request<{ value: unknown }>(
+      const result = await this.request<string | null>(
         createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'get', { key: STORAGE_KEY_NAME }),
       );
-      if (result?.value && typeof result.value === 'string') {
-        this.peerName = result.value;
+      if (result && typeof result === 'string') {
+        this.peerName = result;
       }
     } catch {
       // Name not set yet

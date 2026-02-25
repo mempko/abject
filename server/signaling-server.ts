@@ -90,6 +90,9 @@ export class SignalingServer {
       case 'ice-candidate':
         this.handleRelay(ws, msg);
         break;
+      case 'ping':
+        this.handlePing(ws);
+        break;
       default:
         this.sendMessage(ws, { type: 'error', error: `Unknown message type: ${msg.type}` });
     }
@@ -164,6 +167,17 @@ export class SignalingServer {
 
     // Forward the message to the target peer
     this.sendMessage(target.ws, msg);
+  }
+
+  private handlePing(ws: WebSocket): void {
+    // Update lastSeen for the peer associated with this WebSocket
+    for (const record of this.peers.values()) {
+      if (record.ws === ws) {
+        record.lastSeen = Date.now();
+        break;
+      }
+    }
+    this.sendMessage(ws, { type: 'pong' });
   }
 
   private removePeerBySocket(ws: WebSocket): void {

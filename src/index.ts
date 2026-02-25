@@ -43,6 +43,8 @@ import { IdentityObject } from './objects/identity.js';
 import { PeerRegistry } from './objects/peer-registry.js';
 import { RemoteRegistry } from './objects/remote-registry.js';
 import { NetworkBridge } from './network/network-bridge.js';
+import { WorkspaceShareRegistry } from './objects/workspace-share-registry.js';
+import { WorkspaceBrowser } from './objects/workspace-browser.js';
 
 // Export public API
 export { App, createApp } from './ui/app.js';
@@ -80,7 +82,7 @@ export type { CompositeSpec, CompositeChildSpec, RouteEntry } from './objects/co
 export { Supervisor, SUPERVISOR_ID, SUPERVISOR_INTERFACE_ID } from './runtime/supervisor.js';
 export type { ChildSpec, RestartType, RestartStrategy, SupervisorConfig } from './runtime/supervisor.js';
 export { WorkspaceManager, WORKSPACE_MANAGER_ID } from './objects/workspace-manager.js';
-export type { WorkspaceAccessMode } from './objects/workspace-manager.js';
+export type { WorkspaceAccessMode, SharedWorkspaceInfo } from './objects/workspace-manager.js';
 export { WorkspaceRegistry, WORKSPACE_REGISTRY_ID } from './objects/workspace-registry.js';
 export { WorkspaceSwitcher, WORKSPACE_SWITCHER_ID } from './objects/workspace-switcher.js';
 export { GlobalSettings, GLOBAL_SETTINGS_ID } from './objects/global-settings.js';
@@ -88,6 +90,9 @@ export { ObjectManager, OBJECT_MANAGER_ID } from './objects/object-manager.js';
 export { IdentityObject, IDENTITY_ID } from './objects/identity.js';
 export { PeerRegistry, PEER_REGISTRY_ID } from './objects/peer-registry.js';
 export { RemoteRegistry, REMOTE_REGISTRY_ID } from './objects/remote-registry.js';
+export { WorkspaceShareRegistry, WORKSPACE_SHARE_REGISTRY_ID } from './objects/workspace-share-registry.js';
+export type { DiscoveredWorkspace } from './objects/workspace-share-registry.js';
+export { WorkspaceBrowser, WORKSPACE_BROWSER_ID } from './objects/workspace-browser.js';
 
 // Export widget Abjects
 export { WidgetAbject, buildFont, WIDGET_INTERFACE_DECL } from './objects/widgets/widget-abject.js';
@@ -315,6 +320,8 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('Identity', () => new IdentityObject());
   runtime.objectFactory.registerConstructor('PeerRegistry', () => new PeerRegistry());
   runtime.objectFactory.registerConstructor('RemoteRegistry', () => new RemoteRegistry());
+  runtime.objectFactory.registerConstructor('WorkspaceShareRegistry', () => new WorkspaceShareRegistry());
+  runtime.objectFactory.registerConstructor('WorkspaceBrowser', () => new WorkspaceBrowser());
 
   // Mark worker-eligible constructors (only used when workerEnabled).
   // Per-workspace objects use registryHint to discover workspace dependencies.
@@ -381,6 +388,9 @@ async function main(): Promise<App> {
   bus.addInterceptor(networkBridge);
   remoteRegistryObj.setNetworkBridge(networkBridge);
 
+  const workspaceShareRegistryId = await supervisedSpawn('WorkspaceShareRegistry');
+  const workspaceBrowserId = await supervisedSpawn('WorkspaceBrowser');
+
   const globalSettingsId = await supervisedSpawn('GlobalSettings');
 
   const proxyGenId = await supervisedSpawn('ProxyGenerator');
@@ -402,6 +412,7 @@ async function main(): Promise<App> {
     httpClientId, llmId, storageId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
     identityId, peerRegistryId, remoteRegistryId,
+    workspaceShareRegistryId, workspaceBrowserId,
     globalSettingsId, proxyGenId, negotiatorId,
     workspaceSwitcherId, workspaceManagerId,
   ];
@@ -442,6 +453,8 @@ async function main(): Promise<App> {
     peerRegistry: getObj(peerRegistryId),
     remoteRegistry: getObj(remoteRegistryId),
     networkBridge,
+    workspaceShareRegistry: getObj(workspaceShareRegistryId),
+    workspaceBrowser: getObj(workspaceBrowserId),
     globalSettings: getObj(globalSettingsId),
     workspaceSwitcher: getObj(workspaceSwitcherId),
     workspaceManager: getObj(workspaceManagerId),
@@ -465,6 +478,8 @@ async function main(): Promise<App> {
       identity: identityId,
       peerRegistry: peerRegistryId,
       remoteRegistry: remoteRegistryId,
+      workspaceShareRegistry: workspaceShareRegistryId,
+      workspaceBrowser: workspaceBrowserId,
       globalSettings: globalSettingsId,
       workspaceSwitcher: workspaceSwitcherId,
       workspaceManager: workspaceManagerId,

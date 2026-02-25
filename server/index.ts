@@ -57,6 +57,8 @@ import { IdentityObject } from '../src/objects/identity.js';
 import { PeerRegistry } from '../src/objects/peer-registry.js';
 import { RemoteRegistry } from '../src/objects/remote-registry.js';
 import { NetworkBridge } from '../src/network/network-bridge.js';
+import { WorkspaceShareRegistry } from '../src/objects/workspace-share-registry.js';
+import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
 import { NodeWorkerAdapter } from './node-worker-adapter.js';
 import * as path from 'node:path';
@@ -182,6 +184,8 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('Identity', () => new IdentityObject());
   runtime.objectFactory.registerConstructor('PeerRegistry', () => new PeerRegistry());
   runtime.objectFactory.registerConstructor('RemoteRegistry', () => new RemoteRegistry());
+  runtime.objectFactory.registerConstructor('WorkspaceShareRegistry', () => new WorkspaceShareRegistry());
+  runtime.objectFactory.registerConstructor('WorkspaceBrowser', () => new WorkspaceBrowser());
 
   // Mark worker-eligible constructors (only used when workerEnabled).
   // Per-workspace objects use registryHint to discover workspace dependencies.
@@ -248,6 +252,9 @@ async function main(): Promise<void> {
   bus.addInterceptor(networkBridge);
   remoteRegistryObj.setNetworkBridge(networkBridge);
 
+  const workspaceShareRegistryId = await supervisedSpawn('WorkspaceShareRegistry');
+  const workspaceBrowserId = await supervisedSpawn('WorkspaceBrowser');
+
   const globalSettingsId = await supervisedSpawn('GlobalSettings');
 
   const proxyGenId = await supervisedSpawn('ProxyGenerator');
@@ -269,6 +276,7 @@ async function main(): Promise<void> {
     httpClientId, llmId, storageId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
     identityId, peerRegistryId, remoteRegistryId,
+    workspaceShareRegistryId, workspaceBrowserId,
     globalSettingsId, proxyGenId, negotiatorId,
     workspaceSwitcherId, workspaceManagerId,
   ];

@@ -52,6 +52,7 @@ export interface WorkspaceInfo {
   id: string;
   name: string;
   accessMode: WorkspaceAccessMode;
+  whitelist: string[];
   childIds: AbjectId[];
   registryId: AbjectId;
   storageId: AbjectId;
@@ -59,10 +60,20 @@ export interface WorkspaceInfo {
   uiObjects: Array<{ id: AbjectId; iface: InterfaceId }>;
 }
 
+export interface SharedWorkspaceInfo {
+  workspaceId: string;
+  name: string;
+  ownerPeerId?: string;
+  ownerName?: string;
+  accessMode: WorkspaceAccessMode;
+  whitelist?: string[];
+}
+
 interface PersistedWorkspace {
   id: string;
   name: string;
   accessMode?: WorkspaceAccessMode;
+  whitelist?: string[];
   createdAt: number;
 }
 
@@ -191,6 +202,41 @@ export class WorkspaceManager extends Abject {
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              {
+                name: 'getWhitelist',
+                description: 'Get the whitelist of allowed peer IDs for a workspace',
+                parameters: [
+                  {
+                    name: 'workspaceId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'ID of workspace',
+                  },
+                ],
+                returns: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+              },
+              {
+                name: 'setWhitelist',
+                description: 'Set the whitelist of allowed peer IDs for a workspace',
+                parameters: [
+                  {
+                    name: 'workspaceId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'ID of workspace',
+                  },
+                  {
+                    name: 'whitelist',
+                    type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+                    description: 'Array of peer IDs',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'listSharedWorkspaces',
+                description: 'List workspaces that are shared (not local)',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'reference', reference: 'SharedWorkspaceInfo' } },
+              },
             ],
           },
         ],
@@ -242,6 +288,20 @@ export class WorkspaceManager extends Abject {
       return this.setAccessMode(workspaceId, accessMode as WorkspaceAccessMode);
     });
 
+    this.on('getWhitelist', async (msg: AbjectMessage) => {
+      const { workspaceId } = msg.payload as { workspaceId: string };
+      return this.getWhitelist(workspaceId);
+    });
+
+    this.on('setWhitelist', async (msg: AbjectMessage) => {
+      const { workspaceId, whitelist } = msg.payload as { workspaceId: string; whitelist: string[] };
+      return this.setWhitelist(workspaceId, whitelist);
+    });
+
+    this.on('listSharedWorkspaces', async () => {
+      return this.listSharedWorkspaces();
+    });
+
     this.on('refreshTaskbar', async () => {
       return this.refreshTaskbar();
     });
@@ -279,7 +339,7 @@ export class WorkspaceManager extends Abject {
     } else {
       // Restore each workspace
       for (const ws of persisted) {
-        await this.restoreWorkspace(ws.id, ws.name, ws.accessMode ?? 'local');
+        await this.restoreWorkspace(ws.id, ws.name, ws.accessMode ?? 'local', ws.whitelist ?? []);
       }
 
       // Activate the last-active workspace
@@ -461,9 +521,54 @@ export class WorkspaceManager extends Abject {
     );
     const ws = this.workspaces.get(workspaceId);
     if (!ws) return false;
+    const prevMode = ws.accessMode;
     ws.accessMode = accessMode;
     await this.persistWorkspaceList();
+
+    // Emit sharing events for dependents
+    if (accessMode !== 'local' && prevMode === 'local') {
+      await this.changed('workspaceShared', {
+        workspaceId, name: ws.name, accessMode, whitelist: ws.whitelist,
+      });
+    } else if (accessMode === 'local' && prevMode !== 'local') {
+      await this.changed('workspaceUnshared', { workspaceId, name: ws.name });
+    } else if (accessMode !== 'local') {
+      // Mode changed between private/public
+      await this.changed('workspaceShared', {
+        workspaceId, name: ws.name, accessMode, whitelist: ws.whitelist,
+      });
+    }
+
     return true;
+  }
+
+  getWhitelist(workspaceId: string): string[] {
+    const ws = this.workspaces.get(workspaceId);
+    if (!ws) return [];
+    return [...ws.whitelist];
+  }
+
+  async setWhitelist(workspaceId: string, whitelist: string[]): Promise<boolean> {
+    const ws = this.workspaces.get(workspaceId);
+    if (!ws) return false;
+    ws.whitelist = [...whitelist];
+    await this.persistWorkspaceList();
+    return true;
+  }
+
+  listSharedWorkspaces(): SharedWorkspaceInfo[] {
+    const result: SharedWorkspaceInfo[] = [];
+    for (const [, ws] of this.workspaces) {
+      if (ws.accessMode !== 'local') {
+        result.push({
+          workspaceId: ws.id,
+          name: ws.name,
+          accessMode: ws.accessMode,
+          whitelist: ws.accessMode === 'private' ? [...ws.whitelist] : undefined,
+        });
+      }
+    }
+    return result;
   }
 
   // ── Internal Helpers ──
@@ -610,6 +715,7 @@ export class WorkspaceManager extends Abject {
       id: workspaceId,
       name,
       accessMode: 'local',
+      whitelist: [],
       childIds,
       registryId: wsRegistryId,
       storageId: wsStorageId,
@@ -621,9 +727,10 @@ export class WorkspaceManager extends Abject {
   /**
    * Restore a previously persisted workspace by re-spawning its objects.
    */
-  private async restoreWorkspace(workspaceId: string, name: string, accessMode: WorkspaceAccessMode = 'local'): Promise<void> {
+  private async restoreWorkspace(workspaceId: string, name: string, accessMode: WorkspaceAccessMode = 'local', whitelist: string[] = []): Promise<void> {
     const info = await this.spawnWorkspaceObjects(workspaceId, name);
     info.accessMode = accessMode;
+    info.whitelist = whitelist;
     this.workspaces.set(workspaceId, info);
     console.log(`[WORKSPACE-MANAGER] Restored workspace '${name}' (${workspaceId})`);
   }
@@ -698,6 +805,7 @@ export class WorkspaceManager extends Abject {
       id,
       name: ws.name,
       accessMode: ws.accessMode,
+      whitelist: ws.whitelist,
       createdAt: Date.now(),
     }));
     try {

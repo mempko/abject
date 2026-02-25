@@ -13,6 +13,7 @@ import {
   InterfaceDeclaration,
 } from '../../core/types.js';
 import { request } from '../../core/message.js';
+import { INTROSPECT_INTERFACE_ID } from '../../core/introspect.js';
 import { WidgetAbject, WidgetConfig } from './widget-abject.js';
 import {
   Rect,
@@ -101,6 +102,7 @@ export abstract class LayoutAbject extends WidgetAbject {
   protected margins: LayoutMargins;
   protected spacing: number;
   private hoveredLayoutChildId?: AbjectId;
+  private expandedChildren: Set<AbjectId> = new Set();
 
   constructor(config: LayoutConfig, layoutType: 'vbox' | 'hbox') {
     super({
@@ -156,6 +158,10 @@ export abstract class LayoutAbject extends WidgetAbject {
       this.send(
         request(this.id, this.ownerId, WINDOW_INTERFACE, 'removeChild', { widgetId })
       );
+      // Register as dependent to receive expanded/collapsed events from select widgets
+      this.send(
+        request(this.id, widgetId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+      );
       if (this.rect.width > 0 && this.rect.height > 0) {
         await this.updateChildRects();
       }
@@ -185,6 +191,7 @@ export abstract class LayoutAbject extends WidgetAbject {
       if (this.hoveredLayoutChildId === widgetId) {
         this.hoveredLayoutChildId = undefined;
       }
+      this.expandedChildren.delete(widgetId);
       if (this.rect.width > 0 && this.rect.height > 0) {
         await this.updateChildRects();
       }
@@ -212,6 +219,20 @@ export abstract class LayoutAbject extends WidgetAbject {
 
     this.on('getFocusableWidgets', async () => {
       return this.getFocusableWidgets();
+    });
+
+    // Track expanded state of child widgets (e.g. select dropdowns)
+    // so we can render them on top and give them priority hit-testing.
+    this.on('changed', async (msg: AbjectMessage) => {
+      const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
+      if (aspect === 'expanded') {
+        if (value) {
+          this.expandedChildren.add(msg.routing.from);
+        } else {
+          this.expandedChildren.delete(msg.routing.from);
+        }
+        await this.requestRedraw();
+      }
     });
 
     // Forward child dirty notifications up the layout chain
@@ -244,8 +265,30 @@ export abstract class LayoutAbject extends WidgetAbject {
     const childRects = this.calculateChildRects(contentRect);
     const commands: unknown[] = [];
 
+    // First pass: render all non-expanded children
     for (const cr of childRects) {
-      // Render child at computed position
+      if (this.expandedChildren.has(cr.widgetId)) continue;
+      const childOx = ox + cr.rect.x;
+      const childOy = oy + cr.rect.y;
+      try {
+        const childCmds = await this.request<unknown[]>(
+          request(this.id, cr.widgetId, WIDGET_INTERFACE, 'render', {
+            surfaceId,
+            ox: childOx,
+            oy: childOy,
+          })
+        );
+        if (Array.isArray(childCmds)) {
+          commands.push(...childCmds);
+        }
+      } catch {
+        // Widget may have been destroyed
+      }
+    }
+
+    // Second pass: render expanded children on top so dropdowns paint over siblings
+    for (const cr of childRects) {
+      if (!this.expandedChildren.has(cr.widgetId)) continue;
       const childOx = ox + cr.rect.x;
       const childOy = oy + cr.rect.y;
       try {
@@ -297,6 +340,32 @@ export abstract class LayoutAbject extends WidgetAbject {
 
     const contentRect = this.getContentRect();
     const childRects = this.calculateChildRects(contentRect);
+
+    // Priority: forward mousedown/mousemove to expanded children first.
+    // Expanded widgets (e.g. select dropdowns) extend beyond their rect,
+    // so they need first crack at events before normal hit-testing.
+    if (this.expandedChildren.size > 0 && (inputType === 'mousedown' || inputType === 'mousemove')) {
+      for (const cr of childRects) {
+        if (!this.expandedChildren.has(cr.widgetId)) continue;
+        try {
+          const result = await this.request<{ consumed: boolean; focusWidgetId?: AbjectId }>(
+            request(this.id, cr.widgetId, WIDGET_INTERFACE, 'handleInput', {
+              ...input,
+              x: mx - cr.rect.x,
+              y: my - cr.rect.y,
+            })
+          );
+          if (result.consumed) {
+            return {
+              consumed: true,
+              focusWidgetId: result.focusWidgetId ?? cr.widgetId,
+            };
+          }
+        } catch {
+          // Widget gone
+        }
+      }
+    }
 
     // For mousemove, track hover and send mouseleave to old child
     if (inputType === 'mousemove') {

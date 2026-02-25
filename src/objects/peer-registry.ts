@@ -6,10 +6,10 @@
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
-import { Abject, DEFERRED_REPLY } from '../core/abject.js';
+import { Abject } from '../core/abject.js';
 import { Capabilities } from '../core/capability.js';
 import { require as precondition, invariant } from '../core/contracts.js';
-import { request as createRequest, event as createEvent } from '../core/message.js';
+import { request as createRequest } from '../core/message.js';
 import type { PeerId, PeerIdentity, PeerContact, PeerConnectionState } from '../core/identity.js';
 import { SignalingClient } from '../network/signaling.js';
 import { PeerTransport, PeerTransportConfig } from '../network/peer-transport.js';
@@ -35,6 +35,7 @@ export class PeerRegistry extends Abject {
   private contacts: Map<PeerId, PeerContact> = new Map();
   private transports: Map<PeerId, PeerTransport> = new Map();
   private signalingClients: Map<string, SignalingClient> = new Map();
+  private savedSignalingUrls: Set<string> = new Set();
   private identityId?: AbjectId;
   private storageId?: AbjectId;
   private localIdentity?: PeerIdentity & { exchangePrivateKey?: CryptoKey };
@@ -144,6 +145,20 @@ export class PeerRegistry extends Abject {
                 parameters: [],
                 returns: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
               },
+              {
+                name: 'listSignalingServers',
+                description: 'List all configured signaling servers with their connection status',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'reference', reference: 'SignalingServerInfo' } },
+              },
+              {
+                name: 'removeSignalingServer',
+                description: 'Remove a signaling server (disconnect and forget)',
+                parameters: [
+                  { name: 'url', type: { kind: 'primitive', primitive: 'string' }, description: 'WebSocket URL of signaling server' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
             ],
             events: [
               {
@@ -160,6 +175,14 @@ export class PeerRegistry extends Abject {
                 name: 'contactIntroduced',
                 description: 'A new contact was discovered via signaling',
                 payload: { kind: 'reference', reference: 'PeerIdentity' },
+              },
+              {
+                name: 'signalingStateChanged',
+                description: 'A signaling server changed connection state',
+                payload: { kind: 'object', properties: {
+                  url: { kind: 'primitive', primitive: 'string' },
+                  status: { kind: 'primitive', primitive: 'string' },
+                } },
               },
             ],
           },
@@ -233,6 +256,15 @@ export class PeerRegistry extends Abject {
     this.on('getSignalingUrls', async () => {
       return Array.from(this.signalingClients.keys());
     });
+
+    this.on('listSignalingServers', async () => {
+      return this.listSignalingServersImpl();
+    });
+
+    this.on('removeSignalingServer', async (msg: AbjectMessage) => {
+      const { url } = msg.payload as { url: string };
+      return this.removeSignalingServer(url);
+    });
   }
 
   protected override async onInit(): Promise<void> {
@@ -303,7 +335,7 @@ export class PeerRegistry extends Abject {
     if (existingTransport?.isConnected) {
       contact.state = 'connected';
       contact.lastSeen = Date.now();
-      this.emitEvent('contactConnected', { peerId });
+      this.changed('contactConnected', { peerId });
     }
 
     await this.persistContacts();
@@ -423,9 +455,14 @@ export class PeerRegistry extends Abject {
   // ==========================================================================
 
   private async connectSignalingImpl(url: string): Promise<boolean> {
+    // Always save the URL regardless of connection outcome
+    this.savedSignalingUrls.add(url);
+    await this.persistSignalingUrls();
+
     if (this.signalingClients.has(url)) return true;
 
     const client = new SignalingClient();
+    client.setPersistent(true);
 
     client.on({
       onConnect: () => {
@@ -439,9 +476,13 @@ export class PeerRegistry extends Abject {
             this.localIdentity.name,
           );
         }
+        // Trigger auto-connect now that we have a signaling server
+        this.autoConnectAll();
+        this.changed('signalingStateChanged', { url, status: 'connected' });
       },
       onDisconnect: (reason) => {
         console.log(`[PeerRegistry] Disconnected from signaling: ${reason}`);
+        this.changed('signalingStateChanged', { url, status: 'disconnected' });
       },
       onPeerFound: (peerId, publicSigningKey, publicExchangeKey, name) => {
         this.handlePeerFound(peerId, publicSigningKey, publicExchangeKey, name);
@@ -469,15 +510,15 @@ export class PeerRegistry extends Abject {
       },
     });
 
+    // Always add to signalingClients so it can reconnect in the background
+    this.signalingClients.set(url, client);
+
     try {
       await client.connect(url);
-      this.signalingClients.set(url, client);
-      await this.persistSignalingUrls();
-      // Trigger auto-connect now that we have a signaling server
-      this.autoConnectAll();
       return true;
     } catch (err) {
       console.error(`[PeerRegistry] Failed to connect to signaling: ${url}`, err);
+      // Client is still in the map — persistent reconnect will retry
       return false;
     }
   }
@@ -488,8 +529,21 @@ export class PeerRegistry extends Abject {
 
     await client.disconnect();
     this.signalingClients.delete(url);
+    return true;
+  }
+
+  private async removeSignalingServer(url: string): Promise<boolean> {
+    await this.disconnectSignalingImpl(url);
+    this.savedSignalingUrls.delete(url);
     await this.persistSignalingUrls();
     return true;
+  }
+
+  private listSignalingServersImpl(): Array<{ url: string; status: string }> {
+    return Array.from(this.savedSignalingUrls).map(url => {
+      const client = this.signalingClients.get(url);
+      return { url, status: client?.connectionState ?? 'disconnected' };
+    });
   }
 
   private findPeerViaSignaling(peerId: string): void {
@@ -511,7 +565,7 @@ export class PeerRegistry extends Abject {
   ): void {
     if (!this.contacts.has(peerId)) {
       // Emit event for discovered peer
-      this.emitEvent('contactIntroduced', {
+      this.changed('contactIntroduced', {
         peerId, publicSigningKey, publicExchangeKey, name,
       });
     }
@@ -594,12 +648,12 @@ export class PeerRegistry extends Abject {
     transport.on({
       onConnect: () => {
         this.setContactState(peerId, 'connected');
-        this.emitEvent('contactConnected', { peerId });
+        this.changed('contactConnected', { peerId });
       },
       onDisconnect: () => {
         this.setContactState(peerId, 'offline');
         this.transports.delete(peerId);
-        this.emitEvent('contactDisconnected', { peerId });
+        this.changed('contactDisconnected', { peerId });
       },
       onMessage: (message) => {
         // Messages from peers are forwarded to the local message bus
@@ -672,23 +726,6 @@ export class PeerRegistry extends Abject {
     }
   }
 
-  private emitEvent(eventName: string, payload: unknown): void {
-    // Broadcast to dependents
-    for (const depId of this.getDependents()) {
-      this.send(createEvent(this.id, depId, PEER_REGISTRY_INTERFACE, eventName, payload))
-        .catch(() => { /* best-effort */ });
-    }
-  }
-
-  /**
-   * Get dependent object IDs (objects that called addDependent on us).
-   * Access the inherited dependents set.
-   */
-  private getDependents(): AbjectId[] {
-    // Access via the base class pattern — dependents is private in Abject
-    // We emit via broadcast subscription instead
-    return [];
-  }
 
   // ==========================================================================
   // Persistence
@@ -698,11 +735,11 @@ export class PeerRegistry extends Abject {
     if (!this.storageId) return;
 
     try {
-      const result = await this.request<{ value: unknown }>(
+      const result = await this.request<StoredContact[] | null>(
         createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'get', { key: STORAGE_KEY_CONTACTS }),
       );
-      if (result?.value && Array.isArray(result.value)) {
-        for (const stored of result.value as StoredContact[]) {
+      if (Array.isArray(result)) {
+        for (const stored of result) {
           const contact: PeerContact = {
             identity: {
               peerId: stored.peerId,
@@ -754,7 +791,7 @@ export class PeerRegistry extends Abject {
   private async persistSignalingUrls(): Promise<void> {
     if (!this.storageId) return;
 
-    const urls = Array.from(this.signalingClients.keys());
+    const urls = Array.from(this.savedSignalingUrls);
     await this.request(
       createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'set',
         { key: STORAGE_KEY_SIGNALING_URLS, value: urls }),
@@ -765,11 +802,16 @@ export class PeerRegistry extends Abject {
     if (!this.storageId) return;
 
     try {
-      const result = await this.request<{ value: unknown }>(
+      const result = await this.request<string[] | null>(
         createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'get', { key: STORAGE_KEY_SIGNALING_URLS }),
       );
-      if (result?.value && Array.isArray(result.value)) {
-        for (const url of result.value as string[]) {
+      if (Array.isArray(result)) {
+        // Populate saved set first — ensures URLs are tracked even if connection fails
+        for (const url of result) {
+          this.savedSignalingUrls.add(url);
+        }
+        // Then attempt connections (best effort)
+        for (const url of result) {
           try {
             await this.connectSignalingImpl(url);
           } catch (err) {

@@ -14,7 +14,8 @@ export type SignalingState = 'disconnected' | 'connecting' | 'connected' | 'erro
 
 export interface SignalingMessage {
   type: 'register' | 'find' | 'found' | 'not-found' | 'unregister'
-    | 'sdp-offer' | 'sdp-answer' | 'ice-candidate' | 'error' | 'registered';
+    | 'sdp-offer' | 'sdp-answer' | 'ice-candidate' | 'error' | 'registered'
+    | 'ping' | 'pong';
   peerId?: string;
   targetPeerId?: string;
   publicSigningKey?: string;
@@ -45,6 +46,9 @@ export class SignalingClient {
   private reconnectAttempts = 0;
   private readonly maxReconnectAttempts = 5;
   private readonly reconnectDelay = 2000;
+  private pingTimer?: ReturnType<typeof setInterval>;
+  private static readonly PING_INTERVAL = 120_000; // 2 minutes
+  private persistent = false;
 
   get connectionState(): SignalingState {
     return this.state;
@@ -56,6 +60,13 @@ export class SignalingClient {
 
   on(events: SignalingEvents): void {
     this.events = { ...this.events, ...events };
+  }
+
+  /**
+   * Enable persistent reconnect — ignores maxReconnectAttempts and always retries.
+   */
+  setPersistent(v: boolean): void {
+    this.persistent = v;
   }
 
   /**
@@ -73,12 +84,14 @@ export class SignalingClient {
         this.socket.onopen = () => {
           this.state = 'connected';
           this.reconnectAttempts = 0;
+          this.startPing();
           this.events.onConnect?.();
           resolve();
         };
 
         this.socket.onclose = (event) => {
           this.state = 'disconnected';
+          this.stopPing();
           this.events.onDisconnect?.(event.reason || 'Connection closed');
           this.scheduleReconnect();
         };
@@ -104,7 +117,9 @@ export class SignalingClient {
    * Disconnect from the signaling server.
    */
   async disconnect(): Promise<void> {
+    this.persistent = false;
     this.clearReconnectTimer();
+    this.stopPing();
     if (this.socket) {
       this.socket.close(1000, 'Client disconnect');
       this.socket = undefined;
@@ -211,6 +226,9 @@ export class SignalingClient {
         case 'registered':
           // Acknowledgment — no action needed
           break;
+        case 'pong':
+          // Keepalive acknowledgment — no action needed
+          break;
       }
     } catch (err) {
       console.error('[Signaling] Failed to parse message:', err);
@@ -218,12 +236,17 @@ export class SignalingClient {
   }
 
   private scheduleReconnect(): void {
-    if (this.reconnectTimer || this.reconnectAttempts >= this.maxReconnectAttempts) return;
+    if (this.reconnectTimer) return;
+    if (!this.persistent && this.reconnectAttempts >= this.maxReconnectAttempts) return;
     if (!this.endpoint) return;
 
     this.reconnectAttempts++;
-    const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
-    console.log(`[Signaling] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+    const maxDelay = this.persistent ? 60_000 : Infinity;
+    const delay = Math.min(this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1), maxDelay);
+    const label = this.persistent
+      ? `${this.reconnectAttempts}`
+      : `${this.reconnectAttempts}/${this.maxReconnectAttempts}`;
+    console.log(`[Signaling] Reconnecting in ${delay}ms (attempt ${label})`);
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
@@ -237,6 +260,22 @@ export class SignalingClient {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
+    }
+  }
+
+  private startPing(): void {
+    this.stopPing();
+    this.pingTimer = setInterval(() => {
+      if (this.state === 'connected' && this.socket) {
+        this.socket.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, SignalingClient.PING_INTERVAL);
+  }
+
+  private stopPing(): void {
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = undefined;
     }
   }
 }

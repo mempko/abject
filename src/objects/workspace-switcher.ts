@@ -19,11 +19,13 @@ const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 const WORKSPACE_MANAGER_INTERFACE: InterfaceId = 'abjects:workspace-manager';
 
 const GLOBAL_SETTINGS_INTERFACE: InterfaceId = 'abjects:global-settings';
+const WORKSPACE_BROWSER_INTERFACE: InterfaceId = 'abjects:workspace-browser';
 
 export class WorkspaceSwitcher extends Abject {
   private widgetManagerId?: AbjectId;
   private workspaceManagerId?: AbjectId;
   private globalSettingsId?: AbjectId;
+  private workspaceBrowserId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
 
@@ -31,6 +33,7 @@ export class WorkspaceSwitcher extends Abject {
   private workspaceSwitchButtons: Map<AbjectId, string> = new Map();
   private workspaceCreateBtnId?: AbjectId;
   private globalSettingsBtnId?: AbjectId;
+  private browseBtnId?: AbjectId;
 
   /** Cached workspace data (pushed by WorkspaceManager via show payload) */
   private cachedWorkspaces: Array<{ id: string; name: string }> = [];
@@ -181,6 +184,22 @@ export class WorkspaceSwitcher extends Abject {
         return;
       }
 
+      // Browse button
+      if (fromId === this.browseBtnId) {
+        if (!this.workspaceBrowserId) {
+          this.workspaceBrowserId = await this.discoverDep('WorkspaceBrowser') ?? undefined;
+        }
+        if (this.workspaceBrowserId) {
+          try {
+            await this.request(request(this.id, this.workspaceBrowserId,
+              WORKSPACE_BROWSER_INTERFACE, 'show', {}));
+          } catch (err) {
+            console.warn('[WorkspaceSwitcher] Failed to show WorkspaceBrowser:', err);
+          }
+        }
+        return;
+      }
+
     });
   }
 
@@ -199,6 +218,7 @@ export class WorkspaceSwitcher extends Abject {
     this.workspaceSwitchButtons.clear();
     this.workspaceCreateBtnId = undefined;
     this.globalSettingsBtnId = undefined;
+    this.browseBtnId = undefined;
     this.rootLayoutId = undefined;
 
     const workspaces = this.cachedWorkspaces;
@@ -211,8 +231,8 @@ export class WorkspaceSwitcher extends Abject {
     const padding = 16;
     const spacing = 6;
 
-    // Workspace section: label + all workspace buttons + "+" button
-    const wsBtnCount = hasWorkspaces ? workspaces.length + 1 : 0;
+    // Workspace section: label + all workspace buttons + "+" button + Browse button
+    const wsBtnCount = hasWorkspaces ? workspaces.length + 2 : 0; // +2 for "+" and "Browse"
     const wsLabelCount = hasWorkspaces ? 1 : 0;
     const extraHeight = wsLabelCount * (labelH + spacing);
     const barWidth = btnW + padding * 2;
@@ -328,6 +348,9 @@ export class WorkspaceSwitcher extends Abject {
 
       // "+" button to create a new workspace
       this.workspaceCreateBtnId = await addBtn('+');
+
+      // Browse button to discover remote workspaces
+      this.browseBtnId = await addBtn('Browse');
     }
 
     return true;
@@ -347,6 +370,7 @@ export class WorkspaceSwitcher extends Abject {
     this.workspaceSwitchButtons.clear();
     this.workspaceCreateBtnId = undefined;
     this.globalSettingsBtnId = undefined;
+    this.browseBtnId = undefined;
     return true;
   }
 }
