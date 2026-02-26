@@ -42,8 +42,8 @@ import { ObjectManager } from './objects/object-manager.js';
 import { IdentityObject } from './objects/identity.js';
 import { PeerRegistry } from './objects/peer-registry.js';
 import { RemoteRegistry } from './objects/remote-registry.js';
-import { NetworkBridge } from './network/network-bridge.js';
-import { WorkspaceShareRegistry } from './objects/workspace-share-registry.js';
+import { PeerRouter } from './network/peer-router.js';
+import { WorkspaceShareRegistry, WORKSPACE_SHARE_REGISTRY_ID } from './objects/workspace-share-registry.js';
 import { WorkspaceBrowser } from './objects/workspace-browser.js';
 
 // Export public API
@@ -158,7 +158,7 @@ export type { TransportConfig } from './network/transport.js';
 export { WebSocketTransport } from './network/websocket.js';
 export { SignalingClient } from './network/signaling.js';
 export { PeerTransport } from './network/peer-transport.js';
-export { NetworkBridge } from './network/network-bridge.js';
+export { PeerRouter, PEER_ROUTER_ID } from './network/peer-router.js';
 
 // Export compositor
 export { Compositor } from './ui/compositor.js';
@@ -320,6 +320,7 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('Identity', () => new IdentityObject());
   runtime.objectFactory.registerConstructor('PeerRegistry', () => new PeerRegistry());
   runtime.objectFactory.registerConstructor('RemoteRegistry', () => new RemoteRegistry());
+  runtime.objectFactory.registerConstructor('PeerRouter', () => new PeerRouter());
   runtime.objectFactory.registerConstructor('WorkspaceShareRegistry', () => new WorkspaceShareRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceBrowser', () => new WorkspaceBrowser());
 
@@ -380,16 +381,19 @@ async function main(): Promise<App> {
   const identityId = await supervisedSpawn('Identity');
   const peerRegistryId = await supervisedSpawn('PeerRegistry');
   const remoteRegistryId = await supervisedSpawn('RemoteRegistry');
+  const peerRouterId = await supervisedSpawn('PeerRouter');
 
-  // Install NetworkBridge interceptor for transparent P2P routing
+  // Install PeerRouter interceptor for transparent P2P routing
   const peerRegistryObj = runtime.objectFactory.getObject(peerRegistryId) as PeerRegistry;
-  const remoteRegistryObj = runtime.objectFactory.getObject(remoteRegistryId) as RemoteRegistry;
-  const networkBridge = new NetworkBridge(bus, peerRegistryObj);
-  bus.addInterceptor(networkBridge);
-  remoteRegistryObj.setNetworkBridge(networkBridge);
+  const peerRouterObj = runtime.objectFactory.getObject(peerRouterId) as unknown as PeerRouter;
+  peerRouterObj.setBus(bus);
+  peerRouterObj.setPeerRegistry(peerRegistryObj);
+  bus.addInterceptor(peerRouterObj);
 
-  const workspaceShareRegistryId = await supervisedSpawn('WorkspaceShareRegistry');
-  const workspaceBrowserId = await supervisedSpawn('WorkspaceBrowser');
+  // Wire PeerRegistry → PeerRouter for inbound messages
+  peerRegistryObj.onRemoteMessage((msg, fromPeerId) => {
+    peerRouterObj.handleIncomingMessage(msg, fromPeerId);
+  });
 
   const globalSettingsId = await supervisedSpawn('GlobalSettings');
 
@@ -403,15 +407,23 @@ async function main(): Promise<App> {
   // WorkspaceManager spawns per-workspace objects (Settings, Taskbar, Chat, etc.)
   const workspaceManagerId = await supervisedSpawn('WorkspaceManager');
 
-  // Boot workspaces (must be called after spawn — cannot happen during onInit
-  // because Factory would deadlock processing our spawn request)
+  // Boot workspaces BEFORE spawning WSR — boot() loads persisted workspaces
+  // (including their access modes) so listSharedWorkspaces returns real data.
+  // Cannot happen during onInit because Factory would deadlock processing our spawn request.
   await bootstrapRequest(workspaceManagerId, 'abjects:workspace-manager' as InterfaceId, 'boot', {});
+
+  // WorkspaceShareRegistry must spawn AFTER boot() so listSharedWorkspaces finds shared workspaces
+  const workspaceShareRegistryId = await supervisedSpawn('WorkspaceShareRegistry');
+
+  // Register allowed system objects for remote access
+  peerRouterObj.allowSystemObjectDirect(workspaceShareRegistryId, WORKSPACE_SHARE_REGISTRY_ID);
+  const workspaceBrowserId = await supervisedSpawn('WorkspaceBrowser');
 
   // ALL objects are now spawned and init'd — safe to start health monitoring.
   const monitoredIds = [
     httpClientId, llmId, storageId, timerId, clipboardId,
     consoleId, filesystemId, windowManagerId, widgetManagerId,
-    identityId, peerRegistryId, remoteRegistryId,
+    identityId, peerRegistryId, remoteRegistryId, peerRouterId,
     workspaceShareRegistryId, workspaceBrowserId,
     globalSettingsId, proxyGenId, negotiatorId,
     workspaceSwitcherId, workspaceManagerId,
@@ -452,7 +464,7 @@ async function main(): Promise<App> {
     identity: getObj(identityId),
     peerRegistry: getObj(peerRegistryId),
     remoteRegistry: getObj(remoteRegistryId),
-    networkBridge,
+    peerRouter: getObj(peerRouterId),
     workspaceShareRegistry: getObj(workspaceShareRegistryId),
     workspaceBrowser: getObj(workspaceBrowserId),
     globalSettings: getObj(globalSettingsId),
@@ -478,6 +490,7 @@ async function main(): Promise<App> {
       identity: identityId,
       peerRegistry: peerRegistryId,
       remoteRegistry: remoteRegistryId,
+      peerRouter: peerRouterId,
       workspaceShareRegistry: workspaceShareRegistryId,
       workspaceBrowser: workspaceBrowserId,
       globalSettings: globalSettingsId,

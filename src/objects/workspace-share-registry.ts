@@ -24,6 +24,7 @@ export interface DiscoveredWorkspace {
   ownerPeerId: string;
   ownerName: string;
   accessMode: string;
+  registryId: string;
   discoveredAt: number;
   hops: number;
 }
@@ -162,6 +163,7 @@ export class WorkspaceShareRegistry extends Abject {
       // WorkspaceManager: workspaceShared — update local cache
       if (aspect === 'workspaceShared') {
         const info = value as SharedWorkspaceInfo;
+        console.log(`[WSR] workspaceShared event:`, info.name, info.accessMode);
         this.localShared.set(info.workspaceId, info);
         return;
       }
@@ -189,6 +191,7 @@ export class WorkspaceShareRegistry extends Abject {
         this.localPeerId = identity.peerId;
         this.localPeerName = identity.name;
       } catch { /* identity not ready */ }
+      console.log('[WSR] identity:', this.localPeerId?.slice(0, 16), this.localPeerName);
     }
 
     // Register as dependent of PeerRegistry for connection events
@@ -216,6 +219,7 @@ export class WorkspaceShareRegistry extends Abject {
         for (const ws of shared) {
           this.localShared.set(ws.workspaceId, ws);
         }
+        console.log('[WSR] init loaded', this.localShared.size, 'shared workspaces');
       } catch { /* WorkspaceManager may not be ready */ }
     }
   }
@@ -227,6 +231,7 @@ export class WorkspaceShareRegistry extends Abject {
   }
 
   async queryPeerWorkspaces(peerId: string): Promise<DiscoveredWorkspace[]> {
+    console.log(`[WSR] queryPeerWorkspaces peerId=${peerId.slice(0, 16)}`);
     if (!this.peerRegistryId || !this.localPeerId) return [];
 
     try {
@@ -241,6 +246,8 @@ export class WorkspaceShareRegistry extends Abject {
         )
       );
 
+      console.log('[WSR] queryPeer got', results.length, 'workspaces');
+
       // Cache results
       for (const dw of results) {
         const key = `${dw.ownerPeerId}:${dw.workspaceId}`;
@@ -248,14 +255,15 @@ export class WorkspaceShareRegistry extends Abject {
       }
 
       return results;
-    } catch {
-      // Peer may not have WorkspaceShareRegistry or is unreachable
+    } catch (err) {
+      console.log('[WSR] queryPeer FAILED for', peerId.slice(0, 16), err);
       return [];
     }
   }
 
   async discoverWorkspaces(hops?: number): Promise<DiscoveredWorkspace[]> {
     const effectiveHops = Math.min(hops ?? 1, MAX_HOPS);
+    console.log(`[WSR] discoverWorkspaces hops=${effectiveHops} localPeerId=${this.localPeerId?.slice(0, 16)}`);
 
     if (!this.peerRegistryId || !this.localPeerId) return [];
 
@@ -268,6 +276,7 @@ export class WorkspaceShareRegistry extends Abject {
     } catch { return []; }
 
     const connectedPeers = contacts.filter(c => c.state === 'connected');
+    console.log(`[WSR] connected peers:`, connectedPeers.map(c => c.peerId.slice(0, 16)));
     const allResults: DiscoveredWorkspace[] = [];
     const visited = [this.localPeerId];
 
@@ -291,9 +300,10 @@ export class WorkspaceShareRegistry extends Abject {
             this.discoveredWorkspaces.set(key, dw);
           }
         }
+        console.log('[WSR] peer query result:', results.length, 'workspaces');
         allResults.push(...results);
-      } catch {
-        // Peer may not support workspace sharing
+      } catch (err) {
+        console.log('[WSR] peer query failed for', peer.peerId.slice(0, 16), err);
       }
     }
 
@@ -315,6 +325,8 @@ export class WorkspaceShareRegistry extends Abject {
   ): Promise<DiscoveredWorkspace[]> {
     const effectiveHops = hops ?? 0;
     const visitedSet = new Set(visited ?? []);
+    console.log(`[WSR] handleWorkspaceQuery from=${fromPeerId.slice(0, 16)} hops=${effectiveHops} localShared=${this.localShared.size}`);
+    console.log(`[WSR] localShared entries:`, [...this.localShared.values()].map(w => ({ name: w.name, mode: w.accessMode })));
 
     // Add self to visited (loop prevention)
     if (this.localPeerId) {
@@ -324,12 +336,14 @@ export class WorkspaceShareRegistry extends Abject {
 
     // Filter local shared workspaces for the requesting peer
     const directResults = this.filterWorkspacesForPeer(fromPeerId);
+    console.log('[WSR] filtered results:', directResults.length);
     const results: DiscoveredWorkspace[] = directResults.map(ws => ({
       workspaceId: ws.workspaceId,
       name: ws.name,
       ownerPeerId: this.localPeerId ?? '',
       ownerName: this.localPeerName ?? '',
       accessMode: ws.accessMode,
+      registryId: ws.registryId ?? '',
       discoveredAt: Date.now(),
       hops: 0,
     }));
@@ -377,6 +391,7 @@ export class WorkspaceShareRegistry extends Abject {
       }
     }
 
+    console.log('[WSR] handleWorkspaceQuery returning', results.length, 'total');
     return results;
   }
 

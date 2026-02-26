@@ -125,7 +125,7 @@ export class PeerRegistry extends Abject {
               },
               {
                 name: 'getTransport',
-                description: 'Get the transport for a connected peer (for NetworkBridge)',
+                description: 'Get the transport for a connected peer (for PeerRouter)',
                 parameters: [
                   { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer ID' },
                 ],
@@ -435,7 +435,7 @@ export class PeerRegistry extends Abject {
 
   /**
    * Get the PeerTransport for a connected peer.
-   * Used by NetworkBridge for routing messages.
+   * Used by PeerRouter for routing messages.
    */
   getTransportForPeer(peerId: PeerId): PeerTransport | undefined {
     return this.transports.get(peerId);
@@ -656,9 +656,10 @@ export class PeerRegistry extends Abject {
         this.changed('contactDisconnected', { peerId });
       },
       onMessage: (message) => {
+        console.log(`[PeerRegistry] inbound message from ${peerId.slice(0, 16)} to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
         // Messages from peers are forwarded to the local message bus
-        // by the NetworkBridge interceptor
-        this.events.onMessage?.(message);
+        // by the PeerRouter interceptor
+        this.events.onMessage?.(message, peerId);
       },
       onError: (error) => {
         console.error(`[PeerRegistry] Transport error with ${peerId.slice(0, 16)}:`, error);
@@ -666,13 +667,13 @@ export class PeerRegistry extends Abject {
     });
   }
 
-  // Event callback for incoming messages (used by NetworkBridge)
-  private events: { onMessage?: (msg: AbjectMessage) => void } = {};
+  // Event callback for incoming messages (used by PeerRouter)
+  private events: { onMessage?: (msg: AbjectMessage, fromPeerId: PeerId) => void } = {};
 
   /**
    * Set a handler for messages received from remote peers.
    */
-  onRemoteMessage(handler: (msg: AbjectMessage) => void): void {
+  onRemoteMessage(handler: (msg: AbjectMessage, fromPeerId: PeerId) => void): void {
     this.events.onMessage = handler;
   }
 

@@ -3,7 +3,7 @@
  *
  * When a local object needs a service that isn't available locally,
  * RemoteRegistry queries connected peers' registries and caches results.
- * Discovered remote objects are registered in the NetworkBridge routing table.
+ * Discovered remote objects are registered in the PeerRouter routing table.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId, AbjectManifest } from '../core/types.js';
@@ -11,11 +11,11 @@ import { Abject } from '../core/abject.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request as createRequest, event as createEvent } from '../core/message.js';
 import type { PeerId } from '../core/identity.js';
-import type { NetworkBridge } from '../network/network-bridge.js';
 
 const REMOTE_REGISTRY_INTERFACE = 'abjects:remote-registry' as InterfaceId;
 const REGISTRY_INTERFACE = 'abjects:registry' as InterfaceId;
 const PEER_REGISTRY_INTERFACE = 'abjects:peer-registry' as InterfaceId;
+const PEER_ROUTER_INTERFACE = 'abjects:peer-router' as InterfaceId;
 
 export const REMOTE_REGISTRY_ID = 'abjects:remote-registry' as AbjectId;
 
@@ -32,14 +32,14 @@ const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 export class RemoteRegistry extends Abject {
   private remoteObjects: Map<AbjectId, RemoteObjectEntry> = new Map();
   private peerRegistryId?: AbjectId;
-  private networkBridge?: NetworkBridge;
+  private peerRouterId?: AbjectId;
 
   constructor() {
     super({
       manifest: {
         name: 'RemoteRegistry',
         description:
-          'Distributed object discovery across connected peers. Queries remote registries, caches results, and registers routes in the NetworkBridge.',
+          'Distributed object discovery across connected peers. Queries remote registries, caches results, and registers routes in the PeerRouter.',
         version: '1.0.0',
         interfaces: [
           {
@@ -106,13 +106,6 @@ export class RemoteRegistry extends Abject {
     this.setupHandlers();
   }
 
-  /**
-   * Set the NetworkBridge for route registration.
-   * Called during bootstrap after both objects are created.
-   */
-  setNetworkBridge(bridge: NetworkBridge): void {
-    this.networkBridge = bridge;
-  }
 
   private setupHandlers(): void {
     this.on('discoverRemote', async (msg: AbjectMessage) => {
@@ -144,6 +137,7 @@ export class RemoteRegistry extends Abject {
 
   protected override async onInit(): Promise<void> {
     this.peerRegistryId = (await this.discoverDep('PeerRegistry')) ?? undefined;
+    this.peerRouterId = (await this.discoverDep('PeerRouter')) ?? undefined;
   }
 
   // ==========================================================================
@@ -187,7 +181,7 @@ export class RemoteRegistry extends Abject {
 
   /**
    * Query a remote peer's registry for objects matching the given criteria.
-   * This sends a message to the remote peer's Registry object via NetworkBridge.
+   * This sends a message to the remote peer's Registry object via PeerRouter.
    */
   private async queryPeerRegistry(
     peerId: string,
@@ -196,7 +190,7 @@ export class RemoteRegistry extends Abject {
   ): Promise<Array<{ objectId: string; peerId: string; manifest: AbjectManifest }>> {
     // For now, this requires that we've already synced with the peer
     // Full implementation would send a discovery request to the peer's registry
-    // via the NetworkBridge and wait for the response
+    // via the PeerRouter and wait for the response
     return this.searchCacheForPeer(peerId, name, interfaceId);
   }
 
@@ -210,11 +204,11 @@ export class RemoteRegistry extends Abject {
     return { objectId: entry.objectId, peerId: entry.peerId, manifest: entry.manifest };
   }
 
-  private registerRemoteObjectImpl(
+  private async registerRemoteObjectImpl(
     objectId: string,
     peerId: string,
     manifest: AbjectManifest,
-  ): boolean {
+  ): Promise<boolean> {
     this.remoteObjects.set(objectId as AbjectId, {
       objectId: objectId as AbjectId,
       peerId,
@@ -223,9 +217,17 @@ export class RemoteRegistry extends Abject {
       ttl: CACHE_TTL,
     });
 
-    // Register route in NetworkBridge
-    if (this.networkBridge) {
-      this.networkBridge.registerRoute(objectId as AbjectId, peerId);
+    // Register route in PeerRouter
+    if (this.peerRouterId) {
+      try {
+        await this.request(
+          createRequest(this.id, this.peerRouterId, PEER_ROUTER_INTERFACE, 'registerRoute', {
+            objectId, peerId,
+          }),
+        );
+      } catch {
+        // PeerRouter not ready — route will be discovered via announcements
+      }
     }
 
     return true;

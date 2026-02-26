@@ -5,7 +5,7 @@
  * with a refresh button to trigger new discovery.
  */
 
-import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
+import { AbjectId, AbjectMessage, InterfaceId, SpawnResult } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
@@ -17,14 +17,18 @@ const WORKSPACE_SHARE_REGISTRY_INTERFACE: InterfaceId = 'abjects:workspace-share
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
 const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
+const FACTORY_INTERFACE: InterfaceId = 'abjects:factory';
+const REGISTRY_BROWSER_INTERFACE: InterfaceId = 'abjects:registry-browser';
 
 export class WorkspaceBrowser extends Abject {
   private widgetManagerId?: AbjectId;
   private shareRegistryId?: AbjectId;
+  private factoryId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
   private refreshBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
+  private browseButtons: Map<AbjectId, DiscoveredWorkspace> = new Map();
 
   constructor() {
     super({
@@ -74,6 +78,7 @@ export class WorkspaceBrowser extends Abject {
   protected override async onInit(): Promise<void> {
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.shareRegistryId = await this.discoverDep('WorkspaceShareRegistry') ?? undefined;
+    this.factoryId = await this.discoverDep('Factory') ?? undefined;
   }
 
   private setupHandlers(): void {
@@ -97,6 +102,13 @@ export class WorkspaceBrowser extends Abject {
 
       if (fromId === this.refreshBtnId && aspect === 'click') {
         await this.refresh();
+        return;
+      }
+
+      // Browse button click — open remote RegistryBrowser
+      const ws = this.browseButtons.get(fromId);
+      if (ws && aspect === 'click') {
+        await this.openRemoteBrowser(ws);
       }
     });
   }
@@ -211,6 +223,9 @@ export class WorkspaceBrowser extends Abject {
       } catch { /* ShareRegistry may not be ready */ }
     }
 
+    console.log(`[WorkspaceBrowser] show — got ${workspaces.length} discovered workspaces`);
+    if (workspaces.length > 0) console.log('[WorkspaceBrowser] workspaces:', workspaces.map(w => w.name));
+
     if (workspaces.length === 0) {
       const emptyId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
@@ -254,6 +269,20 @@ export class WorkspaceBrowser extends Abject {
           const badge = ws.accessMode === 'public' ? ' [public]' : ' [private]';
           const hopsLabel = ws.hops > 0 ? ` (${ws.hops} hop${ws.hops > 1 ? 's' : ''})` : '';
 
+          // HBox: label (expanding) + Browse button (fixed)
+          const wsRowId = await this.request<AbjectId>(
+            request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+              parentLayoutId: this.rootLayoutId,
+              margins: { top: 0, right: 0, bottom: 0, left: 0 },
+              spacing: 6,
+            })
+          );
+          await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+            widgetId: wsRowId,
+            sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+            preferredSize: { height: 24 },
+          }));
+
           const wsLabelId = await this.request<AbjectId>(
             request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
               windowId: this.windowId, rect: r0,
@@ -261,11 +290,28 @@ export class WorkspaceBrowser extends Abject {
               style: { color: '#b4b8c8', fontSize: 12 },
             })
           );
-          await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          await this.request(request(this.id, wsRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
             widgetId: wsLabelId,
-            sizePolicy: { vertical: 'fixed' },
-            preferredSize: { height: 20 },
+            sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+            preferredSize: { height: 24 },
           }));
+
+          // Browse button (only if registryId is available)
+          if (ws.registryId) {
+            const browseBtnId = await this.request<AbjectId>(
+              request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+                windowId: this.windowId, rect: r0, text: 'Browse',
+                style: { fontSize: 11 },
+              })
+            );
+            await this.request(request(this.id, browseBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+            this.browseButtons.set(browseBtnId, ws);
+            await this.request(request(this.id, wsRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+              widgetId: browseBtnId,
+              sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+              preferredSize: { width: 70, height: 24 },
+            }));
+          }
         }
       }
     }
@@ -303,12 +349,14 @@ export class WorkspaceBrowser extends Abject {
     this.rootLayoutId = undefined;
     this.refreshBtnId = undefined;
     this.statusLabelId = undefined;
+    this.browseButtons.clear();
 
     await this.changed('visibility', false);
     return true;
   }
 
   async refresh(): Promise<boolean> {
+    console.log('[WorkspaceBrowser] refresh — calling discoverWorkspaces');
     if (!this.shareRegistryId) {
       this.shareRegistryId = await this.discoverDep('WorkspaceShareRegistry') ?? undefined;
     }
@@ -322,10 +370,50 @@ export class WorkspaceBrowser extends Abject {
       } catch { /* best-effort */ }
     }
 
+    console.log('[WorkspaceBrowser] discovery done, rebuilding UI');
     // Rebuild UI
     await this.hide();
     await this.show();
     return true;
+  }
+
+  /**
+   * Spawn a RegistryBrowser, configure it for remote mode, and show it.
+   */
+  private async openRemoteBrowser(ws: DiscoveredWorkspace): Promise<void> {
+    if (!this.factoryId) {
+      this.factoryId = await this.discoverDep('Factory') ?? undefined;
+    }
+    if (!this.factoryId || !ws.registryId) return;
+
+    try {
+      const result = await this.request<SpawnResult>(
+        request(this.id, this.factoryId, FACTORY_INTERFACE, 'spawn', {
+          manifest: {
+            name: 'RegistryBrowser', description: '', version: '1.0.0',
+            interfaces: [], requiredCapabilities: [], tags: ['system'],
+          },
+        })
+      );
+
+      const browserId = result.objectId;
+
+      // Configure for remote mode
+      await this.request(
+        request(this.id, browserId, REGISTRY_BROWSER_INTERFACE, 'browseRemote', {
+          registryId: ws.registryId,
+          peerId: ws.ownerPeerId,
+          label: ws.name,
+        })
+      );
+
+      // Show the browser
+      await this.request(
+        request(this.id, browserId, REGISTRY_BROWSER_INTERFACE, 'show', {})
+      );
+    } catch (err) {
+      console.warn('[WorkspaceBrowser] Failed to open remote browser:', err);
+    }
   }
 }
 

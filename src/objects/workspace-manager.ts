@@ -67,6 +67,7 @@ export interface SharedWorkspaceInfo {
   ownerName?: string;
   accessMode: WorkspaceAccessMode;
   whitelist?: string[];
+  registryId?: string;
 }
 
 interface PersistedWorkspace {
@@ -237,6 +238,29 @@ export class WorkspaceManager extends Abject {
                 parameters: [],
                 returns: { kind: 'array', elementType: { kind: 'reference', reference: 'SharedWorkspaceInfo' } },
               },
+              {
+                name: 'findWorkspaceForObject',
+                description: 'Find which workspace contains a given object and return its access info',
+                parameters: [
+                  {
+                    name: 'objectId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Object ID to look up',
+                  },
+                ],
+                returns: { kind: 'object', properties: {
+                  workspaceId: { kind: 'primitive', primitive: 'string' },
+                  name: { kind: 'primitive', primitive: 'string' },
+                  accessMode: { kind: 'primitive', primitive: 'string' },
+                  whitelist: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+                } },
+              },
+              {
+                name: 'listWorkspacesDetailed',
+                description: 'List all workspaces with full details including child IDs and access mode',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'reference', reference: 'WorkspaceDetailedInfo' } },
+              },
             ],
           },
         ],
@@ -300,6 +324,15 @@ export class WorkspaceManager extends Abject {
 
     this.on('listSharedWorkspaces', async () => {
       return this.listSharedWorkspaces();
+    });
+
+    this.on('findWorkspaceForObject', async (msg: AbjectMessage) => {
+      const { objectId } = msg.payload as { objectId: string };
+      return this.findWorkspaceForObject(objectId as AbjectId);
+    });
+
+    this.on('listWorkspacesDetailed', async () => {
+      return this.listWorkspacesDetailed();
     });
 
     this.on('refreshTaskbar', async () => {
@@ -525,10 +558,16 @@ export class WorkspaceManager extends Abject {
     ws.accessMode = accessMode;
     await this.persistWorkspaceList();
 
+    // Emit access change event for PeerRouter cache invalidation
+    await this.changed('workspaceAccessChanged', {
+      workspaceId, accessMode, whitelist: ws.whitelist,
+    });
+
     // Emit sharing events for dependents
     if (accessMode !== 'local' && prevMode === 'local') {
       await this.changed('workspaceShared', {
         workspaceId, name: ws.name, accessMode, whitelist: ws.whitelist,
+        registryId: ws.registryId,
       });
     } else if (accessMode === 'local' && prevMode !== 'local') {
       await this.changed('workspaceUnshared', { workspaceId, name: ws.name });
@@ -536,6 +575,7 @@ export class WorkspaceManager extends Abject {
       // Mode changed between private/public
       await this.changed('workspaceShared', {
         workspaceId, name: ws.name, accessMode, whitelist: ws.whitelist,
+        registryId: ws.registryId,
       });
     }
 
@@ -553,6 +593,12 @@ export class WorkspaceManager extends Abject {
     if (!ws) return false;
     ws.whitelist = [...whitelist];
     await this.persistWorkspaceList();
+
+    // Emit access change event for PeerRouter cache invalidation
+    await this.changed('workspaceAccessChanged', {
+      workspaceId, accessMode: ws.accessMode, whitelist: ws.whitelist,
+    });
+
     return true;
   }
 
@@ -565,10 +611,53 @@ export class WorkspaceManager extends Abject {
           name: ws.name,
           accessMode: ws.accessMode,
           whitelist: ws.accessMode === 'private' ? [...ws.whitelist] : undefined,
+          registryId: ws.registryId,
         });
       }
     }
     return result;
+  }
+
+  /**
+   * Find the workspace that contains a given object and return its access info.
+   */
+  findWorkspaceForObject(objectId: AbjectId): {
+    workspaceId: string;
+    name: string;
+    accessMode: WorkspaceAccessMode;
+    whitelist: string[];
+  } | null {
+    for (const [, ws] of this.workspaces) {
+      if (ws.childIds.includes(objectId)) {
+        return {
+          workspaceId: ws.id,
+          name: ws.name,
+          accessMode: ws.accessMode,
+          whitelist: [...ws.whitelist],
+        };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * List all workspaces with full details including child IDs and access mode.
+   * Used by PeerRouter for route propagation.
+   */
+  listWorkspacesDetailed(): Array<{
+    workspaceId: string;
+    name: string;
+    accessMode: WorkspaceAccessMode;
+    whitelist: string[];
+    childIds: AbjectId[];
+  }> {
+    return [...this.workspaces.entries()].map(([, ws]) => ({
+      workspaceId: ws.id,
+      name: ws.name,
+      accessMode: ws.accessMode,
+      whitelist: [...ws.whitelist],
+      childIds: [...ws.childIds],
+    }));
   }
 
   // ── Internal Helpers ──

@@ -46,6 +46,10 @@ export class RegistryBrowser extends Abject {
   private selectedMethod?: { interfaceId: InterfaceId; method: string };
   private detailObjectId?: AbjectId;
 
+  // ── Remote browsing mode ──
+  private isRemoteMode = false;
+  private remoteLabel?: string;
+
   // ── Navigation state ──
   private currentView: 'kindList' | 'instanceList' | 'detail' = 'kindList';
   private selectedKindName?: string;
@@ -105,6 +109,16 @@ export class RegistryBrowser extends Abject {
                 returns: { kind: 'object', properties: {
                   visible: { kind: 'primitive', primitive: 'boolean' },
                 }},
+              },
+              {
+                name: 'browseRemote',
+                description: 'Configure this browser to target a remote registry via @peerId addressing',
+                parameters: [
+                  { name: 'registryId', type: { kind: 'primitive', primitive: 'string' }, description: 'Remote workspace registry ID' },
+                  { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Owner peer ID' },
+                  { name: 'label', type: { kind: 'primitive', primitive: 'string' }, description: 'Display label for the window title' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
               },
             ],
           },
@@ -266,6 +280,17 @@ export class RegistryBrowser extends Abject {
       return { visible: !!this.windowId };
     });
 
+    this.on('browseRemote', async (msg: AbjectMessage) => {
+      const { registryId, peerId, label } = msg.payload as {
+        registryId: string; peerId: string; label: string;
+      };
+      this.registryId = `${registryId}@${peerId}` as AbjectId;
+      this.systemRegistryId = undefined;
+      this.isRemoteMode = true;
+      this.remoteLabel = label;
+      return true;
+    });
+
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       if (aspect !== 'click' && aspect !== 'submit' && aspect !== 'change') return;
@@ -274,6 +299,7 @@ export class RegistryBrowser extends Abject {
     });
 
     this.on('objectRegistered', async () => {
+      if (this.isRemoteMode) return;  // no subscription to remote events
       this.cachedObjects = await this.registryList();
       this.systemObjects = await this.systemRegistryList();
       if (this.windowId) {
@@ -331,6 +357,8 @@ export class RegistryBrowser extends Abject {
     this.currentView = 'kindList';
     this.selectedKindName = undefined;
 
+    const windowTitle = this.isRemoteMode ? `Remote: ${this.remoteLabel}` : 'Registry Browser';
+
     if (!this.windowId) {
       const displayInfo = await this.request<{ width: number; height: number }>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
@@ -341,7 +369,7 @@ export class RegistryBrowser extends Abject {
 
       this.windowId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
-          title: 'Registry Browser',
+          title: windowTitle,
           rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
           zIndex: 200,
           resizable: true,
@@ -350,7 +378,7 @@ export class RegistryBrowser extends Abject {
     } else {
       await this.request(
         request(this.id, this.windowId, WINDOW_INTERFACE, 'setTitle', {
-          title: 'Registry Browser',
+          title: windowTitle,
         })
       );
     }
@@ -631,8 +659,8 @@ export class RegistryBrowser extends Abject {
         preferredSize: { height: 32 },
       }));
 
-      // Clone button
-      if (this.factoryId) {
+      // Clone button (skip in remote mode — read-only)
+      if (this.factoryId && !this.isRemoteMode) {
         const cloneBtnId = await this.request<AbjectId>(
           request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
             windowId: this.windowId!, rect: r0, text: 'Clone',
@@ -818,19 +846,51 @@ export class RegistryBrowser extends Abject {
       await addLabel(`Requires: ${reqNames.join(', ')}`);
     }
 
-    // ── Send Message section ──
-    await addLabel('Send Message:', { color: '#e2e4e9', fontWeight: 'bold' });
+    // ── Send Message section (skip in remote mode — read-only) ──
+    if (!this.isRemoteMode) {
+      await addLabel('Send Message:', { color: '#e2e4e9', fontWeight: 'bold' });
 
-    // Method buttons in 2-col HBox rows
-    const allMethods: { interfaceId: InterfaceId; method: string }[] = [];
-    for (const iface of obj.manifest.interfaces) {
-      for (const method of iface.methods) {
-        allMethods.push({ interfaceId: iface.id, method: method.name });
+      // Method buttons in 2-col HBox rows
+      const allMethods: { interfaceId: InterfaceId; method: string }[] = [];
+      for (const iface of obj.manifest.interfaces) {
+        for (const method of iface.methods) {
+          allMethods.push({ interfaceId: iface.id, method: method.name });
+        }
       }
-    }
 
-    for (let i = 0; i < allMethods.length; i += 2) {
-      const rowId = await this.request<AbjectId>(
+      for (let i = 0; i < allMethods.length; i += 2) {
+        const rowId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+            parentLayoutId: scrollVBoxId,
+            margins: { top: 0, right: 0, bottom: 0, left: 0 },
+            spacing: 8,
+          })
+        );
+        await this.request(request(this.id, scrollVBoxId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          widgetId: rowId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 26 },
+        }));
+
+        for (let j = i; j < Math.min(i + 2, allMethods.length); j++) {
+          const m = allMethods[j];
+          const btnId = await this.request<AbjectId>(
+            request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+              windowId: this.windowId!, rect: r0, text: m.method,
+            })
+          );
+          await this.addDep(btnId);
+          this.methodButtons.set(btnId, m);
+          await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+            widgetId: btnId,
+            sizePolicy: { horizontal: 'expanding' },
+            preferredSize: { height: 26 },
+          }));
+        }
+      }
+
+      // Payload row (HBox: input + Send)
+      const payloadRowId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
           parentLayoutId: scrollVBoxId,
           margins: { top: 0, right: 0, bottom: 0, left: 0 },
@@ -838,69 +898,39 @@ export class RegistryBrowser extends Abject {
         })
       );
       await this.request(request(this.id, scrollVBoxId, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: rowId,
+        widgetId: payloadRowId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 26 },
+        preferredSize: { height: 30 },
       }));
 
-      for (let j = i; j < Math.min(i + 2, allMethods.length); j++) {
-        const m = allMethods[j];
-        const btnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-            windowId: this.windowId!, rect: r0, text: m.method,
-          })
-        );
-        await this.addDep(btnId);
-        this.methodButtons.set(btnId, m);
-        await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-          widgetId: btnId,
-          sizePolicy: { horizontal: 'expanding' },
-          preferredSize: { height: 26 },
-        }));
-      }
+      this.msgPayloadId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
+          windowId: this.windowId!, rect: r0, placeholder: 'JSON payload (optional)',
+        })
+      );
+      await this.addDep(this.msgPayloadId);
+      await this.request(request(this.id, payloadRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: this.msgPayloadId,
+        sizePolicy: { horizontal: 'expanding' },
+        preferredSize: { height: 30 },
+      }));
+
+      this.msgSendBtnId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+          windowId: this.windowId!, rect: r0, text: 'Send',
+          style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
+        })
+      );
+      await this.addDep(this.msgSendBtnId);
+      await this.request(request(this.id, payloadRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: this.msgSendBtnId,
+        sizePolicy: { horizontal: 'fixed' },
+        preferredSize: { width: 60, height: 30 },
+      }));
+
+      // Response label
+      this.msgResponseId = await addLabel('');
     }
-
-    // Payload row (HBox: input + Send)
-    const payloadRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-        parentLayoutId: scrollVBoxId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, scrollVBoxId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: payloadRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 30 },
-    }));
-
-    this.msgPayloadId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
-        windowId: this.windowId!, rect: r0, placeholder: 'JSON payload (optional)',
-      })
-    );
-    await this.addDep(this.msgPayloadId);
-    await this.request(request(this.id, payloadRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.msgPayloadId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: 30 },
-    }));
-
-    this.msgSendBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId!, rect: r0, text: 'Send',
-        style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
-      })
-    );
-    await this.addDep(this.msgSendBtnId);
-    await this.request(request(this.id, payloadRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.msgSendBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 60, height: 30 },
-    }));
-
-    // Response label
-    this.msgResponseId = await addLabel('');
 
     // ── Fixed bottom buttons row (outside scrollable area) ──
     const bottomRowId = await this.request<AbjectId>(
@@ -928,51 +958,53 @@ export class RegistryBrowser extends Abject {
       preferredSize: { width: 80, height: 32 },
     }));
 
-    // Show "Edit Source" button if the object is scriptable
-    const isEditable = obj.source !== undefined;
-    if (isEditable) {
-      this.editSourceBtnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-          windowId: this.windowId!, rect: r0, text: 'Edit Source',
-        })
-      );
-      await this.addDep(this.editSourceBtnId);
-      await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: this.editSourceBtnId,
-        sizePolicy: { horizontal: 'fixed' },
-        preferredSize: { width: 110, height: 32 },
-      }));
-
-      // Show "Delete" button for workshop-created objects
-      if (this.factoryId) {
-        this.deleteBtnId = await this.request<AbjectId>(
+    // Show "Edit Source" button if the object is scriptable (skip in remote mode)
+    if (!this.isRemoteMode) {
+      const isEditable = obj.source !== undefined;
+      if (isEditable) {
+        this.editSourceBtnId = await this.request<AbjectId>(
           request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-            windowId: this.windowId!, rect: r0, text: 'Delete',
-            style: { background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' },
+            windowId: this.windowId!, rect: r0, text: 'Edit Source',
           })
         );
-        await this.addDep(this.deleteBtnId);
+        await this.addDep(this.editSourceBtnId);
         await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-          widgetId: this.deleteBtnId,
+          widgetId: this.editSourceBtnId,
+          sizePolicy: { horizontal: 'fixed' },
+          preferredSize: { width: 110, height: 32 },
+        }));
+
+        // Show "Delete" button for workshop-created objects
+        if (this.factoryId) {
+          this.deleteBtnId = await this.request<AbjectId>(
+            request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+              windowId: this.windowId!, rect: r0, text: 'Delete',
+              style: { background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' },
+            })
+          );
+          await this.addDep(this.deleteBtnId);
+          await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+            widgetId: this.deleteBtnId,
+            sizePolicy: { horizontal: 'fixed' },
+            preferredSize: { width: 80, height: 32 },
+          }));
+        }
+      }
+
+      // Clone button (always available if factory exists)
+      if (this.factoryId) {
+        this.cloneBtnId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+            windowId: this.windowId!, rect: r0, text: 'Clone',
+          })
+        );
+        await this.addDep(this.cloneBtnId);
+        await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          widgetId: this.cloneBtnId,
           sizePolicy: { horizontal: 'fixed' },
           preferredSize: { width: 80, height: 32 },
         }));
       }
-    }
-
-    // Clone button (always available if factory exists)
-    if (this.factoryId) {
-      this.cloneBtnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-          windowId: this.windowId!, rect: r0, text: 'Clone',
-        })
-      );
-      await this.addDep(this.cloneBtnId);
-      await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: this.cloneBtnId,
-        sizePolicy: { horizontal: 'fixed' },
-        preferredSize: { width: 80, height: 32 },
-      }));
     }
 
     // Right spacer in bottom row

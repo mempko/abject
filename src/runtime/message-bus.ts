@@ -307,7 +307,7 @@ export class MessageBus implements MessageBusLike {
 
   /**
    * Set a handler for undeliverable messages.
-   * Used by NetworkBridge to catch messages for remote objects that aren't
+   * Used by PeerRouter to catch messages for remote objects that aren't
    * yet in the routing table (late discovery).
    */
   setUndeliverableHandler(handler: (message: AbjectMessage) => void): void {
@@ -326,7 +326,7 @@ export class MessageBus implements MessageBusLike {
    * Network layer can intercept this.
    */
   private notifyUndeliverable(message: AbjectMessage): void {
-    // Fire dedicated handler (NetworkBridge)
+    // Fire dedicated handler (PeerRouter)
     if (this._undeliverableHandler) {
       this._undeliverableHandler(message);
     }

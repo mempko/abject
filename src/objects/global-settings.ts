@@ -82,6 +82,11 @@ export class GlobalSettings extends Abject {
   /** Maps signaling remove button AbjectId -> URL */
   private signalingRemoveButtons: Map<AbjectId, string> = new Map();
 
+  /** Nested VBox that holds all tab-specific content (destroyed/recreated on tab switch). */
+  private tabContentContainerId?: AbjectId;
+  /** All widget IDs created inside the tab content container, for cleanup on tab switch. */
+  private tabContentWidgetIds: AbjectId[] = [];
+
   constructor() {
     super({
       manifest: {
@@ -194,6 +199,75 @@ export class GlobalSettings extends Abject {
     }
   }
 
+  /** Track a widget created inside the tab content container for cleanup. */
+  private trackTabWidget(widgetId: AbjectId): AbjectId {
+    this.tabContentWidgetIds.push(widgetId);
+    return widgetId;
+  }
+
+  /**
+   * Destroy all tab content widgets, remove+destroy the container, then create a fresh container.
+   * The window, root layout, and tab bar persist across tab switches.
+   */
+  private async clearTabContent(): Promise<void> {
+    if (!this.tabContentContainerId || !this.rootLayoutId) return;
+
+    for (const widgetId of this.tabContentWidgetIds) {
+      try { await this.request(request(this.id, widgetId, WIDGET_INTERFACE, 'destroy', {})); }
+      catch { /* gone */ }
+    }
+    this.tabContentWidgetIds = [];
+
+    try { await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'removeLayoutChild', { widgetId: this.tabContentContainerId })); }
+    catch { /* gone */ }
+    try { await this.request(request(this.id, this.tabContentContainerId, WIDGET_INTERFACE, 'destroy', {})); }
+    catch { /* gone */ }
+
+    this.tabContentContainerId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedVBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.tabContentContainerId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
+    // Reset tab-specific widget refs
+    this.anthropicLabelId = undefined;
+    this.anthropicKeyId = undefined;
+    this.anthropicToggleId = undefined;
+    this.openaiLabelId = undefined;
+    this.openaiKeyId = undefined;
+    this.openaiToggleId = undefined;
+    this.saveBtnId = undefined;
+    this.statusLabelId = undefined;
+    this.nameInputId = undefined;
+    this.saveNameBtnId = undefined;
+    this.copyPeerIdBtnId = undefined;
+    this.copyIdentityBtnId = undefined;
+    this.signalingInputId = undefined;
+    this.signalingConnectBtnId = undefined;
+    this.addContactInputId = undefined;
+    this.addContactBtnId = undefined;
+    this.connectButtons.clear();
+    this.removeButtons.clear();
+    this.signalingRemoveButtons.clear();
+    this.unmasked.clear();
+  }
+
+  /**
+   * Refresh the Peer Network tab content without destroying the window.
+   */
+  private async refreshPeerNetworkTab(): Promise<void> {
+    if (!this.windowId || this.activeTab !== 'peer-network') return;
+    await this.clearTabContent();
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+    await this.buildPeerNetworkTab(r0);
+  }
+
   private setupHandlers(): void {
     this.on('show', async () => {
       return this.show();
@@ -214,12 +288,17 @@ export class GlobalSettings extends Abject {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
 
-      // Tab bar change
+      // Tab bar change — clear and rebuild tab content without destroying window
       if (fromId === this.tabBarId && aspect === 'change') {
         const idx = value as number;
         this.activeTab = idx === 0 ? 'api-keys' : 'peer-network';
-        await this.hide();
-        await this.show();
+        await this.clearTabContent();
+        const r0 = { x: 0, y: 0, width: 0, height: 0 };
+        if (this.activeTab === 'api-keys') {
+          await this.buildApiKeysTab(r0);
+        } else {
+          await this.buildPeerNetworkTab(r0);
+        }
         return;
       }
 
@@ -290,10 +369,7 @@ export class GlobalSettings extends Abject {
         aspect === 'contactConnected' || aspect === 'contactDisconnected' ||
         aspect === 'contactIntroduced' || aspect === 'signalingStateChanged'
       )) {
-        if (this.activeTab === 'peer-network' && this.windowId) {
-          await this.hide();
-          await this.show();
-        }
+        await this.refreshPeerNetworkTab();
         return;
       }
 
@@ -309,58 +385,7 @@ export class GlobalSettings extends Abject {
    * Always rebuilds to reflect current contacts/identity state.
    */
   async show(): Promise<boolean> {
-    // Always rebuild (contacts/identity may have changed)
-    if (this.windowId) {
-      await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
-          windowId: this.windowId,
-        })
-      );
-      this.windowId = undefined;
-    }
-
-    // Reset button tracking
-    this.connectButtons.clear();
-    this.removeButtons.clear();
-    this.unmasked.clear();
-
-    // Load saved keys to populate inputs
-    let savedAnthropicKey: string | null = null;
-    let savedOpenaiKey: string | null = null;
-    if (this.storageId) {
-      savedAnthropicKey = await this.request<string | null>(
-        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_ANTHROPIC })
-      );
-      savedOpenaiKey = await this.request<string | null>(
-        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_OPENAI })
-      );
-    }
-
-    // Get identity info
-    let peerId = '';
-    let peerName = '';
-    if (this.identityId) {
-      try {
-        const identity = await this.request<{ peerId: string; name: string }>(
-          request(this.id, this.identityId, IDENTITY_INTERFACE, 'exportPublicKeys', {})
-        );
-        peerId = identity.peerId;
-        peerName = identity.name ?? '';
-      } catch { /* identity not ready */ }
-    }
-
-    // Get contacts
-    interface ContactInfo {
-      peerId: string; name: string; state: string; addedAt: number;
-    }
-    let contacts: ContactInfo[] = [];
-    if (this.peerRegistryId) {
-      try {
-        contacts = await this.request<ContactInfo[]>(
-          request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'listContacts', {})
-        );
-      } catch { /* PeerRegistry not ready */ }
-    }
+    if (this.windowId) return true;
 
     // Get display dimensions
     const displayInfo = await this.request<{ width: number; height: number }>(
@@ -408,29 +433,24 @@ export class GlobalSettings extends Abject {
       preferredSize: { height: 36 },
     }));
 
-    if (this.activeTab === 'api-keys') {
-      await this.buildApiKeysTab(r0, savedAnthropicKey, savedOpenaiKey);
-    } else {
-      await this.buildPeerNetworkTab(r0, peerId, peerName, contacts);
-    }
-
-    // ========== FOOTER ==========
-
-    // Spacer
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
-
-    // Status label (shared across all sections)
-    this.statusLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId!, rect: r0, text: '',
-        style: { color: '#b4b8c8', fontSize: 12, align: 'right' },
+    // Create tab content container (expanding VBox that holds all tab content)
+    this.tabContentContainerId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedVBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
       })
     );
     await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.statusLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 18 },
+      widgetId: this.tabContentContainerId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
+
+    if (this.activeTab === 'api-keys') {
+      await this.buildApiKeysTab(r0);
+    } else {
+      await this.buildPeerNetworkTab(r0);
+    }
 
     await this.changed('visibility', true);
     return true;
@@ -440,69 +460,81 @@ export class GlobalSettings extends Abject {
 
   private async buildApiKeysTab(
     r0: { x: number; y: number; width: number; height: number },
-    savedAnthropicKey: string | null,
-    savedOpenaiKey: string | null,
   ): Promise<void> {
+    const cId = this.tabContentContainerId!;
+
+    // Load saved keys to populate inputs
+    let savedAnthropicKey: string | null = null;
+    let savedOpenaiKey: string | null = null;
+    if (this.storageId) {
+      savedAnthropicKey = await this.request<string | null>(
+        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_ANTHROPIC })
+      );
+      savedOpenaiKey = await this.request<string | null>(
+        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_OPENAI })
+      );
+    }
+
     // Section header: "API Keys"
-    const sectionHeaderId = await this.request<AbjectId>(
+    const sectionHeaderId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'API Keys',
         style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: sectionHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 24 },
     }));
 
     // Description
-    const descLabelId = await this.request<AbjectId>(
+    const descLabelId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Enter your API keys to enable LLM features.',
         style: { color: '#b4b8c8', fontSize: 12 },
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: descLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
     }));
 
     // Anthropic label
-    this.anthropicLabelId = await this.request<AbjectId>(
+    this.anthropicLabelId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Anthropic API Key',
         style: { color: '#e2e4e9', fontSize: 13 },
       })
-    );
+    ));
     await this.request(request(this.id, this.anthropicLabelId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.anthropicLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
 
     // Anthropic input row (HBox: input + toggle)
-    const anthropicRowId = await this.request<AbjectId>(
+    const anthropicRowId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
+        parentLayoutId: cId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: anthropicRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
 
-    this.anthropicKeyId = await this.request<AbjectId>(
+    this.anthropicKeyId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
         windowId: this.windowId, rect: r0, placeholder: 'sk-ant-...', masked: true,
         text: savedAnthropicKey ?? undefined,
       })
-    );
+    ));
     await this.request(request(this.id, this.anthropicKeyId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, anthropicRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.anthropicKeyId,
@@ -510,11 +542,11 @@ export class GlobalSettings extends Abject {
       preferredSize: { height: 32 },
     }));
 
-    this.anthropicToggleId = await this.request<AbjectId>(
+    this.anthropicToggleId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Show',
       })
-    );
+    ));
     await this.request(request(this.id, this.anthropicToggleId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, anthropicRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.anthropicToggleId,
@@ -523,51 +555,51 @@ export class GlobalSettings extends Abject {
     }));
 
     // Divider between Anthropic and OpenAI
-    const dividerId = await this.request<AbjectId>(
+    const dividerId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
         windowId: this.windowId, rect: r0,
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: dividerId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 12 },
     }));
 
     // OpenAI label
-    this.openaiLabelId = await this.request<AbjectId>(
+    this.openaiLabelId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'OpenAI API Key',
         style: { color: '#e2e4e9', fontSize: 13 },
       })
-    );
+    ));
     await this.request(request(this.id, this.openaiLabelId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.openaiLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
 
     // OpenAI input row (HBox: input + toggle)
-    const openaiRowId = await this.request<AbjectId>(
+    const openaiRowId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
+        parentLayoutId: cId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: openaiRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
 
-    this.openaiKeyId = await this.request<AbjectId>(
+    this.openaiKeyId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
         windowId: this.windowId, rect: r0, placeholder: 'sk-...', masked: true,
         text: savedOpenaiKey ?? undefined,
       })
-    );
+    ));
     await this.request(request(this.id, this.openaiKeyId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, openaiRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.openaiKeyId,
@@ -575,11 +607,11 @@ export class GlobalSettings extends Abject {
       preferredSize: { height: 32 },
     }));
 
-    this.openaiToggleId = await this.request<AbjectId>(
+    this.openaiToggleId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Show',
       })
-    );
+    ));
     await this.request(request(this.id, this.openaiToggleId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, openaiRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.openaiToggleId,
@@ -588,14 +620,14 @@ export class GlobalSettings extends Abject {
     }));
 
     // Save button row for API keys (HBox: spacer + button)
-    const saveRowId = await this.request<AbjectId>(
+    const saveRowId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
+        parentLayoutId: cId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: saveRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 36 },
@@ -603,74 +635,114 @@ export class GlobalSettings extends Abject {
 
     await this.request(request(this.id, saveRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
 
-    this.saveBtnId = await this.request<AbjectId>(
+    this.saveBtnId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Save API Keys',
         style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
       })
-    );
+    ));
     await this.request(request(this.id, this.saveBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, saveRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.saveBtnId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 120, height: 36 },
     }));
+
+    // Spacer + status label (footer for this tab)
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+
+    this.statusLabelId = this.trackTabWidget(await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId!, rect: r0, text: '',
+        style: { color: '#b4b8c8', fontSize: 12, align: 'right' },
+      })
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.statusLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
   }
 
   private async buildPeerNetworkTab(
     r0: { x: number; y: number; width: number; height: number },
-    peerId: string,
-    peerName: string,
-    contacts: Array<{ peerId: string; name: string; state: string; addedAt: number }>,
   ): Promise<void> {
+    const cId = this.tabContentContainerId!;
+
+    // Fetch identity info
+    let peerId = '';
+    let peerName = '';
+    if (this.identityId) {
+      try {
+        const identity = await this.request<{ peerId: string; name: string }>(
+          request(this.id, this.identityId, IDENTITY_INTERFACE, 'exportPublicKeys', {})
+        );
+        peerId = identity.peerId;
+        peerName = identity.name ?? '';
+      } catch { /* identity not ready */ }
+    }
+
+    // Fetch contacts
+    interface ContactInfo {
+      peerId: string; name: string; state: string; addedAt: number;
+    }
+    let contacts: ContactInfo[] = [];
+    if (this.peerRegistryId) {
+      try {
+        contacts = await this.request<ContactInfo[]>(
+          request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'listContacts', {})
+        );
+      } catch { /* PeerRegistry not ready */ }
+    }
+
     // ========== IDENTITY SECTION ==========
 
     // Identity header
-    const identityHeaderId = await this.request<AbjectId>(
+    const identityHeaderId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Your Identity',
         style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: identityHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 24 },
     }));
 
     // Display Name label
-    const nameLabelId = await this.request<AbjectId>(
+    const nameLabelId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Display Name',
         style: { color: '#e2e4e9', fontSize: 13 },
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: nameLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
 
     // Name input + Save button row
-    const nameRowId = await this.request<AbjectId>(
+    const nameRowId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
+        parentLayoutId: cId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: nameRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
 
-    this.nameInputId = await this.request<AbjectId>(
+    this.nameInputId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
         windowId: this.windowId, rect: r0, placeholder: 'Enter display name',
         text: peerName,
       })
-    );
+    ));
     await this.request(request(this.id, this.nameInputId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, nameRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.nameInputId,
@@ -678,12 +750,12 @@ export class GlobalSettings extends Abject {
       preferredSize: { height: 32 },
     }));
 
-    this.saveNameBtnId = await this.request<AbjectId>(
+    this.saveNameBtnId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Save',
         style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
       })
-    );
+    ));
     await this.request(request(this.id, this.saveNameBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, nameRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.saveNameBtnId,
@@ -692,13 +764,13 @@ export class GlobalSettings extends Abject {
     }));
 
     // Peer ID label
-    const peerIdHeaderId = await this.request<AbjectId>(
+    const peerIdHeaderId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Peer ID',
         style: { color: '#e2e4e9', fontSize: 13 },
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: peerIdHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -706,37 +778,37 @@ export class GlobalSettings extends Abject {
 
     // Peer ID value (truncated)
     const truncatedPeerId = peerId ? `${peerId.slice(0, 16)}...${peerId.slice(-8)}` : '(not initialized)';
-    const peerIdValueId = await this.request<AbjectId>(
+    const peerIdValueId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId, rect: r0, text: truncatedPeerId,
         style: { color: '#8b8fa3', fontSize: 12 },
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: peerIdValueId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
     }));
 
     // Copy buttons row
-    const copyRowId = await this.request<AbjectId>(
+    const copyRowId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
+        parentLayoutId: cId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: copyRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 30 },
     }));
 
-    this.copyPeerIdBtnId = await this.request<AbjectId>(
+    this.copyPeerIdBtnId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Copy Peer ID',
       })
-    );
+    ));
     await this.request(request(this.id, this.copyPeerIdBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, copyRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.copyPeerIdBtnId,
@@ -744,11 +816,11 @@ export class GlobalSettings extends Abject {
       preferredSize: { width: 130, height: 30 },
     }));
 
-    this.copyIdentityBtnId = await this.request<AbjectId>(
+    this.copyIdentityBtnId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Copy Identity JSON',
       })
-    );
+    ));
     await this.request(request(this.id, this.copyIdentityBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, copyRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.copyIdentityBtnId,
@@ -761,37 +833,37 @@ export class GlobalSettings extends Abject {
     await this.addDivider();
 
     // Signaling Server header
-    const sigHeaderId = await this.request<AbjectId>(
+    const sigHeaderId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Signaling Servers',
         style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 },
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: sigHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
 
     // Signaling URL input + Connect button row
-    const sigRowId = await this.request<AbjectId>(
+    const sigRowId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
+        parentLayoutId: cId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: sigRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
 
-    this.signalingInputId = await this.request<AbjectId>(
+    this.signalingInputId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
         windowId: this.windowId, rect: r0, placeholder: 'ws://localhost:7720',
       })
-    );
+    ));
     await this.request(request(this.id, this.signalingInputId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, sigRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.signalingInputId,
@@ -799,12 +871,12 @@ export class GlobalSettings extends Abject {
       preferredSize: { height: 32 },
     }));
 
-    this.signalingConnectBtnId = await this.request<AbjectId>(
+    this.signalingConnectBtnId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Connect',
         style: { background: '#1e3a2e', borderColor: '#4caf50' },
       })
-    );
+    ));
     await this.request(request(this.id, this.signalingConnectBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, sigRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.signalingConnectBtnId,
@@ -823,14 +895,14 @@ export class GlobalSettings extends Abject {
     }
 
     for (const { url, status } of signalingServers) {
-      const serverRowId = await this.request<AbjectId>(
+      const serverRowId = this.trackTabWidget(await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-          parentLayoutId: this.rootLayoutId,
+          parentLayoutId: cId,
           margins: { top: 0, right: 0, bottom: 0, left: 0 },
           spacing: 8,
         })
-      );
-      await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      ));
+      await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
         widgetId: serverRowId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: 28 },
@@ -840,12 +912,12 @@ export class GlobalSettings extends Abject {
       const urlColor = status === 'connected' ? '#4caf50'
         : status === 'connecting' ? '#e8a84c'
         : '#ff6b6b';
-      const urlLabelId = await this.request<AbjectId>(
+      const urlLabelId = this.trackTabWidget(await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
           windowId: this.windowId, rect: r0, text: url,
           style: { color: urlColor, fontSize: 12 },
         })
-      );
+      ));
       await this.request(request(this.id, serverRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
         widgetId: urlLabelId,
         sizePolicy: { horizontal: 'expanding', vertical: 'fixed' },
@@ -856,12 +928,12 @@ export class GlobalSettings extends Abject {
       const statusText = status === 'connected' ? 'connected'
         : status === 'connecting' ? 'connecting...'
         : 'offline';
-      const statusLabelId = await this.request<AbjectId>(
+      const statusLabelId = this.trackTabWidget(await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
           windowId: this.windowId, rect: r0, text: statusText,
           style: { color: urlColor, fontSize: 11 },
         })
-      );
+      ));
       await this.request(request(this.id, serverRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
         widgetId: statusLabelId,
         sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
@@ -869,12 +941,12 @@ export class GlobalSettings extends Abject {
       }));
 
       // Remove button
-      const removeBtnId = await this.request<AbjectId>(
+      const removeBtnId = this.trackTabWidget(await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
           windowId: this.windowId, rect: r0, text: 'Remove',
           style: { fontSize: 11 },
         })
-      );
+      ));
       await this.request(request(this.id, removeBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
       await this.request(request(this.id, serverRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
         widgetId: removeBtnId,
@@ -889,49 +961,49 @@ export class GlobalSettings extends Abject {
     await this.addDivider();
 
     // Add Contact label
-    const addLabelId = await this.request<AbjectId>(
+    const addLabelId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Add Contact',
         style: { color: '#e2e4e9', fontSize: 13 },
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: addLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
 
-    const addDescId = await this.request<AbjectId>(
+    const addDescId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId, rect: r0, text: "Paste a peer's identity JSON.",
         style: { color: '#b4b8c8', fontSize: 12 },
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: addDescId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
     }));
 
     // Add contact input + button row
-    const addRowId = await this.request<AbjectId>(
+    const addRowId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
+        parentLayoutId: cId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: addRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
 
-    this.addContactInputId = await this.request<AbjectId>(
+    this.addContactInputId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
         windowId: this.windowId, rect: r0, placeholder: '{"peerId":"...","publicSigningKey":"..."}',
       })
-    );
+    ));
     await this.request(request(this.id, this.addContactInputId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, addRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.addContactInputId,
@@ -939,12 +1011,12 @@ export class GlobalSettings extends Abject {
       preferredSize: { height: 32 },
     }));
 
-    this.addContactBtnId = await this.request<AbjectId>(
+    this.addContactBtnId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Add',
         style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
       })
-    );
+    ));
     await this.request(request(this.id, this.addContactBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     await this.request(request(this.id, addRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: this.addContactBtnId,
@@ -953,26 +1025,26 @@ export class GlobalSettings extends Abject {
     }));
 
     // Contacts section header
-    const contactsHeaderId = await this.request<AbjectId>(
+    const contactsHeaderId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Contacts',
         style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 },
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: contactsHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
 
     if (contacts.length === 0) {
-      const emptyLabelId = await this.request<AbjectId>(
+      const emptyLabelId = this.trackTabWidget(await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
           windowId: this.windowId, rect: r0, text: 'No contacts yet.',
           style: { color: '#b4b8c8', fontSize: 12 },
         })
-      );
-      await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      ));
+      await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
         widgetId: emptyLabelId,
         sizePolicy: { vertical: 'fixed' },
         preferredSize: { height: 18 },
@@ -980,14 +1052,14 @@ export class GlobalSettings extends Abject {
     } else {
       for (const contact of contacts) {
         // HBox row: name + state + connect/disconnect + remove
-        const rowId = await this.request<AbjectId>(
+        const rowId = this.trackTabWidget(await this.request<AbjectId>(
           request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-            parentLayoutId: this.rootLayoutId,
+            parentLayoutId: cId,
             margins: { top: 0, right: 0, bottom: 0, left: 0 },
             spacing: 8,
           })
-        );
-        await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+        ));
+        await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
           widgetId: rowId,
           sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
           preferredSize: { height: 30 },
@@ -995,12 +1067,12 @@ export class GlobalSettings extends Abject {
 
         // Name label
         const displayName = contact.name || contact.peerId.slice(0, 12) + '...';
-        const nameId = await this.request<AbjectId>(
+        const nameId = this.trackTabWidget(await this.request<AbjectId>(
           request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
             windowId: this.windowId, rect: r0, text: displayName,
             style: { color: '#e2e4e9', fontSize: 12 },
           })
-        );
+        ));
         await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
           widgetId: nameId,
           sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
@@ -1011,12 +1083,12 @@ export class GlobalSettings extends Abject {
         const stateColor = contact.state === 'connected' ? '#4caf50'
           : contact.state === 'connecting' ? '#e8a84c'
           : '#6b7084';
-        const stateId = await this.request<AbjectId>(
+        const stateId = this.trackTabWidget(await this.request<AbjectId>(
           request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
             windowId: this.windowId, rect: r0, text: contact.state,
             style: { color: stateColor, fontSize: 11 },
           })
-        );
+        ));
         await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
           widgetId: stateId,
           sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
@@ -1025,7 +1097,7 @@ export class GlobalSettings extends Abject {
 
         // Connect/Disconnect button
         const isConnected = contact.state === 'connected';
-        const connBtnId = await this.request<AbjectId>(
+        const connBtnId = this.trackTabWidget(await this.request<AbjectId>(
           request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
             windowId: this.windowId, rect: r0,
             text: isConnected ? 'Disconnect' : 'Connect',
@@ -1033,7 +1105,7 @@ export class GlobalSettings extends Abject {
               ? { fontSize: 11 }
               : { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 },
           })
-        );
+        ));
         await this.request(request(this.id, connBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
         await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
           widgetId: connBtnId,
@@ -1043,12 +1115,12 @@ export class GlobalSettings extends Abject {
         this.connectButtons.set(connBtnId, contact.peerId);
 
         // Remove button
-        const delBtnId = await this.request<AbjectId>(
+        const delBtnId = this.trackTabWidget(await this.request<AbjectId>(
           request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
             windowId: this.windowId, rect: r0, text: 'Remove',
             style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 },
           })
-        );
+        ));
         await this.request(request(this.id, delBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
         await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
           widgetId: delBtnId,
@@ -1058,6 +1130,21 @@ export class GlobalSettings extends Abject {
         this.removeButtons.set(delBtnId, contact.peerId);
       }
     }
+
+    // Spacer + status label (footer for this tab)
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+
+    this.statusLabelId = this.trackTabWidget(await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId!, rect: r0, text: '',
+        style: { color: '#b4b8c8', fontSize: 12, align: 'right' },
+      })
+    ));
+    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: this.statusLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
   }
 
   /**
@@ -1075,6 +1162,8 @@ export class GlobalSettings extends Abject {
     this.windowId = undefined;
     this.rootLayoutId = undefined;
     this.tabBarId = undefined;
+    this.tabContentContainerId = undefined;
+    this.tabContentWidgetIds = [];
     this.anthropicLabelId = undefined;
     this.anthropicKeyId = undefined;
     this.anthropicToggleId = undefined;
@@ -1104,12 +1193,12 @@ export class GlobalSettings extends Abject {
   // ========== HELPERS ==========
 
   private async addDivider(): Promise<void> {
-    const divId = await this.request<AbjectId>(
+    const divId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
         windowId: this.windowId, rect: { x: 0, y: 0, width: 0, height: 0 },
       })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    ));
+    await this.request(request(this.id, this.tabContentContainerId!, LAYOUT_INTERFACE, 'addLayoutChild', {
       widgetId: divId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 1 },
@@ -1293,10 +1382,8 @@ export class GlobalSettings extends Abject {
       await this.request(
         request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'removeSignalingServer', { url })
       );
+      await this.refreshPeerNetworkTab();
       await this.setStatus('Removed signaling server.');
-      // Rebuild to update server list
-      await this.hide();
-      await this.show();
     } catch {
       await this.setStatus('Failed to remove server.', '#ff6b6b');
     }
@@ -1319,10 +1406,8 @@ export class GlobalSettings extends Abject {
         request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'connectSignaling', { url: url.trim() })
       );
       if (ok) {
+        await this.refreshPeerNetworkTab();
         await this.setStatus('Connected to signaling server!', '#4caf50');
-        // Rebuild to show server in list
-        await this.hide();
-        await this.show();
       } else {
         await this.setStatus('Failed to connect.', '#ff6b6b');
       }
@@ -1365,10 +1450,8 @@ export class GlobalSettings extends Abject {
         })
       );
 
+      await this.refreshPeerNetworkTab();
       await this.setStatus('Contact added!');
-      // Rebuild to show updated contacts
-      await this.hide();
-      await this.show();
     } catch {
       await this.setStatus('Invalid JSON format.', '#ff6b6b');
     }
@@ -1382,21 +1465,19 @@ export class GlobalSettings extends Abject {
         request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'getContactState', { peerId })
       );
 
-      if (state === 'connected') {
+      const wasConnected = state === 'connected';
+      if (wasConnected) {
         await this.request(
           request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'disconnectPeer', { peerId })
         );
-        await this.setStatus('Disconnected.');
       } else {
         await this.request(
           request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'connectToPeer', { peerId })
         );
-        await this.setStatus('Connecting...');
       }
 
-      // Rebuild to show updated state
-      await this.hide();
-      await this.show();
+      await this.refreshPeerNetworkTab();
+      await this.setStatus(wasConnected ? 'Disconnected.' : 'Connecting...');
     } catch {
       await this.setStatus('Connection error.', '#ff6b6b');
     }
@@ -1409,10 +1490,8 @@ export class GlobalSettings extends Abject {
       await this.request(
         request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'removeContact', { peerId })
       );
+      await this.refreshPeerNetworkTab();
       await this.setStatus('Contact removed.');
-      // Rebuild to show updated contacts
-      await this.hide();
-      await this.show();
     } catch {
       await this.setStatus('Failed to remove contact.', '#ff6b6b');
     }
