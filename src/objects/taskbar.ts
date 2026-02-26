@@ -18,7 +18,6 @@ const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 
 export class Taskbar extends Abject {
   private widgetManagerId?: AbjectId;
-  private settingsId?: AbjectId;
   private registryBrowserId?: AbjectId;
   private chatId?: AbjectId;
   private jobBrowserId?: AbjectId;
@@ -31,7 +30,6 @@ export class Taskbar extends Abject {
   private yOffset = 8;
 
   // Button AbjectIds for system buttons
-  private settingsBtnId?: AbjectId;
   private registryBtnId?: AbjectId;
   private chatBtnId?: AbjectId;
   private jobsBtnId?: AbjectId;
@@ -87,7 +85,6 @@ export class Taskbar extends Abject {
 
   protected override async onInit(): Promise<void> {
     this.widgetManagerId = await this.requireDep('WidgetManager');
-    this.settingsId = await this.requireDep('Settings');
     this.registryBrowserId = await this.requireDep('RegistryBrowser');
     this.chatId = await this.requireDep('Chat');
     this.jobBrowserId = await this.requireDep('JobBrowser');
@@ -102,7 +99,7 @@ export class Taskbar extends Abject {
     }
 
     // Subscribe as dependent of each system object to receive visibility changes
-    for (const depId of [this.settingsId!, this.registryBrowserId!, this.chatId!, this.jobBrowserId!, this.objectManagerId!]) {
+    for (const depId of [this.registryBrowserId!, this.chatId!, this.jobBrowserId!, this.objectManagerId!]) {
       await this.request(request(this.id, depId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
     }
 
@@ -162,11 +159,7 @@ export class Taskbar extends Abject {
 
       const fromId = msg.routing.from;
 
-      if (fromId === this.settingsBtnId) {
-        await this.request(
-          request(this.id, this.settingsId!, 'abjects:settings' as InterfaceId, 'show', {})
-        );
-      } else if (fromId === this.registryBtnId) {
+      if (fromId === this.registryBtnId) {
         await this.request(
           request(this.id, this.registryBrowserId!, 'abjects:registry-browser' as InterfaceId, 'show', {})
         );
@@ -262,7 +255,6 @@ export class Taskbar extends Abject {
     }
 
     // Reset all button tracking since window is destroyed and rebuilt
-    this.settingsBtnId = undefined;
     this.registryBtnId = undefined;
     this.chatBtnId = undefined;
     this.jobsBtnId = undefined;
@@ -368,44 +360,7 @@ export class Taskbar extends Abject {
       }));
     };
 
-    // ── Apps section header row: "◼ Apps" label + gear button ──
-    const appsHeaderRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 4,
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: appsHeaderRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: labelH },
-    }));
-
-    const appsHeaderLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: '\u25A0 Apps',
-        style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
-      })
-    );
-    await this.request(request(this.id, appsHeaderRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: appsHeaderLabelId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: labelH },
-    }));
-
-    this.settingsBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-        windowId: this.windowId, rect: r0, text: '\u2699',
-        style: { fontSize: 13 },
-      })
-    );
-    await this.request(request(this.id, this.settingsBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, appsHeaderRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-      widgetId: this.settingsBtnId,
-      sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-      preferredSize: { width: 24, height: labelH },
-    }));
+    await addSectionLabel('\u25A0 Apps');
 
     // Query visibility of system objects
     const [registryVis, chatVis, jobsVis, objectManagerVis] = await Promise.all([
@@ -456,7 +411,6 @@ export class Taskbar extends Abject {
 
     this.windowId = undefined;
     this.rootLayoutId = undefined;
-    this.settingsBtnId = undefined;
     this.registryBtnId = undefined;
     this.chatBtnId = undefined;
     this.jobsBtnId = undefined;
