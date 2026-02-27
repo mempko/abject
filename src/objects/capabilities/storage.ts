@@ -321,37 +321,37 @@ export class Storage extends Abject {
 ### Store a Value
 
   await this.call(
-    this.dep('Storage'), 'abjects:storage', 'set',
+    this.dep('Storage'), 'set',
     { key: 'myKey', value: { name: 'foo', count: 42 } });
 
 ### Retrieve a Value
 
   const value = await this.call(
-    this.dep('Storage'), 'abjects:storage', 'get',
+    this.dep('Storage'), 'get',
     { key: 'myKey' });
   // Returns the stored value, or null if not found
 
 ### Check if a Key Exists
 
   const exists = await this.call(
-    this.dep('Storage'), 'abjects:storage', 'has',
+    this.dep('Storage'), 'has',
     { key: 'myKey' });
 
 ### Delete a Value
 
   await this.call(
-    this.dep('Storage'), 'abjects:storage', 'delete',
+    this.dep('Storage'), 'delete',
     { key: 'myKey' });
 
 ### List All Keys
 
   const keys = await this.call(
-    this.dep('Storage'), 'abjects:storage', 'keys', {});
+    this.dep('Storage'), 'keys', {});
 
 ### Clear All Data
 
   await this.call(
-    this.dep('Storage'), 'abjects:storage', 'clear', {});
+    this.dep('Storage'), 'clear', {});
 
 ### IMPORTANT
 - Values can be any JSON-serializable data (objects, arrays, strings, numbers, booleans).

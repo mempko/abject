@@ -1139,21 +1139,21 @@ For static HTML pages, prefer HttpClient.get() + WebParser instead.
 #### Get Rendered HTML (after JS executes)
 
   const result = await this.call(
-    this.dep('WebBrowser'), 'abjects:web-browser', 'getRenderedHtml',
+    this.dep('WebBrowser'), 'getRenderedHtml',
     { url: 'https://example.com', options: { timeout: 30000 } });
   // result = { html: '<html>...</html>', url: 'https://example.com', title: 'Example' }
 
 #### Take a Screenshot
 
   const result = await this.call(
-    this.dep('WebBrowser'), 'abjects:web-browser', 'screenshot',
+    this.dep('WebBrowser'), 'screenshot',
     { url: 'https://example.com' });
   // result = { dataUri: 'data:image/png;base64,...', width: 1280, height: 720 }
 
 #### Extract Elements from Rendered Page
 
   const elements = await this.call(
-    this.dep('WebBrowser'), 'abjects:web-browser', 'extractFromPage',
+    this.dep('WebBrowser'), 'extractFromPage',
     { url: 'https://example.com', selector: 'img',
       options: { waitFor: 'img', timeout: 15000 } });
   // elements = [{ tag: 'img', text: '', attributes: { src: '...', alt: '...' }, innerHTML: '' }]
@@ -1165,31 +1165,31 @@ Use this when you need to interact with a web app: fill forms, click buttons, na
 #### Open a page, navigate, interact, read results, close
 
   const { pageId } = await this.call(
-    this.dep('WebBrowser'), 'abjects:web-browser', 'openPage',
+    this.dep('WebBrowser'), 'openPage',
     { options: { viewport: { width: 1280, height: 720 } } });
 
-  await this.call(this.dep('WebBrowser'), 'abjects:web-browser', 'navigateTo',
+  await this.call(this.dep('WebBrowser'), 'navigateTo',
     { pageId, url: 'https://example.com/login' });
 
-  await this.call(this.dep('WebBrowser'), 'abjects:web-browser', 'fill',
+  await this.call(this.dep('WebBrowser'), 'fill',
     { pageId, selector: '#username', value: 'myuser' });
 
-  await this.call(this.dep('WebBrowser'), 'abjects:web-browser', 'fill',
+  await this.call(this.dep('WebBrowser'), 'fill',
     { pageId, selector: '#password', value: 'mypass' });
 
-  await this.call(this.dep('WebBrowser'), 'abjects:web-browser', 'click',
+  await this.call(this.dep('WebBrowser'), 'click',
     { pageId, selector: 'button[type="submit"]' });
 
-  await this.call(this.dep('WebBrowser'), 'abjects:web-browser', 'waitForSelector',
+  await this.call(this.dep('WebBrowser'), 'waitForSelector',
     { pageId, selector: '.dashboard' });
 
   const { html, url, title } = await this.call(
-    this.dep('WebBrowser'), 'abjects:web-browser', 'getContent', { pageId });
+    this.dep('WebBrowser'), 'getContent', { pageId });
 
   const shot = await this.call(
-    this.dep('WebBrowser'), 'abjects:web-browser', 'screenshotPage', { pageId });
+    this.dep('WebBrowser'), 'screenshotPage', { pageId });
 
-  await this.call(this.dep('WebBrowser'), 'abjects:web-browser', 'closePage', { pageId });
+  await this.call(this.dep('WebBrowser'), 'closePage', { pageId });
 
 #### Available stateful methods
 
@@ -1216,9 +1216,9 @@ One-shot methods accept an optional 'options' object:
 
 ### Pattern: Display Screenshots on Surface
 
-  const shot = await this.call(this.dep('WebBrowser'), 'abjects:web-browser', 'screenshot',
+  const shot = await this.call(this.dep('WebBrowser'), 'screenshot',
     { url: 'https://example.com', options: { viewport: { width: 800, height: 600 } } });
-  await this.call(this.dep('UIServer'), 'abjects:ui', 'draw', {
+  await this.call(this.dep('UIServer'), 'draw', {
     commands: [{ type: 'imageUrl', surfaceId, params: { x: 0, y: 0, width: 400, height: 300, url: shot.dataUri } }]
   });`;
   }

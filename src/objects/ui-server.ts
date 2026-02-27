@@ -72,7 +72,7 @@ export class UIServer extends Abject {
             methods: [
               {
                 name: 'createSurface',
-                description: 'Create a new drawing surface. Example: const surfaceId = await this.call(this.dep("UIServer"), "abjects:ui", "createSurface", { rect: { x: 100, y: 100, width: 300, height: 200 }, zIndex: 100 })',
+                description: 'Create a new drawing surface. Example: const surfaceId = await this.call(this.dep("UIServer"), "createSurface", { rect: { x: 100, y: 100, width: 300, height: 200 }, zIndex: 100 })',
                 parameters: [
                   {
                     name: 'rect',
@@ -102,7 +102,7 @@ export class UIServer extends Abject {
               },
               {
                 name: 'destroySurface',
-                description: 'Destroy a surface. Example: await this.call(this.dep("UIServer"), "abjects:ui", "destroySurface", { surfaceId })',
+                description: 'Destroy a surface. Example: await this.call(this.dep("UIServer"), "destroySurface", { surfaceId })',
                 parameters: [
                   {
                     name: 'surfaceId',
@@ -463,25 +463,25 @@ export class UIServer extends Abject {
 ### Creating and Using Surfaces
 
 Create a surface:
-  const surfaceId = await this.call(this.dep('UIServer'), 'abjects:ui', 'createSurface',
+  const surfaceId = await this.call(this.dep('UIServer'), 'createSurface',
     { rect: { x: 100, y: 100, width: 300, height: 200 }, zIndex: 100 });
 
 Create a display-only surface (input events pass through to surfaces behind it):
-  const surfaceId = await this.call(this.dep('UIServer'), 'abjects:ui', 'createSurface',
+  const surfaceId = await this.call(this.dep('UIServer'), 'createSurface',
     { rect: { x: 0, y: 0, width, height }, zIndex: 50, inputPassthrough: true });
 
 Create a cursor-following overlay (receives all mouse events without blocking input to surfaces behind):
-  const surfaceId = await this.call(this.dep('UIServer'), 'abjects:ui', 'createSurface',
+  const surfaceId = await this.call(this.dep('UIServer'), 'createSurface',
     { rect: { x: 0, y: 0, width, height }, zIndex: 9999, inputPassthrough: true, inputMonitor: true });
 
 Destroy a surface:
-  await this.call(this.dep('UIServer'), 'abjects:ui', 'destroySurface', { surfaceId });
+  await this.call(this.dep('UIServer'), 'destroySurface', { surfaceId });
 
 ### Drawing
 
 Each draw command has exactly 3 fields: { type, surfaceId, params }
 
-  await this.call(this.dep('UIServer'), 'abjects:ui', 'draw', {
+  await this.call(this.dep('UIServer'), 'draw', {
     commands: [
       { type: 'clear', surfaceId, params: {} },
       { type: 'rect', surfaceId, params: { x: 0, y: 0, width: 300, height: 200, fill: '#1e1e2e' } },
@@ -510,7 +510,7 @@ Each draw command has exactly 3 fields: { type, surfaceId, params }
 'image' - Draw image. params: { x, y, width?, height?, data (ImageBitmap | HTMLImageElement | ImageData) }
 'imageUrl' - Draw image from URL or data URI. params: { x, y, width?, height?, url }
           Use with HttpClient.getBase64() to display fetched images:
-          1. const img = await this.call(this.dep('HttpClient'), 'abjects:http', 'getBase64', { url: imageUrl });
+          1. const img = await this.call(this.dep('HttpClient'), 'getBase64', { url: imageUrl });
           2. { type: 'imageUrl', surfaceId, params: { x: 0, y: 0, width: 300, height: 200, url: img.dataUri } }
 
 **State management:**
@@ -560,11 +560,11 @@ IMPORTANT:
 
 ### Other Methods
 
-Move surface: this.call(this.dep('UIServer'), 'abjects:ui', 'moveSurface', { surfaceId, x: 200, y: 100 })
-Resize: this.call(this.dep('UIServer'), 'abjects:ui', 'resizeSurface', { surfaceId, width: 400, height: 300 })
-Set z-index: this.call(this.dep('UIServer'), 'abjects:ui', 'setZIndex', { surfaceId, zIndex: 200 })
-Get display size: const { width, height } = await this.call(this.dep('UIServer'), 'abjects:ui', 'getDisplayInfo', {})
-Measure text: const w = await this.call(this.dep('UIServer'), 'abjects:ui', 'measureText', { surfaceId, text: 'Hello', font: '14px system-ui' })
+Move surface: this.call(this.dep('UIServer'), 'moveSurface', { surfaceId, x: 200, y: 100 })
+Resize: this.call(this.dep('UIServer'), 'resizeSurface', { surfaceId, width: 400, height: 300 })
+Set z-index: this.call(this.dep('UIServer'), 'setZIndex', { surfaceId, zIndex: 200 })
+Get display size: const { width, height } = await this.call(this.dep('UIServer'), 'getDisplayInfo', {})
+Measure text: const w = await this.call(this.dep('UIServer'), 'measureText', { surfaceId, text: 'Hello', font: '14px system-ui' })
 
 ### Background Pattern for Interactive Surfaces
 

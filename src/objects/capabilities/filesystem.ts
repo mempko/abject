@@ -448,45 +448,45 @@ export class FileSystem extends Abject {
 ### Write a File
 
   await this.call(
-    this.dep('FileSystem'), 'abjects:filesystem', 'writeFile',
+    this.dep('FileSystem'), 'writeFile',
     { path: '/data/config.json', content: JSON.stringify({ key: 'value' }) });
 
 ### Read a File
 
   const content = await this.call(
-    this.dep('FileSystem'), 'abjects:filesystem', 'readFile',
+    this.dep('FileSystem'), 'readFile',
     { path: '/data/config.json' });
 
 ### Create a Directory
 
   await this.call(
-    this.dep('FileSystem'), 'abjects:filesystem', 'mkdir',
+    this.dep('FileSystem'), 'mkdir',
     { path: '/data' });
 
 ### List Directory Contents
 
   const entries = await this.call(
-    this.dep('FileSystem'), 'abjects:filesystem', 'readdir',
+    this.dep('FileSystem'), 'readdir',
     { path: '/' });
   // Returns array of { path, name, isDirectory, size, createdAt, modifiedAt }
 
 ### Check if Path Exists
 
   const exists = await this.call(
-    this.dep('FileSystem'), 'abjects:filesystem', 'exists',
+    this.dep('FileSystem'), 'exists',
     { path: '/data/config.json' });
 
 ### Get File Info
 
   const info = await this.call(
-    this.dep('FileSystem'), 'abjects:filesystem', 'stat',
+    this.dep('FileSystem'), 'stat',
     { path: '/data/config.json' });
   // Returns { path, name, isDirectory, size, createdAt, modifiedAt } or null
 
 ### Delete a File
 
   await this.call(
-    this.dep('FileSystem'), 'abjects:filesystem', 'deleteFile',
+    this.dep('FileSystem'), 'deleteFile',
     { path: '/data/config.json' });
 
 ### IMPORTANT

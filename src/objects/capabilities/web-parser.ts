@@ -309,48 +309,48 @@ export class WebParser extends Abject {
 ### Query HTML with CSS Selector
 
   const elements = await this.call(
-    this.dep('WebParser'), 'abjects:web-parser', 'querySelector',
+    this.dep('WebParser'), 'querySelector',
     { html: htmlString, selector: 'div.article h2' });
   // elements = [{ tag: 'h2', text: 'Title', attributes: { class: 'heading' }, innerHTML: 'Title' }]
 
 ### Extract Links
 
   const links = await this.call(
-    this.dep('WebParser'), 'abjects:web-parser', 'extractLinks',
+    this.dep('WebParser'), 'extractLinks',
     { html: htmlString, baseUrl: 'https://example.com' });
   // links = [{ href: 'https://example.com/page', text: 'Click here' }]
 
 ### Extract Images
 
   const images = await this.call(
-    this.dep('WebParser'), 'abjects:web-parser', 'extractImages',
+    this.dep('WebParser'), 'extractImages',
     { html: htmlString, baseUrl: 'https://example.com' });
   // images = [{ src: 'https://example.com/photo.jpg', alt: 'A photo' }]
 
 ### Extract Text
 
   const text = await this.call(
-    this.dep('WebParser'), 'abjects:web-parser', 'extractText',
+    this.dep('WebParser'), 'extractText',
     { html: htmlString, selector: 'article' });
 
 ### Extract Metadata
 
   const meta = await this.call(
-    this.dep('WebParser'), 'abjects:web-parser', 'extractMeta',
+    this.dep('WebParser'), 'extractMeta',
     { html: htmlString });
   // meta = { title, description, ogImage, ogTitle, ogDescription, ogUrl }
 
 ### Common Pattern: Fetch + Parse
 
   // 1. Fetch a page
-  const resp = await this.call(this.dep('HttpClient'), 'abjects:http', 'get', { url: 'https://example.com' });
+  const resp = await this.call(this.dep('HttpClient'), 'get', { url: 'https://example.com' });
   // 2. Extract images
-  const images = await this.call(this.dep('WebParser'), 'abjects:web-parser', 'extractImages',
+  const images = await this.call(this.dep('WebParser'), 'extractImages',
     { html: resp.body, baseUrl: 'https://example.com' });
   // 3. Fetch first image as data URI
-  const imgData = await this.call(this.dep('HttpClient'), 'abjects:http', 'getBase64', { url: images[0].src });
+  const imgData = await this.call(this.dep('HttpClient'), 'getBase64', { url: images[0].src });
   // 4. Display on surface
-  await this.call(this.dep('UIServer'), 'abjects:ui', 'draw', {
+  await this.call(this.dep('UIServer'), 'draw', {
     commands: [{ type: 'imageUrl', surfaceId, params: { x: 0, y: 0, width: 300, height: 200, url: imgData.dataUri } }]
   });`;
   }

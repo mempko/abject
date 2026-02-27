@@ -160,18 +160,18 @@ export class Clipboard extends Abject {
 ### Write Text to Clipboard
 
   await this.call(
-    this.dep('Clipboard'), 'abjects:clipboard', 'write',
+    this.dep('Clipboard'), 'write',
     { text: 'Hello, world!' });
 
 ### Read Text from Clipboard
 
   const text = await this.call(
-    this.dep('Clipboard'), 'abjects:clipboard', 'read', {});
+    this.dep('Clipboard'), 'read', {});
 
 ### Check if Clipboard Has Text
 
   const hasText = await this.call(
-    this.dep('Clipboard'), 'abjects:clipboard', 'hasText', {});
+    this.dep('Clipboard'), 'hasText', {});
 
 ### IMPORTANT
 - May fail if the browser denies clipboard permissions.

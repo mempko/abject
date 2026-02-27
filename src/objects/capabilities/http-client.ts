@@ -438,27 +438,27 @@ export class HttpClient extends Abject {
 ### GET Request
 
   const result = await this.call(
-    this.dep('HttpClient'), 'abjects:http', 'get',
+    this.dep('HttpClient'), 'get',
     { url: 'https://api.example.com/data' });
   const data = JSON.parse(result.body);
 
 ### POST Request
 
   const result = await this.call(
-    this.dep('HttpClient'), 'abjects:http', 'post',
+    this.dep('HttpClient'), 'post',
     { url: 'https://api.example.com/items', body: '{"name":"foo"}',
       headers: { 'Content-Type': 'application/json' } });
 
 ### POST JSON (shorthand)
 
   const result = await this.call(
-    this.dep('HttpClient'), 'abjects:http', 'postJson',
+    this.dep('HttpClient'), 'postJson',
     { url: 'https://api.example.com/items', data: { name: 'foo', count: 42 } });
 
 ### Generic Request
 
   const result = await this.call(
-    this.dep('HttpClient'), 'abjects:http', 'request',
+    this.dep('HttpClient'), 'request',
     { method: 'PUT', url: 'https://api.example.com/items/1',
       headers: { 'Authorization': 'Bearer token' },
       body: '{"name":"updated"}', timeout: 10000 });
@@ -466,7 +466,7 @@ export class HttpClient extends Abject {
 ### Fetch as Base64 Data URI (for images/binary)
 
   const result = await this.call(
-    this.dep('HttpClient'), 'abjects:http', 'getBase64',
+    this.dep('HttpClient'), 'getBase64',
     { url: 'https://example.com/image.png' });
   // result = { dataUri: 'data:image/png;base64,...', mimeType: 'image/png', size: 12345, ok: true, status: 200 }
   // Use dataUri with the 'imageUrl' draw command to display images on a surface.

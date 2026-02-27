@@ -278,9 +278,17 @@ export class JobManager extends Abject {
       to: AbjectId | string | Promise<AbjectId>,
       method: string,
       payload: unknown = {},
+      _unused?: unknown,
     ) => {
+      // Backward compat: if called with 4 args and the 2nd looks like an interface ID, skip it
+      let actualMethod = method;
+      let actualPayload = payload;
+      if (_unused !== undefined && typeof method === 'string' && typeof payload === 'string') {
+        actualMethod = payload as unknown as string;
+        actualPayload = _unused;
+      }
       const resolved = await to;
-      const msg = request(this.id, resolved as AbjectId, method, payload);
+      const msg = request(this.id, resolved as AbjectId, actualMethod, actualPayload);
       this._currentCallMsgId = msg.header.messageId;
       try {
         return await this.request<unknown>(msg, 120000);

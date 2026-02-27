@@ -279,19 +279,19 @@ export class Console extends Abject {
 ### Log at Different Levels
 
   await this.call(
-    this.dep('Console'), 'abjects:console', 'info',
+    this.dep('Console'), 'info',
     { message: 'Operation completed', data: { result: 42 } });
 
   await this.call(
-    this.dep('Console'), 'abjects:console', 'debug',
+    this.dep('Console'), 'debug',
     { message: 'Processing item', data: { id: 'abc' } });
 
   await this.call(
-    this.dep('Console'), 'abjects:console', 'warn',
+    this.dep('Console'), 'warn',
     { message: 'Rate limit approaching', data: { remaining: 5 } });
 
   await this.call(
-    this.dep('Console'), 'abjects:console', 'error',
+    this.dep('Console'), 'error',
     { message: 'Request failed', data: { status: 500 } });
 
 ### Log Levels

@@ -313,7 +313,7 @@ drag, resize, minimize, and restore behavior for all windows in the system.
 
 WidgetManager registers each window with WindowManager via 'registerWindow':
 
-  await this.call(windowManagerId, 'abjects:window-manager', 'registerWindow', {
+  await this.call(windowManagerId, 'registerWindow', {
     surfaceId: 'surface-id',  // UIServer surface ID
     windowId: winAbjectId,    // WindowAbject ID
     zIndex: 200,              // Initial stacking order
@@ -353,19 +353,17 @@ Restore (via 'restoreWindow' method or Taskbar click):
 
 ### Programmatic Restore
 
-  await this.call(windowManagerId, 'abjects:window-manager', 'restoreWindow', {
+  await this.call(windowManagerId, 'restoreWindow', {
     surfaceId: 'surface-id',
   });
 
 ### Raising a Window
 
-  await this.call(windowManagerId, 'abjects:window-manager', 'raiseWindow', {
+  await this.call(windowManagerId, 'raiseWindow', {
     surfaceId: 'surface-id',
   });
 
-### Interface ID
-
-'abjects:window-manager'`;
+`;
   }
 
   protected override async onInit(): Promise<void> {

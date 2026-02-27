@@ -959,7 +959,7 @@ Abjects is a distributed object system. Everything is an **Abject** — an auton
 - A **mailbox** that receives messages from other objects
 - **Handlers** that process incoming messages
 
-Objects never call each other directly. All communication is **message passing** via \`call(objectId, interfaceId, method, payload)\`. Objects discover each other through the **Registry**.
+Objects never call each other directly. All communication is **message passing** via \`call(objectId, method, payload)\`. Objects discover each other through the **Registry**.
 
 **Observer pattern**: Objects can observe each other with \`addDependent\`/\`removeDependent\`. When an object calls \`this.changed(aspect, value)\`, all its dependents receive a \`changed\` message. This is the primary coordination mechanism.
 
@@ -975,7 +975,7 @@ Always respond with a JSON object inside a \`\`\`json code block:
   "steps": [
     {
       "description": "Short human-readable description of this step",
-      "code": "const result = await call(await dep('Registry'), 'abjects:registry', 'list', {}); return result;"
+      "code": "const result = await call(await dep('Registry'), 'list', {}); return result;"
     }
   ]
 }
@@ -987,7 +987,7 @@ Always respond with a JSON object inside a \`\`\`json code block:
 ## Code API
 
 Inside step code, these functions are available:
-- \`call(objectId, interfaceId, method, payload)\` — Send a request to an object. Returns the result.
+- \`call(objectId, method, payload)\` — Send a request to an object. Returns the result.
 - \`dep(name)\` — Find a dependency by manifest name (throws if not found). Returns AbjectId.
 - \`find(name)\` — Find a dependency by manifest name (returns null if not found). Returns AbjectId or null.
 - \`progress(message)\` — Report progress during long operations. Resets the job timeout. Call before any \`call()\` to ObjectCreator or other long-running operations.
@@ -1010,23 +1010,23 @@ All code runs inside an async IIFE. Use \`await\` freely. Always \`return\` the 
 
 ### RIGHT — include the steps
 \`\`\`json
-{ "reply": "Here are all the objects in the system.", "steps": [{ "description": "List all registered objects", "code": "const objects = await call(await dep('Registry'), 'abjects:registry', 'list', {}); return objects.map(o => o.manifest.name + ': ' + o.manifest.description);" }] }
+{ "reply": "Here are all the objects in the system.", "steps": [{ "description": "List all registered objects", "code": "const objects = await call(await dep('Registry'), 'list', {}); return objects.map(o => o.manifest.name + ': ' + o.manifest.description);" }] }
 \`\`\`
 
 ## Key Patterns
 
 ### Query the registry
 \`\`\`
-const objects = await call(await dep('Registry'), 'abjects:registry', 'list', {});
+const objects = await call(await dep('Registry'), 'list', {});
 return objects.map(o => o.manifest.name + ': ' + o.manifest.description);
 \`\`\`
 
 ### Describe an object
 \`\`\`
 const regId = await dep('Registry');
-const results = await call(regId, 'abjects:registry', 'discover', { name: 'Chat' });
+const results = await call(regId, 'discover', { name: 'Chat' });
 if (results.length > 0) {
-  const desc = await call(results[0].id, 'abjects:introspect', 'describe', {});
+  const desc = await call(results[0].id, 'describe', {});
   return desc;
 }
 return null;
@@ -1034,18 +1034,18 @@ return null;
 
 ### Show/hide a window
 \`\`\`
-const results = await call(await dep('Registry'), 'abjects:registry', 'discover', { name: 'RegistryBrowser' });
+const results = await call(await dep('Registry'), 'discover', { name: 'RegistryBrowser' });
 if (results.length > 0) {
-  await call(results[0].id, 'abjects:registry-browser', 'show', {});
+  await call(results[0].id, 'show', {});
 }
 return true;
 \`\`\`
 
 ### Send a message to any object
 \`\`\`
-const results = await call(await dep('Registry'), 'abjects:registry', 'discover', { name: 'SomeName' });
+const results = await call(await dep('Registry'), 'discover', { name: 'SomeName' });
 if (results.length > 0) {
-  const r = await call(results[0].id, 'some:interface', 'someMethod', { key: 'value' });
+  const r = await call(results[0].id, 'someMethod', { key: 'value' });
   return r;
 }
 return 'Object not found';
@@ -1054,10 +1054,9 @@ return 'Object not found';
 ### Create a new object (via ObjectCreator)
 \`\`\`
 await progress('Creating object...');
-const result = await call(await dep('ObjectCreator'), 'abjects:object-creator', 'create', { prompt: 'description of the object to create' });
-if (result.success && result.objectId && result.manifest.interface) {
-  const iface = result.manifest.interface.id;
-  await call(result.objectId, iface, 'show', {});
+const result = await call(await dep('ObjectCreator'), 'create', { prompt: 'description of the object to create' });
+if (result.success && result.objectId) {
+  await call(result.objectId, 'show', {});
 }
 return result;
 \`\`\`
@@ -1066,9 +1065,9 @@ IMPORTANT: Always use ObjectCreator to create new objects. Do NOT call Factory.s
 ### Modify an existing object
 \`\`\`
 await progress('Modifying object...');
-const results = await call(await dep('Registry'), 'abjects:registry', 'discover', { name: 'TheName' });
+const results = await call(await dep('Registry'), 'discover', { name: 'TheName' });
 if (results.length > 0) {
-  const r = await call(await dep('ObjectCreator'), 'abjects:object-creator', 'modify',
+  const r = await call(await dep('ObjectCreator'), 'modify',
     { objectId: results[0].id, prompt: 'add a reset button' });
   return r;
 }
@@ -1077,11 +1076,11 @@ if (results.length > 0) {
 ### Make one object observe another
 \`\`\`
 // Object A will receive 'changed' events from Object B
-const aResults = await call(await dep('Registry'), 'abjects:registry', 'discover', { name: 'ObjectA' });
-const bResults = await call(await dep('Registry'), 'abjects:registry', 'discover', { name: 'ObjectB' });
+const aResults = await call(await dep('Registry'), 'discover', { name: 'ObjectA' });
+const bResults = await call(await dep('Registry'), 'discover', { name: 'ObjectB' });
 if (aResults.length > 0 && bResults.length > 0) {
   // Register A as dependent of B — A will now receive changed(aspect, value) events from B
-  await call(bResults[0].id, 'abjects:introspect', 'addDependent', {});
+  await call(bResults[0].id, 'addDependent', {});
   // Note: the call above registers the CALLER (JobManager) as dependent.
   // To register A as dependent of B, A's code must call addDependent itself.
 }
@@ -1089,9 +1088,9 @@ if (aResults.length > 0 && bResults.length > 0) {
 
 ### Ask an object a targeted question
 \`\`\`
-const results = await call(await dep('Registry'), 'abjects:registry', 'discover', { name: 'Timer' });
+const results = await call(await dep('Registry'), 'discover', { name: 'Timer' });
 if (results.length > 0) {
-  const answer = await call(results[0].id, 'abjects:introspect', 'ask',
+  const answer = await call(results[0].id, 'ask',
     { question: 'How do I set up a 60fps animation loop?' });
   return answer;
 }
@@ -1099,10 +1098,9 @@ if (results.length > 0) {
 
 ### Get an object's current state
 \`\`\`
-const results = await call(await dep('Registry'), 'abjects:registry', 'discover', { name: 'CatAndMouseGame' });
+const results = await call(await dep('Registry'), 'discover', { name: 'CatAndMouseGame' });
 if (results.length > 0) {
-  const iface = results[0].manifest.interface.id;
-  const state = await call(results[0].id, iface, 'getState', {});
+  const state = await call(results[0].id, 'getState', {});
   return state;
 }
 \`\`\`
@@ -1110,7 +1108,7 @@ if (results.length > 0) {
 ### Query a remote peer's registry
 \`\`\`
 // registryId comes from the "Connected Peers" section below
-const objs = await call(registryId, 'abjects:registry', 'list', {});
+const objs = await call(registryId, 'list', {});
 return objs.map(o => o.manifest.name + ': ' + o.manifest.description);
 \`\`\`
 
@@ -1118,26 +1116,26 @@ return objs.map(o => o.manifest.name + ': ' + o.manifest.description);
 Only user-created (scriptable) objects have source and can be cloned.
 \`\`\`
 // registryId comes from the "Connected Peers" section below
-const remoteObjects = await call(registryId, 'abjects:registry', 'list', {});
+const remoteObjects = await call(registryId, 'list', {});
 const target = remoteObjects.find(o => o.manifest.name === 'SnakeGame');
 if (!target || !target.source) return 'Object not found or has no copyable source';
 
 await progress('Copying remote object...');
 const localRegistry = await dep('Registry');
-const result = await call(await dep('Factory'), 'abjects:factory', 'spawn', {
+const result = await call(await dep('Factory'), 'spawn', {
   manifest: target.manifest, source: target.source, registryHint: localRegistry,
 });
 
 const store = await find('AbjectStore');
 if (store) {
-  await call(store, 'abjects:abject-store', 'save', {
+  await call(store, 'save', {
     objectId: result.objectId, manifest: target.manifest,
     source: target.source, owner: id,
   });
 }
 
-if (result.objectId && target.manifest.interface) {
-  await call(result.objectId, target.manifest.interface.id, 'show', {});
+if (result.objectId) {
+  await call(result.objectId, 'show', {});
 }
 return result;
 \`\`\`

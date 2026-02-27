@@ -132,7 +132,7 @@ export class ThemeAbject extends Abject {
 ### Getting the Current Theme
 
   const theme = await this.call(
-    this.dep('Theme'), 'abjects:theme', 'getTheme', {});
+    this.dep('Theme'), 'getTheme', {});
   // Returns a ThemeData object with all color and layout fields
 
 ### ThemeData Fields
@@ -162,21 +162,21 @@ Numeric fields:
 ### Updating the Theme (partial)
 
   const updated = await this.call(
-    this.dep('Theme'), 'abjects:theme', 'setTheme',
+    this.dep('Theme'), 'setTheme',
     { accent: '#ff6b6b', buttonBg: '#2a2b3e' });
   // Only pass the fields you want to change — others are preserved
 
 ### Resetting to Defaults
 
   const defaults = await this.call(
-    this.dep('Theme'), 'abjects:theme', 'resetTheme', {});
+    this.dep('Theme'), 'resetTheme', {});
 
 ### Subscribing to Theme Changes
 
 Register as a dependent so you receive live updates when the theme changes:
 
   await this.call(
-    this.dep('Theme'), 'abjects:theme:introspect', 'addDependent',
+    this.dep('Theme'), 'addDependent',
     { dependentId: this.id });
 
 Then handle the change notification:

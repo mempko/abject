@@ -418,7 +418,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
 ### Basic Completion (chat-style)
 
   const result = await this.call(
-    this.dep('LLM'), 'abjects:llm', 'complete',
+    this.dep('LLM'), 'complete',
     {
       messages: [
         { role: 'system', content: 'You are a helpful assistant.' },
@@ -432,14 +432,14 @@ Only output the code, no explanations. Use proper formatting and comments.`;
 ### Code Generation Shorthand
 
   const code = await this.call(
-    this.dep('LLM'), 'abjects:llm', 'generateCode',
+    this.dep('LLM'), 'generateCode',
     { language: 'typescript', description: 'sort an array of numbers', context: 'optional existing code' });
   // Returns the generated code as a plain string
 
 ### Content Analysis Shorthand
 
   const analysis = await this.call(
-    this.dep('LLM'), 'abjects:llm', 'analyze',
+    this.dep('LLM'), 'analyze',
     { content: 'some text to analyze', task: 'identify the main themes' });
   // Returns the analysis as a plain string
 

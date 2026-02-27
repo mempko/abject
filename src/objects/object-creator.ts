@@ -267,17 +267,16 @@ export class ObjectCreator extends Abject {
 ### Create a New Object
 
   const result = await call(
-    await dep('ObjectCreator'), 'abjects:object-creator', 'create',
+    await dep('ObjectCreator'), 'create',
     { prompt: 'a simple counter widget' });
   // result: { success: boolean, objectId?: string, manifest?: AbjectManifest,
   //           code?: string, error?: string, usedObjects?: string[] }
 
 The created object is ALREADY initialized and registered in the system — do NOT call init() on it.
-To display it, call show() using the first interface ID from the returned manifest:
+To display it, call show() on the returned objectId:
 
-  if (result.success && result.objectId && result.manifest.interface) {
-    const iface = result.manifest.interface.id;
-    await call(result.objectId, iface, 'show', {});
+  if (result.success && result.objectId) {
+    await call(result.objectId, 'show', {});
   }
 
 Always create and show in ONE step. Do NOT generate extra steps to "find", "init", or "discover" the created object — the returned objectId and manifest have everything needed.
@@ -285,14 +284,14 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
 ### Modify an Existing Object
 
   const result = await call(
-    await dep('ObjectCreator'), 'abjects:object-creator', 'modify',
+    await dep('ObjectCreator'), 'modify',
     { objectId: 'the-object-id', prompt: 'add a reset button' });
   // Returns the same CreationResult shape as create
 
 ### Get Suggestions
 
   const suggestions = await call(
-    await dep('ObjectCreator'), 'abjects:object-creator', 'suggest',
+    await dep('ObjectCreator'), 'suggest',
     { context: 'I want to track my daily habits' });
   // Returns string[] of suggested object ideas
 
@@ -300,7 +299,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
 - The interface ID is 'abjects:object-creator' (NOT 'abjects:objectcreator').
 - create is a long-running operation — call progress() before invoking it if available.
 - The returned objectId is ready to use immediately. Do NOT look it up in the registry or call init().
-- Use result.manifest.interface.id to get the correct interface ID for calling the new object.`;
+- The returned objectId can be called directly — interface IDs are resolved automatically.`;
   }
 
   /**

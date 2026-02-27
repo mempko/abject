@@ -91,7 +91,7 @@ export class BackendUI extends Abject {
             methods: [
               {
                 name: 'createSurface',
-                description: 'Create a new drawing surface. Example: const surfaceId = await this.call(this.dep("UIServer"), "abjects:ui", "createSurface", { rect: { x: 100, y: 100, width: 300, height: 200 }, zIndex: 100 })',
+                description: 'Create a new drawing surface. Example: const surfaceId = await this.call(this.dep("UIServer"), "createSurface", { rect: { x: 100, y: 100, width: 300, height: 200 }, zIndex: 100 })',
                 parameters: [
                   {
                     name: 'rect',
@@ -121,7 +121,7 @@ export class BackendUI extends Abject {
               },
               {
                 name: 'destroySurface',
-                description: 'Destroy a surface. Example: await this.call(this.dep("UIServer"), "abjects:ui", "destroySurface", { surfaceId })',
+                description: 'Destroy a surface. Example: await this.call(this.dep("UIServer"), "destroySurface", { surfaceId })',
                 parameters: [
                   {
                     name: 'surfaceId',
@@ -446,17 +446,17 @@ export class BackendUI extends Abject {
 ### Creating and Using Surfaces
 
 Create a surface:
-  const surfaceId = await this.call(this.dep('UIServer'), 'abjects:ui', 'createSurface',
+  const surfaceId = await this.call(this.dep('UIServer'), 'createSurface',
     { rect: { x: 100, y: 100, width: 300, height: 200 }, zIndex: 100 });
 
 Destroy a surface:
-  await this.call(this.dep('UIServer'), 'abjects:ui', 'destroySurface', { surfaceId });
+  await this.call(this.dep('UIServer'), 'destroySurface', { surfaceId });
 
 ### Drawing
 
 Each draw command has exactly 3 fields: { type, surfaceId, params }
 
-  await this.call(this.dep('UIServer'), 'abjects:ui', 'draw', {
+  await this.call(this.dep('UIServer'), 'draw', {
     commands: [
       { type: 'clear', surfaceId, params: { color: '#1e1e2e' } },
       { type: 'rect', surfaceId, params: { x: 10, y: 10, width: 80, height: 30, fill: '#4a4a6e', radius: 4 } },
@@ -481,9 +481,9 @@ Each draw command has exactly 3 fields: { type, surfaceId, params }
 ### Displaying Images
 
   // 1. Fetch image as base64 data URI
-  const img = await this.call(this.dep('HttpClient'), 'abjects:http', 'getBase64', { url: 'https://example.com/photo.jpg' });
+  const img = await this.call(this.dep('HttpClient'), 'getBase64', { url: 'https://example.com/photo.jpg' });
   // 2. Draw on surface
-  await this.call(this.dep('UIServer'), 'abjects:ui', 'draw', {
+  await this.call(this.dep('UIServer'), 'draw', {
     commands: [{ type: 'imageUrl', surfaceId, params: { x: 0, y: 0, width: 300, height: 200, url: img.dataUri } }]
   });
 

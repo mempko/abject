@@ -367,19 +367,19 @@ export class Timer extends Abject {
 ### Setting Up an Animation Timer (setInterval)
 
   this._timerId = await this.call(
-    this.dep('Timer'), 'abjects:timer', 'setInterval',
+    this.dep('Timer'), 'setInterval',
     { intervalMs: 16, data: { type: 'animate' } });
 
 ### One-Shot Timer (setTimeout)
 
   const timerId = await this.call(
-    this.dep('Timer'), 'abjects:timer', 'setTimeout',
+    this.dep('Timer'), 'setTimeout',
     { delayMs: 1000, data: { type: 'delayed-action' } });
 
 ### Clearing a Timer
 
   await this.call(
-    this.dep('Timer'), 'abjects:timer', 'clearTimer',
+    this.dep('Timer'), 'clearTimer',
     { timerId: this._timerId });
   this._timerId = null;
 
