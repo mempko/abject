@@ -40,6 +40,7 @@ export class Factory extends Abject {
   private _workerPool?: WorkerPool;
   private workerEligible: Set<string> = new Set();
   private workerSpawned: Map<AbjectId, string> = new Map(); // objectId → constructorName
+  private workerRegistries: Map<AbjectId, AbjectId> = new Map(); // objectId → registryId
 
   constructor() {
     super({
@@ -587,6 +588,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
 
     // Register with registry from main thread using the real manifest
     const targetRegistry = req.registryHint ?? (req.skipGlobalRegistry ? undefined : this._factoryRegistryId);
+    if (targetRegistry) this.workerRegistries.set(objectId, targetRegistry);
     if (targetRegistry) {
       const now = Date.now();
       await this.request(
@@ -645,6 +647,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
 
     // Register with registry including source and owner (for AbjectStore)
     const targetRegistry = req.registryHint ?? (req.skipGlobalRegistry ? undefined : this._factoryRegistryId);
+    if (targetRegistry) this.workerRegistries.set(objectId, targetRegistry);
     if (targetRegistry) {
       const now = Date.now();
       await this.request(
@@ -705,11 +708,12 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
       }
     } catch { /* Timer may not be available */ }
 
-    // Unregister from registry
-    if (this._factoryRegistryId) {
+    // Unregister from the registry where the object was actually registered
+    const objRegistry = this.workerRegistries.get(objectId) ?? this._factoryRegistryId;
+    if (objRegistry) {
       try {
         await this.request(
-          request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
+          request(this.id, objRegistry, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
         );
       } catch { /* may not be registered */ }
     }
@@ -717,6 +721,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
     // Kill in worker
     await this._workerPool.killInWorker(objectId);
     this.workerSpawned.delete(objectId);
+    this.workerRegistries.delete(objectId);
 
     return true;
   }
@@ -744,11 +749,12 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
       }
     } catch { /* Supervisor may not be tracking this object */ }
 
-    // Unregister from registry BEFORE stopping so cleanup notifications
-    // fire while the object is still on the bus
-    if (this._factoryRegistryId) {
+    // Unregister from the registry where the object was actually registered
+    // (workspace registry via registryHint, or global registry as fallback)
+    const objRegistry = obj.getRegistryId() ?? this._factoryRegistryId;
+    if (objRegistry) {
       await this.request(
-        request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
+        request(this.id, objRegistry, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
       );
     }
 
@@ -795,7 +801,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
   /**
    * Factory knows the Registry directly.
    */
-  protected override getRegistryId(): AbjectId | undefined {
+  override getRegistryId(): AbjectId | undefined {
     return this._factoryRegistryId ?? super.getRegistryId();
   }
 

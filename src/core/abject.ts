@@ -239,8 +239,9 @@ export abstract class Abject {
 
   /**
    * Get the cached Registry ID. Override in subclasses that know the Registry directly.
+   * Public so Factory can determine which registry an object belongs to at kill time.
    */
-  protected getRegistryId(): AbjectId | undefined {
+  getRegistryId(): AbjectId | undefined {
     return this._registryId;
   }
 
