@@ -105,11 +105,20 @@ export class PeerTransport extends Transport {
       this.createPeerConnection();
     }
 
-    await this.peerConnection!.setRemoteDescription(new RTCSessionDescription(sdp));
+    try {
+      await this.peerConnection!.setRemoteDescription(new RTCSessionDescription(sdp));
+    } catch (err) {
+      console.error(`[PeerTransport] Failed to set remote offer for ${this.remotePeerId.slice(0, 16)}:`, err);
+      throw err;
+    }
 
     // Apply any ICE candidates that arrived before the remote description
     for (const candidate of this.pendingCandidates) {
-      await this.peerConnection!.addIceCandidate(new RTCIceCandidate(candidate));
+      try {
+        await this.peerConnection!.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch {
+        // Stale candidates from ICE glare — safe to discard
+      }
     }
     this.pendingCandidates = [];
 
@@ -127,11 +136,21 @@ export class PeerTransport extends Transport {
    */
   async handleSdpAnswer(sdp: RTCSessionDescriptionInit): Promise<void> {
     precondition(this.peerConnection !== undefined, 'No peer connection');
-    await this.peerConnection!.setRemoteDescription(new RTCSessionDescription(sdp));
+
+    try {
+      await this.peerConnection!.setRemoteDescription(new RTCSessionDescription(sdp));
+    } catch (err) {
+      console.error(`[PeerTransport] Failed to set remote answer for ${this.remotePeerId.slice(0, 16)}:`, err);
+      throw err;
+    }
 
     // Apply any ICE candidates that arrived before the remote description
     for (const candidate of this.pendingCandidates) {
-      await this.peerConnection!.addIceCandidate(new RTCIceCandidate(candidate));
+      try {
+        await this.peerConnection!.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch {
+        // Stale candidates from ICE glare — safe to discard
+      }
     }
     this.pendingCandidates = [];
   }
@@ -140,12 +159,19 @@ export class PeerTransport extends Transport {
    * Handle an incoming ICE candidate from the signaling server.
    */
   async handleIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
-    if (!this.peerConnection || !this.peerConnection.remoteDescription) {
-      // Queue if remote description not yet set
+    if (!this.peerConnection ||
+        !this.peerConnection.remoteDescription ||
+        this.peerConnection.signalingState === 'have-local-offer') {
+      // Queue if remote description not yet set (includes ICE glare scenarios
+      // where candidates arrive for a rejected offer)
       this.pendingCandidates.push(candidate);
       return;
     }
-    await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+    try {
+      await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch {
+      // During ICE glare recovery, stale candidates may arrive — safe to discard
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -187,6 +213,14 @@ export class PeerTransport extends Transport {
    */
   get isEncrypted(): boolean {
     return this.handshakeState === 'encrypted';
+  }
+
+  /**
+   * Current signaling state of the underlying RTCPeerConnection.
+   * Used by PeerRegistry for ICE glare detection.
+   */
+  get signalingState(): string {
+    return this.peerConnection?.signalingState ?? 'closed';
   }
 
   // ==========================================================================
@@ -245,6 +279,15 @@ export class PeerTransport extends Transport {
     dc.onmessage = (event) => {
       this.handleIncomingData(event.data as string);
     };
+
+    // Callee may receive a DataChannel already in 'open' state via ondatachannel,
+    // in which case onopen won't fire. Trigger manually.
+    if (dc.readyState === 'open') {
+      console.log(`[PeerTransport] DataChannel already open with ${this.remotePeerId.slice(0, 16)}`);
+      this.handleConnect();
+      this.startHandshake();
+      this.startPing();
+    }
   }
 
   /**
@@ -290,12 +333,20 @@ export class PeerTransport extends Transport {
         const decoder = new TextDecoder();
         const msgData = decoder.decode(plaintext);
         const message = deserialize(msgData);
+        console.log(`[PeerTransport] recv encrypted from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
         this.events.onMessage?.(message);
+        return;
+      }
+
+      // Encrypted message but no session key yet — drop it
+      if (parsed.enc && !this.sessionKey) {
+        console.warn(`[PeerTransport] recv encrypted msg from ${this.remotePeerId.slice(0, 16)} but no session key yet — dropping`);
         return;
       }
 
       // Unencrypted message (during handshake or if encryption not yet established)
       const message = deserialize(data);
+      console.log(`[PeerTransport] recv unencrypted from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
       this.events.onMessage?.(message);
     } catch (err) {
       console.error('[PeerTransport] Failed to handle message:', err);

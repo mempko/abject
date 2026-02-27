@@ -14,6 +14,7 @@ import { invariant } from '../core/contracts.js';
 import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 import { formatManifestAsDescription } from '../core/introspect.js';
 import type { JobResult } from './job-manager.js';
+import type { DiscoveredWorkspace } from './workspace-share-registry.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 
 const CHAT_INTERFACE: InterfaceId = 'abjects:chat';
@@ -77,6 +78,7 @@ export class Chat extends Abject {
   private usageGuideCache: Map<string, { guide: string; fetchedAt: number }> = new Map();
   private readonly GUIDE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
   private enrichedObjectContext = '';
+  private remotePeerContext = '';
   private phase: ChatPhase = 'closed';
   private _currentJobMsgId?: string;
 
@@ -644,6 +646,50 @@ export class Chat extends Abject {
     } catch {
       // Keep existing summaries if refresh fails
     }
+
+    await this.refreshRemotePeerContext();
+  }
+
+  /** Build a text summary of remote peers and their objects for the LLM prompt. */
+  private async refreshRemotePeerContext(): Promise<void> {
+    try {
+      const wsrId = await this.discoverDep('WorkspaceShareRegistry');
+      if (!wsrId) return;
+
+      let workspaces = await this.request<DiscoveredWorkspace[]>(
+        request(this.id, wsrId, 'abjects:workspace-share-registry' as InterfaceId, 'getDiscoveredWorkspaces', {})
+      );
+
+      if (workspaces.length === 0) {
+        workspaces = await this.request<DiscoveredWorkspace[]>(
+          request(this.id, wsrId, 'abjects:workspace-share-registry' as InterfaceId, 'discoverWorkspaces', { hops: 1 })
+        );
+      }
+
+      if (workspaces.length === 0) {
+        this.remotePeerContext = '';
+        return;
+      }
+
+      const lines: string[] = [];
+      for (const ws of workspaces) {
+        try {
+          const remoteObjects = await this.request<ObjectRegistration[]>(
+            request(this.id, ws.registryId as AbjectId, 'abjects:registry' as InterfaceId, 'list', {})
+          );
+          const objNames = remoteObjects.map(o => {
+            const clonable = (o as ObjectRegistration & { source?: string }).source ? ' (clonable)' : '';
+            return `${o.manifest.name}${clonable}`;
+          }).join(', ');
+          lines.push(`- Peer "${ws.ownerName}" workspace "${ws.name}" (registryId: ${ws.registryId})\n  Objects: ${objNames}`);
+        } catch {
+          lines.push(`- Peer "${ws.ownerName}" workspace "${ws.name}" (registryId: ${ws.registryId})\n  Objects: (could not query)`);
+        }
+      }
+      this.remotePeerContext = lines.join('\n');
+    } catch {
+      // Best-effort — leave remotePeerContext unchanged
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1055,6 +1101,41 @@ if (results.length > 0) {
 }
 \`\`\`
 
+### Query a remote peer's registry
+\`\`\`
+// registryId comes from the "Connected Peers" section below
+const objs = await call(registryId, 'abjects:registry', 'list', {});
+return objs.map(o => o.manifest.name + ': ' + o.manifest.description);
+\`\`\`
+
+### Clone/copy a remote object to local workspace
+Only user-created (scriptable) objects have source and can be cloned.
+\`\`\`
+// registryId comes from the "Connected Peers" section below
+const remoteObjects = await call(registryId, 'abjects:registry', 'list', {});
+const target = remoteObjects.find(o => o.manifest.name === 'SnakeGame');
+if (!target || !target.source) return 'Object not found or has no copyable source';
+
+await progress('Copying remote object...');
+const localRegistry = await dep('Registry');
+const result = await call(await dep('Factory'), 'abjects:factory', 'spawn', {
+  manifest: target.manifest, source: target.source, registryHint: localRegistry,
+});
+
+const store = await find('AbjectStore');
+if (store) {
+  await call(store, 'abjects:abject-store', 'save', {
+    objectId: result.objectId, manifest: target.manifest,
+    source: target.source, owner: id,
+  });
+}
+
+if (result.objectId && target.manifest.interfaces.length > 0) {
+  await call(result.objectId, target.manifest.interfaces[0].id, 'show', {});
+}
+return result;
+\`\`\`
+
 ## Available Objects (Summary)
 
 ${this.objectSummaries || '(Loading...)'}
@@ -1062,6 +1143,13 @@ ${useEnrichedContext && this.enrichedObjectContext ? `
 ## Detailed Guides for Relevant Objects
 
 ${this.enrichedObjectContext}
+` : ''}
+${this.remotePeerContext ? `
+## Connected Peers & Remote Workspaces
+
+The following remote workspaces are available from connected peers. Use the registryId to query them.
+
+${this.remotePeerContext}
 ` : ''}
 ## Important Rules
 

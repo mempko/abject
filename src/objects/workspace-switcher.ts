@@ -18,13 +18,12 @@ const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 const WORKSPACE_MANAGER_INTERFACE: InterfaceId = 'abjects:workspace-manager';
 
-const GLOBAL_SETTINGS_INTERFACE: InterfaceId = 'abjects:global-settings';
 const WORKSPACE_BROWSER_INTERFACE: InterfaceId = 'abjects:workspace-browser';
+const SETTINGS_INTERFACE: InterfaceId = 'abjects:settings';
 
 export class WorkspaceSwitcher extends Abject {
   private widgetManagerId?: AbjectId;
   private workspaceManagerId?: AbjectId;
-  private globalSettingsId?: AbjectId;
   private workspaceBrowserId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
@@ -32,12 +31,18 @@ export class WorkspaceSwitcher extends Abject {
   /** Button AbjectId → workspace ID */
   private workspaceSwitchButtons: Map<AbjectId, string> = new Map();
   private workspaceCreateBtnId?: AbjectId;
-  private globalSettingsBtnId?: AbjectId;
   private browseBtnId?: AbjectId;
+  private settingsBtnId?: AbjectId;
+
+  /** Per-workspace Settings ID (pushed by WorkspaceManager via show payload) */
+  private settingsId?: AbjectId;
 
   /** Cached workspace data (pushed by WorkspaceManager via show payload) */
   private cachedWorkspaces: Array<{ id: string; name: string }> = [];
   private cachedActiveWorkspaceId?: string;
+
+  /** Cached y offset for rebuilds (set by WorkspaceManager) */
+  private cachedYOffset = 8;
 
   /** Current window height (queried by WorkspaceManager for Taskbar positioning) */
   private currentHeight = 0;
@@ -101,7 +106,6 @@ export class WorkspaceSwitcher extends Abject {
   protected override async onInit(): Promise<void> {
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
-    this.globalSettingsId = await this.discoverDep('GlobalSettings') ?? undefined;
   }
 
   private setupHandlers(): void {
@@ -109,10 +113,18 @@ export class WorkspaceSwitcher extends Abject {
       const payload = msg.payload as {
         workspaces?: Array<{ id: string; name: string }>;
         activeWorkspaceId?: string;
+        settingsId?: AbjectId;
+        yOffset?: number;
       } | undefined;
       if (payload?.workspaces) {
         this.cachedWorkspaces = payload.workspaces;
         this.cachedActiveWorkspaceId = payload.activeWorkspaceId;
+      }
+      if (payload?.settingsId !== undefined) {
+        this.settingsId = payload.settingsId;
+      }
+      if (payload?.yOffset !== undefined) {
+        this.cachedYOffset = payload.yOffset;
       }
       return this.show();
     });
@@ -168,17 +180,14 @@ export class WorkspaceSwitcher extends Abject {
         return;
       }
 
-      // Global Settings button
-      if (fromId === this.globalSettingsBtnId) {
-        if (!this.globalSettingsId) {
-          this.globalSettingsId = await this.discoverDep('GlobalSettings') ?? undefined;
-        }
-        if (this.globalSettingsId) {
+      // Settings gear button
+      if (fromId === this.settingsBtnId) {
+        if (this.settingsId) {
           try {
-            await this.request(request(this.id, this.globalSettingsId,
-              GLOBAL_SETTINGS_INTERFACE, 'show', {}));
+            await this.request(request(this.id, this.settingsId,
+              SETTINGS_INTERFACE, 'show', {}));
           } catch (err) {
-            console.warn('[WorkspaceSwitcher] Failed to show GlobalSettings:', err);
+            console.warn('[WorkspaceSwitcher] Failed to show Settings:', err);
           }
         }
         return;
@@ -217,8 +226,8 @@ export class WorkspaceSwitcher extends Abject {
     // Reset button tracking
     this.workspaceSwitchButtons.clear();
     this.workspaceCreateBtnId = undefined;
-    this.globalSettingsBtnId = undefined;
     this.browseBtnId = undefined;
+    this.settingsBtnId = undefined;
     this.rootLayoutId = undefined;
 
     const workspaces = this.cachedWorkspaces;
@@ -227,7 +236,6 @@ export class WorkspaceSwitcher extends Abject {
     const btnW = 100;
     const btnH = 30;
     const labelH = 20;
-    const dividerH = 8;
     const padding = 16;
     const spacing = 6;
 
@@ -245,7 +253,7 @@ export class WorkspaceSwitcher extends Abject {
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
         title: '',
-        rect: { x: 8, y: 8, width: barWidth, height: barHeight },
+        rect: { x: 8, y: this.cachedYOffset, width: barWidth, height: barHeight },
         zIndex: 1000,
         chromeless: true,
         draggable: true,
@@ -301,8 +309,8 @@ export class WorkspaceSwitcher extends Abject {
 
     // Build workspace buttons
     if (hasWorkspaces) {
-      // Section header row: "◈ Workspaces" label + gear button
-      const wsHeaderRowId = await this.request<AbjectId>(
+      // ── Spaces section header row: "◈ Spaces" label + gear button ──
+      const spacesHeaderRowId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
           parentLayoutId: this.rootLayoutId,
           margins: { top: 0, right: 0, bottom: 0, left: 0 },
@@ -310,32 +318,32 @@ export class WorkspaceSwitcher extends Abject {
         })
       );
       await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: wsHeaderRowId,
+        widgetId: spacesHeaderRowId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: labelH },
       }));
 
-      const wsHeaderLabelId = await this.request<AbjectId>(
+      const spacesHeaderLabelId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
           windowId: this.windowId, rect: r0, text: '\u25C8 Spaces',
           style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
         })
       );
-      await this.request(request(this.id, wsHeaderRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: wsHeaderLabelId,
+      await this.request(request(this.id, spacesHeaderRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: spacesHeaderLabelId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: labelH },
       }));
 
-      this.globalSettingsBtnId = await this.request<AbjectId>(
+      this.settingsBtnId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
           windowId: this.windowId, rect: r0, text: '\u2699',
           style: { fontSize: 13 },
         })
       );
-      await this.request(request(this.id, this.globalSettingsBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-      await this.request(request(this.id, wsHeaderRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-        widgetId: this.globalSettingsBtnId,
+      await this.request(request(this.id, this.settingsBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+      await this.request(request(this.id, spacesHeaderRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: this.settingsBtnId,
         sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
         preferredSize: { width: 24, height: labelH },
       }));
@@ -369,8 +377,8 @@ export class WorkspaceSwitcher extends Abject {
     this.rootLayoutId = undefined;
     this.workspaceSwitchButtons.clear();
     this.workspaceCreateBtnId = undefined;
-    this.globalSettingsBtnId = undefined;
     this.browseBtnId = undefined;
+    this.settingsBtnId = undefined;
     return true;
   }
 }

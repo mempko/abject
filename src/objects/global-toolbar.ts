@@ -1,0 +1,245 @@
+/**
+ * GlobalToolbar — persistent chromeless panel positioned below WorkspaceSwitcher.
+ *
+ * Provides quick-access buttons for GlobalSettings (API Keys) and
+ * PeerNetwork (identity, signaling, contacts).
+ */
+
+import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
+import { Abject } from '../core/abject.js';
+import { request } from '../core/message.js';
+import { Capabilities } from '../core/capability.js';
+import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
+
+const GLOBAL_TOOLBAR_INTERFACE: InterfaceId = 'abjects:global-toolbar';
+const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
+const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
+const GLOBAL_SETTINGS_INTERFACE: InterfaceId = 'abjects:global-settings';
+const PEER_NETWORK_INTERFACE: InterfaceId = 'abjects:peer-network';
+
+export class GlobalToolbar extends Abject {
+  private widgetManagerId?: AbjectId;
+  private globalSettingsId?: AbjectId;
+  private peerNetworkId?: AbjectId;
+
+  private windowId?: AbjectId;
+  private rootLayoutId?: AbjectId;
+  private settingsBtnId?: AbjectId;
+  private networkBtnId?: AbjectId;
+
+  /** Current window height (queried by WorkspaceManager for Taskbar positioning) */
+  private currentHeight = 0;
+
+  constructor() {
+    super({
+      manifest: {
+        name: 'GlobalToolbar',
+        description:
+          'Persistent toolbar panel with quick-access buttons for system settings and peer network.',
+        version: '1.0.0',
+        interfaces: [
+          {
+            id: GLOBAL_TOOLBAR_INTERFACE,
+            name: 'GlobalToolbar',
+            description: 'System toolbar UI',
+            methods: [
+              {
+                name: 'show',
+                description: 'Show the toolbar at a given y offset',
+                parameters: [
+                  {
+                    name: 'yOffset',
+                    type: { kind: 'primitive', primitive: 'number' },
+                    description: 'Y position for the toolbar window',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'hide',
+                description: 'Hide the toolbar',
+                parameters: [],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'getHeight',
+                description: 'Get the current window height for positioning',
+                parameters: [],
+                returns: { kind: 'primitive', primitive: 'number' },
+              },
+            ],
+          },
+        ],
+        requiredCapabilities: [
+          { capability: Capabilities.UI_SURFACE, reason: 'Display toolbar', required: true },
+        ],
+        providedCapabilities: [],
+        tags: ['system', 'ui'],
+      },
+    });
+
+    this.setupHandlers();
+  }
+
+  protected override async onInit(): Promise<void> {
+    this.widgetManagerId = await this.requireDep('WidgetManager');
+  }
+
+  private setupHandlers(): void {
+    this.on('show', async (msg: AbjectMessage) => {
+      const { yOffset } = msg.payload as { yOffset?: number } ?? {};
+      return this.show(yOffset ?? 8);
+    });
+
+    this.on('hide', async () => {
+      return this.hide();
+    });
+
+    this.on('getHeight', async () => {
+      return this.currentHeight;
+    });
+
+    this.on('changed', async (msg: AbjectMessage) => {
+      const { aspect } = msg.payload as { aspect: string; value?: unknown };
+      if (aspect !== 'click') return;
+
+      const fromId = msg.routing.from;
+
+      // Settings button
+      if (fromId === this.settingsBtnId) {
+        if (!this.globalSettingsId) {
+          this.globalSettingsId = await this.discoverDep('GlobalSettings') ?? undefined;
+        }
+        if (this.globalSettingsId) {
+          try {
+            await this.request(request(this.id, this.globalSettingsId,
+              GLOBAL_SETTINGS_INTERFACE, 'show', {}));
+          } catch (err) {
+            console.warn('[GlobalToolbar] Failed to show GlobalSettings:', err);
+          }
+        }
+        return;
+      }
+
+      // Network button
+      if (fromId === this.networkBtnId) {
+        if (!this.peerNetworkId) {
+          this.peerNetworkId = await this.discoverDep('PeerNetwork') ?? undefined;
+        }
+        if (this.peerNetworkId) {
+          try {
+            await this.request(request(this.id, this.peerNetworkId,
+              PEER_NETWORK_INTERFACE, 'show', {}));
+          } catch (err) {
+            console.warn('[GlobalToolbar] Failed to show PeerNetwork:', err);
+          }
+        }
+        return;
+      }
+    });
+  }
+
+  async show(yOffset = 8): Promise<boolean> {
+    // Always destroy and rebuild (position may have changed)
+    if (this.windowId) {
+      await this.request(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
+          windowId: this.windowId,
+        })
+      );
+      this.windowId = undefined;
+    }
+
+    // Reset button tracking
+    this.settingsBtnId = undefined;
+    this.networkBtnId = undefined;
+    this.rootLayoutId = undefined;
+
+    const btnW = 100;
+    const btnH = 30;
+    const labelH = 20;
+    const padding = 16;
+    const spacing = 6;
+
+    // Height: padding + label + spacing + btn1 + spacing + btn2 + padding
+    const barHeight = padding + labelH + spacing + btnH + spacing + btnH + padding;
+    const barWidth = btnW + padding * 2;
+
+    this.currentHeight = barHeight;
+
+    this.windowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
+        title: '',
+        rect: { x: 8, y: yOffset, width: barWidth, height: barHeight },
+        zIndex: 1000,
+        chromeless: true,
+        draggable: true,
+      })
+    );
+
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+
+    // Create root VBox layout
+    this.rootLayoutId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+        windowId: this.windowId,
+        margins: { top: padding, right: padding, bottom: padding, left: padding },
+        spacing,
+      })
+    );
+
+    // Section label
+    const labelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: '\u2699 System',
+        style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      widgetId: labelId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { width: btnW, height: labelH },
+    }));
+
+    // Helper to add a fixed-size button
+    const addBtn = async (text: string): Promise<AbjectId> => {
+      const btnId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+          windowId: this.windowId, rect: r0, text,
+        })
+      );
+      await this.request(
+        request(this.id, btnId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+      );
+      await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: btnId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { width: btnW, height: btnH },
+      }));
+      return btnId;
+    };
+
+    this.settingsBtnId = await addBtn('Settings');
+    this.networkBtnId = await addBtn('Network');
+
+    return true;
+  }
+
+  async hide(): Promise<boolean> {
+    if (!this.windowId) return true;
+
+    await this.request(
+      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
+        windowId: this.windowId,
+      })
+    );
+
+    this.windowId = undefined;
+    this.rootLayoutId = undefined;
+    this.settingsBtnId = undefined;
+    this.networkBtnId = undefined;
+    return true;
+  }
+}
+
+export const GLOBAL_TOOLBAR_ID = 'abjects:global-toolbar' as AbjectId;

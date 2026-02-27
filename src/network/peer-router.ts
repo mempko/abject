@@ -2,9 +2,10 @@
  * PeerRouter — Abject + MessageInterceptor that provides transparent
  * multi-hop message routing with permission-aware route propagation.
  *
- * Replaces NetworkBridge. An AbjectId is the only address — senders never
- * know or care whether the target is local or remote. Routes are propagated
- * automatically based on workspace access mode (public/private/local).
+ * Replaces NetworkBridge. An AbjectId UUID is the only address — senders
+ * never know or care whether the target is local or remote. Routes are
+ * propagated automatically based on workspace access mode (public/private/local).
+ * Remote well-known objects are resolved to UUIDs via `resolveRemoteObject`.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
@@ -50,6 +51,9 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 
   /** Well-known name → local UUID mapping for inbound message resolution */
   private wellKnownAliases: Map<AbjectId, AbjectId> = new Map();
+
+  /** Remote peer well-known → UUID mappings: key = `${peerId}:${wellKnownId}` */
+  private remoteWellKnown: Map<string, AbjectId> = new Map();
 
   /** Inbound permission cache */
   private permissionCache: Map<AbjectId, PermissionCacheEntry> = new Map();
@@ -132,6 +136,15 @@ export class PeerRouter extends Abject implements MessageInterceptor {
                   { name: 'fromPeerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Announcing peer' },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'resolveRemoteObject',
+                description: 'Resolve a remote peer well-known ID to a routable UUID',
+                parameters: [
+                  { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Remote peer ID' },
+                  { name: 'wellKnownId', type: { kind: 'primitive', primitive: 'string' }, description: 'Well-known object ID to resolve' },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
               },
             ],
             events: [
@@ -232,15 +245,31 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 
     this.on('handleRouteAnnouncement', async (msg: AbjectMessage) => {
       const { routes, fromPeerId } = msg.payload as {
-        routes: Array<{ objectId: string; hops: number }>;
+        routes: Array<{ objectId: string; hops: number; wellKnownId?: string }>;
         fromPeerId: string;
       };
       return this.handleRouteAnnouncementImpl(routes, fromPeerId);
     });
 
-    // Listen for workspace access change events from WorkspaceManager
+    this.on('resolveRemoteObject', async (msg: AbjectMessage) => {
+      const { peerId, wellKnownId } = msg.payload as { peerId: string; wellKnownId: string };
+      const key = `${peerId}:${wellKnownId}`;
+      const result = this.remoteWellKnown.get(key) ?? null;
+      console.log(`[PeerRouter] resolveRemoteObject key="${key.slice(0, 50)}" → ${result ? result.slice(0, 8) : 'null'} (map size=${this.remoteWellKnown.size}, keys=[${[...this.remoteWellKnown.keys()].map(k => k.slice(0, 40)).join(', ')}])`);
+      return result;
+    });
+
+    // Listen for events from PeerRegistry and WorkspaceManager
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
+
+      // PeerRegistry: new peer connected — announce routes immediately
+      if (aspect === 'contactConnected') {
+        const { peerId } = value as { peerId: string };
+        console.log(`[PeerRouter] contactConnected event for ${peerId.slice(0, 16)}, announcing routes`);
+        this.announceRoutesToPeer(peerId as PeerId).catch(() => { /* best-effort */ });
+        return;
+      }
 
       if (aspect === 'workspaceAccessChanged' || aspect === 'workspaceShared' || aspect === 'workspaceUnshared') {
         // Invalidate permission cache
@@ -252,8 +281,20 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   }
 
   protected override async onInit(): Promise<void> {
+    console.log('[PeerRouter] onInit starting');
     this.peerRegistryId = (await this.discoverDep('PeerRegistry')) ?? undefined;
     this.workspaceManagerId = (await this.discoverDep('WorkspaceManager')) ?? undefined;
+    console.log(`[PeerRouter] onInit deps: peerRegistryId=${!!this.peerRegistryId} workspaceManagerId=${!!this.workspaceManagerId}`);
+
+    // Subscribe to PeerRegistry events (contactConnected triggers route announcement)
+    if (this.peerRegistryId) {
+      try {
+        await this.request(
+          createRequest(this.id, this.peerRegistryId, INTROSPECT_INTERFACE, 'addDependent', {}),
+        );
+        console.log('[PeerRouter] subscribed to PeerRegistry events');
+      } catch { /* PeerRegistry may not support addDependent yet */ }
+    }
 
     // Subscribe to WorkspaceManager events for cache invalidation
     if (this.workspaceManagerId) {
@@ -268,6 +309,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     this.announceTimer = setInterval(() => {
       this.announceRoutesToAll().catch(() => { /* best-effort */ });
     }, ANNOUNCE_INTERVAL);
+    console.log('[PeerRouter] onInit complete, announce timer started (60s)');
   }
 
   protected override async onStop(): Promise<void> {
@@ -284,44 +326,13 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   /**
    * Called by MessageBus for every outgoing message.
    * If the recipient is a known remote object, forward via transport.
-   *
-   * Supports explicit peer addressing via `objectId@peerId` suffix — used when
-   * both peers have an object with the same well-known ID (e.g. WorkspaceShareRegistry).
+   * All routing is done via UUID lookup in the routing table.
    */
   async intercept(message: AbjectMessage): Promise<'pass' | 'drop' | AbjectMessage> {
     const recipient = message.routing.to;
 
     if (!this.peerRegistryRef) {
       return 'pass';
-    }
-
-    // Handle explicit peer addressing: "objectId@peerId"
-    const atIdx = recipient.indexOf('@');
-    if (atIdx >= 0) {
-      const targetId = recipient.slice(0, atIdx) as AbjectId;
-      const peerId = recipient.slice(atIdx + 1);
-
-      const transport = this.peerRegistryRef.getTransportForPeer(peerId);
-      console.log(`[PeerRouter] intercept @peerId: ${targetId.slice(0, 8)}@${peerId.slice(0, 16)} connected=${!!transport?.isConnected}`);
-      if (!transport || !transport.isConnected) {
-        console.warn(`[PeerRouter] Cannot route to ${targetId.slice(0, 8)}@${peerId.slice(0, 16)}: peer not connected`);
-        return 'pass';
-      }
-
-      // Rewrite the message to target the actual object ID on the remote peer
-      const rewritten: AbjectMessage = {
-        ...message,
-        routing: { ...message.routing, to: targetId },
-      };
-
-      try {
-        await transport.send(rewritten);
-        console.log('[PeerRouter] forwarded outbound @peerId message');
-        return 'drop';
-      } catch (err) {
-        console.error(`[PeerRouter] Failed to forward to ${peerId.slice(0, 16)}:`, err);
-        return 'pass';
-      }
     }
 
     // Look up route in routing table
@@ -363,6 +374,13 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 
     let targetId = msg.routing.to;
     console.log(`[PeerRouter] inbound: to=${msg.routing.to.slice(0, 20)} from=${msg.routing.from.slice(0, 8)} type=${msg.header.type} method=${(msg.payload as any)?.method ?? '?'}`);
+
+    // Messages addressed to PEER_ROUTER_ID are for this PeerRouter itself
+    if (targetId === PEER_ROUTER_ID) {
+      targetId = this.id;
+      msg = { ...msg, routing: { ...msg.routing, to: this.id } };
+      console.log('[PeerRouter] self-addressed, resolved to', this.id.slice(0, 8));
+    }
 
     // Resolve well-known alias to actual registered UUID
     const resolvedId = this.wellKnownAliases.get(targetId);
@@ -411,20 +429,19 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       }
     }
 
-    // Undeliverable — try local bus anyway (might be a late registration)
+    // Undeliverable — send error reply immediately via transport, then try local bus as fallback
     console.log('[PeerRouter] UNDELIVERABLE for', targetId.slice(0, 20));
+    if (msg.header.type === 'request') {
+      const errMsg = createError(msg, 'RECIPIENT_NOT_FOUND',
+        `Remote object ${targetId} is not available on this peer`);
+      const transport = this.peerRegistryRef?.getTransportForPeer(fromPeerId);
+      if (transport?.isConnected) {
+        transport.send(errMsg).catch(() => { /* best-effort */ });
+      }
+    }
     if (this._messageBus) {
       this._messageBus.send(msg).catch(() => {
         console.warn(`[PeerRouter] Undeliverable remote message for ${targetId.slice(0, 8)}`);
-        // Send error reply so sender doesn't hang for 30s waiting for a timeout
-        if (msg.header.type === 'request') {
-          const errMsg = createError(msg, 'RECIPIENT_NOT_FOUND',
-            `Remote object ${targetId} is not available on this peer`);
-          const transport = this.peerRegistryRef?.getTransportForPeer(fromPeerId);
-          if (transport?.isConnected) {
-            transport.send(errMsg).catch(() => { /* best-effort */ });
-          }
-        }
       });
     }
   }
@@ -537,6 +554,12 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         count++;
       }
     }
+    // Clean up well-known mappings for this peer
+    for (const key of this.remoteWellKnown.keys()) {
+      if (key.startsWith(`${peerId}:`)) {
+        this.remoteWellKnown.delete(key);
+      }
+    }
     return count;
   }
 
@@ -575,13 +598,25 @@ export class PeerRouter extends Abject implements MessageInterceptor {
    * Filters by workspace access mode.
    */
   async announceRoutesToPeer(peerId: PeerId): Promise<boolean> {
-    if (!this.peerRegistryRef || !this.workspaceManagerId) return false;
+    if (!this.peerRegistryRef) {
+      console.log(`[PeerRouter] announceRoutesToPeer(${peerId.slice(0, 16)}) — skipped: no peerRegistryRef`);
+      return false;
+    }
 
     const transport = this.peerRegistryRef.getTransportForPeer(peerId);
-    if (!transport?.isConnected) return false;
+    if (!transport?.isConnected) {
+      console.log(`[PeerRouter] announceRoutesToPeer(${peerId.slice(0, 16)}) — skipped: transport=${!!transport} connected=${transport?.isConnected}`);
+      return false;
+    }
 
     const announcedRoutes = await this.collectRoutesForPeer(peerId);
-    if (announcedRoutes.length === 0) return true;
+    if (announcedRoutes.length === 0) {
+      console.log(`[PeerRouter] announceRoutesToPeer(${peerId.slice(0, 16)}) — no routes to announce`);
+      return true;
+    }
+
+    const localPeerId = this.peerRegistryRef.getLocalPeerId();
+    console.log(`[PeerRouter] announceRoutesToPeer(${peerId.slice(0, 16)}) — ${announcedRoutes.length} routes, localPeerId=${localPeerId.slice(0, 16)}`, announcedRoutes.map(r => ({ obj: r.objectId.slice(0, 8), wk: r.wellKnownId, hops: r.hops })));
 
     // Send route announcement as a message to the remote peer's PeerRouter
     const announcement = createRequest(
@@ -589,13 +624,11 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       PEER_ROUTER_ID,
       PEER_ROUTER_INTERFACE,
       'handleRouteAnnouncement',
-      { routes: announcedRoutes, fromPeerId: this.peerRegistryRef.getConnectedPeers()[0] ?? '' },
+      { routes: announcedRoutes, fromPeerId: localPeerId },
     );
-
-    // We need our local peerId — get it from the first connected peer's transport perspective
-    // Actually, we need the local identity. Get it from PeerRegistry.
     try {
       await transport.send(announcement);
+      console.log(`[PeerRouter] announceRoutesToPeer(${peerId.slice(0, 16)}) — sent OK`);
     } catch (err) {
       console.error(`[PeerRouter] Failed to announce routes to ${peerId.slice(0, 16)}:`, err);
       return false;
@@ -611,6 +644,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     if (!this.peerRegistryRef) return;
 
     const connectedPeers = this.peerRegistryRef.getConnectedPeers();
+    console.log(`[PeerRouter] announceRoutesToAll — ${connectedPeers.length} connected peers: [${connectedPeers.map(p => p.slice(0, 16)).join(', ')}]`);
     for (const peerId of connectedPeers) {
       await this.announceRoutesToPeer(peerId).catch(() => { /* best-effort */ });
     }
@@ -621,12 +655,21 @@ export class PeerRouter extends Abject implements MessageInterceptor {
    */
   private async collectRoutesForPeer(
     peerId: PeerId,
-  ): Promise<Array<{ objectId: string; hops: number }>> {
-    const result: Array<{ objectId: string; hops: number }> = [];
+  ): Promise<Array<{ objectId: string; hops: number; wellKnownId?: string }>> {
+    const result: Array<{ objectId: string; hops: number; wellKnownId?: string }> = [];
 
-    // Include allowed system objects
+    // Include allowed system objects (with well-known alias if known)
     for (const objId of this.allowedSystemObjects) {
-      result.push({ objectId: objId, hops: 0 });
+      let wkId: string | undefined;
+      for (const [alias, uuid] of this.wellKnownAliases) {
+        if (uuid === objId) { wkId = alias; break; }
+      }
+      result.push({ objectId: objId, hops: 0, wellKnownId: wkId });
+    }
+
+    // Lazy-resolve WorkspaceManager if not yet known (spawned after PeerRouter)
+    if (!this.workspaceManagerId) {
+      this.workspaceManagerId = (await this.discoverDep('WorkspaceManager')) ?? undefined;
     }
 
     // Query WorkspaceManager for shared workspace objects
@@ -683,14 +726,22 @@ export class PeerRouter extends Abject implements MessageInterceptor {
    * Handle incoming route announcement from a peer.
    */
   private handleRouteAnnouncementImpl(
-    routes: Array<{ objectId: string; hops: number }>,
+    routes: Array<{ objectId: string; hops: number; wellKnownId?: string }>,
     fromPeerId: PeerId,
   ): boolean {
+    console.log(`[PeerRouter] handleRouteAnnouncement from=${fromPeerId.slice(0, 16)}, ${routes.length} routes`);
     let newRoutes = false;
 
     for (const announced of routes) {
       const objectId = announced.objectId as AbjectId;
       const newHops = announced.hops + 1;
+
+      // Store well-known → UUID mapping for this peer
+      if (announced.wellKnownId) {
+        const key = `${fromPeerId}:${announced.wellKnownId}`;
+        this.remoteWellKnown.set(key, objectId);
+        console.log(`[PeerRouter] remoteWellKnown["${key.slice(0, 40)}..."] = ${objectId.slice(0, 8)}`);
+      }
 
       // Skip if we already have a shorter/equal route
       const existing = this.routes.get(objectId);
@@ -714,6 +765,8 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     // Re-announce newly learned routes to our other peers (transitive propagation)
     if (newRoutes) {
       this.announceRoutesToAll().catch(() => { /* best-effort */ });
+      // Notify dependents (e.g. WSR) that new routes are available
+      this.changed('routesUpdated', { fromPeerId });
     }
 
     return true;

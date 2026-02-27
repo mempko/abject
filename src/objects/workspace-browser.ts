@@ -79,6 +79,15 @@ export class WorkspaceBrowser extends Abject {
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.shareRegistryId = await this.discoverDep('WorkspaceShareRegistry') ?? undefined;
     this.factoryId = await this.discoverDep('Factory') ?? undefined;
+
+    // Subscribe to WSR events for auto-refresh on new discoveries
+    if (this.shareRegistryId) {
+      try {
+        await this.request(
+          request(this.id, this.shareRegistryId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+        );
+      } catch { /* WSR may not be ready */ }
+    }
   }
 
   private setupHandlers(): void {
@@ -102,6 +111,14 @@ export class WorkspaceBrowser extends Abject {
 
       if (fromId === this.refreshBtnId && aspect === 'click') {
         await this.refresh();
+        return;
+      }
+
+      // WSR: new workspaces discovered — auto-refresh if visible
+      if (fromId === this.shareRegistryId && aspect === 'workspacesDiscovered') {
+        if (this.windowId) {
+          await this.refresh();
+        }
         return;
       }
 

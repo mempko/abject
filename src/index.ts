@@ -38,6 +38,8 @@ import { WorkspaceManager } from './objects/workspace-manager.js';
 import { WorkspaceRegistry } from './objects/workspace-registry.js';
 import { WorkspaceSwitcher } from './objects/workspace-switcher.js';
 import { GlobalSettings } from './objects/global-settings.js';
+import { GlobalToolbar } from './objects/global-toolbar.js';
+import { PeerNetwork } from './objects/peer-network.js';
 import { ObjectManager } from './objects/object-manager.js';
 import { IdentityObject } from './objects/identity.js';
 import { PeerRegistry } from './objects/peer-registry.js';
@@ -86,6 +88,8 @@ export type { WorkspaceAccessMode, SharedWorkspaceInfo } from './objects/workspa
 export { WorkspaceRegistry, WORKSPACE_REGISTRY_ID } from './objects/workspace-registry.js';
 export { WorkspaceSwitcher, WORKSPACE_SWITCHER_ID } from './objects/workspace-switcher.js';
 export { GlobalSettings, GLOBAL_SETTINGS_ID } from './objects/global-settings.js';
+export { GlobalToolbar, GLOBAL_TOOLBAR_ID } from './objects/global-toolbar.js';
+export { PeerNetwork, PEER_NETWORK_ID } from './objects/peer-network.js';
 export { ObjectManager, OBJECT_MANAGER_ID } from './objects/object-manager.js';
 export { IdentityObject, IDENTITY_ID } from './objects/identity.js';
 export { PeerRegistry, PEER_REGISTRY_ID } from './objects/peer-registry.js';
@@ -316,6 +320,8 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('WorkspaceRegistry', () => new WorkspaceRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
   runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
+  runtime.objectFactory.registerConstructor('GlobalToolbar', () => new GlobalToolbar());
+  runtime.objectFactory.registerConstructor('PeerNetwork', () => new PeerNetwork());
   runtime.objectFactory.registerConstructor('ObjectManager', () => new ObjectManager());
   runtime.objectFactory.registerConstructor('Identity', () => new IdentityObject());
   runtime.objectFactory.registerConstructor('PeerRegistry', () => new PeerRegistry());
@@ -332,7 +338,7 @@ async function main(): Promise<App> {
       'LLMObject', 'HttpClient', 'Timer',
       'Clipboard', 'Console', 'FileSystem',
       // Global services
-      'GlobalSettings', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
+      'GlobalSettings', 'PeerNetwork', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
       // Per-workspace objects (use workspace registry via registryHint)
       'AbjectStore', 'Theme', 'Settings', 'RegistryBrowser',
       'JobManager', 'JobBrowser', 'ObjectManager',
@@ -396,6 +402,8 @@ async function main(): Promise<App> {
   });
 
   const globalSettingsId = await supervisedSpawn('GlobalSettings');
+  const peerNetworkId = await supervisedSpawn('PeerNetwork');
+  const globalToolbarId = await supervisedSpawn('GlobalToolbar');
 
   const proxyGenId = await supervisedSpawn('ProxyGenerator');
   const negotiatorId = await supervisedSpawn('Negotiator');
@@ -425,7 +433,8 @@ async function main(): Promise<App> {
     consoleId, filesystemId, windowManagerId, widgetManagerId,
     identityId, peerRegistryId, remoteRegistryId, peerRouterId,
     workspaceShareRegistryId, workspaceBrowserId,
-    globalSettingsId, proxyGenId, negotiatorId,
+    globalSettingsId, peerNetworkId, globalToolbarId,
+    proxyGenId, negotiatorId,
     workspaceSwitcherId, workspaceManagerId,
   ];
   for (const objId of monitoredIds) {
@@ -468,6 +477,8 @@ async function main(): Promise<App> {
     workspaceShareRegistry: getObj(workspaceShareRegistryId),
     workspaceBrowser: getObj(workspaceBrowserId),
     globalSettings: getObj(globalSettingsId),
+    globalToolbar: getObj(globalToolbarId),
+    peerNetwork: getObj(peerNetworkId),
     workspaceSwitcher: getObj(workspaceSwitcherId),
     workspaceManager: getObj(workspaceManagerId),
     // Object IDs for message-based interaction
@@ -494,6 +505,8 @@ async function main(): Promise<App> {
       workspaceShareRegistry: workspaceShareRegistryId,
       workspaceBrowser: workspaceBrowserId,
       globalSettings: globalSettingsId,
+      globalToolbar: globalToolbarId,
+      peerNetwork: peerNetworkId,
       workspaceSwitcher: workspaceSwitcherId,
       workspaceManager: workspaceManagerId,
     },

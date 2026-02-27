@@ -13,6 +13,7 @@ import {
   AbjectMessage,
   InterfaceId,
   ObjectRegistration,
+  SpawnResult,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
@@ -49,6 +50,8 @@ export class RegistryBrowser extends Abject {
   // ── Remote browsing mode ──
   private isRemoteMode = false;
   private remoteLabel?: string;
+  private localRegistryId?: AbjectId;   // preserved when switching to remote mode
+  private abjectStoreId?: AbjectId;     // for persisting cloned objects
 
   // ── Navigation state ──
   private currentView: 'kindList' | 'instanceList' | 'detail' = 'kindList';
@@ -112,7 +115,7 @@ export class RegistryBrowser extends Abject {
               },
               {
                 name: 'browseRemote',
-                description: 'Configure this browser to target a remote registry via @peerId addressing',
+                description: 'Configure this browser to target a remote registry via UUID routing',
                 parameters: [
                   { name: 'registryId', type: { kind: 'primitive', primitive: 'string' }, description: 'Remote workspace registry ID' },
                   { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Owner peer ID' },
@@ -142,6 +145,8 @@ export class RegistryBrowser extends Abject {
 
     // Discover the global "SystemRegistry" registered by WorkspaceManager
     this.systemRegistryId = await this.discoverDep('SystemRegistry') ?? undefined;
+
+    this.abjectStoreId = await this.discoverDep('AbjectStore') ?? undefined;
 
     if (this.registryId) {
       await this.request(request(this.id, this.registryId,
@@ -281,10 +286,11 @@ export class RegistryBrowser extends Abject {
     });
 
     this.on('browseRemote', async (msg: AbjectMessage) => {
-      const { registryId, peerId, label } = msg.payload as {
+      const { registryId, label } = msg.payload as {
         registryId: string; peerId: string; label: string;
       };
-      this.registryId = `${registryId}@${peerId}` as AbjectId;
+      this.localRegistryId = this.registryId;   // preserve for cloning back
+      this.registryId = registryId as AbjectId;  // UUID routes via PeerRouter
       this.systemRegistryId = undefined;
       this.isRemoteMode = true;
       this.remoteLabel = label;
@@ -659,8 +665,8 @@ export class RegistryBrowser extends Abject {
         preferredSize: { height: 32 },
       }));
 
-      // Clone button (skip in remote mode — read-only)
-      if (this.factoryId && !this.isRemoteMode) {
+      // Clone button — local mode: always; remote mode: only if source exists
+      if (this.factoryId && (!this.isRemoteMode || inst.source !== undefined)) {
         const cloneBtnId = await this.request<AbjectId>(
           request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
             windowId: this.windowId!, rect: r0, text: 'Clone',
@@ -675,20 +681,22 @@ export class RegistryBrowser extends Abject {
           preferredSize: { width: 60, height: 32 },
         }));
 
-        // Delete button
-        const delBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
-            windowId: this.windowId!, rect: r0, text: 'Delete',
-            style: { fontSize: 12, background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' },
-          })
-        );
-        await this.addDep(delBtnId);
-        this.instanceDeleteButtons.set(delBtnId, i);
-        await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
-          widgetId: delBtnId,
-          sizePolicy: { horizontal: 'fixed' },
-          preferredSize: { width: 60, height: 32 },
-        }));
+        // Delete button (local mode only)
+        if (!this.isRemoteMode) {
+          const delBtnId = await this.request<AbjectId>(
+            request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+              windowId: this.windowId!, rect: r0, text: 'Delete',
+              style: { fontSize: 12, background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' },
+            })
+          );
+          await this.addDep(delBtnId);
+          this.instanceDeleteButtons.set(delBtnId, i);
+          await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+            widgetId: delBtnId,
+            sizePolicy: { horizontal: 'fixed' },
+            preferredSize: { width: 60, height: 32 },
+          }));
+        }
       }
     }
 
@@ -932,6 +940,11 @@ export class RegistryBrowser extends Abject {
       this.msgResponseId = await addLabel('');
     }
 
+    // In remote mode, add a status label for clone feedback
+    if (this.isRemoteMode) {
+      this.msgResponseId = await addLabel('');
+    }
+
     // ── Fixed bottom buttons row (outside scrollable area) ──
     const bottomRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
@@ -958,7 +971,7 @@ export class RegistryBrowser extends Abject {
       preferredSize: { width: 80, height: 32 },
     }));
 
-    // Show "Edit Source" button if the object is scriptable (skip in remote mode)
+    // Edit Source + Delete (local mode only)
     if (!this.isRemoteMode) {
       const isEditable = obj.source !== undefined;
       if (isEditable) {
@@ -991,7 +1004,7 @@ export class RegistryBrowser extends Abject {
         }
       }
 
-      // Clone button (always available if factory exists)
+      // Clone button (always available in local mode if factory exists)
       if (this.factoryId) {
         this.cloneBtnId = await this.request<AbjectId>(
           request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
@@ -1005,6 +1018,21 @@ export class RegistryBrowser extends Abject {
           preferredSize: { width: 80, height: 32 },
         }));
       }
+    }
+
+    // Clone button for remote mode (only for scriptable objects with source)
+    if (this.isRemoteMode && this.factoryId && obj.source !== undefined) {
+      this.cloneBtnId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+          windowId: this.windowId!, rect: r0, text: 'Clone',
+        })
+      );
+      await this.addDep(this.cloneBtnId);
+      await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        widgetId: this.cloneBtnId,
+        sizePolicy: { horizontal: 'fixed' },
+        preferredSize: { width: 80, height: 32 },
+      }));
     }
 
     // Right spacer in bottom row
@@ -1183,6 +1211,10 @@ export class RegistryBrowser extends Abject {
   private async cloneObject(objectId: AbjectId): Promise<void> {
     if (!this.factoryId) return;
 
+    if (this.isRemoteMode) {
+      return this.cloneRemoteObject(objectId);
+    }
+
     try {
       await this.request(request(this.id, this.factoryId,
         FACTORY_INTERFACE, 'clone', { objectId }));
@@ -1215,6 +1247,52 @@ export class RegistryBrowser extends Abject {
             text: 'Cloned successfully',
           })
         );
+      }
+    }
+  }
+
+  /**
+   * Clone a remote object into the local workspace via Factory.spawn + AbjectStore.save.
+   */
+  private async cloneRemoteObject(objectId: AbjectId): Promise<void> {
+    if (!this.factoryId || !this.localRegistryId) return;
+
+    const obj = this.cachedObjects.find(o => o.id === objectId);
+    if (!obj?.source) return;
+
+    try {
+      const result = await this.request<SpawnResult>(request(this.id, this.factoryId,
+        FACTORY_INTERFACE, 'spawn', {
+          manifest: obj.manifest,
+          source: obj.source,
+          registryHint: this.localRegistryId,
+        }));
+
+      // Persist to AbjectStore so it survives page reload
+      if (this.abjectStoreId) {
+        await this.request(request(this.id, this.abjectStoreId,
+          'abjects:abject-store' as InterfaceId, 'save', {
+            objectId: result.objectId,
+            manifest: obj.manifest,
+            source: obj.source,
+            owner: this.id,
+          }));
+      }
+
+      // Show success feedback
+      if (this.msgResponseId) {
+        try {
+          await this.request(request(this.id, this.msgResponseId,
+            WIDGET_INTERFACE, 'update', { text: 'Cloned to workspace' }));
+        } catch { /* widget may be gone */ }
+      }
+    } catch (err) {
+      if (this.msgResponseId) {
+        const msg = err instanceof Error ? err.message : String(err);
+        try {
+          await this.request(request(this.id, this.msgResponseId,
+            WIDGET_INTERFACE, 'update', { text: `Clone error: ${msg.slice(0, 50)}` }));
+        } catch { /* widget may be gone */ }
       }
     }
   }

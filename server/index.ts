@@ -52,6 +52,8 @@ import { WorkspaceManager } from '../src/objects/workspace-manager.js';
 import { WorkspaceRegistry } from '../src/objects/workspace-registry.js';
 import { WorkspaceSwitcher } from '../src/objects/workspace-switcher.js';
 import { GlobalSettings } from '../src/objects/global-settings.js';
+import { GlobalToolbar } from '../src/objects/global-toolbar.js';
+import { PeerNetwork } from '../src/objects/peer-network.js';
 import { ObjectManager } from '../src/objects/object-manager.js';
 import { IdentityObject } from '../src/objects/identity.js';
 import { PeerRegistry } from '../src/objects/peer-registry.js';
@@ -180,6 +182,8 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('WorkspaceRegistry', () => new WorkspaceRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
   runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
+  runtime.objectFactory.registerConstructor('GlobalToolbar', () => new GlobalToolbar());
+  runtime.objectFactory.registerConstructor('PeerNetwork', () => new PeerNetwork());
   runtime.objectFactory.registerConstructor('ObjectManager', () => new ObjectManager());
   runtime.objectFactory.registerConstructor('Identity', () => new IdentityObject());
   runtime.objectFactory.registerConstructor('PeerRegistry', () => new PeerRegistry());
@@ -196,7 +200,7 @@ async function main(): Promise<void> {
       'LLMObject', 'HttpClient', 'Timer',
       'Clipboard', 'Console', 'FileSystem',
       // Global services
-      'GlobalSettings', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
+      'GlobalSettings', 'PeerNetwork', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
       // Per-workspace objects (use workspace registry via registryHint)
       'AbjectStore', 'Theme', 'Settings', 'RegistryBrowser',
       'JobManager', 'JobBrowser', 'ObjectManager',
@@ -260,6 +264,8 @@ async function main(): Promise<void> {
   });
 
   const globalSettingsId = await supervisedSpawn('GlobalSettings');
+  const peerNetworkId = await supervisedSpawn('PeerNetwork');
+  const globalToolbarId = await supervisedSpawn('GlobalToolbar');
 
   const proxyGenId = await supervisedSpawn('ProxyGenerator');
   const negotiatorId = await supervisedSpawn('Negotiator');
@@ -289,7 +295,8 @@ async function main(): Promise<void> {
     consoleId, filesystemId, windowManagerId, widgetManagerId,
     identityId, peerRegistryId, remoteRegistryId, peerRouterId,
     workspaceShareRegistryId, workspaceBrowserId,
-    globalSettingsId, proxyGenId, negotiatorId,
+    globalSettingsId, peerNetworkId, globalToolbarId,
+    proxyGenId, negotiatorId,
     workspaceSwitcherId, workspaceManagerId,
   ];
   for (const objId of monitoredIds) {

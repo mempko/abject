@@ -35,6 +35,7 @@ const REGISTRY_BROWSER_INTERFACE = 'abjects:registry-browser' as InterfaceId;
 const JOB_BROWSER_INTERFACE = 'abjects:job-browser' as InterfaceId;
 const OBJECT_MANAGER_INTERFACE = 'abjects:object-manager' as InterfaceId;
 const WORKSPACE_SWITCHER_INTERFACE = 'abjects:workspace-switcher' as InterfaceId;
+const GLOBAL_TOOLBAR_INTERFACE = 'abjects:global-toolbar' as InterfaceId;
 
 const STORAGE_KEY_LIST = 'workspaces:list';
 const STORAGE_KEY_ACTIVE = 'workspaces:active';
@@ -86,6 +87,7 @@ export class WorkspaceManager extends Abject {
   private factoryId?: AbjectId;
   private supervisorId?: AbjectId;
   private workspaceSwitcherId?: AbjectId;
+  private globalToolbarId?: AbjectId;
   private uiServerId?: AbjectId;
   private widgetManagerId?: AbjectId;
   private windowManagerId?: AbjectId;
@@ -352,6 +354,7 @@ export class WorkspaceManager extends Abject {
     this.factoryId = await this.requireDep('Factory');
     this.supervisorId = await this.discoverDep('Supervisor') ?? undefined;
     this.workspaceSwitcherId = await this.discoverDep('WorkspaceSwitcher') ?? undefined;
+    this.globalToolbarId = await this.discoverDep('GlobalToolbar') ?? undefined;
     this.uiServerId = await this.discoverDep('UIServer') ?? undefined;
     this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
@@ -467,22 +470,10 @@ export class WorkspaceManager extends Abject {
       await this.request(request(this.id, this.uiServerId, UI_INTERFACE, 'setActiveWorkspace', { workspaceId }));
     }
 
-    // Update WorkspaceSwitcher to reflect the new active workspace
-    if (this.workspaceSwitcherId) {
-      try {
-        await this.request(request(this.id, this.workspaceSwitcherId,
-          WORKSPACE_SWITCHER_INTERFACE, 'show', {
-            workspaces: this.listWorkspaces(),
-            activeWorkspaceId: workspaceId,
-          }));
-      } catch (err) {
-        console.warn('[WORKSPACE-MANAGER] Failed to update workspace switcher:', err);
-      }
-    }
-
     await this.persistActiveWorkspaceId();
 
-    // Reposition the active workspace's Taskbar below the WorkspaceSwitcher
+    // Reposition all panels (GlobalToolbar → WorkspaceSwitcher → Taskbar)
+    // This also refreshes WorkspaceSwitcher with current workspace data.
     await this.refreshTaskbar();
 
     console.log(`[WORKSPACE-MANAGER] Switched to workspace '${ws.name}' (${workspaceId})`);
@@ -498,12 +489,32 @@ export class WorkspaceManager extends Abject {
     const ws = this.workspaces.get(this.activeWorkspaceId);
     if (!ws) return false;
 
+    // Stack order: GlobalToolbar → WorkspaceSwitcher → Taskbar
     let yOffset = 8;
+
+    if (this.globalToolbarId) {
+      try {
+        await this.request(request(this.id, this.globalToolbarId, GLOBAL_TOOLBAR_INTERFACE, 'show', { yOffset }));
+        const toolbarHeight = await this.request<number>(
+          request(this.id, this.globalToolbarId, GLOBAL_TOOLBAR_INTERFACE, 'getHeight', {}));
+        yOffset = yOffset + toolbarHeight + 8;
+      } catch { /* toolbar not ready */ }
+    }
+
     if (this.workspaceSwitcherId) {
       try {
+        // Find the active workspace's Settings ID for the gear button
+        const settingsEntry = ws.uiObjects.find(o => o.iface === SETTINGS_INTERFACE);
+        await this.request(request(this.id, this.workspaceSwitcherId,
+          WORKSPACE_SWITCHER_INTERFACE, 'show', {
+            workspaces: this.listWorkspaces(),
+            activeWorkspaceId: this.activeWorkspaceId,
+            settingsId: settingsEntry?.id,
+            yOffset,
+          }));
         const switcherHeight = await this.request<number>(
           request(this.id, this.workspaceSwitcherId, WORKSPACE_SWITCHER_INTERFACE, 'getHeight', {}));
-        yOffset = 8 + switcherHeight + 16;
+        yOffset = yOffset + switcherHeight + 8;
       } catch { /* use default */ }
     }
 

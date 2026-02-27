@@ -442,6 +442,13 @@ export class PeerRegistry extends Abject {
   }
 
   /**
+   * Get the local peer ID.
+   */
+  getLocalPeerId(): PeerId {
+    return (this.localIdentity?.peerId ?? '') as PeerId;
+  }
+
+  /**
    * Get all connected peer IDs.
    */
   getConnectedPeers(): PeerId[] {
@@ -491,7 +498,7 @@ export class PeerRegistry extends Abject {
         console.log(`[PeerRegistry] Peer not found: ${peerId.slice(0, 16)}`);
       },
       onSdpOffer: (fromPeerId, sdp) => {
-        this.handleIncomingSdpOffer(fromPeerId, sdp, client);
+        this.handleIncomingSdpOffer(fromPeerId, sdp, client).catch(console.error);
       },
       onSdpAnswer: (fromPeerId, sdp) => {
         const transport = this.transports.get(fromPeerId);
@@ -587,6 +594,23 @@ export class PeerRegistry extends Abject {
 
     // Auto-accept connections from known contacts
     let transport = this.transports.get(fromPeerId);
+
+    // ICE glare detection: if we already have a transport with a pending local
+    // offer, both peers sent offers simultaneously. Use a tiebreaker: the peer
+    // with the lexicographically lower peerId keeps their offer (acts as caller).
+    if (transport && transport.signalingState === 'have-local-offer') {
+      if (this.localIdentity!.peerId < fromPeerId) {
+        // We have priority — ignore the remote offer; our offer will be answered
+        console.log(`[PeerRegistry] ICE glare with ${fromPeerId.slice(0, 16)}: we win tiebreak, ignoring remote offer`);
+        return;
+      }
+      // They have priority — tear down our connection and accept theirs
+      console.log(`[PeerRegistry] ICE glare with ${fromPeerId.slice(0, 16)}: they win tiebreak, accepting remote offer`);
+      await transport.disconnect();
+      this.transports.delete(fromPeerId);
+      transport = undefined;
+    }
+
     if (!transport) {
       transport = new PeerTransport({
         localPeerId: this.localIdentity!.peerId,
@@ -647,10 +671,16 @@ export class PeerRegistry extends Abject {
   private setupTransportEvents(transport: PeerTransport, peerId: string): void {
     transport.on({
       onConnect: () => {
+        // Only process if this transport is still the active one for this peer
+        // (ICE glare can replace the transport before async events fire)
+        if (this.transports.get(peerId) !== transport) return;
         this.setContactState(peerId, 'connected');
         this.changed('contactConnected', { peerId });
       },
       onDisconnect: () => {
+        // Only clean up if this transport is still the active one for this peer
+        // (ICE glare can replace the transport before async events fire)
+        if (this.transports.get(peerId) !== transport) return;
         this.setContactState(peerId, 'offline');
         this.transports.delete(peerId);
         this.changed('contactDisconnected', { peerId });
