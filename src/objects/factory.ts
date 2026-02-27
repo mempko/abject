@@ -715,6 +715,22 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
       } catch { /* may not be registered */ }
     }
 
+    // Remove from AbjectStore so it doesn't reappear on restart.
+    // AbjectStore lives in the workspace registry, not the global one,
+    // so we must discover it from the object's own registry.
+    if (objRegistry) {
+      try {
+        const storeResults = await this.request<Array<{ id: AbjectId }>>(
+          request(this.id, objRegistry, 'discover', { name: 'AbjectStore' })
+        );
+        if (storeResults.length > 0) {
+          await this.request(
+            request(this.id, storeResults[0].id, 'remove', { objectId })
+          );
+        }
+      } catch { /* AbjectStore may not exist in this workspace */ }
+    }
+
     // Kill in worker
     await this._workerPool.killInWorker(objectId);
     this.workerSpawned.delete(objectId);
@@ -755,16 +771,20 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
       );
     }
 
-    // Remove from AbjectStore if it's a scriptable object
-    if (obj.manifest.tags?.includes('scriptable')) {
+    // Remove from AbjectStore if it's a scriptable object.
+    // AbjectStore lives in the workspace registry, not the global one,
+    // so we must discover it from the object's own registry.
+    if (obj.manifest.tags?.includes('scriptable') && objRegistry) {
       try {
-        const abjectStoreId = await this.discoverDep('AbjectStore');
-        if (abjectStoreId) {
+        const storeResults = await this.request<Array<{ id: AbjectId }>>(
+          request(this.id, objRegistry, 'discover', { name: 'AbjectStore' })
+        );
+        if (storeResults.length > 0) {
           await this.request(
-            request(this.id, abjectStoreId, 'remove', { objectId })
+            request(this.id, storeResults[0].id, 'remove', { objectId })
           );
         }
-      } catch { /* AbjectStore may not exist */ }
+      } catch { /* AbjectStore may not exist in this workspace */ }
     }
 
     await obj.stop();
