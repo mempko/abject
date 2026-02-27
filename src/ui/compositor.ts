@@ -27,7 +27,7 @@ export interface Surface {
 }
 
 export interface DrawCommand {
-  type: 'rect' | 'text' | 'line' | 'image' | 'clear' | 'path' | 'save' | 'restore' | 'clip' | 'translate'
+  type: 'rect' | 'text' | 'line' | 'image' | 'imageUrl' | 'clear' | 'path' | 'save' | 'restore' | 'clip' | 'translate'
     | 'circle' | 'arc' | 'ellipse' | 'polygon' | 'rotate' | 'scale'
     | 'globalAlpha' | 'shadow' | 'setLineDash' | 'linearGradient' | 'radialGradient';
   surfaceId: string;
@@ -72,6 +72,14 @@ export interface ImageParams {
   width?: number;
   height?: number;
   data: ImageBitmap | HTMLImageElement | ImageData;
+}
+
+export interface ImageUrlParams {
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+  url: string;
 }
 
 export interface PathParams {
@@ -162,6 +170,8 @@ export class Compositor {
   private animationFrameId?: number;
   private needsRender = false;
   private activeWorkspaceId?: string;
+  private imageCache: Map<string, { img: HTMLImageElement; loaded: boolean }> = new Map();
+  private static IMAGE_CACHE_MAX = 100;
 
   constructor(canvas: HTMLCanvasElement) {
     require(canvas !== null, 'canvas is required');
@@ -467,6 +477,39 @@ export class Compositor {
         } else {
           ctx.drawImage(p.data as CanvasImageSource, p.x, p.y);
         }
+        break;
+      }
+
+      case 'imageUrl': {
+        const p = command.params as ImageUrlParams;
+        const cached = this.imageCache.get(p.url);
+        if (cached && cached.loaded) {
+          if (p.width && p.height) {
+            ctx.drawImage(cached.img, p.x, p.y, p.width, p.height);
+          } else {
+            ctx.drawImage(cached.img, p.x, p.y);
+          }
+        } else if (!cached) {
+          // Evict oldest entries if cache is full
+          if (this.imageCache.size >= Compositor.IMAGE_CACHE_MAX) {
+            const firstKey = this.imageCache.keys().next().value!;
+            this.imageCache.delete(firstKey);
+          }
+          const img = new Image();
+          img.crossOrigin = 'anonymous';
+          const entry = { img, loaded: false };
+          this.imageCache.set(p.url, entry);
+          img.onload = () => {
+            entry.loaded = true;
+            this.needsRender = true;
+          };
+          img.onerror = () => {
+            // Remove failed entries so they can be retried
+            this.imageCache.delete(p.url);
+          };
+          img.src = p.url;
+        }
+        // If cached but not yet loaded, skip — will render on next frame when load completes
         break;
       }
 

@@ -33,8 +33,7 @@ export class Console extends Abject {
         description:
           'Debug console for logging. Objects can log messages at different levels for debugging.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: CONSOLE_INTERFACE,
             name: 'Console',
             description: 'Debug logging operations',
@@ -153,7 +152,6 @@ export class Console extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [Capabilities.CONSOLE],
         tags: ['capability', 'console', 'debug'],

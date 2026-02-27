@@ -2,7 +2,7 @@
  * Clipboard capability object - provides clipboard access.
  */
 
-import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
+import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
 import { Capabilities } from '../../core/capability.js';
 import { request } from '../../core/message.js';
@@ -25,8 +25,7 @@ export class Clipboard extends Abject {
         description:
           'Provides clipboard read/write capabilities. Objects can copy and paste text.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: CLIPBOARD_INTERFACE,
             name: 'Clipboard',
             description: 'Clipboard operations',
@@ -57,7 +56,6 @@ export class Clipboard extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [
           Capabilities.CLIPBOARD_READ,
@@ -117,7 +115,7 @@ export class Clipboard extends Abject {
     if (isNode) {
       this.memoryClipboard = text;
       if (this.uiServerId) {
-        this.send(request(this.id, this.uiServerId, 'abjects:ui' as InterfaceId, 'clipboardWrite', { text }));
+        this.send(request(this.id, this.uiServerId, 'clipboardWrite', { text }));
       }
       return true;
     }

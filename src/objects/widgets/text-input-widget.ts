@@ -8,7 +8,7 @@
  * text selection (Shift+Arrow/Home/End, Shift+Click, Ctrl+A), and copy/cut.
  */
 
-import { InterfaceId } from '../../core/types.js';
+
 import { event } from '../../core/message.js';
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
 import { WidgetStyle, Rect, WIDGET_FONT, CODE_FONT, DEFAULT_LINE_HEIGHT } from './widget-types.js';
@@ -75,7 +75,7 @@ export class TextInputWidget extends WidgetAbject {
     const selectedText = this.getSelectedText();
     await this.send(event(
       this.id, this.uiServerId,
-      'abjects:ui' as InterfaceId, 'selectionChanged',
+      'selectionChanged',
       { selectedText },
     ));
   }

@@ -11,7 +11,7 @@
  *   temporary  — never restart
  */
 
-import { AbjectId, AbjectMessage, AbjectError, InterfaceId } from '../core/types.js';
+import { AbjectId, AbjectMessage, AbjectError } from '../core/types.js';
 import { invariant, require as contractRequire } from '../core/contracts.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
@@ -38,7 +38,6 @@ export interface SupervisorConfig {
 }
 
 const SUPERVISOR_INTERFACE = 'abjects:supervisor';
-export const SUPERVISOR_INTERFACE_ID = SUPERVISOR_INTERFACE as InterfaceId;
 
 /**
  * Supervises a group of objects and handles failures.
@@ -61,8 +60,7 @@ export class Supervisor extends Abject {
         name: 'Supervisor',
         description: `Erlang-style supervisor using ${config.strategy} strategy. Monitors child objects and restarts them on failure.`,
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: SUPERVISOR_INTERFACE,
             name: 'Supervisor',
             description: 'Object supervision and restart management',
@@ -136,7 +134,6 @@ export class Supervisor extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         tags: ['system', 'supervisor'],
       },
@@ -288,7 +285,7 @@ export class Supervisor extends Abject {
 
     try {
       await this.request(
-        request(this.id, this.factoryId, 'abjects:factory' as InterfaceId, 'respawn', {
+        request(this.id, this.factoryId, 'respawn', {
           objectId: childId,
           constructorName: child.spec.constructorName,
           parentId: child.spec.parentId,
@@ -356,7 +353,7 @@ export class Supervisor extends Abject {
     try {
       await this.request(
         request(this.id, this.healthMonitorId,
-          'abjects:health-monitor' as InterfaceId, 'markObjectReady', { objectId: childId })
+          'markObjectReady', { objectId: childId })
       );
     } catch {
       // best effort

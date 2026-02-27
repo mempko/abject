@@ -27,7 +27,6 @@ import {
 } from '../core/identity.js';
 
 const IDENTITY_INTERFACE = 'abjects:identity';
-const STORAGE_INTERFACE = 'abjects:storage' as InterfaceId;
 const STORAGE_KEY_SIGNING = 'identity:signing-keypair';
 const STORAGE_KEY_EXCHANGE = 'identity:exchange-keypair';
 const STORAGE_KEY_NAME = 'identity:name';
@@ -51,8 +50,7 @@ export class IdentityObject extends Abject {
         description:
           'Cryptographic identity for this peer. Manages ECDSA P-256 signing keys and ECDH P-256 exchange keys. PeerId is the SHA-256 hash of the public signing key.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: IDENTITY_INTERFACE,
             name: 'Identity',
             description: 'Peer identity and cryptographic operations',
@@ -190,7 +188,6 @@ export class IdentityObject extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [
           Capabilities.IDENTITY_SIGN,
@@ -299,10 +296,10 @@ export class IdentityObject extends Abject {
 
     try {
       const signingJwk = await this.request<{ publicKey: string; privateKey: string } | null>(
-        createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'get', { key: STORAGE_KEY_SIGNING }),
+        createRequest(this.id, this.storageId, 'get', { key: STORAGE_KEY_SIGNING }),
       );
       const exchangeJwk = await this.request<{ publicKey: string; privateKey: string } | null>(
-        createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'get', { key: STORAGE_KEY_EXCHANGE }),
+        createRequest(this.id, this.storageId, 'get', { key: STORAGE_KEY_EXCHANGE }),
       );
 
       if (!signingJwk?.publicKey || !signingJwk?.privateKey) return false;
@@ -337,11 +334,11 @@ export class IdentityObject extends Abject {
     };
 
     await this.request(
-      createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'set',
+      createRequest(this.id, this.storageId, 'set',
         { key: STORAGE_KEY_SIGNING, value: signingJwk }),
     );
     await this.request(
-      createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'set',
+      createRequest(this.id, this.storageId, 'set',
         { key: STORAGE_KEY_EXCHANGE, value: exchangeJwk }),
     );
   }
@@ -350,7 +347,7 @@ export class IdentityObject extends Abject {
     if (!this.storageId) return;
     try {
       const result = await this.request<string | null>(
-        createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'get', { key: STORAGE_KEY_NAME }),
+        createRequest(this.id, this.storageId, 'get', { key: STORAGE_KEY_NAME }),
       );
       if (result && typeof result === 'string') {
         this.peerName = result;
@@ -363,7 +360,7 @@ export class IdentityObject extends Abject {
   private async persistName(): Promise<void> {
     if (!this.storageId) return;
     await this.request(
-      createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'set',
+      createRequest(this.id, this.storageId, 'set',
         { key: STORAGE_KEY_NAME, value: this.peerName }),
     );
   }

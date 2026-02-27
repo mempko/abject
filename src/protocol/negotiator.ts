@@ -15,7 +15,7 @@ import {
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
-import { INTROSPECT_INTERFACE_ID, IntrospectResult } from '../core/introspect.js';
+import { IntrospectResult } from '../core/introspect.js';
 import { GeneratedProxy } from '../objects/proxy-generator.js';
 import { ProxyInterceptor, MessageBus } from '../runtime/message-bus.js';
 
@@ -59,8 +59,7 @@ export class Negotiator extends Abject {
         description:
           'Handles connection establishment between objects, generating proxies when needed.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: NEGOTIATOR_INTERFACE,
             name: 'Negotiator',
             description: 'Connection negotiation',
@@ -125,7 +124,6 @@ export class Negotiator extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         tags: ['system', 'protocol'],
       },
@@ -139,7 +137,7 @@ export class Negotiator extends Abject {
 
 ### Connect two objects
 
-  const result = await this.call(this.dep('Negotiator'), 'abjects:negotiator', 'connect',
+  const result = await this.call(this.dep('Negotiator'), 'connect',
     { sourceId: objectA, targetId: objectB });
   // result: { success, agreementId?, proxyId?, error? }
 
@@ -147,12 +145,12 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
 
 ### Disconnect
 
-  await this.call(this.dep('Negotiator'), 'abjects:negotiator', 'disconnect',
+  await this.call(this.dep('Negotiator'), 'disconnect',
     { agreementId: 'the-agreement-id' });
 
 ### Renegotiate (on errors)
 
-  await this.call(this.dep('Negotiator'), 'abjects:negotiator', 'renegotiate',
+  await this.call(this.dep('Negotiator'), 'renegotiate',
     { agreementId: 'the-agreement-id', errorContext: 'method not found' });
 
 ### When to use
@@ -204,7 +202,7 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
   private async introspect(objectId: AbjectId): Promise<IntrospectResult | null> {
     try {
       return await this.request<IntrospectResult>(
-        request(this.id, objectId, INTROSPECT_INTERFACE_ID, 'describe', {})
+        request(this.id, objectId, 'describe', {})
       );
     } catch {
       return null;
@@ -244,7 +242,7 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
       } else {
         // Generate proxy via message passing to ProxyGenerator
         const generated = await this.request<GeneratedProxy>(
-          request(this.id, this.proxyGeneratorId!, 'abjects:proxy-generator' as InterfaceId, 'generateProxy', {
+          request(this.id, this.proxyGeneratorId!, 'generateProxy', {
             sourceId,
             targetId,
             sourceDescription: sourceResult.description,
@@ -288,7 +286,7 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
       }
       if (this.healthMonitorId && agreement.agreementId) {
         this.request(
-          request(this.id, this.healthMonitorId, 'abjects:health-monitor' as InterfaceId, 'trackConnection', {
+          request(this.id, this.healthMonitorId, 'trackConnection', {
             agreementId: agreement.agreementId,
           })
         ).catch(() => { /* health monitor tracking is best-effort */ });
@@ -325,7 +323,7 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
     // Kill proxy via Factory message passing
     if (connection.proxyId && this.factoryId) {
       await this.request(
-        request(this.id, this.factoryId, 'abjects:factory' as InterfaceId, 'kill', { objectId: connection.proxyId })
+        request(this.id, this.factoryId, 'kill', { objectId: connection.proxyId })
       ).catch(() => { /* proxy may already be dead */ });
     }
 
@@ -350,7 +348,7 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
     try {
       // Regenerate proxy via message passing
       const regenerated = await this.request<GeneratedProxy>(
-        request(this.id, this.proxyGeneratorId!, 'abjects:proxy-generator' as InterfaceId, 'regenerateProxy', {
+        request(this.id, this.proxyGeneratorId!, 'regenerateProxy', {
           agreementId,
           errorContext,
         })
@@ -359,7 +357,7 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
       // Kill old proxy
       if (connection.proxyId && this.factoryId) {
         await this.request(
-          request(this.id, this.factoryId, 'abjects:factory' as InterfaceId, 'kill', { objectId: connection.proxyId })
+          request(this.id, this.factoryId, 'kill', { objectId: connection.proxyId })
         ).catch(() => {});
       }
 
@@ -421,11 +419,10 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
    * Check if two manifests have compatible interfaces.
    */
   private checkCompatibility(
-    source: { interfaces: Array<{ id: string }> },
-    target: { interfaces: Array<{ id: string }> }
+    source: { interface: { id: string } },
+    target: { interface: { id: string } }
   ): boolean {
-    const sourceIds = new Set(source.interfaces.map((i) => i.id));
-    return target.interfaces.some((i) => sourceIds.has(i.id));
+    return source.interface.id === target.interface.id;
   }
 
   /**
@@ -461,7 +458,7 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
     }
 
     const spawnResult = await this.request<SpawnResult>(
-      request(this.id, this.factoryId, 'abjects:factory' as InterfaceId, 'spawn', {
+      request(this.id, this.factoryId, 'spawn', {
         manifest: generated.proxyManifest,
         source: generated.handlerSource,
         owner: this.id,
@@ -483,7 +480,6 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
         event(
           this.id,
           participantId,
-          NEGOTIATOR_INTERFACE as InterfaceId,
           'connectionEstablished',
           agreement
         )

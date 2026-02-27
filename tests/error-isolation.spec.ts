@@ -32,7 +32,7 @@ test.describe('Error Isolation', () => {
 
       // Send a message from the good sender to the bad object
       const bus = runtime.messageBus as { send: (msg: unknown) => Promise<void> };
-      const msg = request(sender.id, badObject.id, 'test', 'doWork', {});
+      const msg = request(sender.id, badObject.id, 'doWork', {});
       await bus.send(msg);
 
       // Small delay for async processing
@@ -75,7 +75,7 @@ test.describe('Error Isolation', () => {
 
       // Trigger the error
       const bus = runtime.messageBus as { send: (msg: unknown) => Promise<void> };
-      const msg = request(badObject.id, badObject.id, 'test', 'doWork', {});
+      const msg = request(badObject.id, badObject.id, 'doWork', {});
       await bus.send(msg);
       await new Promise((resolve) => setTimeout(resolve, 100));
 

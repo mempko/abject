@@ -7,14 +7,11 @@
 
 import {
   AbjectManifest,
-  InterfaceId,
   InterfaceDeclaration,
   MethodDeclaration,
   EventDeclaration,
   TypeDeclaration,
 } from './types.js';
-
-export const INTROSPECT_INTERFACE_ID = 'abjects:introspect' as InterfaceId;
 
 export interface IntrospectResult {
   manifest: AbjectManifest;
@@ -22,39 +19,56 @@ export interface IntrospectResult {
 }
 
 /**
- * The introspect interface declaration appended to every Abject's manifest.
+ * Introspect methods merged into every Abject's single interface.
  */
-export const INTROSPECT_INTERFACE: InterfaceDeclaration = {
-  id: INTROSPECT_INTERFACE_ID,
-  name: 'Introspect',
-  description: 'Self-description protocol — any object can describe its capabilities',
-  methods: [
-    {
-      name: 'describe',
-      description: 'Describe this object\'s capabilities in natural language',
-      parameters: [],
-      returns: { kind: 'reference', reference: 'IntrospectResult' },
-    },
-    {
-      name: 'ask',
-      description: 'Ask this object a question about its capabilities, usage, or behavior.',
-      parameters: [
-        {
-          name: 'question',
-          type: { kind: 'primitive', primitive: 'string' },
-          description: 'A question about this object',
-        },
-      ],
-      returns: { kind: 'primitive', primitive: 'string' },
-    },
-    {
-      name: 'getRegistry',
-      description: 'Ask this object for the Registry ID. If unknown, asks its own parent (chains up).',
-      parameters: [],
-      returns: { kind: 'primitive', primitive: 'string' },
-    },
-  ],
-};
+export const INTROSPECT_METHODS: MethodDeclaration[] = [
+  {
+    name: 'describe',
+    description: 'Describe this object\'s capabilities in natural language',
+    parameters: [],
+    returns: { kind: 'reference', reference: 'IntrospectResult' },
+  },
+  {
+    name: 'ask',
+    description: 'Ask this object a question about its capabilities, usage, or behavior.',
+    parameters: [
+      {
+        name: 'question',
+        type: { kind: 'primitive', primitive: 'string' },
+        description: 'A question about this object',
+      },
+    ],
+    returns: { kind: 'primitive', primitive: 'string' },
+  },
+  {
+    name: 'getRegistry',
+    description: 'Ask this object for the Registry ID. If unknown, asks its own parent (chains up).',
+    parameters: [],
+    returns: { kind: 'primitive', primitive: 'string' },
+  },
+];
+
+/**
+ * Introspect events merged into every Abject's single interface.
+ */
+export const INTROSPECT_EVENTS: EventDeclaration[] = [
+  {
+    name: 'childReady',
+    description: 'Emitted when a child object finishes initialization',
+    payload: { kind: 'object', properties: {
+      childId: { kind: 'primitive', primitive: 'string' },
+      name: { kind: 'primitive', primitive: 'string' },
+    }},
+  },
+  {
+    name: 'changed',
+    description: 'Emitted when this object changes (Smalltalk changed: protocol)',
+    payload: { kind: 'object', properties: {
+      aspect: { kind: 'primitive', primitive: 'string' },
+      value: { kind: 'primitive', primitive: 'undefined' },
+    }},
+  },
+];
 
 /**
  * Format a TypeDeclaration to a readable string.
@@ -134,24 +148,49 @@ function formatInterface(iface: InterfaceDeclaration): string {
   return parts.join('\n');
 }
 
+/** Meta-protocol method names that are filtered from descriptions */
+const META_METHODS = new Set([
+  'describe', 'ask', 'getRegistry', 'ping',
+  'addDependent', 'removeDependent',
+  'getSource', 'updateSource', 'probe',
+]);
+
 /**
  * Convert a manifest to a natural language description.
  *
- * The output includes all interfaces, methods with full signatures,
+ * The output includes the object's interface, methods with full signatures,
  * and events with explicit guidance that callers must implement handlers for them.
+ * Meta-protocol methods (introspect, editable) are filtered out.
  */
 export function formatManifestAsDescription(manifest: AbjectManifest): string {
   const parts: string[] = [];
   parts.push(`${manifest.name} (v${manifest.version}) — ${manifest.description}`);
 
-  // Filter out introspect and editable interfaces — they're meta-protocols
-  const userInterfaces = manifest.interfaces.filter(
-    (i) => i.id !== INTROSPECT_INTERFACE_ID && i.id !== 'abjects:editable'
-  );
+  const iface = manifest.interface;
 
-  for (const iface of userInterfaces) {
+  // Filter out meta-protocol methods
+  const userMethods = iface.methods.filter(m => !META_METHODS.has(m.name));
+  // Filter out meta-protocol events
+  const metaEvents = new Set(['childReady', 'changed', 'sourceUpdated']);
+  const userEvents = (iface.events ?? []).filter(e => !metaEvents.has(e.name));
+
+  if (userMethods.length > 0 || userEvents.length > 0) {
     parts.push('');
-    parts.push(formatInterface(iface));
+    parts.push(`  Interface: ${iface.id} — ${iface.description}`);
+
+    if (userMethods.length > 0) {
+      parts.push('  Methods:');
+      for (const m of userMethods) {
+        parts.push(formatMethod(m));
+      }
+    }
+
+    if (userEvents.length > 0) {
+      parts.push('  Events (sent to your object as callbacks):');
+      for (const e of userEvents) {
+        parts.push(formatEvent(e));
+      }
+    }
   }
 
   if (manifest.tags && manifest.tags.length > 0) {

@@ -19,7 +19,6 @@ import {
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
-import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 
 const HEALTH_MONITOR_INTERFACE = 'abjects:health-monitor';
 
@@ -87,8 +86,7 @@ export class HealthMonitor extends Abject {
         description:
           'Monitors connection health and object liveness. Triggers proxy regeneration when error rates exceed threshold and notifies Supervisor when objects stop responding to pings.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: HEALTH_MONITOR_INTERFACE,
             name: 'HealthMonitor',
             description: 'Connection health and object liveness monitoring',
@@ -249,7 +247,6 @@ export class HealthMonitor extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         tags: ['system', 'health', 'monitoring'],
       },
@@ -363,7 +360,7 @@ export class HealthMonitor extends Abject {
     if (registryId) {
       try {
         await this.request(request(this.id, registryId,
-          'abjects:registry' as InterfaceId, 'subscribe', {}));
+          'subscribe', {}));
       } catch { /* best effort */ }
     }
   }
@@ -601,7 +598,7 @@ export class HealthMonitor extends Abject {
       liveness.lastPingAt = Date.now();
       try {
         await this.request(
-          request(this.id, objectId, INTROSPECT_INTERFACE_ID, 'ping', {}),
+          request(this.id, objectId, 'ping', {}),
           this.config.pingTimeout
         );
         liveness.lastPongAt = Date.now();
@@ -643,7 +640,7 @@ export class HealthMonitor extends Abject {
 
     try {
       await this.send(event(this.id, this.supervisorId,
-        'abjects:supervisor' as InterfaceId, 'childFailed', {
+        'childFailed', {
           childId: objectId,
           error: {
             code: 'LIVENESS_FAILURE',
@@ -688,7 +685,6 @@ export class HealthMonitor extends Abject {
       event(
         this.id,
         this.id, // Self-notification for logging
-        HEALTH_MONITOR_INTERFACE as InterfaceId,
         'renegotiationTriggered',
         agreementId
       )
@@ -696,7 +692,7 @@ export class HealthMonitor extends Abject {
 
     try {
       const result = await this.request<{ success: boolean }>(
-        request(this.id, this.negotiatorId, 'abjects:negotiator' as InterfaceId, 'renegotiate', {
+        request(this.id, this.negotiatorId, 'renegotiate', {
           agreementId,
           errorContext,
         })
@@ -742,26 +738,26 @@ export class HealthMonitor extends Abject {
 
 ### Monitor an object's liveness
 
-  await this.call(this.dep('HealthMonitor'), 'abjects:health-monitor', 'monitorObject',
+  await this.call(this.dep('HealthMonitor'), 'monitorObject',
     { objectId: targetId });
 
 HealthMonitor pings monitored objects periodically. After ${this.config.maxPingFailures} consecutive failures, it emits an 'objectDead' event and notifies the Supervisor to restart the object.
 
 ### Check object liveness
 
-  const status = await this.call(this.dep('HealthMonitor'), 'abjects:health-monitor', 'getObjectLiveness',
+  const status = await this.call(this.dep('HealthMonitor'), 'getObjectLiveness',
     { objectId: targetId });
   // status: { objectId, alive, consecutiveFailures, lastPingAt, lastSuccessAt }
 
 ### Track connection health
 
-  await this.call(this.dep('HealthMonitor'), 'abjects:health-monitor', 'trackConnection',
+  await this.call(this.dep('HealthMonitor'), 'trackConnection',
     { agreementId: 'agreement-id' });
 
 ### Get health status
 
-  const allStatus = await this.call(this.dep('HealthMonitor'), 'abjects:health-monitor', 'getAllStatus', {});
-  const allLiveness = await this.call(this.dep('HealthMonitor'), 'abjects:health-monitor', 'getAllObjectLiveness', {});
+  const allStatus = await this.call(this.dep('HealthMonitor'), 'getAllStatus', {});
+  const allLiveness = await this.call(this.dep('HealthMonitor'), 'getAllObjectLiveness', {});
 
 ### Events
 - healthWarning: connection error rate exceeded ${this.config.errorThreshold}%

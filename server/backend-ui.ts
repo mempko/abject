@@ -10,7 +10,6 @@
 import {
   AbjectId,
   AbjectMessage,
-  InterfaceId,
 } from '../src/core/types.js';
 import { Abject } from '../src/core/abject.js';
 import { require as contractRequire } from '../src/core/contracts.js';
@@ -23,7 +22,7 @@ import type {
   InputMsg,
 } from './ws-protocol.js';
 
-const UI_INTERFACE: InterfaceId = 'abjects:ui';
+const UI_INTERFACE = 'abjects:ui';
 const WIDGET_FONT = '14px system-ui';
 
 export interface SurfaceState {
@@ -85,8 +84,7 @@ export class BackendUI extends Abject {
         description:
           'X11-style display server. Manages surfaces, draw commands, and routes input events to surface owners.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: UI_INTERFACE,
             name: 'UI',
             description: 'Surface management and input routing',
@@ -138,7 +136,8 @@ export class BackendUI extends Abject {
                 description: 'Execute draw commands on a surface. Each command has exactly 3 fields: { type, surfaceId, params }. ' +
                   'Valid types: "clear" (params: {}), "rect" (params: { x, y, width, height, fill?, stroke?, lineWidth?, radius? }), ' +
                   '"text" (params: { x, y, text, font?, fill?, align?, baseline? }), "line" (params: { x1, y1, x2, y2, stroke?, lineWidth? }), ' +
-                  '"path" (params: { path (SVG path string), fill?, stroke?, lineWidth? }). ' +
+                  '"path" (params: { path (SVG path string), fill?, stroke?, lineWidth? }), ' +
+                  '"imageUrl" (params: { x, y, width?, height?, url }) — draws an image from a URL or data URI. ' +
                   'IMPORTANT: Use "fill" for fill color (NOT "color"), "stroke" for stroke color, "rect" (NOT "fillRect"), "text" (NOT "fillText"). ' +
                   'Always nest parameters inside "params", NOT as flat top-level fields.',
                 parameters: [
@@ -281,7 +280,6 @@ export class BackendUI extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [Capabilities.UI_SURFACE, Capabilities.UI_INPUT],
         tags: ['system', 'ui'],
@@ -408,7 +406,7 @@ export class BackendUI extends Abject {
       if (!state) return;
       this.mouseGrabAbject = this.windowManagerId;
       this.send(event(this.id, this.windowManagerId,
-        'abjects:window-manager' as InterfaceId, 'startDrag', {
+        'startDrag', {
           surfaceId,
           globalX: this.lastMouseX,
           globalY: this.lastMouseY,
@@ -428,7 +426,7 @@ export class BackendUI extends Abject {
     if (registryId) {
       try {
         await this.request(request(this.id, registryId,
-          'abjects:registry' as InterfaceId, 'subscribe', {}));
+          'subscribe', {}));
       } catch { /* best effort */ }
     }
   }
@@ -437,9 +435,71 @@ export class BackendUI extends Abject {
     if (!this.consoleId) return;
     try {
       await this.send(
-        request(this.id, this.consoleId, 'abjects:console' as InterfaceId, level, { message, data })
+        request(this.id, this.consoleId, level, { message, data })
       );
     } catch { /* logging should never break the caller */ }
+  }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## UIServer Usage Guide
+
+### Creating and Using Surfaces
+
+Create a surface:
+  const surfaceId = await this.call(this.dep('UIServer'), 'abjects:ui', 'createSurface',
+    { rect: { x: 100, y: 100, width: 300, height: 200 }, zIndex: 100 });
+
+Destroy a surface:
+  await this.call(this.dep('UIServer'), 'abjects:ui', 'destroySurface', { surfaceId });
+
+### Drawing
+
+Each draw command has exactly 3 fields: { type, surfaceId, params }
+
+  await this.call(this.dep('UIServer'), 'abjects:ui', 'draw', {
+    commands: [
+      { type: 'clear', surfaceId, params: { color: '#1e1e2e' } },
+      { type: 'rect', surfaceId, params: { x: 10, y: 10, width: 80, height: 30, fill: '#4a4a6e', radius: 4 } },
+      { type: 'text', surfaceId, params: { x: 150, y: 100, text: 'Hello', font: '24px system-ui', fill: '#ffffff', align: 'center' } },
+    ]
+  });
+
+### Draw Command Types
+
+'clear' - Clear surface. params: {} or { color: '#rrggbb' }
+'rect'  - Rectangle. params: { x, y, width, height, fill?, stroke?, lineWidth?, radius? }
+'text'  - Text. params: { x, y, text, font?, fill?, stroke?, align?, baseline? }
+'line'  - Line. params: { x1, y1, x2, y2, stroke?, lineWidth? }
+'path'  - SVG path. params: { path, fill?, stroke?, lineWidth? }
+'circle' - Circle. params: { cx, cy, radius, fill?, stroke?, lineWidth? }
+'arc'   - Arc. params: { cx, cy, radius, startAngle, endAngle, fill?, stroke?, counterclockwise? }
+'ellipse' - Ellipse. params: { cx, cy, radiusX, radiusY, rotation?, fill?, stroke? }
+'polygon' - Polygon. params: { points: [{x,y}...], fill?, stroke?, closePath? }
+'imageUrl' - Draw image from URL or data URI. params: { x, y, width?, height?, url }
+          Use with HttpClient.getBase64() to display fetched images.
+
+### Displaying Images
+
+  // 1. Fetch image as base64 data URI
+  const img = await this.call(this.dep('HttpClient'), 'abjects:http', 'getBase64', { url: 'https://example.com/photo.jpg' });
+  // 2. Draw on surface
+  await this.call(this.dep('UIServer'), 'abjects:ui', 'draw', {
+    commands: [{ type: 'imageUrl', surfaceId, params: { x: 0, y: 0, width: 300, height: 200, url: img.dataUri } }]
+  });
+
+### State management
+'save'/'restore' - Save/restore canvas state
+'clip' - Set clipping region. params: { x, y, width, height }
+'translate'/'rotate'/'scale' - Transform canvas
+'globalAlpha' - Set transparency. params: { alpha }
+'shadow' - Set shadow. params: { color, blur, offsetX?, offsetY? }
+'linearGradient'/'radialGradient' - Set gradient fill+stroke
+
+IMPORTANT:
+- Use 'fill' for fill color, NOT 'color'
+- Use 'rect' NOT 'fillRect', 'text' NOT 'fillText'
+- Always nest parameters inside 'params'
+- Transparent pixels do NOT receive mouse input — use opaque backgrounds`;
   }
 
   // ── WebSocket management ────────────────────────────────────────────
@@ -843,7 +903,7 @@ export class BackendUI extends Abject {
         const state = msg.surfaceId ? this.surfaces.get(msg.surfaceId) : undefined;
         const globalX = (msg.x ?? 0) + (state?.rect.x ?? 0);
         const globalY = (msg.y ?? 0) + (state?.rect.y ?? 0);
-        this.send(event(this.id, this.mouseGrabAbject, UI_INTERFACE, 'dragMove', {
+        this.send(event(this.id, this.mouseGrabAbject, 'dragMove', {
           globalX, globalY,
         }));
         return;
@@ -852,7 +912,7 @@ export class BackendUI extends Abject {
         const state = msg.surfaceId ? this.surfaces.get(msg.surfaceId) : undefined;
         const globalX = (msg.x ?? 0) + (state?.rect.x ?? 0);
         const globalY = (msg.y ?? 0) + (state?.rect.y ?? 0);
-        this.send(event(this.id, this.mouseGrabAbject, UI_INTERFACE, 'dragEnd', {
+        this.send(event(this.id, this.mouseGrabAbject, 'dragEnd', {
           globalX, globalY,
         }));
         this.mouseGrabAbject = undefined;
@@ -884,7 +944,7 @@ export class BackendUI extends Abject {
             const globalX = (msg.x ?? 0) + (state.rect.x ?? 0);
             const globalY = (msg.y ?? 0) + (state.rect.y ?? 0);
             this.send(event(this.id, this.windowManagerId,
-              'abjects:window-manager' as InterfaceId, 'startDrag', {
+              'startDrag', {
                 surfaceId: msg.surfaceId, globalX, globalY,
               }));
             this.handleFocus(state.objectId, msg.surfaceId);
@@ -897,7 +957,7 @@ export class BackendUI extends Abject {
           try {
             const reply = await this.request<{ grab: boolean; minimize?: string }>(
               request(this.id, this.windowManagerId,
-                'abjects:window-manager' as InterfaceId, 'surfaceMouseDown', {
+                'surfaceMouseDown', {
                   surfaceId: msg.surfaceId, localX, localY,
                 })
             );
@@ -995,7 +1055,7 @@ export class BackendUI extends Abject {
     inputEvent: InputEvent
   ): Promise<void> {
     await this.send(
-      event(this.id, objectId, UI_INTERFACE, 'input', inputEvent)
+      event(this.id, objectId, 'input', inputEvent)
     );
   }
 
@@ -1005,7 +1065,7 @@ export class BackendUI extends Abject {
     focused: boolean
   ): Promise<void> {
     await this.send(
-      event(this.id, objectId, UI_INTERFACE, 'focus', { surfaceId, focused })
+      event(this.id, objectId, 'focus', { surfaceId, focused })
     );
   }
 

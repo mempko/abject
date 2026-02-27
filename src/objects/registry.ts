@@ -17,7 +17,7 @@ import { require, invariant } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 
-const REGISTRY_INTERFACE = 'abjects:registry';
+const REGISTRY_INTERFACE = 'abjects:registry' as InterfaceId;
 
 export interface RegistryState {
   objects: Map<AbjectId, ObjectRegistration>;
@@ -43,8 +43,7 @@ export class Registry extends Abject {
         description:
           'Central directory for object discovery. Objects register here to be discoverable by others.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: REGISTRY_INTERFACE,
             name: 'Registry',
             description: 'Object registration and discovery',
@@ -163,7 +162,6 @@ export class Registry extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [
           Capabilities.REGISTRY_READ,
@@ -265,9 +263,7 @@ export class Registry extends Abject {
       const old = reg.manifest;
 
       // Remove old indices
-      for (const iface of old.interfaces) {
-        this.byInterface.get(iface.id)?.delete(objectId);
-      }
+      this.byInterface.get(old.interface.id)?.delete(objectId);
       for (const cap of old.providedCapabilities ?? []) {
         this.byCapability.get(cap)?.delete(objectId);
       }
@@ -277,10 +273,9 @@ export class Registry extends Abject {
       reg.manifest = manifest;
 
       // Re-index
-      for (const iface of manifest.interfaces) {
-        if (!this.byInterface.has(iface.id)) this.byInterface.set(iface.id, new Set());
-        this.byInterface.get(iface.id)!.add(objectId);
-      }
+      const newIfaceId = manifest.interface.id;
+      if (!this.byInterface.has(newIfaceId)) this.byInterface.set(newIfaceId, new Set());
+      this.byInterface.get(newIfaceId)!.add(objectId);
       for (const cap of manifest.providedCapabilities ?? []) {
         if (!this.byCapability.has(cap)) this.byCapability.set(cap, new Set());
         this.byCapability.get(cap)!.add(objectId);
@@ -325,12 +320,11 @@ export class Registry extends Abject {
     this.objects.set(objectId, registration);
 
     // Index by interface
-    for (const iface of manifest.interfaces) {
-      if (!this.byInterface.has(iface.id)) {
-        this.byInterface.set(iface.id, new Set());
-      }
-      this.byInterface.get(iface.id)!.add(objectId);
+    const ifaceId = manifest.interface.id;
+    if (!this.byInterface.has(ifaceId)) {
+      this.byInterface.set(ifaceId, new Set());
     }
+    this.byInterface.get(ifaceId)!.add(objectId);
 
     // Index by capability
     for (const cap of manifest.providedCapabilities ?? []) {
@@ -365,9 +359,7 @@ export class Registry extends Abject {
     const manifest = registration.manifest;
 
     // Remove from interface index
-    for (const iface of manifest.interfaces) {
-      this.byInterface.get(iface.id)?.delete(objectId);
-    }
+    this.byInterface.get(manifest.interface.id)?.delete(objectId);
 
     // Remove from capability index
     for (const cap of manifest.providedCapabilities ?? []) {
@@ -493,7 +485,7 @@ export class Registry extends Abject {
     for (const subscriberId of this.subscribers) {
       try {
         await this.send(
-          event(this.id, subscriberId, REGISTRY_INTERFACE, eventName, payload)
+          event(this.id, subscriberId, eventName, payload)
         );
       } catch (err) {
         console.error(`Failed to notify subscriber ${subscriberId}:`, err);
@@ -522,7 +514,7 @@ export function createRegisterRequest(
   manifest: AbjectManifest,
   status?: AbjectStatus
 ): AbjectMessage {
-  return request(fromId, REGISTRY_ID, REGISTRY_INTERFACE, 'register', {
+  return request(fromId, REGISTRY_ID, 'register', {
     objectId,
     manifest,
     status,
@@ -536,7 +528,7 @@ export function createDiscoverRequest(
   fromId: AbjectId,
   query: DiscoveryQuery
 ): AbjectMessage {
-  return request(fromId, REGISTRY_ID, REGISTRY_INTERFACE, 'discover', query);
+  return request(fromId, REGISTRY_ID, 'discover', query);
 }
 
 /**
@@ -546,7 +538,7 @@ export function createLookupRequest(
   fromId: AbjectId,
   objectId: AbjectId
 ): AbjectMessage {
-  return request(fromId, REGISTRY_ID, REGISTRY_INTERFACE, 'lookup', { objectId });
+  return request(fromId, REGISTRY_ID, 'lookup', { objectId });
 }
 
 /**
@@ -556,7 +548,7 @@ export function createGetManifestRequest(
   fromId: AbjectId,
   objectId: AbjectId
 ): AbjectMessage {
-  return request(fromId, REGISTRY_ID, REGISTRY_INTERFACE, 'getManifest', {
+  return request(fromId, REGISTRY_ID, 'getManifest', {
     objectId,
   });
 }

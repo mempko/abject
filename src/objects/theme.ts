@@ -14,7 +14,6 @@ import { require as contractRequire } from '../core/contracts.js';
 import { ThemeData, MIDNIGHT_BLOOM } from './widgets/widget-types.js';
 
 const THEME_INTERFACE: InterfaceId = 'abjects:theme' as InterfaceId;
-const STORAGE_INTERFACE: InterfaceId = 'abjects:storage' as InterfaceId;
 const STORAGE_KEY = 'theme:active';
 
 export const THEME_ID = 'abjects:theme' as AbjectId;
@@ -29,8 +28,7 @@ export class ThemeAbject extends Abject {
         name: 'Theme',
         description: 'Stores the active UI theme and broadcasts changes to dependents via message passing',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: THEME_INTERFACE,
             name: 'Theme',
             description: 'Theme management — get, set, and reset the UI theme',
@@ -57,7 +55,6 @@ export class ThemeAbject extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [],
         tags: ['system', 'ui', 'theme'],
@@ -96,7 +93,7 @@ export class ThemeAbject extends Abject {
     if (this.storageId) {
       try {
         const saved = await this.request<ThemeData | null>(
-          request(this.id, this.storageId, STORAGE_INTERFACE, 'get', { key: STORAGE_KEY })
+          request(this.id, this.storageId, 'get', { key: STORAGE_KEY })
         );
         if (saved && typeof saved === 'object' && 'canvasBg' in saved) {
           this.currentTheme = { ...MIDNIGHT_BLOOM, ...saved };
@@ -119,7 +116,7 @@ export class ThemeAbject extends Abject {
     if (!this.storageId) return;
     try {
       await this.request(
-        request(this.id, this.storageId, STORAGE_INTERFACE, 'set', {
+        request(this.id, this.storageId, 'set', {
           key: STORAGE_KEY,
           value: this.currentTheme,
         })

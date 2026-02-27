@@ -18,7 +18,7 @@ import {
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
+
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 
 const REGISTRY_BROWSER_INTERFACE: InterfaceId = 'abjects:registry-browser';
@@ -87,8 +87,7 @@ export class RegistryBrowser extends Abject {
         description:
           'Browse all registered objects in the system. View interfaces, methods, and capabilities.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: REGISTRY_BROWSER_INTERFACE,
             name: 'RegistryBrowser',
             description: 'System object browser',
@@ -125,7 +124,6 @@ export class RegistryBrowser extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [
           { capability: Capabilities.UI_SURFACE, reason: 'Display browser window', required: true },
         ],
@@ -150,14 +148,14 @@ export class RegistryBrowser extends Abject {
 
     if (this.registryId) {
       await this.request(request(this.id, this.registryId,
-        'abjects:registry' as InterfaceId, 'subscribe', {}));
+        'subscribe', {}));
     }
 
     // Subscribe to system registry notifications too
     if (this.systemRegistryId) {
       try {
         await this.request(request(this.id, this.systemRegistryId,
-          'abjects:registry' as InterfaceId, 'subscribe', {}));
+          'subscribe', {}));
       } catch { /* SystemRegistry may not support subscribe */ }
     }
   }
@@ -168,7 +166,7 @@ export class RegistryBrowser extends Abject {
   private async registryList(): Promise<ObjectRegistration[]> {
     if (!this.registryId) return [];
     return this.request<ObjectRegistration[]>(
-      request(this.id, this.registryId, 'abjects:registry' as InterfaceId, 'list', {})
+      request(this.id, this.registryId, 'list', {})
     );
   }
 
@@ -179,7 +177,7 @@ export class RegistryBrowser extends Abject {
     if (!this.systemRegistryId) return [];
     try {
       return await this.request<ObjectRegistration[]>(
-        request(this.id, this.systemRegistryId, 'abjects:registry' as InterfaceId, 'list', {})
+        request(this.id, this.systemRegistryId, 'list', {})
       );
     } catch {
       return [];
@@ -191,7 +189,7 @@ export class RegistryBrowser extends Abject {
    * so we receive 'changed' events from it.
    */
   private async addDep(widgetId: AbjectId): Promise<void> {
-    await this.request(request(this.id, widgetId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+    await this.request(request(this.id, widgetId, 'addDependent', {}));
   }
 
   /**
@@ -231,14 +229,14 @@ export class RegistryBrowser extends Abject {
       try {
         // Remove layout from window, then destroy it
         await this.request(
-          request(this.id, this.windowId, WINDOW_INTERFACE, 'removeChild', {
+          request(this.id, this.windowId, 'removeChild', {
             widgetId: this.rootLayoutId,
           })
         );
       } catch { /* layout or window may be gone */ }
       try {
         await this.request(
-          request(this.id, this.rootLayoutId, WIDGET_INTERFACE, 'destroy', {})
+          request(this.id, this.rootLayoutId, 'destroy', {})
         );
       } catch { /* already gone */ }
     }
@@ -337,7 +335,7 @@ export class RegistryBrowser extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
         windowId: this.windowId,
       })
     );
@@ -367,14 +365,14 @@ export class RegistryBrowser extends Abject {
 
     if (!this.windowId) {
       const displayInfo = await this.request<{ width: number; height: number }>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
+        request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
       );
 
       const winX = Math.max(20, Math.floor((displayInfo.width - WIN_W) / 2));
       const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2));
 
       this.windowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
+        request(this.id, this.widgetManagerId!, 'createWindowAbject', {
           title: windowTitle,
           rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
           zIndex: 200,
@@ -383,7 +381,7 @@ export class RegistryBrowser extends Abject {
       );
     } else {
       await this.request(
-        request(this.id, this.windowId, WINDOW_INTERFACE, 'setTitle', {
+        request(this.id, this.windowId, 'setTitle', {
           title: windowTitle,
         })
       );
@@ -402,7 +400,7 @@ export class RegistryBrowser extends Abject {
 
     // Create root VBox layout (non-scrollable outer container)
     this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+      request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId!,
         margins: { top: 8, right: 16, bottom: 8, left: 16 },
         spacing: 6,
@@ -411,12 +409,12 @@ export class RegistryBrowser extends Abject {
 
     // Search input at the top
     this.searchInputId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
+      request(this.id, this.widgetManagerId!, 'createTextInput', {
         windowId: this.windowId!, rect: r0, placeholder: 'Search kinds...',
       })
     );
     await this.addDep(this.searchInputId);
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.searchInputId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
@@ -425,7 +423,7 @@ export class RegistryBrowser extends Abject {
     // Restore search text if non-empty (e.g. after objectRegistered rebuild)
     if (this.searchText) {
       await this.request(
-        request(this.id, this.searchInputId, WIDGET_INTERFACE, 'update', {
+        request(this.id, this.searchInputId, 'update', {
           text: this.searchText,
         })
       );
@@ -433,13 +431,13 @@ export class RegistryBrowser extends Abject {
 
     // Scrollable VBox for the kind list
     this.scrollableListId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedScrollableVBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.scrollableListId,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
@@ -459,12 +457,12 @@ export class RegistryBrowser extends Abject {
     // Destroy existing workspace kind buttons
     for (const [btnId] of this.kindButtons) {
       try {
-        await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'removeLayoutChild', {
+        await this.request(request(this.id, this.scrollableListId, 'removeLayoutChild', {
           widgetId: btnId,
         }));
       } catch { /* may already be gone */ }
       try {
-        await this.request(request(this.id, btnId, WIDGET_INTERFACE, 'destroy', {}));
+        await this.request(request(this.id, btnId, 'destroy', {}));
       } catch { /* already gone */ }
     }
     this.kindButtons.clear();
@@ -472,12 +470,12 @@ export class RegistryBrowser extends Abject {
     // Destroy existing system kind buttons
     for (const [btnId] of this.systemKindButtons) {
       try {
-        await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'removeLayoutChild', {
+        await this.request(request(this.id, this.scrollableListId, 'removeLayoutChild', {
           widgetId: btnId,
         }));
       } catch { /* may already be gone */ }
       try {
-        await this.request(request(this.id, btnId, WIDGET_INTERFACE, 'destroy', {}));
+        await this.request(request(this.id, btnId, 'destroy', {}));
       } catch { /* already gone */ }
     }
     this.systemKindButtons.clear();
@@ -501,7 +499,7 @@ export class RegistryBrowser extends Abject {
       const label = `${kindName} (${count}) — ${descTrunc}`;
 
       const btnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+        request(this.id, this.widgetManagerId!, 'createButton', {
           windowId: this.windowId!, rect: r0, text: label,
           style: { fontSize: 13 },
         })
@@ -509,7 +507,7 @@ export class RegistryBrowser extends Abject {
       await this.addDep(btnId);
       this.kindButtons.set(btnId, kindName);
 
-      await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, this.scrollableListId, 'addLayoutChild', {
         widgetId: btnId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: 32 },
@@ -533,7 +531,7 @@ export class RegistryBrowser extends Abject {
       if (matchingSysNames.length > 0) {
         // Add "System" divider label
         const dividerId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+          request(this.id, this.widgetManagerId!, 'createLabel', {
             windowId: this.windowId!, rect: r0,
             text: 'System',
             style: { color: '#6b7084', fontSize: 12, fontWeight: 'bold' },
@@ -541,7 +539,7 @@ export class RegistryBrowser extends Abject {
         );
         // Track divider in systemKindButtons for cleanup (uses a sentinel key)
         this.systemKindButtons.set(dividerId, '__divider__');
-        await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, this.scrollableListId, 'addLayoutChild', {
           widgetId: dividerId,
           sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
           preferredSize: { height: 24 },
@@ -556,7 +554,7 @@ export class RegistryBrowser extends Abject {
           const label = `${kindName} (${count}) — ${descTrunc}`;
 
           const btnId = await this.request<AbjectId>(
-            request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+            request(this.id, this.widgetManagerId!, 'createButton', {
               windowId: this.windowId!, rect: r0, text: label,
               style: { fontSize: 13, color: '#6b7084' },
             })
@@ -564,7 +562,7 @@ export class RegistryBrowser extends Abject {
           await this.addDep(btnId);
           this.systemKindButtons.set(btnId, kindName);
 
-          await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          await this.request(request(this.id, this.scrollableListId, 'addLayoutChild', {
             widgetId: btnId,
             sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
             preferredSize: { height: 32 },
@@ -601,7 +599,7 @@ export class RegistryBrowser extends Abject {
     const count = this.kindInstances.length;
     if (this.windowId) {
       await this.request(
-        request(this.id, this.windowId, WINDOW_INTERFACE, 'setTitle', {
+        request(this.id, this.windowId, 'setTitle', {
           title: `${kindName} (${count})`,
         })
       );
@@ -611,7 +609,7 @@ export class RegistryBrowser extends Abject {
 
     // Create root VBox layout
     this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+      request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId!,
         margins: { top: 8, right: 16, bottom: 8, left: 16 },
         spacing: 6,
@@ -620,13 +618,13 @@ export class RegistryBrowser extends Abject {
 
     // Scrollable VBox for instance rows
     this.scrollableListId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedScrollableVBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.scrollableListId,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
@@ -637,13 +635,13 @@ export class RegistryBrowser extends Abject {
       const shortId = inst.id.slice(0, 8);
 
       const rowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
           parentLayoutId: this.scrollableListId,
           margins: { top: 0, right: 0, bottom: 0, left: 0 },
           spacing: 6,
         })
       );
-      await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, this.scrollableListId, 'addLayoutChild', {
         widgetId: rowId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: 32 },
@@ -651,7 +649,7 @@ export class RegistryBrowser extends Abject {
 
       // Instance button (click to show detail)
       const instBtnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+        request(this.id, this.widgetManagerId!, 'createButton', {
           windowId: this.windowId!, rect: r0,
           text: `${kindName} [${shortId}...]`,
           style: { fontSize: 13 },
@@ -659,7 +657,7 @@ export class RegistryBrowser extends Abject {
       );
       await this.addDep(instBtnId);
       this.instanceButtons.set(instBtnId, i);
-      await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, rowId, 'addLayoutChild', {
         widgetId: instBtnId,
         sizePolicy: { horizontal: 'expanding' },
         preferredSize: { height: 32 },
@@ -668,14 +666,14 @@ export class RegistryBrowser extends Abject {
       // Clone button — local mode: always; remote mode: only if source exists
       if (this.factoryId && (!this.isRemoteMode || inst.source !== undefined)) {
         const cloneBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+          request(this.id, this.widgetManagerId!, 'createButton', {
             windowId: this.windowId!, rect: r0, text: 'Clone',
             style: { fontSize: 12 },
           })
         );
         await this.addDep(cloneBtnId);
         this.instanceCloneButtons.set(cloneBtnId, i);
-        await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, rowId, 'addLayoutChild', {
           widgetId: cloneBtnId,
           sizePolicy: { horizontal: 'fixed' },
           preferredSize: { width: 60, height: 32 },
@@ -684,14 +682,14 @@ export class RegistryBrowser extends Abject {
         // Delete button (local mode only)
         if (!this.isRemoteMode) {
           const delBtnId = await this.request<AbjectId>(
-            request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+            request(this.id, this.widgetManagerId!, 'createButton', {
               windowId: this.windowId!, rect: r0, text: 'Delete',
               style: { fontSize: 12, background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' },
             })
           );
           await this.addDep(delBtnId);
           this.instanceDeleteButtons.set(delBtnId, i);
-          await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          await this.request(request(this.id, rowId, 'addLayoutChild', {
             widgetId: delBtnId,
             sizePolicy: { horizontal: 'fixed' },
             preferredSize: { width: 60, height: 32 },
@@ -702,32 +700,32 @@ export class RegistryBrowser extends Abject {
 
     // ── Fixed bottom bar ──
     const bottomRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 4, right: 0, bottom: 0, left: 0 },
         spacing: 10,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: bottomRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
 
     this.backBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+      request(this.id, this.widgetManagerId!, 'createButton', {
         windowId: this.windowId!, rect: r0, text: 'Back',
       })
     );
     await this.addDep(this.backBtnId);
-    await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, bottomRowId, 'addLayoutChild', {
       widgetId: this.backBtnId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 80, height: 32 },
     }));
 
     // Right spacer
-    await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+    await this.request(request(this.id, bottomRowId, 'addLayoutSpacer', {}));
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -752,7 +750,7 @@ export class RegistryBrowser extends Abject {
     const shortId = obj.id.slice(0, 8);
     if (this.windowId) {
       await this.request(
-        request(this.id, this.windowId, WINDOW_INTERFACE, 'setTitle', {
+        request(this.id, this.windowId, 'setTitle', {
           title: `${obj.manifest.name} [${shortId}...]`,
         })
       );
@@ -762,7 +760,7 @@ export class RegistryBrowser extends Abject {
 
     // Create root VBox layout (non-scrollable outer container)
     this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+      request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId!,
         margins: { top: 8, right: 16, bottom: 8, left: 16 },
         spacing: 4,
@@ -771,25 +769,25 @@ export class RegistryBrowser extends Abject {
 
     // Scrollable VBox for detail content
     const scrollVBoxId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedScrollableVBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: scrollVBoxId,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
 
     const addLabel = async (text: string, style?: Record<string, unknown>): Promise<AbjectId> => {
       const id = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        request(this.id, this.widgetManagerId!, 'createLabel', {
           windowId: this.windowId!, rect: r0, text,
           ...(style ? { style } : {}),
         })
       );
-      await this.request(request(this.id, scrollVBoxId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, scrollVBoxId, 'addLayoutChild', {
         widgetId: id,
         sizePolicy: { vertical: 'fixed' },
         preferredSize: { height: 20 },
@@ -806,12 +804,12 @@ export class RegistryBrowser extends Abject {
       const mergedStyle = { wordWrap: true, ...style };
 
       const id = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        request(this.id, this.widgetManagerId!, 'createLabel', {
           windowId: this.windowId!, rect: r0, text,
           style: mergedStyle,
         })
       );
-      await this.request(request(this.id, scrollVBoxId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, scrollVBoxId, 'addLayoutChild', {
         widgetId: id,
         sizePolicy: { vertical: 'fixed' },
         preferredSize: { height: estimatedHeight },
@@ -825,8 +823,9 @@ export class RegistryBrowser extends Abject {
     const desc = obj.manifest.description;
     await addWrappedLabel(`Description: ${desc}`);
 
-    // Interfaces
-    for (const iface of obj.manifest.interfaces) {
+    // Interface
+    if (obj.manifest.interface) {
+      const iface = obj.manifest.interface;
       await addLabel(`Interface: ${iface.name} (${iface.id})`);
       for (const method of iface.methods) {
         const params = method.parameters.map((p) => p.name).join(', ');
@@ -860,7 +859,8 @@ export class RegistryBrowser extends Abject {
 
       // Method buttons in 2-col HBox rows
       const allMethods: { interfaceId: InterfaceId; method: string }[] = [];
-      for (const iface of obj.manifest.interfaces) {
+      if (obj.manifest.interface) {
+        const iface = obj.manifest.interface;
         for (const method of iface.methods) {
           allMethods.push({ interfaceId: iface.id, method: method.name });
         }
@@ -868,13 +868,13 @@ export class RegistryBrowser extends Abject {
 
       for (let i = 0; i < allMethods.length; i += 2) {
         const rowId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+          request(this.id, this.widgetManagerId!, 'createNestedHBox', {
             parentLayoutId: scrollVBoxId,
             margins: { top: 0, right: 0, bottom: 0, left: 0 },
             spacing: 8,
           })
         );
-        await this.request(request(this.id, scrollVBoxId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, scrollVBoxId, 'addLayoutChild', {
           widgetId: rowId,
           sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
           preferredSize: { height: 26 },
@@ -883,13 +883,13 @@ export class RegistryBrowser extends Abject {
         for (let j = i; j < Math.min(i + 2, allMethods.length); j++) {
           const m = allMethods[j];
           const btnId = await this.request<AbjectId>(
-            request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+            request(this.id, this.widgetManagerId!, 'createButton', {
               windowId: this.windowId!, rect: r0, text: m.method,
             })
           );
           await this.addDep(btnId);
           this.methodButtons.set(btnId, m);
-          await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          await this.request(request(this.id, rowId, 'addLayoutChild', {
             widgetId: btnId,
             sizePolicy: { horizontal: 'expanding' },
             preferredSize: { height: 26 },
@@ -899,38 +899,38 @@ export class RegistryBrowser extends Abject {
 
       // Payload row (HBox: input + Send)
       const payloadRowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
           parentLayoutId: scrollVBoxId,
           margins: { top: 0, right: 0, bottom: 0, left: 0 },
           spacing: 8,
         })
       );
-      await this.request(request(this.id, scrollVBoxId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, scrollVBoxId, 'addLayoutChild', {
         widgetId: payloadRowId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: 30 },
       }));
 
       this.msgPayloadId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
+        request(this.id, this.widgetManagerId!, 'createTextInput', {
           windowId: this.windowId!, rect: r0, placeholder: 'JSON payload (optional)',
         })
       );
       await this.addDep(this.msgPayloadId);
-      await this.request(request(this.id, payloadRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, payloadRowId, 'addLayoutChild', {
         widgetId: this.msgPayloadId,
         sizePolicy: { horizontal: 'expanding' },
         preferredSize: { height: 30 },
       }));
 
       this.msgSendBtnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+        request(this.id, this.widgetManagerId!, 'createButton', {
           windowId: this.windowId!, rect: r0, text: 'Send',
           style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
         })
       );
       await this.addDep(this.msgSendBtnId);
-      await this.request(request(this.id, payloadRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, payloadRowId, 'addLayoutChild', {
         widgetId: this.msgSendBtnId,
         sizePolicy: { horizontal: 'fixed' },
         preferredSize: { width: 60, height: 30 },
@@ -947,25 +947,25 @@ export class RegistryBrowser extends Abject {
 
     // ── Fixed bottom buttons row (outside scrollable area) ──
     const bottomRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 4, right: 0, bottom: 0, left: 0 },
         spacing: 10,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: bottomRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
 
     this.backBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+      request(this.id, this.widgetManagerId!, 'createButton', {
         windowId: this.windowId!, rect: r0, text: 'Back',
       })
     );
     await this.addDep(this.backBtnId);
-    await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, bottomRowId, 'addLayoutChild', {
       widgetId: this.backBtnId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 80, height: 32 },
@@ -976,12 +976,12 @@ export class RegistryBrowser extends Abject {
       const isEditable = obj.source !== undefined;
       if (isEditable) {
         this.editSourceBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+          request(this.id, this.widgetManagerId!, 'createButton', {
             windowId: this.windowId!, rect: r0, text: 'Edit Source',
           })
         );
         await this.addDep(this.editSourceBtnId);
-        await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, bottomRowId, 'addLayoutChild', {
           widgetId: this.editSourceBtnId,
           sizePolicy: { horizontal: 'fixed' },
           preferredSize: { width: 110, height: 32 },
@@ -990,13 +990,13 @@ export class RegistryBrowser extends Abject {
         // Show "Delete" button for workshop-created objects
         if (this.factoryId) {
           this.deleteBtnId = await this.request<AbjectId>(
-            request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+            request(this.id, this.widgetManagerId!, 'createButton', {
               windowId: this.windowId!, rect: r0, text: 'Delete',
               style: { background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' },
             })
           );
           await this.addDep(this.deleteBtnId);
-          await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          await this.request(request(this.id, bottomRowId, 'addLayoutChild', {
             widgetId: this.deleteBtnId,
             sizePolicy: { horizontal: 'fixed' },
             preferredSize: { width: 80, height: 32 },
@@ -1007,12 +1007,12 @@ export class RegistryBrowser extends Abject {
       // Clone button (always available in local mode if factory exists)
       if (this.factoryId) {
         this.cloneBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+          request(this.id, this.widgetManagerId!, 'createButton', {
             windowId: this.windowId!, rect: r0, text: 'Clone',
           })
         );
         await this.addDep(this.cloneBtnId);
-        await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, bottomRowId, 'addLayoutChild', {
           widgetId: this.cloneBtnId,
           sizePolicy: { horizontal: 'fixed' },
           preferredSize: { width: 80, height: 32 },
@@ -1023,12 +1023,12 @@ export class RegistryBrowser extends Abject {
     // Clone button for remote mode (only for scriptable objects with source)
     if (this.isRemoteMode && this.factoryId && obj.source !== undefined) {
       this.cloneBtnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+        request(this.id, this.widgetManagerId!, 'createButton', {
           windowId: this.windowId!, rect: r0, text: 'Clone',
         })
       );
       await this.addDep(this.cloneBtnId);
-      await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, bottomRowId, 'addLayoutChild', {
         widgetId: this.cloneBtnId,
         sizePolicy: { horizontal: 'fixed' },
         preferredSize: { width: 80, height: 32 },
@@ -1036,7 +1036,7 @@ export class RegistryBrowser extends Abject {
     }
 
     // Right spacer in bottom row
-    await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+    await this.request(request(this.id, bottomRowId, 'addLayoutSpacer', {}));
   }
 
   protected override getSourceForAsk(): string | undefined {
@@ -1103,7 +1103,7 @@ export class RegistryBrowser extends Abject {
         }
         if (this.abjectEditorId) {
           await this.request(request(this.id, this.abjectEditorId,
-            'abjects:abject-editor' as InterfaceId, 'show', { objectId: obj.id }));
+            'show', { objectId: obj.id }));
         }
       }
       return;
@@ -1115,7 +1115,7 @@ export class RegistryBrowser extends Abject {
       await this.setWidgetDisabled(this.cloneBtnId, true);
       try {
         await this.request(request(this.id, this.factoryId,
-          FACTORY_INTERFACE, 'kill', { objectId: this.detailObjectId }));
+          'kill', { objectId: this.detailObjectId }));
       } catch { /* object may already be gone */ }
       this.cachedObjects = await this.registryList();
       this.systemObjects = await this.systemRegistryList();
@@ -1141,7 +1141,7 @@ export class RegistryBrowser extends Abject {
       // Update response label to show selection
       if (this.msgResponseId) {
         await this.request(
-          request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
+          request(this.id, this.msgResponseId, 'update', {
             text: `Selected: ${methodInfo.method}`,
           })
         );
@@ -1217,14 +1217,14 @@ export class RegistryBrowser extends Abject {
 
     try {
       await this.request(request(this.id, this.factoryId,
-        FACTORY_INTERFACE, 'clone', { objectId }));
+        'clone', { objectId }));
     } catch (err) {
       // Best-effort: show error in detail view if available
       if (this.msgResponseId) {
         const msg = err instanceof Error ? err.message : String(err);
         try {
           await this.request(
-            request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
+            request(this.id, this.msgResponseId, 'update', {
               text: `Clone error: ${msg.slice(0, 50)}`,
             })
           );
@@ -1243,7 +1243,7 @@ export class RegistryBrowser extends Abject {
       // Show feedback in response label
       if (this.msgResponseId) {
         await this.request(
-          request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
+          request(this.id, this.msgResponseId, 'update', {
             text: 'Cloned successfully',
           })
         );
@@ -1262,7 +1262,7 @@ export class RegistryBrowser extends Abject {
 
     try {
       const result = await this.request<SpawnResult>(request(this.id, this.factoryId,
-        FACTORY_INTERFACE, 'spawn', {
+        'spawn', {
           manifest: obj.manifest,
           source: obj.source,
           registryHint: this.localRegistryId,
@@ -1271,7 +1271,7 @@ export class RegistryBrowser extends Abject {
       // Persist to AbjectStore so it survives page reload
       if (this.abjectStoreId) {
         await this.request(request(this.id, this.abjectStoreId,
-          'abjects:abject-store' as InterfaceId, 'save', {
+          'save', {
             objectId: result.objectId,
             manifest: obj.manifest,
             source: obj.source,
@@ -1283,7 +1283,7 @@ export class RegistryBrowser extends Abject {
       if (this.msgResponseId) {
         try {
           await this.request(request(this.id, this.msgResponseId,
-            WIDGET_INTERFACE, 'update', { text: 'Cloned to workspace' }));
+            'update', { text: 'Cloned to workspace' }));
         } catch { /* widget may be gone */ }
       }
     } catch (err) {
@@ -1291,7 +1291,7 @@ export class RegistryBrowser extends Abject {
         const msg = err instanceof Error ? err.message : String(err);
         try {
           await this.request(request(this.id, this.msgResponseId,
-            WIDGET_INTERFACE, 'update', { text: `Clone error: ${msg.slice(0, 50)}` }));
+            'update', { text: `Clone error: ${msg.slice(0, 50)}` }));
         } catch { /* widget may be gone */ }
       }
     }
@@ -1305,7 +1305,7 @@ export class RegistryBrowser extends Abject {
 
     try {
       await this.request(request(this.id, this.factoryId,
-        FACTORY_INTERFACE, 'kill', { objectId }));
+        'kill', { objectId }));
     } catch { /* object may already be gone */ }
 
     this.cachedObjects = await this.registryList();
@@ -1325,7 +1325,7 @@ export class RegistryBrowser extends Abject {
   private async setWidgetDisabled(id: AbjectId | undefined, disabled: boolean): Promise<void> {
     if (!id) return;
     try {
-      await this.request(request(this.id, id, WIDGET_INTERFACE, 'update', { style: { disabled } }));
+      await this.request(request(this.id, id, 'update', { style: { disabled } }));
     } catch { /* widget gone */ }
   }
 
@@ -1336,7 +1336,7 @@ export class RegistryBrowser extends Abject {
     if (!this.selectedMethod || !this.detailObjectId || !this.msgPayloadId) return;
 
     const payloadText = await this.request<string>(
-      request(this.id, this.msgPayloadId, WIDGET_INTERFACE, 'getValue', {})
+      request(this.id, this.msgPayloadId, 'getValue', {})
     );
 
     let msgPayload: unknown = {};
@@ -1346,7 +1346,7 @@ export class RegistryBrowser extends Abject {
       } catch {
         if (this.msgResponseId) {
           await this.request(
-            request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
+            request(this.id, this.msgResponseId, 'update', {
               text: 'Error: Invalid JSON payload',
             })
           );
@@ -1361,7 +1361,7 @@ export class RegistryBrowser extends Abject {
     // Show "Sending..." before the (potentially slow) request
     if (this.msgResponseId) {
       await this.request(
-        request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
+        request(this.id, this.msgResponseId, 'update', {
           text: 'Sending...',
         })
       );
@@ -1370,13 +1370,13 @@ export class RegistryBrowser extends Abject {
     try {
       const result = await this.request<unknown>(request(
         this.id, this.detailObjectId,
-        this.selectedMethod.interfaceId, this.selectedMethod.method, msgPayload
+        this.selectedMethod.method, msgPayload
       ));
       const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
       const display = resultStr.length > 60 ? resultStr.slice(0, 60) + '...' : resultStr;
       if (this.msgResponseId) {
         await this.request(
-          request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
+          request(this.id, this.msgResponseId, 'update', {
             text: `Result: ${display}`,
           })
         );
@@ -1387,7 +1387,7 @@ export class RegistryBrowser extends Abject {
       try {
         if (this.msgResponseId) {
           await this.request(
-            request(this.id, this.msgResponseId, WIDGET_INTERFACE, 'update', {
+            request(this.id, this.msgResponseId, 'update', {
               text: `Error: ${msg.slice(0, 60)}`,
             })
           );

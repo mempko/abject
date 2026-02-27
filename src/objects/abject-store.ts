@@ -15,10 +15,6 @@ import { require as precondition, invariant } from '../core/contracts.js';
 import { request } from '../core/message.js';
 
 const ABJECT_STORE_INTERFACE = 'abjects:abject-store' as InterfaceId;
-const STORAGE_INTERFACE = 'abjects:storage' as InterfaceId;
-const FACTORY_INTERFACE = 'abjects:factory' as InterfaceId;
-const REGISTRY_INTERFACE = 'abjects:registry' as InterfaceId;
-const WIDGETS_INTERFACE = 'abjects:widgets' as InterfaceId;
 
 const STORAGE_KEY = 'abject-store:snapshots';
 
@@ -54,8 +50,7 @@ export class AbjectStore extends Abject {
         description:
           'Persists user-created scriptable abject snapshots to Storage and restores them on startup.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: ABJECT_STORE_INTERFACE,
             name: 'AbjectStore',
             description: 'Abject persistence and restoration',
@@ -116,7 +111,6 @@ export class AbjectStore extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [],
         tags: ['system', 'persistence'],
@@ -175,7 +169,7 @@ export class AbjectStore extends Abject {
     if (!this.widgetManagerId) return undefined;
     try {
       const ws = await this.request<string | null>(
-        request(this.id, this.widgetManagerId, WIDGETS_INTERFACE, 'getObjectWorkspace', {
+        request(this.id, this.widgetManagerId, 'getObjectWorkspace', {
           objectId: this.id,
         })
       );
@@ -192,7 +186,7 @@ export class AbjectStore extends Abject {
   private async loadFromStorage(): Promise<void> {
     try {
       const stored = await this.request<AbjectSnapshot[] | null>(
-        request(this.id, this.storageId!, STORAGE_INTERFACE, 'get', { key: STORAGE_KEY })
+        request(this.id, this.storageId!, 'get', { key: STORAGE_KEY })
       );
       if (Array.isArray(stored)) {
         for (const snap of stored) {
@@ -211,7 +205,7 @@ export class AbjectStore extends Abject {
   private async persistToStorage(): Promise<void> {
     try {
       await this.request(
-        request(this.id, this.storageId!, STORAGE_INTERFACE, 'set', {
+        request(this.id, this.storageId!, 'set', {
           key: STORAGE_KEY,
           value: Array.from(this.snapshots.values()),
         })
@@ -248,7 +242,7 @@ export class AbjectStore extends Abject {
     if (this.registryId) {
       try {
         await this.request(request(this.id, this.registryId,
-          REGISTRY_INTERFACE, 'register', {
+          'register', {
             objectId, manifest, owner, source,
           }));
       } catch { /* best effort — registry may not be ready */ }
@@ -259,7 +253,7 @@ export class AbjectStore extends Abject {
     if (this.widgetManagerId && wsId) {
       try {
         await this.request(
-          request(this.id, this.widgetManagerId, WIDGETS_INTERFACE, 'setObjectWorkspace', {
+          request(this.id, this.widgetManagerId, 'setObjectWorkspace', {
             objectId: objectId as AbjectId,
             workspaceId: wsId,
           })
@@ -309,7 +303,7 @@ export class AbjectStore extends Abject {
     for (const snap of snapshotList) {
       try {
         const spawnResult = await this.request<SpawnResult>(
-          request(this.id, this.factoryId!, FACTORY_INTERFACE, 'spawn', {
+          request(this.id, this.factoryId!, 'spawn', {
             manifest: snap.manifest,
             source: snap.source,
             owner: snap.owner,
@@ -330,7 +324,7 @@ export class AbjectStore extends Abject {
           if (this.widgetManagerId && wsId) {
             try {
               await this.request(
-                request(this.id, this.widgetManagerId, WIDGETS_INTERFACE, 'setObjectWorkspace', {
+                request(this.id, this.widgetManagerId, 'setObjectWorkspace', {
                   objectId: spawnResult.objectId,
                   workspaceId: wsId,
                 })

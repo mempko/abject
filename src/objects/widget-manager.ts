@@ -23,7 +23,6 @@ import {
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
-import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 import { WindowAbject } from './widgets/window-abject.js';
 import { LabelWidget } from './widgets/label-widget.js';
 import { ButtonWidget } from './widgets/button-widget.js';
@@ -46,15 +45,11 @@ import {
   Rect,
   ThemeData,
   MIDNIGHT_BLOOM,
-  WIDGET_INTERFACE,
-  WINDOW_INTERFACE,
-  LAYOUT_INTERFACE,
 } from './widgets/widget-types.js';
 
 export type { WidgetStyle } from './widgets/widget-types.js';
 
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
-const UI_INTERFACE: InterfaceId = 'abjects:ui';
 
 /**
  * WidgetManager — spawns window and widget Abjects, returns their IDs.
@@ -92,8 +87,7 @@ export class WidgetManager extends Abject {
         description:
           'Widget factory — spawns WindowAbject and WidgetAbject instances on the bus. Primary API returns AbjectIds for direct message passing. Legacy shim for ScriptableAbjects.',
         version: '2.0.0',
-        interfaces: [
-          {
+        interface: {
             id: WIDGETS_INTERFACE,
             name: 'Widgets',
             description: 'Widget factory — spawns WindowAbject and WidgetAbject instances on the bus. ' +
@@ -424,7 +418,6 @@ export class WidgetManager extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [],
         tags: ['system', 'ui'],
@@ -710,7 +703,7 @@ export class WidgetManager extends Abject {
       // normally positioned by a layout). Canvas widgets always start at 0x0
       // and should fill the window content area when used without a layout.
       await this.request(
-        request(this.id, windowId, WINDOW_INTERFACE, 'addChild', {
+        request(this.id, windowId, 'addChild', {
           widgetId,
           rect: { x: 0, y: 0, width: 0, height: 0 },
         })
@@ -768,7 +761,7 @@ export class WidgetManager extends Abject {
     this.on('getDisplayInfo', async () => {
       require(this.uiServerId !== undefined, 'UIServer not set');
       return this.request<{ width: number; height: number }>(
-        request(this.id, this.uiServerId!, UI_INTERFACE, 'getDisplayInfo', {})
+        request(this.id, this.uiServerId!, 'getDisplayInfo', {})
       );
     });
 
@@ -778,7 +771,7 @@ export class WidgetManager extends Abject {
       const surfaceId = this.windowSurfaces.get(windowId);
       if (!surfaceId) return false;
       return this.request(request(this.id, this.windowManagerId,
-        'abjects:window-manager' as InterfaceId, 'raiseWindow', { surfaceId }));
+        'raiseWindow', { surfaceId }));
     });
 
     this.on('setObjectWorkspace', async (msg: AbjectMessage) => {
@@ -789,7 +782,7 @@ export class WidgetManager extends Abject {
         if (owner === objectId) {
           const surfaceId = this.windowSurfaces.get(windowId);
           if (surfaceId) {
-            await this.request(request(this.id, this.uiServerId!, UI_INTERFACE, 'setSurfaceWorkspace', { surfaceId, workspaceId }));
+            await this.request(request(this.id, this.uiServerId!, 'setSurfaceWorkspace', { surfaceId, workspaceId }));
           }
         }
       }
@@ -817,7 +810,7 @@ export class WidgetManager extends Abject {
         for (const id of this.spawnedWidgets) {
           try {
             await this.send(
-              event(this.id, id, WIDGET_INTERFACE, 'updateTheme', this.cachedTheme)
+              event(this.id, id, 'updateTheme', this.cachedTheme)
             );
           } catch { /* widget gone */ }
         }
@@ -825,7 +818,7 @@ export class WidgetManager extends Abject {
         for (const id of this.spawnedWindows) {
           try {
             await this.send(
-              event(this.id, id, WINDOW_INTERFACE, 'updateTheme', this.cachedTheme)
+              event(this.id, id, 'updateTheme', this.cachedTheme)
             );
           } catch { /* window gone */ }
         }
@@ -836,7 +829,7 @@ export class WidgetManager extends Abject {
       if (aspect === 'windowCloseRequested' || aspect === 'windowMinimized' || aspect === 'windowRestored') {
         const ownerId = this.windowOwners.get(fromId);
         if (ownerId) {
-          await this.send(event(this.id, ownerId, WIDGETS_INTERFACE, aspect, { windowId: fromId }));
+          await this.send(event(this.id, ownerId,aspect, { windowId: fromId }));
         }
         return;
       }
@@ -860,7 +853,7 @@ export class WidgetManager extends Abject {
 
       if (eventType) {
         await this.send(
-          event(this.id, ownerId, WIDGETS_INTERFACE, 'widgetEvent', {
+          event(this.id, ownerId, 'widgetEvent', {
             windowId: windowShimId,
             widgetId: shimId,
             type: eventType,
@@ -873,22 +866,22 @@ export class WidgetManager extends Abject {
       if (aspect === 'windowRect') {
         const { x, y, width, height } = value as { x: number; y: number; width: number; height: number };
         await this.send(
-          event(this.id, ownerId, WIDGETS_INTERFACE, 'windowMoved', { windowId: windowShimId, x, y })
+          event(this.id, ownerId, 'windowMoved', { windowId: windowShimId, x, y })
         );
         await this.send(
-          event(this.id, ownerId, WIDGETS_INTERFACE, 'windowResized', { windowId: windowShimId, width, height })
+          event(this.id, ownerId, 'windowResized', { windowId: windowShimId, width, height })
         );
       }
       if (aspect === 'windowMoved') {
         const { x, y } = value as { x: number; y: number };
         await this.send(
-          event(this.id, ownerId, WIDGETS_INTERFACE, 'windowMoved', { windowId: windowShimId, x, y })
+          event(this.id, ownerId, 'windowMoved', { windowId: windowShimId, x, y })
         );
       }
       if (aspect === 'windowResized') {
         const { width, height } = value as { width: number; height: number };
         await this.send(
-          event(this.id, ownerId, WIDGETS_INTERFACE, 'windowResized', { windowId: windowShimId, width, height })
+          event(this.id, ownerId, 'windowResized', { windowId: windowShimId, width, height })
         );
       }
     });
@@ -904,7 +897,7 @@ export class WidgetManager extends Abject {
     if (registryId) {
       try {
         await this.request(request(this.id, registryId,
-          'abjects:registry' as InterfaceId, 'subscribe', {}));
+          'subscribe', {}));
       } catch { /* best effort */ }
     }
 
@@ -913,7 +906,7 @@ export class WidgetManager extends Abject {
     if (this.themeId) {
       try {
         const theme = await this.request<ThemeData>(
-          request(this.id, this.themeId, 'abjects:theme' as InterfaceId, 'getTheme', {})
+          request(this.id, this.themeId, 'getTheme', {})
         );
         if (theme && typeof theme === 'object' && 'canvasBg' in theme) {
           this.cachedTheme = theme;
@@ -925,7 +918,7 @@ export class WidgetManager extends Abject {
       // Register as dependent to receive theme change notifications
       try {
         await this.request(
-          request(this.id, this.themeId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+          request(this.id, this.themeId, 'addDependent', {})
         );
       } catch {
         // Theme may not support dependents
@@ -937,7 +930,7 @@ export class WidgetManager extends Abject {
     if (!this.consoleId) return;
     try {
       await this.send(
-        request(this.id, this.consoleId, 'abjects:console' as InterfaceId, level, { message, data })
+        request(this.id, this.consoleId, level, { message, data })
       );
     } catch { /* logging should never break the caller */ }
   }
@@ -1194,19 +1187,19 @@ Handle them in your setupHandlers():
     // Tag the surface with the owner's workspace (if known)
     const ownerWs = this.objectWorkspaces.get(owner);
     if (ownerWs && win.surface) {
-      await this.request(request(this.id, this.uiServerId!, UI_INTERFACE, 'setSurfaceWorkspace', { surfaceId: win.surface, workspaceId: ownerWs }));
+      await this.request(request(this.id, this.uiServerId!, 'setSurfaceWorkspace', { surfaceId: win.surface, workspaceId: ownerWs }));
     }
 
     // Register as dependent of the window (for windowMoved/windowResized events)
     await this.request(
-      request(this.id, win.id, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+      request(this.id, win.id, 'addDependent', {})
     );
 
     // Register with WindowManager for z-order and drag/resize management
     if (this.windowManagerId && win.surface) {
       try {
         await this.request(request(this.id, this.windowManagerId,
-          'abjects:window-manager' as InterfaceId, 'registerWindow', {
+          'registerWindow', {
             surfaceId: win.surface, windowId: win.id, zIndex: options?.zIndex ?? 100,
             rect, chromeless: options?.chromeless ?? false,
             draggable: false,
@@ -1257,19 +1250,19 @@ Handle them in your setupHandlers():
     // Tag the surface with the owner's workspace (if known)
     const ownerWs = this.objectWorkspaces.get(owner);
     if (ownerWs && win.surface) {
-      await this.request(request(this.id, this.uiServerId!, UI_INTERFACE, 'setSurfaceWorkspace', { surfaceId: win.surface, workspaceId: ownerWs }));
+      await this.request(request(this.id, this.uiServerId!, 'setSurfaceWorkspace', { surfaceId: win.surface, workspaceId: ownerWs }));
     }
 
     // Register as dependent of the window (for window events)
     await this.request(
-      request(this.id, win.id, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+      request(this.id, win.id, 'addDependent', {})
     );
 
     // Register with WindowManager for z-order and drag/resize management
     if (this.windowManagerId && win.surface) {
       try {
         await this.request(request(this.id, this.windowManagerId,
-          'abjects:window-manager' as InterfaceId, 'registerWindow', {
+          'registerWindow', {
             surfaceId: win.surface, windowId: win.id, zIndex: options?.zIndex ?? 100,
             rect, chromeless: options?.chromeless ?? false,
             draggable: options?.draggable ?? false,
@@ -1295,14 +1288,14 @@ Handle them in your setupHandlers():
     if (this.windowManagerId) {
       try {
         this.send(event(this.id, this.windowManagerId,
-          'abjects:window-manager' as InterfaceId, 'unregisterWindow', { windowId }));
+          'unregisterWindow', { windowId }));
       } catch { /* WM may be gone */ }
     }
 
     try {
       console.debug(`[WidgetManager] sending destroy request to WindowAbject ${windowId}`);
       await this.request(
-        request(this.id, windowId, WINDOW_INTERFACE, 'destroy', {})
+        request(this.id, windowId, 'destroy', {})
       );
       console.debug(`[WidgetManager] WindowAbject ${windowId} destroyed`);
     } catch {
@@ -1352,7 +1345,7 @@ Handle them in your setupHandlers():
     // Add the layout as the window's child with a full-content rect
     // The window will update this rect on resize
     await this.request(
-      request(this.id, windowId, WINDOW_INTERFACE, 'addChild', {
+      request(this.id, windowId, 'addChild', {
         widgetId: layout.id,
         rect: { x: 0, y: 0, width: 0, height: 0 },
       })
@@ -1392,7 +1385,7 @@ Handle them in your setupHandlers():
     // Layout-managed widgets pass {0,0,0,0} and are positioned by their layout.
     if (rect.width > 0 || rect.height > 0) {
       await this.request(
-        request(this.id, windowId, WINDOW_INTERFACE, 'addChild', {
+        request(this.id, windowId, 'addChild', {
           widgetId: widget.id,
           rect,
         })
@@ -1415,14 +1408,14 @@ Handle them in your setupHandlers():
     if (this.windowManagerId) {
       try {
         this.send(event(this.id, this.windowManagerId,
-          'abjects:window-manager' as InterfaceId, 'unregisterWindow', { windowId: winAbjectId }));
+          'unregisterWindow', { windowId: winAbjectId }));
       } catch { /* WM may be gone */ }
     }
 
     // Send destroy message to WindowAbject (it will destroy all children)
     try {
       await this.request(
-        request(this.id, winAbjectId, WINDOW_INTERFACE, 'destroy', {})
+        request(this.id, winAbjectId, 'destroy', {})
       );
     } catch {
       // Window may already be stopped
@@ -1536,7 +1529,7 @@ Handle them in your setupHandlers():
 
     // Register WidgetManager as dependent of the widget (for event translation)
     await this.request(
-      request(this.id, widget.id, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+      request(this.id, widget.id, 'addDependent', {})
     );
 
     // Track shim mappings
@@ -1546,7 +1539,7 @@ Handle them in your setupHandlers():
 
     // Tell the WindowAbject to add this child
     await this.request(
-      request(this.id, winAbjectId, WINDOW_INTERFACE, 'addChild', {
+      request(this.id, winAbjectId, 'addChild', {
         widgetId: widget.id,
         rect: config.rect,
       })
@@ -1566,7 +1559,7 @@ Handle them in your setupHandlers():
 
     try {
       await this.request(
-        request(this.id, abjectId, WIDGET_INTERFACE, 'update', updates)
+        request(this.id, abjectId, 'update', updates)
       );
       return true;
     } catch {
@@ -1586,7 +1579,7 @@ Handle them in your setupHandlers():
       if (winAbjectId) {
         try {
           await this.request(
-            request(this.id, winAbjectId, WINDOW_INTERFACE, 'removeChild', { widgetId: abjectId })
+            request(this.id, winAbjectId, 'removeChild', { widgetId: abjectId })
           );
         } catch {
           // Window may be gone
@@ -1596,7 +1589,7 @@ Handle them in your setupHandlers():
 
     // Destroy the widget (must use request() so the reply is consumed)
     try {
-      await this.request(request(this.id, abjectId, WIDGET_INTERFACE, 'destroy', {}));
+      await this.request(request(this.id, abjectId, 'destroy', {}));
     } catch {
       // Widget may be gone
     }
@@ -1617,7 +1610,7 @@ Handle them in your setupHandlers():
 
     try {
       return await this.request<string>(
-        request(this.id, abjectId, WIDGET_INTERFACE, 'getValue', {})
+        request(this.id, abjectId, 'getValue', {})
       );
     } catch {
       return '';

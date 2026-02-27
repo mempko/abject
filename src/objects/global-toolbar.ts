@@ -9,7 +9,6 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 
 const GLOBAL_TOOLBAR_INTERFACE: InterfaceId = 'abjects:global-toolbar';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
@@ -37,8 +36,7 @@ export class GlobalToolbar extends Abject {
         description:
           'Persistent toolbar panel with quick-access buttons for system settings and peer network.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: GLOBAL_TOOLBAR_INTERFACE,
             name: 'GlobalToolbar',
             description: 'System toolbar UI',
@@ -69,7 +67,6 @@ export class GlobalToolbar extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [
           { capability: Capabilities.UI_SURFACE, reason: 'Display toolbar', required: true },
         ],
@@ -113,7 +110,7 @@ export class GlobalToolbar extends Abject {
         if (this.globalSettingsId) {
           try {
             await this.request(request(this.id, this.globalSettingsId,
-              GLOBAL_SETTINGS_INTERFACE, 'show', {}));
+              'show', {}));
           } catch (err) {
             console.warn('[GlobalToolbar] Failed to show GlobalSettings:', err);
           }
@@ -129,7 +126,7 @@ export class GlobalToolbar extends Abject {
         if (this.peerNetworkId) {
           try {
             await this.request(request(this.id, this.peerNetworkId,
-              PEER_NETWORK_INTERFACE, 'show', {}));
+              'show', {}));
           } catch (err) {
             console.warn('[GlobalToolbar] Failed to show PeerNetwork:', err);
           }
@@ -143,7 +140,7 @@ export class GlobalToolbar extends Abject {
     // Always destroy and rebuild (position may have changed)
     if (this.windowId) {
       await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
+        request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
           windowId: this.windowId,
         })
       );
@@ -168,7 +165,7 @@ export class GlobalToolbar extends Abject {
     this.currentHeight = barHeight;
 
     this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'createWindowAbject', {
         title: '',
         rect: { x: 8, y: yOffset, width: barWidth, height: barHeight },
         zIndex: 1000,
@@ -181,7 +178,7 @@ export class GlobalToolbar extends Abject {
 
     // Create root VBox layout
     this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+      request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
         margins: { top: padding, right: padding, bottom: padding, left: padding },
         spacing,
@@ -190,12 +187,12 @@ export class GlobalToolbar extends Abject {
 
     // Section label
     const labelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: '\u2699 System',
         style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: labelId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { width: btnW, height: labelH },
@@ -204,14 +201,14 @@ export class GlobalToolbar extends Abject {
     // Helper to add a fixed-size button
     const addBtn = async (text: string): Promise<AbjectId> => {
       const btnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+        request(this.id, this.widgetManagerId!, 'createButton', {
           windowId: this.windowId, rect: r0, text,
         })
       );
       await this.request(
-        request(this.id, btnId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+        request(this.id, btnId, 'addDependent', {})
       );
-      await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
         widgetId: btnId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { width: btnW, height: btnH },
@@ -229,7 +226,7 @@ export class GlobalToolbar extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
         windowId: this.windowId,
       })
     );

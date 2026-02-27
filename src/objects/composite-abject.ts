@@ -11,7 +11,6 @@ import {
   AbjectManifest,
   AbjectMessage,
   InterfaceDeclaration,
-  InterfaceId,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require as contractRequire, invariant } from '../core/contracts.js';
@@ -38,7 +37,7 @@ export interface CompositeSpec {
   name: string;
   description: string;
   version?: string;
-  interfaces: InterfaceDeclaration[];
+  interface: InterfaceDeclaration;
   children: CompositeChildSpec[];
   routes: Record<string, RouteEntry>;
   orchestrationSource?: string;
@@ -47,8 +46,6 @@ export interface CompositeSpec {
 }
 
 // ── Constants ───────────────────────────────────────────────────────
-
-const INTROSPECT_INTERFACE = 'abjects:introspect' as InterfaceId;
 
 export const COMPOSITE_ABJECT_ID = 'abjects:composite' as AbjectId;
 
@@ -75,7 +72,7 @@ export class CompositeAbject extends Abject {
         name: spec.name,
         description: spec.description,
         version: spec.version ?? '1.0.0',
-        interfaces: spec.interfaces,
+        interface: spec.interface,
         requiredCapabilities: [],
         tags,
       },
@@ -98,9 +95,8 @@ export class CompositeAbject extends Abject {
   // ── Routing setup ───────────────────────────────────────────────
 
   private setupRouting(): void {
-    for (const iface of this.spec.interfaces) {
-      for (const method of iface.methods) {
-        const routeKey = `${iface.id}::${method.name}`;
+    for (const method of this.spec.interface.methods) {
+        const routeKey = method.name;
         const route = this.spec.routes[routeKey];
 
         if (!route) continue;
@@ -142,7 +138,6 @@ export class CompositeAbject extends Abject {
             break;
           }
         }
-      }
     }
   }
 
@@ -158,17 +153,10 @@ export class CompositeAbject extends Abject {
       `No child with role '${role}' in composite '${this.spec.name}'`
     );
 
-    const childManifest = this.spec.children.find((c) => c.role === role)!.manifest;
-    const childIface =
-      childManifest.interfaces.length > 0
-        ? childManifest.interfaces[0].id
-        : ('' as InterfaceId);
-
     return this.request(
       request(
         this.id,
         childId!,
-        childIface,
         msg.routing.method ?? '',
         msg.payload
       )
@@ -187,19 +175,10 @@ export class CompositeAbject extends Abject {
         `No child with role '${role}' in composite '${this.spec.name}'`
       );
 
-      const childManifest = this.spec.children.find(
-        (c) => c.role === role
-      )!.manifest;
-      const childIface =
-        childManifest.interfaces.length > 0
-          ? childManifest.interfaces[0].id
-          : ('' as InterfaceId);
-
       return this.request(
         request(
           this.id,
           childId!,
-          childIface,
           msg.routing.method ?? '',
           msg.payload
         )
@@ -214,7 +193,6 @@ export class CompositeAbject extends Abject {
 
   private async child(
     role: string,
-    iface: string,
     method: string,
     payload: unknown
   ): Promise<unknown> {
@@ -225,7 +203,7 @@ export class CompositeAbject extends Abject {
     );
 
     return this.request(
-      request(this.id, childId!, iface as InterfaceId, method, payload)
+      request(this.id, childId!, method, payload)
     );
   }
 
@@ -288,7 +266,6 @@ export class CompositeAbject extends Abject {
           request(
             observerId,
             observedId!,
-            INTROSPECT_INTERFACE,
             'addDependent',
             {}
           )

@@ -9,7 +9,6 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { require as contractRequire, requireNonEmpty } from '../core/contracts.js';
-import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 
 const JOBMANAGER_INTERFACE: InterfaceId = 'abjects:job-manager';
 
@@ -51,8 +50,7 @@ export class JobManager extends Abject {
         description:
           'Universal headless job execution service. Any abject can submit code-execution jobs. Sequential FIFO queue with event broadcasting.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: JOBMANAGER_INTERFACE,
             name: 'JobManager',
             description: 'Job execution service',
@@ -96,7 +94,6 @@ export class JobManager extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [],
         tags: ['system', 'core'],
@@ -114,7 +111,7 @@ export class JobManager extends Abject {
     if (!this.consoleId) return;
     try {
       await this.send(
-        request(this.id, this.consoleId, 'abjects:console' as InterfaceId, level, { message, data })
+        request(this.id, this.consoleId, level, { message, data })
       );
     } catch { /* logging should never break the caller */ }
   }
@@ -127,7 +124,7 @@ export class JobManager extends Abject {
       }
       if (this._currentJobCallerId) {
         this.send(
-          event(this.id, this._currentJobCallerId, JOBMANAGER_INTERFACE, 'progress',
+          event(this.id, this._currentJobCallerId, 'progress',
             msg.payload ?? {})
         ).catch(() => {});
       }
@@ -279,12 +276,11 @@ export class JobManager extends Abject {
 
     const callFn = async (
       to: AbjectId | string | Promise<AbjectId>,
-      iface: string,
       method: string,
       payload: unknown = {},
     ) => {
       const resolved = await to;
-      const msg = request(this.id, resolved as AbjectId, iface as InterfaceId, method, payload);
+      const msg = request(this.id, resolved as AbjectId, method, payload);
       this._currentCallMsgId = msg.header.messageId;
       try {
         return await this.request<unknown>(msg, 120000);
@@ -296,7 +292,7 @@ export class JobManager extends Abject {
     const progressFn = async (message?: string) => {
       if (this._currentJobCallerId) {
         await this.send(
-          event(this.id, this._currentJobCallerId, JOBMANAGER_INTERFACE, 'progress',
+          event(this.id, this._currentJobCallerId, 'progress',
             { message: message ?? 'working' })
         ).catch(() => {});
       }

@@ -29,7 +29,7 @@ test.describe('CompositeAbject', () => {
         name: 'CalcWithMem',
         description: 'Calculator with memory',
         version: '1.0.0',
-        interfaces: [{
+        interface: {
           id: 'calc:with-memory',
           name: 'CalculatorWithMemory',
           description: 'Calc + mem',
@@ -38,14 +38,14 @@ test.describe('CompositeAbject', () => {
             { name: 'store', description: 'Store a value', parameters: [], returns: { kind: 'primitive', primitive: 'boolean' } },
             { name: 'recall', description: 'Recall stored value', parameters: [], returns: { kind: 'primitive', primitive: 'number' } },
           ],
-        }],
+        },
         children: [
           {
             role: 'calc',
             source: '({ add(msg) { return msg.payload.a + msg.payload.b; } })',
             manifest: {
               name: 'Calculator', description: 'Adds numbers', version: '1.0.0',
-              interfaces: [{ id: 'calc:math', name: 'Math', description: 'Math ops', methods: [{ name: 'add', description: 'add', parameters: [] }] }],
+              interface: { id: 'calc:math', name: 'Math', description: 'Math ops', methods: [{ name: 'add', description: 'add', parameters: [] }] },
               requiredCapabilities: [], tags: [],
             },
           },
@@ -54,15 +54,15 @@ test.describe('CompositeAbject', () => {
             source: '({ _value: 0, store(msg) { this._value = msg.payload.value; return true; }, recall() { return this._value; } })',
             manifest: {
               name: 'Memory', description: 'Stores a value', version: '1.0.0',
-              interfaces: [{ id: 'calc:storage', name: 'Storage', description: 'Storage ops', methods: [{ name: 'store', description: 'store', parameters: [] }, { name: 'recall', description: 'recall', parameters: [] }] }],
+              interface: { id: 'calc:storage', name: 'Storage', description: 'Storage ops', methods: [{ name: 'store', description: 'store', parameters: [] }, { name: 'recall', description: 'recall', parameters: [] }] },
               requiredCapabilities: [], tags: [],
             },
           },
         ],
         routes: {
-          'calc:with-memory::add': { strategy: 'delegate', target: 'calc' },
-          'calc:with-memory::store': { strategy: 'delegate', target: 'mem' },
-          'calc:with-memory::recall': { strategy: 'delegate', target: 'mem' },
+          'add': { strategy: 'delegate', target: 'calc' },
+          'store': { strategy: 'delegate', target: 'mem' },
+          'recall': { strategy: 'delegate', target: 'mem' },
         },
         tags: ['composite'],
       };
@@ -83,9 +83,9 @@ test.describe('CompositeAbject', () => {
         }
       });
 
-      function testRequest<T>(target: string, iface: string, method: string, payload: unknown): Promise<T> {
+      function testRequest<T>(target: string, method: string, payload: unknown): Promise<T> {
         return new Promise((resolve, reject) => {
-          const msg = request(BOOTSTRAP_ID, target, iface, method, payload);
+          const msg = request(BOOTSTRAP_ID, target, method, payload);
           pendingReplies.set(msg.header.messageId, {
             resolve: resolve as (v: unknown) => void, reject,
           });
@@ -95,22 +95,22 @@ test.describe('CompositeAbject', () => {
 
       try {
         // Spawn the composite
-        const spawnResult: any = await testRequest(factoryId, 'abjects:factory', 'spawn', {
+        const spawnResult: any = await testRequest(factoryId, 'spawn', {
           manifest: { name: spec.name, description: spec.description, version: '1.0.0',
-                      interfaces: spec.interfaces, requiredCapabilities: [], tags: ['composite'] },
+                      interface: spec.interface, requiredCapabilities: [], tags: ['composite'] },
           source: JSON.stringify(spec),
         });
 
         const compositeId = spawnResult.objectId;
 
         // Test add (delegates to calc child)
-        const addResult = await testRequest(compositeId, 'calc:with-memory', 'add', { a: 3, b: 4 });
+        const addResult = await testRequest(compositeId, 'add', { a: 3, b: 4 });
 
         // Test store (delegates to mem child)
-        const storeResult = await testRequest(compositeId, 'calc:with-memory', 'store', { value: 42 });
+        const storeResult = await testRequest(compositeId, 'store', { value: 42 });
 
         // Test recall (delegates to mem child)
-        const recallResult = await testRequest(compositeId, 'calc:with-memory', 'recall', {});
+        const recallResult = await testRequest(compositeId, 'recall', {});
 
         // Cleanup
         bus.removeReplyHandler(BOOTSTRAP_ID);
@@ -144,7 +144,7 @@ test.describe('CompositeAbject', () => {
         name: 'FanoutTest',
         description: 'Tests fanout routing',
         version: '1.0.0',
-        interfaces: [{
+        interface: {
           id: 'test:fanout',
           name: 'FanoutTest',
           description: 'Fanout test',
@@ -152,14 +152,14 @@ test.describe('CompositeAbject', () => {
             { name: 'computeAll', description: 'Compute all (array)', parameters: [], returns: { kind: 'primitive', primitive: 'number' } },
             { name: 'computeFirst', description: 'Compute first only', parameters: [], returns: { kind: 'primitive', primitive: 'number' } },
           ],
-        }],
+        },
         children: [
           {
             role: 'doubler',
             source: '({ computeAll(msg) { return msg.payload.x * 2; }, computeFirst(msg) { return msg.payload.x * 2; } })',
             manifest: {
               name: 'Doubler', description: 'Doubles', version: '1.0.0',
-              interfaces: [{ id: 'test:doubler', name: 'Doubler', description: 'Doubles', methods: [{ name: 'computeAll', description: 'computeAll', parameters: [] }, { name: 'computeFirst', description: 'computeFirst', parameters: [] }] }],
+              interface: { id: 'test:doubler', name: 'Doubler', description: 'Doubles', methods: [{ name: 'computeAll', description: 'computeAll', parameters: [] }, { name: 'computeFirst', description: 'computeFirst', parameters: [] }] },
               requiredCapabilities: [], tags: [],
             },
           },
@@ -168,14 +168,14 @@ test.describe('CompositeAbject', () => {
             source: '({ computeAll(msg) { return msg.payload.x * 3; }, computeFirst(msg) { return msg.payload.x * 3; } })',
             manifest: {
               name: 'Tripler', description: 'Triples', version: '1.0.0',
-              interfaces: [{ id: 'test:tripler', name: 'Tripler', description: 'Triples', methods: [{ name: 'computeAll', description: 'computeAll', parameters: [] }, { name: 'computeFirst', description: 'computeFirst', parameters: [] }] }],
+              interface: { id: 'test:tripler', name: 'Tripler', description: 'Triples', methods: [{ name: 'computeAll', description: 'computeAll', parameters: [] }, { name: 'computeFirst', description: 'computeFirst', parameters: [] }] },
               requiredCapabilities: [], tags: [],
             },
           },
         ],
         routes: {
-          'test:fanout::computeAll': { strategy: 'fanout', targets: ['doubler', 'tripler'], aggregate: 'array' },
-          'test:fanout::computeFirst': { strategy: 'fanout', targets: ['doubler', 'tripler'], aggregate: 'first' },
+          'computeAll': { strategy: 'fanout', targets: ['doubler', 'tripler'], aggregate: 'array' },
+          'computeFirst': { strategy: 'fanout', targets: ['doubler', 'tripler'], aggregate: 'first' },
         },
         tags: ['composite'],
       };
@@ -195,9 +195,9 @@ test.describe('CompositeAbject', () => {
         }
       });
 
-      function testRequest<T>(target: string, iface: string, method: string, payload: unknown): Promise<T> {
+      function testRequest<T>(target: string, method: string, payload: unknown): Promise<T> {
         return new Promise((resolve, reject) => {
-          const msg = request(BOOTSTRAP_ID, target, iface, method, payload);
+          const msg = request(BOOTSTRAP_ID, target, method, payload);
           pendingReplies.set(msg.header.messageId, {
             resolve: resolve as (v: unknown) => void, reject,
           });
@@ -206,19 +206,19 @@ test.describe('CompositeAbject', () => {
       }
 
       try {
-        const spawnResult: any = await testRequest(factoryId, 'abjects:factory', 'spawn', {
+        const spawnResult: any = await testRequest(factoryId, 'spawn', {
           manifest: { name: spec.name, description: spec.description, version: '1.0.0',
-                      interfaces: spec.interfaces, requiredCapabilities: [], tags: ['composite'] },
+                      interface: spec.interface, requiredCapabilities: [], tags: ['composite'] },
           source: JSON.stringify(spec),
         });
 
         const compositeId = spawnResult.objectId;
 
         // Fanout with array aggregation
-        const arrayResult: any = await testRequest(compositeId, 'test:fanout', 'computeAll', { x: 5 });
+        const arrayResult: any = await testRequest(compositeId, 'computeAll', { x: 5 });
 
         // Fanout with first aggregation
-        const firstResult: any = await testRequest(compositeId, 'test:fanout', 'computeFirst', { x: 5 });
+        const firstResult: any = await testRequest(compositeId, 'computeFirst', { x: 5 });
 
         bus.removeReplyHandler(BOOTSTRAP_ID);
         bus.unregister(BOOTSTRAP_ID);
@@ -253,27 +253,27 @@ test.describe('CompositeAbject', () => {
         name: 'LifecycleTest',
         description: 'Tests lifecycle',
         version: '1.0.0',
-        interfaces: [{
+        interface: {
           id: 'test:lifecycle',
           name: 'LifecycleTest',
           description: 'Lifecycle test',
           methods: [
             { name: 'echo', description: 'Echo', parameters: [], returns: { kind: 'primitive', primitive: 'string' } },
           ],
-        }],
+        },
         children: [
           {
             role: 'echoer',
             source: '({ echo(msg) { return msg.payload.text; } })',
             manifest: {
               name: 'Echoer', description: 'Echoes', version: '1.0.0',
-              interfaces: [{ id: 'test:echoer', name: 'Echoer', description: 'Echoes', methods: [{ name: 'echo', description: 'echo', parameters: [] }] }],
+              interface: { id: 'test:echoer', name: 'Echoer', description: 'Echoes', methods: [{ name: 'echo', description: 'echo', parameters: [] }] },
               requiredCapabilities: [], tags: [],
             },
           },
         ],
         routes: {
-          'test:lifecycle::echo': { strategy: 'delegate', target: 'echoer' },
+          'echo': { strategy: 'delegate', target: 'echoer' },
         },
         tags: ['composite'],
       };
@@ -293,9 +293,9 @@ test.describe('CompositeAbject', () => {
         }
       });
 
-      function testRequest<T>(target: string, iface: string, method: string, payload: unknown): Promise<T> {
+      function testRequest<T>(target: string, method: string, payload: unknown): Promise<T> {
         return new Promise((resolve, reject) => {
-          const msg = request(BOOTSTRAP_ID, target, iface, method, payload);
+          const msg = request(BOOTSTRAP_ID, target, method, payload);
           pendingReplies.set(msg.header.messageId, {
             resolve: resolve as (v: unknown) => void, reject,
           });
@@ -304,9 +304,9 @@ test.describe('CompositeAbject', () => {
       }
 
       try {
-        const spawnResult: any = await testRequest(factoryId, 'abjects:factory', 'spawn', {
+        const spawnResult: any = await testRequest(factoryId, 'spawn', {
           manifest: { name: spec.name, description: spec.description, version: '1.0.0',
-                      interfaces: spec.interfaces, requiredCapabilities: [], tags: ['composite'] },
+                      interface: spec.interface, requiredCapabilities: [], tags: ['composite'] },
           source: JSON.stringify(spec),
         });
 
@@ -316,10 +316,10 @@ test.describe('CompositeAbject', () => {
         const objectsBefore = abjects.registry.listObjects().length;
 
         // Verify it works
-        const echoResult = await testRequest(compositeId, 'test:lifecycle', 'echo', { text: 'hello' });
+        const echoResult = await testRequest(compositeId, 'echo', { text: 'hello' });
 
         // Kill the composite
-        await testRequest(factoryId, 'abjects:factory', 'kill', { objectId: compositeId });
+        await testRequest(factoryId, 'kill', { objectId: compositeId });
 
         // Wait for async cleanup
         await new Promise((resolve) => setTimeout(resolve, 200));
@@ -359,27 +359,27 @@ test.describe('CompositeAbject', () => {
         name: 'CloneTest',
         description: 'Tests cloning',
         version: '1.0.0',
-        interfaces: [{
+        interface: {
           id: 'test:clone',
           name: 'CloneTest',
           description: 'Clone test',
           methods: [
             { name: 'add', description: 'Add', parameters: [], returns: { kind: 'primitive', primitive: 'number' } },
           ],
-        }],
+        },
         children: [
           {
             role: 'adder',
             source: '({ add(msg) { return msg.payload.a + msg.payload.b; } })',
             manifest: {
               name: 'Adder', description: 'Adds', version: '1.0.0',
-              interfaces: [{ id: 'test:adder', name: 'Adder', description: 'Adds', methods: [{ name: 'add', description: 'add', parameters: [] }] }],
+              interface: { id: 'test:adder', name: 'Adder', description: 'Adds', methods: [{ name: 'add', description: 'add', parameters: [] }] },
               requiredCapabilities: [], tags: [],
             },
           },
         ],
         routes: {
-          'test:clone::add': { strategy: 'delegate', target: 'adder' },
+          'add': { strategy: 'delegate', target: 'adder' },
         },
         tags: ['composite'],
       };
@@ -399,9 +399,9 @@ test.describe('CompositeAbject', () => {
         }
       });
 
-      function testRequest<T>(target: string, iface: string, method: string, payload: unknown): Promise<T> {
+      function testRequest<T>(target: string, method: string, payload: unknown): Promise<T> {
         return new Promise((resolve, reject) => {
-          const msg = request(BOOTSTRAP_ID, target, iface, method, payload);
+          const msg = request(BOOTSTRAP_ID, target, method, payload);
           pendingReplies.set(msg.header.messageId, {
             resolve: resolve as (v: unknown) => void, reject,
           });
@@ -411,22 +411,22 @@ test.describe('CompositeAbject', () => {
 
       try {
         // Spawn original
-        const spawnResult: any = await testRequest(factoryId, 'abjects:factory', 'spawn', {
+        const spawnResult: any = await testRequest(factoryId, 'spawn', {
           manifest: { name: spec.name, description: spec.description, version: '1.0.0',
-                      interfaces: spec.interfaces, requiredCapabilities: [], tags: ['composite'] },
+                      interface: spec.interface, requiredCapabilities: [], tags: ['composite'] },
           source: JSON.stringify(spec),
         });
         const originalId = spawnResult.objectId;
 
         // Clone it
-        const cloneResult: any = await testRequest(factoryId, 'abjects:factory', 'clone', {
+        const cloneResult: any = await testRequest(factoryId, 'clone', {
           objectId: originalId,
         });
         const cloneId = cloneResult.objectId;
 
         // Both should work independently
-        const originalAdd = await testRequest(originalId, 'test:clone', 'add', { a: 1, b: 2 });
-        const cloneAdd = await testRequest(cloneId, 'test:clone', 'add', { a: 10, b: 20 });
+        const originalAdd = await testRequest(originalId, 'add', { a: 1, b: 2 });
+        const cloneAdd = await testRequest(cloneId, 'add', { a: 10, b: 20 });
 
         // They should have different IDs
         const differentIds = originalId !== cloneId;
@@ -464,7 +464,7 @@ test.describe('CompositeAbject', () => {
         name: 'ObserverTest',
         description: 'Tests inter-child observation',
         version: '1.0.0',
-        interfaces: [{
+        interface: {
           id: 'test:observer',
           name: 'ObserverTest',
           description: 'Observer test',
@@ -472,14 +472,14 @@ test.describe('CompositeAbject', () => {
             { name: 'notify', description: 'Notify', parameters: [], returns: { kind: 'primitive', primitive: 'boolean' } },
             { name: 'getLastChange', description: 'Get last change', parameters: [], returns: { kind: 'primitive', primitive: 'string' } },
           ],
-        }],
+        },
         children: [
           {
             role: 'publisher',
             source: '({ notify(msg) { this.changed("data", msg.payload.value); return true; } })',
             manifest: {
               name: 'Publisher', description: 'Publishes changes', version: '1.0.0',
-              interfaces: [{ id: 'test:publisher', name: 'Publisher', description: 'Publishes', methods: [{ name: 'notify', description: 'notify', parameters: [] }] }],
+              interface: { id: 'test:publisher', name: 'Publisher', description: 'Publishes', methods: [{ name: 'notify', description: 'notify', parameters: [] }] },
               requiredCapabilities: [], tags: [],
             },
           },
@@ -488,15 +488,15 @@ test.describe('CompositeAbject', () => {
             source: '({ _lastChange: null, changed(msg) { this._lastChange = msg.payload; }, getLastChange() { return this._lastChange; } })',
             manifest: {
               name: 'Subscriber', description: 'Subscribes to changes', version: '1.0.0',
-              interfaces: [{ id: 'test:subscriber', name: 'Subscriber', description: 'Subscribes', methods: [{ name: 'getLastChange', description: 'getLastChange', parameters: [] }] }],
+              interface: { id: 'test:subscriber', name: 'Subscriber', description: 'Subscribes', methods: [{ name: 'getLastChange', description: 'getLastChange', parameters: [] }] },
               requiredCapabilities: [], tags: [],
             },
             observes: ['publisher'],
           },
         ],
         routes: {
-          'test:observer::notify': { strategy: 'delegate', target: 'publisher' },
-          'test:observer::getLastChange': { strategy: 'delegate', target: 'subscriber' },
+          'notify': { strategy: 'delegate', target: 'publisher' },
+          'getLastChange': { strategy: 'delegate', target: 'subscriber' },
         },
         tags: ['composite'],
       };
@@ -516,9 +516,9 @@ test.describe('CompositeAbject', () => {
         }
       });
 
-      function testRequest<T>(target: string, iface: string, method: string, payload: unknown): Promise<T> {
+      function testRequest<T>(target: string, method: string, payload: unknown): Promise<T> {
         return new Promise((resolve, reject) => {
-          const msg = request(BOOTSTRAP_ID, target, iface, method, payload);
+          const msg = request(BOOTSTRAP_ID, target, method, payload);
           pendingReplies.set(msg.header.messageId, {
             resolve: resolve as (v: unknown) => void, reject,
           });
@@ -527,22 +527,22 @@ test.describe('CompositeAbject', () => {
       }
 
       try {
-        const spawnResult: any = await testRequest(factoryId, 'abjects:factory', 'spawn', {
+        const spawnResult: any = await testRequest(factoryId, 'spawn', {
           manifest: { name: spec.name, description: spec.description, version: '1.0.0',
-                      interfaces: spec.interfaces, requiredCapabilities: [], tags: ['composite'] },
+                      interface: spec.interface, requiredCapabilities: [], tags: ['composite'] },
           source: JSON.stringify(spec),
         });
 
         const compositeId = spawnResult.objectId;
 
         // Trigger change on publisher
-        await testRequest(compositeId, 'test:observer', 'notify', { value: 'hello-world' });
+        await testRequest(compositeId, 'notify', { value: 'hello-world' });
 
         // Wait for the changed event to propagate
         await new Promise((resolve) => setTimeout(resolve, 200));
 
         // Read subscriber's last change
-        const lastChange: any = await testRequest(compositeId, 'test:observer', 'getLastChange', {});
+        const lastChange: any = await testRequest(compositeId, 'getLastChange', {});
 
         bus.removeReplyHandler(BOOTSTRAP_ID);
         bus.unregister(BOOTSTRAP_ID);

@@ -6,7 +6,6 @@ import { v4 as uuidv4 } from 'uuid';
 import {
   AbjectMessage,
   AbjectId,
-  InterfaceId,
   MessageId,
   AbjectError,
   MessageType,
@@ -61,13 +60,11 @@ function createBaseMessage<T>(
   type: MessageType,
   from: AbjectId,
   to: AbjectId,
-  interfaceId: InterfaceId,
   payload: T,
   options: MessageOptions & { method?: string } = {}
 ): AbjectMessage<T> {
   requireNonEmpty(from, 'from');
   requireNonEmpty(to, 'to');
-  requireNonEmpty(interfaceId, 'interfaceId');
 
   return {
     header: {
@@ -80,7 +77,6 @@ function createBaseMessage<T>(
     routing: {
       from,
       to,
-      interface: interfaceId,
       method: options.method,
     },
     payload,
@@ -97,14 +93,13 @@ function createBaseMessage<T>(
 export function request<T>(
   from: AbjectId,
   to: AbjectId,
-  interfaceId: InterfaceId,
   method: string,
   payload: T,
   options: MessageOptions = {}
 ): AbjectMessage<T> {
   requireNonEmpty(method, 'method');
 
-  return createBaseMessage('request', from, to, interfaceId, payload, {
+  return createBaseMessage('request', from, to, payload, {
     ...options,
     method,
   });
@@ -127,7 +122,6 @@ export function reply<T>(
     'reply',
     originalMessage.routing.to,
     originalMessage.routing.from,
-    originalMessage.routing.interface,
     payload,
     {
       ...options,
@@ -143,14 +137,13 @@ export function reply<T>(
 export function event<T>(
   from: AbjectId,
   to: AbjectId,
-  interfaceId: InterfaceId,
   eventName: string,
   payload: T,
   options: MessageOptions = {}
 ): AbjectMessage<T> {
   requireNonEmpty(eventName, 'eventName');
 
-  return createBaseMessage('event', from, to, interfaceId, payload, {
+  return createBaseMessage('event', from, to, payload, {
     ...options,
     method: eventName,
   });
@@ -178,7 +171,6 @@ export function error(
     'error',
     originalMessage.routing.to,
     originalMessage.routing.from,
-    originalMessage.routing.interface,
     errorPayload,
     {
       correlationId: originalMessage.header.messageId,
@@ -204,7 +196,6 @@ export function errorFromException(
     'error',
     originalMessage.routing.to,
     originalMessage.routing.from,
-    originalMessage.routing.interface,
     errorPayload,
     {
       correlationId: originalMessage.header.messageId,

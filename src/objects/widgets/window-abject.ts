@@ -9,7 +9,6 @@
 import {
   AbjectId,
   AbjectMessage,
-  InterfaceId,
 } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
 import { request, event } from '../../core/message.js';
@@ -17,15 +16,11 @@ import {
   Rect,
   ThemeData,
   MIDNIGHT_BLOOM,
-  WIDGET_INTERFACE,
   WINDOW_INTERFACE,
-  LAYOUT_INTERFACE,
   TITLE_BAR_HEIGHT,
   TITLE_FONT,
   lightenColor,
 } from './widget-types.js';
-
-const UI_INTERFACE: InterfaceId = 'abjects:ui' as InterfaceId;
 
 export interface WindowConfig {
   title: string;
@@ -71,8 +66,7 @@ export class WindowAbject extends Abject {
         name: 'Window',
         description: 'Composite window morph — owns surface, contains child widgets',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: WINDOW_INTERFACE,
             name: 'Window',
             description: 'Window management and child widget coordination',
@@ -143,7 +137,6 @@ export class WindowAbject extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [],
         tags: ['widget', 'window'],
@@ -180,7 +173,7 @@ export class WindowAbject extends Abject {
       if (rect.width === 0 && rect.height === 0) {
         try {
           await this.request(
-            request(this.id, widgetId, WIDGET_INTERFACE, 'update', { rect: effectiveRect })
+            request(this.id, widgetId, 'update', { rect: effectiveRect })
           );
         } catch {
           // Widget setup may not be complete yet
@@ -241,7 +234,7 @@ export class WindowAbject extends Abject {
       if (this.destroying) return;
       if (this.renderScheduled) return;
       this.renderScheduled = true;
-      await this.send(event(this.id, this.id, WINDOW_INTERFACE, 'deferredRender', {}));
+      await this.send(event(this.id, this.id, 'deferredRender', {}));
     });
 
     this.on('deferredRender', async () => {
@@ -341,13 +334,13 @@ method calls on 'abjects:widgets' interface:
   protected async onInit(): Promise<void> {
     // Create surface via UIServer
     this.surfaceId = await this.request<string>(
-      request(this.id, this.uiServerId, UI_INTERFACE, 'createSurface', {
+      request(this.id, this.uiServerId, 'createSurface', {
         rect: this.rect,
         zIndex: this.zIndex,
       })
     );
     await this.request<boolean>(
-      request(this.id, this.uiServerId, UI_INTERFACE, 'focus', {
+      request(this.id, this.uiServerId, 'focus', {
         surfaceId: this.surfaceId,
       })
     );
@@ -370,7 +363,7 @@ method calls on 'abjects:widgets' interface:
     } finally {
       this.rendering = false;
       if (this.renderScheduled) {
-        this.send(event(this.id, this.id, WINDOW_INTERFACE, 'deferredRender', {}))
+        this.send(event(this.id, this.id, 'deferredRender', {}))
           .catch(() => { /* object may be stopping */ });
       }
     }
@@ -507,7 +500,7 @@ method calls on 'abjects:widgets' interface:
 
       try {
         const childCmds = await this.request<unknown[]>(
-          request(this.id, childId, WIDGET_INTERFACE, 'render', { surfaceId: sid, ox, oy })
+          request(this.id, childId, 'render', { surfaceId: sid, ox, oy })
         );
         if (Array.isArray(childCmds)) {
           commands.push(...childCmds);
@@ -523,7 +516,7 @@ method calls on 'abjects:widgets' interface:
 
     // Draw all commands to surface
     await this.request<boolean>(
-      request(this.id, this.uiServerId, UI_INTERFACE, 'draw', { commands })
+      request(this.id, this.uiServerId, 'draw', { commands })
     );
   }
 
@@ -573,7 +566,7 @@ method calls on 'abjects:widgets' interface:
       // Forward to the expanded select widget — let it handle dropdown hit-test
       try {
         const result = await this.request<{ consumed: boolean }>(
-          request(this.id, childId, WIDGET_INTERFACE, 'handleInput', {
+          request(this.id, childId, 'handleInput', {
             type: 'mousedown', x: cx, y: cy,
           })
         );
@@ -590,7 +583,7 @@ method calls on 'abjects:widgets' interface:
     if (this.focusedChildId) {
       try {
         await this.request(
-          request(this.id, this.focusedChildId, WIDGET_INTERFACE, 'setFocused', { focused: false })
+          request(this.id, this.focusedChildId, 'setFocused', { focused: false })
         );
       } catch {
         // Widget gone
@@ -608,7 +601,7 @@ method calls on 'abjects:widgets' interface:
           cy >= childRect.y && cy < childRect.y + childRect.height) {
         try {
           const result = await this.request<{ consumed: boolean; focusWidgetId?: AbjectId }>(
-            request(this.id, childId, WIDGET_INTERFACE, 'handleInput', {
+            request(this.id, childId, 'handleInput', {
               type: 'mousedown', x: cx, y: cy,
             })
           );
@@ -618,7 +611,7 @@ method calls on 'abjects:widgets' interface:
             const focusTarget = result.focusWidgetId ?? childId;
             this.focusedChildId = focusTarget;
             await this.request(
-              request(this.id, focusTarget, WIDGET_INTERFACE, 'setFocused', { focused: true })
+              request(this.id, focusTarget, 'setFocused', { focused: true })
             );
           }
         } catch {
@@ -632,7 +625,7 @@ method calls on 'abjects:widgets' interface:
     // request a drag from UIServer (two-phase grab for chromeless+draggable windows)
     if (!childConsumed && this.draggable) {
       await this.send(
-        event(this.id, this.uiServerId, UI_INTERFACE, 'requestDrag', {
+        event(this.id, this.uiServerId, 'requestDrag', {
           surfaceId: this.surfaceId,
         })
       );
@@ -650,7 +643,7 @@ method calls on 'abjects:widgets' interface:
     for (const childId of this.expandedSelects) {
       try {
         await this.request<{ consumed: boolean }>(
-          request(this.id, childId, WIDGET_INTERFACE, 'handleInput', {
+          request(this.id, childId, 'handleInput', {
             type: 'mousemove', x: cx, y: cy,
           })
         );
@@ -677,7 +670,7 @@ method calls on 'abjects:widgets' interface:
       if (this.hoveredChildId) {
         try {
           await this.request<{ consumed: boolean }>(
-            request(this.id, this.hoveredChildId, WIDGET_INTERFACE, 'handleInput', {
+            request(this.id, this.hoveredChildId, 'handleInput', {
               type: 'mouseleave',
             })
           );
@@ -692,7 +685,7 @@ method calls on 'abjects:widgets' interface:
       if (hitChildId) {
         try {
           await this.request<{ consumed: boolean }>(
-            request(this.id, hitChildId, WIDGET_INTERFACE, 'handleInput', {
+            request(this.id, hitChildId, 'handleInput', {
               type: 'mousemove', x: cx, y: cy,
             })
           );
@@ -704,7 +697,7 @@ method calls on 'abjects:widgets' interface:
       // Same child — forward mousemove with local coords
       try {
         await this.request<{ consumed: boolean }>(
-          request(this.id, hitChildId, WIDGET_INTERFACE, 'handleInput', {
+          request(this.id, hitChildId, 'handleInput', {
             type: 'mousemove', x: cx, y: cy,
           })
         );
@@ -727,7 +720,7 @@ method calls on 'abjects:widgets' interface:
 
     try {
       const result = await this.request<{ consumed: boolean }>(
-        request(this.id, this.focusedChildId, WIDGET_INTERFACE, 'handleInput', {
+        request(this.id, this.focusedChildId, 'handleInput', {
           type: 'keydown', key: e.key, code: e.code, modifiers: e.modifiers,
         })
       );
@@ -760,7 +753,7 @@ method calls on 'abjects:widgets' interface:
           cy >= childRect.y && cy < childRect.y + childRect.height) {
         try {
           await this.request<{ consumed: boolean }>(
-            request(this.id, childId, WIDGET_INTERFACE, 'handleInput', {
+            request(this.id, childId, 'handleInput', {
               type: 'wheel', x: cx, y: cy, deltaY: e.deltaY,
             })
           );
@@ -777,7 +770,7 @@ method calls on 'abjects:widgets' interface:
 
     try {
       await this.request<{ consumed: boolean }>(
-        request(this.id, this.focusedChildId, WIDGET_INTERFACE, 'handleInput', {
+        request(this.id, this.focusedChildId, 'handleInput', {
           type: 'paste', pasteText,
         })
       );
@@ -806,7 +799,7 @@ method calls on 'abjects:widgets' interface:
       // Unfocus current
       try {
         await this.request(
-          request(this.id, this.focusedChildId, WIDGET_INTERFACE, 'setFocused', { focused: false })
+          request(this.id, this.focusedChildId, 'setFocused', { focused: false })
         );
       } catch {
         // Widget gone
@@ -816,7 +809,7 @@ method calls on 'abjects:widgets' interface:
       this.focusedChildId = nextId;
       try {
         await this.request(
-          request(this.id, nextId, WIDGET_INTERFACE, 'setFocused', { focused: true })
+          request(this.id, nextId, 'setFocused', { focused: true })
         );
       } catch {
         // Widget gone
@@ -836,7 +829,7 @@ method calls on 'abjects:widgets' interface:
     for (const childId of this.children) {
       try {
         const nested = await this.request<AbjectId[]>(
-          request(this.id, childId, LAYOUT_INTERFACE, 'getFocusableWidgets', {})
+          request(this.id, childId, 'getFocusableWidgets', {})
         );
         if (Array.isArray(nested) && nested.length > 0) {
           result.push(...nested);
@@ -873,7 +866,7 @@ method calls on 'abjects:widgets' interface:
 
       try {
         await this.request(
-          request(this.id, childId, WIDGET_INTERFACE, 'update', { rect: newRect })
+          request(this.id, childId, 'update', { rect: newRect })
         );
       } catch {
         // Widget gone
@@ -892,7 +885,7 @@ method calls on 'abjects:widgets' interface:
     for (const childId of this.children) {
       try {
         console.debug(`[WindowAbject:${this.id}] destroying child ${childId}`);
-        await this.request(request(this.id, childId, WIDGET_INTERFACE, 'destroy', {}));
+        await this.request(request(this.id, childId, 'destroy', {}));
       } catch {
         // Child may already be gone
       }
@@ -906,7 +899,7 @@ method calls on 'abjects:widgets' interface:
     if (this.surfaceId) {
       console.debug(`[WindowAbject:${this.id}] destroying surface ${this.surfaceId}`);
       await this.request<boolean>(
-        request(this.id, this.uiServerId, UI_INTERFACE, 'destroySurface', {
+        request(this.id, this.uiServerId, 'destroySurface', {
           surfaceId: this.surfaceId,
         })
       );

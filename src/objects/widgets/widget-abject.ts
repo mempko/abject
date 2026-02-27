@@ -9,7 +9,6 @@
 import {
   AbjectId,
   AbjectMessage,
-  InterfaceId,
   InterfaceDeclaration,
 } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
@@ -21,11 +20,9 @@ import {
   ThemeData,
   MIDNIGHT_BLOOM,
   WIDGET_INTERFACE,
-  WINDOW_INTERFACE,
   WIDGET_FONT,
 } from './widget-types.js';
 
-const UI_INTERFACE: InterfaceId = 'abjects:ui' as InterfaceId;
 
 /**
  * Build a CSS font string from a WidgetStyle.
@@ -124,7 +121,7 @@ export abstract class WidgetAbject extends Abject {
         name: `${config.type.charAt(0).toUpperCase() + config.type.slice(1)}Widget`,
         description: `${config.type} widget Abject`,
         version: '1.0.0',
-        interfaces: [WIDGET_INTERFACE_DECL],
+        interface: WIDGET_INTERFACE_DECL,
         requiredCapabilities: [],
         providedCapabilities: [],
         tags: ['widget', config.type],
@@ -211,7 +208,7 @@ export abstract class WidgetAbject extends Abject {
   protected async measureText(surfaceId: string, text: string, font?: string): Promise<number> {
     if (!text) return 0;
     return this.request<number>(
-      request(this.id, this.uiServerId, UI_INTERFACE, 'measureText', {
+      request(this.id, this.uiServerId, 'measureText', {
         surfaceId,
         text,
         font: font ?? WIDGET_FONT,
@@ -223,7 +220,7 @@ export abstract class WidgetAbject extends Abject {
    * Request parent window to redraw (sends childDirty event).
    */
   protected async requestRedraw(): Promise<void> {
-    await this.send(event(this.id, this.ownerId, WINDOW_INTERFACE, 'childDirty', {
+    await this.send(event(this.id, this.ownerId, 'childDirty', {
       widgetId: this.id,
     }));
   }

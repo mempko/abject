@@ -42,8 +42,7 @@ export class HttpClient extends Abject {
         description:
           'Provides HTTP request capabilities. Objects can make GET, POST, PUT, DELETE requests to external APIs.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: HTTP_INTERFACE,
             name: 'HttpClient',
             description: 'HTTP request operations',
@@ -122,6 +121,33 @@ export class HttpClient extends Abject {
                 returns: { kind: 'reference', reference: 'HttpResponse' },
               },
               {
+                name: 'getBase64',
+                description: 'Fetch a URL and return its content as a base64 data URI. Useful for fetching images or binary files.',
+                parameters: [
+                  {
+                    name: 'url',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'URL to fetch',
+                  },
+                  {
+                    name: 'headers',
+                    type: { kind: 'object', properties: {} },
+                    description: 'Request headers',
+                    optional: true,
+                  },
+                ],
+                returns: {
+                  kind: 'object',
+                  properties: {
+                    dataUri: { kind: 'primitive', primitive: 'string' },
+                    mimeType: { kind: 'primitive', primitive: 'string' },
+                    size: { kind: 'primitive', primitive: 'number' },
+                    ok: { kind: 'primitive', primitive: 'boolean' },
+                    status: { kind: 'primitive', primitive: 'number' },
+                  },
+                },
+              },
+              {
                 name: 'postJson',
                 description: 'Make a POST request with JSON body',
                 parameters: [
@@ -140,7 +166,6 @@ export class HttpClient extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [Capabilities.HTTP_REQUEST],
         tags: ['capability', 'http', 'network'],
@@ -196,6 +221,22 @@ export class HttpClient extends Abject {
         headers?: Record<string, string>;
       };
       this.makeRequest({ method: 'POST', url, body, headers }).then(
+        (result) => this.sendDeferredReply(msg, result).catch(() => {}),
+        (err) => {
+          this.send(error(msg, 'HTTP_ERROR',
+            err instanceof Error ? err.message : String(err)
+          )).catch(() => {});
+        },
+      );
+      return DEFERRED_REPLY;
+    });
+
+    this.on('getBase64', async (msg: AbjectMessage) => {
+      const { url, headers } = msg.payload as {
+        url: string;
+        headers?: Record<string, string>;
+      };
+      this.fetchBase64(url, headers).then(
         (result) => this.sendDeferredReply(msg, result).catch(() => {}),
         (err) => {
           this.send(error(msg, 'HTTP_ERROR',
@@ -297,6 +338,68 @@ export class HttpClient extends Abject {
   }
 
   /**
+   * Fetch a URL and return its content as a base64 data URI.
+   */
+  async fetchBase64(
+    url: string,
+    headers?: Record<string, string>
+  ): Promise<{ dataUri: string; mimeType: string; size: number; ok: boolean; status: number }> {
+    const parsed = new URL(url);
+    this.validateDomain(parsed.hostname);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+    try {
+      const response = await fetch(url, {
+        headers,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        return {
+          dataUri: '',
+          mimeType: '',
+          size: 0,
+          ok: false,
+          status: response.status,
+        };
+      }
+
+      const blob = await response.blob();
+      const arrayBuffer = await blob.arrayBuffer();
+      const mimeType = blob.type || 'application/octet-stream';
+
+      // Use Buffer in Node.js for efficiency, btoa for browser
+      let b64: string;
+      if (typeof Buffer !== 'undefined') {
+        b64 = Buffer.from(arrayBuffer).toString('base64');
+      } else {
+        const bytes = new Uint8Array(arrayBuffer);
+        let binary = '';
+        for (let i = 0; i < bytes.length; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        b64 = btoa(binary);
+      }
+
+      const dataUri = `data:${mimeType};base64,${b64}`;
+
+      return {
+        dataUri,
+        mimeType,
+        size: arrayBuffer.byteLength,
+        ok: true,
+        status: response.status,
+      };
+    } catch (err) {
+      clearTimeout(timeoutId);
+      throw err;
+    }
+  }
+
+  /**
    * Validate that a domain is allowed.
    */
   private validateDomain(hostname: string): void {
@@ -359,6 +462,14 @@ export class HttpClient extends Abject {
     { method: 'PUT', url: 'https://api.example.com/items/1',
       headers: { 'Authorization': 'Bearer token' },
       body: '{"name":"updated"}', timeout: 10000 });
+
+### Fetch as Base64 Data URI (for images/binary)
+
+  const result = await this.call(
+    this.dep('HttpClient'), 'abjects:http', 'getBase64',
+    { url: 'https://example.com/image.png' });
+  // result = { dataUri: 'data:image/png;base64,...', mimeType: 'image/png', size: 12345, ok: true, status: 200 }
+  // Use dataUri with the 'imageUrl' draw command to display images on a surface.
 
 ### Response Structure
 

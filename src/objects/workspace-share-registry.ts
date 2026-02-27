@@ -10,7 +10,6 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { invariant } from '../core/contracts.js';
-import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 import type { SharedWorkspaceInfo } from './workspace-manager.js';
 
 const WORKSPACE_SHARE_REGISTRY_INTERFACE: InterfaceId = 'abjects:workspace-share-registry';
@@ -55,8 +54,7 @@ export class WorkspaceShareRegistry extends Abject {
         description:
           'Manages workspace sharing metadata and handles peer discovery queries for shared workspaces.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: WORKSPACE_SHARE_REGISTRY_INTERFACE,
             name: 'WorkspaceShareRegistry',
             description: 'Workspace sharing and discovery',
@@ -101,7 +99,6 @@ export class WorkspaceShareRegistry extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [],
         tags: ['system', 'peer'],
@@ -196,7 +193,7 @@ export class WorkspaceShareRegistry extends Abject {
     if (this.identityId) {
       try {
         const identity = await this.request<{ peerId: string; name: string }>(
-          request(this.id, this.identityId, IDENTITY_INTERFACE, 'exportPublicKeys', {})
+          request(this.id, this.identityId, 'exportPublicKeys', {})
         );
         this.localPeerId = identity.peerId;
         this.localPeerName = identity.name;
@@ -208,7 +205,7 @@ export class WorkspaceShareRegistry extends Abject {
     if (this.peerRegistryId) {
       try {
         await this.request(
-          request(this.id, this.peerRegistryId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+          request(this.id, this.peerRegistryId, 'addDependent', {})
         );
       } catch { /* PeerRegistry may not be ready */ }
     }
@@ -217,7 +214,7 @@ export class WorkspaceShareRegistry extends Abject {
     if (this.peerRouterId) {
       try {
         await this.request(
-          request(this.id, this.peerRouterId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+          request(this.id, this.peerRouterId, 'addDependent', {})
         );
       } catch { /* PeerRouter may not be ready */ }
     }
@@ -226,14 +223,14 @@ export class WorkspaceShareRegistry extends Abject {
     if (this.workspaceManagerId) {
       try {
         await this.request(
-          request(this.id, this.workspaceManagerId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+          request(this.id, this.workspaceManagerId, 'addDependent', {})
         );
       } catch { /* WorkspaceManager may not be ready */ }
 
       // Load initial shared workspaces
       try {
         const shared = await this.request<SharedWorkspaceInfo[]>(
-          request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'listSharedWorkspaces', {})
+          request(this.id, this.workspaceManagerId, 'listSharedWorkspaces', {})
         );
         for (const ws of shared) {
           this.localShared.set(ws.workspaceId, ws);
@@ -265,7 +262,6 @@ export class WorkspaceShareRegistry extends Abject {
         request(
           this.id,
           remoteWsrId,
-          WORKSPACE_SHARE_REGISTRY_INTERFACE,
           'handleWorkspaceQuery',
           { fromPeerId: this.localPeerId, hops: 0, visited: [this.localPeerId] },
         )
@@ -303,7 +299,7 @@ export class WorkspaceShareRegistry extends Abject {
     let contacts: Array<{ peerId: string; state: string }> = [];
     try {
       contacts = await this.request<Array<{ peerId: string; state: string }>>(
-        request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'listContacts', {})
+        request(this.id, this.peerRegistryId, 'listContacts', {})
       );
     } catch { return []; }
 
@@ -325,7 +321,6 @@ export class WorkspaceShareRegistry extends Abject {
           request(
             this.id,
             remoteWsrId,
-            WORKSPACE_SHARE_REGISTRY_INTERFACE,
             'handleWorkspaceQuery',
             { fromPeerId: this.localPeerId, hops: effectiveHops, visited },
           )
@@ -392,7 +387,7 @@ export class WorkspaceShareRegistry extends Abject {
       let contacts: Array<{ peerId: string; state: string }> = [];
       try {
         contacts = await this.request<Array<{ peerId: string; state: string }>>(
-          request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'listContacts', {})
+          request(this.id, this.peerRegistryId, 'listContacts', {})
         );
       } catch { /* no contacts available */ }
 
@@ -411,7 +406,6 @@ export class WorkspaceShareRegistry extends Abject {
             request(
               this.id,
               remoteWsrId,
-              WORKSPACE_SHARE_REGISTRY_INTERFACE,
               'handleWorkspaceQuery',
               { fromPeerId, hops: effectiveHops - 1, visited: newVisited },
             )
@@ -444,7 +438,7 @@ export class WorkspaceShareRegistry extends Abject {
     if (!this.peerRouterId) return null;
     try {
       const remoteId = await this.request<string | null>(
-        request(this.id, this.peerRouterId, PEER_ROUTER_INTERFACE,
+        request(this.id, this.peerRouterId,
           'resolveRemoteObject', {
             peerId,
             wellKnownId: 'abjects:workspace-share-registry',

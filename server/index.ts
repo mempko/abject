@@ -20,7 +20,7 @@ Object.assign(globalThis, {
   RTCDataChannel,
 });
 
-import { AbjectId, AbjectMessage, InterfaceId, SpawnResult } from '../src/core/types.js';
+import { AbjectId, AbjectMessage, SpawnResult } from '../src/core/types.js';
 import { getRuntime, resetRuntime } from '../src/runtime/runtime.js';
 import * as message from '../src/core/message.js';
 import { BackendUI } from './backend-ui.js';
@@ -35,6 +35,8 @@ import { Timer } from '../src/objects/capabilities/timer.js';
 import { Clipboard } from '../src/objects/capabilities/clipboard.js';
 import { Console } from '../src/objects/capabilities/console.js';
 import { FileSystem } from '../src/objects/capabilities/filesystem.js';
+import { WebParser } from '../src/objects/capabilities/web-parser.js';
+import { WebBrowser } from '../src/objects/capabilities/web-browser.js';
 import { Settings } from '../src/objects/settings.js';
 import { Taskbar } from '../src/objects/taskbar.js';
 import { RegistryBrowser } from '../src/objects/registry-browser.js';
@@ -109,7 +111,6 @@ async function main(): Promise<void> {
   const bus = runtime.messageBus;
   const factoryId = runtime.objectFactory.id;
   const registryId = runtime.objectRegistry.id;
-  const FACTORY_IFACE = 'abjects:factory' as InterfaceId;
   const BOOTSTRAP_ID = 'bootstrap' as AbjectId;
 
   // Register a temporary bootstrap sender on the bus for request-reply
@@ -127,9 +128,9 @@ async function main(): Promise<void> {
     }
   });
 
-  function bootstrapRequest<T>(target: AbjectId, iface: InterfaceId, method: string, payload: unknown): Promise<T> {
+  function bootstrapRequest<T>(target: AbjectId, method: string, payload: unknown): Promise<T> {
     return new Promise((resolve, reject) => {
-      const msg = message.request(BOOTSTRAP_ID, target, iface, method, payload);
+      const msg = message.request(BOOTSTRAP_ID, target, method, payload);
       pendingReplies.set(msg.header.messageId, {
         resolve: resolve as (v: unknown) => void, reject,
       });
@@ -138,8 +139,8 @@ async function main(): Promise<void> {
   }
 
   async function factorySpawn(name: string): Promise<AbjectId> {
-    const result = await bootstrapRequest<SpawnResult>(factoryId, FACTORY_IFACE, 'spawn', {
-      manifest: { name, description: '', version: '1.0.0', interfaces: [],
+    const result = await bootstrapRequest<SpawnResult>(factoryId, 'spawn', {
+      manifest: { name, description: '', version: '1.0.0',
                   requiredCapabilities: [], tags: ['system'] },
     });
     return result.objectId;
@@ -191,6 +192,8 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('PeerRouter', () => new PeerRouter());
   runtime.objectFactory.registerConstructor('WorkspaceShareRegistry', () => new WorkspaceShareRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceBrowser', () => new WorkspaceBrowser());
+  runtime.objectFactory.registerConstructor('WebParser', () => new WebParser());
+  runtime.objectFactory.registerConstructor('WebBrowser', () => new WebBrowser());
 
   // Mark worker-eligible constructors (only used when workerEnabled).
   // Per-workspace objects use registryHint to discover workspace dependencies.
@@ -213,13 +216,11 @@ async function main(): Promise<void> {
 
   // Spawn Supervisor early so it can supervise other objects
   const supervisorId = await factorySpawn('Supervisor');
-  const SUPERVISOR_IFACE = 'abjects:supervisor' as InterfaceId;
-  const HEALTH_IFACE = 'abjects:health-monitor' as InterfaceId;
 
   // Helper: spawn via Factory, register with Supervisor, return ID
   async function supervisedSpawn(name: string, restart: RestartType = 'permanent'): Promise<AbjectId> {
     const id = await factorySpawn(name);
-    await bootstrapRequest(supervisorId, SUPERVISOR_IFACE, 'addChild', {
+    await bootstrapRequest(supervisorId, 'addChild', {
       id, constructorName: name, restart,
     });
     return id;
@@ -232,7 +233,7 @@ async function main(): Promise<void> {
 
   // Configure LLM with API keys
   if (anthropicKey || openaiKey) {
-    await bootstrapRequest(llmId, 'abjects:llm' as InterfaceId, 'configure', {
+    await bootstrapRequest(llmId, 'configure', {
       anthropicApiKey: anthropicKey,
       openaiApiKey: openaiKey,
     });
@@ -243,6 +244,8 @@ async function main(): Promise<void> {
   const clipboardId = await supervisedSpawn('Clipboard');
   const consoleId = await supervisedSpawn('Console');
   const filesystemId = await supervisedSpawn('FileSystem');
+  const webParserId = await supervisedSpawn('WebParser');
+  const webBrowserId = await supervisedSpawn('WebBrowser');
   const windowManagerId = await supervisedSpawn('WindowManager');
   const widgetManagerId = await supervisedSpawn('WidgetManager');
 
@@ -280,7 +283,7 @@ async function main(): Promise<void> {
   // Boot workspaces BEFORE spawning WSR — boot() loads persisted workspaces
   // (including their access modes) so listSharedWorkspaces returns real data.
   // Cannot happen during onInit because Factory would deadlock processing our spawn request.
-  await bootstrapRequest(workspaceManagerId, 'abjects:workspace-manager' as InterfaceId, 'boot', {});
+  await bootstrapRequest(workspaceManagerId, 'boot', {});
 
   // WorkspaceShareRegistry must spawn AFTER boot() so listSharedWorkspaces finds shared workspaces
   const workspaceShareRegistryId = await supervisedSpawn('WorkspaceShareRegistry');
@@ -293,7 +296,8 @@ async function main(): Promise<void> {
   // ALL objects are now spawned and init'd — safe to start health monitoring.
   const monitoredIds = [
     httpClientId, llmId, storageId, timerId, clipboardId,
-    consoleId, filesystemId, windowManagerId, widgetManagerId,
+    consoleId, filesystemId, webParserId, webBrowserId,
+    windowManagerId, widgetManagerId,
     identityId, peerRegistryId, remoteRegistryId, peerRouterId,
     workspaceShareRegistryId, workspaceBrowserId,
     globalSettingsId, peerNetworkId, globalToolbarId,
@@ -301,10 +305,10 @@ async function main(): Promise<void> {
     workspaceSwitcherId, workspaceManagerId,
   ];
   for (const objId of monitoredIds) {
-    await bootstrapRequest(healthMonitorId, HEALTH_IFACE, 'monitorObject', { objectId: objId });
-    await bootstrapRequest(healthMonitorId, HEALTH_IFACE, 'markObjectReady', { objectId: objId });
+    await bootstrapRequest(healthMonitorId, 'monitorObject', { objectId: objId });
+    await bootstrapRequest(healthMonitorId, 'markObjectReady', { objectId: objId });
   }
-  await bootstrapRequest(healthMonitorId, HEALTH_IFACE, 'startMonitoring', {});
+  await bootstrapRequest(healthMonitorId, 'startMonitoring', {});
 
   // Clean up bootstrap handler
   bus.removeReplyHandler(BOOTSTRAP_ID);

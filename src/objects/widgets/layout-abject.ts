@@ -9,18 +9,15 @@
 import {
   AbjectId,
   AbjectMessage,
-  InterfaceId,
   InterfaceDeclaration,
 } from '../../core/types.js';
 import { request } from '../../core/message.js';
-import { INTROSPECT_INTERFACE_ID } from '../../core/introspect.js';
+
 import { WidgetAbject, WidgetConfig } from './widget-abject.js';
 import {
   Rect,
   LayoutChildConfig,
   SpacerConfig,
-  WIDGET_INTERFACE,
-  WINDOW_INTERFACE,
   LAYOUT_INTERFACE,
 } from './widget-types.js';
 
@@ -117,7 +114,7 @@ export abstract class LayoutAbject extends WidgetAbject {
       name: layoutType === 'vbox' ? 'VBoxLayout' : 'HBoxLayout',
       description: `${layoutType === 'vbox' ? 'Vertical' : 'Horizontal'} layout container`,
       version: '1.0.0',
-      interfaces: [LAYOUT_INTERFACE_DECL],
+      interface: LAYOUT_INTERFACE_DECL,
       requiredCapabilities: [],
       providedCapabilities: [],
       tags: ['widget', 'layout'],
@@ -156,11 +153,11 @@ export abstract class LayoutAbject extends WidgetAbject {
       // Use fire-and-forget send() to avoid deadlock: the window may be
       // concurrently requesting this layout to render, creating a circular wait.
       this.send(
-        request(this.id, this.ownerId, WINDOW_INTERFACE, 'removeChild', { widgetId })
+        request(this.id, this.ownerId, 'removeChild', { widgetId })
       );
       // Register as dependent to receive expanded/collapsed events from select widgets
       this.send(
-        request(this.id, widgetId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+        request(this.id, widgetId, 'addDependent', {})
       );
       if (this.rect.width > 0 && this.rect.height > 0) {
         await this.updateChildRects();
@@ -272,7 +269,7 @@ export abstract class LayoutAbject extends WidgetAbject {
       const childOy = oy + cr.rect.y;
       try {
         const childCmds = await this.request<unknown[]>(
-          request(this.id, cr.widgetId, WIDGET_INTERFACE, 'render', {
+          request(this.id, cr.widgetId, 'render', {
             surfaceId,
             ox: childOx,
             oy: childOy,
@@ -293,7 +290,7 @@ export abstract class LayoutAbject extends WidgetAbject {
       const childOy = oy + cr.rect.y;
       try {
         const childCmds = await this.request<unknown[]>(
-          request(this.id, cr.widgetId, WIDGET_INTERFACE, 'render', {
+          request(this.id, cr.widgetId, 'render', {
             surfaceId,
             ox: childOx,
             oy: childOy,
@@ -318,7 +315,7 @@ export abstract class LayoutAbject extends WidgetAbject {
       if (this.hoveredLayoutChildId) {
         try {
           await this.request<{ consumed: boolean }>(
-            request(this.id, this.hoveredLayoutChildId, WIDGET_INTERFACE, 'handleInput', {
+            request(this.id, this.hoveredLayoutChildId, 'handleInput', {
               type: 'mouseleave',
             })
           );
@@ -349,7 +346,7 @@ export abstract class LayoutAbject extends WidgetAbject {
         if (!this.expandedChildren.has(cr.widgetId)) continue;
         try {
           const result = await this.request<{ consumed: boolean; focusWidgetId?: AbjectId }>(
-            request(this.id, cr.widgetId, WIDGET_INTERFACE, 'handleInput', {
+            request(this.id, cr.widgetId, 'handleInput', {
               ...input,
               x: mx - cr.rect.x,
               y: my - cr.rect.y,
@@ -380,7 +377,7 @@ export abstract class LayoutAbject extends WidgetAbject {
             if (this.hoveredLayoutChildId) {
               try {
                 await this.request<{ consumed: boolean }>(
-                  request(this.id, this.hoveredLayoutChildId, WIDGET_INTERFACE, 'handleInput', {
+                  request(this.id, this.hoveredLayoutChildId, 'handleInput', {
                     type: 'mouseleave',
                   })
                 );
@@ -394,7 +391,7 @@ export abstract class LayoutAbject extends WidgetAbject {
           // Forward mousemove to hit child
           try {
             await this.request<{ consumed: boolean }>(
-              request(this.id, cr.widgetId, WIDGET_INTERFACE, 'handleInput', {
+              request(this.id, cr.widgetId, 'handleInput', {
                 ...input,
                 x: mx - cr.rect.x,
                 y: my - cr.rect.y,
@@ -411,7 +408,7 @@ export abstract class LayoutAbject extends WidgetAbject {
       if (!hitChildId && this.hoveredLayoutChildId) {
         try {
           await this.request<{ consumed: boolean }>(
-            request(this.id, this.hoveredLayoutChildId, WIDGET_INTERFACE, 'handleInput', {
+            request(this.id, this.hoveredLayoutChildId, 'handleInput', {
               type: 'mouseleave',
             })
           );
@@ -428,7 +425,7 @@ export abstract class LayoutAbject extends WidgetAbject {
           my >= cr.rect.y && my < cr.rect.y + cr.rect.height) {
         try {
           const result = await this.request<{ consumed: boolean; focusWidgetId?: AbjectId }>(
-            request(this.id, cr.widgetId, WIDGET_INTERFACE, 'handleInput', {
+            request(this.id, cr.widgetId, 'handleInput', {
               ...input,
               x: mx - cr.rect.x,
               y: my - cr.rect.y,
@@ -479,7 +476,7 @@ export abstract class LayoutAbject extends WidgetAbject {
     for (const cr of childRects) {
       try {
         await this.request(
-          request(this.id, cr.widgetId, WIDGET_INTERFACE, 'update', {
+          request(this.id, cr.widgetId, 'update', {
             rect: { x: 0, y: 0, width: cr.rect.width, height: cr.rect.height },
           })
         );
@@ -501,7 +498,7 @@ export abstract class LayoutAbject extends WidgetAbject {
       // Try to get focusable widgets from this child (if it's a layout)
       try {
         const nested = await this.request<AbjectId[]>(
-          request(this.id, child.widgetId, LAYOUT_INTERFACE, 'getFocusableWidgets', {})
+          request(this.id, child.widgetId, 'getFocusableWidgets', {})
         );
         if (Array.isArray(nested) && nested.length > 0) {
           result.push(...nested);

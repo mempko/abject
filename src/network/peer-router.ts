@@ -8,7 +8,7 @@
  * Remote well-known objects are resolved to UUIDs via `resolveRemoteObject`.
  */
 
-import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
+import { AbjectId, AbjectMessage } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request as createRequest, error as createError } from '../core/message.js';
@@ -17,10 +17,7 @@ import type { PeerId } from '../core/identity.js';
 import type { PeerRegistry } from '../objects/peer-registry.js';
 import type { WorkspaceAccessMode } from '../objects/workspace-manager.js';
 
-const PEER_ROUTER_INTERFACE = 'abjects:peer-router' as InterfaceId;
-const PEER_REGISTRY_INTERFACE = 'abjects:peer-registry' as InterfaceId;
-const WORKSPACE_MANAGER_INTERFACE = 'abjects:workspace-manager' as InterfaceId;
-const INTROSPECT_INTERFACE = 'abjects:introspect' as InterfaceId;
+const PEER_ROUTER_INTERFACE = 'abjects:peer-router';
 
 export const PEER_ROUTER_ID = 'abjects:peer-router' as AbjectId;
 
@@ -74,8 +71,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         description:
           'Transparent multi-hop message router with permission-aware route propagation. Routes messages to remote peers based on AbjectId, enforces workspace access permissions on inbound messages.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: PEER_ROUTER_INTERFACE,
             name: 'PeerRouter',
             description: 'Message routing and route management',
@@ -166,7 +162,6 @@ export class PeerRouter extends Abject implements MessageInterceptor {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [],
         tags: ['system', 'peer'],
@@ -295,7 +290,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     if (this.peerRegistryId) {
       try {
         await this.request(
-          createRequest(this.id, this.peerRegistryId, INTROSPECT_INTERFACE, 'addDependent', {}),
+          createRequest(this.id, this.peerRegistryId, 'addDependent', {}),
         );
         console.log('[PeerRouter] subscribed to PeerRegistry events');
       } catch { /* PeerRegistry may not support addDependent yet */ }
@@ -305,7 +300,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     if (this.workspaceManagerId) {
       try {
         await this.request(
-          createRequest(this.id, this.workspaceManagerId, INTROSPECT_INTERFACE, 'addDependent', {}),
+          createRequest(this.id, this.workspaceManagerId, 'addDependent', {}),
         );
       } catch { /* WorkspaceManager may not be ready yet */ }
     }
@@ -503,7 +498,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         whitelist: string[];
       } | null>(
         createRequest(
-          this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE,
+          this.id, this.workspaceManagerId,
           'findWorkspaceForObject', { objectId: targetId },
         ),
       );
@@ -628,7 +623,6 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     const announcement = createRequest(
       this.id,
       PEER_ROUTER_ID,
-      PEER_ROUTER_INTERFACE,
       'handleRouteAnnouncement',
       { routes: announcedRoutes, fromPeerId: localPeerId },
     );
@@ -678,7 +672,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       this.workspaceManagerId = (await this.discoverDep('WorkspaceManager')) ?? undefined;
       if (this.workspaceManagerId) {
         this.request(
-          createRequest(this.id, this.workspaceManagerId, INTROSPECT_INTERFACE, 'addDependent', {}),
+          createRequest(this.id, this.workspaceManagerId, 'addDependent', {}),
         ).catch(() => { /* best-effort */ });
       }
     }
@@ -694,7 +688,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
           childIds?: AbjectId[];
         }>>(
           createRequest(
-            this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE,
+            this.id, this.workspaceManagerId,
             'listWorkspacesDetailed', {},
           ),
         );

@@ -37,8 +37,7 @@ export class FileSystem extends Abject {
         description:
           'Virtual in-memory filesystem. Objects can create, read, write, and delete files and directories.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: FILESYSTEM_INTERFACE,
             name: 'FileSystem',
             description: 'Virtual filesystem operations',
@@ -155,7 +154,6 @@ export class FileSystem extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [
           Capabilities.FILESYSTEM_READ,

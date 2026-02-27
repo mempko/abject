@@ -18,13 +18,66 @@ import {
   AbjectId,
   AbjectManifest,
   AbjectMessage,
+  MethodDeclaration,
+  EventDeclaration,
   InterfaceId,
 } from '../core/types.js';
 import { Abject, MessageHandlerFn } from '../core/abject.js';
 import { require as contractRequire } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 
-export const EDITABLE_INTERFACE_ID = 'abjects:editable' as InterfaceId;
+/** Editable methods merged into every ScriptableAbject's interface */
+const EDITABLE_METHODS: MethodDeclaration[] = [
+  {
+    name: 'getSource',
+    description: 'Get the current handler source code',
+    parameters: [],
+    returns: { kind: 'primitive' as const, primitive: 'string' as const },
+  },
+  {
+    name: 'updateSource',
+    description: 'Replace handler source code at runtime',
+    parameters: [
+      {
+        name: 'source',
+        type: { kind: 'primitive' as const, primitive: 'string' as const },
+        description: 'New handler map source',
+      },
+    ],
+    returns: {
+      kind: 'object' as const,
+      properties: {
+        success: { kind: 'primitive' as const, primitive: 'boolean' as const },
+        error: { kind: 'primitive' as const, primitive: 'string' as const },
+      },
+    },
+  },
+  {
+    name: 'probe',
+    description: 'Validate that all dependencies referenced in source can be resolved',
+    parameters: [],
+    returns: {
+      kind: 'object' as const,
+      properties: {
+        success: { kind: 'primitive' as const, primitive: 'boolean' as const },
+        resolvedDeps: { kind: 'array' as const, elementType: { kind: 'primitive' as const, primitive: 'string' as const } },
+        missingDeps: { kind: 'array' as const, elementType: { kind: 'primitive' as const, primitive: 'string' as const } },
+        error: { kind: 'primitive' as const, primitive: 'string' as const },
+      },
+    },
+  },
+];
+
+const EDITABLE_EVENTS: EventDeclaration[] = [
+  {
+    name: 'sourceUpdated',
+    description: 'Emitted when source code is successfully updated',
+    payload: { kind: 'object' as const, properties: {
+      objectId: { kind: 'primitive' as const, primitive: 'string' as const },
+      methods: { kind: 'array' as const, elementType: { kind: 'primitive' as const, primitive: 'string' as const } },
+    }},
+  },
+];
 
 /**
  * An Abject whose handlers are compiled from a JavaScript source string.
@@ -38,48 +91,21 @@ export class ScriptableAbject extends Abject {
   private _depCache: Record<string, AbjectId> = {};
 
   constructor(manifest: AbjectManifest, source: string, owner: AbjectId) {
-    // Append the editable interface and 'scriptable' tag
-    const editableInterface = {
-      id: EDITABLE_INTERFACE_ID,
-      name: 'Editable',
-      description: 'Live-editable handler source',
-      methods: [
-        {
-          name: 'getSource',
-          description: 'Get the current handler source code',
-          parameters: [],
-          returns: { kind: 'primitive' as const, primitive: 'string' as const },
-        },
-        {
-          name: 'updateSource',
-          description: 'Replace handler source code at runtime',
-          parameters: [
-            {
-              name: 'source',
-              type: { kind: 'primitive' as const, primitive: 'string' as const },
-              description: 'New handler map source',
-            },
-          ],
-          returns: {
-            kind: 'object' as const,
-            properties: {
-              success: { kind: 'primitive' as const, primitive: 'boolean' as const },
-              error: { kind: 'primitive' as const, primitive: 'string' as const },
-            },
-          },
-        },
-      ],
-    };
-
     const tags = [...(manifest.tags ?? [])];
     if (!tags.includes('scriptable')) {
       tags.push('scriptable');
     }
 
+    // Merge editable methods and events into the single interface
+    const iface = manifest.interface;
     super({
       manifest: {
         ...manifest,
-        interfaces: [...(manifest.interfaces ?? []), editableInterface],
+        interface: {
+          ...iface,
+          methods: [...iface.methods, ...EDITABLE_METHODS],
+          events: [...(iface.events ?? []), ...EDITABLE_EVENTS],
+        },
         tags,
       },
     });
@@ -124,6 +150,38 @@ export class ScriptableAbject extends Abject {
   private setupEditableHandlers(): void {
     this.on('getSource', () => {
       return this._source;
+    });
+
+    this.on('probe', async () => {
+      // Extract dep('...') and find('...') references from source
+      const depPattern = /this\.dep\(\s*['"]([^'"]+)['"]\s*\)/g;
+      const findPattern = /this\.find\(\s*['"]([^'"]+)['"]\s*\)/g;
+      const depNames = new Set<string>();
+      let match: RegExpExecArray | null;
+      while ((match = depPattern.exec(this._source)) !== null) depNames.add(match[1]);
+      while ((match = findPattern.exec(this._source)) !== null) depNames.add(match[1]);
+
+      const resolved: string[] = [];
+      const missing: string[] = [];
+
+      for (const name of depNames) {
+        const id = await this.find(name);
+        if (id) {
+          resolved.push(name);
+        } else {
+          missing.push(name);
+        }
+      }
+
+      if (missing.length > 0) {
+        return {
+          success: false,
+          resolvedDeps: resolved,
+          missingDeps: missing,
+          error: `Missing dependencies: ${missing.join(', ')}`,
+        };
+      }
+      return { success: true, resolvedDeps: resolved, missingDeps: [], error: '' };
     });
 
     this.on('updateSource', async (msg: AbjectMessage) => {
@@ -179,11 +237,24 @@ export class ScriptableAbject extends Abject {
   /**
    * Call a method on another object via message passing.
    * The `to` parameter accepts a Promise (from this.dep()) or a plain ID.
+   *
+   * Backward compat: detects 4-arg calls (to, interfaceId, method, payload)
+   * from stored user objects and skips the second arg.
    */
-  async call<T>(to: AbjectId | string | Promise<AbjectId>, interfaceId: InterfaceId | string, method: string, payload: unknown = {}): Promise<T> {
+  async call<T>(to: AbjectId | string | Promise<AbjectId>, method: string, payload?: unknown, _unused?: unknown): Promise<T> {
+    // Backward compat: if called with 4 args and the 2nd looks like an interface ID, skip it
+    if (_unused !== undefined && typeof method === 'string' && typeof payload === 'string') {
+      // Old call signature: call(to, interfaceId, method, payload)
+      const actualMethod = payload as unknown as string;
+      const actualPayload = _unused;
+      const resolvedTo = await to;
+      return this.request<T>(
+        request(this.id, resolvedTo as AbjectId, actualMethod, actualPayload)
+      );
+    }
     const resolvedTo = await to;
     return this.request<T>(
-      request(this.id, resolvedTo as AbjectId, interfaceId as InterfaceId, method, payload)
+      request(this.id, resolvedTo as AbjectId, method, payload ?? {})
     );
   }
 
@@ -312,7 +383,6 @@ export class ScriptableAbject extends Abject {
       event(
         this.id,
         this.id, // sent to self; Negotiator listens via bus subscription or handler
-        EDITABLE_INTERFACE_ID,
         'sourceUpdated',
         { objectId: this.id, methods: newMethods }
       )

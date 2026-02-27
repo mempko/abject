@@ -65,8 +65,7 @@ export class UIServer extends Abject {
         description:
           'X11-style display server. Manages surfaces, draw commands, and routes input events to surface owners.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: UI_INTERFACE,
             name: 'UI',
             description: 'Surface management and input routing',
@@ -116,7 +115,7 @@ export class UIServer extends Abject {
               {
                 name: 'draw',
                 description: 'Execute draw commands on a surface. Each command has exactly 3 fields: { type, surfaceId, params }. ' +
-                  'Valid types: "clear", "rect", "text", "line", "path", "save", "restore", "clip", "translate", "image", ' +
+                  'Valid types: "clear", "rect", "text", "line", "path", "save", "restore", "clip", "translate", "image", "imageUrl", ' +
                   '"circle" (params: { cx, cy, radius, fill?, stroke?, lineWidth? }), ' +
                   '"arc" (params: { cx, cy, radius, startAngle, endAngle, fill?, stroke?, lineWidth?, counterclockwise? }), ' +
                   '"ellipse" (params: { cx, cy, radiusX, radiusY, rotation?, fill?, stroke?, lineWidth? }), ' +
@@ -126,6 +125,7 @@ export class UIServer extends Abject {
                   '"setLineDash" (params: { segments }), ' +
                   '"linearGradient" (params: { x0, y0, x1, y1, stops: [{offset, color}...] }), ' +
                   '"radialGradient" (params: { cx0, cy0, r0, cx1, cy1, r1, stops: [{offset, color}...] }). ' +
+                  '"imageUrl" (params: { x, y, width?, height?, url }) — draws an image from a URL or data URI. ' +
                   'IMPORTANT: Use "fill" for fill color (NOT "color"), "stroke" for stroke color, "rect" (NOT "fillRect"), "text" (NOT "fillText"). ' +
                   'Always nest parameters inside "params", NOT as flat top-level fields.',
                 parameters: [
@@ -314,7 +314,6 @@ export class UIServer extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [Capabilities.UI_SURFACE, Capabilities.UI_INPUT],
         tags: ['system', 'ui'],
@@ -424,7 +423,7 @@ export class UIServer extends Abject {
       if (!surface) return;
       this.mouseGrabAbject = this.windowManagerId;
       this.send(event(this.id, this.windowManagerId,
-        'abjects:window-manager' as InterfaceId, 'startDrag', {
+        'startDrag', {
           surfaceId,
           globalX: this.lastMouseX,
           globalY: this.lastMouseY,
@@ -444,7 +443,7 @@ export class UIServer extends Abject {
     if (registryId) {
       try {
         await this.request(request(this.id, registryId,
-          'abjects:registry' as InterfaceId, 'subscribe', {}));
+          'subscribe', {}));
       } catch { /* best effort */ }
     }
   }
@@ -453,7 +452,7 @@ export class UIServer extends Abject {
     if (!this.consoleId) return;
     try {
       await this.send(
-        request(this.id, this.consoleId, 'abjects:console' as InterfaceId, level, { message, data })
+        request(this.id, this.consoleId, level, { message, data })
       );
     } catch { /* logging should never break the caller */ }
   }
@@ -509,6 +508,10 @@ Each draw command has exactly 3 fields: { type, surfaceId, params }
 'ellipse' - Ellipse. params: { cx, cy, radiusX, radiusY, rotation?, fill?, stroke?, lineWidth? }
 'polygon' - Polygon/polyline. params: { points: [{x,y}...], fill?, stroke?, lineWidth?, closePath? }
 'image' - Draw image. params: { x, y, width?, height?, data (ImageBitmap | HTMLImageElement | ImageData) }
+'imageUrl' - Draw image from URL or data URI. params: { x, y, width?, height?, url }
+          Use with HttpClient.getBase64() to display fetched images:
+          1. const img = await this.call(this.dep('HttpClient'), 'abjects:http', 'getBase64', { url: imageUrl });
+          2. { type: 'imageUrl', surfaceId, params: { x: 0, y: 0, width: 300, height: 200, url: img.dataUri } }
 
 **State management:**
 'save'  - Save canvas state. params: {}
@@ -842,13 +845,13 @@ Example handler with keyboard dispatch:
     // ── WindowManager grab: route drag events to WindowManager ──
     if (this.mouseGrabAbject) {
       if (type === 'mousemove') {
-        this.send(event(this.id, this.mouseGrabAbject, UI_INTERFACE, 'dragMove', {
+        this.send(event(this.id, this.mouseGrabAbject, 'dragMove', {
           globalX: x, globalY: y,
         }));
         return;
       }
       if (type === 'mouseup') {
-        this.send(event(this.id, this.mouseGrabAbject, UI_INTERFACE, 'dragEnd', {
+        this.send(event(this.id, this.mouseGrabAbject, 'dragEnd', {
           globalX: x, globalY: y,
         }));
         this.mouseGrabAbject = undefined;
@@ -870,7 +873,7 @@ Example handler with keyboard dispatch:
       if (e.ctrlKey) {
         this.mouseGrabAbject = this.windowManagerId;
         this.send(event(this.id, this.windowManagerId,
-          'abjects:window-manager' as InterfaceId, 'startDrag', {
+          'startDrag', {
             surfaceId: surface.id, globalX: x, globalY: y,
           }));
         if (owner) {
@@ -885,7 +888,7 @@ Example handler with keyboard dispatch:
         const localY = y - surface.rect.y;
         const reply = await this.request<{ grab: boolean; minimize?: string }>(
           request(this.id, this.windowManagerId,
-            'abjects:window-manager' as InterfaceId, 'surfaceMouseDown', {
+            'surfaceMouseDown', {
               surfaceId: surface.id, localX, localY,
             })
         );
@@ -1102,7 +1105,7 @@ Example handler with keyboard dispatch:
     inputEvent: InputEvent
   ): Promise<void> {
     await this.send(
-      event(this.id, objectId, UI_INTERFACE, 'input', inputEvent)
+      event(this.id, objectId, 'input', inputEvent)
     );
   }
 
@@ -1115,7 +1118,7 @@ Example handler with keyboard dispatch:
     focused: boolean
   ): Promise<void> {
     await this.send(
-      event(this.id, objectId, UI_INTERFACE, 'focus', { surfaceId, focused })
+      event(this.id, objectId, 'focus', { surfaceId, focused })
     );
   }
 

@@ -33,8 +33,7 @@ export class Storage extends Abject {
         description:
           'Persistent key-value storage backed by IndexedDB. Objects can store and retrieve data that persists across sessions.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: STORAGE_INTERFACE,
             name: 'Storage',
             description: 'Key-value storage operations',
@@ -115,7 +114,6 @@ export class Storage extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [
           Capabilities.STORAGE_READ,

@@ -13,6 +13,8 @@
  *   Phase 3b: llmVerifyAndFix()          — optional LLM-assisted fix
  *   Phase 4:  compile check
  *   Phase 5:  factory.spawn()
+ *   Phase 5b: probeObject()              — validate deps referenced in source resolve
+ *   Phase 5c: retryWithProbeFeedback()   — re-select deps, regenerate code, apply fix (up to 2 retries)
  *   Phase 6:  negotiator.connect()       — optional, connects to deps
  */
 
@@ -28,9 +30,9 @@ import {
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
-import { INTROSPECT_INTERFACE_ID, IntrospectResult } from '../core/introspect.js';
+import { IntrospectResult } from '../core/introspect.js';
 
-import { ScriptableAbject, EDITABLE_INTERFACE_ID } from './scriptable-abject.js';
+import { ScriptableAbject } from './scriptable-abject.js';
 import { systemMessage, userMessage, LLMMessage, LLMCompletionResult, LLMCompletionOptions } from '../llm/provider.js';
 
 
@@ -90,8 +92,7 @@ export class ObjectCreator extends Abject {
         description:
           'Create and modify objects using natural language. Discovers existing objects and generates new ones that compose with them.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: OBJECT_CREATOR_INTERFACE,
             name: 'ObjectCreator',
             description: 'Object creation via natural language',
@@ -204,7 +205,6 @@ export class ObjectCreator extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [],
         tags: ['system', 'ui', 'creation'],
@@ -275,8 +275,8 @@ export class ObjectCreator extends Abject {
 The created object is ALREADY initialized and registered in the system — do NOT call init() on it.
 To display it, call show() using the first interface ID from the returned manifest:
 
-  if (result.success && result.objectId && result.manifest.interfaces.length > 0) {
-    const iface = result.manifest.interfaces[0].id;
+  if (result.success && result.objectId && result.manifest.interface) {
+    const iface = result.manifest.interface.id;
     await call(result.objectId, iface, 'show', {});
   }
 
@@ -300,7 +300,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
 - The interface ID is 'abjects:object-creator' (NOT 'abjects:objectcreator').
 - create is a long-running operation — call progress() before invoking it if available.
 - The returned objectId is ready to use immediately. Do NOT look it up in the registry or call init().
-- Use result.manifest.interfaces[0].id to get the correct interface ID for calling the new object.`;
+- Use result.manifest.interface.id to get the correct interface ID for calling the new object.`;
   }
 
   /**
@@ -308,7 +308,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
    */
   private async llmComplete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
     return this.request<LLMCompletionResult>(
-      request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', { messages, options }),
+      request(this.id, this.llmId!, 'complete', { messages, options }),
       310000
     );
   }
@@ -318,7 +318,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
    */
   private async registryList(): Promise<ObjectRegistration[]> {
     return this.request<ObjectRegistration[]>(
-      request(this.id, this.registryId!, 'abjects:registry' as InterfaceId, 'list', {})
+      request(this.id, this.registryId!, 'list', {})
     );
   }
 
@@ -328,7 +328,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
   private async systemRegistryList(): Promise<ObjectRegistration[]> {
     if (!this.systemRegistryId) return [];
     return this.request<ObjectRegistration[]>(
-      request(this.id, this.systemRegistryId, 'abjects:registry' as InterfaceId, 'list', {})
+      request(this.id, this.systemRegistryId, 'list', {})
     );
   }
 
@@ -337,7 +337,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
    */
   private async registryLookup(objectId: AbjectId): Promise<ObjectRegistration | null> {
     return this.request<ObjectRegistration | null>(
-      request(this.id, this.registryId!, 'abjects:registry' as InterfaceId, 'lookup', { objectId })
+      request(this.id, this.registryId!, 'lookup', { objectId })
     );
   }
 
@@ -346,7 +346,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
    */
   private async registryGetSource(objectId: AbjectId): Promise<string | null> {
     return this.request<string | null>(
-      request(this.id, this.registryId!, 'abjects:registry' as InterfaceId, 'getSource', { objectId })
+      request(this.id, this.registryId!, 'getSource', { objectId })
     );
   }
 
@@ -355,7 +355,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
    */
   private async factorySpawn(spawnReq: SpawnRequest): Promise<SpawnResult> {
     return this.request<SpawnResult>(
-      request(this.id, this.factoryId!, 'abjects:factory' as InterfaceId, 'spawn', spawnReq)
+      request(this.id, this.factoryId!, 'spawn', spawnReq)
     );
   }
 
@@ -364,7 +364,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
    */
   private async registryUpdateManifest(objectId: AbjectId, manifest: AbjectManifest): Promise<boolean> {
     return this.request<boolean>(
-      request(this.id, this.registryId!, 'abjects:registry' as InterfaceId, 'updateManifest', { objectId, manifest })
+      request(this.id, this.registryId!, 'updateManifest', { objectId, manifest })
     );
   }
 
@@ -373,16 +373,150 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
    */
   private async registryUpdateSource(objectId: AbjectId, source: string): Promise<boolean> {
     return this.request<boolean>(
-      request(this.id, this.registryId!, 'abjects:registry' as InterfaceId, 'updateSource', { objectId, source })
+      request(this.id, this.registryId!, 'updateSource', { objectId, source })
     );
   }
 
   private async reportProgress(callerId: AbjectId, phase: string, message: string): Promise<void> {
     try {
       await this.send(
-        event(this.id, callerId, OBJECT_CREATOR_INTERFACE, 'progress', { phase, message })
+        event(this.id, callerId, 'progress', { phase, message })
       );
     } catch { /* best-effort */ }
+  }
+
+  // ── Post-Spawn Probe Validation ──────────────────────────────────
+
+  /**
+   * Phase 5b: Probe a live ScriptableAbject to validate that all dependencies
+   * referenced in its source (this.dep('...') / this.find('...')) can be resolved.
+   */
+  private async probeObject(objectId: AbjectId): Promise<{ success: boolean; missingDeps: string[]; error: string }> {
+    try {
+      const result = await this.request<{ success: boolean; missingDeps: string[]; error: string }>(
+        request(this.id, objectId, 'probe', {}),
+        15000
+      );
+      return result;
+    } catch (err) {
+      return { success: false, missingDeps: [], error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * Phase 5c: Retry with probe feedback — re-run dependency selection with error context,
+   * regenerate handler code, and apply the fix to the live object.
+   */
+  private async retryWithProbeFeedback(
+    objectId: AbjectId,
+    manifest: AbjectManifest,
+    prompt: string,
+    previousCode: string,
+    probeError: string,
+    summaries: ObjectSummary[],
+    originalDeps: SelectedDependency[],
+    usedObjects: string[],
+    context: string | undefined,
+    callerId: AbjectId | undefined
+  ): Promise<{ success: boolean; code?: string; deps?: SelectedDependency[]; error?: string }> {
+    // 1. Re-run Phase 0b with augmented prompt including probe error
+    if (callerId) await this.reportProgress(callerId, '5c', 'Re-selecting dependencies with probe feedback...');
+    const augmentedPrompt =
+      `${prompt}\n\nIMPORTANT: A previous attempt failed because these dependencies are missing: ${probeError}. Make sure to select them.`;
+    const newSelectedNames = await this.llmSelectDependencies(augmentedPrompt, summaries);
+    console.log('[OBJECT-CREATOR probe-retry] Re-selected dependencies:', newSelectedNames);
+
+    // 2. Identify newly discovered deps (diff against originals)
+    const originalNames = new Set(originalDeps.map((d) => d.name.toLowerCase()));
+    const newNames = newSelectedNames.filter((n) => !originalNames.has(n.toLowerCase()));
+
+    // 3. Fetch manifests, questions, and usage guides for new deps only
+    let allDeps = [...originalDeps];
+    let depContext: string;
+
+    if (newNames.length > 0) {
+      if (callerId) await this.reportProgress(callerId, '5c', `Learning about new deps: ${newNames.join(', ')}...`);
+      const newDeps = await this.fetchFullManifests(newNames, summaries);
+      const newQuestions = await this.generateTargetedQuestions(prompt, newDeps);
+      const newGuides = await this.fetchUsageGuides(newDeps, newQuestions, callerId);
+
+      // Merge new deps with originals
+      allDeps = [...originalDeps, ...newDeps];
+
+      // Re-fetch usage guides for all deps (originals already have context, but
+      // we need a unified depContext string)
+      const allGuides = await this.fetchUsageGuides(originalDeps, undefined, undefined);
+      for (const [k, v] of newGuides) allGuides.set(k, v);
+      depContext = this.formatFullManifestContext(allDeps, allGuides);
+    } else {
+      depContext = this.formatFullManifestContext(allDeps);
+    }
+
+    // 4. Re-run Phase 2 with updated depContext and error feedback
+    if (callerId) await this.reportProgress(callerId, '5c', 'Regenerating handler code...');
+    const errorFeedback = `Runtime probe found missing dependencies: ${probeError}. ` +
+      `The code references objects that don't exist. Fix the code to use only the available dependencies listed below.`;
+    let code = await this.regenerateHandlerCode(
+      manifest, prompt, depContext, usedObjects, previousCode, errorFeedback, context
+    );
+    if (!code) {
+      return { success: false, error: 'Failed to regenerate handler code after probe feedback' };
+    }
+
+    // 5. Phases 3+4: verify + compile
+    if (callerId) await this.reportProgress(callerId, '5c', 'Verifying regenerated code...');
+    const verified = this.verifyAndFix(manifest, code);
+    code = verified.code;
+
+    if (verified.mismatches.length > 0) {
+      try {
+        const llmFixed = await this.llmVerifyAndFix(verified.manifest, code, verified.mismatches);
+        if (!ScriptableAbject.tryCompile(llmFixed.code)) {
+          code = llmFixed.code;
+        }
+      } catch { /* continue with current code */ }
+    }
+
+    const compileError = ScriptableAbject.tryCompile(code);
+    if (compileError) {
+      return { success: false, error: `Compilation failed after probe retry: ${compileError}` };
+    }
+
+    // 6. Clean up partial UI (in case show() left partial windows)
+    if (this.widgetManagerId) {
+      try {
+        await this.request(
+          request(this.id, this.widgetManagerId,
+            'destroyWindowsForOwner', { ownerId: objectId })
+        );
+      } catch { /* best effort */ }
+    }
+
+    // 7. Apply fix via updateSource to the live object (hide → swap → show)
+    if (callerId) await this.reportProgress(callerId, '5c', 'Applying fixed code...');
+    try {
+      const updateResult = await this.request<{ success: boolean; error?: string }>(
+        request(this.id, objectId, 'updateSource', { source: code }),
+        30000
+      );
+      if (!updateResult.success) {
+        return { success: false, error: `Failed to apply fixed source: ${updateResult.error}` };
+      }
+    } catch (err) {
+      return { success: false, error: `Failed to apply fixed source: ${err instanceof Error ? err.message : String(err)}` };
+    }
+
+    // 8. Update registry source and persist
+    await this.registryUpdateSource(objectId, code);
+    if (this.abjectStoreId) {
+      this.request(
+        request(this.id, this.abjectStoreId, 'save', {
+          objectId: objectId as string, manifest, source: code, owner: this.id as string,
+        })
+      ).catch(err => console.warn('[OBJECT-CREATOR probe-retry] Failed to persist:', err));
+    }
+
+    return { success: true, code, deps: allDeps };
   }
 
   // ── Multi-Phase Discovery Pipeline ────────────────────────────────
@@ -428,7 +562,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         'Return one name per line, nothing else. If no dependencies are needed, return "None".'
       ),
       userMessage(`Available objects:\n${summaryText}\n\nNew object to create: ${prompt}\n\nWhich objects does it need?`),
-    ], { tier: 'balanced' });
+    ], { tier: 'smart' });
 
     const content = result.content.trim();
     if (content.toLowerCase() === 'none') return [];
@@ -445,7 +579,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
   private async introspect(objectId: AbjectId): Promise<IntrospectResult | null> {
     try {
       return await this.request<IntrospectResult>(
-        request(this.id, objectId, INTROSPECT_INTERFACE_ID, 'describe', {})
+        request(this.id, objectId, 'describe', {})
       );
     } catch {
       return null;
@@ -488,7 +622,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
   private async askDependency(objectId: AbjectId, question: string): Promise<string | null> {
     try {
       return await this.request<string>(
-        request(this.id, objectId, INTROSPECT_INTERFACE_ID, 'ask', { question }),
+        request(this.id, objectId, 'ask', { question }),
         60000
       );
     } catch {
@@ -604,7 +738,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
 
     return deps
       .map((dep) => {
-        let text = `## ${dep.name} (id available as this.dep('${dep.name}'))\n${dep.description}\n\n  Usage: this.call(this.dep('${dep.name}'), interfaceId, methodName, payload)`;
+        let text = `## ${dep.name} (id available as this.dep('${dep.name}'))\n${dep.description}\n\n  Usage: this.call(this.dep('${dep.name}'), methodName, payload)`;
         const guide = usageGuides?.get(dep.name);
         if (guide) {
           text += `\n\n### Usage Guide (from ${dep.name} itself):\n${guide}`;
@@ -639,7 +773,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
       // Phase 0c: Fetch full manifests for selected dependencies
       const depNames = selectedNames.join(', ') || 'none';
       if (callerId) await this.reportProgress(callerId, '0c', `Learning about ${depNames}...`);
-      const deps = await this.fetchFullManifests(selectedNames, summaries);
+      let deps = await this.fetchFullManifests(selectedNames, summaries);
       console.log('[OBJECT-CREATOR] Fetched manifests for:', deps.map((d) => d.name));
 
       // Phase 0c5: Generate targeted questions for each dependency
@@ -776,6 +910,48 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           registryHint: this.registryId,
         });
 
+        // Phase 5b: Probe validation — check that all deps referenced in source resolve
+        if (spawnResult.objectId) {
+          if (callerId) await this.reportProgress(callerId, '5b', 'Validating dependencies...');
+          let probeResult = await this.probeObject(spawnResult.objectId);
+          console.log('[OBJECT-CREATOR] Probe result:', probeResult);
+
+          if (!probeResult.success) {
+            const MAX_RUNTIME_ATTEMPTS = 2;
+            for (let attempt = 1; attempt <= MAX_RUNTIME_ATTEMPTS; attempt++) {
+              if (callerId) await this.reportProgress(callerId, '5c', `Runtime error recovery attempt ${attempt}/${MAX_RUNTIME_ATTEMPTS}...`);
+              console.log(`[OBJECT-CREATOR] Probe retry ${attempt}/${MAX_RUNTIME_ATTEMPTS}: ${probeResult.error}`);
+
+              const retryResult = await this.retryWithProbeFeedback(
+                spawnResult.objectId, manifest, prompt, code!, probeResult.error,
+                summaries, deps, phase1.usedObjects, context, callerId
+              );
+
+              if (!retryResult.success) {
+                if (attempt === MAX_RUNTIME_ATTEMPTS) {
+                  this._currentCallerId = undefined;
+                  return { success: false, objectId: spawnResult.objectId, manifest, code, error: retryResult.error };
+                }
+                continue;
+              }
+
+              // Update code and deps for Phase 6 connect
+              code = retryResult.code ?? code;
+              if (retryResult.deps) deps = retryResult.deps;
+
+              // Re-probe to verify the fix worked
+              probeResult = await this.probeObject(spawnResult.objectId);
+              console.log('[OBJECT-CREATOR] Post-retry probe result:', probeResult);
+              if (probeResult.success) break;
+            }
+
+            if (!probeResult.success) {
+              this._currentCallerId = undefined;
+              return { success: false, objectId: spawnResult.objectId, manifest, code, error: probeResult.error };
+            }
+          }
+        }
+
         // Phase 6: Connect to dependencies via Negotiator (fire-and-forget)
         if (callerId && deps.length > 0) {
           const connectNames = deps.map((d) => d.name).join(', ');
@@ -785,7 +961,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           for (const dep of deps) {
             this.request(request(
               this.id, this.negotiatorId,
-              'abjects:negotiator' as InterfaceId, 'connect',
+              'connect',
               { sourceId: spawnResult.objectId, targetId: dep.id }
             )).catch((err) => {
               console.warn(`[OBJECT-CREATOR] Connect to ${dep.name} failed:`, err);
@@ -799,12 +975,12 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           try {
             const wsId = await this.request<string | null>(
               request(this.id, this.widgetManagerId,
-                'abjects:widgets' as InterfaceId, 'getObjectWorkspace', { objectId: this.id })
+                'getObjectWorkspace', { objectId: this.id })
             );
             if (wsId) {
               await this.request(
                 request(this.id, this.widgetManagerId,
-                  'abjects:widgets' as InterfaceId, 'setObjectWorkspace', {
+                  'setObjectWorkspace', {
                     objectId: spawnResult.objectId,
                     workspaceId: wsId,
                   })
@@ -816,7 +992,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         // Persist to AbjectStore (fire-and-forget)
         if (this.abjectStoreId && spawnResult.objectId && code) {
           this.request(
-            request(this.id, this.abjectStoreId, 'abjects:abject-store' as InterfaceId, 'save', {
+            request(this.id, this.abjectStoreId, 'save', {
               objectId: spawnResult.objectId, manifest, source: code, owner: this.id as string,
             })
           ).catch(err => console.warn('[OBJECT-CREATOR] Failed to persist:', err));
@@ -887,8 +1063,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
     usedObjects: string[],
     currentSource: string | null
   ): Promise<string | undefined> {
-    const methodList = manifest.interfaces
-      .flatMap((i) => i.methods.map((m) => m.name));
+    const methodList = manifest.interface.methods.map((m) => m.name);
 
     const existingCodeBlock = currentSource
       ? `\n\nExisting handler code to modify (preserve working logic, add/change only what the modification requires):\n\`\`\`javascript\n${currentSource}\n\`\`\`\n`
@@ -1072,7 +1247,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
       // 5a: Update source on the live ScriptableAbject (hot-reload: hide → swap → show)
       try {
         const updateResult = await this.request<{ success: boolean; error?: string }>(
-          request(this.id, objectId, EDITABLE_INTERFACE_ID, 'updateSource', { source: code }),
+          request(this.id, objectId, 'updateSource', { source: code }),
           30000  // generous timeout — hide + applySource + show may take time
         );
         if (!updateResult.success) {
@@ -1092,7 +1267,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
       // 5c2: Persist to AbjectStore (fire-and-forget)
       if (this.abjectStoreId && code) {
         this.request(
-          request(this.id, this.abjectStoreId, 'abjects:abject-store' as InterfaceId, 'save', {
+          request(this.id, this.abjectStoreId, 'save', {
             objectId: objectId as string, manifest, source: code, owner: this.id as string,
           })
         ).catch(err => console.warn('[OBJECT-CREATOR modify] Failed to persist:', err));
@@ -1107,7 +1282,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         for (const dep of deps) {
           this.request(request(
             this.id, this.negotiatorId,
-            'abjects:negotiator' as InterfaceId, 'connect',
+            'connect',
             { sourceId: objectId, targetId: dep.id }
           )).catch((err) => {
             console.warn(`[OBJECT-CREATOR modify] Connect to ${dep.name} failed:`, err);
@@ -1221,8 +1396,7 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
     usedObjects: string[],
     context?: string
   ): Promise<string | undefined> {
-    const methodList = manifest.interfaces
-      .flatMap((i) => i.methods.map((m) => m.name));
+    const methodList = manifest.interface.methods.map((m) => m.name);
 
     const messages: LLMMessage[] = [
       systemMessage(this.getPhase2SystemPrompt()),
@@ -1246,8 +1420,7 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
     errorFeedback: string,
     context?: string
   ): Promise<string | undefined> {
-    const methodList = manifest.interfaces
-      .flatMap((i) => i.methods.map((m) => m.name));
+    const methodList = manifest.interface.methods.map((m) => m.name);
 
     const messages: LLMMessage[] = [
       systemMessage(this.getPhase2SystemPrompt()),
@@ -1270,7 +1443,7 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
     const mismatches: string[] = [];
 
     const declaredMethods = new Set(
-      manifest.interfaces.flatMap((i) => i.methods.map((m) => m.name))
+      manifest.interface.methods.map((m) => m.name)
     );
 
     let handlerMap: Record<string, unknown>;
@@ -1383,7 +1556,13 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
 
     if (manifestMatch) {
       try {
-        manifest = JSON.parse(manifestMatch[1]);
+        const parsed = JSON.parse(manifestMatch[1]);
+        // Compat: LLM may generate old `interfaces: [...]` format — convert to `interface: {...}`
+        if (parsed.interfaces && Array.isArray(parsed.interfaces) && !parsed.interface) {
+          parsed.interface = parsed.interfaces[0];
+          delete parsed.interfaces;
+        }
+        manifest = parsed;
       } catch {
         // Invalid JSON
       }
@@ -1458,7 +1637,7 @@ Example manifest:
   "name": "MyObject",
   "description": "Does something useful",
   "version": "1.0.0",
-  "interfaces": [{
+  "interface": {
     "id": "my:interface",
     "name": "MyInterface",
     "description": "Interface description",
@@ -1468,7 +1647,7 @@ Example manifest:
       "parameters": [],
       "returns": { "kind": "primitive", "primitive": "string" }
     }]
-  }],
+  },
   "requiredCapabilities": []
 }
 \`\`\`
@@ -1600,7 +1779,7 @@ CRITICAL RULES:
 
 The ONLY way to communicate with other objects is:
 
-  this.call(objectId, interfaceId, method, payload) → Promise<result>
+  this.call(objectId, method, payload) → Promise<result>
 
 To get the ID of a dependency object, use:
 
@@ -1621,7 +1800,7 @@ Each dependency's description lists its interfaces, methods, and events. If a de
 Translate dependency descriptions into this.call() invocations:
 \`\`\`javascript
 // Calling a method:
-const result = await this.call(this.dep('SomeService'), 'abjects:some-service', 'doThing', { x: 'hello' });
+const result = await this.call(this.dep('SomeService'), 'doThing', { x: 'hello' });
 
 // Handling an event (add a handler in your handler map):
 async thingHappened(msg) {
@@ -1672,22 +1851,22 @@ async getState(msg) {
     if (this._windowId) return true;
 
     this._windowId = await this.call(
-      this.dep('WidgetManager'), 'abjects:widgets', 'createWindowAbject',
+      this.dep('WidgetManager'), 'createWindowAbject',
       { title: 'My Canvas', rect: { x: 100, y: 80, width: 420, height: 340 }, resizable: false });
 
     this._canvasId = await this.call(
-      this.dep('WidgetManager'), 'abjects:widgets', 'createCanvas',
+      this.dep('WidgetManager'), 'createCanvas',
       { windowId: this._windowId });
 
-    const size = await this.call(this._canvasId, 'abjects:canvas', 'getCanvasSize', {});
+    const size = await this.call(this._canvasId, 'getCanvasSize', {});
     this._canvasW = size.width;
     this._canvasH = size.height;
 
     // Register to receive input events from the canvas
-    await this.call(this._canvasId, 'abjects:introspect', 'addDependent', {});
+    await this.call(this._canvasId, 'addDependent', {});
 
     this._timerId = await this.call(
-      this.dep('Timer'), 'abjects:timer', 'setInterval',
+      this.dep('Timer'), 'setInterval',
       { intervalMs: 16, data: { type: 'animate' } });
 
     await this._draw();
@@ -1697,11 +1876,11 @@ async getState(msg) {
   async hide(msg) {
     if (!this._windowId) return true;
     if (this._timerId) {
-      await this.call(this.dep('Timer'), 'abjects:timer', 'clearTimer',
+      await this.call(this.dep('Timer'), 'clearTimer',
         { timerId: this._timerId });
       this._timerId = null;
     }
-    await this.call(this.dep('WidgetManager'), 'abjects:widgets',
+    await this.call(this.dep('WidgetManager'),
       'destroyWindowAbject', { windowId: this._windowId });
     this._windowId = null;
     this._canvasId = null;
@@ -1736,7 +1915,7 @@ async getState(msg) {
   async _draw() {
     if (!this._canvasId) return;
     const W = this._canvasW, H = this._canvasH;
-    await this.call(this._canvasId, 'abjects:canvas', 'draw', {
+    await this.call(this._canvasId, 'draw', {
       commands: [
         { type: 'clear', surfaceId: 'c', params: { color: '#1e1e2e' } },
         { type: 'rect', surfaceId: 'c',
@@ -1761,34 +1940,34 @@ async getState(msg) {
     if (this._windowId) return true;
 
     this._windowId = await this.call(
-      this.dep('WidgetManager'), 'abjects:widgets', 'createWindowAbject',
+      this.dep('WidgetManager'), 'createWindowAbject',
       { title: 'Greeter', rect: { x: 100, y: 100, width: 350, height: 200 }, resizable: true });
 
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
 
     const layoutId = await this.call(
-      this.dep('WidgetManager'), 'abjects:widgets', 'createVBox',
+      this.dep('WidgetManager'), 'createVBox',
       { windowId: this._windowId, margins: { top: 16, right: 16, bottom: 16, left: 16 }, spacing: 8 });
 
     this._inputId = await this.call(
-      this.dep('WidgetManager'), 'abjects:widgets', 'createTextInput',
+      this.dep('WidgetManager'), 'createTextInput',
       { windowId: this._windowId, rect: r0, placeholder: 'Enter your name...' });
-    await this.call(layoutId, 'abjects:layout', 'addLayoutChild',
+    await this.call(layoutId, 'addLayoutChild',
       { widgetId: this._inputId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: 36 } });
 
     this._buttonId = await this.call(
-      this.dep('WidgetManager'), 'abjects:widgets', 'createButton',
+      this.dep('WidgetManager'), 'createButton',
       { windowId: this._windowId, rect: r0, text: 'Greet' });
-    await this.call(this._buttonId, 'abjects:introspect', 'addDependent', {});
-    await this.call(layoutId, 'abjects:layout', 'addLayoutChild',
+    await this.call(this._buttonId, 'addDependent', {});
+    await this.call(layoutId, 'addLayoutChild',
       { widgetId: this._buttonId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
         preferredSize: { width: 100, height: 36 } });
 
     this._labelId = await this.call(
-      this.dep('WidgetManager'), 'abjects:widgets', 'createLabel',
+      this.dep('WidgetManager'), 'createLabel',
       { windowId: this._windowId, rect: r0, text: '' });
-    await this.call(layoutId, 'abjects:layout', 'addLayoutChild',
+    await this.call(layoutId, 'addLayoutChild',
       { widgetId: this._labelId, sizePolicy: { vertical: 'fixed' },
         preferredSize: { height: 20 } });
 
@@ -1797,7 +1976,7 @@ async getState(msg) {
 
   async hide(msg) {
     if (!this._windowId) return true;
-    await this.call(this.dep('WidgetManager'), 'abjects:widgets',
+    await this.call(this.dep('WidgetManager'),
       'destroyWindowAbject', { windowId: this._windowId });
     this._windowId = null;
     this._inputId = null;
@@ -1818,8 +1997,8 @@ async getState(msg) {
     if (aspect !== 'click') return;
 
     if (msg.routing.from === this._buttonId) {
-      const name = await this.call(this._inputId, 'abjects:widget', 'getValue', {});
-      await this.call(this._labelId, 'abjects:widget', 'update',
+      const name = await this.call(this._inputId, 'getValue', {});
+      await this.call(this._labelId, 'update',
         { text: 'Hello, ' + (name || 'world') + '!' });
       this.changed('greeted', { name });
     }
@@ -1829,9 +2008,9 @@ async getState(msg) {
 
 ## IMPORTANT
 - The methods available on \`this\` are: call(), dep(), find(), changed(), and this.id
-- Study the dependency descriptions to learn their interface IDs, method names, and event names
+- Study the dependency descriptions to learn their method names and event names
 - Do NOT invent wrapper APIs — no api.*, no Host.*, no this.services.*, no this.ui.*, no window.*, no document.*
-- The ONLY way to call another object is: this.call(this.dep('Name'), interfaceId, method, payload)
+- The ONLY way to call another object is: this.call(this.dep('Name'), method, payload)
 - There are NO shortcuts, wrappers, or helper objects. Always use this.call() directly.
 - For canvas objects, use WidgetManager.createCanvas inside a window instead of UIServer.createSurface. The canvas widget handles input routing and coordinate transforms automatically.
 - The surfaceId in draw commands sent to a canvas widget can be any placeholder string (e.g. 'c') — the canvas widget replaces it with the window's actual surfaceId.
@@ -1841,7 +2020,7 @@ async getState(msg) {
 To receive state changes from another object, you MUST register as a dependent first:
 
   // Register as observer — you will now receive 'changed' events from that object
-  await this.call(this.dep('SomeObject'), 'abjects:introspect', 'addDependent', {});
+  await this.call(this.dep('SomeObject'), 'addDependent', {});
 
 Then implement a \`changed\` handler:
 
@@ -1862,10 +2041,10 @@ IMPORTANT: Without calling addDependent, you will NOT receive changed events. Ev
 Every object in the system supports the introspect protocol (abjects:introspect):
 
   // Ask an object to describe itself (returns manifest + description)
-  const info = await this.call(targetId, 'abjects:introspect', 'describe', {});
+  const info = await this.call(targetId, 'describe', {});
 
   // Ask an object a targeted question (LLM-powered answer)
-  const guide = await this.call(targetId, 'abjects:introspect', 'ask',
+  const guide = await this.call(targetId, 'ask',
     { question: 'How do I subscribe to your events?' });
 
 Use this for dynamic composition — objects can learn about each other at runtime.`;

@@ -9,7 +9,6 @@ import { AbjectId, AbjectMessage, InterfaceId, SpawnResult } from '../core/types
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 import type { DiscoveredWorkspace } from './workspace-share-registry.js';
 
 const WORKSPACE_BROWSER_INTERFACE: InterfaceId = 'abjects:workspace-browser';
@@ -37,8 +36,7 @@ export class WorkspaceBrowser extends Abject {
         description:
           'Browse discovered remote workspaces from connected peers.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: WORKSPACE_BROWSER_INTERFACE,
             name: 'WorkspaceBrowser',
             description: 'Remote workspace browser UI',
@@ -63,7 +61,6 @@ export class WorkspaceBrowser extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [
           { capability: Capabilities.UI_SURFACE, reason: 'Display workspace browser', required: true },
         ],
@@ -84,7 +81,7 @@ export class WorkspaceBrowser extends Abject {
     if (this.shareRegistryId) {
       try {
         await this.request(
-          request(this.id, this.shareRegistryId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+          request(this.id, this.shareRegistryId, 'addDependent', {})
         );
       } catch { /* WSR may not be ready */ }
     }
@@ -139,7 +136,7 @@ export class WorkspaceBrowser extends Abject {
 
     // Get display dimensions
     const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
+      request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
 
     const winW = 400;
@@ -148,7 +145,7 @@ export class WorkspaceBrowser extends Abject {
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
     this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'createWindowAbject', {
         title: 'Workspace Browser',
         rect: { x: winX, y: winY, width: winW, height: winH },
         zIndex: 200,
@@ -159,7 +156,7 @@ export class WorkspaceBrowser extends Abject {
 
     // Create root VBox layout
     this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+      request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
         margins: { top: 20, right: 20, bottom: 20, left: 20 },
         spacing: 8,
@@ -168,38 +165,38 @@ export class WorkspaceBrowser extends Abject {
 
     // Header row: title + refresh button
     const headerRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: headerRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 30 },
     }));
 
     const titleLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Remote Workspaces',
         style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
       })
     );
-    await this.request(request(this.id, headerRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, headerRowId, 'addLayoutChild', {
       widgetId: titleLabelId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 30 },
     }));
 
     this.refreshBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+      request(this.id, this.widgetManagerId!, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Refresh',
         style: { fontSize: 12 },
       })
     );
-    await this.request(request(this.id, this.refreshBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, headerRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.refreshBtnId, 'addDependent', {}));
+    await this.request(request(this.id, headerRowId, 'addLayoutChild', {
       widgetId: this.refreshBtnId,
       sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
       preferredSize: { width: 80, height: 28 },
@@ -207,12 +204,12 @@ export class WorkspaceBrowser extends Abject {
 
     // Description
     const descId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Shared workspaces from connected peers.',
         style: { color: '#b4b8c8', fontSize: 12 },
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: descId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
@@ -220,11 +217,11 @@ export class WorkspaceBrowser extends Abject {
 
     // Divider
     const divId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
+      request(this.id, this.widgetManagerId!, 'createDivider', {
         windowId: this.windowId, rect: r0,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: divId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 1 },
@@ -235,7 +232,7 @@ export class WorkspaceBrowser extends Abject {
     if (this.shareRegistryId) {
       try {
         workspaces = await this.request<DiscoveredWorkspace[]>(
-          request(this.id, this.shareRegistryId, WORKSPACE_SHARE_REGISTRY_INTERFACE, 'getDiscoveredWorkspaces', {})
+          request(this.id, this.shareRegistryId, 'getDiscoveredWorkspaces', {})
         );
       } catch { /* ShareRegistry may not be ready */ }
     }
@@ -245,13 +242,13 @@ export class WorkspaceBrowser extends Abject {
 
     if (workspaces.length === 0) {
       const emptyId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        request(this.id, this.widgetManagerId!, 'createLabel', {
           windowId: this.windowId, rect: r0,
           text: 'No remote workspaces discovered yet.\nConnect to peers and click Refresh.',
           style: { color: '#b4b8c8', fontSize: 12 },
         })
       );
-      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
         widgetId: emptyId,
         sizePolicy: { vertical: 'fixed' },
         preferredSize: { height: 36 },
@@ -270,12 +267,12 @@ export class WorkspaceBrowser extends Abject {
 
         // Peer header
         const peerHeaderId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+          request(this.id, this.widgetManagerId!, 'createLabel', {
             windowId: this.windowId, rect: r0, text: peerName,
             style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 },
           })
         );
-        await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
           widgetId: peerHeaderId,
           sizePolicy: { vertical: 'fixed' },
           preferredSize: { height: 22 },
@@ -288,26 +285,26 @@ export class WorkspaceBrowser extends Abject {
 
           // HBox: label (expanding) + Browse button (fixed)
           const wsRowId = await this.request<AbjectId>(
-            request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+            request(this.id, this.widgetManagerId!, 'createNestedHBox', {
               parentLayoutId: this.rootLayoutId,
               margins: { top: 0, right: 0, bottom: 0, left: 0 },
               spacing: 6,
             })
           );
-          await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
             widgetId: wsRowId,
             sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
             preferredSize: { height: 24 },
           }));
 
           const wsLabelId = await this.request<AbjectId>(
-            request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+            request(this.id, this.widgetManagerId!, 'createLabel', {
               windowId: this.windowId, rect: r0,
               text: `  ${ws.name}${badge}${hopsLabel}`,
               style: { color: '#b4b8c8', fontSize: 12 },
             })
           );
-          await this.request(request(this.id, wsRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+          await this.request(request(this.id, wsRowId, 'addLayoutChild', {
             widgetId: wsLabelId,
             sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
             preferredSize: { height: 24 },
@@ -316,14 +313,14 @@ export class WorkspaceBrowser extends Abject {
           // Browse button (only if registryId is available)
           if (ws.registryId) {
             const browseBtnId = await this.request<AbjectId>(
-              request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+              request(this.id, this.widgetManagerId!, 'createButton', {
                 windowId: this.windowId, rect: r0, text: 'Browse',
                 style: { fontSize: 11 },
               })
             );
-            await this.request(request(this.id, browseBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+            await this.request(request(this.id, browseBtnId, 'addDependent', {}));
             this.browseButtons.set(browseBtnId, ws);
-            await this.request(request(this.id, wsRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+            await this.request(request(this.id, wsRowId, 'addLayoutChild', {
               widgetId: browseBtnId,
               sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
               preferredSize: { width: 70, height: 24 },
@@ -334,16 +331,16 @@ export class WorkspaceBrowser extends Abject {
     }
 
     // Spacer + status
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutSpacer', {}));
 
     this.statusLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0,
         text: `${workspaces.length} workspace${workspaces.length !== 1 ? 's' : ''} discovered`,
         style: { color: '#6b7084', fontSize: 11 },
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.statusLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 16 },
@@ -357,7 +354,7 @@ export class WorkspaceBrowser extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
         windowId: this.windowId,
       })
     );
@@ -382,7 +379,7 @@ export class WorkspaceBrowser extends Abject {
     if (this.shareRegistryId) {
       try {
         await this.request(
-          request(this.id, this.shareRegistryId, WORKSPACE_SHARE_REGISTRY_INTERFACE, 'discoverWorkspaces', { hops: 1 })
+          request(this.id, this.shareRegistryId, 'discoverWorkspaces', { hops: 1 })
         );
       } catch { /* best-effort */ }
     }
@@ -405,10 +402,10 @@ export class WorkspaceBrowser extends Abject {
 
     try {
       const result = await this.request<SpawnResult>(
-        request(this.id, this.factoryId, FACTORY_INTERFACE, 'spawn', {
+        request(this.id, this.factoryId, 'spawn', {
           manifest: {
             name: 'RegistryBrowser', description: '', version: '1.0.0',
-            interfaces: [], requiredCapabilities: [], tags: ['system'],
+            requiredCapabilities: [], tags: ['system'],
           },
         })
       );
@@ -417,7 +414,7 @@ export class WorkspaceBrowser extends Abject {
 
       // Configure for remote mode
       await this.request(
-        request(this.id, browserId, REGISTRY_BROWSER_INTERFACE, 'browseRemote', {
+        request(this.id, browserId, 'browseRemote', {
           registryId: ws.registryId,
           peerId: ws.ownerPeerId,
           label: ws.name,
@@ -426,7 +423,7 @@ export class WorkspaceBrowser extends Abject {
 
       // Show the browser
       await this.request(
-        request(this.id, browserId, REGISTRY_BROWSER_INTERFACE, 'show', {})
+        request(this.id, browserId, 'show', {})
       );
     } catch (err) {
       console.warn('[WorkspaceBrowser] Failed to open remote browser:', err);

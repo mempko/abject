@@ -15,7 +15,7 @@ import {
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
 import { request } from '../core/message.js';
-import { INTROSPECT_INTERFACE_ID, IntrospectResult } from '../core/introspect.js';
+import { IntrospectResult } from '../core/introspect.js';
 import { ScriptableAbject } from './scriptable-abject.js';
 import { systemMessage, userMessage, LLMMessage, LLMCompletionResult, LLMCompletionOptions } from '../llm/provider.js';
 
@@ -50,8 +50,7 @@ export class ProxyGenerator extends Abject {
         description:
           'Generates proxy objects using LLM to translate between incompatible object interfaces.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: PROXY_GENERATOR_INTERFACE,
             name: 'ProxyGenerator',
             description: 'Proxy generation',
@@ -104,7 +103,6 @@ export class ProxyGenerator extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         tags: ['system', 'proxy', 'llm'],
       },
@@ -138,7 +136,7 @@ export class ProxyGenerator extends Abject {
    */
   private async llmComplete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
     return this.request<LLMCompletionResult>(
-      request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', { messages, options })
+      request(this.id, this.llmId!, 'complete', { messages, options })
     );
   }
 
@@ -148,7 +146,7 @@ export class ProxyGenerator extends Abject {
   private async introspect(objectId: AbjectId): Promise<IntrospectResult | null> {
     try {
       return await this.request<IntrospectResult>(
-        request(this.id, objectId, INTROSPECT_INTERFACE_ID, 'describe', {})
+        request(this.id, objectId, 'describe', {})
       );
     } catch {
       return null;
@@ -161,7 +159,7 @@ export class ProxyGenerator extends Abject {
   private async askObject(objectId: AbjectId, question: string): Promise<string | null> {
     try {
       return await this.request<string>(
-        request(this.id, objectId, INTROSPECT_INTERFACE_ID, 'ask', { question }),
+        request(this.id, objectId, 'ask', { question }),
         60000
       );
     } catch {
@@ -315,7 +313,7 @@ TARGET OBJECT:
 ${targetDescription}
 ${guideSection}
 The proxy receives messages from the source, translates them, and forwards to the target.
-Use this.call(this.dep('target'), interfaceId, method, payload) to forward.
+Use this.call(this.dep('target'), method, payload) to forward.
 Use this.dep('source') and this.dep('target') for object IDs.
 
 Output ONLY the handler map in a \`\`\`javascript code block.`),
@@ -348,7 +346,7 @@ The handler map is a parenthesized object expression:
 ({
   async methodName(msg) {
     // translate and forward
-    const result = await this.call(this.dep('target'), 'interface:id', 'method', payload);
+    const result = await this.call(this.dep('target'), 'method', payload);
     return result;
   }
 })
@@ -357,7 +355,7 @@ RULES:
 - MUST be plain JavaScript (NOT TypeScript). No type annotations.
 - Format: parenthesized object expression ({ ... })
 - Each handler receives msg with msg.payload containing parameters
-- Use this.call(this.dep('target'), interfaceId, method, payload) to forward to target
+- Use this.call(this.dep('target'), method, payload) to forward to target
 - Use this.dep('source') and this.dep('target') for object IDs
 - Include a wildcard handler '*' as catch-all for unmatched methods
 - Handle errors gracefully with try/catch
@@ -372,8 +370,7 @@ RULES:
   async ['*'](msg) {
     try {
       const method = msg.routing.method;
-      const iface = msg.routing.interface;
-      return await this.call(this.dep('target'), iface, method, msg.payload);
+      return await this.call(this.dep('target'), method, msg.payload);
     } catch (err) {
       return { error: err.message || String(err) };
     }
@@ -407,8 +404,7 @@ RULES:
       name: `Proxy_${sourceName}_${targetName}`,
       description: `LLM-generated proxy that translates between ${sourceName} and ${targetName}`,
       version: '1.0.0',
-      interfaces: [
-        {
+      interface: {
           id: `proxy:${sourceName.toLowerCase()}-${targetName.toLowerCase()}` as InterfaceId,
           name: `Proxy`,
           description: `Translates between ${sourceName} and ${targetName}`,
@@ -420,7 +416,6 @@ RULES:
             },
           ],
         },
-      ],
       requiredCapabilities: [],
       tags: ['proxy', 'generated'],
     };

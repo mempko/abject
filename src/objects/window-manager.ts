@@ -21,8 +21,6 @@ import {
 } from './widgets/widget-types.js';
 
 const WM_INTERFACE: InterfaceId = 'abjects:window-manager';
-const UI_INTERFACE: InterfaceId = 'abjects:ui';
-const WINDOW_INTERFACE: InterfaceId = 'abjects:window';
 
 interface WindowInfo {
   windowId: AbjectId;
@@ -66,8 +64,7 @@ export class WindowManager extends Abject {
         description:
           'Centralized window manager — owns z-order policy, drag, and resize behavior.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: WM_INTERFACE,
             name: 'WindowManager',
             description: 'Window z-order management, drag, and resize',
@@ -149,7 +146,6 @@ export class WindowManager extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [],
         tags: ['system', 'ui'],
@@ -197,7 +193,7 @@ export class WindowManager extends Abject {
         if (info.minimized && this.taskbarId) {
           try {
             await this.send(
-              event(this.id, this.taskbarId, 'abjects:taskbar' as InterfaceId, 'windowRestored', {
+              event(this.id, this.taskbarId, 'windowRestored', {
                 surfaceId: sid, windowId: info.windowId,
               })
             );
@@ -378,7 +374,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
 
     // Register ourselves with UIServer so it sends us surfaceActivated events
     await this.request(
-      request(this.id, this.uiServerId, UI_INTERFACE, 'registerWindowManager', {})
+      request(this.id, this.uiServerId, 'registerWindowManager', {})
     );
   }
 
@@ -415,7 +411,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
       const btn = this.detectTitleButton(info, localX, localY);
       if (btn === 'close') {
         await this.send(
-          event(this.id, info.windowId, WINDOW_INTERFACE, 'titleBarAction', { action: 'close' })
+          event(this.id, info.windowId, 'titleBarAction', { action: 'close' })
         );
         return { grab: false };
       }
@@ -458,7 +454,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     if (moved) {
       try {
         await this.request(
-          request(this.id, this.uiServerId, UI_INTERFACE, 'moveSurface', {
+          request(this.id, this.uiServerId, 'moveSurface', {
             surfaceId: this.dragState.surfaceId, x: newRect.x, y: newRect.y,
           })
         );
@@ -468,7 +464,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     if (resized) {
       try {
         await this.request(
-          request(this.id, this.uiServerId, UI_INTERFACE, 'resizeSurface', {
+          request(this.id, this.uiServerId, 'resizeSurface', {
             surfaceId: this.dragState.surfaceId, width: newRect.width, height: newRect.height,
           })
         );
@@ -476,7 +472,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
 
       // Notify WindowAbject of rect change (it will update children and re-render)
       await this.send(
-        event(this.id, this.dragState.windowId, WINDOW_INTERFACE, 'windowRect', {
+        event(this.id, this.dragState.windowId, 'windowRect', {
           x: newRect.x, y: newRect.y, width: newRect.width, height: newRect.height,
         })
       );
@@ -499,7 +495,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
       if (moved) {
         try {
           await this.request(
-            request(this.id, this.uiServerId, UI_INTERFACE, 'moveSurface', {
+            request(this.id, this.uiServerId, 'moveSurface', {
               surfaceId: this.dragState.surfaceId, x: newRect.x, y: newRect.y,
             })
           );
@@ -509,7 +505,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
       if (resized) {
         try {
           await this.request(
-            request(this.id, this.uiServerId, UI_INTERFACE, 'resizeSurface', {
+            request(this.id, this.uiServerId, 'resizeSurface', {
               surfaceId: this.dragState.surfaceId, width: newRect.width, height: newRect.height,
             })
           );
@@ -519,7 +515,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
 
     // Send final windowRect event to WindowAbject
     await this.send(
-      event(this.id, this.dragState.windowId, WINDOW_INTERFACE, 'windowRect', {
+      event(this.id, this.dragState.windowId, 'windowRect', {
         x: newRect.x, y: newRect.y, width: newRect.width, height: newRect.height,
       })
     );
@@ -650,7 +646,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     // the { minimize } field in the surfaceMouseDown reply to UIServer)
     if (this.uiServerId) {
       this.send(
-        event(this.id, this.uiServerId, UI_INTERFACE, 'setSurfaceVisible', {
+        event(this.id, this.uiServerId, 'setSurfaceVisible', {
           surfaceId, visible: false,
         })
       ).catch(() => {});
@@ -658,7 +654,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
 
     // Notify WindowAbject
     await this.send(
-      event(this.id, info.windowId, WINDOW_INTERFACE, 'titleBarAction', { action: 'minimize' })
+      event(this.id, info.windowId, 'titleBarAction', { action: 'minimize' })
     );
 
     // Notify the correct workspace Taskbar
@@ -666,7 +662,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     if (taskbarId) {
       try {
         await this.send(
-          event(this.id, taskbarId, 'abjects:taskbar' as InterfaceId, 'windowMinimized', {
+          event(this.id, taskbarId, 'windowMinimized', {
             surfaceId, windowId: info.windowId, title: info.title,
           })
         );
@@ -683,7 +679,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     // Show the surface via UIServer (fire-and-forget, consistent with minimize path)
     if (this.uiServerId) {
       this.send(
-        event(this.id, this.uiServerId, UI_INTERFACE, 'setSurfaceVisible', {
+        event(this.id, this.uiServerId, 'setSurfaceVisible', {
           surfaceId, visible: true,
         })
       ).catch(() => {});
@@ -693,7 +689,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
 
     // Notify WindowAbject
     await this.send(
-      event(this.id, info.windowId, WINDOW_INTERFACE, 'titleBarAction', { action: 'restore' })
+      event(this.id, info.windowId, 'titleBarAction', { action: 'restore' })
     );
 
     // Notify the correct workspace Taskbar
@@ -701,7 +697,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     if (taskbarId) {
       try {
         await this.send(
-          event(this.id, taskbarId, 'abjects:taskbar' as InterfaceId, 'windowRestored', {
+          event(this.id, taskbarId, 'windowRestored', {
             surfaceId, windowId: info.windowId,
           })
         );
@@ -746,7 +742,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     if (this.uiServerId) {
       try {
         await this.request(
-          request(this.id, this.uiServerId, UI_INTERFACE, 'setZIndex', {
+          request(this.id, this.uiServerId, 'setZIndex', {
             surfaceId,
             zIndex: newZIndex,
           })

@@ -10,15 +10,10 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 import type { Job } from './job-manager.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 
 const JOB_BROWSER_INTERFACE: InterfaceId = 'abjects:job-browser';
-const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
-const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
-const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
-const JOBMANAGER_INTERFACE: InterfaceId = 'abjects:job-manager';
 
 const WIN_W = 400;
 const WIN_H = 350;
@@ -39,8 +34,7 @@ export class JobBrowser extends Abject {
         description:
           'Browse and monitor job execution status. Shows real-time updates for queued, running, completed, and failed jobs.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: JOB_BROWSER_INTERFACE,
             name: 'JobBrowser',
             description: 'Job status browser UI',
@@ -68,7 +62,6 @@ export class JobBrowser extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [
           { capability: Capabilities.UI_SURFACE, reason: 'Display job browser window', required: true },
         ],
@@ -133,7 +126,7 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
   async show(): Promise<boolean> {
     if (this.windowId) {
       try {
-        await this.request(request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'raiseWindow', {
+        await this.request(request(this.id, this.widgetManagerId!, 'raiseWindow', {
           windowId: this.windowId,
         }));
       } catch { /* best effort */ }
@@ -141,14 +134,14 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
     }
 
     const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
+      request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
 
     const winX = Math.max(20, Math.floor((displayInfo.width - WIN_W) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2));
 
     this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'createWindowAbject', {
         title: 'Jobs',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
@@ -158,7 +151,7 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
 
     // Root VBox
     this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+      request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
         margins: { top: 8, right: 16, bottom: 8, left: 16 },
         spacing: 6,
@@ -167,44 +160,44 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
 
     // Scrollable VBox for job list (expanding)
     this.jobListId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedScrollableVBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.jobListId,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
 
     // Bottom bar with Clear button
     const bottomRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: bottomRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 36 },
     }));
 
     // Spacer pushes button right
-    await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+    await this.request(request(this.id, bottomRowId, 'addLayoutSpacer', {}));
 
     // Clear button
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
     this.clearBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+      request(this.id, this.widgetManagerId!, 'createButton', {
         windowId: this.windowId,
         rect: r0,
         text: 'Clear',
       })
     );
-    await this.request(request(this.id, bottomRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, bottomRowId, 'addLayoutChild', {
       widgetId: this.clearBtnId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 80, height: 36 },
@@ -212,12 +205,12 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
 
     // Register as dependent of Clear button
     await this.request(
-      request(this.id, this.clearBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+      request(this.id, this.clearBtnId, 'addDependent', {})
     );
 
     // Register as dependent of JobManager to receive change events
     await this.request(
-      request(this.id, this.jobManagerId!, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+      request(this.id, this.jobManagerId!, 'addDependent', {})
     );
 
     // Populate existing jobs
@@ -233,12 +226,12 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
     // Unsubscribe from JobManager
     try {
       await this.request(
-        request(this.id, this.jobManagerId!, INTROSPECT_INTERFACE_ID, 'removeDependent', {})
+        request(this.id, this.jobManagerId!, 'removeDependent', {})
       );
     } catch { /* best effort */ }
 
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
         windowId: this.windowId,
       })
     );
@@ -257,7 +250,7 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
 
     try {
       const jobs = await this.request<Job[]>(
-        request(this.id, this.jobManagerId, JOBMANAGER_INTERFACE, 'listJobs', {})
+        request(this.id, this.jobManagerId, 'listJobs', {})
       );
 
       // Jobs come back most-recent-first; display oldest first (top to bottom)
@@ -299,14 +292,14 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
     const estimatedHeight = Math.max(20, lineCount * lineHeight + 4);
 
     const labelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId,
         rect: r0,
         text,
         style: { color, fontSize, wordWrap: true },
       })
     );
-    await this.request(request(this.id, this.jobListId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.jobListId, 'addLayoutChild', {
       widgetId: labelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: estimatedHeight },
@@ -320,7 +313,7 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
 
     try {
       await this.request(
-        request(this.id, labelId, WIDGET_INTERFACE, 'update', {
+        request(this.id, labelId, 'update', {
           text,
           style: { color, fontSize: 13, wordWrap: true },
         })
@@ -333,7 +326,7 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
     if (fromId === this.clearBtnId && aspect === 'click') {
       if (this.jobManagerId) {
         await this.request(
-          request(this.id, this.jobManagerId, JOBMANAGER_INTERFACE, 'clearHistory', {})
+          request(this.id, this.jobManagerId, 'clearHistory', {})
         );
       }
       // Rebuild the job list
@@ -379,12 +372,12 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
 
     for (const [, labelId] of this.jobLabelMap) {
       try {
-        await this.request(request(this.id, this.jobListId, LAYOUT_INTERFACE, 'removeLayoutChild', {
+        await this.request(request(this.id, this.jobListId, 'removeLayoutChild', {
           widgetId: labelId,
         }));
       } catch { /* may already be gone */ }
       try {
-        await this.request(request(this.id, labelId, WIDGET_INTERFACE, 'destroy', {}));
+        await this.request(request(this.id, labelId, 'destroy', {}));
       } catch { /* already gone */ }
     }
     this.jobLabelMap.clear();

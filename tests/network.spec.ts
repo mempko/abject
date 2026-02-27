@@ -34,7 +34,7 @@ test.describe('Network', () => {
       await transportB.connect('mock://peer-a');
 
       // Send message
-      const msg = request('object-a', 'object-b', 'test', 'hello', { data: 'test' });
+      const msg = request('object-a', 'object-b', 'hello', { data: 'test' });
       await transportA.send(msg);
 
       // Wait for message

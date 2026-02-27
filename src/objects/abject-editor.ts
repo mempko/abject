@@ -14,14 +14,9 @@ import {
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
-import { EDITABLE_INTERFACE_ID } from './scriptable-abject.js';
 import { CreationResult } from './object-creator.js';
 
 const ABJECT_EDITOR_INTERFACE: InterfaceId = 'abjects:abject-editor' as InterfaceId;
-const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
-const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
-const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 
 export class AbjectEditor extends Abject {
   private widgetManagerId?: AbjectId;
@@ -51,8 +46,7 @@ export class AbjectEditor extends Abject {
         description:
           'Standalone source editor for ScriptableAbjects. Opens a window with source editing, save/cancel, and AI edit support.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: ABJECT_EDITOR_INTERFACE,
             name: 'AbjectEditor',
             description: 'Source editor for editable abjects',
@@ -77,7 +71,6 @@ export class AbjectEditor extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [
           { capability: Capabilities.UI_SURFACE, reason: 'Display editor window', required: true },
         ],
@@ -116,7 +109,7 @@ export class AbjectEditor extends Abject {
   }
 
   private async addDep(widgetId: AbjectId): Promise<void> {
-    await this.request(request(this.id, widgetId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+    await this.request(request(this.id, widgetId, 'addDependent', {}));
   }
 
   private clearViewTracking(): void {
@@ -134,7 +127,7 @@ export class AbjectEditor extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
         windowId: this.windowId,
       })
     );
@@ -150,7 +143,7 @@ export class AbjectEditor extends Abject {
     let source: string;
     try {
       source = await this.request<string>(
-        request(this.id, objectId, EDITABLE_INTERFACE_ID, 'getSource', {})
+        request(this.id, objectId, 'getSource', {})
       );
     } catch {
       return false;
@@ -161,7 +154,7 @@ export class AbjectEditor extends Abject {
     if (this.registryId) {
       try {
         const reg = await this.request<{ manifest: { name: string } } | null>(
-          request(this.id, this.registryId, 'abjects:registry' as InterfaceId, 'lookup', { objectId })
+          request(this.id, this.registryId, 'lookup', { objectId })
         );
         if (reg) objectName = reg.manifest.name;
       } catch { /* use default name */ }
@@ -170,7 +163,7 @@ export class AbjectEditor extends Abject {
     // Destroy existing window if open
     if (this.windowId) {
       await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
+        request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
           windowId: this.windowId,
         })
       );
@@ -181,7 +174,7 @@ export class AbjectEditor extends Abject {
     this.editingObjectId = objectId;
 
     const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
+      request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
 
     const editW = 600;
@@ -190,7 +183,7 @@ export class AbjectEditor extends Abject {
     const winY = Math.max(20, Math.floor((displayInfo.height - editH) / 2));
 
     this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'createWindowAbject', {
         title: `Edit: ${objectName}`,
         rect: { x: winX, y: winY, width: editW, height: editH },
         zIndex: 200,
@@ -202,7 +195,7 @@ export class AbjectEditor extends Abject {
 
     // Create root VBox layout
     this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+      request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
         margins: { top: 8, right: 16, bottom: 8, left: 16 },
         spacing: 8,
@@ -211,11 +204,11 @@ export class AbjectEditor extends Abject {
 
     // Object name label
     const nameLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: `Source: ${objectName}`,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: nameLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -223,11 +216,11 @@ export class AbjectEditor extends Abject {
 
     // TextArea with source code (expanding both axes)
     this.sourceEditorId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextArea', {
+      request(this.id, this.widgetManagerId!, 'createTextArea', {
         windowId: this.windowId, rect: r0, text: source, monospace: true,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.sourceEditorId,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
       stretch: 1,
@@ -235,91 +228,91 @@ export class AbjectEditor extends Abject {
 
     // Button row (HBox: Save, Cancel, AI Edit)
     const btnRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: btnRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
 
     this.saveBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+      request(this.id, this.widgetManagerId!, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Save',
         style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
       })
     );
     await this.addDep(this.saveBtnId);
-    await this.request(request(this.id, btnRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, btnRowId, 'addLayoutChild', {
       widgetId: this.saveBtnId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 80, height: 32 },
     }));
 
     this.cancelBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+      request(this.id, this.widgetManagerId!, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Cancel',
       })
     );
     await this.addDep(this.cancelBtnId);
-    await this.request(request(this.id, btnRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, btnRowId, 'addLayoutChild', {
       widgetId: this.cancelBtnId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 80, height: 32 },
     }));
 
     this.aiEditBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+      request(this.id, this.widgetManagerId!, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'AI Edit',
         style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
       })
     );
     await this.addDep(this.aiEditBtnId);
-    await this.request(request(this.id, btnRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, btnRowId, 'addLayoutChild', {
       widgetId: this.aiEditBtnId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 80, height: 32 },
     }));
 
-    await this.request(request(this.id, btnRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+    await this.request(request(this.id, btnRowId, 'addLayoutSpacer', {}));
 
     // AI edit prompt row (HBox: input + Go)
     const aiRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: aiRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 30 },
     }));
 
     this.aiPromptInputId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
+      request(this.id, this.widgetManagerId!, 'createTextInput', {
         windowId: this.windowId, rect: r0, placeholder: 'Describe what to change...',
       })
     );
     await this.addDep(this.aiPromptInputId);
-    await this.request(request(this.id, aiRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, aiRowId, 'addLayoutChild', {
       widgetId: this.aiPromptInputId,
       sizePolicy: { horizontal: 'expanding' },
       preferredSize: { height: 30 },
     }));
 
     this.aiGoBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+      request(this.id, this.widgetManagerId!, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Go',
       })
     );
     await this.addDep(this.aiGoBtnId);
-    await this.request(request(this.id, aiRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, aiRowId, 'addLayoutChild', {
       widgetId: this.aiGoBtnId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 80, height: 30 },
@@ -327,11 +320,11 @@ export class AbjectEditor extends Abject {
 
     // Status label
     this.editStatusId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: '',
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.editStatusId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -343,7 +336,7 @@ export class AbjectEditor extends Abject {
   private async updateEditStatus(text: string): Promise<void> {
     if (!this.editStatusId) return;
     await this.request(
-      request(this.id, this.editStatusId, WIDGET_INTERFACE, 'update', { text })
+      request(this.id, this.editStatusId, 'update', { text })
     );
   }
 
@@ -352,7 +345,7 @@ export class AbjectEditor extends Abject {
     const ids = [this.saveBtnId, this.cancelBtnId, this.aiEditBtnId, this.aiGoBtnId, this.aiPromptInputId, this.sourceEditorId];
     for (const id of ids) {
       if (id) {
-        try { await this.request(request(this.id, id, WIDGET_INTERFACE, 'update', { style })); } catch { /* widget gone */ }
+        try { await this.request(request(this.id, id, 'update', { style })); } catch { /* widget gone */ }
       }
     }
   }
@@ -362,12 +355,12 @@ export class AbjectEditor extends Abject {
     if (fromId === this.saveBtnId && this.editingObjectId) {
       await this.setAllControlsDisabled(true);
       const source = await this.request<string>(
-        request(this.id, this.sourceEditorId!, WIDGET_INTERFACE, 'getValue', {})
+        request(this.id, this.sourceEditorId!, 'getValue', {})
       );
 
       try {
         const result = await this.request<{ success: boolean; error?: string }>(
-          request(this.id, this.editingObjectId, EDITABLE_INTERFACE_ID, 'updateSource', {
+          request(this.id, this.editingObjectId, 'updateSource', {
             source,
           })
         );
@@ -375,7 +368,7 @@ export class AbjectEditor extends Abject {
         if (result.success) {
           if (this.registryId) {
             await this.request(
-              request(this.id, this.registryId, 'abjects:registry' as InterfaceId, 'updateSource', {
+              request(this.id, this.registryId, 'updateSource', {
                 objectId: this.editingObjectId, source,
               })
             );
@@ -402,7 +395,7 @@ export class AbjectEditor extends Abject {
     if ((fromId === this.aiGoBtnId || (fromId === this.aiPromptInputId && aspect === 'submit'))
         && this.editingObjectId && this.objectCreatorId) {
       const prompt = await this.request<string>(
-        request(this.id, this.aiPromptInputId!, WIDGET_INTERFACE, 'getValue', {})
+        request(this.id, this.aiPromptInputId!, 'getValue', {})
       );
 
       if (!prompt.trim()) {
@@ -418,7 +411,6 @@ export class AbjectEditor extends Abject {
           request(
             this.id,
             this.objectCreatorId!,
-            'abjects:object-creator' as InterfaceId,
             'modify',
             { objectId: this.editingObjectId, prompt }
           )
@@ -426,7 +418,7 @@ export class AbjectEditor extends Abject {
 
         if (result.success && result.code) {
           await this.request(
-            request(this.id, this.sourceEditorId!, WIDGET_INTERFACE, 'update', {
+            request(this.id, this.sourceEditorId!, 'update', {
               text: result.code,
             })
           );

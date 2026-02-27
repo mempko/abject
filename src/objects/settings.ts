@@ -9,7 +9,7 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
+
 
 const SETTINGS_INTERFACE: InterfaceId = 'abjects:settings';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
@@ -77,8 +77,7 @@ export class Settings extends Abject {
         description:
           'Per-workspace configuration UI. Manages workspace name and access settings.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: SETTINGS_INTERFACE,
             name: 'Settings',
             description: 'Workspace configuration',
@@ -97,7 +96,6 @@ export class Settings extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [
           { capability: Capabilities.UI_SURFACE, reason: 'Display settings window', required: true },
         ],
@@ -127,7 +125,7 @@ export class Settings extends Abject {
     if (!this.widgetManagerId) return undefined;
     try {
       const wsId = await this.request<string | null>(
-        request(this.id, this.widgetManagerId, WIDGETS_INTERFACE, 'getObjectWorkspace', { objectId: this.id })
+        request(this.id, this.widgetManagerId, 'getObjectWorkspace', { objectId: this.id })
       );
       if (wsId) this.workspaceId = wsId;
     } catch { /* not tagged yet */ }
@@ -148,24 +146,24 @@ export class Settings extends Abject {
     if (!this.tabContentContainerId || !this.rootLayoutId) return;
 
     for (const widgetId of this.tabContentWidgetIds) {
-      try { await this.request(request(this.id, widgetId, WIDGET_INTERFACE, 'destroy', {})); }
+      try { await this.request(request(this.id, widgetId, 'destroy', {})); }
       catch { /* gone */ }
     }
     this.tabContentWidgetIds = [];
 
-    try { await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'removeLayoutChild', { widgetId: this.tabContentContainerId })); }
+    try { await this.request(request(this.id, this.rootLayoutId, 'removeLayoutChild', { widgetId: this.tabContentContainerId })); }
     catch { /* gone */ }
-    try { await this.request(request(this.id, this.tabContentContainerId, WIDGET_INTERFACE, 'destroy', {})); }
+    try { await this.request(request(this.id, this.tabContentContainerId, 'destroy', {})); }
     catch { /* gone */ }
 
     this.tabContentContainerId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedVBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.tabContentContainerId,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
@@ -270,7 +268,7 @@ export class Settings extends Abject {
 
     // Get display dimensions
     const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
+      request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
 
     const winW = 440;
@@ -280,7 +278,7 @@ export class Settings extends Abject {
 
     // Create window
     this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'createWindowAbject', {
         title: 'Workspace Settings',
         rect: { x: winX, y: winY, width: winW, height: winH },
         zIndex: 200,
@@ -291,7 +289,7 @@ export class Settings extends Abject {
 
     // Create root VBox layout
     this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+      request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
         margins: { top: 20, right: 20, bottom: 20, left: 20 },
         spacing: 8,
@@ -300,14 +298,14 @@ export class Settings extends Abject {
 
     // Tab bar
     this.tabBarId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTabBar', {
+      request(this.id, this.widgetManagerId!, 'createTabBar', {
         windowId: this.windowId, rect: r0,
         tabs: ['General', 'Access'],
         selectedIndex: this.activeTab === 'general' ? 0 : 1,
       })
     );
-    await this.request(request(this.id, this.tabBarId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.tabBarId, 'addDependent', {}));
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.tabBarId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
@@ -315,13 +313,13 @@ export class Settings extends Abject {
 
     // Create tab content container (expanding VBox that holds all tab content)
     this.tabContentContainerId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedVBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
       widgetId: this.tabContentContainerId,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
@@ -346,7 +344,7 @@ export class Settings extends Abject {
     if (this.workspaceManagerId) {
       try {
         const active = await this.request<{ id: string; name: string } | null>(
-          request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'getActiveWorkspace', {})
+          request(this.id, this.workspaceManagerId, 'getActiveWorkspace', {})
         );
         if (active) currentName = active.name;
       } catch { /* use empty */ }
@@ -358,7 +356,7 @@ export class Settings extends Abject {
     if (this.abjectStoreId) {
       try {
         snapshots = await this.request<AbjectSnapshot[]>(
-          request(this.id, this.abjectStoreId, ABJECT_STORE_INTERFACE, 'list', {})
+          request(this.id, this.abjectStoreId, 'list', {})
         );
       } catch { /* AbjectStore may not be ready */ }
     }
@@ -367,12 +365,12 @@ export class Settings extends Abject {
 
     // Section header: "Workspace"
     const sectionHeaderId = this.trackTabWidget(await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Workspace',
         style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
       })
     ));
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: sectionHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 24 },
@@ -380,12 +378,12 @@ export class Settings extends Abject {
 
     // Description
     const descLabelId = this.trackTabWidget(await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Configure this workspace.',
         style: { color: '#b4b8c8', fontSize: 12 },
       })
     ));
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: descLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
@@ -393,12 +391,12 @@ export class Settings extends Abject {
 
     // Workspace Name label
     const nameLabelId = this.trackTabWidget(await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Workspace Name',
         style: { color: '#e2e4e9', fontSize: 13 },
       })
     ));
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: nameLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -406,13 +404,13 @@ export class Settings extends Abject {
 
     // Workspace Name input
     this.workspaceNameInputId = this.trackTabWidget(await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
+      request(this.id, this.widgetManagerId!, 'createTextInput', {
         windowId: this.windowId, rect: r0, placeholder: 'Workspace name',
         text: currentName,
       })
     ));
-    await this.request(request(this.id, this.workspaceNameInputId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.workspaceNameInputId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: this.workspaceNameInputId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
@@ -422,11 +420,11 @@ export class Settings extends Abject {
 
     // Divider
     const divId = this.trackTabWidget(await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
+      request(this.id, this.widgetManagerId!, 'createDivider', {
         windowId: this.windowId, rect: r0,
       })
     ));
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: divId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 1 },
@@ -434,12 +432,12 @@ export class Settings extends Abject {
 
     // Section header
     const objHeaderId = this.trackTabWidget(await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Created Objects',
         style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
       })
     ));
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: objHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 24 },
@@ -447,12 +445,12 @@ export class Settings extends Abject {
 
     if (snapshots.length === 0) {
       const emptyLabelId = this.trackTabWidget(await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        request(this.id, this.widgetManagerId!, 'createLabel', {
           windowId: this.windowId, rect: r0, text: 'No objects created yet.',
           style: { color: '#b4b8c8', fontSize: 12 },
         })
       ));
-      await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, cId, 'addLayoutChild', {
         widgetId: emptyLabelId,
         sizePolicy: { vertical: 'fixed' },
         preferredSize: { height: 18 },
@@ -461,38 +459,38 @@ export class Settings extends Abject {
       for (const snap of snapshots) {
         // HBox row: name label + delete button
         const rowId = this.trackTabWidget(await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+          request(this.id, this.widgetManagerId!, 'createNestedHBox', {
             parentLayoutId: cId,
             margins: { top: 0, right: 0, bottom: 0, left: 0 },
             spacing: 8,
           })
         ));
-        await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, cId, 'addLayoutChild', {
           widgetId: rowId,
           sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
           preferredSize: { height: 30 },
         }));
 
         const objNameId = this.trackTabWidget(await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+          request(this.id, this.widgetManagerId!, 'createLabel', {
             windowId: this.windowId, rect: r0, text: snap.manifest.name,
             style: { color: '#e2e4e9', fontSize: 13 },
           })
         ));
-        await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, rowId, 'addLayoutChild', {
           widgetId: objNameId,
           sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
           preferredSize: { height: 30 },
         }));
 
         const delBtnId = this.trackTabWidget(await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+          request(this.id, this.widgetManagerId!, 'createButton', {
             windowId: this.windowId, rect: r0, text: 'Delete',
             style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 },
           })
         ));
-        await this.request(request(this.id, delBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-        await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, delBtnId, 'addDependent', {}));
+        await this.request(request(this.id, rowId, 'addLayoutChild', {
           widgetId: delBtnId,
           sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
           preferredSize: { width: 70, height: 28 },
@@ -503,7 +501,7 @@ export class Settings extends Abject {
     }
 
     // Spacer pushes save button to bottom
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+    await this.request(request(this.id, cId, 'addLayoutSpacer', {}));
 
     // Save button row + status label
     await this.buildSaveRow(r0, 'general');
@@ -518,7 +516,7 @@ export class Settings extends Abject {
     if (this.workspaceManagerId && this.workspaceId) {
       try {
         currentAccessMode = await this.request<string>(
-          request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'getAccessMode', { workspaceId: this.workspaceId })
+          request(this.id, this.workspaceManagerId, 'getAccessMode', { workspaceId: this.workspaceId })
         );
       } catch { /* default to local */ }
     }
@@ -527,12 +525,12 @@ export class Settings extends Abject {
 
     // Section header
     const sectionHeaderId = this.trackTabWidget(await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Access Control',
         style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
       })
     ));
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: sectionHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 24 },
@@ -540,12 +538,12 @@ export class Settings extends Abject {
 
     // Description
     const descLabelId = this.trackTabWidget(await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Control who can access this workspace over the network.',
         style: { color: '#b4b8c8', fontSize: 12 },
       })
     ));
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: descLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
@@ -553,12 +551,12 @@ export class Settings extends Abject {
 
     // Access Mode label
     const accessLabelId = this.trackTabWidget(await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Access Mode',
         style: { color: '#e2e4e9', fontSize: 13 },
       })
     ));
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: accessLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -567,14 +565,14 @@ export class Settings extends Abject {
     // Access Mode select dropdown
     const accessModeIndex = currentAccessMode === 'public' ? 2 : currentAccessMode === 'private' ? 1 : 0;
     this.accessModeSelectId = this.trackTabWidget(await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createSelect', {
+      request(this.id, this.widgetManagerId!, 'createSelect', {
         windowId: this.windowId, rect: r0,
         options: ['Local', 'Private', 'Public'],
         selectedIndex: accessModeIndex,
       })
     ));
-    await this.request(request(this.id, this.accessModeSelectId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.accessModeSelectId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: this.accessModeSelectId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
@@ -582,13 +580,13 @@ export class Settings extends Abject {
 
     // ── Whitelist container (always present; populated only for Private mode) ──
     this.whitelistContainerId = this.trackTabWidget(await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedVBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
         parentLayoutId: cId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     ));
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: this.whitelistContainerId,
       sizePolicy: { vertical: 'shrink' },
     }));
@@ -598,7 +596,7 @@ export class Settings extends Abject {
     }
 
     // Spacer pushes save button to bottom
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+    await this.request(request(this.id, cId, 'addLayoutSpacer', {}));
 
     // Save button row + status label
     await this.buildSaveRow(r0, 'access');
@@ -613,12 +611,12 @@ export class Settings extends Abject {
 
     // Divider
     const divId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
+      request(this.id, this.widgetManagerId!, 'createDivider', {
         windowId: this.windowId, rect: r0,
       })
     );
     this.whitelistWidgetIds.push(divId);
-    await this.request(request(this.id, containerId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, containerId, 'addLayoutChild', {
       widgetId: divId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 1 },
@@ -626,13 +624,13 @@ export class Settings extends Abject {
 
     // Section header
     const headerLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Allowed Contacts',
         style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 },
       })
     );
     this.whitelistWidgetIds.push(headerLabelId);
-    await this.request(request(this.id, containerId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, containerId, 'addLayoutChild', {
       widgetId: headerLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -640,13 +638,13 @@ export class Settings extends Abject {
 
     // Description
     const descId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Select which contacts can access this workspace.',
         style: { color: '#b4b8c8', fontSize: 12 },
       })
     );
     this.whitelistWidgetIds.push(descId);
-    await this.request(request(this.id, containerId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, containerId, 'addLayoutChild', {
       widgetId: descId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
@@ -660,7 +658,7 @@ export class Settings extends Abject {
     if (this.peerRegistryId) {
       try {
         contacts = await this.request<Array<{ peerId: string; name: string; state: string }>>(
-          request(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'listContacts', {})
+          request(this.id, this.peerRegistryId, 'listContacts', {})
         );
       } catch { /* PeerRegistry may not be ready */ }
     }
@@ -670,20 +668,20 @@ export class Settings extends Abject {
     if (this.workspaceManagerId && this.workspaceId) {
       try {
         whitelist = await this.request<string[]>(
-          request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'getWhitelist', { workspaceId: this.workspaceId })
+          request(this.id, this.workspaceManagerId, 'getWhitelist', { workspaceId: this.workspaceId })
         );
       } catch { /* whitelist not available yet */ }
     }
 
     if (contacts.length === 0) {
       const emptyLabelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        request(this.id, this.widgetManagerId!, 'createLabel', {
           windowId: this.windowId, rect: r0, text: 'No contacts available. Add contacts in Global Settings.',
           style: { color: '#b4b8c8', fontSize: 12 },
         })
       );
       this.whitelistWidgetIds.push(emptyLabelId);
-      await this.request(request(this.id, containerId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, containerId, 'addLayoutChild', {
         widgetId: emptyLabelId,
         sizePolicy: { vertical: 'fixed' },
         preferredSize: { height: 18 },
@@ -695,28 +693,28 @@ export class Settings extends Abject {
 
         // HBox row: checkbox + name label
         const rowId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+          request(this.id, this.widgetManagerId!, 'createNestedHBox', {
             parentLayoutId: containerId,
             margins: { top: 0, right: 0, bottom: 0, left: 0 },
             spacing: 8,
           })
         );
         this.whitelistWidgetIds.push(rowId);
-        await this.request(request(this.id, containerId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, containerId, 'addLayoutChild', {
           widgetId: rowId,
           sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
           preferredSize: { height: 28 },
         }));
 
         const checkboxId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createCheckbox', {
+          request(this.id, this.widgetManagerId!, 'createCheckbox', {
             windowId: this.windowId, rect: r0,
             checked: isWhitelisted,
             text: displayName,
           })
         );
-        await this.request(request(this.id, checkboxId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-        await this.request(request(this.id, rowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, checkboxId, 'addDependent', {}));
+        await this.request(request(this.id, rowId, 'addLayoutChild', {
           widgetId: checkboxId,
           sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
           preferredSize: { height: 28 },
@@ -734,10 +732,10 @@ export class Settings extends Abject {
     if (!this.whitelistContainerId) return;
     for (const widgetId of this.whitelistWidgetIds) {
       try {
-        await this.request(request(this.id, this.whitelistContainerId, LAYOUT_INTERFACE, 'removeLayoutChild', { widgetId }));
+        await this.request(request(this.id, this.whitelistContainerId, 'removeLayoutChild', { widgetId }));
       } catch { /* widget may already be gone */ }
       try {
-        await this.request(request(this.id, widgetId, WIDGET_INTERFACE, 'destroy', {}));
+        await this.request(request(this.id, widgetId, 'destroy', {}));
       } catch { /* best effort */ }
     }
     this.whitelistWidgetIds = [];
@@ -751,40 +749,40 @@ export class Settings extends Abject {
     const cId = this.tabContentContainerId!;
 
     const saveRowId = this.trackTabWidget(await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: cId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     ));
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: saveRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 36 },
     }));
 
-    await this.request(request(this.id, saveRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+    await this.request(request(this.id, saveRowId, 'addLayoutSpacer', {}));
 
     const btnId = this.trackTabWidget(await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+      request(this.id, this.widgetManagerId!, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Save',
         style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
       })
     ));
-    await this.request(request(this.id, btnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, saveRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, btnId, 'addDependent', {}));
+    await this.request(request(this.id, saveRowId, 'addLayoutChild', {
       widgetId: btnId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 100, height: 36 },
     }));
 
     const statusId = this.trackTabWidget(await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: '',
         style: { color: '#b4b8c8', fontSize: 12, align: 'right' },
       })
     ));
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: statusId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
@@ -806,7 +804,7 @@ export class Settings extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
         windowId: this.windowId,
       })
     );
@@ -835,7 +833,7 @@ export class Settings extends Abject {
     const style = { disabled };
     for (const id of ids) {
       if (id) {
-        try { await this.request(request(this.id, id, WIDGET_INTERFACE, 'update', { style })); } catch { /* widget gone */ }
+        try { await this.request(request(this.id, id, 'update', { style })); } catch { /* widget gone */ }
       }
     }
   }
@@ -849,14 +847,14 @@ export class Settings extends Abject {
     await this.setControlsDisabled(true, [this.saveBtnId, this.workspaceNameInputId]);
 
     const workspaceName = await this.request<string>(
-      request(this.id, this.workspaceNameInputId!, WIDGET_INTERFACE, 'getValue', {})
+      request(this.id, this.workspaceNameInputId!, 'getValue', {})
     );
 
     // Validate non-empty
     if (!workspaceName || workspaceName.trim() === '') {
       if (this.statusLabelId) {
         await this.request(
-          request(this.id, this.statusLabelId, WIDGET_INTERFACE, 'update', {
+          request(this.id, this.statusLabelId, 'update', {
             text: 'Workspace name cannot be empty.',
             style: { color: '#ff6b6b' },
           })
@@ -872,7 +870,7 @@ export class Settings extends Abject {
     // Rename the workspace
     if (this.workspaceManagerId && this.workspaceId) {
       await this.request(
-        request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'renameWorkspace', {
+        request(this.id, this.workspaceManagerId, 'renameWorkspace', {
           workspaceId: this.workspaceId,
           name: workspaceName.trim(),
         })
@@ -885,10 +883,10 @@ export class Settings extends Abject {
       if (this.workspaceSwitcherId) {
         try {
           const workspaces = await this.request<Array<{ id: string; name: string }>>(
-            request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'listWorkspaces', {})
+            request(this.id, this.workspaceManagerId, 'listWorkspaces', {})
           );
           await this.request(
-            request(this.id, this.workspaceSwitcherId, WORKSPACE_SWITCHER_INTERFACE, 'show', {
+            request(this.id, this.workspaceSwitcherId, 'show', {
               workspaces,
               activeWorkspaceId: this.workspaceId,
             })
@@ -900,7 +898,7 @@ export class Settings extends Abject {
     // Show save feedback, then close
     if (this.statusLabelId) {
       await this.request(
-        request(this.id, this.statusLabelId, WIDGET_INTERFACE, 'update', {
+        request(this.id, this.statusLabelId, 'update', {
           text: 'Settings saved!',
           style: { color: '#b4b8c8' },
         })
@@ -924,12 +922,12 @@ export class Settings extends Abject {
     if (this.workspaceManagerId && this.workspaceId && this.accessModeSelectId) {
       try {
         const selectedValue = await this.request<string>(
-          request(this.id, this.accessModeSelectId, WIDGET_INTERFACE, 'getValue', {})
+          request(this.id, this.accessModeSelectId, 'getValue', {})
         );
         const modeMap: Record<string, string> = { 'Local': 'local', 'Private': 'private', 'Public': 'public' };
         const accessMode = modeMap[selectedValue] ?? 'local';
         await this.request(
-          request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'setAccessMode', {
+          request(this.id, this.workspaceManagerId, 'setAccessMode', {
             workspaceId: this.workspaceId,
             accessMode,
           })
@@ -941,13 +939,13 @@ export class Settings extends Abject {
           for (const [checkboxId, peerId] of this.whitelistCheckboxes) {
             try {
               const checked = await this.request<string>(
-                request(this.id, checkboxId, WIDGET_INTERFACE, 'getValue', {})
+                request(this.id, checkboxId, 'getValue', {})
               );
               if (checked === 'true') whitelist.push(peerId);
             } catch { /* checkbox gone */ }
           }
           await this.request(
-            request(this.id, this.workspaceManagerId, WORKSPACE_MANAGER_INTERFACE, 'setWhitelist', {
+            request(this.id, this.workspaceManagerId, 'setWhitelist', {
               workspaceId: this.workspaceId,
               whitelist,
             })
@@ -960,7 +958,7 @@ export class Settings extends Abject {
     const statusId = this.accessStatusLabelId;
     if (statusId) {
       await this.request(
-        request(this.id, statusId, WIDGET_INTERFACE, 'update', {
+        request(this.id, statusId, 'update', {
           text: 'Access settings saved!',
           style: { color: '#b4b8c8' },
         })
@@ -979,7 +977,7 @@ export class Settings extends Abject {
     try {
       // Remove from AbjectStore
       await this.request(
-        request(this.id, this.abjectStoreId, ABJECT_STORE_INTERFACE, 'remove', { objectId })
+        request(this.id, this.abjectStoreId, 'remove', { objectId })
       );
 
       // Kill the live object via Factory
@@ -987,7 +985,7 @@ export class Settings extends Abject {
       if (factoryId) {
         try {
           await this.request(
-            request(this.id, factoryId, 'abjects:factory' as InterfaceId, 'kill', { objectId: objectId as AbjectId })
+            request(this.id, factoryId, 'kill', { objectId: objectId as AbjectId })
           );
         } catch { /* object may already be dead */ }
       }

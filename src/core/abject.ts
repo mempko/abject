@@ -20,7 +20,7 @@ import { reply, error, errorFromException, event, request, isRequest, isReply, i
 import { Mailbox } from '../runtime/mailbox.js';
 import type { MessageBusLike } from '../runtime/message-bus.js';
 import { CapabilitySet, getDefaultCapabilities } from './capability.js';
-import { INTROSPECT_INTERFACE, INTROSPECT_INTERFACE_ID, formatManifestAsDescription } from './introspect.js';
+import { INTROSPECT_METHODS, INTROSPECT_EVENTS, formatManifestAsDescription } from './introspect.js';
 import type { InterfaceId } from './types.js';
 
 /**
@@ -79,15 +79,18 @@ export abstract class Abject {
     requireNonEmpty(options.manifest.name, 'manifest.name');
 
     this.id = uuidv4();
-    // Append the introspect interface to every Abject's manifest
-    const hasIntrospect = options.manifest.interfaces.some(
-      (i) => i.id === INTROSPECT_INTERFACE_ID
-    );
-    this.manifest = hasIntrospect
+    // Merge introspect methods and events into the single interface
+    const iface = options.manifest.interface;
+    const hasDescribe = iface.methods.some(m => m.name === 'describe');
+    this.manifest = hasDescribe
       ? options.manifest
       : {
           ...options.manifest,
-          interfaces: [...options.manifest.interfaces, INTROSPECT_INTERFACE],
+          interface: {
+            ...iface,
+            methods: [...iface.methods, ...INTROSPECT_METHODS],
+            events: [...(iface.events ?? []), ...INTROSPECT_EVENTS],
+          },
         };
     this.state = options.initialState;
     this.startedAt = Date.now();
@@ -185,7 +188,7 @@ export abstract class Abject {
       if (this._parentId) {
         try {
           const id = await this.request<string>(
-            request(this.id, this._parentId, INTROSPECT_INTERFACE_ID, 'getRegistry', {})
+            request(this.id, this._parentId, 'getRegistry', {})
           );
           if (id) this._registryId = id as AbjectId;
           return id;
@@ -221,7 +224,7 @@ export abstract class Abject {
     // Notify parent after full initialization
     if (this._parentId) {
       try {
-        await this.send(event(this.id, this._parentId, INTROSPECT_INTERFACE_ID, 'childReady', {
+        await this.send(event(this.id, this._parentId, 'childReady', {
           childId: this.id, name: this.manifest.name,
         }));
       } catch {
@@ -254,7 +257,7 @@ export abstract class Abject {
     if (this._parentId) {
       try {
         const id = await this.request<string>(
-          request(this.id, this._parentId, INTROSPECT_INTERFACE_ID, 'getRegistry', {})
+          request(this.id, this._parentId, 'getRegistry', {})
         );
         if (id) {
           this._registryId = id as AbjectId;
@@ -273,7 +276,7 @@ export abstract class Abject {
     const regId = await this.resolveRegistryId();
     if (!regId) return null;
     const results = await this.request<Array<{ id: AbjectId }>>(
-      request(this.id, regId, 'abjects:registry' as InterfaceId, 'discover', { name })
+      request(this.id, regId, 'discover', { name })
     );
     return results.length > 0 ? results[0].id : null;
   }
@@ -307,7 +310,7 @@ export abstract class Abject {
       if (!regId && this._parentId) {
         try {
           const id = await this.request<string>(
-            request(this.id, this._parentId, INTROSPECT_INTERFACE_ID, 'getRegistry', {})
+            request(this.id, this._parentId, 'getRegistry', {})
           );
           if (id) {
             regId = id as AbjectId;
@@ -321,7 +324,7 @@ export abstract class Abject {
       if (regId) {
         // Discover LLM via Registry
         const results = await this.request<Array<{ id: AbjectId }>>(
-          request(this.id, regId, 'abjects:registry' as InterfaceId, 'discover', { name: 'LLM' })
+          request(this.id, regId, 'discover', { name: 'LLM' })
         );
 
         if (results && results.length > 0) {
@@ -334,7 +337,7 @@ export abstract class Abject {
           }
 
           const llmResult = await this.request<{ content: string }>(
-            request(this.id, llmId, 'abjects:llm' as InterfaceId, 'complete', {
+            request(this.id, llmId, 'complete', {
               messages: [
                 { role: 'system', content: `You are answering questions about an object in the Abjects system. Use the provided manifest and source code to give accurate, concise answers.\n\n${context}` },
                 { role: 'user', content: question },
@@ -469,7 +472,7 @@ export abstract class Abject {
    */
   protected async changed(aspect: string, value?: unknown): Promise<void> {
     for (const depId of this.dependents) {
-      await this.send(event(this.id, depId, INTROSPECT_INTERFACE_ID, 'changed', {
+      await this.send(event(this.id, depId, 'changed', {
         aspect,
         value,
       }));
@@ -499,9 +502,8 @@ export abstract class Abject {
     return new Promise((resolve, reject) => {
       const target = message.routing.to;
       const method = message.routing.method ?? '?';
-      const iface = message.routing.interface ?? '?';
       const timeoutMsg =
-        `Request timeout after ${timeoutMs}ms: ${this.manifest.name}(${this.id}) → ${target} ${iface}.${method}`;
+        `Request timeout after ${timeoutMs}ms: ${this.manifest.name}(${this.id}) → ${target} ${method}`;
 
       const timeout = setTimeout(() => {
         this.pendingReplies.delete(message.header.messageId);
@@ -686,7 +688,7 @@ export class SimpleAbject extends Abject {
         name,
         description,
         version: '1.0.0',
-        interfaces: [],
+        interface: { id: 'abjects:simple' as InterfaceId, name: 'Simple', description, methods: [] },
         requiredCapabilities: [],
         ...options.manifest,
       },

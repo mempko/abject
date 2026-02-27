@@ -36,6 +36,8 @@ export const Capabilities = {
   FILESYSTEM_WRITE: 'abjects:filesystem:write' as CapabilityId,
   CONSOLE: 'abjects:console' as CapabilityId,
   EDIT_OBJECT: 'abjects:object:edit' as CapabilityId,
+  WEB_PARSE: 'abjects:web:parse' as CapabilityId,
+  WEB_BROWSE: 'abjects:web:browse' as CapabilityId,
 
   // Identity capabilities
   IDENTITY_SIGN: 'abjects:identity:sign' as CapabilityId,

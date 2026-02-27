@@ -2,7 +2,7 @@
  * LLM Service object - provides LLM capabilities to other objects.
  */
 
-import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
+import { AbjectId, AbjectMessage } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
 import { Capabilities } from '../core/capability.js';
@@ -58,8 +58,7 @@ export class LLMObject extends Abject {
         description:
           'Language model service. Provides completion, code generation, and analysis capabilities.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: LLM_INTERFACE,
             name: 'LLM',
             description: 'Language model operations',
@@ -148,7 +147,6 @@ export class LLMObject extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [Capabilities.LLM_QUERY],
         tags: ['system', 'llm', 'ai'],
@@ -234,7 +232,6 @@ export class LLMObject extends Abject {
       const requestMsg = msg.request(
         self.id,
         self.httpClientId!,
-        'abjects:http' as InterfaceId,
         'request',
         httpRequest
       );
@@ -302,7 +299,7 @@ export class LLMObject extends Abject {
     if (callerId) {
       keepaliveTimer = setInterval(() => {
         this.send(
-          event(this.id, callerId, 'abjects:llm' as InterfaceId, 'progress', {
+          event(this.id, callerId, 'progress', {
             phase: 'llm-waiting',
             message: `LLM request in progress (${Math.round((Date.now() - start) / 1000)}s)`,
           })

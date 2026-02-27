@@ -6,7 +6,7 @@
 
 import { createApp, App } from './ui/app.js';
 import type { WorkerLike } from './runtime/worker-bridge.js';
-import { AbjectId, AbjectMessage, InterfaceId, SpawnResult } from './core/types.js';
+import { AbjectId, AbjectMessage, SpawnResult } from './core/types.js';
 import { LLMObject } from './objects/llm-object.js';
 import { ObjectCreator } from './objects/object-creator.js';
 import { ProxyGenerator } from './objects/proxy-generator.js';
@@ -78,10 +78,10 @@ export { JobManager, JOBMANAGER_ID } from './objects/job-manager.js';
 export { JobBrowser, JOB_BROWSER_ID } from './objects/job-browser.js';
 export { Chat, CHAT_ID } from './objects/chat.js';
 export { AbjectStore, ABJECT_STORE_ID } from './objects/abject-store.js';
-export { ScriptableAbject, EDITABLE_INTERFACE_ID } from './objects/scriptable-abject.js';
+export { ScriptableAbject } from './objects/scriptable-abject.js';
 export { CompositeAbject, COMPOSITE_ABJECT_ID } from './objects/composite-abject.js';
 export type { CompositeSpec, CompositeChildSpec, RouteEntry } from './objects/composite-abject.js';
-export { Supervisor, SUPERVISOR_ID, SUPERVISOR_INTERFACE_ID } from './runtime/supervisor.js';
+export { Supervisor, SUPERVISOR_ID } from './runtime/supervisor.js';
 export type { ChildSpec, RestartType, RestartStrategy, SupervisorConfig } from './runtime/supervisor.js';
 export { WorkspaceManager, WORKSPACE_MANAGER_ID } from './objects/workspace-manager.js';
 export type { WorkspaceAccessMode, SharedWorkspaceInfo } from './objects/workspace-manager.js';
@@ -139,13 +139,16 @@ export { Timer, TIMER_ID } from './objects/capabilities/timer.js';
 export { Clipboard, CLIPBOARD_ID } from './objects/capabilities/clipboard.js';
 export { Console, CONSOLE_ID } from './objects/capabilities/console.js';
 export { FileSystem, FILESYSTEM_ID } from './objects/capabilities/filesystem.js';
+// WebParser and WebBrowser are server-only — import directly from their files:
+// import { WebParser } from './objects/capabilities/web-parser.js';
+// import { WebBrowser } from './objects/capabilities/web-browser.js';
 
 // Export core types
 export * from './core/types.js';
 export * from './core/message.js';
 export * from './core/capability.js';
 export * from './core/contracts.js';
-export { INTROSPECT_INTERFACE_ID, INTROSPECT_INTERFACE, formatManifestAsDescription } from './core/introspect.js';
+export { formatManifestAsDescription } from './core/introspect.js';
 export type { PeerId, PeerIdentity, PeerContact, PeerConnectionState } from './core/identity.js';
 export { derivePeerId, derivePeerIdFromJwk, deriveSessionKey, aesEncrypt, aesDecrypt } from './core/identity.js';
 export type { IntrospectResult } from './core/introspect.js';
@@ -252,7 +255,6 @@ async function main(): Promise<App> {
   const bus = runtime.messageBus;
   const factoryId = runtime.objectFactory.id;
   const registryId = runtime.objectRegistry.id;
-  const FACTORY_IFACE = 'abjects:factory' as InterfaceId;
   const BOOTSTRAP_ID = 'bootstrap' as AbjectId;
 
   // Register a temporary bootstrap sender on the bus to enable request-reply
@@ -270,9 +272,9 @@ async function main(): Promise<App> {
     }
   });
 
-  function bootstrapRequest<T>(target: AbjectId, iface: InterfaceId, method: string, payload: unknown): Promise<T> {
+  function bootstrapRequest<T>(target: AbjectId, method: string, payload: unknown): Promise<T> {
     return new Promise((resolve, reject) => {
-      const msg = message.request(BOOTSTRAP_ID, target, iface, method, payload);
+      const msg = message.request(BOOTSTRAP_ID, target, method, payload);
       pendingReplies.set(msg.header.messageId, {
         resolve: resolve as (v: unknown) => void, reject,
       });
@@ -282,8 +284,8 @@ async function main(): Promise<App> {
 
   // Helper: spawn via Factory message, return spawned object ID
   async function factorySpawn(name: string): Promise<AbjectId> {
-    const result = await bootstrapRequest<SpawnResult>(factoryId, FACTORY_IFACE, 'spawn', {
-      manifest: { name, description: '', version: '1.0.0', interfaces: [],
+    const result = await bootstrapRequest<SpawnResult>(factoryId, 'spawn', {
+      manifest: { name, description: '', version: '1.0.0',
                   requiredCapabilities: [], tags: ['system'] },
     });
     return result.objectId;
@@ -351,13 +353,11 @@ async function main(): Promise<App> {
 
   // Spawn Supervisor early so it can supervise other objects
   const supervisorId = await factorySpawn('Supervisor');
-  const SUPERVISOR_IFACE = 'abjects:supervisor' as InterfaceId;
-  const HEALTH_IFACE = 'abjects:health-monitor' as InterfaceId;
 
   // Helper: spawn via Factory, register with Supervisor, return ID
   async function supervisedSpawn(name: string, restart: RestartType = 'permanent'): Promise<AbjectId> {
     const id = await factorySpawn(name);
-    await bootstrapRequest(supervisorId, SUPERVISOR_IFACE, 'addChild', {
+    await bootstrapRequest(supervisorId, 'addChild', {
       id, constructorName: name, restart,
     });
     return id;
@@ -371,7 +371,7 @@ async function main(): Promise<App> {
   const llmId = await supervisedSpawn('LLMObject');
 
   // Configure LLM with API keys (still needed — this isn't a dep)
-  await bootstrapRequest(llmId, 'abjects:llm' as InterfaceId, 'configure', {
+  await bootstrapRequest(llmId, 'configure', {
     anthropicApiKey: anthropicKey,
     openaiApiKey: openaiKey,
   });
@@ -418,7 +418,7 @@ async function main(): Promise<App> {
   // Boot workspaces BEFORE spawning WSR — boot() loads persisted workspaces
   // (including their access modes) so listSharedWorkspaces returns real data.
   // Cannot happen during onInit because Factory would deadlock processing our spawn request.
-  await bootstrapRequest(workspaceManagerId, 'abjects:workspace-manager' as InterfaceId, 'boot', {});
+  await bootstrapRequest(workspaceManagerId, 'boot', {});
 
   // WorkspaceShareRegistry must spawn AFTER boot() so listSharedWorkspaces finds shared workspaces
   const workspaceShareRegistryId = await supervisedSpawn('WorkspaceShareRegistry');
@@ -439,10 +439,10 @@ async function main(): Promise<App> {
     workspaceSwitcherId, workspaceManagerId,
   ];
   for (const objId of monitoredIds) {
-    await bootstrapRequest(healthMonitorId, HEALTH_IFACE, 'monitorObject', { objectId: objId });
-    await bootstrapRequest(healthMonitorId, HEALTH_IFACE, 'markObjectReady', { objectId: objId });
+    await bootstrapRequest(healthMonitorId, 'monitorObject', { objectId: objId });
+    await bootstrapRequest(healthMonitorId, 'markObjectReady', { objectId: objId });
   }
-  await bootstrapRequest(healthMonitorId, HEALTH_IFACE, 'startMonitoring', {});
+  await bootstrapRequest(healthMonitorId, 'startMonitoring', {});
 
   // Clean up bootstrap handler
   bus.removeReplyHandler(BOOTSTRAP_ID);

@@ -63,7 +63,7 @@ test.describe('Worker Parallelism', () => {
       const timerId = ids.timer;
 
       // Use the introspect interface ping
-      const msg = request(testerId, timerId, 'abjects:introspect', 'ping', {});
+      const msg = request(testerId, timerId, 'ping', {});
 
       // Set up reply handling
       return new Promise<boolean>((resolve) => {

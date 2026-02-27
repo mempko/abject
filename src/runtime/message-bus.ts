@@ -6,7 +6,7 @@
  * Replies bypass the mailbox via a fast-path to avoid deadlocks.
  */
 
-import { AbjectMessage, AbjectId, AbjectError, InterfaceId } from '../core/types.js';
+import { AbjectMessage, AbjectId, AbjectError } from '../core/types.js';
 import { require, ensure, invariant, requireNonEmpty } from '../core/contracts.js';
 import { request as createRequest, error as createError } from '../core/message.js';
 import { Mailbox } from './mailbox.js';
@@ -374,7 +374,7 @@ export class LoggingInterceptor implements MessageInterceptor {
       console.log(
         `${this.prefix} ${message.header.type} ` +
           `${message.routing.from} -> ${message.routing.to} ` +
-          `[${message.routing.interface}${message.routing.method ? '.' + message.routing.method : ''}]`
+          `[${message.routing.method ?? ''}]`
       );
     }
     return 'pass';
@@ -461,7 +461,6 @@ export class HealthInterceptor implements MessageInterceptor {
           createRequest(
             'health-interceptor' as AbjectId,
             this.healthMonitorId,
-            'abjects:health-monitor' as InterfaceId,
             'recordError',
             { agreementId, error: errorPayload }
           )
@@ -472,7 +471,6 @@ export class HealthInterceptor implements MessageInterceptor {
           createRequest(
             'health-interceptor' as AbjectId,
             this.healthMonitorId,
-            'abjects:health-monitor' as InterfaceId,
             'recordSuccess',
             { agreementId }
           )

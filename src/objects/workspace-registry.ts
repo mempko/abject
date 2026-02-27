@@ -45,7 +45,7 @@ export class WorkspaceRegistry extends Registry {
     if (this.fallbackRegistryId) {
       try {
         const remote = await this.request<ObjectRegistration[]>(
-          request(this.id, this.fallbackRegistryId, 'abjects:registry' as InterfaceId, 'discover', query)
+          request(this.id, this.fallbackRegistryId, 'discover', query)
         );
         return remote;
       } catch {

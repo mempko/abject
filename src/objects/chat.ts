@@ -11,17 +11,12 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { invariant } from '../core/contracts.js';
-import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 import { formatManifestAsDescription } from '../core/introspect.js';
 import type { JobResult } from './job-manager.js';
 import type { DiscoveredWorkspace } from './workspace-share-registry.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 
 const CHAT_INTERFACE: InterfaceId = 'abjects:chat';
-const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
-const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
-const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
-const JOBMANAGER_INTERFACE: InterfaceId = 'abjects:job-manager';
 
 const WIN_W = 500;
 const WIN_H = 500;
@@ -92,8 +87,7 @@ export class Chat extends Abject {
         description:
           'Conversational LLM agent. Chat naturally to explore, create, and control objects. Submits jobs to JobManager for execution.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: CHAT_INTERFACE,
             name: 'Chat',
             description: 'Conversational LLM agent UI',
@@ -136,7 +130,6 @@ export class Chat extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [
           { capability: Capabilities.UI_SURFACE, reason: 'Display chat window', required: true },
           { capability: Capabilities.LLM_QUERY, reason: 'Query LLM for responses', required: true },
@@ -225,7 +218,7 @@ export class Chat extends Abject {
   async show(): Promise<boolean> {
     if (this.windowId) {
       try {
-        await this.request(request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'raiseWindow', {
+        await this.request(request(this.id, this.widgetManagerId!, 'raiseWindow', {
           windowId: this.windowId,
         }));
       } catch { /* best effort */ }
@@ -233,14 +226,14 @@ export class Chat extends Abject {
     }
 
     const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
+      request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
 
     const winX = Math.max(20, Math.floor((displayInfo.width - WIN_W) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2));
 
     this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'createWindowAbject', {
         title: 'Chat Agent',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
@@ -250,7 +243,7 @@ export class Chat extends Abject {
 
     // Root VBox
     this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+      request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
         margins: { top: 8, right: 16, bottom: 8, left: 16 },
         spacing: 6,
@@ -259,26 +252,26 @@ export class Chat extends Abject {
 
     // Scrollable VBox for message log (expanding)
     this.messageLogId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedScrollableVBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.messageLogId,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
 
     // Input row (HBox: TextInput + Send button)
     this.inputRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.inputRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 36 },
@@ -288,13 +281,13 @@ export class Chat extends Abject {
 
     // Text input (expanding)
     this.textInputId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
+      request(this.id, this.widgetManagerId!, 'createTextInput', {
         windowId: this.windowId,
         rect: r0,
         placeholder: 'Type a message...',
       })
     );
-    await this.request(request(this.id, this.inputRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.inputRowId, 'addLayoutChild', {
       widgetId: this.textInputId,
       sizePolicy: { horizontal: 'expanding' },
       preferredSize: { height: 36 },
@@ -302,22 +295,22 @@ export class Chat extends Abject {
 
     // Send button (fixed)
     this.sendBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+      request(this.id, this.widgetManagerId!, 'createButton', {
         windowId: this.windowId,
         rect: r0,
         text: 'Send',
         style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
       })
     );
-    await this.request(request(this.id, this.inputRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.inputRowId, 'addLayoutChild', {
       widgetId: this.sendBtnId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 60, height: 36 },
     }));
 
     // Register as dependent of interactive widgets
-    await this.request(request(this.id, this.sendBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, this.textInputId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+    await this.request(request(this.id, this.sendBtnId, 'addDependent', {}));
+    await this.request(request(this.id, this.textInputId, 'addDependent', {}));
 
     this.phase = 'idle';
 
@@ -334,7 +327,7 @@ export class Chat extends Abject {
     this.phase = 'closed';
 
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
         windowId: this.windowId,
       })
     );
@@ -355,14 +348,14 @@ export class Chat extends Abject {
     if (this.phase !== 'idle' || !this.textInputId) return;
 
     const text = await this.request<string>(
-      request(this.id, this.textInputId, WIDGET_INTERFACE, 'getValue', {})
+      request(this.id, this.textInputId, 'getValue', {})
     );
 
     if (!text?.trim()) return;
 
     // Clear input
     await this.request(
-      request(this.id, this.textInputId, WIDGET_INTERFACE, 'update', { text: '' })
+      request(this.id, this.textInputId, 'update', { text: '' })
     );
 
     this.triggerSend(text.trim());
@@ -381,10 +374,10 @@ export class Chat extends Abject {
   private async setInputDisabled(disabled: boolean): Promise<void> {
     const style = { disabled };
     if (this.sendBtnId) {
-      try { await this.request(request(this.id, this.sendBtnId, WIDGET_INTERFACE, 'update', { style })); } catch { /* widget gone */ }
+      try { await this.request(request(this.id, this.sendBtnId, 'update', { style })); } catch { /* widget gone */ }
     }
     if (this.textInputId) {
-      try { await this.request(request(this.id, this.textInputId, WIDGET_INTERFACE, 'update', { style })); } catch { /* widget gone */ }
+      try { await this.request(request(this.id, this.textInputId, 'update', { style })); } catch { /* widget gone */ }
     }
   }
 
@@ -408,7 +401,7 @@ export class Chat extends Abject {
       const messages = this.buildLLMMessages();
 
       const llmResult = await this.request<{ content: string }>(
-        request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', {
+        request(this.id, this.llmId!, 'complete', {
           messages,
           options: { tier: 'balanced', maxTokens: 16384 },
         }),
@@ -447,7 +440,7 @@ export class Chat extends Abject {
           });
 
           const pass2Result = await this.request<{ content: string }>(
-            request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', {
+            request(this.id, this.llmId!, 'complete', {
               messages: enrichedMessages,
               options: { tier: 'balanced', maxTokens: 16384 },
             }),
@@ -480,7 +473,7 @@ export class Chat extends Abject {
             'Please respond again with the "steps" array containing the code to execute what you promised.' });
 
           const retry = await this.request<{ content: string }>(
-            request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', {
+            request(this.id, this.llmId!, 'complete', {
               messages: retryMessages,
               options: { tier: 'balanced', maxTokens: 16384 },
             }),
@@ -544,7 +537,7 @@ export class Chat extends Abject {
         // Wrap code to inject previousResult
         const wrappedCode = `const previousResult = ${JSON.stringify(previousResult)};\n${step.code}`;
 
-        const submitMsg = request(this.id, this.jobManagerId!, JOBMANAGER_INTERFACE, 'submitJob', {
+        const submitMsg = request(this.id, this.jobManagerId!, 'submitJob', {
           description: step.description,
           code: wrappedCode,
         });
@@ -596,7 +589,7 @@ export class Chat extends Abject {
       try {
         const messages = this.buildLLMMessages(!!this.enrichedObjectContext);
         const followUp = await this.request<{ content: string }>(
-          request(this.id, this.llmId!, 'abjects:llm' as InterfaceId, 'complete', {
+          request(this.id, this.llmId!, 'complete', {
             messages,
             options: { tier: 'balanced', maxTokens: 16384 },
           }),
@@ -637,7 +630,7 @@ export class Chat extends Abject {
 
     try {
       const objects = await this.request<ObjectRegistration[]>(
-        request(this.id, this.registryId!, 'abjects:registry' as InterfaceId, 'list', {})
+        request(this.id, this.registryId!, 'list', {})
       );
 
       this.objectSummaries = objects
@@ -657,12 +650,12 @@ export class Chat extends Abject {
       if (!wsrId) return;
 
       let workspaces = await this.request<DiscoveredWorkspace[]>(
-        request(this.id, wsrId, 'abjects:workspace-share-registry' as InterfaceId, 'getDiscoveredWorkspaces', {})
+        request(this.id, wsrId, 'getDiscoveredWorkspaces', {})
       );
 
       if (workspaces.length === 0) {
         workspaces = await this.request<DiscoveredWorkspace[]>(
-          request(this.id, wsrId, 'abjects:workspace-share-registry' as InterfaceId, 'discoverWorkspaces', { hops: 1 })
+          request(this.id, wsrId, 'discoverWorkspaces', { hops: 1 })
         );
       }
 
@@ -675,7 +668,7 @@ export class Chat extends Abject {
       for (const ws of workspaces) {
         try {
           const remoteObjects = await this.request<ObjectRegistration[]>(
-            request(this.id, ws.registryId as AbjectId, 'abjects:registry' as InterfaceId, 'list', {})
+            request(this.id, ws.registryId as AbjectId, 'list', {})
           );
           const objNames = remoteObjects.map(o => {
             const clonable = (o as ObjectRegistration & { source?: string }).source ? ' (clonable)' : '';
@@ -700,7 +693,7 @@ export class Chat extends Abject {
   private async discoverObjectSummaries(): Promise<ObjectSummary[]> {
     if (!this.registryId) return [];
     const allObjects = await this.request<ObjectRegistration[]>(
-      request(this.id, this.registryId, 'abjects:registry' as InterfaceId, 'list', {})
+      request(this.id, this.registryId, 'list', {})
     );
     return allObjects.map((o) => ({
       id: o.id,
@@ -721,7 +714,7 @@ export class Chat extends Abject {
       .join('\n');
 
     const result = await this.request<{ content: string }>(
-      request(this.id, this.llmId, 'abjects:llm' as InterfaceId, 'complete', {
+      request(this.id, this.llmId, 'complete', {
         messages: [
           {
             role: 'system',
@@ -764,7 +757,7 @@ export class Chat extends Abject {
 
       try {
         const result = await this.request<{ manifest: AbjectManifest; description: string }>(
-          request(this.id, summary.id, INTROSPECT_INTERFACE_ID, 'describe', {})
+          request(this.id, summary.id, 'describe', {})
         );
         if (result) {
           deps.push({
@@ -795,7 +788,7 @@ export class Chat extends Abject {
         .join('\n');
 
       const result = await this.request<{ content: string }>(
-        request(this.id, this.llmId, 'abjects:llm' as InterfaceId, 'complete', {
+        request(this.id, this.llmId, 'complete', {
           messages: [
             {
               role: 'system',
@@ -877,7 +870,7 @@ export class Chat extends Abject {
       const question = customQuestions?.get(dep.name) ?? genericQuestion;
       try {
         const guide = await this.request<string>(
-          request(this.id, dep.id, INTROSPECT_INTERFACE_ID, 'ask', { question }),
+          request(this.id, dep.id, 'ask', { question }),
           60000
         );
         if (guide) {
@@ -1062,8 +1055,8 @@ return 'Object not found';
 \`\`\`
 await progress('Creating object...');
 const result = await call(await dep('ObjectCreator'), 'abjects:object-creator', 'create', { prompt: 'description of the object to create' });
-if (result.success && result.objectId && result.manifest.interfaces.length > 0) {
-  const iface = result.manifest.interfaces[0].id;
+if (result.success && result.objectId && result.manifest.interface) {
+  const iface = result.manifest.interface.id;
   await call(result.objectId, iface, 'show', {});
 }
 return result;
@@ -1108,7 +1101,7 @@ if (results.length > 0) {
 \`\`\`
 const results = await call(await dep('Registry'), 'abjects:registry', 'discover', { name: 'CatAndMouseGame' });
 if (results.length > 0) {
-  const iface = results[0].manifest.interfaces[0].id;
+  const iface = results[0].manifest.interface.id;
   const state = await call(results[0].id, iface, 'getState', {});
   return state;
 }
@@ -1143,8 +1136,8 @@ if (store) {
   });
 }
 
-if (result.objectId && target.manifest.interfaces.length > 0) {
-  await call(result.objectId, target.manifest.interfaces[0].id, 'show', {});
+if (result.objectId && target.manifest.interface) {
+  await call(result.objectId, target.manifest.interface.id, 'show', {});
 }
 return result;
 \`\`\`
@@ -1271,14 +1264,14 @@ ${this.remotePeerContext}
     const estimatedHeight = Math.max(20, lineCount * lineHeight + 4);
 
     const labelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId,
         rect: r0,
         text: displayText,
         style: { color, fontSize, wordWrap: true },
       })
     );
-    await this.request(request(this.id, this.messageLogId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
       widgetId: labelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: estimatedHeight },
@@ -1291,7 +1284,7 @@ ${this.remotePeerContext}
     if (!labelId) return;
     try {
       await this.request(
-        request(this.id, labelId, WIDGET_INTERFACE, 'update', {
+        request(this.id, labelId, 'update', {
           text,
           style: { color, fontSize: 13, wordWrap: true },
         })
@@ -1302,12 +1295,12 @@ ${this.remotePeerContext}
   private async removeLabel(labelId: AbjectId): Promise<void> {
     if (!labelId || !this.messageLogId) return;
     try {
-      await this.request(request(this.id, this.messageLogId, LAYOUT_INTERFACE, 'removeLayoutChild', {
+      await this.request(request(this.id, this.messageLogId, 'removeLayoutChild', {
         widgetId: labelId,
       }));
     } catch { /* may already be gone */ }
     try {
-      await this.request(request(this.id, labelId, WIDGET_INTERFACE, 'destroy', {}));
+      await this.request(request(this.id, labelId, 'destroy', {}));
     } catch { /* already gone */ }
 
     const idx = this.messageLabelIds.indexOf(labelId);
@@ -1318,12 +1311,12 @@ ${this.remotePeerContext}
     if (!this.messageLogId) return;
     for (const labelId of this.messageLabelIds) {
       try {
-        await this.request(request(this.id, this.messageLogId, LAYOUT_INTERFACE, 'removeLayoutChild', {
+        await this.request(request(this.id, this.messageLogId, 'removeLayoutChild', {
           widgetId: labelId,
         }));
       } catch { /* may already be gone */ }
       try {
-        await this.request(request(this.id, labelId, WIDGET_INTERFACE, 'destroy', {}));
+        await this.request(request(this.id, labelId, 'destroy', {}));
       } catch { /* already gone */ }
     }
     this.messageLabelIds = [];

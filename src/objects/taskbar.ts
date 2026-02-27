@@ -10,11 +10,8 @@ import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../cor
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 
 const TASKBAR_INTERFACE: InterfaceId = 'abjects:taskbar';
-const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
-const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 
 export class Taskbar extends Abject {
   private widgetManagerId?: AbjectId;
@@ -51,8 +48,7 @@ export class Taskbar extends Abject {
         description:
           'Persistent vertical toolbar in the top-left with launch buttons for Settings, Registry Browser, Chat, and Jobs.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: TASKBAR_INTERFACE,
             name: 'Taskbar',
             description: 'System taskbar',
@@ -71,7 +67,6 @@ export class Taskbar extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [
           { capability: Capabilities.UI_SURFACE, reason: 'Display taskbar', required: true },
         ],
@@ -94,13 +89,12 @@ export class Taskbar extends Abject {
 
     // Subscribe to registry for auto-refresh when new objects are registered
     if (this.registryId) {
-      await this.request(request(this.id, this.registryId,
-        'abjects:registry' as InterfaceId, 'subscribe', {}));
+      await this.request(request(this.id, this.registryId, 'subscribe', {}));
     }
 
     // Subscribe as dependent of each system object to receive visibility changes
     for (const depId of [this.registryBrowserId!, this.chatId!, this.jobBrowserId!, this.objectManagerId!]) {
-      await this.request(request(this.id, depId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+      await this.request(request(this.id, depId, 'addDependent', {}));
     }
 
   }
@@ -111,7 +105,7 @@ export class Taskbar extends Abject {
   private async registryLookup(objectId: AbjectId): Promise<ObjectRegistration | null> {
     if (!this.registryId) return null;
     return this.request<ObjectRegistration | null>(
-      request(this.id, this.registryId, 'abjects:registry' as InterfaceId, 'lookup', { objectId })
+      request(this.id, this.registryId, 'lookup', { objectId })
     );
   }
 
@@ -121,14 +115,13 @@ export class Taskbar extends Abject {
   private async discoverShowableObjects(): Promise<ObjectRegistration[]> {
     if (!this.registryId) return [];
     const allObjects = await this.request<ObjectRegistration[]>(
-      request(this.id, this.registryId, 'abjects:registry' as InterfaceId, 'list', {})
+      request(this.id, this.registryId, 'list', {})
     );
     return allObjects.filter((obj) => {
       if ((obj.manifest.tags ?? []).includes('system')) return false;
-      return obj.manifest.interfaces.some((iface) => {
-        const names = iface.methods.map((m) => m.name);
-        return names.includes('show') && names.includes('hide');
-      });
+      if (!obj.manifest.interface) return false;
+      const names = obj.manifest.interface.methods.map((m) => m.name);
+      return names.includes('show') && names.includes('hide');
     });
   }
 
@@ -161,27 +154,26 @@ export class Taskbar extends Abject {
 
       if (fromId === this.registryBtnId) {
         await this.request(
-          request(this.id, this.registryBrowserId!, 'abjects:registry-browser' as InterfaceId, 'show', {})
+          request(this.id, this.registryBrowserId!, 'show', {})
         );
       } else if (fromId === this.chatBtnId) {
         await this.request(
-          request(this.id, this.chatId!, 'abjects:chat' as InterfaceId, 'show', {})
+          request(this.id, this.chatId!, 'show', {})
         );
       } else if (fromId === this.jobsBtnId) {
         await this.request(
-          request(this.id, this.jobBrowserId!, 'abjects:job-browser' as InterfaceId, 'show', {})
+          request(this.id, this.jobBrowserId!, 'show', {})
         );
       } else if (fromId === this.objectManagerBtnId) {
         await this.request(
-          request(this.id, this.objectManagerId!, 'abjects:object-manager' as InterfaceId, 'show', {})
+          request(this.id, this.objectManagerId!, 'show', {})
         );
       } else if (this.restoreButtons.has(fromId)) {
         // Restore a minimized window
         const surfaceId = this.restoreButtons.get(fromId)!;
         if (this.windowManagerId) {
           try {
-            await this.request(request(this.id, this.windowManagerId,
-              'abjects:window-manager' as InterfaceId, 'restoreWindow', { surfaceId }));
+            await this.request(request(this.id, this.windowManagerId, 'restoreWindow', { surfaceId }));
           } catch (err) {
             console.warn('[Taskbar] Failed to restore window:', err);
           }
@@ -192,16 +184,16 @@ export class Taskbar extends Abject {
         if (targetId) {
           const reg = await this.registryLookup(targetId);
           if (reg) {
-            const iface = reg.manifest.interfaces.find((i) =>
-              i.methods.some((m) => m.name === 'show'));
-            if (iface) {
+            const iface = reg.manifest.interface;
+            const hasShow = iface && iface.methods.some((m) => m.name === 'show');
+            if (hasShow) {
               try {
-                await this.request(request(this.id, targetId, iface.id, 'show', {}));
+                await this.request(request(this.id, targetId, 'show', {}));
               } catch (err) {
                 console.warn(`[Taskbar] Failed to show ${reg.manifest.name}:`, err);
               }
             } else {
-              console.warn(`[Taskbar] No show interface found for ${reg.manifest.name}`);
+              console.warn(`[Taskbar] No show method found for ${reg.manifest.name}`);
             }
           } else {
             console.warn(`[Taskbar] Registry lookup failed for ${targetId}`);
@@ -246,7 +238,7 @@ export class Taskbar extends Abject {
     if (this.windowId) {
       console.debug(`[Taskbar] show() — destroying old window ${this.windowId}`);
       await this.request(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
+        request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
           windowId: this.windowId,
         })
       );
@@ -280,7 +272,7 @@ export class Taskbar extends Abject {
     const barHeight = padding + extraHeight + totalBtnCount * (btnH + spacing) - spacing + padding;
 
     this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'createWindowAbject', {
         title: '',
         rect: { x: 8, y: this.yOffset, width: barWidth, height: barHeight },
         zIndex: 999,
@@ -293,7 +285,7 @@ export class Taskbar extends Abject {
 
     // Create root VBox layout (vertical stack)
     this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+      request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
         margins: { top: padding, right: padding, bottom: padding, left: padding },
         spacing,
@@ -304,7 +296,7 @@ export class Taskbar extends Abject {
     const isVisible = async (objectId: AbjectId): Promise<boolean> => {
       try {
         const state = await this.request<{ visible?: boolean }>(
-          request(this.id, objectId, INTROSPECT_INTERFACE_ID, 'getState', {})
+          request(this.id, objectId, 'getState', {})
         );
         return !!state?.visible;
       } catch { return false; }
@@ -315,15 +307,15 @@ export class Taskbar extends Abject {
     // Helper to add a fixed-size button to the layout
     const addBtn = async (text: string, active = false, style?: Record<string, unknown>): Promise<AbjectId> => {
       const btnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+        request(this.id, this.widgetManagerId!, 'createButton', {
           windowId: this.windowId, rect: r0, text,
           ...(style ? { style } : active ? { style: activeStyle } : {}),
         })
       );
       await this.request(
-        request(this.id, btnId, INTROSPECT_INTERFACE_ID, 'addDependent', {})
+        request(this.id, btnId, 'addDependent', {})
       );
-      await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
         widgetId: btnId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { width: btnW, height: btnH },
@@ -334,12 +326,12 @@ export class Taskbar extends Abject {
     // Helper to add a section label to the layout
     const addSectionLabel = async (text: string): Promise<void> => {
       const labelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        request(this.id, this.widgetManagerId!, 'createLabel', {
           windowId: this.windowId, rect: r0, text,
           style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
         })
       );
-      await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
         widgetId: labelId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { width: btnW, height: labelH },
@@ -349,11 +341,11 @@ export class Taskbar extends Abject {
     // Helper to add a divider to the layout
     const addDivider = async (): Promise<void> => {
       const divId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
+        request(this.id, this.widgetManagerId!, 'createDivider', {
           windowId: this.windowId, rect: r0,
         })
       );
-      await this.request(request(this.id, this.rootLayoutId!, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
         widgetId: divId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { width: btnW, height: dividerH },
@@ -404,7 +396,7 @@ export class Taskbar extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
         windowId: this.windowId,
       })
     );

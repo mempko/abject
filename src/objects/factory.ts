@@ -6,7 +6,6 @@ import {
   AbjectId,
   AbjectManifest,
   AbjectMessage,
-  InterfaceId,
   ObjectRegistration,
   SpawnRequest,
   SpawnResult,
@@ -49,8 +48,7 @@ export class Factory extends Abject {
         description:
           'Creates new objects from manifests. Can spawn WASM objects or built-in types.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: FACTORY_INTERFACE,
             name: 'Factory',
             description: 'Object creation and lifecycle management',
@@ -138,7 +136,6 @@ export class Factory extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [Capabilities.FACTORY_SPAWN],
         tags: ['system', 'core'],
@@ -265,7 +262,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
 
     // Look up registration from Registry
     const reg = await this.request<ObjectRegistration | null>(
-      request(this.id, this._factoryRegistryId!, 'abjects:registry' as InterfaceId, 'lookup', { objectId })
+      request(this.id, this._factoryRegistryId!, 'lookup', { objectId })
     );
     require(reg !== null, `Object '${objectId}' not found in registry`);
 
@@ -295,7 +292,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
       if (effectiveRegistryId) {
         try {
           existingReg = await this.request<ObjectRegistration | null>(
-            request(this.id, effectiveRegistryId, 'abjects:registry' as InterfaceId, 'lookup', { objectId })
+            request(this.id, effectiveRegistryId, 'lookup', { objectId })
           );
         } catch { /* may not be registered */ }
       }
@@ -307,14 +304,14 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
           const timerId = await this.discoverDep('Timer');
           if (timerId) {
             await this.request(request(this.id, timerId,
-              'abjects:timer' as InterfaceId, 'clearTimersForObject', { objectId }));
+              'clearTimersForObject', { objectId }));
           }
         } catch { /* Timer may not be available */ }
 
         if (effectiveRegistryId) {
           try {
             await this.request(
-              request(this.id, effectiveRegistryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
+              request(this.id, effectiveRegistryId, 'unregister', { objectId })
             );
           } catch { /* may not be registered */ }
         }
@@ -347,7 +344,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
 
       // Use real manifest from the existing registration if available, otherwise build a placeholder
       const manifest = existingReg?.manifest ?? { name: constructorName, description: '', version: '1.0.0',
-        interfaces: [], requiredCapabilities: [] as never[], tags: ['system'] };
+        interface: { id: 'abjects:unknown', name: constructorName, description: '', methods: [] }, requiredCapabilities: [] as never[], tags: ['system'] };
       const now = Date.now();
       const status = {
         id: objectId, state: 'ready' as const, manifest, connections: [] as AbjectId[],
@@ -361,7 +358,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
           regPayload.owner = existingReg.owner;
         }
         await this.request(
-          request(this.id, effectiveRegistryId, 'abjects:registry' as InterfaceId, 'register', regPayload)
+          request(this.id, effectiveRegistryId, 'register', regPayload)
         );
       }
 
@@ -376,7 +373,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
       if (effectiveRegistryId) {
         try {
           await this.request(
-            request(this.id, effectiveRegistryId, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
+            request(this.id, effectiveRegistryId, 'unregister', { objectId })
           );
         } catch { /* may not be registered */ }
       }
@@ -417,7 +414,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         payload.source = obj.source;
       }
       await this.request(
-        request(this.id, effectiveRegistryId, 'abjects:registry' as InterfaceId, 'register', payload)
+        request(this.id, effectiveRegistryId, 'register', payload)
       );
     }
 
@@ -504,7 +501,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         payload.source = obj.source;
       }
       await this.request(
-        request(this.id, targetRegistry, 'abjects:registry' as InterfaceId, 'register', payload)
+        request(this.id, targetRegistry, 'register', payload)
       );
     }
 
@@ -547,7 +544,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         payload.source = obj.source;
       }
       await this.request(
-        request(this.id, this._factoryRegistryId, 'abjects:registry' as InterfaceId, 'register', payload)
+        request(this.id, this._factoryRegistryId, 'register', payload)
       );
     }
 
@@ -592,7 +589,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
     if (targetRegistry) {
       const now = Date.now();
       await this.request(
-        request(this.id, targetRegistry, 'abjects:registry' as InterfaceId, 'register', {
+        request(this.id, targetRegistry, 'register', {
           objectId,
           manifest: realManifest,
           status: {
@@ -651,7 +648,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
     if (targetRegistry) {
       const now = Date.now();
       await this.request(
-        request(this.id, targetRegistry, 'abjects:registry' as InterfaceId, 'register', {
+        request(this.id, targetRegistry, 'register', {
           objectId,
           manifest: req.manifest,
           owner: req.owner,
@@ -695,7 +692,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
       const supervisorId = await this.discoverDep('Supervisor');
       if (supervisorId) {
         await this.request(request(this.id, supervisorId,
-          'abjects:supervisor' as InterfaceId, 'removeChild', { childId: objectId }));
+          'removeChild', { childId: objectId }));
       }
     } catch { /* Supervisor may not be tracking this object */ }
 
@@ -704,7 +701,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
       const timerId = await this.discoverDep('Timer');
       if (timerId) {
         await this.request(request(this.id, timerId,
-          'abjects:timer' as InterfaceId, 'clearTimersForObject', { objectId }));
+          'clearTimersForObject', { objectId }));
       }
     } catch { /* Timer may not be available */ }
 
@@ -713,7 +710,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
     if (objRegistry) {
       try {
         await this.request(
-          request(this.id, objRegistry, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
+          request(this.id, objRegistry, 'unregister', { objectId })
         );
       } catch { /* may not be registered */ }
     }
@@ -745,7 +742,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
       const supervisorId = await this.discoverDep('Supervisor');
       if (supervisorId) {
         await this.request(request(this.id, supervisorId,
-          'abjects:supervisor' as InterfaceId, 'removeChild', { childId: objectId }));
+          'removeChild', { childId: objectId }));
       }
     } catch { /* Supervisor may not be tracking this object */ }
 
@@ -754,7 +751,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
     const objRegistry = obj.getRegistryId() ?? this._factoryRegistryId;
     if (objRegistry) {
       await this.request(
-        request(this.id, objRegistry, 'abjects:registry' as InterfaceId, 'unregister', { objectId })
+        request(this.id, objRegistry, 'unregister', { objectId })
       );
     }
 
@@ -764,7 +761,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         const abjectStoreId = await this.discoverDep('AbjectStore');
         if (abjectStoreId) {
           await this.request(
-            request(this.id, abjectStoreId, 'abjects:abject-store' as InterfaceId, 'remove', { objectId })
+            request(this.id, abjectStoreId, 'remove', { objectId })
           );
         }
       } catch { /* AbjectStore may not exist */ }
@@ -827,7 +824,7 @@ export function createSpawnRequest(
   initialState?: unknown,
   grantedCapabilities?: CapabilityGrant[]
 ): AbjectMessage {
-  return request(fromId, FACTORY_ID, FACTORY_INTERFACE, 'spawn', {
+  return request(fromId, FACTORY_ID, 'spawn', {
     manifest,
     code,
     initialState,
@@ -842,7 +839,7 @@ export function createCloneRequest(
   fromId: AbjectId,
   objectId: AbjectId
 ): AbjectMessage {
-  return request(fromId, FACTORY_ID, FACTORY_INTERFACE, 'clone', { objectId });
+  return request(fromId, FACTORY_ID, 'clone', { objectId });
 }
 
 /**
@@ -852,5 +849,5 @@ export function createKillRequest(
   fromId: AbjectId,
   objectId: AbjectId
 ): AbjectMessage {
-  return request(fromId, FACTORY_ID, FACTORY_INTERFACE, 'kill', { objectId });
+  return request(fromId, FACTORY_ID, 'kill', { objectId });
 }

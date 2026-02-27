@@ -35,7 +35,7 @@ test.describe('MessageBus & Supervisor', () => {
       await runtime.spawn(sender);
 
       const bus = runtime.messageBus as { send: (msg: unknown) => Promise<void> };
-      const msg = createRequest(sender.id, receiver.id, 'test', 'doWork', {});
+      const msg = createRequest(sender.id, receiver.id, 'doWork', {});
 
       const before = performance.now();
       await bus.send(msg);
@@ -100,8 +100,8 @@ test.describe('MessageBus & Supervisor', () => {
       const bus = runtime.messageBus as { send: (msg: unknown) => Promise<void> };
 
       // Send to both simultaneously
-      await bus.send(createRequest(sender.id, objectA.id, 'test', 'doWork', {}));
-      await bus.send(createRequest(sender.id, objectB.id, 'test', 'doWork', {}));
+      await bus.send(createRequest(sender.id, objectA.id, 'doWork', {}));
+      await bus.send(createRequest(sender.id, objectB.id, 'doWork', {}));
 
       // If parallel, both 200ms handlers finish in ~200ms total.
       // If sequential, second finishes at ~400ms. Wait 350ms to distinguish.
@@ -136,7 +136,7 @@ test.describe('MessageBus & Supervisor', () => {
       await runtime.spawn(requester);
 
       // Use the protected request() method to send and await a reply
-      const msg = createRequest(requester.id, responder.id, 'test', 'getValue', {});
+      const msg = createRequest(requester.id, responder.id, 'getValue', {});
       const reply = await (requester as any).request(msg, 5000);
 
       return reply;
@@ -174,11 +174,11 @@ test.describe('MessageBus & Supervisor', () => {
 
       const [replyA, replyB] = await Promise.all([
         (helper as any).request(
-          createRequest(helper.id, objectA.id, 'test', 'getValue', {}),
+          createRequest(helper.id, objectA.id, 'getValue', {}),
           5000
         ),
         (helper as any).request(
-          createRequest(helper.id, objectB.id, 'test', 'getValue', {}),
+          createRequest(helper.id, objectB.id, 'getValue', {}),
           5000
         ),
       ]);
@@ -232,7 +232,6 @@ test.describe('MessageBus & Supervisor', () => {
         createEvent(
           originalId,
           supervisor.id,
-          'abjects:supervisor',
           'childFailed',
           {
             childId: originalId,

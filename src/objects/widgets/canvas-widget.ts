@@ -11,7 +11,6 @@
 import {
   AbjectId,
   AbjectMessage,
-  InterfaceId,
 } from '../../core/types.js';
 import { event } from '../../core/message.js';
 import { WidgetAbject, WidgetConfig } from './widget-abject.js';
@@ -43,10 +42,7 @@ export class CanvasWidget extends WidgetAbject {
       name: 'CanvasWidget',
       description: 'Canvas drawing widget — stores draw commands and renders into parent window surface',
       version: '1.0.0',
-      interfaces: [
-        // Keep the standard widget interface (render, handleInput, etc.)
-        ...this.manifest.interfaces,
-        {
+      interface: {
           id: CANVAS_INTERFACE,
           name: 'Canvas',
           description: 'Canvas drawing interface',
@@ -73,7 +69,6 @@ export class CanvasWidget extends WidgetAbject {
             },
           ],
         },
-      ],
       requiredCapabilities: [],
       providedCapabilities: [],
       tags: ['widget', 'canvas'],
@@ -138,7 +133,6 @@ export class CanvasWidget extends WidgetAbject {
       await this.send(event(
         this.id,
         this.inputTargetId,
-        'abjects:canvas-input' as InterfaceId,
         'input',
         input
       ));
@@ -177,7 +171,6 @@ export class CanvasWidget extends WidgetAbject {
           await this.send(event(
             this.id,
             this.inputTargetId,
-            'abjects:canvas-input' as InterfaceId,
             'input',
             { type: 'canvasResize', width: newRect.width, height: newRect.height }
           ));

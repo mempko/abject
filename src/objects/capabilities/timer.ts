@@ -2,7 +2,7 @@
  * Timer capability object - provides timing and scheduling capabilities.
  */
 
-import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
+import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
 import { require } from '../../core/contracts.js';
 import { event, request } from '../../core/message.js';
@@ -33,8 +33,7 @@ export class Timer extends Abject {
         description:
           'Provides timing capabilities. Objects can schedule one-shot or repeating timers and receive callbacks.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: TIMER_INTERFACE,
             name: 'Timer',
             description: 'Timer and scheduling operations',
@@ -144,7 +143,6 @@ export class Timer extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [Capabilities.TIMER],
         tags: ['capability', 'timer', 'scheduling'],
@@ -202,7 +200,7 @@ export class Timer extends Abject {
     if (registryId) {
       try {
         await this.request(request(this.id, registryId,
-          'abjects:registry' as InterfaceId, 'subscribe', {}));
+          'subscribe', {}));
       } catch { /* best effort */ }
     }
   }
@@ -328,7 +326,7 @@ export class Timer extends Abject {
     }
 
     await this.send(
-      event(this.id, timer.info.objectId, TIMER_INTERFACE, 'timerFired', {
+      event(this.id, timer.info.objectId, 'timerFired', {
         timerId,
         data,
       })

@@ -15,16 +15,8 @@ import {
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 
 const OBJECT_MANAGER_INTERFACE: InterfaceId = 'abjects:object-manager';
-const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
-const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
-const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
-const WINDOW_INTERFACE: InterfaceId = 'abjects:window';
-const REGISTRY_INTERFACE: InterfaceId = 'abjects:registry';
-const FACTORY_INTERFACE: InterfaceId = 'abjects:factory';
-const SUPERVISOR_INTERFACE: InterfaceId = 'abjects:supervisor';
 
 const WIN_W = 650;
 const WIN_H = 500;
@@ -83,8 +75,7 @@ export class ObjectManager extends Abject {
         description:
           'Process manager for running Abjects. Shows all objects with state, worker placement, and stop/restart actions.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: OBJECT_MANAGER_INTERFACE,
             name: 'ObjectManager',
             description: 'Object process manager',
@@ -111,7 +102,6 @@ export class ObjectManager extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [
           { capability: Capabilities.UI_SURFACE, reason: 'Display process manager window', required: true },
         ],
@@ -133,12 +123,12 @@ export class ObjectManager extends Abject {
     // Subscribe to registry events for auto-refresh
     if (this.registryId) {
       await this.request(request(this.id, this.registryId,
-        REGISTRY_INTERFACE, 'subscribe', {}));
+        'subscribe', {}));
     }
     if (this.systemRegistryId) {
       try {
         await this.request(request(this.id, this.systemRegistryId,
-          REGISTRY_INTERFACE, 'subscribe', {}));
+          'subscribe', {}));
       } catch { /* may not support subscribe */ }
     }
   }
@@ -184,7 +174,7 @@ export class ObjectManager extends Abject {
   private async registryList(): Promise<ObjectRegistration[]> {
     if (!this.registryId) return [];
     return this.request<ObjectRegistration[]>(
-      request(this.id, this.registryId, REGISTRY_INTERFACE, 'list', {})
+      request(this.id, this.registryId, 'list', {})
     );
   }
 
@@ -192,7 +182,7 @@ export class ObjectManager extends Abject {
     if (!this.systemRegistryId) return [];
     try {
       return await this.request<ObjectRegistration[]>(
-        request(this.id, this.systemRegistryId, REGISTRY_INTERFACE, 'list', {})
+        request(this.id, this.systemRegistryId, 'list', {})
       );
     } catch {
       return [];
@@ -213,7 +203,7 @@ export class ObjectManager extends Abject {
         isWorkerHosted: boolean;
         constructorName?: string;
         workerIndex?: number;
-      }>(request(this.id, this.factoryId, FACTORY_INTERFACE, 'getObjectInfo', { objectId }));
+      }>(request(this.id, this.factoryId, 'getObjectInfo', { objectId }));
     } catch {
       return { isWorkerHosted: false };
     }
@@ -231,7 +221,7 @@ export class ObjectManager extends Abject {
       return await this.request<Array<{
         id: AbjectId;
         constructorName: string;
-      }>>(request(this.id, this.supervisorId, SUPERVISOR_INTERFACE, 'getChildren', {}));
+      }>>(request(this.id, this.supervisorId, 'getChildren', {}));
     } catch {
       return [];
     }
@@ -302,7 +292,7 @@ export class ObjectManager extends Abject {
   // ── Widget Helpers ──
 
   private async addDep(widgetId: AbjectId): Promise<void> {
-    await this.request(request(this.id, widgetId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
+    await this.request(request(this.id, widgetId, 'addDependent', {}));
   }
 
   private clearViewTracking(): void {
@@ -324,13 +314,13 @@ export class ObjectManager extends Abject {
     this.searchText = '';
 
     const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
+      request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
     const winX = Math.max(20, Math.floor((displayInfo.width - WIN_W) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2));
 
     this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'createWindowAbject', {
         title: 'Object Manager',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
@@ -347,7 +337,7 @@ export class ObjectManager extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
         windowId: this.windowId,
       })
     );
@@ -368,14 +358,14 @@ export class ObjectManager extends Abject {
     if (this.rootLayoutId && this.windowId) {
       try {
         await this.request(
-          request(this.id, this.windowId, WINDOW_INTERFACE, 'removeChild', {
+          request(this.id, this.windowId, 'removeChild', {
             widgetId: this.rootLayoutId,
           })
         );
       } catch { /* may be gone */ }
       try {
         await this.request(
-          request(this.id, this.rootLayoutId, WIDGET_INTERFACE, 'destroy', {})
+          request(this.id, this.rootLayoutId, 'destroy', {})
         );
       } catch { /* already gone */ }
     }
@@ -385,7 +375,7 @@ export class ObjectManager extends Abject {
 
     // Root VBox
     this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+      request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId!,
         margins: { top: 8, right: 12, bottom: 8, left: 12 },
         spacing: 6,
@@ -394,38 +384,38 @@ export class ObjectManager extends Abject {
 
     // ── Top bar: Search + Refresh ──
     const topBarId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 6,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: topBarId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 30 },
     }));
 
     this.searchInputId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
+      request(this.id, this.widgetManagerId!, 'createTextInput', {
         windowId: this.windowId!, rect: r0, placeholder: 'Search objects...',
       })
     );
     await this.addDep(this.searchInputId);
-    await this.request(request(this.id, topBarId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, topBarId, 'addLayoutChild', {
       widgetId: this.searchInputId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 30 },
     }));
 
     this.refreshBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+      request(this.id, this.widgetManagerId!, 'createButton', {
         windowId: this.windowId!, rect: r0, text: 'Refresh',
         style: { fontSize: 12 },
       })
     );
     await this.addDep(this.refreshBtnId);
-    await this.request(request(this.id, topBarId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, topBarId, 'addLayoutChild', {
       widgetId: this.refreshBtnId,
       sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
       preferredSize: { width: 70, height: 30 },
@@ -433,12 +423,12 @@ export class ObjectManager extends Abject {
 
     // ── Summary label ──
     this.summaryLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId!, rect: r0, text: '',
         style: { color: '#6b7084', fontSize: 11 },
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.summaryLabelId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 18 },
@@ -446,13 +436,13 @@ export class ObjectManager extends Abject {
 
     // ── Header row ──
     const headerRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: headerRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 20 },
@@ -461,11 +451,11 @@ export class ObjectManager extends Abject {
     const headerStyle = { color: '#6b7084', fontSize: 11, fontWeight: 'bold' };
     const addHeaderLabel = async (text: string, width?: number): Promise<void> => {
       const labelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        request(this.id, this.widgetManagerId!, 'createLabel', {
           windowId: this.windowId!, rect: r0, text, style: headerStyle,
         })
       );
-      await this.request(request(this.id, headerRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, headerRowId, 'addLayoutChild', {
         widgetId: labelId,
         sizePolicy: { vertical: 'fixed', horizontal: width ? 'fixed' : 'expanding' },
         preferredSize: width ? { width, height: 20 } : { height: 20 },
@@ -480,13 +470,13 @@ export class ObjectManager extends Abject {
 
     // ── Scrollable list ──
     this.scrollableListId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedScrollableVBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 2,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.scrollableListId,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
@@ -507,22 +497,22 @@ export class ObjectManager extends Abject {
     // Destroy and recreate the scrollable list to clear all children
     if (this.rootLayoutId) {
       try {
-        await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'removeLayoutChild', {
+        await this.request(request(this.id, this.rootLayoutId, 'removeLayoutChild', {
           widgetId: this.scrollableListId,
         }));
       } catch { /* may be gone */ }
       try {
-        await this.request(request(this.id, this.scrollableListId!, WIDGET_INTERFACE, 'destroy', {}));
+        await this.request(request(this.id, this.scrollableListId!, 'destroy', {}));
       } catch { /* may be gone */ }
 
       this.scrollableListId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedScrollableVBox', {
+        request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
           parentLayoutId: this.rootLayoutId,
           margins: { top: 0, right: 0, bottom: 0, left: 0 },
           spacing: 2,
         })
       );
-      await this.request(request(this.id, this.rootLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
         widgetId: this.scrollableListId,
         sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
       }));
@@ -545,7 +535,7 @@ export class ObjectManager extends Abject {
 
     if (this.summaryLabelId) {
       try {
-        await this.request(request(this.id, this.summaryLabelId, WIDGET_INTERFACE, 'update', {
+        await this.request(request(this.id, this.summaryLabelId, 'update', {
           text: summaryText,
         }));
       } catch { /* widget gone */ }
@@ -558,13 +548,13 @@ export class ObjectManager extends Abject {
       const row = filteredRows[i];
 
       const rowLayoutId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
           parentLayoutId: this.scrollableListId,
           margins: { top: 0, right: 0, bottom: 0, left: 0 },
           spacing: 4,
         })
       );
-      await this.request(request(this.id, this.scrollableListId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, this.scrollableListId, 'addLayoutChild', {
         widgetId: rowLayoutId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: rowH },
@@ -572,12 +562,12 @@ export class ObjectManager extends Abject {
 
       // Name (expanding)
       const nameLabelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        request(this.id, this.widgetManagerId!, 'createLabel', {
           windowId: this.windowId!, rect: r0, text: row.name,
           style: { fontSize: 12, color: '#e2e4e9' },
         })
       );
-      await this.request(request(this.id, rowLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
         widgetId: nameLabelId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: rowH },
@@ -586,12 +576,12 @@ export class ObjectManager extends Abject {
       // ID — first 8 chars (fixed 70px)
       const shortId = row.id.slice(0, 8);
       const idLabelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        request(this.id, this.widgetManagerId!, 'createLabel', {
           windowId: this.windowId!, rect: r0, text: shortId,
           style: { fontSize: 11, color: '#6b7084' },
         })
       );
-      await this.request(request(this.id, rowLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
         widgetId: idLabelId,
         sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
         preferredSize: { width: 70, height: rowH },
@@ -600,12 +590,12 @@ export class ObjectManager extends Abject {
       // State — color-coded (fixed 70px)
       const stateColor = STATE_COLORS[row.state] ?? '#6b7084';
       const stateLabelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        request(this.id, this.widgetManagerId!, 'createLabel', {
           windowId: this.windowId!, rect: r0, text: row.state,
           style: { fontSize: 11, color: stateColor },
         })
       );
-      await this.request(request(this.id, rowLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
         widgetId: stateLabelId,
         sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
         preferredSize: { width: 70, height: rowH },
@@ -616,12 +606,12 @@ export class ObjectManager extends Abject {
         ? `Worker ${row.workerIndex ?? '?'}`
         : 'Main';
       const locLabelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+        request(this.id, this.widgetManagerId!, 'createLabel', {
           windowId: this.windowId!, rect: r0, text: location,
           style: { fontSize: 11, color: '#8b8fa3' },
         })
       );
-      await this.request(request(this.id, rowLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+      await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
         widgetId: locLabelId,
         sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
         preferredSize: { width: 80, height: rowH },
@@ -630,12 +620,12 @@ export class ObjectManager extends Abject {
       // Actions (fixed 110px)
       if (row.isProtected) {
         const protectedLabelId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+          request(this.id, this.widgetManagerId!, 'createLabel', {
             windowId: this.windowId!, rect: r0, text: 'protected',
             style: { fontSize: 10, color: '#6b7084', fontStyle: 'italic' },
           })
         );
-        await this.request(request(this.id, rowLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
           widgetId: protectedLabelId,
           sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
           preferredSize: { width: 110, height: rowH },
@@ -643,41 +633,41 @@ export class ObjectManager extends Abject {
       } else {
         // Actions HBox: Stop + Restart
         const actionsRowId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+          request(this.id, this.widgetManagerId!, 'createNestedHBox', {
             parentLayoutId: rowLayoutId,
             margins: { top: 0, right: 0, bottom: 0, left: 0 },
             spacing: 4,
           })
         );
-        await this.request(request(this.id, rowLayoutId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
           widgetId: actionsRowId,
           sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
           preferredSize: { width: 110, height: rowH },
         }));
 
         const stopBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+          request(this.id, this.widgetManagerId!, 'createButton', {
             windowId: this.windowId!, rect: r0, text: 'Stop',
             style: { fontSize: 10, background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' },
           })
         );
         await this.addDep(stopBtnId);
         this.stopButtons.set(stopBtnId, i);
-        await this.request(request(this.id, actionsRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, actionsRowId, 'addLayoutChild', {
           widgetId: stopBtnId,
           sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
           preferredSize: { height: rowH },
         }));
 
         const restartBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+          request(this.id, this.widgetManagerId!, 'createButton', {
             windowId: this.windowId!, rect: r0, text: 'Restart',
             style: { fontSize: 10 },
           })
         );
         await this.addDep(restartBtnId);
         this.restartButtons.set(restartBtnId, i);
-        await this.request(request(this.id, actionsRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+        await this.request(request(this.id, actionsRowId, 'addLayoutChild', {
           widgetId: restartBtnId,
           sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
           preferredSize: { height: rowH },
@@ -709,7 +699,7 @@ export class ObjectManager extends Abject {
       if (row && this.factoryId) {
         try {
           await this.request(request(this.id, this.factoryId,
-            FACTORY_INTERFACE, 'kill', { objectId: row.id }));
+            'kill', { objectId: row.id }));
         } catch { /* object may already be gone */ }
         await this.rebuildList();
       }
@@ -724,7 +714,7 @@ export class ObjectManager extends Abject {
         const constructorName = row.constructorName ?? row.name;
         try {
           await this.request(request(this.id, this.factoryId,
-            FACTORY_INTERFACE, 'respawn', { objectId: row.id, constructorName, registryId: this.registryId }));
+            'respawn', { objectId: row.id, constructorName, registryId: this.registryId }));
         } catch (err) {
           console.warn(`[ObjectManager] Failed to restart ${row.name}:`, err);
         }

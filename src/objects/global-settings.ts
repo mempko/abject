@@ -10,7 +10,6 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { INTROSPECT_INTERFACE_ID } from '../core/introspect.js';
 
 const GLOBAL_SETTINGS_INTERFACE: InterfaceId = 'abjects:global-settings';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
@@ -55,8 +54,7 @@ export class GlobalSettings extends Abject {
         description:
           'Global configuration UI for LLM API keys.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: GLOBAL_SETTINGS_INTERFACE,
             name: 'GlobalSettings',
             description: 'Global system configuration',
@@ -75,7 +73,6 @@ export class GlobalSettings extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [
           { capability: Capabilities.UI_SURFACE, reason: 'Display settings window', required: true },
           { capability: Capabilities.STORAGE_READ, reason: 'Load saved settings', required: false },
@@ -100,19 +97,19 @@ export class GlobalSettings extends Abject {
 
     if (this.storageId) {
       anthropicKey = await this.request<string | null>(
-        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_ANTHROPIC })
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_ANTHROPIC })
       );
       openaiKey = await this.request<string | null>(
-        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_OPENAI })
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OPENAI })
       );
 
       // If not found, attempt migration from legacy per-workspace keys
       if (!anthropicKey && !openaiKey) {
         const legacyAnthropic = await this.request<string | null>(
-          request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: LEGACY_KEY_ANTHROPIC })
+          request(this.id, this.storageId, 'get', { key: LEGACY_KEY_ANTHROPIC })
         );
         const legacyOpenai = await this.request<string | null>(
-          request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: LEGACY_KEY_OPENAI })
+          request(this.id, this.storageId, 'get', { key: LEGACY_KEY_OPENAI })
         );
 
         if (legacyAnthropic || legacyOpenai) {
@@ -122,12 +119,12 @@ export class GlobalSettings extends Abject {
           // Persist under new keys
           if (anthropicKey) {
             await this.request(
-              request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'set', { key: STORAGE_KEY_ANTHROPIC, value: anthropicKey })
+              request(this.id, this.storageId, 'set', { key: STORAGE_KEY_ANTHROPIC, value: anthropicKey })
             );
           }
           if (openaiKey) {
             await this.request(
-              request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'set', { key: STORAGE_KEY_OPENAI, value: openaiKey })
+              request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OPENAI, value: openaiKey })
             );
           }
           console.log('[GLOBAL-SETTINGS] Migrated API keys from legacy storage');
@@ -139,7 +136,7 @@ export class GlobalSettings extends Abject {
       // Keys found — configure LLM silently
       if (this.llmId) {
         await this.request(
-          request(this.id, this.llmId, 'abjects:llm' as InterfaceId, 'configure', {
+          request(this.id, this.llmId, 'configure', {
             anthropicApiKey: anthropicKey ?? undefined,
             openaiApiKey: openaiKey ?? undefined,
           })
@@ -202,7 +199,7 @@ export class GlobalSettings extends Abject {
 
     // Get display dimensions
     const displayInfo = await this.request<{ width: number; height: number }>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'getDisplayInfo', {})
+      request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
 
     const winW = 440;
@@ -212,7 +209,7 @@ export class GlobalSettings extends Abject {
 
     // Create window
     this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'createWindowAbject', {
         title: 'Settings',
         rect: { x: winX, y: winY, width: winW, height: winH },
         zIndex: 200,
@@ -223,7 +220,7 @@ export class GlobalSettings extends Abject {
 
     // Create root VBox layout
     this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createVBox', {
+      request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
         margins: { top: 20, right: 20, bottom: 20, left: 20 },
         spacing: 8,
@@ -237,21 +234,21 @@ export class GlobalSettings extends Abject {
     let savedOpenaiKey: string | null = null;
     if (this.storageId) {
       savedAnthropicKey = await this.request<string | null>(
-        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_ANTHROPIC })
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_ANTHROPIC })
       );
       savedOpenaiKey = await this.request<string | null>(
-        request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'get', { key: STORAGE_KEY_OPENAI })
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OPENAI })
       );
     }
 
     // Section header: "API Keys"
     const sectionHeaderId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'API Keys',
         style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
       })
     );
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: sectionHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 24 },
@@ -259,12 +256,12 @@ export class GlobalSettings extends Abject {
 
     // Description
     const descLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Enter your API keys to enable LLM features.',
         style: { color: '#b4b8c8', fontSize: 12 },
       })
     );
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: descLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
@@ -272,12 +269,12 @@ export class GlobalSettings extends Abject {
 
     // Anthropic label
     const anthropicLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'Anthropic API Key',
         style: { color: '#e2e4e9', fontSize: 13 },
       })
     );
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: anthropicLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -285,38 +282,38 @@ export class GlobalSettings extends Abject {
 
     // Anthropic input row (HBox: input + toggle)
     const anthropicRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: cId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: anthropicRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
 
     this.anthropicKeyId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
+      request(this.id, this.widgetManagerId!, 'createTextInput', {
         windowId: this.windowId, rect: r0, placeholder: 'sk-ant-...', masked: true,
         text: savedAnthropicKey ?? undefined,
       })
     );
-    await this.request(request(this.id, this.anthropicKeyId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, anthropicRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.anthropicKeyId, 'addDependent', {}));
+    await this.request(request(this.id, anthropicRowId, 'addLayoutChild', {
       widgetId: this.anthropicKeyId,
       sizePolicy: { horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
 
     this.anthropicToggleId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+      request(this.id, this.widgetManagerId!, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Show',
       })
     );
-    await this.request(request(this.id, this.anthropicToggleId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, anthropicRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.anthropicToggleId, 'addDependent', {}));
+    await this.request(request(this.id, anthropicRowId, 'addLayoutChild', {
       widgetId: this.anthropicToggleId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 56, height: 32 },
@@ -324,11 +321,11 @@ export class GlobalSettings extends Abject {
 
     // Divider between Anthropic and OpenAI
     const dividerId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createDivider', {
+      request(this.id, this.widgetManagerId!, 'createDivider', {
         windowId: this.windowId, rect: r0,
       })
     );
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: dividerId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 12 },
@@ -336,12 +333,12 @@ export class GlobalSettings extends Abject {
 
     // OpenAI label
     const openaiLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId, rect: r0, text: 'OpenAI API Key',
         style: { color: '#e2e4e9', fontSize: 13 },
       })
     );
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: openaiLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -349,38 +346,38 @@ export class GlobalSettings extends Abject {
 
     // OpenAI input row (HBox: input + toggle)
     const openaiRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: cId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: openaiRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
 
     this.openaiKeyId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createTextInput', {
+      request(this.id, this.widgetManagerId!, 'createTextInput', {
         windowId: this.windowId, rect: r0, placeholder: 'sk-...', masked: true,
         text: savedOpenaiKey ?? undefined,
       })
     );
-    await this.request(request(this.id, this.openaiKeyId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, openaiRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.openaiKeyId, 'addDependent', {}));
+    await this.request(request(this.id, openaiRowId, 'addLayoutChild', {
       widgetId: this.openaiKeyId,
       sizePolicy: { horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
 
     this.openaiToggleId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+      request(this.id, this.widgetManagerId!, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Show',
       })
     );
-    await this.request(request(this.id, this.openaiToggleId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, openaiRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.openaiToggleId, 'addDependent', {}));
+    await this.request(request(this.id, openaiRowId, 'addLayoutChild', {
       widgetId: this.openaiToggleId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 56, height: 32 },
@@ -388,43 +385,43 @@ export class GlobalSettings extends Abject {
 
     // Save button row (HBox: spacer + button)
     const saveRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createNestedHBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: cId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: saveRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 36 },
     }));
 
-    await this.request(request(this.id, saveRowId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+    await this.request(request(this.id, saveRowId, 'addLayoutSpacer', {}));
 
     this.saveBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createButton', {
+      request(this.id, this.widgetManagerId!, 'createButton', {
         windowId: this.windowId, rect: r0, text: 'Save API Keys',
         style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
       })
     );
-    await this.request(request(this.id, this.saveBtnId, INTROSPECT_INTERFACE_ID, 'addDependent', {}));
-    await this.request(request(this.id, saveRowId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, this.saveBtnId, 'addDependent', {}));
+    await this.request(request(this.id, saveRowId, 'addLayoutChild', {
       widgetId: this.saveBtnId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 120, height: 36 },
     }));
 
     // Spacer + status label
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutSpacer', {}));
+    await this.request(request(this.id, cId, 'addLayoutSpacer', {}));
 
     this.statusLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'createLabel', {
+      request(this.id, this.widgetManagerId!, 'createLabel', {
         windowId: this.windowId!, rect: r0, text: '',
         style: { color: '#b4b8c8', fontSize: 12, align: 'right' },
       })
     );
-    await this.request(request(this.id, cId, LAYOUT_INTERFACE, 'addLayoutChild', {
+    await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: this.statusLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
@@ -441,7 +438,7 @@ export class GlobalSettings extends Abject {
     if (!this.windowId) return true;
 
     await this.request(
-      request(this.id, this.widgetManagerId!, WIDGETS_INTERFACE, 'destroyWindowAbject', {
+      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
         windowId: this.windowId,
       })
     );
@@ -465,7 +462,7 @@ export class GlobalSettings extends Abject {
   private async setStatus(text: string, color = '#b4b8c8'): Promise<void> {
     if (!this.statusLabelId) return;
     await this.request(
-      request(this.id, this.statusLabelId, WIDGET_INTERFACE, 'update', {
+      request(this.id, this.statusLabelId, 'update', {
         text, style: { color },
       })
     );
@@ -486,12 +483,12 @@ export class GlobalSettings extends Abject {
     const nowMasked = !this.unmasked.has(inputId);
 
     await this.request(
-      request(this.id, inputId, WIDGET_INTERFACE, 'update', {
+      request(this.id, inputId, 'update', {
         masked: nowMasked,
       })
     );
     await this.request(
-      request(this.id, toggleId, WIDGET_INTERFACE, 'update', {
+      request(this.id, toggleId, 'update', {
         text: nowMasked ? 'Show' : 'Hide',
       })
     );
@@ -502,7 +499,7 @@ export class GlobalSettings extends Abject {
     const ids = [this.saveBtnId, this.anthropicKeyId, this.openaiKeyId];
     for (const id of ids) {
       if (id) {
-        try { await this.request(request(this.id, id, WIDGET_INTERFACE, 'update', { style })); } catch { /* widget gone */ }
+        try { await this.request(request(this.id, id, 'update', { style })); } catch { /* widget gone */ }
       }
     }
   }
@@ -518,23 +515,23 @@ export class GlobalSettings extends Abject {
     await this.setSaveControlsDisabled(true);
 
     const anthropicKey = await this.request<string>(
-      request(this.id, this.anthropicKeyId!, WIDGET_INTERFACE, 'getValue', {})
+      request(this.id, this.anthropicKeyId!, 'getValue', {})
     );
 
     const openaiKey = await this.request<string>(
-      request(this.id, this.openaiKeyId!, WIDGET_INTERFACE, 'getValue', {})
+      request(this.id, this.openaiKeyId!, 'getValue', {})
     );
 
     // Save to global storage
     if (this.storageId) {
       if (anthropicKey) {
         await this.request(
-          request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'set', { key: STORAGE_KEY_ANTHROPIC, value: anthropicKey })
+          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_ANTHROPIC, value: anthropicKey })
         );
       }
       if (openaiKey) {
         await this.request(
-          request(this.id, this.storageId, 'abjects:storage' as InterfaceId, 'set', { key: STORAGE_KEY_OPENAI, value: openaiKey })
+          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OPENAI, value: openaiKey })
         );
       }
     }
@@ -542,14 +539,14 @@ export class GlobalSettings extends Abject {
     // Configure LLM
     if (this.llmId) {
       await this.request(
-        request(this.id, this.llmId, 'abjects:llm' as InterfaceId, 'configure', {
+        request(this.id, this.llmId, 'configure', {
           anthropicApiKey: anthropicKey || undefined,
           openaiApiKey: openaiKey || undefined,
         })
       );
 
       const providers = await this.request<string[]>(
-        request(this.id, this.llmId, 'abjects:llm' as InterfaceId, 'listProviders', {})
+        request(this.id, this.llmId, 'listProviders', {})
       );
       console.log(`[GLOBAL-SETTINGS] Saved. LLM providers: ${providers.join(', ') || 'none'}`);
     }

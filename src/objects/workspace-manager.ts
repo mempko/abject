@@ -99,8 +99,7 @@ export class WorkspaceManager extends Abject {
         description:
           'Manages workspace lifecycle: create, switch, delete, and persist workspaces. Each workspace is an isolated collection of abjects.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: WORKSPACE_MANAGER_INTERFACE,
             name: 'WorkspaceManager',
             description: 'Workspace lifecycle management',
@@ -265,7 +264,6 @@ export class WorkspaceManager extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [],
         tags: ['system', 'core'],
@@ -439,20 +437,20 @@ export class WorkspaceManager extends Abject {
     if (this.windowManagerId) {
       try {
         await this.request(request(this.id, this.windowManagerId,
-          WINDOW_MANAGER_INTERFACE, 'unregisterTaskbar', { workspaceId }));
+          'unregisterTaskbar', { workspaceId }));
       } catch { /* WindowManager may be gone */ }
     }
 
     // Hide workspace taskbar
     try {
-      await this.request(request(this.id, ws.taskbarId, TASKBAR_INTERFACE, 'hide', {}));
+      await this.request(request(this.id, ws.taskbarId, 'hide', {}));
     } catch { /* may already be hidden */ }
 
     // Kill all per-workspace objects (in reverse order)
     for (const childId of [...ws.childIds].reverse()) {
       try {
         await this.request(
-          request(this.id, this.factoryId!, FACTORY_INTERFACE, 'kill', { objectId: childId })
+          request(this.id, this.factoryId!, 'kill', { objectId: childId })
         );
       } catch { /* may already be dead */ }
     }
@@ -460,7 +458,7 @@ export class WorkspaceManager extends Abject {
     // Unregister workspace registry from global registry
     try {
       await this.request(
-        request(this.id, this.globalRegistryId!, REGISTRY_INTERFACE, 'unregister', { objectId: ws.registryId })
+        request(this.id, this.globalRegistryId!, 'unregister', { objectId: ws.registryId })
       );
     } catch { /* already gone */ }
 
@@ -486,7 +484,7 @@ export class WorkspaceManager extends Abject {
 
     // Instant switch: change the compositor filter (no hide/show messages needed)
     if (this.uiServerId) {
-      await this.request(request(this.id, this.uiServerId, UI_INTERFACE, 'setActiveWorkspace', { workspaceId }));
+      await this.request(request(this.id, this.uiServerId, 'setActiveWorkspace', { workspaceId }));
     }
 
     await this.persistActiveWorkspaceId();
@@ -513,9 +511,9 @@ export class WorkspaceManager extends Abject {
 
     if (this.globalToolbarId) {
       try {
-        await this.request(request(this.id, this.globalToolbarId, GLOBAL_TOOLBAR_INTERFACE, 'show', { yOffset }));
+        await this.request(request(this.id, this.globalToolbarId, 'show', { yOffset }));
         const toolbarHeight = await this.request<number>(
-          request(this.id, this.globalToolbarId, GLOBAL_TOOLBAR_INTERFACE, 'getHeight', {}));
+          request(this.id, this.globalToolbarId, 'getHeight', {}));
         yOffset = yOffset + toolbarHeight + 8;
       } catch { /* toolbar not ready */ }
     }
@@ -525,20 +523,20 @@ export class WorkspaceManager extends Abject {
         // Find the active workspace's Settings ID for the gear button
         const settingsEntry = ws.uiObjects.find(o => o.iface === SETTINGS_INTERFACE);
         await this.request(request(this.id, this.workspaceSwitcherId,
-          WORKSPACE_SWITCHER_INTERFACE, 'show', {
+          'show', {
             workspaces: this.listWorkspaces(),
             activeWorkspaceId: this.activeWorkspaceId,
             settingsId: settingsEntry?.id,
             yOffset,
           }));
         const switcherHeight = await this.request<number>(
-          request(this.id, this.workspaceSwitcherId, WORKSPACE_SWITCHER_INTERFACE, 'getHeight', {}));
+          request(this.id, this.workspaceSwitcherId, 'getHeight', {}));
         yOffset = yOffset + switcherHeight + 8;
       } catch { /* use default */ }
     }
 
     try {
-      await this.request(request(this.id, ws.taskbarId, TASKBAR_INTERFACE, 'show', {
+      await this.request(request(this.id, ws.taskbarId, 'show', {
         yOffset,
       }));
     } catch (err) {
@@ -698,9 +696,9 @@ export class WorkspaceManager extends Abject {
   private async spawnWorkspaceObjects(workspaceId: string, name: string): Promise<WorkspaceInfo> {
     // 1. Spawn WorkspaceRegistry (skip all registries — we register manually)
     const wsRegResult = await this.request<SpawnResult>(
-      request(this.id, this.factoryId!, FACTORY_INTERFACE, 'spawn', {
+      request(this.id, this.factoryId!, 'spawn', {
         manifest: { name: 'WorkspaceRegistry', description: `Workspace registry for '${name}'`,
-          version: '1.0.0', interfaces: [], requiredCapabilities: [], tags: ['system'] },
+          version: '1.0.0', requiredCapabilities: [], tags: ['system'] },
         skipGlobalRegistry: true,
       })
     );
@@ -708,23 +706,23 @@ export class WorkspaceManager extends Abject {
 
     // Subscribe to workspace registry for object registration events
     await this.request(
-      request(this.id, wsRegistryId, REGISTRY_INTERFACE, 'subscribe', {})
+      request(this.id, wsRegistryId, 'subscribe', {})
     );
 
     // Configure fallback to global registry
     await this.request(
-      request(this.id, wsRegistryId, WORKSPACE_REGISTRY_INTERFACE, 'setFallback', {
+      request(this.id, wsRegistryId, 'setFallback', {
         registryId: this.globalRegistryId!,
       })
     );
 
     // Register workspace registry in itself (so workspace objects find "Registry")
     await this.request(
-      request(this.id, wsRegistryId, REGISTRY_INTERFACE, 'register', {
+      request(this.id, wsRegistryId, 'register', {
         objectId: wsRegistryId,
         manifest: { name: 'Registry', description: `Workspace registry for '${name}'`,
-          version: '1.0.0', interfaces: [{ id: 'abjects:registry', name: 'Registry',
-          description: 'Object registration and discovery', methods: [] }],
+          version: '1.0.0', interface: { id: 'abjects:registry', name: 'Registry',
+          description: 'Object registration and discovery', methods: [] },
           requiredCapabilities: [], tags: ['system', 'core'] },
       })
     );
@@ -732,14 +730,14 @@ export class WorkspaceManager extends Abject {
     // Register the global registry in the workspace registry as "SystemRegistry"
     // so workspace objects (e.g. RegistryBrowser) can discover and query it
     await this.request(
-      request(this.id, wsRegistryId, REGISTRY_INTERFACE, 'register', {
+      request(this.id, wsRegistryId, 'register', {
         objectId: this.globalRegistryId!,
         manifest: {
           name: 'SystemRegistry',
           description: 'System-wide registry for core objects shared across workspaces',
           version: '1.0.0',
-          interfaces: [{ id: 'abjects:registry' as InterfaceId, name: 'Registry',
-            description: 'Object registration and discovery', methods: [] }],
+          interface: { id: 'abjects:registry' as InterfaceId, name: 'Registry',
+            description: 'Object registration and discovery', methods: [] },
           requiredCapabilities: [], tags: ['system', 'core'],
         },
       })
@@ -747,20 +745,20 @@ export class WorkspaceManager extends Abject {
 
     // Register workspace registry in the global registry so it's discoverable
     await this.request(
-      request(this.id, this.globalRegistryId!, REGISTRY_INTERFACE, 'register', {
+      request(this.id, this.globalRegistryId!, 'register', {
         objectId: wsRegistryId,
         manifest: { name: `WorkspaceRegistry:${name}`, description: `Workspace registry for '${name}'`,
-          version: '1.0.0', interfaces: [{ id: 'abjects:registry', name: 'Registry',
-          description: 'Object registration and discovery', methods: [] }],
+          version: '1.0.0', interface: { id: 'abjects:registry', name: 'Registry',
+          description: 'Object registration and discovery', methods: [] },
           requiredCapabilities: [], tags: ['system', 'workspace'] },
       })
     );
 
     // 2. Spawn workspace-scoped Storage (registryHint → workspace registry, Factory auto-registers)
     const wsStorageResult = await this.request<SpawnResult>(
-      request(this.id, this.factoryId!, FACTORY_INTERFACE, 'spawn', {
+      request(this.id, this.factoryId!, 'spawn', {
         manifest: { name: 'Storage', description: `Workspace storage for '${name}'`,
-          version: '1.0.0', interfaces: [], requiredCapabilities: [], tags: ['system'] },
+          version: '1.0.0', requiredCapabilities: [], tags: ['system'] },
         registryHint: wsRegistryId,
         constructorArgs: { dbName: `abjects-storage-${workspaceId}` },
       })
@@ -784,9 +782,9 @@ export class WorkspaceManager extends Abject {
 
     for (const objName of PER_WORKSPACE_OBJECTS) {
       const result = await this.request<SpawnResult>(
-        request(this.id, this.factoryId!, FACTORY_INTERFACE, 'spawn', {
+        request(this.id, this.factoryId!, 'spawn', {
           manifest: { name: objName, description: '', version: '1.0.0',
-            interfaces: [], requiredCapabilities: [], tags: ['system'] },
+            requiredCapabilities: [], tags: ['system'] },
           registryHint: wsRegistryId,
         })
       );
@@ -801,7 +799,7 @@ export class WorkspaceManager extends Abject {
         if (this.windowManagerId) {
           try {
             await this.request(request(this.id, this.windowManagerId,
-              WINDOW_MANAGER_INTERFACE, 'registerTaskbar', { taskbarId: objId, workspaceId }));
+              'registerTaskbar', { taskbarId: objId, workspaceId }));
           } catch { /* WindowManager may not be ready */ }
         }
       }
@@ -815,7 +813,7 @@ export class WorkspaceManager extends Abject {
       // assign the workspace ID to any surfaces it creates
       if (this.widgetManagerId) {
         try {
-          await this.request(request(this.id, this.widgetManagerId, WIDGETS_INTERFACE, 'setObjectWorkspace', {
+          await this.request(request(this.id, this.widgetManagerId, 'setObjectWorkspace', {
             objectId: objId, workspaceId,
           }));
         } catch { /* WidgetManager may not be ready */ }
@@ -828,7 +826,7 @@ export class WorkspaceManager extends Abject {
     if (abjectStoreId) {
       try {
         await this.request(
-          request(this.id, abjectStoreId, ABJECT_STORE_INTERFACE, 'restoreAll', {})
+          request(this.id, abjectStoreId, 'restoreAll', {})
         );
       } catch (err) {
         console.warn(`[WORKSPACE-MANAGER] Failed to restore abjects for workspace '${name}':`, err);
@@ -838,7 +836,7 @@ export class WorkspaceManager extends Abject {
     // 5. Sync childIds with actual registry contents (picks up restored user objects)
     try {
       const registered = await this.request<Array<{ id: string }>>(
-        request(this.id, wsRegistryId, REGISTRY_INTERFACE, 'list', {})
+        request(this.id, wsRegistryId, 'list', {})
       );
       for (const entry of registered) {
         if (!childIds.includes(entry.id as AbjectId)) {
@@ -880,7 +878,7 @@ export class WorkspaceManager extends Abject {
 
     try {
       const keys = await this.request<string[]>(
-        request(this.id, this.globalStorageId!, STORAGE_INTERFACE, 'keys', {})
+        request(this.id, this.globalStorageId!, 'keys', {})
       );
 
       // Keys that belong to per-workspace objects
@@ -894,11 +892,11 @@ export class WorkspaceManager extends Abject {
       for (const key of migrateKeys) {
         try {
           const value = await this.request<unknown>(
-            request(this.id, this.globalStorageId!, STORAGE_INTERFACE, 'get', { key })
+            request(this.id, this.globalStorageId!, 'get', { key })
           );
           if (value !== null) {
             await this.request(
-              request(this.id, ws.storageId, STORAGE_INTERFACE, 'set', { key, value })
+              request(this.id, ws.storageId, 'set', { key, value })
             );
           }
         } catch { /* skip individual key errors */ }
@@ -917,7 +915,7 @@ export class WorkspaceManager extends Abject {
   private async loadWorkspaceList(): Promise<PersistedWorkspace[]> {
     try {
       const stored = await this.request<PersistedWorkspace[] | null>(
-        request(this.id, this.globalStorageId!, STORAGE_INTERFACE, 'get', { key: STORAGE_KEY_LIST })
+        request(this.id, this.globalStorageId!, 'get', { key: STORAGE_KEY_LIST })
       );
       return Array.isArray(stored) ? stored : [];
     } catch {
@@ -928,7 +926,7 @@ export class WorkspaceManager extends Abject {
   private async loadActiveWorkspaceId(): Promise<string | null> {
     try {
       const stored = await this.request<string | null>(
-        request(this.id, this.globalStorageId!, STORAGE_INTERFACE, 'get', { key: STORAGE_KEY_ACTIVE })
+        request(this.id, this.globalStorageId!, 'get', { key: STORAGE_KEY_ACTIVE })
       );
       return stored;
     } catch {
@@ -946,7 +944,7 @@ export class WorkspaceManager extends Abject {
     }));
     try {
       await this.request(
-        request(this.id, this.globalStorageId!, STORAGE_INTERFACE, 'set', {
+        request(this.id, this.globalStorageId!, 'set', {
           key: STORAGE_KEY_LIST,
           value: list,
         })
@@ -960,7 +958,7 @@ export class WorkspaceManager extends Abject {
     if (!this.activeWorkspaceId) return;
     try {
       await this.request(
-        request(this.id, this.globalStorageId!, STORAGE_INTERFACE, 'set', {
+        request(this.id, this.globalStorageId!, 'set', {
           key: STORAGE_KEY_ACTIVE,
           value: this.activeWorkspaceId,
         })

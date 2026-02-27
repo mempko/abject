@@ -30,7 +30,6 @@ export interface MessageHeader {
 export interface MessageRouting {
   from: AbjectId;
   to: AbjectId;
-  interface: InterfaceId;
   method?: string;
 }
 
@@ -129,7 +128,7 @@ export interface AbjectManifest {
   name: string;
   description: string;
   version: string;
-  interfaces: InterfaceDeclaration[];
+  interface: InterfaceDeclaration;
   requiredCapabilities: CapabilityRequest[];
   providedCapabilities?: CapabilityId[];
   tags?: string[];

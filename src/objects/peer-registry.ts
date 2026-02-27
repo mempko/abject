@@ -52,9 +52,8 @@ export class PeerRegistry extends Abject {
         description:
           'Manages peer contacts, connection states, and orchestrates WebRTC peer-to-peer connections via signaling servers.',
         version: '1.0.0',
-        interfaces: [
-          {
-            id: PEER_REGISTRY_INTERFACE as string,
+        interface: {
+            id: PEER_REGISTRY_INTERFACE,
             name: 'PeerRegistry',
             description: 'Peer contact management and connection control',
             methods: [
@@ -186,7 +185,6 @@ export class PeerRegistry extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [
           Capabilities.PEER_CONNECT,
@@ -315,7 +313,7 @@ export class PeerRegistry extends Abject {
     // Import the contact's keys into Identity for crypto operations
     if (this.identityId) {
       await this.request(
-        createRequest(this.id, this.identityId, IDENTITY_INTERFACE, 'importContact', {
+        createRequest(this.id, this.identityId, 'importContact', {
           peerId, publicSigningKey, publicExchangeKey,
         }),
       );
@@ -729,7 +727,7 @@ export class PeerRegistry extends Abject {
 
     try {
       const identity = await this.request<PeerIdentity>(
-        createRequest(this.id, this.identityId, IDENTITY_INTERFACE, 'exportPublicKeys', {}),
+        createRequest(this.id, this.identityId, 'exportPublicKeys', {}),
       );
       // We also need the private exchange key for ECDH — import it
       // The IdentityObject handles crypto internally, but PeerTransport needs the raw key
@@ -767,7 +765,7 @@ export class PeerRegistry extends Abject {
 
     try {
       const result = await this.request<StoredContact[] | null>(
-        createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'get', { key: STORAGE_KEY_CONTACTS }),
+        createRequest(this.id, this.storageId, 'get', { key: STORAGE_KEY_CONTACTS }),
       );
       if (Array.isArray(result)) {
         for (const stored of result) {
@@ -787,7 +785,7 @@ export class PeerRegistry extends Abject {
           // Import keys into Identity
           if (this.identityId) {
             this.request(
-              createRequest(this.id, this.identityId, IDENTITY_INTERFACE, 'importContact', {
+              createRequest(this.id, this.identityId, 'importContact', {
                 peerId: stored.peerId,
                 publicSigningKey: stored.publicSigningKey,
                 publicExchangeKey: stored.publicExchangeKey,
@@ -814,7 +812,7 @@ export class PeerRegistry extends Abject {
     }));
 
     await this.request(
-      createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'set',
+      createRequest(this.id, this.storageId, 'set',
         { key: STORAGE_KEY_CONTACTS, value: stored }),
     );
   }
@@ -824,7 +822,7 @@ export class PeerRegistry extends Abject {
 
     const urls = Array.from(this.savedSignalingUrls);
     await this.request(
-      createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'set',
+      createRequest(this.id, this.storageId, 'set',
         { key: STORAGE_KEY_SIGNALING_URLS, value: urls }),
     );
   }
@@ -834,7 +832,7 @@ export class PeerRegistry extends Abject {
 
     try {
       const result = await this.request<string[] | null>(
-        createRequest(this.id, this.storageId, STORAGE_INTERFACE, 'get', { key: STORAGE_KEY_SIGNALING_URLS }),
+        createRequest(this.id, this.storageId, 'get', { key: STORAGE_KEY_SIGNALING_URLS }),
       );
       if (Array.isArray(result)) {
         // Populate saved set first — ensures URLs are tracked even if connection fails

@@ -39,7 +39,7 @@ test.describe('Messaging', () => {
 
       // Send message from sender to receiver
       const bus = runtime.messageBus as { send: (msg: unknown) => Promise<void> };
-      const msg = request(sender.id, receiver.id, 'test', 'ping', { data: 'hello' });
+      const msg = request(sender.id, receiver.id, 'ping', { data: 'hello' });
       await bus.send(msg);
 
       // Small delay for async processing

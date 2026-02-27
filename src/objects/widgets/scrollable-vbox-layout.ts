@@ -8,7 +8,7 @@
 
 import { AbjectId } from '../../core/types.js';
 import { request } from '../../core/message.js';
-import { Rect, WIDGET_INTERFACE } from './widget-types.js';
+import { Rect } from './widget-types.js';
 import { VBoxLayout } from './vbox-layout.js';
 import { LayoutConfig, ChildRect, isSpacer } from './layout-abject.js';
 
@@ -93,7 +93,7 @@ export class ScrollableVBoxLayout extends VBoxLayout {
 
       try {
         const childCmds = await this.request<unknown[]>(
-          request(this.id, child.widgetId, WIDGET_INTERFACE, 'render', {
+          request(this.id, child.widgetId, 'render', {
             surfaceId,
             ox: ox + child.rect.x,
             oy: childOy,

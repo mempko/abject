@@ -13,9 +13,6 @@ import { request as createRequest, event as createEvent } from '../core/message.
 import type { PeerId } from '../core/identity.js';
 
 const REMOTE_REGISTRY_INTERFACE = 'abjects:remote-registry' as InterfaceId;
-const REGISTRY_INTERFACE = 'abjects:registry' as InterfaceId;
-const PEER_REGISTRY_INTERFACE = 'abjects:peer-registry' as InterfaceId;
-const PEER_ROUTER_INTERFACE = 'abjects:peer-router' as InterfaceId;
 
 export const REMOTE_REGISTRY_ID = 'abjects:remote-registry' as AbjectId;
 
@@ -41,8 +38,7 @@ export class RemoteRegistry extends Abject {
         description:
           'Distributed object discovery across connected peers. Queries remote registries, caches results, and registers routes in the PeerRouter.',
         version: '1.0.0',
-        interfaces: [
-          {
+        interface: {
             id: REMOTE_REGISTRY_INTERFACE as string,
             name: 'RemoteRegistry',
             description: 'Remote object discovery and lookup',
@@ -97,7 +93,6 @@ export class RemoteRegistry extends Abject {
               },
             ],
           },
-        ],
         requiredCapabilities: [],
         providedCapabilities: [],
         tags: ['system', 'peer'],
@@ -159,7 +154,7 @@ export class RemoteRegistry extends Abject {
 
     try {
       const contacts = await this.request<Array<{ peerId: string; state: string }>>(
-        createRequest(this.id, this.peerRegistryId, PEER_REGISTRY_INTERFACE, 'listContacts', {}),
+        createRequest(this.id, this.peerRegistryId, 'listContacts', {}),
       );
 
       for (const contact of contacts) {
@@ -221,7 +216,7 @@ export class RemoteRegistry extends Abject {
     if (this.peerRouterId) {
       try {
         await this.request(
-          createRequest(this.id, this.peerRouterId, PEER_ROUTER_INTERFACE, 'registerRoute', {
+          createRequest(this.id, this.peerRouterId, 'registerRoute', {
             objectId, peerId,
           }),
         );
@@ -273,7 +268,7 @@ export class RemoteRegistry extends Abject {
       if (now > entry.discoveredAt + entry.ttl) continue;
 
       if (name && entry.manifest.name !== name) continue;
-      if (interfaceId && !entry.manifest.interfaces.some(i => i.id === interfaceId)) continue;
+      if (interfaceId && entry.manifest.interface.id !== interfaceId) continue;
 
       results.push({ objectId: entry.objectId, peerId: entry.peerId, manifest: entry.manifest });
     }
@@ -293,7 +288,7 @@ export class RemoteRegistry extends Abject {
       if (entry.peerId !== peerId) continue;
       if (now > entry.discoveredAt + entry.ttl) continue;
       if (name && entry.manifest.name !== name) continue;
-      if (interfaceId && !entry.manifest.interfaces.some(i => i.id === interfaceId)) continue;
+      if (interfaceId && entry.manifest.interface.id !== interfaceId) continue;
 
       results.push({ objectId: entry.objectId, peerId: entry.peerId, manifest: entry.manifest });
     }
