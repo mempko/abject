@@ -271,7 +271,8 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         return;
       }
 
-      if (aspect === 'workspaceAccessChanged' || aspect === 'workspaceShared' || aspect === 'workspaceUnshared') {
+      if (aspect === 'workspaceAccessChanged' || aspect === 'workspaceShared' ||
+          aspect === 'workspaceUnshared' || aspect === 'workspaceObjectsChanged') {
         // Invalidate permission cache
         this.permissionCache.clear();
         // Re-announce routes to all connected peers
@@ -282,6 +283,10 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 
   protected override async onInit(): Promise<void> {
     console.log('[PeerRouter] onInit starting');
+
+    // Allow inbound messages addressed to PeerRouter itself (route announcements)
+    this.allowedSystemObjects.add(this.id);
+
     this.peerRegistryId = (await this.discoverDep('PeerRegistry')) ?? undefined;
     this.workspaceManagerId = (await this.discoverDep('WorkspaceManager')) ?? undefined;
     console.log(`[PeerRouter] onInit deps: peerRegistryId=${!!this.peerRegistryId} workspaceManagerId=${!!this.workspaceManagerId}`);
@@ -392,7 +397,8 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 
     // Check if target is registered locally on the bus
     const isReg = this._messageBus?.isRegistered(targetId) ?? false;
-    const permOk = isReg ? this.checkInboundPermission(targetId, fromPeerId) : false;
+    const isReply = msg.header.type === 'reply' || msg.header.type === 'error';
+    const permOk = isReg ? (isReply || this.checkInboundPermission(targetId, fromPeerId)) : false;
     console.log('[PeerRouter] isRegistered=', isReg, 'permissionOk=', permOk);
 
     if (this._messageBus && isReg) {
@@ -640,7 +646,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   /**
    * Announce routes to all connected peers.
    */
-  private async announceRoutesToAll(): Promise<void> {
+  async announceRoutesToAll(): Promise<void> {
     if (!this.peerRegistryRef) return;
 
     const connectedPeers = this.peerRegistryRef.getConnectedPeers();
@@ -670,6 +676,11 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     // Lazy-resolve WorkspaceManager if not yet known (spawned after PeerRouter)
     if (!this.workspaceManagerId) {
       this.workspaceManagerId = (await this.discoverDep('WorkspaceManager')) ?? undefined;
+      if (this.workspaceManagerId) {
+        this.request(
+          createRequest(this.id, this.workspaceManagerId, INTROSPECT_INTERFACE, 'addDependent', {}),
+        ).catch(() => { /* best-effort */ });
+      }
     }
 
     // Query WorkspaceManager for shared workspace objects

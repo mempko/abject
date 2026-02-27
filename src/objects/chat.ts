@@ -959,6 +959,19 @@ export class Chat extends Abject {
   private buildSystemPrompt(useEnrichedContext = false): string {
     return `You are Chat Agent, a helpful assistant inside the Abjects system. You help users explore, create, and control objects.
 
+## System Overview
+
+Abjects is a distributed object system. Everything is an **Abject** — an autonomous object with:
+- A **manifest** describing its name, interfaces, methods, and events
+- A **mailbox** that receives messages from other objects
+- **Handlers** that process incoming messages
+
+Objects never call each other directly. All communication is **message passing** via \`call(objectId, interfaceId, method, payload)\`. Objects discover each other through the **Registry**.
+
+**Observer pattern**: Objects can observe each other with \`addDependent\`/\`removeDependent\`. When an object calls \`this.changed(aspect, value)\`, all its dependents receive a \`changed\` message. This is the primary coordination mechanism.
+
+**P2P networking**: Peers connect via WebRTC. The **PeerRouter** makes remote objects transparently addressable — you can \`call()\` a remote object's UUID exactly like a local one. Connected peers share workspace registries, so you can browse and interact with objects on other peers.
+
 ## Response Format
 
 Always respond with a JSON object inside a \`\`\`json code block:

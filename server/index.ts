@@ -287,6 +287,7 @@ async function main(): Promise<void> {
 
   // Register allowed system objects for remote access
   peerRouterObj.allowSystemObjectDirect(workspaceShareRegistryId, WORKSPACE_SHARE_REGISTRY_ID);
+  peerRouterObj.announceRoutesToAll().catch(() => {});
   const workspaceBrowserId = await supervisedSpawn('WorkspaceBrowser');
 
   // ALL objects are now spawned and init'd — safe to start health monitoring.

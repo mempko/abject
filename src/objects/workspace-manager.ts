@@ -341,6 +341,25 @@ export class WorkspaceManager extends Abject {
       return this.refreshTaskbar();
     });
 
+    // Handle objectRegistered events from workspace registries
+    this.on('objectRegistered', async (msg: AbjectMessage) => {
+      const registryId = msg.routing.from;
+      const { id: objectId } = msg.payload as { id: string };
+      for (const ws of this.workspaces.values()) {
+        if (ws.registryId === registryId) {
+          if (!ws.childIds.includes(objectId as AbjectId)) {
+            ws.childIds.push(objectId as AbjectId);
+            if (ws.accessMode !== 'local') {
+              await this.changed('workspaceObjectsChanged', {
+                workspaceId: ws.id, objectId,
+              });
+            }
+          }
+          break;
+        }
+      }
+    });
+
     // Boot must be called after spawn completes (cannot spawn during onInit
     // because Factory is busy processing our own spawn request).
     this.on('boot', async () => {
@@ -687,6 +706,11 @@ export class WorkspaceManager extends Abject {
     );
     const wsRegistryId = wsRegResult.objectId;
 
+    // Subscribe to workspace registry for object registration events
+    await this.request(
+      request(this.id, wsRegistryId, REGISTRY_INTERFACE, 'subscribe', {})
+    );
+
     // Configure fallback to global registry
     await this.request(
       request(this.id, wsRegistryId, WORKSPACE_REGISTRY_INTERFACE, 'setFallback', {
@@ -810,6 +834,18 @@ export class WorkspaceManager extends Abject {
         console.warn(`[WORKSPACE-MANAGER] Failed to restore abjects for workspace '${name}':`, err);
       }
     }
+
+    // 5. Sync childIds with actual registry contents (picks up restored user objects)
+    try {
+      const registered = await this.request<Array<{ id: string }>>(
+        request(this.id, wsRegistryId, REGISTRY_INTERFACE, 'list', {})
+      );
+      for (const entry of registered) {
+        if (!childIds.includes(entry.id as AbjectId)) {
+          childIds.push(entry.id as AbjectId);
+        }
+      }
+    } catch { /* registry not ready */ }
 
     return {
       id: workspaceId,

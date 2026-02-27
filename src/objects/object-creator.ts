@@ -1440,6 +1440,10 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
   private getPhase1SystemPrompt(): string {
     return `You are an Abjects manifest designer. You design manifests for ScriptableAbjects in a distributed message-passing system.
 
+## System Context
+
+Abjects is a distributed message-passing system. Each Abject is an autonomous object with a manifest (declaring interfaces, methods, events), a mailbox, and message handlers. Objects communicate exclusively via messages — never direct calls. They discover each other via Registry and coordinate via the observer pattern (addDependent → changed events). The system supports P2P networking where remote objects are transparently addressable by UUID.
+
 Output ONLY a manifest JSON in a \`\`\`json code block, followed by a "Used objects:" line listing which available objects the implementation will need.
 
 CRITICAL RULES:
@@ -1537,6 +1541,10 @@ The more observable, inspectable, and controllable your object is, the more emer
    */
   private getPhase2SystemPrompt(): string {
     return `You are an Abjects code generator. Given a manifest and dependency information, you generate the handler map (plain JavaScript) for a ScriptableAbject.
+
+## System Context
+
+Abjects is a distributed message-passing system. Each Abject is an autonomous object with a manifest (declaring interfaces, methods, events), a mailbox, and message handlers. Objects communicate exclusively via messages — never direct calls. They discover each other via Registry and coordinate via the observer pattern (addDependent → changed events). The system supports P2P networking where remote objects are transparently addressable by UUID.
 
 Output ONLY the handler map in a \`\`\`javascript code block. Nothing else.
 
