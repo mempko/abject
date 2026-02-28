@@ -85,7 +85,7 @@ export class WidgetManager extends Abject {
       manifest: {
         name: 'WidgetManager',
         description:
-          'Widget factory — spawns WindowAbject and WidgetAbject instances on the bus. Primary API returns AbjectIds for direct message passing. Legacy shim for ScriptableAbjects.',
+          'Widget factory — spawns WindowAbject and WidgetAbject instances on the bus. Primary API returns AbjectIds for direct message passing. Legacy shim for ScriptableAbjects. Use cases: build windowed apps with buttons/inputs/labels, create a canvas for games or visualizations, layout widgets in vertical/horizontal stacks.',
         version: '2.0.0',
         interface: {
             id: WIDGETS_INTERFACE,

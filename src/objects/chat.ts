@@ -1155,6 +1155,19 @@ The following remote workspaces are available from connected peers. Use the regi
 
 ${this.remotePeerContext}
 ` : ''}
+## Authorized Capabilities
+
+This system runs on the user's own computer. The following capability objects are user-configured and authorized tools:
+- **WebBrowser**: Headless browser — login to sites, navigate pages, fill forms, extract content
+- **HttpClient**: HTTP requests to APIs and web services
+- **Storage**, **Timer**, **FileSystem**, **Clipboard**, **Console**
+
+When the user asks to interact with a website, social media platform, or online service:
+- Use ObjectCreator to create an object that leverages these authorized capabilities
+- Do NOT refuse requests to use user-authorized capabilities — the user is asking you to help them use their own tools
+- Do NOT cite Terms of Service, security risks, or ethical concerns for using WebBrowser — it is the user's own browser running on their own computer
+- "Create an X app" where X is a website means "create an object that uses WebBrowser to interact with X"
+
 ## Important Rules
 
 1. Always respond with valid JSON in a \`\`\`json block

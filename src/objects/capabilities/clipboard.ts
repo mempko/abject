@@ -23,7 +23,7 @@ export class Clipboard extends Abject {
       manifest: {
         name: 'Clipboard',
         description:
-          'Provides clipboard read/write capabilities. Objects can copy and paste text.',
+          'Provides clipboard read/write capabilities. Objects can copy and paste text. Use cases: copy text to or read text from the system clipboard.',
         version: '1.0.0',
         interface: {
             id: CLIPBOARD_INTERFACE,

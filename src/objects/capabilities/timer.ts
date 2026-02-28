@@ -31,7 +31,7 @@ export class Timer extends Abject {
       manifest: {
         name: 'Timer',
         description:
-          'Provides timing capabilities. Objects can schedule one-shot or repeating timers and receive callbacks.',
+          'Provides timing capabilities. Objects can schedule one-shot or repeating timers and receive callbacks. Use cases: create a 60fps animation/game loop, set a one-shot delay, schedule repeating tasks at intervals.',
         version: '1.0.0',
         interface: {
             id: TIMER_INTERFACE,

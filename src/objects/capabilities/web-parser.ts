@@ -48,7 +48,7 @@ export class WebParser extends Abject {
       manifest: {
         name: 'WebParser',
         description:
-          'HTML parsing and data extraction. Parse HTML strings, extract links, images, text, and metadata using CSS selectors.',
+          'HTML parsing and data extraction. Parse HTML strings, extract links, images, text, and metadata using CSS selectors. Use cases: parse HTML and extract links/images/text with CSS selectors, get page metadata (title, OG tags).',
         version: '1.0.0',
         interface: {
             id: WEB_PARSER_INTERFACE,

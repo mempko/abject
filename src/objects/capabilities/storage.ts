@@ -31,7 +31,7 @@ export class Storage extends Abject {
       manifest: {
         name: 'Storage',
         description:
-          'Persistent key-value storage backed by IndexedDB. Objects can store and retrieve data that persists across sessions.',
+          'Persistent key-value storage backed by IndexedDB. Objects can store and retrieve data that persists across sessions. Use cases: persist user settings across restarts, cache API responses, save and restore application state.',
         version: '1.0.0',
         interface: {
             id: STORAGE_INTERFACE,

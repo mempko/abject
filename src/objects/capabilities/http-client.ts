@@ -40,7 +40,7 @@ export class HttpClient extends Abject {
       manifest: {
         name: 'HttpClient',
         description:
-          'Provides HTTP request capabilities. Objects can make GET, POST, PUT, DELETE requests to external APIs.',
+          'Provides HTTP request capabilities. Objects can make GET, POST, PUT, DELETE requests to external APIs. Use cases: fetch JSON from REST APIs, download images as base64 data URIs, POST form data or JSON, make authenticated requests with custom headers.',
         version: '1.0.0',
         interface: {
             id: HTTP_INTERFACE,

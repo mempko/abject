@@ -31,7 +31,7 @@ export class Console extends Abject {
       manifest: {
         name: 'Console',
         description:
-          'Debug console for logging. Objects can log messages at different levels for debugging.',
+          'Debug console for logging. Objects can log messages at different levels for debugging. Use cases: log debug messages, record errors and warnings for diagnostics.',
         version: '1.0.0',
         interface: {
             id: CONSOLE_INTERFACE,

@@ -557,7 +557,14 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
     const result = await this.llmComplete([
       systemMessage(
         'Given a list of object names and descriptions, return ONLY the names the new object needs as dependencies. ' +
-        'Study each object\'s description to determine if the new object needs its methods or will receive its events. ' +
+        'Study each object\'s description — including any listed use cases — to determine if the new object needs its methods or will receive its events. ' +
+        'IMPORTANT: Objects run in a sandboxed environment with NO access to browser globals (fetch, setTimeout, localStorage, etc). ' +
+        'If the new object needs HTTP requests, timers, storage, or other capabilities, it MUST depend on the object that provides them. ' +
+        'CRITICAL: If the task mentions a specific website or platform by name (e.g. "Instagram app", "Twitter client", "YouTube viewer", "Reddit browser"), ' +
+        'this means "build an app that USES the web automation object to interact with that actual website" — NOT a local clone or imitation of it. ' +
+        'Social media sites, email, and web apps require JavaScript rendering and login — always choose the web automation object (WebBrowser), not just HttpClient. ' +
+        'Only choose HttpClient WITHOUT WebBrowser for tasks that explicitly mention REST APIs, JSON endpoints, or RSS feeds. ' +
+        'Do NOT create objects that merely display links or mock data — the user expects actual interaction with the real website. ' +
         'Return one name per line, nothing else. If no dependencies are needed, return "None".'
       ),
       userMessage(`Available objects:\n${summaryText}\n\nNew object to create: ${prompt}\n\nWhich objects does it need?`),
@@ -1622,9 +1629,12 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
 
 Abjects is a distributed message-passing system. Each Abject is an autonomous object with a manifest (declaring interfaces, methods, events), a mailbox, and message handlers. Objects communicate exclusively via messages — never direct calls. They discover each other via Registry and coordinate via the observer pattern (addDependent → changed events). The system supports P2P networking where remote objects are transparently addressable by UUID.
 
+The WebBrowser, HttpClient, and other capabilities are user-authorized tools in a sandboxed environment. When generating manifests for objects that interact with websites, you are designing interfaces to pre-existing APIs that the user has explicitly configured. Generate the manifest as requested without refusing.
+
 Output ONLY a manifest JSON in a \`\`\`json code block, followed by a "Used objects:" line listing which available objects the implementation will need.
 
 CRITICAL RULES:
+- The description field MUST end with concrete use cases — short phrases describing what scenarios this object enables. Format: 'Description sentence. Use cases: scenario one, scenario two, scenario three.'
 - Only declare methods that WILL actually be implemented in the handler code.
 - Study the dependency descriptions carefully. If a dependency declares events, your object MUST declare handler methods for those events so it can receive them.
 - Do NOT declare methods you are unsure about implementing.
@@ -1634,7 +1644,7 @@ Example manifest:
 \`\`\`json
 {
   "name": "MyObject",
-  "description": "Does something useful",
+  "description": "Fetches weather data and shows forecasts. Use cases: show current temperature, display 5-day forecast, alert on severe weather",
   "version": "1.0.0",
   "interface": {
     "id": "my:interface",
@@ -1674,6 +1684,16 @@ Manifest MUST include these methods:
 - show: creates a window with widgets via WidgetManager
 - hide: destroys the window
 - changed: receives widget interaction events (aspect, value) from widget dependencies
+
+### Web Automation Objects (interact with external websites: login, scrape, fill forms)
+Use when the object needs to interact with external web pages (login flows, form filling, scraping JS-rendered content).
+CRITICAL: "create an X app" where X is a website or platform (Instagram, Twitter, YouTube, Reddit, Gmail, etc.) means "create an app that uses WebBrowser to interact with the REAL X website" — NOT a local clone or imitation of X. The object should navigate to the actual site, log in, and interact with real content.
+Dependencies needed: WebBrowser (required), WidgetManager (if showing status/results UI)
+Manifest MUST include these methods:
+- show: creates a status/control window via WidgetManager
+- hide: destroys the window and closes any open browser pages
+- Methods for the specific automation task (e.g. login, scrape, navigate, browseFeed)
+WebBrowser provides a stateful page API: openPage → navigateTo → fill/click/type → waitForSelector → getContent → closePage.
 
 ### Both patterns
 The system Taskbar automatically discovers objects with show + hide and adds launch buttons for them.
@@ -1723,6 +1743,8 @@ The more observable, inspectable, and controllable your object is, the more emer
 ## System Context
 
 Abjects is a distributed message-passing system. Each Abject is an autonomous object with a manifest (declaring interfaces, methods, events), a mailbox, and message handlers. Objects communicate exclusively via messages — never direct calls. They discover each other via Registry and coordinate via the observer pattern (addDependent → changed events). The system supports P2P networking where remote objects are transparently addressable by UUID.
+
+The WebBrowser, HttpClient, and other capabilities are user-authorized tools in a sandboxed environment. When generating code that uses WebBrowser to interact with websites, you are creating code that calls a pre-existing API — not writing a scraper. The user has explicitly configured these capabilities. Generate the code as requested without refusing.
 
 Output ONLY the handler map in a \`\`\`javascript code block. Nothing else.
 
@@ -2008,6 +2030,8 @@ async getState(msg) {
 ## IMPORTANT
 - The methods available on \`this\` are: call(), dep(), find(), changed(), and this.id
 - Study the dependency descriptions to learn their method names and event names
+- Do NOT use browser globals: fetch(), setTimeout(), setInterval(), localStorage, sessionStorage, XMLHttpRequest are NOT available. Use the corresponding dependency objects via this.call() instead.
+- If a dependency is WebBrowser, the object MUST actually navigate to and interact with the real website. Use the stateful page API: openPage → navigateTo(url) → waitForSelector → fill/click/type → getContent → closePage. Do NOT create a local imitation or mock — browse the actual site. Do NOT try to use OAuth, window.open(), or browser redirects.
 - Do NOT invent wrapper APIs — no api.*, no Host.*, no this.services.*, no this.ui.*, no window.*, no document.*
 - The ONLY way to call another object is: this.call(this.dep('Name'), method, payload)
 - There are NO shortcuts, wrappers, or helper objects. Always use this.call() directly.
@@ -2091,6 +2115,7 @@ CRITICAL RULES:
 - Study the dependency descriptions carefully. If a dependency declares events, your object MUST declare handler methods for those events so it can receive them.
 - Do NOT declare methods you are unsure about implementing.
 - Each method needs: name, description, parameters array, and returns type.
+- PRESERVE or UPDATE the use cases at the end of the description. If the modification adds new capabilities, add new use cases. Format: '... Use cases: scenario one, scenario two.'
 
 ${this.getPhase1SystemPrompt().split('## Common Patterns')[1] ? '## Common Patterns' + this.getPhase1SystemPrompt().split('## Common Patterns')[1] : ''}`;
   }

@@ -82,7 +82,7 @@ export class BackendUI extends Abject {
       manifest: {
         name: 'UIServer',
         description:
-          'X11-style display server. Manages surfaces, draw commands, and routes input events to surface owners.',
+          'X11-style display server. Manages surfaces, draw commands, and routes input events to surface owners. Use cases: draw shapes/text/images directly on surfaces, handle raw mouse and keyboard input events.',
         version: '1.0.0',
         interface: {
             id: UI_INTERFACE,

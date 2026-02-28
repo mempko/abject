@@ -136,7 +136,8 @@ export class ProxyGenerator extends Abject {
    */
   private async llmComplete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
     return this.request<LLMCompletionResult>(
-      request(this.id, this.llmId!, 'complete', { messages, options })
+      request(this.id, this.llmId!, 'complete', { messages, options }),
+      120000
     );
   }
 

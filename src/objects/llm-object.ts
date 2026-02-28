@@ -56,7 +56,7 @@ export class LLMObject extends Abject {
       manifest: {
         name: 'LLM',
         description:
-          'Language model service. Provides completion, code generation, and analysis capabilities.',
+          'Language model service. Provides completion, code generation, and analysis capabilities. Use cases: generate text completions, analyze or summarize text, generate code from natural language.',
         version: '1.0.0',
         interface: {
             id: LLM_INTERFACE,

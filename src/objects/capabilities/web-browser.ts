@@ -630,7 +630,7 @@ export class WebBrowser extends Abject {
       manifest: {
         name: 'WebBrowser',
         description:
-          'Headless browser automation. Navigate to URLs, wait for JavaScript to render, extract rendered HTML, take screenshots, query elements, and interact with pages via a stateful page API (open → navigate → click/fill/type → read → close).',
+          'Headless browser automation. Navigate to URLs, wait for JavaScript to render, extract rendered HTML, take screenshots, query elements, and interact with pages via a stateful page API (open → navigate → click/fill/type → read → close). Use cases: login to websites (social media, email, web apps), scrape JavaScript-rendered pages, take screenshots, automate form filling and multi-step web interactions.',
         version: '2.0.0',
         interface: {
             id: WEB_BROWSER_INTERFACE,
@@ -1220,7 +1220,57 @@ One-shot methods accept an optional 'options' object:
     { url: 'https://example.com', options: { viewport: { width: 800, height: 600 } } });
   await this.call(this.dep('UIServer'), 'draw', {
     commands: [{ type: 'imageUrl', surfaceId, params: { x: 0, y: 0, width: 400, height: 300, url: shot.dataUri } }]
-  });`;
+  });
+
+### Pattern: OAuth / Login Flow with Redirect Capture
+
+Use this when a site requires login (e.g. Instagram, GitHub, Google) and you need to
+capture an auth code or token from a redirect URL.
+
+  const browser = this.dep('WebBrowser');
+
+  // 1. Open a page and navigate to the login/OAuth page
+  const { pageId } = await this.call(browser, 'openPage', {});
+  await this.call(browser, 'navigateTo',
+    { pageId, url: 'https://example.com/oauth/authorize?client_id=...&redirect_uri=https://localhost/callback' });
+
+  // 2. Fill in credentials and submit
+  await this.call(browser, 'fill',
+    { pageId, selector: 'input[name="username"]', value: username });
+  await this.call(browser, 'fill',
+    { pageId, selector: 'input[name="password"]', value: password });
+  await this.call(browser, 'click',
+    { pageId, selector: 'button[type="submit"]' });
+
+  // 3. Wait for redirect, then poll getUrl() to detect the callback URL
+  //    (waitForSelector returns {found:false} on timeout — use it to pace the loop)
+  let redirectUrl = '';
+  for (let i = 0; i < 30; i++) {
+    const { url } = await this.call(browser, 'getUrl', { pageId });
+    if (url.includes('/callback')) { redirectUrl = url; break; }
+    await this.call(browser, 'waitForSelector',
+      { pageId, selector: '#nonexistent', options: { timeout: 1000 } });
+  }
+
+  // 4. Extract the auth code from the redirect URL
+  const code = new URL(redirectUrl).searchParams.get('code');
+
+  // 5. Exchange code for token using HttpClient (fetch() is NOT available)
+  const tokenResp = await this.call(this.dep('HttpClient'), 'post', {
+    url: 'https://example.com/oauth/token',
+    body: { grant_type: 'authorization_code', code, redirect_uri: 'https://localhost/callback' },
+    headers: { 'Content-Type': 'application/json' }
+  });
+
+  // 6. Clean up the page
+  await this.call(browser, 'closePage', { pageId });
+
+Key points:
+- Do NOT use fetch(), window.open(), or browser redirects — they are unavailable in the sandbox.
+- Use getUrl(pageId) to read the current URL after navigation/redirect.
+- Use waitForSelector with a short timeout as a sleep/polling mechanism.
+- Use HttpClient for any API calls (token exchange, API requests with the token).
+- ALWAYS closePage when done.`;
   }
 }
 

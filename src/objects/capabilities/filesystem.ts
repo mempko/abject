@@ -35,7 +35,7 @@ export class FileSystem extends Abject {
       manifest: {
         name: 'FileSystem',
         description:
-          'Virtual in-memory filesystem. Objects can create, read, write, and delete files and directories.',
+          'Virtual in-memory filesystem. Objects can create, read, write, and delete files and directories. Use cases: read and write files in a virtual file tree, list directory contents.',
         version: '1.0.0',
         interface: {
             id: FILESYSTEM_INTERFACE,
