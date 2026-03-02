@@ -1930,9 +1930,10 @@ async getState(msg) {
 
   // _draw has '_' prefix so it's callable as this._draw().
   // Without the prefix, calling this.draw() would throw "not a function".
-  // Draw command types: clear, rect, text, line, path, circle, arc, ellipse, polygon, image,
+  // Draw command types: clear, rect, text, line, path, circle, arc, ellipse, polygon, imageUrl,
   //   save, restore, clip, translate, rotate, scale,
   //   globalAlpha, shadow, setLineDash, linearGradient, radialGradient
+  // For images: use 'imageUrl' with { url } param (URLs or data URIs from HttpClient.getBase64()).
   async _draw() {
     if (!this._canvasId) return;
     const W = this._canvasW, H = this._canvasH;

@@ -508,7 +508,8 @@ Each draw command has exactly 3 fields: { type, surfaceId, params }
           Filled arcs draw as pie slices (lineTo center + closePath).
 'ellipse' - Ellipse. params: { cx, cy, radiusX, radiusY, rotation?, fill?, stroke?, lineWidth? }
 'polygon' - Polygon/polyline. params: { points: [{x,y}...], fill?, stroke?, lineWidth?, closePath? }
-'image' - Draw image. params: { x, y, width?, height?, data (ImageBitmap | HTMLImageElement | ImageData) }
+'image' - Draw raw image object. params: { x, y, width?, height?, data (ImageBitmap | HTMLImageElement | ImageData) }
+          For URLs or data URIs (including HttpClient.getBase64() results), use 'imageUrl' instead.
 'imageUrl' - Draw image from URL or data URI. params: { x, y, width?, height?, url }
           Use with HttpClient.getBase64() to display fetched images:
           1. const img = await this.call(this.dep('HttpClient'), 'getBase64', { url: imageUrl });

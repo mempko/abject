@@ -1067,7 +1067,7 @@ const canvasId = await this.call(this.dep('WidgetManager'), 'createCanvas', {
 const { width, height } = await this.call(canvasId, 'getCanvasSize', {});
 
 // Available draw command types:
-// Shapes: clear, rect, text, line, path, circle, arc, ellipse, polygon, image
+// Shapes: clear, rect, text, line, path, circle, arc, ellipse, polygon, imageUrl
 // State: save, restore, clip
 // Transforms: translate, rotate, scale
 // Effects: globalAlpha, shadow, setLineDash, linearGradient, radialGradient
@@ -1079,6 +1079,12 @@ await this.call(canvasId, 'draw', {
     { type: 'rect', surfaceId: 'c', params: { x: 10, y: 10, width: 50, height: 50, fill: '#ff0' } },
     { type: 'circle', surfaceId: 'c', params: { cx: 100, cy: 100, radius: 30, fill: '#e8a84c' } },
   ]
+});
+
+// Displaying images (fetch as base64, then draw with imageUrl):
+const img = await this.call(this.dep('HttpClient'), 'getBase64', { url: 'https://example.com/photo.jpg' });
+await this.call(canvasId, 'draw', {
+  commands: [{ type: 'imageUrl', surfaceId: 'c', params: { x: 0, y: 0, width: 200, height: 150, url: img.dataUri } }]
 });
 
 // Input events: click the canvas to focus it, then keydown/keyup arrive via your 'input' handler.

@@ -495,19 +495,34 @@ export class Compositor {
             const firstKey = this.imageCache.keys().next().value!;
             this.imageCache.delete(firstKey);
           }
-          const img = new Image();
-          img.crossOrigin = 'anonymous';
-          const entry = { img, loaded: false };
+          const entry = { img: new Image(), loaded: false };
           this.imageCache.set(p.url, entry);
-          img.onload = () => {
+          const sid = command.surfaceId;
+          const drawToSurface = (image: HTMLImageElement) => {
+            entry.img = image;
             entry.loaded = true;
+            const surf = this.surfaces.get(sid);
+            if (surf) {
+              if (p.width && p.height) {
+                surf.ctx.drawImage(image, p.x, p.y, p.width, p.height);
+              } else {
+                surf.ctx.drawImage(image, p.x, p.y);
+              }
+              surf.dirty = true;
+            }
             this.needsRender = true;
           };
-          img.onerror = () => {
-            // Remove failed entries so they can be retried
-            this.imageCache.delete(p.url);
+          // Try with CORS first (preserves canvas readability for hit testing).
+          // Fall back without CORS so cross-origin images still display.
+          entry.img.crossOrigin = 'anonymous';
+          entry.img.onload = () => drawToSurface(entry.img);
+          entry.img.onerror = () => {
+            const fallback = new Image();
+            fallback.onload = () => drawToSurface(fallback);
+            fallback.onerror = () => this.imageCache.delete(p.url);
+            fallback.src = p.url;
           };
-          img.src = p.url;
+          entry.img.src = p.url;
         }
         // If cached but not yet loaded, skip — will render on next frame when load completes
         break;
@@ -787,13 +802,19 @@ export class Compositor {
         y >= rect.y &&
         y < rect.y + rect.height
       ) {
-        // Transparent pixels pass input through to surfaces below
-        const pixel = surface.ctx.getImageData(
-          Math.floor(x - rect.x),
-          Math.floor(y - rect.y),
-          1, 1
-        ).data;
-        if (pixel[3] === 0) continue;
+        // Transparent pixels pass input through to surfaces below.
+        // getImageData throws on tainted canvases (cross-origin images
+        // loaded without CORS); treat those surfaces as fully opaque.
+        try {
+          const pixel = surface.ctx.getImageData(
+            Math.floor(x - rect.x),
+            Math.floor(y - rect.y),
+            1, 1
+          ).data;
+          if (pixel[3] === 0) continue;
+        } catch {
+          // Canvas tainted by cross-origin image — treat as opaque
+        }
 
         return surface;
       }
