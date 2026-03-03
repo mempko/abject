@@ -194,7 +194,7 @@ main() →
   Negotiator.setDependencies(registry, factory, proxyGenerator, bus) → runtime.spawn(negotiator) →
   HealthMonitor.setNegotiator(negotiator) → startMonitoring() → runtime.spawn(healthMonitor) →
   ObjectCreator.setDependencies(llm, registry, factory) → runtime.spawn(objectCreator) →
-  window.abjects = { app, runtime, llm, objectCreator, registry, factory }
+  // System ready — all objects spawned and health monitoring started
 ```
 
 ### 4.2 Message Flow

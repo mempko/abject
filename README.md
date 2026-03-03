@@ -34,30 +34,22 @@ A distributed object system where objects communicate via message passing, negot
 # Install dependencies
 pnpm install
 
-# Browser-only mode (everything in-browser)
-pnpm dev
-
-# Server/client mode (Node.js backend + thin browser client)
+# Start the system (Node.js backend + thin browser client)
 pnpm serve           # Start Node.js backend
-pnpm client          # Start thin browser client
+pnpm client          # Start thin browser client (http://localhost:5173)
 
 # P2P signaling server
 pnpm signal          # Start signaling server (:7720)
-
-# Build and test
-pnpm build
-pnpm exec playwright install   # First time only
-pnpm test
 ```
 
 ## Architecture
 
 ```
- ┌─ Browser-Only Mode ──────────────────────────────────────────────────┐
+ ┌─ Node.js Backend (pnpm serve) ──────────────────────────────────────┐
  │                                                                      │
  │  ┌─────────────────── MessageBus ──────────────────┐                 │
  │  │  Interceptor Pipeline:                          │                 │
- │  │  HealthInterceptor → NetworkBridge → Delivery   │                 │
+ │  │  HealthInterceptor → PeerRouter → Delivery      │                 │
  │  └──────────┬──────────────┬───────────────┬───────┘                 │
  │             │              │               │                         │
  │  ┌──────────▼──┐ ┌────────▼─────┐ ┌───────▼────────┐               │
@@ -74,23 +66,16 @@ pnpm test
  │  │  └─────────┘ └─────────┘ └─────────┘            │               │
  │  └──────────────────────────────────────────────────┘               │
  │                                                                      │
- │  ┌──────── UI ──────────┐  ┌──────── P2P ───────────────────────┐   │
- │  │ Compositor (Canvas)  │  │ PeerTransport ←→ Signaling Server  │   │
- │  │ Widget Toolkit       │  │ IdentityObject (ECDSA/ECDH)       │   │
- │  │ Window Manager       │  │ PeerRegistry / RemoteRegistry     │   │
+ │  ┌──── Server-Only ─────┐  ┌──────── P2P ───────────────────────┐   │
+ │  │ BackendUI (headless) │  │ PeerTransport ←→ Signaling Server  │   │
+ │  │ WebBrowser (Playwright)  │ IdentityObject (ECDSA/ECDH)       │   │
+ │  │ WebParser (linkedom) │  │ PeerRegistry / RemoteRegistry     │   │
  │  └──────────────────────┘  └────────────────────────────────────┘   │
- └──────────────────────────────────────────────────────────────────────┘
-
- ┌─ Server/Client Mode ────────────────────────────────────────────────┐
- │                                                                      │
- │  Node.js Backend (pnpm serve)        Thin Browser Client (pnpm client)
- │  ┌──────────────────────────┐        ┌─────────────────────────┐    │
- │  │ All Abjects + Worker Pool│◄──────►│ FrontendClient          │    │
- │  │ BackendUI (headless)     │  WS    │ Compositor (Canvas)     │    │
- │  │ WebBrowser (Playwright)  │ :7719  │ Input handling          │    │
- │  │ WebParser (linkedom)     │        └─────────────────────────┘    │
- │  └──────────────────────────┘                                       │
- └──────────────────────────────────────────────────────────────────────┘
+ └─────────────────────────────┬───────────────────────────────────────┘
+                               │ WS :7719
+ ┌─ Thin Browser Client ──────▼───────────────────────────────────────┐
+ │  FrontendClient  │  Compositor (Canvas)  │  Input handling          │
+ └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Project Structure
@@ -110,7 +95,6 @@ src/
 server/                 # Node.js backend: server entry, signaling server, node worker adapter
 client/                 # Thin browser client: FrontendClient, input forwarding
 workers/                # Web Worker / Worker Thread entry points
-tests/                  # Playwright E2E specs
 ```
 
 ## Design Principles
@@ -168,19 +152,7 @@ Built-in objects that provide system capabilities:
 
 ## Configuration
 
-Set LLM API keys as global variables before loading:
-
-```html
-<script>
-  window.ANTHROPIC_API_KEY = 'your-key';
-  // or
-  window.OPENAI_API_KEY = 'your-key';
-</script>
-```
-
-For local LLM, run Ollama on localhost:11434.
-
-### Server Mode
+Set environment variables before running `pnpm serve`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -190,6 +162,8 @@ For local LLM, run Ollama on localhost:11434.
 | `SIGNALING_PORT` | `7720` | Signaling server port for P2P discovery |
 | `ABJECTS_DATA_DIR` | `.abjects` | Persistent storage directory |
 | `ABJECTS_WORKER_COUNT` | CPU cores - 1 (max 8) | Worker thread pool size |
+
+For local LLM, run Ollama on localhost:11434.
 
 ## License
 

@@ -1,6 +1,6 @@
 # server/ - Node.js Backend
 
-Server-side runtime for Abjects. Replaces the browser-only mode (`pnpm dev`) with a client/server split where all object logic runs on Node.js and the browser is a thin rendering client.
+Server-side runtime for Abjects. All object logic runs on Node.js and the browser is a thin rendering client.
 
 ## Architecture
 
@@ -39,25 +39,11 @@ Server-side runtime for Abjects. Replaces the browser-only mode (`pnpm dev`) wit
 └─────────────────────────────────────────────────────────┘
 ```
 
-## Dual-Bootstrap Pattern
-
-The codebase has two bootstrap entry points that **must stay in sync**:
-
-| | Browser-only (`src/index.ts`) | Server mode (`server/index.ts`) |
-|---|---|---|
-| **Run with** | `pnpm dev` | `pnpm serve` + `pnpm client` |
-| **UI rendering** | Canvas + Compositor (in-process) | BackendUI → WebSocket → client Compositor |
-| **Storage** | IndexedDB | JSON file on disk (`NodeStorage`) |
-| **Workers** | Web Workers | Node.js worker_threads |
-| **WebRTC** | Browser-native | Polyfilled via `node-datachannel` |
-
-When adding a new system object, register its constructor and spawn it in **both** files.
-
 ## Files
 
 ### index.ts
 
-Main entry point. Mirrors `src/index.ts` but runs on Node.js.
+Main entry point. Bootstraps the entire Abjects system on Node.js.
 
 - Polyfills WebRTC APIs (`RTCPeerConnection`, `RTCDataChannel`, etc.) via `node-datachannel`
 - Creates `Runtime` with optional worker thread pool (auto-detects CPU cores)

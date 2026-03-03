@@ -18,18 +18,7 @@ Main source directory for the Abjects system. All TypeScript modules organized b
 
 ## Entry Point
 
-`index.ts` is the browser entry point. It:
-1. Exports the full public API (re-exports from all modules)
-2. Contains `main()` which bootstraps the entire system
-3. Exposes `window.abjects` for debugging
-
-## Bootstrap Order
-
-1. `App` creates Canvas, Compositor, UIServer, Runtime
-2. `Runtime.start()` creates MessageBus, initializes Registry and Factory on the bus
-3. `main()` spawns LLMObject, then all 6 capability objects
-4. `main()` spawns ProxyGenerator (with LLM ref), Negotiator (with dependencies), HealthMonitor, ObjectCreator
-5. System logs object count and exposes debug globals
+`index.ts` is the public API re-export barrel. It re-exports all types, objects, and utilities from the various modules. The system bootstrap lives in `server/index.ts`.
 
 ## Import Convention
 
