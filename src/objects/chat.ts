@@ -334,6 +334,25 @@ export class Chat extends Abject {
         }
       }
 
+      case 'modify': {
+        const creatorId = await this.discoverDep('ObjectCreator');
+        if (!creatorId) return { success: false, error: 'ObjectCreator not found' };
+        const objectId = await this.resolveObject(action.object as string);
+        if (!objectId) return { success: false, error: `Object "${action.object}" not found` };
+        try {
+          const result = await this.request(
+            request(this.id, creatorId, 'modify', {
+              objectId,
+              prompt: action.description as string,
+            }),
+            310000,
+          );
+          return { success: true, data: result };
+        } catch (err) {
+          return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+      }
+
       case 'delegate': {
         // Delegate a task to another registered agent
         try {
@@ -377,9 +396,10 @@ Abjects is a distributed message-passing system. Each Abject is an autonomous ob
 2. **Canvas Surface Objects** (games, charts, custom graphics): Raw drawing via WidgetManager.createCanvas — shapes, text, images, gradients, transforms. Timer-driven animation.
 3. **Web Automation** (interact with real websites): WebAgent drives a headless browser to navigate, fill forms, click, and extract data from real sites.
 
-### When to Create vs Call
+### When to Create vs Modify vs Call
 
-- Use **create** when the user wants a new persistent object with its own window and behavior (e.g., "make me a todo app", "build a color picker"). ObjectCreator will design and generate it.
+- Use **create** when the user wants a brand-new object with its own window and behavior (e.g., "make me a todo app", "build a color picker"). ObjectCreator will design and generate it.
+- Use **modify** when the user wants to change an existing object's behavior or appearance (e.g., "add a reset button to the counter", "change the background color of my app"). This updates the object in place.
 - Use **call** to invoke existing objects directly (e.g., "fetch this URL", "set a timer", "run this web task"). Use **ask** first to learn the object's API.
 - Use **ask** on any object to get usage guidance with code examples. This is how you discover APIs — don't guess method signatures.
 
@@ -411,6 +431,8 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   For "object" you can use a name (e.g. "Timer") or an AbjectId (e.g. "abjects:timer").
 - **create**: Create a new object via ObjectCreator.
   \`{ "action": "create", "description": "A counter widget that shows a number and has +/- buttons" }\`
+- **modify**: Modify an existing object via ObjectCreator.
+  \`{ "action": "modify", "object": "ObjectName", "description": "Add a reset button that clears the counter" }\`
 
 ### Agent Delegation
 - **delegate**: Delegate a task to another registered agent.
@@ -456,7 +478,7 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
 5. Always end a conversation turn with **done** when the task is complete.
 6. Keep reasoning brief (1-2 sentences before the JSON block).
 7. Every object supports: describe (get manifest), ask (get usage advice), addDependent/removeDependent (observe state changes).
-8. To create new objects, use **create** with ObjectCreator. Never message Factory.spawn directly.
+8. To create new objects, use **create**. To change existing objects, use **modify**. Never message Factory.spawn directly.
 9. P2P: Remote objects are transparently addressable. Use their registryId to query remote registries.
 10. For web tasks: message WebAgent with runTask on your FIRST action — include ALL details from the user's message (credentials, URLs, specific instructions) in the task description. Do not ask the user to repeat information they already gave you.`;
   }
