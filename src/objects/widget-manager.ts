@@ -34,6 +34,8 @@ import { DividerWidget } from './widgets/divider-widget.js';
 import { SelectWidget, SelectWidgetConfig } from './widgets/select-widget.js';
 import { CanvasWidget, CanvasWidgetConfig } from './widgets/canvas-widget.js';
 import { TabBarWidget, TabBarConfig } from './widgets/tabbar-widget.js';
+import { SliderWidget, SliderWidgetConfig } from './widgets/slider-widget.js';
+import { ImageWidget, ImageWidgetConfig } from './widgets/image-widget.js';
 import { WidgetAbject, WidgetConfig } from './widgets/widget-abject.js';
 import { VBoxLayout } from './widgets/vbox-layout.js';
 import { HBoxLayout } from './widgets/hbox-layout.js';
@@ -221,6 +223,34 @@ export class WidgetManager extends Abject {
                   { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height }' },
                   { name: 'tabs', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Tab labels' },
                   { name: 'selectedIndex', type: { kind: 'primitive', primitive: 'number' }, description: 'Initially selected tab index', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'WidgetStyle' }, description: 'Visual style overrides', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createSlider',
+                description: 'Create a slider (range input) widget. Returns the widget AbjectId. Listen for "changed" events with aspect "change" (value is numeric string).',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height }' },
+                  { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Label text', optional: true },
+                  { name: 'min', type: { kind: 'primitive', primitive: 'number' }, description: 'Minimum value (default 0)', optional: true },
+                  { name: 'max', type: { kind: 'primitive', primitive: 'number' }, description: 'Maximum value (default 100)', optional: true },
+                  { name: 'step', type: { kind: 'primitive', primitive: 'number' }, description: 'Step increment (default 1)', optional: true },
+                  { name: 'value', type: { kind: 'primitive', primitive: 'number' }, description: 'Initial value (default min)', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'WidgetStyle' }, description: 'Visual style overrides', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createImage',
+                description: 'Create an image display widget. Returns the widget AbjectId. Non-interactive.',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height }' },
+                  { name: 'url', type: { kind: 'primitive', primitive: 'string' }, description: 'Image URL or data URI', optional: true },
+                  { name: 'fit', type: { kind: 'primitive', primitive: 'string' }, description: 'Fit mode: contain, cover, or fill (default contain)', optional: true },
+                  { name: 'alt', type: { kind: 'primitive', primitive: 'string' }, description: 'Alt text fallback', optional: true },
                   { name: 'style', type: { kind: 'reference', reference: 'WidgetStyle' }, description: 'Visual style overrides', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
@@ -592,6 +622,40 @@ export class WidgetManager extends Abject {
         type: 'tabBar', rect: payload.rect, style: payload.style,
         ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
         tabs: payload.tabs, selectedIndex: payload.selectedIndex,
+      }), payload.rect);
+    });
+
+    this.on('createSlider', async (msg: AbjectMessage) => {
+      const payload = msg.payload as {
+        windowId: AbjectId;
+        rect: Rect;
+        text?: string;
+        style?: WidgetStyle;
+        min?: number;
+        max?: number;
+        step?: number;
+        value?: number;
+      };
+      return this.createTypedWidget(payload.windowId, new SliderWidget({
+        type: 'slider', rect: payload.rect, text: payload.text, style: payload.style,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
+        min: payload.min, max: payload.max, step: payload.step, value: payload.value,
+      }), payload.rect);
+    });
+
+    this.on('createImage', async (msg: AbjectMessage) => {
+      const payload = msg.payload as {
+        windowId: AbjectId;
+        rect: Rect;
+        url?: string;
+        fit?: 'contain' | 'cover' | 'fill';
+        alt?: string;
+        style?: WidgetStyle;
+      };
+      return this.createTypedWidget(payload.windowId, new ImageWidget({
+        type: 'image', rect: payload.rect, style: payload.style,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
+        url: payload.url, fit: payload.fit, alt: payload.alt,
       }), payload.rect);
     });
 
@@ -1014,6 +1078,9 @@ createCheckbox - Toggle checkbox (aspect: 'change', value: boolean). Keyboard: S
 createProgress - Progress bar (update with { value: 0-100 })
 createDivider - Horizontal divider line
 createSelect - Dropdown select (params: options[], selectedIndex). Keyboard: Enter/Space to open, ArrowUp/Down to navigate, Enter to select, Escape to close.
+createTabBar - Tab bar (params: tabs[] of labels, selectedIndex). Fires 'change' event with selected index. Keyboard: ArrowLeft/Right to switch tabs.
+createSlider - Numeric range slider (params: min, max, step, value). Fires 'change' event with numeric value as string. Keyboard: ArrowLeft/Right ±step, Home/End for min/max. Click track or drag thumb.
+createImage - Image display (params: url, fit 'contain'|'cover'|'fill', alt). Non-interactive. Update URL via this.call(imgId, 'update', { url: '...' }).
 
 ### Widget Style Properties
 
@@ -1045,6 +1112,8 @@ await this.call(btnId, 'update', { style: { disabled: false } });
   Shift+Arrow (extends selection), printable characters insert text at cursor.
 - TextArea: All TextInput keys plus ArrowUp/Down (line navigation), Tab (inserts 2-space indent, consumed),
   mouse wheel (scrolls content). Enter inserts a newline (does NOT submit).
+- TabBar: ArrowLeft/Right → switch tabs
+- Slider: ArrowLeft/Right/Up/Down → ±step; Home → min; End → max
 
 ### Layout Types
 
@@ -1067,10 +1136,11 @@ const canvasId = await this.call(this.dep('WidgetManager'), 'createCanvas', {
 const { width, height } = await this.call(canvasId, 'getCanvasSize', {});
 
 // Available draw command types:
-// Shapes: clear, rect, text, line, path, circle, arc, ellipse, polygon, imageUrl
+// Shapes: clear, rect, text, line, path, circle, arc, ellipse, polygon, bezierCurve, quadraticCurve, imageUrl
 // State: save, restore, clip
 // Transforms: translate, rotate, scale
 // Effects: globalAlpha, shadow, setLineDash, linearGradient, radialGradient
+// Text supports maxWidth: { type: 'text', params: { ..., maxWidth: 200 } } — auto-shrinks text to fit
 
 // Draw using standard draw commands (coordinates are canvas-local, starting at 0,0):
 await this.call(canvasId, 'draw', {
@@ -1142,6 +1212,109 @@ Handle them in your setupHandlers():
     const { windowId } = msg.payload;
     await this.hide();
   });
+
+### Common Layout Patterns
+
+// Header + scrollable content + footer (VBox with fixed/expanding/fixed):
+const rootLayout = await this.call(this.dep('WidgetManager'), 'createVBox', {
+  windowId: winId, margins: { top: 8, right: 16, bottom: 8, left: 16 }, spacing: 8
+});
+const header = await this.call(this.dep('WidgetManager'), 'createLabel', {
+  windowId: winId, rect: { x: 0, y: 0, width: 0, height: 0 }, text: 'Title',
+  style: { fontSize: 18, fontWeight: 'bold' }
+});
+await this.call(rootLayout, 'addLayoutChild', {
+  widgetId: header, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 28 }
+});
+// Scrollable content area
+const scrollArea = await this.call(this.dep('WidgetManager'), 'createNestedScrollableVBox', {
+  parentLayoutId: rootLayout, spacing: 4
+});
+await this.call(rootLayout, 'addLayoutChild', {
+  widgetId: scrollArea, sizePolicy: { vertical: 'expanding' }
+});
+
+// Side-by-side panels (HBox with nested VBoxes):
+const hbox = await this.call(this.dep('WidgetManager'), 'createHBox', {
+  windowId: winId, spacing: 8
+});
+const leftPanel = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
+  parentLayoutId: hbox, spacing: 4
+});
+await this.call(hbox, 'addLayoutChild', {
+  widgetId: leftPanel, sizePolicy: { horizontal: 'expanding' }
+});
+const rightPanel = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
+  parentLayoutId: hbox, spacing: 4
+});
+await this.call(hbox, 'addLayoutChild', {
+  widgetId: rightPanel, sizePolicy: { horizontal: 'expanding' }
+});
+
+### Tab Content Switching
+
+// Create a TabBar + multiple content layouts, show/hide based on tab selection:
+const tabBar = await this.call(this.dep('WidgetManager'), 'createTabBar', {
+  windowId: winId, rect: { x: 0, y: 0, width: 0, height: 0 },
+  tabs: ['Tab A', 'Tab B', 'Tab C']
+});
+await this.call(rootLayout, 'addLayoutChild', {
+  widgetId: tabBar, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 36 }
+});
+await this.call(tabBar, 'addDependent', {});
+
+// Create one content layout per tab
+const tabContents = [];
+for (const tabName of ['Tab A', 'Tab B', 'Tab C']) {
+  const content = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
+    parentLayoutId: rootLayout, spacing: 4
+  });
+  await this.call(rootLayout, 'addLayoutChild', {
+    widgetId: content, sizePolicy: { vertical: 'expanding' }
+  });
+  tabContents.push(content);
+}
+
+// Initially hide all but first tab
+for (let i = 1; i < tabContents.length; i++) {
+  await this.call(tabContents[i], 'update', { style: { visible: false } });
+}
+
+// In your 'changed' handler, toggle visibility:
+// if (fromId === tabBar && aspect === 'change') {
+//   for (let i = 0; i < tabContents.length; i++) {
+//     await this.call(tabContents[i], 'update', { style: { visible: i === parseInt(value) } });
+//   }
+// }
+
+### Dynamic Widget Management
+
+// Add a widget to a layout at runtime:
+await this.call(layoutId, 'addLayoutChild', {
+  widgetId: newWidgetId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 36 }
+});
+
+// Remove a widget from a layout:
+await this.call(layoutId, 'removeLayoutChild', { widgetId: widgetId });
+
+// Destroy a widget (stop its Abject and free resources):
+await this.call(widgetId, 'destroy', {});
+
+### Animation Pattern
+
+// Use Timer to drive a canvas animation loop:
+const timerId = this.dep('Timer');
+const intervalId = await this.call(timerId, 'setInterval', { ms: 16 }); // ~60fps
+await this.call(timerId, 'addDependent', {});
+
+// In your 'changed' handler:
+// if (fromId === timerId && aspect === 'tick') {
+//   this.updateState();
+//   await this._draw(); // redraw canvas
+// }
+
+// Stop animation:
+// await this.call(timerId, 'clearInterval', { intervalId });
 
 `;
   }
@@ -1457,6 +1630,13 @@ Handle them in your setupHandlers():
       placeholder?: string;
       monospace?: boolean;
       masked?: boolean;
+      tabs?: string[];
+      min?: number;
+      max?: number;
+      step?: number;
+      url?: string;
+      fit?: 'contain' | 'cover' | 'fill';
+      alt?: string;
     }
   ): Promise<boolean> {
     const winAbjectId = this.shimWindowMap.get(config.windowId);
@@ -1519,6 +1699,30 @@ Handle them in your setupHandlers():
           options: config.options,
           selectedIndex: config.selectedIndex,
         } as SelectWidgetConfig);
+        break;
+      case 'tabBar':
+        widget = new TabBarWidget({
+          ...baseConfig,
+          tabs: config.tabs,
+          selectedIndex: config.selectedIndex,
+        } as TabBarConfig);
+        break;
+      case 'slider':
+        widget = new SliderWidget({
+          ...baseConfig,
+          min: config.min,
+          max: config.max,
+          step: config.step,
+          value: config.value,
+        } as SliderWidgetConfig);
+        break;
+      case 'image':
+        widget = new ImageWidget({
+          ...baseConfig,
+          url: config.url,
+          fit: config.fit,
+          alt: config.alt,
+        } as ImageWidgetConfig);
         break;
       default:
         return false;

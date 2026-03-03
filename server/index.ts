@@ -37,6 +37,8 @@ import { Console } from '../src/objects/capabilities/console.js';
 import { FileSystem } from '../src/objects/capabilities/filesystem.js';
 import { WebParser } from '../src/objects/capabilities/web-parser.js';
 import { WebBrowser } from '../src/objects/capabilities/web-browser.js';
+import { WebAgent } from '../src/objects/web-agent.js';
+import { WebBrowserViewer } from '../src/objects/web-browser-viewer.js';
 import { Settings } from '../src/objects/settings.js';
 import { Taskbar } from '../src/objects/taskbar.js';
 import { RegistryBrowser } from '../src/objects/registry-browser.js';
@@ -47,6 +49,7 @@ import { AbjectEditor } from '../src/objects/abject-editor.js';
 import { JobManager } from '../src/objects/job-manager.js';
 import { JobBrowser } from '../src/objects/job-browser.js';
 import { Chat } from '../src/objects/chat.js';
+import { AgentAbject } from '../src/objects/agent-abject.js';
 import { AbjectStore } from '../src/objects/abject-store.js';
 import { Supervisor } from '../src/runtime/supervisor.js';
 import type { RestartType } from '../src/runtime/supervisor.js';
@@ -176,6 +179,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('JobManager', () => new JobManager());
   runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
   runtime.objectFactory.registerConstructor('Chat', () => new Chat());
+  runtime.objectFactory.registerConstructor('AgentAbject', () => new AgentAbject());
   runtime.objectFactory.registerConstructor('AbjectStore', () => new AbjectStore());
   runtime.objectFactory.registerConstructor('Supervisor', () => new Supervisor());
   runtime.objectFactory.registerConstructor('Taskbar', () => new Taskbar());
@@ -194,6 +198,8 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('WorkspaceBrowser', () => new WorkspaceBrowser());
   runtime.objectFactory.registerConstructor('WebParser', () => new WebParser());
   runtime.objectFactory.registerConstructor('WebBrowser', () => new WebBrowser());
+  runtime.objectFactory.registerConstructor('WebAgent', () => new WebAgent());
+  runtime.objectFactory.registerConstructor('WebBrowserViewer', () => new WebBrowserViewer());
 
   // Mark worker-eligible constructors (only used when workerEnabled).
   // Per-workspace objects use registryHint to discover workspace dependencies.
@@ -246,6 +252,7 @@ async function main(): Promise<void> {
   const filesystemId = await supervisedSpawn('FileSystem');
   const webParserId = await supervisedSpawn('WebParser');
   const webBrowserId = await supervisedSpawn('WebBrowser');
+  // WebAgent is per-workspace (spawned by WorkspaceManager), not global
   const windowManagerId = await supervisedSpawn('WindowManager');
   const widgetManagerId = await supervisedSpawn('WidgetManager');
 

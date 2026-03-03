@@ -4,9 +4,13 @@
 
 import { require, requireNonEmpty } from '../core/contracts.js';
 
+export interface TextPart { type: 'text'; text: string; }
+export interface ImagePart { type: 'image'; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'; data: string; }
+export type ContentPart = TextPart | ImagePart;
+
 export interface LLMMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: string | ContentPart[];
 }
 
 export type ModelTier = 'smart' | 'balanced' | 'fast';
@@ -228,11 +232,31 @@ export function getProviderRegistry(): LLMProviderRegistry {
 }
 
 /**
+ * Extract the text content from an LLMMessage (ignoring image parts).
+ */
+export function getTextContent(msg: LLMMessage): string {
+  if (typeof msg.content === 'string') return msg.content;
+  return msg.content.filter((p): p is TextPart => p.type === 'text').map(p => p.text).join('');
+}
+
+/**
+ * Create a user message with text and images.
+ */
+export function userMessageWithImages(text: string, images: Array<{ mediaType: ImagePart['mediaType']; data: string }>): LLMMessage {
+  const parts: ContentPart[] = [{ type: 'text', text }];
+  for (const img of images) parts.push({ type: 'image', mediaType: img.mediaType, data: img.data });
+  return { role: 'user', content: parts };
+}
+
+/**
  * Helper to format messages for display/debugging.
  */
 export function formatMessages(messages: LLMMessage[]): string {
   return messages
-    .map((m) => `[${m.role}] ${m.content.slice(0, 100)}${m.content.length > 100 ? '...' : ''}`)
+    .map((m) => {
+      const text = getTextContent(m);
+      return `[${m.role}] ${text.slice(0, 100)}${text.length > 100 ? '...' : ''}`;
+    })
     .join('\n');
 }
 

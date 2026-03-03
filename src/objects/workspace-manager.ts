@@ -44,7 +44,7 @@ const STORAGE_KEY_ACTIVE = 'workspaces:active';
 /** Per-workspace objects in dependency order (matches original bootstrap). */
 const PER_WORKSPACE_OBJECTS = [
   'AbjectStore', 'Theme', 'Settings', 'RegistryBrowser',
-  'JobManager', 'JobBrowser', 'ObjectManager', 'Chat', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
+  'JobManager', 'JobBrowser', 'AgentAbject', 'ObjectManager', 'WebBrowserViewer', 'Chat', 'WebAgent', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
 ] as const;
 
 export type WorkspaceAccessMode = 'local' | 'private' | 'public';
@@ -781,13 +781,19 @@ export class WorkspaceManager extends Abject {
     };
 
     for (const objName of PER_WORKSPACE_OBJECTS) {
-      const result = await this.request<SpawnResult>(
-        request(this.id, this.factoryId!, 'spawn', {
-          manifest: { name: objName, description: '', version: '1.0.0',
-            requiredCapabilities: [], tags: ['system'] },
-          registryHint: wsRegistryId,
-        })
-      );
+      let result: SpawnResult;
+      try {
+        result = await this.request<SpawnResult>(
+          request(this.id, this.factoryId!, 'spawn', {
+            manifest: { name: objName, description: '', version: '1.0.0',
+              requiredCapabilities: [], tags: ['system'] },
+            registryHint: wsRegistryId,
+          })
+        );
+      } catch {
+        // Constructor not registered (e.g. server-only objects in browser mode) — skip
+        continue;
+      }
 
       const objId = result.objectId;
       childIds.push(objId);

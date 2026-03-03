@@ -10,6 +10,9 @@ import {
   LLMCompletionResult,
   LLMStreamChunk,
   ModelTier,
+  ContentPart,
+  ImagePart,
+  getTextContent,
 } from './provider.js';
 import { require } from '../core/contracts.js';
 
@@ -22,6 +25,7 @@ export interface OllamaConfig {
 interface OllamaMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
+  images?: string[];
 }
 
 interface OllamaRequest {
@@ -94,10 +98,7 @@ export class OllamaProvider extends BaseLLMProvider {
   ): Promise<LLMCompletionResult> {
     const request: OllamaRequest = {
       model: this.resolveModel(options.tier),
-      messages: messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-      })),
+      messages: messages.map((m) => this.mapMessage(m)),
       stream: false,
       options: {
         temperature: options.temperature,
@@ -132,10 +133,7 @@ export class OllamaProvider extends BaseLLMProvider {
 
     const request: OllamaRequest = {
       model: this.resolveModel(options.tier),
-      messages: messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-      })),
+      messages: messages.map((m) => this.mapMessage(m)),
       stream: true,
       options: {
         temperature: options.temperature,
@@ -193,6 +191,19 @@ export class OllamaProvider extends BaseLLMProvider {
     }
 
     yield { content: '', done: true };
+  }
+
+  /**
+   * Map LLMMessage to Ollama format.
+   * Ollama vision models (llava) use a separate `images` field for base64 data.
+   */
+  private mapMessage(msg: LLMMessage): OllamaMessage {
+    if (typeof msg.content === 'string') return { role: msg.role, content: msg.content };
+    const text = getTextContent(msg);
+    const images = (msg.content.filter((p): p is ImagePart => p.type === 'image')).map(p => p.data);
+    const result: OllamaMessage = { role: msg.role, content: text };
+    if (images.length > 0) result.images = images;
+    return result;
   }
 
   /**

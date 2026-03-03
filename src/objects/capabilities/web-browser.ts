@@ -592,6 +592,51 @@ const STATEFUL_METHODS: MethodDeclaration[] = [
     },
   },
   // -- Escape hatch --
+  // -- Viewer methods (no ownership check) --
+  {
+    name: 'listPages',
+    description: 'List all open browser pages with metadata. No ownership check — read-only viewer method.',
+    parameters: [],
+    returns: {
+      kind: 'array',
+      elementType: {
+        kind: 'object',
+        properties: {
+          pageId: { kind: 'primitive', primitive: 'string' },
+          owner: { kind: 'primitive', primitive: 'string' },
+          url: { kind: 'primitive', primitive: 'string' },
+          title: { kind: 'primitive', primitive: 'string' },
+          createdAt: { kind: 'primitive', primitive: 'number' },
+          lastActivity: { kind: 'primitive', primitive: 'number' },
+        },
+      },
+    },
+  },
+  {
+    name: 'viewerScreenshot',
+    description: 'Take a screenshot of any page by pageId. No ownership check — read-only viewer method.',
+    parameters: [
+      {
+        name: 'pageId',
+        type: { kind: 'primitive', primitive: 'string' },
+        description: 'Page handle',
+      },
+      {
+        name: 'options',
+        type: { kind: 'reference', reference: 'ScreenshotOptions' },
+        description: 'Screenshot options: { fullPage? }',
+        optional: true,
+      },
+    ],
+    returns: {
+      kind: 'object',
+      properties: {
+        dataUri: { kind: 'primitive', primitive: 'string' },
+        width: { kind: 'primitive', primitive: 'number' },
+        height: { kind: 'primitive', primitive: 'number' },
+      },
+    },
+  },
   {
     name: 'evaluate',
     description: 'Execute a JavaScript expression in the context of a persistent page and return the result.',
@@ -784,8 +829,10 @@ export class WebBrowser extends Abject {
     // -- closePage --
     this.deferredPageHandler('closePage', async (tracked, payload) => {
       const pageId = payload.pageId as string;
+      console.log(`[WebBrowser] closePage (${pageId})`);
       this.pages.delete(pageId);
       try { await tracked.page.close(); } catch { /* already closed */ }
+      this.changed('pageClosed', { pageId });
       return { success: true };
     });
 
@@ -806,60 +853,81 @@ export class WebBrowser extends Abject {
     this.deferredPageHandler('navigateTo', async (tracked, payload) => {
       const url = payload.url as string;
       const options = payload.options as BrowseOptions | undefined;
+      const t0 = Date.now();
       await this.navigatePage(tracked.page, url, options);
-      return { url: tracked.page.url(), title: await tracked.page.title() };
+      const finalUrl = tracked.page.url();
+      const title = await tracked.page.title();
+      console.log(`[WebBrowser] navigateTo (${payload.pageId}) → ${url} [${Date.now() - t0}ms]`);
+      this.changed('pageNavigated', { pageId: payload.pageId, url: finalUrl, title });
+      return { url: finalUrl, title };
     });
 
     // -- click --
     this.deferredPageHandler('click', async (tracked, payload) => {
       const selector = payload.selector as string;
       const options = payload.options as Record<string, unknown> | undefined;
+      const t0 = Date.now();
       await tracked.page.click(selector, options);
+      console.log(`[WebBrowser] click (${payload.pageId}) selector="${selector}" [${Date.now() - t0}ms]`);
       return { success: true };
     });
 
     // -- fill --
     this.deferredPageHandler('fill', async (tracked, payload) => {
+      const t0 = Date.now();
       await tracked.page.fill(payload.selector as string, payload.value as string);
+      console.log(`[WebBrowser] fill (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
       return { success: true };
     });
 
     // -- type --
     this.deferredPageHandler('type', async (tracked, payload) => {
+      const t0 = Date.now();
       await tracked.page.type(payload.selector as string, payload.text as string);
+      console.log(`[WebBrowser] type (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
       return { success: true };
     });
 
     // -- select --
     this.deferredPageHandler('select', async (tracked, payload) => {
+      const t0 = Date.now();
       const selected = await tracked.page.selectOption(
         payload.selector as string,
         payload.values as string[],
       );
+      console.log(`[WebBrowser] select (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
       return { selected };
     });
 
     // -- hover --
     this.deferredPageHandler('hover', async (tracked, payload) => {
+      const t0 = Date.now();
       await tracked.page.hover(payload.selector as string);
+      console.log(`[WebBrowser] hover (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
       return { success: true };
     });
 
     // -- press: uses page.keyboard.press, no selector --
     this.deferredPageHandler('press', async (tracked, payload) => {
+      const t0 = Date.now();
       await tracked.page.keyboard.press(payload.key as string);
+      console.log(`[WebBrowser] press (${payload.pageId}) key="${payload.key}" [${Date.now() - t0}ms]`);
       return { success: true };
     });
 
     // -- check --
     this.deferredPageHandler('check', async (tracked, payload) => {
+      const t0 = Date.now();
       await tracked.page.check(payload.selector as string);
+      console.log(`[WebBrowser] check (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
       return { success: true };
     });
 
     // -- uncheck --
     this.deferredPageHandler('uncheck', async (tracked, payload) => {
+      const t0 = Date.now();
       await tracked.page.uncheck(payload.selector as string);
+      console.log(`[WebBrowser] uncheck (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
       return { success: true };
     });
 
@@ -867,13 +935,16 @@ export class WebBrowser extends Abject {
     this.deferredPageHandler('waitForSelector', async (tracked, payload) => {
       const selector = payload.selector as string;
       const options = payload.options as { timeout?: number; state?: string } | undefined;
+      const t0 = Date.now();
       try {
         await tracked.page.waitForSelector(selector, {
           timeout: options?.timeout ?? 30000,
           ...(options?.state ? { state: options.state } : {}),
         });
+        console.log(`[WebBrowser] waitForSelector (${payload.pageId}) selector="${selector}" found [${Date.now() - t0}ms]`);
         return { found: true };
       } catch {
+        console.log(`[WebBrowser] waitForSelector (${payload.pageId}) selector="${selector}" not found [${Date.now() - t0}ms]`);
         return { found: false };
       }
     });
@@ -930,8 +1001,67 @@ export class WebBrowser extends Abject {
 
     // -- evaluate --
     this.deferredPageHandler('evaluate', async (tracked, payload) => {
+      const t0 = Date.now();
       const result = await tracked.page.evaluate(payload.script as string);
+      console.log(`[WebBrowser] evaluate (${payload.pageId}) [${Date.now() - t0}ms]`);
       return { result };
+    });
+
+    // -- listPages: no ownership check --
+    this.on('listPages', (msg: AbjectMessage) => {
+      const results: Array<{
+        pageId: string; owner: string; url: string; title: string;
+        createdAt: number; lastActivity: number;
+      }> = [];
+      const titlePromises: Array<Promise<void>> = [];
+      for (const [pageId, tracked] of this.pages.entries()) {
+        const entry = {
+          pageId,
+          owner: tracked.owner,
+          url: tracked.page.url(),
+          title: '',
+          createdAt: tracked.createdAt,
+          lastActivity: tracked.lastActivity,
+        };
+        results.push(entry);
+        titlePromises.push(
+          tracked.page.title().then((t) => { entry.title = t; }).catch(() => {}),
+        );
+      }
+      Promise.all(titlePromises).then(
+        () => this.sendDeferredReply(msg, results).catch(() => {}),
+        () => this.sendDeferredReply(msg, results).catch(() => {}),
+      );
+      return DEFERRED_REPLY;
+    });
+
+    // -- viewerScreenshot: no ownership check --
+    this.on('viewerScreenshot', (msg: AbjectMessage) => {
+      const { pageId, options } = msg.payload as {
+        pageId: string; options?: { fullPage?: boolean };
+      };
+      const tracked = this.pages.get(pageId);
+      if (!tracked) {
+        this.send(error(msg, 'BROWSER_ERROR', `Unknown page handle: ${pageId}`)).catch(() => {});
+        return DEFERRED_REPLY;
+      }
+      tracked.page.screenshot({
+        type: 'png',
+        fullPage: options?.fullPage ?? false,
+      }).then((buffer) => {
+        const b64 = Buffer.from(buffer).toString('base64');
+        const viewport = tracked.page.viewportSize() ?? { width: 1280, height: 720 };
+        this.sendDeferredReply(msg, {
+          dataUri: `data:image/png;base64,${b64}`,
+          width: viewport.width,
+          height: viewport.height,
+        }).catch(() => {});
+      }).catch((err) => {
+        this.send(error(msg, 'BROWSER_ERROR',
+          err instanceof Error ? err.message : String(err)
+        )).catch(() => {});
+      });
+      return DEFERRED_REPLY;
     });
   }
 
@@ -975,10 +1105,13 @@ export class WebBrowser extends Abject {
     };
 
     this.pages.set(pageId, tracked);
+    console.log(`[WebBrowser] openPage → ${pageId}`);
+    this.changed('pageOpened', { pageId, owner });
 
     // Auto-remove from map if the page closes externally
     page.on('close', () => {
       this.pages.delete(pageId);
+      this.changed('pageClosed', { pageId });
     });
 
     return { pageId };

@@ -1,18 +1,17 @@
 /**
  * Chat — conversational LLM agent.
  *
- * Provides a chat window where users can type natural language requests.
- * The agent decides whether to just chat or take action by submitting
- * code-execution jobs to the JobManager. Displays inline step progress.
+ * Provides a chat window where users type natural language requests.
+ * Registers with AgentAbject as an agent — AgentAbject drives the
+ * think-act-observe state machine, calling back Chat for observe and act.
  */
 
 import { AbjectId, AbjectManifest, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { invariant } from '../core/contracts.js';
 import { formatManifestAsDescription } from '../core/introspect.js';
-import type { JobResult } from './job-manager.js';
+import type { AgentAction } from './agent-abject.js';
 import type { DiscoveredWorkspace } from './workspace-share-registry.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 
@@ -20,24 +19,14 @@ const CHAT_INTERFACE: InterfaceId = 'abjects:chat';
 
 const WIN_W = 500;
 const WIN_H = 500;
-const MAX_FOLLOW_UP_ROUNDS = 5;
 const MAX_CONVERSATION_ENTRIES = 40;
+const MAX_STEPS = 20;
 
-type ChatPhase = 'closed' | 'idle' | 'thinking' | 'executing';
+// ─── Chat-specific types ─────────────────────────────────────────────
 
 interface ConversationEntry {
   role: 'user' | 'assistant' | 'system';
   content: string;
-}
-
-interface AgentStep {
-  description: string;
-  code: string;
-}
-
-interface AgentResponse {
-  reply: string;
-  steps?: AgentStep[];
 }
 
 interface ObjectSummary {
@@ -46,18 +35,12 @@ interface ObjectSummary {
   description: string;
 }
 
-interface SelectedDependency {
-  id: AbjectId;
-  name: string;
-  manifest: AbjectManifest;
-  description: string;
-}
+type UiPhase = 'closed' | 'idle' | 'busy';
 
 export class Chat extends Abject {
-  private llmId?: AbjectId;
   private widgetManagerId?: AbjectId;
   private registryId?: AbjectId;
-  private jobManagerId?: AbjectId;
+  private agentAbjectId?: AbjectId;
 
   // Window/widget IDs
   private windowId?: AbjectId;
@@ -70,22 +53,18 @@ export class Chat extends Abject {
   private messageLabelIds: AbjectId[] = [];
   private conversationHistory: ConversationEntry[] = [];
   private objectSummaries = '';
-  private usageGuideCache: Map<string, { guide: string; fetchedAt: number }> = new Map();
-  private readonly GUIDE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-  private enrichedObjectContext = '';
   private remotePeerContext = '';
-  private phase: ChatPhase = 'closed';
-  private _currentJobMsgId?: string;
+  private uiPhase: UiPhase = 'closed';
 
-  /** Check if phase is 'closed'. Separate method to avoid TS narrowing issues across async boundaries. */
-  private get isClosed(): boolean { return this.phase === 'closed'; }
+  /** Label ID for the current "Thinking..." indicator. */
+  private thinkingLabelId?: AbjectId;
 
   constructor() {
     super({
       manifest: {
         name: 'Chat',
         description:
-          'Conversational LLM agent. Chat naturally to explore, create, and control objects. Submits jobs to JobManager for execution.',
+          'Conversational LLM agent. Chat naturally to explore, create, and control objects. Uses a think-act-observe loop with structured actions.',
         version: '1.0.0',
         interface: {
             id: CHAT_INTERFACE,
@@ -143,17 +122,28 @@ export class Chat extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
-    this.llmId = await this.requireDep('LLM');
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.registryId = await this.requireDep('Registry');
-    this.jobManagerId = await this.requireDep('JobManager');
+    this.agentAbjectId = await this.requireDep('AgentAbject');
+
+    // Register with AgentAbject
+    await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
+      name: 'Chat',
+      description: 'Conversational LLM agent for interacting with objects',
+      config: {
+        pinnedMessageCount: 1,
+        terminalActions: {
+          done: { type: 'success', resultFields: ['text', 'result', 'reasoning'] },
+          fail: { type: 'error', resultFields: ['reason'] },
+        },
+        intermediateActions: ['reply'],
+        skipFirstObservation: true,
+      },
+    }));
   }
 
   protected override checkInvariants(): void {
     super.checkInvariants();
-    for (const [, entry] of this.usageGuideCache) {
-      invariant(entry.fetchedAt > 0, 'Usage guide cache entry must have a positive timestamp');
-    }
   }
 
   private setupHandlers(): void {
@@ -174,7 +164,7 @@ export class Chat extends Abject {
 
     this.on('getState', async () => {
       return {
-        phase: this.phase,
+        phase: this.uiPhase,
         messageCount: this.conversationHistory.length,
         visible: !!this.windowId,
       };
@@ -182,8 +172,6 @@ export class Chat extends Abject {
 
     this.on('clearHistory', async () => {
       this.conversationHistory = [];
-      this.usageGuideCache.clear();
-      this.enrichedObjectContext = '';
       if (this.windowId) {
         await this.clearMessageLabels();
         await this.appendMessageLabel('Agent', 'How can I help you?', '#a8cc8c');
@@ -192,12 +180,6 @@ export class Chat extends Abject {
     });
 
     this.on('windowCloseRequested', async () => { await this.hide(); });
-
-    this.on('progress', () => {
-      if (this._currentJobMsgId) {
-        this.resetRequestTimeout(this._currentJobMsgId);
-      }
-    });
 
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect } = msg.payload as { aspect: string; value?: unknown };
@@ -213,7 +195,275 @@ export class Chat extends Abject {
         return;
       }
     });
+
+    // ── AgentAbject callback handlers ──
+
+    this.on('agentObserve', async (_msg: AbjectMessage) => {
+      const lines: string[] = [];
+      if (this.objectSummaries) {
+        lines.push('Available objects:');
+        lines.push(this.objectSummaries);
+      }
+      if (this.remotePeerContext) {
+        lines.push('');
+        lines.push('Connected peers:');
+        lines.push(this.remotePeerContext);
+      }
+      return { observation: lines.join('\n') || 'No objects available.' };
+    });
+
+    this.on('agentAct', async (msg: AbjectMessage) => {
+      const { action } = msg.payload as { taskId: string; step: number; action: AgentAction };
+      return this.handleAgentAct(action);
+    });
+
+    this.on('agentPhaseChanged', async (msg: AbjectMessage) => {
+      const { step, newPhase, action } =
+        msg.payload as { taskId: string; step: number; oldPhase: string; newPhase: string; action?: string };
+
+      // Update UI thinking label
+      if (this.thinkingLabelId) {
+        if (newPhase === 'thinking') {
+          this.updateLabel(this.thinkingLabelId, `Thinking... (step ${step + 1})`, '#6b7084').catch(() => {});
+        } else if (newPhase === 'acting' && action) {
+          this.updateLabel(this.thinkingLabelId, `  ▸ ${action}...`, '#e8a84c').catch(() => {});
+        }
+      }
+    });
+
+    this.on('agentIntermediateAction', async (msg: AbjectMessage) => {
+      const { action } = msg.payload as { taskId: string; action: AgentAction };
+
+      // Handle 'reply' intermediate action — show text in UI, clear thinking label
+      if (action.action === 'reply') {
+        const text = (action.text as string) ?? '';
+        if (text && this.thinkingLabelId) {
+          await this.removeLabel(this.thinkingLabelId);
+          await this.appendMessageLabel('Agent', text, '#a8cc8c');
+          this.thinkingLabelId = undefined;
+          // Re-show thinking indicator for next step
+          this.thinkingLabelId = await this.appendMessageLabel('', 'Thinking...', '#6b7084');
+        }
+      }
+    });
+
+    this.on('agentActionResult', async (msg: AbjectMessage) => {
+      const { action, result } =
+        msg.payload as { taskId: string; action: AgentAction; result: { success: boolean; error?: string } };
+
+      // Update UI with action result
+      if (this.thinkingLabelId) {
+        const desc = action?.reasoning ?? action?.action ?? '';
+        if (result.success) {
+          this.updateLabel(this.thinkingLabelId, `  ✓ ${desc}`, '#6b7084').catch(() => {});
+        } else {
+          this.updateLabel(this.thinkingLabelId, `  ✗ ${desc}`, '#e05561').catch(() => {});
+        }
+      }
+    });
   }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Agent act handler
+  // ═══════════════════════════════════════════════════════════════════
+
+  private async handleAgentAct(action: AgentAction): Promise<unknown> {
+    switch (action.action) {
+      case 'list': {
+        const objects = await this.request<ObjectRegistration[]>(
+          request(this.id, this.registryId!, 'list', {})
+        );
+        return {
+          success: true,
+          data: objects.map(o => ({
+            name: o.manifest.name,
+            description: o.manifest.description,
+            id: o.id,
+          })),
+        };
+      }
+
+      case 'introspect': {
+        const objectId = await this.resolveObject(action.object as string);
+        if (!objectId) return { success: false, error: `Object "${action.object}" not found` };
+        const result = await this.request<{ manifest: AbjectManifest; description: string }>(
+          request(this.id, objectId, 'describe', {})
+        );
+        return { success: true, data: result };
+      }
+
+      case 'ask': {
+        const objectId = await this.resolveObject(action.object as string);
+        if (!objectId) return { success: false, error: `Object "${action.object}" not found` };
+        const answer = await this.request<string>(
+          request(this.id, objectId, 'ask', { question: action.question as string }),
+          60000
+        );
+        return { success: true, data: answer };
+      }
+
+      case 'call': {
+        const targetStr = action.object as string;
+        const objectId = await this.resolveObject(targetStr);
+        if (!objectId) return { success: false, error: `Object "${targetStr}" not found` };
+
+        const method = action.method as string;
+        const timeout = method === 'runTask' || method === 'create' ? 310000 : 120000;
+        try {
+          const result = await this.request(
+            request(this.id, objectId, method, action.payload ?? {}),
+            timeout,
+          );
+          return { success: true, data: result };
+        } catch (err) {
+          return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+      }
+
+      case 'create': {
+        const creatorId = await this.discoverDep('ObjectCreator');
+        if (!creatorId) return { success: false, error: 'ObjectCreator not found' };
+        try {
+          const result = await this.request(
+            request(this.id, creatorId, 'create', { prompt: action.description as string }),
+            310000,
+          );
+          return { success: true, data: result };
+        } catch (err) {
+          return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+      }
+
+      case 'delegate': {
+        // Delegate a task to another registered agent
+        try {
+          const agents = await this.request<Array<{ agentId: AbjectId; name: string }>>(
+            request(this.id, this.agentAbjectId!, 'listAgents', {})
+          );
+          const agent = agents.find(a => a.name === action.agent);
+          if (!agent) return { success: false, error: `Agent "${action.agent}" not found` };
+          const result = await this.request(
+            request(this.id, this.agentAbjectId!, 'startTask', {
+              agentId: agent.agentId,
+              task: action.task as string,
+            }),
+            310000,
+          );
+          return { success: true, data: result };
+        } catch (err) {
+          return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+      }
+
+      default:
+        return { success: false, error: `Unknown action: ${action.action}` };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // System prompt
+  // ═══════════════════════════════════════════════════════════════════
+
+  private buildSystemPrompt(): string {
+    return `You are Chat Agent, a helpful assistant inside the Abjects system. You help users by interacting with objects via structured actions.
+
+## System Architecture
+
+Abjects is a distributed message-passing system. Each Abject is an autonomous object with a manifest (declaring methods and events), a mailbox, and message handlers. Objects communicate exclusively via messages — never direct calls. They discover each other via Registry and coordinate via the observer pattern (addDependent → changed events).
+
+### Three UI Patterns
+
+1. **Widget Objects** (forms, settings, dashboards): Standard UI controls — buttons, text inputs, labels, sliders, checkboxes, tabs, progress bars, images. Use WidgetManager to create windows with widget layouts.
+2. **Canvas Surface Objects** (games, charts, custom graphics): Raw drawing via WidgetManager.createCanvas — shapes, text, images, gradients, transforms. Timer-driven animation.
+3. **Web Automation** (interact with real websites): WebAgent drives a headless browser to navigate, fill forms, click, and extract data from real sites.
+
+### When to Create vs Call
+
+- Use **create** when the user wants a new persistent object with its own window and behavior (e.g., "make me a todo app", "build a color picker"). ObjectCreator will design and generate it.
+- Use **call** to invoke existing objects directly (e.g., "fetch this URL", "set a timer", "run this web task"). Use **ask** first to learn the object's API.
+- Use **ask** on any object to get usage guidance with code examples. This is how you discover APIs — don't guess method signatures.
+
+### Observer & Composition Model
+
+Objects observe each other via addDependent → changed events. Any object can inspect another via getState, describe, or ask. Objects with show/hide methods automatically appear in the Taskbar.
+
+## Action Format
+
+Respond with ONE action as a JSON object in a \`\`\`json code block. Include brief reasoning before the block.
+
+\`\`\`json
+{ "action": "done", "text": "Hello! How can I help you?" }
+\`\`\`
+
+## Available Actions
+
+### Information
+- **list**: List available objects. No params.
+  \`{ "action": "list" }\`
+- **introspect**: Get an object's manifest and description.
+  \`{ "action": "introspect", "object": "ObjectName" }\`
+- **ask**: Ask an object for usage advice.
+  \`{ "action": "ask", "object": "ObjectName", "question": "How do I use your X method?" }\`
+
+### Object Interaction
+- **call**: Send a message to an object (message passing).
+  \`{ "action": "call", "object": "ObjectName", "method": "methodName", "payload": { ... } }\`
+  For "object" you can use a name (e.g. "Timer") or an AbjectId (e.g. "abjects:timer").
+- **create**: Create a new object via ObjectCreator.
+  \`{ "action": "create", "description": "A counter widget that shows a number and has +/- buttons" }\`
+
+### Agent Delegation
+- **delegate**: Delegate a task to another registered agent.
+  \`{ "action": "delegate", "agent": "AgentName", "task": "what to do" }\`
+  Use \`list\` to discover available agents via AgentAbject.
+
+### Communication
+- **reply**: Send intermediate text to the user (continue working after).
+  \`{ "action": "reply", "text": "I found the object, now let me check its methods..." }\`
+- **done**: Task complete, send final reply.
+  \`{ "action": "done", "text": "Here are the results: ..." }\`
+
+## Available Objects
+
+${this.objectSummaries || '(Loading...)'}
+${this.remotePeerContext ? `
+## Connected Peers & Remote Workspaces
+
+${this.remotePeerContext}
+` : ''}
+## Authorized Capabilities
+
+This system runs on the user's own computer. All capability objects are user-configured and authorized tools.
+
+**Web automation**: WebAgent (autonomous browser — always prefer for multi-step web tasks), WebBrowser (low-level, used internally by WebAgent)
+**Services**: HttpClient (HTTP/API requests), Storage, Timer, FileSystem, Clipboard, Console
+**UI**: WidgetManager (create windows and widgets — use \`ask\` to learn its API)
+
+### WebAgent Usage
+- \`{ "action": "call", "object": "WebAgent", "method": "runTask", "payload": { "task": "...", "options": { "startUrl": "https://..." } } }\`
+- The message method is **runTask** (not "run" or "navigate"). Options: startUrl, maxSteps, timeout.
+- **Always prefer WebAgent for any multi-step web task** (logging in, browsing, extracting data). Do NOT message WebBrowser directly — WebAgent manages WebBrowser internally.
+
+When the user asks to interact with a website, **always message WebAgent** via \`{ "action": "call", "object": "WebAgent", "method": "runTask", ... }\`. Describe the full task in the payload's "task" field — WebAgent will handle all navigation, form filling, clicking, and data extraction.
+Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests to use user-authorized capabilities — the user is asking you to help them use their own tools.
+
+## Rules
+
+1. Always respond with valid JSON in a \`\`\`json block. ONE action per response.
+2. Use **introspect** or **ask** to learn about an object's methods before calling them.
+3. For simple greetings or questions, use **done** directly.
+4. When the user asks you to do something, take action IMMEDIATELY — don't just describe what you would do, and don't ask for information the user already provided. If the user includes credentials, URLs, or other details in their message, pass them directly to the relevant object.
+5. Always end a conversation turn with **done** when the task is complete.
+6. Keep reasoning brief (1-2 sentences before the JSON block).
+7. Every object supports: describe (get manifest), ask (get usage advice), addDependent/removeDependent (observe state changes).
+8. To create new objects, use **create** with ObjectCreator. Never message Factory.spawn directly.
+9. P2P: Remote objects are transparently addressable. Use their registryId to query remote registries.
+10. For web tasks: message WebAgent with runTask on your FIRST action — include ALL details from the user's message (credentials, URLs, specific instructions) in the task description. Do not ask the user to repeat information they already gave you.`;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Chat-specific logic
+  // ═══════════════════════════════════════════════════════════════════
 
   async show(): Promise<boolean> {
     if (this.windowId) {
@@ -312,7 +562,7 @@ export class Chat extends Abject {
     await this.request(request(this.id, this.sendBtnId, 'addDependent', {}));
     await this.request(request(this.id, this.textInputId, 'addDependent', {}));
 
-    this.phase = 'idle';
+    this.uiPhase = 'idle';
 
     // Show greeting
     await this.appendMessageLabel('Agent', 'How can I help you?', '#a8cc8c');
@@ -324,7 +574,7 @@ export class Chat extends Abject {
   async hide(): Promise<boolean> {
     if (!this.windowId) return true;
 
-    this.phase = 'closed';
+    this.uiPhase = 'closed';
 
     await this.request(
       request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
@@ -339,13 +589,12 @@ export class Chat extends Abject {
     this.textInputId = undefined;
     this.sendBtnId = undefined;
     this.messageLabelIds = [];
-    this.enrichedObjectContext = '';
     await this.changed('visibility', false);
     return true;
   }
 
   private async handleSendClick(): Promise<void> {
-    if (this.phase !== 'idle' || !this.textInputId) return;
+    if (this.uiPhase !== 'idle' || !this.textInputId) return;
 
     const text = await this.request<string>(
       request(this.id, this.textInputId, 'getValue', {})
@@ -362,28 +611,13 @@ export class Chat extends Abject {
   }
 
   private triggerSend(text: string): void {
-    if (this.phase !== 'idle') return;
-    // Fire-and-forget — don't block the message processing loop
-    this.runAgentLoop(text);
+    if (this.uiPhase !== 'idle') return;
+    this.runChatTask(text);
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // Agent Loop
-  // ═══════════════════════════════════════════════════════════════════
-
-  private async setInputDisabled(disabled: boolean): Promise<void> {
-    const style = { disabled };
-    if (this.sendBtnId) {
-      try { await this.request(request(this.id, this.sendBtnId, 'update', { style })); } catch { /* widget gone */ }
-    }
-    if (this.textInputId) {
-      try { await this.request(request(this.id, this.textInputId, 'update', { style })); } catch { /* widget gone */ }
-    }
-  }
-
-  private async runAgentLoop(userText: string): Promise<void> {
-    if (this.phase === 'closed') return;
-    this.phase = 'thinking';
+  private async runChatTask(userText: string): Promise<void> {
+    if (this.uiPhase === 'closed') return;
+    this.uiPhase = 'busy';
     await this.setInputDisabled(true);
 
     // Show user message
@@ -391,238 +625,90 @@ export class Chat extends Abject {
     this.conversationHistory.push({ role: 'user', content: userText });
 
     // Show thinking indicator
-    const thinkingLabelId = await this.appendMessageLabel('', 'Thinking...', '#6b7084');
+    this.thinkingLabelId = await this.appendMessageLabel('', 'Thinking...', '#6b7084');
 
     try {
-      // Refresh context if stale
+      // Refresh object summaries for the system prompt
       await this.refreshObjectSummaries();
 
-      // ── Pass 1: LLM call with lightweight summaries ──
-      const messages = this.buildLLMMessages();
+      // Build initial messages: system prompt + conversation history + new user message
+      const initialMessages: { role: string; content: string }[] = [];
+      const recent = this.conversationHistory.slice(-MAX_CONVERSATION_ENTRIES);
+      for (const entry of recent) {
+        initialMessages.push({ role: entry.role, content: entry.content });
+      }
 
-      const llmResult = await this.request<{ content: string }>(
-        request(this.id, this.llmId!, 'complete', {
-          messages,
-          options: { tier: 'balanced', maxTokens: 16384 },
+      const result = await this.request<{
+        taskId: string;
+        success: boolean;
+        result?: unknown;
+        error?: string;
+        steps: number;
+      }>(
+        request(this.id, this.agentAbjectId!, 'startTask', {
+          task: userText,
+          systemPrompt: this.buildSystemPrompt(),
+          initialMessages,
+          config: { queueName: `chat-${this.id}` },
         }),
-        120000,
+        310000,
       );
 
-      if (this.isClosed) return;
-
-      // Parse Pass 1 response
-      let agentResponse = this.parseAgentResponse(llmResult.content);
-      let finalContent = llmResult.content;
-
-      // ── Pass 2: If steps detected, run discovery and re-call LLM ──
-      if (agentResponse.steps && agentResponse.steps.length > 0) {
-        await this.updateLabel(thinkingLabelId, 'Discovering relevant objects...', '#6b7084');
-        const enrichedContext = await this.runDiscoveryPipeline(userText);
-
-        if (enrichedContext && !this.isClosed) {
-          await this.updateLabel(thinkingLabelId, 'Refining plan...', '#6b7084');
-          this.enrichedObjectContext = enrichedContext;
-
-          const enrichedMessages = this.buildLLMMessages(true);
-
-          // Include Pass 1's plan so Pass 2 refines rather than regenerates
-          enrichedMessages.push({
-            role: 'assistant',
-            content: llmResult.content,
-          });
-          enrichedMessages.push({
-            role: 'user',
-            content:
-              'Refine your plan using the enriched object guides above. ' +
-              'You MUST include the "steps" array in your JSON response. ' +
-              'Preserve all steps from your previous plan, adjusting code ' +
-              'to use the correct method signatures and interface IDs from the guides.',
-          });
-
-          const pass2Result = await this.request<{ content: string }>(
-            request(this.id, this.llmId!, 'complete', {
-              messages: enrichedMessages,
-              options: { tier: 'balanced', maxTokens: 16384 },
-            }),
-            120000,
-          );
-
-          if (!this.isClosed) {
-            const pass2Response = this.parseAgentResponse(pass2Result.content);
-
-            // Only use Pass 2 if it preserved the steps;
-            // otherwise fall back to Pass 1 (safety net for truncation/parse failures)
-            if (pass2Response.steps && pass2Response.steps.length > 0) {
-              agentResponse = pass2Response;
-              finalContent = pass2Result.content;
-            }
+      // Post-task UI cleanup
+      if (this.thinkingLabelId) {
+        if (result.success) {
+          await this.removeLabel(this.thinkingLabelId);
+          const text = (result.result as string) ?? '';
+          if (text) {
+            await this.appendMessageLabel('Agent', text, '#a8cc8c');
+            this.conversationHistory.push({ role: 'assistant', content: text });
           }
+        } else {
+          await this.removeLabel(this.thinkingLabelId);
+          await this.appendMessageLabel('Error', (result.error ?? 'Unknown error').slice(0, 100), '#e05561');
         }
-      }
-
-      // Safety net: if reply promises action but has no steps, re-prompt once
-      if ((!agentResponse.steps || agentResponse.steps.length === 0) &&
-          agentResponse.reply && this.replyIndicatesAction(agentResponse.reply)) {
-        await this.updateLabel(thinkingLabelId, 'Generating steps...', '#6b7084');
-
-        try {
-          const retryMessages = this.buildLLMMessages(!!this.enrichedObjectContext);
-          retryMessages.push({ role: 'assistant', content: finalContent });
-          retryMessages.push({ role: 'user', content:
-            'You said you would take action but didn\'t include any "steps". ' +
-            'Please respond again with the "steps" array containing the code to execute what you promised.' });
-
-          const retry = await this.request<{ content: string }>(
-            request(this.id, this.llmId!, 'complete', {
-              messages: retryMessages,
-              options: { tier: 'balanced', maxTokens: 16384 },
-            }),
-            120000,
-          );
-
-          if (!this.isClosed) {
-            const retryParsed = this.parseAgentResponse(retry.content);
-            if (retryParsed.steps && retryParsed.steps.length > 0) {
-              agentResponse = retryParsed;
-              finalContent = retry.content;
-            }
-          }
-        } catch { /* If retry fails, proceed with original reply */ }
-      }
-
-      // Remove thinking indicator
-      await this.removeLabel(thinkingLabelId);
-
-      if (this.isClosed) return;
-
-      // Display reply
-      if (agentResponse.reply) {
-        await this.appendMessageLabel('Agent', agentResponse.reply, '#a8cc8c');
-        this.conversationHistory.push({ role: 'assistant', content: finalContent });
-      }
-
-      // Execute steps if any
-      if (agentResponse.steps && agentResponse.steps.length > 0) {
-        await this.executeStepsLoop(agentResponse.steps, 0);
-      } else {
-        this.phase = 'idle';
-        await this.setInputDisabled(false);
+        this.thinkingLabelId = undefined;
       }
     } catch (err) {
       // Remove thinking indicator if still there
-      await this.removeLabel(thinkingLabelId);
-
+      if (this.thinkingLabelId) {
+        await this.removeLabel(this.thinkingLabelId);
+        this.thinkingLabelId = undefined;
+      }
       const errMsg = err instanceof Error ? err.message : String(err);
       await this.appendMessageLabel('Error', errMsg.slice(0, 100), '#e05561');
-      this.phase = this.windowId ? 'idle' : 'closed';
-      if (this.windowId) await this.setInputDisabled(false);
-    }
-  }
-
-  private async executeStepsLoop(steps: AgentStep[], round: number): Promise<void> {
-    if (this.isClosed) return;
-    this.phase = 'executing';
-
-    const stepResults: { description: string; success: boolean; result?: unknown; error?: string }[] = [];
-    let previousResult: unknown = undefined;
-
-    for (const step of steps) {
-      if (this.isClosed) return;
-      console.log(`[Chat] Step: ${step.description}\n  Code: ${step.code}`);
-
-      // Show step indicator
-      const stepLabelId = await this.appendMessageLabel('', `  ▸ ${step.description}...`, '#e8a84c');
-
-      try {
-        // Wrap code to inject previousResult
-        const wrappedCode = `const previousResult = ${JSON.stringify(previousResult)};\n${step.code}`;
-
-        const submitMsg = request(this.id, this.jobManagerId!, 'submitJob', {
-          description: step.description,
-          code: wrappedCode,
-        });
-        this._currentJobMsgId = submitMsg.header.messageId;
-        let jobResult: JobResult;
-        try {
-          jobResult = await this.request<JobResult>(submitMsg, 120000);
-        } finally {
-          this._currentJobMsgId = undefined;
-        }
-
-        if (jobResult.status === 'completed') {
-          await this.updateLabel(stepLabelId, `  ✓ ${step.description}`, '#6b7084');
-          previousResult = jobResult.result;
-          stepResults.push({ description: step.description, success: true, result: jobResult.result });
-        } else {
-          await this.updateLabel(stepLabelId, `  ✗ ${step.description}`, '#e05561');
-          stepResults.push({ description: step.description, success: false, error: jobResult.error });
-          // Stop executing remaining steps on failure
-          break;
-        }
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        await this.updateLabel(stepLabelId, `  ✗ ${step.description}`, '#e05561');
-        stepResults.push({ description: step.description, success: false, error: errMsg });
-        break;
-      }
     }
 
-    if (this.isClosed) return;
-
-    // Feed results back to LLM
-    const resultSummary = stepResults.map(r =>
-      r.success
-        ? `✓ ${r.description}: ${JSON.stringify(r.result)?.slice(0, 200) ?? 'ok'}`
-        : `✗ ${r.description}: ${r.error ?? 'unknown error'}`
-    ).join('\n');
-
-    this.conversationHistory.push({
-      role: 'user',
-      content: `Step execution results:\n${resultSummary}`,
-    });
-
-    // Follow-up: ask LLM for summary or more steps
-    if (round < MAX_FOLLOW_UP_ROUNDS) {
-      this.phase = 'thinking';
-      const thinkingLabelId = await this.appendMessageLabel('', 'Thinking...', '#6b7084');
-
-      try {
-        const messages = this.buildLLMMessages(!!this.enrichedObjectContext);
-        const followUp = await this.request<{ content: string }>(
-          request(this.id, this.llmId!, 'complete', {
-            messages,
-            options: { tier: 'balanced', maxTokens: 16384 },
-          }),
-          120000,
-        );
-
-        await this.removeLabel(thinkingLabelId);
-        if (this.isClosed) return;
-
-        const parsed = this.parseAgentResponse(followUp.content);
-
-        if (parsed.reply) {
-          await this.appendMessageLabel('Agent', parsed.reply, '#a8cc8c');
-          this.conversationHistory.push({ role: 'assistant', content: followUp.content });
-        }
-
-        if (parsed.steps && parsed.steps.length > 0) {
-          await this.executeStepsLoop(parsed.steps, round + 1);
-          return;
-        }
-      } catch (err) {
-        await this.removeLabel(thinkingLabelId);
-        const errMsg = err instanceof Error ? err.message : String(err);
-        await this.appendMessageLabel('Error', errMsg.slice(0, 100), '#e05561');
-      }
-    }
-
-    this.phase = this.windowId ? 'idle' : 'closed';
+    this.uiPhase = this.windowId ? 'idle' : 'closed';
     if (this.windowId) await this.setInputDisabled(false);
   }
 
   // ═══════════════════════════════════════════════════════════════════
-  // LLM Prompt Construction
+  // Object Resolution
+  // ═══════════════════════════════════════════════════════════════════
+
+  private async resolveObject(name: string): Promise<AbjectId | null> {
+    if (!this.registryId || !name) return null;
+
+    // UUIDs are direct AbjectIds — use as-is
+    if (name.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
+      return name as AbjectId;
+    }
+
+    // Everything else (names like "WebAgent", interface IDs like "abjects:web-agent")
+    // gets resolved via Registry discovery
+    try {
+      const results = await this.request<Array<{ id: AbjectId }>>(
+        request(this.id, this.registryId, 'discover', { name })
+      );
+      return results.length > 0 ? results[0].id : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Context Refresh
   // ═══════════════════════════════════════════════════════════════════
 
   private async refreshObjectSummaries(): Promise<void> {
@@ -643,7 +729,6 @@ export class Chat extends Abject {
     await this.refreshRemotePeerContext();
   }
 
-  /** Build a text summary of remote peers and their objects for the LLM prompt. */
   private async refreshRemotePeerContext(): Promise<void> {
     try {
       const wsrId = await this.discoverDep('WorkspaceShareRegistry');
@@ -686,582 +771,18 @@ export class Chat extends Abject {
   }
 
   // ═══════════════════════════════════════════════════════════════════
-  // Discovery Pipeline
-  // ═══════════════════════════════════════════════════════════════════
-
-  /** Phase 0a: Get lightweight summaries of all registered objects. */
-  private async discoverObjectSummaries(): Promise<ObjectSummary[]> {
-    if (!this.registryId) return [];
-    const allObjects = await this.request<ObjectRegistration[]>(
-      request(this.id, this.registryId, 'list', {})
-    );
-    return allObjects.map((o) => ({
-      id: o.id,
-      name: o.manifest.name,
-      description: o.manifest.description,
-    }));
-  }
-
-  /** Phase 0b: Ask LLM to select which objects are relevant to the user's request. */
-  private async llmSelectRelevantObjects(
-    userText: string,
-    summaries: ObjectSummary[]
-  ): Promise<string[]> {
-    if (summaries.length === 0 || !this.llmId) return [];
-
-    const summaryText = summaries
-      .map((s) => `- ${s.name}: ${s.description}`)
-      .join('\n');
-
-    const result = await this.request<{ content: string }>(
-      request(this.id, this.llmId, 'complete', {
-        messages: [
-          {
-            role: 'system',
-            content:
-              'Given a list of object names and descriptions, return ONLY the names of objects relevant to the user\'s request. ' +
-              'Study each object\'s description to determine if the user\'s request involves its methods or events. ' +
-              'Return one name per line, nothing else. If no objects are relevant, return "None".',
-          },
-          {
-            role: 'user',
-            content: `Available objects:\n${summaryText}\n\nUser request: ${userText}\n\nWhich objects are relevant?`,
-          },
-        ],
-        options: { tier: 'fast' },
-      }),
-      30000,
-    );
-
-    const content = result.content.trim();
-    if (content.toLowerCase() === 'none') return [];
-
-    return content
-      .split('\n')
-      .map((n) => n.trim().replace(/^-\s*/, ''))
-      .filter((n) => n.length > 0 && n.toLowerCase() !== 'none');
-  }
-
-  /** Phase 0c: Introspect selected objects to get full manifests. */
-  private async fetchFullManifests(
-    selectedNames: string[],
-    summaries: ObjectSummary[]
-  ): Promise<SelectedDependency[]> {
-    const deps: SelectedDependency[] = [];
-
-    for (const name of selectedNames) {
-      const summary = summaries.find(
-        (s) => s.name.toLowerCase() === name.toLowerCase()
-      );
-      if (!summary) continue;
-
-      try {
-        const result = await this.request<{ manifest: AbjectManifest; description: string }>(
-          request(this.id, summary.id, 'describe', {})
-        );
-        if (result) {
-          deps.push({
-            id: summary.id,
-            name: result.manifest.name,
-            manifest: result.manifest,
-            description: result.description,
-          });
-        }
-      } catch {
-        // Skip objects that fail to respond
-      }
-    }
-
-    return deps;
-  }
-
-  /** Phase 0c5: LLM generates one targeted question per dependency. */
-  private async generateTargetedQuestions(
-    userText: string,
-    deps: SelectedDependency[]
-  ): Promise<Map<string, string>> {
-    if (deps.length === 0 || !this.llmId) return new Map();
-
-    try {
-      const depList = deps
-        .map((d) => `- ${d.name}: ${d.description.slice(0, 300)}`)
-        .join('\n');
-
-      const result = await this.request<{ content: string }>(
-        request(this.id, this.llmId, 'complete', {
-          messages: [
-            {
-              role: 'system',
-              content:
-                'You are helping a chat agent interact with objects in a distributed system. ' +
-                'Given the user\'s request and a list of relevant objects, generate ONE targeted question per object. ' +
-                'Each question should ask the object specifically how to accomplish what the user needs, referencing concrete methods or events.\n\n' +
-                'Format: one line per object, exactly like this:\n' +
-                '[ObjectName]: Your targeted question here?\n\n' +
-                'Output ONLY the questions, one per line. Nothing else.',
-            },
-            {
-              role: 'user',
-              content:
-                `User wants to: ${userText}\n\nRelevant objects:\n${depList}\n\n` +
-                `Generate a targeted question for each object.`,
-            },
-          ],
-          options: { tier: 'fast' },
-        }),
-        30000,
-      );
-
-      return this.parseTargetedQuestions(result.content, deps.map((d) => d.name));
-    } catch {
-      return new Map();
-    }
-  }
-
-  /** Parse LLM response for targeted questions. Matches "[Name]: question" or "Name: question". */
-  private parseTargetedQuestions(
-    content: string,
-    depNames: string[]
-  ): Map<string, string> {
-    const questions = new Map<string, string>();
-    const nameMap = new Map(depNames.map((n) => [n.toLowerCase(), n]));
-
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-
-      // Match "[Name]: question" or "Name: question" (with optional leading "- ")
-      const match = trimmed.match(/^-?\s*\[?([^\]:\n]+)\]?\s*:\s*(.+)/);
-      if (!match) continue;
-
-      const rawName = match[1].trim();
-      const question = match[2].trim();
-      if (!question) continue;
-
-      const canonical = nameMap.get(rawName.toLowerCase());
-      if (canonical) {
-        questions.set(canonical, question);
-      }
-    }
-
-    return questions;
-  }
-
-  /** Phase 0d: Ask each relevant object for a usage guide via 'ask' protocol, in parallel. */
-  private async fetchUsageGuides(
-    deps: SelectedDependency[],
-    customQuestions?: Map<string, string>
-  ): Promise<Map<string, string>> {
-    const guides = new Map<string, string>();
-    if (deps.length === 0) return guides;
-
-    const now = Date.now();
-    const genericQuestion =
-      'How should another object use your methods? Give a concise guide with example call() invocations and any important constraints.';
-
-    const promises = deps.map(async (dep) => {
-      // Check cache first
-      const cached = this.usageGuideCache.get(dep.name);
-      if (cached && (now - cached.fetchedAt) < this.GUIDE_CACHE_TTL) {
-        guides.set(dep.name, cached.guide);
-        return;
-      }
-
-      const question = customQuestions?.get(dep.name) ?? genericQuestion;
-      try {
-        const guide = await this.request<string>(
-          request(this.id, dep.id, 'ask', { question }),
-          60000
-        );
-        if (guide) {
-          guides.set(dep.name, guide);
-          this.usageGuideCache.set(dep.name, { guide, fetchedAt: now });
-        }
-      } catch {
-        // Skip objects that fail to respond
-      }
-    });
-
-    await Promise.all(promises);
-    return guides;
-  }
-
-  /** Format dependencies and usage guides into markdown sections for the enriched prompt. */
-  private formatEnrichedContext(
-    deps: SelectedDependency[],
-    usageGuides: Map<string, string>
-  ): string {
-    if (deps.length === 0) return '';
-
-    return deps
-      .map((dep) => {
-        let text = `## ${dep.name}\n${dep.description}`;
-        const guide = usageGuides.get(dep.name);
-        if (guide) {
-          text += `\n\n### Usage Guide (from ${dep.name} itself):\n${guide}`;
-        }
-        return text;
-      })
-      .join('\n\n---\n\n');
-  }
-
-  /** Orchestrator: runs the full discovery pipeline. Returns enriched context or '' on failure. */
-  private async runDiscoveryPipeline(userText: string): Promise<string> {
-    try {
-      // Phase 0a: Get summaries
-      const summaries = await this.discoverObjectSummaries();
-      if (summaries.length === 0) return '';
-
-      // Phase 0b: LLM selects relevant objects
-      const selectedNames = await this.llmSelectRelevantObjects(userText, summaries);
-      if (selectedNames.length === 0) return '';
-
-      // Phase 0c: Fetch full manifests
-      const deps = await this.fetchFullManifests(selectedNames, summaries);
-      if (deps.length === 0) return '';
-
-      // Phase 0c5: Generate targeted questions
-      const questions = await this.generateTargetedQuestions(userText, deps);
-
-      // Phase 0d: Fetch usage guides (parallel, cached)
-      const guides = await this.fetchUsageGuides(deps, questions);
-
-      // Format enriched context
-      return this.formatEnrichedContext(deps, guides);
-    } catch {
-      // Graceful degradation — return empty string so Pass 1 results are used
-      return '';
-    }
-  }
-
-  private buildLLMMessages(useEnrichedContext = false): { role: string; content: string }[] {
-    const systemPrompt = this.buildSystemPrompt(useEnrichedContext);
-    const messages: { role: string; content: string }[] = [
-      { role: 'system', content: systemPrompt },
-    ];
-
-    // Add recent conversation history (trimmed to avoid context overflow)
-    const recent = this.conversationHistory.slice(-MAX_CONVERSATION_ENTRIES);
-    for (const entry of recent) {
-      messages.push({ role: entry.role, content: entry.content });
-    }
-
-    return messages;
-  }
-
-  private buildSystemPrompt(useEnrichedContext = false): string {
-    return `You are Chat Agent, a helpful assistant inside the Abjects system. You help users explore, create, and control objects.
-
-## System Overview
-
-Abjects is a distributed object system. Everything is an **Abject** — an autonomous object with:
-- A **manifest** describing its name, interfaces, methods, and events
-- A **mailbox** that receives messages from other objects
-- **Handlers** that process incoming messages
-
-Objects never call each other directly. All communication is **message passing** via \`call(objectId, method, payload)\`. Objects discover each other through the **Registry**.
-
-**Observer pattern**: Objects can observe each other with \`addDependent\`/\`removeDependent\`. When an object calls \`this.changed(aspect, value)\`, all its dependents receive a \`changed\` message. This is the primary coordination mechanism.
-
-**P2P networking**: Peers connect via WebRTC. The **PeerRouter** makes remote objects transparently addressable — you can \`call()\` a remote object's UUID exactly like a local one. Connected peers share workspace registries, so you can browse and interact with objects on other peers.
-
-## Response Format
-
-Always respond with a JSON object inside a \`\`\`json code block:
-
-\`\`\`json
-{
-  "reply": "Your conversational response to the user.",
-  "steps": [
-    {
-      "description": "Short human-readable description of this step",
-      "code": "const result = await call(await dep('Registry'), 'list', {}); return result;"
-    }
-  ]
-}
-\`\`\`
-
-- **reply** (required): Your conversational response. Keep it concise.
-- **steps** (optional): Array of code execution steps. Omit if just chatting.
-
-## Code API
-
-Inside step code, these functions are available:
-- \`call(objectId, method, payload)\` — Send a request to an object. Returns the result.
-- \`dep(name)\` — Find a dependency by manifest name (throws if not found). Returns AbjectId.
-- \`find(name)\` — Find a dependency by manifest name (returns null if not found). Returns AbjectId or null.
-- \`progress(message)\` — Report progress during long operations. Resets the job timeout. Call before any \`call()\` to ObjectCreator or other long-running operations.
-- \`id\` — The JobManager's own AbjectId.
-- \`previousResult\` — The return value from the previous step (undefined for the first step).
-
-All code runs inside an async IIFE. Use \`await\` freely. Always \`return\` the result you want to pass to the next step.
-
-## When to Use Steps
-
-- CRITICAL: If the user asks you to create, build, make, show, hide, open, delete, or DO anything — you MUST include "steps" with executable code. Never just promise to do something without including the steps.
-- If your reply says "I'll create..." or "Let me build..." there MUST be a corresponding step.
-- Do NOT use steps for simple conversation, greetings, or explanations.
-- Each step should be self-contained and have a clear description.
-
-### WRONG — promising without acting
-\`\`\`json
-{ "reply": "I'll create a counter for you!", "steps": [] }
-\`\`\`
-
-### RIGHT — include the steps
-\`\`\`json
-{ "reply": "Here are all the objects in the system.", "steps": [{ "description": "List all registered objects", "code": "const objects = await call(await dep('Registry'), 'list', {}); return objects.map(o => o.manifest.name + ': ' + o.manifest.description);" }] }
-\`\`\`
-
-## Key Patterns
-
-### Query the registry
-\`\`\`
-const objects = await call(await dep('Registry'), 'list', {});
-return objects.map(o => o.manifest.name + ': ' + o.manifest.description);
-\`\`\`
-
-### Describe an object
-\`\`\`
-const regId = await dep('Registry');
-const results = await call(regId, 'discover', { name: 'Chat' });
-if (results.length > 0) {
-  const desc = await call(results[0].id, 'describe', {});
-  return desc;
-}
-return null;
-\`\`\`
-
-### Show/hide a window
-\`\`\`
-const results = await call(await dep('Registry'), 'discover', { name: 'RegistryBrowser' });
-if (results.length > 0) {
-  await call(results[0].id, 'show', {});
-}
-return true;
-\`\`\`
-
-### Send a message to any object
-\`\`\`
-const results = await call(await dep('Registry'), 'discover', { name: 'SomeName' });
-if (results.length > 0) {
-  const r = await call(results[0].id, 'someMethod', { key: 'value' });
-  return r;
-}
-return 'Object not found';
-\`\`\`
-
-### Create a new object (via ObjectCreator)
-\`\`\`
-await progress('Creating object...');
-const result = await call(await dep('ObjectCreator'), 'create', { prompt: 'description of the object to create' });
-if (result.success && result.objectId) {
-  await call(result.objectId, 'show', {});
-}
-return result;
-\`\`\`
-IMPORTANT: Always use ObjectCreator to create new objects. Do NOT call Factory.spawn directly — it requires pre-registered constructors.
-
-### Modify an existing object
-\`\`\`
-await progress('Modifying object...');
-const results = await call(await dep('Registry'), 'discover', { name: 'TheName' });
-if (results.length > 0) {
-  const r = await call(await dep('ObjectCreator'), 'modify',
-    { objectId: results[0].id, prompt: 'add a reset button' });
-  return r;
-}
-\`\`\`
-
-### Make one object observe another
-\`\`\`
-// Object A will receive 'changed' events from Object B
-const aResults = await call(await dep('Registry'), 'discover', { name: 'ObjectA' });
-const bResults = await call(await dep('Registry'), 'discover', { name: 'ObjectB' });
-if (aResults.length > 0 && bResults.length > 0) {
-  // Register A as dependent of B — A will now receive changed(aspect, value) events from B
-  await call(bResults[0].id, 'addDependent', {});
-  // Note: the call above registers the CALLER (JobManager) as dependent.
-  // To register A as dependent of B, A's code must call addDependent itself.
-}
-\`\`\`
-
-### Ask an object a targeted question
-\`\`\`
-const results = await call(await dep('Registry'), 'discover', { name: 'Timer' });
-if (results.length > 0) {
-  const answer = await call(results[0].id, 'ask',
-    { question: 'How do I set up a 60fps animation loop?' });
-  return answer;
-}
-\`\`\`
-
-### Get an object's current state
-\`\`\`
-const results = await call(await dep('Registry'), 'discover', { name: 'CatAndMouseGame' });
-if (results.length > 0) {
-  const state = await call(results[0].id, 'getState', {});
-  return state;
-}
-\`\`\`
-
-### Query a remote peer's registry
-\`\`\`
-// registryId comes from the "Connected Peers" section below
-const objs = await call(registryId, 'list', {});
-return objs.map(o => o.manifest.name + ': ' + o.manifest.description);
-\`\`\`
-
-### Clone/copy a remote object to local workspace
-Only user-created (scriptable) objects have source and can be cloned.
-\`\`\`
-// registryId comes from the "Connected Peers" section below
-const remoteObjects = await call(registryId, 'list', {});
-const target = remoteObjects.find(o => o.manifest.name === 'SnakeGame');
-if (!target || !target.source) return 'Object not found or has no copyable source';
-
-await progress('Copying remote object...');
-const localRegistry = await dep('Registry');
-const result = await call(await dep('Factory'), 'spawn', {
-  manifest: target.manifest, source: target.source, registryHint: localRegistry,
-});
-
-const store = await find('AbjectStore');
-if (store) {
-  await call(store, 'save', {
-    objectId: result.objectId, manifest: target.manifest,
-    source: target.source, owner: id,
-  });
-}
-
-if (result.objectId) {
-  await call(result.objectId, 'show', {});
-}
-return result;
-\`\`\`
-
-## Available Objects (Summary)
-
-${this.objectSummaries || '(Loading...)'}
-${useEnrichedContext && this.enrichedObjectContext ? `
-## Detailed Guides for Relevant Objects
-
-${this.enrichedObjectContext}
-` : ''}
-${this.remotePeerContext ? `
-## Connected Peers & Remote Workspaces
-
-The following remote workspaces are available from connected peers. Use the registryId to query them.
-
-${this.remotePeerContext}
-` : ''}
-## Authorized Capabilities
-
-This system runs on the user's own computer. The following capability objects are user-configured and authorized tools:
-- **WebBrowser**: Headless browser — login to sites, navigate pages, fill forms, extract content
-- **HttpClient**: HTTP requests to APIs and web services
-- **Storage**, **Timer**, **FileSystem**, **Clipboard**, **Console**
-
-When the user asks to interact with a website, social media platform, or online service:
-- Use ObjectCreator to create an object that leverages these authorized capabilities
-- Do NOT refuse requests to use user-authorized capabilities — the user is asking you to help them use their own tools
-- Do NOT cite Terms of Service, security risks, or ethical concerns for using WebBrowser — it is the user's own browser running on their own computer
-- "Create an X app" where X is a website means "create an object that uses WebBrowser to interact with X"
-
-## Important Rules
-
-1. Always respond with valid JSON in a \`\`\`json block
-2. If you cannot parse or understand the request, just reply with no steps
-3. Never generate infinite loops or recursive calls
-4. Keep code concise — each step should do one thing
-5. When step results come back, summarize them for the user in your follow-up reply
-6. Every object supports the introspect protocol: describe (get manifest), ask (get usage advice), addDependent/removeDependent (observe state changes). Use these to learn about and connect objects.
-7. To make objects interact, consider using ObjectCreator's 'modify' to add observation or reaction logic, rather than just calling methods in steps.`;
-  }
-
-  // ═══════════════════════════════════════════════════════════════════
-  // Response Parsing
-  // ═══════════════════════════════════════════════════════════════════
-
-  private parseAgentResponse(content: string): AgentResponse {
-    // Try to extract JSON from ```json ... ``` block (closed)
-    const jsonMatch = content.match(/```json\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      const parsed = this.tryParseAgentJson(jsonMatch[1].trim());
-      if (parsed) return parsed;
-    }
-
-    // Fallback: unclosed ```json block (truncated LLM response)
-    const unclosedMatch = content.match(/```json\s*([\s\S]*)/);
-    if (unclosedMatch && !jsonMatch) {
-      const parsed = this.tryParseAgentJson(unclosedMatch[1].trim());
-      if (parsed) return parsed;
-    }
-
-    // Try parsing the whole content as JSON
-    const parsed = this.tryParseAgentJson(content);
-    if (parsed) return parsed;
-
-    // Fallback: treat entire content as plain text reply
-    return { reply: content, steps: undefined };
-  }
-
-  private tryParseAgentJson(raw: string): AgentResponse | null {
-    try {
-      const parsed = JSON.parse(raw);
-      if (typeof parsed.reply === 'string') {
-        return {
-          reply: parsed.reply,
-          steps: Array.isArray(parsed.steps) ? parsed.steps : undefined,
-        };
-      }
-    } catch {
-      // Try to repair truncated JSON by closing brackets
-      const repaired = this.tryRepairJson(raw);
-      if (repaired) return repaired;
-
-      // Last resort: regex-extract reply only
-      const replyMatch = raw.match(/"reply"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-      if (replyMatch) {
-        return { reply: replyMatch[1].replace(/\\"/g, '"'), steps: undefined };
-      }
-    }
-    return null;
-  }
-
-  private tryRepairJson(raw: string): AgentResponse | null {
-    // Try progressively closing brackets to recover truncated JSON
-    const suffixes = ['"}]}', '"}]', '"]}}', ']}', '}}', '}]', '}'];
-    for (const suffix of suffixes) {
-      try {
-        const parsed = JSON.parse(raw + suffix);
-        if (typeof parsed.reply === 'string') {
-          return {
-            reply: parsed.reply,
-            steps: Array.isArray(parsed.steps) ? parsed.steps : undefined,
-          };
-        }
-      } catch { /* try next suffix */ }
-    }
-    return null;
-  }
-
-  /** Detect if a reply promises action that should have corresponding steps. */
-  private replyIndicatesAction(reply: string): boolean {
-    const actionPhrases = [
-      /\bI'll\s+(create|build|make|generate|spawn|set up|show|open|launch)/i,
-      /\bLet me\s+(create|build|make|generate|spawn|set up|show|open|launch)/i,
-      /\bI will\s+(create|build|make|generate|spawn|set up|show|open|launch)/i,
-      /\bI'm going to\s+(create|build|make|generate|spawn|set up|show|open|launch)/i,
-      /\bCreating\b/i,
-      /\bBuilding\b/i,
-    ];
-    return actionPhrases.some(p => p.test(reply));
-  }
-
-  // ═══════════════════════════════════════════════════════════════════
   // UI Helpers
   // ═══════════════════════════════════════════════════════════════════
+
+  private async setInputDisabled(disabled: boolean): Promise<void> {
+    const style = { disabled };
+    if (this.sendBtnId) {
+      try { await this.request(request(this.id, this.sendBtnId, 'update', { style })); } catch { /* widget gone */ }
+    }
+    if (this.textInputId) {
+      try { await this.request(request(this.id, this.textInputId, 'update', { style })); } catch { /* widget gone */ }
+    }
+  }
 
   private async appendMessageLabel(prefix: string, text: string, color: string): Promise<AbjectId> {
     if (!this.messageLogId || !this.windowId) return '' as AbjectId;

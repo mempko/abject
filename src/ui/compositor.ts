@@ -29,7 +29,8 @@ export interface Surface {
 export interface DrawCommand {
   type: 'rect' | 'text' | 'line' | 'image' | 'imageUrl' | 'clear' | 'path' | 'save' | 'restore' | 'clip' | 'translate'
     | 'circle' | 'arc' | 'ellipse' | 'polygon' | 'rotate' | 'scale'
-    | 'globalAlpha' | 'shadow' | 'setLineDash' | 'linearGradient' | 'radialGradient';
+    | 'globalAlpha' | 'shadow' | 'setLineDash' | 'linearGradient' | 'radialGradient'
+    | 'bezierCurve' | 'quadraticCurve';
   surfaceId: string;
   params: unknown;
 }
@@ -55,6 +56,7 @@ export interface TextParams {
   strokeWidth?: number;
   align?: CanvasTextAlign;
   baseline?: CanvasTextBaseline;
+  maxWidth?: number;
 }
 
 export interface LineParams {
@@ -127,6 +129,32 @@ export interface PolygonParams {
   stroke?: string;
   lineWidth?: number;
   closePath?: boolean;
+}
+
+export interface BezierCurveParams {
+  x0: number;
+  y0: number;
+  cp1x: number;
+  cp1y: number;
+  cp2x: number;
+  cp2y: number;
+  x1: number;
+  y1: number;
+  stroke?: string;
+  lineWidth?: number;
+  fill?: string;
+}
+
+export interface QuadraticCurveParams {
+  x0: number;
+  y0: number;
+  cpx: number;
+  cpy: number;
+  x1: number;
+  y1: number;
+  stroke?: string;
+  lineWidth?: number;
+  fill?: string;
 }
 
 export interface ShadowParams {
@@ -445,16 +473,16 @@ export class Compositor {
         ctx.textBaseline = p.baseline ?? 'top';
         if (p.fill) {
           ctx.fillStyle = p.fill;
-          ctx.fillText(p.text, p.x, p.y);
+          ctx.fillText(p.text, p.x, p.y, p.maxWidth);
         }
         if (p.stroke) {
           ctx.strokeStyle = p.stroke;
           ctx.lineWidth = p.strokeWidth ?? 1;
-          ctx.strokeText(p.text, p.x, p.y);
+          ctx.strokeText(p.text, p.x, p.y, p.maxWidth);
         }
         if (!p.fill && !p.stroke) {
           ctx.fillStyle = '#000';
-          ctx.fillText(p.text, p.x, p.y);
+          ctx.fillText(p.text, p.x, p.y, p.maxWidth);
         }
         break;
       }
@@ -693,6 +721,42 @@ export class Compositor {
         }
         ctx.fillStyle = grad;
         ctx.strokeStyle = grad;
+        break;
+      }
+
+      case 'bezierCurve': {
+        const p = command.params as BezierCurveParams;
+        ctx.beginPath();
+        ctx.moveTo(p.x0, p.y0);
+        ctx.bezierCurveTo(p.cp1x, p.cp1y, p.cp2x, p.cp2y, p.x1, p.y1);
+        if (p.fill) {
+          ctx.closePath();
+          ctx.fillStyle = p.fill;
+          ctx.fill();
+        }
+        if (p.stroke !== undefined || !p.fill) {
+          ctx.strokeStyle = p.stroke ?? '#000';
+          ctx.lineWidth = p.lineWidth ?? 1;
+          ctx.stroke();
+        }
+        break;
+      }
+
+      case 'quadraticCurve': {
+        const p = command.params as QuadraticCurveParams;
+        ctx.beginPath();
+        ctx.moveTo(p.x0, p.y0);
+        ctx.quadraticCurveTo(p.cpx, p.cpy, p.x1, p.y1);
+        if (p.fill) {
+          ctx.closePath();
+          ctx.fillStyle = p.fill;
+          ctx.fill();
+        }
+        if (p.stroke !== undefined || !p.fill) {
+          ctx.strokeStyle = p.stroke ?? '#000';
+          ctx.lineWidth = p.lineWidth ?? 1;
+          ctx.stroke();
+        }
         break;
       }
     }

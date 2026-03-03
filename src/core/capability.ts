@@ -46,6 +46,9 @@ export const Capabilities = {
   // Peer capabilities
   PEER_CONNECT: 'abjects:peer:connect' as CapabilityId,
   PEER_DISCOVER: 'abjects:peer:discover' as CapabilityId,
+
+  // Agent capabilities
+  WEB_AGENT: 'abjects:web-agent' as CapabilityId,
 } as const;
 
 // =============================================================================

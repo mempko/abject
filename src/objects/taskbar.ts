@@ -19,6 +19,7 @@ export class Taskbar extends Abject {
   private chatId?: AbjectId;
   private jobBrowserId?: AbjectId;
   private objectManagerId?: AbjectId;
+  private webBrowserViewerId?: AbjectId;
   private registryId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
@@ -31,6 +32,7 @@ export class Taskbar extends Abject {
   private chatBtnId?: AbjectId;
   private jobsBtnId?: AbjectId;
   private objectManagerBtnId?: AbjectId;
+  private browserViewerBtnId?: AbjectId;
 
   // Dynamic user object buttons: button widget AbjectId → target object AbjectId
   private userObjButtons: Map<AbjectId, AbjectId> = new Map();
@@ -84,6 +86,7 @@ export class Taskbar extends Abject {
     this.chatId = await this.requireDep('Chat');
     this.jobBrowserId = await this.requireDep('JobBrowser');
     this.objectManagerId = await this.requireDep('ObjectManager');
+    this.webBrowserViewerId = await this.discoverDep('WebBrowserViewer') ?? undefined;
     this.registryId = await this.requireDep('Registry');
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
 
@@ -93,7 +96,9 @@ export class Taskbar extends Abject {
     }
 
     // Subscribe as dependent of each system object to receive visibility changes
-    for (const depId of [this.registryBrowserId!, this.chatId!, this.jobBrowserId!, this.objectManagerId!]) {
+    const depIds = [this.registryBrowserId!, this.chatId!, this.jobBrowserId!, this.objectManagerId!];
+    if (this.webBrowserViewerId) depIds.push(this.webBrowserViewerId);
+    for (const depId of depIds) {
       await this.request(request(this.id, depId, 'addDependent', {}));
     }
 
@@ -167,6 +172,10 @@ export class Taskbar extends Abject {
       } else if (fromId === this.objectManagerBtnId) {
         await this.request(
           request(this.id, this.objectManagerId!, 'show', {})
+        );
+      } else if (fromId === this.browserViewerBtnId && this.webBrowserViewerId) {
+        await this.request(
+          request(this.id, this.webBrowserViewerId, 'show', {})
         );
       } else if (this.restoreButtons.has(fromId)) {
         // Restore a minimized window
@@ -251,6 +260,7 @@ export class Taskbar extends Abject {
     this.chatBtnId = undefined;
     this.jobsBtnId = undefined;
     this.objectManagerBtnId = undefined;
+    this.browserViewerBtnId = undefined;
     this.rootLayoutId = undefined;
     this.userObjButtons.clear();
     this.restoreButtons.clear();
@@ -263,7 +273,7 @@ export class Taskbar extends Abject {
     const dividerH = 8;
     const padding = 16;
     const spacing = 6;
-    const systemBtnCount = 4;
+    const systemBtnCount = 4 + (this.webBrowserViewerId ? 1 : 0);
     const minimizedCount = this.minimizedWindows.size;
     const totalBtnCount = systemBtnCount + showableObjects.length + minimizedCount;
     const extraHeight = (labelH + spacing) // "Apps" label
@@ -355,20 +365,27 @@ export class Taskbar extends Abject {
     await addSectionLabel('\u25A0 Apps');
 
     // Query visibility of system objects
-    const [registryVis, chatVis, jobsVis, objectManagerVis] = await Promise.all([
+    const visPromises: Promise<boolean>[] = [
       isVisible(this.registryBrowserId!),
       isVisible(this.chatId!),
       isVisible(this.jobBrowserId!),
       isVisible(this.objectManagerId!),
-    ]);
+    ];
+    if (this.webBrowserViewerId) visPromises.push(isVisible(this.webBrowserViewerId));
+    const visResults = await Promise.all(visPromises);
+    const [registryVis, chatVis, jobsVis, objectManagerVis] = visResults;
+    const browserViewerVis = this.webBrowserViewerId ? visResults[4] : false;
 
-    console.debug(`[Taskbar] visibility: registry=${registryVis} chat=${chatVis} jobs=${jobsVis} processes=${objectManagerVis}`);
+    console.debug(`[Taskbar] visibility: registry=${registryVis} chat=${chatVis} jobs=${jobsVis} processes=${objectManagerVis} browser=${browserViewerVis}`);
 
     // System buttons
     this.registryBtnId = await addBtn('Registry', registryVis);
     this.chatBtnId = await addBtn('Chat', chatVis);
     this.jobsBtnId = await addBtn('Jobs', jobsVis);
     this.objectManagerBtnId = await addBtn('Processes', objectManagerVis);
+    if (this.webBrowserViewerId) {
+      this.browserViewerBtnId = await addBtn('Browser', browserViewerVis);
+    }
 
     // Dynamic buttons for user-created objects with show/hide
     for (const obj of showableObjects) {
@@ -407,6 +424,7 @@ export class Taskbar extends Abject {
     this.chatBtnId = undefined;
     this.jobsBtnId = undefined;
     this.objectManagerBtnId = undefined;
+    this.browserViewerBtnId = undefined;
     this.userObjButtons.clear();
     return true;
   }

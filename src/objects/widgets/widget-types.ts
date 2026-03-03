@@ -26,7 +26,7 @@ export interface WidgetStyle {
   visible?: boolean;  // default true; when false, widget renders nothing and ignores input
 }
 
-export type WidgetType = 'label' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar';
+export type WidgetType = 'label' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image';
 
 export interface Rect {
   x: number;
@@ -65,6 +65,10 @@ export interface ThemeData {
   selectHover: string;
   selectArrow: string;
   selectionBg: string;
+  sliderTrack: string;
+  sliderFill: string;
+  sliderThumb: string;
+  sliderThumbBorder: string;
   windowRadius: number;
   widgetRadius: number;
   titleBarHeight: number;
@@ -103,6 +107,10 @@ export const MIDNIGHT_BLOOM: ThemeData = {
   selectHover: '#252840',
   selectArrow: '#6b7084',
   selectionBg: 'rgba(232, 168, 76, 0.3)',
+  sliderTrack: '#1a1d2e',
+  sliderFill: '#e8a84c',
+  sliderThumb: '#e8a84c',
+  sliderThumbBorder: '#353958',
   windowRadius: 8,
   widgetRadius: 6,
   titleBarHeight: 34,

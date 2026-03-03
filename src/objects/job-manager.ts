@@ -14,6 +14,7 @@ const JOBMANAGER_INTERFACE: InterfaceId = 'abjects:job-manager';
 
 export interface Job {
   id: string;
+  queue: string;
   description: string;
   code: string;
   callerId: AbjectId;
@@ -25,6 +26,15 @@ export interface Job {
   completedAt?: number;
 }
 
+interface QueueState {
+  name: string;
+  queue: string[];
+  processing: boolean;
+  currentJobId?: string;
+  currentCallMsgId?: string;
+  currentJobCallerId?: AbjectId;
+}
+
 export interface JobResult {
   jobId: string;
   status: 'completed' | 'failed';
@@ -34,14 +44,11 @@ export interface JobResult {
 
 export class JobManager extends Abject {
   private jobs: Map<string, Job> = new Map();
-  private queue: string[] = [];
-  private currentJobId?: string;
+  private queues: Map<string, QueueState> = new Map();
+  private static readonly DEFAULT_QUEUE = 'default';
   private jobCounter = 0;
   private pendingResolvers: Map<string, (job: Job) => void> = new Map();
-  private processing = false;
   private consoleId?: AbjectId;
-  private _currentCallMsgId?: string;
-  private _currentJobCallerId?: AbjectId;
 
   constructor() {
     super({
@@ -61,6 +68,7 @@ export class JobManager extends Abject {
                 parameters: [
                   { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'Human-readable job description' },
                   { name: 'code', type: { kind: 'primitive', primitive: 'string' }, description: 'JavaScript code to execute' },
+                  { name: 'queue', type: { kind: 'primitive', primitive: 'string' }, description: 'Named queue for concurrent execution (default: "default")', optional: true },
                 ],
                 returns: { kind: 'reference', reference: 'JobResult' },
               },
@@ -92,6 +100,12 @@ export class JobManager extends Abject {
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              {
+                name: 'listQueues',
+                description: 'Return names of all active queues.',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+              },
             ],
           },
         requiredCapabilities: [],
@@ -116,30 +130,46 @@ export class JobManager extends Abject {
     } catch { /* logging should never break the caller */ }
   }
 
+  private getOrCreateQueue(name: string): QueueState {
+    let q = this.queues.get(name);
+    if (!q) {
+      q = { name, queue: [], processing: false };
+      this.queues.set(name, q);
+    }
+    return q;
+  }
+
   private setupHandlers(): void {
     // Reset call-level timeout on callee progress AND forward upstream to job submitter
     this.on('progress', (msg: AbjectMessage) => {
-      if (this._currentCallMsgId) {
-        this.resetRequestTimeout(this._currentCallMsgId);
-      }
-      if (this._currentJobCallerId) {
-        this.send(
-          event(this.id, this._currentJobCallerId, 'progress',
-            msg.payload ?? {})
-        ).catch(() => {});
+      // Broadcast to all active queues — progress is a heartbeat/timeout-reset signal
+      for (const q of this.queues.values()) {
+        if (q.currentCallMsgId) {
+          this.resetRequestTimeout(q.currentCallMsgId);
+        }
+        if (q.currentJobCallerId) {
+          this.send(
+            event(this.id, q.currentJobCallerId, 'progress',
+              msg.payload ?? {})
+          ).catch(() => {});
+        }
       }
     });
 
     this.on('submitJob', async (msg: AbjectMessage) => {
-      const { description, code } = msg.payload as { description: string; code: string };
+      const { description, code, queue: queueName } = msg.payload as {
+        description: string; code: string; queue?: string;
+      };
       requireNonEmpty(description, 'description');
       requireNonEmpty(code, 'code');
 
       const callerId = msg.routing.from;
       const jobId = `job-${++this.jobCounter}`;
+      const resolvedQueue = queueName ?? JobManager.DEFAULT_QUEUE;
 
       const job: Job = {
         id: jobId,
+        queue: resolvedQueue,
         description,
         code,
         callerId,
@@ -148,10 +178,11 @@ export class JobManager extends Abject {
       };
 
       this.jobs.set(jobId, job);
-      this.queue.push(jobId);
+      const q = this.getOrCreateQueue(resolvedQueue);
+      q.queue.push(jobId);
 
       // Broadcast jobQueued to dependents (JobBrowser)
-      await this.changed('jobQueued', { jobId, description, position: this.queue.length });
+      await this.changed('jobQueued', { jobId, description, queue: resolvedQueue, position: q.queue.length });
 
       // Create a Promise that resolves when the job finishes
       const jobDone = new Promise<Job>((resolve) => {
@@ -159,7 +190,7 @@ export class JobManager extends Abject {
       });
 
       // Kick off queue processing (fire-and-forget)
-      this.processQueue();
+      this.processQueue(resolvedQueue);
 
       // Send the reply when the job completes (non-blocking)
       jobDone.then(async (finished) => {
@@ -193,9 +224,12 @@ export class JobManager extends Abject {
       const job = this.jobs.get(jobId);
       if (!job || job.status !== 'queued') return false;
 
-      // Remove from queue
-      const idx = this.queue.indexOf(jobId);
-      if (idx >= 0) this.queue.splice(idx, 1);
+      // Remove from the job's named queue
+      const q = this.queues.get(job.queue);
+      if (q) {
+        const idx = q.queue.indexOf(jobId);
+        if (idx >= 0) q.queue.splice(idx, 1);
+      }
 
       job.status = 'failed';
       job.error = 'Cancelled';
@@ -208,7 +242,7 @@ export class JobManager extends Abject {
         resolver(job);
       }
 
-      await this.changed('jobFailed', { jobId, description: job.description, error: 'Cancelled' });
+      await this.changed('jobFailed', { jobId, description: job.description, queue: job.queue, error: 'Cancelled' });
       return true;
     });
 
@@ -225,54 +259,65 @@ export class JobManager extends Abject {
       await this.changed('historyCleared', {});
       return true;
     });
+
+    this.on('listQueues', async () => {
+      return Array.from(this.queues.keys());
+    });
   }
 
-  private async processQueue(): Promise<void> {
-    if (this.processing || this.queue.length === 0) return;
-    this.processing = true;
+  private async processQueue(queueName: string): Promise<void> {
+    const q = this.queues.get(queueName);
+    if (!q || q.processing || q.queue.length === 0) return;
+    q.processing = true;
 
-    while (this.queue.length > 0) {
-      const jobId = this.queue.shift()!;
-      const job = this.jobs.get(jobId);
-      if (!job) continue;
+    try {
+      while (q.queue.length > 0) {
+        const jobId = q.queue.shift()!;
+        const job = this.jobs.get(jobId);
+        if (!job) continue;
 
-      job.status = 'running';
-      job.startedAt = Date.now();
-      this.currentJobId = jobId;
+        job.status = 'running';
+        job.startedAt = Date.now();
+        q.currentJobId = jobId;
 
-      await this.changed('jobStarted', { jobId, description: job.description });
-      await this.log('info', `Job started: ${job.description}`, { jobId });
+        await this.changed('jobStarted', { jobId, description: job.description, queue: job.queue });
+        await this.log('info', `Job started: ${job.description}`, { jobId, queue: job.queue });
 
-      try {
-        const result = await this.executeCode(job.code, job.callerId);
-        job.status = 'completed';
-        job.result = result;
-        await this.changed('jobCompleted', { jobId, description: job.description, result });
-        await this.log('info', `Job completed: ${job.description}`, { jobId, result });
-      } catch (err) {
-        job.status = 'failed';
-        job.error = err instanceof Error ? err.message : String(err);
-        await this.changed('jobFailed', { jobId, description: job.description, error: job.error });
-        await this.log('error', `Job failed: ${job.description}`, { jobId, error: job.error });
+        try {
+          const result = await this.executeCode(job.code, job.callerId, q);
+          job.status = 'completed';
+          job.result = result;
+          await this.changed('jobCompleted', { jobId, description: job.description, queue: job.queue, result });
+          await this.log('info', `Job completed: ${job.description}`, { jobId, queue: job.queue, result });
+        } catch (err) {
+          job.status = 'failed';
+          job.error = err instanceof Error ? err.message : String(err);
+          await this.changed('jobFailed', { jobId, description: job.description, queue: job.queue, error: job.error });
+          await this.log('error', `Job failed: ${job.description}`, { jobId, queue: job.queue, error: job.error });
+        }
+
+        job.completedAt = Date.now();
+        q.currentJobId = undefined;
+
+        // Resolve pending promise for this job
+        const resolver = this.pendingResolvers.get(jobId);
+        if (resolver) {
+          this.pendingResolvers.delete(jobId);
+          resolver(job);
+        }
       }
-
-      job.completedAt = Date.now();
-      this.currentJobId = undefined;
-
-      // Resolve pending promise for this job
-      const resolver = this.pendingResolvers.get(jobId);
-      if (resolver) {
-        this.pendingResolvers.delete(jobId);
-        resolver(job);
+    } finally {
+      q.processing = false;
+      // Clean up empty queues to avoid accumulation
+      if (q.queue.length === 0) {
+        this.queues.delete(queueName);
       }
     }
-
-    this.processing = false;
   }
 
-  private async executeCode(code: string, callerId?: AbjectId): Promise<unknown> {
-    this._currentJobCallerId = callerId;
-    console.log(`[JobManager] Executing job code:\n${code}`);
+  private async executeCode(code: string, callerId: AbjectId | undefined, q: QueueState): Promise<unknown> {
+    q.currentJobCallerId = callerId;
+    console.log(`[JobManager] Executing job code (queue: ${q.name}):\n${code}`);
 
     const callFn = async (
       to: AbjectId | string | Promise<AbjectId>,
@@ -289,18 +334,18 @@ export class JobManager extends Abject {
       }
       const resolved = await to;
       const msg = request(this.id, resolved as AbjectId, actualMethod, actualPayload);
-      this._currentCallMsgId = msg.header.messageId;
+      q.currentCallMsgId = msg.header.messageId;
       try {
-        return await this.request<unknown>(msg, 120000);
+        return await this.request<unknown>(msg, 600000);
       } finally {
-        this._currentCallMsgId = undefined;
+        q.currentCallMsgId = undefined;
       }
     };
 
     const progressFn = async (message?: string) => {
-      if (this._currentJobCallerId) {
+      if (q.currentJobCallerId) {
         await this.send(
-          event(this.id, this._currentJobCallerId, 'progress',
+          event(this.id, q.currentJobCallerId, 'progress',
             { message: message ?? 'working' })
         ).catch(() => {});
       }
@@ -317,8 +362,8 @@ export class JobManager extends Abject {
     try {
       return await fn(callFn, depFn, findFn, this.id, progressFn);
     } finally {
-      this._currentJobCallerId = undefined;
-      this._currentCallMsgId = undefined;
+      q.currentJobCallerId = undefined;
+      q.currentCallMsgId = undefined;
     }
   }
 

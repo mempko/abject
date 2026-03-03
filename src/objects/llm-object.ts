@@ -15,6 +15,7 @@ import {
   LLMMessage,
   LLMCompletionOptions,
   LLMCompletionResult,
+  getTextContent,
 
   systemMessage,
   userMessage,
@@ -289,7 +290,7 @@ export class LLMObject extends Abject {
     const provider = this.getProvider(providerName);
     require(provider !== undefined, 'No LLM provider available');
 
-    const totalChars = messages.reduce((sum, m) => sum + (m.content?.length ?? 0), 0);
+    const totalChars = messages.reduce((sum, m) => sum + getTextContent(m).length, 0);
     console.log(`[LLM] → ${provider!.name} | ${messages.length} msgs | ${totalChars} chars | tier=${options?.tier ?? 'default'} maxTokens=${options?.maxTokens ?? 'default'}`);
     const start = Date.now();
 

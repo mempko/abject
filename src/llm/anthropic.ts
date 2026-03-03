@@ -10,6 +10,8 @@ import {
   LLMCompletionResult,
   LLMStreamChunk,
   ModelTier,
+  ContentPart,
+  getTextContent,
 } from './provider.js';
 import { require } from '../core/contracts.js';
 
@@ -20,9 +22,17 @@ export interface AnthropicConfig {
   fetchFn?: FetchDelegate;
 }
 
+type AnthropicContentBlock = {
+  type: 'text';
+  text: string;
+} | {
+  type: 'image';
+  source: { type: 'base64'; media_type: string; data: string };
+};
+
 interface AnthropicMessage {
   role: 'user' | 'assistant';
-  content: string;
+  content: string | AnthropicContentBlock[];
 }
 
 interface AnthropicRequest {
@@ -89,14 +99,14 @@ export class AnthropicProvider extends BaseLLMProvider {
     require(this.apiKey !== undefined, 'API key is required');
 
     // Separate system message from conversation
-    const systemMessage = messages.find((m) => m.role === 'system');
+    const systemMsg = messages.find((m) => m.role === 'system');
     const conversationMessages = messages.filter((m) => m.role !== 'system');
 
     // Convert to Anthropic format
     const anthropicMessages: AnthropicMessage[] = conversationMessages.map(
       (m) => ({
         role: m.role as 'user' | 'assistant',
-        content: m.content,
+        content: this.mapContent(m.content),
       })
     );
 
@@ -108,8 +118,8 @@ export class AnthropicProvider extends BaseLLMProvider {
       stop_sequences: options.stopSequences,
     };
 
-    if (systemMessage) {
-      request.system = systemMessage.content;
+    if (systemMsg) {
+      request.system = getTextContent(systemMsg);
     }
 
     const response = await this.fetch(`${this.baseUrl}/v1/messages`, {
@@ -148,13 +158,13 @@ export class AnthropicProvider extends BaseLLMProvider {
     require(this.apiKey !== undefined, 'API key is required');
     require(!this.fetchFn, 'Streaming is not supported when using HttpClient delegate');
 
-    const systemMessage = messages.find((m) => m.role === 'system');
+    const systemMsg = messages.find((m) => m.role === 'system');
     const conversationMessages = messages.filter((m) => m.role !== 'system');
 
     const anthropicMessages: AnthropicMessage[] = conversationMessages.map(
       (m) => ({
         role: m.role as 'user' | 'assistant',
-        content: m.content,
+        content: this.mapContent(m.content),
       })
     );
 
@@ -167,8 +177,8 @@ export class AnthropicProvider extends BaseLLMProvider {
       stream: true,
     };
 
-    if (systemMessage) {
-      request.system = systemMessage.content;
+    if (systemMsg) {
+      request.system = getTextContent(systemMsg);
     }
 
     const response = await fetch(`${this.baseUrl}/v1/messages`, {
@@ -232,6 +242,18 @@ export class AnthropicProvider extends BaseLLMProvider {
     }
 
     yield { content: '', done: true };
+  }
+
+  /**
+   * Map LLMMessage content to Anthropic API format.
+   * String content passes through; ContentPart[] maps to Anthropic content blocks.
+   */
+  private mapContent(content: string | ContentPart[]): string | AnthropicContentBlock[] {
+    if (typeof content === 'string') return content;
+    return content.map((part): AnthropicContentBlock => {
+      if (part.type === 'text') return { type: 'text', text: part.text };
+      return { type: 'image', source: { type: 'base64', media_type: part.mediaType, data: part.data } };
+    });
   }
 
   protected buildHeaders(): Record<string, string> {

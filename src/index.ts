@@ -31,6 +31,7 @@ import { AbjectEditor } from './objects/abject-editor.js';
 import { JobManager } from './objects/job-manager.js';
 import { JobBrowser } from './objects/job-browser.js';
 import { Chat } from './objects/chat.js';
+import { AgentAbject } from './objects/agent-abject.js';
 import { AbjectStore } from './objects/abject-store.js';
 import { Supervisor } from './runtime/supervisor.js';
 import type { RestartType } from './runtime/supervisor.js';
@@ -47,6 +48,7 @@ import { RemoteRegistry } from './objects/remote-registry.js';
 import { PeerRouter } from './network/peer-router.js';
 import { WorkspaceShareRegistry, WORKSPACE_SHARE_REGISTRY_ID } from './objects/workspace-share-registry.js';
 import { WorkspaceBrowser } from './objects/workspace-browser.js';
+import { WebBrowserViewer } from './objects/web-browser-viewer.js';
 
 // Export public API
 export { App, createApp } from './ui/app.js';
@@ -112,6 +114,12 @@ export { DividerWidget } from './objects/widgets/divider-widget.js';
 export { SelectWidget } from './objects/widgets/select-widget.js';
 export { CanvasWidget } from './objects/widgets/canvas-widget.js';
 export type { CanvasWidgetConfig } from './objects/widgets/canvas-widget.js';
+export { TabBarWidget } from './objects/widgets/tabbar-widget.js';
+export type { TabBarConfig } from './objects/widgets/tabbar-widget.js';
+export { SliderWidget } from './objects/widgets/slider-widget.js';
+export type { SliderWidgetConfig } from './objects/widgets/slider-widget.js';
+export { ImageWidget } from './objects/widgets/image-widget.js';
+export type { ImageWidgetConfig } from './objects/widgets/image-widget.js';
 export { LayoutAbject, isSpacer, LAYOUT_INTERFACE_DECL } from './objects/widgets/layout-abject.js';
 export type { LayoutConfig, LayoutMargins, ChildRect } from './objects/widgets/layout-abject.js';
 export { VBoxLayout } from './objects/widgets/vbox-layout.js';
@@ -139,9 +147,13 @@ export { Timer, TIMER_ID } from './objects/capabilities/timer.js';
 export { Clipboard, CLIPBOARD_ID } from './objects/capabilities/clipboard.js';
 export { Console, CONSOLE_ID } from './objects/capabilities/console.js';
 export { FileSystem, FILESYSTEM_ID } from './objects/capabilities/filesystem.js';
-// WebParser and WebBrowser are server-only — import directly from their files:
+export { AgentAbject, AGENT_ABJECT_ID } from './objects/agent-abject.js';
+export type { AgentPhase, AgentAction, AgentActionResult, AgentTaskState, AgentTaskOptions, AgentConfig, TerminalActionConfig } from './objects/agent-abject.js';
+export { WebBrowserViewer, WEB_BROWSER_VIEWER_ID } from './objects/web-browser-viewer.js';
+// WebParser, WebBrowser, and WebAgent are server-only — import directly from their files:
 // import { WebParser } from './objects/capabilities/web-parser.js';
 // import { WebBrowser } from './objects/capabilities/web-browser.js';
+// import { WebAgent } from './objects/web-agent.js';
 
 // Export core types
 export * from './core/types.js';
@@ -154,7 +166,8 @@ export { derivePeerId, derivePeerIdFromJwk, deriveSessionKey, aesEncrypt, aesDec
 export type { IntrospectResult } from './core/introspect.js';
 
 // Export LLM providers
-export type { LLMProvider, LLMMessage, LLMCompletionResult, ModelTier } from './llm/provider.js';
+export type { LLMProvider, LLMMessage, LLMCompletionResult, ModelTier, ContentPart, TextPart, ImagePart } from './llm/provider.js';
+export { getTextContent, userMessageWithImages } from './llm/provider.js';
 export { AnthropicProvider } from './llm/anthropic.js';
 export { OpenAIProvider } from './llm/openai.js';
 export { OllamaProvider } from './llm/ollama.js';
@@ -315,6 +328,7 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('JobManager', () => new JobManager());
   runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
   runtime.objectFactory.registerConstructor('Chat', () => new Chat());
+  runtime.objectFactory.registerConstructor('AgentAbject', () => new AgentAbject());
   runtime.objectFactory.registerConstructor('AbjectStore', () => new AbjectStore());
   runtime.objectFactory.registerConstructor('Supervisor', () => new Supervisor());
   runtime.objectFactory.registerConstructor('Taskbar', () => new Taskbar());
@@ -331,6 +345,7 @@ async function main(): Promise<App> {
   runtime.objectFactory.registerConstructor('PeerRouter', () => new PeerRouter());
   runtime.objectFactory.registerConstructor('WorkspaceShareRegistry', () => new WorkspaceShareRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceBrowser', () => new WorkspaceBrowser());
+  runtime.objectFactory.registerConstructor('WebBrowserViewer', () => new WebBrowserViewer());
 
   // Mark worker-eligible constructors (only used when workerEnabled).
   // Per-workspace objects use registryHint to discover workspace dependencies.

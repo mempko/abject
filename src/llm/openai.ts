@@ -10,6 +10,7 @@ import {
   LLMCompletionResult,
   LLMStreamChunk,
   ModelTier,
+  ContentPart,
 } from './provider.js';
 import { require } from '../core/contracts.js';
 
@@ -20,9 +21,11 @@ export interface OpenAIConfig {
   fetchFn?: FetchDelegate;
 }
 
+type OpenAIContentPart = { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } };
+
 interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: string | OpenAIContentPart[];
 }
 
 interface OpenAIRequest {
@@ -94,7 +97,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       model: this.resolveModel(options.tier),
       messages: messages.map((m) => ({
         role: m.role,
-        content: m.content,
+        content: this.mapContent(m.content),
       })),
       max_tokens: options.maxTokens,
       temperature: options.temperature,
@@ -135,7 +138,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       model: this.resolveModel(options.tier),
       messages: messages.map((m) => ({
         role: m.role,
-        content: m.content,
+        content: this.mapContent(m.content),
       })),
       max_tokens: options.maxTokens,
       temperature: options.temperature,
@@ -198,6 +201,18 @@ export class OpenAIProvider extends BaseLLMProvider {
     }
 
     yield { content: '', done: true };
+  }
+
+  /**
+   * Map LLMMessage content to OpenAI API format.
+   * String content passes through; ContentPart[] maps to OpenAI content parts.
+   */
+  private mapContent(content: string | ContentPart[]): string | OpenAIContentPart[] {
+    if (typeof content === 'string') return content;
+    return content.map((part): OpenAIContentPart => {
+      if (part.type === 'text') return { type: 'text', text: part.text };
+      return { type: 'image_url', image_url: { url: `data:${part.mediaType};base64,${part.data}` } };
+    });
   }
 
   protected buildHeaders(): Record<string, string> {

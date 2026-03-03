@@ -27,13 +27,23 @@ import {
   SpawnRequest,
   SpawnResult,
 } from '../core/types.js';
-import { Abject } from '../core/abject.js';
+import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { require } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { IntrospectResult } from '../core/introspect.js';
 
 import { ScriptableAbject } from './scriptable-abject.js';
 import { systemMessage, userMessage, LLMMessage, LLMCompletionResult, LLMCompletionOptions } from '../llm/provider.js';
+import type { AgentAction } from './agent-abject.js';
+
+/** Per-creation-task state for tracking agent-driven creation. */
+interface CreationTaskExtra {
+  prompt: string;
+  context?: string;
+  callerId?: AbjectId;
+  deferredMsg: AbjectMessage;
+  result?: CreationResult;
+}
 
 
 const OBJECT_CREATOR_INTERFACE = 'abjects:object-creator' as InterfaceId;
@@ -83,7 +93,9 @@ export class ObjectCreator extends Abject {
   private negotiatorId?: AbjectId;
   private abjectStoreId?: AbjectId;
   private widgetManagerId?: AbjectId;
+  private agentAbjectId?: AbjectId;
   private _currentCallerId?: AbjectId;
+  private creationTasks = new Map<string, CreationTaskExtra>();
 
   constructor() {
     super({
@@ -217,6 +229,21 @@ export class ObjectCreator extends Abject {
   private setupHandlers(): void {
     this.on('create', async (msg: AbjectMessage) => {
       const { prompt, context } = msg.payload as CreateObjectRequest;
+
+      // Route through AgentAbject if available — jobs become visible in JobBrowser
+      if (this.agentAbjectId) {
+        const taskId = `create-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        this.creationTasks.set(taskId, {
+          prompt,
+          context,
+          callerId: msg.routing.from,
+          deferredMsg: msg,
+        });
+        this.runCreationViaAgent(taskId);
+        return DEFERRED_REPLY;
+      }
+
+      // Fallback: direct execution when AgentAbject is unavailable
       return this.createObject(prompt, context, msg.routing.from);
     });
 
@@ -249,6 +276,54 @@ export class ObjectCreator extends Abject {
         );
       }
     });
+
+    // ── AgentAbject callback handlers (for delegation) ──
+
+    this.on('agentObserve', async (msg: AbjectMessage) => {
+      const { taskId } = msg.payload as { taskId: string; step: number };
+      const extra = this.creationTasks.get(taskId);
+      if (!extra) return { observation: 'ObjectCreator ready. Available actions: create_object, modify_object.' };
+
+      if (extra.result) {
+        if (extra.result.success) {
+          return {
+            observation: `Creation complete. Object "${extra.result.manifest?.name ?? 'unknown'}" spawned as ${extra.result.objectId}. Dependencies: ${(extra.result.usedObjects ?? []).join(', ') || 'none'}.`,
+          };
+        }
+        return { observation: `Creation failed: ${extra.result.error}` };
+      }
+
+      return { observation: `Task: "${extra.prompt}". Execute create_object to run the creation pipeline.` };
+    });
+
+    this.on('agentAct', async (msg: AbjectMessage) => {
+      const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
+      const extra = this.creationTasks.get(taskId);
+
+      switch (action.action) {
+        case 'create_object': {
+          const prompt = extra?.prompt ?? (action.prompt ?? action.description ?? action.task) as string;
+          if (!prompt) return { success: false, error: 'No prompt provided for create_object' };
+          const context = extra?.context ?? (action.context as string | undefined);
+          const result = await this.createObject(prompt, context, extra?.callerId ?? msg.routing.from);
+          if (extra) extra.result = result;
+          return { success: result.success, data: result, error: result.error };
+        }
+        case 'modify_object': {
+          const objectId = action.objectId as string;
+          const prompt = (action.prompt ?? action.description) as string;
+          if (!objectId || !prompt) return { success: false, error: 'objectId and prompt required for modify_object' };
+          const result = await this.modifyObject(objectId as AbjectId, prompt, msg.routing.from);
+          return { success: result.success, data: result, error: result.error };
+        }
+        default:
+          return { success: false, error: `Unknown action: ${action.action}` };
+      }
+    });
+
+    this.on('agentPhaseChanged', async () => { /* no-op */ });
+    this.on('agentIntermediateAction', async () => { /* no-op */ });
+    this.on('agentActionResult', async () => { /* no-op */ });
   }
 
   protected override async onInit(): Promise<void> {
@@ -259,6 +334,78 @@ export class ObjectCreator extends Abject {
     this.abjectStoreId = await this.discoverDep('AbjectStore') ?? undefined;
     this.systemRegistryId = await this.discoverDep('SystemRegistry') ?? undefined;
     this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
+    this.agentAbjectId = await this.discoverDep('AgentAbject') ?? undefined;
+
+    // Register as an agent for discoverability and delegation
+    if (this.agentAbjectId) {
+      try {
+        await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
+          name: 'ObjectCreator',
+          description: 'Creates and modifies objects from natural language prompts',
+          config: {
+            maxSteps: 10,
+            skipFirstObservation: true,
+            terminalActions: {
+              done: { type: 'success', resultFields: ['result'] },
+              fail: { type: 'error', resultFields: ['reason'] },
+            },
+          },
+        }));
+      } catch {
+        // AgentAbject may not be ready yet — non-fatal
+      }
+    }
+  }
+
+  /**
+   * Route a creation task through AgentAbject so each phase appears as a job
+   * in JobBrowser. Uses DEFERRED_REPLY on the original `create` message.
+   */
+  private async runCreationViaAgent(taskId: string): Promise<void> {
+    const extra = this.creationTasks.get(taskId)!;
+    try {
+      const result = await this.request<{ success: boolean; error?: string }>(
+        request(this.id, this.agentAbjectId!, 'startTask', {
+          taskId,
+          task: extra.prompt,
+          systemPrompt: this.buildCreationSystemPrompt(),
+          config: {
+            maxSteps: 10,
+            skipFirstObservation: true,
+            queueName: `object-creator-${this.id}`,
+          },
+        }),
+        310000,
+      );
+
+      // Build a CreationResult from agent task result + stored creation state
+      const creationResult: CreationResult = extra.result ?? {
+        success: result.success,
+        error: result.error,
+      };
+      await this.sendDeferredReply(extra.deferredMsg, creationResult);
+    } catch (err) {
+      await this.sendDeferredReply(extra.deferredMsg, {
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+      } as CreationResult).catch(() => {});
+    } finally {
+      this.creationTasks.delete(taskId);
+    }
+  }
+
+  private buildCreationSystemPrompt(): string {
+    return `You are ObjectCreator, responsible for creating objects from natural language descriptions.
+
+Available actions (output ONE JSON object per turn):
+- create_object: Execute the full creation pipeline (discover deps, design manifest, generate code, spawn, connect).
+  { "action": "create_object", "reasoning": "Creating the requested object" }
+- done: Report success after create_object completes.
+  { "action": "done", "result": "Created [object name] successfully" }
+- fail: Report failure if create_object failed.
+  { "action": "fail", "reason": "..." }
+
+Always begin by executing create_object. After it completes, report done or fail.`;
   }
 
   protected override getSourceForAsk(): string | undefined {
@@ -1930,9 +2077,11 @@ async getState(msg) {
 
   // _draw has '_' prefix so it's callable as this._draw().
   // Without the prefix, calling this.draw() would throw "not a function".
-  // Draw command types: clear, rect, text, line, path, circle, arc, ellipse, polygon, imageUrl,
+  // Draw command types: clear, rect, text, line, path, circle, arc, ellipse, polygon,
+  //   bezierCurve, quadraticCurve, imageUrl,
   //   save, restore, clip, translate, rotate, scale,
   //   globalAlpha, shadow, setLineDash, linearGradient, radialGradient
+  // Text supports maxWidth param: { type: 'text', ..., params: { ..., maxWidth: 200 } }
   // For images: use 'imageUrl' with { url } param (URLs or data URIs from HttpClient.getBase64()).
   async _draw() {
     if (!this._canvasId) return;
