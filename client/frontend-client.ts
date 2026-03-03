@@ -14,6 +14,7 @@ import type {
   CreateSurfaceMsg,
   DrawMsg,
   SetSelectedTextMsg,
+  AuthResultMsg,
 } from '../server/ws-protocol.js';
 
 /**
@@ -26,6 +27,8 @@ export class FrontendClient {
   private focusedSurface?: string;
   private grabbedSurface?: string;
   private currentSelectedText = '';
+  private authenticated = false;
+  private loginFormHandler: ((e: Event) => void) | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -38,6 +41,7 @@ export class FrontendClient {
    */
   connect(url: string): void {
     this.ws = new WebSocket(url);
+    this.authenticated = false;
 
     this.ws.onopen = () => {
       console.log('[Frontend] Connected to backend');
@@ -45,21 +49,35 @@ export class FrontendClient {
       this.compositor.clearAllSurfaces();
       this.focusedSurface = undefined;
       this.grabbedSurface = undefined;
-      this.sendToBackend({ type: 'ready' });
+      // Don't send ready yet — wait for auth status from server
     };
 
     this.ws.onmessage = (evt) => {
       try {
-        const msg = JSON.parse(evt.data as string) as BackendToFrontendMsg;
-        this.handleBackendMessage(msg);
+        const msg = JSON.parse(evt.data as string);
+
+        // Handle auth protocol before authenticated
+        if (!this.authenticated) {
+          this.handleAuthMessage(msg);
+          return;
+        }
+
+        this.handleBackendMessage(msg as BackendToFrontendMsg);
       } catch (err) {
         console.error('[Frontend] Failed to parse backend message:', err);
       }
     };
 
-    this.ws.onclose = () => {
-      console.log('[Frontend] Disconnected from backend');
+    this.ws.onclose = (ev) => {
+      console.log(`[Frontend] Disconnected from backend (code=${ev.code})`);
       this.ws = null;
+      this.authenticated = false;
+
+      // Auto-reconnect after disconnect (auth change, server restart, etc.)
+      setTimeout(() => {
+        console.log('[Frontend] Reconnecting...');
+        this.connect(url);
+      }, 1000);
     };
 
     this.ws.onerror = (err) => {
@@ -82,6 +100,84 @@ export class FrontendClient {
    */
   stop(): void {
     this.compositor.stop();
+  }
+
+  // ── Auth handling ────────────────────────────────────────────────────
+
+  private handleAuthMessage(msg: { type: string; [key: string]: unknown }): void {
+    switch (msg.type) {
+      case 'authNotRequired':
+        this.authenticated = true;
+        this.hideLoginForm();
+        this.sendRaw({ type: 'ready' });
+        break;
+
+      case 'authRequired': {
+        // Try stored session token first
+        const token = localStorage.getItem('abjects_auth_token');
+        if (token) {
+          this.sendRaw({ type: 'auth', token });
+        } else {
+          this.showLoginForm();
+        }
+        break;
+      }
+
+      case 'authResult': {
+        const result = msg as unknown as AuthResultMsg;
+        if (result.success && result.token) {
+          localStorage.setItem('abjects_auth_token', result.token);
+          this.authenticated = true;
+          this.hideLoginForm();
+          this.sendRaw({ type: 'ready' });
+        } else {
+          // Token was rejected — clear it and show form
+          localStorage.removeItem('abjects_auth_token');
+          this.showLoginForm(result.error as string | undefined);
+        }
+        break;
+      }
+    }
+  }
+
+  private showLoginForm(error?: string): void {
+    const overlay = document.getElementById('login-overlay');
+    const errorEl = document.getElementById('login-error');
+    const form = document.getElementById('login-form') as HTMLFormElement | null;
+    if (!overlay || !form) return;
+
+    overlay.classList.add('visible');
+    if (errorEl) errorEl.textContent = error ?? '';
+
+    // Remove previous handler if any
+    if (this.loginFormHandler) {
+      form.removeEventListener('submit', this.loginFormHandler);
+    }
+
+    this.loginFormHandler = (e: Event) => {
+      e.preventDefault();
+      const username = (document.getElementById('login-user') as HTMLInputElement).value;
+      const password = (document.getElementById('login-pass') as HTMLInputElement).value;
+      if (errorEl) errorEl.textContent = '';
+      this.sendRaw({ type: 'auth', username, password });
+    };
+    form.addEventListener('submit', this.loginFormHandler);
+  }
+
+  private hideLoginForm(): void {
+    const overlay = document.getElementById('login-overlay');
+    if (overlay) overlay.classList.remove('visible');
+    if (this.loginFormHandler) {
+      const form = document.getElementById('login-form');
+      form?.removeEventListener('submit', this.loginFormHandler);
+      this.loginFormHandler = null;
+    }
+  }
+
+  private sendRaw(msg: Record<string, unknown>): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(msg));
+    }
   }
 
   // ── Backend message handling ──────────────────────────────────────────

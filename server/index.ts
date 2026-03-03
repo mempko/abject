@@ -68,6 +68,7 @@ import { WorkspaceShareRegistry, WORKSPACE_SHARE_REGISTRY_ID } from '../src/obje
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
 import { NodeWorkerAdapter } from './node-worker-adapter.js';
+import { loadAuthConfig, SessionStore, authenticateConnection } from './auth.js';
 import * as path from 'node:path';
 import os from 'node:os';
 
@@ -324,15 +325,35 @@ async function main(): Promise<void> {
   // Start WebSocket server
   const wsServer = new NodeWebSocketServer({ port: WS_PORT });
 
+  // Auth gate (always create SessionStore so runtime updateAuth works)
+  const authConfig = loadAuthConfig();
+  const sessionStore = new SessionStore();
+  backendUI.setAuthGate(authConfig, sessionStore);
+
   wsServer.onConnection((ws) => {
-    console.log(`[ABJECTS] Frontend connected`);
-    backendUI.setWebSocket(ws);
+    if (authConfig.enabled) {
+      console.log('[ABJECTS] Frontend connected (auth required)');
+      authenticateConnection(ws, authConfig, sessionStore).then(({ result }) => {
+        if (result === 'authenticated') {
+          console.log('[ABJECTS] Frontend authenticated');
+          backendUI.setWebSocket(ws);
+        } else {
+          console.log(`[ABJECTS] Frontend auth ${result}, closing`);
+          ws.close(1008, `Authentication ${result}`);
+        }
+      });
+    } else {
+      console.log('[ABJECTS] Frontend connected');
+      ws.send(JSON.stringify({ type: 'authNotRequired' }));
+      backendUI.setWebSocket(ws);
+    }
   });
 
   console.log('');
   console.log(`  ABJECTS server running`);
   console.log('');
   console.log(`  WebSocket:  ws://localhost:${WS_PORT}`);
+  console.log(`  Auth:       ${authConfig.enabled ? 'enabled' : 'disabled'}`);
   console.log(`  Objects:    ${runtime.objectRegistry.objectCount}`);
   console.log(`  Surfaces:   ${backendUI.surfaceCount}`);
   console.log('');
@@ -341,6 +362,7 @@ async function main(): Promise<void> {
   // Handle graceful shutdown
   const shutdown = async () => {
     console.log('[ABJECTS] Shutting down...');
+    sessionStore.destroy();
     await wsServer.close();
     await runtime.stop();
     process.exit(0);

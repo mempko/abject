@@ -108,6 +108,25 @@ export interface ClipboardWriteMsg extends WsEnvelope {
   text: string;
 }
 
+// =============================================================================
+// Auth messages (server -> client)
+// =============================================================================
+
+export interface AuthRequiredMsg extends WsEnvelope {
+  type: 'authRequired';
+}
+
+export interface AuthNotRequiredMsg extends WsEnvelope {
+  type: 'authNotRequired';
+}
+
+export interface AuthResultMsg extends WsEnvelope {
+  type: 'authResult';
+  success: boolean;
+  token?: string;
+  error?: string;
+}
+
 export type BackendToFrontendMsg =
   | CreateSurfaceMsg
   | DestroySurfaceMsg
@@ -122,7 +141,10 @@ export type BackendToFrontendMsg =
   | SetSurfaceVisibleMsg
   | SetSurfaceWorkspaceMsg
   | SetActiveWorkspaceMsg
-  | ClipboardWriteMsg;
+  | ClipboardWriteMsg
+  | AuthRequiredMsg
+  | AuthNotRequiredMsg
+  | AuthResultMsg;
 
 // =============================================================================
 // Frontend -> Backend messages
@@ -170,11 +192,28 @@ export interface ReadyMsg extends WsEnvelope {
   type: 'ready';
 }
 
+// =============================================================================
+// Auth messages (client -> server)
+// =============================================================================
+
+export interface AuthLoginMsg extends WsEnvelope {
+  type: 'auth';
+  username: string;
+  password: string;
+}
+
+export interface AuthTokenMsg extends WsEnvelope {
+  type: 'auth';
+  token: string;
+}
+
 export type FrontendToBackendMsg =
   | InputMsg
   | MeasureTextReplyMsg
   | DisplayInfoReplyMsg
   | SurfaceCreatedMsg
-  | ReadyMsg;
+  | ReadyMsg
+  | AuthLoginMsg
+  | AuthTokenMsg;
 
 export type WsMessage = BackendToFrontendMsg | FrontendToBackendMsg;

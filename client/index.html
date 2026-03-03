@@ -27,9 +27,95 @@
       canvas {
         display: block;
       }
+
+      /* Login overlay */
+      #login-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 10000;
+        background: #0f1019;
+        align-items: center;
+        justify-content: center;
+      }
+      #login-overlay.visible {
+        display: flex;
+      }
+      .login-card {
+        background: #1a1b2e;
+        border-radius: 12px;
+        padding: 2rem;
+        width: 340px;
+        box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      }
+      .login-card h1 {
+        color: #e2e4f0;
+        font-size: 1.25rem;
+        font-weight: 600;
+        margin-bottom: 1.5rem;
+        text-align: center;
+      }
+      .login-card label {
+        display: block;
+        color: #9698ae;
+        font-size: 0.8rem;
+        margin-bottom: 0.3rem;
+      }
+      .login-card input {
+        width: 100%;
+        padding: 0.55rem 0.75rem;
+        margin-bottom: 1rem;
+        background: #13141f;
+        border: 1px solid #2a2c42;
+        border-radius: 6px;
+        color: #e2e4f0;
+        font-size: 0.9rem;
+        font-family: inherit;
+        outline: none;
+        transition: border-color 0.15s;
+      }
+      .login-card input:focus {
+        border-color: #6366f1;
+      }
+      .login-card button {
+        width: 100%;
+        padding: 0.6rem;
+        background: #6366f1;
+        border: none;
+        border-radius: 6px;
+        color: #fff;
+        font-size: 0.9rem;
+        font-weight: 500;
+        font-family: inherit;
+        cursor: pointer;
+        transition: background 0.15s;
+      }
+      .login-card button:hover {
+        background: #5254cc;
+      }
+      .login-error {
+        color: #f87171;
+        font-size: 0.8rem;
+        text-align: center;
+        margin-bottom: 0.75rem;
+        min-height: 1.2em;
+      }
     </style>
   </head>
   <body>
+    <div id="login-overlay">
+      <div class="login-card">
+        <h1>Abjects</h1>
+        <div id="login-error" class="login-error"></div>
+        <form id="login-form" autocomplete="on">
+          <label for="login-user">Username</label>
+          <input id="login-user" name="username" type="text" autocomplete="username" required />
+          <label for="login-pass">Password</label>
+          <input id="login-pass" name="password" type="password" autocomplete="current-password" required />
+          <button type="submit">Sign in</button>
+        </form>
+      </div>
+    </div>
     <div id="app"></div>
     <script type="module" src="./index.ts"></script>
   </body>

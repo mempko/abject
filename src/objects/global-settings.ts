@@ -18,6 +18,9 @@ const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 
 const STORAGE_KEY_ANTHROPIC = 'global-settings:anthropicApiKey';
 const STORAGE_KEY_OPENAI = 'global-settings:openaiApiKey';
+const STORAGE_KEY_AUTH_ENABLED = 'global-settings:authEnabled';
+const STORAGE_KEY_AUTH_USER = 'global-settings:authUser';
+const STORAGE_KEY_AUTH_PASS = 'global-settings:authPass';
 
 // Legacy keys for migration from per-workspace Settings
 const LEGACY_KEY_ANTHROPIC = 'settings:anthropicApiKey';
@@ -34,6 +37,7 @@ export class GlobalSettings extends Abject {
   private llmId?: AbjectId;
   private storageId?: AbjectId;
   private widgetManagerId?: AbjectId;
+  private uiServerId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
 
@@ -44,6 +48,13 @@ export class GlobalSettings extends Abject {
   private openaiToggleId?: AbjectId;
   private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
+
+  // Auth widgets
+  private authCheckboxId?: AbjectId;
+  private authUserInputId?: AbjectId;
+  private authPassInputId?: AbjectId;
+  private authPassToggleId?: AbjectId;
+  private authSaveBtnId?: AbjectId;
 
   private unmasked: Set<AbjectId> = new Set();
 
@@ -90,6 +101,7 @@ export class GlobalSettings extends Abject {
     this.llmId = await this.requireDep('LLM');
     this.storageId = await this.requireDep('Storage');
     this.widgetManagerId = await this.requireDep('WidgetManager');
+    this.uiServerId = await this.requireDep('UIServer');
 
     // Try to load saved API keys from global storage
     let anthropicKey: string | null = null;
@@ -130,6 +142,9 @@ export class GlobalSettings extends Abject {
           console.log('[GLOBAL-SETTINGS] Migrated API keys from legacy storage');
         }
       }
+
+      // Load saved auth settings and apply to BackendUI
+      await this.applySavedAuthConfig();
     }
 
     if (anthropicKey || openaiKey) {
@@ -166,7 +181,7 @@ export class GlobalSettings extends Abject {
 
     // Handle 'changed' events from widget dependents
     this.on('changed', async (msg: AbjectMessage) => {
-      const { aspect } = msg.payload as { aspect: string; value?: unknown };
+      const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
 
       if (fromId === this.saveBtnId && aspect === 'click') {
@@ -184,9 +199,29 @@ export class GlobalSettings extends Abject {
         return;
       }
 
+      // Auth checkbox toggled — enable/disable auth credential fields
+      if (fromId === this.authCheckboxId && aspect === 'change') {
+        await this.setAuthFieldsDisabled(!(value as boolean));
+        return;
+      }
+
+      if (fromId === this.authPassToggleId && aspect === 'click') {
+        await this.toggleMask(this.authPassInputId!, this.authPassToggleId!);
+        return;
+      }
+
+      if (fromId === this.authSaveBtnId && aspect === 'click') {
+        await this.saveAuthSettings();
+        return;
+      }
+
       // Text input submit triggers save
       if (aspect === 'submit') {
-        await this.saveSettings();
+        if (fromId === this.authUserInputId || fromId === this.authPassInputId) {
+          await this.saveAuthSettings();
+        } else {
+          await this.saveSettings();
+        }
       }
     });
   }
@@ -203,7 +238,7 @@ export class GlobalSettings extends Abject {
     );
 
     const winW = 440;
-    const winH = 400;
+    const winH = 640;
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
@@ -412,6 +447,189 @@ export class GlobalSettings extends Abject {
       preferredSize: { width: 120, height: 36 },
     }));
 
+    // ── Auth section ──────────────────────────────────────────────────
+
+    // Divider before auth
+    const authDividerId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createDivider', {
+        windowId: this.windowId, rect: r0,
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: authDividerId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 12 },
+    }));
+
+    // Section header: "Authentication"
+    const authHeaderId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Authentication',
+        style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: authHeaderId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 24 },
+    }));
+
+    // Load saved auth settings
+    let savedAuthEnabled = false;
+    let savedAuthUser = '';
+    let savedAuthPass = '';
+    if (this.storageId) {
+      const enabled = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AUTH_ENABLED })
+      );
+      savedAuthEnabled = enabled === 'true';
+      savedAuthUser = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AUTH_USER })
+      ) ?? '';
+      savedAuthPass = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AUTH_PASS })
+      ) ?? '';
+    }
+
+    // Enable auth checkbox row
+    const authEnableRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: cId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: authEnableRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 28 },
+    }));
+
+    this.authCheckboxId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createCheckbox', {
+        windowId: this.windowId, rect: r0,
+        checked: savedAuthEnabled,
+        text: 'Require login',
+      })
+    );
+    await this.request(request(this.id, this.authCheckboxId, 'addDependent', {}));
+    await this.request(request(this.id, authEnableRowId, 'addLayoutChild', {
+      widgetId: this.authCheckboxId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: 28 },
+    }));
+
+    // Username label
+    const authUserLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Username',
+        style: { color: '#e2e4e9', fontSize: 13 },
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: authUserLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // Username input
+    this.authUserInputId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createTextInput', {
+        windowId: this.windowId, rect: r0, placeholder: 'Username',
+        text: savedAuthUser || undefined,
+        style: savedAuthEnabled ? undefined : { disabled: true },
+      })
+    );
+    await this.request(request(this.id, this.authUserInputId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.authUserInputId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    // Password label
+    const authPassLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Password',
+        style: { color: '#e2e4e9', fontSize: 13 },
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: authPassLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // Password input row (HBox: input + toggle)
+    const authPassRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: cId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: authPassRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    this.authPassInputId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createTextInput', {
+        windowId: this.windowId, rect: r0, placeholder: 'Password', masked: true,
+        text: savedAuthPass || undefined,
+        style: savedAuthEnabled ? undefined : { disabled: true },
+      })
+    );
+    await this.request(request(this.id, this.authPassInputId, 'addDependent', {}));
+    await this.request(request(this.id, authPassRowId, 'addLayoutChild', {
+      widgetId: this.authPassInputId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    this.authPassToggleId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createButton', {
+        windowId: this.windowId, rect: r0, text: 'Show',
+        style: savedAuthEnabled ? undefined : { disabled: true },
+      })
+    );
+    await this.request(request(this.id, this.authPassToggleId, 'addDependent', {}));
+    await this.request(request(this.id, authPassRowId, 'addLayoutChild', {
+      widgetId: this.authPassToggleId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 56, height: 32 },
+    }));
+
+    // Auth save button row
+    const authSaveRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: cId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: authSaveRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 36 },
+    }));
+
+    await this.request(request(this.id, authSaveRowId, 'addLayoutSpacer', {}));
+
+    this.authSaveBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createButton', {
+        windowId: this.windowId, rect: r0, text: 'Save Auth',
+        style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
+      })
+    );
+    await this.request(request(this.id, this.authSaveBtnId, 'addDependent', {}));
+    await this.request(request(this.id, authSaveRowId, 'addLayoutChild', {
+      widgetId: this.authSaveBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 120, height: 36 },
+    }));
+
     // Spacer + status label
     await this.request(request(this.id, cId, 'addLayoutSpacer', {}));
 
@@ -451,6 +669,11 @@ export class GlobalSettings extends Abject {
     this.openaiToggleId = undefined;
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
+    this.authCheckboxId = undefined;
+    this.authUserInputId = undefined;
+    this.authPassInputId = undefined;
+    this.authPassToggleId = undefined;
+    this.authSaveBtnId = undefined;
     this.unmasked.clear();
 
     await this.changed('visibility', false);
@@ -502,6 +725,95 @@ export class GlobalSettings extends Abject {
         try { await this.request(request(this.id, id, 'update', { style })); } catch { /* widget gone */ }
       }
     }
+  }
+
+  // ========== AUTH HELPERS ==========
+
+  /**
+   * Enable/disable auth credential fields based on checkbox state.
+   */
+  private async setAuthFieldsDisabled(disabled: boolean): Promise<void> {
+    const style = { disabled };
+    const ids = [this.authUserInputId, this.authPassInputId, this.authPassToggleId];
+    for (const id of ids) {
+      if (id) {
+        try { await this.request(request(this.id, id, 'update', { style })); } catch { /* widget gone */ }
+      }
+    }
+  }
+
+  /**
+   * Load saved auth config from Storage and apply to BackendUI.
+   * Called once during onInit so Storage-based settings override env vars.
+   */
+  private async applySavedAuthConfig(): Promise<void> {
+    if (!this.storageId || !this.uiServerId) return;
+
+    const enabledStr = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AUTH_ENABLED })
+    );
+    // Only override if settings have been explicitly saved
+    if (enabledStr === null) return;
+
+    const enabled = enabledStr === 'true';
+    const username = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AUTH_USER })
+    ) ?? '';
+    const password = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AUTH_PASS })
+    ) ?? '';
+
+    await this.request(
+      request(this.id, this.uiServerId, 'updateAuth', { enabled, username, password })
+    );
+    console.log(`[GLOBAL-SETTINGS] Applied saved auth config (enabled=${enabled})`);
+  }
+
+  /**
+   * Read auth widget values, save to storage, and apply to BackendUI.
+   */
+  private async saveAuthSettings(): Promise<void> {
+    if (!this.windowId) return;
+
+    const checked = await this.request<boolean>(
+      request(this.id, this.authCheckboxId!, 'getValue', {})
+    );
+    const username = await this.request<string>(
+      request(this.id, this.authUserInputId!, 'getValue', {})
+    );
+    const password = await this.request<string>(
+      request(this.id, this.authPassInputId!, 'getValue', {})
+    );
+
+    const enabled = !!checked;
+
+    if (enabled && (!username || !password)) {
+      await this.setStatus('Username and password are required.', '#f87171');
+      return;
+    }
+
+    // Persist to storage
+    if (this.storageId) {
+      await this.request(
+        request(this.id, this.storageId, 'set', { key: STORAGE_KEY_AUTH_ENABLED, value: String(enabled) })
+      );
+      await this.request(
+        request(this.id, this.storageId, 'set', { key: STORAGE_KEY_AUTH_USER, value: username })
+      );
+      await this.request(
+        request(this.id, this.storageId, 'set', { key: STORAGE_KEY_AUTH_PASS, value: password })
+      );
+    }
+
+    // Apply to BackendUI (updates config, clears sessions, disconnects frontend)
+    if (this.uiServerId) {
+      await this.request(
+        request(this.id, this.uiServerId, 'updateAuth', { enabled, username, password })
+      );
+    }
+
+    console.log(`[GLOBAL-SETTINGS] Auth settings saved (enabled=${enabled})`);
+    await this.setStatus(enabled ? 'Auth enabled. Reconnecting...' : 'Auth disabled.');
   }
 
   // ========== API KEYS ACTIONS ==========

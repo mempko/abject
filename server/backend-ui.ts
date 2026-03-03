@@ -21,6 +21,7 @@ import type {
   FrontendToBackendMsg,
   InputMsg,
 } from './ws-protocol.js';
+import type { AuthConfig, SessionStore } from './auth.js';
 
 const UI_INTERFACE = 'abjects:ui';
 const WIDGET_FONT = '14px system-ui';
@@ -76,6 +77,8 @@ export class BackendUI extends Abject {
   private lastMouseY = 0;
   private lastMonitorMoveTime = 0;
   private activeWorkspaceId?: string;
+  private authConfig?: AuthConfig;
+  private sessionStore?: SessionStore;
 
   constructor() {
     super({
@@ -417,6 +420,30 @@ export class BackendUI extends Abject {
       const objectId = msg.payload as AbjectId;
       this.destroySurfacesForObject(objectId);
     });
+
+    this.on('updateAuth', async (msg: AbjectMessage) => {
+      const { enabled, username, password } = msg.payload as {
+        enabled: boolean;
+        username: string;
+        password: string;
+      };
+      if (!this.authConfig || !this.sessionStore) return false;
+
+      const changed = this.authConfig.enabled !== enabled
+        || this.authConfig.username !== username
+        || this.authConfig.password !== password;
+
+      this.authConfig.enabled = enabled;
+      this.authConfig.username = username;
+      this.authConfig.password = password;
+
+      if (changed) {
+        this.sessionStore.clearAll();
+        this.disconnectFrontend();
+        console.log(`[BackendUI] Auth config updated (enabled=${enabled}), sessions cleared, frontend disconnected`);
+      }
+      return true;
+    });
   }
 
   protected override async onInit(): Promise<void> {
@@ -500,6 +527,27 @@ IMPORTANT:
 - Use 'rect' NOT 'fillRect', 'text' NOT 'fillText'
 - Always nest parameters inside 'params'
 - Transparent pixels do NOT receive mouse input — use opaque backgrounds`;
+  }
+
+  // ── Auth gate ───────────────────────────────────────────────────────
+
+  /**
+   * Store references to the shared AuthConfig and SessionStore so
+   * the `updateAuth` handler can mutate them at runtime.
+   */
+  setAuthGate(config: AuthConfig, sessions: SessionStore): void {
+    this.authConfig = config;
+    this.sessionStore = sessions;
+  }
+
+  /**
+   * Force-disconnect the current frontend WebSocket.
+   * The frontend will reconnect automatically and go through the auth gate.
+   */
+  disconnectFrontend(): void {
+    if (this.ws) {
+      this.ws.close(4001, 'Auth config changed');
+    }
   }
 
   // ── WebSocket management ────────────────────────────────────────────
