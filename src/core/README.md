@@ -66,6 +66,27 @@ Capability constants and management:
 - `requestCapability()`, `grantCapability()` helper constructors
 - `getDefaultCapabilities(objectId)`: returns SEND_MESSAGE, LOG, TIME grants
 
+### identity.ts
+
+P2P identity layer with cryptographic primitives.
+
+- **`PeerId`**: hex SHA-256 of SPKI public key (unique peer identifier)
+- **Key serialization**: JWK format for signing and exchange keys
+- **Key import**: `importExchangePublicKey()`, `importSigningPublicKey()` from JWK
+- **Peer ID derivation**: `derivePeerIdFromJwk()` computes PeerId from a public key
+- **Session keys**: `deriveSessionKey()` via ECDH key agreement
+- **Encryption**: `aesEncrypt()` / `aesDecrypt()` using AES-256-GCM
+
+### introspect.ts
+
+Introspection protocol for LLM-readable object self-description.
+
+- **`IntrospectResult`**: structured description of an object's capabilities
+- **`INTROSPECT_METHODS`**: array of built-in method declarations (the `describe` handler added to every Abject)
+- **`formatManifestAsDescription(manifest)`**: converts an `AbjectManifest` into plain English, including interfaces, methods with parameters and return types, events, and capabilities
+
+Used by `ObjectCreator`, `ProxyGenerator`, and `Negotiator` to learn what objects can do without hardcoded knowledge.
+
 ## Key Pattern
 
 Every object extends `Abject`, defines a manifest with `InterfaceDeclaration`s, registers message handlers via `on()`, and uses contracts pervasively.

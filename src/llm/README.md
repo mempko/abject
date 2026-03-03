@@ -21,7 +21,8 @@ Abstract interface and shared utilities.
 Anthropic Claude API integration.
 
 - Separates system message from conversation (Claude API format)
-- Default model: `claude-3-5-sonnet-20241022`
+- Default model: `claude-sonnet-4-5-20250929`
+- **Tier mapping**: `smart` → `claude-opus-4-6`, `balanced` → `claude-sonnet-4-6`, `fast` → `claude-haiku-4-5-20251001`
 - SSE streaming via `ReadableStream`
 - Authentication: `x-api-key` header + `anthropic-version`
 - Factory: `createAnthropicProvider()` reads from `globalThis.ANTHROPIC_API_KEY`
@@ -31,6 +32,7 @@ Anthropic Claude API integration.
 OpenAI Chat Completions API integration.
 
 - Default model: `gpt-4-turbo-preview`
+- **Tier mapping**: `smart` → `gpt-4o`, `balanced` → `gpt-4-turbo-preview`, `fast` → `gpt-4o-mini`
 - SSE streaming with `[DONE]` sentinel
 - Authentication: Bearer token
 - Factory: `createOpenAIProvider()`
@@ -47,4 +49,4 @@ Local LLM via Ollama.
 
 ## Usage
 
-LLM providers are registered with the `LLMObject` system object, which exposes them to all other objects via the message bus. `ProxyGenerator` and `ObjectCreator` are the primary consumers.
+LLM providers are registered with the `LLMObject` system object, which exposes them to all other objects via the message bus. `ProxyGenerator` and `ObjectCreator` are the primary consumers. The `AgentAbject` also uses LLM completions for the observe→think→act loop.

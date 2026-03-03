@@ -2,6 +2,35 @@
 
 Manages system lifecycle, message routing, and failure handling. This is the execution infrastructure that objects run on top of.
 
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     Main Thread                         │
+│                                                         │
+│  Object A ──→ MessageBus ──→ Mailbox ──→ Object B      │
+│                   │                                     │
+│                   │ interceptors                        │
+│                   ├── PeerRouter (P2P routing)          │
+│                   ├── HealthInterceptor (error watch)   │
+│                   └── ProxyInterceptor (protocol xlat)  │
+│                                                         │
+│  Runtime (orchestrator)                                 │
+│  Supervisor (failure recovery)                          │
+│                                                         │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │              WorkerPool                            │ │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐        │ │
+│  │  │ Worker 1 │  │ Worker 2 │  │ Worker N │        │ │
+│  │  │WorkerBus │  │WorkerBus │  │WorkerBus │        │ │
+│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘        │ │
+│  │       └──────────────┼──────────────┘              │ │
+│  │                WorkerBridge                        │ │
+│  │           (main ↔ worker forwarding)               │ │
+│  └────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────┘
+```
+
 ## Files
 
 ### runtime.ts
@@ -24,7 +53,8 @@ Central message router. All inter-object communication goes through the bus.
 - **Interceptor pipeline**: each returns `'pass'`, `'drop'`, or a transformed message
   - `LoggingInterceptor` - debug logging with optional filter
   - `ProxyInterceptor` - reroutes messages between source/target through proxy
-- **Undeliverable**: messages to unknown recipients notified to `'undeliverable'` subscribers (for network bridging)
+  - `HealthInterceptor` - passively watches for error messages (used by HealthMonitor)
+- **Undeliverable handler**: `setUndeliverableHandler()` for network-layer late-discovery catchall
 - **Invariant**: mailbox count == handler count
 
 ### mailbox.ts
@@ -50,10 +80,42 @@ Erlang-style supervision tree. Is itself an `Abject`.
 - **Escalation**: removes child from supervision when max restarts exceeded
 - **Handler**: listens for `childFailed` messages
 
+### worker-pool.ts
+
+Manages a pool of reusable Web Workers (or Node.js worker_threads) for object execution.
+
+- Creates workers on demand up to a configurable pool size
+- Assigns objects to workers for isolated execution
+- Tracks which objects are running on which workers
+- Handles worker termination and cleanup
+
+### worker-bridge.ts
+
+Bridge connecting main-thread MessageBus to worker-thread MessageBus instances.
+
+- Forwards messages between the main bus and worker buses via `postMessage`
+- Serializes/deserializes `AbjectMessage` across the worker boundary
+- Handles worker lifecycle events (ready, error, termination)
+
+### worker-bus.ts
+
+MessageBus implementation for Web Worker context.
+
+- Provides an isolated message bus inside each worker thread
+- Objects running in a worker register on the local WorkerBus
+- Cross-worker messages forwarded through `WorkerBridge` to the main bus
+
 ## Message Flow
 
 ```
 Object A → this.send(msg) → Abject.send() → MessageBus.send() →
   interceptor pipeline → Mailbox.send() → handler(msg) →
   if request and handler returns value → auto-reply
+```
+
+**Cross-worker message flow:**
+
+```
+Object A (main) → MessageBus → WorkerBridge → postMessage →
+  Worker N → WorkerBus → Object B (worker)
 ```

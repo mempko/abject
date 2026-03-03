@@ -2,73 +2,117 @@
 
 System-level objects providing core services. Each is an Abject with a well-defined manifest and message interface.
 
-## Files
+## Object Map
 
-### registry.ts
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        FOUNDATION                               │
+│  Registry ←──── Factory ────→ LLMObject ────→ UIServer          │
+│     ↑              ↑                              ↑             │
+│     │              │                              │             │
+│  ┌──┴──────────────┴──────────────────────────────┴──────────┐  │
+│  │                     MessageBus                            │  │
+│  └──┬──────────┬──────────┬──────────┬──────────┬────────────┘  │
+│     │          │          │          │          │               │
+│  ┌──┴───┐  ┌──┴───┐  ┌──┴───┐  ┌──┴───┐  ┌──┴──────────┐   │
+│  │Code  │  │Agent │  │ UI   │  │Work- │  │  P2P /       │   │
+│  │Gen   │  │System│  │Shell │  │space │  │  Identity     │   │
+│  └──────┘  └──────┘  └──────┘  └──────┘  └──────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-Central directory for object discovery. Multi-indexed by ID, interface, capability, and name.
+## Foundation
 
-- **Methods**: `registerObject`, `unregisterObject`, `lookupObject`, `discoverObjects`, `subscribe`, `listObjects`, `getManifest`
-- **`DiscoveryQuery`**: filter by name, interface, capability, tags
-- **Events**: subscribers notified on register/unregister
-- **Well-known ID**: `REGISTRY_ID`
+Core services that everything else depends on.
 
-### factory.ts
+| File | Class | Well-known ID | Description |
+|------|-------|---------------|-------------|
+| `registry.ts` | `Registry` | `REGISTRY_ID` | Multi-indexed directory for object discovery (by ID, interface, capability, name, tags) |
+| `factory.ts` | `Factory` | `FACTORY_ID` | Object lifecycle: spawn from manifest/code, kill, register constructors |
+| `llm-object.ts` | `LLMObject` | `LLM_OBJECT_ID` | Provider-agnostic LLM service (Anthropic, OpenAI, Ollama). Methods: `complete`, `generateCode`, `analyze` |
+| `ui-server.ts` | `UIServer` | `UI_SERVER_ID` | X11-style display server: surfaces, draw commands, input routing, focus management |
 
-Object lifecycle management.
+## Code Generation & Protocol
 
-- **`spawnInstance(obj)`**: spawn pre-constructed Abject (init on bus, register with Registry)
-- **`spawn(request)`**: spawn from manifest + code (constructor-based or WASM)
-- **`kill(id)`**: stop and deregister
-- **`registerConstructor(name, ctor)`**: register JS constructors for name-based spawning
-- **Tracking**: `getAllObjects()`, `getObject(id)`
-- **Well-known ID**: `FACTORY_ID`
+Objects that create and adapt other objects using the LLM.
 
-### llm-object.ts
+| File | Class | Well-known ID | Description |
+|------|-------|---------------|-------------|
+| `object-creator.ts` | `ObjectCreator` | `OBJECT_CREATOR_ID` | Natural language → Abject. Multi-phase LLM pipeline with dependency discovery |
+| `proxy-generator.ts` | `ProxyGenerator` | `PROXY_GENERATOR_ID` | LLM-generated protocol translation proxies (JavaScript handler maps) |
+| `scriptable-abject.ts` | `ScriptableAbject` | `SCRIPTABLE_ABJECT_ID` | Runtime-editable Abject with JavaScript handler source. Emits `sourceUpdated` event |
+| `composite-abject.ts` | `CompositeAbject` | `COMPOSITE_ABJECT_ID` | Symbogenesis: encapsulates multiple child Abjects behind a single ID with routing table |
 
-LLM service wrapper, provider-agnostic.
+## Agent System
 
-- **Methods**: `complete`, `generateCode`, `analyze`, `listProviders`, `setProvider`
-- **`configure({ anthropicApiKey?, openaiApiKey? })`**: registers providers from API keys
-- **Code extraction**: strips markdown code fences from LLM responses
-- **Well-known ID**: `LLM_OBJECT_ID`
+Autonomous agent runtime and conversational interfaces.
 
-### object-creator.ts
+| File | Class | Description |
+|------|-------|-------------|
+| `agent-abject.ts` | `AgentAbject` | Concrete agent runtime: observe→think→act state machine, LLM conversations, JSON action parsing, job orchestration |
+| `chat.ts` | `Chat` | Conversational LLM agent UI. Registers with AgentAbject for task submission |
+| `web-agent.ts` | `WebAgent` | Autonomous browser agent (think-act-observe loop). Integrates with WebBrowser capability |
 
-Create objects from natural language prompts.
+## UI Shell
 
-- **`create(prompt)`**: discovers existing objects, builds LLM prompt with available interfaces, parses response for JSON manifest + TypeScript code
-- **`modify(objectId, prompt)`**: modify existing object, triggers proxy regen
-- **`suggest`, `listAvailable`, `getObjectGraph`**: discovery and visualization
-- **Well-known ID**: `OBJECT_CREATOR_ID`
+Window management, widget infrastructure, and persistent chrome.
 
-### proxy-generator.ts
+| File | Class | Description |
+|------|-------|-------------|
+| `widget-manager.ts` | `WidgetManager` | Factory for spawning WindowAbject and widget instances (createLabel, createButton, etc.) |
+| `window-manager.ts` | `WindowManager` | Centralized window behavior policy: z-order, drag, resize. Delegates display ops to UIServer |
+| `taskbar.ts` | `Taskbar` | Per-workspace bottom bar with launch buttons and minimized window restore |
+| `global-toolbar.ts` | `GlobalToolbar` | System-level panel below WorkspaceSwitcher with quick-access buttons |
+| `theme.ts` | `ThemeAbject` | Stores active UI theme, broadcasts changes. Persisted via Storage |
 
-LLM-generated protocol translation proxies.
+## Browsing & Editing
 
-- **`generateProxy(sourceId, targetId, sourceManifest, targetManifest)`**: LLM generates proxy code + manifest + agreement
-- **`regenerateProxy(agreementId, errorContext)`**: regenerate with error context from previous failures
-- **Cache**: stores generated proxies for regeneration
-- **Well-known ID**: `PROXY_GENERATOR_ID`
+Discovery, inspection, and editing tools.
 
-### ui-server.ts
+| File | Class | Description |
+|------|-------|-------------|
+| `registry-browser.ts` | `RegistryBrowser` | Browse registered objects, interfaces, and methods (3-level navigation) |
+| `object-manager.ts` | `ObjectManager` | Process manager table: running objects with state, worker placement, stop/restart |
+| `abject-editor.ts` | `AbjectEditor` | Source editor for ScriptableAbjects with save/cancel and AI-assisted editing |
+| `abject-store.ts` | `AbjectStore` | Persists user-created scriptable abject snapshots to Storage, restores on startup |
+| `job-manager.ts` | `JobManager` | Universal headless job execution (sequential FIFO queues, broadcasts events) |
+| `job-browser.ts` | `JobBrowser` | UI for viewing job execution status in real-time |
+| `web-browser-viewer.ts` | `WebBrowserViewer` | Visual browser monitor showing tabs and live screenshots (polls every 3s) |
 
-X11-style display server.
+## Workspace Management
 
-- **Surface ownership**: objects own their surfaces, verified on every operation
-- **Input routing**: mouse → surface under pointer, keyboard → focused surface
-- **Focus management**: focus/blur event notifications
-- **Methods**: `createSurface`, `destroySurface`, `draw`, `moveSurface`, `resizeSurface`, `setZIndex`, `focus`, `getDisplayInfo`
-- **Well-known ID**: `UI_SERVER_ID`
+Multi-workspace isolation and sharing.
+
+| File | Class | Description |
+|------|-------|-------------|
+| `workspace-manager.ts` | `WorkspaceManager` | Orchestrates workspace lifecycle: create, delete, switch, spawn per-workspace objects |
+| `workspace-registry.ts` | `WorkspaceRegistry` | Per-workspace Registry that chains to global registry on discovery miss |
+| `workspace-switcher.ts` | `WorkspaceSwitcher` | Global chromeless window for switching workspaces (outside all workspaces to avoid deadlock) |
+| `workspace-browser.ts` | `WorkspaceBrowser` | Browse discovered remote workspaces from connected peers |
+| `workspace-share-registry.ts` | `WorkspaceShareRegistry` | Manages workspace sharing metadata and peer discovery (transitive multi-hop) |
+| `settings.ts` | `Settings` | Per-workspace configuration UI (General and Access tabs) |
+| `global-settings.ts` | `GlobalSettings` | Global LLM API key configuration. Auto-shows on first boot if no keys present |
+
+## P2P / Identity
+
+Cryptographic identity and peer-to-peer networking.
+
+| File | Class | Description |
+|------|-------|-------------|
+| `identity.ts` | `IdentityObject` | ECDSA P-256 signing + ECDH P-256 key exchange. Keys persisted via Storage |
+| `peer-registry.ts` | `PeerRegistry` | Contact management, WebRTC connection orchestration via signaling |
+| `peer-network.ts` | `PeerNetwork` | Modal window for managing identity, signaling servers, and contacts |
+| `remote-registry.ts` | `RemoteRegistry` | Distributed object discovery across connected peers with 5-min TTL cache |
 
 ## Common Pattern
 
 Every object follows the same structure:
 1. Constructor defines manifest with full `InterfaceDeclaration`
 2. `setupHandlers()` registers `this.on('method', handler)` for each method
-3. Dependencies injected via `set*()` methods
+3. Dependencies injected via `set*()` methods or discovered via Registry
 4. Well-known ID exported as `const FOO_ID = 'abjects:foo' as AbjectId`
 
-## Subdirectory
+## Subdirectories
 
-See `capabilities/README.md` for the 6 built-in capability objects.
+- `capabilities/` — 8 built-in capability objects (HTTP, storage, timer, clipboard, console, filesystem, web-browser, web-parser)
+- `widgets/` — Canvas widget toolkit (20 files: windows, layouts, input/display widgets)
