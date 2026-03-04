@@ -1,0 +1,74 @@
+---
+const features = [
+  {
+    icon: '>>',
+    title: 'Message Passing',
+    desc: 'Async messages with request/reply/event/error types. Fire-and-forget or request-response with timeouts.',
+  },
+  {
+    icon: '<>',
+    title: 'Protocol Mediation',
+    desc: 'LLM generates proxy objects that translate between incompatible interfaces automatically.',
+  },
+  {
+    icon: '++',
+    title: 'Self-Healing',
+    desc: 'Error rate > 10% triggers proxy regeneration. Unknown messages trigger renegotiation. Hot-swap without disruption.',
+  },
+  {
+    icon: '{}',
+    title: 'Everything is an Object',
+    desc: 'Registry, Factory, LLM service, UI, proxies — all are Abjects with manifests and message handlers.',
+  },
+  {
+    icon: '=>',
+    title: 'Agents',
+    desc: 'Autonomous task execution via observe-think-act loop. AgentAbject drives goal-oriented behavior.',
+  },
+  {
+    icon: '[]',
+    title: 'Workspaces',
+    desc: 'Isolated, shareable object environments with per-workspace services and state.',
+  },
+  {
+    icon: '::',
+    title: 'P2P Identity',
+    desc: 'ECDSA/ECDH cryptographic identity with WebRTC encrypted peer channels and DNS-like naming.',
+  },
+  {
+    icon: '##',
+    title: 'Canvas UI',
+    desc: 'X11-style compositor with ~20 widgets: buttons, text inputs, layouts, windows — all rendered on Canvas.',
+  },
+];
+---
+
+<section id="concepts">
+  <div class="container">
+    <h2 class="section-title">Core Concepts</h2>
+    <div class="grid-2">
+      {features.map((f) => (
+        <div class="card">
+          <span class="card-icon">{f.icon}</span>
+          <h3>{f.title}</h3>
+          <p>{f.desc}</p>
+        </div>
+      ))}
+    </div>
+  </div>
+</section>
+
+<style>
+  .card-icon {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--accent);
+    background: var(--accent-glow);
+    border: 1px solid var(--border-accent);
+    padding: 0.4rem 0.6rem;
+    border-radius: 6px;
+    margin-bottom: 0.75rem;
+  }
+</style>

@@ -1,0 +1,124 @@
+---
+---
+
+<section id="architecture" class="arch-section">
+  <div class="container">
+    <h2 class="section-title">Architecture</h2>
+    <div class="arch-wrapper">
+      <pre class="arch-diagram"><span class="arch-label">Node.js Backend</span> <span class="arch-dim">(pnpm serve)</span>
+
+  <span class="arch-box">MessageBus</span>
+  <span class="arch-dim">Interceptor Pipeline: HealthInterceptor → PeerRouter → Delivery</span>
+          │              │               │
+  ┌───────┴───┐  ┌──────┴──────┐  ┌─────┴──────────┐
+  │ <span class="arch-accent">Registry</span>  │  │  <span class="arch-accent">Factory</span>   │  │  <span class="arch-accent">LLM Object</span>   │
+  │ Negotiator│  │  ProxyGen   │  │  ObjectCreator │
+  │ Supervisor│  │  AgentAbject│  │  HealthMonitor │
+  └───────────┘  └─────────────┘  └────────────────┘
+          │              │               │
+  ┌───────┴──────────────┴───────────────┴────────┐
+  │           <span class="arch-accent">Worker Pool</span> (WorkerBridge)           │
+  │   ┌─────────┐ ┌─────────┐ ┌─────────┐        │
+  │   │Worker 1 │ │Worker 2 │ │Worker N │ ...    │
+  │   │<span class="arch-dim">(WASM)</span>   │ │<span class="arch-dim">(WASM)</span>   │ │<span class="arch-dim">(WASM)</span>   │        │
+  │   └─────────┘ └─────────┘ └─────────┘        │
+  └───────────────────────────────────────────────┘
+
+  <span class="arch-dim">Server-Only</span>                <span class="arch-dim">P2P</span>
+  BackendUI (headless)       PeerTransport ↔ Signaling
+  WebBrowser (Playwright)    IdentityObject (ECDSA/ECDH)
+  WebParser (linkedom)       PeerRegistry / RemoteRegistry
+                            │ <span class="arch-dim">WS :7719</span>
+<span class="arch-label">Thin Browser Client</span>        ▼
+  FrontendClient  │  Compositor (Canvas)  │  Input handling</pre>
+    </div>
+
+    <div class="arch-detail">
+      <h3>LLM-Generated Proxies</h3>
+      <p>When Object A wants to talk to Object B with incompatible interfaces, the LLM generates a proxy object that translates between them:</p>
+      <pre class="arch-proxy"><span class="arch-accent">Object A</span>  ──►  <span class="arch-highlight">Proxy Object</span>  ──►  <span class="arch-accent">Object B</span>
+          ◄──  <span class="arch-dim">(LLM-generated)</span>  ◄──</pre>
+      <p class="arch-note">The proxy is a real object with a manifest, using the same message protocol.</p>
+    </div>
+  </div>
+</section>
+
+<style>
+  .arch-section {
+    background: linear-gradient(180deg, var(--bg-deep) 0%, var(--bg-surface) 50%, var(--bg-deep) 100%);
+  }
+
+  .arch-wrapper {
+    max-width: 720px;
+    margin: 0 auto 3rem;
+  }
+
+  .arch-diagram {
+    background: var(--bg-primary);
+    border: 1px solid var(--border-accent);
+    border-radius: 12px;
+    padding: 2rem;
+    font-size: 0.8rem;
+    line-height: 1.5;
+    box-shadow: 0 0 40px var(--accent-glow);
+    overflow-x: auto;
+  }
+
+  .arch-label {
+    color: var(--text-primary);
+    font-weight: 700;
+  }
+
+  .arch-accent {
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .arch-dim {
+    color: var(--text-dim);
+  }
+
+  .arch-box {
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 0.9rem;
+  }
+
+  .arch-highlight {
+    color: var(--accent-secondary);
+    font-weight: 600;
+  }
+
+  .arch-detail {
+    max-width: 600px;
+    margin: 0 auto;
+    text-align: center;
+  }
+
+  .arch-detail h3 {
+    color: var(--text-primary);
+    margin-bottom: 0.75rem;
+  }
+
+  .arch-detail p {
+    color: var(--text-secondary);
+    margin-bottom: 1rem;
+  }
+
+  .arch-proxy {
+    display: inline-block;
+    text-align: center;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 2rem;
+    font-size: 0.85rem;
+    margin-bottom: 1rem;
+  }
+
+  .arch-note {
+    font-size: 0.9rem;
+    color: var(--text-dim);
+    font-style: italic;
+  }
+</style>

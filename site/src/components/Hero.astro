@@ -1,0 +1,111 @@
+---
+---
+
+<section class="hero">
+  <div class="hero-bg"></div>
+  <div class="container hero-content">
+    <p class="hero-label">Distributed Object System</p>
+    <h1>
+      <span class="accent">LLM-Mediated</span> Objects<br />
+      That Heal Themselves
+    </h1>
+    <p class="hero-desc">
+      Objects communicate via message passing, negotiate protocols using an LLM,
+      and self-heal when communication breaks down. Everything is an object.
+    </p>
+    <div class="hero-actions">
+      <a href="#quickstart" class="btn btn-primary">Get Started</a>
+      <a href="#concepts" class="btn btn-outline">Learn More</a>
+    </div>
+    <div class="hero-tags">
+      <span>TypeScript</span>
+      <span>WASM</span>
+      <span>WebRTC</span>
+      <span>Canvas UI</span>
+      <span>P2P</span>
+    </div>
+  </div>
+</section>
+
+<style>
+  .hero {
+    position: relative;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    padding-top: 64px;
+    overflow: hidden;
+  }
+
+  .hero-bg {
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(ellipse 80% 60% at 50% 0%, rgba(0, 229, 255, 0.08) 0%, transparent 60%),
+      radial-gradient(ellipse 40% 40% at 80% 20%, rgba(124, 77, 255, 0.06) 0%, transparent 50%);
+    pointer-events: none;
+  }
+
+  .hero-content {
+    position: relative;
+    text-align: center;
+    padding: 4rem 0;
+  }
+
+  .hero-label {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    margin-bottom: 1.25rem;
+  }
+
+  h1 {
+    margin-bottom: 1.5rem;
+  }
+
+  .accent {
+    color: var(--accent);
+    text-shadow: 0 0 30px var(--accent-glow-strong);
+  }
+
+  .hero-desc {
+    max-width: 600px;
+    margin: 0 auto 2.5rem;
+    color: var(--text-secondary);
+    font-size: 1.15rem;
+    line-height: 1.8;
+  }
+
+  .hero-actions {
+    display: flex;
+    gap: 1rem;
+    justify-content: center;
+    margin-bottom: 3rem;
+  }
+
+  .hero-tags {
+    display: flex;
+    gap: 0.75rem;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+
+  .hero-tags span {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 0.3rem 0.75rem;
+    border-radius: 20px;
+  }
+
+  @media (max-width: 600px) {
+    .hero-actions {
+      flex-direction: column;
+      align-items: center;
+    }
+  }
+</style>

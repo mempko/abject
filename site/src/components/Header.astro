@@ -1,0 +1,79 @@
+---
+---
+
+<header>
+  <nav class="container">
+    <a href="/" class="logo">
+      <span class="logo-bracket">[</span>abjects<span class="logo-bracket">]</span>
+    </a>
+    <div class="nav-links">
+      <a href="#concepts">Concepts</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#quickstart">Quick Start</a>
+      <a href="https://github.com/nicebots-xyz/abjects" class="btn btn-outline btn-sm">GitHub</a>
+    </div>
+  </nav>
+</header>
+
+<style>
+  header {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    background: rgba(6, 6, 12, 0.85);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+  }
+
+  nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 64px;
+  }
+
+  .logo {
+    font-family: var(--font-mono);
+    font-size: 1.2rem;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .logo:hover {
+    color: var(--accent);
+  }
+
+  .logo-bracket {
+    color: var(--accent);
+  }
+
+  .nav-links {
+    display: flex;
+    align-items: center;
+    gap: 1.75rem;
+  }
+
+  .nav-links a {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    font-weight: 500;
+    transition: color 0.2s;
+  }
+
+  .nav-links a:hover {
+    color: var(--text-primary);
+  }
+
+  .btn-sm {
+    padding: 0.4rem 1rem;
+    font-size: 0.85rem;
+  }
+
+  @media (max-width: 600px) {
+    .nav-links a:not(.btn) {
+      display: none;
+    }
+  }
+</style>

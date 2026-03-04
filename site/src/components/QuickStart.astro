@@ -1,0 +1,133 @@
+---
+---
+
+<section id="quickstart">
+  <div class="container">
+    <h2 class="section-title">Quick Start</h2>
+    <div class="qs-grid">
+      <div class="qs-code">
+        <div class="code-header">
+          <span class="code-dot"></span>
+          <span class="code-dot"></span>
+          <span class="code-dot"></span>
+          <span class="code-title">terminal</span>
+        </div>
+        <pre><code><span class="c"># Clone the repository</span>
+<span class="cmd">git clone</span> https://github.com/nicebots-xyz/abjects
+<span class="cmd">cd</span> abjects
+
+<span class="c"># Install dependencies</span>
+<span class="cmd">pnpm install</span>
+
+<span class="c"># Start Node.js backend</span>
+<span class="cmd">pnpm serve</span>
+
+<span class="c"># Start thin browser client (new terminal)</span>
+<span class="cmd">pnpm client</span>          <span class="c"># http://localhost:5173</span>
+
+<span class="c"># Start P2P signaling server (new terminal)</span>
+<span class="cmd">pnpm signal</span>          <span class="c"># :7720</span></code></pre>
+      </div>
+      <div class="qs-info">
+        <h3>Three processes, one system</h3>
+        <p>
+          The <strong>backend</strong> runs all Abjects — Registry, Factory, LLM, Negotiator,
+          and your custom objects — in a Node.js process with worker threads.
+        </p>
+        <p>
+          The <strong>browser client</strong> is a thin Canvas renderer that forwards
+          input events and displays composited frames over WebSocket.
+        </p>
+        <p>
+          The <strong>signaling server</strong> enables peer discovery for WebRTC
+          connections between Abjects instances.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .qs-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2rem;
+    align-items: start;
+  }
+
+  .qs-code {
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+
+  .code-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0.75rem 1rem;
+    background: var(--bg-card);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .code-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--text-dim);
+  }
+
+  .code-dot:nth-child(1) { background: #ff5f57; }
+  .code-dot:nth-child(2) { background: #febc2e; }
+  .code-dot:nth-child(3) { background: #28c840; }
+
+  .code-title {
+    margin-left: 0.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--text-dim);
+  }
+
+  .qs-code pre {
+    border: none;
+    border-radius: 0;
+    margin: 0;
+    padding: 1.25rem 1.5rem;
+  }
+
+  .qs-code code .c {
+    color: var(--text-dim);
+  }
+
+  .qs-code code .cmd {
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .qs-info {
+    padding-top: 0.5rem;
+  }
+
+  .qs-info h3 {
+    color: var(--text-primary);
+    margin-bottom: 1.25rem;
+  }
+
+  .qs-info p {
+    color: var(--text-secondary);
+    margin-bottom: 1rem;
+    font-size: 0.95rem;
+  }
+
+  .qs-info strong {
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  @media (max-width: 768px) {
+    .qs-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>
