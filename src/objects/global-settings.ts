@@ -18,9 +18,15 @@ const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 
 const STORAGE_KEY_ANTHROPIC = 'global-settings:anthropicApiKey';
 const STORAGE_KEY_OPENAI = 'global-settings:openaiApiKey';
+const STORAGE_KEY_PROVIDER = 'global-settings:llmProvider';
+const STORAGE_KEY_OLLAMA_URL = 'global-settings:ollamaUrl';
 const STORAGE_KEY_AUTH_ENABLED = 'global-settings:authEnabled';
 const STORAGE_KEY_AUTH_USER = 'global-settings:authUser';
 const STORAGE_KEY_AUTH_PASS = 'global-settings:authPass';
+
+type LLMProviderName = 'anthropic' | 'openai' | 'ollama';
+const PROVIDER_LABELS: string[] = ['Anthropic', 'OpenAI', 'Ollama'];
+const PROVIDER_NAMES: LLMProviderName[] = ['anthropic', 'openai', 'ollama'];
 
 // Legacy keys for migration from per-workspace Settings
 const LEGACY_KEY_ANTHROPIC = 'settings:anthropicApiKey';
@@ -41,11 +47,24 @@ export class GlobalSettings extends Abject {
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
 
-  // API Keys widgets
+  // Provider selection
+  private selectedProvider: LLMProviderName = 'anthropic';
+  private providerSelectId?: AbjectId;
+
+  // Anthropic section widgets
   private anthropicKeyId?: AbjectId;
   private anthropicToggleId?: AbjectId;
+  private anthropicSectionIds: AbjectId[] = [];
+
+  // OpenAI section widgets
   private openaiKeyId?: AbjectId;
   private openaiToggleId?: AbjectId;
+  private openaiSectionIds: AbjectId[] = [];
+
+  // Ollama section widgets
+  private ollamaUrlId?: AbjectId;
+  private ollamaSectionIds: AbjectId[] = [];
+
   private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
 
@@ -103,9 +122,10 @@ export class GlobalSettings extends Abject {
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.uiServerId = await this.requireDep('UIServer');
 
-    // Try to load saved API keys from global storage
     let anthropicKey: string | null = null;
     let openaiKey: string | null = null;
+    let ollamaUrl: string | null = null;
+    let savedProvider: string | null = null;
 
     if (this.storageId) {
       anthropicKey = await this.request<string | null>(
@@ -114,8 +134,14 @@ export class GlobalSettings extends Abject {
       openaiKey = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OPENAI })
       );
+      ollamaUrl = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_URL })
+      );
+      savedProvider = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_PROVIDER })
+      );
 
-      // If not found, attempt migration from legacy per-workspace keys
+      // Legacy migration from per-workspace keys
       if (!anthropicKey && !openaiKey) {
         const legacyAnthropic = await this.request<string | null>(
           request(this.id, this.storageId, 'get', { key: LEGACY_KEY_ANTHROPIC })
@@ -127,8 +153,6 @@ export class GlobalSettings extends Abject {
         if (legacyAnthropic || legacyOpenai) {
           anthropicKey = legacyAnthropic;
           openaiKey = legacyOpenai;
-
-          // Persist under new keys
           if (anthropicKey) {
             await this.request(
               request(this.id, this.storageId, 'set', { key: STORAGE_KEY_ANTHROPIC, value: anthropicKey })
@@ -143,25 +167,75 @@ export class GlobalSettings extends Abject {
         }
       }
 
-      // Load saved auth settings and apply to BackendUI
       await this.applySavedAuthConfig();
     }
 
-    if (anthropicKey || openaiKey) {
-      // Keys found — configure LLM silently
-      if (this.llmId) {
+    // Determine selected provider
+    if (savedProvider && PROVIDER_NAMES.includes(savedProvider as LLMProviderName)) {
+      this.selectedProvider = savedProvider as LLMProviderName;
+    } else if (anthropicKey) {
+      this.selectedProvider = 'anthropic';
+      if (this.storageId) {
         await this.request(
-          request(this.id, this.llmId, 'configure', {
-            anthropicApiKey: anthropicKey ?? undefined,
-            openaiApiKey: openaiKey ?? undefined,
-          })
+          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_PROVIDER, value: 'anthropic' })
         );
       }
-      console.log('[GLOBAL-SETTINGS] Loaded saved API keys');
+    } else if (openaiKey) {
+      this.selectedProvider = 'openai';
+      if (this.storageId) {
+        await this.request(
+          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_PROVIDER, value: 'openai' })
+        );
+      }
     } else {
-      // No keys — show settings UI
+      this.selectedProvider = 'anthropic';
+    }
+
+    // Configure the selected provider
+    const hasConfig = this.providerHasConfig(this.selectedProvider, anthropicKey, openaiKey, ollamaUrl);
+    if (hasConfig && this.llmId) {
+      await this.configureSelectedProvider(anthropicKey, openaiKey, ollamaUrl);
+      console.log(`[GLOBAL-SETTINGS] Loaded saved provider: ${this.selectedProvider}`);
+    } else {
       await this.show();
     }
+  }
+
+  private providerHasConfig(
+    provider: LLMProviderName,
+    anthropicKey: string | null,
+    openaiKey: string | null,
+    ollamaUrl: string | null,
+  ): boolean {
+    switch (provider) {
+      case 'anthropic': return !!anthropicKey;
+      case 'openai': return !!openaiKey;
+      case 'ollama': return true; // Ollama works with default URL
+    }
+  }
+
+  private async configureSelectedProvider(
+    anthropicKey: string | null,
+    openaiKey: string | null,
+    ollamaUrl: string | null,
+  ): Promise<void> {
+    if (!this.llmId) return;
+
+    const config: Record<string, string | undefined> = {};
+    switch (this.selectedProvider) {
+      case 'anthropic':
+        config.anthropicApiKey = anthropicKey ?? undefined;
+        break;
+      case 'openai':
+        config.openaiApiKey = openaiKey ?? undefined;
+        break;
+      case 'ollama':
+        config.ollamaUrl = ollamaUrl || 'http://localhost:11434';
+        break;
+    }
+
+    await this.request(request(this.id, this.llmId, 'configure', config));
+    await this.request(request(this.id, this.llmId, 'setProvider', { name: this.selectedProvider }));
   }
 
   private setupHandlers(): void {
@@ -183,6 +257,17 @@ export class GlobalSettings extends Abject {
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
+
+      // Provider dropdown changed
+      if (fromId === this.providerSelectId && aspect === 'change') {
+        const label = value as string;
+        const idx = PROVIDER_LABELS.indexOf(label);
+        if (idx >= 0) {
+          this.selectedProvider = PROVIDER_NAMES[idx];
+          await this.switchProviderFields(this.selectedProvider);
+        }
+        return;
+      }
 
       if (fromId === this.saveBtnId && aspect === 'click') {
         await this.saveSettings();
@@ -264,9 +349,10 @@ export class GlobalSettings extends Abject {
 
     const cId = this.rootLayoutId;
 
-    // Load saved keys to populate inputs
+    // Load saved values to populate inputs
     let savedAnthropicKey: string | null = null;
     let savedOpenaiKey: string | null = null;
+    let savedOllamaUrl: string | null = null;
     if (this.storageId) {
       savedAnthropicKey = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_ANTHROPIC })
@@ -274,12 +360,15 @@ export class GlobalSettings extends Abject {
       savedOpenaiKey = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OPENAI })
       );
+      savedOllamaUrl = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_URL })
+      );
     }
 
-    // Section header: "API Keys"
+    // Section header: "LLM Provider"
     const sectionHeaderId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'API Keys',
+        windowId: this.windowId, rect: r0, text: 'LLM Provider',
         style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
       })
     );
@@ -292,7 +381,7 @@ export class GlobalSettings extends Abject {
     // Description
     const descLabelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Enter your API keys to enable LLM features.',
+        windowId: this.windowId, rect: r0, text: 'Select your LLM provider and enter credentials.',
         style: { color: '#b4b8c8', fontSize: 12 },
       })
     );
@@ -302,20 +391,38 @@ export class GlobalSettings extends Abject {
       preferredSize: { height: 18 },
     }));
 
-    // Anthropic label
+    // Provider dropdown
+    const selectedIndex = PROVIDER_NAMES.indexOf(this.selectedProvider);
+    this.providerSelectId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createSelect', {
+        windowId: this.windowId, rect: r0,
+        options: PROVIDER_LABELS,
+        selectedIndex: selectedIndex >= 0 ? selectedIndex : 0,
+      })
+    );
+    await this.request(request(this.id, this.providerSelectId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.providerSelectId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    // ── Anthropic section ──
+    this.anthropicSectionIds = [];
+
     const anthropicLabelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Anthropic API Key',
+        windowId: this.windowId, rect: r0, text: 'API Key',
         style: { color: '#e2e4e9', fontSize: 13 },
       })
     );
+    this.anthropicSectionIds.push(anthropicLabelId);
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: anthropicLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
 
-    // Anthropic input row (HBox: input + toggle)
     const anthropicRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: cId,
@@ -323,6 +430,7 @@ export class GlobalSettings extends Abject {
         spacing: 8,
       })
     );
+    this.anthropicSectionIds.push(anthropicRowId);
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: anthropicRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
@@ -354,32 +462,22 @@ export class GlobalSettings extends Abject {
       preferredSize: { width: 56, height: 32 },
     }));
 
-    // Divider between Anthropic and OpenAI
-    const dividerId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createDivider', {
-        windowId: this.windowId, rect: r0,
-      })
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: dividerId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 12 },
-    }));
+    // ── OpenAI section ──
+    this.openaiSectionIds = [];
 
-    // OpenAI label
     const openaiLabelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'OpenAI API Key',
+        windowId: this.windowId, rect: r0, text: 'API Key',
         style: { color: '#e2e4e9', fontSize: 13 },
       })
     );
+    this.openaiSectionIds.push(openaiLabelId);
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: openaiLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
 
-    // OpenAI input row (HBox: input + toggle)
     const openaiRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: cId,
@@ -387,6 +485,7 @@ export class GlobalSettings extends Abject {
         spacing: 8,
       })
     );
+    this.openaiSectionIds.push(openaiRowId);
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: openaiRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
@@ -418,6 +517,39 @@ export class GlobalSettings extends Abject {
       preferredSize: { width: 56, height: 32 },
     }));
 
+    // ── Ollama section ──
+    this.ollamaSectionIds = [];
+
+    const ollamaLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Base URL',
+        style: { color: '#e2e4e9', fontSize: 13 },
+      })
+    );
+    this.ollamaSectionIds.push(ollamaLabelId);
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: ollamaLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    this.ollamaUrlId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createTextInput', {
+        windowId: this.windowId, rect: r0, placeholder: 'http://localhost:11434',
+        text: savedOllamaUrl || 'http://localhost:11434',
+      })
+    );
+    this.ollamaSectionIds.push(this.ollamaUrlId);
+    await this.request(request(this.id, this.ollamaUrlId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.ollamaUrlId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    // Hide non-selected provider sections
+    await this.switchProviderFields(this.selectedProvider);
+
     // Save button row (HBox: spacer + button)
     const saveRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
@@ -436,7 +568,7 @@ export class GlobalSettings extends Abject {
 
     this.saveBtnId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Save API Keys',
+        windowId: this.windowId, rect: r0, text: 'Save Provider',
         style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
       })
     );
@@ -444,7 +576,7 @@ export class GlobalSettings extends Abject {
     await this.request(request(this.id, saveRowId, 'addLayoutChild', {
       widgetId: this.saveBtnId,
       sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 120, height: 36 },
+      preferredSize: { width: 130, height: 36 },
     }));
 
     // ── Auth section ──────────────────────────────────────────────────
@@ -663,10 +795,15 @@ export class GlobalSettings extends Abject {
 
     this.windowId = undefined;
     this.rootLayoutId = undefined;
+    this.providerSelectId = undefined;
     this.anthropicKeyId = undefined;
     this.anthropicToggleId = undefined;
+    this.anthropicSectionIds = [];
     this.openaiKeyId = undefined;
     this.openaiToggleId = undefined;
+    this.openaiSectionIds = [];
+    this.ollamaUrlId = undefined;
+    this.ollamaSectionIds = [];
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
     this.authCheckboxId = undefined;
@@ -719,10 +856,29 @@ export class GlobalSettings extends Abject {
 
   private async setSaveControlsDisabled(disabled: boolean): Promise<void> {
     const style = { disabled };
-    const ids = [this.saveBtnId, this.anthropicKeyId, this.openaiKeyId];
+    const ids = [this.saveBtnId, this.providerSelectId, this.anthropicKeyId, this.openaiKeyId, this.ollamaUrlId];
     for (const id of ids) {
       if (id) {
         try { await this.request(request(this.id, id, 'update', { style })); } catch { /* widget gone */ }
+      }
+    }
+  }
+
+  // ========== PROVIDER VISIBILITY ==========
+
+  private async switchProviderFields(provider: LLMProviderName): Promise<void> {
+    const sections: Record<LLMProviderName, AbjectId[]> = {
+      anthropic: this.anthropicSectionIds,
+      openai: this.openaiSectionIds,
+      ollama: this.ollamaSectionIds,
+    };
+
+    for (const [name, ids] of Object.entries(sections)) {
+      const visible = name === provider;
+      for (const id of ids) {
+        try {
+          await this.request(request(this.id, id, 'update', { style: { visible } }));
+        } catch { /* widget gone */ }
       }
     }
   }
@@ -819,23 +975,54 @@ export class GlobalSettings extends Abject {
   // ========== API KEYS ACTIONS ==========
 
   /**
-   * Read widget values, save to global storage, and configure LLM.
+   * Read widget values for the selected provider, save to global storage, and configure LLM.
    */
   private async saveSettings(): Promise<void> {
     if (!this.windowId) return;
 
     await this.setSaveControlsDisabled(true);
 
-    const anthropicKey = await this.request<string>(
-      request(this.id, this.anthropicKeyId!, 'getValue', {})
-    );
+    const provider = this.selectedProvider;
 
-    const openaiKey = await this.request<string>(
-      request(this.id, this.openaiKeyId!, 'getValue', {})
-    );
+    // Read values for the active provider
+    let anthropicKey = '';
+    let openaiKey = '';
+    let ollamaUrl = '';
 
-    // Save to global storage
+    switch (provider) {
+      case 'anthropic':
+        anthropicKey = await this.request<string>(
+          request(this.id, this.anthropicKeyId!, 'getValue', {})
+        );
+        if (!anthropicKey) {
+          await this.setStatus('Anthropic API key is required.', '#f87171');
+          await this.setSaveControlsDisabled(false);
+          return;
+        }
+        break;
+      case 'openai':
+        openaiKey = await this.request<string>(
+          request(this.id, this.openaiKeyId!, 'getValue', {})
+        );
+        if (!openaiKey) {
+          await this.setStatus('OpenAI API key is required.', '#f87171');
+          await this.setSaveControlsDisabled(false);
+          return;
+        }
+        break;
+      case 'ollama':
+        ollamaUrl = await this.request<string>(
+          request(this.id, this.ollamaUrlId!, 'getValue', {})
+        );
+        if (!ollamaUrl) ollamaUrl = 'http://localhost:11434';
+        break;
+    }
+
+    // Persist to storage
     if (this.storageId) {
+      await this.request(
+        request(this.id, this.storageId, 'set', { key: STORAGE_KEY_PROVIDER, value: provider })
+      );
       if (anthropicKey) {
         await this.request(
           request(this.id, this.storageId, 'set', { key: STORAGE_KEY_ANTHROPIC, value: anthropicKey })
@@ -846,24 +1033,22 @@ export class GlobalSettings extends Abject {
           request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OPENAI, value: openaiKey })
         );
       }
+      if (provider === 'ollama') {
+        await this.request(
+          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OLLAMA_URL, value: ollamaUrl })
+        );
+      }
     }
 
-    // Configure LLM
-    if (this.llmId) {
-      await this.request(
-        request(this.id, this.llmId, 'configure', {
-          anthropicApiKey: anthropicKey || undefined,
-          openaiApiKey: openaiKey || undefined,
-        })
-      );
+    // Configure LLM with the selected provider
+    await this.configureSelectedProvider(
+      anthropicKey || null,
+      openaiKey || null,
+      ollamaUrl || null,
+    );
 
-      const providers = await this.request<string[]>(
-        request(this.id, this.llmId, 'listProviders', {})
-      );
-      console.log(`[GLOBAL-SETTINGS] Saved. LLM providers: ${providers.join(', ') || 'none'}`);
-    }
-
-    await this.setStatus('API keys saved!');
+    console.log(`[GLOBAL-SETTINGS] Saved provider: ${provider}`);
+    await this.setStatus('Provider settings saved!');
     await this.setSaveControlsDisabled(false);
   }
 }
