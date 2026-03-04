@@ -21,6 +21,9 @@ interface WebTaskOptions {
   startUrl?: string;
   timeout?: number;
   pageOptions?: { userAgent?: string; viewport?: { width: number; height: number } };
+  responseSchema?: Record<string, unknown>;
+  pageId?: string;         // reuse an existing open page
+  keepPageOpen?: boolean;  // don't close page after task completes
 }
 
 /** Per-task extra state (page IDs, startUrl, screenshots). */
@@ -28,7 +31,10 @@ interface WebTaskExtra {
   startUrl?: string;
   pageId?: string;
   pageOptions?: { userAgent?: string; viewport?: { width: number; height: number } };
+  responseSchema?: Record<string, unknown>;
   lastScreenshot?: string;  // raw base64 (no data URI prefix)
+  keepPageOpen?: boolean;          // don't close page after task completes
+  pageOpenedByThisTask?: boolean;  // tracks if WE opened it (for cleanup on error)
 }
 
 // ─── WebAgent ───────────────────────────────────────────────────────
@@ -41,6 +47,10 @@ export class WebAgent extends Abject {
 
   /** Per-task extra state (page IDs, startUrl, etc.). */
   private taskExtras = new Map<string, WebTaskExtra>();
+
+  /** Kept-open pages: pageId → idle timeout handle. */
+  private keptOpenPages = new Map<string, ReturnType<typeof setTimeout>>();
+  private static readonly PAGE_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
   constructor() {
     super({
@@ -64,6 +74,9 @@ export class WebAgent extends Abject {
                     maxSteps: { kind: 'primitive', primitive: 'number' },
                     startUrl: { kind: 'primitive', primitive: 'string' },
                     timeout: { kind: 'primitive', primitive: 'number' },
+                    responseSchema: { kind: 'object', properties: {} },
+                    pageId: { kind: 'primitive', primitive: 'string' },
+                    keepPageOpen: { kind: 'primitive', primitive: 'boolean' },
                   }}, description: 'Task options', optional: true,
                 },
               ],
@@ -71,6 +84,8 @@ export class WebAgent extends Abject {
                 success: { kind: 'primitive', primitive: 'boolean' },
                 result: { kind: 'primitive', primitive: 'string' },
                 steps: { kind: 'primitive', primitive: 'number' },
+                validationErrors: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+                pageId: { kind: 'primitive', primitive: 'string' },
               }},
             },
             {
@@ -86,6 +101,16 @@ export class WebAgent extends Abject {
               }},
             },
             {
+              name: 'closePage',
+              description: 'Manually close a kept-open page',
+              parameters: [
+                { name: 'pageId', type: { kind: 'primitive', primitive: 'string' }, description: 'Page ID to close' },
+              ],
+              returns: { kind: 'object', properties: {
+                success: { kind: 'primitive', primitive: 'boolean' },
+              }},
+            },
+            {
               name: 'getTaskStatus',
               description: 'Get status of a running or completed task',
               parameters: [
@@ -96,6 +121,16 @@ export class WebAgent extends Abject {
                 step: { kind: 'primitive', primitive: 'number' },
                 error: { kind: 'primitive', primitive: 'string' },
               }},
+            },
+            {
+              name: 'listPages',
+              description: 'List kept-open pages available for reuse',
+              parameters: [],
+              returns: { kind: 'array', elementType: { kind: 'object', properties: {
+                pageId: { kind: 'primitive', primitive: 'string' },
+                url: { kind: 'primitive', primitive: 'string' },
+                title: { kind: 'primitive', primitive: 'string' },
+              }}},
             },
             {
               name: 'listTasks',
@@ -135,6 +170,108 @@ export class WebAgent extends Abject {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## WebAgent Usage Guide
+
+### Run a Full Web Task (free-text result)
+
+  const result = await call(await dep('WebAgent'), 'runTask', {
+    task: 'Search for "abjects" on Google and return the first result',
+    options: { startUrl: 'https://www.google.com', maxSteps: 15, timeout: 120000 },
+  });
+  // result: { success, result, steps, error? }
+
+### Run a Web Task with Structured Result
+
+  const result = await call(await dep('WebAgent'), 'runTask', {
+    task: 'Extract the top 5 stories from the front page',
+    options: {
+      startUrl: 'https://news.ycombinator.com',
+      responseSchema: {
+        type: 'object',
+        properties: {
+          stories: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                title: { type: 'string' },
+                url: { type: 'string' },
+                points: { type: 'number' },
+              },
+              required: ['title', 'url'],
+            },
+          },
+        },
+        required: ['stories'],
+      },
+    },
+  });
+  // result: { success, result: { stories: [...] }, steps, validationErrors? }
+
+Use responseSchema (JSON Schema format) when you need structured data back.
+Without it, the result is free text. validationErrors is undefined on success.
+
+### Run a Single Step on an Open Page
+
+  const result = await call(await dep('WebAgent'), 'runStep', {
+    pageId: 'existing-page-id',
+    instruction: 'Click the login button',
+  });
+  // result: { success, result, error? }
+
+### Get Task Status
+
+  const status = await call(await dep('WebAgent'), 'getTaskStatus', {
+    taskId: 'web-task-id',
+  });
+  // status: { phase, step, error? }
+
+### List All Tasks
+
+  const tasks = await call(await dep('WebAgent'), 'listTasks', {});
+  // tasks: [{ id, phase, task, step }]
+
+### Multi-Step Workflow (keepPageOpen)
+
+Use keepPageOpen to maintain browser session across multiple runTask calls (e.g., login → 2FA → fetch data):
+
+  // Step 1: Login — keep page open
+  const result = await call(await dep('WebAgent'), 'runTask', {
+    task: 'Go to site and log in with user/pass',
+    options: { startUrl: 'https://example.com/login', keepPageOpen: true },
+  });
+  // result.pageId is available for reuse
+
+  // Step 2: 2FA — reuse same page
+  const result2 = await call(await dep('WebAgent'), 'runTask', {
+    task: 'Enter 2FA code 123456 and submit',
+    options: { pageId: result.pageId, keepPageOpen: true },
+  });
+
+  // Step 3: Final action — page closes automatically (no keepPageOpen)
+  const result3 = await call(await dep('WebAgent'), 'runTask', {
+    task: 'Extract dashboard data',
+    options: { pageId: result2.pageId },
+  });
+
+### List Kept-Open Pages
+
+  const pages = await call(await dep('WebAgent'), 'listPages', {});
+  // pages: [{ pageId, url, title }]
+
+### Close a Kept-Open Page Manually
+
+  await call(await dep('WebAgent'), 'closePage', { pageId: 'page-id' });
+
+### IMPORTANT
+- The method is **runTask** (not "run" or "navigate").
+- Options: startUrl, maxSteps, timeout, pageOptions, responseSchema, pageId, keepPageOpen.
+- WebAgent opens and closes browser pages automatically — do NOT call WebBrowser directly.
+- runTask is long-running — the reply arrives when the task completes.
+- Kept-open pages auto-close after 5 minutes of inactivity.`;
+  }
+
   protected override async onInit(): Promise<void> {
     this.webBrowserId = await this.requireDep('WebBrowser');
     this.consoleId = await this.discoverDep('Console') ?? undefined;
@@ -165,9 +302,17 @@ export class WebAgent extends Abject {
 
       const extra: WebTaskExtra = {
         startUrl: options?.startUrl,
+        pageId: options?.pageId,
         pageOptions: options?.pageOptions,
+        responseSchema: options?.responseSchema,
+        keepPageOpen: options?.keepPageOpen,
       };
       this.taskExtras.set(taskId, extra);
+
+      // If reusing a kept-open page, clear its idle timeout
+      if (options?.pageId) {
+        this.untrackKeptOpenPage(options.pageId);
+      }
 
       // Fire-and-forget: run task asynchronously via AgentAbject
       this.runTaskAsync(msg, taskId, task.trim(), extra, options);
@@ -205,6 +350,25 @@ export class WebAgent extends Abject {
       );
 
       return { success: result.success, result: result.result, error: result.error };
+    });
+
+    this.on('closePage', async (msg: AbjectMessage) => {
+      const { pageId } = msg.payload as { pageId: string };
+      contractRequire(typeof pageId === 'string' && pageId.length > 0, 'pageId required');
+      this.untrackKeptOpenPage(pageId);
+      await this.request(
+        request(this.id, this.webBrowserId!, 'closePage', { pageId })
+      );
+      return { success: true };
+    });
+
+    this.on('listPages', async (msg: AbjectMessage) => {
+      // Query WebBrowser for all pages, then filter to our kept-open set
+      const allPages = await this.request<Array<{ pageId: string; url: string; title: string }>>(
+        request(this.id, this.webBrowserId!, 'listPages', {})
+      );
+      const keptIds = new Set(this.keptOpenPages.keys());
+      return allPages.filter(p => keptIds.has(p.pageId));
     });
 
     this.on('getTaskStatus', async (msg: AbjectMessage) => {
@@ -248,6 +412,39 @@ export class WebAgent extends Abject {
   }
 
   // ═══════════════════════════════════════════════════════════════════
+  // Kept-open page tracking
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** Start an idle timeout for a kept-open page; auto-closes when it expires. */
+  private trackKeptOpenPage(pageId: string): void {
+    this.untrackKeptOpenPage(pageId);
+    const handle = setTimeout(async () => {
+      console.log(`[WebAgent] Idle timeout expired for page ${pageId}, closing`);
+      this.keptOpenPages.delete(pageId);
+      try {
+        await this.request(
+          request(this.id, this.webBrowserId!, 'closePage', { pageId })
+        );
+      } catch { /* best effort */ }
+    }, WebAgent.PAGE_IDLE_TIMEOUT_MS);
+    this.keptOpenPages.set(pageId, handle);
+  }
+
+  /** Clear the idle timeout for a page (called when the page is reused). */
+  private untrackKeptOpenPage(pageId: string): void {
+    const existing = this.keptOpenPages.get(pageId);
+    if (existing) {
+      clearTimeout(existing);
+      this.keptOpenPages.delete(pageId);
+    }
+  }
+
+  protected override async onStop(): Promise<void> {
+    for (const timeout of this.keptOpenPages.values()) clearTimeout(timeout);
+    this.keptOpenPages.clear();
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
   // Async task runner (fire-and-forget from runTask handler)
   // ═══════════════════════════════════════════════════════════════════
 
@@ -261,7 +458,7 @@ export class WebAgent extends Abject {
     let result: { taskId: string; success: boolean; result?: unknown; error?: string; steps: number };
 
     try {
-      // Open page
+      // Open page (or reuse an existing kept-open page)
       if (!extra.pageId) {
         console.log(`[WebAgent] Opening page (${taskId})`);
         const pageResult = await this.request<{ pageId: string }>(
@@ -270,6 +467,7 @@ export class WebAgent extends Abject {
           })
         );
         extra.pageId = pageResult.pageId;
+        extra.pageOpenedByThisTask = true;
 
         if (extra.startUrl) {
           console.log(`[WebAgent] Navigating to ${extra.startUrl}`);
@@ -280,6 +478,8 @@ export class WebAgent extends Abject {
             })
           );
         }
+      } else {
+        console.log(`[WebAgent] Reusing existing page ${extra.pageId} (${taskId})`);
       }
 
       // Run task via AgentAbject
@@ -294,6 +494,7 @@ export class WebAgent extends Abject {
           taskId,
           task: taskText,
           systemPrompt: this.buildSystemPrompt(taskText),
+          responseSchema: extra.responseSchema,
           config: {
             maxSteps: options?.maxSteps,
             timeout: options?.timeout,
@@ -309,20 +510,34 @@ export class WebAgent extends Abject {
         error: err instanceof Error ? err.message : String(err),
         steps: 0,
       };
-    } finally {
-      // Always close the page we opened
-      if (extra.pageId) {
-        try {
-          await this.request(
-            request(this.id, this.webBrowserId!, 'closePage', { pageId: extra.pageId })
-          );
-        } catch { /* best effort */ }
-      }
+    }
+
+    // Page cleanup — after try/catch so `result` is guaranteed assigned
+    if (extra.keepPageOpen && result.success && extra.pageId) {
+      // Keep the page open for the caller to reuse; start idle timeout
+      console.log(`[WebAgent] Keeping page ${extra.pageId} open for reuse`);
+      this.trackKeptOpenPage(extra.pageId);
+    } else if (!result.success && !extra.pageOpenedByThisTask && extra.pageId) {
+      // Task failed on a pre-existing page — leave it for caller to retry/inspect
+      console.log(`[WebAgent] Task failed on pre-existing page ${extra.pageId}, leaving open`);
+      this.trackKeptOpenPage(extra.pageId);
+    } else if (extra.pageId) {
+      // Default: close the page (preserves existing behavior)
+      try {
+        await this.request(
+          request(this.id, this.webBrowserId!, 'closePage', { pageId: extra.pageId })
+        );
+      } catch { /* best effort */ }
     }
 
     if (result.success) {
       console.log(`[WebAgent] ✓ Task complete (${taskId}) in ${result.steps} steps`);
     }
+
+    // Include pageId when the page is kept open for reuse
+    const replyPageId = (extra.keepPageOpen && result.success && extra.pageId)
+      || (!result.success && !extra.pageOpenedByThisTask && extra.pageId)
+      ? extra.pageId : undefined;
 
     try {
       await this.sendDeferredReply(originalMsg, {
@@ -330,6 +545,7 @@ export class WebAgent extends Abject {
         result: result.result,
         error: result.error,
         steps: result.steps,
+        ...(replyPageId ? { pageId: replyPageId } : {}),
       });
     } catch { /* caller may be gone */ }
   }

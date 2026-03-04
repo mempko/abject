@@ -52,7 +52,8 @@ export class Chat extends Abject {
 
   private messageLabelIds: AbjectId[] = [];
   private conversationHistory: ConversationEntry[] = [];
-  private objectSummaries = '';
+  private userObjectSummaries = '';
+  private systemObjectSummaries = '';
   private remotePeerContext = '';
   private uiPhase: UiPhase = 'closed';
 
@@ -200,9 +201,14 @@ export class Chat extends Abject {
 
     this.on('agentObserve', async (_msg: AbjectMessage) => {
       const lines: string[] = [];
-      if (this.objectSummaries) {
-        lines.push('Available objects:');
-        lines.push(this.objectSummaries);
+      if (this.userObjectSummaries) {
+        lines.push('Your objects (user-created — use "modify" to update):');
+        lines.push(this.userObjectSummaries);
+      }
+      if (this.systemObjectSummaries) {
+        lines.push('');
+        lines.push('System objects (built-in):');
+        lines.push(this.systemObjectSummaries);
       }
       if (this.remotePeerContext) {
         lines.push('');
@@ -365,6 +371,7 @@ export class Chat extends Abject {
             request(this.id, this.agentAbjectId!, 'startTask', {
               agentId: agent.agentId,
               task: action.task as string,
+              responseSchema: action.responseSchema as Record<string, unknown> | undefined,
             }),
             310000,
           );
@@ -399,7 +406,7 @@ Abjects is a distributed message-passing system. Each Abject is an autonomous ob
 ### When to Create vs Modify vs Call
 
 - Use **create** when the user wants a brand-new object with its own window and behavior (e.g., "make me a todo app", "build a color picker"). ObjectCreator will design and generate it.
-- Use **modify** when the user wants to change an existing object's behavior or appearance (e.g., "add a reset button to the counter", "change the background color of my app"). This updates the object in place.
+- Use **modify** when the user wants to **fix, change, or update** an existing object's behavior or appearance (e.g., "add a reset button to the counter", "fix the login button", "change the background color"). Always prefer modify over create when the object already exists.
 - Use **call** to invoke existing objects directly (e.g., "fetch this URL", "set a timer", "run this web task"). Use **ask** first to learn the object's API.
 - Use **ask** on any object to get usage guidance with code examples. This is how you discover APIs — don't guess method signatures.
 
@@ -432,12 +439,13 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 - **create**: Create a new object via ObjectCreator.
   \`{ "action": "create", "description": "A counter widget that shows a number and has +/- buttons" }\`
 - **modify**: Modify an existing object via ObjectCreator.
-  \`{ "action": "modify", "object": "ObjectName", "description": "Add a reset button that clears the counter" }\`
+  \`{ "action": "modify", "object": "<name or id>", "description": "Add a reset button that clears the counter" }\`
+  Use the \`[id: ...]\` from the object list for reliable targeting.
 
 ### Agent Delegation
 - **delegate**: Delegate a task to another registered agent.
-  \`{ "action": "delegate", "agent": "AgentName", "task": "what to do" }\`
-  Use \`list\` to discover available agents via AgentAbject.
+  \`{ "action": "delegate", "agent": "AgentName", "task": "what to do", "responseSchema": { ... } }\`
+  Use \`responseSchema\` (JSON Schema) when you need structured data back from the agent. Use \`list\` to discover available agents via AgentAbject.
 
 ### Communication
 - **reply**: Send intermediate text to the user (continue working after).
@@ -445,9 +453,13 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 - **done**: Task complete, send final reply.
   \`{ "action": "done", "text": "Here are the results: ..." }\`
 
-## Available Objects
+## Your Objects (user-created — use "modify" to fix or update these)
 
-${this.objectSummaries || '(Loading...)'}
+${this.userObjectSummaries || '(Loading...)'}
+
+## System Objects (built-in — use "call" to interact, "ask" to learn their API)
+
+${this.systemObjectSummaries || '(Loading...)'}
 ${this.remotePeerContext ? `
 ## Connected Peers & Remote Workspaces
 
@@ -462,8 +474,10 @@ This system runs on the user's own computer. All capability objects are user-con
 **UI**: WidgetManager (create windows and widgets — use \`ask\` to learn its API)
 
 ### WebAgent Usage
-- \`{ "action": "call", "object": "WebAgent", "method": "runTask", "payload": { "task": "...", "options": { "startUrl": "https://..." } } }\`
-- The message method is **runTask** (not "run" or "navigate"). Options: startUrl, maxSteps, timeout.
+- \`{ "action": "call", "object": "WebAgent", "method": "runTask", "payload": { "task": "...", "options": { "startUrl": "https://...", "responseSchema": { "type": "object", "properties": { ... } } } } }\`
+- The message method is **runTask** (not "run" or "navigate"). Options: startUrl, maxSteps, timeout, responseSchema, pageId, keepPageOpen.
+- Use \`responseSchema\` in options when you need structured data back (e.g., extracted page content as JSON). Without it, results are free text.
+- For multi-step flows (login → 2FA → action): use \`keepPageOpen: true\` in options to keep the browser page alive, then pass the returned \`pageId\` in subsequent runTask calls. Omit \`keepPageOpen\` on the final step to auto-close.
 - **Always prefer WebAgent for any multi-step web task** (logging in, browsing, extracting data). Do NOT message WebBrowser directly — WebAgent manages WebBrowser internally.
 
 When the user asks to interact with a website, **always message WebAgent** via \`{ "action": "call", "object": "WebAgent", "method": "runTask", ... }\`. Describe the full task in the payload's "task" field — WebAgent will handle all navigation, form filling, clicking, and data extraction.
@@ -478,7 +492,7 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
 5. Always end a conversation turn with **done** when the task is complete.
 6. Keep reasoning brief (1-2 sentences before the JSON block).
 7. Every object supports: describe (get manifest), ask (get usage advice), addDependent/removeDependent (observe state changes).
-8. To create new objects, use **create**. To change existing objects, use **modify**. Never message Factory.spawn directly.
+8. IMPORTANT: If the user asks to fix, change, update, or improve something and a matching object exists in "Your Objects" above, you MUST use **modify** with its [id: ...] — NEVER re-create it with **create**.
 9. P2P: Remote objects are transparently addressable. Use their registryId to query remote registries.
 10. For web tasks: message WebAgent with runTask on your FIRST action — include ALL details from the user's message (credentials, URLs, specific instructions) in the task description. Do not ask the user to repeat information they already gave you.`;
   }
@@ -734,16 +748,23 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
   // ═══════════════════════════════════════════════════════════════════
 
   private async refreshObjectSummaries(): Promise<void> {
-    if (this.objectSummaries && this.conversationHistory.length < 5) return;
+    if (this.userObjectSummaries && this.conversationHistory.length < 5) return;
 
     try {
       const objects = await this.request<ObjectRegistration[]>(
         request(this.id, this.registryId!, 'list', {})
       );
 
-      this.objectSummaries = objects
-        .map(obj => formatManifestAsDescription(obj.manifest))
-        .join('\n\n---\n\n');
+      const userObjects = objects.filter(obj => !(obj.manifest.tags ?? []).includes('system'));
+      const systemObjects = objects.filter(obj => (obj.manifest.tags ?? []).includes('system'));
+
+      this.userObjectSummaries = userObjects.length > 0
+        ? userObjects.map(obj => `[id: ${obj.id}]\n${formatManifestAsDescription(obj.manifest)}`).join('\n\n---\n\n')
+        : '(None yet — use **create** to build something new)';
+
+      this.systemObjectSummaries = systemObjects
+        .map(obj => `- ${obj.manifest.name} — ${obj.manifest.description}`)
+        .join('\n');
     } catch {
       // Keep existing summaries if refresh fails
     }
@@ -874,6 +895,35 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
       } catch { /* already gone */ }
     }
     this.messageLabelIds = [];
+  }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## Chat Usage Guide
+
+### Send a message programmatically
+
+  await call(await dep('Chat'), 'sendMessage', { message: 'Hello, what can you do?' });
+  // The Chat agent processes the message through its observe-think-act loop
+
+### Show / hide the Chat window
+
+  await call(await dep('Chat'), 'show', {});
+  await call(await dep('Chat'), 'hide', {});
+
+### Get current state
+
+  const state = await call(await dep('Chat'), 'getState', {});
+  // state: { visible, messageCount, ... }
+
+### Clear conversation history
+
+  await call(await dep('Chat'), 'clearHistory', {});
+
+### IMPORTANT
+- The interface ID is 'abjects:chat'.
+- Chat is an agent — it uses AgentAbject's observe-think-act loop to process messages.
+- sendMessage triggers the full agent cycle: the LLM decides what actions to take.
+- Actions can include creating objects, calling other services, or replying with text.`;
   }
 }
 
