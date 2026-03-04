@@ -469,6 +469,37 @@ export class WorkspaceShareRegistry extends Abject {
   protected override checkInvariants(): void {
     super.checkInvariants();
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## WorkspaceShareRegistry Usage Guide
+
+### Get locally shared workspaces
+
+  const workspaces = await call(await dep('WorkspaceShareRegistry'), 'getSharedWorkspaces', {});
+  // workspaces: [{ id, name, accessMode }]
+
+### Query a specific peer's shared workspaces
+
+  const peerWorkspaces = await call(await dep('WorkspaceShareRegistry'), 'queryPeerWorkspaces', {
+    peerId: 'remote-peer-id'
+  });
+  // peerWorkspaces: [{ id, name, accessMode, peerId }]
+
+### Discover workspaces across all connected peers
+
+  await call(await dep('WorkspaceShareRegistry'), 'discoverWorkspaces', { hops: 1 });
+  // Triggers async discovery — results arrive via events or getDiscoveredWorkspaces
+
+### Get previously discovered remote workspaces
+
+  const discovered = await call(await dep('WorkspaceShareRegistry'), 'getDiscoveredWorkspaces', {});
+  // discovered: [{ id, name, accessMode, peerId }]
+
+### IMPORTANT
+- The interface ID is 'abjects:workspace-share-registry'.
+- discoverWorkspaces is async — call getDiscoveredWorkspaces after a delay to read results.
+- Only workspaces with non-local access mode (private or public) are shared.`;
+  }
 }
 
 export const WORKSPACE_SHARE_REGISTRY_ID = 'abjects:workspace-share-registry' as AbjectId;

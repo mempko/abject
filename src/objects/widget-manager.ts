@@ -1294,11 +1294,17 @@ await this.call(layoutId, 'addLayoutChild', {
   widgetId: newWidgetId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 36 }
 });
 
-// Remove a widget from a layout:
+// Remove a widget from its layout (via WidgetManager):
+await this.call(this.dep('WidgetManager'), 'removeWidget', { widgetId: widgetId });
+
+// Remove a widget from a specific layout:
 await this.call(layoutId, 'removeLayoutChild', { widgetId: widgetId });
 
 // Destroy a widget (stop its Abject and free resources):
 await this.call(widgetId, 'destroy', {});
+
+// Bring a window to the front:
+await this.call(this.dep('WidgetManager'), 'raiseWindow', { windowId: winId });
 
 ### Animation Pattern
 

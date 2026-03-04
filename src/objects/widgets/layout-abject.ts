@@ -100,6 +100,7 @@ export abstract class LayoutAbject extends WidgetAbject {
   protected spacing: number;
   private hoveredLayoutChildId?: AbjectId;
   private expandedChildren: Set<AbjectId> = new Set();
+  protected hiddenChildren: Set<AbjectId> = new Set();
 
   constructor(config: LayoutConfig, layoutType: 'vbox' | 'hbox') {
     super({
@@ -189,6 +190,7 @@ export abstract class LayoutAbject extends WidgetAbject {
         this.hoveredLayoutChildId = undefined;
       }
       this.expandedChildren.delete(widgetId);
+      this.hiddenChildren.delete(widgetId);
       if (this.rect.width > 0 && this.rect.height > 0) {
         await this.updateChildRects();
       }
@@ -227,6 +229,17 @@ export abstract class LayoutAbject extends WidgetAbject {
           this.expandedChildren.add(msg.routing.from);
         } else {
           this.expandedChildren.delete(msg.routing.from);
+        }
+        await this.requestRedraw();
+      }
+      if (aspect === 'visibility') {
+        if (value) {
+          this.hiddenChildren.delete(msg.routing.from);
+        } else {
+          this.hiddenChildren.add(msg.routing.from);
+        }
+        if (this.rect.width > 0 && this.rect.height > 0) {
+          await this.updateChildRects();
         }
         await this.requestRedraw();
       }

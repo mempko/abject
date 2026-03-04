@@ -759,6 +759,36 @@ HealthMonitor pings monitored objects periodically. After ${this.config.maxPingF
   const allStatus = await this.call(this.dep('HealthMonitor'), 'getAllStatus', {});
   const allLiveness = await this.call(this.dep('HealthMonitor'), 'getAllObjectLiveness', {});
 
+### Stop monitoring
+
+  await this.call(this.dep('HealthMonitor'), 'unmonitorObject',
+    { objectId: targetId });
+
+### Start/stop the periodic check cycle
+
+  await this.call(this.dep('HealthMonitor'), 'startMonitoring', {});
+
+### Connection health details
+
+  const status = await this.call(this.dep('HealthMonitor'), 'getStatus',
+    { agreementId: 'agreement-id' });
+  // status: { totalMessages, errors, errorRate, isHealthy, lastActivity }
+
+### Force renegotiation
+
+  await this.call(this.dep('HealthMonitor'), 'forceRenegotiate',
+    { agreementId: 'agreement-id' });
+
+### Manual health recording
+
+  await this.call(this.dep('HealthMonitor'), 'recordSuccess', { agreementId: 'agreement-id' });
+  await this.call(this.dep('HealthMonitor'), 'recordError', { agreementId: 'agreement-id' });
+
+### Mark object ready after restart
+
+  await this.call(this.dep('HealthMonitor'), 'markObjectReady', { objectId: targetId });
+  // Resets ping failure count so the monitor gives the object a fresh chance
+
 ### Events
 - healthWarning: connection error rate exceeded ${this.config.errorThreshold}%
 - renegotiationTriggered: automatic renegotiation started

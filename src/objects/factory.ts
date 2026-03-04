@@ -195,6 +195,9 @@ export class Factory extends Abject {
 ### CompositeAbject
 A CompositeAbject groups multiple child ScriptableAbjects behind a single ID with unified interfaces. To spawn one, pass \`source\` as a JSON-serialized CompositeSpec and include \`'composite'\` in \`manifest.tags\`. The spec defines children (role + source + manifest), interfaces, and a routing table mapping "interfaceId::method" to strategies: delegate (single child), fanout (multiple children), or orchestrate (custom handler). Children are managed internally — they are not visible in the Registry unless exposeChildren is set.
 
+### Object Inspection
+- \`getObjectInfo({ objectId })\` — Returns \`{ isWorkerHosted, constructorName, workerIndex }\` or undefined if not found.
+
 ### Key Constraints
 - \`spawn()\` only works for pre-registered constructors or objects with source code. Use ObjectCreator to create entirely new objects from natural language prompts.
 - \`clone()\` looks up the original object in the Registry and re-spawns with the same manifest and source.

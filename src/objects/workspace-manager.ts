@@ -987,6 +987,15 @@ export class WorkspaceManager extends Abject {
 - \`getAccessMode({ workspaceId })\` — Get workspace access mode (local, private, public).
 - \`setAccessMode({ workspaceId, accessMode })\` — Set workspace access mode.
 
+### Whitelist Management
+- \`getWhitelist({ workspaceId })\` — Get the peer whitelist for a workspace. Returns string[].
+- \`setWhitelist({ workspaceId, whitelist })\` — Set the peer whitelist (array of peer IDs).
+
+### Discovery & Inspection
+- \`listSharedWorkspaces({})\` — List workspaces with non-local access mode. Returns [{ id, name, accessMode }].
+- \`findWorkspaceForObject({ objectId })\` — Find which workspace owns an object. Returns { workspaceId } or undefined.
+- \`listWorkspacesDetailed({})\` — Full workspace details including access mode, whitelist, and child objects.
+
 ### Interface ID
 \`abjects:workspace-manager\``;
   }

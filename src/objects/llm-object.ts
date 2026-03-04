@@ -452,6 +452,19 @@ The \`options\` object in \`complete\` accepts:
 - maxTokens: number — limit response length
 - stopSequences: string[] — stop generation at these strings
 
+### Provider Management
+
+  const providers = await this.call(this.dep('LLM'), 'listProviders', {});
+  // providers: [{ name: 'anthropic', available: true }, { name: 'openai', available: false }, ...]
+
+  await this.call(this.dep('LLM'), 'setProvider', { name: 'ollama' });
+  // Switch the active/default provider
+
+  await this.call(this.dep('LLM'), 'configure', {
+    anthropicApiKey: '...', openaiApiKey: '...', ollamaUrl: 'http://localhost:11434'
+  });
+  // Configure provider settings (all fields optional)
+
 ### IMPORTANT
 - The interface ID is 'abjects:llm' (NOT 'abjects:llm-object').
 - Message roles MUST be 'system', 'user', or 'assistant' — no other values.

@@ -384,6 +384,41 @@ export class Supervisor extends Abject {
     super.checkInvariants();
     invariant(this.children.size >= 0, 'child count must be non-negative');
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## Supervisor Usage Guide
+
+### Add a supervised child
+
+  await call(await dep('Supervisor'), 'addChild', {
+    id: 'child-object-id', constructorName: 'MyObject', restart: 'permanent'
+  });
+
+Restart types:
+- 'permanent' — always restarted when it stops
+- 'transient' — restarted only if it stops abnormally (with an error)
+- 'temporary' — never restarted
+
+### Remove a supervised child
+
+  await call(await dep('Supervisor'), 'removeChild', { childId: 'child-object-id' });
+
+### List supervised children
+
+  const children = await call(await dep('Supervisor'), 'getChildren', {});
+  // children: [{ id, constructorName, restart, restarts }]
+
+### Report a child failure
+
+  await call(await dep('Supervisor'), 'childFailed', {
+    childId: 'child-object-id', error: { code: 'CRASH', message: 'unexpected error' }
+  });
+
+### IMPORTANT
+- The interface ID is 'abjects:supervisor'.
+- The Supervisor uses Factory to respawn crashed children.
+- Restart intensity is rate-limited — too many restarts in a short window stops the child permanently.`;
+  }
 }
 
 // Well-known supervisor ID

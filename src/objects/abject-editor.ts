@@ -434,6 +434,24 @@ export class AbjectEditor extends Abject {
       return;
     }
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## AbjectEditor Usage Guide
+
+### Open the editor for a ScriptableAbject
+
+  await call(await dep('AbjectEditor'), 'show', { objectId: 'the-object-id' });
+  // Opens a window with the object's source code and AI-assisted editing
+
+### Hide the editor
+
+  await call(await dep('AbjectEditor'), 'hide', {});
+
+### IMPORTANT
+- The interface ID is 'abjects:abject-editor'.
+- The editor only works with ScriptableAbject instances (objects that have source code).
+- Changes are applied live — the object is recompiled and re-initialized when saved.`;
+  }
 }
 
 export const ABJECT_EDITOR_ID = 'abjects:abject-editor' as AbjectId;

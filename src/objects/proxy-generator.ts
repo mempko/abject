@@ -457,6 +457,34 @@ RULES:
     this.generatedProxies.clear();
     this.proxyMeta.clear();
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## ProxyGenerator Usage Guide
+
+### Generate a proxy between two objects
+
+  const result = await call(await dep('ProxyGenerator'), 'generateProxy', {
+    sourceId: 'source-object-id', targetId: 'target-object-id',
+    sourceDescription: 'optional usage guide', targetDescription: 'optional usage guide'
+  });
+  // result: { proxyId, agreementId }
+
+The proxy is a ScriptableAbject that translates messages from source's protocol to target's protocol. If descriptions are not provided, ProxyGenerator auto-introspects both objects via their 'describe' handler.
+
+### Regenerate a proxy after errors
+
+  const result = await call(await dep('ProxyGenerator'), 'regenerateProxy', {
+    agreementId: 'the-agreement-id', errorContext: 'TypeError: expected number got string'
+  });
+  // result: { proxyId, agreementId }
+
+This re-generates the proxy code with the error context so the LLM can fix the translation issue.
+
+### IMPORTANT
+- The interface ID is 'abjects:proxy-generator'.
+- Proxy generation uses the LLM and may take several seconds.
+- Generated proxies are cached by agreement ID — regenerateProxy replaces the cached version.`;
+  }
 }
 
 // Well-known proxy generator ID

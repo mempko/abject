@@ -11,6 +11,7 @@
  * to implement agentObserve and agentAct message handlers.
  */
 
+import Ajv from 'ajv';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
@@ -107,6 +108,8 @@ interface TaskEntry {
   systemPrompt: string;
   initialMessages?: { role: string; content: string | ContentPart[] }[];
   lastObservationLlmContent?: ContentPart[];
+  /** JSON Schema for structured result validation. */
+  responseSchema?: Record<string, unknown>;
   /** Original message from startTask caller, for deferred reply. */
   originalMsg: AbjectMessage;
 }
@@ -176,6 +179,13 @@ export class AgentAbject extends Abject {
   /** Job submission heartbeat message ID for resetting request timeouts. */
   private _currentJobMsgId?: string;
 
+  /** Lazy Ajv instance for response schema validation. */
+  private _ajv?: Ajv;
+  private get ajv(): Ajv {
+    if (!this._ajv) this._ajv = new Ajv({ allErrors: true });
+    return this._ajv;
+  }
+
   constructor() {
     super({
       manifest: {
@@ -227,6 +237,7 @@ export class AgentAbject extends Abject {
                 { name: 'systemPrompt', type: { kind: 'primitive', primitive: 'string' }, description: 'Override system prompt', optional: true },
                 { name: 'initialMessages', type: { kind: 'array', elementType: { kind: 'object', properties: {} } }, description: 'Initial conversation messages', optional: true },
                 { name: 'config', type: { kind: 'object', properties: {} }, description: 'Per-task config overrides', optional: true },
+                { name: 'responseSchema', type: { kind: 'object', properties: {} }, description: 'JSON Schema for structured result', optional: true },
               ],
               returns: { kind: 'object', properties: {
                 taskId: { kind: 'primitive', primitive: 'string' },
@@ -234,6 +245,7 @@ export class AgentAbject extends Abject {
                 result: { kind: 'primitive', primitive: 'string' },
                 error: { kind: 'primitive', primitive: 'string' },
                 steps: { kind: 'primitive', primitive: 'number' },
+                validationErrors: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
               } },
             },
             {
@@ -302,6 +314,73 @@ export class AgentAbject extends Abject {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## AgentAbject Usage Guide
+
+### Register an Agent
+
+  await call(await dep('AgentAbject'), 'registerAgent', {
+    name: 'MyAgent',
+    description: 'What this agent does',
+    config: {
+      terminalActions: {
+        done: { type: 'success', resultFields: ['result'] },
+        fail: { type: 'error', resultFields: ['reason'] },
+      },
+    },
+  });
+
+Your object must implement these callback handlers:
+- agentObserve(msg) — return { observation: string, llmContent?: ContentPart[] }
+- agentAct(msg) — return { success: boolean, data?: unknown, error?: string }
+
+### Start a Task (free-text result)
+
+  const result = await call(await dep('AgentAbject'), 'startTask', {
+    agentId: 'target-agent-id',  // optional if caller is a registered agent
+    task: 'Describe the task in natural language',
+    config: { maxSteps: 10, timeout: 60000 },
+  });
+  // result: { taskId, success, result, error, steps }
+
+### Start a Task (structured result with responseSchema)
+
+  const result = await call(await dep('AgentAbject'), 'startTask', {
+    agentId: 'target-agent-id',
+    task: 'Extract product info from the page',
+    responseSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        price: { type: 'number' },
+        inStock: { type: 'boolean' },
+      },
+      required: ['name', 'price'],
+    },
+  });
+  // result: { taskId, success, result: { name, price, inStock }, steps, validationErrors? }
+  // validationErrors is undefined when validation passes, or string[] on mismatch
+
+responseSchema is a JSON Schema object. When provided:
+- The agent's LLM is instructed to return structured JSON matching the schema
+- The result is validated with ajv after completion (soft validation — warns but doesn't reject)
+- The result field contains the parsed JSON object instead of a plain string
+
+### List Registered Agents
+
+  const agents = await call(await dep('AgentAbject'), 'listAgents', {});
+  // agents: [{ agentId, name, description, status, activeTasks }]
+
+### Cancel a Task
+
+  await call(await dep('AgentAbject'), 'cancelTask', { taskId: 'task-id' });
+
+### IMPORTANT
+- startTask is a long-running operation — it drives an observe→think→act loop until done/fail.
+- Agents must be registered before tasks can be sent to them.
+- The caller receives a deferred reply when the task completes.`;
+  }
+
   protected override async onInit(): Promise<void> {
     this.llmId = await this.discoverDep('LLM') ?? undefined;
     this.jobManagerId = await this.discoverDep('JobManager') ?? undefined;
@@ -366,6 +445,7 @@ export class AgentAbject extends Abject {
         systemPrompt,
         initialMessages,
         config: taskConfig,
+        responseSchema,
       } = msg.payload as {
         agentId?: AbjectId;
         taskId?: string;
@@ -373,6 +453,7 @@ export class AgentAbject extends Abject {
         systemPrompt?: string;
         initialMessages?: { role: string; content: string | ContentPart[] }[];
         config?: Partial<AgentConfig>;
+        responseSchema?: Record<string, unknown>;
       };
 
       const callerId = msg.routing.from;
@@ -397,6 +478,7 @@ export class AgentAbject extends Abject {
         config,
         systemPrompt: prompt,
         initialMessages,
+        responseSchema,
         originalMsg: msg,
       };
       this.taskEntries.set(taskId, entry);
@@ -609,6 +691,21 @@ export class AgentAbject extends Abject {
 
     // Send deferred reply to startTask caller
     const success = entry.state.phase === 'done';
+
+    // Validate result against responseSchema if present (soft validation — warn only)
+    let validationErrors: string[] | undefined;
+    if (success && entry.responseSchema && entry.state.result !== undefined) {
+      // Parse result if it's a string (LLM may return JSON as string)
+      if (typeof entry.state.result === 'string') {
+        try { entry.state.result = JSON.parse(entry.state.result); } catch { /* keep as string */ }
+      }
+      const validate = this.ajv.compile(entry.responseSchema);
+      if (!validate(entry.state.result)) {
+        validationErrors = validate.errors?.map(e => `${e.instancePath} ${e.message}`) ?? [];
+        console.warn(`[AgentAbject] Schema validation failed for task ${entry.state.id}:`, validationErrors);
+      }
+    }
+
     try {
       await this.sendDeferredReply(entry.originalMsg, {
         taskId: entry.state.id,
@@ -616,6 +713,7 @@ export class AgentAbject extends Abject {
         result: entry.state.result,
         error: entry.state.error,
         steps: entry.state.step,
+        validationErrors,
       });
     } catch { /* caller may be gone */ }
 
@@ -869,8 +967,13 @@ export class AgentAbject extends Abject {
   private initializeConversation(entry: TaskEntry): { role: string; content: string | ContentPart[] }[] {
     const messages: { role: string; content: string | ContentPart[] }[] = [];
 
-    if (entry.systemPrompt) {
-      messages.push({ role: 'system', content: entry.systemPrompt });
+    let prompt = entry.systemPrompt;
+    if (entry.responseSchema) {
+      prompt += `\n\n## Response Schema\nWhen you complete the task, the "result" field of your terminal action MUST be a JSON object (not a string) conforming to this schema:\n\`\`\`json\n${JSON.stringify(entry.responseSchema, null, 2)}\n\`\`\`\nIMPORTANT: The "result" value must be a structured JSON object, NOT a string. Include all required fields. Use exact property names from the schema.`;
+    }
+
+    if (prompt) {
+      messages.push({ role: 'system', content: prompt });
     }
 
     if (entry.initialMessages && entry.initialMessages.length > 0) {

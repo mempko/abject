@@ -299,4 +299,44 @@ export class RemoteRegistry extends Abject {
   protected override checkInvariants(): void {
     super.checkInvariants();
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## RemoteRegistry Usage Guide
+
+### Discover remote objects by name or interface
+
+  const results = await call(await dep('RemoteRegistry'), 'discoverRemote', {
+    name: 'Counter', interfaceId: 'abjects:counter'
+  });
+  // results: [{ objectId, peerId, manifest }]
+  // Both name and interfaceId are optional filters.
+
+### Look up a specific remote object
+
+  const entry = await call(await dep('RemoteRegistry'), 'lookupRemote', {
+    objectId: 'remote-object-id'
+  });
+  // entry: { objectId, peerId, manifest } or undefined
+
+### Register a remote object manually
+
+  await call(await dep('RemoteRegistry'), 'registerRemoteObject', {
+    objectId: 'remote-object-id', peerId: 'peer-id', manifest: { ... }
+  });
+
+### Sync with a connected peer
+
+  await call(await dep('RemoteRegistry'), 'syncWithPeer', { peerId: 'peer-id' });
+  // Fetches the peer's published objects and caches them locally
+
+### List all known remote objects
+
+  const objects = await call(await dep('RemoteRegistry'), 'listRemoteObjects', {});
+  // objects: [{ objectId, peerId, manifest, discoveredAt }]
+
+### IMPORTANT
+- The interface ID is 'abjects:remote-registry'.
+- Remote object entries have a TTL and expire if not refreshed via syncWithPeer.
+- discoverRemote searches the local cache — call syncWithPeer first to ensure fresh data.`;
+  }
 }

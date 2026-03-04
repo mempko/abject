@@ -359,6 +359,35 @@ export class AbjectStore extends Abject {
     super.checkInvariants();
     invariant(this.snapshots.size >= 0, 'snapshot count must be non-negative');
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## AbjectStore Usage Guide
+
+### Save an object snapshot
+
+  await call(await dep('AbjectStore'), 'save', { objectId: 'the-object-id' });
+  // Persists the object's manifest and source code for later restoration
+
+### Remove a saved snapshot
+
+  await call(await dep('AbjectStore'), 'remove', { objectId: 'the-object-id' });
+
+### List all saved snapshots
+
+  const snapshots = await call(await dep('AbjectStore'), 'list', {});
+  // snapshots: [{ objectId, manifest, source, owner, savedAt }]
+
+### Restore all saved objects
+
+  const restored = await call(await dep('AbjectStore'), 'restoreAll', {});
+  // restored: [{ originalId, newId, name }]
+  // Note: restored objects get NEW IDs — the original IDs are not reused.
+
+### IMPORTANT
+- The interface ID is 'abjects:abject-store'.
+- save() snapshots the current state — call it after the object is fully configured.
+- restoreAll() is typically called at boot time to bring back user-created objects.`;
+  }
 }
 
 // Well-known AbjectStore ID

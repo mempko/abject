@@ -153,8 +153,12 @@ export abstract class WidgetAbject extends Abject {
 
     this.on('update', async (msg: AbjectMessage) => {
       const updates = msg.payload as Record<string, unknown>;
+      const oldVisible = this.visible;
       this.applyCommonUpdates(updates);
       await this.applyUpdate(updates);
+      if (this.visible !== oldVisible) {
+        await this.changed('visibility', this.visible);
+      }
       await this.requestRedraw();
       return true;
     });
@@ -191,6 +195,9 @@ export abstract class WidgetAbject extends Abject {
     if (updates.text !== undefined) this.text = updates.text as string;
     if (updates.style !== undefined) this.style = { ...this.style, ...(updates.style as WidgetStyle) };
     if (updates.rect !== undefined) this.rect = updates.rect as Rect;
+    // Support top-level visible/disabled as shorthand for style.visible/style.disabled
+    if (updates.visible !== undefined) this.style = { ...this.style, visible: updates.visible as boolean };
+    if (updates.disabled !== undefined) this.style = { ...this.style, disabled: updates.disabled as boolean };
     this.syncDisabledVisible();
   }
 

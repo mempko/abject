@@ -484,6 +484,58 @@ export class IdentityObject extends Abject {
       invariant(this.signingKeyPair !== undefined, 'signing keys must exist when exchange keys exist');
     }
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## IdentityObject Usage Guide
+
+### Get this peer's identity
+
+  const identity = await call(await dep('Identity'), 'getIdentity', {});
+  // identity: { peerId, name, signingKey, agreementKey }
+
+### Sign and verify data
+
+  const { signature } = await call(await dep('Identity'), 'sign', { data: 'message to sign' });
+  const { valid } = await call(await dep('Identity'), 'verify', {
+    peerId: 'signer-peer-id', data: 'message to sign', signature: signature
+  });
+
+### Encrypt and decrypt for a peer
+
+  const encrypted = await call(await dep('Identity'), 'encrypt', {
+    peerId: 'recipient-peer-id', data: 'secret message'
+  });
+  // encrypted: { iv, ciphertext }
+
+  const { data } = await call(await dep('Identity'), 'decrypt', {
+    peerId: 'sender-peer-id', iv: encrypted.iv, ciphertext: encrypted.ciphertext
+  });
+
+### Export / import keys
+
+  const keys = await call(await dep('Identity'), 'exportPublicKeys', {});
+  // keys: { signingKey, agreementKey } (JWK format)
+
+  await call(await dep('Identity'), 'importContact', {
+    peerId: 'remote-peer-id', publicSigningKey: '...', publicExchangeKey: '...'
+  });
+
+### Set display name
+
+  await call(await dep('Identity'), 'setName', { name: 'Alice' });
+
+### Derive a session key
+
+  const { sessionKey } = await call(await dep('Identity'), 'deriveSessionKey', {
+    peerId: 'remote-peer-id'
+  });
+
+### IMPORTANT
+- The interface ID is 'abjects:identity'.
+- Uses ECDSA P-256 for signing and ECDH P-256 for key agreement.
+- Keys are persisted via the Storage capability — they survive restarts.
+- importContact must be called before encrypt/decrypt/verify with a remote peer.`;
+  }
 }
 
 // =============================================================================

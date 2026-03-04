@@ -16,7 +16,10 @@ export class HBoxLayout extends LayoutAbject {
   }
 
   protected calculateChildRects(contentRect: Rect): ChildRect[] {
-    const children = this.layoutChildren;
+    const children = this.layoutChildren.filter(c => {
+      if (isSpacer(c)) return true;
+      return !this.hiddenChildren.has(c.widgetId);
+    });
     if (children.length === 0) return [];
 
     // Calculate total spacing

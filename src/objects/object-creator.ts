@@ -282,7 +282,7 @@ export class ObjectCreator extends Abject {
     this.on('agentObserve', async (msg: AbjectMessage) => {
       const { taskId } = msg.payload as { taskId: string; step: number };
       const extra = this.creationTasks.get(taskId);
-      if (!extra) return { observation: 'ObjectCreator ready. Available actions: create_object, modify_object.' };
+      if (!extra) return { observation: 'ObjectCreator ready. Available actions: create_object (new object from prompt), modify_object (update existing object by ID).' };
 
       if (extra.result) {
         if (extra.result.success) {
@@ -293,7 +293,7 @@ export class ObjectCreator extends Abject {
         return { observation: `Creation failed: ${extra.result.error}` };
       }
 
-      return { observation: `Task: "${extra.prompt}". Execute create_object to run the creation pipeline.` };
+      return { observation: `Task: "${extra.prompt}". Execute create_object to build it.` };
     });
 
     this.on('agentAct', async (msg: AbjectMessage) => {
@@ -1110,17 +1110,18 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           const connectNames = deps.map((d) => d.name).join(', ');
           await this.reportProgress(callerId, '6', `Connecting to ${connectNames}...`);
         }
-        if (this.negotiatorId && spawnResult.objectId) {
-          for (const dep of deps) {
-            this.request(request(
-              this.id, this.negotiatorId,
-              'connect',
-              { sourceId: spawnResult.objectId, targetId: dep.id }
-            )).catch((err) => {
-              console.warn(`[OBJECT-CREATOR] Connect to ${dep.name} failed:`, err);
-            });
-          }
-        }
+        // TODO: Re-enable Negotiator connect when implementation is improved
+        // if (this.negotiatorId && spawnResult.objectId) {
+        //   for (const dep of deps) {
+        //     this.request(request(
+        //       this.id, this.negotiatorId,
+        //       'connect',
+        //       { sourceId: spawnResult.objectId, targetId: dep.id }
+        //     )).catch((err) => {
+        //       console.warn(`[OBJECT-CREATOR] Connect to ${dep.name} failed:`, err);
+        //     });
+        //   }
+        // }
 
         // Tag the new object with ObjectCreator's own workspace so its windows
         // are scoped to the workspace where it was created
@@ -1431,17 +1432,18 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         const connectNames = deps.map((d) => d.name).join(', ');
         await this.reportProgress(callerId, '6', `Connecting to ${connectNames}...`);
       }
-      if (this.negotiatorId) {
-        for (const dep of deps) {
-          this.request(request(
-            this.id, this.negotiatorId,
-            'connect',
-            { sourceId: objectId, targetId: dep.id }
-          )).catch((err) => {
-            console.warn(`[OBJECT-CREATOR modify] Connect to ${dep.name} failed:`, err);
-          });
-        }
-      }
+      // TODO: Re-enable Negotiator connect when implementation is improved
+      // if (this.negotiatorId) {
+      //   for (const dep of deps) {
+      //     this.request(request(
+      //       this.id, this.negotiatorId,
+      //       'connect',
+      //       { sourceId: objectId, targetId: dep.id }
+      //     )).catch((err) => {
+      //       console.warn(`[OBJECT-CREATOR modify] Connect to ${dep.name} failed:`, err);
+      //     });
+      //   }
+      // }
 
       this._currentCallerId = undefined;
       return {

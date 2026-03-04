@@ -371,6 +371,46 @@ export class JobManager extends Abject {
     super.checkInvariants();
     contractRequire(this.jobCounter >= 0, 'jobCounter must be non-negative');
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## JobManager Usage Guide
+
+### Submit a job for execution
+
+  const result = await call(await dep('JobManager'), 'submitJob', {
+    description: 'Calculate stats', code: 'return 2 + 2;', queue: 'default'
+  });
+  // result: { jobId, status: 'completed'|'failed'|'cancelled', result?, error? }
+
+Jobs run in a FIFO queue. Inside job code you have access to:
+- \`call(target, method, payload)\` — call other objects
+- \`dep(name)\` — resolve a dependency by name
+- \`find(query)\` — find objects in the registry
+- \`id\` — this object's AbjectId
+- \`progress(pct)\` — report progress (0-100)
+
+### Inspect jobs
+
+  const jobs = await call(await dep('JobManager'), 'listJobs', {});
+  // jobs: [{ jobId, description, status, queue, submittedAt, completedAt?, result?, error? }]
+
+  const job = await call(await dep('JobManager'), 'getJob', { jobId: 'job-1' });
+
+### Manage jobs
+
+  await call(await dep('JobManager'), 'cancelJob', { jobId: 'job-1' });
+  await call(await dep('JobManager'), 'clearHistory', {});
+
+### List queues
+
+  const queues = await call(await dep('JobManager'), 'listQueues', {});
+  // queues: [{ name, pendingCount, runningJobId? }]
+
+### IMPORTANT
+- The interface ID is 'abjects:job-manager'.
+- Jobs execute sequentially per queue. The default queue is 'default'.
+- submitJob is synchronous from the caller's perspective — it waits for the job to finish.`;
+  }
 }
 
 export const JOBMANAGER_ID = 'abjects:job-manager' as AbjectId;

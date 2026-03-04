@@ -856,4 +856,55 @@ export class PeerRegistry extends Abject {
   protected override checkInvariants(): void {
     super.checkInvariants();
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## PeerRegistry Usage Guide
+
+### Add a contact
+
+  await call(await dep('PeerRegistry'), 'addContact', {
+    peerId: 'remote-peer-id',
+    publicSigningKey: '...', publicExchangeKey: '...',
+    name: 'Alice'
+  });
+
+### List contacts
+
+  const contacts = await call(await dep('PeerRegistry'), 'listContacts', {});
+  // contacts: [{ peerId, name, state }]
+
+### Connect to a peer
+
+  await call(await dep('PeerRegistry'), 'connectToPeer', { peerId: 'remote-peer-id' });
+  // Initiates WebRTC connection via signaling server
+
+### Disconnect a peer
+
+  await call(await dep('PeerRegistry'), 'disconnectPeer', { peerId: 'remote-peer-id' });
+
+### Get contact connection state
+
+  const state = await call(await dep('PeerRegistry'), 'getContactState', { peerId: 'remote-peer-id' });
+  // state: 'disconnected' | 'connecting' | 'connected'
+
+### Signaling server management
+
+  await call(await dep('PeerRegistry'), 'connectSignaling', { url: 'ws://localhost:7720' });
+  await call(await dep('PeerRegistry'), 'disconnectSignaling', { url: 'ws://localhost:7720' });
+  const servers = await call(await dep('PeerRegistry'), 'listSignalingServers', {});
+  await call(await dep('PeerRegistry'), 'removeSignalingServer', { url: 'ws://localhost:7720' });
+
+### Find a peer on signaling servers
+
+  const found = await call(await dep('PeerRegistry'), 'findPeer', { peerId: 'remote-peer-id' });
+
+### Events
+- contactConnected: { peerId } — a peer's WebRTC connection is established
+- contactDisconnected: { peerId } — a peer's WebRTC connection was lost
+
+### IMPORTANT
+- The interface ID is 'abjects:peer-registry'.
+- connectToPeer requires a signaling server connection and the contact already added.
+- WebRTC connections include an identity handshake with AES-256-GCM encryption.`;
+  }
 }

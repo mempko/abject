@@ -788,4 +788,48 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   protected override checkInvariants(): void {
     super.checkInvariants();
   }
+
+  protected override getSourceForAsk(): string | undefined {
+    return `## PeerRouter Usage Guide
+
+### Register a route to a remote object
+
+  await call(await dep('PeerRouter'), 'registerRoute', {
+    objectId: 'remote-object-id', peerId: 'peer-id', hops: 1
+  });
+
+### Remove a route
+
+  await call(await dep('PeerRouter'), 'removeRoute', { objectId: 'remote-object-id' });
+
+### Clear all routes for a disconnected peer
+
+  await call(await dep('PeerRouter'), 'clearRoutesForPeer', { peerId: 'peer-id' });
+
+### Allow a system object to be routed
+
+  await call(await dep('PeerRouter'), 'allowSystemObject', {
+    objectId: 'local-object-id', wellKnownId: 'abjects:registry'
+  });
+
+### Get all routes
+
+  const routes = await call(await dep('PeerRouter'), 'getRoutes', {});
+  // routes: Map-like entries of { objectId, peerId, hops, wellKnownId? }
+
+### Announce routes to a peer
+
+  await call(await dep('PeerRouter'), 'announceRoutes', { peerId: 'peer-id' });
+
+### Resolve a well-known object on a remote peer
+
+  const objectId = await call(await dep('PeerRouter'), 'resolveRemoteObject', {
+    peerId: 'peer-id', wellKnownId: 'abjects:registry'
+  });
+
+### IMPORTANT
+- The interface ID is 'abjects:peer-router'.
+- Routes are automatically maintained as peers connect/disconnect.
+- Multi-hop routing is transparent — messages are forwarded along the shortest path.`;
+  }
 }
