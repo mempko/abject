@@ -7,8 +7,21 @@
 
 import { FrontendClient } from './frontend-client.js';
 
-const wsPort = import.meta.env.VITE_WS_PORT ?? '7719';
-const WS_URL = `ws://${location.hostname}:${wsPort}`;
+function buildWsUrl(): string {
+  // Explicit override takes precedence
+  if (import.meta.env.VITE_WS_URL) {
+    return import.meta.env.VITE_WS_URL as string;
+  }
+  // Behind HTTPS/nginx: use wss:// on same host via /ws path
+  if (location.protocol === 'https:') {
+    return `wss://${location.host}/ws`;
+  }
+  // Local dev: direct connection to backend port
+  const wsPort = import.meta.env.VITE_WS_PORT ?? '7719';
+  return `ws://${location.hostname}:${wsPort}`;
+}
+
+const WS_URL = buildWsUrl();
 
 function start(): void {
   const container = document.querySelector('#app');
