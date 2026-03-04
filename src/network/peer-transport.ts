@@ -174,6 +174,42 @@ export class PeerTransport extends Transport {
     }
   }
 
+  /**
+   * Reset the PeerConnection for ICE glare recovery (loser side).
+   * Destroys the current PeerConnection without triggering disconnect events,
+   * preserving queued pendingCandidates so the remote peer's trickled ICE
+   * candidates survive into the new connection.
+   *
+   * Note: We can't use SDP rollback because node-datachannel's polyfill
+   * silently ignores setLocalDescription({type: 'rollback'}).
+   */
+  resetForGlare(): void {
+    // Detach ALL event handlers BEFORE close() so the 'closed'/'close'
+    // events don't trigger handleDisconnect and cascade to onDisconnect
+    // (which would delete the transport from PeerRegistry's map).
+    if (this.dataChannel) {
+      this.dataChannel.onopen = null;
+      this.dataChannel.onclose = null;
+      this.dataChannel.onerror = null;
+      this.dataChannel.onmessage = null;
+      this.dataChannel.close();
+      this.dataChannel = undefined;
+    }
+
+    if (this.peerConnection) {
+      this.peerConnection.oniceconnectionstatechange = null;
+      this.peerConnection.ondatachannel = null;
+      this.peerConnection.onicecandidate = null;
+      this.peerConnection.close();
+      this.peerConnection = undefined;
+    }
+
+    this.stopPing();
+    this.sessionKey = undefined;
+    this.handshakeState = 'none';
+    // NOTE: pendingCandidates intentionally preserved
+  }
+
   async disconnect(): Promise<void> {
     this.stopPing();
     this.sessionKey = undefined;
@@ -259,14 +295,17 @@ export class PeerTransport extends Transport {
   }
 
   private setupDataChannel(dc: RTCDataChannel): void {
-    dc.onopen = () => {
+    let opened = false;
+    const onOpen = () => {
+      if (opened) return;
+      opened = true;
       console.log(`[PeerTransport] DataChannel open with ${this.remotePeerId.slice(0, 16)}`);
-      this.handleConnect();
-      // Start identity handshake
+      // Don't call handleConnect() here — defer until handshake completes
+      // so PeerRouter knows about the connection before messages arrive.
       this.startHandshake();
-      // Start keepalive pings
-      this.startPing();
     };
+
+    dc.onopen = onOpen;
 
     dc.onclose = () => {
       this.handleDisconnect('DataChannel closed');
@@ -283,10 +322,7 @@ export class PeerTransport extends Transport {
     // Callee may receive a DataChannel already in 'open' state via ondatachannel,
     // in which case onopen won't fire. Trigger manually.
     if (dc.readyState === 'open') {
-      console.log(`[PeerTransport] DataChannel already open with ${this.remotePeerId.slice(0, 16)}`);
-      this.handleConnect();
-      this.startHandshake();
-      this.startPing();
+      onOpen();
     }
   }
 
@@ -381,6 +417,12 @@ export class PeerTransport extends Transport {
     this.sessionKey = await deriveSessionKey(this.localExchangePrivateKey, remoteExchangeKey);
     this.handshakeState = 'encrypted';
     console.log(`[PeerTransport] Handshake complete with ${this.remotePeerId.slice(0, 16)}, AES-256-GCM session established`);
+
+    // NOW signal connected — after identity is verified and encryption
+    // is established. This ensures PeerRouter learns about the connection
+    // (via contactConnected) before any application-level messages arrive.
+    this.handleConnect();
+    this.startPing();
   }
 
   /**

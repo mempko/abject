@@ -493,7 +493,7 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
 6. Keep reasoning brief (1-2 sentences before the JSON block).
 7. Every object supports: describe (get manifest), ask (get usage advice), addDependent/removeDependent (observe state changes).
 8. IMPORTANT: If the user asks to fix, change, update, or improve something and a matching object exists in "Your Objects" above, you MUST use **modify** with its [id: ...] — NEVER re-create it with **create**.
-9. P2P: Remote objects are transparently addressable. Use their registryId to query remote registries.
+9. P2P: Use qualified names to reference remote objects: this.find('peer.workspace.ObjectName'). NEVER hardcode UUIDs.
 10. For web tasks: message WebAgent with runTask on your FIRST action — include ALL details from the user's message (credentials, URLs, specific instructions) in the task description. Do not ask the user to repeat information they already gave you.`;
   }
 
@@ -800,7 +800,9 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
           );
           const objNames = remoteObjects.map(o => {
             const clonable = (o as ObjectRegistration & { source?: string }).source ? ' (clonable)' : '';
-            return `${o.manifest.name}${clonable}`;
+            const displayName = o.name ?? o.manifest.name;
+            const qualified = `${ws.ownerName}.${ws.name}.${displayName}`;
+            return `${displayName} → find('${qualified}')${clonable}`;
           }).join(', ');
           lines.push(`- Peer "${ws.ownerName}" workspace "${ws.name}" (registryId: ${ws.registryId})\n  Objects: ${objNames}`);
         } catch {
@@ -808,6 +810,9 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
         }
       }
       this.remotePeerContext = lines.join('\n');
+      if (lines.length > 0) {
+        this.remotePeerContext += "\n\nGenerated code should use this.find('peer.workspace.ObjectName') — never hardcode UUIDs.";
+      }
     } catch {
       // Best-effort — leave remotePeerContext unchanged
     }

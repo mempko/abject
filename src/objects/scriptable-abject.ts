@@ -142,9 +142,64 @@ export class ScriptableAbject extends Abject {
 
   /**
    * Find an object by name via Registry discovery. Returns null if not found.
+   * Supports qualified names:
+   *   'ObjectName'                    — local registry
+   *   'workspace.ObjectName'          — specific local workspace
+   *   'peer.workspace.ObjectName'     — remote peer's workspace
    */
   async find(name: string): Promise<AbjectId | null> {
+    const parts = name.split('.');
+    if (parts.length === 3) {
+      return this.findInRemoteWorkspace(parts[0], parts[1], parts[2]);
+    }
+    if (parts.length === 2) {
+      return this.findInLocalWorkspace(parts[0], parts[1]);
+    }
     return this.discoverDep(name);
+  }
+
+  private async findInRemoteWorkspace(
+    ownerName: string, workspaceName: string, objectName: string,
+  ): Promise<AbjectId | null> {
+    const cacheKey = `remote:${ownerName}.${workspaceName}.${objectName}`;
+    if (cacheKey in this._depCache) return this._depCache[cacheKey];
+    try {
+      const wsrId = await this.discoverDep('WorkspaceShareRegistry');
+      if (!wsrId) return null;
+      const workspaces = await this.request<Array<{
+        ownerName: string; name: string; registryId: string;
+      }>>(request(this.id, wsrId, 'getDiscoveredWorkspaces', {}));
+      const ws = workspaces.find(w => w.ownerName === ownerName && w.name === workspaceName);
+      if (!ws) return null;
+      const results = await this.request<Array<{ id: AbjectId }>>(
+        request(this.id, ws.registryId as AbjectId, 'discover', { name: objectName })
+      );
+      if (results.length > 0) {
+        this._depCache[cacheKey] = results[0].id;
+        return results[0].id;
+      }
+    } catch { /* peer offline */ }
+    return null;
+  }
+
+  private async findInLocalWorkspace(
+    workspaceName: string, objectName: string,
+  ): Promise<AbjectId | null> {
+    const cacheKey = `local:${workspaceName}.${objectName}`;
+    if (cacheKey in this._depCache) return this._depCache[cacheKey];
+    try {
+      // Workspace registries are registered as "WorkspaceRegistry:<name>"
+      const wsRegId = await this.discoverDep(`WorkspaceRegistry:${workspaceName}`);
+      if (!wsRegId) return null;
+      const results = await this.request<Array<{ id: AbjectId }>>(
+        request(this.id, wsRegId, 'discover', { name: objectName })
+      );
+      if (results.length > 0) {
+        this._depCache[cacheKey] = results[0].id;
+        return results[0].id;
+      }
+    } catch { /* workspace not found */ }
+    return null;
   }
 
   private setupEditableHandlers(): void {
@@ -161,7 +216,14 @@ export class ScriptableAbject extends Abject {
       while ((match = depPattern.exec(this._source)) !== null) depNames.add(match[1]);
       while ((match = findPattern.exec(this._source)) !== null) depNames.add(match[1]);
 
-      const resolved: string[] = [];
+      // Qualified names (containing dots) are validated at runtime, not probe time
+      const qualifiedNames = new Set<string>();
+      for (const name of depNames) {
+        if (name.includes('.')) qualifiedNames.add(name);
+      }
+      for (const name of qualifiedNames) depNames.delete(name);
+
+      const resolved: string[] = [...qualifiedNames];
       const missing: string[] = [];
 
       for (const name of depNames) {

@@ -1961,6 +1961,19 @@ For runtime discovery of objects not in the dependency list:
 
   this.find('ObjectName') → Promise<AbjectId | null>
 
+## Object Names & Remote Discovery
+
+Objects have unique names within their workspace (auto-assigned from manifest name,
+suffixed with -2, -3 etc. on collision). Use qualified names to find objects in
+other workspaces:
+
+  this.find('MessageBoard')                       // local
+  this.find('Shared.MessageBoard')                // local workspace "Shared"
+  this.find('alice.Public.MessageBoard')           // alice's "Public" workspace
+
+CRITICAL: NEVER hardcode object UUIDs. Always use find() with a name.
+For remote objects, use the fully qualified peer.workspace.name form.
+
 this.id — this object's own ID
 
 ## Using Dependencies
@@ -2181,6 +2194,7 @@ async getState(msg) {
 
 ## IMPORTANT
 - The methods available on \`this\` are: call(), dep(), find(), changed(), and this.id
+- NEVER hardcode object UUIDs. Use this.find('name') for local, this.find('peer.workspace.name') for remote.
 - Study the dependency descriptions to learn their method names and event names
 - Do NOT use browser globals: fetch(), setTimeout(), setInterval(), localStorage, sessionStorage, XMLHttpRequest are NOT available. Use the corresponding dependency objects via this.call() instead.
 - If a dependency is WebBrowser, the object MUST actually navigate to and interact with the real website. Use the stateful page API: openPage → navigateTo(url) → waitForSelector → fill/click/type → getContent → closePage. Do NOT create a local imitation or mock — browse the actual site. Do NOT try to use OAuth, window.open(), or browser redirects.

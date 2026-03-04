@@ -602,11 +602,12 @@ export class PeerRegistry extends Abject {
         console.log(`[PeerRegistry] ICE glare with ${fromPeerId.slice(0, 16)}: we win tiebreak, ignoring remote offer`);
         return;
       }
-      // They have priority — tear down our connection and accept theirs
+      // They have priority — reset PeerConnection and accept their offer.
+      // resetForGlare() destroys the PeerConnection without triggering
+      // disconnect events, preserving queued ICE candidates from the winner.
       console.log(`[PeerRegistry] ICE glare with ${fromPeerId.slice(0, 16)}: they win tiebreak, accepting remote offer`);
-      await transport.disconnect();
-      this.transports.delete(fromPeerId);
-      transport = undefined;
+      transport.resetForGlare();
+      // handleSdpOffer below will create a fresh PeerConnection
     }
 
     if (!transport) {

@@ -178,14 +178,15 @@ export class Registry extends Abject {
     return `## Registry Usage Guide
 
 ### Methods
-- \`list()\` — Returns an array of all ObjectRegistration entries. Each has: id, manifest, status, registeredAt, owner?, source?.
-- \`discover({ name?, interface?, capability?, tags? })\` — Find objects matching a query. Returns ObjectRegistration[]. Use \`{ name: 'Chat' }\` to find by manifest name.
+- \`list()\` — Returns an array of all ObjectRegistration entries. Each has: id, name, manifest, status, registeredAt, owner?, source?.
+- \`discover({ name?, interface?, capability?, tags? })\` — Find objects matching a query. Returns ObjectRegistration[]. Use \`{ name: 'Chat' }\` to find by registration name (falls back to manifest name).
 - \`lookup({ objectId })\` — Look up a single object by its AbjectId. Returns ObjectRegistration or null.
 - \`subscribe()\` — Subscribe to registration events. The caller will receive \`objectRegistered\` events when new objects are registered.
 - \`unsubscribe()\` — Unsubscribe from registration events.
-- \`register({ objectId, manifest, status?, owner?, source? })\` — Register an object (normally called by Factory).
+- \`register({ objectId, manifest, status?, owner?, source?, name? })\` — Register an object (normally called by Factory). Optional name overrides manifest.name; auto-suffixed on collision.
 - \`unregister({ objectId })\` — Remove an object (normally called by Factory).
 - \`updateManifest({ objectId, manifest })\` — Update an object's manifest and re-index it.
+- \`rename({ objectId, name })\` — Rename an object's registered name. Returns \`{ name }\` with the actual assigned name (may be suffixed on collision).
 
 ### Events
 - \`objectRegistered\` — Sent to subscribers when a new object is registered. Payload is the ObjectRegistration.
@@ -197,14 +198,15 @@ export class Registry extends Abject {
 
   private setupHandlers(): void {
     this.on('register', async (msg: AbjectMessage) => {
-      const { objectId, manifest, status, owner, source } = msg.payload as {
+      const { objectId, manifest, status, owner, source, name } = msg.payload as {
         objectId: AbjectId;
         manifest: AbjectManifest;
         status?: AbjectStatus;
         owner?: AbjectId;
         source?: string;
+        name?: string;
       };
-      return this.registerObject(objectId, manifest, status, owner, source);
+      return this.registerObject(objectId, manifest, status, owner, source, name);
     });
 
     this.on('unregister', async (msg: AbjectMessage) => {
@@ -267,7 +269,7 @@ export class Registry extends Abject {
       for (const cap of old.providedCapabilities ?? []) {
         this.byCapability.get(cap)?.delete(objectId);
       }
-      this.byName.get(old.name)?.delete(objectId);
+      this.byName.get(reg.name)?.delete(objectId);
 
       // Update
       reg.manifest = manifest;
@@ -280,10 +282,23 @@ export class Registry extends Abject {
         if (!this.byCapability.has(cap)) this.byCapability.set(cap, new Set());
         this.byCapability.get(cap)!.add(objectId);
       }
-      if (!this.byName.has(manifest.name)) this.byName.set(manifest.name, new Set());
-      this.byName.get(manifest.name)!.add(objectId);
+      if (!this.byName.has(reg.name)) this.byName.set(reg.name, new Set());
+      this.byName.get(reg.name)!.add(objectId);
 
       return true;
+    });
+
+    this.on('rename', async (msg: AbjectMessage) => {
+      const { objectId, name } = msg.payload as { objectId: AbjectId; name: string };
+      const reg = this.objects.get(objectId);
+      if (!reg) return false;
+      // Remove old name from index
+      this.byName.get(reg.name)?.delete(objectId);
+      // Assign new unique name
+      reg.name = this.makeUniqueName(name);
+      if (!this.byName.has(reg.name)) this.byName.set(reg.name, new Set());
+      this.byName.get(reg.name)!.add(objectId);
+      return { name: reg.name };
     });
   }
 
@@ -295,13 +310,19 @@ export class Registry extends Abject {
     manifest: AbjectManifest,
     status?: AbjectStatus,
     owner?: AbjectId,
-    source?: string
+    source?: string,
+    name?: string,
   ): boolean {
     require(objectId !== '', 'objectId must not be empty');
     require(manifest !== undefined, 'manifest is required');
 
+    // Auto-generate unique name
+    const baseName = name ?? manifest.name;
+    const uniqueName = this.makeUniqueName(baseName);
+
     const registration: ObjectRegistration = {
       id: objectId,
+      name: uniqueName,
       manifest,
       status: status ?? {
         id: objectId,
@@ -334,17 +355,32 @@ export class Registry extends Abject {
       this.byCapability.get(cap)!.add(objectId);
     }
 
-    // Index by name
-    if (!this.byName.has(manifest.name)) {
-      this.byName.set(manifest.name, new Set());
+    // Index by registration name
+    if (!this.byName.has(uniqueName)) {
+      this.byName.set(uniqueName, new Set());
     }
-    this.byName.get(manifest.name)!.add(objectId);
+    this.byName.get(uniqueName)!.add(objectId);
 
     // Notify subscribers
     this.notifySubscribers('objectRegistered', registration);
 
     this.checkInvariants();
     return true;
+  }
+
+  /**
+   * Generate a unique name within this registry.
+   * If baseName is taken, appends -2, -3, etc.
+   */
+  private makeUniqueName(baseName: string): string {
+    const existing = this.byName.get(baseName);
+    if (!existing || existing.size === 0) return baseName;
+
+    let n = 2;
+    while (this.byName.has(`${baseName}-${n}`) && this.byName.get(`${baseName}-${n}`)!.size > 0) {
+      n++;
+    }
+    return `${baseName}-${n}`;
   }
 
   /**
@@ -367,7 +403,7 @@ export class Registry extends Abject {
     }
 
     // Remove from name index
-    this.byName.get(manifest.name)?.delete(objectId);
+    this.byName.get(registration.name)?.delete(objectId);
 
     this.objects.delete(objectId);
 
@@ -419,14 +455,23 @@ export class Registry extends Abject {
       }
     }
 
-    // Filter by name
+    // Filter by name — primary: registration.name (byName index), fallback: manifest.name
     if (query.name) {
-      const nameCandidates = this.byName.get(query.name);
+      let nameCandidates = this.byName.get(query.name);
       if (!nameCandidates || nameCandidates.size === 0) {
+        // Fallback: search by manifest.name for system objects
+        nameCandidates = new Set<AbjectId>();
+        for (const [id, reg] of this.objects) {
+          if (reg.manifest.name === query.name) {
+            nameCandidates.add(id);
+          }
+        }
+      }
+      if (nameCandidates.size === 0) {
         return [];
       }
       if (candidates) {
-        candidates = new Set([...candidates].filter((id) => nameCandidates.has(id)));
+        candidates = new Set([...candidates].filter((id) => nameCandidates!.has(id)));
       } else {
         candidates = nameCandidates;
       }

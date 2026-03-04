@@ -185,6 +185,7 @@ export interface AbjectStatus {
 
 export interface ObjectRegistration {
   id: AbjectId;
+  name: string;
   manifest: AbjectManifest;
   status: AbjectStatus;
   registeredAt: number;
