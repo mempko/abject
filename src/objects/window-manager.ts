@@ -384,6 +384,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     localY: number,
   ): Promise<{ grab: boolean; minimize?: string }> {
     const info = this.windows.get(surfaceId);
+    console.log(`[DRAG-DEBUG] surfaceMouseDown surface=${surfaceId} found=${!!info} chromeless=${info?.chromeless} localY=${localY} titleBarHeight=${info?.titleBarHeight}`);
     if (!info) return { grab: false };
 
     // Always raise the window on mousedown
@@ -405,7 +406,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     }
 
     // Title bar: check close/minimize buttons before drag (non-chromeless windows)
-    if (!info.chromeless && localY < TITLE_BAR_HEIGHT) {
+    if (!info.chromeless && localY < info.titleBarHeight) {
       const btn = this.detectTitleButton(info, localX, localY);
       if (btn === 'close') {
         await this.send(
@@ -725,14 +726,14 @@ Restore (via 'restoreWindow' method or Taskbar click):
 
     // Compute max z-index among non-overlay windows
     let maxZ = 0;
-    for (const [, w] of this.windows) {
-      if (w.zIndex < 999 && w.zIndex > maxZ) {
+    for (const [sid, w] of this.windows) {
+      if (sid !== surfaceId && w.zIndex < 999 && w.zIndex > maxZ) {
         maxZ = w.zIndex;
       }
     }
 
     // Already on top
-    if (info.zIndex >= maxZ) return false;
+    if (info.zIndex > maxZ) return false;
 
     const newZIndex = maxZ + 1;
 
