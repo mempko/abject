@@ -20,6 +20,14 @@ import type {
 /**
  * The thin browser frontend that owns the Canvas and Compositor.
  */
+/** Fonts to pre-measure for server-side text width computation */
+const MEASURED_FONTS = [
+  '14px "Inter", system-ui, sans-serif',   // WIDGET_FONT
+  '600 13px "Inter", system-ui, sans-serif', // TITLE_FONT
+  '13px "JetBrains Mono", "Fira Code", monospace', // CODE_FONT
+  '14px system-ui',                         // legacy WIDGET_FONT
+];
+
 export class FrontendClient {
   private compositor: Compositor;
   private canvas: HTMLCanvasElement;
@@ -29,6 +37,8 @@ export class FrontendClient {
   private currentSelectedText = '';
   private authenticated = false;
   private loginFormHandler: ((e: Event) => void) | null = null;
+  private pendingMouseMove: FrontendToBackendMsg | null = null;
+  private mouseMoveRafId = 0;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -62,7 +72,14 @@ export class FrontendClient {
           return;
         }
 
-        this.handleBackendMessage(msg as BackendToFrontendMsg);
+        // Backend may send a single message or a batched array
+        if (Array.isArray(msg)) {
+          for (const m of msg) {
+            this.handleBackendMessage(m as BackendToFrontendMsg);
+          }
+        } else {
+          this.handleBackendMessage(msg as BackendToFrontendMsg);
+        }
       } catch (err) {
         console.error('[Frontend] Failed to parse backend message:', err);
       }
@@ -109,6 +126,7 @@ export class FrontendClient {
       case 'authNotRequired':
         this.authenticated = true;
         this.hideLoginForm();
+        this.sendFontMetrics();
         this.sendRaw({ type: 'ready' });
         break;
 
@@ -129,6 +147,7 @@ export class FrontendClient {
           localStorage.setItem('abjects_auth_token', result.token);
           this.authenticated = true;
           this.hideLoginForm();
+          this.sendFontMetrics();
           this.sendRaw({ type: 'ready' });
         } else {
           // Token was rejected — clear it and show form
@@ -172,6 +191,29 @@ export class FrontendClient {
       form?.removeEventListener('submit', this.loginFormHandler);
       this.loginFormHandler = null;
     }
+  }
+
+  /**
+   * Measure character widths for all known fonts and send to backend.
+   * This lets the server compute text widths locally without round-trips.
+   */
+  private sendFontMetrics(): void {
+    const metrics: Record<string, Record<string, number>> = {};
+    const measureCanvas = document.createElement('canvas');
+    const ctx = measureCanvas.getContext('2d')!;
+
+    for (const font of MEASURED_FONTS) {
+      ctx.font = font;
+      const charWidths: Record<string, number> = {};
+      // Measure printable ASCII (32-126)
+      for (let code = 32; code <= 126; code++) {
+        const ch = String.fromCharCode(code);
+        charWidths[ch] = ctx.measureText(ch).width;
+      }
+      metrics[font] = charWidths;
+    }
+
+    this.sendRaw({ type: 'fontMetrics', metrics });
   }
 
   private sendRaw(msg: Record<string, unknown>): void {
@@ -305,7 +347,7 @@ export class FrontendClient {
       this.handleMouseEvent(e, 'mousedown');
     });
     this.canvas.addEventListener('mouseup', (e) => this.handleMouseEvent(e, 'mouseup'));
-    this.canvas.addEventListener('mousemove', (e) => this.handleMouseEvent(e, 'mousemove'));
+    this.canvas.addEventListener('mousemove', (e) => this.handleMouseMoveThrottled(e));
     this.canvas.addEventListener('wheel', (e) => this.handleWheelEvent(e));
 
     document.addEventListener('keydown', (e) => this.handleKeyEvent(e, 'keydown'));
@@ -356,6 +398,51 @@ export class FrontendClient {
 
     if (type === 'mouseup') {
       this.grabbedSurface = undefined;
+    }
+  }
+
+  private handleMouseMoveThrottled(e: MouseEvent): void {
+    // During drag (grabbed surface), send immediately — throttling causes
+    // jitter because surface positions change between capture and send.
+    if (this.grabbedSurface) {
+      this.handleMouseEvent(e, 'mousemove');
+      return;
+    }
+
+    // Throttle hover moves to rAF rate (~60fps)
+    const canvasRect = this.canvas.getBoundingClientRect();
+    const x = e.clientX - canvasRect.left;
+    const y = e.clientY - canvasRect.top;
+
+    const hitSurface = this.compositor.surfaceAt(x, y);
+    const surface = hitSurface;
+
+    const localX = surface ? x - surface.rect.x : x;
+    const localY = surface ? y - surface.rect.y : y;
+
+    this.pendingMouseMove = {
+      type: 'input',
+      inputType: 'mousemove',
+      surfaceId: surface?.id,
+      x: localX,
+      y: localY,
+      button: e.button,
+      modifiers: {
+        shift: e.shiftKey,
+        ctrl: e.ctrlKey,
+        alt: e.altKey,
+        meta: e.metaKey,
+      },
+    } as FrontendToBackendMsg;
+
+    if (!this.mouseMoveRafId) {
+      this.mouseMoveRafId = requestAnimationFrame(() => {
+        this.mouseMoveRafId = 0;
+        if (this.pendingMouseMove) {
+          this.sendToBackend(this.pendingMouseMove);
+          this.pendingMouseMove = null;
+        }
+      });
     }
   }
 

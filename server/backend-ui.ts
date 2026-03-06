@@ -19,6 +19,7 @@ import type { WebSocket } from 'ws';
 import type {
   BackendToFrontendMsg,
   FrontendToBackendMsg,
+  FontMetricsMsg,
   InputMsg,
 } from './ws-protocol.js';
 import type { AuthConfig, SessionStore } from './auth.js';
@@ -79,6 +80,13 @@ export class BackendUI extends Abject {
   private activeWorkspaceId?: string;
   private authConfig?: AuthConfig;
   private sessionStore?: SessionStore;
+  /** Font metrics from frontend: font → char → pixel width */
+  private fontMetrics: Map<string, Map<string, number>> = new Map();
+  /** Hash of last draw commands per surface for dedup */
+  private lastDrawHash: Map<string, string> = new Map();
+  /** Frame-rate batching: queued messages flushed once per event loop tick */
+  private sendQueue: BackendToFrontendMsg[] = [];
+  private flushScheduled = false;
 
   constructor() {
     super({
@@ -558,6 +566,8 @@ IMPORTANT:
   setWebSocket(ws: WebSocket): void {
     // Clean up state from previous connection
     this.frontendReady = false;
+    this.sendQueue = [];
+    this.flushScheduled = false;
     for (const [, pending] of this.pendingRequests) {
       pending.reject(new Error('Frontend reconnected'));
     }
@@ -577,6 +587,8 @@ IMPORTANT:
       if (this.ws === ws) {
         this.ws = null;
         this.frontendReady = false;
+        this.sendQueue = [];
+        this.flushScheduled = false;
         // Reject any pending frontend requests so they don't hang forever
         for (const [reqId, pending] of this.pendingRequests) {
           pending.reject(new Error('Frontend disconnected'));
@@ -587,12 +599,39 @@ IMPORTANT:
   }
 
   /**
-   * Send a message to the frontend.
+   * Send a message to the frontend (batched).
+   * Messages are queued and flushed once per event-loop tick via setTimeout(0).
+   * All synchronous draw calls within a single bus tick get batched together.
    */
   private sendToFrontend(msg: BackendToFrontendMsg): void {
-    if (this.ws && this.ws.readyState === 1 /* WebSocket.OPEN */) {
+    if (!this.ws || this.ws.readyState !== 1) return;
+    this.sendQueue.push(msg);
+    if (!this.flushScheduled) {
+      this.flushScheduled = true;
+      setTimeout(() => this.flushSendQueue(), 0);
+    }
+  }
+
+  /**
+   * Send a message to the frontend immediately (bypasses batching).
+   * Used for request/reply messages where the caller awaits a response.
+   */
+  private sendToFrontendImmediate(msg: BackendToFrontendMsg): void {
+    if (this.ws && this.ws.readyState === 1) {
       this.ws.send(JSON.stringify(msg));
     }
+  }
+
+  private flushSendQueue(): void {
+    this.flushScheduled = false;
+    if (!this.ws || this.ws.readyState !== 1 || this.sendQueue.length === 0) return;
+
+    if (this.sendQueue.length === 1) {
+      this.ws.send(JSON.stringify(this.sendQueue[0]));
+    } else {
+      this.ws.send(JSON.stringify(this.sendQueue));
+    }
+    this.sendQueue = [];
   }
 
   // ── Surface API ──────────────────────────────────────────────────────
@@ -637,6 +676,7 @@ IMPORTANT:
     }
 
     this.surfaces.delete(surfaceId);
+    this.lastDrawHash.delete(surfaceId);
 
     this.sendToFrontend({
       type: 'destroySurface',
@@ -655,6 +695,7 @@ IMPORTANT:
     for (const [surfaceId, state] of this.surfaces.entries()) {
       if (state.objectId === objectId) {
         this.surfaces.delete(surfaceId);
+        this.lastDrawHash.delete(surfaceId);
         this.sendToFrontend({ type: 'destroySurface', surfaceId });
         if (this.focusedSurface === surfaceId) this.focusedSurface = undefined;
         count++;
@@ -673,6 +714,7 @@ IMPORTANT:
     );
 
     // Store draw commands per surface (each batch is a full redraw)
+    // and deduplicate: skip surfaces whose draw commands haven't changed
     const commandsBySurface = new Map<string, Array<{ type: string; surfaceId: string; params: unknown }>>();
     for (const cmd of validCommands) {
       let batch = commandsBySurface.get(cmd.surfaceId);
@@ -682,17 +724,25 @@ IMPORTANT:
       }
       batch.push(cmd);
     }
+
+    const changedCommands: Array<{ type: string; surfaceId: string; params: unknown }> = [];
     for (const [surfaceId, batch] of commandsBySurface) {
+      const hash = JSON.stringify(batch);
+      const prevHash = this.lastDrawHash.get(surfaceId);
       const state = this.surfaces.get(surfaceId);
       if (state) {
         state.lastDrawCommands = batch;
       }
+      if (hash !== prevHash) {
+        this.lastDrawHash.set(surfaceId, hash);
+        changedCommands.push(...batch);
+      }
     }
 
-    if (validCommands.length > 0) {
+    if (changedCommands.length > 0) {
       this.sendToFrontend({
         type: 'draw',
-        commands: validCommands,
+        commands: changedCommands,
       });
     }
 
@@ -821,8 +871,19 @@ IMPORTANT:
   ): Promise<number> {
     if (!text) return 0;
 
+    // Try local measurement using font metrics table from frontend
+    const charWidths = this.fontMetrics.get(font);
+    if (charWidths) {
+      let width = 0;
+      for (let i = 0; i < text.length; i++) {
+        const cw = charWidths.get(text[i]);
+        width += cw ?? (charWidths.get('M') ?? 7.5);
+      }
+      return width;
+    }
+
+    // No metrics yet — fall back to round-trip or estimate
     if (!this.ws || this.ws.readyState !== 1 || !this.frontendReady) {
-      // Rough estimate: ~7.5px per character at 14px font
       return text.length * 7.5;
     }
 
@@ -865,7 +926,7 @@ IMPORTANT:
           reject(err);
         },
       });
-      this.sendToFrontend(msg);
+      this.sendToFrontendImmediate(msg);
     });
   }
 
@@ -893,6 +954,19 @@ IMPORTANT:
           this.pendingRequests.delete(msg.requestId!);
           pending.resolve({ width: msg.width, height: msg.height });
         }
+        break;
+      }
+
+      case 'fontMetrics': {
+        const fmMsg = msg as FontMetricsMsg;
+        for (const [font, chars] of Object.entries(fmMsg.metrics)) {
+          const charMap = new Map<string, number>();
+          for (const [ch, w] of Object.entries(chars)) {
+            charMap.set(ch, w);
+          }
+          this.fontMetrics.set(font, charMap);
+        }
+        console.log(`[BackendUI] Received font metrics for ${Object.keys(fmMsg.metrics).length} fonts`);
         break;
       }
 
@@ -986,6 +1060,7 @@ IMPORTANT:
       const state = this.surfaces.get(msg.surfaceId);
       if (state) {
         if (msg.inputType === 'mousedown' && this.windowManagerId) {
+          console.log(`[DRAG-DEBUG] mousedown on surface=${msg.surfaceId} windowManagerId=${this.windowManagerId}`);
           // ── Ctrl+click: immediately start window drag ──
           if (msg.modifiers?.ctrl) {
             this.mouseGrabAbject = this.windowManagerId;
@@ -1016,13 +1091,15 @@ IMPORTANT:
               return;
             }
 
+            console.log(`[DRAG-DEBUG] WindowManager reply: grab=${reply.grab} minimize=${reply.minimize}`);
             if (reply.grab) {
               // WindowManager claimed the grab — it handles drag/resize
               this.mouseGrabAbject = this.windowManagerId;
               this.handleFocus(state.objectId, msg.surfaceId);
               return;
             }
-          } catch {
+          } catch (err) {
+            console.log(`[DRAG-DEBUG] WindowManager request failed:`, err);
             // WindowManager not available — fall through to original behavior
           }
 
