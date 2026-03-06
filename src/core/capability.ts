@@ -47,6 +47,16 @@ export const Capabilities = {
   PEER_CONNECT: 'abjects:peer:connect' as CapabilityId,
   PEER_DISCOVER: 'abjects:peer:discover' as CapabilityId,
 
+  // Shared state capabilities
+  SHARED_STATE: 'abjects:shared-state' as CapabilityId,
+
+  // File transfer capabilities
+  FILE_TRANSFER_SEND: 'abjects:file-transfer:send' as CapabilityId,
+  FILE_TRANSFER_RECEIVE: 'abjects:file-transfer:receive' as CapabilityId,
+
+  // Media stream capabilities
+  MEDIA_STREAM: 'abjects:media-stream' as CapabilityId,
+
   // Agent capabilities
   WEB_AGENT: 'abjects:web-agent' as CapabilityId,
 } as const;

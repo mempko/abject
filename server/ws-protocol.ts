@@ -207,12 +207,19 @@ export interface AuthTokenMsg extends WsEnvelope {
   token: string;
 }
 
+export interface FontMetricsMsg extends WsEnvelope {
+  type: 'fontMetrics';
+  /** Keyed by CSS font string, then by character → pixel width */
+  metrics: Record<string, Record<string, number>>;
+}
+
 export type FrontendToBackendMsg =
   | InputMsg
   | MeasureTextReplyMsg
   | DisplayInfoReplyMsg
   | SurfaceCreatedMsg
   | ReadyMsg
+  | FontMetricsMsg
   | AuthLoginMsg
   | AuthTokenMsg;
 

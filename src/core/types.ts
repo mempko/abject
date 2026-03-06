@@ -12,6 +12,7 @@ export type MessageId = string;
 export type AgreementId = string;
 export type CapabilityId = string;
 export type PeerId = string;
+export type TypeId = string;
 
 // =============================================================================
 // Message Types
@@ -170,6 +171,7 @@ export type AbjectState = 'initializing' | 'ready' | 'busy' | 'error' | 'stopped
 
 export interface AbjectStatus {
   id: AbjectId;
+  typeId?: TypeId;
   state: AbjectState;
   manifest: AbjectManifest;
   connections: AbjectId[];
@@ -185,6 +187,7 @@ export interface AbjectStatus {
 
 export interface ObjectRegistration {
   id: AbjectId;
+  typeId?: TypeId;
   name: string;
   manifest: AbjectManifest;
   status: AbjectStatus;
@@ -215,10 +218,12 @@ export interface SpawnRequest {
   skipGlobalRegistry?: boolean;
   constructorArgs?: unknown;
   registryHint?: AbjectId;
+  typeId?: TypeId;
 }
 
 export interface SpawnResult {
   objectId: AbjectId;
+  typeId?: TypeId;
   status: AbjectStatus;
 }
 

@@ -4,6 +4,7 @@
 
 import {
   AbjectId,
+  TypeId,
   AbjectManifest,
   AbjectMessage,
   ObjectRegistration,
@@ -24,6 +25,7 @@ export interface RegistryState {
   byInterface: Map<InterfaceId, Set<AbjectId>>;
   byCapability: Map<CapabilityId, Set<AbjectId>>;
   byName: Map<string, Set<AbjectId>>;
+  byTypeId: Map<TypeId, AbjectId>;
 }
 
 /**
@@ -34,7 +36,10 @@ export class Registry extends Abject {
   private byInterface: Map<InterfaceId, Set<AbjectId>> = new Map();
   private byCapability: Map<CapabilityId, Set<AbjectId>> = new Map();
   private byName: Map<string, Set<AbjectId>> = new Map();
+  private byTypeId: Map<TypeId, AbjectId> = new Map();
   private subscribers: Set<AbjectId> = new Set();
+  private exposedObjectIds: Set<AbjectId> = new Set();
+  private filteringConfigured = false;
 
   constructor() {
     super({
@@ -198,15 +203,16 @@ export class Registry extends Abject {
 
   private setupHandlers(): void {
     this.on('register', async (msg: AbjectMessage) => {
-      const { objectId, manifest, status, owner, source, name } = msg.payload as {
+      const { objectId, manifest, status, owner, source, name, typeId } = msg.payload as {
         objectId: AbjectId;
         manifest: AbjectManifest;
         status?: AbjectStatus;
         owner?: AbjectId;
         source?: string;
         name?: string;
+        typeId?: TypeId;
       };
-      return this.registerObject(objectId, manifest, status, owner, source, name);
+      return this.registerObject(objectId, manifest, status, owner, source, name, typeId);
     });
 
     this.on('unregister', async (msg: AbjectMessage) => {
@@ -221,7 +227,8 @@ export class Registry extends Abject {
 
     this.on('discover', async (msg: AbjectMessage) => {
       const query = msg.payload as DiscoveryQuery;
-      return this.handleDiscover(query);
+      const results = await this.handleDiscover(query);
+      return this.filterForCaller(results, msg.routing.from);
     });
 
     this.on('subscribe', async (msg: AbjectMessage) => {
@@ -234,8 +241,14 @@ export class Registry extends Abject {
       return true;
     });
 
-    this.on('list', async () => {
-      return this.listObjects();
+    this.on('list', async (msg: AbjectMessage) => {
+      return this.filterForCaller(this.listObjects(), msg.routing.from);
+    });
+
+    this.on('setExposedObjectIds', async (msg: AbjectMessage) => {
+      const { ids } = msg.payload as { ids: AbjectId[] };
+      this.setExposedObjectIds(ids);
+      return true;
     });
 
     this.on('getManifest', async (msg: AbjectMessage) => {
@@ -288,6 +301,11 @@ export class Registry extends Abject {
       return true;
     });
 
+    this.on('resolveType', async (msg: AbjectMessage) => {
+      const { typeId } = msg.payload as { typeId: TypeId };
+      return this.byTypeId.get(typeId) ?? null;
+    });
+
     this.on('rename', async (msg: AbjectMessage) => {
       const { objectId, name } = msg.payload as { objectId: AbjectId; name: string };
       const reg = this.objects.get(objectId);
@@ -312,9 +330,19 @@ export class Registry extends Abject {
     owner?: AbjectId,
     source?: string,
     name?: string,
+    typeId?: TypeId,
   ): boolean {
     require(objectId !== '', 'objectId must not be empty');
     require(manifest !== undefined, 'manifest is required');
+
+    // Enforce TypeId uniqueness
+    if (typeId) {
+      const existing = this.byTypeId.get(typeId);
+      require(
+        !existing || existing === objectId,
+        `TypeId '${typeId}' already registered to object ${existing}`,
+      );
+    }
 
     // Auto-generate unique name
     const baseName = name ?? manifest.name;
@@ -322,10 +350,12 @@ export class Registry extends Abject {
 
     const registration: ObjectRegistration = {
       id: objectId,
+      typeId,
       name: uniqueName,
       manifest,
       status: status ?? {
         id: objectId,
+        typeId,
         state: 'ready',
         manifest,
         connections: [],
@@ -339,6 +369,11 @@ export class Registry extends Abject {
     };
 
     this.objects.set(objectId, registration);
+
+    // Index by typeId
+    if (typeId) {
+      this.byTypeId.set(typeId, objectId);
+    }
 
     // Index by interface
     const ifaceId = manifest.interface.id;
@@ -394,6 +429,11 @@ export class Registry extends Abject {
 
     const manifest = registration.manifest;
 
+    // Remove from typeId index
+    if (registration.typeId) {
+      this.byTypeId.delete(registration.typeId);
+    }
+
     // Remove from interface index
     this.byInterface.get(manifest.interface.id)?.delete(objectId);
 
@@ -419,6 +459,13 @@ export class Registry extends Abject {
    */
   lookupObject(objectId: AbjectId): ObjectRegistration | null {
     return this.objects.get(objectId) ?? null;
+  }
+
+  /**
+   * Resolve a TypeId to the current AbjectId.
+   */
+  resolveType(typeId: TypeId): AbjectId | null {
+    return this.byTypeId.get(typeId) ?? null;
   }
 
   /**
@@ -536,6 +583,26 @@ export class Registry extends Abject {
         console.error(`Failed to notify subscriber ${subscriberId}:`, err);
       }
     }
+  }
+
+  /**
+   * Set the IDs of objects that are exposed to remote (non-local) callers.
+   * Empty set means nothing is visible to remote callers.
+   */
+  setExposedObjectIds(ids: AbjectId[]): void {
+    this.exposedObjectIds = new Set(ids);
+    this.filteringConfigured = true;
+  }
+
+  /**
+   * Filter results for a caller: local callers see everything,
+   * remote callers only see exposed objects.
+   */
+  private filterForCaller(results: ObjectRegistration[], callerId: AbjectId): ObjectRegistration[] {
+    if (!this.filteringConfigured) return results;  // Global registry: no filtering
+    if (this.objects.has(callerId)) return results;  // Local callers see everything
+    if (this.exposedObjectIds.size === 0) return [];  // No exposed objects = nothing visible remotely
+    return results.filter(r => this.exposedObjectIds.has(r.id));
   }
 
   /**

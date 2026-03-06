@@ -8,6 +8,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import {
   AbjectId,
+  TypeId,
   AbjectManifest,
   AbjectMessage,
   AbjectState,
@@ -47,6 +48,7 @@ export interface AbjectOptions {
  */
 export abstract class Abject {
   readonly id: AbjectId;
+  private _typeId?: TypeId;
   readonly manifest: AbjectManifest;
   readonly capabilities: CapabilitySet;
 
@@ -110,6 +112,7 @@ export abstract class Abject {
   get status(): AbjectStatus {
     return {
       id: this.id,
+      typeId: this._typeId,
       state: this._status,
       manifest: this.manifest,
       connections: [], // TODO: track connections
@@ -129,11 +132,27 @@ export abstract class Abject {
   }
 
   /**
+   * Scoped, durable type identity. Survives restarts. Like a DNS name.
+   * Format: {peerId}/{workspaceId}/{objectName}
+   */
+  get typeId(): TypeId | undefined {
+    return this._typeId;
+  }
+
+  /**
    * Override ID before initialization. Used by Supervisor for same-ID restart.
    */
   setId(id: AbjectId): void {
     require(this._status === 'initializing', 'Can only set ID before initialization');
     (this as { id: AbjectId }).id = id;
+  }
+
+  /**
+   * Set the type identity before initialization.
+   */
+  setTypeId(typeId: TypeId): void {
+    require(this._status === 'initializing', 'Can only set typeId before initialization');
+    this._typeId = typeId;
   }
 
   /**

@@ -20,7 +20,7 @@ Object.assign(globalThis, {
   RTCDataChannel,
 });
 
-import { AbjectId, AbjectMessage, SpawnResult } from '../src/core/types.js';
+import { AbjectId, TypeId, AbjectMessage, SpawnResult } from '../src/core/types.js';
 import { getRuntime, resetRuntime } from '../src/runtime/runtime.js';
 import * as message from '../src/core/message.js';
 import { BackendUI } from './backend-ui.js';
@@ -64,6 +64,11 @@ import { IdentityObject } from '../src/objects/identity.js';
 import { PeerRegistry } from '../src/objects/peer-registry.js';
 import { RemoteRegistry } from '../src/objects/remote-registry.js';
 import { PeerRouter } from '../src/network/peer-router.js';
+import { SignalingRelayObject } from '../src/objects/signaling-relay.js';
+import { PeerDiscoveryObject } from '../src/objects/peer-discovery.js';
+import { SharedState } from '../src/objects/capabilities/shared-state.js';
+import { FileTransfer } from '../src/objects/capabilities/file-transfer.js';
+import { MediaStreamCapability } from '../src/objects/capabilities/media-stream.js';
 import { WorkspaceShareRegistry, WORKSPACE_SHARE_REGISTRY_ID } from '../src/objects/workspace-share-registry.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
@@ -142,10 +147,11 @@ async function main(): Promise<void> {
     });
   }
 
-  async function factorySpawn(name: string): Promise<AbjectId> {
+  async function factorySpawn(name: string, typeId?: TypeId): Promise<AbjectId> {
     const result = await bootstrapRequest<SpawnResult>(factoryId, 'spawn', {
       manifest: { name, description: '', version: '1.0.0',
                   requiredCapabilities: [], tags: ['system'] },
+      typeId,
     });
     return result.objectId;
   }
@@ -195,12 +201,17 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('PeerRegistry', () => new PeerRegistry());
   runtime.objectFactory.registerConstructor('RemoteRegistry', () => new RemoteRegistry());
   runtime.objectFactory.registerConstructor('PeerRouter', () => new PeerRouter());
+  runtime.objectFactory.registerConstructor('SignalingRelay', () => new SignalingRelayObject());
+  runtime.objectFactory.registerConstructor('PeerDiscovery', () => new PeerDiscoveryObject());
   runtime.objectFactory.registerConstructor('WorkspaceShareRegistry', () => new WorkspaceShareRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceBrowser', () => new WorkspaceBrowser());
   runtime.objectFactory.registerConstructor('WebParser', () => new WebParser());
   runtime.objectFactory.registerConstructor('WebBrowser', () => new WebBrowser());
   runtime.objectFactory.registerConstructor('WebAgent', () => new WebAgent());
   runtime.objectFactory.registerConstructor('WebBrowserViewer', () => new WebBrowserViewer());
+  runtime.objectFactory.registerConstructor('SharedState', () => new SharedState());
+  runtime.objectFactory.registerConstructor('FileTransfer', () => new FileTransfer());
+  runtime.objectFactory.registerConstructor('MediaStream', () => new MediaStreamCapability());
 
   // Mark worker-eligible constructors (only used when workerEnabled).
   // Per-workspace objects use registryHint to discover workspace dependencies.
@@ -225,8 +236,8 @@ async function main(): Promise<void> {
   const supervisorId = await factorySpawn('Supervisor');
 
   // Helper: spawn via Factory, register with Supervisor, return ID
-  async function supervisedSpawn(name: string, restart: RestartType = 'permanent'): Promise<AbjectId> {
-    const id = await factorySpawn(name);
+  async function supervisedSpawn(name: string, restart: RestartType = 'permanent', typeId?: TypeId): Promise<AbjectId> {
+    const id = await factorySpawn(name, typeId);
     await bootstrapRequest(supervisorId, 'addChild', {
       id, constructorName: name, restart,
     });
@@ -258,9 +269,26 @@ async function main(): Promise<void> {
   const widgetManagerId = await supervisedSpawn('WidgetManager');
 
   const identityId = await supervisedSpawn('Identity');
-  const peerRegistryId = await supervisedSpawn('PeerRegistry');
-  const remoteRegistryId = await supervisedSpawn('RemoteRegistry');
-  const peerRouterId = await supervisedSpawn('PeerRouter');
+
+  // Get peerId for computing system TypeIds
+  let localPeerId: string | undefined;
+  try {
+    const identity = await bootstrapRequest<{ peerId: string }>(identityId, 'getIdentity', {});
+    localPeerId = identity.peerId;
+    console.log(`[ABJECTS] Local peerId: ${localPeerId.slice(0, 16)}...`);
+  } catch {
+    console.warn('[ABJECTS] Could not get peerId — system TypeIds will not be assigned');
+  }
+
+  /** Compute a system-scoped TypeId: {peerId}/system/{name} */
+  function systemTypeId(name: string): TypeId | undefined {
+    if (!localPeerId) return undefined;
+    return `${localPeerId}/system/${name}` as TypeId;
+  }
+
+  const peerRegistryId = await supervisedSpawn('PeerRegistry', 'permanent', systemTypeId('PeerRegistry'));
+  const remoteRegistryId = await supervisedSpawn('RemoteRegistry', 'permanent', systemTypeId('RemoteRegistry'));
+  const peerRouterId = await supervisedSpawn('PeerRouter', 'permanent', systemTypeId('PeerRouter'));
 
   // Install PeerRouter interceptor for transparent P2P routing
   const peerRegistryObj = runtime.objectFactory.getObject(peerRegistryId) as PeerRegistry;
@@ -274,19 +302,33 @@ async function main(): Promise<void> {
     peerRouterObj.handleIncomingMessage(msg, fromPeerId);
   });
 
-  const globalSettingsId = await supervisedSpawn('GlobalSettings');
-  const peerNetworkId = await supervisedSpawn('PeerNetwork');
-  const globalToolbarId = await supervisedSpawn('GlobalToolbar');
+  // Spawn and wire SignalingRelay and PeerDiscovery
+  const signalingRelayId = await supervisedSpawn('SignalingRelay', 'permanent', systemTypeId('SignalingRelay'));
+  const peerDiscoveryId = await supervisedSpawn('PeerDiscovery', 'permanent', systemTypeId('PeerDiscovery'));
 
-  const proxyGenId = await supervisedSpawn('ProxyGenerator');
-  const negotiatorId = await supervisedSpawn('Negotiator');
-  const healthMonitorId = await supervisedSpawn('HealthMonitor');
+  const signalingRelayObj = runtime.objectFactory.getObject(signalingRelayId) as unknown as SignalingRelayObject;
+  const peerDiscoveryObj = runtime.objectFactory.getObject(peerDiscoveryId) as unknown as PeerDiscoveryObject;
+
+  signalingRelayObj.setPeerRegistry(peerRegistryObj);
+  peerDiscoveryObj.setPeerRegistry(peerRegistryObj);
+  peerDiscoveryObj.setSignalingRelay(signalingRelayObj);
+
+  // Set the signaling relay as fallback for PeerRegistry when no signaling server is available
+  peerRegistryObj.setSignalingRelay(signalingRelayObj);
+
+  const globalSettingsId = await supervisedSpawn('GlobalSettings', 'permanent', systemTypeId('GlobalSettings'));
+  const peerNetworkId = await supervisedSpawn('PeerNetwork', 'permanent', systemTypeId('PeerNetwork'));
+  const globalToolbarId = await supervisedSpawn('GlobalToolbar', 'permanent', systemTypeId('GlobalToolbar'));
+
+  const proxyGenId = await supervisedSpawn('ProxyGenerator', 'permanent', systemTypeId('ProxyGenerator'));
+  const negotiatorId = await supervisedSpawn('Negotiator', 'permanent', systemTypeId('Negotiator'));
+  const healthMonitorId = await supervisedSpawn('HealthMonitor', 'permanent', systemTypeId('HealthMonitor'));
 
   // WorkspaceSwitcher is a global UI (never hidden during workspace switch)
-  const workspaceSwitcherId = await supervisedSpawn('WorkspaceSwitcher');
+  const workspaceSwitcherId = await supervisedSpawn('WorkspaceSwitcher', 'permanent', systemTypeId('WorkspaceSwitcher'));
 
   // WorkspaceManager spawns per-workspace objects (Settings, Taskbar, Chat, etc.)
-  const workspaceManagerId = await supervisedSpawn('WorkspaceManager');
+  const workspaceManagerId = await supervisedSpawn('WorkspaceManager', 'permanent', systemTypeId('WorkspaceManager'));
 
   // Boot workspaces BEFORE spawning WSR — boot() loads persisted workspaces
   // (including their access modes) so listSharedWorkspaces returns real data.
@@ -294,12 +336,12 @@ async function main(): Promise<void> {
   await bootstrapRequest(workspaceManagerId, 'boot', {});
 
   // WorkspaceShareRegistry must spawn AFTER boot() so listSharedWorkspaces finds shared workspaces
-  const workspaceShareRegistryId = await supervisedSpawn('WorkspaceShareRegistry');
+  const workspaceShareRegistryId = await supervisedSpawn('WorkspaceShareRegistry', 'permanent', systemTypeId('WorkspaceShareRegistry'));
 
   // Register allowed system objects for remote access
-  peerRouterObj.allowSystemObjectDirect(workspaceShareRegistryId, WORKSPACE_SHARE_REGISTRY_ID);
+  peerRouterObj.allowSystemObjectDirect(workspaceShareRegistryId, WORKSPACE_SHARE_REGISTRY_ID, systemTypeId('WorkspaceShareRegistry'));
   peerRouterObj.announceRoutesToAll().catch(() => {});
-  const workspaceBrowserId = await supervisedSpawn('WorkspaceBrowser');
+  const workspaceBrowserId = await supervisedSpawn('WorkspaceBrowser', 'permanent', systemTypeId('WorkspaceBrowser'));
 
   // ALL objects are now spawned and init'd — safe to start health monitoring.
   const monitoredIds = [
@@ -307,6 +349,7 @@ async function main(): Promise<void> {
     consoleId, filesystemId, webParserId, webBrowserId,
     windowManagerId, widgetManagerId,
     identityId, peerRegistryId, remoteRegistryId, peerRouterId,
+    signalingRelayId, peerDiscoveryId,
     workspaceShareRegistryId, workspaceBrowserId,
     globalSettingsId, peerNetworkId, globalToolbarId,
     proxyGenId, negotiatorId,
@@ -323,7 +366,13 @@ async function main(): Promise<void> {
   bus.unregister(BOOTSTRAP_ID);
 
   // Start WebSocket server
-  const wsServer = new NodeWebSocketServer({ port: WS_PORT });
+  const wsServer = new NodeWebSocketServer({
+    port: WS_PORT,
+    perMessageDeflate: {
+      zlibDeflateOptions: { level: 1 },
+      threshold: 128,
+    },
+  });
 
   // Auth gate (always create SessionStore so runtime updateAuth works)
   const authConfig = loadAuthConfig();
