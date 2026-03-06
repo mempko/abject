@@ -37,6 +37,9 @@ export class Taskbar extends Abject {
   // Dynamic user object buttons: button widget AbjectId → target object AbjectId
   private userObjButtons: Map<AbjectId, AbjectId> = new Map();
 
+  // Debounce timer for incremental updates
+  private updateTimer?: ReturnType<typeof setTimeout>;
+
   // Minimized window tracking
   private minimizedWindows: Map<string, { windowId: AbjectId; title: string }> = new Map();
   // Button widget AbjectId → surfaceId for restore buttons
@@ -148,8 +151,7 @@ export class Taskbar extends Abject {
       const { aspect } = msg.payload as { aspect: string; value?: unknown };
 
       if (aspect === 'visibility') {
-        console.debug('[Taskbar] visibility changed — rebuilding');
-        await this.show(); // rebuild to reflect new state
+        await this.updateButtonStates();
         return;
       }
 
@@ -229,17 +231,161 @@ export class Taskbar extends Abject {
 
     // Auto-refresh taskbar when new objects are registered
     this.on('objectRegistered', async () => {
-      console.debug('[Taskbar] objectRegistered — rebuilding taskbar');
-      await this.show();
-      console.debug('[Taskbar] objectRegistered — done');
+      this.scheduleUpdate();
     });
 
     // Auto-refresh taskbar when objects are unregistered (killed)
     this.on('objectUnregistered', async () => {
-      console.debug('[Taskbar] objectUnregistered — rebuilding taskbar');
-      await this.show();
-      console.debug('[Taskbar] objectUnregistered — done');
+      this.scheduleUpdate();
     });
+  }
+
+  /**
+   * Schedule a debounced incremental update (coalesces rapid-fire registry events).
+   */
+  private scheduleUpdate(): void {
+    if (this.updateTimer) return;
+    this.updateTimer = setTimeout(async () => {
+      this.updateTimer = undefined;
+      await this.update();
+    }, 100);
+  }
+
+  /**
+   * Incremental update: diff current buttons against desired state and patch.
+   */
+  private async update(): Promise<void> {
+    if (!this.windowId || !this.rootLayoutId) {
+      await this.show();
+      return;
+    }
+
+    const showableObjects = await this.discoverShowableObjects();
+    const desiredIds = new Set(showableObjects.map(o => o.id));
+
+    // Remove buttons for objects no longer showable
+    for (const [btnId, targetId] of this.userObjButtons) {
+      if (!desiredIds.has(targetId)) {
+        await this.request(request(this.id, this.rootLayoutId!, 'removeLayoutChild', { widgetId: btnId }));
+        await this.request(request(this.id, btnId, 'destroy', {}));
+        this.userObjButtons.delete(btnId);
+      }
+    }
+
+    // Add buttons for newly showable objects
+    const existingTargets = new Set(this.userObjButtons.values());
+
+    const btnW = 100;
+    const btnH = 30;
+    const activeStyle = { background: '#2d3154', borderColor: '#e8a84c' };
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+
+    for (const obj of showableObjects) {
+      if (!existingTargets.has(obj.id)) {
+        let vis = false;
+        try {
+          const state = await this.request<{ visible?: boolean }>(
+            request(this.id, obj.id, 'getState', {})
+          );
+          vis = !!state?.visible;
+        } catch { /* ignore */ }
+
+        const btnId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, 'createButton', {
+            windowId: this.windowId, rect: r0, text: obj.manifest.name,
+            ...(vis ? { style: activeStyle } : {}),
+          })
+        );
+        await this.request(request(this.id, btnId, 'addDependent', {}));
+        await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
+          widgetId: btnId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { width: btnW, height: btnH },
+        }));
+        this.userObjButtons.set(btnId, obj.id);
+      }
+    }
+
+    // Update button active states
+    await this.updateButtonStates();
+
+    // Resize window to fit current button count
+    await this.resizeWindow();
+  }
+
+  /**
+   * Update active/inactive style on all buttons without destroying them.
+   */
+  private async updateButtonStates(): Promise<void> {
+    if (!this.windowId) return;
+
+    const activeStyle = { background: '#2d3154', borderColor: '#e8a84c' };
+    const inactiveStyle = { background: undefined, borderColor: undefined };
+
+    const isVisible = async (objectId: AbjectId): Promise<boolean> => {
+      try {
+        const state = await this.request<{ visible?: boolean }>(
+          request(this.id, objectId, 'getState', {})
+        );
+        return !!state?.visible;
+      } catch { return false; }
+    };
+
+    // System buttons
+    const systemPairs: [AbjectId | undefined, AbjectId | undefined][] = [
+      [this.registryBtnId, this.registryBrowserId],
+      [this.chatBtnId, this.chatId],
+      [this.jobsBtnId, this.jobBrowserId],
+      [this.objectManagerBtnId, this.objectManagerId],
+      [this.browserViewerBtnId, this.webBrowserViewerId],
+    ];
+
+    const updates = systemPairs
+      .filter(([btnId, objId]) => btnId && objId)
+      .map(async ([btnId, objId]) => {
+        const vis = await isVisible(objId!);
+        await this.request(request(this.id, btnId!, 'update', {
+          style: vis ? activeStyle : inactiveStyle,
+        }));
+      });
+
+    // User object buttons
+    for (const [btnId, targetId] of this.userObjButtons) {
+      updates.push((async () => {
+        const vis = await isVisible(targetId);
+        await this.request(request(this.id, btnId, 'update', {
+          style: vis ? activeStyle : inactiveStyle,
+        }));
+      })());
+    }
+
+    await Promise.all(updates);
+  }
+
+  /**
+   * Resize the taskbar window to fit the current number of buttons.
+   */
+  private async resizeWindow(): Promise<void> {
+    if (!this.windowId) return;
+
+    const btnH = 30;
+    const labelH = 20;
+    const dividerH = 8;
+    const padding = 16;
+    const spacing = 6;
+    const btnW = 100;
+    const systemBtnCount = 4 + (this.webBrowserViewerId ? 1 : 0);
+    const minimizedCount = this.minimizedWindows.size;
+    const userBtnCount = this.userObjButtons.size;
+    const totalBtnCount = systemBtnCount + userBtnCount + minimizedCount;
+    const extraHeight = (labelH + spacing)
+      + (minimizedCount > 0 ? (dividerH + spacing) + (labelH + spacing) : 0);
+    const barWidth = btnW + padding * 2;
+    const barHeight = padding + extraHeight + totalBtnCount * (btnH + spacing) - spacing + padding;
+
+    await this.request(request(this.id, this.windowId, 'windowRect', {
+      x: 8, y: this.yOffset, width: barWidth, height: barHeight,
+    }));
   }
 
   async show(): Promise<boolean> {

@@ -2,7 +2,7 @@
  * WorkspaceBrowser — global UI for browsing discovered remote workspaces.
  *
  * Shows shared workspaces from connected peers, grouped by peer name,
- * with a refresh button to trigger new discovery.
+ * with Public/Private tabs, search filtering, and description/tags display.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId, SpawnResult } from '../core/types.js';
@@ -28,6 +28,15 @@ export class WorkspaceBrowser extends Abject {
   private refreshBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
   private browseButtons: Map<AbjectId, DiscoveredWorkspace> = new Map();
+
+  // Tab & search state
+  private searchInputId?: AbjectId;
+  private tabBarId?: AbjectId;
+  private tabContents: AbjectId[] = []; // [publicScrollBox, privateScrollBox]
+  private activeTab: number = 0; // 0=public, 1=private
+
+  /** All widget IDs created inside tab content containers, for cleanup on rebuild. */
+  private tabContentWidgetIds: AbjectId[] = [];
 
   constructor() {
     super({
@@ -103,7 +112,7 @@ export class WorkspaceBrowser extends Abject {
     this.on('windowCloseRequested', async () => { await this.hide(); });
 
     this.on('changed', async (msg: AbjectMessage) => {
-      const { aspect } = msg.payload as { aspect: string };
+      const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
 
       if (fromId === this.refreshBtnId && aspect === 'click') {
@@ -111,10 +120,24 @@ export class WorkspaceBrowser extends Abject {
         return;
       }
 
+      // Tab bar change — switch tab visibility
+      if (fromId === this.tabBarId && aspect === 'change') {
+        const idx = value as number;
+        this.activeTab = idx;
+        await this.switchTabVisibility();
+        return;
+      }
+
+      // Search input submit — rebuild workspace list
+      if (fromId === this.searchInputId && aspect === 'submit') {
+        await this.rebuildWorkspaceList();
+        return;
+      }
+
       // WSR: new workspaces discovered — auto-refresh if visible
       if (fromId === this.shareRegistryId && aspect === 'workspacesDiscovered') {
         if (this.windowId) {
-          await this.refresh();
+          await this.rebuildWorkspaceList();
         }
         return;
       }
@@ -139,8 +162,8 @@ export class WorkspaceBrowser extends Abject {
       request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
 
-    const winW = 400;
-    const winH = 420;
+    const winW = 460;
+    const winH = 520;
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
@@ -179,7 +202,7 @@ export class WorkspaceBrowser extends Abject {
 
     const titleLabelId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Remote Workspaces',
+        windowId: this.windowId, rect: r0, text: 'Workspace Browser',
         style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
       })
     );
@@ -202,32 +225,104 @@ export class WorkspaceBrowser extends Abject {
       preferredSize: { width: 80, height: 28 },
     }));
 
-    // Description
-    const descId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Shared workspaces from connected peers.',
-        style: { color: '#b4b8c8', fontSize: 12 },
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: descId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 18 },
-    }));
-
-    // Divider
-    const divId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createDivider', {
+    // Tab bar: Public / Private
+    this.tabBarId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createTabBar', {
         windowId: this.windowId, rect: r0,
+        tabs: ['Public', 'Private'],
+        selectedIndex: this.activeTab,
+      })
+    );
+    await this.request(request(this.id, this.tabBarId, 'addDependent', {}));
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.tabBarId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    // Search input
+    this.searchInputId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createTextInput', {
+        windowId: this.windowId, rect: r0,
+        placeholder: 'Search by name, description, or tags...',
+        text: '',
+      })
+    );
+    await this.request(request(this.id, this.searchInputId, 'addDependent', {}));
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.searchInputId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    // Two ScrollableVBox containers (one per tab)
+    for (let i = 0; i < 2; i++) {
+      const scrollId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createNestedVBox', {
+          parentLayoutId: this.rootLayoutId,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 6,
+        })
+      );
+      await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+        widgetId: scrollId,
+        sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+      }));
+      this.tabContents.push(scrollId);
+    }
+
+    // Build workspace list content (from cache)
+    await this.buildWorkspaceList();
+
+    // Show only the active tab
+    await this.switchTabVisibility();
+
+    // Kick off background discovery to refresh stale cache
+    if (this.shareRegistryId) {
+      this.request(
+        request(this.id, this.shareRegistryId, 'discoverWorkspaces', { hops: 1 })
+      ).catch(() => { /* best-effort background refresh */ });
+    }
+
+    // Spacer + status
+    this.statusLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createLabel', {
+        windowId: this.windowId, rect: r0,
+        text: '',
+        style: { color: '#6b7084', fontSize: 11 },
       })
     );
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: divId,
+      widgetId: this.statusLabelId,
       sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 1 },
+      preferredSize: { height: 16 },
     }));
 
-    // Get discovered workspaces
+    await this.changed('visibility', true);
+    return true;
+  }
+
+  /**
+   * Build (or rebuild) the workspace list inside both tab containers.
+   */
+  private async buildWorkspaceList(): Promise<void> {
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+
+    // Clear existing tab content widgets
+    for (const widgetId of this.tabContentWidgetIds) {
+      try { await this.request(request(this.id, widgetId, 'destroy', {})); }
+      catch { /* gone */ }
+    }
+    this.tabContentWidgetIds = [];
+    this.browseButtons.clear();
+
+    // Remove children from both tab containers
+    for (const containerId of this.tabContents) {
+      try { await this.request(request(this.id, containerId, 'clearLayoutChildren', {})); }
+      catch { /* best effort */ }
+    }
+
+    // Fetch discovered workspaces
     let workspaces: DiscoveredWorkspace[] = [];
     if (this.shareRegistryId) {
       try {
@@ -237,26 +332,65 @@ export class WorkspaceBrowser extends Abject {
       } catch { /* ShareRegistry may not be ready */ }
     }
 
-    console.log(`[WorkspaceBrowser] show — got ${workspaces.length} discovered workspaces`);
-    if (workspaces.length > 0) console.log('[WorkspaceBrowser] workspaces:', workspaces.map(w => w.name));
+    // Get search filter
+    let searchFilter = '';
+    if (this.searchInputId) {
+      try {
+        searchFilter = (await this.request<string>(
+          request(this.id, this.searchInputId, 'getValue', {})
+        ) ?? '').trim().toLowerCase();
+      } catch { /* input not ready */ }
+    }
 
-    if (workspaces.length === 0) {
-      const emptyId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId, rect: r0,
-          text: 'No remote workspaces discovered yet.\nConnect to peers and click Refresh.',
-          style: { color: '#b4b8c8', fontSize: 12 },
-        })
-      );
-      await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-        widgetId: emptyId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 36 },
-      }));
-    } else {
+    // Filter and split by access mode
+    const publicWs: DiscoveredWorkspace[] = [];
+    const privateWs: DiscoveredWorkspace[] = [];
+
+    for (const ws of workspaces) {
+      // Apply search filter
+      if (searchFilter) {
+        const nameMatch = ws.name.toLowerCase().includes(searchFilter);
+        const descMatch = (ws.description ?? '').toLowerCase().includes(searchFilter);
+        const tagMatch = (ws.tags ?? []).some(t => t.toLowerCase().includes(searchFilter));
+        if (!nameMatch && !descMatch && !tagMatch) continue;
+      }
+
+      if (ws.accessMode === 'public') {
+        publicWs.push(ws);
+      } else if (ws.accessMode === 'private') {
+        privateWs.push(ws);
+      }
+    }
+
+    // Build each tab
+    const tabData = [publicWs, privateWs];
+    for (let tabIdx = 0; tabIdx < 2; tabIdx++) {
+      const containerId = this.tabContents[tabIdx];
+      const tabWorkspaces = tabData[tabIdx];
+
+      if (tabWorkspaces.length === 0) {
+        const emptyText = tabIdx === 0
+          ? 'No public workspaces discovered yet.'
+          : 'No private workspaces available.';
+        const emptyId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, 'createLabel', {
+            windowId: this.windowId, rect: r0,
+            text: emptyText,
+            style: { color: '#b4b8c8', fontSize: 12 },
+          })
+        );
+        this.tabContentWidgetIds.push(emptyId);
+        await this.request(request(this.id, containerId, 'addLayoutChild', {
+          widgetId: emptyId,
+          sizePolicy: { vertical: 'fixed' },
+          preferredSize: { height: 24 },
+        }));
+        continue;
+      }
+
       // Group by peer
       const byPeer = new Map<string, DiscoveredWorkspace[]>();
-      for (const ws of workspaces) {
+      for (const ws of tabWorkspaces) {
         const key = ws.ownerPeerId;
         if (!byPeer.has(key)) byPeer.set(key, []);
         byPeer.get(key)!.push(ws);
@@ -272,7 +406,8 @@ export class WorkspaceBrowser extends Abject {
             style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 },
           })
         );
-        await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+        this.tabContentWidgetIds.push(peerHeaderId);
+        await this.request(request(this.id, containerId, 'addLayoutChild', {
           widgetId: peerHeaderId,
           sizePolicy: { vertical: 'fixed' },
           preferredSize: { height: 22 },
@@ -280,37 +415,36 @@ export class WorkspaceBrowser extends Abject {
 
         // Workspace entries
         for (const ws of peerWorkspaces) {
-          const badge = ws.accessMode === 'public' ? ' [public]' : ' [private]';
-          const hopsLabel = ws.hops > 0 ? ` (${ws.hops} hop${ws.hops > 1 ? 's' : ''})` : '';
-
-          // HBox: label (expanding) + Browse button (fixed)
+          // Row 1: Name + Browse button
           const wsRowId = await this.request<AbjectId>(
             request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-              parentLayoutId: this.rootLayoutId,
+              parentLayoutId: containerId,
               margins: { top: 0, right: 0, bottom: 0, left: 0 },
               spacing: 6,
             })
           );
-          await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+          this.tabContentWidgetIds.push(wsRowId);
+          await this.request(request(this.id, containerId, 'addLayoutChild', {
             widgetId: wsRowId,
             sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
             preferredSize: { height: 24 },
           }));
 
-          const wsLabelId = await this.request<AbjectId>(
+          const wsNameId = await this.request<AbjectId>(
             request(this.id, this.widgetManagerId!, 'createLabel', {
               windowId: this.windowId, rect: r0,
-              text: `  ${ws.name}${badge}${hopsLabel}`,
-              style: { color: '#b4b8c8', fontSize: 12 },
+              text: `  ${ws.name}`,
+              style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 12 },
             })
           );
+          this.tabContentWidgetIds.push(wsNameId);
           await this.request(request(this.id, wsRowId, 'addLayoutChild', {
-            widgetId: wsLabelId,
+            widgetId: wsNameId,
             sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
             preferredSize: { height: 24 },
           }));
 
-          // Browse button (only if registryId is available)
+          // Browse button
           if (ws.registryId) {
             const browseBtnId = await this.request<AbjectId>(
               request(this.id, this.widgetManagerId!, 'createButton', {
@@ -318,6 +452,7 @@ export class WorkspaceBrowser extends Abject {
                 style: { fontSize: 11 },
               })
             );
+            this.tabContentWidgetIds.push(browseBtnId);
             await this.request(request(this.id, browseBtnId, 'addDependent', {}));
             this.browseButtons.set(browseBtnId, ws);
             await this.request(request(this.id, wsRowId, 'addLayoutChild', {
@@ -326,28 +461,93 @@ export class WorkspaceBrowser extends Abject {
               preferredSize: { width: 70, height: 24 },
             }));
           }
+
+          // Row 2: Description (if present)
+          const desc = ws.description ?? '';
+          if (desc) {
+            const truncDesc = desc.length > 80 ? desc.slice(0, 77) + '...' : desc;
+            const descId = await this.request<AbjectId>(
+              request(this.id, this.widgetManagerId!, 'createLabel', {
+                windowId: this.windowId, rect: r0,
+                text: `  ${truncDesc}`,
+                style: { color: '#8b8fa3', fontSize: 11 },
+              })
+            );
+            this.tabContentWidgetIds.push(descId);
+            await this.request(request(this.id, containerId, 'addLayoutChild', {
+              widgetId: descId,
+              sizePolicy: { vertical: 'fixed' },
+              preferredSize: { height: 18 },
+            }));
+          }
+
+          // Row 3: Tags + hop count
+          const tags = ws.tags ?? [];
+          const hopsLabel = ws.hops > 0 ? `${ws.hops} hop${ws.hops > 1 ? 's' : ''}` : '';
+          const tagsStr = tags.join(' \u00b7 ');
+          const metaText = [tagsStr, hopsLabel].filter(Boolean).join('    ');
+          if (metaText) {
+            const metaId = await this.request<AbjectId>(
+              request(this.id, this.widgetManagerId!, 'createLabel', {
+                windowId: this.windowId, rect: r0,
+                text: `  ${metaText}`,
+                style: { color: '#6b7084', fontSize: 11 },
+              })
+            );
+            this.tabContentWidgetIds.push(metaId);
+            await this.request(request(this.id, containerId, 'addLayoutChild', {
+              widgetId: metaId,
+              sizePolicy: { vertical: 'fixed' },
+              preferredSize: { height: 16 },
+            }));
+          }
         }
       }
     }
 
-    // Spacer + status
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutSpacer', {}));
+    // Update status with staleness indicator
+    const totalCount = publicWs.length + privateWs.length;
+    if (this.statusLabelId) {
+      let statusText = `${totalCount} workspace${totalCount !== 1 ? 's' : ''} discovered`;
 
-    this.statusLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0,
-        text: `${workspaces.length} workspace${workspaces.length !== 1 ? 's' : ''} discovered`,
-        style: { color: '#6b7084', fontSize: 11 },
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.statusLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 16 },
-    }));
+      // Check staleness of newest discovery
+      const allWs = [...publicWs, ...privateWs];
+      if (allWs.length > 0) {
+        const newestAt = Math.max(...allWs.map(w => w.discoveredAt));
+        const ageSec = Math.floor((Date.now() - newestAt) / 1000);
+        if (ageSec > 60) {
+          const ageMin = Math.floor(ageSec / 60);
+          statusText += ` · Last updated ${ageMin}m ago`;
+        }
+      }
 
-    await this.changed('visibility', true);
-    return true;
+      try {
+        await this.request(request(this.id, this.statusLabelId, 'update', {
+          text: statusText,
+        }));
+      } catch { /* widget gone */ }
+    }
+  }
+
+  /**
+   * Rebuild workspace list (called on search or discovery events).
+   */
+  private async rebuildWorkspaceList(): Promise<void> {
+    await this.buildWorkspaceList();
+    await this.switchTabVisibility();
+  }
+
+  /**
+   * Show/hide the tab content containers based on activeTab.
+   */
+  private async switchTabVisibility(): Promise<void> {
+    for (let i = 0; i < this.tabContents.length; i++) {
+      try {
+        await this.request(request(this.id, this.tabContents[i], 'update', {
+          style: { visible: i === this.activeTab },
+        }));
+      } catch { /* container gone */ }
+    }
   }
 
   async hide(): Promise<boolean> {
@@ -363,6 +563,10 @@ export class WorkspaceBrowser extends Abject {
     this.rootLayoutId = undefined;
     this.refreshBtnId = undefined;
     this.statusLabelId = undefined;
+    this.searchInputId = undefined;
+    this.tabBarId = undefined;
+    this.tabContents = [];
+    this.tabContentWidgetIds = [];
     this.browseButtons.clear();
 
     await this.changed('visibility', false);
@@ -385,9 +589,11 @@ export class WorkspaceBrowser extends Abject {
     }
 
     console.log('[WorkspaceBrowser] discovery done, rebuilding UI');
-    // Rebuild UI
-    await this.hide();
-    await this.show();
+    if (this.windowId) {
+      await this.rebuildWorkspaceList();
+    } else {
+      await this.show();
+    }
     return true;
   }
 

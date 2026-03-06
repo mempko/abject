@@ -8,6 +8,8 @@
     "client": "vite --config vite.client.config.ts",
     "serve2": "ABJECTS_DATA_DIR=.abjects2 WS_PORT=7721 tsx --watch server/index.ts",
     "client2": "VITE_WS_PORT=7721 VITE_CLIENT_PORT=5175 vite --config vite.client.config.ts",
+    "serve3": "ABJECTS_DATA_DIR=.abjects3 WS_PORT=7722 tsx --watch server/index.ts",
+    "client3": "VITE_WS_PORT=7722 VITE_CLIENT_PORT=5176 vite --config vite.client.config.ts",
     "signal": "tsx server/signaling-server.ts",
     "asc": "asc"
   },

@@ -8,7 +8,7 @@
  * Remote well-known objects are resolved to UUIDs via `resolveRemoteObject`.
  */
 
-import { AbjectId, AbjectMessage } from '../core/types.js';
+import { AbjectId, TypeId, AbjectMessage } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request as createRequest, error as createError } from '../core/message.js';
@@ -28,12 +28,14 @@ interface RouteEntry {
   nextHop: PeerId;
   hops: number;
   ttl: number; // expiry timestamp
+  typeId?: TypeId;
 }
 
 interface PermissionCacheEntry {
   workspaceId: string;
   accessMode: WorkspaceAccessMode;
   whitelist: string[];
+  exposedObjectIds: AbjectId[];
   cachedAt: number;
 }
 
@@ -46,10 +48,13 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   /** System objects explicitly allowed for remote access */
   private allowedSystemObjects: Set<AbjectId> = new Set();
 
-  /** Well-known name → local UUID mapping for inbound message resolution */
+  /** Well-known name → local UUID mapping for inbound message resolution (legacy) */
   private wellKnownAliases: Map<AbjectId, AbjectId> = new Map();
 
-  /** Remote peer well-known → UUID mappings: key = `${peerId}:${wellKnownId}` */
+  /** TypeId → local AbjectId mapping for inbound resolution */
+  private typeIdToLocal: Map<TypeId, AbjectId> = new Map();
+
+  /** Remote peer TypeId/well-known → UUID mappings: key = `${peerId}:${typeIdOrWellKnown}` */
   private remoteWellKnown: Map<string, AbjectId> = new Map();
 
   /** Inbound permission cache */
@@ -186,15 +191,22 @@ export class PeerRouter extends Abject implements MessageInterceptor {
    */
   setPeerRegistry(peerRegistry: PeerRegistry): void {
     this.peerRegistryRef = peerRegistry;
+    peerRegistry.onPeerConnected((peerId: string) => {
+      console.log(`[PeerRouter] direct peerConnected callback for ${peerId.slice(0, 16)}`);
+      this.announceRoutesToPeer(peerId as PeerId).catch(() => {});
+    });
   }
 
   /**
    * Mark a system object as accessible to remote peers (direct method, for bootstrap).
    */
-  allowSystemObjectDirect(objectId: AbjectId, wellKnownId?: AbjectId): void {
+  allowSystemObjectDirect(objectId: AbjectId, wellKnownId?: AbjectId, typeId?: TypeId): void {
     this.allowedSystemObjects.add(objectId);
     if (wellKnownId) {
       this.wellKnownAliases.set(wellKnownId, objectId);
+    }
+    if (typeId) {
+      this.typeIdToLocal.set(typeId, objectId);
     }
   }
 
@@ -221,10 +233,13 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     });
 
     this.on('allowSystemObject', async (msg: AbjectMessage) => {
-      const { objectId, wellKnownId } = msg.payload as { objectId: string; wellKnownId?: string };
+      const { objectId, wellKnownId, typeId } = msg.payload as { objectId: string; wellKnownId?: string; typeId?: string };
       this.allowedSystemObjects.add(objectId as AbjectId);
       if (wellKnownId) {
         this.wellKnownAliases.set(wellKnownId as AbjectId, objectId as AbjectId);
+      }
+      if (typeId) {
+        this.typeIdToLocal.set(typeId as TypeId, objectId as AbjectId);
       }
       return true;
     });
@@ -310,6 +325,11 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       this.announceRoutesToAll().catch(() => { /* best-effort */ });
     }, ANNOUNCE_INTERVAL);
     console.log('[PeerRouter] onInit complete, announce timer started (60s)');
+
+    // Catch peers that connected before setPeerRegistry was called
+    setTimeout(() => {
+      this.announceRoutesToAll().catch(() => {});
+    }, 3000);
   }
 
   protected override async onStop(): Promise<void> {
@@ -348,12 +368,33 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     }
 
     try {
-      await transport.send(message);
+      // Filter list replies to enforce exposed-objects policy
+      const outMsg = this.filterOutboundReply(message);
+      await transport.send(outMsg);
       return 'drop'; // We handled delivery
     } catch (err) {
       console.error(`[PeerRouter] Failed to forward message to peer ${route.nextHop.slice(0, 16)}:`, err);
       return 'pass';
     }
+  }
+
+  /**
+   * Filter outbound reply messages to only include exposed objects.
+   * Prevents Registry `list` replies from leaking non-exposed object IDs.
+   */
+  private filterOutboundReply(msg: AbjectMessage): AbjectMessage {
+    if (msg.header.type !== 'reply' || msg.routing.method !== 'list') return msg;
+    if (!Array.isArray(msg.payload)) return msg;
+
+    const cached = this.permissionCache.get(msg.routing.from as AbjectId);
+    if (!cached) return msg;  // No cache entry — pass through (will be caught by other checks)
+    if (cached.exposedObjectIds.length === 0) return { ...msg, payload: [] };  // Nothing exposed
+
+    const allowed = new Set(cached.exposedObjectIds);
+    const filtered = (msg.payload as Array<{ objectId: string }>)
+      .filter(item => allowed.has(item.objectId as AbjectId));
+
+    return { ...msg, payload: filtered };
   }
 
   // ==========================================================================
@@ -380,6 +421,14 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       targetId = this.id;
       msg = { ...msg, routing: { ...msg.routing, to: this.id } };
       console.log('[PeerRouter] self-addressed, resolved to', this.id.slice(0, 8));
+    }
+
+    // Resolve typeId to local AbjectId
+    const typeResolved = this.typeIdToLocal.get(targetId as TypeId);
+    if (typeResolved) {
+      targetId = typeResolved;
+      msg = { ...msg, routing: { ...msg.routing, to: typeResolved } };
+      console.log('[PeerRouter] typeId resolved:', targetId.slice(0, 8));
     }
 
     // Resolve well-known alias to actual registered UUID
@@ -464,7 +513,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     // Check permission cache
     const cached = this.permissionCache.get(targetId);
     if (cached && Date.now() - cached.cachedAt < PERMISSION_CACHE_TTL) {
-      return this.evaluatePermission(cached, fromPeerId);
+      return this.evaluatePermission(cached, fromPeerId, targetId);
     }
 
     // No cache — trigger async lookup for next time, allow this message
@@ -472,17 +521,31 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     return true;
   }
 
-  private evaluatePermission(entry: PermissionCacheEntry, fromPeerId: PeerId): boolean {
+  private evaluatePermission(entry: PermissionCacheEntry, fromPeerId: PeerId, targetId?: AbjectId): boolean {
+    // First gate: access mode check
+    let accessAllowed: boolean;
     switch (entry.accessMode) {
       case 'public':
-        return true;
+        accessAllowed = true;
+        break;
       case 'private':
-        return entry.whitelist.includes(fromPeerId);
+        accessAllowed = entry.whitelist.includes(fromPeerId);
+        break;
       case 'local':
         return false;
       default:
         return false;
     }
+    if (!accessAllowed) return false;
+
+    // Second gate: exposed objects check
+    if (entry.exposedObjectIds.length === 0) {
+      return false; // No objects exposed — deny remote access
+    }
+    if (targetId) {
+      return entry.exposedObjectIds.includes(targetId);
+    }
+    return true;
   }
 
   /**
@@ -496,6 +559,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         workspaceId: string;
         accessMode: WorkspaceAccessMode;
         whitelist: string[];
+        exposedObjectIds: string[];
       } | null>(
         createRequest(
           this.id, this.workspaceManagerId,
@@ -508,6 +572,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
           workspaceId: result.workspaceId,
           accessMode: result.accessMode,
           whitelist: result.whitelist,
+          exposedObjectIds: (result.exposedObjectIds ?? []) as AbjectId[],
           cachedAt: Date.now(),
         });
       } else {
@@ -516,6 +581,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
           workspaceId: '',
           accessMode: 'local',
           whitelist: [],
+          exposedObjectIds: [],
           cachedAt: Date.now(),
         });
       }
@@ -555,7 +621,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         count++;
       }
     }
-    // Clean up well-known mappings for this peer
+    // Clean up well-known and typeId mappings for this peer
     for (const key of this.remoteWellKnown.keys()) {
       if (key.startsWith(`${peerId}:`)) {
         this.remoteWellKnown.delete(key);
@@ -655,16 +721,20 @@ export class PeerRouter extends Abject implements MessageInterceptor {
    */
   private async collectRoutesForPeer(
     peerId: PeerId,
-  ): Promise<Array<{ objectId: string; hops: number; wellKnownId?: string }>> {
-    const result: Array<{ objectId: string; hops: number; wellKnownId?: string }> = [];
+  ): Promise<Array<{ objectId: string; hops: number; wellKnownId?: string; typeId?: string }>> {
+    const result: Array<{ objectId: string; hops: number; wellKnownId?: string; typeId?: string }> = [];
 
-    // Include allowed system objects (with well-known alias if known)
+    // Include allowed system objects (with well-known alias and typeId if known)
     for (const objId of this.allowedSystemObjects) {
       let wkId: string | undefined;
+      let tId: string | undefined;
       for (const [alias, uuid] of this.wellKnownAliases) {
         if (uuid === objId) { wkId = alias; break; }
       }
-      result.push({ objectId: objId, hops: 0, wellKnownId: wkId });
+      for (const [tid, uuid] of this.typeIdToLocal) {
+        if (uuid === objId) { tId = tid; break; }
+      }
+      result.push({ objectId: objId, hops: 0, wellKnownId: wkId, typeId: tId });
     }
 
     // Lazy-resolve WorkspaceManager if not yet known (spawned after PeerRouter)
@@ -685,7 +755,9 @@ export class PeerRouter extends Abject implements MessageInterceptor {
           name: string;
           accessMode: WorkspaceAccessMode;
           whitelist?: string[];
+          exposedObjectIds?: AbjectId[];
           childIds?: AbjectId[];
+          registryId?: AbjectId;
         }>>(
           createRequest(
             this.id, this.workspaceManagerId,
@@ -698,9 +770,18 @@ export class PeerRouter extends Abject implements MessageInterceptor {
             ws.accessMode === 'public' ||
             (ws.accessMode === 'private' && ws.whitelist?.includes(peerId));
 
-          if (shouldInclude && ws.childIds) {
-            for (const childId of ws.childIds) {
-              result.push({ objectId: childId, hops: 0 });
+          if (shouldInclude) {
+            // Always announce registryId (bootstrap entry point for browsing)
+            if (ws.registryId) {
+              result.push({ objectId: ws.registryId, hops: 0 });
+            }
+
+            const exposed = ws.exposedObjectIds ?? [];
+            for (const objId of exposed) {
+              // Don't double-announce registryId
+              if (objId !== ws.registryId) {
+                result.push({ objectId: objId, hops: 0 });
+              }
             }
           }
         }
@@ -731,7 +812,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
    * Handle incoming route announcement from a peer.
    */
   private handleRouteAnnouncementImpl(
-    routes: Array<{ objectId: string; hops: number; wellKnownId?: string }>,
+    routes: Array<{ objectId: string; hops: number; wellKnownId?: string; typeId?: string }>,
     fromPeerId: PeerId,
   ): boolean {
     console.log(`[PeerRouter] handleRouteAnnouncement from=${fromPeerId.slice(0, 16)}, ${routes.length} routes`);
@@ -746,6 +827,12 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         const key = `${fromPeerId}:${announced.wellKnownId}`;
         this.remoteWellKnown.set(key, objectId);
         console.log(`[PeerRouter] remoteWellKnown["${key.slice(0, 40)}..."] = ${objectId.slice(0, 8)}`);
+      }
+
+      // Store typeId → UUID mapping for this peer
+      if (announced.typeId) {
+        const key = `${fromPeerId}:${announced.typeId}`;
+        this.remoteWellKnown.set(key, objectId);
       }
 
       // Skip if we already have a shorter/equal route
@@ -763,6 +850,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         nextHop: fromPeerId,
         hops: newHops,
         ttl: Date.now() + ROUTE_TTL,
+        typeId: announced.typeId as TypeId | undefined,
       });
       newRoutes = true;
     }

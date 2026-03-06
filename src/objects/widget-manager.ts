@@ -59,8 +59,8 @@ const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 export class WidgetManager extends Abject {
   private uiServerId?: AbjectId;
   private consoleId?: AbjectId;
-  private cachedTheme: ThemeData = MIDNIGHT_BLOOM;
-  private themeId?: AbjectId;
+  private defaultTheme: ThemeData = MIDNIGHT_BLOOM;
+  private workspaceThemes: Map<string, { themeId: AbjectId; theme: ThemeData }> = new Map();
   private windowManagerId?: AbjectId;
 
   // Tracking spawned Abjects (Set<AbjectId>, NOT references — network transparent)
@@ -81,6 +81,8 @@ export class WidgetManager extends Abject {
   private widgetIdToShimId: Map<AbjectId, string> = new Map();
   // Maps widget AbjectId → window string ID (for event translation)
   private widgetToWindowShimId: Map<AbjectId, string> = new Map();
+  // Maps widget AbjectId → parent WindowAbject AbjectId (for workspace tracing)
+  private widgetToWindow: Map<AbjectId, AbjectId> = new Map();
 
   constructor() {
     super({
@@ -350,6 +352,15 @@ export class WidgetManager extends Abject {
                 returns: { kind: 'primitive', primitive: 'string' },
               },
               {
+                name: 'registerWorkspaceTheme',
+                description: 'Register a per-workspace Theme object so widgets in that workspace use the correct theme',
+                parameters: [
+                  { name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Workspace ID' },
+                  { name: 'themeId', type: { kind: 'primitive', primitive: 'string' }, description: 'Theme object AbjectId' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
                 name: 'getDisplayInfo',
                 description: 'Get display dimensions (proxied from UIServer)',
                 parameters: [],
@@ -504,7 +515,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new LabelWidget({
         type: 'label', rect: payload.rect, text: payload.text, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.getThemeForWindow(payload.windowId),
       }), payload.rect);
     });
 
@@ -517,7 +528,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new ButtonWidget({
         type: 'button', rect: payload.rect, text: payload.text, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.getThemeForWindow(payload.windowId),
       }), payload.rect);
     });
 
@@ -532,7 +543,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new TextInputWidget({
         type: 'textInput', rect: payload.rect, text: payload.text, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.getThemeForWindow(payload.windowId),
         placeholder: payload.placeholder, masked: payload.masked,
       }), payload.rect);
     });
@@ -547,7 +558,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new TextAreaWidget({
         type: 'textArea', rect: payload.rect, text: payload.text, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.getThemeForWindow(payload.windowId),
         monospace: payload.monospace,
       }), payload.rect);
     });
@@ -562,7 +573,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new CheckboxWidget({
         type: 'checkbox', rect: payload.rect, text: payload.text, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.getThemeForWindow(payload.windowId),
         checked: payload.checked,
       }), payload.rect);
     });
@@ -577,7 +588,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new ProgressWidget({
         type: 'progress', rect: payload.rect, text: payload.text, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.getThemeForWindow(payload.windowId),
         value: payload.value,
       }), payload.rect);
     });
@@ -590,7 +601,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new DividerWidget({
         type: 'divider', rect: payload.rect, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.getThemeForWindow(payload.windowId),
       }), payload.rect);
     });
 
@@ -605,7 +616,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new SelectWidget({
         type: 'select', rect: payload.rect, text: payload.text, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.getThemeForWindow(payload.windowId),
         options: payload.options, selectedIndex: payload.selectedIndex,
       }), payload.rect);
     });
@@ -620,7 +631,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new TabBarWidget({
         type: 'tabBar', rect: payload.rect, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.getThemeForWindow(payload.windowId),
         tabs: payload.tabs, selectedIndex: payload.selectedIndex,
       }), payload.rect);
     });
@@ -638,7 +649,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new SliderWidget({
         type: 'slider', rect: payload.rect, text: payload.text, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.getThemeForWindow(payload.windowId),
         min: payload.min, max: payload.max, step: payload.step, value: payload.value,
       }), payload.rect);
     });
@@ -654,7 +665,7 @@ export class WidgetManager extends Abject {
       };
       return this.createTypedWidget(payload.windowId, new ImageWidget({
         type: 'image', rect: payload.rect, style: payload.style,
-        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.cachedTheme,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.getThemeForWindow(payload.windowId),
         url: payload.url, fit: payload.fit, alt: payload.alt,
       }), payload.rect);
     });
@@ -758,7 +769,7 @@ export class WidgetManager extends Abject {
         rect: { x: 0, y: 0, width: 0, height: 0 },
         ownerId: windowId,
         uiServerId: this.uiServerId!,
-        theme: this.cachedTheme,
+        theme: this.getThemeForWindow(windowId),
         inputTargetId: targetId,
       });
       const widgetId = await this.createTypedWidget(windowId, widget, { x: 0, y: 0, width: 0, height: 0 });
@@ -852,6 +863,30 @@ export class WidgetManager extends Abject {
       }
     });
 
+    this.on('registerWorkspaceTheme', async (msg: AbjectMessage) => {
+      const { workspaceId, themeId } = msg.payload as { workspaceId: string; themeId: AbjectId };
+      // Fetch current theme from the Theme object
+      let theme: ThemeData = this.defaultTheme;
+      try {
+        const fetched = await this.request<ThemeData>(
+          request(this.id, themeId, 'getTheme', {})
+        );
+        if (fetched && typeof fetched === 'object' && 'canvasBg' in fetched) {
+          theme = fetched;
+        }
+      } catch { /* use default */ }
+
+      // Subscribe for theme change notifications
+      try {
+        await this.request(
+          request(this.id, themeId, 'addDependent', {})
+        );
+      } catch { /* may not support dependents */ }
+
+      this.workspaceThemes.set(workspaceId, { themeId, theme });
+      return true;
+    });
+
     this.on('getObjectWorkspace', async (msg: AbjectMessage) => {
       const { objectId } = msg.payload as { objectId: string };
       return this.objectWorkspaces.get(objectId as AbjectId) ?? null;
@@ -867,26 +902,32 @@ export class WidgetManager extends Abject {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
 
-      // Handle theme changes from ThemeAbject
-      if (aspect === 'themeChanged' && fromId === this.themeId) {
-        this.cachedTheme = value as ThemeData;
-        // Propagate to all spawned widgets
-        for (const id of this.spawnedWidgets) {
-          try {
-            await this.send(
-              event(this.id, id, 'updateTheme', this.cachedTheme)
-            );
-          } catch { /* widget gone */ }
+      // Handle theme changes from per-workspace ThemeAbjects
+      if (aspect === 'themeChanged') {
+        // Find which workspace this theme belongs to
+        let changedWorkspaceId: string | undefined;
+        for (const [wsId, entry] of this.workspaceThemes) {
+          if (entry.themeId === fromId) {
+            entry.theme = value as ThemeData;
+            changedWorkspaceId = wsId;
+            break;
+          }
         }
-        // Propagate to all spawned windows
-        for (const id of this.spawnedWindows) {
-          try {
-            await this.send(
-              event(this.id, id, 'updateTheme', this.cachedTheme)
-            );
-          } catch { /* window gone */ }
+        if (changedWorkspaceId) {
+          const newTheme = value as ThemeData;
+          // Propagate only to widgets/windows in this workspace
+          for (const id of this.spawnedWidgets) {
+            if (this.getWorkspaceForWidgetOrWindow(id) === changedWorkspaceId) {
+              try { await this.send(event(this.id, id, 'updateTheme', newTheme)); } catch { /* gone */ }
+            }
+          }
+          for (const id of this.spawnedWindows) {
+            if (this.getWorkspaceForWidgetOrWindow(id) === changedWorkspaceId) {
+              try { await this.send(event(this.id, id, 'updateTheme', newTheme)); } catch { /* gone */ }
+            }
+          }
+          return;
         }
-        return;
       }
 
       // Forward window close/minimize/restore events to owners
@@ -965,29 +1006,41 @@ export class WidgetManager extends Abject {
       } catch { /* best effort */ }
     }
 
-    // Query ThemeAbject for the current theme
-    this.themeId = await this.discoverDep('Theme') ?? undefined;
-    if (this.themeId) {
-      try {
-        const theme = await this.request<ThemeData>(
-          request(this.id, this.themeId, 'getTheme', {})
-        );
-        if (theme && typeof theme === 'object' && 'canvasBg' in theme) {
-          this.cachedTheme = theme;
-        }
-      } catch {
-        // Theme not available — use default
-      }
+    // Theme is per-workspace — registered via registerWorkspaceTheme from WorkspaceManager
+  }
 
-      // Register as dependent to receive theme change notifications
-      try {
-        await this.request(
-          request(this.id, this.themeId, 'addDependent', {})
-        );
-      } catch {
-        // Theme may not support dependents
-      }
+  /** Get theme for a window's owner (traces windowOwners → objectWorkspaces → workspace theme). */
+  private getThemeForWindow(windowId: AbjectId): ThemeData {
+    const ownerId = this.windowOwners.get(windowId);
+    if (ownerId) return this.getThemeForOwner(ownerId);
+    return this.defaultTheme;
+  }
+
+  /** Get theme for a given owner AbjectId (looks up owner's workspace → workspace theme → default). */
+  private getThemeForOwner(ownerId: AbjectId): ThemeData {
+    const wsId = this.objectWorkspaces.get(ownerId);
+    if (wsId) {
+      const entry = this.workspaceThemes.get(wsId);
+      if (entry) return entry.theme;
     }
+    return this.defaultTheme;
+  }
+
+  /** Get workspace ID for a widget/window by tracing through windowOwners → objectWorkspaces. */
+  private getWorkspaceForWidgetOrWindow(id: AbjectId): string | undefined {
+    // Direct: the id itself might be a window with an owner
+    const ownerId = this.windowOwners.get(id);
+    if (ownerId) {
+      return this.objectWorkspaces.get(ownerId);
+    }
+    // Check if this is a widget → window → owner → workspace
+    const windowId = this.widgetToWindow.get(id);
+    if (windowId) {
+      const winOwner = this.windowOwners.get(windowId);
+      if (winOwner) return this.objectWorkspaces.get(winOwner);
+    }
+    // The id might be in objectWorkspaces directly (unlikely for widgets, but check)
+    return this.objectWorkspaces.get(id);
   }
 
   private async log(level: string, message: string, data?: unknown): Promise<void> {
@@ -1350,6 +1403,7 @@ await this.call(timerId, 'addDependent', {});
   ): Promise<string> {
     require(this.uiServerId !== undefined, 'UIServer not set');
 
+    const ownerTheme = this.getThemeForOwner(owner);
     const win = new WindowAbject({
       title,
       rect,
@@ -1357,7 +1411,7 @@ await this.call(timerId, 'addDependent', {});
       chromeless: options?.chromeless,
       resizable: options?.resizable,
       zIndex: options?.zIndex ?? 100,
-      theme: this.cachedTheme,
+      theme: ownerTheme,
     });
 
     await win.init(this.bus, this.id);
@@ -1383,9 +1437,9 @@ await this.call(timerId, 'addDependent', {});
             rect, chromeless: options?.chromeless ?? false,
             draggable: false,
             title,
-            titleBarHeight: this.cachedTheme.titleBarHeight,
-            titleButtonSize: this.cachedTheme.titleButtonSize,
-            titleButtonMargin: this.cachedTheme.titleButtonMargin,
+            titleBarHeight: ownerTheme.titleBarHeight,
+            titleButtonSize: ownerTheme.titleButtonSize,
+            titleButtonMargin: ownerTheme.titleButtonMargin,
             workspaceId: ownerWs,
           }));
       } catch { /* WindowManager may not be ready */ }
@@ -1409,6 +1463,7 @@ await this.call(timerId, 'addDependent', {});
   ): Promise<AbjectId> {
     require(this.uiServerId !== undefined, 'UIServer not set');
 
+    const ownerTheme = this.getThemeForOwner(owner);
     const win = new WindowAbject({
       title,
       rect,
@@ -1417,7 +1472,7 @@ await this.call(timerId, 'addDependent', {});
       resizable: options?.resizable,
       draggable: options?.draggable,
       zIndex: options?.zIndex ?? 100,
-      theme: this.cachedTheme,
+      theme: ownerTheme,
     });
 
     await win.init(this.bus, this.id);
@@ -1446,11 +1501,12 @@ await this.call(timerId, 'addDependent', {});
             rect, chromeless: options?.chromeless ?? false,
             draggable: options?.draggable ?? false,
             title,
-            titleBarHeight: this.cachedTheme.titleBarHeight,
-            titleButtonSize: this.cachedTheme.titleButtonSize,
-            titleButtonMargin: this.cachedTheme.titleButtonMargin,
+            titleBarHeight: ownerTheme.titleBarHeight,
+            titleButtonSize: ownerTheme.titleButtonSize,
+            titleButtonMargin: ownerTheme.titleButtonMargin,
             workspaceId: ownerWs,
           }));
+        console.log(`[DRAG-DEBUG] registerWindow surface=${win.surface} wmId=${this.windowManagerId}`);
       } catch { /* WindowManager may not be ready */ }
     }
 
@@ -1495,6 +1551,13 @@ await this.call(timerId, 'addDependent', {});
       }
     }
     this.windowOwners.delete(windowId);
+
+    // Clean up widgetToWindow entries for this window's children
+    for (const [widgetId, winId] of this.widgetToWindow.entries()) {
+      if (winId === windowId) {
+        this.widgetToWindow.delete(widgetId);
+      }
+    }
 
     if (windowShimId) {
       for (const [shimId, abjectId] of this.shimWidgetMap.entries()) {
@@ -1558,6 +1621,7 @@ await this.call(timerId, 'addDependent', {});
 
     await widget.init(this.bus, this.id);
     this.spawnedWidgets.add(widget.id);
+    this.widgetToWindow.set(widget.id, windowId);
     this.log('debug', 'createWidget', { widgetId: widget.id, windowId, type: widget.manifest.name });
 
     // Only add to window if rect is non-zero.
@@ -1659,7 +1723,7 @@ await this.call(timerId, 'addDependent', {});
       style: config.style,
       ownerId: winAbjectId,
       uiServerId: this.uiServerId!,
-      theme: this.cachedTheme,
+      theme: this.getThemeForWindow(winAbjectId),
     };
 
     let widget: WidgetAbject;

@@ -4,6 +4,7 @@
 
 import {
   AbjectId,
+  TypeId,
   AbjectManifest,
   AbjectMessage,
   ObjectRegistration,
@@ -354,8 +355,11 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         errorCount: 0, startedAt: now, lastActivity: now,
       };
 
+      const preservedTypeId = existingReg?.typeId;
+
       if (effectiveRegistryId) {
         const regPayload: Record<string, unknown> = { objectId, manifest, status };
+        if (preservedTypeId) regPayload.typeId = preservedTypeId;
         if (isScriptable && existingReg) {
           regPayload.source = existingReg.source;
           regPayload.owner = existingReg.owner;
@@ -365,11 +369,12 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         );
       }
 
-      return { objectId, status };
+      return { objectId, typeId: preservedTypeId, status };
     }
 
     // Kill old instance if still tracked
     const old = this.spawned.get(objectId);
+    const preservedTypeId = old?.typeId;
     if (old) {
       // Unregister from registry BEFORE stopping so cleanup notifications
       // fire while the object is still on the bus
@@ -394,6 +399,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
     if (!factory) throw new Error(`No constructor for '${constructorName}'`);
     const obj = factory();
     obj.setId(objectId);
+    if (preservedTypeId) obj.setTypeId(preservedTypeId);
 
     // Pre-seed registry ID to avoid deadlock (child asking parent during init)
     if (effectiveRegistryId) {
@@ -410,6 +416,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         manifest: obj.manifest,
         status: obj.status,
       };
+      if (preservedTypeId) payload.typeId = preservedTypeId;
       if (obj instanceof CompositeAbject) {
         payload.source = obj.compositeSource;
       } else if (obj instanceof ScriptableAbject) {
@@ -425,6 +432,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
 
     return {
       objectId: obj.id,
+      typeId: preservedTypeId,
       status: obj.status,
     };
   }
@@ -474,6 +482,11 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
       );
     }
 
+    // Set typeId if provided
+    if (req.typeId) {
+      obj.setTypeId(req.typeId);
+    }
+
     // Pre-seed registry ID to avoid deadlock (child asking parent during init)
     // Use registryHint from request if provided (workspace objects), else Factory's registry
     const hint = req.registryHint ?? this._factoryRegistryId;
@@ -497,6 +510,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         manifest: obj.manifest,
         status: obj.status,
       };
+      if (req.typeId) payload.typeId = req.typeId;
       if (obj instanceof CompositeAbject) {
         payload.source = obj.compositeSource;
       } else if (obj instanceof ScriptableAbject) {
@@ -512,6 +526,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
 
     return {
       objectId: obj.id,
+      typeId: req.typeId,
       status: obj.status,
     };
   }
@@ -540,6 +555,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         manifest: obj.manifest,
         status: obj.status,
       };
+      if (obj.typeId) payload.typeId = obj.typeId;
       if (obj instanceof CompositeAbject) {
         payload.source = obj.compositeSource;
       } else if (obj instanceof ScriptableAbject) {
@@ -555,6 +571,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
 
     return {
       objectId: obj.id,
+      typeId: obj.typeId,
       status: obj.status,
     };
   }
@@ -591,28 +608,33 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
     if (targetRegistry) this.workerRegistries.set(objectId, targetRegistry);
     if (targetRegistry) {
       const now = Date.now();
-      await this.request(
-        request(this.id, targetRegistry, 'register', {
-          objectId,
+      const regPayload: Record<string, unknown> = {
+        objectId,
+        manifest: realManifest,
+        status: {
+          id: objectId,
+          typeId: req.typeId,
+          state: 'ready',
           manifest: realManifest,
-          status: {
-            id: objectId,
-            state: 'ready',
-            manifest: realManifest,
-            connections: [] as AbjectId[],
-            errorCount: 0,
-            startedAt: now,
-            lastActivity: now,
-          },
-        })
+          connections: [] as AbjectId[],
+          errorCount: 0,
+          startedAt: now,
+          lastActivity: now,
+        },
+      };
+      if (req.typeId) regPayload.typeId = req.typeId;
+      await this.request(
+        request(this.id, targetRegistry, 'register', regPayload)
       );
     }
 
     const now = Date.now();
     return {
       objectId,
+      typeId: req.typeId,
       status: {
         id: objectId,
+        typeId: req.typeId,
         state: 'ready',
         manifest: realManifest,
         connections: [] as AbjectId[],
@@ -650,30 +672,35 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
     if (targetRegistry) this.workerRegistries.set(objectId, targetRegistry);
     if (targetRegistry) {
       const now = Date.now();
-      await this.request(
-        request(this.id, targetRegistry, 'register', {
-          objectId,
+      const regPayload: Record<string, unknown> = {
+        objectId,
+        manifest: req.manifest,
+        owner: req.owner,
+        source: req.source,
+        status: {
+          id: objectId,
+          typeId: req.typeId,
+          state: 'ready',
           manifest: req.manifest,
-          owner: req.owner,
-          source: req.source,
-          status: {
-            id: objectId,
-            state: 'ready',
-            manifest: req.manifest,
-            connections: [] as AbjectId[],
-            errorCount: 0,
-            startedAt: now,
-            lastActivity: now,
-          },
-        })
+          connections: [] as AbjectId[],
+          errorCount: 0,
+          startedAt: now,
+          lastActivity: now,
+        },
+      };
+      if (req.typeId) regPayload.typeId = req.typeId;
+      await this.request(
+        request(this.id, targetRegistry, 'register', regPayload)
       );
     }
 
     const now = Date.now();
     return {
       objectId,
+      typeId: req.typeId,
       status: {
         id: objectId,
+        typeId: req.typeId,
         state: 'ready',
         manifest: req.manifest,
         connections: [] as AbjectId[],

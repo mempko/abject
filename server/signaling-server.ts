@@ -28,6 +28,7 @@ interface SignalingMessage {
   sdp?: unknown;
   candidate?: unknown;
   error?: string;
+  peers?: Array<{ peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string }>;
 }
 
 const DEFAULT_PORT = 7720;
@@ -89,6 +90,9 @@ export class SignalingServer {
       case 'sdp-answer':
       case 'ice-candidate':
         this.handleRelay(ws, msg);
+        break;
+      case 'list-peers':
+        this.handleListPeers(ws, msg);
         break;
       case 'ping':
         this.handlePing(ws);
@@ -167,6 +171,19 @@ export class SignalingServer {
 
     // Forward the message to the target peer
     this.sendMessage(target.ws, msg);
+  }
+
+  private handleListPeers(ws: WebSocket, msg: SignalingMessage): void {
+    const excludeId = msg.peerId ?? '';
+    const peers = Array.from(this.peers.values())
+      .filter(r => r.peerId !== excludeId)
+      .map(r => ({
+        peerId: r.peerId,
+        name: r.name,
+        publicSigningKey: r.publicSigningKey,
+        publicExchangeKey: r.publicExchangeKey,
+      }));
+    this.sendMessage(ws, { type: 'peer-list', peers } as SignalingMessage);
   }
 
   private handlePing(ws: WebSocket): void {

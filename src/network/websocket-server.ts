@@ -7,6 +7,7 @@ import { WebSocketServer as WsServer, WebSocket } from 'ws';
 export interface WsServerConfig {
   port: number;
   host?: string;
+  perMessageDeflate?: boolean | object;
 }
 
 /**
@@ -17,7 +18,11 @@ export class NodeWebSocketServer {
   private connections: Set<WebSocket> = new Set();
 
   constructor(config: WsServerConfig) {
-    this.wss = new WsServer({ port: config.port, host: config.host });
+    this.wss = new WsServer({
+      port: config.port,
+      host: config.host,
+      perMessageDeflate: config.perMessageDeflate ?? false,
+    });
 
     this.wss.on('connection', (ws) => {
       this.connections.add(ws);

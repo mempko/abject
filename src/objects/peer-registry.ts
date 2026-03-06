@@ -1036,6 +1036,7 @@ export class PeerRegistry extends Abject {
           });
           this.changed('networkPeerConnected', { peerId, name });
         }
+        this.peerConnectedHandler?.(peerId);
       },
       onDisconnect: () => {
         // Only clean up if this transport is still the active one for this peer
@@ -1093,6 +1094,7 @@ export class PeerRegistry extends Abject {
   // Handler callbacks for SignalingRelay and PeerDiscovery objects
   private signalingRelayHandler?: (msg: AbjectMessage, fromPeerId: PeerId) => void;
   private peerDiscoveryHandler?: (msg: AbjectMessage, fromPeerId: PeerId) => void;
+  private peerConnectedHandler?: (peerId: string) => void;
 
   /**
    * Set a handler for messages received from remote peers.
@@ -1113,6 +1115,14 @@ export class PeerRegistry extends Abject {
    */
   onPeerDiscoveryMessage(handler: (msg: AbjectMessage, fromPeerId: PeerId) => void): void {
     this.peerDiscoveryHandler = handler;
+  }
+
+  /**
+   * Set a direct callback for when any peer connects (contact or network).
+   * Bypasses the MessageBus to avoid bootstrap race conditions.
+   */
+  onPeerConnected(handler: (peerId: string) => void): void {
+    this.peerConnectedHandler = handler;
   }
 
   /**

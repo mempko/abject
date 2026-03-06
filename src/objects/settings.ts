@@ -43,6 +43,8 @@ export class Settings extends Abject {
 
   // Widget AbjectIds (General tab)
   private workspaceNameInputId?: AbjectId;
+  private descriptionInputId?: AbjectId;
+  private tagsInputId?: AbjectId;
   private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
 
@@ -54,8 +56,18 @@ export class Settings extends Abject {
   /** Maps delete button AbjectId → object ID for "Created Objects" section. */
   private objectDeleteButtons: Map<AbjectId, string> = new Map();
 
+  /** Maps checkbox AbjectId → object ID for "Exposed" checkboxes on General tab. */
+  private generalExposedCheckboxes: Map<AbjectId, string> = new Map();
+
   /** Maps checkbox AbjectId → peerId for whitelist UI. */
   private whitelistCheckboxes: Map<AbjectId, string> = new Map();
+
+  /** Maps checkbox AbjectId → object ID for exposed objects UI. */
+  private exposedCheckboxes: Map<AbjectId, AbjectId> = new Map();
+  /** Nested VBox container for the exposed objects section. */
+  private exposedContainerId?: AbjectId;
+  /** Widget IDs inside the exposed objects container, for cleanup. */
+  private exposedWidgetIds: AbjectId[] = [];
 
   /** Nested VBox container for the whitelist section (always present in access tab layout). */
   private whitelistContainerId?: AbjectId;
@@ -170,15 +182,21 @@ export class Settings extends Abject {
 
     // Reset tab-specific widget refs
     this.workspaceNameInputId = undefined;
+    this.descriptionInputId = undefined;
+    this.tagsInputId = undefined;
     this.accessModeSelectId = undefined;
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
     this.accessSaveBtnId = undefined;
     this.accessStatusLabelId = undefined;
     this.objectDeleteButtons.clear();
+    this.generalExposedCheckboxes.clear();
     this.whitelistCheckboxes.clear();
     this.whitelistContainerId = undefined;
     this.whitelistWidgetIds = [];
+    this.exposedCheckboxes.clear();
+    this.exposedContainerId = undefined;
+    this.exposedWidgetIds = [];
   }
 
   private setupHandlers(): void {
@@ -244,14 +262,18 @@ export class Settings extends Abject {
         return;
       }
 
-      // Access mode dropdown change — dynamically add/remove whitelist section
+      // Access mode dropdown change — dynamically add/remove whitelist and exposed objects sections
       if (fromId === this.accessModeSelectId && aspect === 'change') {
         const modeMap: Record<string, string> = { 'Local': 'local', 'Private': 'private', 'Public': 'public' };
         const newMode = modeMap[value as string] ?? 'local';
+        const r0 = { x: 0, y: 0, width: 0, height: 0 };
         await this.clearWhitelistSection();
+        await this.clearExposedObjectsSection();
         if (newMode === 'private') {
-          const r0 = { x: 0, y: 0, width: 0, height: 0 };
           await this.buildWhitelistSection(r0);
+        }
+        if (newMode !== 'local') {
+          await this.buildExposedObjectsSection(r0);
         }
         return;
       }
@@ -339,14 +361,29 @@ export class Settings extends Abject {
    * Build the General tab: workspace name + created objects + save button.
    */
   private async buildGeneralTab(r0: { x: number; y: number; width: number; height: number }): Promise<void> {
-    // Get current workspace name
+    // Get current workspace name, description, and tags
     let currentName = '';
+    let currentDescription = '';
+    let currentTags = '';
     if (this.workspaceManagerId) {
       try {
         const active = await this.request<{ id: string; name: string } | null>(
           request(this.id, this.workspaceManagerId, 'getActiveWorkspace', {})
         );
         if (active) currentName = active.name;
+      } catch { /* use empty */ }
+    }
+    if (this.workspaceManagerId && this.workspaceId) {
+      try {
+        currentDescription = await this.request<string>(
+          request(this.id, this.workspaceManagerId, 'getDescription', { workspaceId: this.workspaceId })
+        );
+      } catch { /* use empty */ }
+      try {
+        const tags = await this.request<string[]>(
+          request(this.id, this.workspaceManagerId, 'getTags', { workspaceId: this.workspaceId })
+        );
+        currentTags = tags.join(', ');
       } catch { /* use empty */ }
     }
 
@@ -416,6 +453,60 @@ export class Settings extends Abject {
       preferredSize: { height: 32 },
     }));
 
+    // Description label
+    const descInputLabelId = this.trackTabWidget(await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Description',
+        style: { color: '#e2e4e9', fontSize: 13 },
+      })
+    ));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: descInputLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // Description input
+    this.descriptionInputId = this.trackTabWidget(await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createTextInput', {
+        windowId: this.windowId, rect: r0, placeholder: 'Workspace description',
+        text: currentDescription,
+      })
+    ));
+    await this.request(request(this.id, this.descriptionInputId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.descriptionInputId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    // Tags label
+    const tagsLabelId = this.trackTabWidget(await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Tags (comma-separated)',
+        style: { color: '#e2e4e9', fontSize: 13 },
+      })
+    ));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: tagsLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // Tags input
+    this.tagsInputId = this.trackTabWidget(await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createTextInput', {
+        windowId: this.windowId, rect: r0, placeholder: 'e.g. art, tools, games',
+        text: currentTags,
+      })
+    ));
+    await this.request(request(this.id, this.tagsInputId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.tagsInputId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
     // ── Created Objects Section ──
 
     // Divider
@@ -443,6 +534,17 @@ export class Settings extends Abject {
       preferredSize: { height: 24 },
     }));
 
+    // Fetch current exposed object IDs for checkbox state
+    let generalExposedSet = new Set<string>();
+    if (this.workspaceManagerId && this.workspaceId) {
+      try {
+        const exposedIds = await this.request<string[]>(
+          request(this.id, this.workspaceManagerId, 'getExposedObjects', { workspaceId: this.workspaceId })
+        );
+        generalExposedSet = new Set(exposedIds);
+      } catch { /* not available */ }
+    }
+
     if (snapshots.length === 0) {
       const emptyLabelId = this.trackTabWidget(await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, 'createLabel', {
@@ -457,7 +559,7 @@ export class Settings extends Abject {
       }));
     } else {
       for (const snap of snapshots) {
-        // HBox row: name label + delete button
+        // HBox row: exposed checkbox + name label + delete button
         const rowId = this.trackTabWidget(await this.request<AbjectId>(
           request(this.id, this.widgetManagerId!, 'createNestedHBox', {
             parentLayoutId: cId,
@@ -470,6 +572,22 @@ export class Settings extends Abject {
           sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
           preferredSize: { height: 30 },
         }));
+
+        // Exposed checkbox
+        const exposedCbId = this.trackTabWidget(await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, 'createCheckbox', {
+            windowId: this.windowId, rect: r0,
+            checked: generalExposedSet.has(snap.objectId),
+            text: '',
+          })
+        ));
+        await this.request(request(this.id, exposedCbId, 'addDependent', {}));
+        await this.request(request(this.id, rowId, 'addLayoutChild', {
+          widgetId: exposedCbId,
+          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+          preferredSize: { width: 28, height: 28 },
+        }));
+        this.generalExposedCheckboxes.set(exposedCbId, snap.objectId);
 
         const objNameId = this.trackTabWidget(await this.request<AbjectId>(
           request(this.id, this.widgetManagerId!, 'createLabel', {
@@ -588,15 +706,40 @@ export class Settings extends Abject {
     ));
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: this.whitelistContainerId,
-      sizePolicy: { vertical: 'shrink' },
+      sizePolicy: { vertical: 'preferred' },
     }));
 
     if (currentAccessMode === 'private') {
       await this.buildWhitelistSection(r0);
+      // Set preferred height based on content: divider(1) + spacing(8) + header(20) + spacing(8) + desc(18) + spacing(8)
+      // plus either "no contacts" label(18) or contact rows(28 each with 8px spacing between)
+      const itemCount = this.whitelistCheckboxes.size;
+      const baseHeight = 1 + 8 + 20 + 8 + 18 + 8;
+      const itemsHeight = itemCount === 0
+        ? 18  // "no contacts" label
+        : (itemCount * 28) + ((itemCount - 1) * 8);
+      await this.request(request(this.id, cId, 'updateLayoutChild', {
+        widgetId: this.whitelistContainerId,
+        preferredSize: { height: baseHeight + itemsHeight },
+      }));
     }
 
-    // Spacer pushes save button to bottom
-    await this.request(request(this.id, cId, 'addLayoutSpacer', {}));
+    // ── Exposed Objects container (visible for private or public mode) ──
+    this.exposedContainerId = this.trackTabWidget(await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+        parentLayoutId: cId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    ));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.exposedContainerId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
+    if (currentAccessMode !== 'local') {
+      await this.buildExposedObjectsSection(r0);
+    }
 
     // Save button row + status label
     await this.buildSaveRow(r0, 'access');
@@ -743,6 +886,180 @@ export class Settings extends Abject {
   }
 
   /**
+   * Build the exposed objects section showing workspace objects as checkboxes.
+   */
+  private async buildExposedObjectsSection(r0: { x: number; y: number; width: number; height: number }): Promise<void> {
+    const containerId = this.exposedContainerId!;
+
+    // Divider
+    const divId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createDivider', {
+        windowId: this.windowId, rect: r0,
+      })
+    );
+    this.exposedWidgetIds.push(divId);
+    await this.request(request(this.id, containerId, 'addLayoutChild', {
+      widgetId: divId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 1 },
+    }));
+
+    // Section header
+    const headerLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Exposed Objects',
+        style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 },
+      })
+    );
+    this.exposedWidgetIds.push(headerLabelId);
+    await this.request(request(this.id, containerId, 'addLayoutChild', {
+      widgetId: headerLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // Description
+    const descId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: 'Select which objects remote peers can access.',
+        style: { color: '#b4b8c8', fontSize: 12 },
+      })
+    );
+    this.exposedWidgetIds.push(descId);
+    await this.request(request(this.id, containerId, 'addLayoutChild', {
+      widgetId: descId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
+
+    // Get workspace objects from the workspace registry
+    await this.ensureWorkspaceId();
+    let registryObjects: Array<{ id: string; name: string; tags?: string[] }> = [];
+    if (this.workspaceId && this.widgetManagerId) {
+      // Get workspace registryId to query its objects
+      try {
+        const workspaces = await this.request<Array<{ workspaceId: string; childIds: string[] }>>(
+          request(this.id, this.workspaceManagerId!, 'listWorkspacesDetailed', {})
+        );
+        const myWs = workspaces.find(w => w.workspaceId === this.workspaceId);
+        if (myWs) {
+          // Query the workspace registry for object names
+          const registryId = await this.discoverDep('Registry');
+          if (registryId) {
+            try {
+              const allObjects = await this.request<Array<{ id: string; name: string; manifest?: { tags?: string[] } }>>(
+                request(this.id, registryId, 'list', {})
+              );
+              // Filter to only workspace child objects
+              const childSet = new Set(myWs.childIds);
+              registryObjects = allObjects
+                .filter(o => childSet.has(o.id))
+                .map(o => ({ id: o.id, name: o.name, tags: o.manifest?.tags }));
+            } catch { /* registry query failed */ }
+          }
+        }
+      } catch { /* workspace query failed */ }
+    }
+
+    // Build set of user-created object IDs from AbjectStore for reliable sorting
+    const userObjectIdSet = new Set<string>();
+    if (this.abjectStoreId) {
+      try {
+        const snapshots = await this.request<Array<{ objectId: string }>>(
+          request(this.id, this.abjectStoreId, 'list', {})
+        );
+        for (const s of snapshots) userObjectIdSet.add(s.objectId);
+      } catch { /* AbjectStore may not be ready */ }
+    }
+
+    // Sort: user-created objects first, then system objects, alphabetical within each group
+    registryObjects.sort((a, b) => {
+      const aUser = userObjectIdSet.has(a.id) ? 0 : 1;
+      const bUser = userObjectIdSet.has(b.id) ? 0 : 1;
+      if (aUser !== bUser) return aUser - bUser;
+      return (a.name || a.id).localeCompare(b.name || b.id);
+    });
+
+    // Get current exposed list
+    let exposedIds: string[] = [];
+    if (this.workspaceManagerId && this.workspaceId) {
+      try {
+        exposedIds = await this.request<string[]>(
+          request(this.id, this.workspaceManagerId, 'getExposedObjects', { workspaceId: this.workspaceId })
+        );
+      } catch { /* not available */ }
+    }
+    const exposedSet = new Set(exposedIds);
+
+    if (registryObjects.length === 0) {
+      const emptyLabelId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createLabel', {
+          windowId: this.windowId, rect: r0, text: 'No objects in workspace.',
+          style: { color: '#b4b8c8', fontSize: 12 },
+        })
+      );
+      this.exposedWidgetIds.push(emptyLabelId);
+      await this.request(request(this.id, containerId, 'addLayoutChild', {
+        widgetId: emptyLabelId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 18 },
+      }));
+    } else {
+      for (const obj of registryObjects) {
+        const isExposed = exposedSet.has(obj.id);
+        const displayName = obj.name || obj.id.slice(0, 16) + '...';
+
+        const rowId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+            parentLayoutId: containerId,
+            margins: { top: 0, right: 0, bottom: 0, left: 0 },
+            spacing: 8,
+          })
+        );
+        this.exposedWidgetIds.push(rowId);
+        await this.request(request(this.id, containerId, 'addLayoutChild', {
+          widgetId: rowId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 28 },
+        }));
+
+        const checkboxId = await this.request<AbjectId>(
+          request(this.id, this.widgetManagerId!, 'createCheckbox', {
+            windowId: this.windowId, rect: r0,
+            checked: isExposed,
+            text: displayName,
+          })
+        );
+        await this.request(request(this.id, checkboxId, 'addDependent', {}));
+        await this.request(request(this.id, rowId, 'addLayoutChild', {
+          widgetId: checkboxId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 28 },
+        }));
+
+        this.exposedCheckboxes.set(checkboxId, obj.id as AbjectId);
+      }
+    }
+  }
+
+  /**
+   * Remove all widgets from the exposed objects container without destroying the container itself.
+   */
+  private async clearExposedObjectsSection(): Promise<void> {
+    if (!this.exposedContainerId) return;
+    for (const widgetId of this.exposedWidgetIds) {
+      try {
+        await this.request(request(this.id, this.exposedContainerId, 'removeLayoutChild', { widgetId }));
+      } catch { /* widget may already be gone */ }
+      try {
+        await this.request(request(this.id, widgetId, 'destroy', {}));
+      } catch { /* best effort */ }
+    }
+    this.exposedWidgetIds = [];
+    this.exposedCheckboxes.clear();
+  }
+
+  /**
    * Build the save button row and status label at the bottom of a tab.
    */
   private async buildSaveRow(r0: { x: number; y: number; width: number; height: number }, tab: 'general' | 'access'): Promise<void> {
@@ -815,15 +1132,21 @@ export class Settings extends Abject {
     this.tabContentContainerId = undefined;
     this.tabContentWidgetIds = [];
     this.workspaceNameInputId = undefined;
+    this.descriptionInputId = undefined;
+    this.tagsInputId = undefined;
     this.accessModeSelectId = undefined;
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
     this.accessSaveBtnId = undefined;
     this.accessStatusLabelId = undefined;
     this.objectDeleteButtons.clear();
+    this.generalExposedCheckboxes.clear();
     this.whitelistCheckboxes.clear();
     this.whitelistContainerId = undefined;
     this.whitelistWidgetIds = [];
+    this.exposedCheckboxes.clear();
+    this.exposedContainerId = undefined;
+    this.exposedWidgetIds = [];
 
     await this.changed('visibility', false);
     return true;
@@ -867,7 +1190,7 @@ export class Settings extends Abject {
     // Ensure we know our workspace ID
     await this.ensureWorkspaceId();
 
-    // Rename the workspace
+    // Save workspace name, description, and tags
     if (this.workspaceManagerId && this.workspaceId) {
       await this.request(
         request(this.id, this.workspaceManagerId, 'renameWorkspace', {
@@ -875,6 +1198,62 @@ export class Settings extends Abject {
           name: workspaceName.trim(),
         })
       );
+
+      // Save description
+      if (this.descriptionInputId) {
+        try {
+          const description = await this.request<string>(
+            request(this.id, this.descriptionInputId, 'getValue', {})
+          );
+          await this.request(
+            request(this.id, this.workspaceManagerId, 'setDescription', {
+              workspaceId: this.workspaceId,
+              description: description?.trim() ?? '',
+            })
+          );
+        } catch { /* best effort */ }
+      }
+
+      // Save tags
+      if (this.tagsInputId) {
+        try {
+          const tagsStr = await this.request<string>(
+            request(this.id, this.tagsInputId, 'getValue', {})
+          );
+          const tags = (tagsStr ?? '').split(',').map(t => t.trim()).filter(t => t.length > 0);
+          await this.request(
+            request(this.id, this.workspaceManagerId, 'setTags', {
+              workspaceId: this.workspaceId,
+              tags,
+            })
+          );
+        } catch { /* best effort */ }
+      }
+
+      // Save exposed objects from General tab checkboxes
+      if (this.generalExposedCheckboxes.size > 0) {
+        try {
+          const objectIds: string[] = [];
+          for (const [checkboxId, objectId] of this.generalExposedCheckboxes) {
+            const checked = await this.request<string>(
+              request(this.id, checkboxId, 'getValue', {})
+            );
+            if (checked === 'true') objectIds.push(objectId);
+          }
+          // Merge: preserve exposed objects that aren't user-created
+          const currentExposed = await this.request<string[]>(
+            request(this.id, this.workspaceManagerId!, 'getExposedObjects', { workspaceId: this.workspaceId! })
+          );
+          const userObjectIds = new Set(this.generalExposedCheckboxes.values());
+          const nonUserExposed = currentExposed.filter(id => !userObjectIds.has(id));
+          await this.request(
+            request(this.id, this.workspaceManagerId!, 'setExposedObjects', {
+              workspaceId: this.workspaceId!,
+              objectIds: [...nonUserExposed, ...objectIds],
+            })
+          );
+        } catch { /* best effort */ }
+      }
 
       // Refresh WorkspaceSwitcher to show updated name
       if (!this.workspaceSwitcherId) {
@@ -948,6 +1327,25 @@ export class Settings extends Abject {
             request(this.id, this.workspaceManagerId, 'setWhitelist', {
               workspaceId: this.workspaceId,
               whitelist,
+            })
+          );
+        }
+
+        // Save exposed objects if not local
+        if (accessMode !== 'local' && this.exposedCheckboxes.size > 0) {
+          const objectIds: string[] = [];
+          for (const [checkboxId, objectId] of this.exposedCheckboxes) {
+            try {
+              const checked = await this.request<string>(
+                request(this.id, checkboxId, 'getValue', {})
+              );
+              if (checked === 'true') objectIds.push(objectId);
+            } catch { /* checkbox gone */ }
+          }
+          await this.request(
+            request(this.id, this.workspaceManagerId, 'setExposedObjects', {
+              workspaceId: this.workspaceId,
+              objectIds,
             })
           );
         }

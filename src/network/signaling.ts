@@ -15,7 +15,7 @@ export type SignalingState = 'disconnected' | 'connecting' | 'connected' | 'erro
 export interface SignalingMessage {
   type: 'register' | 'find' | 'found' | 'not-found' | 'unregister'
     | 'sdp-offer' | 'sdp-answer' | 'ice-candidate' | 'error' | 'registered'
-    | 'ping' | 'pong';
+    | 'ping' | 'pong' | 'list-peers' | 'peer-list';
   peerId?: string;
   targetPeerId?: string;
   publicSigningKey?: string;
@@ -24,6 +24,7 @@ export interface SignalingMessage {
   sdp?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
   error?: string;
+  peers?: Array<{ peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string }>;
 }
 
 export interface SignalingEvents {
@@ -35,9 +36,20 @@ export interface SignalingEvents {
   onSdpAnswer?: (fromPeerId: PeerId, sdp: RTCSessionDescriptionInit) => void;
   onIceCandidate?: (fromPeerId: PeerId, candidate: RTCIceCandidateInit) => void;
   onError?: (error: string) => void;
+  onPeerList?: (peers: Array<{ peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string }>) => void;
 }
 
-export class SignalingClient {
+/**
+ * Minimal interface for relaying WebRTC signaling (SDP + ICE).
+ * Implemented by SignalingClient (server-based) and SignalingRelayObject (peer-based).
+ */
+export interface SignalingRelay {
+  sendSdpOffer(fromPeerId: PeerId, targetPeerId: PeerId, sdp: RTCSessionDescriptionInit): void;
+  sendSdpAnswer(fromPeerId: PeerId, targetPeerId: PeerId, sdp: RTCSessionDescriptionInit): void;
+  sendIceCandidate(fromPeerId: PeerId, targetPeerId: PeerId, candidate: RTCIceCandidateInit): void;
+}
+
+export class SignalingClient implements SignalingRelay {
   private socket?: WebSocket;
   private state: SignalingState = 'disconnected';
   private events: SignalingEvents = {};
@@ -155,6 +167,13 @@ export class SignalingClient {
   }
 
   /**
+   * Request the list of all peers registered on this signaling server.
+   */
+  listPeers(myPeerId: PeerId): void {
+    this.sendMessage({ type: 'list-peers', peerId: myPeerId });
+  }
+
+  /**
    * Send an SDP offer to a remote peer via the signaling server.
    */
   sendSdpOffer(fromPeerId: PeerId, targetPeerId: PeerId, sdp: RTCSessionDescriptionInit): void {
@@ -228,6 +247,9 @@ export class SignalingClient {
           break;
         case 'pong':
           // Keepalive acknowledgment — no action needed
+          break;
+        case 'peer-list':
+          this.events.onPeerList?.(msg.peers ?? []);
           break;
       }
     } catch (err) {

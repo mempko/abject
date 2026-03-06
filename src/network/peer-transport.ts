@@ -21,14 +21,17 @@ import {
   aesEncrypt,
   aesDecrypt,
 } from '../core/identity.js';
-import type { SignalingClient } from './signaling.js';
+import type { SignalingRelay } from './signaling.js';
+import { gzipSync, gunzipSync } from 'node:zlib';
 
 const PONG_MISS_LIMIT = 3;
+const MAX_CHUNK_SIZE = 200_000; // 200KB per chunk (safe under 256KB SCTP limit)
+const CHUNK_REASSEMBLY_TIMEOUT = 30_000; // 30s to receive all chunks
 
 export interface PeerTransportConfig extends TransportConfig {
   localPeerId: PeerId;
   remotePeerId: PeerId;
-  signalingClient: SignalingClient;
+  signalingClient: SignalingRelay;
   localPublicSigningKey: string;   // JWK
   localPublicExchangeKey: string;  // JWK
   localExchangePrivateKey: CryptoKey;
@@ -47,7 +50,7 @@ export class PeerTransport extends Transport {
 
   private peerConnection?: RTCPeerConnection;
   private dataChannel?: RTCDataChannel;
-  private signalingClient: SignalingClient;
+  private signalingClient: SignalingRelay;
   private localPublicSigningKey: string;
   private localPublicExchangeKey: string;
   private localExchangePrivateKey: CryptoKey;
@@ -57,6 +60,8 @@ export class PeerTransport extends Transport {
   private pendingCandidates: RTCIceCandidateInit[] = [];
   private pingInterval?: ReturnType<typeof setInterval>;
   private lastPongReceived: number = 0;
+  private chunkCounter = 0;
+  private pendingChunks: Map<string, { total: number; parts: Map<number, string>; timer: ReturnType<typeof setTimeout> }> = new Map();
 
   constructor(config: PeerTransportConfig) {
     super({ ...config, heartbeatInterval: config.heartbeatInterval ?? 15_000 });
@@ -238,7 +243,25 @@ export class PeerTransport extends Transport {
     if (this.sessionKey) {
       const encoder = new TextEncoder();
       const encrypted = await aesEncrypt(this.sessionKey, encoder.encode(data));
-      this.dataChannel!.send(JSON.stringify({ enc: true, ...encrypted }));
+      const payload = JSON.stringify({ enc: true, ...encrypted });
+
+      // Compress and possibly chunk the encrypted payload
+      const compressed = gzipSync(Buffer.from(payload));
+      const b64 = compressed.toString('base64');
+
+      if (b64.length <= MAX_CHUNK_SIZE) {
+        // Single compressed message
+        this.dataChannel!.send(JSON.stringify({ gz: true, data: b64 }));
+      } else {
+        // Split into chunks
+        const chunkId = String(this.chunkCounter++);
+        const total = Math.ceil(b64.length / MAX_CHUNK_SIZE);
+        for (let i = 0; i < total; i++) {
+          const slice = b64.slice(i * MAX_CHUNK_SIZE, (i + 1) * MAX_CHUNK_SIZE);
+          this.dataChannel!.send(JSON.stringify({ chunk: true, id: chunkId, idx: i, total, data: slice }));
+        }
+        console.log(`[PeerTransport] sent ${total} chunks (${b64.length} bytes compressed) to ${this.remotePeerId.slice(0, 16)}`);
+      }
     } else {
       this.dataChannel!.send(data);
     }
@@ -258,6 +281,23 @@ export class PeerTransport extends Transport {
   get signalingState(): string {
     return this.peerConnection?.signalingState ?? 'closed';
   }
+
+  /**
+   * Get the underlying RTCPeerConnection for media track management.
+   * Used by MediaStream capability to add/remove audio/video tracks.
+   */
+  get rtcPeerConnection(): RTCPeerConnection | undefined {
+    return this.peerConnection;
+  }
+
+  /**
+   * Set a handler for remote media tracks received via RTCPeerConnection.
+   */
+  onRemoteTrack(handler: (track: MediaStreamTrack, streams: readonly MediaStream[]) => void): void {
+    this.remoteTrackHandler = handler;
+  }
+
+  private remoteTrackHandler?: (track: MediaStreamTrack, streams: readonly MediaStream[]) => void;
 
   // ==========================================================================
   // Internal
@@ -291,6 +331,11 @@ export class PeerTransport extends Transport {
     this.peerConnection.ondatachannel = (event) => {
       this.dataChannel = event.channel;
       this.setupDataChannel(this.dataChannel);
+    };
+
+    // Handle incoming media tracks (for MediaStream capability)
+    this.peerConnection.ontrack = (event) => {
+      this.remoteTrackHandler?.(event.track, event.streams);
     };
   }
 
@@ -363,6 +408,23 @@ export class PeerTransport extends Transport {
         return;
       }
 
+      // Chunked message — reassemble before processing
+      if (parsed.chunk) {
+        const reassembled = this.handleChunk(parsed);
+        if (!reassembled) return; // waiting for more chunks
+        // Reassembled data is gz-compressed — decompress and re-parse
+        const decompressed = gunzipSync(Buffer.from(reassembled, 'base64')).toString();
+        await this.handleIncomingData(decompressed);
+        return;
+      }
+
+      // Compressed (non-chunked) message — decompress and re-parse
+      if (parsed.gz) {
+        const decompressed = gunzipSync(Buffer.from(parsed.data, 'base64')).toString();
+        await this.handleIncomingData(decompressed);
+        return;
+      }
+
       // Encrypted message
       if (parsed.enc && this.sessionKey) {
         const plaintext = await aesDecrypt(this.sessionKey, parsed.iv, parsed.ciphertext);
@@ -388,6 +450,38 @@ export class PeerTransport extends Transport {
       console.error('[PeerTransport] Failed to handle message:', err);
       this.events.onError?.(err instanceof Error ? err : new Error(String(err)));
     }
+  }
+
+  /**
+   * Handle a chunk of a multi-part message. Returns the reassembled base64
+   * string when all chunks are received, or null if still waiting.
+   */
+  private handleChunk(parsed: { id: string; idx: number; total: number; data: string }): string | null {
+    let entry = this.pendingChunks.get(parsed.id);
+    if (!entry) {
+      const timer = setTimeout(() => {
+        console.warn(`[PeerTransport] chunk reassembly timeout for id=${parsed.id}, discarding`);
+        this.pendingChunks.delete(parsed.id);
+      }, CHUNK_REASSEMBLY_TIMEOUT);
+      entry = { total: parsed.total, parts: new Map(), timer };
+      this.pendingChunks.set(parsed.id, entry);
+    }
+
+    entry.parts.set(parsed.idx, parsed.data);
+
+    if (entry.parts.size < entry.total) return null;
+
+    // All chunks received — reassemble
+    clearTimeout(entry.timer);
+    this.pendingChunks.delete(parsed.id);
+
+    const pieces: string[] = [];
+    for (let i = 0; i < entry.total; i++) {
+      pieces.push(entry.parts.get(i)!);
+    }
+    const reassembled = pieces.join('');
+    console.log(`[PeerTransport] reassembled ${entry.total} chunks (${reassembled.length} bytes) from ${this.remotePeerId.slice(0, 16)}`);
+    return reassembled;
   }
 
   /**
@@ -460,6 +554,10 @@ export class PeerTransport extends Transport {
    */
   protected override handleDisconnect(reason?: string): void {
     this.stopPing();
+    for (const [, entry] of this.pendingChunks) {
+      clearTimeout(entry.timer);
+    }
+    this.pendingChunks.clear();
     super.handleDisconnect(reason);
   }
 }

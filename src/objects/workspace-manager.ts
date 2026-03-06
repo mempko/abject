@@ -9,6 +9,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import {
   AbjectId,
+  TypeId,
   AbjectMessage,
   InterfaceId,
   SpawnResult,
@@ -43,7 +44,7 @@ const STORAGE_KEY_ACTIVE = 'workspaces:active';
 /** Per-workspace object names spawned by WorkspaceManager. */
 /** Per-workspace objects in dependency order (matches original bootstrap). */
 const PER_WORKSPACE_OBJECTS = [
-  'AbjectStore', 'Theme', 'Settings', 'RegistryBrowser',
+  'AbjectStore', 'SharedState', 'FileTransfer', 'MediaStream', 'Theme', 'Settings', 'RegistryBrowser',
   'JobManager', 'JobBrowser', 'AgentAbject', 'ObjectManager', 'WebBrowserViewer', 'Chat', 'WebAgent', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
 ] as const;
 
@@ -52,36 +53,49 @@ export type WorkspaceAccessMode = 'local' | 'private' | 'public';
 export interface WorkspaceInfo {
   id: string;
   name: string;
+  description: string;
+  tags: string[];
   accessMode: WorkspaceAccessMode;
   whitelist: string[];
+  exposedObjectIds: AbjectId[];
+  exposedTypeIds: TypeId[];
   childIds: AbjectId[];
   registryId: AbjectId;
   storageId: AbjectId;
   taskbarId: AbjectId;
   uiObjects: Array<{ id: AbjectId; iface: InterfaceId }>;
+  childTypeIds: Map<AbjectId, TypeId>;
 }
 
 export interface SharedWorkspaceInfo {
   workspaceId: string;
   name: string;
+  description?: string;
+  tags?: string[];
   ownerPeerId?: string;
   ownerName?: string;
   accessMode: WorkspaceAccessMode;
   whitelist?: string[];
+  exposedObjectIds?: string[];
   registryId?: string;
 }
 
 interface PersistedWorkspace {
   id: string;
   name: string;
+  description?: string;
+  tags?: string[];
   accessMode?: WorkspaceAccessMode;
   whitelist?: string[];
+  exposedObjectIds?: string[];
+  exposedTypeIds?: string[];
   createdAt: number;
 }
 
 export class WorkspaceManager extends Abject {
   private workspaces: Map<string, WorkspaceInfo> = new Map();
   private activeWorkspaceId?: string;
+  private peerId?: string;
   private globalStorageId?: AbjectId;
   private globalRegistryId?: AbjectId;
   private factoryId?: AbjectId;
@@ -262,6 +276,57 @@ export class WorkspaceManager extends Abject {
                 parameters: [],
                 returns: { kind: 'array', elementType: { kind: 'reference', reference: 'WorkspaceDetailedInfo' } },
               },
+              {
+                name: 'getExposedObjects',
+                description: 'Get the list of exposed object IDs for a workspace',
+                parameters: [
+                  { name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'ID of workspace' },
+                ],
+                returns: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+              },
+              {
+                name: 'setExposedObjects',
+                description: 'Set the list of exposed object IDs for a workspace',
+                parameters: [
+                  { name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'ID of workspace' },
+                  { name: 'objectIds', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Array of object IDs to expose' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'getDescription',
+                description: 'Get the description of a workspace',
+                parameters: [
+                  { name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'ID of workspace' },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'setDescription',
+                description: 'Set the description of a workspace',
+                parameters: [
+                  { name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'ID of workspace' },
+                  { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'Workspace description' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'getTags',
+                description: 'Get the tags of a workspace',
+                parameters: [
+                  { name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'ID of workspace' },
+                ],
+                returns: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+              },
+              {
+                name: 'setTags',
+                description: 'Set the tags of a workspace',
+                parameters: [
+                  { name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'ID of workspace' },
+                  { name: 'tags', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Array of tags' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
             ],
           },
         requiredCapabilities: [],
@@ -335,6 +400,36 @@ export class WorkspaceManager extends Abject {
       return this.listWorkspacesDetailed();
     });
 
+    this.on('getExposedObjects', async (msg: AbjectMessage) => {
+      const { workspaceId } = msg.payload as { workspaceId: string };
+      return this.getExposedObjects(workspaceId);
+    });
+
+    this.on('setExposedObjects', async (msg: AbjectMessage) => {
+      const { workspaceId, objectIds } = msg.payload as { workspaceId: string; objectIds: string[] };
+      return this.setExposedObjects(workspaceId, objectIds as AbjectId[]);
+    });
+
+    this.on('getDescription', async (msg: AbjectMessage) => {
+      const { workspaceId } = msg.payload as { workspaceId: string };
+      return this.getDescription(workspaceId);
+    });
+
+    this.on('setDescription', async (msg: AbjectMessage) => {
+      const { workspaceId, description } = msg.payload as { workspaceId: string; description: string };
+      return this.setDescription(workspaceId, description);
+    });
+
+    this.on('getTags', async (msg: AbjectMessage) => {
+      const { workspaceId } = msg.payload as { workspaceId: string };
+      return this.getTags(workspaceId);
+    });
+
+    this.on('setTags', async (msg: AbjectMessage) => {
+      const { workspaceId, tags } = msg.payload as { workspaceId: string; tags: string[] };
+      return this.setTags(workspaceId, tags);
+    });
+
     this.on('refreshTaskbar', async () => {
       return this.refreshTaskbar();
     });
@@ -342,11 +437,14 @@ export class WorkspaceManager extends Abject {
     // Handle objectRegistered events from workspace registries
     this.on('objectRegistered', async (msg: AbjectMessage) => {
       const registryId = msg.routing.from;
-      const { id: objectId } = msg.payload as { id: string };
+      const { id: objectId, typeId } = msg.payload as { id: string; typeId?: string };
       for (const ws of this.workspaces.values()) {
         if (ws.registryId === registryId) {
           if (!ws.childIds.includes(objectId as AbjectId)) {
             ws.childIds.push(objectId as AbjectId);
+            if (typeId) {
+              ws.childTypeIds.set(objectId as AbjectId, typeId as TypeId);
+            }
             if (ws.accessMode !== 'local') {
               await this.changed('workspaceObjectsChanged', {
                 workspaceId: ws.id, objectId,
@@ -382,6 +480,19 @@ export class WorkspaceManager extends Abject {
    * This cannot run during onInit because Factory would deadlock.
    */
   private async boot(): Promise<boolean> {
+    // Discover peerId from IdentityObject for scoped TypeIds
+    try {
+      const identityId = await this.discoverDep('Identity');
+      if (identityId) {
+        const identity = await this.request<{ peerId: string }>(
+          request(this.id, identityId, 'getIdentity', {})
+        );
+        this.peerId = identity.peerId;
+      }
+    } catch {
+      console.warn('[WORKSPACE-MANAGER] Could not discover peerId from IdentityObject');
+    }
+
     const persisted = await this.loadWorkspaceList();
 
     if (persisted.length === 0) {
@@ -392,7 +503,8 @@ export class WorkspaceManager extends Abject {
     } else {
       // Restore each workspace
       for (const ws of persisted) {
-        await this.restoreWorkspace(ws.id, ws.name, ws.accessMode ?? 'local', ws.whitelist ?? []);
+        await this.restoreWorkspace(ws.id, ws.name, ws.accessMode ?? 'local', ws.whitelist ?? [],
+          ws.exposedTypeIds ?? [], ws.description ?? '', ws.tags ?? []);
       }
 
       // Activate the last-active workspace
@@ -584,17 +696,28 @@ export class WorkspaceManager extends Abject {
     if (!ws) return false;
     const prevMode = ws.accessMode;
     ws.accessMode = accessMode;
+
+    // Ensure registry is always exposed when workspace is shared
+    if (accessMode !== 'local' && ws.exposedObjectIds.length === 0) {
+      ws.exposedObjectIds = [ws.registryId];
+      const regTypeId = ws.childTypeIds.get(ws.registryId);
+      ws.exposedTypeIds = regTypeId ? [regTypeId] : [];
+    }
+
+    await this.syncExposedToRegistry(ws);
     await this.persistWorkspaceList();
 
     // Emit access change event for PeerRouter cache invalidation
     await this.changed('workspaceAccessChanged', {
       workspaceId, accessMode, whitelist: ws.whitelist,
+      exposedObjectIds: ws.exposedObjectIds,
     });
 
     // Emit sharing events for dependents
     if (accessMode !== 'local' && prevMode === 'local') {
       await this.changed('workspaceShared', {
-        workspaceId, name: ws.name, accessMode, whitelist: ws.whitelist,
+        workspaceId, name: ws.name, description: ws.description, tags: ws.tags,
+        accessMode, whitelist: ws.whitelist, exposedObjectIds: ws.exposedObjectIds,
         registryId: ws.registryId,
       });
     } else if (accessMode === 'local' && prevMode !== 'local') {
@@ -602,7 +725,8 @@ export class WorkspaceManager extends Abject {
     } else if (accessMode !== 'local') {
       // Mode changed between private/public
       await this.changed('workspaceShared', {
-        workspaceId, name: ws.name, accessMode, whitelist: ws.whitelist,
+        workspaceId, name: ws.name, description: ws.description, tags: ws.tags,
+        accessMode, whitelist: ws.whitelist, exposedObjectIds: ws.exposedObjectIds,
         registryId: ws.registryId,
       });
     }
@@ -625,8 +749,68 @@ export class WorkspaceManager extends Abject {
     // Emit access change event for PeerRouter cache invalidation
     await this.changed('workspaceAccessChanged', {
       workspaceId, accessMode: ws.accessMode, whitelist: ws.whitelist,
+      exposedObjectIds: ws.exposedObjectIds,
     });
 
+    return true;
+  }
+
+  getExposedObjects(workspaceId: string): AbjectId[] {
+    const ws = this.workspaces.get(workspaceId);
+    if (!ws) return [];
+    return [...ws.exposedObjectIds];
+  }
+
+  async setExposedObjects(workspaceId: string, objectIds: AbjectId[]): Promise<boolean> {
+    const ws = this.workspaces.get(workspaceId);
+    if (!ws) return false;
+    // Always include workspace registry when workspace is shared
+    if (ws.accessMode !== 'local' && !objectIds.includes(ws.registryId)) {
+      objectIds = [ws.registryId, ...objectIds];
+    }
+    ws.exposedObjectIds = [...objectIds];
+    // Compute corresponding typeIds for durable persistence
+    ws.exposedTypeIds = objectIds
+      .map(id => ws.childTypeIds.get(id))
+      .filter((t): t is TypeId => t !== undefined);
+    await this.syncExposedToRegistry(ws);
+    await this.persistWorkspaceList();
+
+    await this.changed('workspaceAccessChanged', {
+      workspaceId, accessMode: ws.accessMode, whitelist: ws.whitelist,
+      exposedObjectIds: ws.exposedObjectIds,
+    });
+
+    return true;
+  }
+
+  getDescription(workspaceId: string): string {
+    const ws = this.workspaces.get(workspaceId);
+    if (!ws) return '';
+    return ws.description;
+  }
+
+  async setDescription(workspaceId: string, description: string): Promise<boolean> {
+    const ws = this.workspaces.get(workspaceId);
+    if (!ws) return false;
+    ws.description = description;
+    await this.persistWorkspaceList();
+    await this.changed('workspaceMetadataChanged', { workspaceId, description, tags: ws.tags });
+    return true;
+  }
+
+  getTags(workspaceId: string): string[] {
+    const ws = this.workspaces.get(workspaceId);
+    if (!ws) return [];
+    return [...ws.tags];
+  }
+
+  async setTags(workspaceId: string, tags: string[]): Promise<boolean> {
+    const ws = this.workspaces.get(workspaceId);
+    if (!ws) return false;
+    ws.tags = [...tags];
+    await this.persistWorkspaceList();
+    await this.changed('workspaceMetadataChanged', { workspaceId, description: ws.description, tags: ws.tags });
     return true;
   }
 
@@ -637,8 +821,11 @@ export class WorkspaceManager extends Abject {
         result.push({
           workspaceId: ws.id,
           name: ws.name,
+          description: ws.description,
+          tags: [...ws.tags],
           accessMode: ws.accessMode,
           whitelist: ws.accessMode === 'private' ? [...ws.whitelist] : undefined,
+          exposedObjectIds: [...ws.exposedObjectIds],
           registryId: ws.registryId,
         });
       }
@@ -654,14 +841,20 @@ export class WorkspaceManager extends Abject {
     name: string;
     accessMode: WorkspaceAccessMode;
     whitelist: string[];
+    exposedObjectIds: AbjectId[];
   } | null {
     for (const [, ws] of this.workspaces) {
-      if (ws.childIds.includes(objectId)) {
+      if (ws.registryId === objectId || ws.childIds.includes(objectId)) {
+        const exposed = [...ws.exposedObjectIds];
+        if (!exposed.includes(ws.registryId)) {
+          exposed.push(ws.registryId);
+        }
         return {
           workspaceId: ws.id,
           name: ws.name,
           accessMode: ws.accessMode,
           whitelist: [...ws.whitelist],
+          exposedObjectIds: exposed,
         };
       }
     }
@@ -677,29 +870,44 @@ export class WorkspaceManager extends Abject {
     name: string;
     accessMode: WorkspaceAccessMode;
     whitelist: string[];
+    exposedObjectIds: AbjectId[];
     childIds: AbjectId[];
+    registryId: AbjectId;
   }> {
     return [...this.workspaces.entries()].map(([, ws]) => ({
       workspaceId: ws.id,
       name: ws.name,
       accessMode: ws.accessMode,
       whitelist: [...ws.whitelist],
+      exposedObjectIds: [...ws.exposedObjectIds],
       childIds: [...ws.childIds],
+      registryId: ws.registryId,
     }));
   }
 
   // ── Internal Helpers ──
 
   /**
+   * Compute a scoped TypeId: {peerId}/{workspaceId}/{objectName}
+   * Returns undefined if peerId is not yet known.
+   */
+  private computeTypeId(workspaceId: string, objectName: string): TypeId | undefined {
+    if (!this.peerId) return undefined;
+    return `${this.peerId}/${workspaceId}/${objectName}` as TypeId;
+  }
+
+  /**
    * Spawn all objects for a workspace: WorkspaceRegistry, Storage, and per-ws objects.
    */
   private async spawnWorkspaceObjects(workspaceId: string, name: string): Promise<WorkspaceInfo> {
     // 1. Spawn WorkspaceRegistry (skip all registries — we register manually)
+    const wsRegistryTypeId = this.computeTypeId(workspaceId, 'WorkspaceRegistry');
     const wsRegResult = await this.request<SpawnResult>(
       request(this.id, this.factoryId!, 'spawn', {
         manifest: { name: 'WorkspaceRegistry', description: `Workspace registry for '${name}'`,
           version: '1.0.0', requiredCapabilities: [], tags: ['system'] },
         skipGlobalRegistry: true,
+        typeId: wsRegistryTypeId,
       })
     );
     const wsRegistryId = wsRegResult.objectId;
@@ -720,6 +928,7 @@ export class WorkspaceManager extends Abject {
     await this.request(
       request(this.id, wsRegistryId, 'register', {
         objectId: wsRegistryId,
+        typeId: wsRegistryTypeId,
         manifest: { name: 'Registry', description: `Workspace registry for '${name}'`,
           version: '1.0.0', interface: { id: 'abjects:registry', name: 'Registry',
           description: 'Object registration and discovery', methods: [] },
@@ -747,6 +956,7 @@ export class WorkspaceManager extends Abject {
     await this.request(
       request(this.id, this.globalRegistryId!, 'register', {
         objectId: wsRegistryId,
+        typeId: wsRegistryTypeId,
         manifest: { name: `WorkspaceRegistry:${name}`, description: `Workspace registry for '${name}'`,
           version: '1.0.0', interface: { id: 'abjects:registry', name: 'Registry',
           description: 'Object registration and discovery', methods: [] },
@@ -755,12 +965,14 @@ export class WorkspaceManager extends Abject {
     );
 
     // 2. Spawn workspace-scoped Storage (registryHint → workspace registry, Factory auto-registers)
+    const wsStorageTypeId = this.computeTypeId(workspaceId, 'Storage');
     const wsStorageResult = await this.request<SpawnResult>(
       request(this.id, this.factoryId!, 'spawn', {
         manifest: { name: 'Storage', description: `Workspace storage for '${name}'`,
           version: '1.0.0', requiredCapabilities: [], tags: ['system'] },
         registryHint: wsRegistryId,
         constructorArgs: { dbName: `abjects-storage-${workspaceId}` },
+        typeId: wsStorageTypeId,
       })
     );
     const wsStorageId = wsStorageResult.objectId;
@@ -770,6 +982,13 @@ export class WorkspaceManager extends Abject {
     const childIds: AbjectId[] = [wsRegistryId, wsStorageId];
     let taskbarId: AbjectId = '' as AbjectId;
     const uiObjects: Array<{ id: AbjectId; iface: InterfaceId }> = [];
+    const childTypeIds = new Map<AbjectId, TypeId>();
+
+    // Compute typeIds for infrastructure objects
+    const regTypeId = this.computeTypeId(workspaceId, 'WorkspaceRegistry');
+    const storTypeId = this.computeTypeId(workspaceId, 'Storage');
+    if (regTypeId) childTypeIds.set(wsRegistryId, regTypeId);
+    if (storTypeId) childTypeIds.set(wsStorageId, storTypeId);
 
     // Map object names to their interface IDs for UI object tracking
     const uiIfaceMap: Record<string, InterfaceId> = {
@@ -781,6 +1000,7 @@ export class WorkspaceManager extends Abject {
     };
 
     for (const objName of PER_WORKSPACE_OBJECTS) {
+      const typeId = this.computeTypeId(workspaceId, objName);
       let result: SpawnResult;
       try {
         result = await this.request<SpawnResult>(
@@ -788,6 +1008,7 @@ export class WorkspaceManager extends Abject {
             manifest: { name: objName, description: '', version: '1.0.0',
               requiredCapabilities: [], tags: ['system'] },
             registryHint: wsRegistryId,
+            typeId,
           })
         );
       } catch {
@@ -797,6 +1018,7 @@ export class WorkspaceManager extends Abject {
 
       const objId = result.objectId;
       childIds.push(objId);
+      if (typeId) childTypeIds.set(objId, typeId);
 
       if (objName === 'Taskbar') {
         taskbarId = objId;
@@ -808,6 +1030,14 @@ export class WorkspaceManager extends Abject {
               'registerTaskbar', { taskbarId: objId, workspaceId }));
           } catch { /* WindowManager may not be ready */ }
         }
+      }
+
+      // Register per-workspace Theme with WidgetManager for per-workspace theming
+      if (objName === 'Theme' && this.widgetManagerId) {
+        try {
+          await this.request(request(this.id, this.widgetManagerId,
+            'registerWorkspaceTheme', { workspaceId, themeId: objId }));
+        } catch { /* WidgetManager may not be ready */ }
       }
 
       // Track UI objects for reference
@@ -841,12 +1071,16 @@ export class WorkspaceManager extends Abject {
 
     // 5. Sync childIds with actual registry contents (picks up restored user objects)
     try {
-      const registered = await this.request<Array<{ id: string }>>(
+      const registered = await this.request<Array<{ id: string; typeId?: string }>>(
         request(this.id, wsRegistryId, 'list', {})
       );
       for (const entry of registered) {
-        if (!childIds.includes(entry.id as AbjectId)) {
-          childIds.push(entry.id as AbjectId);
+        const eid = entry.id as AbjectId;
+        if (!childIds.includes(eid)) {
+          childIds.push(eid);
+        }
+        if (entry.typeId && !childTypeIds.has(eid)) {
+          childTypeIds.set(eid, entry.typeId as TypeId);
         }
       }
     } catch { /* registry not ready */ }
@@ -854,24 +1088,52 @@ export class WorkspaceManager extends Abject {
     return {
       id: workspaceId,
       name,
+      description: '',
+      tags: [],
       accessMode: 'local',
       whitelist: [],
+      exposedObjectIds: [],
+      exposedTypeIds: [],
       childIds,
       registryId: wsRegistryId,
       storageId: wsStorageId,
       taskbarId,
       uiObjects,
+      childTypeIds,
     };
   }
 
   /**
    * Restore a previously persisted workspace by re-spawning its objects.
    */
-  private async restoreWorkspace(workspaceId: string, name: string, accessMode: WorkspaceAccessMode = 'local', whitelist: string[] = []): Promise<void> {
+  private async restoreWorkspace(
+    workspaceId: string, name: string,
+    accessMode: WorkspaceAccessMode = 'local', whitelist: string[] = [],
+    exposedTypeIds: string[] = [], description: string = '', tags: string[] = [],
+  ): Promise<void> {
     const info = await this.spawnWorkspaceObjects(workspaceId, name);
     info.accessMode = accessMode;
     info.whitelist = whitelist;
+    info.description = description;
+    info.tags = tags;
+    info.exposedTypeIds = exposedTypeIds as TypeId[];
+
+    // Resolve persisted typeIds to current runtime AbjectIds via Registry
+    const resolvedIds: AbjectId[] = [];
+    for (const typeId of exposedTypeIds) {
+      try {
+        const abjectId = await this.request<AbjectId | null>(
+          request(this.id, info.registryId, 'resolveType', { typeId })
+        );
+        if (abjectId) resolvedIds.push(abjectId);
+      } catch { /* type not found — may have been removed */ }
+    }
+    info.exposedObjectIds = resolvedIds;
+
     this.workspaces.set(workspaceId, info);
+    if (info.accessMode !== 'local') {
+      await this.syncExposedToRegistry(info);
+    }
     console.log(`[WORKSPACE-MANAGER] Restored workspace '${name}' (${workspaceId})`);
   }
 
@@ -940,14 +1202,32 @@ export class WorkspaceManager extends Abject {
     }
   }
 
+  private async syncExposedToRegistry(ws: WorkspaceInfo): Promise<void> {
+    try {
+      await this.send(
+        request(this.id, ws.registryId, 'setExposedObjectIds', {
+          ids: ws.exposedObjectIds,
+        })
+      );
+    } catch (err) {
+      console.warn('[WORKSPACE-MANAGER] Failed to sync exposed objects to registry:', err);
+    }
+  }
+
   private async persistWorkspaceList(): Promise<void> {
-    const list: PersistedWorkspace[] = [...this.workspaces.entries()].map(([id, ws]) => ({
-      id,
-      name: ws.name,
-      accessMode: ws.accessMode,
-      whitelist: ws.whitelist,
-      createdAt: Date.now(),
-    }));
+    const list: PersistedWorkspace[] = [...this.workspaces.entries()].map(([id, ws]) => {
+      return {
+        id,
+        name: ws.name,
+        description: ws.description,
+        tags: ws.tags,
+        accessMode: ws.accessMode,
+        whitelist: ws.whitelist,
+        exposedObjectIds: ws.exposedObjectIds,
+        exposedTypeIds: ws.exposedTypeIds,
+        createdAt: Date.now(),
+      };
+    });
     try {
       await this.request(
         request(this.id, this.globalStorageId!, 'set', {

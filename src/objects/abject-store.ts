@@ -5,6 +5,7 @@
 
 import {
   AbjectId,
+  TypeId,
   AbjectManifest,
   AbjectMessage,
   InterfaceId,
@@ -19,6 +20,7 @@ const ABJECT_STORE_INTERFACE = 'abjects:abject-store' as InterfaceId;
 const STORAGE_KEY = 'abject-store:snapshots';
 
 export interface AbjectSnapshot {
+  typeId: string;
   objectId: string;
   manifest: AbjectManifest;
   source: string;
@@ -41,6 +43,7 @@ export class AbjectStore extends Abject {
   private registryId?: AbjectId;
   private widgetManagerId?: AbjectId;
   private workspaceId?: string;
+  private peerId?: string;
   private snapshots: Map<string, AbjectSnapshot> = new Map();
 
   constructor() {
@@ -218,6 +221,15 @@ export class AbjectStore extends Abject {
   /**
    * Save (upsert) a snapshot.
    */
+  /**
+   * Compute a scoped TypeId for a user-created object.
+   */
+  private computeTypeId(manifestName: string): TypeId | undefined {
+    const wsId = this.workspaceId;
+    if (!this.peerId || !wsId) return undefined;
+    return `${this.peerId}/${wsId}/user/${manifestName}` as TypeId;
+  }
+
   async saveSnapshot(
     objectId: string,
     manifest: AbjectManifest,
@@ -227,7 +239,23 @@ export class AbjectStore extends Abject {
     precondition(objectId !== '', 'objectId must not be empty');
     precondition(source !== '', 'source must not be empty');
 
+    // Discover peerId lazily if not yet known
+    if (!this.peerId) {
+      try {
+        const identityId = await this.discoverDep('Identity');
+        if (identityId) {
+          const identity = await this.request<{ peerId: string }>(
+            request(this.id, identityId, 'getIdentity', {})
+          );
+          this.peerId = identity.peerId;
+        }
+      } catch { /* Identity may not be available */ }
+    }
+
+    const typeId = this.computeTypeId(manifest.name) ?? objectId;
+
     const snapshot: AbjectSnapshot = {
+      typeId,
       objectId,
       manifest,
       source,
@@ -235,7 +263,8 @@ export class AbjectStore extends Abject {
       savedAt: Date.now(),
     };
 
-    this.snapshots.set(objectId, snapshot);
+    // Key by typeId for durable identity (survives restart with new objectId)
+    this.snapshots.set(typeId, snapshot);
     await this.persistToStorage();
 
     // Register the object in the workspace registry so it appears in RegistryBrowser/Taskbar
@@ -243,7 +272,7 @@ export class AbjectStore extends Abject {
       try {
         await this.request(request(this.id, this.registryId,
           'register', {
-            objectId, manifest, owner, source,
+            objectId, manifest, owner, source, typeId: typeId as TypeId,
           }));
       } catch { /* best effort — registry may not be ready */ }
     }
@@ -271,7 +300,17 @@ export class AbjectStore extends Abject {
    * Remove a snapshot by objectId.
    */
   async removeSnapshot(objectId: string): Promise<boolean> {
-    const existed = this.snapshots.delete(objectId);
+    // Try direct key (typeId) first, then search by objectId
+    let existed = this.snapshots.delete(objectId);
+    if (!existed) {
+      for (const [key, snap] of this.snapshots) {
+        if (snap.objectId === objectId) {
+          this.snapshots.delete(key);
+          existed = true;
+          break;
+        }
+      }
+    }
     if (existed) {
       await this.persistToStorage();
       console.log(`[ABJECT-STORE] Removed snapshot for ${objectId}`);
@@ -294,14 +333,30 @@ export class AbjectStore extends Abject {
 
     console.log(`[ABJECT-STORE] Restoring ${snapshotList.length} abjects...`);
 
+    // Discover peerId lazily if not yet known
+    if (!this.peerId) {
+      try {
+        const identityId = await this.discoverDep('Identity');
+        if (identityId) {
+          const identity = await this.request<{ peerId: string }>(
+            request(this.id, identityId, 'getIdentity', {})
+          );
+          this.peerId = identity.peerId;
+        }
+      } catch { /* Identity may not be available */ }
+    }
+
     // Discover our workspace now (after WorkspaceManager has tagged us)
     const wsId = await this.ensureWorkspaceId();
 
-    // Clear old snapshots — we'll rebuild with new IDs
+    // Clear old snapshots — we'll rebuild keyed by typeId
     this.snapshots.clear();
 
     for (const snap of snapshotList) {
       try {
+        // Compute typeId for restored object (use saved typeId or compute fresh)
+        const typeId = snap.typeId || this.computeTypeId(snap.manifest.name) || snap.objectId;
+
         const spawnResult = await this.request<SpawnResult>(
           request(this.id, this.factoryId!, 'spawn', {
             manifest: snap.manifest,
@@ -309,13 +364,15 @@ export class AbjectStore extends Abject {
             owner: snap.owner,
             parentId: this.id,
             registryHint: this.registryId,
+            typeId: typeId as TypeId,
           })
         );
 
         if (spawnResult.objectId) {
-          // Store with new ID
-          this.snapshots.set(spawnResult.objectId as string, {
+          // Store keyed by typeId (durable identity)
+          this.snapshots.set(typeId, {
             ...snap,
+            typeId,
             objectId: spawnResult.objectId as string,
             savedAt: Date.now(),
           });
@@ -344,7 +401,7 @@ export class AbjectStore extends Abject {
         console.warn(`[ABJECT-STORE] ${errMsg}`);
 
         // Keep the old snapshot so the user can debug via list()
-        this.snapshots.set(snap.objectId, snap);
+        this.snapshots.set(snap.typeId || snap.objectId, snap);
       }
     }
 
