@@ -9,9 +9,10 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { Capabilities } from '../core/capability.js';
 import { require as precondition, invariant } from '../core/contracts.js';
-import { request as createRequest } from '../core/message.js';
+import { request as createRequest, event as createEvent } from '../core/message.js';
 import type { PeerId, PeerIdentity, PeerContact, PeerConnectionState } from '../core/identity.js';
 import { SignalingClient } from '../network/signaling.js';
+import type { SignalingRelay } from '../network/signaling.js';
 import { PeerTransport, PeerTransportConfig } from '../network/peer-transport.js';
 
 const PEER_REGISTRY_INTERFACE = 'abjects:peer-registry' as InterfaceId;
@@ -19,8 +20,14 @@ const IDENTITY_INTERFACE = 'abjects:identity' as InterfaceId;
 const STORAGE_INTERFACE = 'abjects:storage' as InterfaceId;
 const STORAGE_KEY_CONTACTS = 'peer-registry:contacts';
 const STORAGE_KEY_SIGNALING_URLS = 'peer-registry:signaling-urls';
+const STORAGE_KEY_BLOCKED = 'peer-registry:blocked-peers';
 
 export const PEER_REGISTRY_ID = 'abjects:peer-registry' as AbjectId;
+
+interface NetworkPeerEntry {
+  identity: { peerId: string; publicSigningKey: string; publicExchangeKey: string; name: string };
+  connectedAt: number;
+}
 
 interface StoredContact {
   peerId: string;
@@ -33,6 +40,7 @@ interface StoredContact {
 
 export class PeerRegistry extends Abject {
   private contacts: Map<PeerId, PeerContact> = new Map();
+  private blockedPeers: Set<PeerId> = new Set();
   private transports: Map<PeerId, PeerTransport> = new Map();
   private signalingClients: Map<string, SignalingClient> = new Map();
   private savedSignalingUrls: Set<string> = new Set();
@@ -40,10 +48,30 @@ export class PeerRegistry extends Abject {
   private storageId?: AbjectId;
   private localIdentity?: PeerIdentity & { exchangePrivateKey?: CryptoKey };
 
+  // Signaling relay fallback (peer-based relay when servers are down)
+  private signalingRelayRef?: SignalingRelay;
+
   // Auto-connect state
   private manuallyDisconnected: Set<PeerId> = new Set();
   private autoConnectTimer?: ReturnType<typeof setInterval>;
   private static readonly AUTO_CONNECT_INTERVAL = 30_000; // 30s
+
+  // Network peers (non-contact connected peers, transient — not persisted)
+  private networkPeers: Map<PeerId, NetworkPeerEntry> = new Map();
+  private static readonly MAX_NETWORK_PEERS = 20;
+
+  // Signaling peers (all peers registered on each signaling server)
+  private signalingPeers: Map<string, Array<{ peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string }>> = new Map();
+
+  // Pending introductions awaiting user acceptance
+  private pendingIntroductions: Map<PeerId, {
+    peerId: string;
+    publicSigningKey: string;
+    publicExchangeKey: string;
+    name: string;
+    fromPeerId: string;
+    receivedAt: number;
+  }> = new Map();
 
   constructor() {
     super({
@@ -158,6 +186,108 @@ export class PeerRegistry extends Abject {
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              {
+                name: 'introduceContact',
+                description: 'Introduce one of your contacts to another connected peer',
+                parameters: [
+                  { name: 'contactId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer ID of the contact to introduce' },
+                  { name: 'toPeerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer ID of the recipient' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'acceptIntroduction',
+                description: 'Accept a pending contact introduction',
+                parameters: [
+                  { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer ID from the introduction' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'rejectIntroduction',
+                description: 'Reject a pending contact introduction',
+                parameters: [
+                  { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer ID from the introduction' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'listPendingIntroductions',
+                description: 'List all pending contact introductions awaiting acceptance',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'reference', reference: 'PendingIntroduction' } },
+              },
+              {
+                name: 'getMediaPeerConnection',
+                description: 'Get the RTCPeerConnection for a peer (for MediaStream track management)',
+                parameters: [
+                  { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer ID' },
+                ],
+                returns: { kind: 'reference', reference: 'RTCPeerConnection' },
+              },
+              {
+                name: 'getConnectedPeers',
+                description: 'Get all connected peer IDs',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+              },
+              {
+                name: 'listNetworkPeers',
+                description: 'List non-contact connected peers (network mesh participants)',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'reference', reference: 'NetworkPeerInfo' } },
+              },
+              {
+                name: 'promoteToContact',
+                description: 'Promote a network peer to a trusted contact',
+                parameters: [
+                  { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer ID to promote' },
+                  { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Display name', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'getNetworkPeerCount',
+                description: 'Get the count of connected network peers',
+                parameters: [],
+                returns: { kind: 'primitive', primitive: 'number' },
+              },
+              {
+                name: 'listSignalingPeers',
+                description: 'List peers registered on connected signaling servers (excluding self and contacts)',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'reference', reference: 'SignalingPeerInfo' } },
+              },
+              {
+                name: 'blockPeer',
+                description: 'Block a peer — disconnect, remove from contacts/network, prevent future connections',
+                parameters: [
+                  { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer ID to block' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'unblockPeer',
+                description: 'Unblock a previously blocked peer',
+                parameters: [
+                  { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer ID to unblock' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'listBlockedPeers',
+                description: 'List all blocked peer IDs',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+              },
+              {
+                name: 'isBlocked',
+                description: 'Check if a peer is blocked',
+                parameters: [
+                  { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer ID to check' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
             ],
             events: [
               {
@@ -182,6 +312,45 @@ export class PeerRegistry extends Abject {
                   url: { kind: 'primitive', primitive: 'string' },
                   status: { kind: 'primitive', primitive: 'string' },
                 } },
+              },
+              {
+                name: 'introductionReceived',
+                description: 'A contact introduction was received from a connected peer',
+                payload: { kind: 'object', properties: {
+                  fromPeerId: { kind: 'primitive', primitive: 'string' },
+                  introducedPeerId: { kind: 'primitive', primitive: 'string' },
+                  introducedName: { kind: 'primitive', primitive: 'string' },
+                } },
+              },
+              {
+                name: 'networkPeerConnected',
+                description: 'A non-contact peer has connected (network mesh participant)',
+                payload: { kind: 'object', properties: {
+                  peerId: { kind: 'primitive', primitive: 'string' },
+                  name: { kind: 'primitive', primitive: 'string' },
+                } },
+              },
+              {
+                name: 'networkPeerDisconnected',
+                description: 'A non-contact peer has disconnected',
+                payload: { kind: 'object', properties: {
+                  peerId: { kind: 'primitive', primitive: 'string' },
+                } },
+              },
+              {
+                name: 'signalingPeersUpdated',
+                description: 'The list of peers on signaling servers has been refreshed',
+                payload: { kind: 'object', properties: {} },
+              },
+              {
+                name: 'peerBlocked',
+                description: 'A peer has been blocked',
+                payload: { kind: 'object', properties: { peerId: { kind: 'primitive', primitive: 'string' } } },
+              },
+              {
+                name: 'peerUnblocked',
+                description: 'A peer has been unblocked',
+                payload: { kind: 'object', properties: { peerId: { kind: 'primitive', primitive: 'string' } } },
               },
             ],
           },
@@ -263,6 +432,78 @@ export class PeerRegistry extends Abject {
       const { url } = msg.payload as { url: string };
       return this.removeSignalingServer(url);
     });
+
+    this.on('introduceContact', async (msg: AbjectMessage) => {
+      const { contactId, toPeerId } = msg.payload as { contactId: string; toPeerId: string };
+      return this.introduceContactImpl(contactId, toPeerId);
+    });
+
+    this.on('acceptIntroduction', async (msg: AbjectMessage) => {
+      const { peerId } = msg.payload as { peerId: string };
+      return this.acceptIntroductionImpl(peerId);
+    });
+
+    this.on('rejectIntroduction', async (msg: AbjectMessage) => {
+      const { peerId } = msg.payload as { peerId: string };
+      return this.rejectIntroductionImpl(peerId);
+    });
+
+    this.on('listPendingIntroductions', async () => {
+      return Array.from(this.pendingIntroductions.values()).map(i => ({
+        peerId: i.peerId,
+        name: i.name,
+        fromPeerId: i.fromPeerId,
+        receivedAt: i.receivedAt,
+      }));
+    });
+
+    this.on('getMediaPeerConnection', async (msg: AbjectMessage) => {
+      const { peerId } = msg.payload as { peerId: string };
+      const transport = this.transports.get(peerId);
+      if (!transport?.isConnected) return null;
+      const pc = transport.rtcPeerConnection;
+      return pc ? { peerConnection: pc } : null;
+    });
+
+    this.on('getConnectedPeers', async () => {
+      return this.getConnectedPeers();
+    });
+
+    this.on('listNetworkPeers', async () => {
+      return this.listNetworkPeersImpl();
+    });
+
+    this.on('promoteToContact', async (msg: AbjectMessage) => {
+      const { peerId, name } = msg.payload as { peerId: string; name?: string };
+      return this.promoteToContactImpl(peerId, name);
+    });
+
+    this.on('getNetworkPeerCount', async () => {
+      return this.networkPeers.size;
+    });
+
+    this.on('listSignalingPeers', async () => {
+      return this.listSignalingPeersImpl();
+    });
+
+    this.on('blockPeer', async (msg: AbjectMessage) => {
+      const { peerId } = msg.payload as { peerId: string };
+      return this.blockPeerImpl(peerId);
+    });
+
+    this.on('unblockPeer', async (msg: AbjectMessage) => {
+      const { peerId } = msg.payload as { peerId: string };
+      return this.unblockPeerImpl(peerId);
+    });
+
+    this.on('listBlockedPeers', async () => {
+      return Array.from(this.blockedPeers);
+    });
+
+    this.on('isBlocked', async (msg: AbjectMessage) => {
+      const { peerId } = msg.payload as { peerId: string };
+      return this.blockedPeers.has(peerId);
+    });
   }
 
   protected override async onInit(): Promise<void> {
@@ -272,6 +513,9 @@ export class PeerRegistry extends Abject {
 
     // Load local identity
     await this.loadLocalIdentity();
+
+    // Load blocked peers from storage
+    await this.loadBlockedPeers();
 
     // Load contacts from storage
     await this.loadContacts();
@@ -288,10 +532,11 @@ export class PeerRegistry extends Abject {
     this.stopAutoConnect();
 
     // Disconnect all peers
-    for (const [peerId, transport] of this.transports) {
+    for (const [, transport] of this.transports) {
       await transport.disconnect();
     }
     this.transports.clear();
+    this.networkPeers.clear();
 
     // Disconnect all signaling clients
     for (const [, client] of this.signalingClients) {
@@ -310,6 +555,9 @@ export class PeerRegistry extends Abject {
     publicExchangeKey: string,
     name: string,
   ): Promise<boolean> {
+    // Reject adding a blocked peer as contact
+    if (this.blockedPeers.has(peerId)) return false;
+
     // Import the contact's keys into Identity for crypto operations
     if (this.identityId) {
       await this.request(
@@ -385,10 +633,12 @@ export class PeerRegistry extends Abject {
     precondition(this.localIdentity !== undefined, 'Local identity not loaded');
     precondition(this.localIdentity!.exchangePrivateKey !== undefined, 'Exchange private key not loaded');
 
-    // Need at least one signaling client
-    const signalingClient = this.getActiveSignalingClient();
-    if (!signalingClient) {
-      console.warn('[PeerRegistry] No signaling server connected');
+    // Try signaling server first, then relay fallback
+    const signalingRelay: SignalingRelay | undefined =
+      this.getActiveSignalingClient() ?? this.signalingRelayRef;
+
+    if (!signalingRelay) {
+      console.warn('[PeerRegistry] No signaling server or relay available');
       return false;
     }
 
@@ -397,7 +647,7 @@ export class PeerRegistry extends Abject {
     const transport = new PeerTransport({
       localPeerId: this.localIdentity!.peerId,
       remotePeerId: peerId,
-      signalingClient,
+      signalingClient: signalingRelay,
       localPublicSigningKey: this.localIdentity!.publicSigningKey,
       localPublicExchangeKey: this.localIdentity!.publicExchangeKey,
       localExchangePrivateKey: this.localIdentity!.exchangePrivateKey!,
@@ -447,6 +697,13 @@ export class PeerRegistry extends Abject {
   }
 
   /**
+   * Set a SignalingRelay fallback for when no signaling server is available.
+   */
+  setSignalingRelay(relay: SignalingRelay): void {
+    this.signalingRelayRef = relay;
+  }
+
+  /**
    * Get all connected peer IDs.
    */
   getConnectedPeers(): PeerId[] {
@@ -480,6 +737,8 @@ export class PeerRegistry extends Abject {
             this.localIdentity.publicExchangeKey,
             this.localIdentity.name,
           );
+          // Request the list of all registered peers
+          client.listPeers(this.localIdentity.peerId);
         }
         // Trigger auto-connect now that we have a signaling server
         this.autoConnectAll();
@@ -509,6 +768,12 @@ export class PeerRegistry extends Abject {
         if (transport) {
           transport.handleIceCandidate(candidate).catch(console.error);
         }
+      },
+      onPeerList: (peers) => {
+        this.signalingPeers.set(url, peers);
+        this.changed('signalingPeersUpdated', {});
+        // Auto-connect to signaling peers for gossip bootstrap
+        this.autoConnectSignalingPeers(url, client);
       },
       onError: (error) => {
         console.error(`[PeerRegistry] Signaling error: ${error}`);
@@ -582,10 +847,24 @@ export class PeerRegistry extends Abject {
   private async handleIncomingSdpOffer(
     fromPeerId: string,
     sdp: RTCSessionDescriptionInit,
-    signalingClient: SignalingClient,
+    signalingClient: SignalingRelay,
   ): Promise<void> {
     precondition(this.localIdentity !== undefined, 'Local identity not loaded');
     precondition(this.localIdentity!.exchangePrivateKey !== undefined, 'Exchange private key not loaded');
+
+    // Reject inbound offers from blocked peers
+    if (this.blockedPeers.has(fromPeerId)) {
+      console.log(`[PeerRegistry] Rejecting SDP offer from blocked peer ${fromPeerId.slice(0, 16)}`);
+      return;
+    }
+
+    // Reject network peer connections when at capacity
+    if (!this.contacts.has(fromPeerId) && !this.transports.has(fromPeerId)) {
+      if (this.networkPeers.size >= PeerRegistry.MAX_NETWORK_PEERS) {
+        console.log(`[PeerRegistry] Rejecting network peer ${fromPeerId.slice(0, 16)}: at capacity (${PeerRegistry.MAX_NETWORK_PEERS})`);
+        return;
+      }
+    }
 
     // Mark known contacts as 'connecting' for accurate UI feedback
     this.setContactState(fromPeerId, 'connecting');
@@ -650,10 +929,11 @@ export class PeerRegistry extends Abject {
    */
   private autoConnectAll(): void {
     if (!this.localIdentity) return;
-    if (!this.getActiveSignalingClient()) return;
+    if (!this.getActiveSignalingClient() && !this.signalingRelayRef) return;
 
     for (const [peerId, contact] of this.contacts) {
       if (contact.state !== 'offline') continue;
+      if (this.blockedPeers.has(peerId)) continue;
       if (this.manuallyDisconnected.has(peerId)) continue;
       if (this.transports.has(peerId)) continue;
 
@@ -661,6 +941,76 @@ export class PeerRegistry extends Abject {
         // Silently ignore — will retry on next interval
       });
     }
+  }
+
+  // ==========================================================================
+  // Contact Introductions
+  // ==========================================================================
+
+  private async introduceContactImpl(contactId: string, toPeerId: string): Promise<boolean> {
+    const contact = this.contacts.get(contactId);
+    if (!contact) return false;
+
+    const transport = this.transports.get(toPeerId);
+    if (!transport?.isConnected) return false;
+
+    // Send the contact's public identity to the target peer via DataChannel
+    const introMsg = createEvent(this.id, PEER_REGISTRY_ID, '_introduction', {
+      fromPeerId: this.localIdentity!.peerId,
+      peerId: contact.identity.peerId,
+      publicSigningKey: contact.identity.publicSigningKey,
+      publicExchangeKey: contact.identity.publicExchangeKey,
+      name: contact.identity.name,
+    });
+
+    await transport.send(introMsg);
+    return true;
+  }
+
+  /**
+   * Handle an introduction message received from a remote peer.
+   * Called by the transport event handler when we get an _introduction message.
+   */
+  handleIntroductionMessage(msg: AbjectMessage): void {
+    const { fromPeerId, peerId, publicSigningKey, publicExchangeKey, name } = msg.payload as {
+      fromPeerId: string; peerId: string; publicSigningKey: string;
+      publicExchangeKey: string; name: string;
+    };
+
+    // Don't accept introductions for ourselves or contacts we already have
+    if (peerId === this.localIdentity?.peerId) return;
+    if (this.contacts.has(peerId)) return;
+    if (this.pendingIntroductions.has(peerId)) return;
+
+    this.pendingIntroductions.set(peerId, {
+      peerId, publicSigningKey, publicExchangeKey, name,
+      fromPeerId, receivedAt: Date.now(),
+    });
+
+    this.changed('introductionReceived', {
+      fromPeerId,
+      introducedPeerId: peerId,
+      introducedName: name,
+    });
+  }
+
+  private async acceptIntroductionImpl(peerId: string): Promise<boolean> {
+    const intro = this.pendingIntroductions.get(peerId);
+    if (!intro) return false;
+    if (this.blockedPeers.has(peerId)) return false;
+
+    this.pendingIntroductions.delete(peerId);
+    await this.addContact(
+      intro.peerId,
+      intro.publicSigningKey,
+      intro.publicExchangeKey,
+      intro.name,
+    );
+    return true;
+  }
+
+  private rejectIntroductionImpl(peerId: string): boolean {
+    return this.pendingIntroductions.delete(peerId);
   }
 
   // ==========================================================================
@@ -673,18 +1023,59 @@ export class PeerRegistry extends Abject {
         // Only process if this transport is still the active one for this peer
         // (ICE glare can replace the transport before async events fire)
         if (this.transports.get(peerId) !== transport) return;
-        this.setContactState(peerId, 'connected');
-        this.changed('contactConnected', { peerId });
+
+        if (this.contacts.has(peerId)) {
+          this.setContactState(peerId, 'connected');
+          this.changed('contactConnected', { peerId });
+        } else {
+          // This is a network peer (not a contact)
+          const name = transport.remotePeerId.slice(0, 12) + '...';
+          this.networkPeers.set(peerId, {
+            identity: { peerId, publicSigningKey: '', publicExchangeKey: '', name },
+            connectedAt: Date.now(),
+          });
+          this.changed('networkPeerConnected', { peerId, name });
+        }
       },
       onDisconnect: () => {
         // Only clean up if this transport is still the active one for this peer
         // (ICE glare can replace the transport before async events fire)
         if (this.transports.get(peerId) !== transport) return;
-        this.setContactState(peerId, 'offline');
+
+        if (this.contacts.has(peerId)) {
+          this.setContactState(peerId, 'offline');
+        }
+        if (this.networkPeers.has(peerId)) {
+          this.networkPeers.delete(peerId);
+          this.changed('networkPeerDisconnected', { peerId });
+        }
         this.transports.delete(peerId);
         this.changed('contactDisconnected', { peerId });
       },
       onMessage: (message) => {
+        // Intercept introduction messages before forwarding
+        if (message.routing.method === '_introduction' &&
+            message.routing.to === PEER_REGISTRY_ID) {
+          this.handleIntroductionMessage(message);
+          return;
+        }
+
+        // Intercept signaling relay messages
+        if (message.routing.method === '_signalingRelay' &&
+            message.routing.to === PEER_REGISTRY_ID) {
+          this.signalingRelayHandler?.(message, peerId);
+          return;
+        }
+
+        // Intercept peer exchange / find gossip messages
+        if ((message.routing.method === '_peerExchange' ||
+             message.routing.method === '_findPeer' ||
+             message.routing.method === '_peerFound') &&
+            message.routing.to === PEER_REGISTRY_ID) {
+          this.peerDiscoveryHandler?.(message, peerId);
+          return;
+        }
+
         console.log(`[PeerRegistry] inbound message from ${peerId.slice(0, 16)} to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
         // Messages from peers are forwarded to the local message bus
         // by the PeerRouter interceptor
@@ -699,11 +1090,102 @@ export class PeerRegistry extends Abject {
   // Event callback for incoming messages (used by PeerRouter)
   private events: { onMessage?: (msg: AbjectMessage, fromPeerId: PeerId) => void } = {};
 
+  // Handler callbacks for SignalingRelay and PeerDiscovery objects
+  private signalingRelayHandler?: (msg: AbjectMessage, fromPeerId: PeerId) => void;
+  private peerDiscoveryHandler?: (msg: AbjectMessage, fromPeerId: PeerId) => void;
+
   /**
    * Set a handler for messages received from remote peers.
    */
   onRemoteMessage(handler: (msg: AbjectMessage, fromPeerId: PeerId) => void): void {
     this.events.onMessage = handler;
+  }
+
+  /**
+   * Set a handler for signaling relay messages received from remote peers.
+   */
+  onSignalingRelayMessage(handler: (msg: AbjectMessage, fromPeerId: PeerId) => void): void {
+    this.signalingRelayHandler = handler;
+  }
+
+  /**
+   * Set a handler for peer discovery/gossip messages received from remote peers.
+   */
+  onPeerDiscoveryMessage(handler: (msg: AbjectMessage, fromPeerId: PeerId) => void): void {
+    this.peerDiscoveryHandler = handler;
+  }
+
+  /**
+   * Send a raw message to a connected peer via their transport.
+   * Used by SignalingRelayObject and PeerDiscoveryObject.
+   */
+  async sendToPeer(peerId: PeerId, message: AbjectMessage): Promise<boolean> {
+    const transport = this.transports.get(peerId);
+    if (!transport?.isConnected) return false;
+    await transport.send(message);
+    return true;
+  }
+
+  /**
+   * Check if we have an active transport to a specific peer.
+   */
+  hasTransportTo(peerId: PeerId): boolean {
+    const transport = this.transports.get(peerId);
+    return !!transport?.isConnected;
+  }
+
+  /**
+   * Initiate a WebRTC connection to a peer using a specific signaling relay.
+   * Used by SignalingRelayObject for peer-relayed connections.
+   */
+  async connectToPeerViaRelay(peerId: string, relay: SignalingRelay): Promise<boolean> {
+    if (this.blockedPeers.has(peerId)) return false;
+    if (this.transports.has(peerId)) return true; // already connected
+
+    precondition(this.localIdentity !== undefined, 'Local identity not loaded');
+    precondition(this.localIdentity!.exchangePrivateKey !== undefined, 'Exchange private key not loaded');
+
+    // Reject if at network peer capacity (for non-contacts)
+    if (!this.contacts.has(peerId) && this.networkPeers.size >= PeerRegistry.MAX_NETWORK_PEERS) {
+      return false;
+    }
+
+    const transport = new PeerTransport({
+      localPeerId: this.localIdentity!.peerId,
+      remotePeerId: peerId,
+      signalingClient: relay,
+      localPublicSigningKey: this.localIdentity!.publicSigningKey,
+      localPublicExchangeKey: this.localIdentity!.publicExchangeKey,
+      localExchangePrivateKey: this.localIdentity!.exchangePrivateKey!,
+    });
+
+    this.setupTransportEvents(transport, peerId);
+    this.transports.set(peerId, transport);
+
+    try {
+      await transport.connect('webrtc');
+    } catch (err) {
+      console.error(`[PeerRegistry] Failed to connect via relay to ${peerId.slice(0, 16)}:`, err);
+      this.transports.delete(peerId);
+      return false;
+    }
+
+    return true;
+  }
+
+  private autoConnectSignalingPeers(url: string, client: SignalingClient): void {
+    const peers = this.signalingPeers.get(url);
+    if (!peers) return;
+    const myPeerId = this.localIdentity?.peerId;
+    if (!myPeerId) return;
+
+    for (const peer of peers) {
+      if (peer.peerId === myPeerId) continue;
+      if (this.blockedPeers.has(peer.peerId)) continue;
+      if (this.contacts.has(peer.peerId)) continue;
+      if (this.transports.has(peer.peerId)) continue;
+      this.connectToPeerViaRelay(peer.peerId, client).catch(() => {});
+    }
   }
 
   private setContactState(peerId: string, state: PeerConnectionState): void {
@@ -756,6 +1238,90 @@ export class PeerRegistry extends Abject {
     }
   }
 
+
+  // ==========================================================================
+  // Network Peers
+  // ==========================================================================
+
+  private listSignalingPeersImpl(): Array<{ peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string; serverUrl: string }> {
+    const myPeerId = this.localIdentity?.peerId;
+    const contactIds = new Set(this.contacts.keys());
+    const result: Array<{ peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string; serverUrl: string }> = [];
+    for (const [serverUrl, peers] of this.signalingPeers) {
+      for (const p of peers) {
+        if (p.peerId === myPeerId) continue;
+        if (this.blockedPeers.has(p.peerId)) continue;
+        if (contactIds.has(p.peerId)) continue;
+        if (this.transports.has(p.peerId)) continue;
+        result.push({ peerId: p.peerId, name: p.name, publicSigningKey: p.publicSigningKey, publicExchangeKey: p.publicExchangeKey, serverUrl });
+      }
+    }
+    return result;
+  }
+
+  private listNetworkPeersImpl(): Array<{ peerId: string; name: string; connectedAt: number }> {
+    return Array.from(this.networkPeers.values()).map(np => ({
+      peerId: np.identity.peerId,
+      name: np.identity.name,
+      connectedAt: np.connectedAt,
+    }));
+  }
+
+  private async promoteToContactImpl(peerId: string, name?: string): Promise<boolean> {
+    const networkPeer = this.networkPeers.get(peerId);
+    if (!networkPeer) return false;
+
+    // Move from network peers to contacts
+    this.networkPeers.delete(peerId);
+    await this.addContact(
+      networkPeer.identity.peerId,
+      networkPeer.identity.publicSigningKey,
+      networkPeer.identity.publicExchangeKey,
+      name ?? networkPeer.identity.name,
+    );
+    return true;
+  }
+
+  // ==========================================================================
+  // Block / Unblock
+  // ==========================================================================
+
+  private async blockPeerImpl(peerId: string): Promise<boolean> {
+    this.blockedPeers.add(peerId);
+    await this.persistBlockedPeers();
+
+    // Disconnect transport if connected
+    const transport = this.transports.get(peerId);
+    if (transport) {
+      await transport.disconnect();
+      this.transports.delete(peerId);
+    }
+
+    // Remove from contacts if present
+    if (this.contacts.has(peerId)) {
+      this.contacts.delete(peerId);
+      this.manuallyDisconnected.delete(peerId);
+      await this.persistContacts();
+    }
+
+    // Remove from network peers if present
+    this.networkPeers.delete(peerId);
+
+    // Remove from pending introductions
+    this.pendingIntroductions.delete(peerId);
+
+    this.changed('peerBlocked', { peerId });
+    return true;
+  }
+
+  private async unblockPeerImpl(peerId: string): Promise<boolean> {
+    const removed = this.blockedPeers.delete(peerId);
+    if (removed) {
+      await this.persistBlockedPeers();
+      this.changed('peerUnblocked', { peerId });
+    }
+    return removed;
+  }
 
   // ==========================================================================
   // Persistence
@@ -825,6 +1391,33 @@ export class PeerRegistry extends Abject {
     await this.request(
       createRequest(this.id, this.storageId, 'set',
         { key: STORAGE_KEY_SIGNALING_URLS, value: urls }),
+    );
+  }
+
+  private async loadBlockedPeers(): Promise<void> {
+    if (!this.storageId) return;
+
+    try {
+      const result = await this.request<string[] | null>(
+        createRequest(this.id, this.storageId, 'get', { key: STORAGE_KEY_BLOCKED }),
+      );
+      if (Array.isArray(result)) {
+        for (const peerId of result) {
+          this.blockedPeers.add(peerId);
+        }
+      }
+    } catch {
+      // No blocked peers saved yet
+    }
+  }
+
+  private async persistBlockedPeers(): Promise<void> {
+    if (!this.storageId) return;
+
+    const peerIds = Array.from(this.blockedPeers);
+    await this.request(
+      createRequest(this.id, this.storageId, 'set',
+        { key: STORAGE_KEY_BLOCKED, value: peerIds }),
     );
   }
 
