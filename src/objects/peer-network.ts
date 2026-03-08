@@ -708,7 +708,7 @@ export class PeerNetwork extends Abject {
 
     this.signalingInputId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createTextInput', {
-        windowId: this.windowId, rect: r0, placeholder: 'ws://localhost:7720',
+        windowId: this.windowId, rect: r0, placeholder: 'wss://signal.abject.world',
       })
     );
     await this.request(request(this.id, this.signalingInputId, 'addDependent', {}));

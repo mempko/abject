@@ -23,6 +23,7 @@ const STORAGE_KEY_SIGNALING_URLS = 'peer-registry:signaling-urls';
 const STORAGE_KEY_BLOCKED = 'peer-registry:blocked-peers';
 const STORAGE_KEY_GOSSIP_PEERS = 'peer-registry:gossip-peers';
 const MAX_GOSSIP_PEERS = 30;
+const DEFAULT_SIGNALING_URL = 'wss://signal.abject.world';
 
 export const PEER_REGISTRY_ID = 'abjects:peer-registry' as AbjectId;
 
@@ -1668,26 +1669,34 @@ export class PeerRegistry extends Abject {
   private async loadAndReconnectSignaling(): Promise<void> {
     if (!this.storageId) return;
 
+    let urls: string[] = [];
     try {
       const result = await this.request<string[] | null>(
         createRequest(this.id, this.storageId, 'get', { key: STORAGE_KEY_SIGNALING_URLS }),
       );
-      if (Array.isArray(result)) {
-        // Populate saved set first — ensures URLs are tracked even if connection fails
-        for (const url of result) {
-          this.savedSignalingUrls.add(url);
-        }
-        // Then attempt connections (best effort)
-        for (const url of result) {
-          try {
-            await this.connectSignalingImpl(url);
-          } catch (err) {
-            console.warn(`[PeerRegistry] Failed to auto-reconnect to signaling: ${url}`, err);
-          }
-        }
+      if (Array.isArray(result) && result.length > 0) {
+        urls = result;
       }
     } catch {
       // No signaling URLs saved yet
+    }
+
+    // First run: no saved signaling servers — connect to the default
+    if (urls.length === 0) {
+      urls = [DEFAULT_SIGNALING_URL];
+    }
+
+    // Populate saved set first — ensures URLs are tracked even if connection fails
+    for (const url of urls) {
+      this.savedSignalingUrls.add(url);
+    }
+    // Then attempt connections (best effort)
+    for (const url of urls) {
+      try {
+        await this.connectSignalingImpl(url);
+      } catch (err) {
+        console.warn(`[PeerRegistry] Failed to auto-reconnect to signaling: ${url}`, err);
+      }
     }
   }
 
