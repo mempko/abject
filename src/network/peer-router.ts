@@ -391,8 +391,8 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     if (cached.exposedObjectIds.length === 0) return { ...msg, payload: [] };  // Nothing exposed
 
     const allowed = new Set(cached.exposedObjectIds);
-    const filtered = (msg.payload as Array<{ objectId: string }>)
-      .filter(item => allowed.has(item.objectId as AbjectId));
+    const filtered = (msg.payload as Array<{ id: string }>)
+      .filter(item => allowed.has(item.id as AbjectId));
 
     return { ...msg, payload: filtered };
   }
@@ -414,7 +414,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     });
 
     let targetId = msg.routing.to;
-    console.log(`[PeerRouter] inbound: to=${msg.routing.to.slice(0, 20)} from=${msg.routing.from.slice(0, 8)} type=${msg.header.type} method=${(msg.payload as any)?.method ?? '?'}`);
+    console.log(`[PeerRouter] inbound: to=${msg.routing.to.slice(0, 20)} from=${msg.routing.from.slice(0, 8)} type=${msg.header.type} method=${msg.routing.method ?? '?'}`);
 
     // Messages addressed to PEER_ROUTER_ID are for this PeerRouter itself
     if (targetId === PEER_ROUTER_ID) {

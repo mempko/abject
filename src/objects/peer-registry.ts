@@ -21,6 +21,8 @@ const STORAGE_INTERFACE = 'abjects:storage' as InterfaceId;
 const STORAGE_KEY_CONTACTS = 'peer-registry:contacts';
 const STORAGE_KEY_SIGNALING_URLS = 'peer-registry:signaling-urls';
 const STORAGE_KEY_BLOCKED = 'peer-registry:blocked-peers';
+const STORAGE_KEY_GOSSIP_PEERS = 'peer-registry:gossip-peers';
+const MAX_GOSSIP_PEERS = 30;
 
 export const PEER_REGISTRY_ID = 'abjects:peer-registry' as AbjectId;
 
@@ -36,6 +38,16 @@ interface StoredContact {
   name: string;
   addresses: string[];
   addedAt: number;
+  lastSeen?: number;
+}
+
+interface StoredGossipPeer {
+  peerId: string;
+  publicSigningKey: string;
+  publicExchangeKey: string;
+  name: string;
+  signalingUrls: string[];
+  lastSeen: number;
 }
 
 export class PeerRegistry extends Abject {
@@ -55,6 +67,8 @@ export class PeerRegistry extends Abject {
   private manuallyDisconnected: Set<PeerId> = new Set();
   private autoConnectTimer?: ReturnType<typeof setInterval>;
   private static readonly AUTO_CONNECT_INTERVAL = 30_000; // 30s
+  private static readonly STALE_OFFER_TIMEOUT = 15_000; // 15s
+  private offerTimestamps: Map<string, number> = new Map();
 
   // Network peers (non-contact connected peers, transient — not persisted)
   private networkPeers: Map<PeerId, NetworkPeerEntry> = new Map();
@@ -62,6 +76,12 @@ export class PeerRegistry extends Abject {
 
   // Signaling peers (all peers registered on each signaling server)
   private signalingPeers: Map<string, Array<{ peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string }>> = new Map();
+
+  // Persisted gossip peers (non-contacts seen on signaling servers)
+  private gossipPeers: Map<string, StoredGossipPeer> = new Map();
+
+  // Track which signaling URL facilitated each transport
+  private transportSignalingUrl: Map<string, string> = new Map();
 
   // Pending introductions awaiting user acceptance
   private pendingIntroductions: Map<PeerId, {
@@ -520,6 +540,9 @@ export class PeerRegistry extends Abject {
     // Load contacts from storage
     await this.loadContacts();
 
+    // Load persisted gossip peers
+    await this.loadGossipPeers();
+
     // Auto-reconnect to saved signaling servers
     await this.loadAndReconnectSignaling();
 
@@ -567,10 +590,18 @@ export class PeerRegistry extends Abject {
       );
     }
 
+    // If peer was a gossip peer, migrate their signaling URLs to contact addresses
+    const gossipPeer = this.gossipPeers.get(peerId);
+    const addresses = gossipPeer ? gossipPeer.signalingUrls.slice() : [];
+    if (gossipPeer) {
+      this.gossipPeers.delete(peerId);
+      this.persistGossipPeers().catch(() => {});
+    }
+
     const contact: PeerContact = {
       identity: { peerId, publicSigningKey, publicExchangeKey, name },
       state: 'offline',
-      addresses: [],
+      addresses,
       addedAt: Date.now(),
     };
     this.contacts.set(peerId, contact);
@@ -634,13 +665,29 @@ export class PeerRegistry extends Abject {
     precondition(this.localIdentity!.exchangePrivateKey !== undefined, 'Exchange private key not loaded');
 
     // Try signaling server first, then relay fallback
-    const signalingRelay: SignalingRelay | undefined =
+    let signalingRelay: SignalingRelay | undefined =
       this.getActiveSignalingClient() ?? this.signalingRelayRef;
+
+    // Fallback: try signaling servers from contact's stored addresses
+    if (!signalingRelay && contact.addresses.length > 0) {
+      for (const addr of contact.addresses) {
+        if (this.signalingClients.has(addr)) continue;
+        try {
+          await this.connectSignalingImpl(addr);
+          signalingRelay = this.getActiveSignalingClient();
+          if (signalingRelay) break;
+        } catch { /* try next */ }
+      }
+    }
 
     if (!signalingRelay) {
       console.warn('[PeerRegistry] No signaling server or relay available');
       return false;
     }
+
+    // Track which signaling URL facilitated this connection
+    const sigUrl = this.findSignalingUrlForRelay(signalingRelay);
+    if (sigUrl) this.transportSignalingUrl.set(peerId, sigUrl);
 
     this.setContactState(peerId, 'connecting');
 
@@ -655,6 +702,7 @@ export class PeerRegistry extends Abject {
 
     this.setupTransportEvents(transport, peerId);
     this.transports.set(peerId, transport);
+    this.offerTimestamps.set(peerId, Date.now());
 
     try {
       await transport.connect('webrtc');
@@ -662,6 +710,7 @@ export class PeerRegistry extends Abject {
       console.error(`[PeerRegistry] Failed to connect to ${peerId.slice(0, 16)}:`, err);
       this.setContactState(peerId, 'offline');
       this.transports.delete(peerId);
+      this.offerTimestamps.delete(peerId);
       return false;
     }
 
@@ -772,6 +821,24 @@ export class PeerRegistry extends Abject {
       onPeerList: (peers) => {
         this.signalingPeers.set(url, peers);
         this.changed('signalingPeersUpdated', {});
+
+        // Persist gossip peers with their signaling URLs
+        for (const peer of peers) {
+          if (peer.peerId === this.localIdentity?.peerId) continue;
+          if (this.contacts.has(peer.peerId)) {
+            // Update contact addresses with this signaling URL
+            const contact = this.contacts.get(peer.peerId)!;
+            if (!contact.addresses.includes(url)) {
+              contact.addresses.push(url);
+              if (contact.addresses.length > 5) contact.addresses.shift();
+            }
+          } else {
+            // Store as gossip peer
+            this.updateGossipPeer(peer.peerId, peer.publicSigningKey,
+              peer.publicExchangeKey, peer.name, url);
+          }
+        }
+
         // Auto-connect to signaling peers for gossip bootstrap
         this.autoConnectSignalingPeers(url, client);
       },
@@ -877,8 +944,31 @@ export class PeerRegistry extends Abject {
     // with the lexicographically lower peerId keeps their offer (acts as caller).
     if (transport && transport.signalingState === 'have-local-offer') {
       if (this.localIdentity!.peerId < fromPeerId) {
-        // We have priority — ignore the remote offer; our offer will be answered
-        console.log(`[PeerRegistry] ICE glare with ${fromPeerId.slice(0, 16)}: we win tiebreak, ignoring remote offer`);
+        // We have priority — but our original offer may have been lost (peer wasn't
+        // online yet). Since the remote peer is clearly online now (they just sent us
+        // an offer), destroy the stale transport and create a fresh one.
+        console.log(`[PeerRegistry] ICE glare with ${fromPeerId.slice(0, 16)}: we win tiebreak, re-sending offer`);
+        transport.resetForGlare();
+        this.transports.delete(fromPeerId);
+        this.offerTimestamps.delete(fromPeerId);
+
+        const newTransport = new PeerTransport({
+          localPeerId: this.localIdentity!.peerId,
+          remotePeerId: fromPeerId,
+          signalingClient,
+          localPublicSigningKey: this.localIdentity!.publicSigningKey,
+          localPublicExchangeKey: this.localIdentity!.publicExchangeKey,
+          localExchangePrivateKey: this.localIdentity!.exchangePrivateKey!,
+        });
+        this.setupTransportEvents(newTransport, fromPeerId);
+        this.transports.set(fromPeerId, newTransport);
+        this.offerTimestamps.set(fromPeerId, Date.now());
+        newTransport.connect('webrtc').catch((err) => {
+          console.error(`[PeerRegistry] Re-offer to ${fromPeerId.slice(0, 16)} failed:`, err);
+          this.transports.delete(fromPeerId);
+          this.offerTimestamps.delete(fromPeerId);
+          this.setContactState(fromPeerId, 'offline');
+        });
         return;
       }
       // They have priority — reset PeerConnection and accept their offer.
@@ -901,6 +991,10 @@ export class PeerRegistry extends Abject {
       this.setupTransportEvents(transport, fromPeerId);
       this.transports.set(fromPeerId, transport);
     }
+
+    // Track signaling URL for this incoming connection
+    const incomingSigUrl = this.findSignalingUrlForRelay(signalingClient);
+    if (incomingSigUrl) this.transportSignalingUrl.set(fromPeerId, incomingSigUrl);
 
     await transport.handleSdpOffer(sdp);
   }
@@ -929,7 +1023,32 @@ export class PeerRegistry extends Abject {
    */
   private autoConnectAll(): void {
     if (!this.localIdentity) return;
-    if (!this.getActiveSignalingClient() && !this.signalingRelayRef) return;
+
+    // Clean up stale offers — transports stuck in have-local-offer where the
+    // remote peer never responded (e.g. they weren't online when we sent it)
+    const now = Date.now();
+    for (const [peerId, timestamp] of this.offerTimestamps) {
+      if (now - timestamp < PeerRegistry.STALE_OFFER_TIMEOUT) continue;
+      const transport = this.transports.get(peerId);
+      if (transport && transport.signalingState === 'have-local-offer') {
+        console.log(`[PeerRegistry] Cleaning up stale offer to ${peerId.slice(0, 16)} (${Math.round((now - timestamp) / 1000)}s old)`);
+        transport.resetForGlare();
+        this.transports.delete(peerId);
+        this.offerTimestamps.delete(peerId);
+        this.setContactState(peerId, 'offline');
+      } else {
+        // Transport connected or was replaced — timestamp no longer relevant
+        this.offerTimestamps.delete(peerId);
+      }
+    }
+
+    const hasSignaling = !!this.getActiveSignalingClient() || !!this.signalingRelayRef;
+
+    // If no signaling is available, try connecting to signaling servers
+    // where gossip peers or contacts were last seen
+    if (!hasSignaling) {
+      this.tryAlternativeSignaling();
+    }
 
     for (const [peerId, contact] of this.contacts) {
       if (contact.state !== 'offline') continue;
@@ -1023,6 +1142,19 @@ export class PeerRegistry extends Abject {
         // Only process if this transport is still the active one for this peer
         // (ICE glare can replace the transport before async events fire)
         if (this.transports.get(peerId) !== transport) return;
+        this.offerTimestamps.delete(peerId);
+
+        // Record signaling URL on contact or gossip peer
+        const sigUrl = this.transportSignalingUrl.get(peerId);
+        if (sigUrl) {
+          const contact = this.contacts.get(peerId);
+          if (contact && !contact.addresses.includes(sigUrl)) {
+            contact.addresses.push(sigUrl);
+            if (contact.addresses.length > 5) contact.addresses.shift();
+            this.persistContacts().catch(() => {});
+          }
+          this.transportSignalingUrl.delete(peerId);
+        }
 
         if (this.contacts.has(peerId)) {
           this.setContactState(peerId, 'connected');
@@ -1035,6 +1167,15 @@ export class PeerRegistry extends Abject {
             connectedAt: Date.now(),
           });
           this.changed('networkPeerConnected', { peerId, name });
+
+          // Update gossip peer with signaling URL if known
+          if (sigUrl) {
+            const np = this.networkPeers.get(peerId as any);
+            if (np) {
+              this.updateGossipPeer(peerId, np.identity.publicSigningKey,
+                np.identity.publicExchangeKey, np.identity.name, sigUrl);
+            }
+          }
         }
         this.peerConnectedHandler?.(peerId);
       },
@@ -1042,6 +1183,7 @@ export class PeerRegistry extends Abject {
         // Only clean up if this transport is still the active one for this peer
         // (ICE glare can replace the transport before async events fire)
         if (this.transports.get(peerId) !== transport) return;
+        this.offerTimestamps.delete(peerId);
 
         if (this.contacts.has(peerId)) {
           this.setContactState(peerId, 'offline');
@@ -1171,12 +1313,14 @@ export class PeerRegistry extends Abject {
 
     this.setupTransportEvents(transport, peerId);
     this.transports.set(peerId, transport);
+    this.offerTimestamps.set(peerId, Date.now());
 
     try {
       await transport.connect('webrtc');
     } catch (err) {
       console.error(`[PeerRegistry] Failed to connect via relay to ${peerId.slice(0, 16)}:`, err);
       this.transports.delete(peerId);
+      this.offerTimestamps.delete(peerId);
       return false;
     }
 
@@ -1356,6 +1500,7 @@ export class PeerRegistry extends Abject {
             state: 'offline',
             addresses: stored.addresses,
             addedAt: stored.addedAt,
+            lastSeen: stored.lastSeen,
           };
           this.contacts.set(stored.peerId, contact);
 
@@ -1386,6 +1531,7 @@ export class PeerRegistry extends Abject {
       name: c.identity.name,
       addresses: c.addresses,
       addedAt: c.addedAt,
+      lastSeen: c.lastSeen,
     }));
 
     await this.request(
@@ -1429,6 +1575,94 @@ export class PeerRegistry extends Abject {
       createRequest(this.id, this.storageId, 'set',
         { key: STORAGE_KEY_BLOCKED, value: peerIds }),
     );
+  }
+
+  // ==========================================================================
+  // Gossip Peer Persistence
+  // ==========================================================================
+
+  private updateGossipPeer(peerId: string, publicSigningKey: string,
+      publicExchangeKey: string, name: string, signalingUrl: string): void {
+    const existing = this.gossipPeers.get(peerId);
+    if (existing) {
+      if (!existing.signalingUrls.includes(signalingUrl)) {
+        existing.signalingUrls.push(signalingUrl);
+        if (existing.signalingUrls.length > 5) existing.signalingUrls.shift();
+      }
+      existing.lastSeen = Date.now();
+      existing.name = name;
+    } else {
+      // Evict oldest if at capacity
+      if (this.gossipPeers.size >= MAX_GOSSIP_PEERS) {
+        let oldestKey = '';
+        let oldestTime = Infinity;
+        for (const [k, v] of this.gossipPeers) {
+          if (v.lastSeen < oldestTime) { oldestTime = v.lastSeen; oldestKey = k; }
+        }
+        if (oldestKey) this.gossipPeers.delete(oldestKey);
+      }
+      this.gossipPeers.set(peerId, {
+        peerId, publicSigningKey, publicExchangeKey, name,
+        signalingUrls: [signalingUrl], lastSeen: Date.now(),
+      });
+    }
+    this.persistGossipPeers().catch(() => {});
+  }
+
+  private async persistGossipPeers(): Promise<void> {
+    if (!this.storageId) return;
+
+    const stored = Array.from(this.gossipPeers.values());
+    await this.request(
+      createRequest(this.id, this.storageId, 'set',
+        { key: STORAGE_KEY_GOSSIP_PEERS, value: stored }),
+    );
+  }
+
+  private async loadGossipPeers(): Promise<void> {
+    if (!this.storageId) return;
+
+    try {
+      const result = await this.request<StoredGossipPeer[] | null>(
+        createRequest(this.id, this.storageId, 'get', { key: STORAGE_KEY_GOSSIP_PEERS }),
+      );
+      if (Array.isArray(result)) {
+        for (const gp of result) {
+          this.gossipPeers.set(gp.peerId, gp);
+        }
+      }
+    } catch {
+      // No gossip peers saved yet
+    }
+  }
+
+  // ==========================================================================
+  // Alternative Signaling Bootstrap
+  // ==========================================================================
+
+  private tryAlternativeSignaling(): void {
+    // Collect signaling URLs from contacts and gossip peers
+    const urlsToTry = new Set<string>();
+    for (const contact of this.contacts.values()) {
+      for (const addr of contact.addresses) urlsToTry.add(addr);
+    }
+    for (const gp of this.gossipPeers.values()) {
+      for (const addr of gp.signalingUrls) urlsToTry.add(addr);
+    }
+
+    for (const url of urlsToTry) {
+      // Skip URLs we're already trying (persistent reconnect handles them)
+      if (this.signalingClients.has(url)) continue;
+
+      this.connectSignalingImpl(url).catch(() => {});
+    }
+  }
+
+  private findSignalingUrlForRelay(relay: SignalingRelay): string | undefined {
+    for (const [url, client] of this.signalingClients) {
+      if (client === relay) return url;
+    }
+    return undefined;
   }
 
   private async loadAndReconnectSignaling(): Promise<void> {
