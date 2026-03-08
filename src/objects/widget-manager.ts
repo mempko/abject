@@ -976,6 +976,15 @@ export class WidgetManager extends Abject {
         await this.send(
           event(this.id, ownerId, 'windowResized', { windowId: windowShimId, width, height })
         );
+        // Keep WindowManager's tracked rect in sync (programmatic resize from owner)
+        if (this.windowManagerId) {
+          const surfaceId = this.windowSurfaces.get(fromId);
+          if (surfaceId) {
+            this.send(event(this.id, this.windowManagerId, 'updateWindowRect', {
+              surfaceId, x, y, width, height,
+            })).catch(() => {});
+          }
+        }
       }
       if (aspect === 'windowMoved') {
         const { x, y } = value as { x: number; y: number };

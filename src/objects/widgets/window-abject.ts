@@ -276,11 +276,28 @@ export class WindowAbject extends Abject {
       }
     });
 
-    // WindowManager sends rect updates during drag/resize
+    // WindowManager sends rect updates during drag/resize;
+    // Taskbar (and other owners) may also send windowRect for programmatic resize.
     this.on('windowRect', async (msg: AbjectMessage) => {
       const { x, y, width, height } = msg.payload as { x: number; y: number; width: number; height: number };
+      const moved = x !== this.rect.x || y !== this.rect.y;
       const sizeChanged = width !== this.rect.width || height !== this.rect.height;
       this.rect = { x, y, width, height };
+
+      // Update the actual UIServer surface so it matches the new rect
+      if (this.surfaceId) {
+        if (moved) {
+          this.request(
+            request(this.id, this.uiServerId, 'moveSurface', { surfaceId: this.surfaceId, x, y })
+          ).catch(() => {});
+        }
+        if (sizeChanged) {
+          this.request(
+            request(this.id, this.uiServerId, 'resizeSurface', { surfaceId: this.surfaceId, width, height })
+          ).catch(() => {});
+        }
+      }
+
       if (sizeChanged) {
         await this.updateChildrenOnResize();
         await this.renderWindow();

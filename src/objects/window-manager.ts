@@ -271,6 +271,17 @@ export class WindowManager extends Abject {
       this.dragState = undefined;
     });
 
+    // Programmatic rect update (e.g. Taskbar resized its window) — keep tracking in sync
+    this.on('updateWindowRect', async (msg: AbjectMessage) => {
+      const { surfaceId, x, y, width, height } = msg.payload as {
+        surfaceId: string; x: number; y: number; width: number; height: number;
+      };
+      const info = this.windows.get(surfaceId);
+      if (info) {
+        info.rect = { x, y, width, height };
+      }
+    });
+
     // Legacy: Event from UIServer on mousedown — raise the clicked window
     this.on('surfaceActivated', async (msg: AbjectMessage) => {
       const { surfaceId } = msg.payload as { surfaceId: string };
