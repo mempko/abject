@@ -108,6 +108,12 @@ export interface ClipboardWriteMsg extends WsEnvelope {
   text: string;
 }
 
+export interface StartWindowDragMsg extends WsEnvelope {
+  type: 'startWindowDrag';
+  surfaceId: string;
+  dragType: 'move' | 'resize';
+}
+
 // =============================================================================
 // Auth messages (server -> client)
 // =============================================================================
@@ -142,6 +148,7 @@ export type BackendToFrontendMsg =
   | SetSurfaceWorkspaceMsg
   | SetActiveWorkspaceMsg
   | ClipboardWriteMsg
+  | StartWindowDragMsg
   | AuthRequiredMsg
   | AuthNotRequiredMsg
   | AuthResultMsg;
@@ -168,6 +175,15 @@ export interface InputMsg extends WsEnvelope {
   deltaX?: number;
   deltaY?: number;
   pasteText?: string;
+  globalX?: number;   // canvas-space X (for drag events — avoids stale local→global reconstruction)
+  globalY?: number;   // canvas-space Y (for drag events)
+}
+
+export interface EndWindowDragMsg extends WsEnvelope {
+  type: 'endWindowDrag';
+  surfaceId: string;
+  x: number;
+  y: number;
 }
 
 export interface MeasureTextReplyMsg extends WsEnvelope {
@@ -215,6 +231,7 @@ export interface FontMetricsMsg extends WsEnvelope {
 
 export type FrontendToBackendMsg =
   | InputMsg
+  | EndWindowDragMsg
   | MeasureTextReplyMsg
   | DisplayInfoReplyMsg
   | SurfaceCreatedMsg

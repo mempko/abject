@@ -14,6 +14,7 @@ import type {
   CreateSurfaceMsg,
   DrawMsg,
   SetSelectedTextMsg,
+  StartWindowDragMsg,
   AuthResultMsg,
 } from '../server/ws-protocol.js';
 
@@ -39,6 +40,18 @@ export class FrontendClient {
   private loginFormHandler: ((e: Event) => void) | null = null;
   private pendingMouseMove: FrontendToBackendMsg | null = null;
   private mouseMoveRafId = 0;
+  /** Client-side drag state for zero-latency window moves */
+  private localDragState?: {
+    surfaceId: string;
+    dragType: 'move' | 'resize';
+    startX: number;
+    startY: number;
+    startSurfaceX: number;
+    startSurfaceY: number;
+  };
+  /** Track last canvas-space mouse position for drag start */
+  private lastCanvasX = 0;
+  private lastCanvasY = 0;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -59,6 +72,7 @@ export class FrontendClient {
       this.compositor.clearAllSurfaces();
       this.focusedSurface = undefined;
       this.grabbedSurface = undefined;
+      this.localDragState = undefined;
       // Don't send ready yet — wait for auth status from server
     };
 
@@ -239,6 +253,8 @@ export class FrontendClient {
         break;
 
       case 'moveSurface':
+        // Ignore server-side move if we're locally dragging this surface
+        if (this.localDragState && this.localDragState.surfaceId === msg.surfaceId) break;
         this.compositor.moveSurface(msg.surfaceId, msg.x, msg.y);
         break;
 
@@ -283,6 +299,10 @@ export class FrontendClient {
           console.warn('[Frontend] Clipboard write failed:', err)
         );
         break;
+
+      case 'startWindowDrag':
+        this.handleStartWindowDrag(msg as StartWindowDragMsg);
+        break;
     }
   }
 
@@ -305,6 +325,44 @@ export class FrontendClient {
     for (const cmd of msg.commands) {
       this.compositor.draw(cmd as DrawCommand);
     }
+  }
+
+  private handleStartWindowDrag(msg: StartWindowDragMsg): void {
+    if (msg.dragType === 'move') {
+      // Enter client-side local drag mode for zero-latency window moves
+      const surface = this.compositor.getSurface(msg.surfaceId);
+      if (!surface) return;
+      this.localDragState = {
+        surfaceId: msg.surfaceId,
+        dragType: 'move',
+        startX: this.lastCanvasX,
+        startY: this.lastCanvasY,
+        startSurfaceX: surface.rect.x,
+        startSurfaceY: surface.rect.y,
+      };
+    }
+    // For resize drags: no local handling — server sends moveSurface/resizeSurface
+  }
+
+  private handleMouseUp(e: MouseEvent): void {
+    // If in local move drag, send final position to server and clean up
+    if (this.localDragState && this.localDragState.dragType === 'move') {
+      const surface = this.compositor.getSurface(this.localDragState.surfaceId);
+      if (surface) {
+        this.sendToBackend({
+          type: 'endWindowDrag',
+          surfaceId: this.localDragState.surfaceId,
+          x: surface.rect.x,
+          y: surface.rect.y,
+        } as FrontendToBackendMsg);
+      }
+      this.localDragState = undefined;
+      this.grabbedSurface = undefined;
+      return;
+    }
+
+    // Normal mouseup path
+    this.handleMouseEvent(e, 'mouseup');
   }
 
   private handleMeasureTextRequest(
@@ -346,7 +404,7 @@ export class FrontendClient {
       this.canvas.focus();
       this.handleMouseEvent(e, 'mousedown');
     });
-    this.canvas.addEventListener('mouseup', (e) => this.handleMouseEvent(e, 'mouseup'));
+    this.canvas.addEventListener('mouseup', (e) => this.handleMouseUp(e));
     this.canvas.addEventListener('mousemove', (e) => this.handleMouseMoveThrottled(e));
     this.canvas.addEventListener('wheel', (e) => this.handleWheelEvent(e));
 
@@ -366,6 +424,10 @@ export class FrontendClient {
     const x = e.clientX - canvasRect.left;
     const y = e.clientY - canvasRect.top;
 
+    // Track canvas-space mouse position for drag start reference
+    this.lastCanvasX = x;
+    this.lastCanvasY = y;
+
     // Hit test locally — compositor is local
     const hitSurface = this.compositor.surfaceAt(x, y);
     const grabbed = this.grabbedSurface
@@ -376,7 +438,9 @@ export class FrontendClient {
     const localX = surface ? x - surface.rect.x : x;
     const localY = surface ? y - surface.rect.y : y;
 
-    this.sendToBackend({
+    // For resize drags (grabbedSurface set, no local drag), include globalX/globalY
+    // to avoid stale local→global reconstruction on the server
+    const inputMsg: Record<string, unknown> = {
       type: 'input',
       inputType: type,
       surfaceId: surface?.id,
@@ -389,7 +453,14 @@ export class FrontendClient {
         alt: e.altKey,
         meta: e.metaKey,
       },
-    });
+    };
+
+    if (this.grabbedSurface && !this.localDragState) {
+      inputMsg.globalX = x;
+      inputMsg.globalY = y;
+    }
+
+    this.sendToBackend(inputMsg as unknown as FrontendToBackendMsg);
 
     if (type === 'mousedown' && surface) {
       this.grabbedSurface = surface.id;
@@ -402,6 +473,23 @@ export class FrontendClient {
   }
 
   private handleMouseMoveThrottled(e: MouseEvent): void {
+    // Client-side local move drag — move surface instantly, no server round-trip
+    if (this.localDragState && this.localDragState.dragType === 'move') {
+      const canvasRect = this.canvas.getBoundingClientRect();
+      const x = e.clientX - canvasRect.left;
+      const y = e.clientY - canvasRect.top;
+      this.lastCanvasX = x;
+      this.lastCanvasY = y;
+      const dx = x - this.localDragState.startX;
+      const dy = y - this.localDragState.startY;
+      this.compositor.moveSurface(
+        this.localDragState.surfaceId,
+        this.localDragState.startSurfaceX + dx,
+        this.localDragState.startSurfaceY + dy,
+      );
+      return;
+    }
+
     // During drag (grabbed surface), send immediately — throttling causes
     // jitter because surface positions change between capture and send.
     if (this.grabbedSurface) {
@@ -413,6 +501,8 @@ export class FrontendClient {
     const canvasRect = this.canvas.getBoundingClientRect();
     const x = e.clientX - canvasRect.left;
     const y = e.clientY - canvasRect.top;
+    this.lastCanvasX = x;
+    this.lastCanvasY = y;
 
     const hitSurface = this.compositor.surfaceAt(x, y);
     const surface = hitSurface;

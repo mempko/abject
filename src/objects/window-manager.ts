@@ -254,6 +254,23 @@ export class WindowManager extends Abject {
       await this.handleDragEnd(globalX, globalY);
     });
 
+    // Client-side move drag completed — update final position directly
+    this.on('clientDragEnd', async (msg: AbjectMessage) => {
+      const { surfaceId, x, y } = msg.payload as { surfaceId: string; x: number; y: number };
+      const info = this.windows.get(surfaceId);
+      if (info) {
+        info.rect.x = x;
+        info.rect.y = y;
+        // Notify WindowAbject of final rect so it can update its state
+        await this.send(
+          event(this.id, info.windowId, 'windowRect', {
+            x, y, width: info.rect.width, height: info.rect.height,
+          })
+        );
+      }
+      this.dragState = undefined;
+    });
+
     // Legacy: Event from UIServer on mousedown — raise the clicked window
     this.on('surfaceActivated', async (msg: AbjectMessage) => {
       const { surfaceId } = msg.payload as { surfaceId: string };
@@ -382,7 +399,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     surfaceId: string,
     localX: number,
     localY: number,
-  ): Promise<{ grab: boolean; minimize?: string }> {
+  ): Promise<{ grab: boolean; dragType?: 'move' | 'resize'; minimize?: string }> {
     const info = this.windows.get(surfaceId);
     console.log(`[DRAG-DEBUG] surfaceMouseDown surface=${surfaceId} found=${!!info} chromeless=${info?.chromeless} localY=${localY} titleBarHeight=${info?.titleBarHeight}`);
     if (!info) return { grab: false };
@@ -402,7 +419,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
         startMouseY: localY + info.rect.y,
         startRect: { ...info.rect },
       };
-      return { grab: true };
+      return { grab: true, dragType: 'resize' };
     }
 
     // Title bar: check close/minimize buttons before drag (non-chromeless windows)
@@ -429,7 +446,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
         startMouseY: localY + info.rect.y,
         startRect: { ...info.rect },
       };
-      return { grab: true };
+      return { grab: true, dragType: 'move' };
     }
 
     return { grab: false };

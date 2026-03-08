@@ -21,6 +21,7 @@ import type {
   FrontendToBackendMsg,
   FontMetricsMsg,
   InputMsg,
+  EndWindowDragMsg,
 } from './ws-protocol.js';
 import type { AuthConfig, SessionStore } from './auth.js';
 
@@ -408,20 +409,25 @@ export class BackendUI extends Abject {
     });
 
     // Two-phase drag: WindowAbject sends requestDrag when a chromeless+draggable
-    // window's empty area is clicked. We set the mouse grab and tell WindowManager
-    // to start the drag using the last known mouse position.
+    // window's empty area is clicked. We tell WindowManager to start the drag
+    // and the client to handle the move locally (zero latency).
     this.on('requestDrag', async (msg: AbjectMessage) => {
       const { surfaceId } = msg.payload as { surfaceId: string };
       if (!this.windowManagerId || !surfaceId) return;
       const state = this.surfaces.get(surfaceId);
       if (!state) return;
-      this.mouseGrabAbject = this.windowManagerId;
       this.send(event(this.id, this.windowManagerId,
         'startDrag', {
           surfaceId,
           globalX: this.lastMouseX,
           globalY: this.lastMouseY,
         }));
+      // Client handles the move drag locally
+      this.sendToFrontend({
+        type: 'startWindowDrag',
+        surfaceId,
+        dragType: 'move',
+      });
     });
 
     this.on('objectUnregistered', async (msg: AbjectMessage) => {
@@ -976,6 +982,10 @@ IMPORTANT:
         this.replayStateToFrontend();
         break;
 
+      case 'endWindowDrag':
+        this.handleEndWindowDrag(msg as EndWindowDragMsg);
+        break;
+
       case 'surfaceCreated':
         // Acknowledgment from frontend — no action needed
         break;
@@ -1018,13 +1028,14 @@ IMPORTANT:
       }
     }
 
-    // ── WindowManager grab: route drag events to WindowManager ──
+    // ── WindowManager grab: route drag events to WindowManager (resize only) ──
+    // Move drags are handled client-side; resize drags still go through the server.
     if (this.mouseGrabAbject) {
       if (msg.inputType === 'mousemove') {
-        // Reconstruct global coords from local + surface rect
+        // Prefer globalX/globalY from client (avoids stale local→global reconstruction)
         const state = msg.surfaceId ? this.surfaces.get(msg.surfaceId) : undefined;
-        const globalX = (msg.x ?? 0) + (state?.rect.x ?? 0);
-        const globalY = (msg.y ?? 0) + (state?.rect.y ?? 0);
+        const globalX = msg.globalX ?? ((msg.x ?? 0) + (state?.rect.x ?? 0));
+        const globalY = msg.globalY ?? ((msg.y ?? 0) + (state?.rect.y ?? 0));
         this.send(event(this.id, this.mouseGrabAbject, 'dragMove', {
           globalX, globalY,
         }));
@@ -1032,8 +1043,8 @@ IMPORTANT:
       }
       if (msg.inputType === 'mouseup') {
         const state = msg.surfaceId ? this.surfaces.get(msg.surfaceId) : undefined;
-        const globalX = (msg.x ?? 0) + (state?.rect.x ?? 0);
-        const globalY = (msg.y ?? 0) + (state?.rect.y ?? 0);
+        const globalX = msg.globalX ?? ((msg.x ?? 0) + (state?.rect.x ?? 0));
+        const globalY = msg.globalY ?? ((msg.y ?? 0) + (state?.rect.y ?? 0));
         this.send(event(this.id, this.mouseGrabAbject, 'dragEnd', {
           globalX, globalY,
         }));
@@ -1061,15 +1072,20 @@ IMPORTANT:
       if (state) {
         if (msg.inputType === 'mousedown' && this.windowManagerId) {
           console.log(`[DRAG-DEBUG] mousedown on surface=${msg.surfaceId} windowManagerId=${this.windowManagerId}`);
-          // ── Ctrl+click: immediately start window drag ──
+          // ── Ctrl+click: immediately start window drag (client-side move) ──
           if (msg.modifiers?.ctrl) {
-            this.mouseGrabAbject = this.windowManagerId;
             const globalX = (msg.x ?? 0) + (state.rect.x ?? 0);
             const globalY = (msg.y ?? 0) + (state.rect.y ?? 0);
             this.send(event(this.id, this.windowManagerId,
               'startDrag', {
                 surfaceId: msg.surfaceId, globalX, globalY,
               }));
+            // Tell client to handle the move drag locally (zero latency)
+            this.sendToFrontend({
+              type: 'startWindowDrag',
+              surfaceId: msg.surfaceId,
+              dragType: 'move',
+            });
             this.handleFocus(state.objectId, msg.surfaceId);
             return;
           }
@@ -1078,7 +1094,7 @@ IMPORTANT:
           const localX = msg.x ?? 0;
           const localY = msg.y ?? 0;
           try {
-            const reply = await this.request<{ grab: boolean; minimize?: string }>(
+            const reply = await this.request<{ grab: boolean; dragType?: 'move' | 'resize'; minimize?: string }>(
               request(this.id, this.windowManagerId,
                 'surfaceMouseDown', {
                   surfaceId: msg.surfaceId, localX, localY,
@@ -1091,10 +1107,20 @@ IMPORTANT:
               return;
             }
 
-            console.log(`[DRAG-DEBUG] WindowManager reply: grab=${reply.grab} minimize=${reply.minimize}`);
+            console.log(`[DRAG-DEBUG] WindowManager reply: grab=${reply.grab} dragType=${reply.dragType} minimize=${reply.minimize}`);
             if (reply.grab) {
-              // WindowManager claimed the grab — it handles drag/resize
-              this.mouseGrabAbject = this.windowManagerId;
+              // Tell client about the drag start
+              this.sendToFrontend({
+                type: 'startWindowDrag',
+                surfaceId: msg.surfaceId,
+                dragType: reply.dragType ?? 'move',
+              });
+
+              if (reply.dragType === 'resize') {
+                // Resize drags still go through server (needs content re-rendering)
+                this.mouseGrabAbject = this.windowManagerId;
+              }
+              // Move drags: no mouseGrabAbject — client handles it locally
               this.handleFocus(state.objectId, msg.surfaceId);
               return;
             }
@@ -1112,6 +1138,31 @@ IMPORTANT:
         await this.sendInputEvent(state.objectId, inputEvent);
       }
     }
+  }
+
+  // ── Client-side drag end ────────────────────────────────────────────
+
+  /**
+   * Handle endWindowDrag from client — client did the move locally,
+   * now sync final position to server state and WindowManager.
+   */
+  private handleEndWindowDrag(msg: EndWindowDragMsg): void {
+    const state = this.surfaces.get(msg.surfaceId);
+    if (state) {
+      state.rect.x = msg.x;
+      state.rect.y = msg.y;
+    }
+
+    // Notify WindowManager of the final position so it updates its windows map
+    if (this.windowManagerId) {
+      this.send(event(this.id, this.windowManagerId, 'clientDragEnd', {
+        surfaceId: msg.surfaceId,
+        x: msg.x,
+        y: msg.y,
+      }));
+    }
+
+    // Do NOT send moveSurface back to client — it already has the correct position
   }
 
   // ── State replay ────────────────────────────────────────────────────
