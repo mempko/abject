@@ -359,6 +359,78 @@ export class Chat extends Abject {
         }
       }
 
+      case 'clone': {
+        // Clone a clonable object (local or remote) — Factory searches all registries
+        const qualifiedName = action.object as string;
+        if (!qualifiedName) return { success: false, error: 'Missing object name or qualified name (peer.workspace.ObjectName)' };
+
+        try {
+          // Resolve qualified name to an AbjectId via remote registry listing
+          const parts = qualifiedName.split('.');
+          let objectId: AbjectId | null = null;
+          let objectName = qualifiedName;
+
+          if (parts.length >= 3) {
+            // Qualified name: peer.workspace.ObjectName
+            const peerName = parts[0];
+            const wsName = parts[1];
+            objectName = parts.slice(2).join('.');
+
+            const wsrId = await this.discoverDep('WorkspaceShareRegistry');
+            if (!wsrId) return { success: false, error: 'WorkspaceShareRegistry not found' };
+
+            const workspaces = await this.request<DiscoveredWorkspace[]>(
+              request(this.id, wsrId, 'getDiscoveredWorkspaces', {})
+            );
+            const ws = workspaces.find(w => w.ownerName === peerName && w.name === wsName);
+            if (!ws) return { success: false, error: `Workspace "${peerName}.${wsName}" not found in discovered workspaces` };
+
+            const remoteObjects = await this.request<ObjectRegistration[]>(
+              request(this.id, ws.registryId as AbjectId, 'list', {})
+            );
+            const target = remoteObjects.find(o => (o.name ?? o.manifest.name) === objectName);
+            if (!target) return { success: false, error: `Object "${objectName}" not found in ${peerName}.${wsName}` };
+            objectId = target.id;
+          } else {
+            // Simple name or AbjectId — resolve locally
+            objectId = await this.resolveObject(qualifiedName);
+          }
+
+          if (!objectId) return { success: false, error: `Object "${qualifiedName}" not found` };
+
+          // Factory.clone searches local then remote registries automatically
+          const factoryId = await this.requireDep('Factory');
+          const result = await this.request<{ objectId: AbjectId }>(
+            request(this.id, factoryId, 'clone', { objectId, registryHint: this.registryId })
+          );
+
+          // Persist to AbjectStore so it survives reload
+          try {
+            const storeResults = await this.request<Array<{ id: AbjectId }>>(
+              request(this.id, this.registryId!, 'discover', { name: 'AbjectStore' })
+            );
+            if (storeResults.length > 0) {
+              // Look up the freshly cloned object's registration for manifest/source
+              const reg = await this.request<ObjectRegistration | null>(
+                request(this.id, this.registryId!, 'lookup', { objectId: result.objectId })
+              );
+              if (reg?.source) {
+                await this.request(request(this.id, storeResults[0].id, 'save', {
+                  objectId: result.objectId,
+                  manifest: reg.manifest,
+                  source: reg.source,
+                  owner: this.id,
+                }));
+              }
+            }
+          } catch { /* AbjectStore may not exist */ }
+
+          return { success: true, data: { clonedObjectId: result.objectId, name: objectName } };
+        } catch (err) {
+          return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+      }
+
       case 'delegate': {
         // Delegate a task to another registered agent
         try {
@@ -441,6 +513,9 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 - **modify**: Modify an existing object via ObjectCreator.
   \`{ "action": "modify", "object": "<name or id>", "description": "Add a reset button that clears the counter" }\`
   Use the \`[id: ...]\` from the object list for reliable targeting.
+- **clone**: Clone a clonable object from a remote peer's workspace into your local workspace.
+  \`{ "action": "clone", "object": "peer.workspace.ObjectName" }\`
+  Use the qualified name shown next to "(clonable)" objects in Connected Peers.
 
 ### Agent Delegation
 - **delegate**: Delegate a task to another registered agent.
@@ -811,7 +886,7 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
       }
       this.remotePeerContext = lines.join('\n');
       if (lines.length > 0) {
-        this.remotePeerContext += "\n\nGenerated code should use this.find('peer.workspace.ObjectName') — never hardcode UUIDs.";
+        this.remotePeerContext += "\n\nGenerated code should use this.find('peer.workspace.ObjectName') — never hardcode UUIDs. To copy a clonable object locally, use the clone action.";
       }
     } catch {
       // Best-effort — leave remotePeerContext unchanged

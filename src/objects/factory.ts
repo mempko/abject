@@ -97,12 +97,18 @@ export class Factory extends Abject {
               },
               {
                 name: 'clone',
-                description: 'Clone an existing object (new instance with same manifest/source)',
+                description: 'Clone an existing object (new instance with same manifest/source). Searches local registry first, then remote workspace registries. Pass registryHint to control which registry the clone lands in.',
                 parameters: [
                   {
                     name: 'objectId',
                     type: { kind: 'primitive', primitive: 'string' },
                     description: 'The ID of the object to clone',
+                  },
+                  {
+                    name: 'registryHint',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Optional registry ID to register the clone in (e.g. workspace registry). Defaults to global registry.',
+                    optional: true,
                   },
                 ],
                 returns: { kind: 'reference', reference: 'SpawnResult' },
@@ -158,8 +164,8 @@ export class Factory extends Abject {
     });
 
     this.on('clone', async (msg: AbjectMessage) => {
-      const { objectId } = msg.payload as { objectId: AbjectId };
-      return this.clone(objectId);
+      const { objectId, registryHint } = msg.payload as { objectId: AbjectId; registryHint?: AbjectId };
+      return this.clone(objectId, registryHint);
     });
 
     this.on('respawn', async (msg: AbjectMessage) => {
@@ -189,7 +195,7 @@ export class Factory extends Abject {
 ### Methods
 - \`spawn({ manifest, source?, code?, owner?, parentId? })\` — Spawn a new object. If a constructor is registered for the manifest name, uses that. If source is provided and manifest.tags includes 'composite', creates a CompositeAbject from a JSON CompositeSpec. If source is provided without the composite tag, creates a ScriptableAbject. Returns { objectId, status }.
 - \`kill({ objectId })\` — Stop and destroy an object. Unregisters from Registry, removes from Supervisor, and stops the object. Returns boolean.
-- \`clone({ objectId })\` — Clone an existing object (new instance with same manifest/source but new ID). Returns { objectId, status }. Works for CompositeAbjects — the clone gets fresh children with new IDs.
+- \`clone({ objectId, registryHint? })\` — Clone an existing object (new instance with same manifest/source but new ID). Returns { objectId, status }. Works for CompositeAbjects — the clone gets fresh children with new IDs. Searches local registry first, then remote workspace registries. Pass \`registryHint\` (a registry AbjectId) to register the clone in a specific registry (e.g. workspace registry) instead of the global one.
 - \`respawn({ objectId, constructorName, parentId? })\` — Kill and re-create an object with the same ID. Used by Supervisor for restart.
 - \`registerConstructor(name, factory)\` — Register a constructor function for a named object type.
 
@@ -260,15 +266,21 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
   /**
    * Clone an existing object — creates a new instance with the same manifest/source but a new ID.
    */
-  async clone(objectId: AbjectId): Promise<SpawnResult> {
+  async clone(objectId: AbjectId, registryHint?: AbjectId): Promise<SpawnResult> {
     require(this._factoryBus !== undefined, 'Factory must have a message bus');
     require(this._factoryRegistryId !== undefined, 'Factory must have a registry');
 
-    // Look up registration from Registry
-    const reg = await this.request<ObjectRegistration | null>(
+    // Search local registry first
+    let reg = await this.request<ObjectRegistration | null>(
       request(this.id, this._factoryRegistryId!, 'lookup', { objectId })
     );
-    require(reg !== null, `Object '${objectId}' not found in registry`);
+
+    // If not found locally, search remote workspace registries
+    if (!reg) {
+      reg = await this.findInRemoteRegistries(objectId);
+    }
+
+    require(reg !== null, `Object '${objectId}' not found in any registry`);
 
     // Delegate to spawn with the same manifest and source
     const spawnReq: SpawnRequest = { manifest: reg!.manifest };
@@ -276,7 +288,35 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
       spawnReq.source = reg!.source;
       spawnReq.owner = reg!.owner;
     }
+    if (registryHint) {
+      spawnReq.registryHint = registryHint;
+    }
     return this.spawn(spawnReq);
+  }
+
+  /**
+   * Search remote workspace registries for an object by ID.
+   */
+  private async findInRemoteRegistries(objectId: AbjectId): Promise<ObjectRegistration | null> {
+    try {
+      const wsrId = await this.discoverDep('WorkspaceShareRegistry');
+      if (!wsrId) return null;
+
+      const workspaces = await this.request<Array<{ registryId: string }>>(
+        request(this.id, wsrId, 'getDiscoveredWorkspaces', {})
+      );
+
+      for (const ws of workspaces) {
+        try {
+          const reg = await this.request<ObjectRegistration | null>(
+            request(this.id, ws.registryId as AbjectId, 'lookup', { objectId })
+          );
+          if (reg) return reg;
+        } catch { /* remote registry may be unreachable */ }
+      }
+    } catch { /* WorkspaceShareRegistry may not exist */ }
+
+    return null;
   }
 
   /**

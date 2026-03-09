@@ -1217,7 +1217,7 @@ export class RegistryBrowser extends Abject {
 
     try {
       await this.request(request(this.id, this.factoryId,
-        'clone', { objectId }));
+        'clone', { objectId, registryHint: this.registryId }));
     } catch (err) {
       // Best-effort: show error in detail view if available
       if (this.msgResponseId) {

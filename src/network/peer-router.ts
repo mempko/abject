@@ -57,6 +57,9 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   /** Remote peer TypeId/well-known → UUID mappings: key = `${peerId}:${typeIdOrWellKnown}` */
   private remoteWellKnown: Map<string, AbjectId> = new Map();
 
+  /** NAT table: local objectId → Map<peerId, expiryTimestamp> */
+  private connTrack: Map<AbjectId, Map<PeerId, number>> = new Map();
+
   /** Inbound permission cache */
   private permissionCache: Map<AbjectId, PermissionCacheEntry> = new Map();
 
@@ -371,6 +374,8 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       // Filter list replies to enforce exposed-objects policy
       const outMsg = this.filterOutboundReply(message);
       await transport.send(outMsg);
+      // NAT-like: record that this local object talked to this peer
+      this.trackOutboundConnection(message.routing.from as AbjectId, route.nextHop);
       return 'drop'; // We handled delivery
     } catch (err) {
       console.error(`[PeerRouter] Failed to forward message to peer ${route.nextHop.slice(0, 16)}:`, err);
@@ -395,6 +400,19 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       .filter(item => allowed.has(item.id as AbjectId));
 
     return { ...msg, payload: filtered };
+  }
+
+  /**
+   * Record that a local object sent a message to a remote peer.
+   * Enables NAT-like return path: the peer can send back to this object.
+   */
+  private trackOutboundConnection(localObjectId: AbjectId, remotePeerId: PeerId): void {
+    let peers = this.connTrack.get(localObjectId);
+    if (!peers) {
+      peers = new Map();
+      this.connTrack.set(localObjectId, peers);
+    }
+    peers.set(remotePeerId, Date.now() + ROUTE_TTL);
   }
 
   // ==========================================================================
@@ -510,6 +528,18 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       return true;
     }
 
+    // NAT-like: allow return traffic if this object previously talked to this peer
+    const trackedPeers = this.connTrack.get(targetId);
+    if (trackedPeers) {
+      const expiry = trackedPeers.get(fromPeerId);
+      if (expiry && Date.now() < expiry) {
+        return true;
+      }
+      // Clean up expired entry
+      if (expiry) trackedPeers.delete(fromPeerId);
+      if (trackedPeers.size === 0) this.connTrack.delete(targetId);
+    }
+
     // Check permission cache
     const cached = this.permissionCache.get(targetId);
     if (cached && Date.now() - cached.cachedAt < PERMISSION_CACHE_TTL) {
@@ -620,6 +650,11 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         this.routes.delete(objectId);
         count++;
       }
+    }
+    // Clean up connection tracking entries for this peer
+    for (const [objId, peers] of this.connTrack) {
+      peers.delete(peerId as PeerId);
+      if (peers.size === 0) this.connTrack.delete(objId);
     }
     // Clean up well-known and typeId mappings for this peer
     for (const key of this.remoteWellKnown.keys()) {

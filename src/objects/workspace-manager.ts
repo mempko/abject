@@ -170,6 +170,7 @@ export class WorkspaceManager extends Abject {
                 returns: { kind: 'object', properties: {
                   id: { kind: 'primitive', primitive: 'string' },
                   name: { kind: 'primitive', primitive: 'string' },
+                  registryId: { kind: 'primitive', primitive: 'string' },
                 } },
               },
               {
@@ -665,11 +666,11 @@ export class WorkspaceManager extends Abject {
     }));
   }
 
-  getActiveWorkspace(): { id: string; name: string } | null {
+  getActiveWorkspace(): { id: string; name: string; registryId: string } | null {
     if (!this.activeWorkspaceId) return null;
     const ws = this.workspaces.get(this.activeWorkspaceId);
     if (!ws) return null;
-    return { id: this.activeWorkspaceId, name: ws.name };
+    return { id: this.activeWorkspaceId, name: ws.name, registryId: ws.registryId };
   }
 
   async renameWorkspace(workspaceId: string, name: string): Promise<boolean> {

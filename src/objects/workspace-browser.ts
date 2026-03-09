@@ -606,6 +606,20 @@ export class WorkspaceBrowser extends Abject {
     }
     if (!this.factoryId || !ws.registryId) return;
 
+    // Find active workspace registry so clones land in the right place
+    let localRegistryId: AbjectId | undefined;
+    try {
+      const wmId = await this.discoverDep('WorkspaceManager');
+      if (wmId) {
+        const activeWs = await this.request<{ id: string; name: string; registryId: string } | null>(
+          request(this.id, wmId, 'getActiveWorkspace', {})
+        );
+        if (activeWs?.registryId) {
+          localRegistryId = activeWs.registryId as AbjectId;
+        }
+      }
+    } catch { /* best effort */ }
+
     try {
       const result = await this.request<SpawnResult>(
         request(this.id, this.factoryId, 'spawn', {
@@ -613,6 +627,7 @@ export class WorkspaceBrowser extends Abject {
             name: 'RegistryBrowser', description: '', version: '1.0.0',
             requiredCapabilities: [], tags: ['system'],
           },
+          registryHint: localRegistryId,
         })
       );
 
