@@ -347,6 +347,25 @@ export class ScriptableAbject extends Abject {
     );
   }
 
+  /**
+   * Send an event (fire-and-forget) to another object.
+   * The `to` parameter accepts a Promise (from this.dep()) or a plain ID.
+   */
+  async emit(to: AbjectId | string | Promise<AbjectId>, eventName: string, payload?: unknown): Promise<void> {
+    const resolvedTo = await to;
+    await this.send(event(this.id, resolvedTo as AbjectId, eventName, payload ?? {}));
+  }
+
+  /**
+   * Observe another object — call addDependent so this object receives
+   * 'changed' events from the target. Define a 'changed' handler in your
+   * source to process them.
+   */
+  async observe(target: AbjectId | string | Promise<AbjectId>): Promise<void> {
+    const resolvedTarget = await target;
+    await this.request(request(this.id, resolvedTarget as AbjectId, 'addDependent', {}));
+  }
+
   // ── Compilation ───────────────────────────────────────────────────
 
   /**

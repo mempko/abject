@@ -271,6 +271,23 @@ export class SharedState extends Abject {
         this.sendFullSyncToPeer(name, map, fromPeerId);
       }
     });
+
+    // Auto-sync subscribed state names when a new peer connects
+    this.on('changed', async (msg: AbjectMessage) => {
+      const { aspect } = msg.payload as { aspect: string; value?: unknown };
+      if (aspect !== 'contactConnected' && aspect !== 'networkPeerConnected') return;
+
+      // Only request sync for state names that have local subscribers
+      for (const [name, subs] of this.subscribers) {
+        if (subs.size === 0) continue;
+        if (!this.stateMaps.has(name)) continue;
+        // Request full sync from remote peers for this state name
+        this.send(createEvent(this.id, SHARED_STATE_ID, '_requestSync', {
+          name,
+          fromPeerId: this.localPeerId,
+        })).catch(() => { /* best-effort */ });
+      }
+    });
   }
 
   protected override async onInit(): Promise<void> {
@@ -366,7 +383,14 @@ export class SharedState extends Abject {
   // ==========================================================================
 
   private notifySubscribers(name: string, key: string, value: unknown): void {
-    this.changed('stateChanged', { name, key, value });
+    const subs = this.subscribers.get(name);
+    if (!subs || subs.size === 0) return;
+    for (const subId of subs) {
+      this.send(createEvent(this.id, subId, 'changed', {
+        aspect: 'stateChanged',
+        value: { name, key, value },
+      })).catch(() => { /* best-effort */ });
+    }
   }
 
   private broadcastEntry(name: string, key: string, entry: LWWEntry): void {
@@ -408,10 +432,32 @@ export class SharedState extends Abject {
 
   const all = await call(ssId, 'getAll', { name: 'my-state' });
 
-### Subscribe to changes
+### Subscribe to changes and receive events
 
+  // 1. Subscribe to a named state (scoped — only changes to 'my-state' are sent)
   await call(ssId, 'subscribe', { name: 'my-state' });
-  // Listen for 'stateChanged' events with { name, key, value }
+
+  // 2. Define a 'changed' handler in your source to receive events:
+  //
+  //   changed(msg) {
+  //     const { aspect, value } = msg.payload;
+  //     if (aspect === 'stateChanged') {
+  //       const { name, key, value: newVal } = value;
+  //       // React to the change...
+  //     }
+  //   }
+  //
+  // The event payload shape is:
+  //   { aspect: 'stateChanged', value: { name: string, key: string, value: any } }
+
+### Send events to other objects
+
+  await this.emit(targetId, 'myEvent', { data: 123 });
+
+### Observe another object (receive its 'changed' events)
+
+  await this.observe(ssId);
+  // Now your 'changed' handler will receive events from that object
 
 ### Delete a key
 
@@ -419,6 +465,7 @@ export class SharedState extends Abject {
 
 ### IMPORTANT
 - State syncs automatically to connected peers via PeerTransport
+- When a new peer connects, subscribed state is automatically synced
 - Conflicts resolved by Last-Writer-Wins (highest timestamp, then highest peerId)
 - Create the state instance on both peers before they connect`;
   }
