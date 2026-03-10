@@ -318,6 +318,12 @@ async function main(): Promise<void> {
   // Set the signaling relay as fallback for PeerRegistry when no signaling server is available
   peerRegistryObj.setSignalingRelay(signalingRelayObj);
 
+  // Set up auth gate BEFORE GlobalSettings spawns, so applySavedAuthConfig()
+  // can update the authConfig during its onInit()
+  const authConfig = loadAuthConfig();
+  const sessionStore = new SessionStore();
+  backendUI.setAuthGate(authConfig, sessionStore);
+
   const globalSettingsId = await supervisedSpawn('GlobalSettings', 'permanent', systemTypeId('GlobalSettings'));
   const peerNetworkId = await supervisedSpawn('PeerNetwork', 'permanent', systemTypeId('PeerNetwork'));
   const globalToolbarId = await supervisedSpawn('GlobalToolbar', 'permanent', systemTypeId('GlobalToolbar'));
@@ -376,11 +382,6 @@ async function main(): Promise<void> {
       threshold: 128,
     },
   });
-
-  // Auth gate (always create SessionStore so runtime updateAuth works)
-  const authConfig = loadAuthConfig();
-  const sessionStore = new SessionStore();
-  backendUI.setAuthGate(authConfig, sessionStore);
 
   wsServer.onConnection((ws) => {
     if (authConfig.enabled) {
