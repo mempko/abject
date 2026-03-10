@@ -42,6 +42,7 @@ import { WebBrowserViewer } from '../src/objects/web-browser-viewer.js';
 import { Settings } from '../src/objects/settings.js';
 import { Taskbar } from '../src/objects/taskbar.js';
 import { RegistryBrowser } from '../src/objects/registry-browser.js';
+import { ObjectBrowser } from '../src/objects/object-browser.js';
 import { WidgetManager } from '../src/objects/widget-manager.js';
 import { ThemeAbject } from '../src/objects/theme.js';
 import { WindowManager } from '../src/objects/window-manager.js';
@@ -183,6 +184,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('AbjectEditor', () => new AbjectEditor());
   runtime.objectFactory.registerConstructor('Settings', () => new Settings());
   runtime.objectFactory.registerConstructor('RegistryBrowser', () => new RegistryBrowser());
+  runtime.objectFactory.registerConstructor('ObjectBrowser', () => new ObjectBrowser());
   runtime.objectFactory.registerConstructor('JobManager', () => new JobManager());
   runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
   runtime.objectFactory.registerConstructor('Chat', () => new Chat());
@@ -221,7 +223,7 @@ async function main(): Promise<void> {
       'LLMObject', 'HttpClient', 'Timer',
       'Clipboard', 'Console', 'FileSystem',
       // Global services
-      'GlobalSettings', 'PeerNetwork', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
+      'GlobalSettings', 'PeerNetwork', 'ObjectBrowser', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
       // Per-workspace objects (use workspace registry via registryHint)
       'AbjectStore', 'Theme', 'Settings', 'RegistryBrowser',
       'JobManager', 'JobBrowser', 'ObjectManager',
@@ -319,6 +321,7 @@ async function main(): Promise<void> {
   const globalSettingsId = await supervisedSpawn('GlobalSettings', 'permanent', systemTypeId('GlobalSettings'));
   const peerNetworkId = await supervisedSpawn('PeerNetwork', 'permanent', systemTypeId('PeerNetwork'));
   const globalToolbarId = await supervisedSpawn('GlobalToolbar', 'permanent', systemTypeId('GlobalToolbar'));
+  const objectBrowserId = await supervisedSpawn('ObjectBrowser', 'permanent', systemTypeId('ObjectBrowser'));
 
   const proxyGenId = await supervisedSpawn('ProxyGenerator', 'permanent', systemTypeId('ProxyGenerator'));
   const negotiatorId = await supervisedSpawn('Negotiator', 'permanent', systemTypeId('Negotiator'));
@@ -351,7 +354,7 @@ async function main(): Promise<void> {
     identityId, peerRegistryId, remoteRegistryId, peerRouterId,
     signalingRelayId, peerDiscoveryId,
     workspaceShareRegistryId, workspaceBrowserId,
-    globalSettingsId, peerNetworkId, globalToolbarId,
+    globalSettingsId, peerNetworkId, globalToolbarId, objectBrowserId,
     proxyGenId, negotiatorId,
     workspaceSwitcherId, workspaceManagerId,
   ];

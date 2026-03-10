@@ -20,11 +20,13 @@ export class GlobalToolbar extends Abject {
   private widgetManagerId?: AbjectId;
   private globalSettingsId?: AbjectId;
   private peerNetworkId?: AbjectId;
+  private objectBrowserId?: AbjectId;
 
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
   private settingsBtnId?: AbjectId;
   private networkBtnId?: AbjectId;
+  private explorerBtnId?: AbjectId;
 
   /** Current window height (queried by WorkspaceManager for Taskbar positioning) */
   private currentHeight = 0;
@@ -133,6 +135,22 @@ export class GlobalToolbar extends Abject {
         }
         return;
       }
+
+      // Explorer button
+      if (fromId === this.explorerBtnId) {
+        if (!this.objectBrowserId) {
+          this.objectBrowserId = await this.discoverDep('ObjectBrowser') ?? undefined;
+        }
+        if (this.objectBrowserId) {
+          try {
+            await this.request(request(this.id, this.objectBrowserId,
+              'show', {}));
+          } catch (err) {
+            console.warn('[GlobalToolbar] Failed to show ObjectBrowser:', err);
+          }
+        }
+        return;
+      }
     });
   }
 
@@ -150,6 +168,7 @@ export class GlobalToolbar extends Abject {
     // Reset button tracking
     this.settingsBtnId = undefined;
     this.networkBtnId = undefined;
+    this.explorerBtnId = undefined;
     this.rootLayoutId = undefined;
 
     const btnW = 100;
@@ -158,8 +177,8 @@ export class GlobalToolbar extends Abject {
     const padding = 16;
     const spacing = 6;
 
-    // Height: padding + label + spacing + btn1 + spacing + btn2 + padding
-    const barHeight = padding + labelH + spacing + btnH + spacing + btnH + padding;
+    // Height: padding + label + spacing + btn1 + spacing + btn2 + spacing + btn3 + padding
+    const barHeight = padding + labelH + (spacing + btnH) * 3 + padding;
     const barWidth = btnW + padding * 2;
 
     this.currentHeight = barHeight;
@@ -218,6 +237,7 @@ export class GlobalToolbar extends Abject {
 
     this.settingsBtnId = await addBtn('Settings');
     this.networkBtnId = await addBtn('Network');
+    this.explorerBtnId = await addBtn('Explorer');
 
     return true;
   }
@@ -235,6 +255,7 @@ export class GlobalToolbar extends Abject {
     this.rootLayoutId = undefined;
     this.settingsBtnId = undefined;
     this.networkBtnId = undefined;
+    this.explorerBtnId = undefined;
     return true;
   }
 }

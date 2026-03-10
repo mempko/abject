@@ -403,6 +403,7 @@ export class Taskbar extends Abject {
 
     // Reset all button tracking since window is destroyed and rebuilt
     this.registryBtnId = undefined;
+
     this.chatBtnId = undefined;
     this.jobsBtnId = undefined;
     this.objectManagerBtnId = undefined;
@@ -520,7 +521,8 @@ export class Taskbar extends Abject {
     if (this.webBrowserViewerId) visPromises.push(isVisible(this.webBrowserViewerId));
     const visResults = await Promise.all(visPromises);
     const [registryVis, chatVis, jobsVis, objectManagerVis] = visResults;
-    const browserViewerVis = this.webBrowserViewerId ? visResults[4] : false;
+    let visIdx = 4;
+    const browserViewerVis = this.webBrowserViewerId ? visResults[visIdx++] : false;
 
     console.debug(`[Taskbar] visibility: registry=${registryVis} chat=${chatVis} jobs=${jobsVis} processes=${objectManagerVis} browser=${browserViewerVis}`);
 
@@ -567,6 +569,7 @@ export class Taskbar extends Abject {
     this.windowId = undefined;
     this.rootLayoutId = undefined;
     this.registryBtnId = undefined;
+
     this.chatBtnId = undefined;
     this.jobsBtnId = undefined;
     this.objectManagerBtnId = undefined;
