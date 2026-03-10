@@ -32,7 +32,7 @@ const WINDOW_MANAGER_INTERFACE = 'abjects:window-manager' as InterfaceId;
 
 const SETTINGS_INTERFACE = 'abjects:settings' as InterfaceId;
 const CHAT_INTERFACE = 'abjects:chat' as InterfaceId;
-const REGISTRY_BROWSER_INTERFACE = 'abjects:registry-browser' as InterfaceId;
+const APP_EXPLORER_INTERFACE = 'abjects:app-explorer' as InterfaceId;
 const JOB_BROWSER_INTERFACE = 'abjects:job-browser' as InterfaceId;
 const OBJECT_MANAGER_INTERFACE = 'abjects:object-manager' as InterfaceId;
 const WORKSPACE_SWITCHER_INTERFACE = 'abjects:workspace-switcher' as InterfaceId;
@@ -44,7 +44,7 @@ const STORAGE_KEY_ACTIVE = 'workspaces:active';
 /** Per-workspace object names spawned by WorkspaceManager. */
 /** Per-workspace objects in dependency order (matches original bootstrap). */
 const PER_WORKSPACE_OBJECTS = [
-  'AbjectStore', 'SharedState', 'FileTransfer', 'MediaStream', 'Theme', 'Settings', 'RegistryBrowser',
+  'AbjectStore', 'SharedState', 'FileTransfer', 'MediaStream', 'Theme', 'Settings', 'AppExplorer',
   'JobManager', 'JobBrowser', 'AgentAbject', 'ObjectManager', 'WebBrowserViewer', 'Chat', 'WebAgent', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
 ] as const;
 
@@ -938,7 +938,7 @@ export class WorkspaceManager extends Abject {
     );
 
     // Register the global registry in the workspace registry as "SystemRegistry"
-    // so workspace objects (e.g. RegistryBrowser) can discover and query it
+    // so workspace objects (e.g. AppExplorer) can discover and query it
     await this.request(
       request(this.id, wsRegistryId, 'register', {
         objectId: this.globalRegistryId!,
@@ -994,7 +994,7 @@ export class WorkspaceManager extends Abject {
     // Map object names to their interface IDs for UI object tracking
     const uiIfaceMap: Record<string, InterfaceId> = {
       Settings: SETTINGS_INTERFACE,
-      RegistryBrowser: REGISTRY_BROWSER_INTERFACE,
+      AppExplorer: APP_EXPLORER_INTERFACE,
       JobBrowser: JOB_BROWSER_INTERFACE,
       ObjectManager: OBJECT_MANAGER_INTERFACE,
       Chat: CHAT_INTERFACE,

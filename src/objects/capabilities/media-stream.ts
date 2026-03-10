@@ -132,7 +132,7 @@ export class MediaStreamCapability extends Abject {
         providedCapabilities: [
           Capabilities.MEDIA_STREAM,
         ],
-        tags: ['capability', 'media-stream'],
+        tags: ['system', 'capability', 'media-stream'],
       },
     });
     this.setupHandlers();

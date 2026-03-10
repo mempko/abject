@@ -16,13 +16,10 @@ const WORKSPACE_SHARE_REGISTRY_INTERFACE: InterfaceId = 'abjects:workspace-share
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
 const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
-const FACTORY_INTERFACE: InterfaceId = 'abjects:factory';
-const REGISTRY_BROWSER_INTERFACE: InterfaceId = 'abjects:registry-browser';
 
 export class WorkspaceBrowser extends Abject {
   private widgetManagerId?: AbjectId;
   private shareRegistryId?: AbjectId;
-  private factoryId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
   private refreshBtnId?: AbjectId;
@@ -84,7 +81,6 @@ export class WorkspaceBrowser extends Abject {
   protected override async onInit(): Promise<void> {
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.shareRegistryId = await this.discoverDep('WorkspaceShareRegistry') ?? undefined;
-    this.factoryId = await this.discoverDep('Factory') ?? undefined;
 
     // Subscribe to WSR events for auto-refresh on new discoveries
     if (this.shareRegistryId) {
@@ -142,7 +138,7 @@ export class WorkspaceBrowser extends Abject {
         return;
       }
 
-      // Browse button click — open remote RegistryBrowser
+      // Browse button click — open ObjectBrowser scoped to remote workspace
       const ws = this.browseButtons.get(fromId);
       if (ws && aspect === 'click') {
         await this.openRemoteBrowser(ws);
@@ -598,53 +594,33 @@ export class WorkspaceBrowser extends Abject {
   }
 
   /**
-   * Spawn a RegistryBrowser, configure it for remote mode, and show it.
+   * Open AppExplorer in remote mode for the given workspace.
    */
   private async openRemoteBrowser(ws: DiscoveredWorkspace): Promise<void> {
-    if (!this.factoryId) {
-      this.factoryId = await this.discoverDep('Factory') ?? undefined;
-    }
-    if (!this.factoryId || !ws.registryId) return;
-
-    // Find active workspace registry so clones land in the right place
-    let localRegistryId: AbjectId | undefined;
-    try {
-      const wmId = await this.discoverDep('WorkspaceManager');
-      if (wmId) {
-        const activeWs = await this.request<{ id: string; name: string; registryId: string } | null>(
-          request(this.id, wmId, 'getActiveWorkspace', {})
-        );
-        if (activeWs?.registryId) {
-          localRegistryId = activeWs.registryId as AbjectId;
-        }
-      }
-    } catch { /* best effort */ }
+    if (!ws.registryId) return;
 
     try {
+      const factoryId = await this.discoverDep('Factory');
+      if (!factoryId) return;
+
       const result = await this.request<SpawnResult>(
-        request(this.id, this.factoryId, 'spawn', {
+        request(this.id, factoryId, 'spawn', {
           manifest: {
-            name: 'RegistryBrowser', description: '', version: '1.0.0',
-            requiredCapabilities: [], tags: ['system'],
+            name: 'AppExplorer',
+            description: '',
+            version: '1.0.0',
+            requiredCapabilities: [],
+            tags: ['system'],
           },
-          registryHint: localRegistryId,
         })
       );
 
-      const browserId = result.objectId;
-
-      // Configure for remote mode
       await this.request(
-        request(this.id, browserId, 'browseRemote', {
+        request(this.id, result.objectId, 'browseRemote', {
           registryId: ws.registryId,
           peerId: ws.ownerPeerId,
-          label: ws.name,
+          label: `${ws.name} (${ws.ownerName || ws.ownerPeerId.slice(0, 8)})`,
         })
-      );
-
-      // Show the browser
-      await this.request(
-        request(this.id, browserId, 'show', {})
       );
     } catch (err) {
       console.warn('[WorkspaceBrowser] Failed to open remote browser:', err);

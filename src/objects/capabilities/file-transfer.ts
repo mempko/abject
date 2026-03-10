@@ -149,7 +149,7 @@ export class FileTransfer extends Abject {
           Capabilities.FILE_TRANSFER_SEND,
           Capabilities.FILE_TRANSFER_RECEIVE,
         ],
-        tags: ['capability', 'file-transfer'],
+        tags: ['system', 'capability', 'file-transfer'],
       },
     });
     this.setupHandlers();

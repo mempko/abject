@@ -25,7 +25,8 @@ export { Negotiator, NEGOTIATOR_ID } from './protocol/negotiator.js';
 export { HealthMonitor, HEALTH_MONITOR_ID } from './protocol/health-monitor.js';
 export { Settings, SETTINGS_ID } from './objects/settings.js';
 export { Taskbar, TASKBAR_ID } from './objects/taskbar.js';
-export { RegistryBrowser, REGISTRY_BROWSER_ID } from './objects/registry-browser.js';
+export { AppExplorer, APP_EXPLORER_ID } from './objects/app-explorer.js';
+export { ObjectBrowser, OBJECT_BROWSER_ID } from './objects/object-browser.js';
 export { WidgetManager, WIDGET_MANAGER_ID } from './objects/widget-manager.js';
 export { ThemeAbject, THEME_ID } from './objects/theme.js';
 export { WindowManager, WINDOW_MANAGER_ID } from './objects/window-manager.js';
@@ -81,6 +82,10 @@ export type { LayoutConfig, LayoutMargins, ChildRect } from './objects/widgets/l
 export { VBoxLayout } from './objects/widgets/vbox-layout.js';
 export { HBoxLayout } from './objects/widgets/hbox-layout.js';
 export { ScrollableVBoxLayout } from './objects/widgets/scrollable-vbox-layout.js';
+export { ListWidget } from './objects/widgets/list-widget.js';
+export type { ListItem, ListWidgetConfig } from './objects/widgets/list-widget.js';
+export { SplitPaneWidget } from './objects/widgets/split-pane-widget.js';
+export type { SplitPaneConfig } from './objects/widgets/split-pane-widget.js';
 export {
   WIDGET_INTERFACE,
   WINDOW_INTERFACE,

@@ -61,7 +61,7 @@ export class Clipboard extends Abject {
           Capabilities.CLIPBOARD_READ,
           Capabilities.CLIPBOARD_WRITE,
         ],
-        tags: ['capability', 'clipboard'],
+        tags: ['system', 'capability', 'clipboard'],
       },
     });
 

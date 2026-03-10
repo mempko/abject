@@ -3,7 +3,7 @@
  *
  * Shows a scrollable table of all running objects with name, ID, state,
  * worker placement, and stop/restart actions. Per-workspace UI object
- * (follows RegistryBrowser/JobBrowser pattern).
+ * (follows AppExplorer/JobBrowser pattern).
  */
 
 import {

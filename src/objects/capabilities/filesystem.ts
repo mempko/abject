@@ -159,7 +159,7 @@ export class FileSystem extends Abject {
           Capabilities.FILESYSTEM_READ,
           Capabilities.FILESYSTEM_WRITE,
         ],
-        tags: ['capability', 'filesystem'],
+        tags: ['system', 'capability', 'filesystem'],
       },
     });
 

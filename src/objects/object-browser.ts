@@ -18,6 +18,7 @@ import {
   MethodDeclaration,
   ObjectRegistration,
   SpawnResult,
+  TypeDeclaration,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
@@ -87,7 +88,10 @@ export class ObjectBrowser extends Abject {
   private outerSplitId?: AbjectId;
   private leftSplitId?: AbjectId;
   private rightSplitId?: AbjectId;
-  private pane1ListId?: AbjectId;
+  private pane1VBoxId?: AbjectId;
+  private scopeListId?: AbjectId;
+  private localWsListId?: AbjectId;
+  private remoteWsListId?: AbjectId;
   private pane2ListId?: AbjectId;
   private pane3ListId?: AbjectId;
   private pane4LayoutId?: AbjectId;
@@ -95,7 +99,7 @@ export class ObjectBrowser extends Abject {
   // ── Pane 4 content widgets ──
   private pane4LabelIds: AbjectId[] = [];
   private pane4ButtonIds: Map<AbjectId, string> = new Map();
-  private msgPayloadId?: AbjectId;
+  private msgParamInputIds: Map<string, AbjectId> = new Map(); // param name → input widget
   private msgSendBtnId?: AbjectId;
   private msgResponseLabelId?: AbjectId;
 
@@ -145,6 +149,14 @@ export class ObjectBrowser extends Abject {
               description: 'Navigate to a specific object kind',
               parameters: [
                 { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Kind name' },
+              ],
+              returns: { kind: 'primitive', primitive: 'boolean' },
+            },
+            {
+              name: 'browseScope',
+              description: 'Navigate to a specific scope (workspace or remote)',
+              parameters: [
+                { name: 'scope', type: { kind: 'primitive', primitive: 'string' }, description: 'Scope key' },
               ],
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
@@ -200,6 +212,21 @@ export class ObjectBrowser extends Abject {
         pane1Filter: { scope: 'all' },
         selectedKind: name,
         label: `All > ${name}`,
+      };
+      this.navigateTo(state);
+      await this.rebuildAllPanes();
+      return true;
+    });
+
+    this.on('browseScope', async (msg: AbjectMessage) => {
+      const { scope } = msg.payload as { scope: string };
+      await this.show();
+      await this.discoverRegistrySources();
+      const source = this.registrySources.get(scope);
+      const label = source?.label ?? scope;
+      const state: NavState = {
+        pane1Filter: { scope },
+        label,
       };
       this.navigateTo(state);
       await this.rebuildAllPanes();
@@ -326,13 +353,16 @@ export class ObjectBrowser extends Abject {
     this.outerSplitId = undefined;
     this.leftSplitId = undefined;
     this.rightSplitId = undefined;
-    this.pane1ListId = undefined;
+    this.pane1VBoxId = undefined;
+    this.scopeListId = undefined;
+    this.localWsListId = undefined;
+    this.remoteWsListId = undefined;
     this.pane2ListId = undefined;
     this.pane3ListId = undefined;
     this.pane4LayoutId = undefined;
     this.pane4LabelIds = [];
     this.pane4ButtonIds.clear();
-    this.msgPayloadId = undefined;
+    this.msgParamInputIds.clear();
     this.msgSendBtnId = undefined;
     this.msgResponseLabelId = undefined;
   }
@@ -610,7 +640,7 @@ export class ObjectBrowser extends Abject {
 
     // Create window
     this.windowId = await wm('createWindowAbject', {
-      title: 'Object Browser',
+      title: 'Object Explorer',
       rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
       resizable: true,
     }) as AbjectId;
@@ -685,15 +715,49 @@ export class ObjectBrowser extends Abject {
     }) as AbjectId;
     await this.addToLayout(this.rootLayoutId, paneHBox, { vertical: 'expanding' });
 
-    // Pane 1: Scope list
-    this.pane1ListId = await wm('createList', {
-      windowId: this.windowId,
-      rect: { x: 0, y: 0, width: 0, height: 0 },
-      items: [],
-      searchable: true,
+    // Pane 1: Scope lists in a VBox
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+    this.pane1VBoxId = await wm('createNestedVBox', {
+      parentLayoutId: paneHBox,
+      margins: { top: 0, right: 0, bottom: 0, left: 0 },
+      spacing: 2,
     }) as AbjectId;
-    await this.addDep(this.pane1ListId);
-    await this.addToLayout(paneHBox, this.pane1ListId, { horizontal: 'expanding' }, { width: 180 });
+    await this.addToLayout(paneHBox, this.pane1VBoxId, { horizontal: 'expanding' }, { width: 180 });
+
+    // Scope list (All, System) — fixed height
+    this.scopeListId = await wm('createList', {
+      windowId: this.windowId, rect: r0, items: [],
+    }) as AbjectId;
+    await this.addDep(this.scopeListId);
+    await this.addToLayout(this.pane1VBoxId, this.scopeListId, { vertical: 'fixed' }, { height: 60 });
+
+    // "Local" label
+    const localLabel = await wm('createLabel', {
+      windowId: this.windowId, rect: r0, text: 'Local',
+      style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
+    }) as AbjectId;
+    await this.addToLayout(this.pane1VBoxId, localLabel, { vertical: 'fixed' }, { height: 20 });
+
+    // Local workspace list
+    this.localWsListId = await wm('createList', {
+      windowId: this.windowId, rect: r0, items: [], searchable: true,
+    }) as AbjectId;
+    await this.addDep(this.localWsListId);
+    await this.addToLayout(this.pane1VBoxId, this.localWsListId, { vertical: 'expanding' });
+
+    // "Discovered" label
+    const remoteLabel = await wm('createLabel', {
+      windowId: this.windowId, rect: r0, text: 'Discovered',
+      style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
+    }) as AbjectId;
+    await this.addToLayout(this.pane1VBoxId, remoteLabel, { vertical: 'fixed' }, { height: 20 });
+
+    // Remote workspace list
+    this.remoteWsListId = await wm('createList', {
+      windowId: this.windowId, rect: r0, items: [],
+    }) as AbjectId;
+    await this.addDep(this.remoteWsListId);
+    await this.addToLayout(this.pane1VBoxId, this.remoteWsListId, { vertical: 'expanding' });
 
     // Pane 2: Object Kinds list
     this.pane2ListId = await wm('createList', {
@@ -739,49 +803,43 @@ export class ObjectBrowser extends Abject {
   }
 
   private async rebuildPane1(): Promise<void> {
-    if (!this.pane1ListId) return;
+    if (!this.scopeListId || !this.localWsListId || !this.remoteWsListId) return;
     const state = this.currentState;
     const scope = state.pane1Filter.scope;
 
-    const items: Array<{ label: string; value: string; secondary?: string }> = [];
+    // Scope list (All, System)
+    const scopeItems = [
+      { label: scope === 'all' ? '\u25CF All' : '\u25CB All', value: 'scope:all' },
+      { label: scope === 'system' ? '\u25CF System' : '\u25CB System', value: 'scope:system' },
+    ];
+    const scopeSelected = scope === 'all' ? 0 : scope === 'system' ? 1 : -1;
+    await this.request(request(this.id, this.scopeListId, 'update', {
+      items: scopeItems, selectedIndex: scopeSelected,
+    }));
 
-    // "All" and "System" options
-    items.push({
-      label: scope === 'all' ? '\u25CF All' : '\u25CB All',
-      value: 'scope:all',
-    });
-    items.push({
-      label: scope === 'system' ? '\u25CF System' : '\u25CB System',
-      value: 'scope:system',
-    });
-
-    // Local workspaces section
+    // Local workspaces
     const localSources = [...this.registrySources.entries()]
       .filter(([, s]) => s.kind === 'local-workspace');
-    if (localSources.length > 0) {
-      items.push({ label: '\u2500\u2500\u2500 Local', value: '_divider_local' });
-      for (const [key, source] of localSources) {
-        items.push({
-          label: scope === key ? `\u25CF ${source.label}` : `\u25CB ${source.label}`,
-          value: `scope:${key}`,
-        });
-      }
-    }
+    const localItems = localSources.map(([key, source]) => ({
+      label: scope === key ? `\u25CF ${source.label}` : `\u25CB ${source.label}`,
+      value: `scope:${key}`,
+    }));
+    const localSelected = localSources.findIndex(([key]) => scope === key);
+    await this.request(request(this.id, this.localWsListId, 'update', {
+      items: localItems, selectedIndex: localSelected,
+    }));
 
-    // Remote workspaces section
+    // Remote (discovered) workspaces
     const remoteSources = [...this.registrySources.entries()]
       .filter(([, s]) => s.kind === 'remote-workspace');
-    if (remoteSources.length > 0) {
-      items.push({ label: '\u2500\u2500\u2500 Discovered', value: '_divider_discovered' });
-      for (const [key, source] of remoteSources) {
-        items.push({
-          label: scope === key ? `\u25CF ${source.label}` : `\u25CB ${source.label}`,
-          value: `scope:${key}`,
-        });
-      }
-    }
-
-    await this.request(request(this.id, this.pane1ListId, 'update', { items }));
+    const remoteItems = remoteSources.map(([key, source]) => ({
+      label: scope === key ? `\u25CF ${source.label}` : `\u25CB ${source.label}`,
+      value: `scope:${key}`,
+    }));
+    const remoteSelected = remoteSources.findIndex(([key]) => scope === key);
+    await this.request(request(this.id, this.remoteWsListId, 'update', {
+      items: remoteItems, selectedIndex: remoteSelected,
+    }));
   }
 
   private async rebuildPane2(): Promise<void> {
@@ -877,10 +935,10 @@ export class ObjectBrowser extends Abject {
         await this.request(request(this.id, id, 'destroy', {}));
       } catch { /* gone */ }
     }
-    if (this.msgPayloadId) {
+    for (const [, inputId] of this.msgParamInputIds) {
       try {
-        await this.request(request(this.id, this.pane4LayoutId!, 'removeLayoutChild', { widgetId: this.msgPayloadId }));
-        await this.request(request(this.id, this.msgPayloadId, 'destroy', {}));
+        await this.request(request(this.id, this.pane4LayoutId!, 'removeLayoutChild', { widgetId: inputId }));
+        await this.request(request(this.id, inputId, 'destroy', {}));
       } catch { /* gone */ }
     }
     if (this.msgSendBtnId) {
@@ -897,7 +955,7 @@ export class ObjectBrowser extends Abject {
     }
     this.pane4LabelIds = [];
     this.pane4ButtonIds.clear();
-    this.msgPayloadId = undefined;
+    this.msgParamInputIds.clear();
     this.msgSendBtnId = undefined;
     this.msgResponseLabelId = undefined;
   }
@@ -1014,16 +1072,21 @@ export class ObjectBrowser extends Abject {
         await this.addPane4Button('Clone to Local', 'cloneObject');
       }
     } else {
-      // Local: Edit Source, Clone, Delete
+      // Local: Edit Source, Clone, Delete (Clone/Delete only for non-system objects)
+      const isSystem = tags.includes('system');
       if (hasSource) {
         const editorId = await this.findAbjectEditorForScope();
         if (editorId) {
           await this.addPane4Button('Edit Source', 'editSource');
         }
-        await this.addPane4Button('Clone', 'cloneObject');
+        if (!isSystem) {
+          await this.addPane4Button('Clone', 'cloneObject');
+        }
       }
-      await this.addPane4Button('Delete', 'deleteObject',
-        { background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' });
+      if (!isSystem) {
+        await this.addPane4Button('Delete', 'deleteObject',
+          { background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' });
+      }
     }
 
     // Response label for feedback
@@ -1079,19 +1142,49 @@ export class ObjectBrowser extends Abject {
       await this.addPane4Button('Find Senders', `senders:${method.name}`);
     }
 
-    // Send Message section (skip for remote objects)
-    if (method.type === 'method' && !this.isRemoteScope()) {
+    // Send Message section
+    if (method.type === 'method') {
       await this.addPane4Label('\u2500\u2500\u2500 Send Message', true);
 
       const regs = this.getRegistrationsForKind(state.selectedKind);
       if (regs.length > 0) {
-        this.msgPayloadId = await this.wm('createTextInput', {
-          windowId: this.windowId,
-          rect: { x: 0, y: 0, width: 0, height: 0 },
-          placeholder: 'JSON payload...',
-        }) as AbjectId;
-        await this.addDep(this.msgPayloadId);
-        await this.addToLayout(this.pane4LayoutId!, this.msgPayloadId, { vertical: 'fixed' }, { height: 30 });
+        const params = method.decl?.parameters ?? [];
+
+        if (params.length === 0) {
+          // No declared parameters — show a JSON payload input as fallback
+          await this.addPane4Label('payload (JSON)', true);
+          const inputId = await this.wm('createTextInput', {
+            windowId: this.windowId,
+            rect: { x: 0, y: 0, width: 0, height: 0 },
+            placeholder: 'JSON payload... (leave empty for {})',
+            text: '',
+          }) as AbjectId;
+          await this.addDep(inputId);
+          await this.addToLayout(this.pane4LayoutId!, inputId, { vertical: 'fixed' }, { height: 30 });
+          this.msgParamInputIds.set('__raw_json__', inputId);
+        } else {
+          // Generate a labeled input for each parameter
+          for (const param of params) {
+            const typeStr = param.type ? this.formatType(param.type) : 'any';
+            const optLabel = param.optional ? ' (optional)' : '';
+            await this.addPane4Label(`${param.name}: ${typeStr}${optLabel}`, true);
+
+            const isComplex = param.type?.kind === 'object' || param.type?.kind === 'array';
+            const placeholder = isComplex
+              ? `JSON ${typeStr}...`
+              : param.description || `${typeStr} value...`;
+
+            const inputId = await this.wm('createTextInput', {
+              windowId: this.windowId,
+              rect: { x: 0, y: 0, width: 0, height: 0 },
+              placeholder,
+              text: '',
+            }) as AbjectId;
+            await this.addDep(inputId);
+            await this.addToLayout(this.pane4LayoutId!, inputId, { vertical: 'fixed' }, { height: 30 });
+            this.msgParamInputIds.set(param.name, inputId);
+          }
+        }
 
         this.msgSendBtnId = await this.wm('createButton', {
           windowId: this.windowId,
@@ -1256,6 +1349,44 @@ export class ObjectBrowser extends Abject {
       return;
     }
 
+    // Tab bar close — remove tab (keep at least 1)
+    if (fromId === this.tabBarId && aspect === 'close') {
+      const idx = typeof value === 'number' ? value : parseInt(String(value), 10);
+      if (idx >= 0 && idx < this.tabs.length && this.tabs.length > 1) {
+        this.tabs.splice(idx, 1);
+        // Adjust active tab index
+        if (this.activeTabIndex >= this.tabs.length) {
+          this.activeTabIndex = this.tabs.length - 1;
+        } else if (this.activeTabIndex > idx) {
+          this.activeTabIndex--;
+        }
+        // Update tab bar
+        const tabNames = this.tabs.map(t => t.name);
+        tabNames.push('+');
+        await this.request(request(this.id, this.tabBarId!, 'update', {
+          tabs: tabNames,
+          selectedIndex: this.activeTabIndex,
+        }));
+        await this.rebuildAllPanes();
+      }
+      return;
+    }
+
+    // Tab bar rename
+    if (fromId === this.tabBarId && aspect === 'rename') {
+      const { index, name } = value as { index: number; name: string };
+      if (index >= 0 && index < this.tabs.length) {
+        this.tabs[index].name = name;
+        // Update tab bar with new names
+        const tabNames = this.tabs.map(t => t.name);
+        tabNames.push('+');
+        await this.request(request(this.id, this.tabBarId!, 'update', {
+          tabs: tabNames,
+        }));
+      }
+      return;
+    }
+
     // Back/Forward buttons
     if (fromId === this.backBtnId && aspect === 'click') {
       if (this.goBack()) {
@@ -1270,9 +1401,27 @@ export class ObjectBrowser extends Abject {
       return;
     }
 
-    // Pane 1 selection (scope)
-    if (fromId === this.pane1ListId && aspect === 'selectionChanged') {
+    // Pane 1 scope list selection
+    if (fromId === this.scopeListId && aspect === 'selectionChanged') {
       const sel = JSON.parse(String(value)) as { value: string };
+      await this.request(request(this.id, this.localWsListId!, 'update', { selectedIndex: -1 }));
+      await this.request(request(this.id, this.remoteWsListId!, 'update', { selectedIndex: -1 }));
+      await this.handlePane1Selection(sel.value);
+      return;
+    }
+    // Pane 1 local workspace list selection
+    if (fromId === this.localWsListId && aspect === 'selectionChanged') {
+      const sel = JSON.parse(String(value)) as { value: string };
+      await this.request(request(this.id, this.scopeListId!, 'update', { selectedIndex: -1 }));
+      await this.request(request(this.id, this.remoteWsListId!, 'update', { selectedIndex: -1 }));
+      await this.handlePane1Selection(sel.value);
+      return;
+    }
+    // Pane 1 remote workspace list selection
+    if (fromId === this.remoteWsListId && aspect === 'selectionChanged') {
+      const sel = JSON.parse(String(value)) as { value: string };
+      await this.request(request(this.id, this.scopeListId!, 'update', { selectedIndex: -1 }));
+      await this.request(request(this.id, this.localWsListId!, 'update', { selectedIndex: -1 }));
       await this.handlePane1Selection(sel.value);
       return;
     }
@@ -1304,16 +1453,16 @@ export class ObjectBrowser extends Abject {
       return;
     }
 
-    // Send on Enter in payload input
-    if (fromId === this.msgPayloadId && aspect === 'submit') {
-      await this.handleSendMessage();
-      return;
+    // Send on Enter in any param input
+    for (const [, inputId] of this.msgParamInputIds) {
+      if (fromId === inputId && aspect === 'submit') {
+        await this.handleSendMessage();
+        return;
+      }
     }
   }
 
   private async handlePane1Selection(val: string): Promise<void> {
-    if (val.startsWith('_divider_')) return; // ignore divider clicks
-
     if (!val.startsWith('scope:')) return;
     const scope = val.substring('scope:'.length);
 
@@ -1560,18 +1709,29 @@ export class ObjectBrowser extends Abject {
     return undefined;
   }
 
-  /** Show feedback text in the response label. */
+  /** Show feedback text in the response label, resizing to fit. */
   private async showFeedback(text: string): Promise<void> {
-    if (this.msgResponseLabelId) {
+    if (this.msgResponseLabelId && this.pane4LayoutId) {
       try {
         await this.request(request(this.id, this.msgResponseLabelId, 'update', { text }));
+        // Resize label to fit wrapped text — count explicit newlines + wrapped lines
+        const explicitLines = text.split('\n');
+        let totalLines = 0;
+        for (const line of explicitLines) {
+          totalLines += Math.max(1, Math.ceil((line.length || 1) / 35));
+        }
+        const height = Math.max(16, totalLines * 16);
+        await this.request(request(this.id, this.pane4LayoutId, 'updateLayoutChild', {
+          widgetId: this.msgResponseLabelId,
+          preferredSize: { height },
+        }));
       } catch { /* widget gone */ }
     }
   }
 
   private async handleSendMessage(): Promise<void> {
     const state = this.currentState;
-    if (!state.selectedKind || !state.selectedItem || !this.msgPayloadId || !this.msgResponseLabelId) return;
+    if (!state.selectedKind || !state.selectedItem || !this.msgResponseLabelId) return;
 
     const regs = this.getRegistrationsForKind(state.selectedKind);
     if (regs.length === 0) return;
@@ -1579,22 +1739,61 @@ export class ObjectBrowser extends Abject {
     const targetId = regs[0].id as AbjectId;
     const methodName = state.selectedItem.name;
 
-    // Get payload from text input
-    let payloadText: string;
-    try {
-      payloadText = await this.request<string>(
-        request(this.id, this.msgPayloadId, 'getValue', {})
-      );
-    } catch {
-      payloadText = '{}';
-    }
+    // Look up method declaration for type info
+    const method = this.currentMethods.find(
+      m => m.type === state.selectedItem!.type && m.name === state.selectedItem!.name
+    );
+    const paramDecls = method?.decl?.parameters ?? [];
 
-    let payload: Record<string, unknown>;
-    try {
-      payload = JSON.parse(payloadText || '{}');
-    } catch {
-      await this.showFeedback('Error: Invalid JSON payload');
-      return;
+    // Collect values from per-parameter inputs
+    let payload: Record<string, unknown> = {};
+
+    // Check for raw JSON fallback (no declared parameters)
+    const rawJsonInputId = this.msgParamInputIds.get('__raw_json__');
+    if (rawJsonInputId && paramDecls.length === 0) {
+      let rawValue: string;
+      try {
+        rawValue = (await this.request<string>(
+          request(this.id, rawJsonInputId, 'getValue', {})
+        ) ?? '').trim();
+      } catch {
+        rawValue = '';
+      }
+      try {
+        payload = rawValue ? JSON.parse(rawValue) : {};
+      } catch {
+        await this.showFeedback('Error: invalid JSON payload');
+        return;
+      }
+    } else {
+      for (const paramDecl of paramDecls) {
+        const inputId = this.msgParamInputIds.get(paramDecl.name);
+        if (!inputId) continue;
+
+        let rawValue: string;
+        try {
+          rawValue = (await this.request<string>(
+            request(this.id, inputId, 'getValue', {})
+          ) ?? '').trim();
+        } catch {
+          rawValue = '';
+        }
+
+        // Skip empty optional params
+        if (rawValue === '' && paramDecl.optional) continue;
+        if (rawValue === '' && !paramDecl.optional) {
+          await this.showFeedback(`Error: "${paramDecl.name}" is required`);
+          return;
+        }
+
+        // Parse value based on declared type
+        const parsed = this.parseParamValue(rawValue, paramDecl.type);
+        if (parsed.error) {
+          await this.showFeedback(`Error in "${paramDecl.name}": ${parsed.error}`);
+          return;
+        }
+        payload[paramDecl.name] = parsed.value;
+      }
     }
 
     // Disable send button during request
@@ -1606,8 +1805,7 @@ export class ObjectBrowser extends Abject {
         request(this.id, targetId, methodName, payload)
       );
       const resultStr = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
-      const truncated = resultStr.length > 300 ? resultStr.substring(0, 300) + '...' : resultStr;
-      await this.showFeedback(`Response: ${truncated}`);
+      await this.showFeedback(`Response: ${resultStr}`);
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
       await this.showFeedback(`Error: ${errMsg}`);
@@ -1616,7 +1814,45 @@ export class ObjectBrowser extends Abject {
     await this.setWidgetDisabled(this.msgSendBtnId, false);
   }
 
-  // ── Type formatting ───────────────────────────────────────────────
+  // ── Type parsing / formatting ────────────────────────────────────
+
+  /** Parse a raw string value into the appropriate JS type based on the TypeDeclaration. */
+  private parseParamValue(raw: string, type?: TypeDeclaration): { value?: unknown; error?: string } {
+    if (!type) {
+      // No type info — try JSON, fall back to string
+      try { return { value: JSON.parse(raw) }; }
+      catch { return { value: raw }; }
+    }
+
+    if (type.kind === 'primitive') {
+      switch (type.primitive) {
+        case 'string':
+          return { value: raw };
+        case 'number': {
+          const n = Number(raw);
+          if (isNaN(n)) return { error: `"${raw}" is not a valid number` };
+          return { value: n };
+        }
+        case 'boolean': {
+          const lower = raw.toLowerCase();
+          if (lower === 'true') return { value: true };
+          if (lower === 'false') return { value: false };
+          return { error: `"${raw}" is not a boolean (use true/false)` };
+        }
+        case 'null':
+          return { value: null };
+        default:
+          return { value: raw };
+      }
+    }
+
+    // object, array, union, reference — parse as JSON
+    try {
+      return { value: JSON.parse(raw) };
+    } catch {
+      return { error: 'invalid JSON' };
+    }
+  }
 
   private formatType(t: unknown): string {
     if (!t || typeof t !== 'object') return 'any';

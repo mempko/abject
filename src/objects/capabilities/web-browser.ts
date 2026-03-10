@@ -685,7 +685,7 @@ export class WebBrowser extends Abject {
           },
         requiredCapabilities: [],
         providedCapabilities: [Capabilities.WEB_BROWSE],
-        tags: ['capability', 'web', 'browser'],
+        tags: ['system', 'capability', 'web', 'browser'],
       },
     });
 

@@ -168,7 +168,7 @@ export class HttpClient extends Abject {
           },
         requiredCapabilities: [],
         providedCapabilities: [Capabilities.HTTP_REQUEST],
-        tags: ['capability', 'http', 'network'],
+        tags: ['system', 'capability', 'http', 'network'],
       },
     });
 

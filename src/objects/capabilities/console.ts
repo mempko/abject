@@ -154,7 +154,7 @@ export class Console extends Abject {
           },
         requiredCapabilities: [],
         providedCapabilities: [Capabilities.CONSOLE],
-        tags: ['capability', 'console', 'debug'],
+        tags: ['system', 'capability', 'console', 'debug'],
       },
     });
 

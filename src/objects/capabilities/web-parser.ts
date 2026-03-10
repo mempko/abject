@@ -151,7 +151,7 @@ export class WebParser extends Abject {
           },
         requiredCapabilities: [],
         providedCapabilities: [Capabilities.WEB_PARSE],
-        tags: ['capability', 'web', 'parser'],
+        tags: ['system', 'capability', 'web', 'parser'],
       },
     });
 

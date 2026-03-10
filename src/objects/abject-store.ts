@@ -267,7 +267,7 @@ export class AbjectStore extends Abject {
     this.snapshots.set(typeId, snapshot);
     await this.persistToStorage();
 
-    // Register the object in the workspace registry so it appears in RegistryBrowser/Taskbar
+    // Register the object in the workspace registry so it appears in AppExplorer/Taskbar
     if (this.registryId) {
       try {
         await this.request(request(this.id, this.registryId,

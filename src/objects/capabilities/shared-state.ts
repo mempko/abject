@@ -191,7 +191,7 @@ export class SharedState extends Abject {
         providedCapabilities: [
           Capabilities.SHARED_STATE,
         ],
-        tags: ['capability', 'shared-state'],
+        tags: ['system', 'capability', 'shared-state'],
       },
     });
     this.setupHandlers();

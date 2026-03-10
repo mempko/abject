@@ -19,7 +19,7 @@ import { Capabilities } from '../core/capability.js';
 import { request } from '../core/message.js';
 import type { MessageBusLike } from '../runtime/message-bus.js';
 import { type WorkerPool, workerIndexForId } from '../runtime/worker-pool.js';
-import { ScriptableAbject } from './scriptable-abject.js';
+import { ScriptableAbject, mergeScriptableManifest } from './scriptable-abject.js';
 import { CompositeAbject } from './composite-abject.js';
 import type { CompositeSpec } from './composite-abject.js';
 
@@ -707,6 +707,9 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
 
     this.workerSpawned.set(objectId, 'ScriptableAbject');
 
+    // Compute the merged manifest (with introspect + editable methods) for registry
+    const realManifest = mergeScriptableManifest(req.manifest);
+
     // Register with registry including source and owner (for AbjectStore)
     const targetRegistry = req.registryHint ?? (req.skipGlobalRegistry ? undefined : this._factoryRegistryId);
     if (targetRegistry) this.workerRegistries.set(objectId, targetRegistry);
@@ -714,14 +717,14 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
       const now = Date.now();
       const regPayload: Record<string, unknown> = {
         objectId,
-        manifest: req.manifest,
+        manifest: realManifest,
         owner: req.owner,
         source: req.source,
         status: {
           id: objectId,
           typeId: req.typeId,
           state: 'ready',
-          manifest: req.manifest,
+          manifest: realManifest,
           connections: [] as AbjectId[],
           errorCount: 0,
           startedAt: now,
@@ -742,7 +745,7 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         id: objectId,
         typeId: req.typeId,
         state: 'ready',
-        manifest: req.manifest,
+        manifest: realManifest,
         connections: [] as AbjectId[],
         errorCount: 0,
         startedAt: now,

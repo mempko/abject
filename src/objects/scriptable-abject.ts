@@ -25,6 +25,7 @@ import {
 import { Abject, MessageHandlerFn } from '../core/abject.js';
 import { require as contractRequire } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
+import { INTROSPECT_METHODS, INTROSPECT_EVENTS } from '../core/introspect.js';
 
 /** Editable methods merged into every ScriptableAbject's interface */
 const EDITABLE_METHODS: MethodDeclaration[] = [
@@ -78,6 +79,32 @@ const EDITABLE_EVENTS: EventDeclaration[] = [
     }},
   },
 ];
+
+/**
+ * Compute the merged manifest for a ScriptableAbject without constructing one.
+ * Merges editable methods/events and the 'scriptable' tag, matching the constructor logic.
+ * Also merges introspect methods/events (same as Abject constructor).
+ */
+export function mergeScriptableManifest(manifest: AbjectManifest): AbjectManifest {
+  const tags = [...(manifest.tags ?? [])];
+  if (!tags.includes('scriptable')) tags.push('scriptable');
+
+  const iface = manifest.interface;
+  const allMethods = [...iface.methods, ...EDITABLE_METHODS];
+  const allEvents = [...(iface.events ?? []), ...EDITABLE_EVENTS];
+
+  // Also merge introspect methods/events (same as Abject constructor)
+  const hasDescribe = allMethods.some(m => m.name === 'describe');
+  const finalMethods = hasDescribe ? allMethods : [...allMethods, ...INTROSPECT_METHODS];
+  const hasChildReady = allEvents.some(e => e.name === 'childReady');
+  const finalEvents = hasChildReady ? allEvents : [...allEvents, ...INTROSPECT_EVENTS];
+
+  return {
+    ...manifest,
+    interface: { ...iface, methods: finalMethods, events: finalEvents },
+    tags,
+  };
+}
 
 /**
  * An Abject whose handlers are compiled from a JavaScript source string.

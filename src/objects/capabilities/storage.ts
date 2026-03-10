@@ -119,7 +119,7 @@ export class Storage extends Abject {
           Capabilities.STORAGE_READ,
           Capabilities.STORAGE_WRITE,
         ],
-        tags: ['capability', 'storage', 'persistence'],
+        tags: ['system', 'capability', 'storage', 'persistence'],
       },
     });
 

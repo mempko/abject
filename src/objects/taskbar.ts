@@ -15,7 +15,7 @@ const TASKBAR_INTERFACE: InterfaceId = 'abjects:taskbar';
 
 export class Taskbar extends Abject {
   private widgetManagerId?: AbjectId;
-  private registryBrowserId?: AbjectId;
+  private appExplorerId?: AbjectId;
   private chatId?: AbjectId;
   private jobBrowserId?: AbjectId;
   private objectManagerId?: AbjectId;
@@ -85,7 +85,7 @@ export class Taskbar extends Abject {
 
   protected override async onInit(): Promise<void> {
     this.widgetManagerId = await this.requireDep('WidgetManager');
-    this.registryBrowserId = await this.requireDep('RegistryBrowser');
+    this.appExplorerId = await this.requireDep('AppExplorer');
     this.chatId = await this.requireDep('Chat');
     this.jobBrowserId = await this.requireDep('JobBrowser');
     this.objectManagerId = await this.requireDep('ObjectManager');
@@ -99,7 +99,7 @@ export class Taskbar extends Abject {
     }
 
     // Subscribe as dependent of each system object to receive visibility changes
-    const depIds = [this.registryBrowserId!, this.chatId!, this.jobBrowserId!, this.objectManagerId!];
+    const depIds = [this.appExplorerId!, this.chatId!, this.jobBrowserId!, this.objectManagerId!];
     if (this.webBrowserViewerId) depIds.push(this.webBrowserViewerId);
     for (const depId of depIds) {
       await this.request(request(this.id, depId, 'addDependent', {}));
@@ -161,7 +161,7 @@ export class Taskbar extends Abject {
 
       if (fromId === this.registryBtnId) {
         await this.request(
-          request(this.id, this.registryBrowserId!, 'show', {})
+          request(this.id, this.appExplorerId!, 'show', {})
         );
       } else if (fromId === this.chatBtnId) {
         await this.request(
@@ -333,7 +333,7 @@ export class Taskbar extends Abject {
 
     // System buttons
     const systemPairs: [AbjectId | undefined, AbjectId | undefined][] = [
-      [this.registryBtnId, this.registryBrowserId],
+      [this.registryBtnId, this.appExplorerId],
       [this.chatBtnId, this.chatId],
       [this.jobsBtnId, this.jobBrowserId],
       [this.objectManagerBtnId, this.objectManagerId],
@@ -374,7 +374,7 @@ export class Taskbar extends Abject {
     const padding = 16;
     const spacing = 6;
     const btnW = 100;
-    const systemBtnCount = 4 + (this.webBrowserViewerId ? 1 : 0);
+    const systemBtnCount = 3 + (this.webBrowserViewerId ? 1 : 0);
     const minimizedCount = this.minimizedWindows.size;
     const userBtnCount = this.userObjButtons.size;
     const totalBtnCount = systemBtnCount + userBtnCount + minimizedCount;
@@ -420,10 +420,10 @@ export class Taskbar extends Abject {
     const dividerH = 8;
     const padding = 16;
     const spacing = 6;
-    const systemBtnCount = 4 + (this.webBrowserViewerId ? 1 : 0);
+    const systemBtnCount = 3 + (this.webBrowserViewerId ? 1 : 0);
     const minimizedCount = this.minimizedWindows.size;
     const totalBtnCount = systemBtnCount + showableObjects.length + minimizedCount;
-    const extraHeight = (labelH + spacing) // "Apps" label
+    const extraHeight = (labelH + spacing) // "Apps" header row
       + (minimizedCount > 0 ? (dividerH + spacing) + (labelH + spacing) : 0);
     const barWidth = btnW + padding * 2;
     const barHeight = padding + extraHeight + totalBtnCount * (btnH + spacing) - spacing + padding;
@@ -509,25 +509,63 @@ export class Taskbar extends Abject {
       }));
     };
 
-    await addSectionLabel('\u25A0 Apps');
+    // ── Apps section header row: "■ Apps" label + gear button ──
+    const appsHeaderRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 4,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
+      widgetId: appsHeaderRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: labelH },
+    }));
+
+    const appsLabelId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createLabel', {
+        windowId: this.windowId, rect: r0, text: '\u25A0 Apps',
+        style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
+      })
+    );
+    await this.request(request(this.id, appsHeaderRowId, 'addLayoutChild', {
+      widgetId: appsLabelId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: labelH },
+    }));
+
+    // Query app explorer visibility for gear button style
+    const registryVis = await isVisible(this.appExplorerId!);
+
+    this.registryBtnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createButton', {
+        windowId: this.windowId, rect: r0, text: '\u2699',
+        style: { fontSize: 13, ...(registryVis ? activeStyle : {}) },
+      })
+    );
+    await this.request(request(this.id, this.registryBtnId, 'addDependent', {}));
+    await this.request(request(this.id, appsHeaderRowId, 'addLayoutChild', {
+      widgetId: this.registryBtnId,
+      sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+      preferredSize: { width: 24, height: labelH },
+    }));
 
     // Query visibility of system objects
     const visPromises: Promise<boolean>[] = [
-      isVisible(this.registryBrowserId!),
       isVisible(this.chatId!),
       isVisible(this.jobBrowserId!),
       isVisible(this.objectManagerId!),
     ];
     if (this.webBrowserViewerId) visPromises.push(isVisible(this.webBrowserViewerId));
     const visResults = await Promise.all(visPromises);
-    const [registryVis, chatVis, jobsVis, objectManagerVis] = visResults;
-    let visIdx = 4;
+    const [chatVis, jobsVis, objectManagerVis] = visResults;
+    let visIdx = 3;
     const browserViewerVis = this.webBrowserViewerId ? visResults[visIdx++] : false;
 
     console.debug(`[Taskbar] visibility: registry=${registryVis} chat=${chatVis} jobs=${jobsVis} processes=${objectManagerVis} browser=${browserViewerVis}`);
 
     // System buttons
-    this.registryBtnId = await addBtn('Registry', registryVis);
     this.chatBtnId = await addBtn('Chat', chatVis);
     this.jobsBtnId = await addBtn('Jobs', jobsVis);
     this.objectManagerBtnId = await addBtn('Processes', objectManagerVis);

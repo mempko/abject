@@ -2,8 +2,8 @@
  * AbjectEditor — standalone source editor for ScriptableAbjects.
  *
  * Provides a window with a source code textarea, Save/Cancel buttons,
- * AI edit prompt, and status label. Can be opened by any abject to edit
- * the source of a given ScriptableAbject.
+ * and status label. Can be opened by any abject to edit the source of
+ * a given ScriptableAbject.
  */
 
 import {
@@ -14,14 +14,13 @@ import {
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { CreationResult } from './object-creator.js';
 
 const ABJECT_EDITOR_INTERFACE: InterfaceId = 'abjects:abject-editor' as InterfaceId;
 
 export class AbjectEditor extends Abject {
   private widgetManagerId?: AbjectId;
   private registryId?: AbjectId;
-  private objectCreatorId?: AbjectId;
+
 
   // Window and layout
   private windowId?: AbjectId;
@@ -31,9 +30,6 @@ export class AbjectEditor extends Abject {
   private sourceEditorId?: AbjectId;
   private saveBtnId?: AbjectId;
   private cancelBtnId?: AbjectId;
-  private aiEditBtnId?: AbjectId;
-  private aiPromptInputId?: AbjectId;
-  private aiGoBtnId?: AbjectId;
   private editStatusId?: AbjectId;
 
   // State
@@ -44,7 +40,7 @@ export class AbjectEditor extends Abject {
       manifest: {
         name: 'AbjectEditor',
         description:
-          'Standalone source editor for ScriptableAbjects. Opens a window with source editing, save/cancel, and AI edit support.',
+          'Standalone source editor for ScriptableAbjects. Opens a window with source editing and save/cancel.',
         version: '1.0.0',
         interface: {
             id: ABJECT_EDITOR_INTERFACE,
@@ -85,7 +81,7 @@ export class AbjectEditor extends Abject {
   protected override async onInit(): Promise<void> {
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.registryId = await this.requireDep('Registry');
-    this.objectCreatorId = await this.discoverDep('ObjectCreator') ?? undefined;
+
   }
 
   private setupHandlers(): void {
@@ -117,9 +113,6 @@ export class AbjectEditor extends Abject {
     this.sourceEditorId = undefined;
     this.saveBtnId = undefined;
     this.cancelBtnId = undefined;
-    this.aiEditBtnId = undefined;
-    this.aiPromptInputId = undefined;
-    this.aiGoBtnId = undefined;
     this.editStatusId = undefined;
   }
 
@@ -226,7 +219,7 @@ export class AbjectEditor extends Abject {
       stretch: 1,
     }));
 
-    // Button row (HBox: Save, Cancel, AI Edit)
+    // Button row (HBox: Save, Cancel)
     const btnRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
@@ -265,58 +258,7 @@ export class AbjectEditor extends Abject {
       preferredSize: { width: 80, height: 32 },
     }));
 
-    this.aiEditBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'AI Edit',
-        style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
-      })
-    );
-    await this.addDep(this.aiEditBtnId);
-    await this.request(request(this.id, btnRowId, 'addLayoutChild', {
-      widgetId: this.aiEditBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 80, height: 32 },
-    }));
-
     await this.request(request(this.id, btnRowId, 'addLayoutSpacer', {}));
-
-    // AI edit prompt row (HBox: input + Go)
-    const aiRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: aiRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 30 },
-    }));
-
-    this.aiPromptInputId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTextInput', {
-        windowId: this.windowId, rect: r0, placeholder: 'Describe what to change...',
-      })
-    );
-    await this.addDep(this.aiPromptInputId);
-    await this.request(request(this.id, aiRowId, 'addLayoutChild', {
-      widgetId: this.aiPromptInputId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: 30 },
-    }));
-
-    this.aiGoBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Go',
-      })
-    );
-    await this.addDep(this.aiGoBtnId);
-    await this.request(request(this.id, aiRowId, 'addLayoutChild', {
-      widgetId: this.aiGoBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 80, height: 30 },
-    }));
 
     // Status label
     this.editStatusId = await this.request<AbjectId>(
@@ -342,7 +284,7 @@ export class AbjectEditor extends Abject {
 
   private async setAllControlsDisabled(disabled: boolean): Promise<void> {
     const style = { disabled };
-    const ids = [this.saveBtnId, this.cancelBtnId, this.aiEditBtnId, this.aiGoBtnId, this.aiPromptInputId, this.sourceEditorId];
+    const ids = [this.saveBtnId, this.cancelBtnId, this.sourceEditorId];
     for (const id of ids) {
       if (id) {
         try { await this.request(request(this.id, id, 'update', { style })); } catch { /* widget gone */ }
@@ -391,48 +333,6 @@ export class AbjectEditor extends Abject {
       return;
     }
 
-    // ── AI Edit: Go button or submit from prompt input ──
-    if ((fromId === this.aiGoBtnId || (fromId === this.aiPromptInputId && aspect === 'submit'))
-        && this.editingObjectId && this.objectCreatorId) {
-      const prompt = await this.request<string>(
-        request(this.id, this.aiPromptInputId!, 'getValue', {})
-      );
-
-      if (!prompt.trim()) {
-        await this.updateEditStatus('Enter a description of changes');
-        return;
-      }
-
-      await this.setAllControlsDisabled(true);
-      await this.updateEditStatus('AI editing...');
-
-      try {
-        const result = await this.request<CreationResult>(
-          request(
-            this.id,
-            this.objectCreatorId!,
-            'modify',
-            { objectId: this.editingObjectId, prompt }
-          )
-        );
-
-        if (result.success && result.code) {
-          await this.request(
-            request(this.id, this.sourceEditorId!, 'update', {
-              text: result.code,
-            })
-          );
-          await this.updateEditStatus('AI edit applied (review and Save)');
-        } else {
-          await this.updateEditStatus(`AI error: ${result.error ?? 'Unknown'}`);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await this.updateEditStatus(`AI error: ${msg}`);
-      }
-      await this.setAllControlsDisabled(false);
-      return;
-    }
   }
 
   protected override getSourceForAsk(): string | undefined {
@@ -441,7 +341,7 @@ export class AbjectEditor extends Abject {
 ### Open the editor for a ScriptableAbject
 
   await call(await dep('AbjectEditor'), 'show', { objectId: 'the-object-id' });
-  // Opens a window with the object's source code and AI-assisted editing
+  // Opens a window with the object's source code for editing
 
 ### Hide the editor
 

@@ -41,7 +41,7 @@ import { WebAgent } from '../src/objects/web-agent.js';
 import { WebBrowserViewer } from '../src/objects/web-browser-viewer.js';
 import { Settings } from '../src/objects/settings.js';
 import { Taskbar } from '../src/objects/taskbar.js';
-import { RegistryBrowser } from '../src/objects/registry-browser.js';
+import { AppExplorer } from '../src/objects/app-explorer.js';
 import { ObjectBrowser } from '../src/objects/object-browser.js';
 import { WidgetManager } from '../src/objects/widget-manager.js';
 import { ThemeAbject } from '../src/objects/theme.js';
@@ -183,7 +183,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('ObjectCreator', () => new ObjectCreator());
   runtime.objectFactory.registerConstructor('AbjectEditor', () => new AbjectEditor());
   runtime.objectFactory.registerConstructor('Settings', () => new Settings());
-  runtime.objectFactory.registerConstructor('RegistryBrowser', () => new RegistryBrowser());
+  runtime.objectFactory.registerConstructor('AppExplorer', () => new AppExplorer());
   runtime.objectFactory.registerConstructor('ObjectBrowser', () => new ObjectBrowser());
   runtime.objectFactory.registerConstructor('JobManager', () => new JobManager());
   runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
@@ -225,7 +225,7 @@ async function main(): Promise<void> {
       // Global services
       'GlobalSettings', 'PeerNetwork', 'ObjectBrowser', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
       // Per-workspace objects (use workspace registry via registryHint)
-      'AbjectStore', 'Theme', 'Settings', 'RegistryBrowser',
+      'AbjectStore', 'Theme', 'Settings', 'AppExplorer',
       'JobManager', 'JobBrowser', 'ObjectManager',
       'Chat', 'AbjectEditor', 'Taskbar',
     ];

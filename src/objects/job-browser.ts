@@ -2,7 +2,7 @@
  * JobBrowser — UI widget for viewing job execution status.
  *
  * Shows/hides from Taskbar. Subscribes to JobManager as a dependent to
- * receive real-time job status updates. Similar to RegistryBrowser but
+ * receive real-time job status updates. Similar to AppExplorer but
  * for jobs instead of registered objects.
  */
 

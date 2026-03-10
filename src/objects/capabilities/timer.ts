@@ -145,7 +145,7 @@ export class Timer extends Abject {
           },
         requiredCapabilities: [],
         providedCapabilities: [Capabilities.TIMER],
-        tags: ['capability', 'timer', 'scheduling'],
+        tags: ['system', 'capability', 'timer', 'scheduling'],
       },
     });
 

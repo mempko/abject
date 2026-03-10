@@ -36,6 +36,8 @@ import { CanvasWidget, CanvasWidgetConfig } from './widgets/canvas-widget.js';
 import { TabBarWidget, TabBarConfig } from './widgets/tabbar-widget.js';
 import { SliderWidget, SliderWidgetConfig } from './widgets/slider-widget.js';
 import { ImageWidget, ImageWidgetConfig } from './widgets/image-widget.js';
+import { ListWidget, ListWidgetConfig, ListItem } from './widgets/list-widget.js';
+import { SplitPaneWidget, SplitPaneConfig } from './widgets/split-pane-widget.js';
 import { WidgetAbject, WidgetConfig } from './widgets/widget-abject.js';
 import { VBoxLayout } from './widgets/vbox-layout.js';
 import { HBoxLayout } from './widgets/hbox-layout.js';
@@ -668,6 +670,43 @@ export class WidgetManager extends Abject {
         ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.getThemeForWindow(payload.windowId),
         url: payload.url, fit: payload.fit, alt: payload.alt,
       }), payload.rect);
+    });
+
+    this.on('createList', async (msg: AbjectMessage) => {
+      const payload = msg.payload as {
+        windowId: AbjectId;
+        rect: Rect;
+        items?: ListItem[];
+        selectedIndex?: number;
+        searchable?: boolean;
+        itemHeight?: number;
+        style?: WidgetStyle;
+      };
+      return this.createTypedWidget(payload.windowId, new ListWidget({
+        type: 'label' as WidgetType, rect: payload.rect, style: payload.style,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.getThemeForWindow(payload.windowId),
+        items: payload.items, selectedIndex: payload.selectedIndex,
+        searchable: payload.searchable, itemHeight: payload.itemHeight,
+      }), payload.rect);
+    });
+
+    this.on('createSplitPane', async (msg: AbjectMessage) => {
+      const payload = msg.payload as {
+        windowId: AbjectId;
+        rect: Rect;
+        orientation?: 'horizontal' | 'vertical';
+        dividerPosition?: number;
+        minSize?: number;
+        style?: WidgetStyle;
+      };
+      const widget = new SplitPaneWidget({
+        type: 'label' as WidgetType, rect: payload.rect, style: payload.style,
+        ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.getThemeForWindow(payload.windowId),
+        orientation: payload.orientation, dividerPosition: payload.dividerPosition,
+        minSize: payload.minSize,
+      });
+      const widgetId = await this.createTypedWidget(payload.windowId, widget, payload.rect);
+      return widgetId;
     });
 
     // ── Layout factory methods ──
