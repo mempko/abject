@@ -600,7 +600,8 @@ export class Registry extends Abject {
    */
   private filterForCaller(results: ObjectRegistration[], callerId: AbjectId): ObjectRegistration[] {
     if (!this.filteringConfigured) return results;  // Global registry: no filtering
-    if (this.objects.has(callerId)) return results;  // Local callers see everything
+    if (this.objects.has(callerId)) return results;  // Registered in this registry — local
+    if (this.bus.isRegistered(callerId)) return results;  // Same peer (e.g. system object querying workspace registry) — local
     if (this.exposedObjectIds.size === 0) return [];  // No exposed objects = nothing visible remotely
     return results.filter(r => this.exposedObjectIds.has(r.id));
   }
