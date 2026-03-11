@@ -59,6 +59,7 @@ export class WindowAbject extends Abject {
   private destroying = false;
   private rendering = false;
   private renderScheduled = false;
+  private frameTimer?: ReturnType<typeof setTimeout>;
 
   constructor(config: WindowConfig) {
     super({
@@ -180,25 +181,26 @@ export class WindowAbject extends Abject {
         }
       }
 
-      await this.renderWindow();
+      this.scheduleFrame();
       return true;
     });
 
     this.on('removeChild', async (msg: AbjectMessage) => {
       const { widgetId } = msg.payload as { widgetId: AbjectId };
+      if (!this.children.includes(widgetId)) return true;  // Not a direct child (layout-managed) — no-op
       this.children = this.children.filter((id) => id !== widgetId);
       this.childRects.delete(widgetId);
       this.expandedSelects.delete(widgetId);
       if (this.focusedChildId === widgetId) this.focusedChildId = undefined;
       if (this.hoveredChildId === widgetId) this.hoveredChildId = undefined;
-      await this.renderWindow();
+      this.scheduleFrame();
       return true;
     });
 
     this.on('setTitle', async (msg: AbjectMessage) => {
       const { title } = msg.payload as { title: string };
       this.title = title;
-      await this.renderWindow();
+      this.scheduleFrame();
       return true;
     });
 
@@ -229,20 +231,10 @@ export class WindowAbject extends Abject {
       await this.handleInputEvent(inputEvent);
     });
 
-    // Child dirty notification — coalesce N events into 1 deferred render via self-message
+    // Child dirty notification — schedule a frame render
     this.on('childDirty', async () => {
       if (this.destroying) return;
-      if (this.renderScheduled) return;
-      this.renderScheduled = true;
-      await this.send(event(this.id, this.id, 'deferredRender', {}));
-    });
-
-    this.on('deferredRender', async () => {
-      if (!this.renderScheduled) return;
-      this.renderScheduled = false;
-      if (!this.destroying) {
-        await this.renderWindow();
-      }
+      this.scheduleFrame();
     });
 
     // Receive changed events from children (e.g., select expanded/collapsed)
@@ -259,7 +251,7 @@ export class WindowAbject extends Abject {
 
     this.on('updateTheme', async (msg: AbjectMessage) => {
       this.theme = msg.payload as ThemeData;
-      await this.renderWindow();
+      this.scheduleFrame();
       return true;
     });
 
@@ -272,7 +264,7 @@ export class WindowAbject extends Abject {
         await this.changed('windowMinimized', {});
       } else if (action === 'restore') {
         await this.changed('windowRestored', {});
-        await this.renderWindow();
+        this.scheduleFrame();
       }
     });
 
@@ -301,7 +293,6 @@ export class WindowAbject extends Abject {
       if (sizeChanged) {
         await this.updateChildrenOnResize();
         await this.renderWindow();
-        this.renderScheduled = false;
       }
       await this.changed('windowRect', { x, y, width, height });
     });
@@ -366,6 +357,21 @@ method calls on 'abjects:widgets' interface:
 
   // ── Rendering (Morphic drawOn:) ──────────────────────────────────────
 
+  /**
+   * Game-engine style frame scheduler: debounce all mutation-triggered renders
+   * into a single renderWindow() call. The timer resets on each call, so the
+   * render fires only after all pending mutations settle.
+   */
+  private scheduleFrame(): void {
+    if (this.frameTimer) clearTimeout(this.frameTimer);
+    this.frameTimer = setTimeout(() => {
+      this.frameTimer = undefined;
+      if (!this.destroying) {
+        this.renderWindow().catch(() => {});
+      }
+    }, 0);
+  }
+
   private async renderWindow(): Promise<void> {
     if (!this.surfaceId || this.destroying) return;
     if (this.rendering) {
@@ -380,8 +386,8 @@ method calls on 'abjects:widgets' interface:
     } finally {
       this.rendering = false;
       if (this.renderScheduled) {
-        this.send(event(this.id, this.id, 'deferredRender', {}))
-          .catch(() => { /* object may be stopping */ });
+        this.renderScheduled = false;
+        this.scheduleFrame();
       }
     }
   }
@@ -507,24 +513,24 @@ method calls on 'abjects:widgets' interface:
       });
     }
 
-    // Render children — request draw commands from each child widget (Morphic drawOn:)
-    for (const childId of this.children) {
-      const childRect = this.childRects.get(childId);
-      if (!childRect) continue;
-
-      const ox = childRect.x;
-      const oy = this.chromeless ? childRect.y : childRect.y + TITLE_BAR_HEIGHT;
-
-      try {
-        const childCmds = await this.request<unknown[]>(
-          request(this.id, childId, 'render', { surfaceId: sid, ox, oy })
-        );
-        if (Array.isArray(childCmds)) {
-          commands.push(...childCmds);
+    // Render children in parallel — request draw commands from each child widget (Morphic drawOn:)
+    const childResults = await Promise.all(
+      this.children.map(async (childId) => {
+        const childRect = this.childRects.get(childId);
+        if (!childRect) return null;
+        const ox = childRect.x;
+        const oy = this.chromeless ? childRect.y : childRect.y + TITLE_BAR_HEIGHT;
+        try {
+          return await this.request<unknown[]>(
+            request(this.id, childId, 'render', { surfaceId: sid, ox, oy })
+          );
+        } catch {
+          return null;
         }
-      } catch {
-        // Child may have been destroyed
-      }
+      })
+    );
+    for (const childCmds of childResults) {
+      if (Array.isArray(childCmds)) commands.push(...childCmds);
     }
 
     // Window may have been destroyed mid-render (e.g., destroy arrived
@@ -588,7 +594,7 @@ method calls on 'abjects:widgets' interface:
           })
         );
         if (result.consumed) {
-          await this.renderWindow();
+          this.scheduleFrame();
           return;
         }
       } catch {
@@ -648,7 +654,7 @@ method calls on 'abjects:widgets' interface:
       );
     }
 
-    await this.renderWindow();
+    this.scheduleFrame();
   }
 
   private async handleMouseMove(e: { surfaceId?: string; x?: number; y?: number }): Promise<void> {
@@ -832,7 +838,7 @@ method calls on 'abjects:widgets' interface:
         // Widget gone
       }
 
-      await this.renderWindow();
+      this.scheduleFrame();
       return;
     }
   }
@@ -895,6 +901,10 @@ method calls on 'abjects:widgets' interface:
 
   private async destroyWindow(): Promise<void> {
     this.destroying = true;
+    if (this.frameTimer) {
+      clearTimeout(this.frameTimer);
+      this.frameTimer = undefined;
+    }
     console.debug(`[WindowAbject:${this.id}] destroyWindow — ${this.children.length} children`);
     // Send destroy message to all children (must use request() so the reply
     // is consumed; using send() with a request message causes the reply to
