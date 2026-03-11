@@ -76,6 +76,12 @@ export const LAYOUT_INTERFACE_DECL: InterfaceDeclaration = {
       returns: { kind: 'primitive', primitive: 'boolean' },
     },
     {
+      name: 'clearLayoutChildren',
+      description: 'Remove all children from this layout',
+      parameters: [],
+      returns: { kind: 'primitive', primitive: 'boolean' },
+    },
+    {
       name: 'getFocusableWidgets',
       description: 'Return flat ordered list of all focusable widget AbjectIds',
       parameters: [],
@@ -101,6 +107,7 @@ export abstract class LayoutAbject extends WidgetAbject {
   private hoveredLayoutChildId?: AbjectId;
   private expandedChildren: Set<AbjectId> = new Set();
   protected hiddenChildren: Set<AbjectId> = new Set();
+  private layoutDirty = false;
 
   constructor(config: LayoutConfig, layoutType: 'vbox' | 'hbox') {
     super({
@@ -132,6 +139,23 @@ export abstract class LayoutAbject extends WidgetAbject {
     this.setupLayoutHandlers();
   }
 
+  private relayoutTimer?: ReturnType<typeof setTimeout>;
+
+  private scheduleRelayout(): void {
+    // Debounce: reset timer on every mutation so the redraw fires only
+    // after a quiet period.  This automatically batches rapid sequential
+    // addLayoutChild / removeLayoutChild calls into a single render frame.
+    if (this.relayoutTimer) {
+      clearTimeout(this.relayoutTimer);
+    }
+    this.relayoutTimer = setTimeout(() => {
+      this.relayoutTimer = undefined;
+      if (this.layoutDirty) {
+        this.requestRedraw().catch(() => {});
+      }
+    }, 0);
+  }
+
   private setupLayoutHandlers(): void {
     this.on('addLayoutChild', async (msg: AbjectMessage) => {
       const { widgetId, sizePolicy, preferredSize, alignment, stretch } = msg.payload as {
@@ -160,10 +184,8 @@ export abstract class LayoutAbject extends WidgetAbject {
       this.send(
         request(this.id, widgetId, 'addDependent', {})
       );
-      if (this.rect.width > 0 && this.rect.height > 0) {
-        await this.updateChildRects();
-      }
-      await this.requestRedraw();
+      this.layoutDirty = true;
+      this.scheduleRelayout();
       return true;
     });
 
@@ -173,10 +195,8 @@ export abstract class LayoutAbject extends WidgetAbject {
         type: 'spacer',
         stretch: stretch ?? 1,
       });
-      if (this.rect.width > 0 && this.rect.height > 0) {
-        await this.updateChildRects();
-      }
-      await this.requestRedraw();
+      this.layoutDirty = true;
+      this.scheduleRelayout();
       return true;
     });
 
@@ -191,10 +211,18 @@ export abstract class LayoutAbject extends WidgetAbject {
       }
       this.expandedChildren.delete(widgetId);
       this.hiddenChildren.delete(widgetId);
-      if (this.rect.width > 0 && this.rect.height > 0) {
-        await this.updateChildRects();
-      }
-      await this.requestRedraw();
+      this.layoutDirty = true;
+      this.scheduleRelayout();
+      return true;
+    });
+
+    this.on('clearLayoutChildren', async () => {
+      this.layoutChildren = [];
+      this.hoveredLayoutChildId = undefined;
+      this.expandedChildren.clear();
+      this.hiddenChildren.clear();
+      this.layoutDirty = true;
+      this.scheduleRelayout();
       return true;
     });
 
@@ -209,10 +237,8 @@ export abstract class LayoutAbject extends WidgetAbject {
           break;
         }
       }
-      if (this.rect.width > 0 && this.rect.height > 0) {
-        await this.updateChildRects();
-      }
-      await this.requestRedraw();
+      this.layoutDirty = true;
+      this.scheduleRelayout();
       return true;
     });
 
@@ -238,10 +264,8 @@ export abstract class LayoutAbject extends WidgetAbject {
         } else {
           this.hiddenChildren.add(msg.routing.from);
         }
-        if (this.rect.width > 0 && this.rect.height > 0) {
-          await this.updateChildRects();
-        }
-        await this.requestRedraw();
+        this.layoutDirty = true;
+        this.scheduleRelayout();
       }
     });
 
@@ -270,51 +294,68 @@ export abstract class LayoutAbject extends WidgetAbject {
 
   // ── WidgetAbject implementation ───────────────────────────────────
 
+  /**
+   * Flush any pending relayout — subclasses that override buildDrawCommands
+   * must call this at the top of their override.
+   */
+  protected async flushPendingRelayout(): Promise<void> {
+    if (this.layoutDirty) {
+      this.layoutDirty = false;
+      if (this.rect.width > 0 && this.rect.height > 0) {
+        await this.updateChildRects();
+      }
+    }
+  }
+
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
+    // Flush pending relayout before rendering — the render IS the frame
+    // boundary, so all mutations between renders are automatically batched.
+    await this.flushPendingRelayout();
+
     const contentRect = this.getContentRect();
     const childRects = this.calculateChildRects(contentRect);
     const commands: unknown[] = [];
 
-    // First pass: render all non-expanded children
-    for (const cr of childRects) {
-      if (this.expandedChildren.has(cr.widgetId)) continue;
-      const childOx = ox + cr.rect.x;
-      const childOy = oy + cr.rect.y;
-      try {
-        const childCmds = await this.request<unknown[]>(
-          request(this.id, cr.widgetId, 'render', {
-            surfaceId,
-            ox: childOx,
-            oy: childOy,
-          })
-        );
-        if (Array.isArray(childCmds)) {
-          commands.push(...childCmds);
+    // First pass: render all non-expanded children in parallel
+    const nonExpanded = childRects.filter((cr) => !this.expandedChildren.has(cr.widgetId));
+    const nonExpandedResults = await Promise.all(
+      nonExpanded.map(async (cr) => {
+        try {
+          return await this.request<unknown[]>(
+            request(this.id, cr.widgetId, 'render', {
+              surfaceId,
+              ox: ox + cr.rect.x,
+              oy: oy + cr.rect.y,
+            })
+          );
+        } catch {
+          return null;
         }
-      } catch {
-        // Widget may have been destroyed
-      }
+      })
+    );
+    for (const childCmds of nonExpandedResults) {
+      if (Array.isArray(childCmds)) commands.push(...childCmds);
     }
 
     // Second pass: render expanded children on top so dropdowns paint over siblings
-    for (const cr of childRects) {
-      if (!this.expandedChildren.has(cr.widgetId)) continue;
-      const childOx = ox + cr.rect.x;
-      const childOy = oy + cr.rect.y;
-      try {
-        const childCmds = await this.request<unknown[]>(
-          request(this.id, cr.widgetId, 'render', {
-            surfaceId,
-            ox: childOx,
-            oy: childOy,
-          })
-        );
-        if (Array.isArray(childCmds)) {
-          commands.push(...childCmds);
+    const expanded = childRects.filter((cr) => this.expandedChildren.has(cr.widgetId));
+    const expandedResults = await Promise.all(
+      expanded.map(async (cr) => {
+        try {
+          return await this.request<unknown[]>(
+            request(this.id, cr.widgetId, 'render', {
+              surfaceId,
+              ox: ox + cr.rect.x,
+              oy: oy + cr.rect.y,
+            })
+          );
+        } catch {
+          return null;
         }
-      } catch {
-        // Widget may have been destroyed
-      }
+      })
+    );
+    for (const childCmds of expandedResults) {
+      if (Array.isArray(childCmds)) commands.push(...childCmds);
     }
 
     return commands;
@@ -486,7 +527,7 @@ export abstract class LayoutAbject extends WidgetAbject {
     const contentRect = this.getContentRect();
     const childRects = this.calculateChildRects(contentRect);
 
-    for (const cr of childRects) {
+    await Promise.all(childRects.map(async (cr) => {
       try {
         await this.request(
           request(this.id, cr.widgetId, 'update', {
@@ -496,7 +537,7 @@ export abstract class LayoutAbject extends WidgetAbject {
       } catch {
         // Widget may have been destroyed
       }
-    }
+    }));
   }
 
   /**

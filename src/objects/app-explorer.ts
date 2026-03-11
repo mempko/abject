@@ -565,17 +565,27 @@ export class AppExplorer extends Abject {
     // Browse button (always visible)
     await this.addDetailButton(wm, r0, 'Browse', 'browse');
 
+    const hasSource = (inst as unknown as { source?: string }).source !== undefined;
+
     if (this.isRemote) {
       // Remote: "Clone to Local" if object has source
-      const hasSource = !!(inst as unknown as { source?: string }).source;
       if (hasSource) {
         await this.addDetailButton(wm, r0, 'Clone to Local', 'cloneToLocal');
       }
-    } else if (!this.selectedKindIsSystem) {
-      // Local user apps: Clone and Delete
-      await this.addDetailButton(wm, r0, 'Clone', 'clone');
-      await this.addDetailButton(wm, r0, 'Delete', 'delete',
-        { background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' });
+    } else {
+      // Local: Edit Source (if scriptable with source and editor available)
+      if (hasSource) {
+        const editorId = await this.findAbjectEditor();
+        if (editorId) {
+          await this.addDetailButton(wm, r0, 'Edit Source', 'editSource');
+        }
+      }
+      if (!this.selectedKindIsSystem) {
+        // Local user apps: Clone and Delete
+        await this.addDetailButton(wm, r0, 'Clone', 'clone');
+        await this.addDetailButton(wm, r0, 'Delete', 'delete',
+          { background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' });
+      }
     }
   }
 
@@ -643,6 +653,10 @@ export class AppExplorer extends Abject {
       } else if (action === 'delete') {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
           await this.deleteObject(this.instanceEntries[this.selectedInstanceIndex].id);
+        }
+      } else if (action === 'editSource') {
+        if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
+          await this.editSource(this.instanceEntries[this.selectedInstanceIndex].id);
         }
       } else if (action === 'cloneToLocal') {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
@@ -714,6 +728,31 @@ export class AppExplorer extends Abject {
 
     await this.rebuildKindList();
     await this.rebuildInstanceList();
+  }
+
+  /** Find an AbjectEditor in the workspace registry. */
+  private async findAbjectEditor(): Promise<AbjectId | undefined> {
+    if (this.isRemote) return undefined;
+    const regId = this.effectiveRegistryId;
+    if (!regId) return undefined;
+    try {
+      const regs = await this.request<ObjectRegistration[]>(
+        request(this.id, regId, 'list', {})
+      );
+      const editor = regs.find(r => r.manifest.name === 'AbjectEditor');
+      return editor?.id as AbjectId | undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Open the AbjectEditor for a given object. */
+  private async editSource(objectId: AbjectId): Promise<void> {
+    const editorId = await this.findAbjectEditor();
+    if (!editorId) return;
+    try {
+      await this.request(request(this.id, editorId, 'show', { objectId }));
+    } catch { /* editor may not be available */ }
   }
 
   /** Clone a remote object's source into the active local workspace. */

@@ -195,6 +195,23 @@ export class Chat extends Abject {
         await this.handleSendClick();
         return;
       }
+
+      if (fromId === this.textInputId && aspect === 'resize') {
+        const { preferredHeight } = (msg.payload as { aspect: string; value: { preferredHeight: number } }).value;
+        // Update text input height in HBox
+        try {
+          await this.request(request(this.id, this.inputRowId!, 'updateLayoutChild', {
+            widgetId: this.textInputId,
+            preferredSize: { height: preferredHeight },
+          }));
+          // Update input row height in root VBox
+          await this.request(request(this.id, this.rootLayoutId!, 'updateLayoutChild', {
+            widgetId: this.inputRowId,
+            preferredSize: { height: preferredHeight },
+          }));
+        } catch { /* layout may be gone */ }
+        return;
+      }
     });
 
     // ── AgentAbject callback handlers ──
@@ -634,18 +651,20 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
     );
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.inputRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      sizePolicy: { vertical: 'preferred', horizontal: 'expanding' },
       preferredSize: { height: 36 },
     }));
 
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
 
-    // Text input (expanding)
+    // Text input (expanding, with word wrap)
     this.textInputId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createTextInput', {
         windowId: this.windowId,
         rect: r0,
         placeholder: 'Type a message...',
+        wordWrap: true,
+        maxLines: 6,
       })
     );
     await this.request(request(this.id, this.inputRowId, 'addLayoutChild', {

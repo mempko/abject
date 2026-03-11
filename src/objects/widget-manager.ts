@@ -542,11 +542,15 @@ export class WidgetManager extends Abject {
         style?: WidgetStyle;
         placeholder?: string;
         masked?: boolean;
+        wordWrap?: boolean;
+        minLines?: number;
+        maxLines?: number;
       };
       return this.createTypedWidget(payload.windowId, new TextInputWidget({
         type: 'textInput', rect: payload.rect, text: payload.text, style: payload.style,
         ownerId: payload.windowId, uiServerId: this.uiServerId!, theme: this.getThemeForWindow(payload.windowId),
         placeholder: payload.placeholder, masked: payload.masked,
+        wordWrap: payload.wordWrap, minLines: payload.minLines, maxLines: payload.maxLines,
       }), payload.rect);
     });
 
@@ -1316,6 +1320,10 @@ Handle them in your setupHandlers():
 
 ### Common Layout Patterns
 
+// Note: Nested layouts (createNestedVBox, createNestedHBox, createNestedScrollableVBox)
+// are auto-added to their parent with expanding policy. Use addLayoutChild only to
+// override sizing (e.g. fixed height or custom stretch).
+
 // Header + scrollable content + footer (VBox with fixed/expanding/fixed):
 const rootLayout = await this.call(this.dep('WidgetManager'), 'createVBox', {
   windowId: winId, margins: { top: 8, right: 16, bottom: 8, left: 16 }, spacing: 8
@@ -1327,12 +1335,9 @@ const header = await this.call(this.dep('WidgetManager'), 'createLabel', {
 await this.call(rootLayout, 'addLayoutChild', {
   widgetId: header, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 28 }
 });
-// Scrollable content area
+// Scrollable content area (auto-added to parent with expanding policy)
 const scrollArea = await this.call(this.dep('WidgetManager'), 'createNestedScrollableVBox', {
   parentLayoutId: rootLayout, spacing: 4
-});
-await this.call(rootLayout, 'addLayoutChild', {
-  widgetId: scrollArea, sizePolicy: { vertical: 'expanding' }
 });
 
 // Side-by-side panels (HBox with nested VBoxes):
@@ -1342,14 +1347,8 @@ const hbox = await this.call(this.dep('WidgetManager'), 'createHBox', {
 const leftPanel = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
   parentLayoutId: hbox, spacing: 4
 });
-await this.call(hbox, 'addLayoutChild', {
-  widgetId: leftPanel, sizePolicy: { horizontal: 'expanding' }
-});
 const rightPanel = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
   parentLayoutId: hbox, spacing: 4
-});
-await this.call(hbox, 'addLayoutChild', {
-  widgetId: rightPanel, sizePolicy: { horizontal: 'expanding' }
 });
 
 ### Tab Content Switching
@@ -1364,14 +1363,11 @@ await this.call(rootLayout, 'addLayoutChild', {
 });
 await this.call(tabBar, 'addDependent', {});
 
-// Create one content layout per tab
+// Create one content layout per tab (auto-added to parent with expanding policy)
 const tabContents = [];
 for (const tabName of ['Tab A', 'Tab B', 'Tab C']) {
   const content = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
     parentLayoutId: rootLayout, spacing: 4
-  });
-  await this.call(rootLayout, 'addLayoutChild', {
-    widgetId: content, sizePolicy: { vertical: 'expanding' }
   });
   tabContents.push(content);
 }
@@ -1654,6 +1650,12 @@ await this.call(timerId, 'addDependent', {});
 
     await layout.init(this.bus, this.id);
     this.spawnedWidgets.add(layout.id);
+
+    // Auto-add to parent with expanding defaults
+    await this.request(request(this.id, parentLayoutId, 'addLayoutChild', {
+      widgetId: layout.id,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
 
     return layout.id;
   }
