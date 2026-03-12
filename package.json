@@ -11,7 +11,8 @@
     "serve3": "ABJECTS_DATA_DIR=.abjects3 WS_PORT=7722 tsx --watch server/index.ts",
     "client3": "VITE_WS_PORT=7722 VITE_CLIENT_PORT=5176 vite --config vite.client.config.ts",
     "signal": "tsx server/signaling-server.ts",
-    "asc": "asc"
+    "asc": "asc",
+    "hack": "tsx hack/security-audit.ts"
   },
   "dependencies": {
     "ajv": "^8.12.0",
