@@ -404,6 +404,13 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         return;
       }
 
+      if (aspect === 'contactDisconnected') {
+        const { peerId } = value as { peerId: string };
+        log.info(`contactDisconnected event for ${peerId.slice(0, 16)}, clearing routes`);
+        this.clearRoutesForPeerImpl(peerId as PeerId);
+        return;
+      }
+
       if (aspect === 'workspaceAccessChanged' || aspect === 'workspaceShared' ||
           aspect === 'workspaceUnshared' || aspect === 'workspaceObjectsChanged') {
         // Invalidate permission cache

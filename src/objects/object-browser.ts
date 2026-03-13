@@ -68,7 +68,6 @@ export class ObjectBrowser extends Abject {
   private workspaceManagerId?: AbjectId;
   private shareRegistryId?: AbjectId;
   private systemRegistryId?: AbjectId;
-  private peerRouterId?: AbjectId;
 
   // ── Multi-registry data ──
   private registrySources: Map<string, RegistrySource> = new Map();
@@ -466,11 +465,6 @@ export class ObjectBrowser extends Abject {
       }
     }
 
-    // Lazy-discover PeerRouter for resolving fresh registryIds
-    if (!this.peerRouterId) {
-      this.peerRouterId = await this.discoverDep('PeerRouter') ?? undefined;
-    }
-
     // Discover remote workspaces via WorkspaceShareRegistry
     if (this.shareRegistryId) {
       try {
@@ -482,25 +476,10 @@ export class ObjectBrowser extends Abject {
           // Skip workspaces without a routable registry ID
           if (!dw.registryId) continue;
 
-          // Resolve current registryId from PeerRouter route table
-          // (cached WSR entries may have stale UUIDs from a previous session)
-          let registryId = dw.registryId;
-          if (this.peerRouterId) {
-            try {
-              const resolved = await this.request<string | null>(
-                request(this.id, this.peerRouterId, 'resolveWorkspaceRegistry', {
-                  ownerPeerId: dw.ownerPeerId,
-                  workspaceId: dw.workspaceId,
-                })
-              );
-              if (resolved) registryId = resolved;
-            } catch { /* PeerRouter not ready */ }
-          }
-
           const key = `remote:${dw.ownerPeerId}/${dw.workspaceId}`;
           const ownerLabel = dw.ownerName || dw.ownerPeerId.slice(0, 8);
           this.registrySources.set(key, {
-            id: registryId as AbjectId,
+            id: dw.registryId as AbjectId,
             label: `${ownerLabel} / ${dw.name}`,
             kind: 'remote-workspace',
             workspaceId: dw.workspaceId,

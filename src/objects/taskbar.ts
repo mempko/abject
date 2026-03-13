@@ -261,6 +261,7 @@ export class Taskbar extends Abject {
    * Incremental update: diff current buttons against desired state and patch.
    */
   private async update(): Promise<void> {
+    if (this.showInProgress) return;
     if (!this.windowId || !this.rootLayoutId) {
       await this.show();
       return;
