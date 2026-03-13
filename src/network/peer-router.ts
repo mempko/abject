@@ -111,6 +111,10 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   /** NAT table: local objectId → Map<peerId, expiryTimestamp> */
   private connTrack: Map<AbjectId, Map<PeerId, number>> = new Map();
 
+  /** Hint map: registryId/objectId → ownerPeerId, populated from workspace route announcements.
+   *  Persists beyond workspace route TTL to help speculative routing. */
+  private registryOwnerHints: Map<AbjectId, PeerId> = new Map();
+
   /** Inbound permission cache */
   private permissionCache: Map<AbjectId, PermissionCacheEntry> = new Map();
 
@@ -498,7 +502,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     const route = this.getRoute(recipient);
     if (!route) {
       // No explicit route — try speculative forwarding before giving up
-      const specPeer = this.speculateNextHop(message.routing.from as AbjectId);
+      const specPeer = this.speculateNextHop(message.routing.from as AbjectId, recipient);
       if (specPeer) {
         const specTransport = this.peerRegistryRef.getTransportForPeer(specPeer);
         if (specTransport?.isConnected) {
@@ -535,10 +539,11 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   /**
    * Speculative next-hop: when no explicit route exists, guess the peer.
    * Tier 1: connTrack — sender previously talked to a peer, recipient likely lives there.
-   * Tier 2: Exactly one connected peer — forward to them (no ambiguity).
+   * Tier 2: registryOwnerHints — recipient matches a previously-seen registryId/objectId.
+   * Tier 3: Exactly one connected peer — forward to them (no ambiguity).
    * No system routes are cached for speculative forwards.
    */
-  private speculateNextHop(senderId: AbjectId): PeerId | undefined {
+  private speculateNextHop(senderId: AbjectId, recipientId: AbjectId): PeerId | undefined {
     if (!this.peerRegistryRef) return undefined;
     const now = Date.now();
 
@@ -559,7 +564,14 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       if (bestPeer) return bestPeer;
     }
 
-    // Tier 2: Exactly one connected peer
+    // Tier 2: registryOwnerHints — recipient matches a known registryId/objectId
+    const hintPeer = this.registryOwnerHints.get(recipientId);
+    if (hintPeer) {
+      const transport = this.peerRegistryRef.getTransportForPeer(hintPeer);
+      if (transport?.isConnected) return hintPeer;
+    }
+
+    // Tier 3: Exactly one connected peer
     const connected = this.peerRegistryRef.getConnectedPeers();
     if (connected.length === 1) return connected[0];
 
@@ -997,6 +1009,18 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     }
 
     return undefined;
+  }
+
+  /**
+   * Record registryId → ownerPeerId hint from a workspace route.
+   * These hints survive beyond workspace route TTL expiry, helping
+   * speculative routing when workspace routes haven't propagated yet.
+   */
+  private recordRegistryOwnerHint(wsRoute: WorkspaceRoute): void {
+    this.registryOwnerHints.set(wsRoute.registryId, wsRoute.ownerPeerId);
+    for (const objId of wsRoute.exposedObjectIds) {
+      this.registryOwnerHints.set(objId, wsRoute.ownerPeerId);
+    }
   }
 
   private getRoutesImpl(): Array<{ objectId: string; nextHop: string; hops: number; ttl: number; workspaceKey?: string }> {
@@ -1447,6 +1471,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         this.workspaceRoutes.set(wsKey, wsRoute);
         this.recordRouteChange('add', wsKey, wsRoute);
         newRoutes = true;
+        this.recordRegistryOwnerHint(wsRoute);
 
         // Cache object → workspace mappings for exposed objects
         for (const objId of wsRoute.exposedObjectIds) {
@@ -1481,6 +1506,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
           this.workspaceRoutes.set(wsKey, wsRoute);
           this.recordRouteChange(existing ? 'update' : 'add', wsKey, wsRoute);
           newRoutes = true;
+          this.recordRegistryOwnerHint(wsRoute);
 
           for (const objId of wsRoute.exposedObjectIds) {
             this.objectToWorkspace.set(objId, wsKey);
@@ -1644,7 +1670,25 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     digest: Array<{ workspaceKey: string; version: number }>,
     fromPeerId: PeerId,
   ): Promise<boolean> {
-    // Announce our routes to this peer (will send diff if possible)
+    // Compare digest against what we think we've sent this peer.
+    // If the peer is missing workspace routes we think we announced,
+    // reset announce state so the next call sends a FULL (forces convergence).
+    const peerState = this.peerAnnounceState.get(fromPeerId);
+    if (peerState) {
+      const peerWsKeys = new Set(digest.map(d => d.workspaceKey));
+      let peerMissing = false;
+      for (const wsKey of peerState.announcedRoutes) {
+        if (!peerWsKeys.has(wsKey) && this.workspaceRoutes.has(wsKey)) {
+          peerMissing = true;
+          break;
+        }
+      }
+      if (peerMissing) {
+        this.peerAnnounceState.delete(fromPeerId);
+      }
+    }
+
+    // Announce our routes to this peer (full if state was reset, diff otherwise)
     await this.announceRoutesToPeer(fromPeerId).catch(() => {});
     return true;
   }
