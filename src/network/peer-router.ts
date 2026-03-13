@@ -468,6 +468,12 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       return 'pass';
     }
 
+    // If the recipient is registered locally, always deliver locally —
+    // never route a local object's messages to a remote peer.
+    if (this._messageBus?.isRegistered(recipient)) {
+      return 'pass';
+    }
+
     // Look up route in routing table
     const route = this.getRoute(recipient);
     if (!route) {
@@ -539,12 +545,21 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     // request (e.g. the remote registry), NOT the actual peer that generated it.
     // Recording it would create a bogus systemRoute that shadows the correct
     // workspace route, causing a routing loop.
+    //
+    // Also skip if the sender ID is registered locally — a remote SharedState
+    // (or similar P2P object) may share the same well-known pattern but have a
+    // different UUID. If a local object exists with this ID, creating a remote
+    // route would shadow it, causing local messages to be mis-routed to the
+    // remote peer.
     if (msg.header.type === 'request' || msg.header.type === 'event') {
-      this.systemRoutes.set(msg.routing.from, {
-        nextHop: fromPeerId,
-        hops: 0,
-        ttl: Date.now() + ROUTE_TTL,
-      });
+      const senderId = msg.routing.from;
+      if (!this._messageBus?.isRegistered(senderId as AbjectId)) {
+        this.systemRoutes.set(senderId as AbjectId, {
+          nextHop: fromPeerId,
+          hops: 0,
+          ttl: Date.now() + ROUTE_TTL,
+        });
+      }
     }
 
     let targetId = msg.routing.to;
