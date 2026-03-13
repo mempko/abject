@@ -27,7 +27,6 @@ import type { AuthConfig, SessionStore } from './auth.js';
 import { Log } from '../src/core/timed-log.js';
 
 const log = new Log('BackendUI');
-const dragLog = new Log('DRAG-DEBUG');
 const UI_INTERFACE = 'abjects:ui';
 const WIDGET_FONT = '14px "Inter", system-ui, sans-serif';
 
@@ -1074,7 +1073,6 @@ IMPORTANT:
       const state = this.surfaces.get(msg.surfaceId);
       if (state) {
         if (msg.inputType === 'mousedown' && this.windowManagerId) {
-          dragLog.info(`mousedown on surface=${msg.surfaceId} windowManagerId=${this.windowManagerId}`);
           // ── Ctrl+click: immediately start window drag (client-side move) ──
           if (msg.modifiers?.ctrl) {
             const globalX = (msg.x ?? 0) + (state.rect.x ?? 0);
@@ -1110,7 +1108,6 @@ IMPORTANT:
               return;
             }
 
-            dragLog.info(`WindowManager reply: grab=${reply.grab} dragType=${reply.dragType} minimize=${reply.minimize}`);
             if (reply.grab) {
               // Tell client about the drag start
               this.sendToFrontend({
@@ -1128,7 +1125,6 @@ IMPORTANT:
               return;
             }
           } catch (err) {
-            dragLog.info(`WindowManager request failed:`, err);
             // WindowManager not available — fall through to original behavior
           }
 
