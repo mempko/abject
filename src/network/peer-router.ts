@@ -225,15 +225,6 @@ export class PeerRouter extends Abject implements MessageInterceptor {
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
-              {
-                name: 'ensureRoute',
-                description: 'Ensure a system route exists for an objectId via a specific peer',
-                parameters: [
-                  { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'Object ID to route' },
-                  { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer that owns this object' },
-                ],
-                returns: { kind: 'primitive', primitive: 'boolean' },
-              },
             ],
             events: [
               {
@@ -388,22 +379,6 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       return null;
     });
 
-    // Ensure a system route exists for a given objectId via a specific peer.
-    // Used when we know an objectId belongs to a peer (e.g. from WSR cache)
-    // but the workspace route hasn't arrived via anti-entropy yet.
-    this.on('ensureRoute', async (msg: AbjectMessage) => {
-      const { objectId, peerId } = msg.payload as { objectId: string; peerId: string };
-      if (this.getRoute(objectId as AbjectId)) return true; // Already routable
-      if (!this.peerRegistryRef) return false;
-      const transport = this.peerRegistryRef.getTransportForPeer(peerId as PeerId);
-      if (!transport?.isConnected) return false;
-      this.systemRoutes.set(objectId as AbjectId, {
-        nextHop: peerId as PeerId,
-        hops: 1,
-        ttl: Date.now() + ROUTE_TTL,
-      });
-      return true;
-    });
 
     this.on('handleRouteDigest', async (msg: AbjectMessage) => {
       const { digest, fromPeerId } = msg.payload as {
@@ -522,6 +497,19 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     // Look up route in routing table
     const route = this.getRoute(recipient);
     if (!route) {
+      // No explicit route — try speculative forwarding before giving up
+      const specPeer = this.speculateNextHop(message.routing.from as AbjectId);
+      if (specPeer) {
+        const specTransport = this.peerRegistryRef.getTransportForPeer(specPeer);
+        if (specTransport?.isConnected) {
+          try {
+            const outMsg = this.filterOutboundReply(message);
+            await specTransport.send(outMsg);
+            this.trackOutboundConnection(message.routing.from as AbjectId, specPeer);
+            return 'drop';
+          } catch { /* fall through to 'pass' */ }
+        }
+      }
       return 'pass'; // Local delivery
     }
 
@@ -542,6 +530,40 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       log.error(`Failed to forward message to peer ${route.nextHop.slice(0, 16)}:`, err);
       return 'pass';
     }
+  }
+
+  /**
+   * Speculative next-hop: when no explicit route exists, guess the peer.
+   * Tier 1: connTrack — sender previously talked to a peer, recipient likely lives there.
+   * Tier 2: Exactly one connected peer — forward to them (no ambiguity).
+   * No system routes are cached for speculative forwards.
+   */
+  private speculateNextHop(senderId: AbjectId): PeerId | undefined {
+    if (!this.peerRegistryRef) return undefined;
+    const now = Date.now();
+
+    // Tier 1: connTrack — sender previously talked to a peer
+    const senderPeers = this.connTrack.get(senderId);
+    if (senderPeers) {
+      let bestPeer: PeerId | undefined;
+      let bestExpiry = 0;
+      for (const [peerId, expiry] of senderPeers) {
+        if (now < expiry && expiry > bestExpiry) {
+          const transport = this.peerRegistryRef.getTransportForPeer(peerId);
+          if (transport?.isConnected) {
+            bestPeer = peerId;
+            bestExpiry = expiry;
+          }
+        }
+      }
+      if (bestPeer) return bestPeer;
+    }
+
+    // Tier 2: Exactly one connected peer
+    const connected = this.peerRegistryRef.getConnectedPeers();
+    if (connected.length === 1) return connected[0];
+
+    return undefined;
   }
 
   /**
@@ -902,21 +924,19 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       if (wsRoute) {
         if (now > wsRoute.ttl) {
           // Renew if peer still connected
-          if (this.peerRegistryRef) {
-            const transport = this.peerRegistryRef.getTransportForPeer(wsRoute.nextHop);
-            if (transport?.isConnected) {
-              wsRoute.ttl = now + ROUTE_TTL;
-              return {
-                nextHop: wsRoute.nextHop,
-                hops: wsRoute.hops,
-                ttl: wsRoute.ttl,
-              };
-            }
+          const bestHop = this.bestNextHopForWsRoute(wsRoute);
+          if (bestHop) {
+            wsRoute.ttl = now + ROUTE_TTL;
+            return {
+              nextHop: bestHop,
+              hops: wsRoute.hops,
+              ttl: wsRoute.ttl,
+            };
           }
           this.objectToWorkspace.delete(objectId);
         } else {
           return {
-            nextHop: wsRoute.nextHop,
+            nextHop: this.bestNextHopForWsRoute(wsRoute) ?? wsRoute.nextHop,
             hops: wsRoute.hops,
             ttl: wsRoute.ttl,
           };
@@ -931,14 +951,9 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     for (const [wsKey, wsRoute] of this.workspaceRoutes) {
       if (now > wsRoute.ttl) {
         // Renew if peer still connected
-        if (this.peerRegistryRef) {
-          const transport = this.peerRegistryRef.getTransportForPeer(wsRoute.nextHop);
-          if (transport?.isConnected) {
-            wsRoute.ttl = now + ROUTE_TTL;
-          } else {
-            this.workspaceRoutes.delete(wsKey);
-            continue;
-          }
+        const bestHop = this.bestNextHopForWsRoute(wsRoute);
+        if (bestHop) {
+          wsRoute.ttl = now + ROUTE_TTL;
         } else {
           this.workspaceRoutes.delete(wsKey);
           continue;
@@ -948,11 +963,37 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         // Cache the mapping for future lookups
         this.objectToWorkspace.set(objectId, wsKey);
         return {
-          nextHop: wsRoute.nextHop,
+          nextHop: this.bestNextHopForWsRoute(wsRoute) ?? wsRoute.nextHop,
           hops: wsRoute.hops,
           ttl: wsRoute.ttl,
         };
       }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * For a workspace route, prefer routing directly to ownerPeerId if we're
+   * connected to them. Gossipped routes may have nextHop set to the relaying
+   * peer rather than the actual owner, so a direct link is always better.
+   * Returns the best nextHop, or undefined if no connected peer is available.
+   */
+  private bestNextHopForWsRoute(wsRoute: WorkspaceRoute): PeerId | undefined {
+    if (!this.peerRegistryRef) return undefined;
+
+    // Prefer direct connection to owner
+    if (wsRoute.ownerPeerId !== wsRoute.nextHop) {
+      const ownerTransport = this.peerRegistryRef.getTransportForPeer(wsRoute.ownerPeerId);
+      if (ownerTransport?.isConnected) {
+        return wsRoute.ownerPeerId;
+      }
+    }
+
+    // Fall back to stored nextHop (relay peer)
+    const transport = this.peerRegistryRef.getTransportForPeer(wsRoute.nextHop);
+    if (transport?.isConnected) {
+      return wsRoute.nextHop;
     }
 
     return undefined;
