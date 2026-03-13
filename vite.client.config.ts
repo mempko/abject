@@ -11,5 +11,6 @@ export default defineConfig({
   },
   server: {
     port: parseInt(process.env.VITE_CLIENT_PORT ?? '5174', 10),
+    host: '127.0.0.1',
   },
 });

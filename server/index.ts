@@ -75,14 +75,17 @@ import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
 import { NodeWorkerAdapter } from './node-worker-adapter.js';
 import { loadAuthConfig, SessionStore, authenticateConnection } from './auth.js';
+import { Log } from '../src/core/timed-log.js';
 import * as path from 'node:path';
 import os from 'node:os';
 
 const WS_PORT = parseInt(process.env.WS_PORT ?? '7719', 10);
 const DATA_DIR = process.env.ABJECTS_DATA_DIR ?? '.abjects';
+const alog = new Log('ABJECTS');
 
 async function main(): Promise<void> {
-  console.log('[ABJECTS] Initializing backend...');
+  const log = new Log('BOOTSTRAP');
+  alog.info('Initializing backend...');
 
   // Read API keys from environment
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
@@ -117,6 +120,7 @@ async function main(): Promise<void> {
 
   // Start runtime (bootstraps Registry + Factory)
   await runtime.start();
+  log.timed('runtime started');
 
   const bus = runtime.messageBus;
   const factoryId = runtime.objectFactory.id;
@@ -234,6 +238,8 @@ async function main(): Promise<void> {
     }
   }
 
+  log.timed('constructors registered');
+
   // Spawn Supervisor early so it can supervise other objects
   const supervisorId = await factorySpawn('Supervisor');
 
@@ -270,6 +276,7 @@ async function main(): Promise<void> {
   const windowManagerId = await supervisedSpawn('WindowManager');
   const widgetManagerId = await supervisedSpawn('WidgetManager');
 
+  log.timed('core capabilities spawned');
   const identityId = await supervisedSpawn('Identity');
 
   // Get peerId for computing system TypeIds
@@ -277,9 +284,9 @@ async function main(): Promise<void> {
   try {
     const identity = await bootstrapRequest<{ peerId: string }>(identityId, 'getIdentity', {});
     localPeerId = identity.peerId;
-    console.log(`[ABJECTS] Local peerId: ${localPeerId.slice(0, 16)}...`);
+    alog.info(`Local peerId: ${localPeerId.slice(0, 16)}...`);
   } catch {
-    console.warn('[ABJECTS] Could not get peerId — system TypeIds will not be assigned');
+    alog.warn('Could not get peerId — system TypeIds will not be assigned');
   }
 
   /** Compute a system-scoped TypeId: {peerId}/system/{name} */
@@ -288,6 +295,7 @@ async function main(): Promise<void> {
     return `${localPeerId}/system/${name}` as TypeId;
   }
 
+  log.timed('identity ready');
   const peerRegistryId = await supervisedSpawn('PeerRegistry', 'permanent', systemTypeId('PeerRegistry'));
   const remoteRegistryId = await supervisedSpawn('RemoteRegistry', 'permanent', systemTypeId('RemoteRegistry'));
   const peerRouterId = await supervisedSpawn('PeerRouter', 'permanent', systemTypeId('PeerRouter'));
@@ -318,6 +326,7 @@ async function main(): Promise<void> {
   // Set the signaling relay as fallback for PeerRegistry when no signaling server is available
   peerRegistryObj.setSignalingRelay(signalingRelayObj);
 
+  log.timed('P2P layer ready');
   // Set up auth gate BEFORE GlobalSettings spawns, so applySavedAuthConfig()
   // can update the authConfig during its onInit()
   const authConfig = loadAuthConfig();
@@ -336,13 +345,17 @@ async function main(): Promise<void> {
   // WorkspaceSwitcher is a global UI (never hidden during workspace switch)
   const workspaceSwitcherId = await supervisedSpawn('WorkspaceSwitcher', 'permanent', systemTypeId('WorkspaceSwitcher'));
 
+  log.timed('global UI + services spawned');
+
   // WorkspaceManager spawns per-workspace objects (Settings, Taskbar, Chat, etc.)
   const workspaceManagerId = await supervisedSpawn('WorkspaceManager', 'permanent', systemTypeId('WorkspaceManager'));
+  log.timed('WorkspaceManager spawned');
 
   // Boot workspaces BEFORE spawning WSR — boot() loads persisted workspaces
   // (including their access modes) so listSharedWorkspaces returns real data.
   // Cannot happen during onInit because Factory would deadlock processing our spawn request.
   await bootstrapRequest(workspaceManagerId, 'boot', {});
+  log.timed('workspace boot complete');
 
   // WorkspaceShareRegistry must spawn AFTER boot() so listSharedWorkspaces finds shared workspaces
   const workspaceShareRegistryId = await supervisedSpawn('WorkspaceShareRegistry', 'permanent', systemTypeId('WorkspaceShareRegistry'));
@@ -364,10 +377,10 @@ async function main(): Promise<void> {
     proxyGenId, negotiatorId,
     workspaceSwitcherId, workspaceManagerId,
   ];
-  for (const objId of monitoredIds) {
+  await Promise.all(monitoredIds.map(async (objId) => {
     await bootstrapRequest(healthMonitorId, 'monitorObject', { objectId: objId });
     await bootstrapRequest(healthMonitorId, 'markObjectReady', { objectId: objId });
-  }
+  }));
   await bootstrapRequest(healthMonitorId, 'startMonitoring', {});
 
   // Clean up bootstrap handler
@@ -377,31 +390,31 @@ async function main(): Promise<void> {
   // Start WebSocket server
   const wsServer = new NodeWebSocketServer({
     port: WS_PORT,
-    perMessageDeflate: {
-      zlibDeflateOptions: { level: 1 },
-      threshold: 128,
-    },
+    host: '127.0.0.1',
+    perMessageDeflate: false,
   });
 
   wsServer.onConnection((ws) => {
+    alog.info('Frontend connection received');
     if (authConfig.enabled) {
-      console.log('[ABJECTS] Frontend connected (auth required)');
+      alog.info('Frontend connected (auth required)');
       authenticateConnection(ws, authConfig, sessionStore).then(({ result }) => {
         if (result === 'authenticated') {
-          console.log('[ABJECTS] Frontend authenticated');
+          alog.info('Frontend authenticated');
           backendUI.setWebSocket(ws);
         } else {
-          console.log(`[ABJECTS] Frontend auth ${result}, closing`);
+          alog.info(`Frontend auth ${result}, closing`);
           ws.close(1008, `Authentication ${result}`);
         }
       });
     } else {
-      console.log('[ABJECTS] Frontend connected');
+      alog.info('Frontend connected');
       ws.send(JSON.stringify({ type: 'authNotRequired' }));
       backendUI.setWebSocket(ws);
     }
   });
 
+  log.summary('server ready');
   console.log('');
   console.log(`  ABJECTS server running`);
   console.log('');
@@ -414,7 +427,7 @@ async function main(): Promise<void> {
 
   // Handle graceful shutdown
   const shutdown = async () => {
-    console.log('[ABJECTS] Shutting down...');
+    alog.info('Shutting down...');
     sessionStore.destroy();
     await wsServer.close();
     await runtime.stop();
@@ -426,10 +439,10 @@ async function main(): Promise<void> {
 }
 
 process.on('unhandledRejection', (reason) => {
-  console.error('[ABJECTS] Unhandled rejection (server stayed up):', reason);
+  alog.error('Unhandled rejection (server stayed up):', reason);
 });
 
 main().catch((err) => {
-  console.error('[ABJECTS] Fatal startup error:', err);
+  alog.error('Fatal startup error:', err);
   process.exit(1);
 });
