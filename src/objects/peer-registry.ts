@@ -1099,12 +1099,19 @@ export class PeerRegistry extends Abject {
       }
     }
 
-    const hasSignaling = !!this.getActiveSignalingClient() || !!this.signalingRelayRef;
+    const activeSignaling = this.getActiveSignalingClient();
+    const hasSignaling = !!activeSignaling || !!this.signalingRelayRef;
 
     // If no signaling is available, try connecting to signaling servers
     // where gossip peers or contacts were last seen
     if (!hasSignaling) {
       this.tryAlternativeSignaling();
+    }
+
+    // Re-poll signaling for fresh peer lists so we discover peers that
+    // (re)registered since our last list-peers request.
+    if (activeSignaling && this.localIdentity) {
+      activeSignaling.listPeers(this.localIdentity.peerId);
     }
 
     for (const [peerId, contact] of this.contacts) {

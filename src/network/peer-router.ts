@@ -360,6 +360,16 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       return result;
     });
 
+    this.on('resolveWorkspaceRegistry', async (msg: AbjectMessage) => {
+      const { ownerPeerId, workspaceId } = msg.payload as { ownerPeerId: string; workspaceId: string };
+      const wsKey = `${ownerPeerId}/${workspaceId}`;
+      const wsRoute = this.workspaceRoutes.get(wsKey);
+      if (wsRoute && Date.now() < wsRoute.ttl) {
+        return wsRoute.registryId;
+      }
+      return null;
+    });
+
     this.on('handleRouteDigest', async (msg: AbjectMessage) => {
       const { digest, fromPeerId } = msg.payload as {
         digest: Array<{ workspaceKey: string; version: number }>;

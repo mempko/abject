@@ -166,8 +166,12 @@ export class WorkspaceShareRegistry extends Abject {
       // Phase 6a: Extract workspace metadata from route announcements
       if (aspect === 'routesUpdated') {
         const { fromPeerId } = value as { fromPeerId: string };
-        // Query peer workspaces but only as a fallback — route announcements
-        // now carry workspace metadata that populates our cache directly
+        // Synchronously update cached registryIds from PeerRouter's route data.
+        // This handles the case where a peer restarted and got new UUIDs —
+        // the route announcement arrives with the fresh registryId before any
+        // WSR query completes.
+        this.syncRegistryIdsFromRoutes(fromPeerId).catch(() => {});
+        // Also query peer workspaces for full metadata (names, descriptions)
         this.queryPeerWorkspaces(fromPeerId).catch(() => { /* best-effort */ });
         return;
       }
@@ -540,6 +544,34 @@ export class WorkspaceShareRegistry extends Abject {
       return remoteId ? remoteId as AbjectId : null;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Sync cached discoveredWorkspaces registryIds from PeerRouter's route data.
+   * Route announcements carry the current registryId — if a peer restarted,
+   * the route has the new UUID while our cache may have the old one.
+   */
+  private async syncRegistryIdsFromRoutes(fromPeerId: string): Promise<void> {
+    if (!this.peerRouterId) return;
+
+    // Check each cached discovery from this peer
+    for (const [key, dw] of this.discoveredWorkspaces) {
+      if (dw.ownerPeerId !== fromPeerId) continue;
+
+      try {
+        const currentRegistryId = await this.request<string | null>(
+          request(this.id, this.peerRouterId, 'resolveWorkspaceRegistry', {
+            ownerPeerId: dw.ownerPeerId,
+            workspaceId: dw.workspaceId,
+          })
+        );
+        if (currentRegistryId && currentRegistryId !== dw.registryId) {
+          log.info(`updated stale registryId for ${dw.name}: ${dw.registryId.slice(0, 8)} → ${currentRegistryId.slice(0, 8)}`);
+          dw.registryId = currentRegistryId;
+          this.discoveredWorkspaces.set(key, dw);
+        }
+      } catch { /* PeerRouter not ready */ }
     }
   }
 

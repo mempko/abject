@@ -140,6 +140,10 @@ export class SignalingServer {
 
     log.info(`Registered peer: ${msg.peerId.slice(0, 16)} (${msg.name ?? 'unnamed'})`);
     this.sendMessage(ws, { type: 'registered', peerId: msg.peerId });
+
+    // Broadcast updated peer-list to all other connected peers so they can
+    // discover and reconnect to the newly registered peer immediately.
+    this.broadcastPeerList(msg.peerId);
   }
 
   private handleUnregister(msg: SignalingMessage): void {
@@ -224,6 +228,25 @@ export class SignalingServer {
       }
     }
     this.sendMessage(ws, { type: 'pong' });
+  }
+
+  /**
+   * Send updated peer-list to all connected peers except the one that just registered.
+   */
+  private broadcastPeerList(excludePeerId: string): void {
+    for (const [peerId, record] of this.peers) {
+      if (peerId === excludePeerId) continue;
+      if (record.ws.readyState !== WebSocket.OPEN) continue;
+      const peers = Array.from(this.peers.values())
+        .filter(r => r.peerId !== peerId)
+        .map(r => ({
+          peerId: r.peerId,
+          name: r.name,
+          publicSigningKey: r.publicSigningKey,
+          publicExchangeKey: r.publicExchangeKey,
+        }));
+      this.sendMessage(record.ws, { type: 'peer-list', peers } as SignalingMessage);
+    }
   }
 
   private removePeerBySocket(ws: WebSocket): void {

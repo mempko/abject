@@ -603,6 +603,23 @@ export class WorkspaceBrowser extends Abject {
     if (!ws.registryId) return;
 
     try {
+      // Resolve the current registryId from PeerRouter's workspace route.
+      // The cached discoveredWorkspace may have a stale registryId if the
+      // remote peer restarted (all UUIDs change on restart).
+      let registryId = ws.registryId;
+      const peerRouterId = await this.discoverDep('PeerRouter');
+      if (peerRouterId) {
+        const resolved = await this.request<string | null>(
+          request(this.id, peerRouterId, 'resolveWorkspaceRegistry', {
+            ownerPeerId: ws.ownerPeerId,
+            workspaceId: ws.workspaceId,
+          })
+        );
+        if (resolved) {
+          registryId = resolved;
+        }
+      }
+
       const factoryId = await this.discoverDep('Factory');
       if (!factoryId) return;
 
@@ -620,7 +637,7 @@ export class WorkspaceBrowser extends Abject {
 
       await this.request(
         request(this.id, result.objectId, 'browseRemote', {
-          registryId: ws.registryId,
+          registryId,
           peerId: ws.ownerPeerId,
           label: `${ws.name} (${ws.ownerName || ws.ownerPeerId.slice(0, 8)})`,
         })
