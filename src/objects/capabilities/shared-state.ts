@@ -103,6 +103,7 @@ const PROPAGATION_EXPIRY = 15_000; // 15s dedup window
 
 export class SharedState extends Abject {
   private peerRegistryId?: AbjectId;
+  private peerRouterId?: AbjectId;
   private wsrId?: AbjectId;
   private storageId?: AbjectId;
   private localPeerId = '';
@@ -424,6 +425,7 @@ export class SharedState extends Abject {
     log.info(`[${this.id.slice(0, 8)}] onInit starting`);
     this.peerRegistryId = await this.discoverDep('PeerRegistry') ?? undefined;
     log.info(`[${this.id.slice(0, 8)}] peerRegistryId=${this.peerRegistryId?.slice(0, 8) ?? 'NONE'}`);
+    this.peerRouterId = await this.discoverDep('PeerRouter') ?? undefined;
 
     // Discover Storage for optional key persistence
     this.storageId = await this.discoverDep('Storage') ?? undefined;
@@ -561,6 +563,14 @@ export class SharedState extends Abject {
       if (!registryId) continue;
 
       try {
+        // Ensure PeerRouter has a route for the remote registry
+        if (this.peerRouterId && ws.ownerPeerId) {
+          await this.request(createRequest(this.id, this.peerRouterId, 'ensureRoute', {
+            objectId: registryId,
+            peerId: ws.ownerPeerId,
+          }));
+        }
+
         const queryResults = await this.request<Array<{ id: AbjectId }>>(
           createRequest(this.id, registryId, 'discover', { name: 'SharedState' }),
         );
@@ -568,6 +578,13 @@ export class SharedState extends Abject {
           const remoteSSId = queryResults[0].id;
           if (remoteSSId !== this.id) {
             newRemotePeers.set(remoteSSId, remoteSSId);
+            // Ensure PeerRouter has a route for the discovered SharedState
+            if (this.peerRouterId && ws.ownerPeerId) {
+              await this.request(createRequest(this.id, this.peerRouterId, 'ensureRoute', {
+                objectId: remoteSSId,
+                peerId: ws.ownerPeerId,
+              }));
+            }
           }
         }
       } catch {
