@@ -43,6 +43,9 @@ export class Taskbar extends Abject {
   // Debounce timer for incremental updates
   private updateTimer?: ReturnType<typeof setTimeout>;
 
+  // Guard against concurrent show() rebuilds (prevents double rendering)
+  private showInProgress = false;
+
   // Minimized window tracking
   private minimizedWindows: Map<string, { windowId: AbjectId; title: string }> = new Map();
   // Button widget AbjectId → surfaceId for restore buttons
@@ -392,6 +395,16 @@ export class Taskbar extends Abject {
   }
 
   async show(): Promise<boolean> {
+    if (this.showInProgress) return false; // Skip concurrent rebuild
+    this.showInProgress = true;
+    try {
+    return await this._showImpl();
+    } finally {
+      this.showInProgress = false;
+    }
+  }
+
+  private async _showImpl(): Promise<boolean> {
     // Always destroy and rebuild to pick up new objects
     if (this.windowId) {
       log.info(`show() — destroying old window ${this.windowId}`);

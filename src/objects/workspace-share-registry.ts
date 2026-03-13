@@ -319,6 +319,16 @@ export class WorkspaceShareRegistry extends Abject {
         this.discoveredWorkspaces.set(key, dw);
       }
 
+      // Remove stale entries for this peer if they weren't in fresh results
+      const returnedKeys = new Set(results.map(dw => `${dw.ownerPeerId}:${dw.workspaceId}`));
+      for (const [key, dw] of this.discoveredWorkspaces) {
+        if (dw.ownerPeerId === peerId && !returnedKeys.has(key)) {
+          log.info(`removing stale cache entry ${key} (peer ${peerId.slice(0, 16)} no longer shares)`);
+          this.discoveredWorkspaces.delete(key);
+          newDiscoveries = true; // trigger persist + notify
+        }
+      }
+
       // Notify dependents (e.g. WorkspaceBrowser) if new workspaces found
       if (newDiscoveries) {
         this.changed('workspacesDiscovered', { count: results.length, peerId });
