@@ -65,6 +65,7 @@ export class ScrollableVBoxLayout extends VBoxLayout {
   // ── Rendering ─────────────────────────────────────────────────────
 
   protected override async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
+    await this.flushPendingRelayout();
     const cr = this.contentRect;
     const childRects = this.calculateChildRects(cr);
     const commands: unknown[] = [];

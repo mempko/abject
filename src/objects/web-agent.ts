@@ -13,6 +13,9 @@ import { Capabilities } from '../core/capability.js';
 import { require as contractRequire } from '../core/contracts.js';
 import type { AgentAction } from './agent-abject.js';
 import type { ContentPart } from '../llm/provider.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('WebAgent');
 
 const WEB_AGENT_INTERFACE: InterfaceId = 'abjects:web-agent';
 
@@ -298,7 +301,7 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
       contractRequire(typeof task === 'string' && task.trim().length > 0, 'task must be a non-empty string');
 
       const taskId = `web-task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      console.log(`[WebAgent] ► runTask (${taskId}): "${task.trim().slice(0, 80)}"`);
+      log.info(`► runTask (${taskId}): "${task.trim().slice(0, 80)}"`);
 
       const extra: WebTaskExtra = {
         startUrl: options?.startUrl,
@@ -419,7 +422,7 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
   private trackKeptOpenPage(pageId: string): void {
     this.untrackKeptOpenPage(pageId);
     const handle = setTimeout(async () => {
-      console.log(`[WebAgent] Idle timeout expired for page ${pageId}, closing`);
+      log.info(`Idle timeout expired for page ${pageId}, closing`);
       this.keptOpenPages.delete(pageId);
       try {
         await this.request(
@@ -460,7 +463,7 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
     try {
       // Open page (or reuse an existing kept-open page)
       if (!extra.pageId) {
-        console.log(`[WebAgent] Opening page (${taskId})`);
+        log.info(`Opening page (${taskId})`);
         const pageResult = await this.request<{ pageId: string }>(
           request(this.id, this.webBrowserId!, 'openPage', {
             options: extra.pageOptions,
@@ -470,7 +473,7 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
         extra.pageOpenedByThisTask = true;
 
         if (extra.startUrl) {
-          console.log(`[WebAgent] Navigating to ${extra.startUrl}`);
+          log.info(`Navigating to ${extra.startUrl}`);
           await this.request(
             request(this.id, this.webBrowserId!, 'navigateTo', {
               pageId: extra.pageId,
@@ -479,7 +482,7 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
           );
         }
       } else {
-        console.log(`[WebAgent] Reusing existing page ${extra.pageId} (${taskId})`);
+        log.info(`Reusing existing page ${extra.pageId} (${taskId})`);
       }
 
       // Run task via AgentAbject
@@ -515,11 +518,11 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
     // Page cleanup — after try/catch so `result` is guaranteed assigned
     if (extra.keepPageOpen && result.success && extra.pageId) {
       // Keep the page open for the caller to reuse; start idle timeout
-      console.log(`[WebAgent] Keeping page ${extra.pageId} open for reuse`);
+      log.info(`Keeping page ${extra.pageId} open for reuse`);
       this.trackKeptOpenPage(extra.pageId);
     } else if (!result.success && !extra.pageOpenedByThisTask && extra.pageId) {
       // Task failed on a pre-existing page — leave it for caller to retry/inspect
-      console.log(`[WebAgent] Task failed on pre-existing page ${extra.pageId}, leaving open`);
+      log.info(`Task failed on pre-existing page ${extra.pageId}, leaving open`);
       this.trackKeptOpenPage(extra.pageId);
     } else if (extra.pageId) {
       // Default: close the page (preserves existing behavior)
@@ -531,7 +534,7 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
     }
 
     if (result.success) {
-      console.log(`[WebAgent] ✓ Task complete (${taskId}) in ${result.steps} steps`);
+      log.info(`Task complete (${taskId}) in ${result.steps} steps`);
     }
 
     // Include pageId when the page is kept open for reuse
@@ -623,7 +626,7 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
       const pageData = evalResult.result as { elements: Array<Record<string, string>>; bodyText: string };
 
       const elementCount = (pageData?.elements ?? []).length;
-      console.log(`[WebAgent] Observe: URL=${urlResult.url} | ${elementCount} elements`);
+      log.info(`Observe: URL=${urlResult.url} | ${elementCount} elements`);
 
       const lines: string[] = [];
       lines.push(`URL: ${urlResult.url}`);
@@ -684,7 +687,7 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
 
     // Log the action with its key parameter
     const actionParam = action.selector ?? action.url ?? action.key ?? action.script?.toString().slice(0, 40) ?? '';
-    console.log(`[WebAgent] Act: ${action.action}${actionParam ? ' ' + actionParam : ''}${action.value ? ' value="' + String(action.value).slice(0, 30) + '"' : ''}`);
+    log.info(`Act: ${action.action}${actionParam ? ' ' + actionParam : ''}${action.value ? ' value="' + String(action.value).slice(0, 30) + '"' : ''}`);
 
     try {
       switch (action.action) {

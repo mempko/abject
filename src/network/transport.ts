@@ -5,6 +5,9 @@
 import { AbjectMessage } from '../core/types.js';
 import { require } from '../core/contracts.js';
 import { serialize, deserialize } from '../core/message.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('Transport');
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
 
@@ -96,7 +99,7 @@ export abstract class Transport {
       const message = deserialize(data);
       this.events.onMessage?.(message);
     } catch (err) {
-      console.error('[TRANSPORT] Failed to parse message:', err);
+      log.error('Failed to parse message:', err);
       this.events.onError?.(
         err instanceof Error ? err : new Error(String(err))
       );

@@ -14,6 +14,9 @@ import {
   getTextContent,
 } from './provider.js';
 import { require } from '../core/contracts.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('ANTHROPIC');
 
 export interface AnthropicConfig {
   apiKey: string;
@@ -272,7 +275,7 @@ export function createAnthropicProvider(): AnthropicProvider | undefined {
     (globalThis as Record<string, unknown>).ANTHROPIC_API_KEY as string | undefined;
 
   if (!apiKey) {
-    console.warn('[ANTHROPIC] No API key found');
+    log.warn('No API key found');
     return undefined;
   }
 

@@ -20,6 +20,9 @@ import {
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('AppExplorer');
 
 const APP_EXPLORER_INTERFACE: InterfaceId = 'abjects:app-explorer';
 
@@ -436,7 +439,8 @@ export class AppExplorer extends Abject {
       return o.manifest.name === this.selectedKindName
         && isSys === this.selectedKindIsSystem;
     });
-    this.selectedInstanceIndex = -1;
+    // Auto-select if there's exactly one instance
+    this.selectedInstanceIndex = this.instanceEntries.length === 1 ? 0 : -1;
 
     const items = this.instanceEntries.map(inst => {
       const shortId = inst.id.slice(0, 8);
@@ -449,7 +453,7 @@ export class AppExplorer extends Abject {
 
     await this.request(request(this.id, this.instanceListId, 'update', {
       items,
-      selectedIndex: -1,
+      selectedIndex: this.selectedInstanceIndex,
     }));
     await this.rebuildDetailPane();
   }
@@ -682,7 +686,7 @@ export class AppExplorer extends Abject {
         request(this.id, objectBrowserId, 'browseKind', { name: this.selectedKindName })
       );
     } catch (err) {
-      console.warn('[AppExplorer] Browse error:', err);
+      log.warn('Browse error:', err);
     }
   }
 
@@ -693,7 +697,7 @@ export class AppExplorer extends Abject {
       await this.request(request(this.id, this.factoryId,
         'clone', { objectId, registryHint: this.registryId }));
     } catch (err) {
-      console.warn('[AppExplorer] Clone error:', err);
+      log.warn('Clone error:', err);
       return;
     }
 
@@ -768,7 +772,7 @@ export class AppExplorer extends Abject {
     // Find the active workspace's registry to clone into
     const targetRegistryId = await this.findLocalTargetRegistry();
     if (!targetRegistryId) {
-      console.warn('[AppExplorer] No local workspace found for clone');
+      log.warn('No local workspace found for clone');
       return;
     }
 
@@ -794,9 +798,9 @@ export class AppExplorer extends Abject {
         } catch { /* best-effort persist */ }
       }
 
-      console.log('[AppExplorer] Cloned to local workspace');
+      log.info('Cloned to local workspace');
     } catch (err) {
-      console.warn('[AppExplorer] Clone to local error:', err);
+      log.warn('Clone to local error:', err);
     }
   }
 

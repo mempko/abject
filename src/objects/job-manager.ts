@@ -9,6 +9,9 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { require as contractRequire, requireNonEmpty } from '../core/contracts.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('JobManager');
 
 const JOBMANAGER_INTERFACE: InterfaceId = 'abjects:job-manager';
 
@@ -317,7 +320,7 @@ export class JobManager extends Abject {
 
   private async executeCode(code: string, callerId: AbjectId | undefined, q: QueueState): Promise<unknown> {
     q.currentJobCallerId = callerId;
-    console.log(`[JobManager] Executing job code (queue: ${q.name}):\n${code}`);
+    log.info(`Executing job code (queue: ${q.name}):\n${code}`);
 
     const callFn = async (
       to: AbjectId | string | Promise<AbjectId>,

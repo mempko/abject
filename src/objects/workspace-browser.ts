@@ -9,7 +9,10 @@ import { AbjectId, AbjectMessage, InterfaceId, SpawnResult } from '../core/types
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { Log } from '../core/timed-log.js';
 import type { DiscoveredWorkspace } from './workspace-share-registry.js';
+
+const log = new Log('WorkspaceBrowser');
 
 const WORKSPACE_BROWSER_INTERFACE: InterfaceId = 'abjects:workspace-browser';
 const WORKSPACE_SHARE_REGISTRY_INTERFACE: InterfaceId = 'abjects:workspace-share-registry';
@@ -570,7 +573,7 @@ export class WorkspaceBrowser extends Abject {
   }
 
   async refresh(): Promise<boolean> {
-    console.log('[WorkspaceBrowser] refresh — calling discoverWorkspaces');
+    log.info('refresh — calling discoverWorkspaces');
     if (!this.shareRegistryId) {
       this.shareRegistryId = await this.discoverDep('WorkspaceShareRegistry') ?? undefined;
     }
@@ -584,7 +587,7 @@ export class WorkspaceBrowser extends Abject {
       } catch { /* best-effort */ }
     }
 
-    console.log('[WorkspaceBrowser] discovery done, rebuilding UI');
+    log.info('discovery done, rebuilding UI');
     if (this.windowId) {
       await this.rebuildWorkspaceList();
     } else {
@@ -623,7 +626,7 @@ export class WorkspaceBrowser extends Abject {
         })
       );
     } catch (err) {
-      console.warn('[WorkspaceBrowser] Failed to open remote browser:', err);
+      log.warn('Failed to open remote browser:', err);
     }
   }
 }

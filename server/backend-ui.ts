@@ -29,7 +29,7 @@ import { Log } from '../src/core/timed-log.js';
 const log = new Log('BackendUI');
 const dragLog = new Log('DRAG-DEBUG');
 const UI_INTERFACE = 'abjects:ui';
-const WIDGET_FONT = '14px system-ui';
+const WIDGET_FONT = '14px "Inter", system-ui, sans-serif';
 
 export interface SurfaceState {
   surfaceId: string;
@@ -609,15 +609,15 @@ IMPORTANT:
 
   /**
    * Send a message to the frontend (batched).
-   * Messages are queued and flushed via process.nextTick (before I/O and timers).
-   * All synchronous draw calls within a single bus tick get batched together.
+   * Messages are queued and flushed via setTimeout(0) so that draw flushing
+   * and scheduleRelayout timers fire in the same event-loop phase.
    */
   private sendToFrontend(msg: BackendToFrontendMsg): void {
     if (!this.ws || this.ws.readyState !== 1) return;
     this.sendQueue.push(msg);
     if (!this.flushScheduled) {
       this.flushScheduled = true;
-      process.nextTick(() => this.flushSendQueue());
+      setTimeout(() => this.flushSendQueue(), 0);
     }
   }
 

@@ -9,6 +9,9 @@
 import { AbjectMessage, AbjectId } from '../core/types.js';
 import { Mailbox } from './mailbox.js';
 import type { MessageBusLike, ReplyHandler } from './message-bus.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('WorkerBus');
 
 /** Function for posting messages back to the main thread. */
 export type PostToMainFn = (data: unknown) => void;
@@ -114,7 +117,7 @@ export class WorkerBus implements MessageBusLike {
     const recipient = message.routing.to;
     const mailbox = this.mailboxes.get(recipient);
     if (!mailbox) {
-      console.warn(`[WorkerBus] Cannot deliver to ${recipient}: not registered locally`);
+      log.warn(`Cannot deliver to ${recipient}: not registered locally`);
       return;
     }
     mailbox.send(message);

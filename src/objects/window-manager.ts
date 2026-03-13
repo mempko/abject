@@ -14,6 +14,9 @@ import {
 import { Abject } from '../core/abject.js';
 import { require as contractRequire } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('DRAG-DEBUG');
 import {
   Rect,
   TITLE_BAR_HEIGHT,
@@ -412,7 +415,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     localY: number,
   ): Promise<{ grab: boolean; dragType?: 'move' | 'resize'; minimize?: string }> {
     const info = this.windows.get(surfaceId);
-    console.log(`[DRAG-DEBUG] surfaceMouseDown surface=${surfaceId} found=${!!info} chromeless=${info?.chromeless} localY=${localY} titleBarHeight=${info?.titleBarHeight}`);
+    log.info(`surfaceMouseDown surface=${surfaceId} found=${!!info} chromeless=${info?.chromeless} localY=${localY} titleBarHeight=${info?.titleBarHeight}`);
     if (!info) return { grab: false };
 
     // Always raise the window on mousedown

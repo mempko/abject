@@ -10,6 +10,9 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('GlobalSettings');
 
 const GLOBAL_SETTINGS_INTERFACE: InterfaceId = 'abjects:global-settings';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
@@ -163,7 +166,7 @@ export class GlobalSettings extends Abject {
               request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OPENAI, value: openaiKey })
             );
           }
-          console.log('[GLOBAL-SETTINGS] Migrated API keys from legacy storage');
+          log.info('Migrated API keys from legacy storage');
         }
       }
 
@@ -195,7 +198,7 @@ export class GlobalSettings extends Abject {
     const hasConfig = this.providerHasConfig(this.selectedProvider, anthropicKey, openaiKey, ollamaUrl);
     if (hasConfig && this.llmId) {
       await this.configureSelectedProvider(anthropicKey, openaiKey, ollamaUrl);
-      console.log(`[GLOBAL-SETTINGS] Loaded saved provider: ${this.selectedProvider}`);
+      log.info(`Loaded saved provider: ${this.selectedProvider}`);
     } else {
       await this.show();
     }
@@ -922,7 +925,7 @@ export class GlobalSettings extends Abject {
     await this.request(
       request(this.id, this.uiServerId, 'updateAuth', { enabled, username, password })
     );
-    console.log(`[GLOBAL-SETTINGS] Applied saved auth config (enabled=${enabled})`);
+    log.info(`Applied saved auth config (enabled=${enabled})`);
   }
 
   /**
@@ -968,7 +971,7 @@ export class GlobalSettings extends Abject {
       );
     }
 
-    console.log(`[GLOBAL-SETTINGS] Auth settings saved (enabled=${enabled})`);
+    log.info(`Auth settings saved (enabled=${enabled})`);
     await this.setStatus(enabled ? 'Auth enabled. Reconnecting...' : 'Auth disabled.');
   }
 
@@ -1047,7 +1050,7 @@ export class GlobalSettings extends Abject {
       ollamaUrl || null,
     );
 
-    console.log(`[GLOBAL-SETTINGS] Saved provider: ${provider}`);
+    log.info(`Saved provider: ${provider}`);
     await this.setStatus('Provider settings saved!');
     await this.setSaveControlsDisabled(false);
   }

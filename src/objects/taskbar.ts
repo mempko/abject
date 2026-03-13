@@ -10,6 +10,9 @@ import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../cor
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('Taskbar');
 
 const TASKBAR_INTERFACE: InterfaceId = 'abjects:taskbar';
 
@@ -186,7 +189,7 @@ export class Taskbar extends Abject {
           try {
             await this.request(request(this.id, this.windowManagerId, 'restoreWindow', { surfaceId }));
           } catch (err) {
-            console.warn('[Taskbar] Failed to restore window:', err);
+            log.warn('Failed to restore window:', err);
           }
         }
       } else {
@@ -201,13 +204,13 @@ export class Taskbar extends Abject {
               try {
                 await this.request(request(this.id, targetId, 'show', {}));
               } catch (err) {
-                console.warn(`[Taskbar] Failed to show ${reg.manifest.name}:`, err);
+                log.warn(`Failed to show ${reg.manifest.name}:`, err);
               }
             } else {
-              console.warn(`[Taskbar] No show method found for ${reg.manifest.name}`);
+              log.warn(`No show method found for ${reg.manifest.name}`);
             }
           } else {
-            console.warn(`[Taskbar] Registry lookup failed for ${targetId}`);
+            log.warn(`Registry lookup failed for ${targetId}`);
           }
         }
       }
@@ -391,13 +394,13 @@ export class Taskbar extends Abject {
   async show(): Promise<boolean> {
     // Always destroy and rebuild to pick up new objects
     if (this.windowId) {
-      console.debug(`[Taskbar] show() — destroying old window ${this.windowId}`);
+      log.info(`show() — destroying old window ${this.windowId}`);
       await this.request(
         request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
           windowId: this.windowId,
         })
       );
-      console.debug('[Taskbar] show() — old window destroyed');
+      log.info('show() — old window destroyed');
       this.windowId = undefined;
     }
 
@@ -563,7 +566,7 @@ export class Taskbar extends Abject {
     let visIdx = 3;
     const browserViewerVis = this.webBrowserViewerId ? visResults[visIdx++] : false;
 
-    console.debug(`[Taskbar] visibility: registry=${registryVis} chat=${chatVis} jobs=${jobsVis} processes=${objectManagerVis} browser=${browserViewerVis}`);
+    log.info(`visibility: registry=${registryVis} chat=${chatVis} jobs=${jobsVis} processes=${objectManagerVis} browser=${browserViewerVis}`);
 
     // System buttons
     this.chatBtnId = await addBtn('Chat', chatVis);

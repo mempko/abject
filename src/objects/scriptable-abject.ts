@@ -26,6 +26,9 @@ import { Abject, MessageHandlerFn } from '../core/abject.js';
 import { require as contractRequire } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { INTROSPECT_METHODS, INTROSPECT_EVENTS } from '../core/introspect.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('ScriptableAbject');
 
 /** Editable methods merged into every ScriptableAbject's interface */
 const EDITABLE_METHODS: MethodDeclaration[] = [
@@ -276,8 +279,8 @@ export class ScriptableAbject extends Abject {
     this.on('updateSource', async (msg: AbjectMessage) => {
       const { source } = msg.payload as { source: string };
       if (msg.routing.from !== this._owner) {
-        console.warn(
-          `[ScriptableAbject] updateSource called by ${msg.routing.from}, owner is ${this._owner}`
+        log.warn(
+          `updateSource called by ${msg.routing.from}, owner is ${this._owner}`
         );
       }
 
@@ -287,7 +290,7 @@ export class ScriptableAbject extends Abject {
         try {
           await currentHide(msg);
         } catch (err) {
-          console.warn(`[ScriptableAbject:${this.manifest.name}] hide() during reload failed:`, err);
+          log.warn(`${this.manifest.name} hide() during reload failed:`, err);
         }
       }
 
@@ -301,7 +304,7 @@ export class ScriptableAbject extends Abject {
         try {
           await newShow(msg);
         } catch (err) {
-          console.warn(`[ScriptableAbject:${this.manifest.name}] show() during reload failed:`, err);
+          log.warn(`${this.manifest.name} show() during reload failed:`, err);
         }
       }
 
@@ -413,7 +416,7 @@ export class ScriptableAbject extends Abject {
       } else {
         // State property — skip if it collides with a base class field
         if (baseProps.has(key)) {
-          console.warn(`[ScriptableAbject] Skipping user property '${key}' — collides with base class`);
+          log.warn(`Skipping user property '${key}' — collides with base class`);
           continue;
         }
         (this as Record<string, unknown>)[key] = value;
@@ -472,7 +475,7 @@ export class ScriptableAbject extends Abject {
       } else {
         // State property — skip if it collides with a base class field
         if (baseProps.has(key)) {
-          console.warn(`[ScriptableAbject] Skipping user property '${key}' — collides with base class`);
+          log.warn(`Skipping user property '${key}' — collides with base class`);
           continue;
         }
         (this as Record<string, unknown>)[key] = value;

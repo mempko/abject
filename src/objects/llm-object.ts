@@ -5,6 +5,7 @@
 import { AbjectId, AbjectMessage } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
+import { Log } from '../core/timed-log.js';
 import { Capabilities } from '../core/capability.js';
 import * as msg from '../core/message.js';
 import { event } from '../core/message.js';
@@ -24,6 +25,8 @@ import { AnthropicProvider } from '../llm/anthropic.js';
 import { OpenAIProvider } from '../llm/openai.js';
 import { OllamaProvider } from '../llm/ollama.js';
 import type { HttpRequest, HttpResponse } from './capabilities/http-client.js';
+
+const log = new Log('LLM');
 
 const LLM_INTERFACE = 'abjects:llm';
 
@@ -291,7 +294,7 @@ export class LLMObject extends Abject {
     require(provider !== undefined, 'No LLM provider available');
 
     const totalChars = messages.reduce((sum, m) => sum + getTextContent(m).length, 0);
-    console.log(`[LLM] → ${provider!.name} | ${messages.length} msgs | ${totalChars} chars | tier=${options?.tier ?? 'default'} maxTokens=${options?.maxTokens ?? 'default'}`);
+    log.info(`→ ${provider!.name} | ${messages.length} msgs | ${totalChars} chars | tier=${options?.tier ?? 'default'} maxTokens=${options?.maxTokens ?? 'default'}`);
     const start = Date.now();
 
     // Send keep-alive progress events every 30s so upstream timeouts don't fire
@@ -311,12 +314,12 @@ export class LLMObject extends Abject {
     try {
       const result = await provider!.complete(messages, options);
       const elapsed = Date.now() - start;
-      console.log(`[LLM] ← ${provider!.name} | ${result.content.length} chars | ${elapsed}ms | reason=${result.finishReason} | tokens=${result.usage?.inputTokens ?? '?'}in/${result.usage?.outputTokens ?? '?'}out`);
+      log.info(`← ${provider!.name} | ${result.content.length} chars | ${elapsed}ms | reason=${result.finishReason} | tokens=${result.usage?.inputTokens ?? '?'}in/${result.usage?.outputTokens ?? '?'}out`);
       return result;
     } catch (err) {
       const elapsed = Date.now() - start;
       const errMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[LLM] ✗ ${provider!.name} | ${elapsed}ms | ${errMsg}`);
+      log.error(`${provider!.name} | ${elapsed}ms | ${errMsg}`);
       throw err;
     } finally {
       if (keepaliveTimer) clearInterval(keepaliveTimer);

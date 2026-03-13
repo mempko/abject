@@ -15,6 +15,9 @@ import {
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
 import { request } from '../core/message.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('PROXY-GEN');
 import { IntrospectResult } from '../core/introspect.js';
 import { ScriptableAbject } from './scriptable-abject.js';
 import { systemMessage, userMessage, LLMMessage, LLMCompletionResult, LLMCompletionOptions } from '../llm/provider.js';
@@ -269,7 +272,7 @@ Generate a corrected handler map that fixes these issues. Output ONLY the handle
     // Validate compilation
     const compileError = ScriptableAbject.tryCompile(handlerSource);
     if (compileError) {
-      console.warn('[PROXY-GEN] Regenerated code failed to compile:', compileError);
+      log.warn('Regenerated code failed to compile:', compileError);
       handlerSource = existing!.handlerSource;
     }
 
@@ -330,7 +333,7 @@ Output ONLY the handler map in a \`\`\`javascript code block.`),
     // Validate compilation
     const compileError = ScriptableAbject.tryCompile(handlerSource);
     if (compileError) {
-      console.warn('[PROXY-GEN] Generated code failed to compile, using fallback:', compileError);
+      log.warn('Generated code failed to compile, using fallback:', compileError);
       handlerSource = this.getFallbackHandlerMap();
     }
 

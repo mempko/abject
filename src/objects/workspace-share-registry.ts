@@ -10,7 +10,10 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { invariant } from '../core/contracts.js';
+import { Log } from '../core/timed-log.js';
 import type { SharedWorkspaceInfo } from './workspace-manager.js';
+
+const log = new Log('WSR');
 
 const WORKSPACE_SHARE_REGISTRY_INTERFACE: InterfaceId = 'abjects:workspace-share-registry';
 const WORKSPACE_MANAGER_INTERFACE: InterfaceId = 'abjects:workspace-manager';
@@ -136,6 +139,16 @@ export class WorkspaceShareRegistry extends Abject {
       return this.getDiscoveredWorkspaces();
     });
 
+    this.on('addWorkspaceFromRoute', async (msg: AbjectMessage) => {
+      const route = msg.payload as {
+        ownerPeerId: string; workspaceId: string;
+        accessMode: string; registryId: string;
+        hops: number; exposedNames?: string[];
+      };
+      this.addWorkspaceFromRoute(route);
+      return true;
+    });
+
     this.on('handleWorkspaceQuery', async (msg: AbjectMessage) => {
       const { fromPeerId, hops, visited } = msg.payload as {
         fromPeerId: string;
@@ -149,9 +162,12 @@ export class WorkspaceShareRegistry extends Abject {
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
 
-      // PeerRouter: routesUpdated — new routes received from a peer, query their workspaces
+      // PeerRouter: routesUpdated — new routes received from a peer
+      // Phase 6a: Extract workspace metadata from route announcements
       if (aspect === 'routesUpdated') {
         const { fromPeerId } = value as { fromPeerId: string };
+        // Query peer workspaces but only as a fallback — route announcements
+        // now carry workspace metadata that populates our cache directly
         this.queryPeerWorkspaces(fromPeerId).catch(() => { /* best-effort */ });
         return;
       }
@@ -178,7 +194,7 @@ export class WorkspaceShareRegistry extends Abject {
       // WorkspaceManager: workspaceShared — update local cache
       if (aspect === 'workspaceShared') {
         const info = value as SharedWorkspaceInfo;
-        console.log(`[WSR] workspaceShared event:`, info.name, info.accessMode);
+        log.info(`workspaceShared event: ${info.name} ${info.accessMode}`);
         this.localShared.set(info.workspaceId, info);
         return;
       }
@@ -208,7 +224,7 @@ export class WorkspaceShareRegistry extends Abject {
         this.localPeerId = identity.peerId;
         this.localPeerName = identity.name;
       } catch { /* identity not ready */ }
-      console.log('[WSR] identity:', this.localPeerId?.slice(0, 16), this.localPeerName);
+      log.info(`identity: ${this.localPeerId?.slice(0, 16)} ${this.localPeerName}`);
     }
 
     // Register as dependent of PeerRegistry for connection events
@@ -245,7 +261,7 @@ export class WorkspaceShareRegistry extends Abject {
         for (const ws of shared) {
           this.localShared.set(ws.workspaceId, ws);
         }
-        console.log('[WSR] init loaded', this.localShared.size, 'shared workspaces');
+        log.info(`init loaded ${this.localShared.size} shared workspaces`);
       } catch { /* WorkspaceManager may not be ready */ }
     }
 
@@ -260,14 +276,14 @@ export class WorkspaceShareRegistry extends Abject {
   }
 
   async queryPeerWorkspaces(peerId: string): Promise<DiscoveredWorkspace[]> {
-    console.log(`[WSR] queryPeerWorkspaces peerId=${peerId.slice(0, 16)}`);
+    log.info(`queryPeerWorkspaces peerId=${peerId.slice(0, 16)}`);
     if (!this.peerRegistryId || !this.localPeerId) return [];
 
     // Debounce: return cached results if queried within QUERY_DEBOUNCE_MS
     const now = Date.now();
     const lastQuery = this.lastQueryTime.get(peerId);
     if (lastQuery && now - lastQuery < QUERY_DEBOUNCE_MS) {
-      console.log(`[WSR] debounce: peer ${peerId.slice(0, 16)} queried ${now - lastQuery}ms ago, returning cached`);
+      log.info(`debounce: peer ${peerId.slice(0, 16)} queried ${now - lastQuery}ms ago, returning cached`);
       return this.getDiscoveredWorkspacesForPeer(peerId);
     }
     this.lastQueryTime.set(peerId, now);
@@ -275,7 +291,7 @@ export class WorkspaceShareRegistry extends Abject {
     // Resolve remote WSR UUID via PeerRouter
     const remoteWsrId = await this.resolveRemoteWsr(peerId);
     if (!remoteWsrId) {
-      console.log(`[WSR] No WSR route for peer ${peerId.slice(0, 16)}`);
+      log.info(`No WSR route for peer ${peerId.slice(0, 16)}`);
       return [];
     }
 
@@ -289,7 +305,7 @@ export class WorkspaceShareRegistry extends Abject {
         )
       );
 
-      console.log('[WSR] queryPeer got', results.length, 'workspaces');
+      log.info(`queryPeer got ${results.length} workspaces`);
 
       // Cache results
       let newDiscoveries = false;
@@ -307,14 +323,14 @@ export class WorkspaceShareRegistry extends Abject {
 
       return results;
     } catch (err) {
-      console.log('[WSR] queryPeer FAILED for', peerId.slice(0, 16), err);
+      log.info(`queryPeer FAILED for ${peerId.slice(0, 16)}`, err);
       return [];
     }
   }
 
   async discoverWorkspaces(hops?: number): Promise<DiscoveredWorkspace[]> {
     const effectiveHops = Math.min(hops ?? 1, MAX_HOPS);
-    console.log(`[WSR] discoverWorkspaces hops=${effectiveHops} localPeerId=${this.localPeerId?.slice(0, 16)}`);
+    log.info(`discoverWorkspaces hops=${effectiveHops} localPeerId=${this.localPeerId?.slice(0, 16)}`);
 
     if (!this.peerRegistryId || !this.localPeerId) return [];
 
@@ -326,7 +342,16 @@ export class WorkspaceShareRegistry extends Abject {
       );
     } catch { return []; }
 
-    console.log(`[WSR] connected peers:`, connectedPeerIds.map(p => p.slice(0, 16)));
+    log.info(`connected peers: ${connectedPeerIds.map(p => p.slice(0, 16)).join(', ')}`);
+
+    // Phase 6a: Return cached results if they're fresh (populated by route announcements)
+    const cachedResults = this.getDiscoveredWorkspaces();
+    const freshCached = cachedResults.filter(dw => Date.now() - dw.discoveredAt < DISCOVERY_CACHE_TTL);
+    if (freshCached.length > 0 && effectiveHops <= 1) {
+      log.info(`returning ${freshCached.length} cached results from route announcements`);
+      return freshCached;
+    }
+
     const allResults: DiscoveredWorkspace[] = [];
     const visited = [this.localPeerId];
 
@@ -334,7 +359,7 @@ export class WorkspaceShareRegistry extends Abject {
       // Resolve remote WSR UUID via PeerRouter
       const remoteWsrId = await this.resolveRemoteWsr(peer);
       if (!remoteWsrId) {
-        console.log(`[WSR] No WSR route for peer ${peer.slice(0, 16)}, skipping`);
+        log.info(`No WSR route for peer ${peer.slice(0, 16)}, skipping`);
         continue;
       }
 
@@ -356,10 +381,10 @@ export class WorkspaceShareRegistry extends Abject {
             this.discoveredWorkspaces.set(key, dw);
           }
         }
-        console.log('[WSR] peer query result:', results.length, 'workspaces');
+        log.info(`peer query result: ${results.length} workspaces`);
         allResults.push(...results);
       } catch (err) {
-        console.log('[WSR] peer query failed for', peer.slice(0, 16), err);
+        log.info(`peer query failed for ${peer.slice(0, 16)}`, err);
       }
     }
 
@@ -378,6 +403,43 @@ export class WorkspaceShareRegistry extends Abject {
   }
 
   /**
+   * Phase 6a: Populate discovered workspaces from PeerRouter workspace route data.
+   * Called when route announcements arrive, avoiding recursive peer queries.
+   */
+  addWorkspaceFromRoute(route: {
+    ownerPeerId: string;
+    workspaceId: string;
+    accessMode: string;
+    registryId: string;
+    hops: number;
+    exposedNames?: string[];
+  }): void {
+    const key = `${route.ownerPeerId}:${route.workspaceId}`;
+    const existing = this.discoveredWorkspaces.get(key);
+
+    // Keep existing entry if it has fewer hops
+    if (existing && existing.hops <= route.hops) return;
+
+    const entry: DiscoveredWorkspace = {
+      workspaceId: route.workspaceId,
+      name: route.workspaceId, // Name not available from route, use ID
+      ownerPeerId: route.ownerPeerId,
+      ownerName: '',
+      accessMode: route.accessMode,
+      registryId: route.registryId,
+      discoveredAt: Date.now(),
+      hops: route.hops,
+    };
+
+    const isNew = !this.discoveredWorkspaces.has(key);
+    this.discoveredWorkspaces.set(key, entry);
+
+    if (isNew) {
+      this.changed('workspacesDiscovered', { count: 1, peerId: route.ownerPeerId });
+    }
+  }
+
+  /**
    * Handle an incoming workspace query from a remote peer.
    * Returns applicable local workspaces + optionally forwards to other peers.
    */
@@ -388,8 +450,8 @@ export class WorkspaceShareRegistry extends Abject {
   ): Promise<DiscoveredWorkspace[]> {
     const effectiveHops = hops ?? 0;
     const visitedSet = new Set(visited ?? []);
-    console.log(`[WSR] handleWorkspaceQuery from=${fromPeerId.slice(0, 16)} hops=${effectiveHops} localShared=${this.localShared.size}`);
-    console.log(`[WSR] localShared entries:`, [...this.localShared.values()].map(w => ({ name: w.name, mode: w.accessMode })));
+    log.info(`handleWorkspaceQuery from=${fromPeerId.slice(0, 16)} hops=${effectiveHops} localShared=${this.localShared.size}`);
+    log.info(`localShared entries: ${JSON.stringify([...this.localShared.values()].map(w => ({ name: w.name, mode: w.accessMode })))}`);
 
     // Add self to visited (loop prevention)
     if (this.localPeerId) {
@@ -399,7 +461,7 @@ export class WorkspaceShareRegistry extends Abject {
 
     // Filter local shared workspaces for the requesting peer
     const directResults = this.filterWorkspacesForPeer(fromPeerId);
-    console.log('[WSR] filtered results:', directResults.length);
+    log.info(`filtered results: ${directResults.length}`);
     const results: DiscoveredWorkspace[] = directResults.map(ws => ({
       workspaceId: ws.workspaceId,
       name: ws.name,
@@ -458,7 +520,7 @@ export class WorkspaceShareRegistry extends Abject {
       }
     }
 
-    console.log('[WSR] handleWorkspaceQuery returning', results.length, 'total');
+    log.info(`handleWorkspaceQuery returning ${results.length} total`);
     return results;
   }
 
@@ -516,7 +578,7 @@ export class WorkspaceShareRegistry extends Abject {
           loaded++;
         }
       }
-      console.log(`[WSR] loaded ${loaded} cached discoveries (${entries.length} total in storage)`);
+      log.info(`loaded ${loaded} cached discoveries (${entries.length} total in storage)`);
     } catch { /* Storage not ready or corrupt data */ }
   }
 

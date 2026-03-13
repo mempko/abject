@@ -8,6 +8,9 @@
 
 import { AbjectMessage, AbjectId } from '../core/types.js';
 import type { MessageBus } from './message-bus.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('WorkerBridge');
 
 /**
  * Cross-platform worker interface.
@@ -67,7 +70,7 @@ export class WorkerBridge {
 
     this.worker.onmessage = this.handleWorkerMessage.bind(this);
     this.worker.onerror = (e) => {
-      console.error('[WorkerBridge] Worker error:', e.message);
+      log.error('Worker error:', e.message);
     };
   }
 
@@ -195,7 +198,7 @@ export class WorkerBridge {
         // Worker-side object wants to send a message — route through main bus
         const message = data.message!;
         this.bus.send(message).catch((err) => {
-          console.error('[WorkerBridge] Failed to route message from worker:', err);
+          log.error('Failed to route message from worker:', err);
         });
         break;
       }
@@ -203,7 +206,7 @@ export class WorkerBridge {
       case 'error': {
         const objectId = data.objectId;
         const errorMsg = data.error ?? 'Unknown worker error';
-        console.error(`[WorkerBridge] Worker error for ${objectId}:`, errorMsg);
+        log.error(`Worker error for ${objectId}:`, errorMsg);
 
         // Reject pending spawn if applicable
         if (objectId) {
@@ -217,7 +220,7 @@ export class WorkerBridge {
       }
 
       default:
-        console.warn(`[WorkerBridge] Unknown message type from worker: ${type}`);
+        log.warn(`Unknown message type from worker: ${type}`);
     }
   }
 }

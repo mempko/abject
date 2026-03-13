@@ -12,6 +12,9 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { event as createEvent } from '../core/message.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('PeerDiscovery');
 import type { PeerId, PeerIdentity } from '../core/identity.js';
 import type { PeerRegistry } from './peer-registry.js';
 import type { SignalingRelayObject } from './signaling-relay.js';
@@ -226,7 +229,7 @@ export class PeerDiscoveryObject extends Abject {
         queryId,
         ttl,
       });
-      this.peerRegistry.sendToPeer(peerId, findMsg).catch(console.error);
+      this.peerRegistry.sendToPeer(peerId, findMsg).catch(e => log.error('gossip error', e));
     }
   }
 
@@ -249,12 +252,15 @@ export class PeerDiscoveryObject extends Abject {
       name: '',  // We don't have names for all peers
     }));
 
+    const signalingUrls = this.peerRegistry.getSignalingUrls?.() ?? [];
+
     for (const peerId of connectedPeers) {
       const exchangeMsg = createEvent(this.id, PEER_REGISTRY_ID, '_peerExchange', {
         fromPeerId: this.localPeerId,
         peers: peerList.filter(p => p.peerId !== peerId),  // Don't include recipient in their own list
+        signalingUrls,
       });
-      this.peerRegistry.sendToPeer(peerId, exchangeMsg).catch(console.error);
+      this.peerRegistry.sendToPeer(peerId, exchangeMsg).catch(e => log.error('gossip error', e));
     }
   }
 
@@ -272,11 +278,14 @@ export class PeerDiscoveryObject extends Abject {
 
     if (peerList.length === 0) return;
 
+    const signalingUrls = this.peerRegistry.getSignalingUrls?.() ?? [];
+
     const exchangeMsg = createEvent(this.id, PEER_REGISTRY_ID, '_peerExchange', {
       fromPeerId: this.localPeerId,
       peers: peerList,
+      signalingUrls,
     });
-    this.peerRegistry.sendToPeer(peerId, exchangeMsg).catch(console.error);
+    this.peerRegistry.sendToPeer(peerId, exchangeMsg).catch(e => log.error('gossip error', e));
   }
 
   // ==========================================================================
@@ -296,12 +305,20 @@ export class PeerDiscoveryObject extends Abject {
   }
 
   private handlePeerExchange(msg: AbjectMessage, fromPeerId: PeerId): void {
-    const { peers } = msg.payload as {
+    const { peers, signalingUrls } = msg.payload as {
       fromPeerId: string;
       peers: Array<{ peerId: string; name: string }>;
+      signalingUrls?: string[];
     };
 
     this.changed('peerExchangeReceived', { fromPeerId, peerCount: peers.length });
+
+    // Phase 5: Learn signaling URLs from gossip
+    if (signalingUrls && signalingUrls.length > 0 && this.peerRegistry) {
+      for (const url of signalingUrls) {
+        this.peerRegistry.addSignalingUrlFromGossip?.(url);
+      }
+    }
 
     let newPeersDiscovered = 0;
     for (const peer of peers) {
@@ -355,7 +372,7 @@ export class PeerDiscoveryObject extends Abject {
         foundByPeerId: this.localPeerId,
       });
       // Reply to the origin peer (via the sender if needed)
-      this.peerRegistry.sendToPeer(fromPeerId, foundMsg).catch(console.error);
+      this.peerRegistry.sendToPeer(fromPeerId, foundMsg).catch(e => log.error('gossip error', e));
       return;
     }
 
@@ -370,7 +387,7 @@ export class PeerDiscoveryObject extends Abject {
           queryId,
           ttl: ttl - 1,
         });
-        this.peerRegistry.sendToPeer(peerId, fwdMsg).catch(console.error);
+        this.peerRegistry.sendToPeer(peerId, fwdMsg).catch(e => log.error('gossip error', e));
       }
     }
   }
@@ -440,7 +457,7 @@ export class PeerDiscoveryObject extends Abject {
 
     if (bestPeer) {
       this.lastSpeculativeConnect = Date.now();
-      console.log(`[PeerDiscovery] Speculative connect to ${bestPeer.slice(0, 16)} (score=${bestScore})`);
+      log.info(`Speculative connect to ${bestPeer.slice(0, 16)} (score=${bestScore})`);
       this.peerRegistry.connectToPeerViaRelay(bestPeer, this.signalingRelay).catch(() => {});
     }
   }

@@ -14,6 +14,9 @@ import {
 import { Abject } from '../core/abject.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request } from '../core/message.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('ABJECT-STORE');
 
 const ABJECT_STORE_INTERFACE = 'abjects:abject-store' as InterfaceId;
 
@@ -195,10 +198,10 @@ export class AbjectStore extends Abject {
         for (const snap of stored) {
           this.snapshots.set(snap.objectId, snap);
         }
-        console.log(`[ABJECT-STORE] Loaded ${this.snapshots.size} snapshots from storage`);
+        log.info(`Loaded ${this.snapshots.size} snapshots from storage`);
       }
     } catch (err) {
-      console.warn('[ABJECT-STORE] Failed to load from storage:', err);
+      log.warn('Failed to load from storage:', err);
     }
   }
 
@@ -214,7 +217,7 @@ export class AbjectStore extends Abject {
         })
       );
     } catch (err) {
-      console.warn('[ABJECT-STORE] Failed to persist to storage:', err);
+      log.warn('Failed to persist to storage:', err);
     }
   }
 
@@ -292,7 +295,7 @@ export class AbjectStore extends Abject {
       }
     }
 
-    console.log(`[ABJECT-STORE] Saved snapshot for '${manifest.name}' (${objectId})`);
+    log.info(`Saved snapshot for '${manifest.name}' (${objectId})`);
     return true;
   }
 
@@ -313,7 +316,7 @@ export class AbjectStore extends Abject {
     }
     if (existed) {
       await this.persistToStorage();
-      console.log(`[ABJECT-STORE] Removed snapshot for ${objectId}`);
+      log.info(`Removed snapshot for ${objectId}`);
     }
     return existed;
   }
@@ -327,11 +330,11 @@ export class AbjectStore extends Abject {
     const snapshotList = Array.from(this.snapshots.values());
 
     if (snapshotList.length === 0) {
-      console.log('[ABJECT-STORE] No snapshots to restore');
+      log.info('No snapshots to restore');
       return result;
     }
 
-    console.log(`[ABJECT-STORE] Restoring ${snapshotList.length} abjects...`);
+    log.info(`Restoring ${snapshotList.length} abjects...`);
 
     // Discover peerId lazily if not yet known
     if (!this.peerId) {
@@ -392,13 +395,13 @@ export class AbjectStore extends Abject {
           }
 
           result.restored++;
-          console.log(`[ABJECT-STORE] Restored '${snap.manifest.name}' as ${spawnResult.objectId}`);
+          log.info(`Restored '${snap.manifest.name}' as ${spawnResult.objectId}`);
         }
       } catch (err) {
         result.failed++;
         const errMsg = `Failed to restore '${snap.manifest.name}': ${err instanceof Error ? err.message : String(err)}`;
         result.errors.push(errMsg);
-        console.warn(`[ABJECT-STORE] ${errMsg}`);
+        log.warn(errMsg);
 
         // Keep the old snapshot so the user can debug via list()
         this.snapshots.set(snap.typeId || snap.objectId, snap);
@@ -408,7 +411,7 @@ export class AbjectStore extends Abject {
     // Persist updated snapshots (with new IDs for restored ones)
     await this.persistToStorage();
 
-    console.log(`[ABJECT-STORE] Restore complete: ${result.restored} restored, ${result.failed} failed`);
+    log.info(`Restore complete: ${result.restored} restored, ${result.failed} failed`);
     return result;
   }
 

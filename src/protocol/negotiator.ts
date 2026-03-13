@@ -15,6 +15,9 @@ import {
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('NEGOTIATOR');
 import { IntrospectResult } from '../core/introspect.js';
 import { GeneratedProxy } from '../objects/proxy-generator.js';
 import { ProxyInterceptor, MessageBus } from '../runtime/message-bus.js';
@@ -404,7 +407,7 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
   private async handleSourceUpdated(changedId: AbjectId): Promise<void> {
     for (const [agreementId, connection] of this.connections) {
       if (connection.sourceId === changedId || connection.targetId === changedId) {
-        console.log(`[NEGOTIATOR] Source updated for ${changedId}, regenerating proxy for ${agreementId}`);
+        log.info(`Source updated for ${changedId}, regenerating proxy for ${agreementId}`);
         // Re-introspect the changed object to learn its new interface
         const result = await this.introspect(changedId);
         const errorContext = result

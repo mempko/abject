@@ -11,6 +11,9 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('WorkspaceSwitcher');
 
 const WORKSPACE_SWITCHER_INTERFACE: InterfaceId = 'abjects:workspace-switcher';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
@@ -171,7 +174,7 @@ export class WorkspaceSwitcher extends Abject {
             await this.send(request(this.id, this.workspaceManagerId,
               'refreshTaskbar', {}));
           } catch (err) {
-            console.warn('[WorkspaceSwitcher] Failed to create workspace:', err);
+            log.warn('Failed to create workspace:', err);
           }
         }
         return;
@@ -184,7 +187,7 @@ export class WorkspaceSwitcher extends Abject {
             await this.request(request(this.id, this.settingsId,
               'show', {}));
           } catch (err) {
-            console.warn('[WorkspaceSwitcher] Failed to show Settings:', err);
+            log.warn('Failed to show Settings:', err);
           }
         }
         return;
@@ -200,7 +203,7 @@ export class WorkspaceSwitcher extends Abject {
             await this.request(request(this.id, this.workspaceBrowserId,
               'show', {}));
           } catch (err) {
-            console.warn('[WorkspaceSwitcher] Failed to show WorkspaceBrowser:', err);
+            log.warn('Failed to show WorkspaceBrowser:', err);
           }
         }
         return;

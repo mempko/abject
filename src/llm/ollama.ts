@@ -15,6 +15,9 @@ import {
   getTextContent,
 } from './provider.js';
 import { require } from '../core/contracts.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('OLLAMA');
 
 export interface OllamaConfig {
   model?: string;
@@ -244,6 +247,6 @@ export async function createOllamaProvider(): Promise<OllamaProvider | undefined
     return provider;
   }
 
-  console.warn('[OLLAMA] Local Ollama not available');
+  log.warn('Local Ollama not available');
   return undefined;
 }

@@ -14,6 +14,9 @@ import type { PeerId, PeerIdentity, PeerContact, PeerConnectionState } from '../
 import { SignalingClient } from '../network/signaling.js';
 import type { SignalingRelay } from '../network/signaling.js';
 import { PeerTransport, PeerTransportConfig } from '../network/peer-transport.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('PeerRegistry');
 
 const PEER_REGISTRY_INTERFACE = 'abjects:peer-registry' as InterfaceId;
 const IDENTITY_INTERFACE = 'abjects:identity' as InterfaceId;
@@ -73,7 +76,8 @@ export class PeerRegistry extends Abject {
 
   // Network peers (non-contact connected peers, transient — not persisted)
   private networkPeers: Map<PeerId, NetworkPeerEntry> = new Map();
-  private static readonly MAX_NETWORK_PEERS = 20;
+  // Phase 6c: Configurable connection limit (default 20)
+  private maxNetworkPeers = 20;
 
   // Signaling peers (all peers registered on each signaling server)
   private signalingPeers: Map<string, Array<{ peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string }>> = new Map();
@@ -442,7 +446,12 @@ export class PeerRegistry extends Abject {
     });
 
     this.on('getSignalingUrls', async () => {
-      return Array.from(this.signalingClients.keys());
+      return this.getSignalingUrls();
+    });
+
+    this.on('addSignalingUrl', async (msg: AbjectMessage) => {
+      const { url } = msg.payload as { url: string };
+      return this.addSignalingUrl(url);
     });
 
     this.on('listSignalingServers', async () => {
@@ -544,8 +553,8 @@ export class PeerRegistry extends Abject {
     // Load persisted gossip peers
     await this.loadGossipPeers();
 
-    // Auto-reconnect to saved signaling servers
-    await this.loadAndReconnectSignaling();
+    // Auto-reconnect to saved signaling servers (non-blocking — reconnect runs in background)
+    this.loadAndReconnectSignaling().catch(() => {});
 
     // Start auto-connect for contacts
     this.startAutoConnect();
@@ -682,7 +691,7 @@ export class PeerRegistry extends Abject {
     }
 
     if (!signalingRelay) {
-      console.warn('[PeerRegistry] No signaling server or relay available');
+      log.warn('No signaling server or relay available');
       return false;
     }
 
@@ -708,7 +717,7 @@ export class PeerRegistry extends Abject {
     try {
       await transport.connect('webrtc');
     } catch (err) {
-      console.error(`[PeerRegistry] Failed to connect to ${peerId.slice(0, 16)}:`, err);
+      log.error(`Failed to connect to ${peerId.slice(0, 16)}:`, err);
       this.setContactState(peerId, 'offline');
       this.transports.delete(peerId);
       this.offerTimestamps.delete(peerId);
@@ -747,6 +756,19 @@ export class PeerRegistry extends Abject {
   }
 
   /**
+   * Phase 6c: Set the maximum number of network peer connections.
+   * Default is 20. With 20 connections per peer, network diameter for
+   * 10K peers ≈ log₂₀(10000) ≈ 3.3 hops.
+   */
+  setMaxNetworkPeers(max: number): void {
+    this.maxNetworkPeers = Math.max(1, Math.floor(max));
+  }
+
+  getMaxNetworkPeers(): number {
+    return this.maxNetworkPeers;
+  }
+
+  /**
    * Set a SignalingRelay fallback for when no signaling server is available.
    */
   setSignalingRelay(relay: SignalingRelay): void {
@@ -766,6 +788,40 @@ export class PeerRegistry extends Abject {
   // Signaling
   // ==========================================================================
 
+  /**
+   * Get all known signaling server URLs (connected + saved).
+   */
+  getSignalingUrls(): string[] {
+    const urls = new Set<string>(this.signalingClients.keys());
+    for (const url of this.savedSignalingUrls) urls.add(url);
+    return Array.from(urls);
+  }
+
+  /**
+   * Add a signaling server URL (from gossip or federation).
+   * Persists the URL and attempts connection.
+   */
+  async addSignalingUrl(url: string): Promise<boolean> {
+    if (this.savedSignalingUrls.has(url) || this.signalingClients.has(url)) {
+      return true; // Already known
+    }
+    this.savedSignalingUrls.add(url);
+    await this.persistSignalingUrls();
+    // Best-effort connection
+    this.connectSignalingImpl(url).catch(() => {});
+    return true;
+  }
+
+  /**
+   * Add a signaling URL received via gossip (best-effort, no await).
+   */
+  addSignalingUrlFromGossip(url: string): void {
+    if (this.savedSignalingUrls.has(url) || this.signalingClients.has(url)) return;
+    this.savedSignalingUrls.add(url);
+    this.persistSignalingUrls().catch(() => {});
+    this.connectSignalingImpl(url).catch(() => {});
+  }
+
   private async connectSignalingImpl(url: string): Promise<boolean> {
     // Always save the URL regardless of connection outcome
     this.savedSignalingUrls.add(url);
@@ -778,7 +834,7 @@ export class PeerRegistry extends Abject {
 
     client.on({
       onConnect: () => {
-        console.log(`[PeerRegistry] Connected to signaling server: ${url}`);
+        log.info(`Connected to signaling server: ${url}`);
         // Register with the signaling server
         if (this.localIdentity) {
           client.register(
@@ -795,28 +851,28 @@ export class PeerRegistry extends Abject {
         this.changed('signalingStateChanged', { url, status: 'connected' });
       },
       onDisconnect: (reason) => {
-        console.log(`[PeerRegistry] Disconnected from signaling: ${reason}`);
+        log.info(`Disconnected from signaling: ${reason}`);
         this.changed('signalingStateChanged', { url, status: 'disconnected' });
       },
       onPeerFound: (peerId, publicSigningKey, publicExchangeKey, name) => {
         this.handlePeerFound(peerId, publicSigningKey, publicExchangeKey, name);
       },
       onPeerNotFound: (peerId) => {
-        console.log(`[PeerRegistry] Peer not found: ${peerId.slice(0, 16)}`);
+        log.info(`Peer not found: ${peerId.slice(0, 16)}`);
       },
       onSdpOffer: (fromPeerId, sdp) => {
-        this.handleIncomingSdpOffer(fromPeerId, sdp, client).catch(console.error);
+        this.handleIncomingSdpOffer(fromPeerId, sdp, client).catch(e => log.error('handleIncomingSdpOffer failed:', e));
       },
       onSdpAnswer: (fromPeerId, sdp) => {
         const transport = this.transports.get(fromPeerId);
         if (transport) {
-          transport.handleSdpAnswer(sdp).catch(console.error);
+          transport.handleSdpAnswer(sdp).catch(e => log.error('handleSdpAnswer failed:', e));
         }
       },
       onIceCandidate: (fromPeerId, candidate) => {
         const transport = this.transports.get(fromPeerId);
         if (transport) {
-          transport.handleIceCandidate(candidate).catch(console.error);
+          transport.handleIceCandidate(candidate).catch(e => log.error('handleIceCandidate failed:', e));
         }
       },
       onPeerList: (peers) => {
@@ -844,7 +900,7 @@ export class PeerRegistry extends Abject {
         this.autoConnectSignalingPeers(url, client);
       },
       onError: (error) => {
-        console.error(`[PeerRegistry] Signaling error: ${error}`);
+        log.error(`Signaling error: ${error}`);
       },
     });
 
@@ -855,7 +911,7 @@ export class PeerRegistry extends Abject {
       await client.connect(url);
       return true;
     } catch (err) {
-      console.error(`[PeerRegistry] Failed to connect to signaling: ${url}`, err);
+      log.error(`Failed to connect to signaling: ${url}`, err);
       // Client is still in the map — persistent reconnect will retry
       return false;
     }
@@ -922,14 +978,14 @@ export class PeerRegistry extends Abject {
 
     // Reject inbound offers from blocked peers
     if (this.blockedPeers.has(fromPeerId)) {
-      console.log(`[PeerRegistry] Rejecting SDP offer from blocked peer ${fromPeerId.slice(0, 16)}`);
+      log.info(`Rejecting SDP offer from blocked peer ${fromPeerId.slice(0, 16)}`);
       return;
     }
 
     // Reject network peer connections when at capacity
     if (!this.contacts.has(fromPeerId) && !this.transports.has(fromPeerId)) {
-      if (this.networkPeers.size >= PeerRegistry.MAX_NETWORK_PEERS) {
-        console.log(`[PeerRegistry] Rejecting network peer ${fromPeerId.slice(0, 16)}: at capacity (${PeerRegistry.MAX_NETWORK_PEERS})`);
+      if (this.networkPeers.size >= this.maxNetworkPeers) {
+        log.info(`Rejecting network peer ${fromPeerId.slice(0, 16)}: at capacity (${this.maxNetworkPeers})`);
         return;
       }
     }
@@ -948,7 +1004,7 @@ export class PeerRegistry extends Abject {
         // We have priority — but our original offer may have been lost (peer wasn't
         // online yet). Since the remote peer is clearly online now (they just sent us
         // an offer), destroy the stale transport and create a fresh one.
-        console.log(`[PeerRegistry] ICE glare with ${fromPeerId.slice(0, 16)}: we win tiebreak, re-sending offer`);
+        log.info(`ICE glare with ${fromPeerId.slice(0, 16)}: we win tiebreak, re-sending offer`);
         transport.resetForGlare();
         this.transports.delete(fromPeerId);
         this.offerTimestamps.delete(fromPeerId);
@@ -965,7 +1021,7 @@ export class PeerRegistry extends Abject {
         this.transports.set(fromPeerId, newTransport);
         this.offerTimestamps.set(fromPeerId, Date.now());
         newTransport.connect('webrtc').catch((err) => {
-          console.error(`[PeerRegistry] Re-offer to ${fromPeerId.slice(0, 16)} failed:`, err);
+          log.error(`Re-offer to ${fromPeerId.slice(0, 16)} failed:`, err);
           this.transports.delete(fromPeerId);
           this.offerTimestamps.delete(fromPeerId);
           this.setContactState(fromPeerId, 'offline');
@@ -975,7 +1031,7 @@ export class PeerRegistry extends Abject {
       // They have priority — reset PeerConnection and accept their offer.
       // resetForGlare() destroys the PeerConnection without triggering
       // disconnect events, preserving queued ICE candidates from the winner.
-      console.log(`[PeerRegistry] ICE glare with ${fromPeerId.slice(0, 16)}: they win tiebreak, accepting remote offer`);
+      log.info(`ICE glare with ${fromPeerId.slice(0, 16)}: they win tiebreak, accepting remote offer`);
       transport.resetForGlare();
       // handleSdpOffer below will create a fresh PeerConnection
     }
@@ -1032,7 +1088,7 @@ export class PeerRegistry extends Abject {
       if (now - timestamp < PeerRegistry.STALE_OFFER_TIMEOUT) continue;
       const transport = this.transports.get(peerId);
       if (transport && transport.signalingState === 'have-local-offer') {
-        console.log(`[PeerRegistry] Cleaning up stale offer to ${peerId.slice(0, 16)} (${Math.round((now - timestamp) / 1000)}s old)`);
+        log.info(`Cleaning up stale offer to ${peerId.slice(0, 16)} (${Math.round((now - timestamp) / 1000)}s old)`);
         transport.resetForGlare();
         this.transports.delete(peerId);
         this.offerTimestamps.delete(peerId);
@@ -1220,13 +1276,13 @@ export class PeerRegistry extends Abject {
           return;
         }
 
-        console.log(`[PeerRegistry] inbound message from ${peerId.slice(0, 16)} to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
+        log.info(`inbound message from ${peerId.slice(0, 16)} to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
         // Messages from peers are forwarded to the local message bus
         // by the PeerRouter interceptor
         this.events.onMessage?.(message, peerId);
       },
       onError: (error) => {
-        console.error(`[PeerRegistry] Transport error with ${peerId.slice(0, 16)}:`, error);
+        log.error(`Transport error with ${peerId.slice(0, 16)}:`, error);
       },
     });
   }
@@ -1299,7 +1355,7 @@ export class PeerRegistry extends Abject {
     precondition(this.localIdentity!.exchangePrivateKey !== undefined, 'Exchange private key not loaded');
 
     // Reject if at network peer capacity (for non-contacts)
-    if (!this.contacts.has(peerId) && this.networkPeers.size >= PeerRegistry.MAX_NETWORK_PEERS) {
+    if (!this.contacts.has(peerId) && this.networkPeers.size >= this.maxNetworkPeers) {
       return false;
     }
 
@@ -1319,7 +1375,7 @@ export class PeerRegistry extends Abject {
     try {
       await transport.connect('webrtc');
     } catch (err) {
-      console.error(`[PeerRegistry] Failed to connect via relay to ${peerId.slice(0, 16)}:`, err);
+      log.error(`Failed to connect via relay to ${peerId.slice(0, 16)}:`, err);
       this.transports.delete(peerId);
       this.offerTimestamps.delete(peerId);
       return false;
@@ -1389,7 +1445,7 @@ export class PeerRegistry extends Abject {
       this.localIdentity.publicExchangeKey = JSON.stringify(pubJwk);
       this.localIdentity.exchangePrivateKey = ephemeral.privateKey;
     } catch (err) {
-      console.error('[PeerRegistry] Failed to load local identity:', err);
+      log.error('Failed to load local identity:', err);
     }
   }
 
@@ -1695,7 +1751,7 @@ export class PeerRegistry extends Abject {
       try {
         await this.connectSignalingImpl(url);
       } catch (err) {
-        console.warn(`[PeerRegistry] Failed to auto-reconnect to signaling: ${url}`, err);
+        log.warn(`Failed to auto-reconnect to signaling: ${url}`, err);
       }
     }
   }

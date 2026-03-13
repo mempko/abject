@@ -9,6 +9,9 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('GlobalToolbar');
 
 const GLOBAL_TOOLBAR_INTERFACE: InterfaceId = 'abjects:global-toolbar';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
@@ -114,7 +117,7 @@ export class GlobalToolbar extends Abject {
             await this.request(request(this.id, this.globalSettingsId,
               'show', {}));
           } catch (err) {
-            console.warn('[GlobalToolbar] Failed to show GlobalSettings:', err);
+            log.warn('Failed to show GlobalSettings:', err);
           }
         }
         return;
@@ -130,7 +133,7 @@ export class GlobalToolbar extends Abject {
             await this.request(request(this.id, this.peerNetworkId,
               'show', {}));
           } catch (err) {
-            console.warn('[GlobalToolbar] Failed to show PeerNetwork:', err);
+            log.warn('Failed to show PeerNetwork:', err);
           }
         }
         return;
@@ -146,7 +149,7 @@ export class GlobalToolbar extends Abject {
             await this.request(request(this.id, this.objectBrowserId,
               'show', {}));
           } catch (err) {
-            console.warn('[GlobalToolbar] Failed to show ObjectBrowser:', err);
+            log.warn('Failed to show ObjectBrowser:', err);
           }
         }
         return;

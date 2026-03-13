@@ -9,6 +9,9 @@
 
 import { require as precondition } from '../core/contracts.js';
 import type { PeerId } from '../core/identity.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('Signaling');
 
 export type SignalingState = 'disconnected' | 'connecting' | 'connected' | 'error';
 
@@ -84,16 +87,30 @@ export class SignalingClient implements SignalingRelay {
   /**
    * Connect to a signaling server.
    */
-  async connect(endpoint: string): Promise<void> {
+  async connect(endpoint: string, timeoutMs = 5000): Promise<void> {
     precondition(endpoint !== '', 'endpoint is required');
     this.endpoint = endpoint;
     this.state = 'connecting';
 
     return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.socket) {
+          this.socket.onopen = null;
+          this.socket.onerror = null;
+          this.socket.onclose = null;
+          this.socket.onmessage = null;
+          this.socket.close();
+          this.socket = undefined;
+        }
+        this.state = 'error';
+        reject(new Error(`Signaling connection to ${endpoint} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
       try {
         this.socket = new WebSocket(endpoint);
 
         this.socket.onopen = () => {
+          clearTimeout(timer);
           this.state = 'connected';
           this.reconnectAttempts = 0;
           this.startPing();
@@ -109,6 +126,7 @@ export class SignalingClient implements SignalingRelay {
         };
 
         this.socket.onerror = () => {
+          clearTimeout(timer);
           this.state = 'error';
           const error = new Error('Signaling WebSocket error');
           this.events.onError?.(error.message);
@@ -119,6 +137,7 @@ export class SignalingClient implements SignalingRelay {
           this.handleMessage(event.data as string);
         };
       } catch (err) {
+        clearTimeout(timer);
         this.state = 'error';
         reject(err instanceof Error ? err : new Error(String(err)));
       }
@@ -253,7 +272,7 @@ export class SignalingClient implements SignalingRelay {
           break;
       }
     } catch (err) {
-      console.error('[Signaling] Failed to parse message:', err);
+      log.error('Failed to parse message:', err);
     }
   }
 
@@ -268,7 +287,7 @@ export class SignalingClient implements SignalingRelay {
     const label = this.persistent
       ? `${this.reconnectAttempts}`
       : `${this.reconnectAttempts}/${this.maxReconnectAttempts}`;
-    console.log(`[Signaling] Reconnecting in ${delay}ms (attempt ${label})`);
+    log.info(`Reconnecting in ${delay}ms (attempt ${label})`);
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;

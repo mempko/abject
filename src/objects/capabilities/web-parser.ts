@@ -8,6 +8,9 @@ import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
 import { error } from '../../core/message.js';
 import { Capabilities } from '../../core/capability.js';
+import { Log } from '../../core/timed-log.js';
+
+const log = new Log('WebParser');
 
 const WEB_PARSER_INTERFACE = 'abjects:web-parser';
 
@@ -164,7 +167,7 @@ export class WebParser extends Abject {
       const linkedom = await import('linkedom');
       this.parseHTML = linkedom.parseHTML;
     } catch {
-      console.warn('[WebParser] linkedom not available — falling back to regex-based extraction');
+      log.warn('linkedom not available — falling back to regex-based extraction');
     }
   }
 

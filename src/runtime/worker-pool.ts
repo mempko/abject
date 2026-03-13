@@ -11,6 +11,9 @@ import { require, invariant } from '../core/contracts.js';
 import { WorkerBridge } from './worker-bridge.js';
 import type { WorkerLike } from './worker-bridge.js';
 import type { MessageBus } from './message-bus.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('WorkerPool');
 
 export interface WorkerPoolConfig {
   workerCount: number;
@@ -62,7 +65,7 @@ export class WorkerPool {
     await Promise.all(this.bridges.map((b) => b.waitReady()));
 
     this.started = true;
-    console.log(`[WorkerPool] ${this.config.workerCount} workers ready`);
+    log.info(`${this.config.workerCount} workers ready`);
   }
 
   /**
@@ -144,7 +147,7 @@ export class WorkerPool {
     this.objectToBridge.clear();
     this.started = false;
 
-    console.log('[WorkerPool] Shut down');
+    log.info('Shut down');
   }
 
   /**

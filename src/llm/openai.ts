@@ -13,6 +13,9 @@ import {
   ContentPart,
 } from './provider.js';
 import { require } from '../core/contracts.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('OPENAI');
 
 export interface OpenAIConfig {
   apiKey: string;
@@ -231,7 +234,7 @@ export function createOpenAIProvider(): OpenAIProvider | undefined {
     (globalThis as Record<string, unknown>).OPENAI_API_KEY as string | undefined;
 
   if (!apiKey) {
-    console.warn('[OPENAI] No API key found');
+    log.warn('No API key found');
     return undefined;
   }
 

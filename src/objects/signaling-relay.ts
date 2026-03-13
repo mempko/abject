@@ -10,6 +10,9 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require as precondition } from '../core/contracts.js';
 import { event as createEvent } from '../core/message.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('SignalingRelay');
 import type { PeerId } from '../core/identity.js';
 import type { SignalingRelay } from '../network/signaling.js';
 import type { PeerRegistry } from './peer-registry.js';
@@ -189,7 +192,7 @@ export class SignalingRelayObject extends Abject implements SignalingRelay {
 
     // If target is directly connected, deliver to them
     if (this.peerRegistry.hasTransportTo(targetPeerId)) {
-      this.peerRegistry.sendToPeer(targetPeerId, relayMsg).catch(console.error);
+      this.peerRegistry.sendToPeer(targetPeerId, relayMsg).catch(e => log.error('relay error', e));
       return true;
     }
 
@@ -205,7 +208,7 @@ export class SignalingRelayObject extends Abject implements SignalingRelay {
           ...data,
           ttl: ttl - 1,
         });
-        this.peerRegistry.sendToPeer(peerId, fwdMsg).catch(console.error);
+        this.peerRegistry.sendToPeer(peerId, fwdMsg).catch(e => log.error('relay error', e));
       }
     }
 
@@ -251,23 +254,23 @@ export class SignalingRelayObject extends Abject implements SignalingRelay {
 
     if (type === 'sdp-offer' && sdp) {
       if (transport) {
-        transport.handleSdpOffer(sdp).catch(console.error);
+        transport.handleSdpOffer(sdp).catch(e => log.error('relay error', e));
       } else {
         // No transport yet — create one via PeerRegistry (this acts as SignalingRelay)
-        this.peerRegistry.connectToPeerViaRelay(fromPeerId, this).catch(console.error);
+        this.peerRegistry.connectToPeerViaRelay(fromPeerId, this).catch(e => log.error('relay error', e));
         // The SDP offer will need to be re-sent once the transport is created
         // For simplicity, we handle it by creating the transport and immediately processing
         setTimeout(() => {
           const newTransport = this.peerRegistry?.getTransportForPeer(fromPeerId);
           if (newTransport) {
-            newTransport.handleSdpOffer(sdp).catch(console.error);
+            newTransport.handleSdpOffer(sdp).catch(e => log.error('relay error', e));
           }
         }, 100);
       }
     } else if (type === 'sdp-answer' && sdp && transport) {
-      transport.handleSdpAnswer(sdp).catch(console.error);
+      transport.handleSdpAnswer(sdp).catch(e => log.error('relay error', e));
     } else if (type === 'ice-candidate' && candidate && transport) {
-      transport.handleIceCandidate(candidate).catch(console.error);
+      transport.handleIceCandidate(candidate).catch(e => log.error('relay error', e));
     }
   }
 

@@ -5,6 +5,9 @@
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
 import { Capabilities } from '../../core/capability.js';
+import { Log } from '../../core/timed-log.js';
+
+const log = new Log('Storage');
 
 const STORAGE_INTERFACE = 'abjects:storage';
 const DB_NAME = 'abjects-storage';
@@ -167,7 +170,7 @@ export class Storage extends Abject {
   private async initDatabase(): Promise<void> {
     // Check if IndexedDB is available
     if (typeof indexedDB === 'undefined') {
-      console.warn('[STORAGE] IndexedDB not available, using memory fallback');
+      log.warn('IndexedDB not available, using memory fallback');
       this.useMemory = true;
       return;
     }
@@ -176,7 +179,7 @@ export class Storage extends Abject {
       const request = indexedDB.open(this.dbName, 1);
 
       request.onerror = () => {
-        console.warn('[STORAGE] IndexedDB error, using memory fallback');
+        log.warn('IndexedDB error, using memory fallback');
         this.useMemory = true;
         resolve();
       };

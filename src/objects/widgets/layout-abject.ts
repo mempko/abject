@@ -165,13 +165,27 @@ export abstract class LayoutAbject extends WidgetAbject {
         alignment?: 'left' | 'center' | 'right';
         stretch?: number;
       };
-      this.layoutChildren.push({
-        widgetId,
-        sizePolicy: sizePolicy as LayoutChildConfig['sizePolicy'],
-        preferredSize,
-        alignment,
-        stretch,
-      });
+      const existingIdx = this.layoutChildren.findIndex(
+        (c) => !isSpacer(c) && c.widgetId === widgetId
+      );
+      if (existingIdx >= 0) {
+        // Update existing entry (caller is overriding defaults from createNestedLayout)
+        this.layoutChildren[existingIdx] = {
+          widgetId,
+          sizePolicy: sizePolicy as LayoutChildConfig['sizePolicy'],
+          preferredSize,
+          alignment,
+          stretch: stretch ?? 1,
+        };
+      } else {
+        this.layoutChildren.push({
+          widgetId,
+          sizePolicy: sizePolicy as LayoutChildConfig['sizePolicy'],
+          preferredSize,
+          alignment,
+          stretch,
+        });
+      }
       // Remove widget from window's direct children to prevent double rendering.
       // When a widget (e.g. canvas) is both a window child and a layout child,
       // it would be rendered twice — once by the window and once by the layout.

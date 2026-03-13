@@ -17,6 +17,9 @@ import { Abject } from '../core/abject.js';
 import { require, invariant } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('Registry');
 
 const REGISTRY_INTERFACE = 'abjects:registry' as InterfaceId;
 
@@ -580,7 +583,7 @@ export class Registry extends Abject {
           event(this.id, subscriberId, eventName, payload)
         );
       } catch (err) {
-        console.error(`Failed to notify subscriber ${subscriberId}:`, err);
+        log.error(`Failed to notify subscriber ${subscriberId}:`, err);
       }
     }
   }

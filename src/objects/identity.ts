@@ -11,6 +11,9 @@ import { Abject } from '../core/abject.js';
 import { Capabilities } from '../core/capability.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request as createRequest } from '../core/message.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('Identity');
 import {
   PeerId,
   PeerIdentity,
@@ -288,7 +291,7 @@ export class IdentityObject extends Abject {
       ['deriveBits', 'deriveKey'],
     );
     this.peerId = await derivePeerId(this.signingKeyPair.publicKey);
-    console.log(`[Identity] Generated new identity: ${this.peerId.slice(0, 16)}...`);
+    log.info(`Generated new identity: ${this.peerId.slice(0, 16)}...`);
   }
 
   private async loadKeys(): Promise<boolean> {
@@ -314,7 +317,7 @@ export class IdentityObject extends Abject {
         privateKey: await importExchangePrivateKey(exchangeJwk.privateKey),
       };
       this.peerId = await derivePeerId(this.signingKeyPair.publicKey);
-      console.log(`[Identity] Loaded existing identity: ${this.peerId.slice(0, 16)}...`);
+      log.info(`Loaded existing identity: ${this.peerId.slice(0, 16)}...`);
       return true;
     } catch {
       return false;

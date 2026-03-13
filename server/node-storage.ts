@@ -8,9 +8,11 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Storage, StorageEntry } from '../src/objects/capabilities/storage.js';
+import { Log } from '../src/core/timed-log.js';
 
 const STORAGE_DIR = '.abjects';
 const STORAGE_FILE = 'storage.json';
+const log = new Log('NODE-STORAGE');
 
 export class NodeStorage extends Storage {
   private storagePath: string;
@@ -38,9 +40,9 @@ export class NodeStorage extends Storage {
         for (const [key, entry] of Object.entries(entries)) {
           this.memoryFallback.set(key, entry);
         }
-        console.log(`[NODE-STORAGE] Loaded ${this.memoryFallback.size} entries from ${this.storagePath}`);
+        log.info(`Loaded ${this.memoryFallback.size} entries from ${this.storagePath}`);
       } catch (err) {
-        console.warn(`[NODE-STORAGE] Failed to load ${this.storagePath}, starting fresh:`, err);
+        log.warn(`Failed to load ${this.storagePath}, starting fresh:`, err);
       }
     }
   }

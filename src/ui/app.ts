@@ -7,6 +7,9 @@ import type { WorkerLike } from '../runtime/worker-bridge.js';
 import { Compositor } from './compositor.js';
 import { UIServer } from '../objects/ui-server.js';
 import { require } from '../core/contracts.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('APP');
 
 export interface AppConfig {
   container: HTMLElement | string;
@@ -67,7 +70,7 @@ export class App {
     // Setup input listeners
     this.uiServer.setupInputListeners(this.canvas);
 
-    console.log('[APP] Abjects application started');
+    log.info('Abjects application started');
   }
 
   /**
@@ -76,7 +79,7 @@ export class App {
   async stop(): Promise<void> {
     this.compositor.stop();
     await this.runtime.stop();
-    console.log('[APP] Abjects application stopped');
+    log.info('Abjects application stopped');
   }
 
   /**

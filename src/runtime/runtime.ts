@@ -10,6 +10,9 @@ import type { WorkerLike } from './worker-bridge.js';
 import { Registry } from '../objects/registry.js';
 import { Factory } from '../objects/factory.js';
 import { Abject } from '../core/abject.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('RUNTIME');
 
 export interface RuntimeConfig {
   debug?: boolean;
@@ -105,13 +108,13 @@ export class Runtime {
       await this._workerPool.start();
       this.bus.setWorkerPool(this._workerPool);
       this.factory.setWorkerPool(this._workerPool);
-      console.log(`[RUNTIME] Worker pool started with ${poolConfig.workerCount} workers`);
+      log.info(`Worker pool started with ${poolConfig.workerCount} workers`);
     }
 
     this.state = 'running';
 
-    console.log('[RUNTIME] Abjects runtime started');
-    console.log(`[RUNTIME] Registry: ${this.registry.objectCount} objects`);
+    log.info('Abjects runtime started');
+    log.info(`Registry: ${this.registry.objectCount} objects`);
 
     this.checkInvariants();
   }
@@ -144,7 +147,7 @@ export class Runtime {
 
     this.state = 'stopped';
 
-    console.log('[RUNTIME] Abjects runtime stopped');
+    log.info('Abjects runtime stopped');
   }
 
   /**

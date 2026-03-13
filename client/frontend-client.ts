@@ -63,10 +63,16 @@ export class FrontendClient {
    * Connect to the backend WebSocket server.
    */
   connect(url: string): void {
+    const t0 = performance.now();
+    const clog = (msg: string) => console.log(`[WS-CLIENT T+${Math.round(performance.now() - t0)}ms] ${msg}`);
+
+    clog(`new WebSocket(${url})`);
     this.ws = new WebSocket(url);
+    clog('WebSocket constructor returned');
     this.authenticated = false;
 
     this.ws.onopen = () => {
+      clog('onopen fired');
       console.log('[Frontend] Connected to backend');
       // Clear stale surfaces from any previous connection before replaying state
       this.compositor.clearAllSurfaces();
@@ -100,6 +106,7 @@ export class FrontendClient {
     };
 
     this.ws.onclose = (ev) => {
+      clog(`onclose fired (code=${ev.code})`);
       console.log(`[Frontend] Disconnected from backend (code=${ev.code})`);
       this.ws = null;
       this.authenticated = false;
@@ -112,6 +119,7 @@ export class FrontendClient {
     };
 
     this.ws.onerror = (err) => {
+      clog('onerror fired');
       console.error('[Frontend] WebSocket error:', err);
     };
   }
@@ -140,8 +148,7 @@ export class FrontendClient {
       case 'authNotRequired':
         this.authenticated = true;
         this.hideLoginForm();
-        this.sendFontMetrics();
-        this.sendRaw({ type: 'ready' });
+        this.sendFontMetricsWhenReady();
         break;
 
       case 'authRequired': {
@@ -161,8 +168,7 @@ export class FrontendClient {
           localStorage.setItem('abjects_auth_token', result.token);
           this.authenticated = true;
           this.hideLoginForm();
-          this.sendFontMetrics();
-          this.sendRaw({ type: 'ready' });
+          this.sendFontMetricsWhenReady();
         } else {
           // Token was rejected — clear it and show form
           localStorage.removeItem('abjects_auth_token');
@@ -228,6 +234,18 @@ export class FrontendClient {
     }
 
     this.sendRaw({ type: 'fontMetrics', metrics });
+  }
+
+  /**
+   * Wait for web fonts to finish loading, then send metrics and ready.
+   * Without this, measurements use the system-ui fallback and the first
+   * render frame has wrong glyph widths / visually different font weight.
+   */
+  private sendFontMetricsWhenReady(): void {
+    document.fonts.ready.then(() => {
+      this.sendFontMetrics();
+      this.sendRaw({ type: 'ready' });
+    });
   }
 
   private sendRaw(msg: Record<string, unknown>): void {

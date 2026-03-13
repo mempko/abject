@@ -6,6 +6,9 @@ import { AbjectMessage } from '../core/types.js';
 import { require } from '../core/contracts.js';
 import { serialize } from '../core/message.js';
 import { Transport, TransportConfig } from './transport.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('WebSocket');
 
 export interface WebSocketConfig extends TransportConfig {
   protocols?: string[];
@@ -128,8 +131,8 @@ export class WebSocketTransport extends Transport {
     this.reconnectAttempts++;
     const delay = this.config.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
 
-    console.log(
-      `[WEBSOCKET] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.config.maxReconnectAttempts})`
+    log.info(
+      `Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.config.maxReconnectAttempts})`
     );
 
     this.reconnectTimer = setTimeout(() => {

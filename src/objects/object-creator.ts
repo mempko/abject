@@ -35,6 +35,9 @@ import { IntrospectResult } from '../core/introspect.js';
 import { ScriptableAbject } from './scriptable-abject.js';
 import { systemMessage, userMessage, LLMMessage, LLMCompletionResult, LLMCompletionOptions } from '../llm/provider.js';
 import type { AgentAction } from './agent-abject.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('OBJECT-CREATOR');
 
 /** Per-creation-task state for tracking agent-driven creation. */
 interface CreationTaskExtra {
@@ -570,7 +573,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
     const augmentedPrompt =
       `${prompt}\n\nIMPORTANT: A previous attempt failed because these dependencies are missing: ${probeError}. Make sure to select them.`;
     const newSelectedNames = await this.llmSelectDependencies(augmentedPrompt, summaries);
-    console.log('[OBJECT-CREATOR probe-retry] Re-selected dependencies:', newSelectedNames);
+    log.info('probe-retry Re-selected dependencies:', newSelectedNames);
 
     // 2. Identify newly discovered deps (diff against originals)
     const originalNames = new Set(originalDeps.map((d) => d.name.toLowerCase()));
@@ -659,7 +662,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         request(this.id, this.abjectStoreId, 'save', {
           objectId: objectId as string, manifest, source: code, owner: this.id as string,
         })
-      ).catch(err => console.warn('[OBJECT-CREATOR probe-retry] Failed to persist:', err));
+      ).catch(err => log.warn('probe-retry Failed to persist:', err));
     }
 
     return { success: true, code, deps: allDeps };
@@ -816,7 +819,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
 
       return this.parseTargetedQuestions(result.content, deps.map((d) => d.name));
     } catch (err) {
-      console.warn('[OBJECT-CREATOR] Failed to generate targeted questions, falling back to generic:', err);
+      log.warn('Failed to generate targeted questions, falling back to generic:', err);
       return new Map();
     }
   }
@@ -921,22 +924,22 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
       // Phase 0b: LLM selects dependencies
       if (callerId) await this.reportProgress(callerId, '0b', 'Choosing dependencies...');
       const selectedNames = await this.llmSelectDependencies(prompt, summaries);
-      console.log('[OBJECT-CREATOR] Selected dependencies:', selectedNames);
+      log.info('Selected dependencies:', selectedNames);
 
       // Phase 0c: Fetch full manifests for selected dependencies
       const depNames = selectedNames.join(', ') || 'none';
       if (callerId) await this.reportProgress(callerId, '0c', `Learning about ${depNames}...`);
       let deps = await this.fetchFullManifests(selectedNames, summaries);
-      console.log('[OBJECT-CREATOR] Fetched manifests for:', deps.map((d) => d.name));
+      log.info('Fetched manifests for:', deps.map((d) => d.name));
 
       // Phase 0c5: Generate targeted questions for each dependency
       if (callerId) await this.reportProgress(callerId, '0c5', 'Formulating questions...');
       const targetedQuestions = await this.generateTargetedQuestions(prompt, deps);
-      console.log('[OBJECT-CREATOR] Generated targeted questions for:', Array.from(targetedQuestions.keys()));
+      log.info('Generated targeted questions for:', Array.from(targetedQuestions.keys()));
 
       // Phase 0d: Ask each dependency for usage guides (with targeted questions)
       const usageGuides = await this.fetchUsageGuides(deps, targetedQuestions, callerId);
-      console.log('[OBJECT-CREATOR] Got usage guides from:', Array.from(usageGuides.keys()));
+      log.info('Got usage guides from:', Array.from(usageGuides.keys()));
 
       const depContext = this.formatFullManifestContext(deps, usageGuides);
 
@@ -963,14 +966,14 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           );
         } else {
           if (callerId) await this.reportProgress(callerId, '2', `Generating handler code (retry ${attempt}/${MAX_CODE_ATTEMPTS})...`);
-          console.log(`[OBJECT-CREATOR] Retry ${attempt}/${MAX_CODE_ATTEMPTS}: ${lastError}`);
+          log.info(`Retry ${attempt}/${MAX_CODE_ATTEMPTS}: ${lastError}`);
           code = await this.regenerateHandlerCode(
             manifest, prompt, depContext, phase1.usedObjects, code ?? '', lastError, context
           );
         }
         if (!code) {
           lastError = 'Failed to generate handler code (LLM did not return a javascript code block)';
-          console.warn(`[OBJECT-CREATOR] Attempt ${attempt}: ${lastError}`);
+          log.warn(`Attempt ${attempt}: ${lastError}`);
           continue;
         }
 
@@ -989,10 +992,10 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
               manifest = llmFixed.manifest;
               code = llmFixed.code;
             } else {
-              console.warn('[OBJECT-CREATOR] Phase 3b produced non-compiling code, keeping original');
+              log.warn('Phase 3b produced non-compiling code, keeping original');
             }
           } catch (err) {
-            console.warn('[OBJECT-CREATOR] LLM verify/fix failed, continuing:', err);
+            log.warn('LLM verify/fix failed, continuing:', err);
           }
         }
 
@@ -1003,7 +1006,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         const missingHandlers = recheck.mismatches.filter((m) => m.startsWith('Missing handler:'));
         if (missingHandlers.length > 0) {
           lastError = `Handler code is missing required methods: ${missingHandlers.join('; ')}`;
-          console.warn(`[OBJECT-CREATOR] Attempt ${attempt}: ${lastError}`);
+          log.warn(`Attempt ${attempt}: ${lastError}`);
           if (attempt < MAX_CODE_ATTEMPTS) continue;
           return { success: false, error: lastError, code };
         }
@@ -1027,7 +1030,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
             code = fixMatch[1];
           } else {
             lastError = `Compilation failed: ${compileError}`;
-            console.warn(`[OBJECT-CREATOR] Attempt ${attempt}: ${lastError}`);
+            log.warn(`Attempt ${attempt}: ${lastError}`);
             if (attempt < MAX_CODE_ATTEMPTS) continue;
             return { success: false, error: lastError, code };
           }
@@ -1037,7 +1040,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           const postMissing = postCompileCheck.mismatches.filter((m) => m.startsWith('Missing handler:'));
           if (postMissing.length > 0) {
             lastError = `Compile fix dropped required methods: ${postMissing.join('; ')}`;
-            console.warn(`[OBJECT-CREATOR] Attempt ${attempt}: ${lastError}`);
+            log.warn(`Attempt ${attempt}: ${lastError}`);
             if (attempt < MAX_CODE_ATTEMPTS) continue;
             return { success: false, error: lastError, code };
           }
@@ -1067,13 +1070,13 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         if (spawnResult.objectId) {
           if (callerId) await this.reportProgress(callerId, '5b', 'Validating dependencies...');
           let probeResult = await this.probeObject(spawnResult.objectId);
-          console.log('[OBJECT-CREATOR] Probe result:', probeResult);
+          log.info('Probe result:', probeResult);
 
           if (!probeResult.success) {
             const MAX_RUNTIME_ATTEMPTS = 2;
             for (let attempt = 1; attempt <= MAX_RUNTIME_ATTEMPTS; attempt++) {
               if (callerId) await this.reportProgress(callerId, '5c', `Runtime error recovery attempt ${attempt}/${MAX_RUNTIME_ATTEMPTS}...`);
-              console.log(`[OBJECT-CREATOR] Probe retry ${attempt}/${MAX_RUNTIME_ATTEMPTS}: ${probeResult.error}`);
+              log.info(`Probe retry ${attempt}/${MAX_RUNTIME_ATTEMPTS}: ${probeResult.error}`);
 
               const retryResult = await this.retryWithProbeFeedback(
                 spawnResult.objectId, manifest, prompt, code!, probeResult.error,
@@ -1094,7 +1097,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
 
               // Re-probe to verify the fix worked
               probeResult = await this.probeObject(spawnResult.objectId);
-              console.log('[OBJECT-CREATOR] Post-retry probe result:', probeResult);
+              log.info('Post-retry probe result:', probeResult);
               if (probeResult.success) break;
             }
 
@@ -1149,7 +1152,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
             request(this.id, this.abjectStoreId, 'save', {
               objectId: spawnResult.objectId, manifest, source: code, owner: this.id as string,
             })
-          ).catch(err => console.warn('[OBJECT-CREATOR] Failed to persist:', err));
+          ).catch(err => log.warn('Failed to persist:', err));
         }
 
         this._currentCallerId = undefined;
@@ -1237,7 +1240,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
     ];
 
     const result = await this.llmComplete(messages, { tier: 'balanced', maxTokens: 16384 });
-    console.log(`[OBJECT-CREATOR] Modify Phase 2 LLM response (${result.content.length} chars):\n${result.content.slice(0, 500)}`);
+    log.info(`Modify Phase 2 LLM response (${result.content.length} chars):\n${result.content.slice(0, 500)}`);
     return this.parseCodeResponse(result.content);
   }
 
@@ -1265,22 +1268,22 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
       // Phase 0b: LLM selects dependencies
       if (callerId) await this.reportProgress(callerId, '0b', 'Choosing dependencies...');
       const selectedNames = await this.llmSelectDependencies(prompt, summaries);
-      console.log('[OBJECT-CREATOR modify] Selected dependencies:', selectedNames);
+      log.info('modify Selected dependencies:', selectedNames);
 
       // Phase 0c: Fetch full manifests for selected dependencies
       const depNames = selectedNames.join(', ') || 'none';
       if (callerId) await this.reportProgress(callerId, '0c', `Learning about ${depNames}...`);
       const deps = await this.fetchFullManifests(selectedNames, summaries);
-      console.log('[OBJECT-CREATOR modify] Fetched manifests for:', deps.map((d) => d.name));
+      log.info('modify Fetched manifests for:', deps.map((d) => d.name));
 
       // Phase 0c5: Generate targeted questions for each dependency
       if (callerId) await this.reportProgress(callerId, '0c5', 'Formulating questions...');
       const targetedQuestions = await this.generateTargetedQuestions(prompt, deps);
-      console.log('[OBJECT-CREATOR modify] Generated targeted questions for:', Array.from(targetedQuestions.keys()));
+      log.info('modify Generated targeted questions for:', Array.from(targetedQuestions.keys()));
 
       // Phase 0d: Ask each dependency for usage guides (with targeted questions)
       const usageGuides = await this.fetchUsageGuides(deps, targetedQuestions, callerId);
-      console.log('[OBJECT-CREATOR modify] Got usage guides from:', Array.from(usageGuides.keys()));
+      log.info('modify Got usage guides from:', Array.from(usageGuides.keys()));
 
       const depContext = this.formatFullManifestContext(deps, usageGuides);
 
@@ -1306,14 +1309,14 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           );
         } else {
           if (callerId) await this.reportProgress(callerId, '2', `Generating handler code (retry ${attempt}/${MAX_CODE_ATTEMPTS})...`);
-          console.log(`[OBJECT-CREATOR modify] Retry ${attempt}/${MAX_CODE_ATTEMPTS}: ${lastError}`);
+          log.info(`modify Retry ${attempt}/${MAX_CODE_ATTEMPTS}: ${lastError}`);
           code = await this.regenerateHandlerCode(
             manifest, prompt, depContext, phaseM.usedObjects, code ?? '', lastError
           );
         }
         if (!code) {
           lastError = 'Failed to generate handler code (LLM did not return a javascript code block)';
-          console.warn(`[OBJECT-CREATOR modify] Attempt ${attempt}: ${lastError}`);
+          log.warn(`modify Attempt ${attempt}: ${lastError}`);
           continue;
         }
 
@@ -1332,10 +1335,10 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
               manifest = llmFixed.manifest;
               code = llmFixed.code;
             } else {
-              console.warn('[OBJECT-CREATOR modify] Phase 3b produced non-compiling code, keeping original');
+              log.warn('modify Phase 3b produced non-compiling code, keeping original');
             }
           } catch (err) {
-            console.warn('[OBJECT-CREATOR modify] LLM verify/fix failed, continuing:', err);
+            log.warn('modify LLM verify/fix failed, continuing:', err);
           }
         }
 
@@ -1346,7 +1349,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         const missingHandlers = recheck.mismatches.filter((m) => m.startsWith('Missing handler:'));
         if (missingHandlers.length > 0) {
           lastError = `Handler code is missing required methods: ${missingHandlers.join('; ')}`;
-          console.warn(`[OBJECT-CREATOR modify] Attempt ${attempt}: ${lastError}`);
+          log.warn(`modify Attempt ${attempt}: ${lastError}`);
           if (attempt < MAX_CODE_ATTEMPTS) continue;
           return { success: false, error: lastError, code };
         }
@@ -1370,7 +1373,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
             code = fixMatch[1];
           } else {
             lastError = `Compilation failed: ${compileError}`;
-            console.warn(`[OBJECT-CREATOR modify] Attempt ${attempt}: ${lastError}`);
+            log.warn(`modify Attempt ${attempt}: ${lastError}`);
             if (attempt < MAX_CODE_ATTEMPTS) continue;
             return { success: false, error: lastError, code };
           }
@@ -1380,7 +1383,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           const postMissing = postCompileCheck.mismatches.filter((m) => m.startsWith('Missing handler:'));
           if (postMissing.length > 0) {
             lastError = `Compile fix dropped required methods: ${postMissing.join('; ')}`;
-            console.warn(`[OBJECT-CREATOR modify] Attempt ${attempt}: ${lastError}`);
+            log.warn(`modify Attempt ${attempt}: ${lastError}`);
             if (attempt < MAX_CODE_ATTEMPTS) continue;
             return { success: false, error: lastError, code };
           }
@@ -1408,7 +1411,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           return { success: false, error: `Failed to apply source to live object: ${updateResult.error}`, code };
         }
       } catch (err) {
-        console.warn('[OBJECT-CREATOR modify] Failed to update live object source:', err);
+        log.warn('modify Failed to update live object source:', err);
         return { success: false, error: `Failed to apply source to live object: ${err instanceof Error ? err.message : String(err)}`, code };
       }
 
@@ -1424,7 +1427,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           request(this.id, this.abjectStoreId, 'save', {
             objectId: objectId as string, manifest, source: code, owner: this.id as string,
           })
-        ).catch(err => console.warn('[OBJECT-CREATOR modify] Failed to persist:', err));
+        ).catch(err => log.warn('modify Failed to persist:', err));
       }
 
       // Phase 6: Connect to any new dependencies via Negotiator
@@ -1559,7 +1562,7 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
     ];
 
     const result = await this.llmComplete(messages, { tier: 'balanced', maxTokens: 16384 });
-    console.log(`[OBJECT-CREATOR] Phase 2 LLM response (${result.content.length} chars):\n${result.content.slice(0, 500)}`);
+    log.info(`Phase 2 LLM response (${result.content.length} chars):\n${result.content.slice(0, 500)}`);
     return this.parseCodeResponse(result.content);
   }
 
@@ -1584,7 +1587,7 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
     ];
 
     const result = await this.llmComplete(messages, { tier: 'balanced', maxTokens: 16384 });
-    console.log(`[OBJECT-CREATOR] Phase 2 retry LLM response (${result.content.length} chars):\n${result.content.slice(0, 500)}`);
+    log.info(`Phase 2 retry LLM response (${result.content.length} chars):\n${result.content.slice(0, 500)}`);
     return this.parseCodeResponse(result.content);
   }
 
@@ -1746,7 +1749,7 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
     // Fallback: unclosed code block (LLM response truncated)
     const unclosedMatch = content.match(/```(?:javascript|js|typescript|ts)\s*([\s\S]*)/);
     if (unclosedMatch) {
-      console.warn('[OBJECT-CREATOR] parseCodeResponse: code block was not closed (truncated LLM response), extracting anyway');
+      log.warn('parseCodeResponse: code block was not closed (truncated LLM response), extracting anyway');
       return unclosedMatch[1];
     }
 

@@ -20,8 +20,18 @@ export class NodeWebSocketServer {
   constructor(config: WsServerConfig) {
     this.wss = new WsServer({
       port: config.port,
-      host: config.host,
+      host: config.host ?? '0.0.0.0',
       perMessageDeflate: config.perMessageDeflate ?? false,
+    });
+
+    this.wss.on('listening', () => {
+      const addr = this.wss.address();
+      const addrStr = typeof addr === 'object' && addr ? `${addr.address}:${addr.port}` : String(addr);
+      console.log(`[WS-SERVER] listening on ${addrStr} (T+${Math.round(performance.now())}ms)`);
+    });
+
+    this.wss.on('error', (err) => {
+      console.error(`[WS-SERVER] error:`, err);
     });
 
     this.wss.on('connection', (ws) => {

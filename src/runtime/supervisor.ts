@@ -15,6 +15,9 @@ import { AbjectId, AbjectMessage, AbjectError } from '../core/types.js';
 import { invariant, require as contractRequire } from '../core/contracts.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('SUPERVISOR');
 
 export type RestartStrategy = 'one_for_one' | 'one_for_all' | 'rest_for_one';
 export type RestartType = 'permanent' | 'transient' | 'temporary';
@@ -171,7 +174,7 @@ export class Supervisor extends Abject {
     try {
       this.factoryId = await this.requireDep('Factory');
     } catch {
-      console.warn('[SUPERVISOR] Could not discover Factory — restarts will fail');
+      log.warn('Could not discover Factory — restarts will fail');
     }
 
     // Discover HealthMonitor (to re-mark objects ready after restart)
@@ -232,11 +235,11 @@ export class Supervisor extends Abject {
       return;
     }
 
-    console.log(`[SUPERVISOR] Child ${childId} (${child.spec.constructorName}) failed: ${error.message}`);
+    log.info(`Child ${childId} (${child.spec.constructorName}) failed: ${error.message}`);
 
     // Temporary children are never restarted
     if (child.spec.restart === 'temporary') {
-      console.log(`[SUPERVISOR] Child ${childId} is temporary — not restarting`);
+      log.info(`Child ${childId} is temporary — not restarting`);
       this.children.delete(childId);
       return;
     }
@@ -248,8 +251,8 @@ export class Supervisor extends Abject {
     );
 
     if (child.restarts.length >= this.config.maxRestarts) {
-      console.error(
-        `[SUPERVISOR] Child ${childId} exceeded max restarts (${this.config.maxRestarts} in ${this.config.maxTime}ms), giving up`
+      log.error(
+        `Child ${childId} exceeded max restarts (${this.config.maxRestarts} in ${this.config.maxTime}ms), giving up`
       );
       await this.handleMaxRestartsExceeded(childId);
       return;
@@ -277,11 +280,11 @@ export class Supervisor extends Abject {
   private async restartOne(childId: AbjectId): Promise<void> {
     const child = this.children.get(childId);
     if (!child || !this.factoryId) {
-      console.error(`[SUPERVISOR] Cannot restart ${childId} — no factory or child spec`);
+      log.error(`Cannot restart ${childId} — no factory or child spec`);
       return;
     }
 
-    console.log(`[SUPERVISOR] Restarting child ${childId} (${child.spec.constructorName})`);
+    log.info(`Restarting child ${childId} (${child.spec.constructorName})`);
 
     try {
       await this.request(
@@ -291,12 +294,12 @@ export class Supervisor extends Abject {
           parentId: child.spec.parentId,
         })
       );
-      console.log(`[SUPERVISOR] Child ${childId} restarted successfully`);
+      log.info(`Child ${childId} restarted successfully`);
 
       // Notify HealthMonitor the object is ready for pings again
       await this.notifyHealthMonitorReady(childId);
     } catch (err) {
-      console.error(`[SUPERVISOR] Failed to restart child ${childId}:`, err);
+      log.error(`Failed to restart child ${childId}:`, err);
     }
   }
 
@@ -308,7 +311,7 @@ export class Supervisor extends Abject {
       return;
     }
 
-    console.log('[SUPERVISOR] Restarting all children');
+    log.info('Restarting all children');
 
     for (const [childId] of this.children) {
       await this.restartOne(childId);
@@ -323,7 +326,7 @@ export class Supervisor extends Abject {
       return;
     }
 
-    console.log(`[SUPERVISOR] Restarting children from ${failedId}`);
+    log.info(`Restarting children from ${failedId}`);
 
     const ids = Array.from(this.children.keys());
     const failedIndex = ids.indexOf(failedId);
@@ -367,7 +370,7 @@ export class Supervisor extends Abject {
     // Remove from supervision
     this.children.delete(childId);
 
-    console.error(`[SUPERVISOR] Child ${childId} permanently failed`);
+    log.error(`Child ${childId} permanently failed`);
   }
 
   /**

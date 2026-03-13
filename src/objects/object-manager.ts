@@ -15,6 +15,9 @@ import {
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('ObjectManager');
 
 const OBJECT_MANAGER_INTERFACE: InterfaceId = 'abjects:object-manager';
 
@@ -716,7 +719,7 @@ export class ObjectManager extends Abject {
           await this.request(request(this.id, this.factoryId,
             'respawn', { objectId: row.id, constructorName, registryId: this.registryId }));
         } catch (err) {
-          console.warn(`[ObjectManager] Failed to restart ${row.name}:`, err);
+          log.warn(`Failed to restart ${row.name}:`, err);
         }
         await this.rebuildList();
       }

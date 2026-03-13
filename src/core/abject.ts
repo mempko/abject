@@ -23,6 +23,9 @@ import type { MessageBusLike } from '../runtime/message-bus.js';
 import { CapabilitySet, getDefaultCapabilities } from './capability.js';
 import { INTROSPECT_METHODS, INTROSPECT_EVENTS, formatManifestAsDescription } from './introspect.js';
 import type { InterfaceId } from './types.js';
+import { Log } from './timed-log.js';
+
+const log = new Log('ABJECT');
 
 /**
  * Return this from a request handler to suppress the auto-reply.
@@ -393,7 +396,7 @@ export abstract class Abject {
       try {
         await this.handleMessage(msg);
       } catch (err) {
-        console.error(`[${this.id}] Processing loop error:`, err);
+        log.error(`[${this.id}] Processing loop error:`, err);
       }
     }
   }
@@ -569,7 +572,7 @@ export abstract class Abject {
    */
   private async handleMessage(message: AbjectMessage): Promise<void> {
     if (message === undefined) {
-      console.error(`[${this.id}] handleMessage called with undefined message`);
+      log.error(`[${this.id}] handleMessage called with undefined message`);
       return;
     }
 
@@ -649,7 +652,7 @@ export abstract class Abject {
 
         // Finalize deferred cleanup (bus.unregister already done in stop())
         this._processingLoop = undefined;
-        console.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
+        log.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
         return;
       }
 
@@ -658,7 +661,7 @@ export abstract class Abject {
         try {
           await this.send(errorFromException(message, err));
         } catch (sendErr) {
-          console.error(`[${this.id}] Failed to send error reply:`, sendErr);
+          log.error(`[${this.id}] Failed to send error reply:`, sendErr);
         }
       }
 
@@ -666,13 +669,13 @@ export abstract class Abject {
       if (prevStatus !== 'busy') {
         this._status = 'error';
       }
-      console.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
+      log.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
     }
 
     try {
       this.checkInvariants();
     } catch (err) {
-      console.error(`[${this.id}] Invariant violation after message handling:`, err);
+      log.error(`[${this.id}] Invariant violation after message handling:`, err);
       this.errorCount++;
       if (this._status !== 'stopped') {
         this._status = 'error';

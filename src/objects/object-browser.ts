@@ -23,6 +23,9 @@ import {
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('ObjectBrowser');
 import type { DiscoveredWorkspace } from './workspace-share-registry.js';
 
 const OBJECT_BROWSER_INTERFACE: InterfaceId = 'abjects:object-browser' as InterfaceId;
@@ -458,7 +461,7 @@ export class ObjectBrowser extends Abject {
           } catch { /* may not support subscribe */ }
         }
       } catch {
-        console.warn('[ObjectBrowser] Failed to list workspaces');
+        log.warn('Failed to list workspaces');
       }
     }
 
@@ -486,7 +489,7 @@ export class ObjectBrowser extends Abject {
           oldKeys.delete(key);
         }
       } catch {
-        console.warn('[ObjectBrowser] Failed to get discovered workspaces');
+        log.warn('Failed to get discovered workspaces');
       }
     }
 

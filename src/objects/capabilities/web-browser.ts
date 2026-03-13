@@ -13,6 +13,9 @@ import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
 import { error, request } from '../../core/message.js';
 import { require as requireContract } from '../../core/contracts.js';
 import { Capabilities } from '../../core/capability.js';
+import { Log } from '../../core/timed-log.js';
+
+const log = new Log('WebBrowser');
 
 const WEB_BROWSER_INTERFACE = 'abjects:web-browser';
 
@@ -829,7 +832,7 @@ export class WebBrowser extends Abject {
     // -- closePage --
     this.deferredPageHandler('closePage', async (tracked, payload) => {
       const pageId = payload.pageId as string;
-      console.log(`[WebBrowser] closePage (${pageId})`);
+      log.info(`closePage (${pageId})`);
       this.pages.delete(pageId);
       try { await tracked.page.close(); } catch { /* already closed */ }
       this.changed('pageClosed', { pageId });
@@ -857,7 +860,7 @@ export class WebBrowser extends Abject {
       await this.navigatePage(tracked.page, url, options);
       const finalUrl = tracked.page.url();
       const title = await tracked.page.title();
-      console.log(`[WebBrowser] navigateTo (${payload.pageId}) → ${url} [${Date.now() - t0}ms]`);
+      log.info(`navigateTo (${payload.pageId}) → ${url} [${Date.now() - t0}ms]`);
       this.changed('pageNavigated', { pageId: payload.pageId, url: finalUrl, title });
       return { url: finalUrl, title };
     });
@@ -868,7 +871,7 @@ export class WebBrowser extends Abject {
       const options = payload.options as Record<string, unknown> | undefined;
       const t0 = Date.now();
       await tracked.page.click(selector, options);
-      console.log(`[WebBrowser] click (${payload.pageId}) selector="${selector}" [${Date.now() - t0}ms]`);
+      log.info(`click (${payload.pageId}) selector="${selector}" [${Date.now() - t0}ms]`);
       return { success: true };
     });
 
@@ -876,7 +879,7 @@ export class WebBrowser extends Abject {
     this.deferredPageHandler('fill', async (tracked, payload) => {
       const t0 = Date.now();
       await tracked.page.fill(payload.selector as string, payload.value as string);
-      console.log(`[WebBrowser] fill (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
+      log.info(`fill (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
       return { success: true };
     });
 
@@ -884,7 +887,7 @@ export class WebBrowser extends Abject {
     this.deferredPageHandler('type', async (tracked, payload) => {
       const t0 = Date.now();
       await tracked.page.type(payload.selector as string, payload.text as string);
-      console.log(`[WebBrowser] type (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
+      log.info(`type (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
       return { success: true };
     });
 
@@ -895,7 +898,7 @@ export class WebBrowser extends Abject {
         payload.selector as string,
         payload.values as string[],
       );
-      console.log(`[WebBrowser] select (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
+      log.info(`select (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
       return { selected };
     });
 
@@ -903,7 +906,7 @@ export class WebBrowser extends Abject {
     this.deferredPageHandler('hover', async (tracked, payload) => {
       const t0 = Date.now();
       await tracked.page.hover(payload.selector as string);
-      console.log(`[WebBrowser] hover (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
+      log.info(`hover (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
       return { success: true };
     });
 
@@ -911,7 +914,7 @@ export class WebBrowser extends Abject {
     this.deferredPageHandler('press', async (tracked, payload) => {
       const t0 = Date.now();
       await tracked.page.keyboard.press(payload.key as string);
-      console.log(`[WebBrowser] press (${payload.pageId}) key="${payload.key}" [${Date.now() - t0}ms]`);
+      log.info(`press (${payload.pageId}) key="${payload.key}" [${Date.now() - t0}ms]`);
       return { success: true };
     });
 
@@ -919,7 +922,7 @@ export class WebBrowser extends Abject {
     this.deferredPageHandler('check', async (tracked, payload) => {
       const t0 = Date.now();
       await tracked.page.check(payload.selector as string);
-      console.log(`[WebBrowser] check (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
+      log.info(`check (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
       return { success: true };
     });
 
@@ -927,7 +930,7 @@ export class WebBrowser extends Abject {
     this.deferredPageHandler('uncheck', async (tracked, payload) => {
       const t0 = Date.now();
       await tracked.page.uncheck(payload.selector as string);
-      console.log(`[WebBrowser] uncheck (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
+      log.info(`uncheck (${payload.pageId}) selector="${payload.selector}" [${Date.now() - t0}ms]`);
       return { success: true };
     });
 
@@ -941,10 +944,10 @@ export class WebBrowser extends Abject {
           timeout: options?.timeout ?? 30000,
           ...(options?.state ? { state: options.state } : {}),
         });
-        console.log(`[WebBrowser] waitForSelector (${payload.pageId}) selector="${selector}" found [${Date.now() - t0}ms]`);
+        log.info(`waitForSelector (${payload.pageId}) selector="${selector}" found [${Date.now() - t0}ms]`);
         return { found: true };
       } catch {
-        console.log(`[WebBrowser] waitForSelector (${payload.pageId}) selector="${selector}" not found [${Date.now() - t0}ms]`);
+        log.info(`waitForSelector (${payload.pageId}) selector="${selector}" not found [${Date.now() - t0}ms]`);
         return { found: false };
       }
     });
@@ -1003,7 +1006,7 @@ export class WebBrowser extends Abject {
     this.deferredPageHandler('evaluate', async (tracked, payload) => {
       const t0 = Date.now();
       const result = await tracked.page.evaluate(payload.script as string);
-      console.log(`[WebBrowser] evaluate (${payload.pageId}) [${Date.now() - t0}ms]`);
+      log.info(`evaluate (${payload.pageId}) [${Date.now() - t0}ms]`);
       return { result };
     });
 
@@ -1105,7 +1108,7 @@ export class WebBrowser extends Abject {
     };
 
     this.pages.set(pageId, tracked);
-    console.log(`[WebBrowser] openPage → ${pageId}`);
+    log.info(`openPage → ${pageId}`);
     this.changed('pageOpened', { pageId, owner });
 
     // Auto-remove from map if the page closes externally

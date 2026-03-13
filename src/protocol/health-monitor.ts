@@ -19,6 +19,9 @@ import {
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('HEALTH');
 
 const HEALTH_MONITOR_INTERFACE = 'abjects:health-monitor';
 
@@ -378,7 +381,7 @@ export class HealthMonitor extends Abject {
       this.checkObjectLiveness();
     }, this.config.checkInterval);
 
-    console.log('[HEALTH] Monitoring started');
+    log.info('Monitoring started');
   }
 
   /**
@@ -389,7 +392,7 @@ export class HealthMonitor extends Abject {
       clearInterval(this.checkTimer);
       this.checkTimer = undefined;
     }
-    console.log('[HEALTH] Monitoring stopped');
+    log.info('Monitoring stopped');
   }
 
   /**
@@ -551,8 +554,8 @@ export class HealthMonitor extends Abject {
       const errorRate = (health.errorCount / health.messageCount) * 100;
 
       if (errorRate >= this.config.errorThreshold) {
-        console.warn(
-          `[HEALTH] Connection ${agreementId} has ${errorRate.toFixed(1)}% error rate`
+        log.warn(
+          `Connection ${agreementId} has ${errorRate.toFixed(1)}% error rate`
         );
 
         // Build error context
@@ -606,8 +609,8 @@ export class HealthMonitor extends Abject {
       } catch {
         liveness.consecutiveFailures++;
         if (liveness.consecutiveFailures >= liveness.maxFailures) {
-          console.warn(
-            `[HEALTH] Object ${objectId} did not respond to ${liveness.maxFailures} consecutive pings`
+          log.warn(
+            `Object ${objectId} did not respond to ${liveness.maxFailures} consecutive pings`
           );
           // Gate the object so it won't be pinged again until
           // markObjectReady is called after the restart completes.
@@ -634,7 +637,7 @@ export class HealthMonitor extends Abject {
     }
 
     if (!this.supervisorId) {
-      console.warn('[HEALTH] No Supervisor available to handle dead object');
+      log.warn('No Supervisor available to handle dead object');
       return;
     }
 
@@ -674,11 +677,11 @@ export class HealthMonitor extends Abject {
     errorContext: string
   ): Promise<boolean> {
     if (!this.negotiatorId) {
-      console.error('[HEALTH] No negotiator set, cannot renegotiate');
+      log.error('No negotiator set, cannot renegotiate');
       return false;
     }
 
-    console.log(`[HEALTH] Triggering renegotiation for ${agreementId}`);
+    log.info(`Triggering renegotiation for ${agreementId}`);
 
     // Notify listeners
     await this.send(
@@ -699,7 +702,7 @@ export class HealthMonitor extends Abject {
       );
       return result.success;
     } catch (err) {
-      console.error('[HEALTH] Renegotiation failed:', err);
+      log.error('Renegotiation failed:', err);
       return false;
     }
   }

@@ -11,6 +11,9 @@ import { require, ensure, invariant, requireNonEmpty } from '../core/contracts.j
 import { request as createRequest, error as createError } from '../core/message.js';
 import { Mailbox } from './mailbox.js';
 import type { WorkerPool } from './worker-pool.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('MessageBus');
 
 export type MessageHandler = (message: AbjectMessage) => void | Promise<void>;
 export type ReplyHandler = (message: AbjectMessage) => void;
@@ -162,7 +165,7 @@ export class MessageBus implements MessageBusLike {
 
     // Check if recipient exists locally
     if (!this.mailboxes.has(recipient)) {
-      console.warn(`[MessageBus] UNDELIVERABLE: ${message.header.type} ${message.routing.method ?? '?'} from=${message.routing.from.slice(0,8)} to=${recipient.slice(0,8)} (not registered)`);
+      log.warn(`UNDELIVERABLE: ${message.header.type} ${message.routing.method ?? '?'} from=${message.routing.from.slice(0,8)} to=${recipient.slice(0,8)} (not registered)`);
 
       // For undeliverable requests, immediately send an error reply via the
       // fast-path so the sender's request() rejects instantly instead of
@@ -334,7 +337,7 @@ export class MessageBus implements MessageBusLike {
     // Emit to subscriptions
     for (const sub of this.subscriptions) {
       if (sub.objectId === '*' || sub.objectId === 'undeliverable') {
-        Promise.resolve(sub.handler(message)).catch(console.error);
+        Promise.resolve(sub.handler(message)).catch((err) => log.error('Subscription handler error:', err));
       }
     }
   }
@@ -364,15 +367,18 @@ export interface MessageInterceptor {
  * Logging interceptor for debugging.
  */
 export class LoggingInterceptor implements MessageInterceptor {
+  private readonly _log: Log;
   constructor(
-    private readonly prefix: string = '[MSG]',
+    prefix: string = 'MSG',
     private readonly filter?: (msg: AbjectMessage) => boolean
-  ) {}
+  ) {
+    this._log = new Log(prefix.replace(/^\[|\]$/g, ''));
+  }
 
   async intercept(message: AbjectMessage): Promise<'pass'> {
     if (!this.filter || this.filter(message)) {
-      console.log(
-        `${this.prefix} ${message.header.type} ` +
+      this._log.info(
+        `${message.header.type} ` +
           `${message.routing.from} -> ${message.routing.to} ` +
           `[${message.routing.method ?? ''}]`
       );

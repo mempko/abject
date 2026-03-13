@@ -23,6 +23,9 @@ import {
 import { Abject } from '../core/abject.js';
 import { require } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('DRAG-DEBUG');
 import { WindowAbject } from './widgets/window-abject.js';
 import { LabelWidget } from './widgets/label-widget.js';
 import { ButtonWidget } from './widgets/button-widget.js';
@@ -1550,7 +1553,7 @@ await this.call(timerId, 'addDependent', {});
             titleButtonMargin: ownerTheme.titleButtonMargin,
             workspaceId: ownerWs,
           }));
-        console.log(`[DRAG-DEBUG] registerWindow surface=${win.surface} wmId=${this.windowManagerId}`);
+        log.info(`registerWindow surface=${win.surface} wmId=${this.windowManagerId}`);
       } catch { /* WindowManager may not be ready */ }
     }
 

@@ -9,6 +9,9 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('SETTINGS');
 
 
 const SETTINGS_INTERFACE: InterfaceId = 'abjects:settings';
@@ -1388,7 +1391,7 @@ export class Settings extends Abject {
         } catch { /* object may already be dead */ }
       }
     } catch (err) {
-      console.warn('[SETTINGS] Failed to delete object:', err);
+      log.warn('Failed to delete object:', err);
     }
 
     // Rebuild tab content to reflect the change (without destroying window)

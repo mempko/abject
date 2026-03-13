@@ -17,6 +17,7 @@ import {
 import { Abject } from '../core/abject.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request } from '../core/message.js';
+import { Log } from '../core/timed-log.js';
 
 const WORKSPACE_MANAGER_INTERFACE = 'abjects:workspace-manager' as InterfaceId;
 const STORAGE_INTERFACE = 'abjects:storage' as InterfaceId;
@@ -41,12 +42,22 @@ const GLOBAL_TOOLBAR_INTERFACE = 'abjects:global-toolbar' as InterfaceId;
 const STORAGE_KEY_LIST = 'workspaces:list';
 const STORAGE_KEY_ACTIVE = 'workspaces:active';
 
-/** Per-workspace object names spawned by WorkspaceManager. */
-/** Per-workspace objects in dependency order (matches original bootstrap). */
-const PER_WORKSPACE_OBJECTS = [
-  'AbjectStore', 'SharedState', 'FileTransfer', 'MediaStream', 'Theme', 'Settings', 'AppExplorer',
-  'JobManager', 'JobBrowser', 'AgentAbject', 'ObjectManager', 'WebBrowserViewer', 'Chat', 'WebAgent', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
+const wsLog = new Log('WORKSPACE-MANAGER');
+
+/** Infrastructure objects — always spawned for every workspace (no UI). */
+const INFRA_OBJECTS = [
+  'AbjectStore', 'SharedState', 'FileTransfer', 'MediaStream', 'Theme',
+  'JobManager', 'AgentAbject', 'WebAgent',
 ] as const;
+
+/** UI objects — deferred for inactive workspaces, spawned on first switch. */
+const UI_OBJECTS = [
+  'Settings', 'AppExplorer', 'JobBrowser', 'ObjectManager',
+  'WebBrowserViewer', 'Chat', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
+] as const;
+
+/** All per-workspace objects in dependency order. */
+const PER_WORKSPACE_OBJECTS = [...INFRA_OBJECTS, ...UI_OBJECTS];
 
 export type WorkspaceAccessMode = 'local' | 'private' | 'public';
 
@@ -65,6 +76,7 @@ export interface WorkspaceInfo {
   taskbarId: AbjectId;
   uiObjects: Array<{ id: AbjectId; iface: InterfaceId }>;
   childTypeIds: Map<AbjectId, TypeId>;
+  uiSpawned: boolean;
 }
 
 export interface SharedWorkspaceInfo {
@@ -272,6 +284,21 @@ export class WorkspaceManager extends Abject {
                 } },
               },
               {
+                name: 'getWorkspaceForObject',
+                description: 'Fast lookup: find which workspace contains a given object by ID',
+                parameters: [
+                  {
+                    name: 'objectId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Object ID to look up',
+                  },
+                ],
+                returns: { kind: 'object', properties: {
+                  workspaceId: { kind: 'primitive', primitive: 'string' },
+                  workspaceName: { kind: 'primitive', primitive: 'string' },
+                } },
+              },
+              {
                 name: 'listWorkspacesDetailed',
                 description: 'List all workspaces with full details including child IDs and access mode',
                 parameters: [],
@@ -397,6 +424,11 @@ export class WorkspaceManager extends Abject {
       return this.findWorkspaceForObject(objectId as AbjectId);
     });
 
+    this.on('getWorkspaceForObject', async (msg: AbjectMessage) => {
+      const { objectId } = msg.payload as { objectId: string };
+      return this.getWorkspaceForObject(objectId as AbjectId);
+    });
+
     this.on('listWorkspacesDetailed', async () => {
       return this.listWorkspacesDetailed();
     });
@@ -481,6 +513,8 @@ export class WorkspaceManager extends Abject {
    * This cannot run during onInit because Factory would deadlock.
    */
   private async boot(): Promise<boolean> {
+    const log = new Log('WORKSPACE-BOOT');
+
     // Discover peerId from IdentityObject for scoped TypeIds
     try {
       const identityId = await this.discoverDep('Identity');
@@ -491,33 +525,61 @@ export class WorkspaceManager extends Abject {
         this.peerId = identity.peerId;
       }
     } catch {
-      console.warn('[WORKSPACE-MANAGER] Could not discover peerId from IdentityObject');
+      wsLog.warn('Could not discover peerId from IdentityObject');
     }
+    log.timed('identity resolved');
 
     const persisted = await this.loadWorkspaceList();
+    log.timed(`workspace list loaded (${persisted.length} workspaces)`);
 
     if (persisted.length === 0) {
       // First boot — create "Default" workspace and migrate existing data
       const { workspaceId } = await this.createWorkspace('Default');
+      log.timed('created Default workspace');
       await this.migrateExistingData(workspaceId);
+      log.timed('migrated existing data');
       await this.switchWorkspace(workspaceId);
+      log.timed('switched to Default workspace');
     } else {
-      // Restore each workspace
-      for (const ws of persisted) {
-        await this.restoreWorkspace(ws.id, ws.name, ws.accessMode ?? 'local', ws.whitelist ?? [],
-          ws.exposedTypeIds ?? [], ws.description ?? '', ws.tags ?? []);
-      }
-
-      // Activate the last-active workspace
+      // Load active workspace ID BEFORE restoring so we know which one to fully spawn
       const activeId = await this.loadActiveWorkspaceId();
-      const targetId = activeId && this.workspaces.has(activeId) ? activeId : persisted[0].id;
+      const targetId = activeId && persisted.some(ws => ws.id === activeId) ? activeId : persisted[0].id;
+
+      // Restore active workspace first with FULL spawn (infra + UI)
+      const activeWs = persisted.find(ws => ws.id === targetId)!;
+      await this.restoreWorkspace(activeWs.id, activeWs.name, activeWs.accessMode ?? 'local',
+        activeWs.whitelist ?? [], activeWs.exposedTypeIds ?? [], activeWs.description ?? '',
+        activeWs.tags ?? [], true);
+      log.timed(`active workspace '${activeWs.name}' restored`);
+
+      // Switch to active workspace immediately — UI is ready
       await this.switchWorkspace(targetId);
+      log.timed('switchWorkspace done');
+
+      // Restore remaining workspaces in the background — don't block boot.
+      // This lets the server start accepting connections immediately.
+      const remaining = persisted.filter(ws => ws.id !== targetId);
+      if (remaining.length > 0) {
+        void this.restoreRemainingWorkspaces(remaining);
+      }
     }
 
-    // Ensure the active workspace's Taskbar is positioned with the correct y-offset
-    await this.refreshTaskbar();
-
+    log.summary();
     return true;
+  }
+
+  /**
+   * Restore inactive workspaces in the background after boot completes.
+   */
+  private async restoreRemainingWorkspaces(workspaces: PersistedWorkspace[]): Promise<void> {
+    for (const ws of workspaces) {
+      try {
+        await this.restoreWorkspace(ws.id, ws.name, ws.accessMode ?? 'local', ws.whitelist ?? [],
+          ws.exposedTypeIds ?? [], ws.description ?? '', ws.tags ?? [], false);
+      } catch (err) {
+        wsLog.warn(`Failed to restore workspace '${ws.name}':`, err);
+      }
+    }
   }
 
   // ── Workspace Lifecycle ──
@@ -531,7 +593,7 @@ export class WorkspaceManager extends Abject {
 
     await this.persistWorkspaceList();
 
-    console.log(`[WORKSPACE-MANAGER] Created workspace '${name}' (${workspaceId})`);
+    wsLog.info(`Created workspace '${name}' (${workspaceId})`);
     return { workspaceId };
   }
 
@@ -585,13 +647,18 @@ export class WorkspaceManager extends Abject {
     this.workspaces.delete(workspaceId);
     await this.persistWorkspaceList();
 
-    console.log(`[WORKSPACE-MANAGER] Deleted workspace '${ws.name}' (${workspaceId})`);
+    wsLog.info(`Deleted workspace '${ws.name}' (${workspaceId})`);
     return true;
   }
 
   async switchWorkspace(workspaceId: string): Promise<boolean> {
     const ws = this.workspaces.get(workspaceId);
     if (!ws) return false;
+
+    // Lazy-spawn UI objects on first switch to a deferred workspace
+    if (!ws.uiSpawned) {
+      await this.spawnUIObjects(workspaceId);
+    }
 
     this.activeWorkspaceId = workspaceId;
 
@@ -606,7 +673,7 @@ export class WorkspaceManager extends Abject {
     // This also refreshes WorkspaceSwitcher with current workspace data.
     await this.refreshTaskbar();
 
-    console.log(`[WORKSPACE-MANAGER] Switched to workspace '${ws.name}' (${workspaceId})`);
+    wsLog.info(`Switched to workspace '${ws.name}' (${workspaceId})`);
     return true;
   }
 
@@ -653,7 +720,7 @@ export class WorkspaceManager extends Abject {
         yOffset,
       }));
     } catch (err) {
-      console.warn('[WORKSPACE-MANAGER] Failed to refresh taskbar:', err);
+      wsLog.warn('Failed to refresh taskbar:', err);
     }
 
     return true;
@@ -698,11 +765,14 @@ export class WorkspaceManager extends Abject {
     const prevMode = ws.accessMode;
     ws.accessMode = accessMode;
 
-    // Ensure registry is always exposed when workspace is shared
+    // Ensure registry and SharedState are always exposed when workspace is shared
     if (accessMode !== 'local' && ws.exposedObjectIds.length === 0) {
       ws.exposedObjectIds = [ws.registryId];
       const regTypeId = ws.childTypeIds.get(ws.registryId);
       ws.exposedTypeIds = regTypeId ? [regTypeId] : [];
+    }
+    if (accessMode !== 'local') {
+      await this.ensureSharedStateExposed(ws);
     }
 
     await this.syncExposedToRegistry(ws);
@@ -863,6 +933,19 @@ export class WorkspaceManager extends Abject {
   }
 
   /**
+   * Fast lookup: find which workspace contains a given object by ID.
+   * Returns workspaceId and workspaceName, or null if not found.
+   */
+  getWorkspaceForObject(objectId: AbjectId): { workspaceId: string; workspaceName: string } | null {
+    for (const [, ws] of this.workspaces) {
+      if (ws.registryId === objectId || ws.childIds.includes(objectId)) {
+        return { workspaceId: ws.id, workspaceName: ws.name };
+      }
+    }
+    return null;
+  }
+
+  /**
    * List all workspaces with full details including child IDs and access mode.
    * Used by PeerRouter for route propagation.
    */
@@ -889,6 +972,70 @@ export class WorkspaceManager extends Abject {
   // ── Internal Helpers ──
 
   /**
+   * Spawn only UI objects into an existing workspace that was initially
+   * created with infra-only objects. Reuses the same per-object post-spawn
+   * setup (Taskbar registration, Theme registration, uiObjects tracking).
+   */
+  private async spawnUIObjects(workspaceId: string): Promise<void> {
+    const ws = this.workspaces.get(workspaceId);
+    if (!ws || ws.uiSpawned) return;
+
+    const uiIfaceMap: Record<string, InterfaceId> = {
+      Settings: SETTINGS_INTERFACE,
+      AppExplorer: APP_EXPLORER_INTERFACE,
+      JobBrowser: JOB_BROWSER_INTERFACE,
+      ObjectManager: OBJECT_MANAGER_INTERFACE,
+      Chat: CHAT_INTERFACE,
+    };
+
+    for (const objName of UI_OBJECTS) {
+      const typeId = this.computeTypeId(workspaceId, objName);
+      let result: SpawnResult;
+      try {
+        result = await this.request<SpawnResult>(
+          request(this.id, this.factoryId!, 'spawn', {
+            manifest: { name: objName, description: '', version: '1.0.0',
+              requiredCapabilities: [], tags: ['system'] },
+            registryHint: ws.registryId,
+            typeId,
+          })
+        );
+      } catch {
+        continue;
+      }
+
+      const objId = result.objectId;
+      ws.childIds.push(objId);
+      if (typeId) ws.childTypeIds.set(objId, typeId);
+
+      if (objName === 'Taskbar') {
+        ws.taskbarId = objId;
+        if (this.windowManagerId) {
+          try {
+            await this.request(request(this.id, this.windowManagerId,
+              'registerTaskbar', { taskbarId: objId, workspaceId }));
+          } catch { /* WindowManager may not be ready */ }
+        }
+      }
+
+      if (uiIfaceMap[objName]) {
+        ws.uiObjects.push({ id: objId, iface: uiIfaceMap[objName] });
+      }
+
+      if (this.widgetManagerId) {
+        try {
+          await this.request(request(this.id, this.widgetManagerId, 'setObjectWorkspace', {
+            objectId: objId, workspaceId,
+          }));
+        } catch { /* WidgetManager may not be ready */ }
+      }
+    }
+
+    ws.uiSpawned = true;
+    wsLog.info(`Spawned deferred UI objects for workspace '${ws.name}' (${workspaceId})`);
+  }
+
+  /**
    * Compute a scoped TypeId: {peerId}/{workspaceId}/{objectName}
    * Returns undefined if peerId is not yet known.
    */
@@ -900,7 +1047,11 @@ export class WorkspaceManager extends Abject {
   /**
    * Spawn all objects for a workspace: WorkspaceRegistry, Storage, and per-ws objects.
    */
-  private async spawnWorkspaceObjects(workspaceId: string, name: string): Promise<WorkspaceInfo> {
+  private async spawnWorkspaceObjects(
+    workspaceId: string, name: string,
+    objectsToSpawn: readonly string[] = PER_WORKSPACE_OBJECTS,
+  ): Promise<WorkspaceInfo> {
+    const log = new Log(`WS-SPAWN:${name}`);
     // 1. Spawn WorkspaceRegistry (skip all registries — we register manually)
     const wsRegistryTypeId = this.computeTypeId(workspaceId, 'WorkspaceRegistry');
     const wsRegResult = await this.request<SpawnResult>(
@@ -977,6 +1128,7 @@ export class WorkspaceManager extends Abject {
       })
     );
     const wsStorageId = wsStorageResult.objectId;
+    log.timed('registry + storage ready');
 
     // 3. Spawn per-workspace objects (in dependency order)
     // Factory auto-registers each in the workspace registry via registryHint
@@ -1000,7 +1152,7 @@ export class WorkspaceManager extends Abject {
       Chat: CHAT_INTERFACE,
     };
 
-    for (const objName of PER_WORKSPACE_OBJECTS) {
+    for (const objName of objectsToSpawn) {
       const typeId = this.computeTypeId(workspaceId, objName);
       let result: SpawnResult;
       try {
@@ -1016,6 +1168,7 @@ export class WorkspaceManager extends Abject {
         // Constructor not registered (e.g. server-only objects in browser mode) — skip
         continue;
       }
+      log.timed(`spawn ${objName}`);
 
       const objId = result.objectId;
       childIds.push(objId);
@@ -1057,6 +1210,8 @@ export class WorkspaceManager extends Abject {
       }
     }
 
+    log.timed(`all ${objectsToSpawn.length} objects spawned`);
+
     // 4. Restore persisted user-created abjects for this workspace
     // AbjectStore is at index 0 in PER_WORKSPACE_OBJECTS, so childIds[2]
     const abjectStoreId = childIds[2];
@@ -1065,8 +1220,9 @@ export class WorkspaceManager extends Abject {
         await this.request(
           request(this.id, abjectStoreId, 'restoreAll', {})
         );
+        log.timed('restoreAll complete');
       } catch (err) {
-        console.warn(`[WORKSPACE-MANAGER] Failed to restore abjects for workspace '${name}':`, err);
+        wsLog.warn(`Failed to restore abjects for workspace '${name}':`, err);
       }
     }
 
@@ -1086,6 +1242,7 @@ export class WorkspaceManager extends Abject {
       }
     } catch { /* registry not ready */ }
 
+    log.summary();
     return {
       id: workspaceId,
       name,
@@ -1101,6 +1258,7 @@ export class WorkspaceManager extends Abject {
       taskbarId,
       uiObjects,
       childTypeIds,
+      uiSpawned: objectsToSpawn.includes('Taskbar'),
     };
   }
 
@@ -1111,8 +1269,10 @@ export class WorkspaceManager extends Abject {
     workspaceId: string, name: string,
     accessMode: WorkspaceAccessMode = 'local', whitelist: string[] = [],
     exposedTypeIds: string[] = [], description: string = '', tags: string[] = [],
+    isActive: boolean = true,
   ): Promise<void> {
-    const info = await this.spawnWorkspaceObjects(workspaceId, name);
+    const objectsToSpawn = isActive ? PER_WORKSPACE_OBJECTS : INFRA_OBJECTS;
+    const info = await this.spawnWorkspaceObjects(workspaceId, name, objectsToSpawn);
     info.accessMode = accessMode;
     info.whitelist = whitelist;
     info.description = description;
@@ -1133,9 +1293,10 @@ export class WorkspaceManager extends Abject {
 
     this.workspaces.set(workspaceId, info);
     if (info.accessMode !== 'local') {
+      await this.ensureSharedStateExposed(info);
       await this.syncExposedToRegistry(info);
     }
-    console.log(`[WORKSPACE-MANAGER] Restored workspace '${name}' (${workspaceId})`);
+    wsLog.info(`Restored workspace '${name}' (${workspaceId})`);
   }
 
   /**
@@ -1172,10 +1333,10 @@ export class WorkspaceManager extends Abject {
       }
 
       if (migrateKeys.length > 0) {
-        console.log(`[WORKSPACE-MANAGER] Migrated ${migrateKeys.length} keys to default workspace`);
+        wsLog.info(`Migrated ${migrateKeys.length} keys to default workspace`);
       }
     } catch (err) {
-      console.warn('[WORKSPACE-MANAGER] Data migration failed:', err);
+      wsLog.warn('Data migration failed:', err);
     }
   }
 
@@ -1203,6 +1364,35 @@ export class WorkspaceManager extends Abject {
     }
   }
 
+  /**
+   * Ensure SharedState is in the workspace's exposed objects when shared.
+   * Discovers SharedState via the workspace registry and adds it if missing.
+   */
+  private async ensureSharedStateExposed(ws: WorkspaceInfo): Promise<void> {
+    // Check if SharedState is already exposed
+    const alreadyExposed = ws.exposedObjectIds.some(id => {
+      const typeId = ws.childTypeIds.get(id);
+      return typeId?.endsWith('/SharedState');
+    });
+    if (alreadyExposed) return;
+
+    try {
+      const results = await this.request<Array<{ id: AbjectId }>>(
+        request(this.id, ws.registryId, 'discover', { name: 'SharedState' })
+      );
+      if (results.length > 0) {
+        const ssId = results[0].id;
+        if (!ws.exposedObjectIds.includes(ssId)) {
+          ws.exposedObjectIds.push(ssId);
+          const ssTypeId = ws.childTypeIds.get(ssId);
+          if (ssTypeId && !ws.exposedTypeIds.includes(ssTypeId)) {
+            ws.exposedTypeIds.push(ssTypeId);
+          }
+        }
+      }
+    } catch { /* SharedState not spawned yet */ }
+  }
+
   private async syncExposedToRegistry(ws: WorkspaceInfo): Promise<void> {
     try {
       await this.send(
@@ -1211,7 +1401,7 @@ export class WorkspaceManager extends Abject {
         })
       );
     } catch (err) {
-      console.warn('[WORKSPACE-MANAGER] Failed to sync exposed objects to registry:', err);
+      wsLog.warn('Failed to sync exposed objects to registry:', err);
     }
   }
 
@@ -1237,7 +1427,7 @@ export class WorkspaceManager extends Abject {
         })
       );
     } catch (err) {
-      console.warn('[WORKSPACE-MANAGER] Failed to persist workspace list:', err);
+      wsLog.warn('Failed to persist workspace list:', err);
     }
   }
 
@@ -1251,7 +1441,7 @@ export class WorkspaceManager extends Abject {
         })
       );
     } catch (err) {
-      console.warn('[WORKSPACE-MANAGER] Failed to persist active workspace:', err);
+      wsLog.warn('Failed to persist active workspace:', err);
     }
   }
 

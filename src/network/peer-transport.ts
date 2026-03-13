@@ -23,6 +23,9 @@ import {
 } from '../core/identity.js';
 import type { SignalingRelay } from './signaling.js';
 import { gzipSync, gunzipSync } from 'node:zlib';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('PeerTransport');
 
 const PONG_MISS_LIMIT = 3;
 const MAX_CHUNK_SIZE = 200_000; // 200KB per chunk (safe under 256KB SCTP limit)
@@ -113,7 +116,7 @@ export class PeerTransport extends Transport {
     try {
       await this.peerConnection!.setRemoteDescription(new RTCSessionDescription(sdp));
     } catch (err) {
-      console.error(`[PeerTransport] Failed to set remote offer for ${this.remotePeerId.slice(0, 16)}:`, err);
+      log.error(`Failed to set remote offer for ${this.remotePeerId.slice(0, 16)}:`, err);
       throw err;
     }
 
@@ -145,7 +148,7 @@ export class PeerTransport extends Transport {
     try {
       await this.peerConnection!.setRemoteDescription(new RTCSessionDescription(sdp));
     } catch (err) {
-      console.error(`[PeerTransport] Failed to set remote answer for ${this.remotePeerId.slice(0, 16)}:`, err);
+      log.error(`Failed to set remote answer for ${this.remotePeerId.slice(0, 16)}:`, err);
       throw err;
     }
 
@@ -260,7 +263,7 @@ export class PeerTransport extends Transport {
           const slice = b64.slice(i * MAX_CHUNK_SIZE, (i + 1) * MAX_CHUNK_SIZE);
           this.dataChannel!.send(JSON.stringify({ chunk: true, id: chunkId, idx: i, total, data: slice }));
         }
-        console.log(`[PeerTransport] sent ${total} chunks (${b64.length} bytes compressed) to ${this.remotePeerId.slice(0, 16)}`);
+        log.info(`sent ${total} chunks (${b64.length} bytes compressed) to ${this.remotePeerId.slice(0, 16)}`);
       }
     } else {
       this.dataChannel!.send(data);
@@ -344,7 +347,7 @@ export class PeerTransport extends Transport {
     const onOpen = () => {
       if (opened) return;
       opened = true;
-      console.log(`[PeerTransport] DataChannel open with ${this.remotePeerId.slice(0, 16)}`);
+      log.info(`DataChannel open with ${this.remotePeerId.slice(0, 16)}`);
       // Don't call handleConnect() here — defer until handshake completes
       // so PeerRouter knows about the connection before messages arrive.
       this.startHandshake();
@@ -431,23 +434,23 @@ export class PeerTransport extends Transport {
         const decoder = new TextDecoder();
         const msgData = decoder.decode(plaintext);
         const message = deserialize(msgData);
-        console.log(`[PeerTransport] recv encrypted from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
+        log.info(`recv encrypted from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
         this.events.onMessage?.(message);
         return;
       }
 
       // Encrypted message but no session key yet — drop it
       if (parsed.enc && !this.sessionKey) {
-        console.warn(`[PeerTransport] recv encrypted msg from ${this.remotePeerId.slice(0, 16)} but no session key yet — dropping`);
+        log.warn(`recv encrypted msg from ${this.remotePeerId.slice(0, 16)} but no session key yet — dropping`);
         return;
       }
 
       // Unencrypted message (during handshake or if encryption not yet established)
       const message = deserialize(data);
-      console.log(`[PeerTransport] recv unencrypted from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
+      log.info(`recv unencrypted from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
       this.events.onMessage?.(message);
     } catch (err) {
-      console.error('[PeerTransport] Failed to handle message:', err);
+      log.error('Failed to handle message:', err);
       this.events.onError?.(err instanceof Error ? err : new Error(String(err)));
     }
   }
@@ -460,7 +463,7 @@ export class PeerTransport extends Transport {
     let entry = this.pendingChunks.get(parsed.id);
     if (!entry) {
       const timer = setTimeout(() => {
-        console.warn(`[PeerTransport] chunk reassembly timeout for id=${parsed.id}, discarding`);
+        log.warn(`chunk reassembly timeout for id=${parsed.id}, discarding`);
         this.pendingChunks.delete(parsed.id);
       }, CHUNK_REASSEMBLY_TIMEOUT);
       entry = { total: parsed.total, parts: new Map(), timer };
@@ -480,7 +483,7 @@ export class PeerTransport extends Transport {
       pieces.push(entry.parts.get(i)!);
     }
     const reassembled = pieces.join('');
-    console.log(`[PeerTransport] reassembled ${entry.total} chunks (${reassembled.length} bytes) from ${this.remotePeerId.slice(0, 16)}`);
+    log.info(`reassembled ${entry.total} chunks (${reassembled.length} bytes) from ${this.remotePeerId.slice(0, 16)}`);
     return reassembled;
   }
 
@@ -495,13 +498,13 @@ export class PeerTransport extends Transport {
     // Verify the peer's identity
     const computedPeerId = await derivePeerIdFromJwk(msg.publicSigningKey);
     if (computedPeerId !== msg.peerId) {
-      console.error(`[PeerTransport] PeerId verification failed for ${msg.peerId.slice(0, 16)}`);
+      log.error(`PeerId verification failed for ${msg.peerId.slice(0, 16)}`);
       await this.disconnect();
       return;
     }
 
     if (msg.peerId !== this.remotePeerId) {
-      console.error(`[PeerTransport] Unexpected peer: expected ${this.remotePeerId.slice(0, 16)}, got ${msg.peerId.slice(0, 16)}`);
+      log.error(`Unexpected peer: expected ${this.remotePeerId.slice(0, 16)}, got ${msg.peerId.slice(0, 16)}`);
       await this.disconnect();
       return;
     }
@@ -510,7 +513,7 @@ export class PeerTransport extends Transport {
     const remoteExchangeKey = await importExchangePublicKey(msg.publicExchangeKey);
     this.sessionKey = await deriveSessionKey(this.localExchangePrivateKey, remoteExchangeKey);
     this.handshakeState = 'encrypted';
-    console.log(`[PeerTransport] Handshake complete with ${this.remotePeerId.slice(0, 16)}, AES-256-GCM session established`);
+    log.info(`Handshake complete with ${this.remotePeerId.slice(0, 16)}, AES-256-GCM session established`);
 
     // NOW signal connected — after identity is verified and encryption
     // is established. This ensures PeerRouter learns about the connection
@@ -528,7 +531,7 @@ export class PeerTransport extends Transport {
 
     this.pingInterval = setInterval(() => {
       if (Date.now() - this.lastPongReceived > this.config.heartbeatInterval * PONG_MISS_LIMIT) {
-        console.warn(`[PeerTransport] No pong from ${this.remotePeerId.slice(0, 16)} in ${PONG_MISS_LIMIT} intervals, disconnecting`);
+        log.warn(`No pong from ${this.remotePeerId.slice(0, 16)} in ${PONG_MISS_LIMIT} intervals, disconnecting`);
         this.disconnect().catch(console.error);
         return;
       }

@@ -18,6 +18,9 @@ import { request, event } from '../core/message.js';
 import { requireDefined } from '../core/contracts.js';
 import type { JobResult } from './job-manager.js';
 import type { ContentPart } from '../llm/provider.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('AgentAbject');
 
 // ─── Shared types ────────────────────────────────────────────────────
 
@@ -411,7 +414,7 @@ responseSchema is a JSON Schema object. When provided:
         registeredAt: Date.now(),
       });
 
-      console.log(`[AgentAbject] Agent registered: "${name}" (${agentId})`);
+      log.info(`Agent registered: "${name}" (${agentId})`);
       this.changed('agentRegistered', { agentId, name }).catch(() => {});
       return { agentId };
     });
@@ -419,7 +422,7 @@ responseSchema is a JSON Schema object. When provided:
     this.on('unregisterAgent', async (msg: AbjectMessage) => {
       const agentId = msg.routing.from;
       const deleted = this.registeredAgents.delete(agentId);
-      if (deleted) console.log(`[AgentAbject] Agent unregistered: ${agentId}`);
+      if (deleted) log.info(`Agent unregistered: ${agentId}`);
       return { success: deleted };
     });
 
@@ -702,7 +705,7 @@ responseSchema is a JSON Schema object. When provided:
       const validate = this.ajv.compile(entry.responseSchema);
       if (!validate(entry.state.result)) {
         validationErrors = validate.errors?.map(e => `${e.instancePath} ${e.message}`) ?? [];
-        console.warn(`[AgentAbject] Schema validation failed for task ${entry.state.id}:`, validationErrors);
+        log.warn(`Schema validation failed for task ${entry.state.id}:`, validationErrors);
       }
     }
 
@@ -731,7 +734,7 @@ responseSchema is a JSON Schema object. When provided:
   private async runStateMachine(entry: TaskEntry): Promise<void> {
     const task = entry.state;
     const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
-    console.log(`[AgentAbject/${agentName}] Task started: "${task.task.slice(0, 80)}" (${task.id}, max ${task.maxSteps} steps)`);
+    log.info(`[${agentName}] Task started: "${task.task.slice(0, 80)}" (${task.id}, max ${task.maxSteps} steps)`);
 
     let phase = 'observing' as AgentPhase;
     task.phase = phase;
@@ -754,7 +757,7 @@ responseSchema is a JSON Schema object. When provided:
               break;
             }
 
-            console.log(`[AgentAbject/${agentName}] Step ${task.step + 1} — observing`);
+            log.info(`[${agentName}] Step ${task.step + 1} — observing`);
             // Job calls agent directly (not through _observe handler) to avoid
             // deadlocks — Abject handlers are serialized, and nested callbacks
             // through this object would block the message processing loop.
@@ -778,7 +781,7 @@ responseSchema is a JSON Schema object. When provided:
           }
 
           case 'thinking': {
-            console.log(`[AgentAbject/${agentName}] Step ${task.step + 1} — thinking (awaiting LLM)`);
+            log.info(`[${agentName}] Step ${task.step + 1} — thinking (awaiting LLM)`);
             const thinkResult = await this.executeStep(
               entry,
               `[${agentName}] Plan next action (step ${task.step + 1})`,
@@ -821,7 +824,7 @@ responseSchema is a JSON Schema object. When provided:
           }
 
           case 'acting': {
-            console.log(`[AgentAbject/${agentName}] Step ${task.step + 1} — acting: ${task.action?.action} (${(task.action?.reasoning ?? '').toString().slice(0, 60)})`);
+            log.info(`[${agentName}] Step ${task.step + 1} — acting: ${task.action?.action} (${(task.action?.reasoning ?? '').toString().slice(0, 60)})`);
             const desc = (task.action?.reasoning ?? task.action?.action ?? 'act').toString().slice(0, 80);
             // Job calls agent directly (not through _act handler) to avoid
             // deadlocks — the agent's act callback may call other objects that
@@ -839,7 +842,7 @@ responseSchema is a JSON Schema object. When provided:
               error: actResult.error,
             };
             this.emitActionResult(entry);
-            console.log(`[AgentAbject/${agentName}] Step ${task.step + 1} — action result: ${actResult.success ? 'success' : 'failed: ' + actResult.error}`);
+            log.info(`[${agentName}] Step ${task.step + 1} — action result: ${actResult.success ? 'success' : 'failed: ' + actResult.error}`);
             task.step++;
 
             if (task.step >= task.maxSteps) {
@@ -855,9 +858,9 @@ responseSchema is a JSON Schema object. When provided:
       }
     } finally {
       if (task.phase === 'done') {
-        console.log(`[AgentAbject/${agentName}] Task done in ${task.step} steps`);
+        log.info(`[${agentName}] Task done in ${task.step} steps`);
       } else if (task.phase === 'error') {
-        console.log(`[AgentAbject/${agentName}] Task error at step ${task.step}: ${task.error}`);
+        log.info(`[${agentName}] Task error at step ${task.step}: ${task.error}`);
       }
     }
   }
@@ -956,7 +959,7 @@ responseSchema is a JSON Schema object. When provided:
 
     const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
     const parsed = this.parseAction(entry, llmResult.content);
-    console.log(`[AgentAbject/${agentName}] Step ${task.step + 1} — LLM action: ${parsed.action}${parsed.reasoning ? ' (' + parsed.reasoning.slice(0, 60) + ')' : ''}`);
+    log.info(`[${agentName}] Step ${task.step + 1} — LLM action: ${parsed.action}${parsed.reasoning ? ' (' + parsed.reasoning.slice(0, 60) + ')' : ''}`);
     return parsed;
   }
 
