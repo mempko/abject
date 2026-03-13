@@ -255,6 +255,12 @@ export class WindowAbject extends Abject {
       return true;
     });
 
+    // Frontend reconnected with new font metrics — recompute layout and redraw
+    this.on('fontMetricsChanged', async () => {
+      this.scheduleFrame();
+      return true;
+    });
+
     // WindowManager sends titleBarAction when close/minimize buttons are clicked
     this.on('titleBarAction', async (msg: AbjectMessage) => {
       const { action } = msg.payload as { action: string };

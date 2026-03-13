@@ -24,7 +24,10 @@ import type {
   EndWindowDragMsg,
 } from './ws-protocol.js';
 import type { AuthConfig, SessionStore } from './auth.js';
+import { Log } from '../src/core/timed-log.js';
 
+const log = new Log('BackendUI');
+const dragLog = new Log('DRAG-DEBUG');
 const UI_INTERFACE = 'abjects:ui';
 const WIDGET_FONT = '14px system-ui';
 
@@ -454,7 +457,7 @@ export class BackendUI extends Abject {
       if (changed) {
         this.sessionStore.clearAll();
         this.disconnectFrontend();
-        console.log(`[BackendUI] Auth config updated (enabled=${enabled}), sessions cleared, frontend disconnected`);
+        log.info(`Auth config updated (enabled=${enabled}), sessions cleared, frontend disconnected`);
       }
       return true;
     });
@@ -586,7 +589,7 @@ IMPORTANT:
         const msg = JSON.parse(str) as FrontendToBackendMsg;
         this.handleFrontendMessage(msg);
       } catch (err) {
-        console.error('[BackendUI] Failed to parse frontend message:', err);
+        log.error('Failed to parse frontend message:', err);
       }
     });
     ws.on('close', () => {
@@ -606,7 +609,7 @@ IMPORTANT:
 
   /**
    * Send a message to the frontend (batched).
-   * Messages are queued and flushed once per event-loop tick via setTimeout(0).
+   * Messages are queued and flushed via process.nextTick (before I/O and timers).
    * All synchronous draw calls within a single bus tick get batched together.
    */
   private sendToFrontend(msg: BackendToFrontendMsg): void {
@@ -614,7 +617,7 @@ IMPORTANT:
     this.sendQueue.push(msg);
     if (!this.flushScheduled) {
       this.flushScheduled = true;
-      setTimeout(() => this.flushSendQueue(), 0);
+      process.nextTick(() => this.flushSendQueue());
     }
   }
 
@@ -972,12 +975,12 @@ IMPORTANT:
           }
           this.fontMetrics.set(font, charMap);
         }
-        console.log(`[BackendUI] Received font metrics for ${Object.keys(fmMsg.metrics).length} fonts`);
+        log.info(`Received font metrics for ${Object.keys(fmMsg.metrics).length} fonts`);
         break;
       }
 
       case 'ready':
-        console.log('[BackendUI] Frontend connected and ready');
+        log.info('Frontend connected and ready');
         this.frontendReady = true;
         this.replayStateToFrontend();
         break;
@@ -1071,7 +1074,7 @@ IMPORTANT:
       const state = this.surfaces.get(msg.surfaceId);
       if (state) {
         if (msg.inputType === 'mousedown' && this.windowManagerId) {
-          console.log(`[DRAG-DEBUG] mousedown on surface=${msg.surfaceId} windowManagerId=${this.windowManagerId}`);
+          dragLog.info(`mousedown on surface=${msg.surfaceId} windowManagerId=${this.windowManagerId}`);
           // ── Ctrl+click: immediately start window drag (client-side move) ──
           if (msg.modifiers?.ctrl) {
             const globalX = (msg.x ?? 0) + (state.rect.x ?? 0);
@@ -1107,7 +1110,7 @@ IMPORTANT:
               return;
             }
 
-            console.log(`[DRAG-DEBUG] WindowManager reply: grab=${reply.grab} dragType=${reply.dragType} minimize=${reply.minimize}`);
+            dragLog.info(`WindowManager reply: grab=${reply.grab} dragType=${reply.dragType} minimize=${reply.minimize}`);
             if (reply.grab) {
               // Tell client about the drag start
               this.sendToFrontend({
@@ -1125,7 +1128,7 @@ IMPORTANT:
               return;
             }
           } catch (err) {
-            console.log(`[DRAG-DEBUG] WindowManager request failed:`, err);
+            dragLog.info(`WindowManager request failed:`, err);
             // WindowManager not available — fall through to original behavior
           }
 
@@ -1221,7 +1224,24 @@ IMPORTANT:
       });
     }
 
-    console.log(`[BackendUI] Replayed ${this.surfaces.size} surfaces to frontend`);
+    let totalDrawCmds = 0;
+    for (const state of this.surfaces.values()) {
+      totalDrawCmds += state.lastDrawCommands.length;
+    }
+    log.info(`Replayed ${this.surfaces.size} surfaces (${totalDrawCmds} draw commands) to frontend`);
+
+    // 6. Trigger all surface owners to redraw with fresh font metrics.
+    // The replayed draw commands used metrics from the previous browser session;
+    // if the new browser has different fonts, layouts need recomputing.
+    this.lastDrawHash.clear();
+    const notifiedOwners = new Set<string>();
+    for (const state of this.surfaces.values()) {
+      const ownerId = state.objectId;
+      if (!notifiedOwners.has(ownerId)) {
+        notifiedOwners.add(ownerId);
+        this.send(event(this.id, ownerId as AbjectId, 'fontMetricsChanged', {}));
+      }
+    }
   }
 
   // ── Event sending ───────────────────────────────────────────────────
