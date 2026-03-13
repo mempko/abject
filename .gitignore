@@ -6,3 +6,5 @@ test-results/
 .abjects/
 .abjects2/
 .abjects3/
+*.log
+*.har
