@@ -618,6 +618,15 @@ export class WorkspaceBrowser extends Abject {
         if (resolved) {
           registryId = resolved;
         }
+        // Ensure the PeerRouter has a route for this registryId.
+        // Workspace routes may not have arrived via anti-entropy yet,
+        // but we know ownerPeerId owns this registryId.
+        await this.request(
+          request(this.id, peerRouterId, 'ensureRoute', {
+            objectId: registryId,
+            peerId: ws.ownerPeerId,
+          })
+        );
       }
 
       const factoryId = await this.discoverDep('Factory');

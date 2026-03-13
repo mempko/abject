@@ -216,6 +216,24 @@ export class PeerRouter extends Abject implements MessageInterceptor {
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              {
+                name: 'resolveWorkspaceRegistry',
+                description: 'Look up the current registryId for a workspace from the route table',
+                parameters: [
+                  { name: 'ownerPeerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Owner peer ID' },
+                  { name: 'workspaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Workspace ID' },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'ensureRoute',
+                description: 'Ensure a system route exists for an objectId via a specific peer',
+                parameters: [
+                  { name: 'objectId', type: { kind: 'primitive', primitive: 'string' }, description: 'Object ID to route' },
+                  { name: 'peerId', type: { kind: 'primitive', primitive: 'string' }, description: 'Peer that owns this object' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
             ],
             events: [
               {
@@ -368,6 +386,23 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         return wsRoute.registryId;
       }
       return null;
+    });
+
+    // Ensure a system route exists for a given objectId via a specific peer.
+    // Used when we know an objectId belongs to a peer (e.g. from WSR cache)
+    // but the workspace route hasn't arrived via anti-entropy yet.
+    this.on('ensureRoute', async (msg: AbjectMessage) => {
+      const { objectId, peerId } = msg.payload as { objectId: string; peerId: string };
+      if (this.getRoute(objectId as AbjectId)) return true; // Already routable
+      if (!this.peerRegistryRef) return false;
+      const transport = this.peerRegistryRef.getTransportForPeer(peerId as PeerId);
+      if (!transport?.isConnected) return false;
+      this.systemRoutes.set(objectId as AbjectId, {
+        nextHop: peerId as PeerId,
+        hops: 1,
+        ttl: Date.now() + ROUTE_TTL,
+      });
+      return true;
     });
 
     this.on('handleRouteDigest', async (msg: AbjectMessage) => {
