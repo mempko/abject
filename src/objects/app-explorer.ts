@@ -138,9 +138,14 @@ export class AppExplorer extends Abject {
   private async registryList(): Promise<ObjectRegistration[]> {
     const regId = this.effectiveRegistryId;
     if (!regId) return [];
-    return this.request<ObjectRegistration[]>(
-      request(this.id, regId, 'list', {})
-    );
+    try {
+      return await this.request<ObjectRegistration[]>(
+        request(this.id, regId, 'list', {})
+      );
+    } catch {
+      // Remote registry may be unreachable (route expired, peer disconnected)
+      return [];
+    }
   }
 
   private async addDep(widgetId: AbjectId): Promise<void> {

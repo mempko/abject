@@ -820,6 +820,15 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     const sysRoute = this.systemRoutes.get(objectId);
     if (sysRoute) {
       if (now > sysRoute.ttl) {
+        // TTL expired — renew if the peer is still connected (avoids gap
+        // between anti-entropy announcements and the 5-minute TTL).
+        if (this.peerRegistryRef) {
+          const transport = this.peerRegistryRef.getTransportForPeer(sysRoute.nextHop);
+          if (transport?.isConnected) {
+            sysRoute.ttl = now + ROUTE_TTL;
+            return sysRoute;
+          }
+        }
         this.systemRoutes.delete(objectId);
       } else {
         return sysRoute;
@@ -830,22 +839,50 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     const cachedWsKey = this.objectToWorkspace.get(objectId);
     if (cachedWsKey) {
       const wsRoute = this.workspaceRoutes.get(cachedWsKey);
-      if (wsRoute && now < wsRoute.ttl) {
-        return {
-          nextHop: wsRoute.nextHop,
-          hops: wsRoute.hops,
-          ttl: wsRoute.ttl,
-        };
+      if (wsRoute) {
+        if (now > wsRoute.ttl) {
+          // Renew if peer still connected
+          if (this.peerRegistryRef) {
+            const transport = this.peerRegistryRef.getTransportForPeer(wsRoute.nextHop);
+            if (transport?.isConnected) {
+              wsRoute.ttl = now + ROUTE_TTL;
+              return {
+                nextHop: wsRoute.nextHop,
+                hops: wsRoute.hops,
+                ttl: wsRoute.ttl,
+              };
+            }
+          }
+          this.objectToWorkspace.delete(objectId);
+        } else {
+          return {
+            nextHop: wsRoute.nextHop,
+            hops: wsRoute.hops,
+            ttl: wsRoute.ttl,
+          };
+        }
+      } else {
+        // Stale cache entry
+        this.objectToWorkspace.delete(objectId);
       }
-      // Stale cache entry
-      this.objectToWorkspace.delete(objectId);
     }
 
     // 3. Search workspace routes by exposed object IDs
     for (const [wsKey, wsRoute] of this.workspaceRoutes) {
       if (now > wsRoute.ttl) {
-        this.workspaceRoutes.delete(wsKey);
-        continue;
+        // Renew if peer still connected
+        if (this.peerRegistryRef) {
+          const transport = this.peerRegistryRef.getTransportForPeer(wsRoute.nextHop);
+          if (transport?.isConnected) {
+            wsRoute.ttl = now + ROUTE_TTL;
+          } else {
+            this.workspaceRoutes.delete(wsKey);
+            continue;
+          }
+        } else {
+          this.workspaceRoutes.delete(wsKey);
+          continue;
+        }
       }
       if (wsRoute.exposedObjectIds.includes(objectId) || wsRoute.registryId === objectId) {
         // Cache the mapping for future lookups
