@@ -71,6 +71,7 @@ export class WidgetManager extends Abject {
   // Tracking spawned Abjects (Set<AbjectId>, NOT references — network transparent)
   private spawnedWindows: Set<AbjectId> = new Set();
   private spawnedWidgets: Set<AbjectId> = new Set();
+  private orphanSweepTimer?: ReturnType<typeof setInterval>;
   // Maps windowId → surfaceId for raiseWindow support
   private windowSurfaces: Map<AbjectId, string> = new Map();
   // Maps objectId → workspaceId for compositor-level workspace filtering
@@ -769,6 +770,20 @@ export class WidgetManager extends Abject {
     }
 
     // Theme is per-workspace — registered via registerWorkspaceTheme from WorkspaceManager
+
+    // Periodic sweep for orphaned windows whose owners are no longer on the bus.
+    // The objectUnregistered event only covers the global registry; user apps in
+    // workspace registries need this safety net.
+    this.orphanSweepTimer = setInterval(() => {
+      this.sweepOrphanedWindows().catch(() => {});
+    }, 5000);
+  }
+
+  protected override async onStop(): Promise<void> {
+    if (this.orphanSweepTimer) {
+      clearInterval(this.orphanSweepTimer);
+      this.orphanSweepTimer = undefined;
+    }
   }
 
   /** Get theme for a window's owner (traces windowOwners → objectWorkspaces → workspace theme). */
@@ -1055,16 +1070,23 @@ const scrollArea = await this.call(this.dep('WidgetManager'), 'createNestedScrol
   parentLayoutId: rootLayout, spacing: 4
 });
 
-// Side-by-side panels (HBox with nested VBoxes):
+// Side-by-side panels (HBox with fixed sidebar + expanding main area):
 const hbox = await this.call(this.dep('WidgetManager'), 'createHBox', {
   windowId: winId, spacing: 8
 });
-const leftPanel = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
+const sidebar = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
   parentLayoutId: hbox, spacing: 4
 });
-const rightPanel = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
+// Make sidebar fixed-width (default is expanding which splits 50/50)
+await this.call(hbox, 'updateLayoutChild', {
+  widgetId: sidebar,
+  sizePolicy: { horizontal: 'fixed' },
+  preferredSize: { width: 200 }
+});
+const mainArea = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
   parentLayoutId: hbox, spacing: 4
 });
+// mainArea stays expanding (default) and fills remaining width
 
 ### Tab Content Switching
 
@@ -1139,6 +1161,18 @@ await this.call(timerId, 'addDependent', {});
   /**
    * Destroy all windows owned by a specific object.
    */
+  private async sweepOrphanedWindows(): Promise<void> {
+    const deadOwners = new Set<AbjectId>();
+    for (const [_windowId, ownerId] of this.windowOwners) {
+      if (!this.bus.isRegistered(ownerId)) {
+        deadOwners.add(ownerId);
+      }
+    }
+    for (const ownerId of deadOwners) {
+      await this.destroyWindowsForOwner(ownerId);
+    }
+  }
+
   private async destroyWindowsForOwner(ownerId: AbjectId): Promise<number> {
     const windowIds: AbjectId[] = [];
     for (const [windowId, owner] of this.windowOwners.entries()) {
