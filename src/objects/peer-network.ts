@@ -287,6 +287,7 @@ export class PeerNetwork extends Abject {
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.tabBarId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 36 },
     }));
 
     // Create 4 tab content ScrollableVBoxes

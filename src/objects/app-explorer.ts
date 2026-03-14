@@ -43,10 +43,12 @@ export class AppExplorer extends Abject {
   private remoteLabel?: string;
   private remoteRegistryId?: AbjectId;
 
-  // ── Pane 1: Kind lists (split into user/system) ──
+  // ── Pane 1: Kind lists with User/System tabs ──
   private kindPaneVBoxId?: AbjectId;
+  private kindTabBarId?: AbjectId;
   private userKindListId?: AbjectId;
   private systemKindListId?: AbjectId;
+  private activeKindTab = 0; // 0=user, 1=system
   private userKindEntries: string[] = [];
   private systemKindEntries: string[] = [];
 
@@ -167,6 +169,7 @@ export class AppExplorer extends Abject {
   private clearWidgetTracking(): void {
     this.rootLayoutId = undefined;
     this.kindPaneVBoxId = undefined;
+    this.kindTabBarId = undefined;
     this.userKindListId = undefined;
     this.systemKindListId = undefined;
     this.instancePaneVBoxId = undefined;
@@ -334,13 +337,6 @@ export class AppExplorer extends Abject {
     });
     await this.addToLayout(paneHBox, this.kindPaneVBoxId, { horizontal: 'expanding' }, { width: 200 });
 
-    // ── Pane 3: Detail (scrollable VBox, like ObjectBrowser pane 4) ──
-    this.detailPaneId = await wm('createNestedScrollableVBox', {
-      parentLayoutId: paneHBox,
-      margins: { top: 4, right: 8, bottom: 4, left: 8 },
-      spacing: 4,
-    });
-
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
     const windowId = this.windowId;
 
@@ -348,23 +344,21 @@ export class AppExplorer extends Abject {
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          // [0] "User Apps" label
-          { type: 'label', windowId, rect: r0, text: 'User Apps',
-            style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } },
+          // [0] Kind tab bar (User / System)
+          { type: 'tabBar', windowId, rect: r0,
+            tabs: ['User', 'System'], selectedIndex: this.activeKindTab, closable: false },
           // [1] User kind list (searchable)
           { type: 'list', windowId, rect: r0, items: [], searchable: true },
-          // [2] "System" label
-          { type: 'label', windowId, rect: r0, text: 'System',
-            style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } },
-          // [3] System kind list
+          // [2] System kind list
           { type: 'list', windowId, rect: r0, items: [] },
-          // [4] Instance list
+          // [3] Instance list
           { type: 'list', windowId, rect: r0, items: [] },
         ],
       })
     );
 
-    const [userLabel, userKindList, sysLabel, systemKindList, instanceList] = widgetIds;
+    const [kindTabBar, userKindList, systemKindList, instanceList] = widgetIds;
+    this.kindTabBarId = kindTabBar;
     this.userKindListId = userKindList;
     this.systemKindListId = systemKindList;
     this.instanceListId = instanceList;
@@ -372,21 +366,32 @@ export class AppExplorer extends Abject {
     // ── Batch add kind-pane widgets to their layout ──
     await this.request(request(this.id, this.kindPaneVBoxId, 'addLayoutChildren', {
       children: [
-        { widgetId: userLabel, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 } },
+        { widgetId: this.kindTabBarId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 32 } },
         { widgetId: this.userKindListId, sizePolicy: { vertical: 'expanding' } },
-        { widgetId: sysLabel, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 } },
         { widgetId: this.systemKindListId, sizePolicy: { vertical: 'expanding' } },
       ],
     }));
 
-    // ── Add instance list and detail pane to paneHBox ──
+    // ── Add instance list to paneHBox BEFORE creating detail pane,
+    //    so createNestedScrollableVBox auto-appends detail pane last ──
     await this.addToLayout(paneHBox, this.instanceListId, { horizontal: 'expanding' }, { width: 220 });
+
+    // ── Pane 3: Detail (scrollable VBox) — created after instanceList so it appends in the correct position ──
+    this.detailPaneId = await wm('createNestedScrollableVBox', {
+      parentLayoutId: paneHBox,
+      margins: { top: 4, right: 8, bottom: 4, left: 8 },
+      spacing: 4,
+    });
     await this.addToLayout(paneHBox, this.detailPaneId, { horizontal: 'expanding' }, { width: 300 });
 
-    // Fire-and-forget addDep for interactive lists
+    // Fire-and-forget addDep for interactive widgets
+    this.send(request(this.id, this.kindTabBarId, 'addDependent', {}));
     this.send(request(this.id, this.userKindListId, 'addDependent', {}));
     this.send(request(this.id, this.systemKindListId, 'addDependent', {}));
     this.send(request(this.id, this.instanceListId, 'addDependent', {}));
+
+    // Show only the active tab's list
+    await this.switchKindTabVisibility();
 
     // Populate kind list
     await this.rebuildKindList();
@@ -663,7 +668,31 @@ export class AppExplorer extends Abject {
   // Event Handling
   // ═══════════════════════════════════════════════════════════════════
 
+  private async switchKindTabVisibility(): Promise<void> {
+    if (this.userKindListId) {
+      try {
+        await this.request(request(this.id, this.userKindListId, 'update', {
+          style: { visible: this.activeKindTab === 0 },
+        }));
+      } catch { /* widget gone */ }
+    }
+    if (this.systemKindListId) {
+      try {
+        await this.request(request(this.id, this.systemKindListId, 'update', {
+          style: { visible: this.activeKindTab === 1 },
+        }));
+      } catch { /* widget gone */ }
+    }
+  }
+
   private async handleWidgetEvent(fromId: AbjectId, aspect: string, value?: unknown): Promise<void> {
+    // Kind tab bar change
+    if (fromId === this.kindTabBarId && aspect === 'change') {
+      this.activeKindTab = value as number;
+      await this.switchKindTabVisibility();
+      return;
+    }
+
     // User kind list selection
     if (fromId === this.userKindListId && aspect === 'selectionChanged') {
       const sel = JSON.parse(String(value)) as { value: string };

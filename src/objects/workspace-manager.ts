@@ -580,6 +580,8 @@ export class WorkspaceManager extends Abject {
         wsLog.warn(`Failed to restore workspace '${ws.name}':`, err);
       }
     }
+    // Refresh the switcher now that all workspaces are available
+    await this.refreshTaskbar();
   }
 
   // ── Workspace Lifecycle ──

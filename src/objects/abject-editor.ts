@@ -193,15 +193,6 @@ export class AbjectEditor extends Abject {
       })
     );
 
-    // Button row (HBox: Save, Cancel)
-    const btnRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-
     // Batch create all widgets
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
@@ -221,14 +212,34 @@ export class AbjectEditor extends Abject {
     this.cancelBtnId = cancelBtnId;
     this.editStatusId = editStatusId;
 
-    // Add widgets to root layout
+    // Add nameLabel and sourceEditor to root layout first
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChildren', {
       children: [
         { widgetId: nameLabelId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 } },
         { widgetId: this.sourceEditorId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' }, stretch: 1 },
-        { widgetId: btnRowId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 32 } },
-        { widgetId: this.editStatusId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 } },
       ],
+    }));
+
+    // Create button row AFTER the above children so it auto-appends in the correct position
+    const btnRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    // Update btnRowId's layout properties (auto-added with expanding defaults)
+    await this.request(request(this.id, this.rootLayoutId, 'updateLayoutChild', {
+      widgetId: btnRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    // Add editStatus after btnRow
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.editStatusId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
     }));
 
     // Add buttons to button row
