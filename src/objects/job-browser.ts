@@ -166,10 +166,6 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
         spacing: 4,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.jobListId,
-      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
-    }));
 
     // Bottom bar with Clear button
     const bottomRowId = await this.request<AbjectId>(
@@ -179,39 +175,38 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
         spacing: 8,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: bottomRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 36 },
+
+    // Add layouts to root
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChildren', {
+      children: [
+        { widgetId: this.jobListId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+        { widgetId: bottomRowId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 36 } },
+      ],
     }));
 
     // Spacer pushes button right
     await this.request(request(this.id, bottomRowId, 'addLayoutSpacer', {}));
 
-    // Clear button
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-    this.clearBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId,
-        rect: r0,
-        text: 'Clear',
+    // Create clear button
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          { type: 'button', windowId: this.windowId, text: 'Clear' },
+        ],
       })
     );
-    await this.request(request(this.id, bottomRowId, 'addLayoutChild', {
-      widgetId: this.clearBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 80, height: 36 },
+    this.clearBtnId = widgetIds[0];
+
+    // Add to layout
+    await this.request(request(this.id, bottomRowId, 'addLayoutChildren', {
+      children: [
+        { widgetId: this.clearBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 80, height: 36 } },
+      ],
     }));
 
-    // Register as dependent of Clear button
-    await this.request(
-      request(this.id, this.clearBtnId, 'addDependent', {})
-    );
-
-    // Register as dependent of JobManager to receive change events
-    await this.request(
-      request(this.id, this.jobManagerId!, 'addDependent', {})
-    );
+    // Fire-and-forget: register as dependent
+    this.send(request(this.id, this.clearBtnId, 'addDependent', {}));
+    this.send(request(this.id, this.jobManagerId!, 'addDependent', {}));
 
     // Populate existing jobs
     await this.populateExistingJobs();
@@ -246,7 +241,7 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
   }
 
   private async populateExistingJobs(): Promise<void> {
-    if (!this.jobManagerId || !this.jobListId) return;
+    if (!this.jobManagerId || !this.jobListId || !this.windowId) return;
 
     try {
       const jobs = await this.request<Job[]>(
@@ -255,10 +250,34 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
 
       // Jobs come back most-recent-first; display oldest first (top to bottom)
       const reversed = [...jobs].reverse();
-      for (const job of reversed) {
+      if (reversed.length === 0) return;
+
+      const fontSize = 13;
+      const lineHeight = fontSize + 4;
+      const availableWidth = WIN_W - 32 - 8;
+
+      // Build specs for all job labels
+      const specs = reversed.map(job => {
         const { text, color } = this.formatJobLabel(job);
-        await this.appendJobLabel(job.id, text, color);
-      }
+        return { type: 'label' as const, windowId: this.windowId!, text, style: { color, fontSize, wordWrap: true } };
+      });
+
+      // Batch create all labels
+      const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs })
+      );
+
+      // Build layout children specs
+      const children = reversed.map((job, i) => {
+        const { text } = this.formatJobLabel(job);
+        const lineCount = estimateWrappedLineCount(text, availableWidth, fontSize);
+        const estimatedHeight = Math.max(20, lineCount * lineHeight + 4);
+        this.jobLabelMap.set(job.id, widgetIds[i]);
+        return { widgetId: widgetIds[i], sizePolicy: { vertical: 'fixed' as const }, preferredSize: { height: estimatedHeight } };
+      });
+
+      // Batch add to layout
+      await this.request(request(this.id, this.jobListId, 'addLayoutChildren', { children }));
     } catch { /* JobManager may not have any jobs yet */ }
   }
 
@@ -285,19 +304,17 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
   private async appendJobLabel(jobId: string, text: string, color: string): Promise<void> {
     if (!this.jobListId || !this.windowId) return;
 
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
     const fontSize = 13;
     const lineHeight = fontSize + 4;
     const availableWidth = WIN_W - 32 - 8;
     const lineCount = estimateWrappedLineCount(text, availableWidth, fontSize);
     const estimatedHeight = Math.max(20, lineCount * lineHeight + 4);
 
-    const labelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId,
-        rect: r0,
-        text,
-        style: { color, fontSize, wordWrap: true },
+    const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          { type: 'label', windowId: this.windowId, text, style: { color, fontSize, wordWrap: true } },
+        ],
       })
     );
     await this.request(request(this.id, this.jobListId, 'addLayoutChild', {
@@ -373,15 +390,14 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
   private async clearJobLabels(): Promise<void> {
     if (!this.jobListId) return;
 
+    // Clear layout in one request
+    try {
+      await this.request(request(this.id, this.jobListId, 'clearLayoutChildren', {}));
+    } catch { /* may already be gone */ }
+
+    // Fire-and-forget destroy all labels
     for (const [, labelId] of this.jobLabelMap) {
-      try {
-        await this.request(request(this.id, this.jobListId, 'removeLayoutChild', {
-          widgetId: labelId,
-        }));
-      } catch { /* may already be gone */ }
-      try {
-        await this.request(request(this.id, labelId, 'destroy', {}));
-      } catch { /* already gone */ }
+      this.send(request(this.id, labelId, 'destroy', {}));
     }
     this.jobLabelMap.clear();
   }

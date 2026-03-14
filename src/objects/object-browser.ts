@@ -663,35 +663,23 @@ export class ObjectBrowser extends Abject {
     }) as AbjectId;
     await this.addToLayout(this.rootLayoutId, toolbarLayout, { vertical: 'fixed' }, { height: 30 });
 
-    // Tab bar
+    // Tab bar + Back/Forward buttons (batch)
     const tabNames = this.tabs.map(t => t.name);
     tabNames.push('+');
-    this.tabBarId = await wm('createTabBar', {
-      windowId: this.windowId,
-      rect: { x: 0, y: 0, width: 0, height: 0 },
-      tabs: tabNames,
-      selectedIndex: this.activeTabIndex,
-    }) as AbjectId;
+    const { widgetIds: [tabBarId, backBtnId, forwardBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'tabBar', windowId: this.windowId, tabs: tabNames, selectedIndex: this.activeTabIndex },
+        { type: 'button', windowId: this.windowId, text: '\u25C0', style: { fontSize: 12 } },
+        { type: 'button', windowId: this.windowId, text: '\u25B6', style: { fontSize: 12 } },
+      ]})
+    );
+    this.tabBarId = tabBarId;
+    this.backBtnId = backBtnId;
+    this.forwardBtnId = forwardBtnId;
     await this.addDep(this.tabBarId);
     await this.addToLayout(toolbarLayout, this.tabBarId, { horizontal: 'expanding' }, { height: 28 });
-
-    // Back button
-    this.backBtnId = await wm('createButton', {
-      windowId: this.windowId,
-      rect: { x: 0, y: 0, width: 0, height: 0 },
-      text: '\u25C0',
-      style: { fontSize: 12 },
-    }) as AbjectId;
     await this.addDep(this.backBtnId);
     await this.addToLayout(toolbarLayout, this.backBtnId, { horizontal: 'fixed' }, { width: 32, height: 28 });
-
-    // Forward button
-    this.forwardBtnId = await wm('createButton', {
-      windowId: this.windowId,
-      rect: { x: 0, y: 0, width: 0, height: 0 },
-      text: '\u25B6',
-      style: { fontSize: 12 },
-    }) as AbjectId;
     await this.addDep(this.forwardBtnId);
     await this.addToLayout(toolbarLayout, this.forwardBtnId, { horizontal: 'fixed' }, { width: 32, height: 28 });
 
@@ -704,10 +692,11 @@ export class ObjectBrowser extends Abject {
     await this.addToLayout(this.rootLayoutId, this.breadcrumbLayoutId, { vertical: 'fixed' }, { height: 22 });
 
     // ── Divider ──
-    const divId = await wm('createDivider', {
-      windowId: this.windowId,
-      rect: { x: 0, y: 0, width: 0, height: 0 },
-    }) as AbjectId;
+    const { widgetIds: [divId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'divider', windowId: this.windowId },
+      ]})
+    );
     await this.addToLayout(this.rootLayoutId, divId, { vertical: 'fixed' }, { height: 1 });
 
     // ── Four-pane area using HBox ──
@@ -719,7 +708,6 @@ export class ObjectBrowser extends Abject {
     await this.addToLayout(this.rootLayoutId, paneHBox, { vertical: 'expanding' });
 
     // Pane 1: Scope lists in a VBox
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
     this.pane1VBoxId = await wm('createNestedVBox', {
       parentLayoutId: paneHBox,
       margins: { top: 0, right: 0, bottom: 0, left: 0 },
@@ -727,58 +715,40 @@ export class ObjectBrowser extends Abject {
     }) as AbjectId;
     await this.addToLayout(paneHBox, this.pane1VBoxId, { horizontal: 'expanding' }, { width: 180 });
 
-    // Scope list (All, System) — fixed height
-    this.scopeListId = await wm('createList', {
-      windowId: this.windowId, rect: r0, items: [],
-    }) as AbjectId;
+    // Batch create pane1 widgets: scopeList, localLabel, localWsList, remoteLabel, remoteWsList
+    const { widgetIds: [scopeListId, localLabelId, localWsListId, remoteLabelId, remoteWsListId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'list', windowId: this.windowId, items: [] },
+        { type: 'label', windowId: this.windowId, text: 'Local', style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } },
+        { type: 'list', windowId: this.windowId, items: [], searchable: true },
+        { type: 'label', windowId: this.windowId, text: 'Discovered', style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } },
+        { type: 'list', windowId: this.windowId, items: [] },
+      ]})
+    );
+    this.scopeListId = scopeListId;
+    this.localWsListId = localWsListId;
+    this.remoteWsListId = remoteWsListId;
+
     await this.addDep(this.scopeListId);
     await this.addToLayout(this.pane1VBoxId, this.scopeListId, { vertical: 'fixed' }, { height: 60 });
-
-    // "Local" label
-    const localLabel = await wm('createLabel', {
-      windowId: this.windowId, rect: r0, text: 'Local',
-      style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
-    }) as AbjectId;
-    await this.addToLayout(this.pane1VBoxId, localLabel, { vertical: 'fixed' }, { height: 20 });
-
-    // Local workspace list
-    this.localWsListId = await wm('createList', {
-      windowId: this.windowId, rect: r0, items: [], searchable: true,
-    }) as AbjectId;
+    await this.addToLayout(this.pane1VBoxId, localLabelId, { vertical: 'fixed' }, { height: 20 });
     await this.addDep(this.localWsListId);
     await this.addToLayout(this.pane1VBoxId, this.localWsListId, { vertical: 'expanding' });
-
-    // "Discovered" label
-    const remoteLabel = await wm('createLabel', {
-      windowId: this.windowId, rect: r0, text: 'Discovered',
-      style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
-    }) as AbjectId;
-    await this.addToLayout(this.pane1VBoxId, remoteLabel, { vertical: 'fixed' }, { height: 20 });
-
-    // Remote workspace list
-    this.remoteWsListId = await wm('createList', {
-      windowId: this.windowId, rect: r0, items: [],
-    }) as AbjectId;
+    await this.addToLayout(this.pane1VBoxId, remoteLabelId, { vertical: 'fixed' }, { height: 20 });
     await this.addDep(this.remoteWsListId);
     await this.addToLayout(this.pane1VBoxId, this.remoteWsListId, { vertical: 'expanding' });
 
-    // Pane 2: Object Kinds list
-    this.pane2ListId = await wm('createList', {
-      windowId: this.windowId,
-      rect: { x: 0, y: 0, width: 0, height: 0 },
-      items: [],
-      searchable: true,
-    }) as AbjectId;
+    // Pane 2 + Pane 3: Object Kinds list + Methods/Events list (batch)
+    const { widgetIds: [pane2ListId, pane3ListId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'list', windowId: this.windowId, items: [], searchable: true },
+        { type: 'list', windowId: this.windowId, items: [], searchable: true },
+      ]})
+    );
+    this.pane2ListId = pane2ListId;
+    this.pane3ListId = pane3ListId;
     await this.addDep(this.pane2ListId);
     await this.addToLayout(paneHBox, this.pane2ListId, { horizontal: 'expanding' }, { width: 200 });
-
-    // Pane 3: Methods/Events list
-    this.pane3ListId = await wm('createList', {
-      windowId: this.windowId,
-      rect: { x: 0, y: 0, width: 0, height: 0 },
-      items: [],
-      searchable: true,
-    }) as AbjectId;
     await this.addDep(this.pane3ListId);
     await this.addToLayout(paneHBox, this.pane3ListId, { horizontal: 'expanding' }, { width: 200 });
 
@@ -925,36 +895,22 @@ export class ObjectBrowser extends Abject {
   }
 
   private async clearPane4(): Promise<void> {
-    // Destroy old pane4 widgets
-    for (const id of this.pane4LabelIds) {
-      try {
-        await this.request(request(this.id, this.pane4LayoutId!, 'removeLayoutChild', { widgetId: id }));
-        await this.request(request(this.id, id, 'destroy', {}));
-      } catch { /* gone */ }
-    }
-    for (const [id] of this.pane4ButtonIds) {
-      try {
-        await this.request(request(this.id, this.pane4LayoutId!, 'removeLayoutChild', { widgetId: id }));
-        await this.request(request(this.id, id, 'destroy', {}));
-      } catch { /* gone */ }
-    }
-    for (const [, inputId] of this.msgParamInputIds) {
-      try {
-        await this.request(request(this.id, this.pane4LayoutId!, 'removeLayoutChild', { widgetId: inputId }));
-        await this.request(request(this.id, inputId, 'destroy', {}));
-      } catch { /* gone */ }
-    }
-    if (this.msgSendBtnId) {
-      try {
-        await this.request(request(this.id, this.pane4LayoutId!, 'removeLayoutChild', { widgetId: this.msgSendBtnId }));
-        await this.request(request(this.id, this.msgSendBtnId, 'destroy', {}));
-      } catch { /* gone */ }
-    }
-    if (this.msgResponseLabelId) {
-      try {
-        await this.request(request(this.id, this.pane4LayoutId!, 'removeLayoutChild', { widgetId: this.msgResponseLabelId }));
-        await this.request(request(this.id, this.msgResponseLabelId, 'destroy', {}));
-      } catch { /* gone */ }
+    // Clear layout in one request
+    try {
+      await this.request(request(this.id, this.pane4LayoutId!, 'clearLayoutChildren', {}));
+    } catch { /* gone */ }
+
+    // Fire-and-forget destroy for all old widgets
+    const allIds = [
+      ...this.pane4LabelIds,
+      ...this.pane4ButtonIds.keys(),
+      ...this.msgParamInputIds.values(),
+    ];
+    if (this.msgSendBtnId) allIds.push(this.msgSendBtnId);
+    if (this.msgResponseLabelId) allIds.push(this.msgResponseLabelId);
+
+    for (const id of allIds) {
+      this.send(request(this.id, id, 'destroy', {}));
     }
     this.pane4LabelIds = [];
     this.pane4ButtonIds.clear();
@@ -964,17 +920,20 @@ export class ObjectBrowser extends Abject {
   }
 
   private async addPane4Label(text: string, isSecondary = false, style?: Record<string, unknown>): Promise<AbjectId> {
-    const labelId = await this.wm('createLabel', {
-      windowId: this.windowId,
-      rect: { x: 0, y: 0, width: 0, height: 0 },
-      text,
-      style: {
-        fontSize: isSecondary ? 12 : 13,
-        color: isSecondary ? undefined : undefined,
-        wordWrap: true,
-        ...style,
-      },
-    }) as AbjectId;
+    const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        {
+          type: 'label',
+          windowId: this.windowId,
+          text,
+          style: {
+            fontSize: isSecondary ? 12 : 13,
+            wordWrap: true,
+            ...style,
+          },
+        },
+      ]})
+    );
     const lines = Math.max(1, Math.ceil(text.length / 40));
     const lineHeight = isSecondary ? 16 : 18;
     await this.addToLayout(this.pane4LayoutId!, labelId, { vertical: 'fixed' },
@@ -984,12 +943,16 @@ export class ObjectBrowser extends Abject {
   }
 
   private async addPane4Button(text: string, actionKey: string, style?: Record<string, unknown>): Promise<AbjectId> {
-    const btnId = await this.wm('createButton', {
-      windowId: this.windowId,
-      rect: { x: 0, y: 0, width: 0, height: 0 },
-      text,
-      style: { fontSize: 11, ...style },
-    }) as AbjectId;
+    const { widgetIds: [btnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        {
+          type: 'button',
+          windowId: this.windowId,
+          text,
+          style: { fontSize: 11, ...style },
+        },
+      ]})
+    );
     await this.addDep(btnId);
     await this.addToLayout(this.pane4LayoutId!, btnId, { vertical: 'fixed', horizontal: 'fixed' },
       { width: 160, height: 26 });
@@ -1045,55 +1008,138 @@ export class ObjectBrowser extends Abject {
     const reg = regs[0];
     const isRemote = this.isRemoteScope();
     const hasSource = (reg as unknown as { source?: string }).source !== undefined;
+    const tags = reg.manifest.tags ?? [];
+    const isSystem = tags.includes('system');
 
-    await this.addPane4Label(kindName, false, { fontWeight: 'bold', fontSize: 15 });
+    // Determine which action buttons to show
+    let editorId: AbjectId | undefined;
+    if (!isRemote && hasSource) {
+      editorId = await this.findAbjectEditorForScope();
+    }
+
+    // ── Build label specs ──
+    type LabelSpec = { text: string; isSecondary: boolean; style?: Record<string, unknown> };
+    const labelSpecs: LabelSpec[] = [];
+
+    labelSpecs.push({ text: kindName, isSecondary: false, style: { fontWeight: 'bold', fontSize: 15 } });
 
     if (reg.manifest.description) {
-      await this.addPane4Label(reg.manifest.description, true);
+      labelSpecs.push({ text: reg.manifest.description, isSecondary: true });
     }
 
-    await this.addPane4Label(`Instances: ${regs.length}`, true);
+    labelSpecs.push({ text: `Instances: ${regs.length}`, isSecondary: true });
 
-    const tags = reg.manifest.tags ?? [];
     if (tags.length > 0) {
-      await this.addPane4Label(`Tags: ${tags.join(', ')}`, true);
+      labelSpecs.push({ text: `Tags: ${tags.join(', ')}`, isSecondary: true });
     }
 
-    // Show status of first instance
-    await this.addPane4Label(`\u2500\u2500\u2500 Status`, true);
-    await this.addPane4Label(`State: ${reg.status?.state ?? 'running'}`, true);
+    labelSpecs.push({ text: '\u2500\u2500\u2500 Status', isSecondary: true });
+    labelSpecs.push({ text: `State: ${reg.status?.state ?? 'running'}`, isSecondary: true });
+
     if (reg.status?.errorCount !== undefined && reg.status.errorCount > 0) {
-      await this.addPane4Label(`Errors: ${reg.status.errorCount}`, true);
+      labelSpecs.push({ text: `Errors: ${reg.status.errorCount}`, isSecondary: true });
     }
 
-    // ── Actions section ──
-    await this.addPane4Label('\u2500\u2500\u2500 Actions', true);
+    labelSpecs.push({ text: '\u2500\u2500\u2500 Actions', isSecondary: true });
+
+    // Response label placeholder (last)
+    const responseLabelIndex = labelSpecs.length + /* buttons below */ 0; // tracked after buttons
+
+    // ── Build button specs ──
+    type BtnSpec = { text: string; actionKey: string; style?: Record<string, unknown> };
+    const btnSpecs: BtnSpec[] = [];
 
     if (isRemote) {
-      // Remote: only Clone (if scriptable with source)
       if (hasSource) {
-        await this.addPane4Button('Clone to Local', 'cloneObject');
+        btnSpecs.push({ text: 'Clone to Local', actionKey: 'cloneObject' });
       }
     } else {
-      // Local: Edit Source, Clone, Delete (Clone/Delete only for non-system objects)
-      const isSystem = tags.includes('system');
       if (hasSource) {
-        const editorId = await this.findAbjectEditorForScope();
         if (editorId) {
-          await this.addPane4Button('Edit Source', 'editSource');
+          btnSpecs.push({ text: 'Edit Source', actionKey: 'editSource' });
         }
         if (!isSystem) {
-          await this.addPane4Button('Clone', 'cloneObject');
+          btnSpecs.push({ text: 'Clone', actionKey: 'cloneObject' });
         }
       }
       if (!isSystem) {
-        await this.addPane4Button('Delete', 'deleteObject',
-          { background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' });
+        btnSpecs.push({ text: 'Delete', actionKey: 'deleteObject',
+          style: { background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' } });
       }
     }
 
-    // Response label for feedback
-    this.msgResponseLabelId = await this.addPane4Label('', true);
+    // ── Batch create all labels + buttons + response label ──
+    const allLabelTexts = [...labelSpecs, { text: '', isSecondary: true }]; // last = response label
+    const labelCreateSpecs = allLabelTexts.map(ls => ({
+      type: 'label',
+      windowId: this.windowId!,
+      rect: { x: 0, y: 0, width: 0, height: 0 },
+      text: ls.text,
+      style: {
+        fontSize: ls.isSecondary ? 12 : 13,
+        wordWrap: true,
+        ...(ls.style ?? {}),
+      },
+    }));
+
+    const btnCreateSpecs = btnSpecs.map(bs => ({
+      type: 'button',
+      windowId: this.windowId!,
+      rect: { x: 0, y: 0, width: 0, height: 0 },
+      text: bs.text,
+      style: { fontSize: 11, ...(bs.style ?? {}) },
+    }));
+
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [...labelCreateSpecs, ...btnCreateSpecs],
+      })
+    );
+
+    const labelIds = widgetIds.slice(0, allLabelTexts.length);
+    const btnIds = widgetIds.slice(allLabelTexts.length);
+
+    // Track widgets
+    const contentLabelIds = labelIds.slice(0, labelSpecs.length);
+    this.msgResponseLabelId = labelIds[labelIds.length - 1];
+    for (const id of contentLabelIds) this.pane4LabelIds.push(id);
+    this.pane4LabelIds.push(this.msgResponseLabelId);
+
+    for (let i = 0; i < btnIds.length; i++) {
+      this.pane4ButtonIds.set(btnIds[i], btnSpecs[i].actionKey);
+    }
+
+    // ── Batch add to layout ──
+    const layoutChildren: Array<{ widgetId: AbjectId; sizePolicy?: Record<string, string>; preferredSize?: Record<string, number> }> = [];
+
+    for (let i = 0; i < allLabelTexts.length; i++) {
+      const ls = allLabelTexts[i];
+      const text = ls.text;
+      const lineHeight = ls.isSecondary ? 16 : 18;
+      const lines = Math.max(1, Math.ceil(text.length / 40));
+      layoutChildren.push({
+        widgetId: labelIds[i],
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: Math.max(lineHeight, lines * lineHeight) },
+      });
+    }
+
+    for (const btnId of btnIds) {
+      layoutChildren.push({
+        widgetId: btnId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+        preferredSize: { width: 160, height: 26 },
+      });
+    }
+
+    await this.request(request(this.id, this.pane4LayoutId!, 'addLayoutChildren', {
+      children: layoutChildren,
+    }));
+
+    // Fire-and-forget addDependent for buttons so ObjectBrowser receives click events
+    for (const btnId of btnIds) {
+      this.send(request(this.id, btnId, 'addDependent', {}));
+    }
   }
 
   private async rebuildPane4Detail(): Promise<void> {
@@ -1108,9 +1154,18 @@ export class ObjectBrowser extends Abject {
       return;
     }
 
+    type LabelSpec = { text: string; isSecondary: boolean; style?: Record<string, unknown> };
+    type InputSpec = { paramName: string; placeholder: string };
+
+    const labelSpecs: LabelSpec[] = [];
+    const navBtnSpecs: Array<{ text: string; actionKey: string }> = [];
+    let inputSpecs: InputSpec[] = [];
+    let sendBtnText = '';
+    let hasSendSection = false;
+
     // Header
     const typeBadge = method.type === 'event' ? '[Event]' : '[Method]';
-    await this.addPane4Label(`${typeBadge} ${method.name}`, false, { fontWeight: 'bold', fontSize: 14 });
+    labelSpecs.push({ text: `${typeBadge} ${method.name}`, isSecondary: false, style: { fontWeight: 'bold', fontSize: 14 } });
 
     // Signature
     if (method.decl) {
@@ -1120,97 +1175,290 @@ export class ObjectBrowser extends Abject {
         return `${p.name}: ${typeStr}`;
       }).join(', ');
 
-      await this.addPane4Label(`(${paramStr})`, true);
+      labelSpecs.push({ text: `(${paramStr})`, isSecondary: true });
 
       if (method.decl.returns) {
-        await this.addPane4Label(`\u2192 ${this.formatType(method.decl.returns)}`, true);
+        labelSpecs.push({ text: `\u2192 ${this.formatType(method.decl.returns)}`, isSecondary: true });
       }
 
       if (method.decl.description) {
-        await this.addPane4Label(method.decl.description, true);
+        labelSpecs.push({ text: method.decl.description, isSecondary: true });
       }
     }
 
     // Interface info
     if (method.iface) {
-      await this.addPane4Label(`Interface: ${method.iface.id}`, true);
+      labelSpecs.push({ text: `Interface: ${method.iface.id}`, isSecondary: true });
     }
 
     // Divider
-    await this.addPane4Label('\u2500\u2500\u2500', true);
+    labelSpecs.push({ text: '\u2500\u2500\u2500', isSecondary: true });
 
     // Find Implementors / Senders buttons
     if (method.type === 'method') {
-      await this.addPane4Button('Find Implementors', `implementors:${method.name}`);
-      await this.addPane4Button('Find Senders', `senders:${method.name}`);
+      navBtnSpecs.push({ text: 'Find Implementors', actionKey: `implementors:${method.name}` });
+      navBtnSpecs.push({ text: 'Find Senders', actionKey: `senders:${method.name}` });
     }
 
     // Send Message section
-    if (method.type === 'method') {
-      await this.addPane4Label('\u2500\u2500\u2500 Send Message', true);
+    const regs = this.getRegistrationsForKind(state.selectedKind);
+    if (method.type === 'method' && regs.length > 0) {
+      hasSendSection = true;
+      sendBtnText = `Send to ${regs[0].manifest.name}`;
+      labelSpecs.push({ text: '\u2500\u2500\u2500 Send Message', isSecondary: true });
 
-      const regs = this.getRegistrationsForKind(state.selectedKind);
-      if (regs.length > 0) {
-        const params = method.decl?.parameters ?? [];
+      const params = method.decl?.parameters ?? [];
+      if (params.length === 0) {
+        labelSpecs.push({ text: 'payload (JSON)', isSecondary: true });
+        inputSpecs = [{ paramName: '__raw_json__', placeholder: 'JSON payload... (leave empty for {})' }];
+      } else {
+        for (const param of params) {
+          const typeStr = param.type ? this.formatType(param.type) : 'any';
+          const optLabel = param.optional ? ' (optional)' : '';
+          labelSpecs.push({ text: `${param.name}: ${typeStr}${optLabel}`, isSecondary: true });
 
-        if (params.length === 0) {
-          // No declared parameters — show a JSON payload input as fallback
-          await this.addPane4Label('payload (JSON)', true);
-          const inputId = await this.wm('createTextInput', {
-            windowId: this.windowId,
-            rect: { x: 0, y: 0, width: 0, height: 0 },
-            placeholder: 'JSON payload... (leave empty for {})',
-            text: '',
-          }) as AbjectId;
-          await this.addDep(inputId);
-          await this.addToLayout(this.pane4LayoutId!, inputId, { vertical: 'fixed' }, { height: 30 });
-          this.msgParamInputIds.set('__raw_json__', inputId);
-        } else {
-          // Generate a labeled input for each parameter
-          for (const param of params) {
-            const typeStr = param.type ? this.formatType(param.type) : 'any';
-            const optLabel = param.optional ? ' (optional)' : '';
-            await this.addPane4Label(`${param.name}: ${typeStr}${optLabel}`, true);
-
-            const isComplex = param.type?.kind === 'object' || param.type?.kind === 'array';
-            const placeholder = isComplex
-              ? `JSON ${typeStr}...`
-              : param.description || `${typeStr} value...`;
-
-            const inputId = await this.wm('createTextInput', {
-              windowId: this.windowId,
-              rect: { x: 0, y: 0, width: 0, height: 0 },
-              placeholder,
-              text: '',
-            }) as AbjectId;
-            await this.addDep(inputId);
-            await this.addToLayout(this.pane4LayoutId!, inputId, { vertical: 'fixed' }, { height: 30 });
-            this.msgParamInputIds.set(param.name, inputId);
-          }
+          const isComplex = param.type?.kind === 'object' || param.type?.kind === 'array';
+          const placeholder = isComplex
+            ? `JSON ${typeStr}...`
+            : param.description || `${typeStr} value...`;
+          inputSpecs.push({ paramName: param.name, placeholder });
         }
-
-        this.msgSendBtnId = await this.wm('createButton', {
-          windowId: this.windowId,
-          rect: { x: 0, y: 0, width: 0, height: 0 },
-          text: `Send to ${regs[0].manifest.name}`,
-          style: { fontSize: 11, background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
-        }) as AbjectId;
-        await this.addDep(this.msgSendBtnId);
-        await this.addToLayout(this.pane4LayoutId!, this.msgSendBtnId, { vertical: 'fixed', horizontal: 'fixed' },
-          { width: 180, height: 26 });
-
-        this.msgResponseLabelId = await this.addPane4Label('', true);
       }
     }
 
+    // Response label (always last if we have a send section)
+    if (hasSendSection) {
+      labelSpecs.push({ text: '', isSecondary: true }); // response label
+    }
+
+    // ── Build batch create specs ──
+    // Order: labels interleaved with inputs per label, then nav buttons, send button
+    // Actually build flat specs list in desired layout order:
+    // [header labels...] [nav buttons] [send section labels + inputs interleaved] [send btn] [response label]
+    // Re-collect in layout order:
+
+    // Split labelSpecs into pre-send and send-section parts
+    const sendSectionStart = hasSendSection
+      ? labelSpecs.findIndex(l => l.text === '\u2500\u2500\u2500 Send Message')
+      : -1;
+
+    const preSendLabels = sendSectionStart >= 0 ? labelSpecs.slice(0, sendSectionStart) : labelSpecs.slice(0, hasSendSection ? -1 : labelSpecs.length);
+    // For send section, we need to interleave param labels with inputs
+    // sendSectionLabels = from sendSectionStart to (labelSpecs.length - 1) [excluding response label]
+    // responseLabelSpec = last entry if hasSendSection
+
+    interface WidgetSpec {
+      type: string;
+      windowId: AbjectId;
+      rect: { x: number; y: number; width: number; height: number };
+      text?: string;
+      style?: Record<string, unknown>;
+      placeholder?: string;
+    }
+
+    // We'll build specs in this order for easy index mapping:
+    // [preSendLabels] [navBtns] [sendSectionLabel "Send Message"] [paramLabel+input pairs] [sendBtn] [responseLabel]
+    const batchSpecs: WidgetSpec[] = [];
+
+    // Track indices for mapping
+    const preSendLabelStart = 0;
+    for (const ls of preSendLabels) {
+      batchSpecs.push({
+        type: 'label', windowId: this.windowId!,
+        rect: { x: 0, y: 0, width: 0, height: 0 },
+        text: ls.text,
+        style: { fontSize: ls.isSecondary ? 12 : 13, wordWrap: true, ...(ls.style ?? {}) },
+      });
+    }
+
+    const navBtnStart = batchSpecs.length;
+    for (const bs of navBtnSpecs) {
+      batchSpecs.push({
+        type: 'button', windowId: this.windowId!,
+        rect: { x: 0, y: 0, width: 0, height: 0 },
+        text: bs.text,
+        style: { fontSize: 11 },
+      });
+    }
+
+    // Send section
+    let sendSectionLabelIndex = -1;
+    // paramLabelIndices[i] = index of label for inputSpecs[i]
+    const paramLabelIndices: number[] = [];
+    const inputIndices: number[] = [];
+    let sendBtnIndex = -1;
+    let responseLabelIndex = -1;
+
+    if (hasSendSection) {
+      sendSectionLabelIndex = batchSpecs.length;
+      batchSpecs.push({
+        type: 'label', windowId: this.windowId!,
+        rect: { x: 0, y: 0, width: 0, height: 0 },
+        text: '\u2500\u2500\u2500 Send Message',
+        style: { fontSize: 12, wordWrap: true },
+      });
+
+      if (inputSpecs.length === 1 && inputSpecs[0].paramName === '__raw_json__') {
+        // raw json: label then input
+        paramLabelIndices.push(batchSpecs.length);
+        batchSpecs.push({
+          type: 'label', windowId: this.windowId!,
+          rect: { x: 0, y: 0, width: 0, height: 0 },
+          text: 'payload (JSON)',
+          style: { fontSize: 12, wordWrap: true },
+        });
+        inputIndices.push(batchSpecs.length);
+        batchSpecs.push({
+          type: 'textInput', windowId: this.windowId!,
+          rect: { x: 0, y: 0, width: 0, height: 0 },
+          placeholder: inputSpecs[0].placeholder,
+          text: '',
+        } as unknown as WidgetSpec);
+      } else {
+        // Per-param label + input pairs
+        // Find the param labels in labelSpecs (from sendSectionStart+1 to length-2)
+        const paramLabels = sendSectionStart >= 0
+          ? labelSpecs.slice(sendSectionStart + 1, labelSpecs.length - 1)
+          : [];
+        for (let i = 0; i < inputSpecs.length; i++) {
+          paramLabelIndices.push(batchSpecs.length);
+          const pl = paramLabels[i];
+          batchSpecs.push({
+            type: 'label', windowId: this.windowId!,
+            rect: { x: 0, y: 0, width: 0, height: 0 },
+            text: pl?.text ?? inputSpecs[i].paramName,
+            style: { fontSize: 12, wordWrap: true },
+          });
+          inputIndices.push(batchSpecs.length);
+          batchSpecs.push({
+            type: 'textInput', windowId: this.windowId!,
+            rect: { x: 0, y: 0, width: 0, height: 0 },
+            placeholder: inputSpecs[i].placeholder,
+            text: '',
+          } as unknown as WidgetSpec);
+        }
+      }
+
+      sendBtnIndex = batchSpecs.length;
+      batchSpecs.push({
+        type: 'button', windowId: this.windowId!,
+        rect: { x: 0, y: 0, width: 0, height: 0 },
+        text: sendBtnText,
+        style: { fontSize: 11, background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
+      });
+
+      responseLabelIndex = batchSpecs.length;
+      batchSpecs.push({
+        type: 'label', windowId: this.windowId!,
+        rect: { x: 0, y: 0, width: 0, height: 0 },
+        text: '',
+        style: { fontSize: 12, wordWrap: true },
+      });
+    }
+
+    // ── Batch create ──
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: batchSpecs })
+    );
+
+    // ── Track widget IDs ──
+    for (let i = preSendLabelStart; i < navBtnStart; i++) {
+      this.pane4LabelIds.push(widgetIds[i]);
+    }
+    for (let i = navBtnStart; i < navBtnStart + navBtnSpecs.length; i++) {
+      this.pane4ButtonIds.set(widgetIds[i], navBtnSpecs[i - navBtnStart].actionKey);
+    }
+    if (hasSendSection) {
+      this.pane4LabelIds.push(widgetIds[sendSectionLabelIndex]);
+      for (let i = 0; i < paramLabelIndices.length; i++) {
+        this.pane4LabelIds.push(widgetIds[paramLabelIndices[i]]);
+        const inputId = widgetIds[inputIndices[i]];
+        this.msgParamInputIds.set(inputSpecs[i].paramName, inputId);
+      }
+      this.msgSendBtnId = widgetIds[sendBtnIndex];
+      this.msgResponseLabelId = widgetIds[responseLabelIndex];
+      this.pane4LabelIds.push(this.msgResponseLabelId);
+    }
+
+    // ── Batch add to layout ──
+    const layoutChildren: Array<{ widgetId: AbjectId; sizePolicy?: Record<string, string>; preferredSize?: Record<string, number> }> = [];
+
+    // Pre-send labels
+    for (let i = preSendLabelStart; i < navBtnStart; i++) {
+      const ls = preSendLabels[i - preSendLabelStart];
+      const text = ls.text;
+      const lineHeight = ls.isSecondary ? 16 : 18;
+      const lines = Math.max(1, Math.ceil(text.length / 40));
+      layoutChildren.push({
+        widgetId: widgetIds[i],
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: Math.max(lineHeight, lines * lineHeight) },
+      });
+    }
+
+    // Nav buttons
+    for (let i = 0; i < navBtnSpecs.length; i++) {
+      layoutChildren.push({
+        widgetId: widgetIds[navBtnStart + i],
+        sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+        preferredSize: { width: 160, height: 26 },
+      });
+    }
+
+    // Send section
+    if (hasSendSection) {
+      layoutChildren.push({
+        widgetId: widgetIds[sendSectionLabelIndex],
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 16 },
+      });
+      for (let i = 0; i < inputSpecs.length; i++) {
+        const paramLabelText = batchSpecs[paramLabelIndices[i]].text ?? '';
+        const paramLines = Math.max(1, Math.ceil(paramLabelText.length / 40));
+        layoutChildren.push({
+          widgetId: widgetIds[paramLabelIndices[i]],
+          sizePolicy: { vertical: 'fixed' },
+          preferredSize: { height: Math.max(16, paramLines * 16) },
+        });
+        layoutChildren.push({
+          widgetId: widgetIds[inputIndices[i]],
+          sizePolicy: { vertical: 'fixed' },
+          preferredSize: { height: 30 },
+        });
+      }
+      layoutChildren.push({
+        widgetId: widgetIds[sendBtnIndex],
+        sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+        preferredSize: { width: 180, height: 26 },
+      });
+      layoutChildren.push({
+        widgetId: widgetIds[responseLabelIndex],
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 16 },
+      });
+    }
+
+    await this.request(request(this.id, this.pane4LayoutId!, 'addLayoutChildren', {
+      children: layoutChildren,
+    }));
+
+    // Fire-and-forget addDependent for nav buttons and send button
+    for (let i = 0; i < navBtnSpecs.length; i++) {
+      this.send(request(this.id, widgetIds[navBtnStart + i], 'addDependent', {}));
+    }
+    if (hasSendSection && sendBtnIndex >= 0) {
+      this.send(request(this.id, widgetIds[sendBtnIndex], 'addDependent', {}));
+    }
+    // addDependent for text inputs (so ObjectBrowser receives submit events)
+    for (const idx of inputIndices) {
+      this.send(request(this.id, widgetIds[idx], 'addDependent', {}));
+    }
   }
 
   private async rebuildPane4Implementors(): Promise<void> {
     const state = this.currentState;
     if (!state.selectedItem) return;
     const methodName = state.selectedItem.name;
-
-    await this.addPane4Label(`Implementors of "${methodName}"`, false, { fontWeight: 'bold', fontSize: 14 });
 
     const allRegs = this.getFilteredRegistrations();
     const implementors: string[] = [];
@@ -1226,12 +1474,63 @@ export class ObjectBrowser extends Abject {
       }
     }
 
-    if (implementors.length === 0) {
-      await this.addPane4Label('No implementors found.', true);
+    const headerText = `Implementors of "${methodName}"`;
+    const btnNames = implementors.sort();
+
+    // ── Build batch specs ──
+    const specs: Array<Record<string, unknown>> = [];
+    specs.push({
+      type: 'label', windowId: this.windowId!,
+      rect: { x: 0, y: 0, width: 0, height: 0 },
+      text: headerText,
+      style: { fontSize: 13, wordWrap: true, fontWeight: 'bold', fontSize2: 14 },
+    });
+
+    if (btnNames.length === 0) {
+      specs.push({
+        type: 'label', windowId: this.windowId!,
+        rect: { x: 0, y: 0, width: 0, height: 0 },
+        text: 'No implementors found.',
+        style: { fontSize: 12, wordWrap: true },
+      });
     } else {
-      for (const name of implementors.sort()) {
-        await this.addPane4Button(name, `navKind:${name}`);
+      for (const name of btnNames) {
+        specs.push({
+          type: 'button', windowId: this.windowId!,
+          rect: { x: 0, y: 0, width: 0, height: 0 },
+          text: name,
+          style: { fontSize: 11 },
+        });
       }
+    }
+
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs })
+    );
+
+    // Track
+    this.pane4LabelIds.push(widgetIds[0]); // header label
+    const layoutChildren: Array<{ widgetId: AbjectId; sizePolicy?: Record<string, string>; preferredSize?: Record<string, number> }> = [];
+
+    const headerLines = Math.max(1, Math.ceil(headerText.length / 40));
+    layoutChildren.push({ widgetId: widgetIds[0], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: Math.max(18, headerLines * 18) } });
+
+    if (btnNames.length === 0) {
+      this.pane4LabelIds.push(widgetIds[1]);
+      layoutChildren.push({ widgetId: widgetIds[1], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 16 } });
+    } else {
+      for (let i = 0; i < btnNames.length; i++) {
+        const btnId = widgetIds[1 + i];
+        this.pane4ButtonIds.set(btnId, `navKind:${btnNames[i]}`);
+        layoutChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 160, height: 26 } });
+      }
+    }
+
+    await this.request(request(this.id, this.pane4LayoutId!, 'addLayoutChildren', { children: layoutChildren }));
+
+    // Fire-and-forget addDependent for buttons
+    for (let i = 0; i < btnNames.length; i++) {
+      this.send(request(this.id, widgetIds[1 + i], 'addDependent', {}));
     }
   }
 
@@ -1239,8 +1538,6 @@ export class ObjectBrowser extends Abject {
     const state = this.currentState;
     if (!state.selectedItem) return;
     const methodName = state.selectedItem.name;
-
-    await this.addPane4Label(`Senders of "${methodName}"`, false, { fontWeight: 'bold', fontSize: 14 });
 
     const allRegs = this.getFilteredRegistrations();
     const senders: string[] = [];
@@ -1256,12 +1553,63 @@ export class ObjectBrowser extends Abject {
       }
     }
 
-    if (senders.length === 0) {
-      await this.addPane4Label('No senders found.', true);
+    const headerText = `Senders of "${methodName}"`;
+    const btnNames = senders.sort();
+
+    // ── Build batch specs ──
+    const specs: Array<Record<string, unknown>> = [];
+    specs.push({
+      type: 'label', windowId: this.windowId!,
+      rect: { x: 0, y: 0, width: 0, height: 0 },
+      text: headerText,
+      style: { fontSize: 13, wordWrap: true, fontWeight: 'bold' },
+    });
+
+    if (btnNames.length === 0) {
+      specs.push({
+        type: 'label', windowId: this.windowId!,
+        rect: { x: 0, y: 0, width: 0, height: 0 },
+        text: 'No senders found.',
+        style: { fontSize: 12, wordWrap: true },
+      });
     } else {
-      for (const name of senders.sort()) {
-        await this.addPane4Button(name, `navKind:${name}`);
+      for (const name of btnNames) {
+        specs.push({
+          type: 'button', windowId: this.windowId!,
+          rect: { x: 0, y: 0, width: 0, height: 0 },
+          text: name,
+          style: { fontSize: 11 },
+        });
       }
+    }
+
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs })
+    );
+
+    // Track
+    this.pane4LabelIds.push(widgetIds[0]); // header label
+    const layoutChildren: Array<{ widgetId: AbjectId; sizePolicy?: Record<string, string>; preferredSize?: Record<string, number> }> = [];
+
+    const headerLines = Math.max(1, Math.ceil(headerText.length / 40));
+    layoutChildren.push({ widgetId: widgetIds[0], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: Math.max(18, headerLines * 18) } });
+
+    if (btnNames.length === 0) {
+      this.pane4LabelIds.push(widgetIds[1]);
+      layoutChildren.push({ widgetId: widgetIds[1], sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 16 } });
+    } else {
+      for (let i = 0; i < btnNames.length; i++) {
+        const btnId = widgetIds[1 + i];
+        this.pane4ButtonIds.set(btnId, `navKind:${btnNames[i]}`);
+        layoutChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 160, height: 26 } });
+      }
+    }
+
+    await this.request(request(this.id, this.pane4LayoutId!, 'addLayoutChildren', { children: layoutChildren }));
+
+    // Fire-and-forget addDependent for buttons
+    for (let i = 0; i < btnNames.length; i++) {
+      this.send(request(this.id, widgetIds[1 + i], 'addDependent', {}));
     }
   }
 
@@ -1270,12 +1618,12 @@ export class ObjectBrowser extends Abject {
   private async updateBreadcrumb(): Promise<void> {
     if (!this.breadcrumbLayoutId || !this.windowId) return;
 
-    // Remove old breadcrumb widgets
+    // Clear layout in one request, then fire-and-forget destroys
+    try {
+      await this.request(request(this.id, this.breadcrumbLayoutId, 'clearLayoutChildren', {}));
+    } catch { /* gone */ }
     for (const id of this.breadcrumbIds) {
-      try {
-        await this.request(request(this.id, this.breadcrumbLayoutId, 'removeLayoutChild', { widgetId: id }));
-        await this.request(request(this.id, id, 'destroy', {}));
-      } catch { /* gone */ }
+      this.send(request(this.id, id, 'destroy', {}));
     }
     this.breadcrumbIds = [];
 
@@ -1297,29 +1645,52 @@ export class ObjectBrowser extends Abject {
     if (state.detailMode === 'implementors') parts.push('Implementors');
     if (state.detailMode === 'senders') parts.push('Senders');
 
+    if (parts.length === 0) return;
+
+    // ── Batch create all breadcrumb labels (and arrow separators) ──
+    const batchSpecs: Array<Record<string, unknown>> = [];
+    // Track which spec index is an arrow vs a part
+    const specMeta: Array<{ kind: 'arrow' | 'part'; partIndex: number }> = [];
+
     for (let i = 0; i < parts.length; i++) {
       if (i > 0) {
-        // Arrow separator
-        const arrowId = await this.wm('createLabel', {
-          windowId: this.windowId,
+        batchSpecs.push({
+          type: 'label', windowId: this.windowId!,
           rect: { x: 0, y: 0, width: 0, height: 0 },
           text: '>',
           style: { fontSize: 11, color: '#6b7084' },
-        }) as AbjectId;
-        await this.addToLayout(this.breadcrumbLayoutId, arrowId, { horizontal: 'fixed' }, { width: 12, height: 20 });
-        this.breadcrumbIds.push(arrowId);
+        });
+        specMeta.push({ kind: 'arrow', partIndex: i });
       }
-
-      const partId = await this.wm('createLabel', {
-        windowId: this.windowId,
+      batchSpecs.push({
+        type: 'label', windowId: this.windowId!,
         rect: { x: 0, y: 0, width: 0, height: 0 },
         text: parts[i],
         style: { fontSize: 11, color: i === parts.length - 1 ? '#e8a84c' : '#b4b8c8' },
-      }) as AbjectId;
-      const estimatedWidth = Math.min(150, parts[i].length * 7 + 8);
-      await this.addToLayout(this.breadcrumbLayoutId, partId, { horizontal: 'fixed' }, { width: estimatedWidth, height: 20 });
-      this.breadcrumbIds.push(partId);
+      });
+      specMeta.push({ kind: 'part', partIndex: i });
     }
+
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: batchSpecs })
+    );
+
+    // Track
+    for (const id of widgetIds) this.breadcrumbIds.push(id);
+
+    // ── Batch add to layout ──
+    const layoutChildren: Array<{ widgetId: AbjectId; sizePolicy?: Record<string, string>; preferredSize?: Record<string, number> }> = [];
+    for (let i = 0; i < widgetIds.length; i++) {
+      const meta = specMeta[i];
+      if (meta.kind === 'arrow') {
+        layoutChildren.push({ widgetId: widgetIds[i], sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 12, height: 20 } });
+      } else {
+        const estimatedWidth = Math.min(150, parts[meta.partIndex].length * 7 + 8);
+        layoutChildren.push({ widgetId: widgetIds[i], sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: estimatedWidth, height: 20 } });
+      }
+    }
+
+    await this.request(request(this.id, this.breadcrumbLayoutId, 'addLayoutChildren', { children: layoutChildren }));
   }
 
   // ── Event Handling ────────────────────────────────────────────────

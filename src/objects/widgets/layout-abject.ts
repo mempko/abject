@@ -68,10 +68,21 @@ export const LAYOUT_INTERFACE_DECL: InterfaceDeclaration = {
     },
     {
       name: 'updateLayoutChild',
-      description: 'Update a child\'s preferredSize in this layout',
+      description: 'Update a child\'s layout properties (sizePolicy, preferredSize, alignment, stretch)',
       parameters: [
         { name: 'widgetId', type: { kind: 'primitive', primitive: 'string' }, description: 'Widget AbjectId' },
-        { name: 'preferredSize', type: { kind: 'reference', reference: 'PreferredSize' }, description: 'New preferred size' },
+        { name: 'preferredSize', type: { kind: 'reference', reference: 'PreferredSize' }, description: 'New preferred size (merged)' },
+        { name: 'sizePolicy', type: { kind: 'reference', reference: 'SizePolicy' }, description: 'New size policy (merged with existing)' },
+        { name: 'alignment', type: { kind: 'primitive', primitive: 'string' }, description: 'Alignment: left, center, or right' },
+        { name: 'stretch', type: { kind: 'primitive', primitive: 'number' }, description: 'Stretch factor' },
+      ],
+      returns: { kind: 'primitive', primitive: 'boolean' },
+    },
+    {
+      name: 'addLayoutChildren',
+      description: 'Add multiple widgets to this layout in one call',
+      parameters: [
+        { name: 'children', type: { kind: 'array', elementType: { kind: 'reference', reference: 'LayoutChildSpec' } }, description: 'Array of child specs' },
       ],
       returns: { kind: 'primitive', primitive: 'boolean' },
     },
@@ -214,6 +225,50 @@ export abstract class LayoutAbject extends WidgetAbject {
       return true;
     });
 
+    this.on('addLayoutChildren', async (msg: AbjectMessage) => {
+      const { children } = msg.payload as {
+        children: Array<{
+          widgetId: AbjectId;
+          sizePolicy?: { horizontal?: string; vertical?: string };
+          preferredSize?: { width?: number; height?: number };
+          alignment?: 'left' | 'center' | 'right';
+          stretch?: number;
+        }>;
+      };
+      for (const child of children) {
+        const existingIdx = this.layoutChildren.findIndex(
+          (c) => !isSpacer(c) && c.widgetId === child.widgetId
+        );
+        if (existingIdx >= 0) {
+          this.layoutChildren[existingIdx] = {
+            widgetId: child.widgetId,
+            sizePolicy: child.sizePolicy as LayoutChildConfig['sizePolicy'],
+            preferredSize: child.preferredSize,
+            alignment: child.alignment,
+            stretch: child.stretch ?? 1,
+          };
+        } else {
+          this.layoutChildren.push({
+            widgetId: child.widgetId,
+            sizePolicy: child.sizePolicy as LayoutChildConfig['sizePolicy'],
+            preferredSize: child.preferredSize,
+            alignment: child.alignment,
+            stretch: child.stretch,
+          });
+        }
+        // Fire-and-forget: remove from window direct children + register as dependent
+        this.send(
+          request(this.id, this.ownerId, 'removeChild', { widgetId: child.widgetId })
+        );
+        this.send(
+          request(this.id, child.widgetId, 'addDependent', {})
+        );
+      }
+      this.layoutDirty = true;
+      this.scheduleRelayout();
+      return true;
+    });
+
     this.on('removeLayoutChild', async (msg: AbjectMessage) => {
       const { widgetId } = msg.payload as { widgetId: AbjectId };
       this.layoutChildren = this.layoutChildren.filter(
@@ -241,13 +296,19 @@ export abstract class LayoutAbject extends WidgetAbject {
     });
 
     this.on('updateLayoutChild', async (msg: AbjectMessage) => {
-      const { widgetId, preferredSize } = msg.payload as {
+      const { widgetId, preferredSize, sizePolicy, alignment, stretch } = msg.payload as {
         widgetId: AbjectId;
-        preferredSize: { width?: number; height?: number };
+        preferredSize?: { width?: number; height?: number };
+        sizePolicy?: { horizontal?: string; vertical?: string };
+        alignment?: 'left' | 'center' | 'right';
+        stretch?: number;
       };
       for (const child of this.layoutChildren) {
         if (!isSpacer(child) && child.widgetId === widgetId) {
-          child.preferredSize = { ...child.preferredSize, ...preferredSize };
+          if (preferredSize) child.preferredSize = { ...child.preferredSize, ...preferredSize };
+          if (sizePolicy) child.sizePolicy = { ...child.sizePolicy, ...sizePolicy } as LayoutChildConfig['sizePolicy'];
+          if (alignment !== undefined) child.alignment = alignment;
+          if (stretch !== undefined) child.stretch = stretch;
           break;
         }
       }

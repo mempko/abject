@@ -174,8 +174,6 @@ export class WorkspaceBrowser extends Abject {
       })
     );
 
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-
     // Create root VBox layout
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
@@ -185,7 +183,7 @@ export class WorkspaceBrowser extends Abject {
       })
     );
 
-    // Header row: title + refresh button
+    // Header row: title + refresh button (nested HBox)
     const headerRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
@@ -193,66 +191,6 @@ export class WorkspaceBrowser extends Abject {
         spacing: 8,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: headerRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 30 },
-    }));
-
-    const titleLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Workspace Browser',
-        style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
-      })
-    );
-    await this.request(request(this.id, headerRowId, 'addLayoutChild', {
-      widgetId: titleLabelId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 30 },
-    }));
-
-    this.refreshBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Refresh',
-        style: { fontSize: 12 },
-      })
-    );
-    await this.request(request(this.id, this.refreshBtnId, 'addDependent', {}));
-    await this.request(request(this.id, headerRowId, 'addLayoutChild', {
-      widgetId: this.refreshBtnId,
-      sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-      preferredSize: { width: 80, height: 28 },
-    }));
-
-    // Tab bar: Public / Private
-    this.tabBarId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTabBar', {
-        windowId: this.windowId, rect: r0,
-        tabs: ['Public', 'Private'],
-        selectedIndex: this.activeTab,
-      })
-    );
-    await this.request(request(this.id, this.tabBarId, 'addDependent', {}));
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.tabBarId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-
-    // Search input
-    this.searchInputId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTextInput', {
-        windowId: this.windowId, rect: r0,
-        placeholder: 'Search by name, description, or tags...',
-        text: '',
-      })
-    );
-    await this.request(request(this.id, this.searchInputId, 'addDependent', {}));
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.searchInputId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
 
     // Two ScrollableVBox containers (one per tab)
     for (let i = 0; i < 2; i++) {
@@ -263,12 +201,111 @@ export class WorkspaceBrowser extends Abject {
           spacing: 6,
         })
       );
-      await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-        widgetId: scrollId,
-        sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
-      }));
       this.tabContents.push(scrollId);
     }
+
+    // Batch create all non-layout widgets: titleLabel, refreshBtn, tabBar, searchInput, statusLabel
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          {
+            type: 'label',
+            windowId: this.windowId,
+            text: 'Workspace Browser',
+            style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
+          },
+          {
+            type: 'button',
+            windowId: this.windowId,
+            text: 'Refresh',
+            style: { fontSize: 12 },
+          },
+          {
+            type: 'tabBar',
+            windowId: this.windowId,
+            tabs: ['Public', 'Private'],
+            selectedIndex: this.activeTab,
+          },
+          {
+            type: 'textInput',
+            windowId: this.windowId,
+            placeholder: 'Search by name, description, or tags...',
+            text: '',
+          },
+          {
+            type: 'label',
+            windowId: this.windowId,
+            text: '',
+            style: { color: '#6b7084', fontSize: 11 },
+          },
+        ],
+      })
+    );
+
+    const [titleLabelId, refreshBtnId, tabBarId, searchInputId, statusLabelId] = widgetIds;
+    this.refreshBtnId = refreshBtnId;
+    this.tabBarId = tabBarId;
+    this.searchInputId = searchInputId;
+    this.statusLabelId = statusLabelId;
+
+    // Fire-and-forget addDependent for interactive widgets
+    this.send(request(this.id, this.refreshBtnId, 'addDependent', {}));
+    this.send(request(this.id, this.tabBarId, 'addDependent', {}));
+    this.send(request(this.id, this.searchInputId, 'addDependent', {}));
+
+    // Batch add headerRow children: titleLabel (expanding), refreshBtn (fixed)
+    await this.request(
+      request(this.id, headerRowId, 'addLayoutChildren', {
+        children: [
+          {
+            widgetId: titleLabelId,
+            sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+            preferredSize: { height: 30 },
+          },
+          {
+            widgetId: this.refreshBtnId,
+            sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+            preferredSize: { width: 80, height: 28 },
+          },
+        ],
+      })
+    );
+
+    // Batch add rootLayout children: headerRow, tabBar, searchInput, scroll containers, statusLabel
+    await this.request(
+      request(this.id, this.rootLayoutId, 'addLayoutChildren', {
+        children: [
+          {
+            widgetId: headerRowId,
+            sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+            preferredSize: { height: 30 },
+          },
+          {
+            widgetId: this.tabBarId,
+            sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+            preferredSize: { height: 32 },
+          },
+          {
+            widgetId: this.searchInputId,
+            sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+            preferredSize: { height: 32 },
+          },
+          {
+            widgetId: this.tabContents[0],
+            sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+          },
+          {
+            widgetId: this.tabContents[1],
+            sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+          },
+          {
+            widgetId: this.statusLabelId,
+            sizePolicy: { vertical: 'fixed' },
+            preferredSize: { height: 16 },
+          },
+        ],
+      })
+    );
 
     // Build workspace list content (from cache)
     await this.buildWorkspaceList();
@@ -283,20 +320,6 @@ export class WorkspaceBrowser extends Abject {
       ).catch(() => { /* best-effort background refresh */ });
     }
 
-    // Spacer + status
-    this.statusLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0,
-        text: '',
-        style: { color: '#6b7084', fontSize: 11 },
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.statusLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 16 },
-    }));
-
     await this.changed('visibility', true);
     return true;
   }
@@ -305,21 +328,19 @@ export class WorkspaceBrowser extends Abject {
    * Build (or rebuild) the workspace list inside both tab containers.
    */
   private async buildWorkspaceList(): Promise<void> {
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-
-    // Clear existing tab content widgets
+    // Clear existing tab content widgets (fire-and-forget destroy)
     for (const widgetId of this.tabContentWidgetIds) {
-      try { await this.request(request(this.id, widgetId, 'destroy', {})); }
-      catch { /* gone */ }
+      this.send(request(this.id, widgetId, 'destroy', {}));
     }
     this.tabContentWidgetIds = [];
     this.browseButtons.clear();
 
-    // Remove children from both tab containers
-    for (const containerId of this.tabContents) {
-      try { await this.request(request(this.id, containerId, 'clearLayoutChildren', {})); }
-      catch { /* best effort */ }
-    }
+    // Clear children from both tab containers (can run in parallel)
+    await Promise.all(
+      this.tabContents.map(containerId =>
+        this.request(request(this.id, containerId, 'clearLayoutChildren', {})).catch(() => { /* best effort */ })
+      )
+    );
 
     // Fetch discovered workspaces
     let workspaces: DiscoveredWorkspace[] = [];
@@ -371,19 +392,31 @@ export class WorkspaceBrowser extends Abject {
         const emptyText = tabIdx === 0
           ? 'No public workspaces discovered yet.'
           : 'No private workspaces available.';
-        const emptyId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createLabel', {
-            windowId: this.windowId, rect: r0,
-            text: emptyText,
-            style: { color: '#b4b8c8', fontSize: 12 },
+
+        const { widgetIds: [emptyId] } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', {
+            specs: [
+              {
+                type: 'label',
+                windowId: this.windowId,
+                text: emptyText,
+                style: { color: '#b4b8c8', fontSize: 12 },
+              },
+            ],
           })
         );
         this.tabContentWidgetIds.push(emptyId);
-        await this.request(request(this.id, containerId, 'addLayoutChild', {
-          widgetId: emptyId,
-          sizePolicy: { vertical: 'fixed' },
-          preferredSize: { height: 24 },
-        }));
+        await this.request(
+          request(this.id, containerId, 'addLayoutChildren', {
+            children: [
+              {
+                widgetId: emptyId,
+                sizePolicy: { vertical: 'fixed' },
+                preferredSize: { height: 24 },
+              },
+            ],
+          })
+        );
         continue;
       }
 
@@ -398,23 +431,10 @@ export class WorkspaceBrowser extends Abject {
       for (const [peerId, peerWorkspaces] of byPeer) {
         const peerName = peerWorkspaces[0]?.ownerName || peerId.slice(0, 16) + '...';
 
-        // Peer header
-        const peerHeaderId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createLabel', {
-            windowId: this.windowId, rect: r0, text: peerName,
-            style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 },
-          })
-        );
-        this.tabContentWidgetIds.push(peerHeaderId);
-        await this.request(request(this.id, containerId, 'addLayoutChild', {
-          widgetId: peerHeaderId,
-          sizePolicy: { vertical: 'fixed' },
-          preferredSize: { height: 22 },
-        }));
-
-        // Workspace entries
+        // Collect all widget specs for this peer group
+        // First pass: create HBox rows (layouts) for each workspace entry
+        const wsRowIds: AbjectId[] = [];
         for (const ws of peerWorkspaces) {
-          // Row 1: Name + Browse button
           const wsRowId = await this.request<AbjectId>(
             request(this.id, this.widgetManagerId!, 'createNestedHBox', {
               parentLayoutId: containerId,
@@ -422,83 +442,205 @@ export class WorkspaceBrowser extends Abject {
               spacing: 6,
             })
           );
+          wsRowIds.push(wsRowId);
           this.tabContentWidgetIds.push(wsRowId);
-          await this.request(request(this.id, containerId, 'addLayoutChild', {
-            widgetId: wsRowId,
-            sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-            preferredSize: { height: 24 },
-          }));
+        }
 
-          const wsNameId = await this.request<AbjectId>(
-            request(this.id, this.widgetManagerId!, 'createLabel', {
-              windowId: this.windowId, rect: r0,
-              text: `  ${ws.name}`,
-              style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 12 },
-            })
-          );
-          this.tabContentWidgetIds.push(wsNameId);
-          await this.request(request(this.id, wsRowId, 'addLayoutChild', {
-            widgetId: wsNameId,
-            sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-            preferredSize: { height: 24 },
-          }));
+        // Second pass: collect all non-layout widget specs for batch creation
+        type WidgetSpec = {
+          type: string;
+          windowId: AbjectId;
+          text?: string;
+          style?: Record<string, unknown>;
+          placeholder?: string;
+        };
 
-          // Browse button
+        const allSpecs: WidgetSpec[] = [];
+
+        // Peer header label
+        allSpecs.push({
+          type: 'label',
+          windowId: this.windowId!,
+          text: peerName,
+          style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 },
+        });
+
+        // Per-workspace widgets
+        // We need to track which specs belong to which workspace/layout
+        // Structure: for each workspace, we push [wsNameLabel, (optional browseBtnSpec), (optional descLabel), (optional metaLabel)]
+        type WsWidgetGroup = {
+          ws: DiscoveredWorkspace;
+          wsRowId: AbjectId;
+          specIndices: {
+            nameIdx: number;
+            browseIdx?: number;
+            descIdx?: number;
+            metaIdx?: number;
+          };
+        };
+        const wsGroups: WsWidgetGroup[] = [];
+
+        // peerHeaderIdx = 0 (already pushed above)
+        const peerHeaderIdx = 0;
+
+        for (let wi = 0; wi < peerWorkspaces.length; wi++) {
+          const ws = peerWorkspaces[wi];
+
+          const nameIdx = allSpecs.length;
+          allSpecs.push({
+            type: 'label',
+            windowId: this.windowId!,
+            text: `  ${ws.name}`,
+            style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 12 },
+          });
+
+          let browseIdx: number | undefined;
           if (ws.registryId) {
-            const browseBtnId = await this.request<AbjectId>(
-              request(this.id, this.widgetManagerId!, 'createButton', {
-                windowId: this.windowId, rect: r0, text: 'Browse',
-                style: { fontSize: 11 },
-              })
-            );
-            this.tabContentWidgetIds.push(browseBtnId);
-            await this.request(request(this.id, browseBtnId, 'addDependent', {}));
-            this.browseButtons.set(browseBtnId, ws);
-            await this.request(request(this.id, wsRowId, 'addLayoutChild', {
-              widgetId: browseBtnId,
-              sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-              preferredSize: { width: 70, height: 24 },
-            }));
+            browseIdx = allSpecs.length;
+            allSpecs.push({
+              type: 'button',
+              windowId: this.windowId!,
+              text: 'Browse',
+              style: { fontSize: 11 },
+            });
           }
 
-          // Row 2: Description (if present)
+          let descIdx: number | undefined;
           const desc = ws.description ?? '';
           if (desc) {
             const truncDesc = desc.length > 80 ? desc.slice(0, 77) + '...' : desc;
-            const descId = await this.request<AbjectId>(
-              request(this.id, this.widgetManagerId!, 'createLabel', {
-                windowId: this.windowId, rect: r0,
-                text: `  ${truncDesc}`,
-                style: { color: '#8b8fa3', fontSize: 11 },
-              })
-            );
-            this.tabContentWidgetIds.push(descId);
-            await this.request(request(this.id, containerId, 'addLayoutChild', {
-              widgetId: descId,
-              sizePolicy: { vertical: 'fixed' },
-              preferredSize: { height: 18 },
-            }));
+            descIdx = allSpecs.length;
+            allSpecs.push({
+              type: 'label',
+              windowId: this.windowId!,
+              text: `  ${truncDesc}`,
+              style: { color: '#8b8fa3', fontSize: 11 },
+            });
           }
 
-          // Row 3: Tags + hop count
+          let metaIdx: number | undefined;
           const tags = ws.tags ?? [];
           const hopsLabel = ws.hops > 0 ? `${ws.hops} hop${ws.hops > 1 ? 's' : ''}` : '';
           const tagsStr = tags.join(' \u00b7 ');
           const metaText = [tagsStr, hopsLabel].filter(Boolean).join('    ');
           if (metaText) {
-            const metaId = await this.request<AbjectId>(
-              request(this.id, this.widgetManagerId!, 'createLabel', {
-                windowId: this.windowId, rect: r0,
-                text: `  ${metaText}`,
-                style: { color: '#6b7084', fontSize: 11 },
-              })
-            );
+            metaIdx = allSpecs.length;
+            allSpecs.push({
+              type: 'label',
+              windowId: this.windowId!,
+              text: `  ${metaText}`,
+              style: { color: '#6b7084', fontSize: 11 },
+            });
+          }
+
+          wsGroups.push({
+            ws,
+            wsRowId: wsRowIds[wi],
+            specIndices: { nameIdx, browseIdx, descIdx, metaIdx },
+          });
+        }
+
+        // Batch create all widgets for this peer group
+        const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs: allSpecs })
+        );
+
+        const peerHeaderId = widgetIds[peerHeaderIdx];
+        this.tabContentWidgetIds.push(peerHeaderId);
+
+        // Batch add peer header to container
+        await this.request(
+          request(this.id, containerId, 'addLayoutChildren', {
+            children: [
+              {
+                widgetId: peerHeaderId,
+                sizePolicy: { vertical: 'fixed' },
+                preferredSize: { height: 22 },
+              },
+            ],
+          })
+        );
+
+        // For each workspace: add wsRow to container, then add wsRow children, then add desc/meta to container
+        for (const group of wsGroups) {
+          const { ws, wsRowId, specIndices } = group;
+
+          // Add wsRow to container
+          await this.request(
+            request(this.id, containerId, 'addLayoutChildren', {
+              children: [
+                {
+                  widgetId: wsRowId,
+                  sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+                  preferredSize: { height: 24 },
+                },
+              ],
+            })
+          );
+
+          // Batch add wsRow children (name label + optional browse button)
+          const wsRowChildren: Array<{
+            widgetId: AbjectId;
+            sizePolicy?: { horizontal?: string; vertical?: string };
+            preferredSize?: { width?: number; height?: number };
+          }> = [];
+
+          const wsNameId = widgetIds[specIndices.nameIdx];
+          this.tabContentWidgetIds.push(wsNameId);
+          wsRowChildren.push({
+            widgetId: wsNameId,
+            sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+            preferredSize: { height: 24 },
+          });
+
+          if (specIndices.browseIdx !== undefined) {
+            const browseBtnId = widgetIds[specIndices.browseIdx];
+            this.tabContentWidgetIds.push(browseBtnId);
+            // Fire-and-forget addDependent for browse button
+            this.send(request(this.id, browseBtnId, 'addDependent', {}));
+            this.browseButtons.set(browseBtnId, ws);
+            wsRowChildren.push({
+              widgetId: browseBtnId,
+              sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+              preferredSize: { width: 70, height: 24 },
+            });
+          }
+
+          await this.request(
+            request(this.id, wsRowId, 'addLayoutChildren', { children: wsRowChildren })
+          );
+
+          // Add optional desc/meta labels directly to container (batch if both present)
+          const containerChildren: Array<{
+            widgetId: AbjectId;
+            sizePolicy?: { vertical?: string };
+            preferredSize?: { height?: number };
+          }> = [];
+
+          if (specIndices.descIdx !== undefined) {
+            const descId = widgetIds[specIndices.descIdx];
+            this.tabContentWidgetIds.push(descId);
+            containerChildren.push({
+              widgetId: descId,
+              sizePolicy: { vertical: 'fixed' },
+              preferredSize: { height: 18 },
+            });
+          }
+
+          if (specIndices.metaIdx !== undefined) {
+            const metaId = widgetIds[specIndices.metaIdx];
             this.tabContentWidgetIds.push(metaId);
-            await this.request(request(this.id, containerId, 'addLayoutChild', {
+            containerChildren.push({
               widgetId: metaId,
               sizePolicy: { vertical: 'fixed' },
               preferredSize: { height: 16 },
-            }));
+            });
+          }
+
+          if (containerChildren.length > 0) {
+            await this.request(
+              request(this.id, containerId, 'addLayoutChildren', { children: containerChildren })
+            );
           }
         }
       }

@@ -267,8 +267,6 @@ export class PeerNetwork extends Abject {
       })
     );
 
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-
     // Create root VBox layout (non-scrollable — tabs handle their own scrolling)
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
@@ -279,18 +277,16 @@ export class PeerNetwork extends Abject {
     );
 
     // Tab bar
-    this.tabBarId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTabBar', {
-        windowId: this.windowId, rect: r0,
-        tabs: ['Identity', 'Contacts', 'Servers & Peers', 'Introductions'],
-        selectedIndex: 0,
-      })
+    const { widgetIds: [_tabBarId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'tabBar', windowId: this.windowId, tabs: ['Identity', 'Contacts', 'Servers & Peers', 'Introductions'], selectedIndex: 0 },
+      ] })
     );
+    this.tabBarId = _tabBarId;
     await this.request(request(this.id, this.tabBarId, 'addDependent', {}));
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.tabBarId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 36 },
     }));
 
     // Create 4 tab content ScrollableVBoxes
@@ -345,11 +341,10 @@ export class PeerNetwork extends Abject {
     const tab0 = this.tabContents[0];
 
     // Display Name label
-    const nameLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Display Name',
-        style: { color: '#e2e4e9', fontSize: 13 },
-      })
+    const { widgetIds: [nameLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Display Name', style: { color: '#e2e4e9', fontSize: 13 } },
+      ] })
     );
     await this.request(request(this.id, tab0, 'addLayoutChild', {
       widgetId: nameLabelId,
@@ -371,25 +366,21 @@ export class PeerNetwork extends Abject {
       preferredSize: { height: 32 },
     }));
 
-    this.nameInputId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTextInput', {
-        windowId: this.windowId, rect: r0, placeholder: 'Enter display name',
-        text: peerName,
-      })
+    // Batch: name input + save button
+    const { widgetIds: [_nameInputId, _saveNameBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, placeholder: 'Enter display name', text: peerName },
+        { type: 'button', windowId: this.windowId, text: 'Save', style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' } },
+      ] })
     );
+    this.nameInputId = _nameInputId;
+    this.saveNameBtnId = _saveNameBtnId;
     await this.request(request(this.id, this.nameInputId, 'addDependent', {}));
     await this.request(request(this.id, nameRowId, 'addLayoutChild', {
       widgetId: this.nameInputId,
       sizePolicy: { horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
-
-    this.saveNameBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Save',
-        style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
-      })
-    );
     await this.request(request(this.id, this.saveNameBtnId, 'addDependent', {}));
     await this.request(request(this.id, nameRowId, 'addLayoutChild', {
       widgetId: this.saveNameBtnId,
@@ -397,27 +388,19 @@ export class PeerNetwork extends Abject {
       preferredSize: { width: 70, height: 32 },
     }));
 
-    // Peer ID label
-    const peerIdHeaderId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Peer ID',
-        style: { color: '#e2e4e9', fontSize: 13 },
-      })
+    // Batch: Peer ID header + Peer ID value (2 adjacent labels in tab0)
+    const truncatedPeerId = peerId ? `${peerId.slice(0, 16)}...${peerId.slice(-8)}` : '(not initialized)';
+    const { widgetIds: [peerIdHeaderId, peerIdValueId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Peer ID', style: { color: '#e2e4e9', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: truncatedPeerId, style: { color: '#8b8fa3', fontSize: 12 } },
+      ] })
     );
     await this.request(request(this.id, tab0, 'addLayoutChild', {
       widgetId: peerIdHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
-
-    // Peer ID value (truncated)
-    const truncatedPeerId = peerId ? `${peerId.slice(0, 16)}...${peerId.slice(-8)}` : '(not initialized)';
-    const peerIdValueId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: truncatedPeerId,
-        style: { color: '#8b8fa3', fontSize: 12 },
-      })
-    );
     await this.request(request(this.id, tab0, 'addLayoutChild', {
       widgetId: peerIdValueId,
       sizePolicy: { vertical: 'fixed' },
@@ -438,23 +421,21 @@ export class PeerNetwork extends Abject {
       preferredSize: { height: 30 },
     }));
 
-    this.copyPeerIdBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Copy Peer ID',
-      })
+    // Batch: copy peer ID + copy identity buttons
+    const { widgetIds: [_copyPeerIdBtnId, _copyIdentityBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Copy Peer ID' },
+        { type: 'button', windowId: this.windowId, text: 'Copy Identity JSON' },
+      ] })
     );
+    this.copyPeerIdBtnId = _copyPeerIdBtnId;
+    this.copyIdentityBtnId = _copyIdentityBtnId;
     await this.request(request(this.id, this.copyPeerIdBtnId, 'addDependent', {}));
     await this.request(request(this.id, copyRowId, 'addLayoutChild', {
       widgetId: this.copyPeerIdBtnId,
       sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
       preferredSize: { width: 130, height: 30 },
     }));
-
-    this.copyIdentityBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Copy Identity JSON',
-      })
-    );
     await this.request(request(this.id, this.copyIdentityBtnId, 'addDependent', {}));
     await this.request(request(this.id, copyRowId, 'addLayoutChild', {
       widgetId: this.copyIdentityBtnId,
@@ -465,12 +446,12 @@ export class PeerNetwork extends Abject {
     // Spacer + status label at bottom of Identity tab
     await this.request(request(this.id, tab0, 'addLayoutSpacer', {}));
 
-    this.statusLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId!, rect: r0, text: '',
-        style: { color: '#b4b8c8', fontSize: 12, align: 'right' },
-      })
+    const { widgetIds: [_statusLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId!, text: '', style: { color: '#b4b8c8', fontSize: 12, align: 'right' } },
+      ] })
     );
+    this.statusLabelId = _statusLabelId;
     await this.request(request(this.id, tab0, 'addLayoutChild', {
       widgetId: this.statusLabelId,
       sizePolicy: { vertical: 'fixed' },
@@ -480,25 +461,18 @@ export class PeerNetwork extends Abject {
     // ========== TAB 1: CONTACTS ==========
     const tab1 = this.tabContents[1];
 
-    // Add Contact label
-    const addLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Add Contact',
-        style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 },
-      })
+    // Batch: Add Contact label + description label
+    const { widgetIds: [addLabelId, addDescId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Add Contact', style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: "Paste a peer's identity JSON.", style: { color: '#b4b8c8', fontSize: 12 } },
+      ] })
     );
     await this.request(request(this.id, tab1, 'addLayoutChild', {
       widgetId: addLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
-
-    const addDescId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: "Paste a peer's identity JSON.",
-        style: { color: '#b4b8c8', fontSize: 12 },
-      })
-    );
     await this.request(request(this.id, tab1, 'addLayoutChild', {
       widgetId: addDescId,
       sizePolicy: { vertical: 'fixed' },
@@ -519,24 +493,21 @@ export class PeerNetwork extends Abject {
       preferredSize: { height: 32 },
     }));
 
-    this.addContactInputId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTextInput', {
-        windowId: this.windowId, rect: r0, placeholder: '{"peerId":"...","publicSigningKey":"..."}',
-      })
+    // Batch: add contact input + add button
+    const { widgetIds: [_addContactInputId, _addContactBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, placeholder: 'Paste identity JSON' },
+        { type: 'button', windowId: this.windowId, text: 'Add', style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' } },
+      ] })
     );
+    this.addContactInputId = _addContactInputId;
+    this.addContactBtnId = _addContactBtnId;
     await this.request(request(this.id, this.addContactInputId, 'addDependent', {}));
     await this.request(request(this.id, addRowId, 'addLayoutChild', {
       widgetId: this.addContactInputId,
       sizePolicy: { horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
-
-    this.addContactBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Add',
-        style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
-      })
-    );
     await this.request(request(this.id, this.addContactBtnId, 'addDependent', {}));
     await this.request(request(this.id, addRowId, 'addLayoutChild', {
       widgetId: this.addContactBtnId,
@@ -545,11 +516,10 @@ export class PeerNetwork extends Abject {
     }));
 
     // Contacts list header
-    const contactsHeaderId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Contacts',
-        style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 },
-      })
+    const { widgetIds: [contactsHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Contacts', style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 } },
+      ] })
     );
     await this.request(request(this.id, tab1, 'addLayoutChild', {
       widgetId: contactsHeaderId,
@@ -558,11 +528,10 @@ export class PeerNetwork extends Abject {
     }));
 
     if (contacts.length === 0) {
-      const emptyLabelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId, rect: r0, text: 'No contacts yet.',
-          style: { color: '#b4b8c8', fontSize: 12 },
-        })
+      const { widgetIds: [emptyLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: 'No contacts yet.', style: { color: '#b4b8c8', fontSize: 12 } },
+        ] })
       );
       await this.request(request(this.id, tab1, 'addLayoutChild', {
         widgetId: emptyLabelId,
@@ -585,43 +554,51 @@ export class PeerNetwork extends Abject {
         }));
 
         const displayName = contact.name || contact.peerId.slice(0, 12) + '...';
-        const nameId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createLabel', {
-            windowId: this.windowId, rect: r0, text: displayName,
-            style: { color: '#e2e4e9', fontSize: 12 },
-          })
+        const stateColor = contact.state === 'connected' ? '#4caf50'
+          : contact.state === 'connecting' ? '#e8a84c'
+          : '#6b7084';
+        const isConnected = contact.state === 'connected';
+
+        // Batch: name label + state label + connect button + delete button + block button
+        const connBtnText = isConnected ? 'Disconnect' : 'Connect';
+        const connBtnStyle = isConnected
+          ? { fontSize: 11 }
+          : { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 };
+        const specs: Array<Record<string, unknown>> = [
+          { type: 'label', windowId: this.windowId, text: displayName, style: { color: '#e2e4e9', fontSize: 12 } },
+          { type: 'label', windowId: this.windowId, text: contact.state, style: { color: stateColor, fontSize: 11 } },
+          { type: 'button', windowId: this.windowId, text: connBtnText, style: connBtnStyle },
+        ];
+        if (isConnected) {
+          specs.push({ type: 'button', windowId: this.windowId, text: 'Introduce', style: { background: '#1e2a3a', borderColor: '#5b9bd5', fontSize: 11 } });
+        }
+        specs.push(
+          { type: 'button', windowId: this.windowId, text: 'Remove', style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 } },
+          { type: 'button', windowId: this.windowId, text: 'Block', style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 } },
         );
+
+        const { widgetIds: contactRowWidgets } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs })
+        );
+
+        let idx = 0;
+        const nameId = contactRowWidgets[idx++];
+        const stateId = contactRowWidgets[idx++];
+        const connBtnId = contactRowWidgets[idx++];
+        const introBtnId = isConnected ? contactRowWidgets[idx++] : undefined;
+        const delBtnId = contactRowWidgets[idx++];
+        const blockBtnId = contactRowWidgets[idx++];
+
         await this.request(request(this.id, rowId, 'addLayoutChild', {
           widgetId: nameId,
           sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
           preferredSize: { height: 30 },
         }));
-
-        const stateColor = contact.state === 'connected' ? '#4caf50'
-          : contact.state === 'connecting' ? '#e8a84c'
-          : '#6b7084';
-        const stateId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createLabel', {
-            windowId: this.windowId, rect: r0, text: contact.state,
-            style: { color: stateColor, fontSize: 11 },
-          })
-        );
         await this.request(request(this.id, rowId, 'addLayoutChild', {
           widgetId: stateId,
           sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
           preferredSize: { width: 70, height: 30 },
         }));
-
-        const isConnected = contact.state === 'connected';
-        const connBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createButton', {
-            windowId: this.windowId, rect: r0,
-            text: isConnected ? 'Disconnect' : 'Connect',
-            style: isConnected
-              ? { fontSize: 11 }
-              : { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 },
-          })
-        );
         await this.request(request(this.id, connBtnId, 'addDependent', {}));
         await this.request(request(this.id, rowId, 'addLayoutChild', {
           widgetId: connBtnId,
@@ -630,13 +607,7 @@ export class PeerNetwork extends Abject {
         }));
         this.connectButtons.set(connBtnId, contact.peerId);
 
-        if (isConnected) {
-          const introBtnId = await this.request<AbjectId>(
-            request(this.id, this.widgetManagerId!, 'createButton', {
-              windowId: this.windowId, rect: r0, text: 'Introduce',
-              style: { background: '#1e2a3a', borderColor: '#5b9bd5', fontSize: 11 },
-            })
-          );
+        if (isConnected && introBtnId) {
           await this.request(request(this.id, introBtnId, 'addDependent', {}));
           await this.request(request(this.id, rowId, 'addLayoutChild', {
             widgetId: introBtnId,
@@ -646,12 +617,6 @@ export class PeerNetwork extends Abject {
           this.introduceButtons.set(introBtnId, contact.peerId);
         }
 
-        const delBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createButton', {
-            windowId: this.windowId, rect: r0, text: 'Remove',
-            style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 },
-          })
-        );
         await this.request(request(this.id, delBtnId, 'addDependent', {}));
         await this.request(request(this.id, rowId, 'addLayoutChild', {
           widgetId: delBtnId,
@@ -660,12 +625,6 @@ export class PeerNetwork extends Abject {
         }));
         this.removeButtons.set(delBtnId, contact.peerId);
 
-        const blockBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createButton', {
-            windowId: this.windowId, rect: r0, text: 'Block',
-            style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 },
-          })
-        );
         await this.request(request(this.id, blockBtnId, 'addDependent', {}));
         await this.request(request(this.id, rowId, 'addLayoutChild', {
           widgetId: blockBtnId,
@@ -680,11 +639,10 @@ export class PeerNetwork extends Abject {
     const tab2 = this.tabContents[2];
 
     // Signaling Server header
-    const sigHeaderId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Signaling Servers',
-        style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 },
-      })
+    const { widgetIds: [sigHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Signaling Servers', style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 } },
+      ] })
     );
     await this.request(request(this.id, tab2, 'addLayoutChild', {
       widgetId: sigHeaderId,
@@ -706,24 +664,21 @@ export class PeerNetwork extends Abject {
       preferredSize: { height: 32 },
     }));
 
-    this.signalingInputId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTextInput', {
-        windowId: this.windowId, rect: r0, placeholder: 'wss://signal.abject.world',
-      })
+    // Batch: signaling input + connect button
+    const { widgetIds: [_signalingInputId, _signalingConnectBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, placeholder: 'wss://signal.abject.world' },
+        { type: 'button', windowId: this.windowId, text: 'Connect', style: { background: '#1e3a2e', borderColor: '#4caf50' } },
+      ] })
     );
+    this.signalingInputId = _signalingInputId;
+    this.signalingConnectBtnId = _signalingConnectBtnId;
     await this.request(request(this.id, this.signalingInputId, 'addDependent', {}));
     await this.request(request(this.id, sigRowId, 'addLayoutChild', {
       widgetId: this.signalingInputId,
       sizePolicy: { horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
-
-    this.signalingConnectBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Connect',
-        style: { background: '#1e3a2e', borderColor: '#4caf50' },
-      })
-    );
     await this.request(request(this.id, this.signalingConnectBtnId, 'addDependent', {}));
     await this.request(request(this.id, sigRowId, 'addLayoutChild', {
       widgetId: this.signalingConnectBtnId,
@@ -758,39 +713,28 @@ export class PeerNetwork extends Abject {
       const urlColor = status === 'connected' ? '#4caf50'
         : status === 'connecting' ? '#e8a84c'
         : '#ff6b6b';
-      const urlLabelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId, rect: r0, text: url,
-          style: { color: urlColor, fontSize: 12 },
-        })
+      const statusText = status === 'connected' ? 'connected'
+        : status === 'connecting' ? 'connecting...'
+        : 'offline';
+
+      // Batch: url label + status label + remove button
+      const { widgetIds: [urlLabelId, statusLabelId, removeBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: url, style: { color: urlColor, fontSize: 12 } },
+          { type: 'label', windowId: this.windowId, text: statusText, style: { color: urlColor, fontSize: 11 } },
+          { type: 'button', windowId: this.windowId, text: 'Remove', style: { fontSize: 11 } },
+        ] })
       );
       await this.request(request(this.id, serverRowId, 'addLayoutChild', {
         widgetId: urlLabelId,
         sizePolicy: { horizontal: 'expanding', vertical: 'fixed' },
         preferredSize: { height: 28 },
       }));
-
-      const statusText = status === 'connected' ? 'connected'
-        : status === 'connecting' ? 'connecting...'
-        : 'offline';
-      const statusLabelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId, rect: r0, text: statusText,
-          style: { color: urlColor, fontSize: 11 },
-        })
-      );
       await this.request(request(this.id, serverRowId, 'addLayoutChild', {
         widgetId: statusLabelId,
         sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
         preferredSize: { width: 80, height: 28 },
       }));
-
-      const removeBtnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createButton', {
-          windowId: this.windowId, rect: r0, text: 'Remove',
-          style: { fontSize: 11 },
-        })
-      );
       await this.request(request(this.id, removeBtnId, 'addDependent', {}));
       await this.request(request(this.id, serverRowId, 'addLayoutChild', {
         widgetId: removeBtnId,
@@ -816,11 +760,10 @@ export class PeerNetwork extends Abject {
     if (signalingPeers.length > 0) {
       await this.addDivider(tab2);
 
-      const spHeaderId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId, rect: r0, text: 'Signaling Peers',
-          style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 },
-        })
+      const { widgetIds: [spHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: 'Signaling Peers', style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 } },
+        ] })
       );
       await this.request(request(this.id, tab2, 'addLayoutChild', {
         widgetId: spHeaderId,
@@ -845,24 +788,19 @@ export class PeerNetwork extends Abject {
         }));
 
         const displayName = sp.name || sp.peerId.slice(0, 12) + '...';
-        const spNameId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createLabel', {
-            windowId: this.windowId, rect: r0, text: displayName,
-            style: { color: '#b4b8c8', fontSize: 12 },
-          })
+
+        // Batch: name label + add button
+        const { widgetIds: [spNameId, addBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs: [
+            { type: 'label', windowId: this.windowId, text: displayName, style: { color: '#b4b8c8', fontSize: 12 } },
+            { type: 'button', windowId: this.windowId, text: 'Add', style: { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 } },
+          ] })
         );
         await this.request(request(this.id, spRowId, 'addLayoutChild', {
           widgetId: spNameId,
           sizePolicy: { horizontal: 'expanding', vertical: 'fixed' },
           preferredSize: { height: 28 },
         }));
-
-        const addBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createButton', {
-            windowId: this.windowId, rect: r0, text: 'Add',
-            style: { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 },
-          })
-        );
         await this.request(request(this.id, addBtnId, 'addDependent', {}));
         await this.request(request(this.id, spRowId, 'addLayoutChild', {
           widgetId: addBtnId,
@@ -905,26 +843,21 @@ export class PeerNetwork extends Abject {
     if (connectedContacts.length > 0 || networkPeers.length > 0 || discoveryStats.cacheSize > 0) {
       await this.addDivider(tab2);
 
-      const netHeaderId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId, rect: r0, text: 'Network Peers',
-          style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 },
-        })
+      const hasSignaling = await this.hasSignalingServer();
+      const meshStatus = `Mesh: ${contacts.filter(c => c.state === 'connected').length + networkPeers.length} direct, ${discoveryStats.cacheSize} discoverable${!hasSignaling && networkPeers.length > 0 ? ' | Relay active' : ''}`;
+
+      // Batch: network header + mesh status (2 adjacent labels)
+      const { widgetIds: [netHeaderId, meshStatusId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: 'Network Peers', style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 } },
+          { type: 'label', windowId: this.windowId, text: meshStatus, style: { color: '#8b8fa3', fontSize: 11 } },
+        ] })
       );
       await this.request(request(this.id, tab2, 'addLayoutChild', {
         widgetId: netHeaderId,
         sizePolicy: { vertical: 'fixed' },
         preferredSize: { height: 20 },
       }));
-
-      const hasSignaling = await this.hasSignalingServer();
-      const meshStatus = `Mesh: ${contacts.filter(c => c.state === 'connected').length + networkPeers.length} direct, ${discoveryStats.cacheSize} discoverable${!hasSignaling && networkPeers.length > 0 ? ' | Relay active' : ''}`;
-      const meshStatusId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId, rect: r0, text: meshStatus,
-          style: { color: '#8b8fa3', fontSize: 11 },
-        })
-      );
       await this.request(request(this.id, tab2, 'addLayoutChild', {
         widgetId: meshStatusId,
         sizePolicy: { vertical: 'fixed' },
@@ -946,37 +879,24 @@ export class PeerNetwork extends Abject {
           preferredSize: { height: 30 },
         }));
 
-        const cNameId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createLabel', {
-            windowId: this.windowId, rect: r0,
-            text: contact.name || contact.peerId.slice(0, 12) + '...',
-            style: { color: '#b4b8c8', fontSize: 12 },
-          })
+        // Batch: name label + tag label + block button
+        const { widgetIds: [cNameId, cTagId, cBlockBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs: [
+            { type: 'label', windowId: this.windowId, text: contact.name || contact.peerId.slice(0, 12) + '...', style: { color: '#b4b8c8', fontSize: 12 } },
+            { type: 'label', windowId: this.windowId, text: 'contact', style: { color: '#4caf50', fontSize: 11 } },
+            { type: 'button', windowId: this.windowId, text: 'Block', style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 } },
+          ] })
         );
         await this.request(request(this.id, cRowId, 'addLayoutChild', {
           widgetId: cNameId,
           sizePolicy: { horizontal: 'expanding', vertical: 'fixed' },
           preferredSize: { height: 30 },
         }));
-
-        const cTagId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createLabel', {
-            windowId: this.windowId, rect: r0, text: 'contact',
-            style: { color: '#4caf50', fontSize: 11 },
-          })
-        );
         await this.request(request(this.id, cRowId, 'addLayoutChild', {
           widgetId: cTagId,
           sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
           preferredSize: { width: 50, height: 30 },
         }));
-
-        const cBlockBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createButton', {
-            windowId: this.windowId, rect: r0, text: 'Block',
-            style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 },
-          })
-        );
         await this.request(request(this.id, cBlockBtnId, 'addDependent', {}));
         await this.request(request(this.id, cRowId, 'addLayoutChild', {
           widgetId: cBlockBtnId,
@@ -1000,38 +920,27 @@ export class PeerNetwork extends Abject {
           preferredSize: { height: 30 },
         }));
 
-        const npNameId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createLabel', {
-            windowId: this.windowId, rect: r0,
-            text: netPeer.name || netPeer.peerId.slice(0, 12) + '...',
-            style: { color: '#b4b8c8', fontSize: 12 },
-          })
+        const duration = this.formatDuration(Date.now() - netPeer.connectedAt);
+
+        // Batch: name label + duration label + trust button + block button
+        const { widgetIds: [npNameId, durationId, promoteBtnId, npBlockBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs: [
+            { type: 'label', windowId: this.windowId, text: netPeer.name || netPeer.peerId.slice(0, 12) + '...', style: { color: '#b4b8c8', fontSize: 12 } },
+            { type: 'label', windowId: this.windowId, text: duration, style: { color: '#6b7084', fontSize: 11 } },
+            { type: 'button', windowId: this.windowId, text: 'Trust', style: { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 } },
+            { type: 'button', windowId: this.windowId, text: 'Block', style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 } },
+          ] })
         );
         await this.request(request(this.id, npRowId, 'addLayoutChild', {
           widgetId: npNameId,
           sizePolicy: { horizontal: 'expanding', vertical: 'fixed' },
           preferredSize: { height: 30 },
         }));
-
-        const duration = this.formatDuration(Date.now() - netPeer.connectedAt);
-        const durationId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createLabel', {
-            windowId: this.windowId, rect: r0, text: duration,
-            style: { color: '#6b7084', fontSize: 11 },
-          })
-        );
         await this.request(request(this.id, npRowId, 'addLayoutChild', {
           widgetId: durationId,
           sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
           preferredSize: { width: 50, height: 30 },
         }));
-
-        const promoteBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createButton', {
-            windowId: this.windowId, rect: r0, text: 'Trust',
-            style: { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 },
-          })
-        );
         await this.request(request(this.id, promoteBtnId, 'addDependent', {}));
         await this.request(request(this.id, npRowId, 'addLayoutChild', {
           widgetId: promoteBtnId,
@@ -1039,13 +948,6 @@ export class PeerNetwork extends Abject {
           preferredSize: { width: 60, height: 28 },
         }));
         this.promoteButtons.set(promoteBtnId, netPeer.peerId);
-
-        const npBlockBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createButton', {
-            windowId: this.windowId, rect: r0, text: 'Block',
-            style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 },
-          })
-        );
         await this.request(request(this.id, npBlockBtnId, 'addDependent', {}));
         await this.request(request(this.id, npRowId, 'addLayoutChild', {
           widgetId: npBlockBtnId,
@@ -1069,11 +971,10 @@ export class PeerNetwork extends Abject {
     if (blockedPeers.length > 0) {
       await this.addDivider(tab2);
 
-      const blockedHeaderId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId, rect: r0, text: 'Blocked Peers',
-          style: { color: '#ff6b6b', fontWeight: 'bold', fontSize: 13 },
-        })
+      const { widgetIds: [blockedHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: 'Blocked Peers', style: { color: '#ff6b6b', fontWeight: 'bold', fontSize: 13 } },
+        ] })
       );
       await this.request(request(this.id, tab2, 'addLayoutChild', {
         widgetId: blockedHeaderId,
@@ -1095,25 +996,18 @@ export class PeerNetwork extends Abject {
           preferredSize: { height: 28 },
         }));
 
-        const bNameId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createLabel', {
-            windowId: this.windowId, rect: r0,
-            text: bPeerId.slice(0, 16) + '...',
-            style: { color: '#6b7084', fontSize: 12 },
-          })
+        // Batch: name label + unblock button
+        const { widgetIds: [bNameId, unblockBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs: [
+            { type: 'label', windowId: this.windowId, text: bPeerId.slice(0, 16) + '...', style: { color: '#6b7084', fontSize: 12 } },
+            { type: 'button', windowId: this.windowId, text: 'Unblock', style: { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 } },
+          ] })
         );
         await this.request(request(this.id, bRowId, 'addLayoutChild', {
           widgetId: bNameId,
           sizePolicy: { horizontal: 'expanding', vertical: 'fixed' },
           preferredSize: { height: 28 },
         }));
-
-        const unblockBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createButton', {
-            windowId: this.windowId, rect: r0, text: 'Unblock',
-            style: { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 },
-          })
-        );
         await this.request(request(this.id, unblockBtnId, 'addDependent', {}));
         await this.request(request(this.id, bRowId, 'addLayoutChild', {
           widgetId: unblockBtnId,
@@ -1140,11 +1034,10 @@ export class PeerNetwork extends Abject {
     }
 
     // Introductions header
-    const introHeaderId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Pending Introductions',
-        style: { color: '#5b9bd5', fontWeight: 'bold', fontSize: 13 },
-      })
+    const { widgetIds: [introHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Pending Introductions', style: { color: '#5b9bd5', fontWeight: 'bold', fontSize: 13 } },
+      ] })
     );
     await this.request(request(this.id, tab3, 'addLayoutChild', {
       widgetId: introHeaderId,
@@ -1153,11 +1046,10 @@ export class PeerNetwork extends Abject {
     }));
 
     if (pendingIntros.length === 0) {
-      const emptyIntroId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId, rect: r0, text: 'No pending introductions.',
-          style: { color: '#b4b8c8', fontSize: 12 },
-        })
+      const { widgetIds: [emptyIntroId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: 'No pending introductions.', style: { color: '#b4b8c8', fontSize: 12 } },
+        ] })
       );
       await this.request(request(this.id, tab3, 'addLayoutChild', {
         widgetId: emptyIntroId,
@@ -1182,25 +1074,20 @@ export class PeerNetwork extends Abject {
         const introName = intro.name || intro.peerId.slice(0, 12) + '...';
         const fromContact = contacts.find(c => c.peerId === intro.fromPeerId);
         const fromName = fromContact?.name || intro.fromPeerId.slice(0, 12) + '...';
-        const introLabel = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createLabel', {
-            windowId: this.windowId, rect: r0,
-            text: `${introName} (from ${fromName})`,
-            style: { color: '#e2e4e9', fontSize: 12 },
-          })
+
+        // Batch: intro label + accept button + reject button
+        const { widgetIds: [introLabel, acceptBtnId, rejectBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs: [
+            { type: 'label', windowId: this.windowId, text: `${introName} (from ${fromName})`, style: { color: '#e2e4e9', fontSize: 12 } },
+            { type: 'button', windowId: this.windowId, text: 'Accept', style: { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 } },
+            { type: 'button', windowId: this.windowId, text: 'Reject', style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 } },
+          ] })
         );
         await this.request(request(this.id, introRowId, 'addLayoutChild', {
           widgetId: introLabel,
           sizePolicy: { horizontal: 'expanding', vertical: 'fixed' },
           preferredSize: { height: 30 },
         }));
-
-        const acceptBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createButton', {
-            windowId: this.windowId, rect: r0, text: 'Accept',
-            style: { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 },
-          })
-        );
         await this.request(request(this.id, acceptBtnId, 'addDependent', {}));
         await this.request(request(this.id, introRowId, 'addLayoutChild', {
           widgetId: acceptBtnId,
@@ -1208,13 +1095,6 @@ export class PeerNetwork extends Abject {
           preferredSize: { width: 65, height: 28 },
         }));
         this.acceptIntroButtons.set(acceptBtnId, intro.peerId);
-
-        const rejectBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createButton', {
-            windowId: this.windowId, rect: r0, text: 'Reject',
-            style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 },
-          })
-        );
         await this.request(request(this.id, rejectBtnId, 'addDependent', {}));
         await this.request(request(this.id, introRowId, 'addLayoutChild', {
           widgetId: rejectBtnId,
@@ -1275,10 +1155,10 @@ export class PeerNetwork extends Abject {
   }
 
   private async addDivider(containerId: AbjectId): Promise<void> {
-    const divId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createDivider', {
-        windowId: this.windowId, rect: { x: 0, y: 0, width: 0, height: 0 },
-      })
+    const { widgetIds: [divId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'divider', windowId: this.windowId },
+      ] })
     );
     await this.request(request(this.id, containerId, 'addLayoutChild', {
       widgetId: divId,

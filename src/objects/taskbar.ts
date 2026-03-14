@@ -285,31 +285,45 @@ export class Taskbar extends Abject {
     const btnW = 100;
     const btnH = 30;
     const activeStyle = { background: '#2d3154', borderColor: '#e8a84c' };
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
 
-    for (const obj of showableObjects) {
-      if (!existingTargets.has(obj.id)) {
-        let vis = false;
-        try {
-          const state = await this.request<{ visible?: boolean }>(
-            request(this.id, obj.id, 'getState', {})
-          );
-          vis = !!state?.visible;
-        } catch { /* ignore */ }
+    const newObjects = showableObjects.filter(obj => !existingTargets.has(obj.id));
+    if (newObjects.length > 0) {
+      // Query visibility in parallel
+      const visResults = await Promise.all(
+        newObjects.map(async (obj) => {
+          try {
+            const state = await this.request<{ visible?: boolean }>(
+              request(this.id, obj.id, 'getState', {})
+            );
+            return !!state?.visible;
+          } catch { return false; }
+        })
+      );
 
-        const btnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createButton', {
-            windowId: this.windowId, rect: r0, text: obj.manifest.name,
-            ...(vis ? { style: activeStyle } : {}),
-          })
-        );
-        await this.request(request(this.id, btnId, 'addDependent', {}));
-        await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
-          widgetId: btnId,
-          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-          preferredSize: { width: btnW, height: btnH },
-        }));
-        this.userObjButtons.set(btnId, obj.id);
+      // Batch create buttons
+      const specs = newObjects.map((obj, i) => ({
+        type: 'button' as const,
+        windowId: this.windowId!,
+        text: obj.manifest.name,
+        ...(visResults[i] ? { style: activeStyle } : {}),
+      }));
+
+      const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs })
+      );
+
+      // Batch add to layout
+      const children = widgetIds.map(id => ({
+        widgetId: id,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { width: btnW, height: btnH },
+      }));
+      await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChildren', { children }));
+
+      // Track and fire-and-forget addDep
+      for (let i = 0; i < newObjects.length; i++) {
+        this.userObjButtons.set(widgetIds[i], newObjects[i].id);
+        this.send(request(this.id, widgetIds[i], 'addDependent', {}));
       }
     }
 
@@ -455,8 +469,6 @@ export class Taskbar extends Abject {
       })
     );
 
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-
     // Create root VBox layout (vertical stack)
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
@@ -478,54 +490,6 @@ export class Taskbar extends Abject {
 
     const activeStyle = { background: '#2d3154', borderColor: '#e8a84c' };
 
-    // Helper to add a fixed-size button to the layout
-    const addBtn = async (text: string, active = false, style?: Record<string, unknown>): Promise<AbjectId> => {
-      const btnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createButton', {
-          windowId: this.windowId, rect: r0, text,
-          ...(style ? { style } : active ? { style: activeStyle } : {}),
-        })
-      );
-      await this.request(
-        request(this.id, btnId, 'addDependent', {})
-      );
-      await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
-        widgetId: btnId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { width: btnW, height: btnH },
-      }));
-      return btnId;
-    };
-
-    // Helper to add a section label to the layout
-    const addSectionLabel = async (text: string): Promise<void> => {
-      const labelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId, rect: r0, text,
-          style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
-        })
-      );
-      await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
-        widgetId: labelId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { width: btnW, height: labelH },
-      }));
-    };
-
-    // Helper to add a divider to the layout
-    const addDivider = async (): Promise<void> => {
-      const divId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createDivider', {
-          windowId: this.windowId, rect: r0,
-        })
-      );
-      await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
-        widgetId: divId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { width: btnW, height: dividerH },
-      }));
-    };
-
     // ── Apps section header row: "■ Apps" label + gear button ──
     const appsHeaderRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
@@ -540,73 +504,131 @@ export class Taskbar extends Abject {
       preferredSize: { height: labelH },
     }));
 
-    const appsLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: '\u25A0 Apps',
-        style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
-      })
-    );
-    await this.request(request(this.id, appsHeaderRowId, 'addLayoutChild', {
-      widgetId: appsLabelId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: labelH },
-    }));
-
-    // Query app explorer visibility for gear button style
-    const registryVis = await isVisible(this.appExplorerId!);
-
-    this.registryBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: '\u2699',
-        style: { fontSize: 13, ...(registryVis ? activeStyle : {}) },
-      })
-    );
-    await this.request(request(this.id, this.registryBtnId, 'addDependent', {}));
-    await this.request(request(this.id, appsHeaderRowId, 'addLayoutChild', {
-      widgetId: this.registryBtnId,
-      sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-      preferredSize: { width: 24, height: labelH },
-    }));
-
-    // Query visibility of system objects
+    // Query visibility of all system objects in parallel
     const visPromises: Promise<boolean>[] = [
+      isVisible(this.appExplorerId!),
       isVisible(this.chatId!),
       isVisible(this.jobBrowserId!),
       isVisible(this.objectManagerId!),
     ];
     if (this.webBrowserViewerId) visPromises.push(isVisible(this.webBrowserViewerId));
-    const visResults = await Promise.all(visPromises);
-    const [chatVis, jobsVis, objectManagerVis] = visResults;
-    let visIdx = 3;
-    const browserViewerVis = this.webBrowserViewerId ? visResults[visIdx++] : false;
+
+    // Query showable object visibility in parallel
+    const showableVisPromises = showableObjects.map(obj => isVisible(obj.id));
+
+    const [visResults, showableVisResults] = await Promise.all([
+      Promise.all(visPromises),
+      Promise.all(showableVisPromises),
+    ]);
+    const [registryVis, chatVis, jobsVis, objectManagerVis] = visResults;
+    const browserViewerVis = this.webBrowserViewerId ? visResults[4] : false;
 
     log.info(`visibility: registry=${registryVis} chat=${chatVis} jobs=${jobsVis} processes=${objectManagerVis} browser=${browserViewerVis}`);
 
-    // System buttons
-    this.chatBtnId = await addBtn('Chat', chatVis);
-    this.jobsBtnId = await addBtn('Jobs', jobsVis);
-    this.objectManagerBtnId = await addBtn('Processes', objectManagerVis);
+    // Batch create all widgets: header label, gear button, system buttons, user buttons, minimize section
+    const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
+
+    // 0: Apps header label
+    specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A0 Apps', style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } });
+    // 1: Gear button
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13, ...(registryVis ? activeStyle : {}) } });
+    // 2: Chat button
+    specs.push({ type: 'button', windowId: this.windowId!, text: 'Chat', ...(chatVis ? { style: activeStyle } : {}) });
+    // 3: Jobs button
+    specs.push({ type: 'button', windowId: this.windowId!, text: 'Jobs', ...(jobsVis ? { style: activeStyle } : {}) });
+    // 4: Processes button
+    specs.push({ type: 'button', windowId: this.windowId!, text: 'Processes', ...(objectManagerVis ? { style: activeStyle } : {}) });
+    // 5?: Browser button (optional)
     if (this.webBrowserViewerId) {
-      this.browserViewerBtnId = await addBtn('Browser', browserViewerVis);
+      specs.push({ type: 'button', windowId: this.windowId!, text: 'Browser', ...(browserViewerVis ? { style: activeStyle } : {}) });
     }
-
-    // Dynamic buttons for user-created objects with show/hide
-    for (const obj of showableObjects) {
-      const vis = await isVisible(obj.id);
-      const btnId = await addBtn(obj.manifest.name, vis);
-      this.userObjButtons.set(btnId, obj.id);
+    // User object buttons
+    const userObjStartIdx = specs.length;
+    for (let i = 0; i < showableObjects.length; i++) {
+      const vis = showableVisResults[i];
+      specs.push({ type: 'button', windowId: this.windowId!, text: showableObjects[i].manifest.name, ...(vis ? { style: activeStyle } : {}) });
     }
-
-    // ── Windows section (only when there are minimized windows) ──
+    // Minimized window section
+    const minimizedStartIdx = specs.length;
     if (minimizedCount > 0) {
-      await addDivider();
-      await addSectionLabel('\u25A1 Windows');
+      specs.push({ type: 'divider', windowId: this.windowId!, text: '' });
+      specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A1 Windows', style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } });
+      for (const [, { title }] of this.minimizedWindows) {
+        specs.push({ type: 'button', windowId: this.windowId!, text: title });
+      }
     }
 
-    // Minimized window restore buttons
-    for (const [surfaceId, { title }] of this.minimizedWindows) {
-      const btnId = await addBtn(title);
-      this.restoreButtons.set(btnId, surfaceId);
+    // One batch create for all widgets
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs })
+    );
+
+    // Assign IDs
+    const appsLabelId = widgetIds[0];
+    this.registryBtnId = widgetIds[1];
+    this.chatBtnId = widgetIds[2];
+    this.jobsBtnId = widgetIds[3];
+    this.objectManagerBtnId = widgetIds[4];
+    let nextIdx = 5;
+    if (this.webBrowserViewerId) {
+      this.browserViewerBtnId = widgetIds[nextIdx++];
+    }
+
+    // Map user object buttons
+    for (let i = 0; i < showableObjects.length; i++) {
+      this.userObjButtons.set(widgetIds[userObjStartIdx + i], showableObjects[i].id);
+    }
+
+    // Add header row children
+    await this.request(request(this.id, appsHeaderRowId, 'addLayoutChildren', {
+      children: [
+        { widgetId: appsLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: labelH } },
+        { widgetId: this.registryBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } },
+      ],
+    }));
+
+    // Build root layout children: all system buttons + user buttons
+    const rootChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize: Record<string, number> }> = [];
+    const allButtonIds = [this.chatBtnId, this.jobsBtnId, this.objectManagerBtnId];
+    if (this.browserViewerBtnId) allButtonIds.push(this.browserViewerBtnId);
+    for (const btnId of allButtonIds) {
+      rootChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
+    }
+    for (let i = 0; i < showableObjects.length; i++) {
+      rootChildren.push({ widgetId: widgetIds[userObjStartIdx + i], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
+    }
+
+    // Minimized section
+    if (minimizedCount > 0) {
+      let mIdx = minimizedStartIdx;
+      rootChildren.push({ widgetId: widgetIds[mIdx++], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: dividerH } }); // divider
+      rootChildren.push({ widgetId: widgetIds[mIdx++], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: labelH } }); // label
+      let surfaceIdx = 0;
+      for (const [surfaceId] of this.minimizedWindows) {
+        const btnId = widgetIds[mIdx + surfaceIdx];
+        this.restoreButtons.set(btnId, surfaceId);
+        rootChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
+        surfaceIdx++;
+      }
+    }
+
+    // Batch add all to root layout
+    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChildren', {
+      children: rootChildren,
+    }));
+
+    // Fire-and-forget: register as dependent for all interactive buttons
+    this.send(request(this.id, this.registryBtnId, 'addDependent', {}));
+    for (const btnId of allButtonIds) {
+      this.send(request(this.id, btnId, 'addDependent', {}));
+    }
+    for (let i = 0; i < showableObjects.length; i++) {
+      this.send(request(this.id, widgetIds[userObjStartIdx + i], 'addDependent', {}));
+    }
+    if (minimizedCount > 0) {
+      for (const [btnId] of this.restoreButtons) {
+        this.send(request(this.id, btnId, 'addDependent', {}));
+      }
     }
 
     return true;

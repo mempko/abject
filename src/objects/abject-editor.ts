@@ -184,8 +184,6 @@ export class AbjectEditor extends Abject {
       })
     );
 
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-
     // Create root VBox layout
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
@@ -195,30 +193,6 @@ export class AbjectEditor extends Abject {
       })
     );
 
-    // Object name label
-    const nameLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: `Source: ${objectName}`,
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: nameLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-
-    // TextArea with source code (expanding both axes)
-    this.sourceEditorId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTextArea', {
-        windowId: this.windowId, rect: r0, text: source, monospace: true,
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.sourceEditorId,
-      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
-      stretch: 1,
-    }));
-
     // Button row (HBox: Save, Cancel)
     const btnRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
@@ -227,50 +201,48 @@ export class AbjectEditor extends Abject {
         spacing: 8,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: btnRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
 
-    this.saveBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Save',
-        style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
+    // Batch create all widgets
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          { type: 'label', windowId: this.windowId, text: `Source: ${objectName}` },
+          { type: 'textArea', windowId: this.windowId, text: source, monospace: true },
+          { type: 'button', windowId: this.windowId, text: 'Save',
+            style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' } },
+          { type: 'button', windowId: this.windowId, text: 'Cancel' },
+          { type: 'label', windowId: this.windowId, text: '' },
+        ],
       })
     );
-    await this.addDep(this.saveBtnId);
-    await this.request(request(this.id, btnRowId, 'addLayoutChild', {
-      widgetId: this.saveBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 80, height: 32 },
+    const [nameLabelId, sourceEditorId, saveBtnId, cancelBtnId, editStatusId] = widgetIds;
+    this.sourceEditorId = sourceEditorId;
+    this.saveBtnId = saveBtnId;
+    this.cancelBtnId = cancelBtnId;
+    this.editStatusId = editStatusId;
+
+    // Add widgets to root layout
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChildren', {
+      children: [
+        { widgetId: nameLabelId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 } },
+        { widgetId: this.sourceEditorId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' }, stretch: 1 },
+        { widgetId: btnRowId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 32 } },
+        { widgetId: this.editStatusId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 } },
+      ],
     }));
 
-    this.cancelBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Cancel',
-      })
-    );
-    await this.addDep(this.cancelBtnId);
-    await this.request(request(this.id, btnRowId, 'addLayoutChild', {
-      widgetId: this.cancelBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 80, height: 32 },
+    // Add buttons to button row
+    await this.request(request(this.id, btnRowId, 'addLayoutChildren', {
+      children: [
+        { widgetId: this.saveBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 80, height: 32 } },
+        { widgetId: this.cancelBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 80, height: 32 } },
+      ],
     }));
-
     await this.request(request(this.id, btnRowId, 'addLayoutSpacer', {}));
 
-    // Status label
-    this.editStatusId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: '',
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.editStatusId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
+    // Register as dependent for interactive widgets
+    await this.addDep(this.saveBtnId);
+    await this.addDep(this.cancelBtnId);
 
     return true;
   }

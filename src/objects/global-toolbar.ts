@@ -196,8 +196,6 @@ export class GlobalToolbar extends Abject {
       })
     );
 
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-
     // Create root VBox layout
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
@@ -207,40 +205,37 @@ export class GlobalToolbar extends Abject {
       })
     );
 
-    // Section label
-    const labelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: '\u2699 System',
-        style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
+    // Batch create all widgets: section label + 3 buttons
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          { type: 'label', windowId: this.windowId!, text: '\u2699 System', style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } },
+          { type: 'button', windowId: this.windowId!, text: 'Settings' },
+          { type: 'button', windowId: this.windowId!, text: 'Network' },
+          { type: 'button', windowId: this.windowId!, text: 'Explorer' },
+        ],
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: labelId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { width: btnW, height: labelH },
+
+    const labelId = widgetIds[0];
+    this.settingsBtnId = widgetIds[1];
+    this.networkBtnId = widgetIds[2];
+    this.explorerBtnId = widgetIds[3];
+
+    // Batch add all to layout
+    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChildren', {
+      children: [
+        { widgetId: labelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: labelH } },
+        { widgetId: this.settingsBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
+        { widgetId: this.networkBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
+        { widgetId: this.explorerBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
+      ],
     }));
 
-    // Helper to add a fixed-size button
-    const addBtn = async (text: string): Promise<AbjectId> => {
-      const btnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createButton', {
-          windowId: this.windowId, rect: r0, text,
-        })
-      );
-      await this.request(
-        request(this.id, btnId, 'addDependent', {})
-      );
-      await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
-        widgetId: btnId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { width: btnW, height: btnH },
-      }));
-      return btnId;
-    };
-
-    this.settingsBtnId = await addBtn('Settings');
-    this.networkBtnId = await addBtn('Network');
-    this.explorerBtnId = await addBtn('Explorer');
+    // Fire-and-forget: register as dependent for all buttons
+    this.send(request(this.id, this.settingsBtnId, 'addDependent', {}));
+    this.send(request(this.id, this.networkBtnId, 'addDependent', {}));
+    this.send(request(this.id, this.explorerBtnId, 'addDependent', {}));
 
     return true;
   }

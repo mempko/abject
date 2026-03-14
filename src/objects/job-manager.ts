@@ -395,7 +395,7 @@ Jobs run in a FIFO queue. Inside job code you have access to:
 ### Inspect jobs
 
   const jobs = await call(await dep('JobManager'), 'listJobs', {});
-  // jobs: [{ jobId, description, status, queue, submittedAt, completedAt?, result?, error? }]
+  // jobs: [{ jobId, description, status, queue, queuedAt, startedAt?, completedAt?, result?, error? }]
 
   const job = await call(await dep('JobManager'), 'getJob', { jobId: 'job-1' });
 

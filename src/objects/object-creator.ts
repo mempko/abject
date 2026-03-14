@@ -447,7 +447,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
 
 ### IMPORTANT
 - The interface ID is 'abjects:object-creator' (NOT 'abjects:objectcreator').
-- create is a long-running operation — call progress() before invoking it if available.
+- create is a long-running operation (may take 30-60 seconds). ObjectCreator emits 'progress' events during creation.
 - The returned objectId is ready to use immediately. Do NOT look it up in the registry or call init().
 - The returned objectId can be called directly — interface IDs are resolved automatically.`;
   }
@@ -2132,33 +2132,34 @@ async getState(msg) {
       this.dep('WidgetManager'), 'createWindowAbject',
       { title: 'Greeter', rect: { x: 100, y: 100, width: 350, height: 200 }, resizable: true });
 
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-
     const layoutId = await this.call(
       this.dep('WidgetManager'), 'createVBox',
       { windowId: this._windowId, margins: { top: 16, right: 16, bottom: 16, left: 16 }, spacing: 8 });
 
-    this._inputId = await this.call(
-      this.dep('WidgetManager'), 'createTextInput',
-      { windowId: this._windowId, rect: r0, placeholder: 'Enter your name...' });
-    await this.call(layoutId, 'addLayoutChild',
-      { widgetId: this._inputId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 36 } });
+    // Batch create all widgets in one request
+    const { widgetIds } = await this.call(
+      this.dep('WidgetManager'), 'create',
+      { specs: [
+        { type: 'textInput', windowId: this._windowId, placeholder: 'Enter your name...' },
+        { type: 'button', windowId: this._windowId, text: 'Greet' },
+        { type: 'label', windowId: this._windowId, text: '' },
+      ] });
+    this._inputId = widgetIds[0];
+    this._buttonId = widgetIds[1];
+    this._labelId = widgetIds[2];
 
-    this._buttonId = await this.call(
-      this.dep('WidgetManager'), 'createButton',
-      { windowId: this._windowId, rect: r0, text: 'Greet' });
     await this.call(this._buttonId, 'addDependent', {});
-    await this.call(layoutId, 'addLayoutChild',
-      { widgetId: this._buttonId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-        preferredSize: { width: 100, height: 36 } });
 
-    this._labelId = await this.call(
-      this.dep('WidgetManager'), 'createLabel',
-      { windowId: this._windowId, rect: r0, text: '' });
-    await this.call(layoutId, 'addLayoutChild',
-      { widgetId: this._labelId, sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 20 } });
+    // Batch add all to layout
+    await this.call(layoutId, 'addLayoutChildren',
+      { children: [
+        { widgetId: this._inputId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 36 } },
+        { widgetId: this._buttonId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+          preferredSize: { width: 100, height: 36 } },
+        { widgetId: this._labelId, sizePolicy: { vertical: 'fixed' },
+          preferredSize: { height: 20 } },
+      ] });
 
     return true;
   },

@@ -636,10 +636,6 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
         spacing: 4,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.messageLogId,
-      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
-    }));
 
     // Input row (HBox: TextInput + Send button)
     this.inputRowId = await this.request<AbjectId>(
@@ -649,48 +645,38 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
         spacing: 8,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.inputRowId,
-      sizePolicy: { vertical: 'preferred', horizontal: 'expanding' },
-      preferredSize: { height: 36 },
+
+    // Add layouts to root
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChildren', {
+      children: [
+        { widgetId: this.messageLogId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+        { widgetId: this.inputRowId, sizePolicy: { vertical: 'preferred', horizontal: 'expanding' }, preferredSize: { height: 36 } },
+      ],
     }));
 
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-
-    // Text input (expanding, with word wrap)
-    this.textInputId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTextInput', {
-        windowId: this.windowId,
-        rect: r0,
-        placeholder: 'Type a message...',
-        wordWrap: true,
-        maxLines: 6,
+    // Batch create text input + send button
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          { type: 'textInput', windowId: this.windowId, placeholder: 'Type a message...', wordWrap: true, maxLines: 6 },
+          { type: 'button', windowId: this.windowId, text: 'Send', style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' } },
+        ],
       })
     );
-    await this.request(request(this.id, this.inputRowId, 'addLayoutChild', {
-      widgetId: this.textInputId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: 36 },
+    this.textInputId = widgetIds[0];
+    this.sendBtnId = widgetIds[1];
+
+    // Batch add to input row
+    await this.request(request(this.id, this.inputRowId, 'addLayoutChildren', {
+      children: [
+        { widgetId: this.textInputId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 36 } },
+        { widgetId: this.sendBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 60, height: 36 } },
+      ],
     }));
 
-    // Send button (fixed)
-    this.sendBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId,
-        rect: r0,
-        text: 'Send',
-        style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
-      })
-    );
-    await this.request(request(this.id, this.inputRowId, 'addLayoutChild', {
-      widgetId: this.sendBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 60, height: 36 },
-    }));
-
-    // Register as dependent of interactive widgets
-    await this.request(request(this.id, this.sendBtnId, 'addDependent', {}));
-    await this.request(request(this.id, this.textInputId, 'addDependent', {}));
+    // Fire-and-forget: register as dependent of interactive widgets
+    this.send(request(this.id, this.sendBtnId, 'addDependent', {}));
+    this.send(request(this.id, this.textInputId, 'addDependent', {}));
 
     this.uiPhase = 'idle';
 
@@ -930,19 +916,17 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
     if (!this.messageLogId || !this.windowId) return '' as AbjectId;
 
     const displayText = prefix ? `${prefix}: ${text}` : text;
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
     const fontSize = 13;
     const lineHeight = fontSize + 4;
     const availableWidth = WIN_W - 32 - 8; // margins + scrollbar
     const lineCount = estimateWrappedLineCount(displayText, availableWidth, fontSize);
     const estimatedHeight = Math.max(20, lineCount * lineHeight + 4);
 
-    const labelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId,
-        rect: r0,
-        text: displayText,
-        style: { color, fontSize, wordWrap: true },
+    const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          { type: 'label', windowId: this.windowId, text: displayText, style: { color, fontSize, wordWrap: true } },
+        ],
       })
     );
     await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
@@ -983,15 +967,15 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
 
   private async clearMessageLabels(): Promise<void> {
     if (!this.messageLogId) return;
+
+    // Clear layout in one request
+    try {
+      await this.request(request(this.id, this.messageLogId, 'clearLayoutChildren', {}));
+    } catch { /* may already be gone */ }
+
+    // Fire-and-forget destroy all labels
     for (const labelId of this.messageLabelIds) {
-      try {
-        await this.request(request(this.id, this.messageLogId, 'removeLayoutChild', {
-          widgetId: labelId,
-        }));
-      } catch { /* may already be gone */ }
-      try {
-        await this.request(request(this.id, labelId, 'destroy', {}));
-      } catch { /* already gone */ }
+      this.send(request(this.id, labelId, 'destroy', {}));
     }
     this.messageLabelIds = [];
   }

@@ -154,8 +154,6 @@ export class WebBrowserViewer extends Abject {
       })
     );
 
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-
     // Root VBox
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
@@ -165,63 +163,39 @@ export class WebBrowserViewer extends Abject {
       })
     );
 
-    // TabBar (fixed 36px)
-    this.tabBarId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTabBar', {
-        windowId: this.windowId,
-        rect: r0,
-        tabs: [],
-        selectedIndex: 0,
+    // Batch create non-canvas widgets
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          { type: 'tabBar', windowId: this.windowId, tabs: [], selectedIndex: 0 },
+          { type: 'label', windowId: this.windowId, text: '', style: { color: '#8b8fa3', fontSize: 11 } },
+          { type: 'label', windowId: this.windowId, text: 'No browser pages open', style: { color: '#6b7084', fontSize: 11 } },
+        ],
       })
     );
-    await this.request(request(this.id, this.tabBarId, 'addDependent', {}));
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.tabBarId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 36 },
-    }));
+    this.tabBarId = widgetIds[0];
+    this.urlLabelId = widgetIds[1];
+    this.statusLabelId = widgetIds[2];
 
-    // URL label (fixed 22px)
-    this.urlLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId,
-        rect: r0,
-        text: '',
-        style: { color: '#8b8fa3', fontSize: 11 },
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.urlLabelId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 22 },
-    }));
-
-    // Canvas (expanding)
+    // Canvas (expanding) — kept separate due to special creation
     this.canvasId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createCanvas', {
         windowId: this.windowId,
         inputTargetId: this.id,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.canvasId,
-      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+
+    // Add all to root layout
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChildren', {
+      children: [
+        { widgetId: this.tabBarId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 36 } },
+        { widgetId: this.urlLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 22 } },
+        { widgetId: this.canvasId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+        { widgetId: this.statusLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 20 } },
+      ],
     }));
 
-    // Status label (fixed 20px)
-    this.statusLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId,
-        rect: r0,
-        text: 'No browser pages open',
-        style: { color: '#6b7084', fontSize: 11 },
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.statusLabelId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 20 },
-    }));
+    await this.request(request(this.id, this.tabBarId, 'addDependent', {}));
 
     // Subscribe to WebBrowser for page events
     if (this.webBrowserId) {

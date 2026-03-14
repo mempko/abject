@@ -311,8 +311,6 @@ export class AppExplorer extends Abject {
       resizable: true,
     });
 
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-
     // Root VBox
     this.rootLayoutId = await wm('createVBox', {
       windowId: this.windowId,
@@ -336,48 +334,59 @@ export class AppExplorer extends Abject {
     });
     await this.addToLayout(paneHBox, this.kindPaneVBoxId, { horizontal: 'expanding' }, { width: 200 });
 
-    // "User Apps" label
-    const userLabel = await wm('createLabel', {
-      windowId: this.windowId, rect: r0, text: 'User Apps',
-      style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
-    });
-    await this.addToLayout(this.kindPaneVBoxId, userLabel, { vertical: 'fixed' }, { height: 20 });
-
-    // User kind list (searchable)
-    this.userKindListId = await wm('createList', {
-      windowId: this.windowId, rect: r0, items: [], searchable: true,
-    });
-    await this.addDep(this.userKindListId);
-    await this.addToLayout(this.kindPaneVBoxId, this.userKindListId, { vertical: 'expanding' });
-
-    // "System" label
-    const sysLabel = await wm('createLabel', {
-      windowId: this.windowId, rect: r0, text: 'System',
-      style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
-    });
-    await this.addToLayout(this.kindPaneVBoxId, sysLabel, { vertical: 'fixed' }, { height: 20 });
-
-    // System kind list
-    this.systemKindListId = await wm('createList', {
-      windowId: this.windowId, rect: r0, items: [],
-    });
-    await this.addDep(this.systemKindListId);
-    await this.addToLayout(this.kindPaneVBoxId, this.systemKindListId, { vertical: 'expanding' });
-
-    // ── Pane 2: Instance list ──
-    this.instanceListId = await wm('createList', {
-      windowId: this.windowId, rect: r0, items: [],
-    });
-    await this.addDep(this.instanceListId);
-    await this.addToLayout(paneHBox, this.instanceListId, { horizontal: 'expanding' }, { width: 220 });
-
     // ── Pane 3: Detail (scrollable VBox, like ObjectBrowser pane 4) ──
     this.detailPaneId = await wm('createNestedScrollableVBox', {
       parentLayoutId: paneHBox,
       margins: { top: 4, right: 8, bottom: 4, left: 8 },
       spacing: 4,
     });
+
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+    const windowId = this.windowId;
+
+    // ── Batch create all non-layout widgets ──
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          // [0] "User Apps" label
+          { type: 'label', windowId, rect: r0, text: 'User Apps',
+            style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } },
+          // [1] User kind list (searchable)
+          { type: 'list', windowId, rect: r0, items: [], searchable: true },
+          // [2] "System" label
+          { type: 'label', windowId, rect: r0, text: 'System',
+            style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } },
+          // [3] System kind list
+          { type: 'list', windowId, rect: r0, items: [] },
+          // [4] Instance list
+          { type: 'list', windowId, rect: r0, items: [] },
+        ],
+      })
+    );
+
+    const [userLabel, userKindList, sysLabel, systemKindList, instanceList] = widgetIds;
+    this.userKindListId = userKindList;
+    this.systemKindListId = systemKindList;
+    this.instanceListId = instanceList;
+
+    // ── Batch add kind-pane widgets to their layout ──
+    await this.request(request(this.id, this.kindPaneVBoxId, 'addLayoutChildren', {
+      children: [
+        { widgetId: userLabel, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 } },
+        { widgetId: this.userKindListId, sizePolicy: { vertical: 'expanding' } },
+        { widgetId: sysLabel, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 } },
+        { widgetId: this.systemKindListId, sizePolicy: { vertical: 'expanding' } },
+      ],
+    }));
+
+    // ── Add instance list and detail pane to paneHBox ──
+    await this.addToLayout(paneHBox, this.instanceListId, { horizontal: 'expanding' }, { width: 220 });
     await this.addToLayout(paneHBox, this.detailPaneId, { horizontal: 'expanding' }, { width: 300 });
+
+    // Fire-and-forget addDep for interactive lists
+    this.send(request(this.id, this.userKindListId, 'addDependent', {}));
+    this.send(request(this.id, this.systemKindListId, 'addDependent', {}));
+    this.send(request(this.id, this.instanceListId, 'addDependent', {}));
 
     // Populate kind list
     await this.rebuildKindList();
@@ -470,19 +479,12 @@ export class AppExplorer extends Abject {
   private async rebuildDetailPane(): Promise<void> {
     if (!this.detailPaneId || !this.windowId) return;
 
-    const wm = async (method: string, params: Record<string, unknown>) =>
-      this.request<AbjectId>(request(this.id, this.widgetManagerId!, method, params));
-
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-
-    // Destroy old detail content widgets
+    // Fire-and-forget destroy old detail widgets
     for (const wid of this.detailWidgetIds) {
-      try { await this.request(request(this.id, wid, 'destroy', {})); }
-      catch { /* gone */ }
+      this.send(request(this.id, wid, 'destroy', {}));
     }
     for (const [btnId] of this.detailButtonIds) {
-      try { await this.request(request(this.id, btnId, 'destroy', {})); }
-      catch { /* gone */ }
+      this.send(request(this.id, btnId, 'destroy', {}));
     }
     this.detailWidgetIds = [];
     this.detailButtonIds.clear();
@@ -491,129 +493,170 @@ export class AppExplorer extends Abject {
       await this.request(request(this.id, this.detailPaneId, 'clearLayoutChildren', {}));
     } catch { /* best effort */ }
 
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+    const windowId = this.windowId;
+
     // No selection → placeholder
     if (this.selectedInstanceIndex < 0 || this.selectedInstanceIndex >= this.instanceEntries.length) {
-      const placeholderId = await wm('createLabel', {
-        windowId: this.windowId, rect: r0,
-        text: 'Select an instance to view details.',
-        style: { color: '#6b7084', fontSize: 12 },
-      });
+      const { widgetIds: [placeholderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', {
+          specs: [
+            { type: 'label', windowId, rect: r0,
+              text: 'Select an instance to view details.',
+              style: { color: '#6b7084', fontSize: 12 } },
+          ],
+        })
+      );
       this.detailWidgetIds.push(placeholderId);
-      await this.addToLayout(this.detailPaneId, placeholderId, { vertical: 'fixed' }, { height: 20 });
+      await this.request(request(this.id, this.detailPaneId, 'addLayoutChildren', {
+        children: [
+          { widgetId: placeholderId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 } },
+        ],
+      }));
       return;
     }
 
     const inst = this.instanceEntries[this.selectedInstanceIndex];
     const manifest = inst.manifest;
+    const hasSource = (inst as unknown as { source?: string }).source !== undefined;
+
+    // Build label specs (non-button detail widgets)
+    type LabelSpec = {
+      type: 'label';
+      windowId: AbjectId;
+      rect: { x: number; y: number; width: number; height: number };
+      text: string;
+      style: Record<string, unknown>;
+    };
+    type ButtonSpec = {
+      type: 'button';
+      windowId: AbjectId;
+      rect: { x: number; y: number; width: number; height: number };
+      text: string;
+      style: Record<string, unknown>;
+      action: string;
+    };
+    type WidgetSpec = LabelSpec | ButtonSpec;
+
+    const specs: WidgetSpec[] = [];
 
     // Name (bold)
-    const nameId = await wm('createLabel', {
-      windowId: this.windowId, rect: r0,
+    specs.push({ type: 'label', windowId, rect: r0,
       text: manifest.name,
-      style: { color: '#e2e4e9', fontSize: 13, fontWeight: 'bold' },
-    });
-    this.detailWidgetIds.push(nameId);
-    await this.addToLayout(this.detailPaneId, nameId, { vertical: 'fixed' }, { height: 20 });
+      style: { color: '#e2e4e9', fontSize: 13, fontWeight: 'bold' } });
 
     // Description
     if (manifest.description) {
-      const descId = await wm('createLabel', {
-        windowId: this.windowId, rect: r0,
+      specs.push({ type: 'label', windowId, rect: r0,
         text: manifest.description,
-        style: { color: '#b4b8c8', fontSize: 11 },
-      });
-      this.detailWidgetIds.push(descId);
-      await this.addToLayout(this.detailPaneId, descId, { vertical: 'fixed' }, { height: 18 });
+        style: { color: '#b4b8c8', fontSize: 11 } });
     }
 
     // Version
     if (manifest.version) {
-      const verId = await wm('createLabel', {
-        windowId: this.windowId, rect: r0,
+      specs.push({ type: 'label', windowId, rect: r0,
         text: `Version: ${manifest.version}`,
-        style: { color: '#8b8fa3', fontSize: 11 },
-      });
-      this.detailWidgetIds.push(verId);
-      await this.addToLayout(this.detailPaneId, verId, { vertical: 'fixed' }, { height: 16 });
+        style: { color: '#8b8fa3', fontSize: 11 } });
     }
 
     // Tags
     const tags = manifest.tags ?? [];
     if (tags.length > 0) {
-      const tagsId = await wm('createLabel', {
-        windowId: this.windowId, rect: r0,
+      specs.push({ type: 'label', windowId, rect: r0,
         text: `Tags: ${tags.join(', ')}`,
-        style: { color: '#8b8fa3', fontSize: 11 },
-      });
-      this.detailWidgetIds.push(tagsId);
-      await this.addToLayout(this.detailPaneId, tagsId, { vertical: 'fixed' }, { height: 16 });
+        style: { color: '#8b8fa3', fontSize: 11 } });
     }
 
     // Methods
     const iface = manifest.interface;
     if (iface && 'methods' in iface && Array.isArray(iface.methods) && iface.methods.length > 0) {
       const methodNames = iface.methods.map((m: { name: string }) => `${m.name}()`).join(', ');
-      const methodsId = await wm('createLabel', {
-        windowId: this.windowId, rect: r0,
+      specs.push({ type: 'label', windowId, rect: r0,
         text: `Methods: ${methodNames}`,
-        style: { color: '#8b8fa3', fontSize: 11 },
-      });
-      this.detailWidgetIds.push(methodsId);
-      await this.addToLayout(this.detailPaneId, methodsId, { vertical: 'fixed' }, { height: 16 });
+        style: { color: '#8b8fa3', fontSize: 11 } });
     }
 
-    // ── Actions separator ──
-    const sepId = await wm('createLabel', {
-      windowId: this.windowId, rect: r0,
+    // Actions separator
+    specs.push({ type: 'label', windowId, rect: r0,
       text: '─── Actions',
-      style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
-    });
-    this.detailWidgetIds.push(sepId);
-    await this.addToLayout(this.detailPaneId, sepId, { vertical: 'fixed' }, { height: 20 });
+      style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } });
 
-    // Browse button (always visible)
-    await this.addDetailButton(wm, r0, 'Browse', 'browse');
-
-    const hasSource = (inst as unknown as { source?: string }).source !== undefined;
+    // Browse button (always)
+    specs.push({ type: 'button', windowId, rect: r0,
+      text: 'Browse', style: { fontSize: 12 }, action: 'browse' });
 
     if (this.isRemote) {
-      // Remote: "Clone to Local" if object has source
       if (hasSource) {
-        await this.addDetailButton(wm, r0, 'Clone to Local', 'cloneToLocal');
+        specs.push({ type: 'button', windowId, rect: r0,
+          text: 'Clone to Local', style: { fontSize: 12 }, action: 'cloneToLocal' });
       }
     } else {
-      // Local: Edit Source (if scriptable with source and editor available)
       if (hasSource) {
         const editorId = await this.findAbjectEditor();
         if (editorId) {
-          await this.addDetailButton(wm, r0, 'Edit Source', 'editSource');
+          specs.push({ type: 'button', windowId, rect: r0,
+            text: 'Edit Source', style: { fontSize: 12 }, action: 'editSource' });
         }
       }
       if (!this.selectedKindIsSystem) {
-        // Local user apps: Clone and Delete
-        await this.addDetailButton(wm, r0, 'Clone', 'clone');
-        await this.addDetailButton(wm, r0, 'Delete', 'delete',
-          { background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' });
+        specs.push({ type: 'button', windowId, rect: r0,
+          text: 'Clone', style: { fontSize: 12 }, action: 'clone' });
+        specs.push({ type: 'button', windowId, rect: r0,
+          text: 'Delete',
+          style: { fontSize: 12, background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' },
+          action: 'delete' });
       }
     }
-  }
 
-  private async addDetailButton(
-    wm: (method: string, params: Record<string, unknown>) => Promise<AbjectId>,
-    r0: Record<string, number>,
-    text: string,
-    action: string,
-    extraStyle?: Record<string, string>,
-  ): Promise<void> {
-    if (!this.detailPaneId) return;
-    const btnId = await wm('createButton', {
-      windowId: this.windowId, rect: r0, text,
-      style: { fontSize: 12, ...extraStyle },
+    // Strip out local `action` field before sending to create
+    const batchSpecs = specs.map(s => {
+      const { action: _action, ...rest } = s as ButtonSpec;
+      return rest;
     });
-    await this.addDep(btnId);
-    this.detailButtonIds.set(btnId, action);
-    this.detailWidgetIds.push(btnId);
-    await this.addToLayout(this.detailPaneId, btnId, { vertical: 'fixed', horizontal: 'fixed' }, { width: 120, height: 28 });
+
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: batchSpecs })
+    );
+
+    // Build layout children and track buttons
+    type LayoutChild = {
+      widgetId: AbjectId;
+      sizePolicy: { vertical: string; horizontal?: string };
+      preferredSize?: { width?: number; height?: number };
+    };
+    const layoutChildren: LayoutChild[] = [];
+
+    for (let i = 0; i < specs.length; i++) {
+      const spec = specs[i];
+      const wid = widgetIds[i];
+      this.detailWidgetIds.push(wid);
+
+      if (spec.type === 'button') {
+        this.detailButtonIds.set(wid, (spec as ButtonSpec).action);
+        this.send(request(this.id, wid, 'addDependent', {}));
+        layoutChildren.push({
+          widgetId: wid,
+          sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+          preferredSize: { width: 120, height: 28 },
+        });
+      } else {
+        // Determine height based on label role
+        let height = 16;
+        if (spec.text === manifest.name) height = 20;
+        else if (manifest.description && spec.text === manifest.description) height = 18;
+        else if (spec.text === '─── Actions') height = 20;
+
+        layoutChildren.push({
+          widgetId: wid,
+          sizePolicy: { vertical: 'fixed' },
+          preferredSize: { height },
+        });
+      }
+    }
+
+    await this.request(request(this.id, this.detailPaneId, 'addLayoutChildren', {
+      children: layoutChildren,
+    }));
   }
 
   // ═══════════════════════════════════════════════════════════════════

@@ -339,8 +339,6 @@ export class GlobalSettings extends Abject {
       })
     );
 
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-
     // Create root VBox layout
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
@@ -368,41 +366,30 @@ export class GlobalSettings extends Abject {
       );
     }
 
-    // Section header: "LLM Provider"
-    const sectionHeaderId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'LLM Provider',
-        style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
-      })
+    // Section header + description + provider dropdown
+    const selectedIndex = PROVIDER_NAMES.indexOf(this.selectedProvider);
+    const { widgetIds: [sectionHeaderId, descLabelId, providerSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'LLM Provider',
+          style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 } },
+        { type: 'label', windowId: this.windowId, text: 'Select your LLM provider and enter credentials.',
+          style: { color: '#b4b8c8', fontSize: 12 } },
+        { type: 'select', windowId: this.windowId,
+          options: PROVIDER_LABELS,
+          selectedIndex: selectedIndex >= 0 ? selectedIndex : 0 },
+      ]})
     );
+    this.providerSelectId = providerSelectId;
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: sectionHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 24 },
     }));
-
-    // Description
-    const descLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Select your LLM provider and enter credentials.',
-        style: { color: '#b4b8c8', fontSize: 12 },
-      })
-    );
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: descLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
     }));
-
-    // Provider dropdown
-    const selectedIndex = PROVIDER_NAMES.indexOf(this.selectedProvider);
-    this.providerSelectId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createSelect', {
-        windowId: this.windowId, rect: r0,
-        options: PROVIDER_LABELS,
-        selectedIndex: selectedIndex >= 0 ? selectedIndex : 0,
-      })
-    );
     await this.request(request(this.id, this.providerSelectId, 'addDependent', {}));
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: this.providerSelectId,
@@ -413,11 +400,11 @@ export class GlobalSettings extends Abject {
     // ── Anthropic section ──
     this.anthropicSectionIds = [];
 
-    const anthropicLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'API Key',
-        style: { color: '#e2e4e9', fontSize: 13 },
-      })
+    const { widgetIds: [anthropicLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'API Key',
+          style: { color: '#e2e4e9', fontSize: 13 } },
+      ]})
     );
     this.anthropicSectionIds.push(anthropicLabelId);
     await this.request(request(this.id, cId, 'addLayoutChild', {
@@ -440,24 +427,21 @@ export class GlobalSettings extends Abject {
       preferredSize: { height: 32 },
     }));
 
-    this.anthropicKeyId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTextInput', {
-        windowId: this.windowId, rect: r0, placeholder: 'sk-ant-...', masked: true,
-        text: savedAnthropicKey ?? undefined,
-      })
+    const { widgetIds: [anthropicKeyId, anthropicToggleId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, placeholder: 'sk-ant-...', masked: true,
+          text: savedAnthropicKey ?? undefined },
+        { type: 'button', windowId: this.windowId, text: 'Show' },
+      ]})
     );
+    this.anthropicKeyId = anthropicKeyId;
+    this.anthropicToggleId = anthropicToggleId;
     await this.request(request(this.id, this.anthropicKeyId, 'addDependent', {}));
     await this.request(request(this.id, anthropicRowId, 'addLayoutChild', {
       widgetId: this.anthropicKeyId,
       sizePolicy: { horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
-
-    this.anthropicToggleId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Show',
-      })
-    );
     await this.request(request(this.id, this.anthropicToggleId, 'addDependent', {}));
     await this.request(request(this.id, anthropicRowId, 'addLayoutChild', {
       widgetId: this.anthropicToggleId,
@@ -468,11 +452,11 @@ export class GlobalSettings extends Abject {
     // ── OpenAI section ──
     this.openaiSectionIds = [];
 
-    const openaiLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'API Key',
-        style: { color: '#e2e4e9', fontSize: 13 },
-      })
+    const { widgetIds: [openaiLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'API Key',
+          style: { color: '#e2e4e9', fontSize: 13 } },
+      ]})
     );
     this.openaiSectionIds.push(openaiLabelId);
     await this.request(request(this.id, cId, 'addLayoutChild', {
@@ -495,24 +479,21 @@ export class GlobalSettings extends Abject {
       preferredSize: { height: 32 },
     }));
 
-    this.openaiKeyId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTextInput', {
-        windowId: this.windowId, rect: r0, placeholder: 'sk-...', masked: true,
-        text: savedOpenaiKey ?? undefined,
-      })
+    const { widgetIds: [openaiKeyId, openaiToggleId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, placeholder: 'sk-...', masked: true,
+          text: savedOpenaiKey ?? undefined },
+        { type: 'button', windowId: this.windowId, text: 'Show' },
+      ]})
     );
+    this.openaiKeyId = openaiKeyId;
+    this.openaiToggleId = openaiToggleId;
     await this.request(request(this.id, this.openaiKeyId, 'addDependent', {}));
     await this.request(request(this.id, openaiRowId, 'addLayoutChild', {
       widgetId: this.openaiKeyId,
       sizePolicy: { horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
-
-    this.openaiToggleId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Show',
-      })
-    );
     await this.request(request(this.id, this.openaiToggleId, 'addDependent', {}));
     await this.request(request(this.id, openaiRowId, 'addLayoutChild', {
       widgetId: this.openaiToggleId,
@@ -523,26 +504,22 @@ export class GlobalSettings extends Abject {
     // ── Ollama section ──
     this.ollamaSectionIds = [];
 
-    const ollamaLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Base URL',
-        style: { color: '#e2e4e9', fontSize: 13 },
-      })
+    const { widgetIds: [ollamaLabelId, ollamaUrlId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Base URL',
+          style: { color: '#e2e4e9', fontSize: 13 } },
+        { type: 'textInput', windowId: this.windowId, placeholder: 'http://localhost:11434',
+          text: savedOllamaUrl || 'http://localhost:11434' },
+      ]})
     );
+    this.ollamaUrlId = ollamaUrlId;
     this.ollamaSectionIds.push(ollamaLabelId);
+    this.ollamaSectionIds.push(this.ollamaUrlId);
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: ollamaLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
-
-    this.ollamaUrlId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTextInput', {
-        windowId: this.windowId, rect: r0, placeholder: 'http://localhost:11434',
-        text: savedOllamaUrl || 'http://localhost:11434',
-      })
-    );
-    this.ollamaSectionIds.push(this.ollamaUrlId);
     await this.request(request(this.id, this.ollamaUrlId, 'addDependent', {}));
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: this.ollamaUrlId,
@@ -569,12 +546,13 @@ export class GlobalSettings extends Abject {
 
     await this.request(request(this.id, saveRowId, 'addLayoutSpacer', {}));
 
-    this.saveBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Save Provider',
-        style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
-      })
+    const { widgetIds: [saveBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Save Provider',
+          style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' } },
+      ]})
     );
+    this.saveBtnId = saveBtnId;
     await this.request(request(this.id, this.saveBtnId, 'addDependent', {}));
     await this.request(request(this.id, saveRowId, 'addLayoutChild', {
       widgetId: this.saveBtnId,
@@ -584,25 +562,19 @@ export class GlobalSettings extends Abject {
 
     // ── Auth section ──────────────────────────────────────────────────
 
-    // Divider before auth
-    const authDividerId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createDivider', {
-        windowId: this.windowId, rect: r0,
-      })
+    // Divider + auth section header
+    const { widgetIds: [authDividerId, authHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'divider', windowId: this.windowId },
+        { type: 'label', windowId: this.windowId, text: 'Authentication',
+          style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 } },
+      ]})
     );
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: authDividerId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 12 },
     }));
-
-    // Section header: "Authentication"
-    const authHeaderId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Authentication',
-        style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 },
-      })
-    );
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: authHeaderId,
       sizePolicy: { vertical: 'fixed' },
@@ -640,13 +612,14 @@ export class GlobalSettings extends Abject {
       preferredSize: { height: 28 },
     }));
 
-    this.authCheckboxId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createCheckbox', {
-        windowId: this.windowId, rect: r0,
-        checked: savedAuthEnabled,
-        text: 'Require login',
-      })
+    const { widgetIds: [authCheckboxId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'checkbox', windowId: this.windowId,
+          checked: savedAuthEnabled,
+          text: 'Require login' },
+      ]})
     );
+    this.authCheckboxId = authCheckboxId;
     await this.request(request(this.id, this.authCheckboxId, 'addDependent', {}));
     await this.request(request(this.id, authEnableRowId, 'addLayoutChild', {
       widgetId: this.authCheckboxId,
@@ -654,27 +627,22 @@ export class GlobalSettings extends Abject {
       preferredSize: { height: 28 },
     }));
 
-    // Username label
-    const authUserLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Username',
-        style: { color: '#e2e4e9', fontSize: 13 },
-      })
+    // Username label + input
+    const { widgetIds: [authUserLabelId, authUserInputId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Username',
+          style: { color: '#e2e4e9', fontSize: 13 } },
+        { type: 'textInput', windowId: this.windowId, placeholder: 'Username',
+          text: savedAuthUser || undefined,
+          style: savedAuthEnabled ? undefined : { disabled: true } },
+      ]})
     );
+    this.authUserInputId = authUserInputId;
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: authUserLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
-
-    // Username input
-    this.authUserInputId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTextInput', {
-        windowId: this.windowId, rect: r0, placeholder: 'Username',
-        text: savedAuthUser || undefined,
-        style: savedAuthEnabled ? undefined : { disabled: true },
-      })
-    );
     await this.request(request(this.id, this.authUserInputId, 'addDependent', {}));
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: this.authUserInputId,
@@ -683,11 +651,11 @@ export class GlobalSettings extends Abject {
     }));
 
     // Password label
-    const authPassLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId, rect: r0, text: 'Password',
-        style: { color: '#e2e4e9', fontSize: 13 },
-      })
+    const { widgetIds: [authPassLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Password',
+          style: { color: '#e2e4e9', fontSize: 13 } },
+      ]})
     );
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: authPassLabelId,
@@ -709,26 +677,23 @@ export class GlobalSettings extends Abject {
       preferredSize: { height: 32 },
     }));
 
-    this.authPassInputId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTextInput', {
-        windowId: this.windowId, rect: r0, placeholder: 'Password', masked: true,
-        text: savedAuthPass || undefined,
-        style: savedAuthEnabled ? undefined : { disabled: true },
-      })
+    const { widgetIds: [authPassInputId, authPassToggleId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, placeholder: 'Password', masked: true,
+          text: savedAuthPass || undefined,
+          style: savedAuthEnabled ? undefined : { disabled: true } },
+        { type: 'button', windowId: this.windowId, text: 'Show',
+          style: savedAuthEnabled ? undefined : { disabled: true } },
+      ]})
     );
+    this.authPassInputId = authPassInputId;
+    this.authPassToggleId = authPassToggleId;
     await this.request(request(this.id, this.authPassInputId, 'addDependent', {}));
     await this.request(request(this.id, authPassRowId, 'addLayoutChild', {
       widgetId: this.authPassInputId,
       sizePolicy: { horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
-
-    this.authPassToggleId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Show',
-        style: savedAuthEnabled ? undefined : { disabled: true },
-      })
-    );
     await this.request(request(this.id, this.authPassToggleId, 'addDependent', {}));
     await this.request(request(this.id, authPassRowId, 'addLayoutChild', {
       widgetId: this.authPassToggleId,
@@ -752,12 +717,13 @@ export class GlobalSettings extends Abject {
 
     await this.request(request(this.id, authSaveRowId, 'addLayoutSpacer', {}));
 
-    this.authSaveBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId, rect: r0, text: 'Save Auth',
-        style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
-      })
+    const { widgetIds: [authSaveBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Save Auth',
+          style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' } },
+      ]})
     );
+    this.authSaveBtnId = authSaveBtnId;
     await this.request(request(this.id, this.authSaveBtnId, 'addDependent', {}));
     await this.request(request(this.id, authSaveRowId, 'addLayoutChild', {
       widgetId: this.authSaveBtnId,
@@ -768,12 +734,13 @@ export class GlobalSettings extends Abject {
     // Spacer + status label
     await this.request(request(this.id, cId, 'addLayoutSpacer', {}));
 
-    this.statusLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId!, rect: r0, text: '',
-        style: { color: '#b4b8c8', fontSize: 12, align: 'right' },
-      })
+    const { widgetIds: [statusLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId!, text: '',
+          style: { color: '#b4b8c8', fontSize: 12, align: 'right' } },
+      ]})
     );
+    this.statusLabelId = statusLabelId;
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: this.statusLabelId,
       sizePolicy: { vertical: 'fixed' },

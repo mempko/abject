@@ -374,8 +374,6 @@ export class ObjectManager extends Abject {
     }
     this.clearViewTracking();
 
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-
     // Root VBox
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
@@ -399,11 +397,19 @@ export class ObjectManager extends Abject {
       preferredSize: { height: 30 },
     }));
 
-    this.searchInputId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createTextInput', {
-        windowId: this.windowId!, rect: r0, placeholder: 'Search objects...',
+    const { widgetIds: [searchId, refreshId, summaryId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          { type: 'textInput', windowId: this.windowId!, placeholder: 'Search objects...' },
+          { type: 'button', windowId: this.windowId!, text: 'Refresh', style: { fontSize: 12 } },
+          { type: 'label', windowId: this.windowId!, text: '', style: { color: '#6b7084', fontSize: 11 } },
+        ],
       })
     );
+    this.searchInputId = searchId;
+    this.refreshBtnId = refreshId;
+    this.summaryLabelId = summaryId;
+
     await this.addDep(this.searchInputId);
     await this.request(request(this.id, topBarId, 'addLayoutChild', {
       widgetId: this.searchInputId,
@@ -411,26 +417,12 @@ export class ObjectManager extends Abject {
       preferredSize: { height: 30 },
     }));
 
-    this.refreshBtnId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createButton', {
-        windowId: this.windowId!, rect: r0, text: 'Refresh',
-        style: { fontSize: 12 },
-      })
-    );
     await this.addDep(this.refreshBtnId);
     await this.request(request(this.id, topBarId, 'addLayoutChild', {
       widgetId: this.refreshBtnId,
       sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
       preferredSize: { width: 70, height: 30 },
     }));
-
-    // ── Summary label ──
-    this.summaryLabelId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createLabel', {
-        windowId: this.windowId!, rect: r0, text: '',
-        style: { color: '#6b7084', fontSize: 11 },
-      })
-    );
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: this.summaryLabelId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
@@ -452,24 +444,25 @@ export class ObjectManager extends Abject {
     }));
 
     const headerStyle = { color: '#6b7084', fontSize: 11, fontWeight: 'bold' };
-    const addHeaderLabel = async (text: string, width?: number): Promise<void> => {
-      const labelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId!, rect: r0, text, style: headerStyle,
-        })
-      );
+    const headerTexts = ['Name', 'ID', 'State', 'Location', 'Actions'];
+    const headerWidths: Array<number | undefined> = [undefined, 70, 70, 80, 110];
+
+    const { widgetIds: headerLabelIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: headerTexts.map((text) => ({
+          type: 'label' as const, windowId: this.windowId!, text, style: headerStyle,
+        })),
+      })
+    );
+
+    for (let h = 0; h < headerLabelIds.length; h++) {
+      const width = headerWidths[h];
       await this.request(request(this.id, headerRowId, 'addLayoutChild', {
-        widgetId: labelId,
+        widgetId: headerLabelIds[h],
         sizePolicy: { vertical: 'fixed', horizontal: width ? 'fixed' : 'expanding' },
         preferredSize: width ? { width, height: 20 } : { height: 20 },
       }));
-    };
-
-    await addHeaderLabel('Name');
-    await addHeaderLabel('ID', 70);
-    await addHeaderLabel('State', 70);
-    await addHeaderLabel('Location', 80);
-    await addHeaderLabel('Actions', 110);
+    }
 
     // ── Scrollable list ──
     this.scrollableListId = await this.request<AbjectId>(
@@ -544,7 +537,6 @@ export class ObjectManager extends Abject {
       } catch { /* widget gone */ }
     }
 
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
     const rowH = 26;
 
     for (let i = 0; i < filteredRows.length; i++) {
@@ -563,57 +555,47 @@ export class ObjectManager extends Abject {
         preferredSize: { height: rowH },
       }));
 
+      // Batch-create the 4 data labels for each row
+      const shortId = row.id.slice(0, 8);
+      const stateColor = STATE_COLORS[row.state] ?? '#6b7084';
+      const location = row.isWorker
+        ? `Worker ${row.workerIndex ?? '?'}`
+        : 'Main';
+
+      const { widgetIds: [nameLabelId, idLabelId, stateLabelId, locLabelId] } =
+        await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', {
+            specs: [
+              { type: 'label', windowId: this.windowId!, text: row.name, style: { fontSize: 12, color: '#e2e4e9' } },
+              { type: 'label', windowId: this.windowId!, text: shortId, style: { fontSize: 11, color: '#6b7084' } },
+              { type: 'label', windowId: this.windowId!, text: row.state, style: { fontSize: 11, color: stateColor } },
+              { type: 'label', windowId: this.windowId!, text: location, style: { fontSize: 11, color: '#8b8fa3' } },
+            ],
+          })
+        );
+
       // Name (expanding)
-      const nameLabelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId!, rect: r0, text: row.name,
-          style: { fontSize: 12, color: '#e2e4e9' },
-        })
-      );
       await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
         widgetId: nameLabelId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: rowH },
       }));
 
-      // ID — first 8 chars (fixed 70px)
-      const shortId = row.id.slice(0, 8);
-      const idLabelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId!, rect: r0, text: shortId,
-          style: { fontSize: 11, color: '#6b7084' },
-        })
-      );
+      // ID (fixed 70px)
       await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
         widgetId: idLabelId,
         sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
         preferredSize: { width: 70, height: rowH },
       }));
 
-      // State — color-coded (fixed 70px)
-      const stateColor = STATE_COLORS[row.state] ?? '#6b7084';
-      const stateLabelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId!, rect: r0, text: row.state,
-          style: { fontSize: 11, color: stateColor },
-        })
-      );
+      // State (fixed 70px)
       await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
         widgetId: stateLabelId,
         sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
         preferredSize: { width: 70, height: rowH },
       }));
 
-      // Location — "Main" or "Worker N" (fixed 80px)
-      const location = row.isWorker
-        ? `Worker ${row.workerIndex ?? '?'}`
-        : 'Main';
-      const locLabelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId!, rect: r0, text: location,
-          style: { fontSize: 11, color: '#8b8fa3' },
-        })
-      );
+      // Location (fixed 80px)
       await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
         widgetId: locLabelId,
         sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
@@ -622,10 +604,11 @@ export class ObjectManager extends Abject {
 
       // Actions (fixed 110px)
       if (row.isProtected) {
-        const protectedLabelId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createLabel', {
-            windowId: this.windowId!, rect: r0, text: 'protected',
-            style: { fontSize: 10, color: '#6b7084', fontStyle: 'italic' },
+        const { widgetIds: [protectedLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', {
+            specs: [
+              { type: 'label', windowId: this.windowId!, text: 'protected', style: { fontSize: 10, color: '#6b7084', fontStyle: 'italic' } },
+            ],
           })
         );
         await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
@@ -648,12 +631,15 @@ export class ObjectManager extends Abject {
           preferredSize: { width: 110, height: rowH },
         }));
 
-        const stopBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createButton', {
-            windowId: this.windowId!, rect: r0, text: 'Stop',
-            style: { fontSize: 10, background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' },
+        const { widgetIds: [stopBtnId, restartBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', {
+            specs: [
+              { type: 'button', windowId: this.windowId!, text: 'Stop', style: { fontSize: 10, background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' } },
+              { type: 'button', windowId: this.windowId!, text: 'Restart', style: { fontSize: 10 } },
+            ],
           })
         );
+
         await this.addDep(stopBtnId);
         this.stopButtons.set(stopBtnId, i);
         await this.request(request(this.id, actionsRowId, 'addLayoutChild', {
@@ -662,12 +648,6 @@ export class ObjectManager extends Abject {
           preferredSize: { height: rowH },
         }));
 
-        const restartBtnId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createButton', {
-            windowId: this.windowId!, rect: r0, text: 'Restart',
-            style: { fontSize: 10 },
-          })
-        );
         await this.addDep(restartBtnId);
         this.restartButtons.set(restartBtnId, i);
         await this.request(request(this.id, actionsRowId, 'addLayoutChild', {

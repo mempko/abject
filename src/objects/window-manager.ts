@@ -16,7 +16,7 @@ import { require as contractRequire } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 
-const log = new Log('DRAG-DEBUG');
+const log = new Log('WindowManager');
 import {
   Rect,
   TITLE_BAR_HEIGHT,

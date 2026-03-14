@@ -173,13 +173,7 @@ Numeric fields:
 
 ### Subscribing to Theme Changes
 
-Register as a dependent so you receive live updates when the theme changes:
-
-  await this.call(
-    this.dep('Theme'), 'addDependent',
-    { dependentId: this.id });
-
-Then handle the change notification:
+Theme broadcasts changes to all objects via the changed() event. Handle it like this:
 
   async changed(msg) {
     const { aspect, data } = msg.payload;

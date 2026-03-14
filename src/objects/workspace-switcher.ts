@@ -260,8 +260,6 @@ export class WorkspaceSwitcher extends Abject {
       })
     );
 
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-
     // Create root VBox layout
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
@@ -272,40 +270,6 @@ export class WorkspaceSwitcher extends Abject {
     );
 
     const wsActiveStyle = { background: '#1e3a2e', borderColor: '#4caf50' };
-
-    // Helper to add a fixed-size button to the layout
-    const addBtn = async (text: string, style?: Record<string, unknown>): Promise<AbjectId> => {
-      const btnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createButton', {
-          windowId: this.windowId, rect: r0, text,
-          ...(style ? { style } : {}),
-        })
-      );
-      await this.request(
-        request(this.id, btnId, 'addDependent', {})
-      );
-      await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
-        widgetId: btnId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { width: btnW, height: btnH },
-      }));
-      return btnId;
-    };
-
-    // Helper to add a section label
-    const addSectionLabel = async (text: string): Promise<void> => {
-      const labelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId, rect: r0, text,
-          style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
-        })
-      );
-      await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
-        widgetId: labelId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { width: btnW, height: labelH },
-      }));
-    };
 
     // Build workspace buttons
     if (hasWorkspaces) {
@@ -323,42 +287,63 @@ export class WorkspaceSwitcher extends Abject {
         preferredSize: { height: labelH },
       }));
 
-      const spacesHeaderLabelId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createLabel', {
-          windowId: this.windowId, rect: r0, text: '\u25C8 Spaces',
-          style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' },
-        })
-      );
-      await this.request(request(this.id, spacesHeaderRowId, 'addLayoutChild', {
-        widgetId: spacesHeaderLabelId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: labelH },
-      }));
-
-      this.settingsBtnId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createButton', {
-          windowId: this.windowId, rect: r0, text: '\u2699',
-          style: { fontSize: 13 },
-        })
-      );
-      await this.request(request(this.id, this.settingsBtnId, 'addDependent', {}));
-      await this.request(request(this.id, spacesHeaderRowId, 'addLayoutChild', {
-        widgetId: this.settingsBtnId,
-        sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-        preferredSize: { width: 24, height: labelH },
-      }));
-
+      // Batch create all widgets: header label, settings button, workspace buttons, +, Browse
+      const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
+      // 0: header label
+      specs.push({ type: 'label', windowId: this.windowId!, text: '\u25C8 Spaces', style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } });
+      // 1: settings gear button
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13 } });
+      // 2..N-1: workspace buttons
       for (const ws of workspaces) {
         const isActive = ws.id === this.cachedActiveWorkspaceId;
-        const btnId = await addBtn(ws.name, isActive ? wsActiveStyle : undefined);
-        this.workspaceSwitchButtons.set(btnId, ws.id);
+        specs.push({ type: 'button', windowId: this.windowId!, text: ws.name, ...(isActive ? { style: wsActiveStyle } : {}) });
+      }
+      // N: "+" button
+      specs.push({ type: 'button', windowId: this.windowId!, text: '+' });
+      // N+1: Browse button
+      specs.push({ type: 'button', windowId: this.windowId!, text: 'Browse' });
+
+      const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs })
+      );
+
+      const spacesHeaderLabelId = widgetIds[0];
+      this.settingsBtnId = widgetIds[1];
+
+      // Add header row children
+      await this.request(request(this.id, spacesHeaderRowId, 'addLayoutChildren', {
+        children: [
+          { widgetId: spacesHeaderLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: labelH } },
+          { widgetId: this.settingsBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } },
+        ],
+      }));
+
+      // Map workspace buttons and build root layout children
+      const rootChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize: Record<string, number> }> = [];
+      for (let i = 0; i < workspaces.length; i++) {
+        const btnId = widgetIds[2 + i];
+        this.workspaceSwitchButtons.set(btnId, workspaces[i].id);
+        rootChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
       }
 
-      // "+" button to create a new workspace
-      this.workspaceCreateBtnId = await addBtn('+');
+      this.workspaceCreateBtnId = widgetIds[2 + workspaces.length];
+      rootChildren.push({ widgetId: this.workspaceCreateBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
 
-      // Browse button to discover remote workspaces
-      this.browseBtnId = await addBtn('Browse');
+      this.browseBtnId = widgetIds[3 + workspaces.length];
+      rootChildren.push({ widgetId: this.browseBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
+
+      // Batch add all to root layout
+      await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChildren', {
+        children: rootChildren,
+      }));
+
+      // Fire-and-forget: register as dependent for all interactive buttons
+      this.send(request(this.id, this.settingsBtnId, 'addDependent', {}));
+      for (let i = 0; i < workspaces.length; i++) {
+        this.send(request(this.id, widgetIds[2 + i], 'addDependent', {}));
+      }
+      this.send(request(this.id, this.workspaceCreateBtnId, 'addDependent', {}));
+      this.send(request(this.id, this.browseBtnId, 'addDependent', {}));
     }
 
     return true;
