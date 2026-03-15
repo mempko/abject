@@ -116,7 +116,7 @@ export abstract class LayoutAbject extends WidgetAbject {
   protected margins: LayoutMargins;
   protected spacing: number;
   private hoveredLayoutChildId?: AbjectId;
-  private expandedChildren: Set<AbjectId> = new Set();
+  protected expandedChildren: Set<AbjectId> = new Set();
   protected hiddenChildren: Set<AbjectId> = new Set();
   private layoutDirty = false;
 

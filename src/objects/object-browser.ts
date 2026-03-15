@@ -1961,6 +1961,15 @@ export class ObjectBrowser extends Abject {
     const regs = this.getRegistrationsForKind(state.selectedKind);
     if (regs.length === 0) return;
 
+    const objectName = regs[0].name || state.selectedKind;
+    const confirmed = await this.confirm({
+      title: 'Delete Object',
+      message: `Delete "${objectName}"? This cannot be undone.`,
+      confirmLabel: 'Delete',
+      destructive: true,
+    });
+    if (!confirmed) return;
+
     const targetId = regs[0].id as AbjectId;
 
     try {

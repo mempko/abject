@@ -20,12 +20,13 @@ import {
   AbjectMessage,
   InterfaceId,
 } from '../core/types.js';
-import { Abject } from '../core/abject.js';
+import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { require } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('WidgetManager');
+import { ModalDialog } from './modal-dialog.js';
 import { WindowAbject } from './widgets/window-abject.js';
 import { LabelWidget } from './widgets/label-widget.js';
 import { ButtonWidget } from './widgets/button-widget.js';
@@ -207,6 +208,18 @@ export class WidgetManager extends Abject {
                 returns: { kind: 'object', properties: { widgetIds: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } } } },
               },
               {
+                name: 'showConfirmDialog',
+                description: 'Show a modal confirmation dialog with backdrop overlay. Returns true if confirmed, false if cancelled.',
+                parameters: [
+                  { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Dialog title' },
+                  { name: 'message', type: { kind: 'primitive', primitive: 'string' }, description: 'Dialog message' },
+                  { name: 'confirmLabel', type: { kind: 'primitive', primitive: 'string' }, description: 'Confirm button label (default: "Confirm")', optional: true },
+                  { name: 'cancelLabel', type: { kind: 'primitive', primitive: 'string' }, description: 'Cancel button label (default: "Cancel")', optional: true },
+                  { name: 'destructive', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, confirm button uses destructive styling', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
                 name: 'destroyWindowsForOwner',
                 description: 'Destroy all windows owned by a specific object',
                 parameters: [
@@ -367,15 +380,16 @@ export class WidgetManager extends Abject {
 
     // Direct factory: create window, return AbjectId (not shim string)
     this.on('createWindowAbject', async (msg: AbjectMessage) => {
-      const { title, rect, zIndex, chromeless, resizable, draggable } = msg.payload as {
+      const { title, rect, zIndex, chromeless, transparent, resizable, draggable } = msg.payload as {
         title: string;
         rect: { x: number; y: number; width: number; height: number };
         zIndex?: number;
         chromeless?: boolean;
+        transparent?: boolean;
         resizable?: boolean;
         draggable?: boolean;
       };
-      return this.createWindowDirect(msg.routing.from, title, rect, { chromeless, resizable, draggable, zIndex });
+      return this.createWindowDirect(msg.routing.from, title, rect, { chromeless, transparent, resizable, draggable, zIndex });
     });
 
     // Direct factory: destroy window by AbjectId (not shim string)
@@ -646,6 +660,26 @@ export class WidgetManager extends Abject {
       return this.objectWorkspaces.get(objectId as AbjectId) ?? null;
     });
 
+    // ── Modal confirmation dialog ──
+
+    this.on('showConfirmDialog', (msg: AbjectMessage) => {
+      const { title, message: dialogMessage, confirmLabel, cancelLabel, destructive } = msg.payload as {
+        title: string;
+        message: string;
+        confirmLabel?: string;
+        cancelLabel?: string;
+        destructive?: boolean;
+      };
+
+      this.spawnModalDialog(title, dialogMessage, { confirmLabel, cancelLabel, destructive })
+        .then(
+          (confirmed) => this.sendDeferredReply(msg, confirmed).catch(() => {}),
+          () => this.sendDeferredReply(msg, false).catch(() => {}),
+        );
+
+      return DEFERRED_REPLY;
+    });
+
     this.on('objectUnregistered', async (msg: AbjectMessage) => {
       const objectId = msg.payload as AbjectId;
       await this.destroyWindowsForOwner(objectId);
@@ -784,6 +818,27 @@ export class WidgetManager extends Abject {
       clearInterval(this.orphanSweepTimer);
       this.orphanSweepTimer = undefined;
     }
+  }
+
+  // ── Modal confirmation dialog — spawns an ephemeral ModalDialog Abject ──
+
+  private async spawnModalDialog(
+    title: string,
+    dialogMessage: string,
+    opts: { confirmLabel?: string; cancelLabel?: string; destructive?: boolean },
+  ): Promise<boolean> {
+    const dialog = new ModalDialog();
+    dialog.setWidgetManagerId(this.id);
+    await dialog.init(this.bus, this.id);
+    return this.request<boolean>(
+      request(this.id, dialog.id, 'show', {
+        title,
+        message: dialogMessage,
+        ...opts,
+        theme: this.defaultTheme,
+      }),
+      120000,
+    );
   }
 
   /** Get theme for a window's owner (traces windowOwners → objectWorkspaces → workspace theme). */
@@ -1251,7 +1306,7 @@ await this.call(timerId, 'addDependent', {});
     owner: AbjectId,
     title: string,
     rect: { x: number; y: number; width: number; height: number },
-    options?: { chromeless?: boolean; resizable?: boolean; draggable?: boolean; zIndex?: number }
+    options?: { chromeless?: boolean; transparent?: boolean; resizable?: boolean; draggable?: boolean; zIndex?: number }
   ): Promise<AbjectId> {
     require(this.uiServerId !== undefined, 'UIServer not set');
 
@@ -1261,6 +1316,7 @@ await this.call(timerId, 'addDependent', {});
       rect,
       uiServerId: this.uiServerId!,
       chromeless: options?.chromeless,
+      transparent: options?.transparent,
       resizable: options?.resizable,
       draggable: options?.draggable,
       zIndex: options?.zIndex ?? 100,

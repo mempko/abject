@@ -346,6 +346,7 @@ export class WorkspaceSwitcher extends Abject {
       }
       this.send(request(this.id, this.workspaceCreateBtnId, 'addDependent', {}));
       this.send(request(this.id, this.browseBtnId, 'addDependent', {}));
+
     }
 
     return true;

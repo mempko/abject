@@ -686,6 +686,13 @@ export class ProcessExplorer extends Abject {
     if (stopIdx !== undefined) {
       const row = this.currentRows[stopIdx];
       if (row && this.factoryId) {
+        const confirmed = await this.confirm({
+          title: 'Stop Object',
+          message: `Stop "${row.name}"? This will kill the running object.`,
+          confirmLabel: 'Stop',
+          destructive: true,
+        });
+        if (!confirmed) return;
         try {
           await this.request(request(this.id, this.factoryId,
             'kill', { objectId: row.id }));

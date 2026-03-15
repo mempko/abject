@@ -27,6 +27,7 @@ export interface WindowConfig {
   rect: Rect;
   uiServerId: AbjectId;
   chromeless?: boolean;
+  transparent?: boolean;
   resizable?: boolean;
   draggable?: boolean;
   zIndex?: number;
@@ -42,6 +43,7 @@ export class WindowAbject extends Abject {
   private title: string;
   private rect: Rect;
   private chromeless: boolean;
+  private transparent: boolean;
   private resizable: boolean;
   private draggable: boolean;
   private zIndex: number;
@@ -149,6 +151,7 @@ export class WindowAbject extends Abject {
     this.title = config.title;
     this.rect = { ...config.rect };
     this.chromeless = config.chromeless ?? false;
+    this.transparent = config.transparent ?? false;
     this.resizable = config.resizable ?? false;
     this.draggable = config.draggable ?? false;
     this.zIndex = config.zIndex ?? 100;
@@ -415,58 +418,60 @@ method calls on 'abjects:widgets' interface:
     // Clear
     commands.push({ type: 'clear', surfaceId: sid, params: {} });
 
-    // Window shadow
-    commands.push({ type: 'save', surfaceId: sid, params: {} });
-    commands.push({
-      type: 'shadow',
-      surfaceId: sid,
-      params: { color: this.theme.shadowColor, blur: 20, offsetY: 6 },
-    });
-    commands.push({
-      type: 'rect',
-      surfaceId: sid,
-      params: { x: 0, y: 0, width: w, height: h, fill: this.theme.windowBg, radius: this.theme.windowRadius },
-    });
-    commands.push({ type: 'restore', surfaceId: sid, params: {} });
-
-    // Window background (drawn without shadow)
-    commands.push({
-      type: 'rect',
-      surfaceId: sid,
-      params: { x: 0, y: 0, width: w, height: h, fill: this.theme.windowBg, stroke: this.theme.windowBorder, radius: this.theme.windowRadius },
-    });
-
-    // Faint accent overlay — barely-perceptible green tint matching website card glow
-    commands.push({ type: 'save', surfaceId: sid, params: {} });
-    commands.push({ type: 'globalAlpha', surfaceId: sid, params: { alpha: 0.03 } });
-    commands.push({
-      type: 'rect',
-      surfaceId: sid,
-      params: { x: 1, y: 1, width: w - 2, height: h - 2, fill: this.theme.accent, radius: this.theme.windowRadius },
-    });
-    commands.push({ type: 'restore', surfaceId: sid, params: {} });
-
-    // Accent border glow — brighter when focused
-    const borderGlowAlpha = this.windowFocused ? 0.2 : 0.08;
-    if (this.windowFocused) {
+    if (!this.transparent) {
+      // Window shadow
       commands.push({ type: 'save', surfaceId: sid, params: {} });
       commands.push({
         type: 'shadow',
         surfaceId: sid,
-        params: { color: 'rgba(57, 255, 142, 0.07)', blur: 16 },
+        params: { color: this.theme.shadowColor, blur: 20, offsetY: 6 },
       });
       commands.push({
         type: 'rect',
         surfaceId: sid,
-        params: { x: 0, y: 0, width: w, height: h, stroke: `rgba(57, 255, 142, ${borderGlowAlpha})`, radius: this.theme.windowRadius },
+        params: { x: 0, y: 0, width: w, height: h, fill: this.theme.windowBg, radius: this.theme.windowRadius },
       });
       commands.push({ type: 'restore', surfaceId: sid, params: {} });
-    } else {
+
+      // Window background (drawn without shadow)
       commands.push({
         type: 'rect',
         surfaceId: sid,
-        params: { x: 0, y: 0, width: w, height: h, stroke: `rgba(57, 255, 142, ${borderGlowAlpha})`, radius: this.theme.windowRadius },
+        params: { x: 0, y: 0, width: w, height: h, fill: this.theme.windowBg, stroke: this.theme.windowBorder, radius: this.theme.windowRadius },
       });
+
+      // Faint accent overlay — barely-perceptible green tint matching website card glow
+      commands.push({ type: 'save', surfaceId: sid, params: {} });
+      commands.push({ type: 'globalAlpha', surfaceId: sid, params: { alpha: 0.03 } });
+      commands.push({
+        type: 'rect',
+        surfaceId: sid,
+        params: { x: 1, y: 1, width: w - 2, height: h - 2, fill: this.theme.accent, radius: this.theme.windowRadius },
+      });
+      commands.push({ type: 'restore', surfaceId: sid, params: {} });
+
+      // Accent border glow — brighter when focused
+      const borderGlowAlpha = this.windowFocused ? 0.2 : 0.08;
+      if (this.windowFocused) {
+        commands.push({ type: 'save', surfaceId: sid, params: {} });
+        commands.push({
+          type: 'shadow',
+          surfaceId: sid,
+          params: { color: 'rgba(57, 255, 142, 0.07)', blur: 16 },
+        });
+        commands.push({
+          type: 'rect',
+          surfaceId: sid,
+          params: { x: 0, y: 0, width: w, height: h, stroke: `rgba(57, 255, 142, ${borderGlowAlpha})`, radius: this.theme.windowRadius },
+        });
+        commands.push({ type: 'restore', surfaceId: sid, params: {} });
+      } else {
+        commands.push({
+          type: 'rect',
+          surfaceId: sid,
+          params: { x: 0, y: 0, width: w, height: h, stroke: `rgba(57, 255, 142, ${borderGlowAlpha})`, radius: this.theme.windowRadius },
+        });
+      }
     }
 
     if (!this.chromeless) {

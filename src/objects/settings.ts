@@ -58,6 +58,12 @@ export class Settings extends Abject {
   private accessSearchInputId?: AbjectId;
   private accessSearchText = '';
 
+  /** Pending access mode from dropdown change (used during tab rebuild). */
+  private pendingAccessMode?: string;
+
+  /** Delete workspace button in Danger Zone section. */
+  private deleteWorkspaceBtnId?: AbjectId;
+
   /** Maps delete button AbjectId → object ID for "Created Objects" section. */
   private objectDeleteButtons: Map<AbjectId, string> = new Map();
 
@@ -174,7 +180,7 @@ export class Settings extends Abject {
     catch { /* gone */ }
 
     this.tabContentContainerId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
@@ -192,6 +198,7 @@ export class Settings extends Abject {
     this.accessModeSelectId = undefined;
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
+    this.deleteWorkspaceBtnId = undefined;
     this.accessSaveBtnId = undefined;
     this.accessStatusLabelId = undefined;
     this.objectDeleteButtons.clear();
@@ -261,6 +268,12 @@ export class Settings extends Abject {
         return;
       }
 
+      // Delete workspace button
+      if (fromId === this.deleteWorkspaceBtnId && aspect === 'click') {
+        await this.handleDeleteWorkspace();
+        return;
+      }
+
       // Handle delete button clicks for created objects
       if (aspect === 'click' && this.objectDeleteButtons.has(fromId)) {
         const objectId = this.objectDeleteButtons.get(fromId)!;
@@ -277,19 +290,16 @@ export class Settings extends Abject {
         return;
       }
 
-      // Access mode dropdown change — dynamically add/remove whitelist and exposed objects sections
+      // Access mode dropdown change — rebuild the entire tab for clean layout
       if (fromId === this.accessModeSelectId && aspect === 'change') {
         const modeMap: Record<string, string> = { 'Local': 'local', 'Private': 'private', 'Public': 'public' };
         const newMode = modeMap[value as string] ?? 'local';
+        // Stash the selected mode so buildAccessTab picks it up
+        this.pendingAccessMode = newMode;
+        await this.clearTabContent();
         const r0 = { x: 0, y: 0, width: 0, height: 0 };
-        await this.clearWhitelistSection();
-        await this.clearExposedObjectsSection();
-        if (newMode === 'private') {
-          await this.buildWhitelistSection(r0);
-        }
-        if (newMode !== 'local') {
-          await this.buildExposedObjectsSection(r0);
-        }
+        await this.buildAccessTab(r0);
+        this.pendingAccessMode = undefined;
         return;
       }
     });
@@ -309,7 +319,7 @@ export class Settings extends Abject {
     );
 
     const winW = 440;
-    const winH = 520;
+    const winH = 620;
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
@@ -350,9 +360,9 @@ export class Settings extends Abject {
       preferredSize: { height: 32 },
     }));
 
-    // Create tab content container (expanding VBox that holds all tab content)
+    // Create tab content container (scrollable VBox that holds all tab content)
     this.tabContentContainerId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
@@ -488,15 +498,18 @@ export class Settings extends Abject {
 
     // Save button row + status label
     await this.buildSaveRow(r0, 'general');
+
+    // ── Danger Zone ──
+    await this.buildDangerZone();
   }
 
   /**
    * Build the Access tab: access mode selector + whitelist for private mode + save button.
    */
   private async buildAccessTab(r0: { x: number; y: number; width: number; height: number }): Promise<void> {
-    // Get current access mode
-    let currentAccessMode = 'local';
-    if (this.workspaceManagerId && this.workspaceId) {
+    // Get current access mode (use pending mode from dropdown if rebuilding after change)
+    let currentAccessMode = this.pendingAccessMode ?? 'local';
+    if (!this.pendingAccessMode && this.workspaceManagerId && this.workspaceId) {
       try {
         currentAccessMode = await this.request<string>(
           request(this.id, this.workspaceManagerId, 'getAccessMode', { workspaceId: this.workspaceId })
@@ -578,10 +591,11 @@ export class Settings extends Abject {
       }));
     }
 
-    // ── Search input for exposed objects ──
+    // ── Search input for exposed objects (hidden in local mode) ──
+    const searchVisible = currentAccessMode !== 'local';
     const { widgetIds: [searchId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'textInput', windowId: this.windowId, placeholder: 'Search objects...' },
+        { type: 'textInput', windowId: this.windowId, placeholder: 'Search objects...', style: { visible: searchVisible } },
       ] })
     );
     this.accessSearchInputId = this.trackTabWidget(searchId);
@@ -589,10 +603,10 @@ export class Settings extends Abject {
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: this.accessSearchInputId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 30 },
+      preferredSize: { height: searchVisible ? 30 : 0 },
     }));
 
-    // ── Exposed Objects container (visible for private or public mode) ──
+    // ── Exposed Objects container (hidden in local mode) ──
     this.exposedContainerId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
         parentLayoutId: cId,
@@ -602,7 +616,8 @@ export class Settings extends Abject {
     ));
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: this.exposedContainerId,
-      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+      sizePolicy: { vertical: searchVisible ? 'expanding' : 'fixed', horizontal: 'expanding' },
+      preferredSize: searchVisible ? undefined : { height: 0 },
     }));
 
     if (currentAccessMode !== 'local') {
@@ -994,6 +1009,7 @@ export class Settings extends Abject {
     this.accessModeSelectId = undefined;
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
+    this.deleteWorkspaceBtnId = undefined;
     this.accessSaveBtnId = undefined;
     this.accessStatusLabelId = undefined;
     this.objectDeleteButtons.clear();
@@ -1208,6 +1224,118 @@ export class Settings extends Abject {
       await new Promise((resolve) => setTimeout(resolve, 800));
     }
     await this.hide();
+  }
+
+  /**
+   * Build the Danger Zone section at the bottom of the General tab.
+   */
+  private async buildDangerZone(): Promise<void> {
+    const cId = this.tabContentContainerId!;
+
+    // Divider + section header + description + delete button row
+    const { widgetIds: [divId, headerLabelId, descId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'divider', windowId: this.windowId },
+        { type: 'label', windowId: this.windowId, text: 'Danger Zone', style: { color: this.theme.destructiveText, fontWeight: 'bold', fontSize: 15 } },
+        { type: 'label', windowId: this.windowId, text: 'Permanently delete this workspace and all its objects.', style: { color: this.theme.textDescription, fontSize: 12 } },
+      ] })
+    );
+    this.trackTabWidget(divId);
+    this.trackTabWidget(headerLabelId);
+    this.trackTabWidget(descId);
+
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: divId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 1 },
+    }));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: headerLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 24 },
+    }));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: descId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
+
+    // Delete button row (right-aligned)
+    const deleteRowId = this.trackTabWidget(await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: cId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    ));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: deleteRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 36 },
+    }));
+
+    await this.request(request(this.id, deleteRowId, 'addLayoutSpacer', {}));
+
+    const { widgetIds: [deleteBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Delete Workspace', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder } },
+      ] })
+    );
+    this.deleteWorkspaceBtnId = this.trackTabWidget(deleteBtnId);
+    await this.request(request(this.id, this.deleteWorkspaceBtnId, 'addDependent', {}));
+    await this.request(request(this.id, deleteRowId, 'addLayoutChild', {
+      widgetId: this.deleteWorkspaceBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 160, height: 36 },
+    }));
+  }
+
+  /**
+   * Handle "Delete Workspace" button click: confirm, then delete.
+   */
+  private async handleDeleteWorkspace(): Promise<void> {
+    await this.ensureWorkspaceId();
+    if (!this.workspaceManagerId || !this.workspaceId) return;
+
+    // Get workspace name for the dialog
+    let workspaceName = 'this workspace';
+    try {
+      const active = await this.request<{ id: string; name: string } | null>(
+        request(this.id, this.workspaceManagerId, 'getActiveWorkspace', {})
+      );
+      if (active) workspaceName = active.name;
+    } catch { /* use fallback */ }
+
+    const confirmed = await this.confirm({
+      title: 'Delete Workspace',
+      message: `Delete workspace "${workspaceName}"? All objects in it will be destroyed.`,
+      confirmLabel: 'Delete',
+      destructive: true,
+    });
+    if (!confirmed) return;
+
+    try {
+      await this.request(
+        request(this.id, this.workspaceManagerId, 'deleteWorkspace', { workspaceId: this.workspaceId })
+      );
+      await this.hide();
+    } catch (err) {
+      // Guard: if Settings was killed mid-handler (e.g. workspace deletion destroyed us),
+      // don't attempt requests on a stopped object.
+      if (this._status === 'stopped') return;
+      // Last workspace can't be deleted
+      if (this.statusLabelId) {
+        try {
+          const msg = err instanceof Error ? err.message : String(err);
+          await this.request(
+            request(this.id, this.statusLabelId, 'update', {
+              text: msg.slice(0, 60),
+              style: { color: this.theme.statusErrorBright },
+            })
+          );
+        } catch { /* widget may be gone */ }
+      }
+    }
   }
 
   /**

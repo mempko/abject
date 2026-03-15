@@ -598,6 +598,25 @@ export abstract class Abject {
   }
 
   /**
+   * Show a modal confirmation dialog. Returns true if the user confirmed, false otherwise.
+   * Falls back to true (confirmed) if no WidgetManager is available.
+   */
+  protected async confirm(opts: {
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    cancelLabel?: string;
+    destructive?: boolean;
+  }): Promise<boolean> {
+    const wmId = await this.discoverDep('WidgetManager');
+    if (!wmId) return true; // no UI → default to confirmed
+    return this.request<boolean>(
+      request(this.id, wmId, 'showConfirmDialog', opts),
+      60000 // 60s timeout for user think time
+    );
+  }
+
+  /**
    * Handle an incoming message from the processing loop.
    * Replies are handled via handleReply() fast-path, not here.
    */

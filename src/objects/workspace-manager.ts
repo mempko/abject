@@ -648,6 +648,10 @@ export class WorkspaceManager extends Abject {
     this.workspaces.delete(workspaceId);
     await this.persistWorkspaceList();
 
+    // Rebuild switcher/taskbar with the updated workspace list (the earlier
+    // refreshTaskbar inside switchWorkspace ran before the workspace was removed).
+    await this.refreshTaskbar();
+
     wsLog.info(`Deleted workspace '${ws.name}' (${workspaceId})`);
     return true;
   }

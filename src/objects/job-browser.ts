@@ -343,6 +343,13 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
   private async handleChanged(fromId: AbjectId, aspect: string, value?: unknown): Promise<void> {
     // Clear button click
     if (fromId === this.clearBtnId && aspect === 'click') {
+      const confirmed = await this.confirm({
+        title: 'Clear Job History',
+        message: 'Clear all completed and failed jobs from history?',
+        confirmLabel: 'Clear',
+        destructive: true,
+      });
+      if (!confirmed) return;
       if (this.jobManagerId) {
         await this.request(
           request(this.id, this.jobManagerId, 'clearHistory', {})

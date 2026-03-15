@@ -1255,6 +1255,14 @@ export class PeerNetwork extends Abject {
   private async removeSignalingServer(url: string): Promise<void> {
     if (!this.peerRegistryId) return;
 
+    const confirmed = await this.confirm({
+      title: 'Remove Server',
+      message: `Remove signaling server "${url}"?`,
+      confirmLabel: 'Remove',
+      destructive: true,
+    });
+    if (!confirmed) return;
+
     try {
       await this.request(
         request(this.id, this.peerRegistryId, 'removeSignalingServer', { url })
@@ -1432,6 +1440,14 @@ export class PeerNetwork extends Abject {
   private async blockPeer(peerId: string): Promise<void> {
     if (!this.peerRegistryId) return;
 
+    const confirmed = await this.confirm({
+      title: 'Block Peer',
+      message: `Block this peer? They will no longer be able to connect to you.`,
+      confirmLabel: 'Block',
+      destructive: true,
+    });
+    if (!confirmed) return;
+
     try {
       await this.request(
         request(this.id, this.peerRegistryId, 'blockPeer', { peerId })
@@ -1494,6 +1510,14 @@ export class PeerNetwork extends Abject {
 
   private async removeContact(peerId: string): Promise<void> {
     if (!this.peerRegistryId) return;
+
+    const confirmed = await this.confirm({
+      title: 'Remove Contact',
+      message: `Remove this contact? You will lose the ability to connect to them.`,
+      confirmLabel: 'Remove',
+      destructive: true,
+    });
+    if (!confirmed) return;
 
     try {
       await this.request(

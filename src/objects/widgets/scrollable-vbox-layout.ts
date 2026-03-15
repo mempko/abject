@@ -83,11 +83,23 @@ export class ScrollableVBoxLayout extends VBoxLayout {
       },
     });
 
+    // Separate expanded children (e.g. select dropdowns) to render after clip restore
+    const normalChildren: typeof childRects = [];
+    const expandedChildList: typeof childRects = [];
     for (const child of childRects) {
+      if (this.expandedChildren.has(child.widgetId)) {
+        expandedChildList.push(child);
+      } else {
+        normalChildren.push(child);
+      }
+    }
+
+    const clipTop = oy + cr.y;
+    const clipBottom = clipTop + cr.height;
+
+    for (const child of normalChildren) {
       const childOy = oy + child.rect.y - this.scrollTop;
       const childBottom = childOy + child.rect.height;
-      const clipTop = oy + cr.y;
-      const clipBottom = clipTop + cr.height;
 
       // Skip fully off-screen children
       if (childBottom < clipTop || childOy > clipBottom) continue;
@@ -109,6 +121,26 @@ export class ScrollableVBoxLayout extends VBoxLayout {
     }
 
     commands.push({ type: 'restore', surfaceId, params: {} });
+
+    // Render expanded children outside the clip region so dropdowns aren't clipped
+    for (const child of expandedChildList) {
+      const childOy = oy + child.rect.y - this.scrollTop;
+
+      try {
+        const childCmds = await this.request<unknown[]>(
+          request(this.id, child.widgetId, 'render', {
+            surfaceId,
+            ox: ox + child.rect.x,
+            oy: childOy,
+          })
+        );
+        if (Array.isArray(childCmds)) {
+          commands.push(...childCmds);
+        }
+      } catch {
+        // Widget may have been destroyed
+      }
+    }
 
     // Draw scrollbar if content overflows
     const totalHeight = this.getTotalContentHeight();
