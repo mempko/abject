@@ -167,14 +167,14 @@ See [PHILOSOPHY.md](PHILOSOPHY.md) for the principles that carry the fire forwar
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | - | Anthropic Claude API key |
-| `OPENAI_API_KEY` | - | OpenAI API key |
+| `ANTHROPIC_API_KEY` | - | Anthropic Claude API key (optional) |
+| `OPENAI_API_KEY` | - | OpenAI API key (optional) |
 | `WS_PORT` | `7719` | WebSocket port for client connection |
 | `SIGNALING_PORT` | `7720` | Signaling server port for P2P discovery |
 | `ABJECTS_DATA_DIR` | `.abjects` | Persistent storage directory |
 | `ABJECTS_WORKER_COUNT` | CPU cores - 1 (max 8) | Worker thread pool size |
 
-For local LLM, run Ollama on localhost:11434.
+API keys can also be configured through the Global Settings UI at runtime. For local LLM, run Ollama on localhost:11434.
 
 ## License
 
