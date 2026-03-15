@@ -24,6 +24,8 @@ import { CapabilitySet, getDefaultCapabilities } from './capability.js';
 import { INTROSPECT_METHODS, INTROSPECT_EVENTS, formatManifestAsDescription } from './introspect.js';
 import type { InterfaceId } from './types.js';
 import { Log } from './timed-log.js';
+import type { ThemeData } from './theme-data.js';
+import { MIDNIGHT_BLOOM } from './theme-data.js';
 
 const log = new Log('ABJECT');
 
@@ -71,6 +73,7 @@ export abstract class Abject {
   private _stoppedDuringHandler = false;
   protected handlers: Map<string, MessageHandlerFn> = new Map();
   private dependents: Set<AbjectId> = new Set();
+  private _themeId?: AbjectId;
   private pendingReplies: Map<string, {
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
@@ -310,6 +313,34 @@ export abstract class Abject {
     const id = await this.discoverDep(name);
     if (!id) throw new Error(`Required dependency '${name}' not found in Registry`);
     return id;
+  }
+
+  /**
+   * Get the current theme. Returns cached theme or MIDNIGHT_BLOOM default.
+   * WidgetAbject overrides this field directly (set from config).
+   */
+  protected theme: ThemeData = MIDNIGHT_BLOOM;
+
+  /**
+   * Discover the Theme object, fetch the current theme, cache it, and
+   * subscribe as a dependent so themeChanged events keep the cache fresh.
+   */
+  protected async fetchTheme(): Promise<ThemeData> {
+    try {
+      const themeId = await this.discoverDep('Theme');
+      if (themeId) {
+        this._themeId = themeId;
+        const themeData = await this.request<ThemeData>(
+          request(this.id, themeId, 'getTheme', {})
+        );
+        this.theme = themeData;
+        // Subscribe as dependent so we get themeChanged events
+        try {
+          await this.request(request(this.id, themeId, 'addDependent', {}));
+        } catch { /* best effort */ }
+      }
+    } catch { /* Theme not available — use default */ }
+    return this.theme;
   }
 
   /**
@@ -577,6 +608,16 @@ export abstract class Abject {
     }
 
     this.lastActivity = Date.now();
+
+    // Auto-update cached theme on themeChanged events from Theme object
+    if (message.routing.from === this._themeId
+        && message.routing.method === 'changed'
+        && message.header.type === 'event') {
+      const payload = message.payload as { aspect?: string; value?: unknown } | undefined;
+      if (payload?.aspect === 'themeChanged' && payload.value) {
+        this.theme = payload.value as ThemeData;
+      }
+    }
 
     // Save status to handle re-entrant message delivery
     const prevStatus = this._status;

@@ -45,7 +45,7 @@ export class WindowAbject extends Abject {
   private resizable: boolean;
   private draggable: boolean;
   private zIndex: number;
-  private theme: ThemeData;
+  protected override theme: ThemeData;
 
   /** Expose surfaceId so WidgetManager can register with WindowManager. */
   get surface(): string | undefined { return this.surfaceId; }
@@ -412,7 +412,7 @@ method calls on 'abjects:widgets' interface:
     commands.push({
       type: 'shadow',
       surfaceId: sid,
-      params: { color: 'rgba(0,0,0,0.5)', blur: 12, offsetY: 4 },
+      params: { color: this.theme.shadowColor, blur: 12, offsetY: 4 },
     });
     commands.push({
       type: 'rect',

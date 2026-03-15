@@ -123,6 +123,7 @@ export class Settings extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
+    await this.fetchTheme();
     this.storageId = await this.requireDep('Storage');
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
@@ -407,16 +408,16 @@ export class Settings extends Abject {
     // Batch-create all General tab header widgets
     const { widgetIds: [sectionHeaderId, descLabelId, nameLabelId, nameInputId, descInputLabelId, descInputId, tagsLabelId, tagsInputId, divId, objHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Workspace', style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 } },
-        { type: 'label', windowId: this.windowId, text: 'Configure this workspace.', style: { color: '#b4b8c8', fontSize: 12 } },
-        { type: 'label', windowId: this.windowId, text: 'Workspace Name', style: { color: '#e2e4e9', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: 'Workspace', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
+        { type: 'label', windowId: this.windowId, text: 'Configure this workspace.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: 'Workspace Name', style: { color: this.theme.textHeading, fontSize: 13 } },
         { type: 'textInput', windowId: this.windowId, placeholder: 'Workspace name', text: currentName },
-        { type: 'label', windowId: this.windowId, text: 'Description', style: { color: '#e2e4e9', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: 'Description', style: { color: this.theme.textHeading, fontSize: 13 } },
         { type: 'textInput', windowId: this.windowId, placeholder: 'Workspace description', text: currentDescription },
-        { type: 'label', windowId: this.windowId, text: 'Tags (comma-separated)', style: { color: '#e2e4e9', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: 'Tags (comma-separated)', style: { color: this.theme.textHeading, fontSize: 13 } },
         { type: 'textInput', windowId: this.windowId, placeholder: 'e.g. art, tools, games', text: currentTags },
         { type: 'divider', windowId: this.windowId },
-        { type: 'label', windowId: this.windowId, text: 'Created Objects', style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 } },
+        { type: 'label', windowId: this.windowId, text: 'Created Objects', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
       ] })
     );
     this.trackTabWidget(sectionHeaderId);
@@ -519,7 +520,7 @@ export class Settings extends Abject {
     if (snapshots.length === 0) {
       const { widgetIds: [emptyLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'No objects created yet.', style: { color: '#b4b8c8', fontSize: 12 } },
+          { type: 'label', windowId: this.windowId, text: 'No objects created yet.', style: { color: this.theme.textDescription, fontSize: 12 } },
         ] })
       );
       this.trackTabWidget(emptyLabelId);
@@ -548,8 +549,8 @@ export class Settings extends Abject {
         const { widgetIds: [exposedCbId, objNameId, delBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
             { type: 'checkbox', windowId: this.windowId, checked: generalExposedSet.has(snap.objectId), text: '' },
-            { type: 'label', windowId: this.windowId, text: snap.manifest.name, style: { color: '#e2e4e9', fontSize: 13 } },
-            { type: 'button', windowId: this.windowId, text: 'Delete', style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 } },
+            { type: 'label', windowId: this.windowId, text: snap.manifest.name, style: { color: this.theme.textHeading, fontSize: 13 } },
+            { type: 'button', windowId: this.windowId, text: 'Delete', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
           ] })
         );
         this.trackTabWidget(exposedCbId);
@@ -608,9 +609,9 @@ export class Settings extends Abject {
     const accessModeIndex = currentAccessMode === 'public' ? 2 : currentAccessMode === 'private' ? 1 : 0;
     const { widgetIds: [sectionHeaderId, descLabelId, accessLabelId, accessSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Access Control', style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 } },
-        { type: 'label', windowId: this.windowId, text: 'Control who can access this workspace over the network.', style: { color: '#b4b8c8', fontSize: 12 } },
-        { type: 'label', windowId: this.windowId, text: 'Access Mode', style: { color: '#e2e4e9', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: 'Access Control', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
+        { type: 'label', windowId: this.windowId, text: 'Control who can access this workspace over the network.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: 'Access Mode', style: { color: this.theme.textHeading, fontSize: 13 } },
         { type: 'select', windowId: this.windowId, options: ['Local', 'Private', 'Public'], selectedIndex: accessModeIndex },
       ] })
     );
@@ -708,8 +709,8 @@ export class Settings extends Abject {
     const { widgetIds: [divId, headerLabelId, descId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'divider', windowId: this.windowId },
-        { type: 'label', windowId: this.windowId, text: 'Allowed Contacts', style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 } },
-        { type: 'label', windowId: this.windowId, text: 'Select which contacts can access this workspace.', style: { color: '#b4b8c8', fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: 'Allowed Contacts', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: 'Select which contacts can access this workspace.', style: { color: this.theme.textDescription, fontSize: 12 } },
       ] })
     );
     this.whitelistWidgetIds.push(divId, headerLabelId, descId);
@@ -756,7 +757,7 @@ export class Settings extends Abject {
     if (contacts.length === 0) {
       const { widgetIds: [emptyLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'No contacts available. Add contacts in Global Settings.', style: { color: '#b4b8c8', fontSize: 12 } },
+          { type: 'label', windowId: this.windowId, text: 'No contacts available. Add contacts in Global Settings.', style: { color: this.theme.textDescription, fontSize: 12 } },
         ] })
       );
       this.whitelistWidgetIds.push(emptyLabelId);
@@ -829,8 +830,8 @@ export class Settings extends Abject {
     const { widgetIds: [divId, headerLabelId, descId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'divider', windowId: this.windowId },
-        { type: 'label', windowId: this.windowId, text: 'Exposed Objects', style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 } },
-        { type: 'label', windowId: this.windowId, text: 'Select which objects remote peers can access.', style: { color: '#b4b8c8', fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: 'Exposed Objects', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: 'Select which objects remote peers can access.', style: { color: this.theme.textDescription, fontSize: 12 } },
       ] })
     );
     this.exposedWidgetIds.push(divId, headerLabelId, descId);
@@ -913,7 +914,7 @@ export class Settings extends Abject {
     if (registryObjects.length === 0) {
       const { widgetIds: [emptyLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'No objects in workspace.', style: { color: '#b4b8c8', fontSize: 12 } },
+          { type: 'label', windowId: this.windowId, text: 'No objects in workspace.', style: { color: this.theme.textDescription, fontSize: 12 } },
         ] })
       );
       this.exposedWidgetIds.push(emptyLabelId);
@@ -999,8 +1000,8 @@ export class Settings extends Abject {
     // Batch-create save button and status label
     const { widgetIds: [btnId, statusId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'button', windowId: this.windowId, text: 'Save', style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' } },
-        { type: 'label', windowId: this.windowId, text: '', style: { color: '#b4b8c8', fontSize: 12, align: 'right' } },
+        { type: 'button', windowId: this.windowId, text: 'Save', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+        { type: 'label', windowId: this.windowId, text: '', style: { color: this.theme.textDescription, fontSize: 12, align: 'right' } },
       ] })
     );
     this.trackTabWidget(btnId);
@@ -1092,7 +1093,7 @@ export class Settings extends Abject {
         await this.request(
           request(this.id, this.statusLabelId, 'update', {
             text: 'Workspace name cannot be empty.',
-            style: { color: '#ff6b6b' },
+            style: { color: this.theme.statusErrorBright },
           })
         );
       }
@@ -1192,7 +1193,7 @@ export class Settings extends Abject {
       await this.request(
         request(this.id, this.statusLabelId, 'update', {
           text: 'Settings saved!',
-          style: { color: '#b4b8c8' },
+          style: { color: this.theme.textDescription },
         })
       );
       await new Promise((resolve) => setTimeout(resolve, 800));
@@ -1271,7 +1272,7 @@ export class Settings extends Abject {
       await this.request(
         request(this.id, statusId, 'update', {
           text: 'Access settings saved!',
-          style: { color: '#b4b8c8' },
+          style: { color: this.theme.textDescription },
         })
       );
       await new Promise((resolve) => setTimeout(resolve, 800));

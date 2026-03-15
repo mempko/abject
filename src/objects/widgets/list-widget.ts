@@ -280,7 +280,7 @@ export class ListWidget extends WidgetAbject {
         surfaceId,
         params: {
           x: trackX, y: listY, width: SCROLLBAR_WIDTH, height: trackH,
-          fill: 'rgba(255, 255, 255, 0.05)',
+          fill: this.theme.scrollbarTrack,
         },
       });
 
@@ -295,7 +295,7 @@ export class ListWidget extends WidgetAbject {
         params: {
           x: trackX + 1, y: thumbY, width: SCROLLBAR_WIDTH - 2, height: thumbHeight,
           radius: 3,
-          fill: 'rgba(255, 255, 255, 0.2)',
+          fill: this.theme.scrollbarThumb,
         },
       });
     }

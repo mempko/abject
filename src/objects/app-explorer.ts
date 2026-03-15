@@ -127,6 +127,7 @@ export class AppExplorer extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
+    await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.registryId = await this.requireDep('Registry');
     this.factoryId = await this.discoverDep('Factory') ?? undefined;
@@ -508,7 +509,7 @@ export class AppExplorer extends Abject {
           specs: [
             { type: 'label', windowId, rect: r0,
               text: 'Select an instance to view details.',
-              style: { color: '#6b7084', fontSize: 12 } },
+              style: { color: this.theme.sectionLabel, fontSize: 12 } },
           ],
         })
       );
@@ -548,20 +549,20 @@ export class AppExplorer extends Abject {
     // Name (bold)
     specs.push({ type: 'label', windowId, rect: r0,
       text: manifest.name,
-      style: { color: '#e2e4e9', fontSize: 13, fontWeight: 'bold' } });
+      style: { color: this.theme.textHeading, fontSize: 13, fontWeight: 'bold' } });
 
     // Description
     if (manifest.description) {
       specs.push({ type: 'label', windowId, rect: r0,
         text: manifest.description,
-        style: { color: '#b4b8c8', fontSize: 11 } });
+        style: { color: this.theme.textDescription, fontSize: 11 } });
     }
 
     // Version
     if (manifest.version) {
       specs.push({ type: 'label', windowId, rect: r0,
         text: `Version: ${manifest.version}`,
-        style: { color: '#8b8fa3', fontSize: 11 } });
+        style: { color: this.theme.textMeta, fontSize: 11 } });
     }
 
     // Tags
@@ -569,7 +570,7 @@ export class AppExplorer extends Abject {
     if (tags.length > 0) {
       specs.push({ type: 'label', windowId, rect: r0,
         text: `Tags: ${tags.join(', ')}`,
-        style: { color: '#8b8fa3', fontSize: 11 } });
+        style: { color: this.theme.textMeta, fontSize: 11 } });
     }
 
     // Methods
@@ -578,13 +579,13 @@ export class AppExplorer extends Abject {
       const methodNames = iface.methods.map((m: { name: string }) => `${m.name}()`).join(', ');
       specs.push({ type: 'label', windowId, rect: r0,
         text: `Methods: ${methodNames}`,
-        style: { color: '#8b8fa3', fontSize: 11 } });
+        style: { color: this.theme.textMeta, fontSize: 11 } });
     }
 
     // Actions separator
     specs.push({ type: 'label', windowId, rect: r0,
       text: '─── Actions',
-      style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } });
+      style: { color: this.theme.sectionLabel, fontSize: 11, fontWeight: 'bold' } });
 
     // Browse button (always)
     specs.push({ type: 'button', windowId, rect: r0,
@@ -608,7 +609,7 @@ export class AppExplorer extends Abject {
           text: 'Clone', style: { fontSize: 12 }, action: 'clone' });
         specs.push({ type: 'button', windowId, rect: r0,
           text: 'Delete',
-          style: { fontSize: 12, background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' },
+          style: { fontSize: 12, background: this.theme.destructiveText, color: '#ffffff', borderColor: this.theme.destructiveText },
           action: 'delete' });
       }
     }

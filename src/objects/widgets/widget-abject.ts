@@ -113,7 +113,7 @@ export abstract class WidgetAbject extends Abject {
   protected disabled = false;
   protected visible = true;
   protected widgetType: WidgetType;
-  protected theme: ThemeData;
+  protected override theme: ThemeData;
 
   constructor(config: WidgetConfig) {
     super({

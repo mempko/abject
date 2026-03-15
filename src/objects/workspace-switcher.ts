@@ -104,6 +104,7 @@ export class WorkspaceSwitcher extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
+    await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
   }
@@ -269,7 +270,7 @@ export class WorkspaceSwitcher extends Abject {
       })
     );
 
-    const wsActiveStyle = { background: '#1e3a2e', borderColor: '#4caf50' };
+    const wsActiveStyle = { background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
 
     // Build workspace buttons
     if (hasWorkspaces) {
@@ -290,7 +291,7 @@ export class WorkspaceSwitcher extends Abject {
       // Batch create all widgets: header label, settings button, workspace buttons, +, Browse
       const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
       // 0: header label
-      specs.push({ type: 'label', windowId: this.windowId!, text: '\u25C8 Spaces', style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } });
+      specs.push({ type: 'label', windowId: this.windowId!, text: '\u25C8 Spaces', style: { color: this.theme.sectionLabel, fontSize: 11, fontWeight: 'bold' } });
       // 1: settings gear button
       specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13 } });
       // 2..N-1: workspace buttons

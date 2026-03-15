@@ -330,6 +330,7 @@ export class ObjectCreator extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
+    await this.fetchTheme();
     this.llmId = await this.requireDep('LLM');
     this.registryId = await this.requireDep('Registry');
     this.factoryId = await this.requireDep('Factory');
@@ -2109,7 +2110,7 @@ async getState(msg) {
         { type: 'clear', surfaceId: 'c', params: { color: '#1e1e2e' } },
         { type: 'rect', surfaceId: 'c',
           params: { x: this._mouseX - 10, y: this._mouseY - 10,
-                    width: 20, height: 20, fill: '#e8a84c', radius: 4 } },
+                    width: 20, height: 20, fill: '#39ff8e', radius: 4 } },
       ]
     });
   }

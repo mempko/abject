@@ -111,7 +111,7 @@ export class SelectWidget extends WidgetAbject {
       commands.push({
         type: 'shadow',
         surfaceId,
-        params: { color: 'rgba(0,0,0,0.4)', blur: 8, offsetY: 2 },
+        params: { color: this.theme.dropdownShadow, blur: 8, offsetY: 2 },
       });
       commands.push({
         type: 'rect',

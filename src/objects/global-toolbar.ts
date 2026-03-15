@@ -84,6 +84,7 @@ export class GlobalToolbar extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
+    await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
   }
 
@@ -209,7 +210,7 @@ export class GlobalToolbar extends Abject {
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'label', windowId: this.windowId!, text: '\u2699 System', style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } },
+          { type: 'label', windowId: this.windowId!, text: '\u2699 System', style: { color: this.theme.textTertiary, fontSize: 11, fontWeight: 'bold' } },
           { type: 'button', windowId: this.windowId!, text: 'Settings' },
           { type: 'button', windowId: this.windowId!, text: 'Network' },
           { type: 'button', windowId: this.windowId!, text: 'Explorer' },

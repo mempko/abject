@@ -179,6 +179,7 @@ export class ObjectBrowser extends Abject {
   // ── Lifecycle ─────────────────────────────────────────────────────
 
   protected override async onInit(): Promise<void> {
+    await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.factoryId = await this.discoverDep('Factory') ?? undefined;
     this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
@@ -719,9 +720,9 @@ export class ObjectBrowser extends Abject {
     const { widgetIds: [scopeListId, localLabelId, localWsListId, remoteLabelId, remoteWsListId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'list', windowId: this.windowId, items: [] },
-        { type: 'label', windowId: this.windowId, text: 'Local', style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } },
+        { type: 'label', windowId: this.windowId, text: 'Local', style: { color: this.theme.sectionLabel, fontSize: 11, fontWeight: 'bold' } },
         { type: 'list', windowId: this.windowId, items: [], searchable: true },
-        { type: 'label', windowId: this.windowId, text: 'Discovered', style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } },
+        { type: 'label', windowId: this.windowId, text: 'Discovered', style: { color: this.theme.sectionLabel, fontSize: 11, fontWeight: 'bold' } },
         { type: 'list', windowId: this.windowId, items: [] },
       ]})
     );
@@ -1064,7 +1065,7 @@ export class ObjectBrowser extends Abject {
       }
       if (!isSystem) {
         btnSpecs.push({ text: 'Delete', actionKey: 'deleteObject',
-          style: { background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' } });
+          style: { background: this.theme.destructiveText, color: '#ffffff', borderColor: this.theme.destructiveText } });
       }
     }
 
@@ -1344,7 +1345,7 @@ export class ObjectBrowser extends Abject {
         type: 'button', windowId: this.windowId!,
         rect: { x: 0, y: 0, width: 0, height: 0 },
         text: sendBtnText,
-        style: { fontSize: 11, background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' },
+        style: { fontSize: 11, background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder },
       });
 
       responseLabelIndex = batchSpecs.length;
@@ -1658,7 +1659,7 @@ export class ObjectBrowser extends Abject {
           type: 'label', windowId: this.windowId!,
           rect: { x: 0, y: 0, width: 0, height: 0 },
           text: '>',
-          style: { fontSize: 11, color: '#6b7084' },
+          style: { fontSize: 11, color: this.theme.statusNeutral },
         });
         specMeta.push({ kind: 'arrow', partIndex: i });
       }
@@ -1666,7 +1667,7 @@ export class ObjectBrowser extends Abject {
         type: 'label', windowId: this.windowId!,
         rect: { x: 0, y: 0, width: 0, height: 0 },
         text: parts[i],
-        style: { fontSize: 11, color: i === parts.length - 1 ? '#e8a84c' : '#b4b8c8' },
+        style: { fontSize: 11, color: i === parts.length - 1 ? this.theme.actionBg : this.theme.textDescription },
       });
       specMeta.push({ kind: 'part', partIndex: i });
     }

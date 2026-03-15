@@ -90,6 +90,7 @@ export class Taskbar extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
+    await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.appExplorerId = await this.requireDep('AppExplorer');
     this.chatId = await this.requireDep('Chat');
@@ -284,7 +285,7 @@ export class Taskbar extends Abject {
 
     const btnW = 100;
     const btnH = 30;
-    const activeStyle = { background: '#2d3154', borderColor: '#e8a84c' };
+    const activeStyle = { background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
 
     const newObjects = showableObjects.filter(obj => !existingTargets.has(obj.id));
     if (newObjects.length > 0) {
@@ -340,7 +341,7 @@ export class Taskbar extends Abject {
   private async updateButtonStates(): Promise<void> {
     if (!this.windowId) return;
 
-    const activeStyle = { background: '#2d3154', borderColor: '#e8a84c' };
+    const activeStyle = { background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
     const inactiveStyle = { background: undefined, borderColor: undefined };
 
     const isVisible = async (objectId: AbjectId): Promise<boolean> => {
@@ -488,7 +489,7 @@ export class Taskbar extends Abject {
       } catch { return false; }
     };
 
-    const activeStyle = { background: '#2d3154', borderColor: '#e8a84c' };
+    const activeStyle = { background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
 
     // ── Apps section header row: "■ Apps" label + gear button ──
     const appsHeaderRowId = await this.request<AbjectId>(
@@ -529,7 +530,7 @@ export class Taskbar extends Abject {
     const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
 
     // 0: Apps header label
-    specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A0 Apps', style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } });
+    specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A0 Apps', style: { color: this.theme.sectionLabel, fontSize: 11, fontWeight: 'bold' } });
     // 1: Gear button
     specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13, ...(registryVis ? activeStyle : {}) } });
     // 2: Chat button
@@ -552,7 +553,7 @@ export class Taskbar extends Abject {
     const minimizedStartIdx = specs.length;
     if (minimizedCount > 0) {
       specs.push({ type: 'divider', windowId: this.windowId!, text: '' });
-      specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A1 Windows', style: { color: '#6b7084', fontSize: 11, fontWeight: 'bold' } });
+      specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A1 Windows', style: { color: this.theme.sectionLabel, fontSize: 11, fontWeight: 'bold' } });
       for (const [, { title }] of this.minimizedWindows) {
         specs.push({ type: 'button', windowId: this.windowId!, text: title });
       }

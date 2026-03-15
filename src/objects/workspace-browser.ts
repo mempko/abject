@@ -99,6 +99,7 @@ export class WorkspaceBrowser extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
+    await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.shareRegistryId = await this.discoverDep('WorkspaceShareRegistry') ?? undefined;
 
@@ -398,7 +399,7 @@ export class WorkspaceBrowser extends Abject {
         specs: [
           // [0] Title label
           { type: 'label', windowId, rect: r0, text: 'Workspace Browser',
-            style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 } },
+            style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
           // [1] Refresh button
           { type: 'button', windowId, rect: r0, text: 'Refresh',
             style: { fontSize: 12 } },
@@ -413,7 +414,7 @@ export class WorkspaceBrowser extends Abject {
           { type: 'list', windowId, rect: r0, items: [] },
           // [6] Status label
           { type: 'label', windowId, rect: r0, text: '',
-            style: { color: '#6b7084', fontSize: 11 } },
+            style: { color: this.theme.statusNeutral, fontSize: 11 } },
         ],
       })
     );
@@ -613,7 +614,7 @@ export class WorkspaceBrowser extends Abject {
           specs: [
             { type: 'label', windowId, rect: r0,
               text: 'Select a workspace to view details.',
-              style: { color: '#6b7084', fontSize: 12 } },
+              style: { color: this.theme.statusNeutral, fontSize: 12 } },
           ],
         })
       );
@@ -650,39 +651,39 @@ export class WorkspaceBrowser extends Abject {
     // Name (bold)
     specs.push({ type: 'label', windowId, rect: r0,
       text: ws.name,
-      style: { color: '#e2e4e9', fontSize: 13, fontWeight: 'bold' } });
+      style: { color: this.theme.textHeading, fontSize: 13, fontWeight: 'bold' } });
 
     // Description
     if (ws.description) {
       specs.push({ type: 'label', windowId, rect: r0,
         text: ws.description,
-        style: { color: '#b4b8c8', fontSize: 11, wordWrap: true } });
+        style: { color: this.theme.textDescription, fontSize: 11, wordWrap: true } });
     }
 
     // Access mode
     specs.push({ type: 'label', windowId, rect: r0,
       text: `Access: ${ws.accessMode}`,
-      style: { color: '#8b8fa3', fontSize: 11 } });
+      style: { color: this.theme.textMeta, fontSize: 11 } });
 
     // Owner
     const ownerLabel = ws.ownerName || ws.ownerPeerId.slice(0, 16) + '...';
     specs.push({ type: 'label', windowId, rect: r0,
       text: `Owner: ${ownerLabel}`,
-      style: { color: '#8b8fa3', fontSize: 11 } });
+      style: { color: this.theme.textMeta, fontSize: 11 } });
 
     // Tags
     const tags = ws.tags ?? [];
     if (tags.length > 0) {
       specs.push({ type: 'label', windowId, rect: r0,
         text: `Tags: ${tags.join(', ')}`,
-        style: { color: '#8b8fa3', fontSize: 11 } });
+        style: { color: this.theme.textMeta, fontSize: 11 } });
     }
 
     // Hops
     if (ws.hops > 0) {
       specs.push({ type: 'label', windowId, rect: r0,
         text: `Hops: ${ws.hops}`,
-        style: { color: '#8b8fa3', fontSize: 11 } });
+        style: { color: this.theme.textMeta, fontSize: 11 } });
     }
 
     // Browse button

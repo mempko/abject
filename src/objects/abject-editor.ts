@@ -79,6 +79,7 @@ export class AbjectEditor extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
+    await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.registryId = await this.requireDep('Registry');
 
@@ -200,7 +201,7 @@ export class AbjectEditor extends Abject {
           { type: 'label', windowId: this.windowId, text: `Source: ${objectName}` },
           { type: 'textArea', windowId: this.windowId, text: source, monospace: true },
           { type: 'button', windowId: this.windowId, text: 'Save',
-            style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' } },
+            style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
           { type: 'button', windowId: this.windowId, text: 'Cancel' },
           { type: 'label', windowId: this.windowId, text: '' },
         ],

@@ -74,6 +74,7 @@ export class JobBrowser extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
+    await this.fetchTheme();
     this.jobManagerId = await this.requireDep('JobManager');
     this.widgetManagerId = await this.requireDep('WidgetManager');
   }
@@ -289,15 +290,15 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
 
     switch (job.status) {
       case 'queued':
-        return { text: `○ #${job.id.replace('job-', '')} ${queueTag}${job.description}`, color: '#6b7084' };
+        return { text: `○ #${job.id.replace('job-', '')} ${queueTag}${job.description}`, color: this.theme.statusNeutral };
       case 'running':
-        return { text: `▸ #${job.id.replace('job-', '')} ${queueTag}${job.description}`, color: '#e8a84c' };
+        return { text: `▸ #${job.id.replace('job-', '')} ${queueTag}${job.description}`, color: this.theme.statusWarning };
       case 'completed':
-        return { text: `✓ #${job.id.replace('job-', '')} ${queueTag}${job.description}${elapsed ? `  ${elapsed}` : ''}`, color: '#a8cc8c' };
+        return { text: `✓ #${job.id.replace('job-', '')} ${queueTag}${job.description}${elapsed ? `  ${elapsed}` : ''}`, color: this.theme.statusSuccess };
       case 'failed':
-        return { text: `✗ #${job.id.replace('job-', '')} ${queueTag}${job.description}`, color: '#e05561' };
+        return { text: `✗ #${job.id.replace('job-', '')} ${queueTag}${job.description}`, color: this.theme.statusError };
       default:
-        return { text: `? #${job.id.replace('job-', '')} ${queueTag}${job.description}`, color: '#6b7084' };
+        return { text: `? #${job.id.replace('job-', '')} ${queueTag}${job.description}`, color: this.theme.statusNeutral };
     }
   }
 
@@ -365,18 +366,18 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
 
       switch (aspect) {
         case 'jobQueued':
-          await this.appendJobLabel(jobId, `○ #${jobId.replace('job-', '')} ${queueTag}${description}`, '#6b7084');
+          await this.appendJobLabel(jobId, `○ #${jobId.replace('job-', '')} ${queueTag}${description}`, this.theme.statusNeutral);
           break;
         case 'jobStarted':
-          await this.updateJobLabel(jobId, `▸ #${jobId.replace('job-', '')} ${queueTag}${description}`, '#e8a84c');
+          await this.updateJobLabel(jobId, `▸ #${jobId.replace('job-', '')} ${queueTag}${description}`, this.theme.statusWarning);
           break;
         case 'jobCompleted':
-          await this.updateJobLabel(jobId, `✓ #${jobId.replace('job-', '')} ${queueTag}${description}`, '#a8cc8c');
+          await this.updateJobLabel(jobId, `✓ #${jobId.replace('job-', '')} ${queueTag}${description}`, this.theme.statusSuccess);
           break;
         case 'jobFailed': {
           const error = data.error as string | undefined;
           const errorSuffix = error ? ` — ${error.slice(0, 30)}` : '';
-          await this.updateJobLabel(jobId, `✗ #${jobId.replace('job-', '')} ${queueTag}${description}${errorSuffix}`, '#e05561');
+          await this.updateJobLabel(jobId, `✗ #${jobId.replace('job-', '')} ${queueTag}${description}${errorSuffix}`, this.theme.statusError);
           break;
         }
         case 'historyCleared':

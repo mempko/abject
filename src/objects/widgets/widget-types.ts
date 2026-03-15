@@ -4,6 +4,10 @@
 
 import { AbjectId, InterfaceId } from '../../core/types.js';
 
+// Re-export ThemeData and MIDNIGHT_BLOOM from core (canonical source)
+export type { ThemeData } from '../../core/theme-data.js';
+export { MIDNIGHT_BLOOM } from '../../core/theme-data.js';
+
 // ── Interface IDs ──────────────────────────────────────────────────────────
 
 export const WIDGET_INTERFACE: InterfaceId = 'abjects:widget' as InterfaceId;
@@ -34,92 +38,6 @@ export interface Rect {
   width: number;
   height: number;
 }
-
-// ── Theme ──────────────────────────────────────────────────────────────────
-
-export interface ThemeData {
-  canvasBg: string;
-  windowBg: string;
-  titleBarBg: string;
-  accent: string;
-  textPrimary: string;
-  textSecondary: string;
-  textTertiary: string;
-  textPlaceholder: string;
-  buttonBg: string;
-  buttonBorder: string;
-  buttonText: string;
-  inputBg: string;
-  inputBorder: string;
-  inputBorderFocus: string;
-  windowBorder: string;
-  divider: string;
-  resizeGrip: string;
-  progressTrack: string;
-  progressFill: string;
-  cursor: string;
-  checkboxCheckedBg: string;
-  checkboxBorder: string;
-  checkmarkColor: string;
-  selectBg: string;
-  selectHover: string;
-  selectArrow: string;
-  selectionBg: string;
-  sliderTrack: string;
-  sliderFill: string;
-  sliderThumb: string;
-  sliderThumbBorder: string;
-  windowRadius: number;
-  widgetRadius: number;
-  titleBarHeight: number;
-  titleButtonSize: number;
-  titleButtonMargin: number;
-  titleButtonIconSize: number;
-  titleButtonHoverBg: string;
-  titleCloseHoverBg: string;
-}
-
-export const MIDNIGHT_BLOOM: ThemeData = {
-  canvasBg: '#0f1019',
-  windowBg: '#171923',
-  titleBarBg: '#1e2030',
-  accent: '#e8a84c',
-  textPrimary: '#e2e4e9',
-  textSecondary: '#b4b8c8',
-  textTertiary: '#6b7084',
-  textPlaceholder: '#3d4158',
-  buttonBg: '#252840',
-  buttonBorder: '#353958',
-  buttonText: '#e2e4e9',
-  inputBg: '#10121c',
-  inputBorder: '#2a2d42',
-  inputBorderFocus: '#e8a84c',
-  windowBorder: '#252840',
-  divider: '#252840',
-  resizeGrip: '#4a4d5e',
-  progressTrack: '#1a1d2e',
-  progressFill: '#e8a84c',
-  cursor: '#e8a84c',
-  checkboxCheckedBg: '#e8a84c',
-  checkboxBorder: '#353958',
-  checkmarkColor: '#0f1019',
-  selectBg: '#1e2030',
-  selectHover: '#252840',
-  selectArrow: '#6b7084',
-  selectionBg: 'rgba(232, 168, 76, 0.3)',
-  sliderTrack: '#1a1d2e',
-  sliderFill: '#e8a84c',
-  sliderThumb: '#e8a84c',
-  sliderThumbBorder: '#353958',
-  windowRadius: 8,
-  widgetRadius: 6,
-  titleBarHeight: 34,
-  titleButtonSize: 20,
-  titleButtonMargin: 7,
-  titleButtonIconSize: 10,
-  titleButtonHoverBg: '#353958',
-  titleCloseHoverBg: '#c53030',
-};
 
 // ── Constants ──────────────────────────────────────────────────────────────
 

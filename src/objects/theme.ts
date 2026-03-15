@@ -137,8 +137,8 @@ export class ThemeAbject extends Abject {
 
 ### ThemeData Fields
 
-Colors (all strings, e.g. '#1a1b2e'):
-  canvasBg, windowBg, titleBarBg, accent,
+Base colors (all strings, e.g. '#1a1b2e'):
+  canvasBg, windowBg, titleBarBg, accent, accentSecondary, accentTertiary,
   textPrimary, textSecondary, textTertiary, textPlaceholder,
   buttonBg, buttonBorder, buttonText,
   inputBg, inputBorder, inputBorderFocus,
@@ -146,6 +146,33 @@ Colors (all strings, e.g. '#1a1b2e'):
   progressTrack, progressFill, cursor,
   checkboxCheckedBg, checkboxBorder, checkmarkColor,
   selectBg, selectHover, selectArrow, selectionBg
+
+Semantic action buttons:
+  actionBg, actionText, actionBorder       — Save, Send, Apply, Connect
+  destructiveBg, destructiveText, destructiveBorder — Delete, Block, Remove
+
+Active item highlight:
+  activeItemBg, activeItemBorder           — sidebar/list active state
+
+Status indicators:
+  statusSuccess    — completed, ready (#a8cc8c)
+  statusError      — failed, error (#e05561)
+  statusErrorBright — validation error, blocked (#ff6b6b)
+  statusWarning    — in-progress, connecting (#9b59ff)
+  statusNeutral    — pending, stopped, queued (#6b7084)
+  statusInfo       — informational (#5b9bd5)
+
+Semantic text:
+  textHeading      — bold headings, object names (#e2e4e9)
+  textDescription  — descriptions, body text (#b4b8c8)
+  textMeta         — metadata, version, counts (#8b8fa3)
+  sectionLabel     — section headers like "Apps", "System" (#6b7084)
+
+Scrollbar:
+  scrollbarTrack, scrollbarThumb, scrollbarThumbHover
+
+Shadow:
+  shadowColor, dropdownShadow
 
 Numeric fields:
   windowRadius: number   — border radius for windows
@@ -155,7 +182,12 @@ Numeric fields:
 ### Common Color Mapping
 - Background: theme.windowBg (panels), theme.canvasBg (canvas behind windows)
 - Text: theme.textPrimary (main), theme.textSecondary (muted), theme.textTertiary (disabled)
-- Accents/highlights: theme.accent
+- Headings: theme.textHeading, Descriptions: theme.textDescription, Meta: theme.textMeta
+- Accents/highlights: theme.accent (green), theme.accentSecondary (purple), theme.accentTertiary (red)
+- Action buttons: theme.actionBg, theme.actionText, theme.actionBorder
+- Destructive buttons: theme.destructiveBg, theme.destructiveText, theme.destructiveBorder
+- Active items: theme.activeItemBg, theme.activeItemBorder
+- Status: theme.statusSuccess, statusError, statusWarning, statusNeutral, statusInfo
 - Buttons: theme.buttonBg, theme.buttonBorder, theme.buttonText
 - Inputs: theme.inputBg, theme.inputBorder, theme.inputBorderFocus
 

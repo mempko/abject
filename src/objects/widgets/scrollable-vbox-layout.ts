@@ -126,7 +126,7 @@ export class ScrollableVBoxLayout extends VBoxLayout {
           y: trackY,
           width: SCROLLBAR_WIDTH,
           height: trackH,
-          fill: 'rgba(255, 255, 255, 0.05)',
+          fill: this.theme.scrollbarTrack,
         },
       });
 
@@ -142,8 +142,8 @@ export class ScrollableVBoxLayout extends VBoxLayout {
         type: 'linearGradient',
         surfaceId,
         params: { x0: trackX, y0: 0, x1: trackX + SCROLLBAR_WIDTH, y1: 0, stops: [
-          { offset: 0, color: 'rgba(255,255,255,0.15)' },
-          { offset: 1, color: 'rgba(255,255,255,0.3)' },
+          { offset: 0, color: this.theme.scrollbarThumb },
+          { offset: 1, color: this.theme.scrollbarThumbHover },
         ] },
       });
       commands.push({
@@ -155,7 +155,7 @@ export class ScrollableVBoxLayout extends VBoxLayout {
           width: SCROLLBAR_WIDTH - 2,
           height: thumbHeight,
           radius: 3,
-          fill: 'rgba(255, 255, 255, 0.2)',
+          fill: this.theme.scrollbarThumb,
         },
       });
       commands.push({ type: 'restore', surfaceId, params: {} });

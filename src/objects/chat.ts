@@ -123,6 +123,7 @@ export class Chat extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
+    await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.registryId = await this.requireDep('Registry');
     this.agentAbjectId = await this.requireDep('AgentAbject');
@@ -175,7 +176,7 @@ export class Chat extends Abject {
       this.conversationHistory = [];
       if (this.windowId) {
         await this.clearMessageLabels();
-        await this.appendMessageLabel('Agent', 'How can I help you?', '#a8cc8c');
+        await this.appendMessageLabel('Agent', 'How can I help you?', this.theme.statusSuccess);
       }
       return true;
     });
@@ -247,9 +248,9 @@ export class Chat extends Abject {
       // Update UI thinking label
       if (this.thinkingLabelId) {
         if (newPhase === 'thinking') {
-          this.updateLabel(this.thinkingLabelId, `Thinking... (step ${step + 1})`, '#6b7084').catch(() => {});
+          this.updateLabel(this.thinkingLabelId, `Thinking... (step ${step + 1})`, this.theme.statusNeutral).catch(() => {});
         } else if (newPhase === 'acting' && action) {
-          this.updateLabel(this.thinkingLabelId, `  ▸ ${action}...`, '#e8a84c').catch(() => {});
+          this.updateLabel(this.thinkingLabelId, `  ▸ ${action}...`, this.theme.actionBg).catch(() => {});
         }
       }
     });
@@ -262,10 +263,10 @@ export class Chat extends Abject {
         const text = (action.text as string) ?? '';
         if (text && this.thinkingLabelId) {
           await this.removeLabel(this.thinkingLabelId);
-          await this.appendMessageLabel('Agent', text, '#a8cc8c');
+          await this.appendMessageLabel('Agent', text, this.theme.statusSuccess);
           this.thinkingLabelId = undefined;
           // Re-show thinking indicator for next step
-          this.thinkingLabelId = await this.appendMessageLabel('', 'Thinking...', '#6b7084');
+          this.thinkingLabelId = await this.appendMessageLabel('', 'Thinking...', this.theme.statusNeutral);
         }
       }
     });
@@ -278,9 +279,9 @@ export class Chat extends Abject {
       if (this.thinkingLabelId) {
         const desc = action?.reasoning ?? action?.action ?? '';
         if (result.success) {
-          this.updateLabel(this.thinkingLabelId, `  ✓ ${desc}`, '#6b7084').catch(() => {});
+          this.updateLabel(this.thinkingLabelId, `  ✓ ${desc}`, this.theme.statusNeutral).catch(() => {});
         } else {
-          this.updateLabel(this.thinkingLabelId, `  ✗ ${desc}`, '#e05561').catch(() => {});
+          this.updateLabel(this.thinkingLabelId, `  ✗ ${desc}`, this.theme.statusError).catch(() => {});
         }
       }
     });
@@ -659,7 +660,7 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
           { type: 'textInput', windowId: this.windowId, placeholder: 'Type a message...', wordWrap: true, maxLines: 6 },
-          { type: 'button', windowId: this.windowId, text: 'Send', style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' } },
+          { type: 'button', windowId: this.windowId, text: 'Send', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
         ],
       })
     );
@@ -681,7 +682,7 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
     this.uiPhase = 'idle';
 
     // Show greeting
-    await this.appendMessageLabel('Agent', 'How can I help you?', '#a8cc8c');
+    await this.appendMessageLabel('Agent', 'How can I help you?', this.theme.statusSuccess);
 
     await this.changed('visibility', true);
     return true;
@@ -737,11 +738,11 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
     await this.setInputDisabled(true);
 
     // Show user message
-    await this.appendMessageLabel('You', userText, '#e2e4e9');
+    await this.appendMessageLabel('You', userText, this.theme.textHeading);
     this.conversationHistory.push({ role: 'user', content: userText });
 
     // Show thinking indicator
-    this.thinkingLabelId = await this.appendMessageLabel('', 'Thinking...', '#6b7084');
+    this.thinkingLabelId = await this.appendMessageLabel('', 'Thinking...', this.theme.statusNeutral);
 
     try {
       // Refresh object summaries for the system prompt
@@ -776,12 +777,12 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
           await this.removeLabel(this.thinkingLabelId);
           const text = (result.result as string) ?? '';
           if (text) {
-            await this.appendMessageLabel('Agent', text, '#a8cc8c');
+            await this.appendMessageLabel('Agent', text, this.theme.statusSuccess);
             this.conversationHistory.push({ role: 'assistant', content: text });
           }
         } else {
           await this.removeLabel(this.thinkingLabelId);
-          await this.appendMessageLabel('Error', (result.error ?? 'Unknown error').slice(0, 100), '#e05561');
+          await this.appendMessageLabel('Error', (result.error ?? 'Unknown error').slice(0, 100), this.theme.statusError);
         }
         this.thinkingLabelId = undefined;
       }
@@ -792,7 +793,7 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
         this.thinkingLabelId = undefined;
       }
       const errMsg = err instanceof Error ? err.message : String(err);
-      await this.appendMessageLabel('Error', errMsg.slice(0, 100), '#e05561');
+      await this.appendMessageLabel('Error', errMsg.slice(0, 100), this.theme.statusError);
     }
 
     this.uiPhase = this.windowId ? 'idle' : 'closed';

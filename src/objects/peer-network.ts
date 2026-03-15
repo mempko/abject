@@ -101,6 +101,7 @@ export class PeerNetwork extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
+    await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.identityId = await this.discoverDep('Identity') ?? undefined;
     this.clipboardId = await this.discoverDep('Clipboard') ?? undefined;
@@ -344,7 +345,7 @@ export class PeerNetwork extends Abject {
     // Display Name label
     const { widgetIds: [nameLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Display Name', style: { color: '#e2e4e9', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: 'Display Name', style: { color: this.theme.textHeading, fontSize: 13 } },
       ] })
     );
     await this.request(request(this.id, tab0, 'addLayoutChild', {
@@ -371,7 +372,7 @@ export class PeerNetwork extends Abject {
     const { widgetIds: [_nameInputId, _saveNameBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'textInput', windowId: this.windowId, placeholder: 'Enter display name', text: peerName },
-        { type: 'button', windowId: this.windowId, text: 'Save', style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' } },
+        { type: 'button', windowId: this.windowId, text: 'Save', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
       ] })
     );
     this.nameInputId = _nameInputId;
@@ -393,8 +394,8 @@ export class PeerNetwork extends Abject {
     const truncatedPeerId = peerId ? `${peerId.slice(0, 16)}...${peerId.slice(-8)}` : '(not initialized)';
     const { widgetIds: [peerIdHeaderId, peerIdValueId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Peer ID', style: { color: '#e2e4e9', fontSize: 13 } },
-        { type: 'label', windowId: this.windowId, text: truncatedPeerId, style: { color: '#8b8fa3', fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: 'Peer ID', style: { color: this.theme.textHeading, fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: truncatedPeerId, style: { color: this.theme.textMeta, fontSize: 12 } },
       ] })
     );
     await this.request(request(this.id, tab0, 'addLayoutChild', {
@@ -449,7 +450,7 @@ export class PeerNetwork extends Abject {
 
     const { widgetIds: [_statusLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId!, text: '', style: { color: '#b4b8c8', fontSize: 12, align: 'right' } },
+        { type: 'label', windowId: this.windowId!, text: '', style: { color: this.theme.textDescription, fontSize: 12, align: 'right' } },
       ] })
     );
     this.statusLabelId = _statusLabelId;
@@ -465,8 +466,8 @@ export class PeerNetwork extends Abject {
     // Batch: Add Contact label + description label
     const { widgetIds: [addLabelId, addDescId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Add Contact', style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 } },
-        { type: 'label', windowId: this.windowId, text: "Paste a peer's identity JSON.", style: { color: '#b4b8c8', fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: 'Add Contact', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: "Paste a peer's identity JSON.", style: { color: this.theme.textDescription, fontSize: 12 } },
       ] })
     );
     await this.request(request(this.id, tab1, 'addLayoutChild', {
@@ -498,7 +499,7 @@ export class PeerNetwork extends Abject {
     const { widgetIds: [_addContactInputId, _addContactBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'textInput', windowId: this.windowId, placeholder: 'Paste identity JSON' },
-        { type: 'button', windowId: this.windowId, text: 'Add', style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' } },
+        { type: 'button', windowId: this.windowId, text: 'Add', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
       ] })
     );
     this.addContactInputId = _addContactInputId;
@@ -519,7 +520,7 @@ export class PeerNetwork extends Abject {
     // Contacts list header
     const { widgetIds: [contactsHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Contacts', style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: 'Contacts', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
       ] })
     );
     await this.request(request(this.id, tab1, 'addLayoutChild', {
@@ -531,7 +532,7 @@ export class PeerNetwork extends Abject {
     if (contacts.length === 0) {
       const { widgetIds: [emptyLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'No contacts yet.', style: { color: '#b4b8c8', fontSize: 12 } },
+          { type: 'label', windowId: this.windowId, text: 'No contacts yet.', style: { color: this.theme.textDescription, fontSize: 12 } },
         ] })
       );
       await this.request(request(this.id, tab1, 'addLayoutChild', {
@@ -555,27 +556,27 @@ export class PeerNetwork extends Abject {
         }));
 
         const displayName = contact.name || contact.peerId.slice(0, 12) + '...';
-        const stateColor = contact.state === 'connected' ? '#4caf50'
-          : contact.state === 'connecting' ? '#e8a84c'
-          : '#6b7084';
+        const stateColor = contact.state === 'connected' ? this.theme.actionBg
+          : contact.state === 'connecting' ? this.theme.statusWarning
+          : this.theme.statusNeutral;
         const isConnected = contact.state === 'connected';
 
         // Batch: name label + state label + connect button + delete button + block button
         const connBtnText = isConnected ? 'Disconnect' : 'Connect';
         const connBtnStyle = isConnected
           ? { fontSize: 11 }
-          : { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 };
+          : { background: '#1e3a2e', borderColor: this.theme.statusSuccess, fontSize: 11 };
         const specs: Array<Record<string, unknown>> = [
-          { type: 'label', windowId: this.windowId, text: displayName, style: { color: '#e2e4e9', fontSize: 12 } },
+          { type: 'label', windowId: this.windowId, text: displayName, style: { color: this.theme.textHeading, fontSize: 12 } },
           { type: 'label', windowId: this.windowId, text: contact.state, style: { color: stateColor, fontSize: 11 } },
           { type: 'button', windowId: this.windowId, text: connBtnText, style: connBtnStyle },
         ];
         if (isConnected) {
-          specs.push({ type: 'button', windowId: this.windowId, text: 'Introduce', style: { background: '#1e2a3a', borderColor: '#5b9bd5', fontSize: 11 } });
+          specs.push({ type: 'button', windowId: this.windowId, text: 'Introduce', style: { background: '#1e2a3a', borderColor: this.theme.statusInfo, fontSize: 11 } });
         }
         specs.push(
-          { type: 'button', windowId: this.windowId, text: 'Remove', style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 } },
-          { type: 'button', windowId: this.windowId, text: 'Block', style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 } },
+          { type: 'button', windowId: this.windowId, text: 'Remove', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
+          { type: 'button', windowId: this.windowId, text: 'Block', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
         );
 
         const { widgetIds: contactRowWidgets } = await this.request<{ widgetIds: AbjectId[] }>(
@@ -642,7 +643,7 @@ export class PeerNetwork extends Abject {
     // Signaling Server header
     const { widgetIds: [sigHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Signaling Servers', style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: 'Signaling Servers', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
       ] })
     );
     await this.request(request(this.id, tab2, 'addLayoutChild', {
@@ -669,7 +670,7 @@ export class PeerNetwork extends Abject {
     const { widgetIds: [_signalingInputId, _signalingConnectBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'textInput', windowId: this.windowId, placeholder: 'wss://signal.abject.world' },
-        { type: 'button', windowId: this.windowId, text: 'Connect', style: { background: '#1e3a2e', borderColor: '#4caf50' } },
+        { type: 'button', windowId: this.windowId, text: 'Connect', style: { background: '#1e3a2e', borderColor: this.theme.statusSuccess } },
       ] })
     );
     this.signalingInputId = _signalingInputId;
@@ -711,9 +712,9 @@ export class PeerNetwork extends Abject {
         preferredSize: { height: 28 },
       }));
 
-      const urlColor = status === 'connected' ? '#4caf50'
-        : status === 'connecting' ? '#e8a84c'
-        : '#ff6b6b';
+      const urlColor = status === 'connected' ? this.theme.actionBg
+        : status === 'connecting' ? this.theme.statusWarning
+        : this.theme.statusErrorBright;
       const statusText = status === 'connected' ? 'connected'
         : status === 'connecting' ? 'connecting...'
         : 'offline';
@@ -763,7 +764,7 @@ export class PeerNetwork extends Abject {
 
       const { widgetIds: [spHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'Signaling Peers', style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 } },
+          { type: 'label', windowId: this.windowId, text: 'Signaling Peers', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
         ] })
       );
       await this.request(request(this.id, tab2, 'addLayoutChild', {
@@ -793,8 +794,8 @@ export class PeerNetwork extends Abject {
         // Batch: name label + add button
         const { widgetIds: [spNameId, addBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: displayName, style: { color: '#b4b8c8', fontSize: 12 } },
-            { type: 'button', windowId: this.windowId, text: 'Add', style: { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 } },
+            { type: 'label', windowId: this.windowId, text: displayName, style: { color: this.theme.textDescription, fontSize: 12 } },
+            { type: 'button', windowId: this.windowId, text: 'Add', style: { background: '#1e3a2e', borderColor: this.theme.statusSuccess, fontSize: 11 } },
           ] })
         );
         await this.request(request(this.id, spRowId, 'addLayoutChild', {
@@ -850,8 +851,8 @@ export class PeerNetwork extends Abject {
       // Batch: network header + mesh status (2 adjacent labels)
       const { widgetIds: [netHeaderId, meshStatusId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'Network Peers', style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 13 } },
-          { type: 'label', windowId: this.windowId, text: meshStatus, style: { color: '#8b8fa3', fontSize: 11 } },
+          { type: 'label', windowId: this.windowId, text: 'Network Peers', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 13 } },
+          { type: 'label', windowId: this.windowId, text: meshStatus, style: { color: this.theme.textMeta, fontSize: 11 } },
         ] })
       );
       await this.request(request(this.id, tab2, 'addLayoutChild', {
@@ -883,9 +884,9 @@ export class PeerNetwork extends Abject {
         // Batch: name label + tag label + block button
         const { widgetIds: [cNameId, cTagId, cBlockBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: contact.name || contact.peerId.slice(0, 12) + '...', style: { color: '#b4b8c8', fontSize: 12 } },
-            { type: 'label', windowId: this.windowId, text: 'contact', style: { color: '#4caf50', fontSize: 11 } },
-            { type: 'button', windowId: this.windowId, text: 'Block', style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 } },
+            { type: 'label', windowId: this.windowId, text: contact.name || contact.peerId.slice(0, 12) + '...', style: { color: this.theme.textDescription, fontSize: 12 } },
+            { type: 'label', windowId: this.windowId, text: 'contact', style: { color: this.theme.statusSuccess, fontSize: 11 } },
+            { type: 'button', windowId: this.windowId, text: 'Block', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
           ] })
         );
         await this.request(request(this.id, cRowId, 'addLayoutChild', {
@@ -926,10 +927,10 @@ export class PeerNetwork extends Abject {
         // Batch: name label + duration label + trust button + block button
         const { widgetIds: [npNameId, durationId, promoteBtnId, npBlockBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: netPeer.name || netPeer.peerId.slice(0, 12) + '...', style: { color: '#b4b8c8', fontSize: 12 } },
-            { type: 'label', windowId: this.windowId, text: duration, style: { color: '#6b7084', fontSize: 11 } },
-            { type: 'button', windowId: this.windowId, text: 'Trust', style: { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 } },
-            { type: 'button', windowId: this.windowId, text: 'Block', style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 } },
+            { type: 'label', windowId: this.windowId, text: netPeer.name || netPeer.peerId.slice(0, 12) + '...', style: { color: this.theme.textDescription, fontSize: 12 } },
+            { type: 'label', windowId: this.windowId, text: duration, style: { color: this.theme.statusNeutral, fontSize: 11 } },
+            { type: 'button', windowId: this.windowId, text: 'Trust', style: { background: '#1e3a2e', borderColor: this.theme.statusSuccess, fontSize: 11 } },
+            { type: 'button', windowId: this.windowId, text: 'Block', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
           ] })
         );
         await this.request(request(this.id, npRowId, 'addLayoutChild', {
@@ -974,7 +975,7 @@ export class PeerNetwork extends Abject {
 
       const { widgetIds: [blockedHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'Blocked Peers', style: { color: '#ff6b6b', fontWeight: 'bold', fontSize: 13 } },
+          { type: 'label', windowId: this.windowId, text: 'Blocked Peers', style: { color: this.theme.statusErrorBright, fontWeight: 'bold', fontSize: 13 } },
         ] })
       );
       await this.request(request(this.id, tab2, 'addLayoutChild', {
@@ -1000,8 +1001,8 @@ export class PeerNetwork extends Abject {
         // Batch: name label + unblock button
         const { widgetIds: [bNameId, unblockBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: bPeerId.slice(0, 16) + '...', style: { color: '#6b7084', fontSize: 12 } },
-            { type: 'button', windowId: this.windowId, text: 'Unblock', style: { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 } },
+            { type: 'label', windowId: this.windowId, text: bPeerId.slice(0, 16) + '...', style: { color: this.theme.statusNeutral, fontSize: 12 } },
+            { type: 'button', windowId: this.windowId, text: 'Unblock', style: { background: '#1e3a2e', borderColor: this.theme.statusSuccess, fontSize: 11 } },
           ] })
         );
         await this.request(request(this.id, bRowId, 'addLayoutChild', {
@@ -1037,7 +1038,7 @@ export class PeerNetwork extends Abject {
     // Introductions header
     const { widgetIds: [introHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Pending Introductions', style: { color: '#5b9bd5', fontWeight: 'bold', fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: 'Pending Introductions', style: { color: this.theme.statusInfo, fontWeight: 'bold', fontSize: 13 } },
       ] })
     );
     await this.request(request(this.id, tab3, 'addLayoutChild', {
@@ -1049,7 +1050,7 @@ export class PeerNetwork extends Abject {
     if (pendingIntros.length === 0) {
       const { widgetIds: [emptyIntroId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'No pending introductions.', style: { color: '#b4b8c8', fontSize: 12 } },
+          { type: 'label', windowId: this.windowId, text: 'No pending introductions.', style: { color: this.theme.textDescription, fontSize: 12 } },
         ] })
       );
       await this.request(request(this.id, tab3, 'addLayoutChild', {
@@ -1079,9 +1080,9 @@ export class PeerNetwork extends Abject {
         // Batch: intro label + accept button + reject button
         const { widgetIds: [introLabel, acceptBtnId, rejectBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: `${introName} (from ${fromName})`, style: { color: '#e2e4e9', fontSize: 12 } },
-            { type: 'button', windowId: this.windowId, text: 'Accept', style: { background: '#1e3a2e', borderColor: '#4caf50', fontSize: 11 } },
-            { type: 'button', windowId: this.windowId, text: 'Reject', style: { background: '#3a1f1f', color: '#ff6b6b', borderColor: '#ff6b6b', fontSize: 11 } },
+            { type: 'label', windowId: this.windowId, text: `${introName} (from ${fromName})`, style: { color: this.theme.textHeading, fontSize: 12 } },
+            { type: 'button', windowId: this.windowId, text: 'Accept', style: { background: '#1e3a2e', borderColor: this.theme.statusSuccess, fontSize: 11 } },
+            { type: 'button', windowId: this.windowId, text: 'Reject', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
           ] })
         );
         await this.request(request(this.id, introRowId, 'addLayoutChild', {
@@ -1168,7 +1169,7 @@ export class PeerNetwork extends Abject {
     }));
   }
 
-  private async setStatus(text: string, color = '#b4b8c8'): Promise<void> {
+  private async setStatus(text: string, color = this.theme.textDescription): Promise<void> {
     if (!this.statusLabelId) return;
     await this.request(
       request(this.id, this.statusLabelId, 'update', {
@@ -1187,7 +1188,7 @@ export class PeerNetwork extends Abject {
     );
 
     if (!name || name.trim() === '') {
-      await this.setStatus('Name cannot be empty.', '#ff6b6b');
+      await this.setStatus('Name cannot be empty.', this.theme.statusErrorBright);
       return;
     }
 
@@ -1212,10 +1213,10 @@ export class PeerNetwork extends Abject {
         );
         await this.setStatus('Peer ID copied!');
       } else {
-        await this.setStatus('Clipboard not available.', '#ff6b6b');
+        await this.setStatus('Clipboard not available.', this.theme.statusErrorBright);
       }
     } catch {
-      await this.setStatus('Failed to copy Peer ID.', '#ff6b6b');
+      await this.setStatus('Failed to copy Peer ID.', this.theme.statusErrorBright);
     }
   }
 
@@ -1242,10 +1243,10 @@ export class PeerNetwork extends Abject {
         );
         await this.setStatus('Identity JSON copied!');
       } else {
-        await this.setStatus('Clipboard not available.', '#ff6b6b');
+        await this.setStatus('Clipboard not available.', this.theme.statusErrorBright);
       }
     } catch {
-      await this.setStatus('Failed to copy identity.', '#ff6b6b');
+      await this.setStatus('Failed to copy identity.', this.theme.statusErrorBright);
     }
   }
 
@@ -1261,7 +1262,7 @@ export class PeerNetwork extends Abject {
       await this.refresh();
       await this.setStatus('Removed signaling server.');
     } catch {
-      await this.setStatus('Failed to remove server.', '#ff6b6b');
+      await this.setStatus('Failed to remove server.', this.theme.statusErrorBright);
     }
   }
 
@@ -1273,7 +1274,7 @@ export class PeerNetwork extends Abject {
     );
 
     if (!url || url.trim() === '') {
-      await this.setStatus('Enter a signaling server URL.', '#ff6b6b');
+      await this.setStatus('Enter a signaling server URL.', this.theme.statusErrorBright);
       return;
     }
 
@@ -1283,12 +1284,12 @@ export class PeerNetwork extends Abject {
       );
       if (ok) {
         await this.refresh();
-        await this.setStatus('Connected to signaling server!', '#4caf50');
+        await this.setStatus('Connected to signaling server!', this.theme.statusSuccess);
       } else {
-        await this.setStatus('Failed to connect.', '#ff6b6b');
+        await this.setStatus('Failed to connect.', this.theme.statusErrorBright);
       }
     } catch {
-      await this.setStatus('Connection error.', '#ff6b6b');
+      await this.setStatus('Connection error.', this.theme.statusErrorBright);
     }
   }
 
@@ -1300,7 +1301,7 @@ export class PeerNetwork extends Abject {
     );
 
     if (!jsonStr || jsonStr.trim() === '') {
-      await this.setStatus('Paste identity JSON.', '#ff6b6b');
+      await this.setStatus('Paste identity JSON.', this.theme.statusErrorBright);
       return;
     }
 
@@ -1313,7 +1314,7 @@ export class PeerNetwork extends Abject {
       };
 
       if (!parsed.peerId || !parsed.publicSigningKey || !parsed.publicExchangeKey) {
-        await this.setStatus('Invalid identity JSON.', '#ff6b6b');
+        await this.setStatus('Invalid identity JSON.', this.theme.statusErrorBright);
         return;
       }
 
@@ -1329,7 +1330,7 @@ export class PeerNetwork extends Abject {
       await this.refresh();
       await this.setStatus('Contact added!');
     } catch {
-      await this.setStatus('Invalid JSON format.', '#ff6b6b');
+      await this.setStatus('Invalid JSON format.', this.theme.statusErrorBright);
     }
   }
 
@@ -1355,7 +1356,7 @@ export class PeerNetwork extends Abject {
       await this.refresh();
       await this.setStatus(wasConnected ? 'Disconnected.' : 'Connecting...');
     } catch {
-      await this.setStatus('Connection error.', '#ff6b6b');
+      await this.setStatus('Connection error.', this.theme.statusErrorBright);
     }
   }
 
@@ -1376,7 +1377,7 @@ export class PeerNetwork extends Abject {
     // Find connected peers that are not the contact being introduced
     const connectedPeers = contacts.filter(c => c.state === 'connected' && c.peerId !== contactId);
     if (connectedPeers.length === 0) {
-      await this.setStatus('No other connected peers to introduce to.', '#ff6b6b');
+      await this.setStatus('No other connected peers to introduce to.', this.theme.statusErrorBright);
       return;
     }
 
@@ -1396,7 +1397,7 @@ export class PeerNetwork extends Abject {
     if (introduced > 0) {
       await this.setStatus(`Introduced to ${introduced} peer(s)!`);
     } else {
-      await this.setStatus('Failed to introduce.', '#ff6b6b');
+      await this.setStatus('Failed to introduce.', this.theme.statusErrorBright);
     }
   }
 
@@ -1410,7 +1411,7 @@ export class PeerNetwork extends Abject {
       await this.refresh();
       await this.setStatus('Introduction accepted!');
     } catch {
-      await this.setStatus('Failed to accept introduction.', '#ff6b6b');
+      await this.setStatus('Failed to accept introduction.', this.theme.statusErrorBright);
     }
   }
 
@@ -1424,7 +1425,7 @@ export class PeerNetwork extends Abject {
       await this.refresh();
       await this.setStatus('Introduction rejected.');
     } catch {
-      await this.setStatus('Failed to reject introduction.', '#ff6b6b');
+      await this.setStatus('Failed to reject introduction.', this.theme.statusErrorBright);
     }
   }
 
@@ -1438,7 +1439,7 @@ export class PeerNetwork extends Abject {
       await this.refresh();
       await this.setStatus('Peer blocked.');
     } catch {
-      await this.setStatus('Failed to block peer.', '#ff6b6b');
+      await this.setStatus('Failed to block peer.', this.theme.statusErrorBright);
     }
   }
 
@@ -1452,7 +1453,7 @@ export class PeerNetwork extends Abject {
       await this.refresh();
       await this.setStatus('Peer unblocked.');
     } catch {
-      await this.setStatus('Failed to unblock peer.', '#ff6b6b');
+      await this.setStatus('Failed to unblock peer.', this.theme.statusErrorBright);
     }
   }
 
@@ -1466,7 +1467,7 @@ export class PeerNetwork extends Abject {
       await this.refresh();
       await this.setStatus('Peer promoted to contact!');
     } catch {
-      await this.setStatus('Failed to promote peer.', '#ff6b6b');
+      await this.setStatus('Failed to promote peer.', this.theme.statusErrorBright);
     }
   }
 
@@ -1501,7 +1502,7 @@ export class PeerNetwork extends Abject {
       await this.refresh();
       await this.setStatus('Contact removed.');
     } catch {
-      await this.setStatus('Failed to remove contact.', '#ff6b6b');
+      await this.setStatus('Failed to remove contact.', this.theme.statusErrorBright);
     }
   }
 }

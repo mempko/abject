@@ -31,14 +31,7 @@ const PROTECTED_NAMES = new Set([
   'ObjectManager',
 ]);
 
-/** State → color mapping for the state label. */
-const STATE_COLORS: Record<string, string> = {
-  ready: '#a8cc8c',
-  error: '#e85b6e',
-  initializing: '#e8a84c',
-  busy: '#e8a84c',
-  stopped: '#6b7084',
-};
+/** Names removed — state colors now come from this.theme via stateColor(). */
 
 interface ObjectRow {
   id: AbjectId;
@@ -116,7 +109,20 @@ export class ObjectManager extends Abject {
     this.setupHandlers();
   }
 
+  /** Map object state → theme color. */
+  private stateColor(state: string): string {
+    switch (state) {
+      case 'ready': return this.theme.statusSuccess;
+      case 'error': return this.theme.statusError;
+      case 'initializing':
+      case 'busy': return this.theme.statusWarning;
+      case 'stopped': return this.theme.statusNeutral;
+      default: return this.theme.statusNeutral;
+    }
+  }
+
   protected override async onInit(): Promise<void> {
+    await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.registryId = await this.requireDep('Registry');
     this.factoryId = await this.discoverDep('Factory') ?? undefined;
@@ -402,7 +408,7 @@ export class ObjectManager extends Abject {
         specs: [
           { type: 'textInput', windowId: this.windowId!, placeholder: 'Search objects...' },
           { type: 'button', windowId: this.windowId!, text: 'Refresh', style: { fontSize: 12 } },
-          { type: 'label', windowId: this.windowId!, text: '', style: { color: '#6b7084', fontSize: 11 } },
+          { type: 'label', windowId: this.windowId!, text: '', style: { color: this.theme.sectionLabel, fontSize: 11 } },
         ],
       })
     );
@@ -443,7 +449,7 @@ export class ObjectManager extends Abject {
       preferredSize: { height: 20 },
     }));
 
-    const headerStyle = { color: '#6b7084', fontSize: 11, fontWeight: 'bold' };
+    const headerStyle = { color: this.theme.sectionLabel, fontSize: 11, fontWeight: 'bold' };
     const headerTexts = ['Name', 'ID', 'State', 'Location', 'Actions'];
     const headerWidths: Array<number | undefined> = [undefined, 70, 70, 80, 110];
 
@@ -557,7 +563,7 @@ export class ObjectManager extends Abject {
 
       // Batch-create the 4 data labels for each row
       const shortId = row.id.slice(0, 8);
-      const stateColor = STATE_COLORS[row.state] ?? '#6b7084';
+      const stateColor = this.stateColor(row.state);
       const location = row.isWorker
         ? `Worker ${row.workerIndex ?? '?'}`
         : 'Main';
@@ -566,10 +572,10 @@ export class ObjectManager extends Abject {
         await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', {
             specs: [
-              { type: 'label', windowId: this.windowId!, text: row.name, style: { fontSize: 12, color: '#e2e4e9' } },
-              { type: 'label', windowId: this.windowId!, text: shortId, style: { fontSize: 11, color: '#6b7084' } },
+              { type: 'label', windowId: this.windowId!, text: row.name, style: { fontSize: 12, color: this.theme.textHeading } },
+              { type: 'label', windowId: this.windowId!, text: shortId, style: { fontSize: 11, color: this.theme.sectionLabel } },
               { type: 'label', windowId: this.windowId!, text: row.state, style: { fontSize: 11, color: stateColor } },
-              { type: 'label', windowId: this.windowId!, text: location, style: { fontSize: 11, color: '#8b8fa3' } },
+              { type: 'label', windowId: this.windowId!, text: location, style: { fontSize: 11, color: this.theme.textMeta } },
             ],
           })
         );
@@ -607,7 +613,7 @@ export class ObjectManager extends Abject {
         const { widgetIds: [protectedLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', {
             specs: [
-              { type: 'label', windowId: this.windowId!, text: 'protected', style: { fontSize: 10, color: '#6b7084', fontStyle: 'italic' } },
+              { type: 'label', windowId: this.windowId!, text: 'protected', style: { fontSize: 10, color: this.theme.sectionLabel, fontStyle: 'italic' } },
             ],
           })
         );
@@ -634,7 +640,7 @@ export class ObjectManager extends Abject {
         const { widgetIds: [stopBtnId, restartBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', {
             specs: [
-              { type: 'button', windowId: this.windowId!, text: 'Stop', style: { fontSize: 10, background: '#c0392b', color: '#ffffff', borderColor: '#c0392b' } },
+              { type: 'button', windowId: this.windowId!, text: 'Stop', style: { fontSize: 10, background: this.theme.destructiveText, color: '#ffffff', borderColor: this.theme.destructiveText } },
               { type: 'button', windowId: this.windowId!, text: 'Restart', style: { fontSize: 10 } },
             ],
           })

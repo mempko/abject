@@ -120,6 +120,7 @@ export class GlobalSettings extends Abject {
   }
 
   protected override async onInit(): Promise<void> {
+    await this.fetchTheme();
     this.llmId = await this.requireDep('LLM');
     this.storageId = await this.requireDep('Storage');
     this.widgetManagerId = await this.requireDep('WidgetManager');
@@ -371,9 +372,9 @@ export class GlobalSettings extends Abject {
     const { widgetIds: [sectionHeaderId, descLabelId, providerSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId, text: 'LLM Provider',
-          style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 } },
+          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
         { type: 'label', windowId: this.windowId, text: 'Select your LLM provider and enter credentials.',
-          style: { color: '#b4b8c8', fontSize: 12 } },
+          style: { color: this.theme.textDescription, fontSize: 12 } },
         { type: 'select', windowId: this.windowId,
           options: PROVIDER_LABELS,
           selectedIndex: selectedIndex >= 0 ? selectedIndex : 0 },
@@ -403,7 +404,7 @@ export class GlobalSettings extends Abject {
     const { widgetIds: [anthropicLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId, text: 'API Key',
-          style: { color: '#e2e4e9', fontSize: 13 } },
+          style: { color: this.theme.textHeading, fontSize: 13 } },
       ]})
     );
     this.anthropicSectionIds.push(anthropicLabelId);
@@ -455,7 +456,7 @@ export class GlobalSettings extends Abject {
     const { widgetIds: [openaiLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId, text: 'API Key',
-          style: { color: '#e2e4e9', fontSize: 13 } },
+          style: { color: this.theme.textHeading, fontSize: 13 } },
       ]})
     );
     this.openaiSectionIds.push(openaiLabelId);
@@ -507,7 +508,7 @@ export class GlobalSettings extends Abject {
     const { widgetIds: [ollamaLabelId, ollamaUrlId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId, text: 'Base URL',
-          style: { color: '#e2e4e9', fontSize: 13 } },
+          style: { color: this.theme.textHeading, fontSize: 13 } },
         { type: 'textInput', windowId: this.windowId, placeholder: 'http://localhost:11434',
           text: savedOllamaUrl || 'http://localhost:11434' },
       ]})
@@ -549,7 +550,7 @@ export class GlobalSettings extends Abject {
     const { widgetIds: [saveBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'button', windowId: this.windowId, text: 'Save Provider',
-          style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' } },
+          style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
       ]})
     );
     this.saveBtnId = saveBtnId;
@@ -567,7 +568,7 @@ export class GlobalSettings extends Abject {
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'divider', windowId: this.windowId },
         { type: 'label', windowId: this.windowId, text: 'Authentication',
-          style: { color: '#e2e4e9', fontWeight: 'bold', fontSize: 15 } },
+          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
       ]})
     );
     await this.request(request(this.id, cId, 'addLayoutChild', {
@@ -631,7 +632,7 @@ export class GlobalSettings extends Abject {
     const { widgetIds: [authUserLabelId, authUserInputId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId, text: 'Username',
-          style: { color: '#e2e4e9', fontSize: 13 } },
+          style: { color: this.theme.textHeading, fontSize: 13 } },
         { type: 'textInput', windowId: this.windowId, placeholder: 'Username',
           text: savedAuthUser || undefined,
           style: savedAuthEnabled ? undefined : { disabled: true } },
@@ -654,7 +655,7 @@ export class GlobalSettings extends Abject {
     const { widgetIds: [authPassLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId, text: 'Password',
-          style: { color: '#e2e4e9', fontSize: 13 } },
+          style: { color: this.theme.textHeading, fontSize: 13 } },
       ]})
     );
     await this.request(request(this.id, cId, 'addLayoutChild', {
@@ -720,7 +721,7 @@ export class GlobalSettings extends Abject {
     const { widgetIds: [authSaveBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'button', windowId: this.windowId, text: 'Save Auth',
-          style: { background: '#e8a84c', color: '#0f1019', borderColor: '#e8a84c' } },
+          style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
       ]})
     );
     this.authSaveBtnId = authSaveBtnId;
@@ -737,7 +738,7 @@ export class GlobalSettings extends Abject {
     const { widgetIds: [statusLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId!, text: '',
-          style: { color: '#b4b8c8', fontSize: 12, align: 'right' } },
+          style: { color: this.theme.textDescription, fontSize: 12, align: 'right' } },
       ]})
     );
     this.statusLabelId = statusLabelId;
@@ -789,7 +790,7 @@ export class GlobalSettings extends Abject {
 
   // ========== HELPERS ==========
 
-  private async setStatus(text: string, color = '#b4b8c8'): Promise<void> {
+  private async setStatus(text: string, color = this.theme.textDescription): Promise<void> {
     if (!this.statusLabelId) return;
     await this.request(
       request(this.id, this.statusLabelId, 'update', {
@@ -914,7 +915,7 @@ export class GlobalSettings extends Abject {
     const enabled = !!checked;
 
     if (enabled && (!username || !password)) {
-      await this.setStatus('Username and password are required.', '#f87171');
+      await this.setStatus('Username and password are required.', this.theme.statusErrorBright);
       return;
     }
 
@@ -965,7 +966,7 @@ export class GlobalSettings extends Abject {
           request(this.id, this.anthropicKeyId!, 'getValue', {})
         );
         if (!anthropicKey) {
-          await this.setStatus('Anthropic API key is required.', '#f87171');
+          await this.setStatus('Anthropic API key is required.', this.theme.statusErrorBright);
           await this.setSaveControlsDisabled(false);
           return;
         }
@@ -975,7 +976,7 @@ export class GlobalSettings extends Abject {
           request(this.id, this.openaiKeyId!, 'getValue', {})
         );
         if (!openaiKey) {
-          await this.setStatus('OpenAI API key is required.', '#f87171');
+          await this.setStatus('OpenAI API key is required.', this.theme.statusErrorBright);
           await this.setSaveControlsDisabled(false);
           return;
         }
