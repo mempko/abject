@@ -25,7 +25,7 @@ export class ButtonWidget extends WidgetAbject {
 
     let fill = style.background ?? this.theme.buttonBg;
     if (this.hovered && !this.disabled) {
-      fill = lightenColor(fill);
+      fill = lightenColor(fill, 25);
     }
 
     // Reduce opacity when disabled

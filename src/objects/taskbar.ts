@@ -522,12 +522,12 @@ export class Taskbar extends Abject {
     // 1: Gear button
     specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13, ...(registryVis ? activeStyle : {}) } });
     // 2: Chat button
-    specs.push({ type: 'button', windowId: this.windowId!, text: 'Chat', ...(chatVis ? { style: activeStyle } : {}) });
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCAC Chat', ...(chatVis ? { style: activeStyle } : {}) });
     // 3: Jobs button
-    specs.push({ type: 'button', windowId: this.windowId!, text: 'Jobs', ...(jobsVis ? { style: activeStyle } : {}) });
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCCB Jobs', ...(jobsVis ? { style: activeStyle } : {}) });
     // 4?: Browser button (optional)
     if (this.webBrowserViewerId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: 'Browser', ...(browserViewerVis ? { style: activeStyle } : {}) });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Web', ...(browserViewerVis ? { style: activeStyle } : {}) });
     }
     // User object buttons
     const userObjStartIdx = specs.length;

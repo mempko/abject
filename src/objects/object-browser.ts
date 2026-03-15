@@ -644,7 +644,7 @@ export class ObjectBrowser extends Abject {
 
     // Create window
     this.windowId = await wm('createWindowAbject', {
-      title: 'Object Explorer',
+      title: '\uD83D\uDD0D Object Explorer',
       rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
       resizable: true,
     }) as AbjectId;

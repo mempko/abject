@@ -143,7 +143,7 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: 'Jobs',
+        title: '\uD83D\uDCCB Jobs',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
         resizable: true,

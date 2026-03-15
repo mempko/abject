@@ -246,9 +246,9 @@ export class GlobalToolbar extends Abject {
         specs: [
           { type: 'label', windowId: this.windowId!, text: '\u2699 System', style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } },
           { type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13 } },
-          { type: 'button', windowId: this.windowId!, text: 'Network' },
-          { type: 'button', windowId: this.windowId!, text: 'Explorer' },
-          { type: 'button', windowId: this.windowId!, text: 'Processes' },
+          { type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Network' },
+          { type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0D Explorer' },
+          { type: 'button', windowId: this.windowId!, text: '\u2699\uFE0F Processes' },
         ],
       })
     );

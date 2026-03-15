@@ -40,7 +40,7 @@ export class WorkspaceSwitcher extends Abject {
   private settingsId?: AbjectId;
 
   /** Cached workspace data (pushed by WorkspaceManager via show payload) */
-  private cachedWorkspaces: Array<{ id: string; name: string }> = [];
+  private cachedWorkspaces: Array<{ id: string; name: string; accessMode: string }> = [];
   private cachedActiveWorkspaceId?: string;
 
   /** Cached y offset for rebuilds (set by WorkspaceManager) */
@@ -112,7 +112,7 @@ export class WorkspaceSwitcher extends Abject {
   private setupHandlers(): void {
     this.on('show', async (msg: AbjectMessage) => {
       const payload = msg.payload as {
-        workspaces?: Array<{ id: string; name: string }>;
+        workspaces?: Array<{ id: string; name: string; accessMode: string }>;
         activeWorkspaceId?: string;
         settingsId?: AbjectId;
         yOffset?: number;
@@ -167,7 +167,7 @@ export class WorkspaceSwitcher extends Abject {
             await this.request(request(this.id, this.workspaceManagerId,
               'createWorkspace', { name }));
             // Refresh cached workspace data
-            this.cachedWorkspaces = await this.request<Array<{ id: string; name: string }>>(
+            this.cachedWorkspaces = await this.request<Array<{ id: string; name: string; accessMode: string }>>(
               request(this.id, this.workspaceManagerId,
                 'listWorkspaces', {}));
             await this.show();
@@ -297,12 +297,13 @@ export class WorkspaceSwitcher extends Abject {
       // 2..N-1: workspace buttons
       for (const ws of workspaces) {
         const isActive = ws.id === this.cachedActiveWorkspaceId;
-        specs.push({ type: 'button', windowId: this.windowId!, text: ws.name, ...(isActive ? { style: wsActiveStyle } : {}) });
+        const accessIcon = ws.accessMode === 'public' ? '\uD83C\uDF0D' : ws.accessMode === 'private' ? '\uD83D\uDD11' : '\uD83D\uDD12';
+        specs.push({ type: 'button', windowId: this.windowId!, text: `${accessIcon} ${ws.name}`, ...(isActive ? { style: wsActiveStyle } : {}) });
       }
       // N: "+" button
       specs.push({ type: 'button', windowId: this.windowId!, text: '+' });
       // N+1: Browse button
-      specs.push({ type: 'button', windowId: this.windowId!, text: 'Browse' });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0E Browse' });
 
       const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs })

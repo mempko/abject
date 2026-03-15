@@ -262,7 +262,7 @@ export class PeerNetwork extends Abject {
     // Create window
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: 'Peer Network',
+        title: '\uD83C\uDF10 Peer Network',
         rect: { x: winX, y: winY, width: winW, height: winH },
         zIndex: 200,
       })

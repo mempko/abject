@@ -613,7 +613,7 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: 'Chat Agent',
+        title: '\uD83D\uDCAC Chat Agent',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
         resizable: true,

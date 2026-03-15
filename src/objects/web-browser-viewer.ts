@@ -147,7 +147,7 @@ export class WebBrowserViewer extends Abject {
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: 'Browser Viewer',
+        title: '\uD83C\uDF10 Web Viewer',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
         resizable: true,

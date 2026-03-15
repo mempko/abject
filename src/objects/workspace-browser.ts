@@ -351,7 +351,7 @@ export class WorkspaceBrowser extends Abject {
     const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2));
 
     this.windowId = await wm('createWindowAbject', {
-      title: 'Workspace Browser',
+      title: '\uD83D\uDD0E Workspace Browser',
       rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
       zIndex: 200,
     });

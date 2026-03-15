@@ -330,7 +330,7 @@ export class ProcessExplorer extends Abject {
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: 'Process Explorer',
+        title: '\u2699\uFE0F Process Explorer',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
         resizable: true,

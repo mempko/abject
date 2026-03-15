@@ -727,10 +727,11 @@ export class WorkspaceManager extends Abject {
     return true;
   }
 
-  listWorkspaces(): Array<{ id: string; name: string }> {
+  listWorkspaces(): Array<{ id: string; name: string; accessMode: WorkspaceAccessMode }> {
     return [...this.workspaces.entries()].map(([id, ws]) => ({
       id,
       name: ws.name,
+      accessMode: ws.accessMode,
     }));
   }
 
