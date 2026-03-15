@@ -55,12 +55,13 @@ export class Settings extends Abject {
   private accessModeSelectId?: AbjectId;
   private accessSaveBtnId?: AbjectId;
   private accessStatusLabelId?: AbjectId;
+  private accessSearchInputId?: AbjectId;
+  private accessSearchText = '';
 
   /** Maps delete button AbjectId → object ID for "Created Objects" section. */
   private objectDeleteButtons: Map<AbjectId, string> = new Map();
 
   /** Maps checkbox AbjectId → object ID for "Exposed" checkboxes on General tab. */
-  private generalExposedCheckboxes: Map<AbjectId, string> = new Map();
 
   /** Maps checkbox AbjectId → peerId for whitelist UI. */
   private whitelistCheckboxes: Map<AbjectId, string> = new Map();
@@ -194,13 +195,14 @@ export class Settings extends Abject {
     this.accessSaveBtnId = undefined;
     this.accessStatusLabelId = undefined;
     this.objectDeleteButtons.clear();
-    this.generalExposedCheckboxes.clear();
     this.whitelistCheckboxes.clear();
     this.whitelistContainerId = undefined;
     this.whitelistWidgetIds = [];
     this.exposedCheckboxes.clear();
     this.exposedContainerId = undefined;
     this.exposedWidgetIds = [];
+    this.accessSearchInputId = undefined;
+    this.accessSearchText = '';
   }
 
   private setupHandlers(): void {
@@ -266,6 +268,15 @@ export class Settings extends Abject {
         return;
       }
 
+      // Search input change — filter exposed objects
+      if (fromId === this.accessSearchInputId && aspect === 'change') {
+        this.accessSearchText = ((value as string) ?? '').toLowerCase();
+        await this.clearExposedObjectsSection();
+        const r0 = { x: 0, y: 0, width: 0, height: 0 };
+        await this.buildExposedObjectsSection(r0);
+        return;
+      }
+
       // Access mode dropdown change — dynamically add/remove whitelist and exposed objects sections
       if (fromId === this.accessModeSelectId && aspect === 'change') {
         const modeMap: Record<string, string> = { 'Local': 'local', 'Private': 'private', 'Public': 'public' };
@@ -298,7 +309,7 @@ export class Settings extends Abject {
     );
 
     const winW = 440;
-    const winH = 500;
+    const winH = 520;
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
@@ -308,6 +319,7 @@ export class Settings extends Abject {
         title: 'Workspace Settings',
         rect: { x: winX, y: winY, width: winW, height: winH },
         zIndex: 200,
+        resizable: true,
       })
     );
 
@@ -392,21 +404,10 @@ export class Settings extends Abject {
       } catch { /* use empty */ }
     }
 
-    // Get created objects from AbjectStore
-    interface AbjectSnapshot { objectId: string; manifest: { name: string; description: string }; source: string; owner: string; savedAt: number }
-    let snapshots: AbjectSnapshot[] = [];
-    if (this.abjectStoreId) {
-      try {
-        snapshots = await this.request<AbjectSnapshot[]>(
-          request(this.id, this.abjectStoreId, 'list', {})
-        );
-      } catch { /* AbjectStore may not be ready */ }
-    }
-
     const cId = this.tabContentContainerId!;
 
     // Batch-create all General tab header widgets
-    const { widgetIds: [sectionHeaderId, descLabelId, nameLabelId, nameInputId, descInputLabelId, descInputId, tagsLabelId, tagsInputId, divId, objHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    const { widgetIds: [sectionHeaderId, descLabelId, nameLabelId, nameInputId, descInputLabelId, descInputId, tagsLabelId, tagsInputId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId, text: 'Workspace', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
         { type: 'label', windowId: this.windowId, text: 'Configure this workspace.', style: { color: this.theme.textDescription, fontSize: 12 } },
@@ -416,8 +417,6 @@ export class Settings extends Abject {
         { type: 'textInput', windowId: this.windowId, placeholder: 'Workspace description', text: currentDescription },
         { type: 'label', windowId: this.windowId, text: 'Tags (comma-separated)', style: { color: this.theme.textHeading, fontSize: 13 } },
         { type: 'textInput', windowId: this.windowId, placeholder: 'e.g. art, tools, games', text: currentTags },
-        { type: 'divider', windowId: this.windowId },
-        { type: 'label', windowId: this.windowId, text: 'Created Objects', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
       ] })
     );
     this.trackTabWidget(sectionHeaderId);
@@ -428,9 +427,6 @@ export class Settings extends Abject {
     this.descriptionInputId = this.trackTabWidget(descInputId);
     this.trackTabWidget(tagsLabelId);
     this.tagsInputId = this.trackTabWidget(tagsInputId);
-    this.trackTabWidget(divId);
-    this.trackTabWidget(objHeaderId);
-
     // Section header: "Workspace"
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: sectionHeaderId,
@@ -489,101 +485,6 @@ export class Settings extends Abject {
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
-
-    // ── Created Objects Section ──
-
-    // Divider
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: divId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 1 },
-    }));
-
-    // Section header
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: objHeaderId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 24 },
-    }));
-
-    // Fetch current exposed object IDs for checkbox state
-    let generalExposedSet = new Set<string>();
-    if (this.workspaceManagerId && this.workspaceId) {
-      try {
-        const exposedIds = await this.request<string[]>(
-          request(this.id, this.workspaceManagerId, 'getExposedObjects', { workspaceId: this.workspaceId })
-        );
-        generalExposedSet = new Set(exposedIds);
-      } catch { /* not available */ }
-    }
-
-    if (snapshots.length === 0) {
-      const { widgetIds: [emptyLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: 'No objects created yet.', style: { color: this.theme.textDescription, fontSize: 12 } },
-        ] })
-      );
-      this.trackTabWidget(emptyLabelId);
-      await this.request(request(this.id, cId, 'addLayoutChild', {
-        widgetId: emptyLabelId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 18 },
-      }));
-    } else {
-      for (const snap of snapshots) {
-        // HBox row: exposed checkbox + name label + delete button
-        const rowId = this.trackTabWidget(await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-            parentLayoutId: cId,
-            margins: { top: 0, right: 0, bottom: 0, left: 0 },
-            spacing: 8,
-          })
-        ));
-        await this.request(request(this.id, cId, 'addLayoutChild', {
-          widgetId: rowId,
-          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-          preferredSize: { height: 30 },
-        }));
-
-        // Batch-create exposed checkbox + name label + delete button
-        const { widgetIds: [exposedCbId, objNameId, delBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
-          request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'checkbox', windowId: this.windowId, checked: generalExposedSet.has(snap.objectId), text: '' },
-            { type: 'label', windowId: this.windowId, text: snap.manifest.name, style: { color: this.theme.textHeading, fontSize: 13 } },
-            { type: 'button', windowId: this.windowId, text: 'Delete', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
-          ] })
-        );
-        this.trackTabWidget(exposedCbId);
-        this.trackTabWidget(objNameId);
-        this.trackTabWidget(delBtnId);
-
-        await this.request(request(this.id, exposedCbId, 'addDependent', {}));
-        await this.request(request(this.id, rowId, 'addLayoutChild', {
-          widgetId: exposedCbId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 28, height: 28 },
-        }));
-        this.generalExposedCheckboxes.set(exposedCbId, snap.objectId);
-
-        await this.request(request(this.id, rowId, 'addLayoutChild', {
-          widgetId: objNameId,
-          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-          preferredSize: { height: 30 },
-        }));
-
-        await this.request(request(this.id, delBtnId, 'addDependent', {}));
-        await this.request(request(this.id, rowId, 'addLayoutChild', {
-          widgetId: delBtnId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 70, height: 28 },
-        }));
-
-        this.objectDeleteButtons.set(delBtnId, snap.objectId);
-      }
-    }
-
-    // Spacer pushes save button to bottom
-    await this.request(request(this.id, cId, 'addLayoutSpacer', {}));
 
     // Save button row + status label
     await this.buildSaveRow(r0, 'general');
@@ -676,6 +577,20 @@ export class Settings extends Abject {
         preferredSize: { height: baseHeight + itemsHeight },
       }));
     }
+
+    // ── Search input for exposed objects ──
+    const { widgetIds: [searchId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, placeholder: 'Search objects...' },
+      ] })
+    );
+    this.accessSearchInputId = this.trackTabWidget(searchId);
+    await this.request(request(this.id, this.accessSearchInputId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.accessSearchInputId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 30 },
+    }));
 
     // ── Exposed Objects container (visible for private or public mode) ──
     this.exposedContainerId = this.trackTabWidget(await this.request<AbjectId>(
@@ -900,6 +815,13 @@ export class Settings extends Abject {
       return (a.name || a.id).localeCompare(b.name || b.id);
     });
 
+    // Filter by search text
+    if (this.accessSearchText) {
+      registryObjects = registryObjects.filter(obj =>
+        (obj.name || obj.id).toLowerCase().includes(this.accessSearchText)
+      );
+    }
+
     // Get current exposed list
     let exposedIds: string[] = [];
     if (this.workspaceManagerId && this.workspaceId) {
@@ -942,11 +864,19 @@ export class Settings extends Abject {
           preferredSize: { height: 28 },
         }));
 
-        const { widgetIds: [checkboxId] } = await this.request<{ widgetIds: AbjectId[] }>(
-          request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'checkbox', windowId: this.windowId, checked: isExposed, text: displayName },
-          ] })
+        const isUserCreated = userObjectIdSet.has(obj.id);
+        const specs: Array<{ type: string; windowId: AbjectId; text: string; checked?: boolean; style?: Record<string, unknown> }> = [
+          { type: 'checkbox', windowId: this.windowId!, text: displayName, checked: isExposed },
+        ];
+        if (isUserCreated) {
+          specs.push({ type: 'button', windowId: this.windowId!, text: 'Delete', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } });
+        }
+
+        const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs })
         );
+        const checkboxId = widgetIds[0];
+        this.exposedWidgetIds.push(checkboxId);
         await this.request(request(this.id, checkboxId, 'addDependent', {}));
         await this.request(request(this.id, rowId, 'addLayoutChild', {
           widgetId: checkboxId,
@@ -955,6 +885,18 @@ export class Settings extends Abject {
         }));
 
         this.exposedCheckboxes.set(checkboxId, obj.id as AbjectId);
+
+        if (isUserCreated) {
+          const delBtnId = widgetIds[1];
+          this.exposedWidgetIds.push(delBtnId);
+          await this.request(request(this.id, delBtnId, 'addDependent', {}));
+          await this.request(request(this.id, rowId, 'addLayoutChild', {
+            widgetId: delBtnId,
+            sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+            preferredSize: { width: 70, height: 28 },
+          }));
+          this.objectDeleteButtons.set(delBtnId, obj.id);
+        }
       }
     }
   }
@@ -974,6 +916,7 @@ export class Settings extends Abject {
     }
     this.exposedWidgetIds = [];
     this.exposedCheckboxes.clear();
+    this.objectDeleteButtons.clear();
   }
 
   /**
@@ -1054,13 +997,14 @@ export class Settings extends Abject {
     this.accessSaveBtnId = undefined;
     this.accessStatusLabelId = undefined;
     this.objectDeleteButtons.clear();
-    this.generalExposedCheckboxes.clear();
     this.whitelistCheckboxes.clear();
     this.whitelistContainerId = undefined;
     this.whitelistWidgetIds = [];
     this.exposedCheckboxes.clear();
     this.exposedContainerId = undefined;
     this.exposedWidgetIds = [];
+    this.accessSearchInputId = undefined;
+    this.accessSearchText = '';
 
     await this.changed('visibility', false);
     return true;
@@ -1144,30 +1088,7 @@ export class Settings extends Abject {
         } catch { /* best effort */ }
       }
 
-      // Save exposed objects from General tab checkboxes
-      if (this.generalExposedCheckboxes.size > 0) {
-        try {
-          const objectIds: string[] = [];
-          for (const [checkboxId, objectId] of this.generalExposedCheckboxes) {
-            const checked = await this.request<string>(
-              request(this.id, checkboxId, 'getValue', {})
-            );
-            if (checked === 'true') objectIds.push(objectId);
-          }
-          // Merge: preserve exposed objects that aren't user-created
-          const currentExposed = await this.request<string[]>(
-            request(this.id, this.workspaceManagerId!, 'getExposedObjects', { workspaceId: this.workspaceId! })
-          );
-          const userObjectIds = new Set(this.generalExposedCheckboxes.values());
-          const nonUserExposed = currentExposed.filter(id => !userObjectIds.has(id));
-          await this.request(
-            request(this.id, this.workspaceManagerId!, 'setExposedObjects', {
-              workspaceId: this.workspaceId!,
-              objectIds: [...nonUserExposed, ...objectIds],
-            })
-          );
-        } catch { /* best effort */ }
-      }
+
 
       // Refresh WorkspaceSwitcher to show updated name
       if (!this.workspaceSwitcherId) {
@@ -1247,19 +1168,28 @@ export class Settings extends Abject {
 
         // Save exposed objects if not local
         if (accessMode !== 'local' && this.exposedCheckboxes.size > 0) {
-          const objectIds: string[] = [];
+          // Read checked state from visible checkboxes
+          const visibleObjectIds = new Set(this.exposedCheckboxes.values());
+          const checkedIds: string[] = [];
           for (const [checkboxId, objectId] of this.exposedCheckboxes) {
             try {
               const checked = await this.request<string>(
                 request(this.id, checkboxId, 'getValue', {})
               );
-              if (checked === 'true') objectIds.push(objectId);
+              if (checked === 'true') checkedIds.push(objectId);
             } catch { /* checkbox gone */ }
           }
+
+          // Preserve exposed state for objects not currently shown (filtered out by search)
+          const currentExposed = await this.request<string[]>(
+            request(this.id, this.workspaceManagerId, 'getExposedObjects', { workspaceId: this.workspaceId! })
+          );
+          const preservedIds = currentExposed.filter(id => !visibleObjectIds.has(id as AbjectId));
+
           await this.request(
             request(this.id, this.workspaceManagerId, 'setExposedObjects', {
               workspaceId: this.workspaceId,
-              objectIds,
+              objectIds: [...preservedIds, ...checkedIds],
             })
           );
         }
@@ -1308,7 +1238,11 @@ export class Settings extends Abject {
     // Rebuild tab content to reflect the change (without destroying window)
     await this.clearTabContent();
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
-    await this.buildGeneralTab(r0);
+    if (this.activeTab === 'general') {
+      await this.buildGeneralTab(r0);
+    } else {
+      await this.buildAccessTab(r0);
+    }
   }
 }
 

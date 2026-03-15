@@ -91,8 +91,8 @@ export interface ThemeData {
 
 export const MIDNIGHT_BLOOM: ThemeData = {
   canvasBg: '#030308',
-  windowBg: '#141422',
-  titleBarBg: '#1a1a2a',
+  windowBg: '#16162a',
+  titleBarBg: '#1e1e34',
   accent: '#39ff8e',
   accentSecondary: '#9b59ff',
   accentTertiary: '#ff4d6a',
@@ -100,14 +100,14 @@ export const MIDNIGHT_BLOOM: ThemeData = {
   textSecondary: '#8a8a9e',
   textTertiary: '#5a5a70',
   textPlaceholder: '#3a3a4a',
-  buttonBg: '#1a1a2a',
-  buttonBorder: '#2a2a3a',
+  buttonBg: '#1e1e34',
+  buttonBorder: '#32325a',
   buttonText: '#e0e0ea',
   inputBg: '#08080f',
-  inputBorder: '#1a1a2a',
+  inputBorder: '#22223a',
   inputBorderFocus: '#39ff8e',
-  windowBorder: '#2a2a3e',
-  divider: '#1a1a2a',
+  windowBorder: '#32325a',
+  divider: '#22223a',
   resizeGrip: '#5a5a70',
   progressTrack: '#0e0e18',
   progressFill: '#9b59ff',
@@ -166,6 +166,6 @@ export const MIDNIGHT_BLOOM: ThemeData = {
   scrollbarThumbHover: 'rgba(255,255,255,0.3)',
 
   // ── Shadow ──
-  shadowColor: 'rgba(0,0,0,0.5)',
+  shadowColor: 'rgba(0,0,0,0.7)',
   dropdownShadow: 'rgba(0,0,0,0.4)',
 };

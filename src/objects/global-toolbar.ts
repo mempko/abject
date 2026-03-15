@@ -25,11 +25,14 @@ export class GlobalToolbar extends Abject {
   private peerNetworkId?: AbjectId;
   private objectBrowserId?: AbjectId;
 
+  private objectManagerId?: AbjectId;
+
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
   private settingsBtnId?: AbjectId;
   private networkBtnId?: AbjectId;
   private explorerBtnId?: AbjectId;
+  private processesBtnId?: AbjectId;
 
   /** Current window height (queried by WorkspaceManager for Taskbar positioning) */
   private currentHeight = 0;
@@ -155,6 +158,22 @@ export class GlobalToolbar extends Abject {
         }
         return;
       }
+
+      // Processes button
+      if (fromId === this.processesBtnId) {
+        if (!this.objectManagerId) {
+          this.objectManagerId = await this.discoverDep('ProcessExplorer') ?? undefined;
+        }
+        if (this.objectManagerId) {
+          try {
+            await this.request(request(this.id, this.objectManagerId,
+              'show', {}));
+          } catch (err) {
+            log.warn('Failed to show ProcessExplorer:', err);
+          }
+        }
+        return;
+      }
     });
   }
 
@@ -173,6 +192,7 @@ export class GlobalToolbar extends Abject {
     this.settingsBtnId = undefined;
     this.networkBtnId = undefined;
     this.explorerBtnId = undefined;
+    this.processesBtnId = undefined;
     this.rootLayoutId = undefined;
 
     const btnW = 100;
@@ -181,7 +201,7 @@ export class GlobalToolbar extends Abject {
     const padding = 16;
     const spacing = 6;
 
-    // Height: padding + label + spacing + btn1 + spacing + btn2 + spacing + btn3 + padding
+    // Height: padding + label row + 3 buttons + padding
     const barHeight = padding + labelH + (spacing + btnH) * 3 + padding;
     const barWidth = btnW + padding * 2;
 
@@ -206,14 +226,29 @@ export class GlobalToolbar extends Abject {
       })
     );
 
-    // Batch create all widgets: section label + 3 buttons
+    // Header row: "System" label + gear (settings) button
+    const headerRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 4,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
+      widgetId: headerRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: labelH },
+    }));
+
+    // Batch create all widgets: header label, gear button, 3 action buttons
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'label', windowId: this.windowId!, text: '\u2699 System', style: { color: this.theme.textTertiary, fontSize: 11, fontWeight: 'bold' } },
-          { type: 'button', windowId: this.windowId!, text: 'Settings' },
+          { type: 'label', windowId: this.windowId!, text: '\u2699 System', style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } },
+          { type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13 } },
           { type: 'button', windowId: this.windowId!, text: 'Network' },
           { type: 'button', windowId: this.windowId!, text: 'Explorer' },
+          { type: 'button', windowId: this.windowId!, text: 'Processes' },
         ],
       })
     );
@@ -222,14 +257,22 @@ export class GlobalToolbar extends Abject {
     this.settingsBtnId = widgetIds[1];
     this.networkBtnId = widgetIds[2];
     this.explorerBtnId = widgetIds[3];
+    this.processesBtnId = widgetIds[4];
 
-    // Batch add all to layout
+    // Add header row children: label + gear button
+    await this.request(request(this.id, headerRowId, 'addLayoutChildren', {
+      children: [
+        { widgetId: labelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: labelH } },
+        { widgetId: this.settingsBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } },
+      ],
+    }));
+
+    // Add action buttons to root layout
     await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChildren', {
       children: [
-        { widgetId: labelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: labelH } },
-        { widgetId: this.settingsBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
         { widgetId: this.networkBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
         { widgetId: this.explorerBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
+        { widgetId: this.processesBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
       ],
     }));
 
@@ -237,6 +280,7 @@ export class GlobalToolbar extends Abject {
     this.send(request(this.id, this.settingsBtnId, 'addDependent', {}));
     this.send(request(this.id, this.networkBtnId, 'addDependent', {}));
     this.send(request(this.id, this.explorerBtnId, 'addDependent', {}));
+    this.send(request(this.id, this.processesBtnId, 'addDependent', {}));
 
     return true;
   }
@@ -255,6 +299,7 @@ export class GlobalToolbar extends Abject {
     this.settingsBtnId = undefined;
     this.networkBtnId = undefined;
     this.explorerBtnId = undefined;
+    this.processesBtnId = undefined;
     return true;
   }
 }

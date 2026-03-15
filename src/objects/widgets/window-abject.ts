@@ -56,6 +56,7 @@ export class WindowAbject extends Abject {
   private focusedChildId?: AbjectId;
   private hoveredChildId?: AbjectId;
 
+  private windowFocused = false;
   private destroying = false;
   private rendering = false;
   private renderScheduled = false;
@@ -249,6 +250,13 @@ export class WindowAbject extends Abject {
       }
     });
 
+    // Focus/unfocus events from UIServer
+    this.on('focus', async (msg: AbjectMessage) => {
+      const { focused } = msg.payload as { surfaceId: string; focused: boolean };
+      this.windowFocused = focused;
+      this.scheduleFrame();
+    });
+
     this.on('updateTheme', async (msg: AbjectMessage) => {
       this.theme = msg.payload as ThemeData;
       this.scheduleFrame();
@@ -412,7 +420,7 @@ method calls on 'abjects:widgets' interface:
     commands.push({
       type: 'shadow',
       surfaceId: sid,
-      params: { color: this.theme.shadowColor, blur: 12, offsetY: 4 },
+      params: { color: this.theme.shadowColor, blur: 20, offsetY: 6 },
     });
     commands.push({
       type: 'rect',
@@ -427,6 +435,39 @@ method calls on 'abjects:widgets' interface:
       surfaceId: sid,
       params: { x: 0, y: 0, width: w, height: h, fill: this.theme.windowBg, stroke: this.theme.windowBorder, radius: this.theme.windowRadius },
     });
+
+    // Faint accent overlay — barely-perceptible green tint matching website card glow
+    commands.push({ type: 'save', surfaceId: sid, params: {} });
+    commands.push({ type: 'globalAlpha', surfaceId: sid, params: { alpha: 0.03 } });
+    commands.push({
+      type: 'rect',
+      surfaceId: sid,
+      params: { x: 1, y: 1, width: w - 2, height: h - 2, fill: this.theme.accent, radius: this.theme.windowRadius },
+    });
+    commands.push({ type: 'restore', surfaceId: sid, params: {} });
+
+    // Accent border glow — brighter when focused
+    const borderGlowAlpha = this.windowFocused ? 0.2 : 0.08;
+    if (this.windowFocused) {
+      commands.push({ type: 'save', surfaceId: sid, params: {} });
+      commands.push({
+        type: 'shadow',
+        surfaceId: sid,
+        params: { color: 'rgba(57, 255, 142, 0.07)', blur: 16 },
+      });
+      commands.push({
+        type: 'rect',
+        surfaceId: sid,
+        params: { x: 0, y: 0, width: w, height: h, stroke: `rgba(57, 255, 142, ${borderGlowAlpha})`, radius: this.theme.windowRadius },
+      });
+      commands.push({ type: 'restore', surfaceId: sid, params: {} });
+    } else {
+      commands.push({
+        type: 'rect',
+        surfaceId: sid,
+        params: { x: 0, y: 0, width: w, height: h, stroke: `rgba(57, 255, 142, ${borderGlowAlpha})`, radius: this.theme.windowRadius },
+      });
+    }
 
     if (!this.chromeless) {
       // Title bar with gradient
@@ -450,6 +491,13 @@ method calls on 'abjects:widgets' interface:
         surfaceId: sid,
         params: { x: 0, y: TITLE_BAR_HEIGHT - 6, width: w, height: 6, fill: this.theme.titleBarBg },
       });
+      // Title text with subtle glow shadow
+      commands.push({ type: 'save', surfaceId: sid, params: {} });
+      commands.push({
+        type: 'shadow',
+        surfaceId: sid,
+        params: { color: 'rgba(57, 255, 142, 0.15)', blur: 8 },
+      });
       commands.push({
         type: 'text',
         surfaceId: sid,
@@ -458,6 +506,7 @@ method calls on 'abjects:widgets' interface:
           text: this.title, font: TITLE_FONT, fill: this.theme.textPrimary, baseline: 'middle',
         },
       });
+      commands.push({ type: 'restore', surfaceId: sid, params: {} });
 
       // Close and minimize buttons (right side of title bar)
       const btnSize = this.theme.titleButtonSize;
@@ -499,12 +548,19 @@ method calls on 'abjects:widgets' interface:
         },
       });
 
-      // Signature amber accent line under title bar
+      // Signature accent line under title bar with soft glow
+      commands.push({ type: 'save', surfaceId: sid, params: {} });
+      commands.push({
+        type: 'shadow',
+        surfaceId: sid,
+        params: { color: 'rgba(57, 255, 142, 0.3)', blur: 6 },
+      });
       commands.push({
         type: 'line',
         surfaceId: sid,
         params: { x1: 0, y1: TITLE_BAR_HEIGHT, x2: w, y2: TITLE_BAR_HEIGHT, stroke: this.theme.accent },
       });
+      commands.push({ type: 'restore', surfaceId: sid, params: {} });
     }
 
     // Resize grip

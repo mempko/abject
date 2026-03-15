@@ -1,9 +1,9 @@
 /**
- * ObjectManager — process/task manager for Abjects.
+ * ProcessExplorer — process/task manager for Abjects.
  *
  * Shows a scrollable table of all running objects with name, ID, state,
- * worker placement, and stop/restart actions. Per-workspace UI object
- * (follows AppExplorer/JobBrowser pattern).
+ * worker placement, and stop/restart actions. System-level UI object
+ * discoverable by GlobalToolbar.
  */
 
 import {
@@ -17,9 +17,9 @@ import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 
-const log = new Log('ObjectManager');
+const log = new Log('ProcessExplorer');
 
-const OBJECT_MANAGER_INTERFACE: InterfaceId = 'abjects:object-manager';
+const PROCESS_EXPLORER_INTERFACE: InterfaceId = 'abjects:process-explorer';
 
 const WIN_W = 650;
 const WIN_H = 500;
@@ -28,7 +28,7 @@ const WIN_H = 500;
 const PROTECTED_NAMES = new Set([
   'Registry', 'Factory', 'Supervisor', 'WidgetManager', 'WindowManager',
   'WorkspaceManager', 'WorkspaceRegistry', 'WorkspaceSwitcher', 'UIServer',
-  'ObjectManager',
+  'ProcessExplorer',
 ]);
 
 /** Names removed — state colors now come from this.theme via stateColor(). */
@@ -43,7 +43,7 @@ interface ObjectRow {
   isProtected: boolean;
 }
 
-export class ObjectManager extends Abject {
+export class ProcessExplorer extends Abject {
   private widgetManagerId?: AbjectId;
   private registryId?: AbjectId;
   private systemRegistryId?: AbjectId;
@@ -67,24 +67,24 @@ export class ObjectManager extends Abject {
   constructor() {
     super({
       manifest: {
-        name: 'ObjectManager',
+        name: 'ProcessExplorer',
         description:
           'Process manager for running Abjects. Shows all objects with state, worker placement, and stop/restart actions.',
         version: '1.0.0',
         interface: {
-            id: OBJECT_MANAGER_INTERFACE,
-            name: 'ObjectManager',
-            description: 'Object process manager',
+            id: PROCESS_EXPLORER_INTERFACE,
+            name: 'ProcessExplorer',
+            description: 'Process explorer',
             methods: [
               {
                 name: 'show',
-                description: 'Show the object manager window',
+                description: 'Show the process explorer window',
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'hide',
-                description: 'Hide the object manager window',
+                description: 'Hide the process explorer window',
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -99,7 +99,7 @@ export class ObjectManager extends Abject {
             ],
           },
         requiredCapabilities: [
-          { capability: Capabilities.UI_SURFACE, reason: 'Display process manager window', required: true },
+          { capability: Capabilities.UI_SURFACE, reason: 'Display process explorer window', required: true },
         ],
         providedCapabilities: [],
         tags: ['system', 'ui'],
@@ -330,7 +330,7 @@ export class ObjectManager extends Abject {
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: 'Object Manager',
+        title: 'Process Explorer',
         rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
         zIndex: 200,
         resizable: true,
@@ -714,11 +714,11 @@ export class ObjectManager extends Abject {
   }
 
   protected override getSourceForAsk(): string | undefined {
-    return `## ObjectManager Usage Guide
+    return `## ProcessExplorer Usage Guide
 
 ### Methods
-- \`show()\` — Open the object manager window. Shows all running objects.
-- \`hide()\` — Close the object manager window.
+- \`show()\` — Open the process explorer window. Shows all running objects.
+- \`hide()\` — Close the process explorer window.
 - \`getState()\` — Returns { visible: boolean }.
 
 ### Features
@@ -729,8 +729,8 @@ export class ObjectManager extends Abject {
 - Auto-refreshes on registry changes. Manual Refresh button available.
 
 ### Interface ID
-\`abjects:object-manager\``;
+\`abjects:process-explorer\``;
   }
 }
 
-export const OBJECT_MANAGER_ID = 'abjects:object-manager' as AbjectId;
+export const PROCESS_EXPLORER_ID = 'abjects:process-explorer' as AbjectId;

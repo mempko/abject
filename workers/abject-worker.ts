@@ -31,7 +31,7 @@ import { JobBrowser } from '../src/objects/job-browser.js';
 import { Chat } from '../src/objects/chat.js';
 import { ThemeAbject } from '../src/objects/theme.js';
 import { Taskbar } from '../src/objects/taskbar.js';
-import { ObjectManager } from '../src/objects/object-manager.js';
+import { ProcessExplorer } from '../src/objects/process-explorer.js';
 import { GlobalSettings } from '../src/objects/global-settings.js';
 import { PeerNetwork } from '../src/objects/peer-network.js';
 import { ScriptableAbject } from '../src/objects/scriptable-abject.js';
@@ -63,7 +63,7 @@ constructors.set('Chat', () => new Chat());
 constructors.set('AbjectStore', () => new AbjectStore());
 constructors.set('Theme', () => new ThemeAbject());
 constructors.set('Taskbar', () => new Taskbar());
-constructors.set('ObjectManager', () => new ObjectManager());
+constructors.set('ProcessExplorer', () => new ProcessExplorer());
 constructors.set('GlobalSettings', () => new GlobalSettings());
 constructors.set('PeerNetwork', () => new PeerNetwork());
 constructors.set('ScriptableAbject', (args?: unknown) => {

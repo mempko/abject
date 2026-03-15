@@ -306,7 +306,7 @@ export class AppExplorer extends Abject {
 
     const title = this.isRemote
       ? this.remoteLabel ?? 'Remote Explorer'
-      : 'App Explorer';
+      : 'Workspace Abject Explorer';
 
     this.windowId = await wm('createWindowAbject', {
       title,

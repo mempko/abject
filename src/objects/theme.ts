@@ -108,7 +108,11 @@ export class ThemeAbject extends Abject {
 
   private applyBodyBackground(): void {
     if (typeof document !== 'undefined') {
-      document.body.style.background = this.currentTheme.canvasBg;
+      document.body.style.background = [
+        'radial-gradient(ellipse 60% 50% at 50% 30%, rgba(57,255,142,0.04) 0%, transparent 60%)',
+        'radial-gradient(ellipse 40% 40% at 70% 20%, rgba(155,89,255,0.03) 0%, transparent 50%)',
+        this.currentTheme.canvasBg,
+      ].join(', ');
     }
   }
 

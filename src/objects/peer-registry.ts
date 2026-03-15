@@ -23,6 +23,7 @@ const IDENTITY_INTERFACE = 'abjects:identity' as InterfaceId;
 const STORAGE_INTERFACE = 'abjects:storage' as InterfaceId;
 const STORAGE_KEY_CONTACTS = 'peer-registry:contacts';
 const STORAGE_KEY_SIGNALING_URLS = 'peer-registry:signaling-urls';
+const STORAGE_KEY_REMOVED_SIGNALING = 'peer-registry:removed-signaling-urls';
 const STORAGE_KEY_BLOCKED = 'peer-registry:blocked-peers';
 const STORAGE_KEY_GOSSIP_PEERS = 'peer-registry:gossip-peers';
 const MAX_GOSSIP_PEERS = 30;
@@ -60,6 +61,8 @@ export class PeerRegistry extends Abject {
   private transports: Map<PeerId, PeerTransport> = new Map();
   private signalingClients: Map<string, SignalingClient> = new Map();
   private savedSignalingUrls: Set<string> = new Set();
+  /** URLs the user explicitly removed — prevents gossip from re-adding them. */
+  private removedSignalingUrls: Set<string> = new Set();
   private identityId?: AbjectId;
   private storageId?: AbjectId;
   private localIdentity?: PeerIdentity & { exchangePrivateKey?: CryptoKey };
@@ -425,6 +428,11 @@ export class PeerRegistry extends Abject {
 
     this.on('connectSignaling', async (msg: AbjectMessage) => {
       const { url } = msg.payload as { url: string };
+      // User explicitly connecting — clear from removed list and persist
+      this.removedSignalingUrls.delete(url);
+      this.savedSignalingUrls.add(url);
+      await this.persistSignalingUrls();
+      await this.persistRemovedSignalingUrls();
       return this.connectSignalingImpl(url);
     });
 
@@ -552,6 +560,9 @@ export class PeerRegistry extends Abject {
 
     // Load persisted gossip peers
     await this.loadGossipPeers();
+
+    // Load removed signaling URLs before reconnecting (prevents gossip re-addition)
+    await this.loadRemovedSignalingUrls();
 
     // Auto-reconnect to saved signaling servers (non-blocking — reconnect runs in background)
     this.loadAndReconnectSignaling().catch(() => {});
@@ -681,7 +692,7 @@ export class PeerRegistry extends Abject {
     // Fallback: try signaling servers from contact's stored addresses
     if (!signalingRelay && contact.addresses.length > 0) {
       for (const addr of contact.addresses) {
-        if (this.signalingClients.has(addr)) continue;
+        if (this.signalingClients.has(addr) || this.removedSignalingUrls.has(addr)) continue;
         try {
           await this.connectSignalingImpl(addr);
           signalingRelay = this.getActiveSignalingClient();
@@ -802,6 +813,7 @@ export class PeerRegistry extends Abject {
    * Persists the URL and attempts connection.
    */
   async addSignalingUrl(url: string): Promise<boolean> {
+    if (this.removedSignalingUrls.has(url)) return false;
     if (this.savedSignalingUrls.has(url) || this.signalingClients.has(url)) {
       return true; // Already known
     }
@@ -816,6 +828,7 @@ export class PeerRegistry extends Abject {
    * Add a signaling URL received via gossip (best-effort, no await).
    */
   addSignalingUrlFromGossip(url: string): void {
+    if (this.removedSignalingUrls.has(url)) return;
     if (this.savedSignalingUrls.has(url) || this.signalingClients.has(url)) return;
     this.savedSignalingUrls.add(url);
     this.persistSignalingUrls().catch(() => {});
@@ -823,10 +836,6 @@ export class PeerRegistry extends Abject {
   }
 
   private async connectSignalingImpl(url: string): Promise<boolean> {
-    // Always save the URL regardless of connection outcome
-    this.savedSignalingUrls.add(url);
-    await this.persistSignalingUrls();
-
     if (this.signalingClients.has(url)) return true;
 
     const client = new SignalingClient();
@@ -937,7 +946,9 @@ export class PeerRegistry extends Abject {
   private async removeSignalingServer(url: string): Promise<boolean> {
     await this.disconnectSignalingImpl(url);
     this.savedSignalingUrls.delete(url);
+    this.removedSignalingUrls.add(url);
     await this.persistSignalingUrls();
+    await this.persistRemovedSignalingUrls();
     return true;
   }
 
@@ -1622,6 +1633,31 @@ export class PeerRegistry extends Abject {
     );
   }
 
+  private async persistRemovedSignalingUrls(): Promise<void> {
+    if (!this.storageId) return;
+
+    const urls = Array.from(this.removedSignalingUrls);
+    await this.request(
+      createRequest(this.id, this.storageId, 'set',
+        { key: STORAGE_KEY_REMOVED_SIGNALING, value: urls }),
+    );
+  }
+
+  private async loadRemovedSignalingUrls(): Promise<void> {
+    if (!this.storageId) return;
+
+    try {
+      const result = await this.request<string[] | null>(
+        createRequest(this.id, this.storageId, 'get', { key: STORAGE_KEY_REMOVED_SIGNALING }),
+      );
+      if (Array.isArray(result)) {
+        for (const url of result) {
+          this.removedSignalingUrls.add(url);
+        }
+      }
+    } catch { /* not yet saved */ }
+  }
+
   private async loadBlockedPeers(): Promise<void> {
     if (!this.storageId) return;
 
@@ -1741,19 +1777,22 @@ export class PeerRegistry extends Abject {
     if (!this.storageId) return;
 
     let urls: string[] = [];
+    let hasStoredKey = false;
     try {
       const result = await this.request<string[] | null>(
         createRequest(this.id, this.storageId, 'get', { key: STORAGE_KEY_SIGNALING_URLS }),
       );
-      if (Array.isArray(result) && result.length > 0) {
+      if (Array.isArray(result)) {
+        hasStoredKey = true;
         urls = result;
       }
     } catch {
       // No signaling URLs saved yet
     }
 
-    // First run: no saved signaling servers — connect to the default
-    if (urls.length === 0) {
+    // First run only: no key in storage → use default.
+    // An empty array means the user explicitly removed all servers — respect that.
+    if (!hasStoredKey) {
       urls = [DEFAULT_SIGNALING_URL];
     }
 

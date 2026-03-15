@@ -47,7 +47,7 @@ export { WorkspaceSwitcher, WORKSPACE_SWITCHER_ID } from './objects/workspace-sw
 export { GlobalSettings, GLOBAL_SETTINGS_ID } from './objects/global-settings.js';
 export { GlobalToolbar, GLOBAL_TOOLBAR_ID } from './objects/global-toolbar.js';
 export { PeerNetwork, PEER_NETWORK_ID } from './objects/peer-network.js';
-export { ObjectManager, OBJECT_MANAGER_ID } from './objects/object-manager.js';
+export { ProcessExplorer, PROCESS_EXPLORER_ID } from './objects/process-explorer.js';
 export { IdentityObject, IDENTITY_ID } from './objects/identity.js';
 export { PeerRegistry, PEER_REGISTRY_ID } from './objects/peer-registry.js';
 export { SignalingRelayObject, SIGNALING_RELAY_ID } from './objects/signaling-relay.js';

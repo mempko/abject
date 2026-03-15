@@ -35,7 +35,6 @@ const SETTINGS_INTERFACE = 'abjects:settings' as InterfaceId;
 const CHAT_INTERFACE = 'abjects:chat' as InterfaceId;
 const APP_EXPLORER_INTERFACE = 'abjects:app-explorer' as InterfaceId;
 const JOB_BROWSER_INTERFACE = 'abjects:job-browser' as InterfaceId;
-const OBJECT_MANAGER_INTERFACE = 'abjects:object-manager' as InterfaceId;
 const WORKSPACE_SWITCHER_INTERFACE = 'abjects:workspace-switcher' as InterfaceId;
 const GLOBAL_TOOLBAR_INTERFACE = 'abjects:global-toolbar' as InterfaceId;
 
@@ -52,7 +51,7 @@ const INFRA_OBJECTS = [
 
 /** UI objects — deferred for inactive workspaces, spawned on first switch. */
 const UI_OBJECTS = [
-  'Settings', 'AppExplorer', 'JobBrowser', 'ObjectManager',
+  'Settings', 'AppExplorer', 'JobBrowser',
   'WebBrowserViewer', 'Chat', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
 ] as const;
 
@@ -986,7 +985,6 @@ export class WorkspaceManager extends Abject {
       Settings: SETTINGS_INTERFACE,
       AppExplorer: APP_EXPLORER_INTERFACE,
       JobBrowser: JOB_BROWSER_INTERFACE,
-      ObjectManager: OBJECT_MANAGER_INTERFACE,
       Chat: CHAT_INTERFACE,
     };
 
@@ -1150,7 +1148,6 @@ export class WorkspaceManager extends Abject {
       Settings: SETTINGS_INTERFACE,
       AppExplorer: APP_EXPLORER_INTERFACE,
       JobBrowser: JOB_BROWSER_INTERFACE,
-      ObjectManager: OBJECT_MANAGER_INTERFACE,
       Chat: CHAT_INTERFACE,
     };
 

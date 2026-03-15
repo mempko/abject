@@ -1299,6 +1299,9 @@ await this.call(timerId, 'addDependent', {});
             workspaceId: ownerWs,
           }));
         log.info(`registerWindow surface=${win.surface} wmId=${this.windowManagerId}`);
+        // Bring newly created window to front so it isn't hidden behind existing windows
+        await this.request(request(this.id, this.windowManagerId,
+          'raiseWindow', { surfaceId: win.surface }));
       } catch { /* WindowManager may not be ready */ }
     }
 

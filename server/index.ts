@@ -60,7 +60,7 @@ import { WorkspaceSwitcher } from '../src/objects/workspace-switcher.js';
 import { GlobalSettings } from '../src/objects/global-settings.js';
 import { GlobalToolbar } from '../src/objects/global-toolbar.js';
 import { PeerNetwork } from '../src/objects/peer-network.js';
-import { ObjectManager } from '../src/objects/object-manager.js';
+import { ProcessExplorer } from '../src/objects/process-explorer.js';
 import { IdentityObject } from '../src/objects/identity.js';
 import { PeerRegistry } from '../src/objects/peer-registry.js';
 import { RemoteRegistry } from '../src/objects/remote-registry.js';
@@ -202,7 +202,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
   runtime.objectFactory.registerConstructor('GlobalToolbar', () => new GlobalToolbar());
   runtime.objectFactory.registerConstructor('PeerNetwork', () => new PeerNetwork());
-  runtime.objectFactory.registerConstructor('ObjectManager', () => new ObjectManager());
+  runtime.objectFactory.registerConstructor('ProcessExplorer', () => new ProcessExplorer());
   runtime.objectFactory.registerConstructor('Identity', () => new IdentityObject());
   runtime.objectFactory.registerConstructor('PeerRegistry', () => new PeerRegistry());
   runtime.objectFactory.registerConstructor('RemoteRegistry', () => new RemoteRegistry());
@@ -227,10 +227,10 @@ async function main(): Promise<void> {
       'LLMObject', 'HttpClient', 'Timer',
       'Clipboard', 'Console', 'FileSystem',
       // Global services
-      'GlobalSettings', 'PeerNetwork', 'ObjectBrowser', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
+      'GlobalSettings', 'PeerNetwork', 'ObjectBrowser', 'ProcessExplorer', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
       // Per-workspace objects (use workspace registry via registryHint)
       'AbjectStore', 'Theme', 'Settings', 'AppExplorer',
-      'JobManager', 'JobBrowser', 'ObjectManager',
+      'JobManager', 'JobBrowser',
       'Chat', 'AbjectEditor', 'Taskbar',
     ];
     for (const name of workerEligible) {
@@ -337,6 +337,7 @@ async function main(): Promise<void> {
   const peerNetworkId = await supervisedSpawn('PeerNetwork', 'permanent', systemTypeId('PeerNetwork'));
   const globalToolbarId = await supervisedSpawn('GlobalToolbar', 'permanent', systemTypeId('GlobalToolbar'));
   const objectBrowserId = await supervisedSpawn('ObjectBrowser', 'permanent', systemTypeId('ObjectBrowser'));
+  const processExplorerId = await supervisedSpawn('ProcessExplorer', 'permanent', systemTypeId('ProcessExplorer'));
 
   const proxyGenId = await supervisedSpawn('ProxyGenerator', 'permanent', systemTypeId('ProxyGenerator'));
   const negotiatorId = await supervisedSpawn('Negotiator', 'permanent', systemTypeId('Negotiator'));
@@ -373,7 +374,7 @@ async function main(): Promise<void> {
     identityId, peerRegistryId, remoteRegistryId, peerRouterId,
     signalingRelayId, peerDiscoveryId,
     workspaceShareRegistryId, workspaceBrowserId,
-    globalSettingsId, peerNetworkId, globalToolbarId, objectBrowserId,
+    globalSettingsId, peerNetworkId, globalToolbarId, objectBrowserId, processExplorerId,
     proxyGenId, negotiatorId,
     workspaceSwitcherId, workspaceManagerId,
   ];

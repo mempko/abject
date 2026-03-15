@@ -61,7 +61,7 @@ import { WorkspaceSwitcher } from '../src/objects/workspace-switcher.js';
 import { GlobalSettings } from '../src/objects/global-settings.js';
 import { GlobalToolbar } from '../src/objects/global-toolbar.js';
 import { PeerNetwork } from '../src/objects/peer-network.js';
-import { ObjectManager } from '../src/objects/object-manager.js';
+import { ProcessExplorer } from '../src/objects/process-explorer.js';
 import { IdentityObject } from '../src/objects/identity.js';
 import { PeerRegistry } from '../src/objects/peer-registry.js';
 import { RemoteRegistry } from '../src/objects/remote-registry.js';
@@ -196,7 +196,7 @@ export async function bootAbjectsCore(opts: BootOptions): Promise<BootResult> {
   runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
   runtime.objectFactory.registerConstructor('GlobalToolbar', () => new GlobalToolbar());
   runtime.objectFactory.registerConstructor('PeerNetwork', () => new PeerNetwork());
-  runtime.objectFactory.registerConstructor('ObjectManager', () => new ObjectManager());
+  runtime.objectFactory.registerConstructor('ProcessExplorer', () => new ProcessExplorer());
   runtime.objectFactory.registerConstructor('Identity', () => new IdentityObject());
   runtime.objectFactory.registerConstructor('PeerRegistry', () => new PeerRegistry());
   runtime.objectFactory.registerConstructor('RemoteRegistry', () => new RemoteRegistry());
