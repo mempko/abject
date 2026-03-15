@@ -37,6 +37,16 @@ const MAX_CHANGELOG = 500; // Phase 2: max changelog entries
 const PROPAGATION_EXPIRY = 30_000; // Phase 3: propagation dedup window
 const MAX_GOSSIP_HOPS = 3; // Phase 3: max hops for gossip propagation
 
+// Rate limiting: token bucket per peer
+const RATE_LIMIT_CAPACITY = 100; // max burst
+const RATE_LIMIT_REFILL = 50; // tokens per second
+
+interface TokenBucket {
+  tokens: number;
+  lastRefill: number;
+}
+
+
 // Phase 1: Per-object route entry (kept only for system objects ~20 entries)
 interface RouteEntry {
   nextHop: PeerId;
@@ -110,6 +120,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 
   /** NAT table: local objectId → Map<peerId, expiryTimestamp> */
   private connTrack: Map<AbjectId, Map<PeerId, number>> = new Map();
+  private rateLimitBuckets: Map<PeerId, TokenBucket> = new Map();
 
   /** Hint map: registryId/objectId → ownerPeerId, populated from workspace route announcements.
    *  Persists beyond workspace route TTL to help speculative routing. */
@@ -626,6 +637,19 @@ export class PeerRouter extends Abject implements MessageInterceptor {
    * Called by PeerRegistry when a message arrives via transport.
    */
   handleIncomingMessage(msg: AbjectMessage, fromPeerId: PeerId): void {
+    // Rate limit: drop messages from peers that exceed the token bucket
+    if (!this.consumeRateLimitToken(fromPeerId)) {
+      log.warn(`RATE_LIMITED: dropping message from ${fromPeerId.slice(0, 16)}`);
+      if (msg.header.type === 'request') {
+        const errMsg = createError(msg, 'RATE_LIMITED', 'Too many messages — slow down');
+        const transport = this.peerRegistryRef?.getTransportForPeer(fromPeerId);
+        if (transport?.isConnected) {
+          transport.send(errMsg).catch(() => { /* best-effort */ });
+        }
+      }
+      return;
+    }
+
     // Record sender's route for reply routing — but ONLY for requests/events.
     // For reply/error messages, msg.routing.from is the TARGET of the original
     // request (e.g. the remote registry), NOT the actual peer that generated it.
@@ -762,9 +786,9 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       return this.evaluatePermission(cached, fromPeerId, targetId);
     }
 
-    // No cache — trigger async lookup for next time, allow this message
+    // No cache — trigger async lookup for next time, deny until populated (fail-closed)
     this.refreshPermissionCache(targetId).catch(() => { /* best-effort */ });
-    return true;
+    return false;
   }
 
   private evaluatePermission(entry: PermissionCacheEntry, fromPeerId: PeerId, targetId?: AbjectId): boolean {
@@ -904,8 +928,33 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     }
     // Clean up announcement state
     this.peerAnnounceState.delete(peerId as PeerId);
+    // Clean up rate limit bucket
+    this.rateLimitBuckets.delete(peerId as PeerId);
 
     return count;
+  }
+
+  /**
+   * Token bucket rate limiter. Returns true if a token was consumed, false if exhausted.
+   */
+  private consumeRateLimitToken(peerId: PeerId): boolean {
+    const now = Date.now();
+    let bucket = this.rateLimitBuckets.get(peerId);
+    if (!bucket) {
+      bucket = { tokens: RATE_LIMIT_CAPACITY, lastRefill: now };
+      this.rateLimitBuckets.set(peerId, bucket);
+    }
+
+    // Refill tokens based on elapsed time
+    const elapsed = (now - bucket.lastRefill) / 1000; // seconds
+    bucket.tokens = Math.min(RATE_LIMIT_CAPACITY, bucket.tokens + elapsed * RATE_LIMIT_REFILL);
+    bucket.lastRefill = now;
+
+    if (bucket.tokens >= 1) {
+      bucket.tokens -= 1;
+      return true;
+    }
+    return false;
   }
 
   /**

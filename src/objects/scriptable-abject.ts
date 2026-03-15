@@ -280,8 +280,9 @@ export class ScriptableAbject extends Abject {
       const { source } = msg.payload as { source: string };
       if (msg.routing.from !== this._owner) {
         log.warn(
-          `updateSource called by ${msg.routing.from}, owner is ${this._owner}`
+          `updateSource rejected: ${msg.routing.from} is not owner ${this._owner}`
         );
+        return { success: false, error: 'Only the owner can update source' };
       }
 
       // Hot-reload: tear down current UI via old hide() handler

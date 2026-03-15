@@ -275,6 +275,7 @@ export class HttpClient extends Abject {
   async makeRequest(req: HttpRequest): Promise<HttpResponse> {
     // Validate URL
     const url = new URL(req.url);
+    this.validateScheme(url.protocol);
     this.validateDomain(url.hostname);
 
     // Build fetch options
@@ -345,6 +346,7 @@ export class HttpClient extends Abject {
     headers?: Record<string, string>
   ): Promise<{ dataUri: string; mimeType: string; size: number; ok: boolean; status: number }> {
     const parsed = new URL(url);
+    this.validateScheme(parsed.protocol);
     this.validateDomain(parsed.hostname);
 
     const controller = new AbortController();
@@ -400,7 +402,16 @@ export class HttpClient extends Abject {
   }
 
   /**
-   * Validate that a domain is allowed.
+   * Reject non-HTTP(S) schemes to prevent file:/ftp:/etc. abuse.
+   */
+  private validateScheme(protocol: string): void {
+    if (protocol !== 'http:' && protocol !== 'https:') {
+      throw new Error(`Scheme ${protocol} is not allowed — only http: and https: are permitted`);
+    }
+  }
+
+  /**
+   * Validate that a domain is allowed. Blocks private/internal IPs by default (SSRF protection).
    */
   private validateDomain(hostname: string): void {
     if (this.deniedDomains?.has(hostname)) {
@@ -410,6 +421,51 @@ export class HttpClient extends Abject {
     if (this.allowedDomains && !this.allowedDomains.has(hostname)) {
       throw new Error(`Domain ${hostname} is not in allowed list`);
     }
+
+    // SSRF protection: block requests to private/internal addresses
+    if (this.isPrivateHost(hostname)) {
+      throw new Error(`Domain ${hostname} is blocked — private/internal addresses are not allowed`);
+    }
+  }
+
+  /**
+   * Check if a hostname resolves to a private/internal address.
+   */
+  private isPrivateHost(hostname: string): boolean {
+    const lower = hostname.toLowerCase();
+
+    // Block localhost variants
+    if (lower === 'localhost' || lower === 'localhost.') return true;
+
+    // Block IPv6 loopback and link-local
+    if (lower === '::1' || lower === '[::1]') return true;
+    if (lower.startsWith('fe80:') || lower.startsWith('[fe80:')) return true;
+    // IPv6 ULA (fd00::/8)
+    if (lower.startsWith('fd') && (lower[2] === ':' || lower[2] === undefined || /^fd[0-9a-f]{2}:/.test(lower))) return true;
+    if (lower.startsWith('[fd')) return true;
+
+    // Strip brackets for IPv6 literal
+    const bare = lower.startsWith('[') && lower.endsWith(']') ? lower.slice(1, -1) : lower;
+
+    // Check IPv4 patterns
+    const ipv4Match = bare.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (ipv4Match) {
+      const [, a, b, c] = ipv4Match.map(Number);
+      // 127.0.0.0/8
+      if (a === 127) return true;
+      // 10.0.0.0/8
+      if (a === 10) return true;
+      // 172.16.0.0/12
+      if (a === 172 && b >= 16 && b <= 31) return true;
+      // 192.168.0.0/16
+      if (a === 192 && b === 168) return true;
+      // 169.254.0.0/16 (link-local / cloud metadata)
+      if (a === 169 && b === 254) return true;
+      // 0.0.0.0
+      if (a === 0 && b === 0 && c === 0) return true;
+    }
+
+    return false;
   }
 
   /**

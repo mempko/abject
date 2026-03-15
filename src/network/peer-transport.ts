@@ -116,7 +116,9 @@ export class PeerTransport extends Transport {
     try {
       await this.peerConnection!.setRemoteDescription(new RTCSessionDescription(sdp));
     } catch (err) {
-      log.error(`Failed to set remote offer for ${this.remotePeerId.slice(0, 16)}:`, err);
+      log.warn(`Failed to set remote offer for ${this.remotePeerId.slice(0, 16)}: ${err instanceof Error ? err.message : err}`);
+      // Reset the PeerConnection so the next attempt starts clean
+      this.resetForGlare();
       throw err;
     }
 

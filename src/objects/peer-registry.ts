@@ -861,7 +861,15 @@ export class PeerRegistry extends Abject {
         log.info(`Peer not found: ${peerId.slice(0, 16)}`);
       },
       onSdpOffer: (fromPeerId, sdp) => {
-        this.handleIncomingSdpOffer(fromPeerId, sdp, client).catch(e => log.error('handleIncomingSdpOffer failed:', e));
+        this.handleIncomingSdpOffer(fromPeerId, sdp, client).catch(e => {
+          log.warn('handleIncomingSdpOffer failed, cleaning up transport:', e instanceof Error ? e.message : e);
+          // Remove the broken transport so the next auto-connect cycle starts fresh
+          const broken = this.transports.get(fromPeerId);
+          if (broken) {
+            this.transports.delete(fromPeerId);
+            this.offerTimestamps.delete(fromPeerId);
+          }
+        });
       },
       onSdpAnswer: (fromPeerId, sdp) => {
         const transport = this.transports.get(fromPeerId);
