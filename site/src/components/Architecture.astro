@@ -3,42 +3,124 @@
 
 <section id="architecture" class="arch-section">
   <div class="container">
-    <h2 class="section-title">Architecture</h2>
-    <div class="arch-wrapper">
-      <pre class="arch-diagram"><span class="arch-label">Node.js Backend</span> <span class="arch-dim">(pnpm serve)</span>
+    <h2 class="section-title">The Architecture of the Living System</h2>
 
-  <span class="arch-box">MessageBus</span>
-  <span class="arch-dim">Interceptor Pipeline: HealthInterceptor → PeerRouter → Delivery</span>
-          │              │               │
-  ┌───────┴───┐  ┌──────┴──────┐  ┌─────┴──────────┐
-  │ <span class="arch-accent">Registry</span>  │  │  <span class="arch-accent">Factory</span>   │  │  <span class="arch-accent">LLM Object</span>   │
-  │ Negotiator│  │  ProxyGen   │  │  ObjectCreator │
-  │ Supervisor│  │  AgentAbject│  │  HealthMonitor │
-  └───────────┘  └─────────────┘  └────────────────┘
-          │              │               │
-  ┌───────┴──────────────┴───────────────┴────────┐
-  │           <span class="arch-accent">Worker Pool</span> (WorkerBridge)           │
-  │   ┌─────────┐ ┌─────────┐ ┌─────────┐        │
-  │   │Worker 1 │ │Worker 2 │ │Worker N │ ...    │
-  │   │<span class="arch-dim">(WASM)</span>   │ │<span class="arch-dim">(WASM)</span>   │ │<span class="arch-dim">(WASM)</span>   │        │
-  │   └─────────┘ └─────────┘ └─────────┘        │
-  └───────────────────────────────────────────────┘
+    <div class="tiers">
+      <div class="tier tier-surface">
+        <div class="tier-label">I</div>
+        <h3>The Surface</h3>
+        <p class="tier-tagline">A window into the abyss.</p>
+        <p>Thin browser client, Canvas compositor, input forwarding. Nothing runs here; it only renders what the depths send up.</p>
+      </div>
 
-  <span class="arch-dim">Server-Only</span>                <span class="arch-dim">P2P</span>
-  BackendUI (headless)       PeerTransport ↔ Signaling
-  WebBrowser (Playwright)    IdentityObject (ECDSA/ECDH)
-  WebParser (linkedom)       PeerRegistry / RemoteRegistry
-                            │ <span class="arch-dim">WS :7719</span>
-<span class="arch-label">Thin Browser Client</span>        ▼
-  FrontendClient  │  Compositor (Canvas)  │  Input handling</pre>
+      <div class="tier-connector">
+        <span class="connector-line"></span>
+        <span class="connector-glyph">↕</span>
+        <span class="connector-label">WS :7719</span>
+        <span class="connector-line"></span>
+      </div>
+
+      <div class="tier tier-depths">
+        <div class="tier-label">II</div>
+        <h3>The Depths</h3>
+        <p class="tier-tagline">Where the Abjects dwell.</p>
+        <p>MessageBus, Registry, Factory, Negotiator, Supervisor, LLM, ProxyGenerator, HealthMonitor. Every system service is an Abject: same manifests, same message protocol, same contracts.</p>
+      </div>
+
+      <div class="tier-connector">
+        <span class="connector-line"></span>
+        <span class="connector-glyph">↕</span>
+        <span class="connector-label">WorkerBridge</span>
+        <span class="connector-line"></span>
+      </div>
+
+      <div class="tier tier-containment">
+        <div class="tier-label">III</div>
+        <h3>The Containment</h3>
+        <p class="tier-tagline">Cages for things that cannot be trusted.</p>
+        <p>Worker pool with WASM sandboxes. Capability-gated imports. No ambient authority. Untrusted Abjects run here; they can see only what you allow them to see.</p>
+      </div>
     </div>
 
     <div class="arch-detail">
-      <h3>LLM-Generated Proxies</h3>
-      <p>When Object A wants to talk to Object B with incompatible interfaces, the LLM generates a proxy object that translates between them:</p>
-      <pre class="arch-proxy"><span class="arch-accent">Object A</span>  ──►  <span class="arch-highlight">Proxy Object</span>  ──►  <span class="arch-accent">Object B</span>
-          ◄──  <span class="arch-dim">(LLM-generated)</span>  ◄──</pre>
-      <p class="arch-note">The proxy is a real object with a manifest, using the same message protocol.</p>
+      <h3>The Proxy Ritual</h3>
+      <p>When Object A speaks a language Object B cannot comprehend, the Negotiator reads both their manifests and invokes the LLM to generate a living translator:</p>
+
+      <svg class="proxy-svg" viewBox="0 0 740 300" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <filter id="pr-glow-g">
+            <feGaussianBlur stdDeviation="3" result="blur"/>
+            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+          <filter id="pr-glow-p">
+            <feGaussianBlur stdDeviation="3" result="blur"/>
+            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+          <marker id="pr-arrow-g" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#39ff8e"/>
+          </marker>
+          <marker id="pr-arrow-g-rev" viewBox="0 0 10 10" refX="0" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M 10 0 L 0 5 L 10 10 z" fill="#39ff8e"/>
+          </marker>
+          <marker id="pr-arrow-p" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#9b59ff"/>
+          </marker>
+        </defs>
+
+        <!-- Object A -->
+        <rect x="30" y="110" width="140" height="80" rx="8" fill="#12121e" stroke="rgba(57,255,142,0.35)" stroke-width="1.5"/>
+        <text x="100" y="145" text-anchor="middle" fill="#39ff8e" font-weight="600" font-size="15" font-family="monospace">Object A</text>
+        <text x="100" y="168" text-anchor="middle" fill="#5a5a70" font-size="10" font-family="monospace">interface X</text>
+
+        <!-- Object B -->
+        <rect x="570" y="110" width="140" height="80" rx="8" fill="#12121e" stroke="rgba(57,255,142,0.35)" stroke-width="1.5"/>
+        <text x="640" y="145" text-anchor="middle" fill="#39ff8e" font-weight="600" font-size="15" font-family="monospace">Object B</text>
+        <text x="640" y="168" text-anchor="middle" fill="#5a5a70" font-size="10" font-family="monospace">interface Y</text>
+
+        <!-- Incompatibility marker -->
+        <text x="370" y="118" text-anchor="middle" fill="#ff4d6a" font-size="18" font-family="monospace" font-weight="700">&#x2260;</text>
+        <line x1="170" y1="115" x2="340" y2="115" stroke="rgba(255,77,106,0.25)" stroke-width="1" stroke-dasharray="4 4"/>
+        <line x1="400" y1="115" x2="570" y2="115" stroke="rgba(255,77,106,0.25)" stroke-width="1" stroke-dasharray="4 4"/>
+
+        <!-- Negotiator -->
+        <rect x="295" y="18" width="150" height="38" rx="6" fill="#12121e" stroke="rgba(155,89,255,0.4)" stroke-width="1.5"/>
+        <text x="370" y="43" text-anchor="middle" fill="#9b59ff" font-size="13" font-family="monospace" font-weight="600">Negotiator</text>
+
+        <!-- Negotiator reads Object A manifest -->
+        <line x1="310" y1="56" x2="130" y2="110" stroke="#9b59ff" stroke-width="1" stroke-dasharray="5 3" filter="url(#pr-glow-p)"/>
+        <text x="190" y="72" fill="#9b59ff" font-size="9" font-family="monospace" opacity="0.7">reads manifest</text>
+
+        <!-- Negotiator reads Object B manifest -->
+        <line x1="430" y1="56" x2="610" y2="110" stroke="#9b59ff" stroke-width="1" stroke-dasharray="5 3" filter="url(#pr-glow-p)"/>
+        <text x="548" y="72" fill="#9b59ff" font-size="9" font-family="monospace" opacity="0.7" text-anchor="end">reads manifest</text>
+
+        <!-- LLM invocation arrow -->
+        <line x1="370" y1="56" x2="370" y2="82" stroke="#9b59ff" stroke-width="1.5" marker-end="url(#pr-arrow-p)" filter="url(#pr-glow-p)"/>
+        <text x="370" y="96" text-anchor="middle" fill="#5a5a70" font-size="9" font-family="monospace">LLM conjures</text>
+
+        <!-- Proxy Object (the living translator) -->
+        <rect x="300" y="195" width="140" height="55" rx="8" fill="#12121e" stroke="rgba(57,255,142,0.5)" stroke-width="2" filter="url(#pr-glow-g)"/>
+        <text x="370" y="218" text-anchor="middle" fill="#39ff8e" font-weight="700" font-size="14" font-family="monospace">Proxy</text>
+        <text x="370" y="237" text-anchor="middle" fill="#5a5a70" font-size="9" font-family="monospace">X &#x2194; Y translator</text>
+
+        <!-- Negotiator spawns Proxy -->
+        <line x1="370" y1="96" x2="370" y2="192" stroke="rgba(57,255,142,0.4)" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#pr-arrow-g)"/>
+
+        <!-- Object A <-> Proxy (bidirectional) -->
+        <line x1="170" y1="170" x2="298" y2="215" stroke="#39ff8e" stroke-width="1.5" marker-start="url(#pr-arrow-g-rev)" marker-end="url(#pr-arrow-g)" filter="url(#pr-glow-g)"/>
+
+        <!-- Proxy <-> Object B (bidirectional) -->
+        <line x1="442" y1="215" x2="570" y2="170" stroke="#39ff8e" stroke-width="1.5" marker-start="url(#pr-arrow-g-rev)" marker-end="url(#pr-arrow-g)" filter="url(#pr-glow-g)"/>
+
+        <!-- Labels on data flow arrows -->
+        <text x="210" y="205" fill="rgba(57,255,142,0.5)" font-size="9" font-family="monospace">interface X</text>
+        <text x="530" y="205" fill="rgba(57,255,142,0.5)" font-size="9" font-family="monospace" text-anchor="end">interface Y</text>
+
+        <!-- Bottom note -->
+        <text x="370" y="280" text-anchor="middle" fill="#5a5a70" font-size="10" font-family="monospace" font-style="italic">the proxy is a real Abject, with its own manifest and handlers</text>
+      </svg>
+
+      <p class="arch-note">The proxy is not a shim. It is a real Abject, with a manifest, handlers, and a will to survive.</p>
     </div>
   </div>
 </section>
@@ -48,45 +130,101 @@
     background: linear-gradient(180deg, var(--bg-deep) 0%, var(--bg-surface) 50%, var(--bg-deep) 100%);
   }
 
-  .arch-wrapper {
-    max-width: 720px;
+  .tiers {
+    max-width: 640px;
     margin: 0 auto 3rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
   }
 
-  .arch-diagram {
-    background: var(--bg-primary);
-    border: 1px solid var(--border-accent);
+  .tier {
+    width: 100%;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
     border-radius: 12px;
-    padding: 2rem;
-    font-size: 0.8rem;
-    line-height: 1.5;
-    box-shadow: 0 0 40px var(--accent-glow);
-    overflow-x: auto;
+    padding: 1.75rem 2rem;
+    position: relative;
+    transition: border-color 0.3s, box-shadow 0.3s;
   }
 
-  .arch-label {
-    color: var(--text-primary);
+  .tier:hover {
+    border-color: var(--border-accent);
+    box-shadow: 0 0 24px var(--eldritch-glow);
+  }
+
+  .tier-label {
+    position: absolute;
+    top: -0.6rem;
+    right: 1.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
     font-weight: 700;
+    color: var(--eldritch);
+    background: var(--bg-deep);
+    padding: 0 0.5rem;
   }
 
-  .arch-accent {
-    color: var(--accent);
-    font-weight: 600;
+  .tier h3 {
+    color: var(--eldritch);
+    margin-bottom: 0.25rem;
   }
 
-  .arch-dim {
-    color: var(--text-dim);
-  }
-
-  .arch-box {
-    color: var(--accent);
-    font-weight: 700;
+  .tier-tagline {
+    color: var(--void-purple);
+    font-style: italic;
     font-size: 0.9rem;
+    margin-bottom: 0.5rem;
   }
 
-  .arch-highlight {
-    color: var(--accent-secondary);
-    font-weight: 600;
+  .tier p:last-child {
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+  }
+
+  .tier-containment {
+    border-color: rgba(255, 77, 106, 0.15);
+  }
+
+  .tier-containment:hover {
+    border-color: rgba(255, 77, 106, 0.3);
+    box-shadow: 0 0 24px rgba(255, 77, 106, 0.1);
+  }
+
+  .tier-containment .tier-label {
+    color: var(--ichor);
+  }
+
+  .tier-containment h3 {
+    color: var(--ichor);
+  }
+
+  .tier-connector {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+    padding: 0.25rem 0;
+  }
+
+  .connector-line {
+    width: 1px;
+    height: 12px;
+    background: var(--eldritch-glow-strong);
+    box-shadow: 0 0 6px var(--eldritch-glow);
+  }
+
+  .connector-glyph {
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    color: var(--eldritch-dim);
+    line-height: 1;
+  }
+
+  .connector-label {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-dim);
   }
 
   .arch-detail {
@@ -105,15 +243,11 @@
     margin-bottom: 1rem;
   }
 
-  .arch-proxy {
-    display: inline-block;
-    text-align: center;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 1rem 2rem;
-    font-size: 0.85rem;
-    margin-bottom: 1rem;
+  .proxy-svg {
+    width: 100%;
+    max-width: 740px;
+    display: block;
+    margin: 0 auto 1rem;
   }
 
   .arch-note {

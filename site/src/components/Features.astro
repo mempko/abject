@@ -1,56 +1,53 @@
 ---
 const features = [
   {
-    icon: '>>',
-    title: 'Message Passing',
-    desc: 'Async messages with request/reply/event/error types. Fire-and-forget or request-response with timeouts.',
+    icon: '{!}',
+    title: 'Self-Healing Proxies',
+    hook: 'Break them. They grow back. They always grow back.',
+    desc: 'Error rates above 10% trigger LLM proxy regeneration with traffic still flowing. Unknown messages trigger renegotiation. Hot-swap without disruption.',
   },
   {
-    icon: '<>',
-    title: 'Protocol Mediation',
-    desc: 'LLM generates proxy objects that translate between incompatible interfaces automatically.',
+    icon: '{~}',
+    title: 'The Negotiator',
+    hook: 'An alien intelligence bridges incompatible minds.',
+    desc: 'The LLM reads both manifests, generates a real proxy Abject for protocol translation. Not a shim. A living translator with its own manifest and handlers.',
   },
   {
-    icon: '++',
-    title: 'Self-Healing',
-    desc: 'Error rate > 10% triggers proxy regeneration. Unknown messages trigger renegotiation. Hot-swap without disruption.',
+    icon: '{*}',
+    title: 'Everything is Alive',
+    hook: 'The registry is an Abject. The factory is an Abject. Even the thing that makes Abjects is an Abject.',
+    desc: 'System services follow the same Abject pattern: manifests, handlers, contracts. There is no privileged layer. Only Abjects passing messages in the dark.',
   },
   {
-    icon: '{}',
-    title: 'Everything is an Object',
-    desc: 'Registry, Factory, LLM service, UI, proxies — all are Abjects with manifests and message handlers.',
+    icon: '{=}',
+    title: 'Containment Protocols',
+    hook: 'Untrusted code runs inside a WASM cage. It can see nothing. Unless you grant it permission.',
+    desc: 'Sandboxed execution with capability-gated imports. No ambient authority. Abjects cannot touch anything they haven\'t been explicitly allowed to reach.',
   },
   {
-    icon: '=>',
-    title: 'Agents',
-    desc: 'Autonomous task execution via observe-think-act loop. AgentAbject drives goal-oriented behavior.',
+    icon: '{@}',
+    title: 'True Names',
+    hook: 'Every peer has a true name: a SHA-256 hash of its public key.',
+    desc: 'Cryptographic P2P identity with ECDSA/ECDH. AES-256-GCM encrypted WebRTC channels. Trust is verified, not assumed.',
   },
   {
-    icon: '[]',
-    title: 'Workspaces',
-    desc: 'Isolated, shareable object environments with per-workspace services and state.',
-  },
-  {
-    icon: '::',
-    title: 'P2P Identity',
-    desc: 'ECDSA/ECDH cryptographic identity with WebRTC encrypted peer channels and DNS-like naming.',
-  },
-  {
-    icon: '##',
-    title: 'Canvas UI',
-    desc: 'X11-style compositor with ~20 widgets: buttons, text inputs, layouts, windows — all rendered on Canvas.',
+    icon: '{+}',
+    title: 'Nothing Truly Dies',
+    hook: 'Dead Abjects restart. Crashed processes respawn. The supervisor ensures nothing stays buried.',
+    desc: 'Erlang-style supervision with state snapshots for resurrection with memories intact. Kill an Abject; it comes back knowing what it knew.',
   },
 ];
 ---
 
-<section id="concepts">
+<section id="features">
   <div class="container">
-    <h2 class="section-title">Core Concepts</h2>
+    <h2 class="section-title">What Lurks Inside</h2>
     <div class="grid-2">
       {features.map((f) => (
-        <div class="card">
+        <div class="card feature-card">
           <span class="card-icon">{f.icon}</span>
           <h3>{f.title}</h3>
+          <p class="hook">{f.hook}</p>
           <p>{f.desc}</p>
         </div>
       ))}
@@ -64,11 +61,19 @@ const features = [
     font-family: var(--font-mono);
     font-size: 1.1rem;
     font-weight: 700;
-    color: var(--accent);
-    background: var(--accent-glow);
+    color: var(--eldritch);
+    background: var(--eldritch-glow);
     border: 1px solid var(--border-accent);
     padding: 0.4rem 0.6rem;
     border-radius: 6px;
     margin-bottom: 0.75rem;
+  }
+
+  .feature-card .hook {
+    color: var(--void-purple);
+    font-style: italic;
+    font-size: 0.9rem;
+    margin-bottom: 0.5rem;
+    line-height: 1.5;
   }
 </style>

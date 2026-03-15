@@ -59,8 +59,8 @@ Main entry point. Bootstraps the entire Abjects system on Node.js.
 |----------|---------|-------------|
 | `WS_PORT` | `7719` | WebSocket port for frontend connection |
 | `DATA_DIR` | `.abjects` | Storage directory for persisted state |
-| `ANTHROPIC_API_KEY` | — | Anthropic Claude API key |
-| `OPENAI_API_KEY` | — | OpenAI API key |
+| `ANTHROPIC_API_KEY` | - | Anthropic Claude API key |
+| `OPENAI_API_KEY` | - | OpenAI API key |
 | `ABJECTS_WORKER_COUNT` | CPU cores | Worker thread pool size |
 
 ### backend-ui.ts
@@ -141,9 +141,9 @@ Wraps Node.js `worker_threads` to implement the `WorkerLike` interface used by t
 ## Usage
 
 ```bash
-# Start backend (all objects run here)
-pnpm serve
+# Awaken the depths (all objects run here)
+pnpm awaken
 
-# In another terminal, start browser client (thin renderer)
-pnpm client
+# In another terminal, scry into the abyss (thin renderer)
+pnpm scry
 ```

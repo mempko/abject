@@ -65,14 +65,14 @@ Core client class. Owns the Canvas, Compositor, and WebSocket connection.
 - Mouse grab: mousedown locks events to a surface until mouseup (enables window dragging)
 
 **Key state:**
-- `focusedSurface` — receives keyboard events
-- `grabbedSurface` — receives all mouse events during drag
-- `currentSelectedText` — clipboard selection buffer
+- `focusedSurface`: receives keyboard events
+- `grabbedSurface`: receives all mouse events during drag
+- `currentSelectedText`: clipboard selection buffer
 
 ## Build
 
 ```bash
-pnpm client          # Dev server on port 5174
+pnpm scry            # Dev server on port 5174
 ```
 
 Configured via `vite.client.config.ts` (root: `client/`, output: `dist-client/`).

@@ -4,25 +4,29 @@
 <section class="hero">
   <div class="hero-bg"></div>
   <div class="container hero-content">
-    <p class="hero-label">Distributed Object System</p>
+    <p class="hero-label">// GRASS COMPUTING PLATFORM</p>
     <h1>
-      <span class="accent">LLM-Mediated</span> Objects<br />
-      That Heal Themselves
+      The Things That <span class="accent">Think</span>
     </h1>
     <p class="hero-desc">
-      Objects communicate via message passing, negotiate protocols using an LLM,
-      and self-heal when communication breaks down. Everything is an object.
+      Abjects is an LLM-mediated runtime where Abjects communicate through message passing,
+      negotiate protocols through an artificial intelligence, and regenerate when broken.
+      Ask any Abject what it does; it answers in its own words.
+      Everything in the system is alive.
+    </p>
+    <p class="hero-tagline">
+      abject <span class="dim">(n.)</span> - AI Object. Also: cosmic dread. Both apply.
     </p>
     <div class="hero-actions">
-      <a href="#quickstart" class="btn btn-primary">Get Started</a>
-      <a href="#concepts" class="btn btn-outline">Learn More</a>
+      <a href="#summon" class="btn btn-primary">Begin the Ritual</a>
+      <a href="#architecture" class="btn btn-outline">Witness the Architecture</a>
     </div>
     <div class="hero-tags">
       <span>TypeScript</span>
       <span>WASM</span>
       <span>WebRTC</span>
-      <span>Canvas UI</span>
       <span>P2P</span>
+      <span>Canvas</span>
     </div>
   </div>
 </section>
@@ -41,9 +45,11 @@
     position: absolute;
     inset: 0;
     background:
-      radial-gradient(ellipse 80% 60% at 50% 0%, rgba(0, 229, 255, 0.08) 0%, transparent 60%),
-      radial-gradient(ellipse 40% 40% at 80% 20%, rgba(124, 77, 255, 0.06) 0%, transparent 50%);
+      radial-gradient(ellipse 60% 50% at 50% 30%, rgba(57, 255, 142, 0.07) 0%, transparent 60%),
+      radial-gradient(ellipse 40% 40% at 70% 20%, rgba(155, 89, 255, 0.05) 0%, transparent 50%),
+      radial-gradient(ellipse 30% 30% at 30% 60%, rgba(57, 255, 142, 0.04) 0%, transparent 50%);
     pointer-events: none;
+    animation: pulse-glow 8s ease-in-out infinite;
   }
 
   .hero-content {
@@ -55,27 +61,41 @@
   .hero-label {
     font-family: var(--font-mono);
     font-size: 0.85rem;
-    color: var(--accent);
-    text-transform: uppercase;
+    color: var(--eldritch);
     letter-spacing: 0.15em;
     margin-bottom: 1.25rem;
+    animation: pulse-glow 4s ease-in-out infinite;
   }
 
   h1 {
     margin-bottom: 1.5rem;
+    text-shadow: 0 0 40px rgba(57, 255, 142, 0.1);
+    animation: glitch 12s infinite;
   }
 
   .accent {
-    color: var(--accent);
-    text-shadow: 0 0 30px var(--accent-glow-strong);
+    color: var(--eldritch);
+    text-shadow: 0 0 30px var(--eldritch-glow-strong);
   }
 
   .hero-desc {
-    max-width: 600px;
-    margin: 0 auto 2.5rem;
+    max-width: 620px;
+    margin: 0 auto 1.5rem;
     color: var(--text-secondary);
     font-size: 1.15rem;
     line-height: 1.8;
+  }
+
+  .hero-tagline {
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    color: var(--text-dim);
+    margin-bottom: 2.5rem;
+    font-style: italic;
+  }
+
+  .hero-tagline .dim {
+    opacity: 0.6;
   }
 
   .hero-actions {

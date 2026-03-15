@@ -983,7 +983,7 @@ await this.call(canvasId, 'draw', {
   commands: [
     { type: 'clear', surfaceId: 'c', params: { color: '#1a1a2e' } },
     { type: 'rect', surfaceId: 'c', params: { x: 10, y: 10, width: 50, height: 50, fill: '#ff0' } },
-    { type: 'circle', surfaceId: 'c', params: { cx: 100, cy: 100, radius: 30, fill: '#e8a84c' } },
+    { type: 'circle', surfaceId: 'c', params: { cx: 100, cy: 100, radius: 30, fill: '#39ff8e' } },
   ]
 });
 

@@ -9,10 +9,10 @@ Abjects is an LLM-mediated distributed object system where objects communicate v
 ## Build & Run Commands
 
 ```bash
-pnpm install                      # Install dependencies
-pnpm serve                        # Start Node.js backend (ws://localhost:7719)
-pnpm client                       # Start thin browser client (http://localhost:5173)
-pnpm signal                       # Start P2P signaling server (:7720)
+pnpm conjure                      # Gather dependencies
+pnpm awaken                       # Awaken the backend (ws://localhost:7719)
+pnpm scry                         # Scry into the abyss (http://localhost:5174)
+pnpm whisper                      # Start P2P signaling server (:7720)
 ```
 
 ## Project Structure

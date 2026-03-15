@@ -114,5 +114,5 @@ Every object follows the same structure:
 
 ## Subdirectories
 
-- `capabilities/` — 8 built-in capability objects (HTTP, storage, timer, clipboard, console, filesystem, web-browser, web-parser)
-- `widgets/` — Canvas widget toolkit (20 files: windows, layouts, input/display widgets)
+- `capabilities/`: 8 built-in capability objects (HTTP, storage, timer, clipboard, console, filesystem, web-browser, web-parser)
+- `widgets/`: Canvas widget toolkit (20 files: windows, layouts, input/display widgets)

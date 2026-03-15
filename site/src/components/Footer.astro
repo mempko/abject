@@ -5,14 +5,17 @@
   <div class="container footer-content">
     <div class="footer-brand">
       <span class="footer-logo">
-        <span class="bracket">[</span>abjects<span class="bracket">]</span>
+        <span class="bracket">{</span>abjects<span class="bracket">}</span>
       </span>
-      <p>LLM-mediated distributed object system</p>
+      <p>Grass computing from the abyss.</p>
     </div>
-    <div class="footer-links">
-      <span class="coming-soon">GitHub — Coming Soon</span>
-      <span class="sep">|</span>
-      <span class="license">GPL-3.0-or-later</span>
+    <div class="footer-right">
+      <p class="footer-flavor">Made with mass hallucination and message passing</p>
+      <div class="footer-links">
+        <span class="coming-soon">GitHub - Coming Soon</span>
+        <span class="sep">|</span>
+        <span class="license">GPL-3.0-or-later</span>
+      </div>
     </div>
   </div>
 </footer>
@@ -39,7 +42,7 @@
   }
 
   .bracket {
-    color: var(--accent);
+    color: var(--eldritch);
   }
 
   .footer-brand p {
@@ -48,15 +51,22 @@
     margin-top: 0.25rem;
   }
 
+  .footer-right {
+    text-align: right;
+  }
+
+  .footer-flavor {
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    font-style: italic;
+    margin-bottom: 0.35rem;
+  }
+
   .footer-links {
     display: flex;
     align-items: center;
     gap: 0.75rem;
     font-size: 0.9rem;
-  }
-
-  .footer-links a {
-    color: var(--text-secondary);
   }
 
   .coming-soon {

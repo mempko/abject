@@ -1,46 +1,48 @@
 ---
 ---
 
-<section id="quickstart">
+<section id="summon">
   <div class="container">
-    <h2 class="section-title">Quick Start</h2>
+    <h2 class="section-title">Summon the System</h2>
     <div class="qs-grid">
       <div class="qs-code">
         <div class="code-header">
-          <span class="code-dot"></span>
-          <span class="code-dot"></span>
-          <span class="code-dot"></span>
+          <span class="code-dot dot-green"></span>
+          <span class="code-dot dot-purple"></span>
+          <span class="code-dot dot-red"></span>
           <span class="code-title">terminal</span>
         </div>
         <pre><code><span class="c"># Clone the repository (coming soon)</span>
 <span class="cmd">git clone</span> https://github.com/mempko/abjects
 <span class="cmd">cd</span> abjects
 
-<span class="c"># Install dependencies</span>
-<span class="cmd">pnpm install</span>
+<span class="c"># Gather the ritual components</span>
+<span class="cmd">pnpm conjure</span>
 
-<span class="c"># Start Node.js backend</span>
-<span class="cmd">pnpm serve</span>
+<span class="c"># Awaken the depths</span>
+<span class="cmd">pnpm awaken</span>
 
-<span class="c"># Start thin browser client (new terminal)</span>
-<span class="cmd">pnpm client</span>          <span class="c"># http://localhost:5173</span>
+<span class="c"># Scry into the abyss (new terminal)</span>
+<span class="cmd">pnpm scry</span>            <span class="c"># http://localhost:5174</span>
 
-<span class="c"># Start P2P signaling server (new terminal)</span>
-<span class="cmd">pnpm signal</span>          <span class="c"># :7720</span></code></pre>
+<span class="c"># Let them find each other in the dark (new terminal)</span>
+<span class="cmd">pnpm whisper</span>         <span class="c"># :7720</span></code></pre>
       </div>
       <div class="qs-info">
-        <h3>Three processes, one system</h3>
+        <h3>Three processes. One living system.</h3>
         <p>
-          The <strong>backend</strong> runs all Abjects — Registry, Factory, LLM, Negotiator,
-          and your custom objects — in a Node.js process with worker threads.
+          The <strong>backend</strong> is the depths: all Abjects live here. Registry, Factory,
+          LLM, Negotiator, Supervisor, and your own Abjects, passing messages in a Node.js
+          process with worker threads.
         </p>
         <p>
-          The <strong>browser client</strong> is a thin Canvas renderer that forwards
-          input events and displays composited frames over WebSocket.
+          The <strong>browser client</strong> is the surface: a thin Canvas renderer that
+          forwards input events and displays composited frames over WebSocket.
+          It sees only what the depths allow.
         </p>
         <p>
-          The <strong>signaling server</strong> enables peer discovery for WebRTC
-          connections between Abjects instances.
+          The <strong>signaling server</strong> enables peer discovery: how instances
+          find each other for encrypted WebRTC connections.
         </p>
       </div>
     </div>
@@ -60,6 +62,7 @@
     border: 1px solid var(--border);
     border-radius: 12px;
     overflow: hidden;
+    box-shadow: 0 0 30px var(--eldritch-glow);
   }
 
   .code-header {
@@ -75,12 +78,11 @@
     width: 10px;
     height: 10px;
     border-radius: 50%;
-    background: var(--text-dim);
   }
 
-  .code-dot:nth-child(1) { background: #ff5f57; }
-  .code-dot:nth-child(2) { background: #febc2e; }
-  .code-dot:nth-child(3) { background: #28c840; }
+  .dot-green { background: var(--eldritch); }
+  .dot-purple { background: var(--void-purple); }
+  .dot-red { background: var(--ichor); }
 
   .code-title {
     margin-left: 0.5rem;
@@ -101,7 +103,7 @@
   }
 
   .qs-code code .cmd {
-    color: var(--accent);
+    color: var(--eldritch);
     font-weight: 600;
   }
 
@@ -121,7 +123,7 @@
   }
 
   .qs-info strong {
-    color: var(--accent);
+    color: var(--eldritch);
     font-weight: 600;
   }
 

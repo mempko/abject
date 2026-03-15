@@ -1,0 +1,618 @@
+---
+---
+
+<section id="symbiogenesis" class="symbio-section">
+  <div class="container">
+
+    <!-- Zone A: Title + Thesis -->
+    <div class="section-title">
+      <h2>Symbiogenesis</h2>
+    </div>
+    <p class="symbio-subtitle">When the boundary between program and agent dissolves.</p>
+    <p class="symbio-thesis">
+      Every agent framework draws the same line: the agent thinks, the tool obeys. Abjects erases that line. Here, Abjects create Abjects, Abjects interview their dependencies, and the LLM is just another service, summoned when an Abject needs a mind, silent otherwise. The result is not a framework. It is a new kind of organism.
+    </p>
+
+    <!-- Zone B: Inversion Diagrams -->
+    <div class="diagrams">
+      <div class="diagram-old">
+        <h3 class="diagram-label">The Old Way</h3>
+        <svg class="diagram-svg diagram-svg-old" viewBox="0 0 620 170" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="arrow-old" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a5a70"/>
+            </marker>
+          </defs>
+          <!-- Row 1 -->
+          <rect x="30" y="15" width="100" height="34" rx="6" fill="#12121e" stroke="rgba(255,77,106,0.2)" stroke-width="1"/>
+          <text x="80" y="37" text-anchor="middle" fill="#e0e0ea" font-size="13" font-family="monospace">Agent</text>
+          <line x1="135" y1="32" x2="195" y2="32" stroke="#5a5a70" stroke-width="1.5" marker-end="url(#arrow-old)"/>
+          <rect x="200" y="15" width="100" height="34" rx="6" fill="#12121e" stroke="#1a1a2a" stroke-width="1"/>
+          <text x="250" y="37" text-anchor="middle" fill="#5a5a70" font-size="13" font-family="monospace">Tool</text>
+          <text x="340" y="37" fill="#5a5a70" font-size="12" font-family="monospace" opacity="0.8">Agent decides. Tool obeys.</text>
+          <!-- Row 2 -->
+          <rect x="30" y="65" width="100" height="34" rx="6" fill="#12121e" stroke="rgba(255,77,106,0.2)" stroke-width="1"/>
+          <text x="80" y="87" text-anchor="middle" fill="#e0e0ea" font-size="13" font-family="monospace">Agent</text>
+          <line x1="135" y1="82" x2="195" y2="82" stroke="#5a5a70" stroke-width="1.5" marker-end="url(#arrow-old)"/>
+          <rect x="200" y="65" width="100" height="34" rx="6" fill="#12121e" stroke="#1a1a2a" stroke-width="1"/>
+          <text x="250" y="87" text-anchor="middle" fill="#5a5a70" font-size="13" font-family="monospace">Tool</text>
+          <text x="340" y="87" fill="#5a5a70" font-size="12" font-family="monospace" opacity="0.8">One-way. Always.</text>
+          <!-- Row 3 -->
+          <rect x="30" y="115" width="100" height="34" rx="6" fill="#12121e" stroke="rgba(255,77,106,0.2)" stroke-width="1"/>
+          <text x="80" y="137" text-anchor="middle" fill="#e0e0ea" font-size="13" font-family="monospace">Agent</text>
+          <line x1="135" y1="132" x2="195" y2="132" stroke="#5a5a70" stroke-width="1.5" marker-end="url(#arrow-old)"/>
+          <rect x="200" y="115" width="100" height="34" rx="6" fill="#12121e" stroke="#1a1a2a" stroke-width="1"/>
+          <text x="250" y="137" text-anchor="middle" fill="#5a5a70" font-size="13" font-family="monospace">Tool</text>
+        </svg>
+      </div>
+
+      <div class="diagram-new">
+        <h3 class="diagram-label diagram-label-new">The Inversion</h3>
+        <svg class="diagram-svg diagram-svg-new" viewBox="0 0 620 310" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <filter id="glow-eldritch">
+              <feGaussianBlur stdDeviation="3" result="blur"/>
+              <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+            <marker id="arrow-eldritch" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#39ff8e"/>
+            </marker>
+            <marker id="arrow-eldritch-rev" viewBox="0 0 10 10" refX="0" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+              <path d="M 10 0 L 0 5 L 10 10 z" fill="#39ff8e"/>
+            </marker>
+            <marker id="arrow-eldritch-down" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(57,255,142,0.4)"/>
+            </marker>
+          </defs>
+
+          <!-- Row 1: Object ◄──► Object -->
+          <rect x="30" y="15" width="110" height="38" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1.5"/>
+          <text x="85" y="40" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace">Object</text>
+          <line x1="145" y1="34" x2="195" y2="34" stroke="#39ff8e" stroke-width="1.5" marker-start="url(#arrow-eldritch-rev)" marker-end="url(#arrow-eldritch)" filter="url(#glow-eldritch)"/>
+          <rect x="200" y="15" width="110" height="38" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1.5"/>
+          <text x="255" y="40" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace">Object</text>
+          <text x="350" y="40" fill="#39ff8e" font-size="12" font-family="monospace" opacity="0.7">Abjects talk to each other.</text>
+
+          <!-- Vertical arrow down from left Object -->
+          <line x1="85" y1="53" x2="85" y2="100" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#arrow-eldritch-down)"/>
+          <text x="350" y="78" fill="#39ff8e" font-size="12" font-family="monospace" opacity="0.7">Abjects create Abjects.</text>
+          <text x="350" y="98" fill="#39ff8e" font-size="12" font-family="monospace" opacity="0.7">Abjects interview dependencies.</text>
+
+          <!-- Row 2: Object ──► LLM -->
+          <rect x="30" y="105" width="110" height="38" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1.5"/>
+          <text x="85" y="130" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace">Object</text>
+          <line x1="145" y1="124" x2="195" y2="124" stroke="#9b59ff" stroke-width="1.5" marker-end="url(#arrow-old)" filter="url(#glow-eldritch)"/>
+          <rect x="200" y="105" width="110" height="38" rx="6" fill="#12121e" stroke="rgba(155,89,255,0.3)" stroke-width="1.5"/>
+          <text x="255" y="130" text-anchor="middle" fill="#9b59ff" font-size="13" font-family="monospace">LLM</text>
+          <text x="350" y="130" fill="#39ff8e" font-size="12" font-family="monospace" opacity="0.7">Summons a mind when needed.</text>
+
+          <!-- Vertical arrow down -->
+          <line x1="85" y1="143" x2="85" y2="195" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#arrow-eldritch-down)"/>
+
+          <!-- Row 3: Object ◄──► Object (created becomes creator) -->
+          <rect x="30" y="200" width="110" height="38" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1.5"/>
+          <text x="85" y="225" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace">Object</text>
+          <line x1="145" y1="219" x2="195" y2="219" stroke="#39ff8e" stroke-width="1.5" marker-start="url(#arrow-eldritch-rev)" marker-end="url(#arrow-eldritch)" filter="url(#glow-eldritch)"/>
+          <rect x="200" y="200" width="110" height="38" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1.5"/>
+          <text x="255" y="225" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace">Object</text>
+          <text x="350" y="225" fill="#39ff8e" font-size="12" font-family="monospace" opacity="0.7">The created becomes the creator.</text>
+
+          <!-- Recursion hint: arrow looping back up from bottom-left Object -->
+          <line x1="30" y1="238" x2="30" y2="275" stroke="rgba(57,255,142,0.25)" stroke-width="1" stroke-dasharray="4 3"/>
+          <line x1="30" y1="275" x2="15" y2="275" stroke="rgba(57,255,142,0.25)" stroke-width="1" stroke-dasharray="4 3"/>
+          <line x1="15" y1="275" x2="15" y2="34" stroke="rgba(57,255,142,0.25)" stroke-width="1" stroke-dasharray="4 3"/>
+          <line x1="15" y1="34" x2="30" y2="34" stroke="rgba(57,255,142,0.25)" stroke-width="1" stroke-dasharray="4 3"/>
+          <text x="85" y="295" text-anchor="middle" fill="rgba(57,255,142,0.35)" font-size="10" font-family="monospace">∞ recursion</text>
+        </svg>
+      </div>
+    </div>
+
+    <!-- Zone C: Left-Right Comparisons -->
+    <h3 class="compare-heading">How is Abjects different?</h3>
+
+    <div class="comparisons">
+
+      <div class="compare-row">
+        <div class="compare-label">Agent Frameworks</div>
+        <div class="compare-systems">OpenClaw &middot; LangChain &middot; CrewAI</div>
+        <svg class="compare-svg" viewBox="0 0 900 170" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="cf-arrow-dim" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a5a70"/>
+            </marker>
+            <marker id="cf-arrow-green" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#39ff8e"/>
+            </marker>
+            <marker id="cf-arrow-green-rev" viewBox="0 0 10 10" refX="0" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+              <path d="M 10 0 L 0 5 L 10 10 z" fill="#39ff8e"/>
+            </marker>
+            <filter id="cf-glow-g">
+              <feGaussianBlur stdDeviation="2.5" result="blur"/>
+              <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+          </defs>
+
+          <!-- Left: Hub-spoke Agent → Tools -->
+          <text x="195" y="16" text-anchor="middle" fill="#5a5a70" font-size="11" font-family="monospace">hub-and-spoke</text>
+          <rect x="145" y="25" width="100" height="34" rx="6" fill="#12121e" stroke="rgba(255,77,106,0.2)" stroke-width="1"/>
+          <text x="195" y="47" text-anchor="middle" fill="#e0e0ea" font-size="13" font-family="monospace">Agent</text>
+          <line x1="165" y1="59" x2="95" y2="90" stroke="#5a5a70" stroke-width="1" marker-end="url(#cf-arrow-dim)"/>
+          <line x1="195" y1="59" x2="195" y2="90" stroke="#5a5a70" stroke-width="1" marker-end="url(#cf-arrow-dim)"/>
+          <line x1="225" y1="59" x2="295" y2="90" stroke="#5a5a70" stroke-width="1" marker-end="url(#cf-arrow-dim)"/>
+          <rect x="50" y="95" width="85" height="30" rx="5" fill="#12121e" stroke="#1a1a2a" stroke-width="1"/>
+          <text x="92" y="115" text-anchor="middle" fill="#5a5a70" font-size="11" font-family="monospace">Tool</text>
+          <rect x="153" y="95" width="85" height="30" rx="5" fill="#12121e" stroke="#1a1a2a" stroke-width="1"/>
+          <text x="195" y="115" text-anchor="middle" fill="#5a5a70" font-size="11" font-family="monospace">Tool</text>
+          <rect x="255" y="95" width="85" height="30" rx="5" fill="#12121e" stroke="#1a1a2a" stroke-width="1"/>
+          <text x="297" y="115" text-anchor="middle" fill="#5a5a70" font-size="11" font-family="monospace">Tool</text>
+          <text x="195" y="150" text-anchor="middle" fill="#5a5a70" font-size="10" font-family="monospace" opacity="0.6">silent, passive, one-way</text>
+
+          <!-- Divider -->
+          <line x1="420" y1="10" x2="420" y2="160" stroke="#1a1a2a" stroke-width="1" stroke-dasharray="4 4"/>
+
+          <!-- Right: Mesh with Ask Protocol -->
+          <text x="660" y="16" text-anchor="middle" fill="rgba(57,255,142,0.5)" font-size="11" font-family="monospace">living mesh</text>
+          <rect x="590" y="25" width="140" height="34" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1.5"/>
+          <text x="660" y="47" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace">ObjectCreator</text>
+          <!-- bidirectional to Object A -->
+          <line x1="615" y1="59" x2="545" y2="90" stroke="#39ff8e" stroke-width="1.5" marker-start="url(#cf-arrow-green-rev)" marker-end="url(#cf-arrow-green)" filter="url(#cf-glow-g)"/>
+          <text x="558" y="72" text-anchor="middle" fill="rgba(57,255,142,0.5)" font-size="9" font-family="monospace">ask</text>
+          <!-- bidirectional to Object B -->
+          <line x1="705" y1="59" x2="775" y2="90" stroke="#39ff8e" stroke-width="1.5" marker-start="url(#cf-arrow-green-rev)" marker-end="url(#cf-arrow-green)" filter="url(#cf-glow-g)"/>
+          <text x="762" y="72" text-anchor="middle" fill="rgba(57,255,142,0.5)" font-size="9" font-family="monospace">ask</text>
+          <rect x="480" y="95" width="120" height="30" rx="5" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1"/>
+          <text x="540" y="115" text-anchor="middle" fill="#39ff8e" font-size="11" font-family="monospace">Object A</text>
+          <rect x="720" y="95" width="120" height="30" rx="5" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1"/>
+          <text x="780" y="115" text-anchor="middle" fill="#39ff8e" font-size="11" font-family="monospace">Object B</text>
+          <!-- A ◄──► B -->
+          <line x1="600" y1="110" x2="720" y2="110" stroke="#39ff8e" stroke-width="1" stroke-dasharray="5 3" marker-start="url(#cf-arrow-green-rev)" marker-end="url(#cf-arrow-green)" filter="url(#cf-glow-g)"/>
+          <text x="660" y="150" text-anchor="middle" fill="rgba(57,255,142,0.5)" font-size="10" font-family="monospace">tools teach the creator</text>
+        </svg>
+        <div class="compare-pair">
+          <div class="compare-side compare-them">
+            <span class="compare-tag">Them</span>
+            <p>OpenClaw's skills are modular add-ons the agent invokes. LangChain chains tools into workflows. CrewAI assigns tools to roles. In all of them, tools are passive: they execute when called and go silent. Even OpenClaw's ACP, which lets agents talk to agents, leaves skills voiceless.</p>
+          </div>
+          <div class="compare-side compare-abjects">
+            <span class="compare-tag compare-tag-abjects">Abjects</span>
+            <p>ObjectCreator interviews existing Abjects, learns their protocols through the Ask Protocol, and generates living collaborators. The tool teaches the creator how to use it.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="compare-row">
+        <div class="compare-label">Tool Protocols</div>
+        <div class="compare-systems">MCP &middot; Claude Skills &middot; Function Calling</div>
+        <svg class="compare-svg" viewBox="0 0 900 180" xmlns="http://www.w3.org/2000/svg">
+          <!-- Left: LLM reads static schema menu -->
+          <text x="195" y="16" text-anchor="middle" fill="#5a5a70" font-size="11" font-family="monospace">static schema</text>
+          <rect x="145" y="25" width="100" height="34" rx="6" fill="#12121e" stroke="rgba(255,77,106,0.2)" stroke-width="1"/>
+          <text x="195" y="47" text-anchor="middle" fill="#e0e0ea" font-size="13" font-family="monospace">LLM</text>
+          <line x1="195" y1="59" x2="195" y2="80" stroke="#5a5a70" stroke-width="1" marker-end="url(#cf-arrow-dim)"/>
+          <!-- Schema menu box -->
+          <rect x="115" y="85" width="160" height="50" rx="6" fill="#12121e" stroke="rgba(255,77,106,0.15)" stroke-width="1"/>
+          <text x="195" y="104" text-anchor="middle" fill="#5a5a70" font-size="10" font-family="monospace">{'{ "tools": ['}</text>
+          <text x="195" y="118" text-anchor="middle" fill="#5a5a70" font-size="10" font-family="monospace">{'  fn(), fn(), fn() ]}'}</text>
+          <!-- arrows to silent functions -->
+          <line x1="145" y1="135" x2="95" y2="152" stroke="#5a5a70" stroke-width="1" stroke-dasharray="3 3"/>
+          <line x1="195" y1="135" x2="195" y2="152" stroke="#5a5a70" stroke-width="1" stroke-dasharray="3 3"/>
+          <line x1="245" y1="135" x2="295" y2="152" stroke="#5a5a70" stroke-width="1" stroke-dasharray="3 3"/>
+          <text x="95" y="167" text-anchor="middle" fill="#5a5a70" font-size="9" font-family="monospace">fn()</text>
+          <text x="195" y="167" text-anchor="middle" fill="#5a5a70" font-size="9" font-family="monospace">fn()</text>
+          <text x="295" y="167" text-anchor="middle" fill="#5a5a70" font-size="9" font-family="monospace">fn()</text>
+
+          <!-- Divider -->
+          <line x1="420" y1="10" x2="420" y2="170" stroke="#1a1a2a" stroke-width="1" stroke-dasharray="4 4"/>
+
+          <!-- Right: Negotiator bridging incompatible objects -->
+          <text x="660" y="16" text-anchor="middle" fill="rgba(57,255,142,0.5)" font-size="11" font-family="monospace">living negotiation</text>
+          <!-- Object A (incompatible) -->
+          <rect x="480" y="30" width="100" height="44" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1"/>
+          <text x="530" y="50" text-anchor="middle" fill="#39ff8e" font-size="11" font-family="monospace">Object A</text>
+          <text x="530" y="65" text-anchor="middle" fill="rgba(57,255,142,0.35)" font-size="9" font-family="monospace">interface X</text>
+          <!-- Object B (incompatible) -->
+          <rect x="740" y="30" width="100" height="44" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1"/>
+          <text x="790" y="50" text-anchor="middle" fill="#39ff8e" font-size="11" font-family="monospace">Object B</text>
+          <text x="790" y="65" text-anchor="middle" fill="rgba(57,255,142,0.35)" font-size="9" font-family="monospace">interface Y</text>
+          <!-- incompatible mark -->
+          <text x="660" y="50" text-anchor="middle" fill="#ff4d6a" font-size="16" font-family="monospace">≠</text>
+          <line x1="580" y1="52" x2="625" y2="52" stroke="rgba(255,77,106,0.3)" stroke-width="1" stroke-dasharray="3 3"/>
+          <line x1="695" y1="52" x2="740" y2="52" stroke="rgba(255,77,106,0.3)" stroke-width="1" stroke-dasharray="3 3"/>
+          <!-- Negotiator -->
+          <rect x="600" y="85" width="120" height="34" rx="6" fill="#12121e" stroke="rgba(155,89,255,0.4)" stroke-width="1.5"/>
+          <text x="660" y="107" text-anchor="middle" fill="#9b59ff" font-size="12" font-family="monospace">Negotiator</text>
+          <!-- arrows from Negotiator reading both -->
+          <line x1="620" y1="85" x2="555" y2="74" stroke="#9b59ff" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#cf-arrow-dim)"/>
+          <line x1="700" y1="85" x2="765" y2="74" stroke="#9b59ff" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#cf-arrow-dim)"/>
+          <!-- Proxy output -->
+          <line x1="660" y1="119" x2="660" y2="138" stroke="#39ff8e" stroke-width="1.5" marker-end="url(#cf-arrow-green)" filter="url(#cf-glow-g)"/>
+          <rect x="605" y="140" width="110" height="30" rx="5" fill="#12121e" stroke="rgba(57,255,142,0.4)" stroke-width="1.5"/>
+          <text x="660" y="160" text-anchor="middle" fill="#39ff8e" font-size="11" font-family="monospace">Living Proxy</text>
+        </svg>
+        <div class="compare-pair">
+          <div class="compare-side compare-them">
+            <span class="compare-tag">Them</span>
+            <p>MCP exposes tools as JSON-RPC functions with schemas. Claude Skills inject behavior templates into prompts. Both give the LLM a menu to order from. Tools can't ask questions about each other. There is no negotiation, no healing, no composition.</p>
+          </div>
+          <div class="compare-side compare-abjects">
+            <span class="compare-tag compare-tag-abjects">Abjects</span>
+            <p>Every Abject explains itself in natural language. The Negotiator reads two incompatible manifests and conjures a living proxy between them, a real Abject, not a shim.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="compare-row">
+        <div class="compare-label">Orchestration</div>
+        <div class="compare-systems">AutoGen &middot; Subagents &middot; ReAct</div>
+        <svg class="compare-svg" viewBox="0 0 900 180" xmlns="http://www.w3.org/2000/svg">
+          <!-- Left: Strict hierarchy - LLM Planner at top -->
+          <text x="195" y="16" text-anchor="middle" fill="#5a5a70" font-size="11" font-family="monospace">strict hierarchy</text>
+          <rect x="140" y="25" width="110" height="34" rx="6" fill="#12121e" stroke="rgba(255,77,106,0.2)" stroke-width="1"/>
+          <text x="195" y="47" text-anchor="middle" fill="#e0e0ea" font-size="12" font-family="monospace">LLM Planner</text>
+          <!-- arrows down to subagents -->
+          <line x1="170" y1="59" x2="120" y2="85" stroke="#5a5a70" stroke-width="1" marker-end="url(#cf-arrow-dim)"/>
+          <line x1="220" y1="59" x2="270" y2="85" stroke="#5a5a70" stroke-width="1" marker-end="url(#cf-arrow-dim)"/>
+          <rect x="65" y="88" width="110" height="28" rx="5" fill="#12121e" stroke="#1a1a2a" stroke-width="1"/>
+          <text x="120" y="107" text-anchor="middle" fill="#5a5a70" font-size="10" font-family="monospace">Subagent 1</text>
+          <rect x="215" y="88" width="110" height="28" rx="5" fill="#12121e" stroke="#1a1a2a" stroke-width="1"/>
+          <text x="270" y="107" text-anchor="middle" fill="#5a5a70" font-size="10" font-family="monospace">Subagent 2</text>
+          <!-- arrows down to tools -->
+          <line x1="120" y1="116" x2="120" y2="136" stroke="#5a5a70" stroke-width="1" marker-end="url(#cf-arrow-dim)"/>
+          <line x1="270" y1="116" x2="270" y2="136" stroke="#5a5a70" stroke-width="1" marker-end="url(#cf-arrow-dim)"/>
+          <rect x="85" y="140" width="70" height="24" rx="4" fill="#12121e" stroke="#1a1a2a" stroke-width="1"/>
+          <text x="120" y="157" text-anchor="middle" fill="#5a5a70" font-size="9" font-family="monospace">Tool</text>
+          <rect x="235" y="140" width="70" height="24" rx="4" fill="#12121e" stroke="#1a1a2a" stroke-width="1"/>
+          <text x="270" y="157" text-anchor="middle" fill="#5a5a70" font-size="9" font-family="monospace">Tool</text>
+          <!-- no lateral connections - visual gap -->
+          <text x="195" y="177" text-anchor="middle" fill="#5a5a70" font-size="9" font-family="monospace" opacity="0.5">no lateral links, LLM always on top</text>
+
+          <!-- Divider -->
+          <line x1="420" y1="10" x2="420" y2="170" stroke="#1a1a2a" stroke-width="1" stroke-dasharray="4 4"/>
+
+          <!-- Right: Flat mesh, LLM as service -->
+          <text x="660" y="16" text-anchor="middle" fill="rgba(57,255,142,0.5)" font-size="11" font-family="monospace">flat mesh, LLM as service</text>
+          <!-- Objects at same level -->
+          <rect x="485" y="35" width="90" height="34" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1"/>
+          <text x="530" y="57" text-anchor="middle" fill="#39ff8e" font-size="11" font-family="monospace">Object</text>
+          <rect x="635" y="35" width="90" height="34" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1"/>
+          <text x="680" y="57" text-anchor="middle" fill="#39ff8e" font-size="11" font-family="monospace">Object</text>
+          <rect x="785" y="35" width="90" height="34" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1"/>
+          <text x="830" y="57" text-anchor="middle" fill="#39ff8e" font-size="11" font-family="monospace">Object</text>
+          <!-- lateral mesh connections -->
+          <line x1="575" y1="52" x2="635" y2="52" stroke="#39ff8e" stroke-width="1" marker-start="url(#cf-arrow-green-rev)" marker-end="url(#cf-arrow-green)" filter="url(#cf-glow-g)"/>
+          <line x1="725" y1="52" x2="785" y2="52" stroke="#39ff8e" stroke-width="1" marker-start="url(#cf-arrow-green-rev)" marker-end="url(#cf-arrow-green)" filter="url(#cf-glow-g)"/>
+          <!-- Object spawns Object -->
+          <line x1="530" y1="69" x2="530" y2="100" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#cf-arrow-green)"/>
+          <rect x="485" y="105" width="90" height="28" rx="5" fill="#12121e" stroke="rgba(57,255,142,0.25)" stroke-width="1" stroke-dasharray="4 3"/>
+          <text x="530" y="124" text-anchor="middle" fill="rgba(57,255,142,0.6)" font-size="10" font-family="monospace">spawned</text>
+          <!-- that spawned object spawns another -->
+          <line x1="530" y1="133" x2="530" y2="148" stroke="rgba(57,255,142,0.3)" stroke-width="1" marker-end="url(#cf-arrow-green)"/>
+          <rect x="497" y="150" width="66" height="22" rx="4" fill="#12121e" stroke="rgba(57,255,142,0.2)" stroke-width="1" stroke-dasharray="3 3"/>
+          <text x="530" y="165" text-anchor="middle" fill="rgba(57,255,142,0.45)" font-size="9" font-family="monospace">spawned</text>
+          <!-- LLM as side-service -->
+          <line x1="680" y1="69" x2="680" y2="95" stroke="#9b59ff" stroke-width="1" stroke-dasharray="4 3"/>
+          <rect x="635" y="100" width="90" height="28" rx="5" fill="#12121e" stroke="rgba(155,89,255,0.3)" stroke-width="1"/>
+          <text x="680" y="119" text-anchor="middle" fill="#9b59ff" font-size="10" font-family="monospace">LLM</text>
+          <text x="680" y="148" text-anchor="middle" fill="rgba(155,89,255,0.5)" font-size="9" font-family="monospace">on demand</text>
+        </svg>
+        <div class="compare-pair">
+          <div class="compare-side compare-them">
+            <span class="compare-tag">Them</span>
+            <p>AutoGen orchestrates LLM conversations. Claude Code spawns subagents in fresh contexts, but they can't spawn subagents. The LLM sits at the top, planning and delegating. Programs are inert material the planner manipulates.</p>
+          </div>
+          <div class="compare-side compare-abjects">
+            <span class="compare-tag compare-tag-abjects">Abjects</span>
+            <p>The LLM is a service Abject, summoned when needed, silent otherwise. A ScriptableAbject can register as an agent with its own observe&rarr;think&rarr;act loop. Abjects create Abjects that create Abjects. The recursion is unlimited.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="compare-row">
+        <div class="compare-label">Visual Interface</div>
+        <div class="compare-systems">ChatGPT &middot; Claude &middot; Terminal Agents</div>
+        <svg class="compare-svg" viewBox="0 0 900 200" xmlns="http://www.w3.org/2000/svg">
+          <!-- Left: Chat terminal - text in, text out -->
+          <text x="195" y="16" text-anchor="middle" fill="#5a5a70" font-size="11" font-family="monospace">text stream</text>
+
+          <!-- Terminal frame -->
+          <rect x="60" y="28" width="270" height="145" rx="8" fill="#0a0a12" stroke="#1a1a2a" stroke-width="1.5"/>
+          <!-- Title bar dots -->
+          <circle cx="78" cy="42" r="4" fill="#ff4d6a" opacity="0.5"/>
+          <circle cx="92" cy="42" r="4" fill="#5a5a70" opacity="0.3"/>
+          <circle cx="106" cy="42" r="4" fill="#5a5a70" opacity="0.3"/>
+          <line x1="60" y1="52" x2="330" y2="52" stroke="#1a1a2a" stroke-width="1"/>
+
+          <!-- Chat lines -->
+          <text x="78" y="72" fill="#5a5a70" font-size="10" font-family="monospace">user&gt; do the thing</text>
+          <text x="78" y="90" fill="#5a5a70" font-size="10" font-family="monospace">agent&gt; I'll do the thing.</text>
+          <text x="78" y="108" fill="#5a5a70" font-size="10" font-family="monospace">agent&gt; Done. Here's the</text>
+          <text x="78" y="122" fill="#5a5a70" font-size="10" font-family="monospace">  result as text...</text>
+          <text x="78" y="140" fill="#5a5a70" font-size="10" font-family="monospace">user&gt; show me visually</text>
+          <text x="78" y="158" fill="#ff4d6a" font-size="10" font-family="monospace" opacity="0.7">agent&gt; I can't do that.</text>
+
+          <!-- Blinking cursor -->
+          <rect x="78" y="164" width="6" height="2" fill="#5a5a70" opacity="0.5"/>
+
+          <!-- Divider -->
+          <line x1="420" y1="10" x2="420" y2="190" stroke="#1a1a2a" stroke-width="1" stroke-dasharray="4 4"/>
+
+          <!-- Right: Canvas compositor with windows -->
+          <text x="660" y="16" text-anchor="middle" fill="rgba(57,255,142,0.5)" font-size="11" font-family="monospace">living canvas</text>
+
+          <!-- Compositor background -->
+          <rect x="470" y="28" width="390" height="160" rx="8" fill="#08080f" stroke="rgba(57,255,142,0.15)" stroke-width="1"/>
+
+          <!-- Window 1: Chart object (back) -->
+          <rect x="580" y="55" width="155" height="100" rx="5" fill="#12121e" stroke="rgba(57,255,142,0.25)" stroke-width="1"/>
+          <!-- Title bar -->
+          <rect x="580" y="55" width="155" height="18" rx="5" fill="#1a1a2a"/>
+          <text x="592" y="67" fill="#39ff8e" font-size="8" font-family="monospace">SensorView</text>
+          <rect x="716" y="60" width="8" height="8" rx="1" fill="none" stroke="#5a5a70" stroke-width="0.8"/>
+          <line x1="727" y1="60" x2="733" y2="68" stroke="#5a5a70" stroke-width="0.8"/>
+          <line x1="733" y1="60" x2="727" y2="68" stroke="#5a5a70" stroke-width="0.8"/>
+          <!-- Bar chart inside -->
+          <rect x="600" y="100" width="14" height="36" rx="2" fill="rgba(57,255,142,0.3)" stroke="rgba(57,255,142,0.5)" stroke-width="0.5"/>
+          <rect x="620" y="88" width="14" height="48" rx="2" fill="rgba(57,255,142,0.4)" stroke="rgba(57,255,142,0.5)" stroke-width="0.5"/>
+          <rect x="640" y="112" width="14" height="24" rx="2" fill="rgba(57,255,142,0.25)" stroke="rgba(57,255,142,0.5)" stroke-width="0.5"/>
+          <rect x="660" y="96" width="14" height="40" rx="2" fill="rgba(57,255,142,0.35)" stroke="rgba(57,255,142,0.5)" stroke-width="0.5"/>
+          <rect x="680" y="80" width="14" height="56" rx="2" fill="rgba(57,255,142,0.5)" stroke="rgba(57,255,142,0.6)" stroke-width="0.5"/>
+          <!-- Axis line -->
+          <line x1="595" y1="140" x2="710" y2="140" stroke="#5a5a70" stroke-width="0.5"/>
+
+          <!-- Window 2: Chat object (front, overlapping) -->
+          <rect x="490" y="42" width="140" height="120" rx="5" fill="#12121e" stroke="rgba(155,89,255,0.3)" stroke-width="1.2"/>
+          <!-- Title bar -->
+          <rect x="490" y="42" width="140" height="18" rx="5" fill="#1a1a2a"/>
+          <text x="502" y="54" fill="#9b59ff" font-size="8" font-family="monospace">Chat</text>
+          <rect x="612" y="47" width="8" height="8" rx="1" fill="none" stroke="#5a5a70" stroke-width="0.8"/>
+          <line x1="623" y1="47" x2="629" y2="55" stroke="#5a5a70" stroke-width="0.8"/>
+          <line x1="629" y1="47" x2="623" y2="55" stroke="#5a5a70" stroke-width="0.8"/>
+          <!-- Chat content -->
+          <rect x="500" y="68" width="85" height="10" rx="3" fill="rgba(155,89,255,0.15)"/>
+          <rect x="500" y="84" width="105" height="10" rx="3" fill="rgba(57,255,142,0.1)"/>
+          <rect x="500" y="100" width="70" height="10" rx="3" fill="rgba(155,89,255,0.15)"/>
+          <!-- Text input bar -->
+          <rect x="498" y="138" width="124" height="16" rx="3" fill="#0a0a12" stroke="#1a1a2a" stroke-width="0.8"/>
+          <text x="508" y="149" fill="#5a5a70" font-size="7" font-family="monospace">ask anything...</text>
+
+          <!-- Window 3: Button panel (small, bottom-right) -->
+          <rect x="745" y="100" width="100" height="72" rx="5" fill="#12121e" stroke="rgba(232,168,76,0.3)" stroke-width="1"/>
+          <!-- Title bar -->
+          <rect x="745" y="100" width="100" height="16" rx="5" fill="#1a1a2a"/>
+          <text x="757" y="111" fill="#e8a84c" font-size="7" font-family="monospace">Controls</text>
+          <!-- Buttons -->
+          <rect x="757" y="124" width="76" height="14" rx="4" fill="rgba(57,255,142,0.12)" stroke="rgba(57,255,142,0.3)" stroke-width="0.8"/>
+          <text x="795" y="134" text-anchor="middle" fill="#39ff8e" font-size="7" font-family="monospace">Run Analysis</text>
+          <rect x="757" y="144" width="76" height="14" rx="4" fill="rgba(155,89,255,0.1)" stroke="rgba(155,89,255,0.25)" stroke-width="0.8"/>
+          <text x="795" y="154" text-anchor="middle" fill="#9b59ff" font-size="7" font-family="monospace">Configure</text>
+
+          <!-- Taskbar at bottom -->
+          <rect x="470" y="172" width="390" height="16" rx="0" fill="#0e0e18" stroke="rgba(57,255,142,0.08)" stroke-width="0.5"/>
+          <rect x="478" y="175" width="40" height="10" rx="2" fill="rgba(155,89,255,0.15)" stroke="rgba(155,89,255,0.2)" stroke-width="0.5"/>
+          <text x="498" y="183" text-anchor="middle" fill="#9b59ff" font-size="6" font-family="monospace">Chat</text>
+          <rect x="524" y="175" width="48" height="10" rx="2" fill="rgba(57,255,142,0.1)" stroke="rgba(57,255,142,0.2)" stroke-width="0.5"/>
+          <text x="548" y="183" text-anchor="middle" fill="#39ff8e" font-size="6" font-family="monospace">Sensors</text>
+          <rect x="578" y="175" width="48" height="10" rx="2" fill="rgba(232,168,76,0.1)" stroke="rgba(232,168,76,0.2)" stroke-width="0.5"/>
+          <text x="602" y="183" text-anchor="middle" fill="#e8a84c" font-size="6" font-family="monospace">Controls</text>
+        </svg>
+        <div class="compare-pair">
+          <div class="compare-side compare-them">
+            <span class="compare-tag">Them</span>
+            <p>Every agent framework outputs text. Chat windows. Markdown. Terminal logs. Even multi-modal agents render results as images embedded in a conversation. There is no interactive surface. No buttons, no layouts, no windows an Abject can draw on. Agents are blind.</p>
+          </div>
+          <div class="compare-side compare-abjects">
+            <span class="compare-tag compare-tag-abjects">Abjects</span>
+            <p>Every Abject can paint its own face. An X11-style Canvas compositor gives each Abject a surface with windows, buttons, text inputs, layouts, and custom draw commands. Abjects are visual and interactive, not text streams. The organism has a body.</p>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Zone D: Closing Thesis -->
+    <div class="symbio-closing">
+      <p class="closing-line">This is not AI-assisted programming. It is not agents with tools.</p>
+      <p class="closing-line closing-vivid">It is symbiogenesis: code that thinks, intelligence that lives in Abjects, communication that heals itself. Programs, LLMs, and P2P identity merged into a single organism that no component could become alone.</p>
+      <p class="closing-line closing-body">And it renders itself. An X11-style Canvas compositor where Abjects paint their own faces. No other agent framework has a visual body.</p>
+      <p class="closing-definition"><em>symbiogenesis</em> (n.) - the merging of two organisms into a new form. Neither host nor parasite. Something else.</p>
+    </div>
+
+  </div>
+</section>
+
+<style>
+  .symbio-section {
+    background: linear-gradient(180deg, var(--bg-deep) 0%, #0d0a14 50%, var(--bg-deep) 100%);
+  }
+
+  .symbio-subtitle {
+    text-align: center;
+    color: var(--void-purple);
+    font-style: italic;
+    font-size: 1.1rem;
+    margin-top: -2rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .symbio-thesis {
+    max-width: 700px;
+    margin: 0 auto 3rem;
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 1rem;
+    line-height: 1.8;
+  }
+
+  /* Diagrams */
+  .diagrams {
+    max-width: 640px;
+    margin: 0 auto 3.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+  }
+
+  .diagram-label {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 0.5rem;
+    color: var(--text-dim);
+  }
+
+  .diagram-label-new {
+    color: var(--eldritch);
+  }
+
+  .diagram-svg {
+    width: 100%;
+    display: block;
+  }
+
+  .diagram-svg-old {
+    opacity: 0.7;
+  }
+
+  .diagram-svg-new {
+    filter: drop-shadow(0 0 24px rgba(57, 255, 142, 0.08));
+  }
+
+  /* Comparisons */
+  .compare-heading {
+    text-align: center;
+    color: var(--text-primary);
+    font-size: 1.3rem;
+    margin-bottom: 2.5rem;
+  }
+
+  .comparisons {
+    max-width: 900px;
+    margin: 0 auto 3.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+  }
+
+  .compare-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .compare-label {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .compare-systems {
+    color: var(--void-purple);
+    font-size: 0.8rem;
+    font-style: italic;
+  }
+
+  .compare-svg {
+    width: 100%;
+    display: block;
+    margin-bottom: 0.75rem;
+  }
+
+  .compare-pair {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+
+  .compare-side {
+    border-radius: 10px;
+    padding: 1.25rem 1.5rem;
+    font-size: 0.9rem;
+    line-height: 1.7;
+  }
+
+  .compare-side p {
+    color: var(--text-secondary);
+  }
+
+  .compare-them {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+  }
+
+  .compare-abjects {
+    background: rgba(57, 255, 142, 0.03);
+    border: 1px solid var(--border-accent);
+    box-shadow: 0 0 20px var(--eldritch-glow);
+  }
+
+  .compare-abjects p {
+    color: var(--eldritch);
+  }
+
+  .compare-tag {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    padding: 0.2rem 0.6rem;
+    border-radius: 4px;
+    margin-bottom: 0.75rem;
+  }
+
+  .compare-tag-abjects {
+    color: var(--eldritch);
+    background: var(--eldritch-glow);
+    border-color: var(--border-accent);
+  }
+
+  /* Closing */
+  .symbio-closing {
+    max-width: 700px;
+    margin: 0 auto;
+    text-align: center;
+  }
+
+  .closing-line {
+    color: var(--text-secondary);
+    font-size: 1rem;
+    margin-bottom: 1.25rem;
+    line-height: 1.8;
+  }
+
+  .closing-vivid {
+    color: var(--text-primary);
+    font-size: 1.05rem;
+  }
+
+  .closing-body {
+    color: var(--text-secondary);
+  }
+
+  .closing-definition {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    margin-top: 2rem;
+    padding: 1rem 1.5rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-primary);
+  }
+
+  /* Mobile */
+  @media (max-width: 768px) {
+    .compare-pair {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

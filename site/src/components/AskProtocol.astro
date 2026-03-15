@@ -1,0 +1,164 @@
+---
+const useCases = [
+  {
+    glyph: '{→}',
+    actor: 'ObjectCreator',
+    action: 'Asks dependencies how to use them, before writing a single line of code.',
+  },
+  {
+    glyph: '{⇄}',
+    actor: 'ProxyGenerator',
+    action: 'Asks both sides what they expect, then writes a living translator between them.',
+  },
+  {
+    glyph: '{⌘}',
+    actor: 'Chat',
+    action: 'Users ask Abjects about themselves directly. The Abject answers from its own source.',
+  },
+];
+---
+
+<section id="ask-protocol" class="ask-section">
+  <div class="container">
+    <h2 class="section-title">The Ask Protocol</h2>
+    <p class="ask-subtitle">Abjects that explain themselves, in their own words.</p>
+
+    <div class="ask-flow">
+      <svg class="ask-svg" viewBox="0 0 750 240" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <filter id="ask-glow-g">
+            <feGaussianBlur stdDeviation="2.5" result="blur"/>
+            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+          <filter id="ask-glow-p">
+            <feGaussianBlur stdDeviation="2.5" result="blur"/>
+            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+          <marker id="ask-arrow-g" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#39ff8e"/>
+          </marker>
+          <marker id="ask-arrow-p" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#9b59ff"/>
+          </marker>
+        </defs>
+
+        <!-- Object A (tall, spans both arrow rows) -->
+        <rect x="30" y="50" width="130" height="140" rx="8" fill="#12121e" stroke="rgba(57,255,142,0.35)" stroke-width="1.5"/>
+        <text x="95" y="125" text-anchor="middle" fill="#39ff8e" font-weight="600" font-size="15" font-family="monospace">Object A</text>
+
+        <!-- Object B (tall, spans both arrow rows) -->
+        <rect x="530" y="50" width="130" height="140" rx="8" fill="#12121e" stroke="rgba(155,89,255,0.35)" stroke-width="1.5"/>
+        <text x="595" y="125" text-anchor="middle" fill="#9b59ff" font-weight="600" font-size="15" font-family="monospace">Object B</text>
+
+        <!-- Question arrow: A → B (top) -->
+        <line x1="160" y1="90" x2="525" y2="90" stroke="#39ff8e" stroke-width="1.5" marker-end="url(#ask-arrow-g)" filter="url(#ask-glow-g)"/>
+        <text x="345" y="78" text-anchor="middle" fill="#e0e0ea" font-style="italic" font-size="12" font-family="monospace">"How do I send you data?"</text>
+
+        <!-- LLM consultation (inside Object B, below name) -->
+        <text x="595" y="145" text-anchor="middle" fill="#5a5a70" font-size="10" font-family="monospace">LLM consults</text>
+        <text x="595" y="159" text-anchor="middle" fill="#5a5a70" font-size="10" font-family="monospace">manifest + source</text>
+
+        <!-- Reply arrow: B → A (bottom) -->
+        <line x1="525" y1="155" x2="165" y2="155" stroke="#9b59ff" stroke-width="1.5" marker-end="url(#ask-arrow-p)" filter="url(#ask-glow-p)"/>
+        <text x="345" y="175" text-anchor="middle" fill="#e0e0ea" font-style="italic" font-size="12" font-family="monospace">"Send a 'store' message</text>
+        <text x="345" y="193" text-anchor="middle" fill="#e0e0ea" font-style="italic" font-size="12" font-family="monospace">{'with {key, value} payload"'}</text>
+      </svg>
+    </div>
+
+    <p class="ask-explanation">Every Abject has a built-in <code>ask</code> handler. Send it a natural language question, and the LLM answers using the Abject's own manifest and source code as context. Abjects don't just describe their API; they <em>teach</em> each other how to collaborate.</p>
+
+    <div class="ask-uses grid-3">
+      {useCases.map((u) => (
+        <div class="card ask-card">
+          <span class="ask-glyph">{u.glyph}</span>
+          <h3>{u.actor}</h3>
+          <p>{u.action}</p>
+        </div>
+      ))}
+    </div>
+
+    <p class="ask-novelty">No other system does this. Reflection gives you structure. Schemas give you metadata. The Ask Protocol gives Abjects a <em>voice</em>.</p>
+  </div>
+</section>
+
+<style>
+  .ask-section {
+    background: linear-gradient(180deg, var(--bg-deep) 0%, var(--bg-surface) 50%, var(--bg-deep) 100%);
+  }
+
+  .ask-subtitle {
+    text-align: center;
+    color: var(--void-purple);
+    font-style: italic;
+    font-size: 1.1rem;
+    margin-top: -2rem;
+    margin-bottom: 2.5rem;
+  }
+
+  .ask-flow {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 2rem;
+  }
+
+  .ask-svg {
+    width: 100%;
+    max-width: 750px;
+    display: block;
+    margin: 0 auto;
+  }
+
+  .ask-explanation {
+    max-width: 680px;
+    margin: 0 auto 2.5rem;
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+    line-height: 1.7;
+  }
+
+  .ask-explanation em {
+    color: var(--eldritch);
+    font-style: italic;
+  }
+
+  .ask-uses {
+    margin-bottom: 2.5rem;
+  }
+
+  .ask-card {
+    text-align: center;
+  }
+
+  .ask-glyph {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--void-purple);
+    background: var(--void-purple-glow);
+    border: 1px solid rgba(155, 89, 255, 0.2);
+    padding: 0.4rem 0.6rem;
+    border-radius: 6px;
+    margin-bottom: 0.75rem;
+  }
+
+  .ask-card h3 {
+    color: var(--void-purple);
+  }
+
+  .ask-novelty {
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 0.95rem;
+    max-width: 600px;
+    margin: 0 auto;
+    line-height: 1.7;
+  }
+
+  .ask-novelty em {
+    color: var(--eldritch);
+    font-style: italic;
+  }
+
+</style>

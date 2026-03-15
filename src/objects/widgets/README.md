@@ -61,11 +61,11 @@ Size Policies:
 
 | File | Class | Description |
 |------|-------|-------------|
-| `widget-types.ts` | — | Shared types (`WidgetStyle`, `SizePolicy`, `Rect`, `ThemeData`), `MIDNIGHT_BLOOM` theme, color utilities |
+| `widget-types.ts` | - | Shared types (`WidgetStyle`, `SizePolicy`, `Rect`, `ThemeData`), `MIDNIGHT_BLOOM` theme, color utilities |
 | `widget-abject.ts` | `WidgetAbject` | Abstract base for all widgets. Defines `buildDrawCommands()`, `processInput()`, `getWidgetValue()`, `applyUpdate()` |
 | `window-abject.ts` | `WindowAbject` | Top-level composite. Owns UIServer surface, renders title bar, routes input to children with hit-testing, manages focus and Tab navigation |
 | `layout-abject.ts` | `LayoutAbject` | Abstract layout container. Manages child list with size policies, two-pass rendering (expanded dropdowns on top), hover tracking |
-| `word-wrap.ts` | — | Text wrapping utilities: `wrapText()` (async, precise) and `estimateWrappedLineCount()` (sync heuristic) |
+| `word-wrap.ts` | - | Text wrapping utilities: `wrapText()` (async, precise) and `estimateWrappedLineCount()` (sync heuristic) |
 
 ### Layout Widgets
 
@@ -129,7 +129,7 @@ UIServer input event
 
 ### Theme
 
-All widgets read colors from `this.theme` (`ThemeData`). The default `MIDNIGHT_BLOOM` theme provides a dark palette with amber (`#e8a84c`) accents. The `ThemeAbject` broadcasts theme changes to all dependents.
+All widgets read colors from `this.theme` (`ThemeData`). The default `MIDNIGHT_BLOOM` theme provides a dark palette with amber (`#39ff8e`) accents. The `ThemeAbject` broadcasts theme changes to all dependents.
 
 ### Focus Management
 

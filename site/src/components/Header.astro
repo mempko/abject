@@ -4,13 +4,17 @@
 <header>
   <nav class="container">
     <a href="/" class="logo">
-      <span class="logo-bracket">[</span>abjects<span class="logo-bracket">]</span>
+      <span class="logo-bracket">{</span>abjects<span class="logo-bracket">}</span><span class="logo-tagline">An Abject Horror</span>
     </a>
     <div class="nav-links">
-      <a href="#concepts">Concepts</a>
+      <a href="#ask-protocol">Ask</a>
+      <a href="#features">Features</a>
+      <a href="#symbiogenesis">Genesis</a>
+      <a href="#spreading">P2P</a>
       <a href="#architecture">Architecture</a>
-      <a href="#quickstart">Quick Start</a>
-      <span class="btn btn-outline btn-sm btn-soon">GitHub — Coming Soon</span>
+      <a href="#lineage">Lineage</a>
+      <a href="#summon">Summon</a>
+      <span class="btn btn-outline btn-sm btn-soon">GitHub - Coming Soon</span>
     </div>
   </nav>
 </header>
@@ -22,7 +26,7 @@
     left: 0;
     right: 0;
     z-index: 100;
-    background: rgba(6, 6, 12, 0.85);
+    background: rgba(3, 3, 8, 0.85);
     backdrop-filter: blur(12px);
     border-bottom: 1px solid var(--border);
   }
@@ -42,11 +46,20 @@
   }
 
   .logo:hover {
-    color: var(--accent);
+    color: var(--eldritch);
+    animation: glitch 4s infinite;
   }
 
   .logo-bracket {
-    color: var(--accent);
+    color: var(--eldritch);
+  }
+
+  .logo-tagline {
+    color: var(--text-dim);
+    font-size: 0.7rem;
+    font-weight: 400;
+    margin-left: 0.6rem;
+    letter-spacing: 0.04em;
   }
 
   .nav-links {

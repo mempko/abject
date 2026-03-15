@@ -1,12 +1,20 @@
 # workers/ - Web Worker Runtime
 
-Contains the Web Worker that provides an isolated execution environment for WASM-based user objects. Communicates with the main thread via `postMessage`.
+Contains Web Workers and worker_threads entry points for isolated object execution. WASM-based objects use `object-runtime.worker.ts`; native Abject parallelism uses `abject-worker.ts` / `abject-worker-node.ts`.
 
 ## Files
 
 ### object-runtime.worker.ts
 
-The Web Worker entry point. Manages WASM object lifecycles in isolation from the main thread.
+The Web Worker entry point for WASM objects. Manages WASM object lifecycles in isolation from the main thread.
+
+### abject-worker.ts
+
+Web Worker entry point for Abject parallelism. Runs a `WorkerBus` and hosts a subset of Abject instances (LLM, capabilities, editors, agents, etc.). Communicates with the main thread via structured clone messages.
+
+### abject-worker-node.ts
+
+Node.js `worker_threads` variant of `abject-worker.ts`. Same logic but uses `parentPort` instead of the Web Worker `self` API.
 
 ## Message Protocol (Main Thread ↔ Worker)
 

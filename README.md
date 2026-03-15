@@ -1,51 +1,67 @@
-# Abjects: LLM-Mediated Object System
+# {abjects} - An Abject Horror
 
-A distributed object system where objects communicate via message passing, negotiate protocols using an LLM, and self-heal when communication breaks down.
+## The Things That Think
 
-## Core Concepts
+> A grass computing platform where objects communicate via message passing,
+> negotiate protocols through an artificial intelligence, and regenerate
+> when broken. The successor to Fire★.
+>
+> *abject (n.) - AI Object. Also: cosmic dread. Both apply.*
 
-- **Abject** - Self-describing object with state, behavior, and manifest
-- **Message Passing** - Async messages with request/reply/event/error types
-- **Protocol Mediation** - LLM generates proxy objects that translate between incompatible interfaces
-- **Self-Healing** - Objects detect incomprehension, LLM regenerates proxies automatically
-- **Everything is an Object** - Registry, Factory, LLM, UI, proxies are all objects
-- **Object Creator** - Create objects via natural language prompts
-- **Agents** - Autonomous task execution via observe→think→act loop (AgentAbject)
-- **Workspaces** - Isolated, shareable object environments with per-workspace services
-- **Widgets** - Canvas-based UI toolkit (~20 widgets: buttons, text inputs, layouts, windows)
-- **P2P Identity** - ECDSA/ECDH cryptographic identity, WebRTC encrypted peer channels
-- **Supervision** - Erlang-style restart strategies for fault tolerance
+## What Lurks Inside
 
-## Tech Stack
+Abjects is an LLM-mediated distributed object system. Everything is alive:
+the registry, the factory, the thing that makes objects. They describe
+themselves in their own words. They teach each other how to collaborate.
 
-- **Runtime**: TypeScript
-- **Build**: Vite
-- **Object Virtualization**: WASM (sandboxed execution)
-- **Network**: WebSocket
-- **UI**: Canvas-based compositor (X11-style)
-- **LLM**: Provider-agnostic (Claude, OpenAI, Ollama)
-- **P2P**: WebRTC (browser-native + node-datachannel polyfill)
-- **Browser Automation**: Playwright (server-only headless browser capability)
-- **Crypto**: Web Crypto API (ECDSA P-256, ECDH, AES-256-GCM)
+Objects that can't understand each other? The Negotiator reads both minds
+and conjures a living translator between them. Not a shim, a real object.
+Break it. It grows back. Kill an object, and the Supervisor resurrects it
+with memories intact. Nothing truly dies.
 
-## Quick Start
+## Summon the System
 
 ```bash
-# Install dependencies
-pnpm install
+# Clone the repository
+git clone https://github.com/mempko/abjects
+cd abjects
 
-# Start the system (Node.js backend + thin browser client)
-pnpm serve           # Start Node.js backend
-pnpm client          # Start thin browser client (http://localhost:5173)
+# Gather the ritual components
+pnpm conjure
 
-# P2P signaling server
-pnpm signal          # Start signaling server (:7720)
+# Awaken the depths
+pnpm awaken
+
+# Scry into the abyss (new terminal)
+pnpm scry            # http://localhost:5174
+
+# Let them find each other in the dark (new terminal)
+pnpm whisper         # :7720
 ```
+
+Three processes. One living system.
+
+The **backend** is the depths: all Abjects live here, passing messages in a
+Node.js process with worker threads. The **browser client** is the surface: a
+thin Canvas renderer that forwards input and displays composited frames over
+WebSocket. The **signaling server** helps peers find each other in the dark.
+
+## What It Does
+
+- **The Ask Protocol**: Every object answers natural language questions about itself. The LLM reads its manifest and source to respond. Objects don't just describe their API; they *teach* each other how to collaborate.
+- **Self-Healing Proxies**: Error rates above 10% trigger proxy regeneration with traffic still flowing. Unknown messages trigger renegotiation. Hot-swap without disruption. Break them. They always grow back.
+- **The Negotiator**: An alien intelligence bridges incompatible minds. It reads both manifests, generates a real proxy object. Not a shim. A living translator.
+- **Everything is Alive**: The registry is an object. The factory is an object. Even the thing that makes objects is an object. There is no privileged layer. Only objects passing messages in the dark.
+- **Containment Protocols**: Untrusted code runs inside a WASM cage. Capability-gated imports. No ambient authority. Objects cannot touch anything they haven't been explicitly allowed to reach.
+- **True Names**: Every peer has a true name, a SHA-256 hash of its public key. ECDSA/ECDH identity. AES-256-GCM encrypted WebRTC channels. Trust is verified, not assumed.
+- **Nothing Truly Dies**: Erlang-style supervision with state snapshots. Kill an object; it comes back knowing what it knew.
+- **Workspaces**: Isolated object environments. Local vaults that nothing can reach. Private circles shared only with those you name. Public wounds that bleed into the mesh.
+- **Canvas UI**: An X11-style compositor where objects paint their own faces. No other agent framework has a visual body.
 
 ## Architecture
 
 ```
- ┌─ Node.js Backend (pnpm serve) ──────────────────────────────────────┐
+ ┌─ Node.js Backend (pnpm awaken) ──────────────────────────────────────┐
  │                                                                      │
  │  ┌─────────────────── MessageBus ──────────────────┐                 │
  │  │  Interceptor Pipeline:                          │                 │
@@ -97,52 +113,28 @@ client/                 # Thin browser client: FrontendClient, input forwarding
 workers/                # Web Worker / Worker Thread entry points
 ```
 
-## Design Principles
+## Design by Contract
 
-### Design by Contract
-
-Every function uses preconditions, postconditions, and invariants:
+Correctness over performance. Every function uses preconditions, postconditions,
+and invariants. They are never disabled.
 
 ```typescript
 function send(message: AbjectMessage): void {
-  // Preconditions
   require(message.header.messageId !== '', 'messageId must not be empty');
   require(message.routing.to !== '', 'recipient must be specified');
 
   // ... implementation ...
 
-  // Postconditions
   ensure(this.messageCount > oldMessageCount, 'message count must increase');
 }
 ```
 
-### LLM-Generated Proxies
-
-When Object A wants to talk to Object B with incompatible interfaces:
-
-```
-┌──────────┐     ┌─────────────────┐     ┌──────────┐
-│ Object A │────►│  Proxy Object   │────►│ Object B │
-│          │◄────│ (LLM-generated) │◄────│          │
-└──────────┘     └─────────────────┘     └──────────┘
-```
-
-The proxy is a real object with a manifest, using the same message protocol.
-
-### Self-Healing
-
-- Error rate > 10% triggers proxy regeneration
-- Unknown message types trigger renegotiation
-- Hot-swap proxies without disrupting objects
-
 ## Capability Objects
 
-Built-in objects that provide system capabilities:
-
-| Object | Description |
+| Object | What It Does |
 |--------|-------------|
-| **HttpClient** | HTTP requests |
-| **Storage** | Persistent key-value (IndexedDB) |
+| **HttpClient** | HTTP requests with domain allow/deny |
+| **Storage** | Persistent key-value store |
 | **Timer** | Scheduling and delays |
 | **Clipboard** | System clipboard access |
 | **Console** | Debug logging |
@@ -150,14 +142,31 @@ Built-in objects that provide system capabilities:
 | **WebBrowser** | Headless browser automation (Playwright, server-only) |
 | **WebParser** | HTML parsing and content extraction (linkedom, server-only) |
 
-## Configuration
+## From Fire to the Abyss
 
-Set environment variables before running `pnpm serve`:
+> Abjects grew from the ashes of **Fire★** (firestr.com), a peer-to-peer
+> platform for creating and sharing distributed applications. Fire★ called it
+> **Grass Computing**: software you can touch, shape, and share directly.
+> No cloud. No landlords. Fire★ proved the vision. But it dreamed in C++ and Lua.
+>
+> Abjects is the next incarnation. The same soul in a new body.
+> The grass still grows. Now it thinks.
+
+| Fire★ | Abjects |
+|-------|---------|
+| C++ / Qt / Lua | TypeScript / WASM / Canvas |
+| RSA 4096 | ECDSA/ECDH + AES-256-GCM |
+| Manual app sharing | LLM-mediated protocol negotiation |
+| firelocator | Signaling server |
+
+See [PHILOSOPHY.md](PHILOSOPHY.md) for the principles that carry the fire forward.
+
+## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | — | Anthropic Claude API key |
-| `OPENAI_API_KEY` | — | OpenAI API key |
+| `ANTHROPIC_API_KEY` | - | Anthropic Claude API key |
+| `OPENAI_API_KEY` | - | OpenAI API key |
 | `WS_PORT` | `7719` | WebSocket port for client connection |
 | `SIGNALING_PORT` | `7720` | Signaling server port for P2P discovery |
 | `ABJECTS_DATA_DIR` | `.abjects` | Persistent storage directory |
@@ -167,4 +176,4 @@ For local LLM, run Ollama on localhost:11434.
 
 ## License
 
-GPL-3.0-or-later - See [LICENSE](LICENSE) for details.
+GPL-3.0-or-later. See [LICENSE](LICENSE) for details.

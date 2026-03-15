@@ -558,7 +558,7 @@ IMPORTANT:
   { type: 'restore', surfaceId, params: {} },
 
   // Pie chart wedge:
-  { type: 'arc', surfaceId, params: { cx: 150, cy: 150, radius: 80, startAngle: 0, endAngle: Math.PI / 2, fill: '#e8a84c' } }
+  { type: 'arc', surfaceId, params: { cx: 150, cy: 150, radius: 80, startAngle: 0, endAngle: Math.PI / 2, fill: '#39ff8e' } }
 
 ### Other Methods
 

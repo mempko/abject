@@ -1,0 +1,188 @@
+---
+---
+
+<section id="lineage" class="lineage-section">
+  <div class="container">
+    <h2 class="section-title">From Fire to the Abyss</h2>
+
+    <div class="lineage-narrative">
+      <p>
+        Abjects grew from the ashes of <a href="https://firestr.com" target="_blank" rel="noopener" class="fire-link">Fire★</a>, a peer-to-peer
+        platform for creating and sharing distributed applications. Fire★ called it
+        <strong>Grass Computing</strong>: software you can touch, shape, and share directly.
+        No cloud. No landlords.
+      </p>
+      <p>
+        Fire★ proved the vision: encrypted P2P communication, live collaborative coding,
+        apps that spread through conversations. But it dreamed in C++ and Lua.
+      </p>
+      <p>
+        Abjects is the next incarnation. The same soul in a new body: TypeScript and WASM,
+        Canvas compositing, and an LLM that negotiates between incompatible minds.
+        The grass still grows. Now it thinks.
+      </p>
+    </div>
+
+    <div class="evolution">
+      <div class="evo-card evo-fire">
+        <h3>Fire★</h3>
+        <ul>
+          <li>C++ / Qt / Lua</li>
+          <li>RSA 4096 encryption</li>
+          <li>Manual app sharing</li>
+          <li>firelocator for peer discovery</li>
+          <li><a href="https://firestr.com" target="_blank" rel="noopener" class="evo-link">firestr.com</a></li>
+        </ul>
+      </div>
+
+      <div class="evo-arrow">
+        <span class="arrow-glyph">→</span>
+      </div>
+
+      <div class="evo-card evo-abjects">
+        <h3>Abjects</h3>
+        <ul>
+          <li>TypeScript / WASM / Canvas</li>
+          <li>ECDSA/ECDH + AES-256-GCM</li>
+          <li>LLM-mediated protocol negotiation</li>
+          <li>Signaling server for peer discovery</li>
+          <li><span class="evo-link">abject.world</span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .lineage-section {
+    background: linear-gradient(180deg, var(--bg-deep) 0%, #0a0810 50%, var(--bg-deep) 100%);
+  }
+
+  .lineage-narrative {
+    max-width: 680px;
+    margin: 0 auto 3rem;
+    text-align: center;
+  }
+
+  .lineage-narrative p {
+    color: var(--text-secondary);
+    font-size: 1.05rem;
+    line-height: 1.8;
+    margin-bottom: 1rem;
+  }
+
+  .lineage-narrative .fire {
+    color: #ff9f43;
+  }
+
+  .lineage-narrative strong {
+    color: var(--text-primary);
+  }
+
+  .evolution {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 1.5rem;
+    max-width: 700px;
+    margin: 0 auto;
+  }
+
+  .evo-card {
+    flex: 1;
+    background: var(--bg-card);
+    border-radius: 12px;
+    padding: 1.5rem 1.75rem;
+    border: 1px solid var(--border);
+  }
+
+  .evo-fire {
+    border-color: rgba(255, 159, 67, 0.2);
+  }
+
+  .evo-fire:hover {
+    border-color: rgba(255, 159, 67, 0.4);
+    box-shadow: 0 0 20px rgba(255, 159, 67, 0.08);
+  }
+
+  .evo-fire h3 {
+    color: #ff9f43;
+    margin-bottom: 0.75rem;
+    font-family: var(--font-mono);
+  }
+
+  .evo-abjects {
+    border-color: var(--border-accent);
+  }
+
+  .evo-abjects:hover {
+    border-color: rgba(57, 255, 142, 0.4);
+    box-shadow: 0 0 20px var(--eldritch-glow);
+  }
+
+  .evo-abjects h3 {
+    color: var(--eldritch);
+    margin-bottom: 0.75rem;
+    font-family: var(--font-mono);
+  }
+
+  .evo-card ul {
+    list-style: none;
+    padding: 0;
+  }
+
+  .evo-card li {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    padding: 0.25rem 0;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+  }
+
+  .fire-link {
+    color: #ff9f43;
+    font-weight: 700;
+    text-decoration: none;
+    border-bottom: 1px solid rgba(255, 159, 67, 0.3);
+    transition: border-color 0.2s;
+  }
+
+  .fire-link:hover {
+    border-color: #ff9f43;
+  }
+
+  .evo-link {
+    color: var(--text-dim);
+    font-style: italic;
+    text-decoration: none;
+    border-bottom: 1px solid rgba(90, 90, 112, 0.3);
+    transition: border-color 0.2s;
+  }
+
+  .evo-link:hover {
+    border-color: var(--text-dim);
+  }
+
+  .evo-arrow {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .arrow-glyph {
+    font-family: var(--font-mono);
+    font-size: 1.5rem;
+    color: var(--void-purple);
+    text-shadow: 0 0 12px var(--void-purple-glow);
+  }
+
+  @media (max-width: 600px) {
+    .evolution {
+      flex-direction: column;
+    }
+
+    .evo-arrow {
+      transform: rotate(90deg);
+    }
+  }
+</style>

@@ -63,8 +63,8 @@ Each capability object:
 
 Headless browser automation powered by Playwright. **Server-only** (requires Node.js).
 
-- **Stateless methods**: `getRenderedHtml`, `screenshot`, `extractFromPage` — one-shot operations that open a page, act, and close
-- **Stateful page API**: `openPage`, `navigateTo`, `click`, `fill`, `type`, `getContent`, `closePage` — multi-step interactions on persistent browser pages
+- **Stateless methods**: `getRenderedHtml`, `screenshot`, `extractFromPage`: one-shot operations that open a page, act, and close
+- **Stateful page API**: `openPage`, `navigateTo`, `click`, `fill`, `type`, `getContent`, `closePage`: multi-step interactions on persistent browser pages
 - **Page management**: tracks open pages per owner, auto-closes on cleanup
 - **Events**: `pageOpened`, `pageClosed`, `pageNavigated`
 
