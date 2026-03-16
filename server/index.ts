@@ -492,7 +492,35 @@ async function main(): Promise<void> {
   const authConfig = loadAuthConfig();
   const sessionStore = new SessionStore();
   if (backendUI) {
+    // Non-worker mode: BackendUI directly mutates the shared authConfig
     backendUI.setAuthGate(authConfig, sessionStore);
+  }
+  if (DEDICATED_WORKERS) {
+    // Worker mode: intercept updateAuth messages going TO BackendUI so we
+    // update the main-thread authConfig used by the WS connection handler.
+    // Use a MessageInterceptor that passes the message through but taps it.
+    bus.addInterceptor({
+      async intercept(msg: AbjectMessage): Promise<'pass' | 'drop' | AbjectMessage> {
+        if (msg.routing.to === backendUIId && msg.routing.method === 'updateAuth') {
+          const { enabled, username, password } = msg.payload as {
+            enabled: boolean; username: string; password: string;
+          };
+          const changed = authConfig.enabled !== enabled
+            || authConfig.username !== username
+            || authConfig.password !== password;
+
+          authConfig.enabled = enabled;
+          authConfig.username = username;
+          authConfig.password = password;
+
+          if (changed) {
+            sessionStore.clearAll();
+            alog.info(`Auth config updated on main thread (enabled=${enabled})`);
+          }
+        }
+        return 'pass'; // always pass through — BackendUI still handles it
+      },
+    });
   }
 
   const globalSettingsId = await supervisedSpawn('GlobalSettings', 'permanent', systemTypeId('GlobalSettings'));
