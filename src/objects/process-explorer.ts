@@ -572,10 +572,10 @@ export class ProcessExplorer extends Abject {
         await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', {
             specs: [
-              { type: 'label', windowId: this.windowId!, text: row.name, style: { fontSize: 12, color: this.theme.textHeading } },
-              { type: 'label', windowId: this.windowId!, text: shortId, style: { fontSize: 11, color: this.theme.sectionLabel } },
-              { type: 'label', windowId: this.windowId!, text: row.state, style: { fontSize: 11, color: stateColor } },
-              { type: 'label', windowId: this.windowId!, text: location, style: { fontSize: 11, color: this.theme.textMeta } },
+              { type: 'label', windowId: this.windowId!, text: row.name, style: { fontSize: 12, color: this.theme.textHeading, selectable: true } },
+              { type: 'label', windowId: this.windowId!, text: shortId, style: { fontSize: 11, color: this.theme.sectionLabel, selectable: true } },
+              { type: 'label', windowId: this.windowId!, text: row.state, style: { fontSize: 11, color: stateColor, selectable: true } },
+              { type: 'label', windowId: this.windowId!, text: location, style: { fontSize: 11, color: this.theme.textMeta, selectable: true } },
             ],
           })
         );

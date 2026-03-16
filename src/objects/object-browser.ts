@@ -930,6 +930,7 @@ export class ObjectBrowser extends Abject {
           style: {
             fontSize: isSecondary ? 12 : 13,
             wordWrap: true,
+            selectable: true,
             ...style,
           },
         },
@@ -1079,6 +1080,7 @@ export class ObjectBrowser extends Abject {
       style: {
         fontSize: ls.isSecondary ? 12 : 13,
         wordWrap: true,
+        selectable: true,
         ...(ls.style ?? {}),
       },
     }));
@@ -1268,7 +1270,7 @@ export class ObjectBrowser extends Abject {
         type: 'label', windowId: this.windowId!,
         rect: { x: 0, y: 0, width: 0, height: 0 },
         text: ls.text,
-        style: { fontSize: ls.isSecondary ? 12 : 13, wordWrap: true, ...(ls.style ?? {}) },
+        style: { fontSize: ls.isSecondary ? 12 : 13, wordWrap: true, selectable: true, ...(ls.style ?? {}) },
       });
     }
 
@@ -1353,7 +1355,7 @@ export class ObjectBrowser extends Abject {
         type: 'label', windowId: this.windowId!,
         rect: { x: 0, y: 0, width: 0, height: 0 },
         text: '',
-        style: { fontSize: 12, wordWrap: true },
+        style: { fontSize: 12, wordWrap: true, selectable: true },
       });
     }
 

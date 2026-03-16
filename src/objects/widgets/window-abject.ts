@@ -56,6 +56,7 @@ export class WindowAbject extends Abject {
   private childRects: Map<AbjectId, Rect> = new Map();
   private expandedSelects: Set<AbjectId> = new Set();
   private focusedChildId?: AbjectId;
+  private focusedParentChildId?: AbjectId;  // the window's direct child (layout) that contains focusedChildId
   private hoveredChildId?: AbjectId;
 
   private windowFocused = false;
@@ -195,7 +196,8 @@ export class WindowAbject extends Abject {
       this.children = this.children.filter((id) => id !== widgetId);
       this.childRects.delete(widgetId);
       this.expandedSelects.delete(widgetId);
-      if (this.focusedChildId === widgetId) this.focusedChildId = undefined;
+      if (this.focusedChildId === widgetId) { this.focusedChildId = undefined; this.focusedParentChildId = undefined; }
+      if (this.focusedParentChildId === widgetId) this.focusedParentChildId = undefined;
       if (this.hoveredChildId === widgetId) this.hoveredChildId = undefined;
       this.scheduleFrame();
       return true;
@@ -679,6 +681,7 @@ method calls on 'abjects:widgets' interface:
         // Widget gone
       }
       this.focusedChildId = undefined;
+      this.focusedParentChildId = undefined;
     }
 
     // Hit-test children
@@ -700,6 +703,7 @@ method calls on 'abjects:widgets' interface:
             // Use focusWidgetId if returned (layout routing), otherwise the child itself
             const focusTarget = result.focusWidgetId ?? childId;
             this.focusedChildId = focusTarget;
+            this.focusedParentChildId = childId;
             await this.request(
               request(this.id, focusTarget, 'setFocused', { focused: true })
             );
@@ -795,10 +799,37 @@ method calls on 'abjects:widgets' interface:
         // Widget gone
       }
     }
+
+    // Forward mousemove to the parent layout of the focused child even when
+    // the cursor is outside its bounds (supports drag-selection)
+    if (this.focusedParentChildId && this.focusedParentChildId !== hitChildId) {
+      try {
+        await this.request<{ consumed: boolean }>(
+          request(this.id, this.focusedParentChildId, 'handleInput', {
+            type: 'mousemove', x: cx, y: cy,
+          })
+        );
+      } catch {
+        // Widget gone
+      }
+    }
   }
 
-  private async handleMouseUp(_e: { x?: number; y?: number }): Promise<void> {
-    // No-op — drag/resize is handled by WindowManager
+  private async handleMouseUp(e: { x?: number; y?: number }): Promise<void> {
+    // Forward mouseup to focused child so it can end drag-selection
+    if (this.focusedChildId) {
+      const cx = e.x ?? 0;
+      const cy = (e.y ?? 0) - (this.chromeless ? 0 : TITLE_BAR_HEIGHT);
+      try {
+        await this.request<{ consumed: boolean }>(
+          request(this.id, this.focusedChildId, 'handleInput', {
+            type: 'mouseup', x: cx, y: cy,
+          })
+        );
+      } catch {
+        // Widget gone
+      }
+    }
   }
 
   private async handleKeyDown(e: {
@@ -988,6 +1019,7 @@ method calls on 'abjects:widgets' interface:
     this.childRects.clear();
     this.expandedSelects.clear();
     this.focusedChildId = undefined;
+    this.focusedParentChildId = undefined;
 
     // Destroy surface
     if (this.surfaceId) {

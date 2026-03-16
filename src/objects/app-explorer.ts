@@ -555,14 +555,14 @@ export class AppExplorer extends Abject {
     if (manifest.description) {
       specs.push({ type: 'label', windowId, rect: r0,
         text: manifest.description,
-        style: { color: this.theme.textDescription, fontSize: 11 } });
+        style: { color: this.theme.textDescription, fontSize: 11, selectable: true } });
     }
 
     // Version
     if (manifest.version) {
       specs.push({ type: 'label', windowId, rect: r0,
         text: `Version: ${manifest.version}`,
-        style: { color: this.theme.textMeta, fontSize: 11 } });
+        style: { color: this.theme.textMeta, fontSize: 11, selectable: true } });
     }
 
     // Tags
@@ -570,7 +570,7 @@ export class AppExplorer extends Abject {
     if (tags.length > 0) {
       specs.push({ type: 'label', windowId, rect: r0,
         text: `Tags: ${tags.join(', ')}`,
-        style: { color: this.theme.textMeta, fontSize: 11 } });
+        style: { color: this.theme.textMeta, fontSize: 11, selectable: true } });
     }
 
     // Methods
@@ -579,7 +579,7 @@ export class AppExplorer extends Abject {
       const methodNames = iface.methods.map((m: { name: string }) => `${m.name}()`).join(', ');
       specs.push({ type: 'label', windowId, rect: r0,
         text: `Methods: ${methodNames}`,
-        style: { color: this.theme.textMeta, fontSize: 11 } });
+        style: { color: this.theme.textMeta, fontSize: 11, selectable: true } });
     }
 
     // Actions separator

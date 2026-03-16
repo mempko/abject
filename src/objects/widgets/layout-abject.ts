@@ -116,6 +116,7 @@ export abstract class LayoutAbject extends WidgetAbject {
   protected margins: LayoutMargins;
   protected spacing: number;
   private hoveredLayoutChildId?: AbjectId;
+  private focusedLayoutChildId?: AbjectId;
   protected expandedChildren: Set<AbjectId> = new Set();
   protected hiddenChildren: Set<AbjectId> = new Set();
   private layoutDirty = false;
@@ -274,9 +275,12 @@ export abstract class LayoutAbject extends WidgetAbject {
       this.layoutChildren = this.layoutChildren.filter(
         (c) => isSpacer(c) || c.widgetId !== widgetId
       );
-      // Clear stale hover reference to prevent handleInput to destroyed widgets
+      // Clear stale references to prevent handleInput to destroyed widgets
       if (this.hoveredLayoutChildId === widgetId) {
         this.hoveredLayoutChildId = undefined;
+      }
+      if (this.focusedLayoutChildId === widgetId) {
+        this.focusedLayoutChildId = undefined;
       }
       this.expandedChildren.delete(widgetId);
       this.hiddenChildren.delete(widgetId);
@@ -288,6 +292,7 @@ export abstract class LayoutAbject extends WidgetAbject {
     this.on('clearLayoutChildren', async () => {
       this.layoutChildren = [];
       this.hoveredLayoutChildId = undefined;
+      this.focusedLayoutChildId = undefined;
       this.expandedChildren.clear();
       this.hiddenChildren.clear();
       this.layoutDirty = true;
@@ -456,6 +461,23 @@ export abstract class LayoutAbject extends WidgetAbject {
       return { consumed: true };
     }
 
+    // Forward mouseup to focused child so it can end drag-selection
+    if (inputType === 'mouseup') {
+      if (this.focusedLayoutChildId) {
+        try {
+          await this.request<{ consumed: boolean }>(
+            request(this.id, this.focusedLayoutChildId, 'handleInput', {
+              ...input,
+            })
+          );
+        } catch {
+          // Widget gone
+        }
+        this.focusedLayoutChildId = undefined;
+      }
+      return { consumed: true };
+    }
+
     // Only route mouse events through layout
     if (inputType !== 'mousedown' && inputType !== 'mousemove' && inputType !== 'wheel') {
       return { consumed: false };
@@ -546,6 +568,29 @@ export abstract class LayoutAbject extends WidgetAbject {
         }
         this.hoveredLayoutChildId = undefined;
       }
+
+      // Forward mousemove to focused child even when cursor is outside its bounds
+      // (supports drag-selection continuing when cursor leaves the label area)
+      if (this.focusedLayoutChildId && this.focusedLayoutChildId !== hitChildId) {
+        // Find the focused child's rect for coordinate translation
+        for (const cr of childRects) {
+          if (cr.widgetId === this.focusedLayoutChildId) {
+            try {
+              await this.request<{ consumed: boolean }>(
+                request(this.id, this.focusedLayoutChildId, 'handleInput', {
+                  ...input,
+                  x: mx - cr.rect.x,
+                  y: my - cr.rect.y,
+                })
+              );
+            } catch {
+              // Widget gone
+            }
+            return { consumed: true };
+          }
+        }
+      }
+
       return { consumed: false };
     }
 
@@ -561,6 +606,8 @@ export abstract class LayoutAbject extends WidgetAbject {
             })
           );
           if (result.consumed) {
+            // Track focused child for drag-selection forwarding
+            this.focusedLayoutChildId = result.focusWidgetId ?? cr.widgetId;
             return {
               consumed: true,
               focusWidgetId: result.focusWidgetId ?? cr.widgetId,
@@ -572,6 +619,7 @@ export abstract class LayoutAbject extends WidgetAbject {
       }
     }
 
+    this.focusedLayoutChildId = undefined;
     return { consumed: false };
   }
 

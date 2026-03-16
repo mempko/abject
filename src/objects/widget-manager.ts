@@ -950,7 +950,7 @@ await this.call(this.dep('WidgetManager'), 'destroyWindowAbject', { windowId: wi
 
 ### Widget Types (used as \`type\` in create() specs)
 
-label - Static text display. Style: { wordWrap: true } for multi-line text.
+label - Static text display. Style: { wordWrap: true } for multi-line text. Style: { selectable: true } to allow users to click-drag, double-click, Shift+click, Ctrl+A, and Ctrl+C to select and copy text (read-only).
 button - Clickable button (listen for 'changed' with aspect 'click'). Keyboard: Enter/Space when focused.
 textInput - Single-line text input (aspects: 'change', 'submit')
 textArea - Multi-line text area (params: monospace?)
@@ -971,6 +971,7 @@ All widgets accept a \`style\` object with these optional properties:
 - fontSize, fontWeight ('normal' | 'bold'), align ('left' | 'center' | 'right') — typography
 - radius — border radius
 - wordWrap — enable word wrapping on labels
+- selectable — labels only: enable read-only text selection (click-drag, double-click word select, Shift+click, Ctrl+A, Ctrl+C)
 - disabled — when true, widget renders at 50% opacity and ignores all input
 - visible — when false, widget renders nothing and ignores input (default: true)
 
@@ -996,6 +997,7 @@ await this.call(btnId, 'update', { style: { disabled: false } });
   mouse wheel (scrolls content). Enter inserts a newline (does NOT submit).
 - TabBar: ArrowLeft/Right → switch tabs
 - Slider: ArrowLeft/Right/Up/Down → ±step; Home → min; End → max
+- Selectable Label: Ctrl+A (select all), Ctrl+C (copy), Shift+Arrow (extend selection), Home/End (jump), double-click (select word), click-drag (select range)
 
 ### Layout Types
 

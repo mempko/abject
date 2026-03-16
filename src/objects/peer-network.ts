@@ -395,7 +395,7 @@ export class PeerNetwork extends Abject {
     const { widgetIds: [peerIdHeaderId, peerIdValueId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId, text: 'Peer ID', style: { color: this.theme.textHeading, fontSize: 13 } },
-        { type: 'label', windowId: this.windowId, text: truncatedPeerId, style: { color: this.theme.textMeta, fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: truncatedPeerId, style: { color: this.theme.textMeta, fontSize: 12, selectable: true } },
       ] })
     );
     await this.request(request(this.id, tab0, 'addLayoutChild', {
@@ -450,7 +450,7 @@ export class PeerNetwork extends Abject {
 
     const { widgetIds: [_statusLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId!, text: '', style: { color: this.theme.textDescription, fontSize: 12, align: 'right' } },
+        { type: 'label', windowId: this.windowId!, text: '', style: { color: this.theme.textDescription, fontSize: 12, align: 'right', selectable: true } },
       ] })
     );
     this.statusLabelId = _statusLabelId;
@@ -567,8 +567,8 @@ export class PeerNetwork extends Abject {
           ? { fontSize: 11 }
           : { background: '#1e3a2e', borderColor: this.theme.statusSuccess, fontSize: 11 };
         const specs: Array<Record<string, unknown>> = [
-          { type: 'label', windowId: this.windowId, text: displayName, style: { color: this.theme.textHeading, fontSize: 12 } },
-          { type: 'label', windowId: this.windowId, text: contact.state, style: { color: stateColor, fontSize: 11 } },
+          { type: 'label', windowId: this.windowId, text: displayName, style: { color: this.theme.textHeading, fontSize: 12, selectable: true } },
+          { type: 'label', windowId: this.windowId, text: contact.state, style: { color: stateColor, fontSize: 11, selectable: true } },
           { type: 'button', windowId: this.windowId, text: connBtnText, style: connBtnStyle },
         ];
         if (isConnected) {
@@ -722,8 +722,8 @@ export class PeerNetwork extends Abject {
       // Batch: url label + status label + remove button
       const { widgetIds: [urlLabelId, statusLabelId, removeBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: url, style: { color: urlColor, fontSize: 12 } },
-          { type: 'label', windowId: this.windowId, text: statusText, style: { color: urlColor, fontSize: 11 } },
+          { type: 'label', windowId: this.windowId, text: url, style: { color: urlColor, fontSize: 12, selectable: true } },
+          { type: 'label', windowId: this.windowId, text: statusText, style: { color: urlColor, fontSize: 11, selectable: true } },
           { type: 'button', windowId: this.windowId, text: 'Remove', style: { fontSize: 11 } },
         ] })
       );
@@ -794,7 +794,7 @@ export class PeerNetwork extends Abject {
         // Batch: name label + add button
         const { widgetIds: [spNameId, addBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: displayName, style: { color: this.theme.textDescription, fontSize: 12 } },
+            { type: 'label', windowId: this.windowId, text: displayName, style: { color: this.theme.textDescription, fontSize: 12, selectable: true } },
             { type: 'button', windowId: this.windowId, text: 'Add', style: { background: '#1e3a2e', borderColor: this.theme.statusSuccess, fontSize: 11 } },
           ] })
         );
@@ -884,8 +884,8 @@ export class PeerNetwork extends Abject {
         // Batch: name label + tag label + block button
         const { widgetIds: [cNameId, cTagId, cBlockBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: contact.name || contact.peerId.slice(0, 12) + '...', style: { color: this.theme.textDescription, fontSize: 12 } },
-            { type: 'label', windowId: this.windowId, text: 'contact', style: { color: this.theme.statusSuccess, fontSize: 11 } },
+            { type: 'label', windowId: this.windowId, text: contact.name || contact.peerId.slice(0, 12) + '...', style: { color: this.theme.textDescription, fontSize: 12, selectable: true } },
+            { type: 'label', windowId: this.windowId, text: 'contact', style: { color: this.theme.statusSuccess, fontSize: 11, selectable: true } },
             { type: 'button', windowId: this.windowId, text: 'Block', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
           ] })
         );
@@ -927,8 +927,8 @@ export class PeerNetwork extends Abject {
         // Batch: name label + duration label + trust button + block button
         const { widgetIds: [npNameId, durationId, promoteBtnId, npBlockBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: netPeer.name || netPeer.peerId.slice(0, 12) + '...', style: { color: this.theme.textDescription, fontSize: 12 } },
-            { type: 'label', windowId: this.windowId, text: duration, style: { color: this.theme.statusNeutral, fontSize: 11 } },
+            { type: 'label', windowId: this.windowId, text: netPeer.name || netPeer.peerId.slice(0, 12) + '...', style: { color: this.theme.textDescription, fontSize: 12, selectable: true } },
+            { type: 'label', windowId: this.windowId, text: duration, style: { color: this.theme.statusNeutral, fontSize: 11, selectable: true } },
             { type: 'button', windowId: this.windowId, text: 'Trust', style: { background: '#1e3a2e', borderColor: this.theme.statusSuccess, fontSize: 11 } },
             { type: 'button', windowId: this.windowId, text: 'Block', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
           ] })
@@ -1001,7 +1001,7 @@ export class PeerNetwork extends Abject {
         // Batch: name label + unblock button
         const { widgetIds: [bNameId, unblockBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: bPeerId.slice(0, 16) + '...', style: { color: this.theme.statusNeutral, fontSize: 12 } },
+            { type: 'label', windowId: this.windowId, text: bPeerId.slice(0, 16) + '...', style: { color: this.theme.statusNeutral, fontSize: 12, selectable: true } },
             { type: 'button', windowId: this.windowId, text: 'Unblock', style: { background: '#1e3a2e', borderColor: this.theme.statusSuccess, fontSize: 11 } },
           ] })
         );
@@ -1080,7 +1080,7 @@ export class PeerNetwork extends Abject {
         // Batch: intro label + accept button + reject button
         const { widgetIds: [introLabel, acceptBtnId, rejectBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
           request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: `${introName} (from ${fromName})`, style: { color: this.theme.textHeading, fontSize: 12 } },
+            { type: 'label', windowId: this.windowId, text: `${introName} (from ${fromName})`, style: { color: this.theme.textHeading, fontSize: 12, selectable: true } },
             { type: 'button', windowId: this.windowId, text: 'Accept', style: { background: '#1e3a2e', borderColor: this.theme.statusSuccess, fontSize: 11 } },
             { type: 'button', windowId: this.windowId, text: 'Reject', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
           ] })

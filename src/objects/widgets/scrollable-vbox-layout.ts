@@ -214,7 +214,7 @@ export class ScrollableVBoxLayout extends VBoxLayout {
     }
 
     // For mouse events, offset Y by scrollTop before delegating to parent
-    if (inputType === 'mousedown' || inputType === 'mousemove') {
+    if (inputType === 'mousedown' || inputType === 'mousemove' || inputType === 'mouseup') {
       const adjusted = { ...input, y: (input.y as number) + this.scrollTop };
       return super.processInput(adjusted);
     }

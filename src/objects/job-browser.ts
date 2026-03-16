@@ -260,7 +260,7 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
       // Build specs for all job labels
       const specs = reversed.map(job => {
         const { text, color } = this.formatJobLabel(job);
-        return { type: 'label' as const, windowId: this.windowId!, text, style: { color, fontSize, wordWrap: true } };
+        return { type: 'label' as const, windowId: this.windowId!, text, style: { color, fontSize, wordWrap: true, selectable: true } };
       });
 
       // Batch create all labels
@@ -314,7 +314,7 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
     const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'label', windowId: this.windowId, text, style: { color, fontSize, wordWrap: true } },
+          { type: 'label', windowId: this.windowId, text, style: { color, fontSize, wordWrap: true, selectable: true } },
         ],
       })
     );

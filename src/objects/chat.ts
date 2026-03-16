@@ -926,7 +926,7 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
     const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'label', windowId: this.windowId, text: displayText, style: { color, fontSize, wordWrap: true } },
+          { type: 'label', windowId: this.windowId, text: displayText, style: { color, fontSize, wordWrap: true, selectable: true } },
         ],
       })
     );
