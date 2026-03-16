@@ -25,11 +25,20 @@ export class TextAreaWidget extends WidgetAbject {
   private monospace: boolean;
   private selAnchorLine: number | null = null;
   private selAnchorCol: number | null = null;
+  private dragging = false;
+  private lastClickTime = 0;
+  private lastClickLine = 0;
+  private lastClickCol = 0;
+  private lastSurfaceId = '';
 
   constructor(config: TextAreaWidgetConfig) {
     super(config);
     this.monospace = config.monospace ?? false;
     this.lineHeight = DEFAULT_LINE_HEIGHT;
+  }
+
+  protected override acceptsInputWhenDisabled(): boolean {
+    return true;
   }
 
   // ── Selection helpers ──────────────────────────────────────────────
@@ -128,6 +137,7 @@ export class TextAreaWidget extends WidgetAbject {
   // ── Rendering ──────────────────────────────────────────────────────
 
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
+    this.lastSurfaceId = surfaceId;
     const commands: unknown[] = [];
     const w = this.rect.width;
     const h = this.rect.height;
@@ -274,6 +284,14 @@ export class TextAreaWidget extends WidgetAbject {
       return this.handleMouseDown(input);
     }
 
+    if (type === 'mousemove') {
+      return this.handleMouseMove(input);
+    }
+
+    if (type === 'mouseup') {
+      return this.handleMouseUp();
+    }
+
     if (type === 'keydown') {
       return this.handleKeyDown(input);
     }
@@ -289,25 +307,19 @@ export class TextAreaWidget extends WidgetAbject {
     return { consumed: false };
   }
 
-  private async handleMouseDown(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
-    const clickX = (input.localX as number | undefined) ?? (input.x as number | undefined) ?? 0;
-    const clickY = (input.localY as number | undefined) ?? (input.y as number | undefined) ?? 0;
-    const surfaceId = input.surfaceId as string | undefined;
-    const modifiers = input.modifiers as { shift: boolean; ctrl: boolean; alt: boolean; meta: boolean } | undefined;
+  private async posFromClick(clickX: number, clickY: number, surfaceId: string | undefined): Promise<{ line: number; col: number }> {
     const textPadding = 8;
     const lineHeight = this.lineHeight;
     const scrollTop = this.scrollTop;
     const lines = this.text.split('\n');
 
-    // Determine clicked line
-    const clickLine = Math.min(
+    const clickLine = Math.max(0, Math.min(
       scrollTop + Math.floor(clickY / lineHeight),
       lines.length - 1,
-    );
+    ));
     const lineText = lines[clickLine] ?? '';
     const clickOffset = clickX - textPadding;
 
-    // Determine clicked column
     let clickCol = 0;
     if (lineText.length > 0 && clickOffset > 0 && surfaceId) {
       const taFont = this.monospace
@@ -315,17 +327,53 @@ export class TextAreaWidget extends WidgetAbject {
         : (this.style.fontSize ? buildFont(this.style) : WIDGET_FONT);
       const lineWidth = await this.measureText(surfaceId, lineText, taFont);
       const avgCharWidth = lineWidth / lineText.length;
-      clickCol = Math.min(
-        Math.round(clickOffset / avgCharWidth),
-        lineText.length,
-      );
+      clickCol = Math.min(Math.round(clickOffset / avgCharWidth), lineText.length);
     }
 
-    const targetLine = Math.max(0, clickLine);
-    const targetCol = Math.max(0, clickCol);
+    return { line: clickLine, col: Math.max(0, clickCol) };
+  }
 
-    if (modifiers?.shift) {
-      // Shift+click: extend selection
+  private wordBoundaries(lineText: string, col: number): { start: number; end: number } {
+    const isWordChar = (ch: string) => /\w/.test(ch);
+    let start = col;
+    let end = col;
+    if (col < lineText.length && isWordChar(lineText[col])) {
+      while (start > 0 && isWordChar(lineText[start - 1])) start--;
+      while (end < lineText.length && isWordChar(lineText[end])) end++;
+    } else {
+      while (start > 0 && !isWordChar(lineText[start - 1]) && lineText[start - 1] !== ' ') start--;
+      while (end < lineText.length && !isWordChar(lineText[end]) && lineText[end] !== ' ') end++;
+    }
+    return { start, end };
+  }
+
+  private async handleMouseDown(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
+    const clickX = (input.localX as number | undefined) ?? (input.x as number | undefined) ?? 0;
+    const clickY = (input.localY as number | undefined) ?? (input.y as number | undefined) ?? 0;
+    const surfaceId = (input.surfaceId as string | undefined) ?? this.lastSurfaceId;
+    const modifiers = input.modifiers as { shift: boolean; ctrl: boolean; alt: boolean; meta: boolean } | undefined;
+
+    const { line: targetLine, col: targetCol } = await this.posFromClick(clickX, clickY, surfaceId);
+
+    const now = Date.now();
+    const isDoubleClick = (now - this.lastClickTime) < 400
+      && targetLine === this.lastClickLine
+      && Math.abs(targetCol - this.lastClickCol) <= 1;
+    this.lastClickTime = now;
+    this.lastClickLine = targetLine;
+    this.lastClickCol = targetCol;
+
+    if (isDoubleClick) {
+      const lines = this.text.split('\n');
+      const lineText = lines[targetLine] ?? '';
+      const { start, end } = this.wordBoundaries(lineText, targetCol);
+      this.selAnchorLine = targetLine;
+      this.selAnchorCol = start;
+      this.cursorLine = targetLine;
+      this.cursorCol = end;
+      this.dragging = false;
+      await this.notifySelectionChanged();
+    } else if (modifiers?.shift) {
       if (this.selAnchorLine === null) {
         this.selAnchorLine = this.cursorLine;
         this.selAnchorCol = this.cursorCol;
@@ -334,14 +382,42 @@ export class TextAreaWidget extends WidgetAbject {
       this.cursorCol = targetCol;
       await this.notifySelectionChanged();
     } else {
-      // Normal click: clear selection
       this.clearSelection();
       this.cursorLine = targetLine;
       this.cursorCol = targetCol;
+      this.selAnchorLine = targetLine;
+      this.selAnchorCol = targetCol;
+      this.dragging = true;
       await this.notifySelectionChanged();
     }
 
     await this.requestRedraw();
+    return { consumed: true };
+  }
+
+  private async handleMouseMove(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
+    if (!this.dragging) return { consumed: false };
+
+    const clickX = (input.localX as number | undefined) ?? (input.x as number | undefined) ?? 0;
+    const clickY = (input.localY as number | undefined) ?? (input.y as number | undefined) ?? 0;
+    const surfaceId = (input.surfaceId as string | undefined) ?? this.lastSurfaceId;
+
+    const { line, col } = await this.posFromClick(clickX, clickY, surfaceId);
+    this.cursorLine = line;
+    this.cursorCol = col;
+    await this.notifySelectionChanged();
+    await this.requestRedraw();
+    return { consumed: true };
+  }
+
+  private async handleMouseUp(): Promise<{ consumed: boolean }> {
+    if (this.dragging) {
+      this.dragging = false;
+      if (this.selAnchorLine === this.cursorLine && this.selAnchorCol === this.cursorCol) {
+        this.clearSelection();
+        await this.notifySelectionChanged();
+      }
+    }
     return { consumed: true };
   }
 
@@ -379,6 +455,16 @@ export class TextAreaWidget extends WidgetAbject {
     // Ctrl+C / Meta+C: copy (handled by UIServer's copy event listener)
     if (key === 'c' && (ctrl || meta)) {
       return { consumed: true };
+    }
+
+    // When disabled, block all editing keys but allow navigation/selection above
+    if (this.disabled) {
+      if (key === 'ArrowLeft' || key === 'ArrowRight' || key === 'ArrowUp' || key === 'ArrowDown'
+          || key === 'Home' || key === 'End') {
+        // fall through to normal handling below
+      } else {
+        return { consumed: true };
+      }
     }
 
     // Ctrl+X / Meta+X: cut
@@ -719,6 +805,7 @@ export class TextAreaWidget extends WidgetAbject {
   }
 
   private async handlePaste(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
+    if (this.disabled) return { consumed: true };
     const pasteText = (input.pasteText as string) ?? '';
     if (!pasteText) return { consumed: true };
 

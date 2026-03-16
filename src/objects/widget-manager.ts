@@ -972,7 +972,7 @@ All widgets accept a \`style\` object with these optional properties:
 - radius — border radius
 - wordWrap — enable word wrapping on labels
 - selectable — labels only: enable read-only text selection (click-drag, double-click word select, Shift+click, Ctrl+A, Ctrl+C)
-- disabled — when true, widget renders at 50% opacity and ignores all input
+- disabled — when true, widget renders at 50% opacity and ignores all input (except textInput/textArea which still allow text selection and copy)
 - visible — when false, widget renders nothing and ignores input (default: true)
 
 ### Disabling Widgets During Async Operations
@@ -992,9 +992,11 @@ await this.call(btnId, 'update', { style: { disabled: false } });
 - Select: Enter/Space → opens dropdown; ArrowUp/Down → navigate options; Enter → select; Escape → close
 - TextInput: Backspace/Delete (delete chars), ArrowLeft/Right (move cursor), Home/End (jump to start/end),
   Ctrl+A (select all), Ctrl+C/X (copy/cut), Enter (fires 'submit' aspect), Tab (bubbles — advances focus),
-  Shift+Arrow (extends selection), printable characters insert text at cursor.
+  Shift+Arrow (extends selection), click-drag (select range), double-click (select word), Shift+click (extend selection),
+  printable characters insert text at cursor. When disabled: selection, copy, and navigation still work; editing is blocked.
 - TextArea: All TextInput keys plus ArrowUp/Down (line navigation), Tab (inserts 2-space indent, consumed),
-  mouse wheel (scrolls content). Enter inserts a newline (does NOT submit).
+  mouse wheel (scrolls content), click-drag (select range), double-click (select word), Shift+click (extend selection).
+  Enter inserts a newline (does NOT submit). When disabled: selection, copy, and navigation still work; editing is blocked.
 - TabBar: ArrowLeft/Right → switch tabs
 - Slider: ArrowLeft/Right/Up/Down → ±step; Home → min; End → max
 - Selectable Label: Ctrl+A (select all), Ctrl+C (copy), Shift+Arrow (extend selection), Home/End (jump), double-click (select word), click-drag (select range)

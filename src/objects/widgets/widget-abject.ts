@@ -171,7 +171,8 @@ export abstract class WidgetAbject extends Abject {
     });
 
     this.on('handleInput', async (msg: AbjectMessage) => {
-      if (!this.visible || this.disabled) return { consumed: false };
+      if (!this.visible) return { consumed: false };
+      if (this.disabled && !this.acceptsInputWhenDisabled()) return { consumed: false };
       const input = msg.payload as Record<string, unknown>;
       return this.processInput(input);
     });
@@ -186,6 +187,14 @@ export abstract class WidgetAbject extends Abject {
       await this.stop();
       return true;
     });
+  }
+
+  /**
+   * Override to return true if this widget should still receive input when disabled.
+   * Used by text widgets to allow selection/copy while blocking edits.
+   */
+  protected acceptsInputWhenDisabled(): boolean {
+    return false;
   }
 
   /**
