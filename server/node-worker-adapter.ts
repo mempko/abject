@@ -32,8 +32,12 @@ export class NodeWorkerAdapter implements WorkerLike {
     });
   }
 
-  postMessage(data: unknown): void {
-    this.worker.postMessage(data);
+  postMessage(data: unknown, transferList?: unknown[]): void {
+    if (transferList && transferList.length > 0) {
+      this.worker.postMessage(data, transferList as import('node:worker_threads').TransferListItem[]);
+    } else {
+      this.worker.postMessage(data);
+    }
   }
 
   terminate(): void {

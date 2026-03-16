@@ -24,6 +24,8 @@ import type {
   EndWindowDragMsg,
 } from './ws-protocol.js';
 import type { AuthConfig, SessionStore } from './auth.js';
+import type { UITransport } from './ui-transport.js';
+import { WebSocketUITransport } from './ui-transport.js';
 import { Log } from '../src/core/timed-log.js';
 
 const log = new Log('BackendUI');
@@ -70,7 +72,7 @@ export class BackendUI extends Abject {
   private focusedSurface?: string;
   private mouseGrabAbject?: AbjectId;  // WindowManager grabs mouse during drag
   private pendingRequests: Map<string, { resolve: (value: unknown) => void; reject: (e: Error) => void }> = new Map();
-  private ws: WebSocket | null = null;
+  private transport: UITransport | null = null;
   private frontendReady = false;
   private surfaceCounter = 0;
   private consoleId?: AbjectId;
@@ -561,17 +563,26 @@ IMPORTANT:
    * The frontend will reconnect automatically and go through the auth gate.
    */
   disconnectFrontend(): void {
-    if (this.ws) {
-      this.ws.close(4001, 'Auth config changed');
+    if (this.transport) {
+      this.transport.close(4001, 'Auth config changed');
     }
   }
 
   // ── WebSocket management ────────────────────────────────────────────
 
   /**
-   * Set the WebSocket connection to the frontend.
+   * Set the WebSocket connection to the frontend (convenience wrapper).
+   * Wraps the WebSocket in a WebSocketUITransport and calls setTransport().
    */
   setWebSocket(ws: WebSocket): void {
+    this.setTransport(new WebSocketUITransport(ws));
+  }
+
+  /**
+   * Set the transport used to communicate with the frontend.
+   * Works with any UITransport: WebSocket, MessagePort, etc.
+   */
+  setTransport(newTransport: UITransport): void {
     // Clean up state from previous connection
     this.frontendReady = false;
     this.sendQueue = [];
@@ -581,9 +592,8 @@ IMPORTANT:
     }
     this.pendingRequests.clear();
 
-    this.ws = ws;
-    ws.on('message', (data: Buffer | string) => {
-      const str = typeof data === 'string' ? data : data.toString();
+    this.transport = newTransport;
+    newTransport.onMessage((str: string) => {
       try {
         const msg = JSON.parse(str) as FrontendToBackendMsg;
         this.handleFrontendMessage(msg);
@@ -591,9 +601,9 @@ IMPORTANT:
         log.error('Failed to parse frontend message:', err);
       }
     });
-    ws.on('close', () => {
-      if (this.ws === ws) {
-        this.ws = null;
+    newTransport.onClose(() => {
+      if (this.transport === newTransport) {
+        this.transport = null;
         this.frontendReady = false;
         this.sendQueue = [];
         this.flushScheduled = false;
@@ -612,7 +622,7 @@ IMPORTANT:
    * and scheduleRelayout timers fire in the same event-loop phase.
    */
   private sendToFrontend(msg: BackendToFrontendMsg): void {
-    if (!this.ws || this.ws.readyState !== 1) return;
+    if (!this.transport || !this.transport.ready) return;
     this.sendQueue.push(msg);
     if (!this.flushScheduled) {
       this.flushScheduled = true;
@@ -625,19 +635,19 @@ IMPORTANT:
    * Used for request/reply messages where the caller awaits a response.
    */
   private sendToFrontendImmediate(msg: BackendToFrontendMsg): void {
-    if (this.ws && this.ws.readyState === 1) {
-      this.ws.send(JSON.stringify(msg));
+    if (this.transport && this.transport.ready) {
+      this.transport.send(JSON.stringify(msg));
     }
   }
 
   private flushSendQueue(): void {
     this.flushScheduled = false;
-    if (!this.ws || this.ws.readyState !== 1 || this.sendQueue.length === 0) return;
+    if (!this.transport || !this.transport.ready || this.sendQueue.length === 0) return;
 
     if (this.sendQueue.length === 1) {
-      this.ws.send(JSON.stringify(this.sendQueue[0]));
+      this.transport.send(JSON.stringify(this.sendQueue[0]));
     } else {
-      this.ws.send(JSON.stringify(this.sendQueue));
+      this.transport.send(JSON.stringify(this.sendQueue));
     }
     this.sendQueue = [];
   }
@@ -857,7 +867,7 @@ IMPORTANT:
   }
 
   private async handleGetDisplayInfo(): Promise<{ width: number; height: number }> {
-    if (!this.ws || this.ws.readyState !== 1 || !this.frontendReady) {
+    if (!this.transport || !this.transport.ready || !this.frontendReady) {
       return { ...this.lastDisplayInfo };
     }
     try {
@@ -891,7 +901,7 @@ IMPORTANT:
     }
 
     // No metrics yet — fall back to round-trip or estimate
-    if (!this.ws || this.ws.readyState !== 1 || !this.frontendReady) {
+    if (!this.transport || !this.transport.ready || !this.frontendReady) {
       return text.length * 7.5;
     }
 

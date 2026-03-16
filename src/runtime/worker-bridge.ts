@@ -19,7 +19,7 @@ const log = new Log('WorkerBridge');
  * so that WorkerBridge can work in either environment.
  */
 export interface WorkerLike {
-  postMessage(data: unknown): void;
+  postMessage(data: unknown, transferList?: unknown[]): void;
   terminate(): void;
   onmessage: ((event: { data: unknown }) => void) | null;
   onerror: ((event: { message: string }) => void) | null;
@@ -53,8 +53,8 @@ export interface WorkerOutboundMessage {
 export class WorkerBridge {
   readonly hostedObjects: Set<AbjectId> = new Set();
 
-  private worker: WorkerLike;
-  private bus: MessageBus;
+  protected worker: WorkerLike;
+  protected bus: MessageBus;
   private readyResolve?: () => void;
   private readyPromise: Promise<void>;
   private pendingSpawns: Map<AbjectId, { resolve: () => void; reject: (err: Error) => void }> = new Map();
@@ -159,8 +159,9 @@ export class WorkerBridge {
 
   /**
    * Handle messages from the worker.
+   * Protected so DedicatedWorkerBridge can override to intercept custom message types.
    */
-  private handleWorkerMessage(event: { data: unknown }): void {
+  protected handleWorkerMessage(event: { data: unknown }): void {
     const data = event.data as WorkerOutboundMessage;
     const { type } = data;
 

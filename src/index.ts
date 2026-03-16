@@ -14,6 +14,7 @@ export { WorkerBus } from './runtime/worker-bus.js';
 export { WorkerBridge } from './runtime/worker-bridge.js';
 export type { WorkerLike } from './runtime/worker-bridge.js';
 export { WorkerPool, workerIndexForId } from './runtime/worker-pool.js';
+export { DedicatedWorkerBridge } from './runtime/dedicated-worker-bridge.js';
 export { Abject, SimpleAbject, DEFERRED_REPLY } from './core/abject.js';
 export { Registry, REGISTRY_ID } from './objects/registry.js';
 export { Factory, FACTORY_ID } from './objects/factory.js';

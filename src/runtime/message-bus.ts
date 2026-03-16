@@ -11,6 +11,7 @@ import { require, ensure, invariant, requireNonEmpty } from '../core/contracts.j
 import { request as createRequest, error as createError } from '../core/message.js';
 import { Mailbox } from './mailbox.js';
 import type { WorkerPool } from './worker-pool.js';
+import type { WorkerBridge } from './worker-bridge.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('MessageBus');
@@ -54,6 +55,9 @@ export class MessageBus implements MessageBusLike {
   // Worker parallelism — set of object IDs hosted in workers
   private workerObjects: Set<AbjectId> = new Set();
   private _workerPool?: WorkerPool;
+
+  // Dedicated worker bridges (UI, P2P) — registered separately from the pool
+  private dedicatedBridges: Map<AbjectId, WorkerBridge> = new Map();
 
   /**
    * Register an object with the bus. Creates a mailbox for the object.
@@ -147,9 +151,9 @@ export class MessageBus implements MessageBusLike {
 
     const recipient = message.routing.to;
 
-    // Worker routing: if recipient is in a worker, forward via WorkerPool
-    if (this.workerObjects.has(recipient) && this._workerPool) {
-      const bridge = this._workerPool.getBridgeForObject(recipient);
+    // Worker routing: if recipient is in a worker, forward via dedicated bridge or WorkerPool
+    if (this.workerObjects.has(recipient)) {
+      const bridge = this.getBridgeForObject(recipient);
       if (bridge) {
         // Reply fast-path: forward replies directly for fast resolution
         if ((message.header.type === 'reply' || message.header.type === 'error')
@@ -180,9 +184,9 @@ export class MessageBus implements MessageBusLike {
             `Recipient ${recipient} is not registered`,
           ));
           this.messageCount++;
-        } else if (this.workerObjects.has(sender) && this._workerPool) {
+        } else if (this.workerObjects.has(sender)) {
           // Sender is in a worker — route error reply through bridge
-          const senderBridge = this._workerPool.getBridgeForObject(sender);
+          const senderBridge = this.getBridgeForObject(sender);
           if (senderBridge) {
             senderBridge.deliverReply(createError(
               message,
@@ -304,6 +308,30 @@ export class MessageBus implements MessageBusLike {
    */
   isWorkerObject(objectId: AbjectId): boolean {
     return this.workerObjects.has(objectId);
+  }
+
+  /**
+   * Register a dedicated worker bridge for a specific object ID.
+   * Used for dedicated workers (UI, P2P) that are not part of the WorkerPool.
+   */
+  registerDedicatedBridge(objectId: AbjectId, bridge: WorkerBridge): void {
+    this.dedicatedBridges.set(objectId, bridge);
+    this.workerObjects.add(objectId);
+  }
+
+  /**
+   * Unregister a dedicated worker bridge.
+   */
+  unregisterDedicatedBridge(objectId: AbjectId): void {
+    this.dedicatedBridges.delete(objectId);
+    this.workerObjects.delete(objectId);
+  }
+
+  /**
+   * Find the bridge for a worker-hosted object (dedicated or pool).
+   */
+  private getBridgeForObject(objectId: AbjectId): WorkerBridge | undefined {
+    return this.dedicatedBridges.get(objectId) ?? this._workerPool?.getBridgeForObject(objectId);
   }
 
   private _undeliverableHandler?: (message: AbjectMessage) => void;

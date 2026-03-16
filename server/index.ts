@@ -2,23 +2,8 @@
  * Abjects Node.js Backend Entry Point
  *
  * Mirrors the bootstrap in src/index.ts but without DOM/Canvas.
- * All system objects run here; the browser is a thin rendering client.
+ * System objects run here or in dedicated worker_threads (UI, P2P).
  */
-
-// Polyfill WebRTC APIs for Node.js (PeerTransport needs RTCPeerConnection, etc.)
-import {
-  RTCPeerConnection,
-  RTCSessionDescription,
-  RTCIceCandidate,
-  RTCDataChannel,
-} from 'node-datachannel/polyfill';
-
-Object.assign(globalThis, {
-  RTCPeerConnection,
-  RTCSessionDescription,
-  RTCIceCandidate,
-  RTCDataChannel,
-});
 
 import { AbjectId, TypeId, AbjectMessage, SpawnResult } from '../src/core/types.js';
 import { getRuntime, resetRuntime } from '../src/runtime/runtime.js';
@@ -74,13 +59,19 @@ import { WorkspaceShareRegistry, WORKSPACE_SHARE_REGISTRY_ID } from '../src/obje
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
 import { NodeWorkerAdapter } from './node-worker-adapter.js';
+import { DedicatedWorkerBridge } from '../src/runtime/dedicated-worker-bridge.js';
+import { WebSocketUITransport } from './ui-transport.js';
 import { loadAuthConfig, SessionStore, authenticateConnection } from './auth.js';
 import { Log } from '../src/core/timed-log.js';
 import * as path from 'node:path';
 import os from 'node:os';
+import { randomUUID } from 'node:crypto';
+import { MessageChannel } from 'node:worker_threads';
+import type { PeerId } from '../src/core/identity.js';
 
 const WS_PORT = parseInt(process.env.WS_PORT ?? '7719', 10);
 const DATA_DIR = process.env.ABJECTS_DATA_DIR ?? '.abjects';
+const DEDICATED_WORKERS = process.env.ABJECTS_DEDICATED_WORKERS !== '0'; // default: enabled
 const alog = new Log('ABJECTS');
 
 async function main(): Promise<void> {
@@ -114,15 +105,47 @@ async function main(): Promise<void> {
       : undefined,
   });
 
-  // Create BackendUI (replaces UIServer)
-  const backendUI = new BackendUI();
-  runtime.registerCoreObject(backendUI);
+  // Pre-assign BackendUI ID (used in both worker and non-worker modes)
+  const backendUIId = randomUUID() as AbjectId;
+  let backendUI: BackendUI | null = null;        // non-null only in non-worker mode
+  let uiBridge: DedicatedWorkerBridge | null = null;  // non-null only in worker mode
+
+  if (DEDICATED_WORKERS) {
+    // UI Worker mode: BackendUI runs in a dedicated worker_thread
+    alog.info('Spawning dedicated UI worker...');
+  } else {
+    // Non-worker fallback: BackendUI runs on main thread (original behavior)
+    // Polyfill WebRTC on main thread (needed for P2P objects)
+    const { RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, RTCDataChannel } =
+      await import('node-datachannel/polyfill');
+    Object.assign(globalThis, { RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, RTCDataChannel });
+
+    backendUI = new BackendUI();
+    runtime.registerCoreObject(backendUI);
+  }
 
   // Start runtime (bootstraps Registry + Factory)
   await runtime.start();
   log.timed('runtime started');
 
   const bus = runtime.messageBus;
+
+  // ── Create UI Worker (if dedicated workers enabled) ──────────────────
+  if (DEDICATED_WORKERS) {
+    const uiWorkerScript = new URL('../workers/ui-worker-node.ts', import.meta.url);
+    const uiWorker = new NodeWorkerAdapter(uiWorkerScript);
+    uiBridge = new DedicatedWorkerBridge(uiWorker, bus);
+
+    // Register BackendUI ID on the main bus before worker init
+    // so replies can be routed back to BackendUI during its init
+    bus.registerDedicatedBridge(backendUIId, uiBridge);
+
+    // Wait for worker to be ready, then send config
+    await uiBridge.waitReady();
+    uiBridge.sendConfig({ backendUIId: backendUIId as string, registryId: runtime.objectRegistry.id as string });
+    log.timed('UI worker ready');
+  }
+
   const factoryId = runtime.objectFactory.id;
   const registryId = runtime.objectRegistry.id;
   const BOOTSTRAP_ID = 'bootstrap' as AbjectId;
@@ -159,6 +182,31 @@ async function main(): Promise<void> {
       typeId,
     });
     return result.objectId;
+  }
+
+  // In worker mode, register BackendUI with the Registry so other objects
+  // can discover it via discoverDep('UIServer'). In non-worker mode, this
+  // was handled by runtime.registerCoreObject() + factory.spawnInstance().
+  if (DEDICATED_WORKERS) {
+    await bootstrapRequest(registryId, 'register', {
+      objectId: backendUIId,
+      manifest: {
+        name: 'UIServer',
+        description: 'X11-style display server (running in UI worker)',
+        version: '1.0.0',
+        interface: {
+          id: 'abjects:ui',
+          name: 'UI',
+          description: 'Surface management and input routing',
+          methods: [],
+        },
+        requiredCapabilities: [],
+        providedCapabilities: ['abjects:ui:surface', 'abjects:ui:input'],
+        tags: ['system', 'ui'],
+      },
+      status: 'running',
+    });
+    log.timed('BackendUI registered in Registry');
   }
 
   // Register constructors with Factory
@@ -277,17 +325,16 @@ async function main(): Promise<void> {
   const widgetManagerId = await supervisedSpawn('WidgetManager');
 
   log.timed('core capabilities spawned');
-  const identityId = await supervisedSpawn('Identity');
 
-  // Get peerId for computing system TypeIds
+  // ── P2P Layer: dedicated worker or main thread ───────────────────────
   let localPeerId: string | undefined;
-  try {
-    const identity = await bootstrapRequest<{ peerId: string }>(identityId, 'getIdentity', {});
-    localPeerId = identity.peerId;
-    alog.info(`Local peerId: ${localPeerId.slice(0, 16)}...`);
-  } catch {
-    alog.warn('Could not get peerId — system TypeIds will not be assigned');
-  }
+  let identityId: AbjectId;
+  let peerRegistryId: AbjectId;
+  let remoteRegistryId: AbjectId;
+  let peerRouterId: AbjectId;
+  let signalingRelayId: AbjectId;
+  let peerDiscoveryId: AbjectId;
+  let p2pBridge: DedicatedWorkerBridge | null = null;
 
   /** Compute a system-scoped TypeId: {peerId}/system/{name} */
   function systemTypeId(name: string): TypeId | undefined {
@@ -295,43 +342,158 @@ async function main(): Promise<void> {
     return `${localPeerId}/system/${name}` as TypeId;
   }
 
-  log.timed('identity ready');
-  const peerRegistryId = await supervisedSpawn('PeerRegistry', 'permanent', systemTypeId('PeerRegistry'));
-  const remoteRegistryId = await supervisedSpawn('RemoteRegistry', 'permanent', systemTypeId('RemoteRegistry'));
-  const peerRouterId = await supervisedSpawn('PeerRouter', 'permanent', systemTypeId('PeerRouter'));
-
-  // Install PeerRouter interceptor for transparent P2P routing
-  const peerRegistryObj = runtime.objectFactory.getObject(peerRegistryId) as PeerRegistry;
+  // PeerRouter always runs on main thread (it's a MessageInterceptor)
+  peerRouterId = await supervisedSpawn('PeerRouter');
   const peerRouterObj = runtime.objectFactory.getObject(peerRouterId) as unknown as PeerRouter;
   peerRouterObj.setBus(bus);
-  peerRouterObj.setPeerRegistry(peerRegistryObj);
   bus.addInterceptor(peerRouterObj);
 
-  // Wire PeerRegistry → PeerRouter for inbound messages
-  peerRegistryObj.onRemoteMessage((msg, fromPeerId) => {
-    peerRouterObj.handleIncomingMessage(msg, fromPeerId);
-  });
+  if (DEDICATED_WORKERS) {
+    // ── P2P Worker mode ──────────────────────────────────────────────
+    alog.info('Spawning dedicated P2P worker...');
 
-  // Spawn and wire SignalingRelay and PeerDiscovery
-  const signalingRelayId = await supervisedSpawn('SignalingRelay', 'permanent', systemTypeId('SignalingRelay'));
-  const peerDiscoveryId = await supervisedSpawn('PeerDiscovery', 'permanent', systemTypeId('PeerDiscovery'));
+    // Pre-assign IDs for all P2P objects
+    identityId = randomUUID() as AbjectId;
+    peerRegistryId = randomUUID() as AbjectId;
+    remoteRegistryId = randomUUID() as AbjectId;
+    signalingRelayId = randomUUID() as AbjectId;
+    peerDiscoveryId = randomUUID() as AbjectId;
 
-  const signalingRelayObj = runtime.objectFactory.getObject(signalingRelayId) as unknown as SignalingRelayObject;
-  const peerDiscoveryObj = runtime.objectFactory.getObject(peerDiscoveryId) as unknown as PeerDiscoveryObject;
+    const p2pWorkerScript = new URL('../workers/p2p-worker-node.ts', import.meta.url);
+    const p2pWorker = new NodeWorkerAdapter(p2pWorkerScript);
+    p2pBridge = new DedicatedWorkerBridge(p2pWorker, bus);
 
-  signalingRelayObj.setPeerRegistry(peerRegistryObj);
-  peerDiscoveryObj.setPeerRegistry(peerRegistryObj);
-  peerDiscoveryObj.setSignalingRelay(signalingRelayObj);
+    // Register all P2P object IDs on the main bus before worker init
+    const p2pObjectIds = [identityId, peerRegistryId, remoteRegistryId, signalingRelayId, peerDiscoveryId];
+    for (const id of p2pObjectIds) {
+      bus.registerDedicatedBridge(id, p2pBridge);
+    }
 
-  // Set the signaling relay as fallback for PeerRegistry when no signaling server is available
-  peerRegistryObj.setSignalingRelay(signalingRelayObj);
+    // Register P2P objects in the Registry so other objects can discover them.
+    // P2P objects in the worker use discoverDep/requireDep which queries the
+    // main Registry. Without this, PeerRegistry can't find Identity, etc.
+    const p2pRegistrations: Array<{ id: AbjectId; name: string; interfaceId: string }> = [
+      { id: identityId, name: 'Identity', interfaceId: 'abjects:identity' },
+      { id: peerRegistryId, name: 'PeerRegistry', interfaceId: 'abjects:peer-registry' },
+      { id: remoteRegistryId, name: 'RemoteRegistry', interfaceId: 'abjects:remote-registry' },
+      { id: signalingRelayId, name: 'SignalingRelay', interfaceId: 'abjects:signaling-relay' },
+      { id: peerDiscoveryId, name: 'PeerDiscovery', interfaceId: 'abjects:peer-discovery' },
+    ];
+    for (const reg of p2pRegistrations) {
+      await bootstrapRequest(registryId, 'register', {
+        objectId: reg.id,
+        manifest: {
+          name: reg.name,
+          description: `${reg.name} (running in P2P worker)`,
+          version: '1.0.0',
+          interface: { id: reg.interfaceId, name: reg.name, description: '', methods: [] },
+          requiredCapabilities: [],
+          tags: ['system', 'peer'],
+        },
+        status: 'running',
+      });
+    }
+
+    // Wire P2P bridge events before starting worker
+    // peer-id: set once when Identity reports peerId
+    p2pBridge.onCustom('peer-id', (data) => {
+      localPeerId = data.peerId as string;
+      peerRouterObj.setLocalPeerId(localPeerId as PeerId);
+      alog.info(`Local peerId (from P2P worker): ${localPeerId.slice(0, 16)}...`);
+    });
+
+    // remote-message: inbound P2P messages → PeerRouter
+    p2pBridge.onCustom('remote-message', (data) => {
+      const msg = data.message as AbjectMessage;
+      const fromPeerId = data.fromPeerId as string as PeerId;
+      peerRouterObj.handleIncomingMessage(msg, fromPeerId);
+    });
+
+    // peer-status: connected peers cache update
+    p2pBridge.onCustom('peer-status', (data) => {
+      const peers = (data.connectedPeers as string[]).map(p => p as PeerId);
+      peerRouterObj.updateConnectedPeers(peers);
+
+      // On new connection, announce routes
+      if (data.event === 'connected' && data.peerId) {
+        peerRouterObj.announceRoutesToPeer(data.peerId as string as PeerId).catch(() => {});
+      }
+    });
+
+    // Wire PeerRouter → P2P bridge for transport sends
+    peerRouterObj.setP2PBridge(p2pBridge);
+
+    // Wait for worker ready, then send config
+    await p2pBridge.waitReady();
+    p2pBridge.sendConfig({
+      identityId: identityId as string,
+      peerRegistryId: peerRegistryId as string,
+      remoteRegistryId: remoteRegistryId as string,
+      signalingRelayId: signalingRelayId as string,
+      peerDiscoveryId: peerDiscoveryId as string,
+      registryId: registryId as string,
+    });
+
+    // Wait a tick for the worker to bootstrap (it sends 'ready' again after P2P init)
+    // Note: the first 'ready' was from the worker starting up,
+    // the actual P2P bootstrap happens after init-config
+    // We need to wait for the P2P objects to be fully initialized
+    await new Promise<void>((resolve) => {
+      p2pBridge!.onCustom('p2p-ready', () => resolve());
+      // Also resolve on timeout to avoid blocking forever
+      setTimeout(resolve, 10000);
+    });
+
+    log.timed('P2P worker ready');
+  } else {
+    // ── Non-worker fallback (original behavior) ──────────────────────
+    identityId = await supervisedSpawn('Identity');
+
+    // Get peerId for computing system TypeIds
+    try {
+      const identity = await bootstrapRequest<{ peerId: string }>(identityId, 'getIdentity', {});
+      localPeerId = identity.peerId;
+      alog.info(`Local peerId: ${localPeerId.slice(0, 16)}...`);
+    } catch {
+      alog.warn('Could not get peerId — system TypeIds will not be assigned');
+    }
+
+    log.timed('identity ready');
+    peerRegistryId = await supervisedSpawn('PeerRegistry', 'permanent', systemTypeId('PeerRegistry'));
+    remoteRegistryId = await supervisedSpawn('RemoteRegistry', 'permanent', systemTypeId('RemoteRegistry'));
+
+    // Install PeerRouter with direct PeerRegistry reference
+    const peerRegistryObj = runtime.objectFactory.getObject(peerRegistryId) as PeerRegistry;
+    peerRouterObj.setPeerRegistry(peerRegistryObj);
+
+    // Wire PeerRegistry → PeerRouter for inbound messages
+    peerRegistryObj.onRemoteMessage((msg, fromPeerId) => {
+      peerRouterObj.handleIncomingMessage(msg, fromPeerId);
+    });
+
+    // Spawn and wire SignalingRelay and PeerDiscovery
+    signalingRelayId = await supervisedSpawn('SignalingRelay', 'permanent', systemTypeId('SignalingRelay'));
+    peerDiscoveryId = await supervisedSpawn('PeerDiscovery', 'permanent', systemTypeId('PeerDiscovery'));
+
+    const signalingRelayObj = runtime.objectFactory.getObject(signalingRelayId) as unknown as SignalingRelayObject;
+    const peerDiscoveryObj = runtime.objectFactory.getObject(peerDiscoveryId) as unknown as PeerDiscoveryObject;
+
+    signalingRelayObj.setPeerRegistry(peerRegistryObj);
+    peerDiscoveryObj.setPeerRegistry(peerRegistryObj);
+    peerDiscoveryObj.setSignalingRelay(signalingRelayObj);
+
+    // Set the signaling relay as fallback for PeerRegistry
+    peerRegistryObj.setSignalingRelay(signalingRelayObj);
+  }
 
   log.timed('P2P layer ready');
   // Set up auth gate BEFORE GlobalSettings spawns, so applySavedAuthConfig()
   // can update the authConfig during its onInit()
   const authConfig = loadAuthConfig();
   const sessionStore = new SessionStore();
-  backendUI.setAuthGate(authConfig, sessionStore);
+  if (backendUI) {
+    backendUI.setAuthGate(authConfig, sessionStore);
+  }
 
   const globalSettingsId = await supervisedSpawn('GlobalSettings', 'permanent', systemTypeId('GlobalSettings'));
   const peerNetworkId = await supervisedSpawn('PeerNetwork', 'permanent', systemTypeId('PeerNetwork'));
@@ -395,6 +557,47 @@ async function main(): Promise<void> {
     perMessageDeflate: false,
   });
 
+  /**
+   * Connect an authenticated WebSocket to BackendUI.
+   * In worker mode: create MessageChannel, relay ws ↔ port, transfer port to UI worker.
+   * In non-worker mode: pass WebSocket directly to BackendUI.
+   */
+  function connectFrontend(ws: import('ws').WebSocket): void {
+    if (DEDICATED_WORKERS && uiBridge) {
+      // Worker mode: relay via MessageChannel
+      const { port1, port2 } = new MessageChannel();
+
+      // Relay: ws → port1 (to worker)
+      ws.on('message', (data: Buffer | string) => {
+        port1.postMessage(typeof data === 'string' ? data : data.toString());
+      });
+
+      // Relay: port1 (from worker) → ws
+      port1.on('message', (data: unknown) => {
+        if (ws.readyState === 1) {
+          ws.send(String(data));
+        }
+      });
+
+      // Clean up on close
+      ws.on('close', () => {
+        port1.close();
+      });
+      port1.on('close', () => {
+        if (ws.readyState === 1) {
+          ws.close();
+        }
+      });
+
+      // Transfer port2 to UI worker for BackendUI to use as transport
+      uiBridge.transferPort('ws-relay', port2);
+      alog.info('Frontend WebSocket relayed to UI worker via MessagePort');
+    } else if (backendUI) {
+      // Non-worker mode: direct WebSocket
+      backendUI.setWebSocket(ws);
+    }
+  }
+
   wsServer.onConnection((ws) => {
     alog.info('Frontend connection received');
     if (authConfig.enabled) {
@@ -402,7 +605,7 @@ async function main(): Promise<void> {
       authenticateConnection(ws, authConfig, sessionStore).then(({ result }) => {
         if (result === 'authenticated') {
           alog.info('Frontend authenticated');
-          backendUI.setWebSocket(ws);
+          connectFrontend(ws);
         } else {
           alog.info(`Frontend auth ${result}, closing`);
           ws.close(1008, `Authentication ${result}`);
@@ -411,7 +614,7 @@ async function main(): Promise<void> {
     } else {
       alog.info('Frontend connected');
       ws.send(JSON.stringify({ type: 'authNotRequired' }));
-      backendUI.setWebSocket(ws);
+      connectFrontend(ws);
     }
   });
 
@@ -421,8 +624,8 @@ async function main(): Promise<void> {
   console.log('');
   console.log(`  WebSocket:  ws://localhost:${WS_PORT}`);
   console.log(`  Auth:       ${authConfig.enabled ? 'enabled' : 'disabled'}`);
+  console.log(`  Workers:    ${DEDICATED_WORKERS ? 'UI + P2P dedicated' : 'disabled'}`);
   console.log(`  Objects:    ${runtime.objectRegistry.objectCount}`);
-  console.log(`  Surfaces:   ${backendUI.surfaceCount}`);
   console.log('');
   console.log(`  Waiting for frontend connection...`);
 
