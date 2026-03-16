@@ -6,6 +6,7 @@
  */
 
 import { FrontendClient } from './frontend-client.js';
+import { startAbyssBg } from './abyss-bg.js';
 
 const T0 = performance.now();
 const clog = (msg: string) => console.log(`[CLIENT T+${Math.round(performance.now() - T0)}ms] ${msg}`);
@@ -41,6 +42,10 @@ function start(): void {
     console.warn('[Frontend] Canvas already exists — skipping re-init');
     return;
   }
+
+  // Start abyss background animation
+  const abyssBg = document.getElementById('abyss-bg') as HTMLCanvasElement | null;
+  if (abyssBg) startAbyssBg(abyssBg);
 
   const canvas = document.createElement('canvas');
   canvas.style.width = '100%';
