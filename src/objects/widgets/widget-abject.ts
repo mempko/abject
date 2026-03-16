@@ -209,7 +209,9 @@ export abstract class WidgetAbject extends Abject {
     });
 
     this.on('destroy', async () => {
-      this.tooltipSurface?.destroy();
+      if (this.tooltipSurface) {
+        await this.tooltipSurface.destroyAsync();
+      }
       await this.stop();
       return true;
     });

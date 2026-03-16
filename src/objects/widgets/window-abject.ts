@@ -259,6 +259,23 @@ export class WindowAbject extends Abject {
     this.on('focus', async (msg: AbjectMessage) => {
       const { focused } = msg.payload as { surfaceId: string; focused: boolean };
       this.windowFocused = focused;
+
+      // When window loses focus, send mouseleave to hovered child so it
+      // clears hover highlight and hides tooltips (the mouse may never
+      // re-enter this window before entering the newly focused one).
+      if (!focused && this.hoveredChildId) {
+        try {
+          await this.request<{ consumed: boolean }>(
+            request(this.id, this.hoveredChildId, 'handleInput', {
+              type: 'mouseleave',
+            })
+          );
+        } catch {
+          // Widget gone
+        }
+        this.hoveredChildId = undefined;
+      }
+
       this.scheduleFrame();
     });
 
@@ -639,6 +656,37 @@ method calls on 'abjects:widgets' interface:
       await this.handleWheel(inputEvent);
     } else if (inputEvent.type === 'paste') {
       await this.handlePaste(inputEvent.pasteText ?? '');
+    } else if (inputEvent.type === 'mouseleave') {
+      await this.handleMouseLeave();
+    }
+  }
+
+  private async handleMouseLeave(): Promise<void> {
+    // Send mouseleave to hovered child
+    if (this.hoveredChildId) {
+      try {
+        await this.request<{ consumed: boolean }>(
+          request(this.id, this.hoveredChildId, 'handleInput', {
+            type: 'mouseleave',
+          })
+        );
+      } catch {
+        // Widget gone
+      }
+      this.hoveredChildId = undefined;
+    }
+    // Send mouseleave to focused layout child (stops drag-selection forwarding)
+    if (this.focusedParentChildId) {
+      try {
+        await this.request<{ consumed: boolean }>(
+          request(this.id, this.focusedParentChildId, 'handleInput', {
+            type: 'mouseleave',
+          })
+        );
+      } catch {
+        // Widget gone
+      }
+      this.focusedParentChildId = undefined;
     }
   }
 

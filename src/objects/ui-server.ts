@@ -24,7 +24,7 @@ const UI_INTERFACE: InterfaceId = 'abjects:ui';
 const WIDGET_FONT = '14px system-ui';
 
 export interface InputEvent {
-  type: 'mousedown' | 'mouseup' | 'mousemove' | 'keydown' | 'keyup' | 'wheel' | 'paste';
+  type: 'mousedown' | 'mouseup' | 'mousemove' | 'mouseleave' | 'keydown' | 'keyup' | 'wheel' | 'paste';
   surfaceId?: string;
   x?: number;
   y?: number;
@@ -52,6 +52,7 @@ export class UIServer extends Abject {
   private focusedSurface?: string;
   private grabbedSurface?: string;  // Mouse capture: routes events during drag
   private mouseGrabAbject?: AbjectId;  // WindowManager grabs mouse during drag
+  private lastHoveredSurfaceId?: string;  // Track surface under cursor for mouseleave synthesis
   private consoleId?: AbjectId;
   private windowManagerId?: AbjectId;
   private currentSelectedText = '';
@@ -937,6 +938,11 @@ Example handler with keyboard dispatch:
 
     // ── Normal mousemove / mouseup path ──
 
+    // Synthesize mouseleave based on actual hit surface (not grabbed surface)
+    if (type === 'mousemove') {
+      this.updateHoveredSurface(hitSurface?.id);
+    }
+
     const inputEvent: InputEvent = {
       type,
       surfaceId: surface?.id,
@@ -1102,6 +1108,24 @@ Example handler with keyboard dispatch:
   /**
    * Send input event to an object.
    */
+  /**
+   * Send mouseleave to the old surface owner when the cursor moves to a different surface.
+   */
+  private updateHoveredSurface(currentSurfaceId: string | undefined): void {
+    if (currentSurfaceId !== this.lastHoveredSurfaceId) {
+      if (this.lastHoveredSurfaceId) {
+        const oldOwner = this.surfaceOwners.get(this.lastHoveredSurfaceId);
+        if (oldOwner) {
+          this.sendInputEvent(oldOwner, {
+            type: 'mouseleave',
+            surfaceId: this.lastHoveredSurfaceId,
+          });
+        }
+      }
+      this.lastHoveredSurfaceId = currentSurfaceId;
+    }
+  }
+
   private async sendInputEvent(
     objectId: AbjectId,
     inputEvent: InputEvent

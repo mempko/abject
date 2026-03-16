@@ -23,10 +23,13 @@ const TOOLTIP_MAX_WIDTH = 300;
 const TOOLTIP_MAX_LINES = 5;
 const TOOLTIP_LINE_HEIGHT = 16; // 12px font + 4px leading
 const TOOLTIP_CHAR_WIDTH = 6.5; // approximate average for 12px Inter
+const TOOLTIP_AUTO_HIDE_MS = 3000;
 
 export class TooltipSurface {
   private timer?: ReturnType<typeof setTimeout>;
+  private autoHideTimer?: ReturnType<typeof setTimeout>;
   private surfaceId?: string;
+  private showGeneration = 0;  // Incremented on hide() to cancel in-flight showTooltip
   private uiServerId: AbjectId;
   private requester: TooltipRequester;
   private screenWidth: number;
@@ -55,7 +58,9 @@ export class TooltipSurface {
   }
 
   hide(): void {
+    this.showGeneration++;
     this.cancelTimer();
+    this.cancelAutoHide();
     this.destroySurface();
   }
 
@@ -63,11 +68,38 @@ export class TooltipSurface {
     this.hide();
   }
 
+  /** Await-able destroy for use before widget shutdown. */
+  async destroyAsync(): Promise<void> {
+    this.showGeneration++;
+    this.cancelTimer();
+    this.cancelAutoHide();
+    if (this.surfaceId) {
+      const sid = this.surfaceId;
+      this.surfaceId = undefined;
+      await this.requester<boolean>(this.uiServerId, 'destroySurface', { surfaceId: sid }).catch(() => {});
+    }
+  }
+
   private cancelTimer(): void {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
+  }
+
+  private cancelAutoHide(): void {
+    if (this.autoHideTimer) {
+      clearTimeout(this.autoHideTimer);
+      this.autoHideTimer = undefined;
+    }
+  }
+
+  private startAutoHide(): void {
+    this.cancelAutoHide();
+    this.autoHideTimer = setTimeout(() => {
+      this.autoHideTimer = undefined;
+      this.destroySurface();
+    }, TOOLTIP_AUTO_HIDE_MS);
   }
 
   private destroySurface(): void {
@@ -119,6 +151,7 @@ export class TooltipSurface {
   }
 
   private async showTooltip(text: string, screenX: number, screenY: number, theme: ThemeData): Promise<void> {
+    const gen = this.showGeneration;
     const { lines, width: surfaceW, height: surfaceH } = this.measureTooltip(text);
 
     // Position tooltip below cursor, clamped to screen
@@ -130,11 +163,18 @@ export class TooltipSurface {
     if (y < 0) y = 0;
 
     // Create surface with inputPassthrough so it doesn't steal events
-    this.surfaceId = await this.requester<string>(this.uiServerId, 'createSurface', {
+    const surfaceId = await this.requester<string>(this.uiServerId, 'createSurface', {
       rect: { x, y, width: surfaceW, height: surfaceH },
       zIndex: TOOLTIP_Z_INDEX,
       inputPassthrough: true,
     });
+
+    // If hide() was called while awaiting createSurface, destroy immediately
+    if (gen !== this.showGeneration) {
+      this.requester<boolean>(this.uiServerId, 'destroySurface', { surfaceId }).catch(() => {});
+      return;
+    }
+    this.surfaceId = surfaceId;
 
     // Draw tooltip background and text lines
     const commands: unknown[] = [
@@ -167,6 +207,10 @@ export class TooltipSurface {
     }
 
     await this.requester<boolean>(this.uiServerId, 'draw', { commands });
+
+    // Auto-hide after timeout as a safety net — the mouse may leave
+    // the window without triggering a mouseleave on the widget.
+    this.startAutoHide();
   }
 
 }

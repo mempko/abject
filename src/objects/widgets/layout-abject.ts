@@ -444,7 +444,7 @@ export abstract class LayoutAbject extends WidgetAbject {
   protected async processInput(input: Record<string, unknown>): Promise<{ consumed: boolean; focusWidgetId?: AbjectId }> {
     const inputType = input.type as string;
 
-    // Handle mouseleave by propagating to hovered child
+    // Handle mouseleave by propagating to hovered and focused children
     if (inputType === 'mouseleave') {
       if (this.hoveredLayoutChildId) {
         try {
@@ -457,6 +457,19 @@ export abstract class LayoutAbject extends WidgetAbject {
           // Widget gone
         }
         this.hoveredLayoutChildId = undefined;
+      }
+      // Clear focused child to stop drag-selection forwarding
+      if (this.focusedLayoutChildId) {
+        try {
+          await this.request<{ consumed: boolean }>(
+            request(this.id, this.focusedLayoutChildId, 'handleInput', {
+              type: 'mouseleave',
+            })
+          );
+        } catch {
+          // Widget gone
+        }
+        this.focusedLayoutChildId = undefined;
       }
       return { consumed: true };
     }
