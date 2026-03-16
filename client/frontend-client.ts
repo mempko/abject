@@ -40,6 +40,11 @@ export class FrontendClient {
   private loginFormHandler: ((e: Event) => void) | null = null;
   private pendingMouseMove: FrontendToBackendMsg | null = null;
   private mouseMoveRafId = 0;
+  private reconnectAttempt = 0;
+  // Stay at 200ms for many attempts to catch tsx --watch restarts quickly,
+  // then back off to 1s. ECONNREFUSED returns instantly on localhost so
+  // fast retries don't waste resources.
+  private static readonly RECONNECT_DELAYS = [100, 100, 200, 200, 200, 200, 200, 200, 200, 200, 500, 1000];
   /** Client-side drag state for zero-latency window moves */
   private localDragState?: {
     surfaceId: string;
@@ -71,9 +76,19 @@ export class FrontendClient {
     clog('WebSocket constructor returned');
     this.authenticated = false;
 
+    // Abort stuck TCP connections quickly — browser default timeout is ~5s
+    const connectTimeout = setTimeout(() => {
+      if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
+        clog('connect timeout (500ms), aborting');
+        this.ws.close();
+      }
+    }, 500);
+
     this.ws.onopen = () => {
+      clearTimeout(connectTimeout);
       clog('onopen fired');
       console.log('[Frontend] Connected to backend');
+      this.reconnectAttempt = 0;
       // Clear stale surfaces from any previous connection before replaying state
       this.compositor.clearAllSurfaces();
       this.focusedSurface = undefined;
@@ -106,16 +121,20 @@ export class FrontendClient {
     };
 
     this.ws.onclose = (ev) => {
+      clearTimeout(connectTimeout);
       clog(`onclose fired (code=${ev.code})`);
       console.log(`[Frontend] Disconnected from backend (code=${ev.code})`);
       this.ws = null;
       this.authenticated = false;
 
-      // Auto-reconnect after disconnect (auth change, server restart, etc.)
+      // Auto-reconnect with progressive delay (100ms → 200ms → 500ms → 1000ms)
+      const delays = FrontendClient.RECONNECT_DELAYS;
+      const delay = delays[Math.min(this.reconnectAttempt, delays.length - 1)];
+      this.reconnectAttempt++;
       setTimeout(() => {
-        console.log('[Frontend] Reconnecting...');
+        console.log(`[Frontend] Reconnecting (attempt ${this.reconnectAttempt}, delay ${delay}ms)...`);
         this.connect(url);
-      }, 1000);
+      }, delay);
     };
 
     this.ws.onerror = (err) => {

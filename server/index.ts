@@ -209,6 +209,113 @@ async function main(): Promise<void> {
     log.timed('BackendUI registered in Registry');
   }
 
+  // ── Start WS server early (right after BackendUI is ready) ──────────
+  // The frontend only talks to BackendUI, which is already initialized.
+  // Surfaces appear progressively as objects spawn during remaining bootstrap.
+  const authConfig = loadAuthConfig();
+  const sessionStore = new SessionStore();
+  if (backendUI) {
+    // Non-worker mode: BackendUI directly mutates the shared authConfig
+    backendUI.setAuthGate(authConfig, sessionStore);
+  }
+  if (DEDICATED_WORKERS) {
+    // Worker mode: intercept updateAuth messages going TO BackendUI so we
+    // update the main-thread authConfig used by the WS connection handler.
+    bus.addInterceptor({
+      async intercept(msg: AbjectMessage): Promise<'pass' | 'drop' | AbjectMessage> {
+        if (msg.routing.to === backendUIId && msg.routing.method === 'updateAuth') {
+          const { enabled, username, password } = msg.payload as {
+            enabled: boolean; username: string; password: string;
+          };
+          const changed = authConfig.enabled !== enabled
+            || authConfig.username !== username
+            || authConfig.password !== password;
+
+          authConfig.enabled = enabled;
+          authConfig.username = username;
+          authConfig.password = password;
+
+          if (changed) {
+            sessionStore.clearAll();
+            alog.info(`Auth config updated on main thread (enabled=${enabled})`);
+          }
+        }
+        return 'pass'; // always pass through — BackendUI still handles it
+      },
+    });
+  }
+
+  /**
+   * Connect an authenticated WebSocket to BackendUI.
+   * In worker mode: create MessageChannel, relay ws ↔ port, transfer port to UI worker.
+   * In non-worker mode: pass WebSocket directly to BackendUI.
+   */
+  function connectFrontend(ws: import('ws').WebSocket): void {
+    if (DEDICATED_WORKERS && uiBridge) {
+      // Worker mode: relay via MessageChannel
+      const { port1, port2 } = new MessageChannel();
+
+      // Relay: ws → port1 (to worker)
+      ws.on('message', (data: Buffer | string) => {
+        port1.postMessage(typeof data === 'string' ? data : data.toString());
+      });
+
+      // Relay: port1 (from worker) → ws
+      port1.on('message', (data: unknown) => {
+        if (ws.readyState === 1) {
+          ws.send(String(data));
+        }
+      });
+
+      // Clean up on close
+      ws.on('close', () => {
+        port1.close();
+      });
+      port1.on('close', () => {
+        if (ws.readyState === 1) {
+          ws.close();
+        }
+      });
+
+      // Transfer port2 to UI worker for BackendUI to use as transport
+      uiBridge.transferPort('ws-relay', port2);
+      alog.info('Frontend WebSocket relayed to UI worker via MessagePort');
+    } else if (backendUI) {
+      // Non-worker mode: direct WebSocket
+      backendUI.setWebSocket(ws);
+    }
+  }
+
+  const wsServer = new NodeWebSocketServer({
+    port: WS_PORT,
+    host: '127.0.0.1',
+    perMessageDeflate: false,
+  });
+
+  wsServer.onConnection((ws) => {
+    alog.info('Frontend connection received');
+    if (authConfig.enabled) {
+      alog.info('Frontend connected (auth required)');
+      authenticateConnection(ws, authConfig, sessionStore).then(({ result }) => {
+        if (result === 'authenticated') {
+          alog.info('Frontend authenticated');
+          connectFrontend(ws);
+        } else {
+          alog.info(`Frontend auth ${result}, closing`);
+          ws.close(1008, `Authentication ${result}`);
+        }
+      });
+    } else {
+      alog.info('Frontend connected');
+      ws.send(JSON.stringify({ type: 'authNotRequired' }));
+      connectFrontend(ws);
+    }
+  });
+
+  // Wait for the TCP port to actually be bound before proceeding
+  await wsServer.ready();
+  log.timed('WS server listening');
+
   // Register constructors with Factory
   runtime.objectFactory.registerConstructor('HttpClient', () => new HttpClient());
   runtime.objectFactory.registerConstructor('LLMObject', () => new LLMObject());
@@ -441,7 +548,7 @@ async function main(): Promise<void> {
     await new Promise<void>((resolve) => {
       p2pBridge!.onCustom('p2p-ready', () => resolve());
       // Also resolve on timeout to avoid blocking forever
-      setTimeout(resolve, 10000);
+      setTimeout(resolve, 2000);
     });
 
     log.timed('P2P worker ready');
@@ -487,41 +594,6 @@ async function main(): Promise<void> {
   }
 
   log.timed('P2P layer ready');
-  // Set up auth gate BEFORE GlobalSettings spawns, so applySavedAuthConfig()
-  // can update the authConfig during its onInit()
-  const authConfig = loadAuthConfig();
-  const sessionStore = new SessionStore();
-  if (backendUI) {
-    // Non-worker mode: BackendUI directly mutates the shared authConfig
-    backendUI.setAuthGate(authConfig, sessionStore);
-  }
-  if (DEDICATED_WORKERS) {
-    // Worker mode: intercept updateAuth messages going TO BackendUI so we
-    // update the main-thread authConfig used by the WS connection handler.
-    // Use a MessageInterceptor that passes the message through but taps it.
-    bus.addInterceptor({
-      async intercept(msg: AbjectMessage): Promise<'pass' | 'drop' | AbjectMessage> {
-        if (msg.routing.to === backendUIId && msg.routing.method === 'updateAuth') {
-          const { enabled, username, password } = msg.payload as {
-            enabled: boolean; username: string; password: string;
-          };
-          const changed = authConfig.enabled !== enabled
-            || authConfig.username !== username
-            || authConfig.password !== password;
-
-          authConfig.enabled = enabled;
-          authConfig.username = username;
-          authConfig.password = password;
-
-          if (changed) {
-            sessionStore.clearAll();
-            alog.info(`Auth config updated on main thread (enabled=${enabled})`);
-          }
-        }
-        return 'pass'; // always pass through — BackendUI still handles it
-      },
-    });
-  }
 
   const globalSettingsId = await supervisedSpawn('GlobalSettings', 'permanent', systemTypeId('GlobalSettings'));
   const peerNetworkId = await supervisedSpawn('PeerNetwork', 'permanent', systemTypeId('PeerNetwork'));
@@ -578,74 +650,6 @@ async function main(): Promise<void> {
   bus.removeReplyHandler(BOOTSTRAP_ID);
   bus.unregister(BOOTSTRAP_ID);
 
-  // Start WebSocket server
-  const wsServer = new NodeWebSocketServer({
-    port: WS_PORT,
-    host: '127.0.0.1',
-    perMessageDeflate: false,
-  });
-
-  /**
-   * Connect an authenticated WebSocket to BackendUI.
-   * In worker mode: create MessageChannel, relay ws ↔ port, transfer port to UI worker.
-   * In non-worker mode: pass WebSocket directly to BackendUI.
-   */
-  function connectFrontend(ws: import('ws').WebSocket): void {
-    if (DEDICATED_WORKERS && uiBridge) {
-      // Worker mode: relay via MessageChannel
-      const { port1, port2 } = new MessageChannel();
-
-      // Relay: ws → port1 (to worker)
-      ws.on('message', (data: Buffer | string) => {
-        port1.postMessage(typeof data === 'string' ? data : data.toString());
-      });
-
-      // Relay: port1 (from worker) → ws
-      port1.on('message', (data: unknown) => {
-        if (ws.readyState === 1) {
-          ws.send(String(data));
-        }
-      });
-
-      // Clean up on close
-      ws.on('close', () => {
-        port1.close();
-      });
-      port1.on('close', () => {
-        if (ws.readyState === 1) {
-          ws.close();
-        }
-      });
-
-      // Transfer port2 to UI worker for BackendUI to use as transport
-      uiBridge.transferPort('ws-relay', port2);
-      alog.info('Frontend WebSocket relayed to UI worker via MessagePort');
-    } else if (backendUI) {
-      // Non-worker mode: direct WebSocket
-      backendUI.setWebSocket(ws);
-    }
-  }
-
-  wsServer.onConnection((ws) => {
-    alog.info('Frontend connection received');
-    if (authConfig.enabled) {
-      alog.info('Frontend connected (auth required)');
-      authenticateConnection(ws, authConfig, sessionStore).then(({ result }) => {
-        if (result === 'authenticated') {
-          alog.info('Frontend authenticated');
-          connectFrontend(ws);
-        } else {
-          alog.info(`Frontend auth ${result}, closing`);
-          ws.close(1008, `Authentication ${result}`);
-        }
-      });
-    } else {
-      alog.info('Frontend connected');
-      ws.send(JSON.stringify({ type: 'authNotRequired' }));
-      connectFrontend(ws);
-    }
-  });
-
   log.summary('server ready');
   console.log('');
   console.log(`  ABJECTS server running`);
@@ -655,7 +659,6 @@ async function main(): Promise<void> {
   console.log(`  Workers:    ${DEDICATED_WORKERS ? 'UI + P2P dedicated' : 'disabled'}`);
   console.log(`  Objects:    ${runtime.objectRegistry.objectCount}`);
   console.log('');
-  console.log(`  Waiting for frontend connection...`);
 
   // Handle graceful shutdown
   const shutdown = async () => {

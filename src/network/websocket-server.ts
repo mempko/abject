@@ -16,6 +16,7 @@ export interface WsServerConfig {
 export class NodeWebSocketServer {
   private wss: WsServer;
   private connections: Set<WebSocket> = new Set();
+  private _ready: Promise<void>;
 
   constructor(config: WsServerConfig) {
     this.wss = new WsServer({
@@ -24,10 +25,14 @@ export class NodeWebSocketServer {
       perMessageDeflate: config.perMessageDeflate ?? false,
     });
 
-    this.wss.on('listening', () => {
-      const addr = this.wss.address();
-      const addrStr = typeof addr === 'object' && addr ? `${addr.address}:${addr.port}` : String(addr);
-      console.log(`[WS-SERVER] listening on ${addrStr} (T+${Math.round(performance.now())}ms)`);
+    this._ready = new Promise<void>((resolve, reject) => {
+      this.wss.once('listening', () => {
+        const addr = this.wss.address();
+        const addrStr = typeof addr === 'object' && addr ? `${addr.address}:${addr.port}` : String(addr);
+        console.log(`[WS-SERVER] listening on ${addrStr} (T+${Math.round(performance.now())}ms)`);
+        resolve();
+      });
+      this.wss.once('error', reject);
     });
 
     this.wss.on('error', (err) => {
@@ -40,6 +45,13 @@ export class NodeWebSocketServer {
         this.connections.delete(ws);
       });
     });
+  }
+
+  /**
+   * Wait for the server to be listening on its port.
+   */
+  ready(): Promise<void> {
+    return this._ready;
   }
 
   /**

@@ -928,8 +928,10 @@ export class PeerRegistry extends Abject {
       await client.connect(url);
       return true;
     } catch (err) {
-      log.error(`Failed to connect to signaling: ${url}`, err);
-      // Client is still in the map — persistent reconnect will retry
+      // Connection failures are expected (e.g. local signaling server not running).
+      // Persistent reconnect will retry in the background — log without stack trace.
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`Signaling unavailable: ${url} (${msg})`);
       return false;
     }
   }
