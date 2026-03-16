@@ -75,16 +75,25 @@ export class ButtonWidget extends WidgetAbject {
     });
     commands.push({ type: 'restore', surfaceId, params: {} });
 
+    // Truncate text with ellipsis if it exceeds button width (with padding)
+    const padding = 8;
+    const maxTextWidth = w - padding * 2;
+    const displayText = await this.truncateWithEllipsis(surfaceId, this.text, maxTextWidth, font);
+
+    const align = style.align ?? 'left';
+    const textX = align === 'center' ? ox + w / 2
+      : align === 'right' ? ox + w - padding
+      : ox + padding;
     commands.push({
       type: 'text',
       surfaceId,
       params: {
-        x: ox + w / 2,
+        x: textX,
         y: oy + h / 2,
-        text: this.text,
+        text: displayText,
         font,
         fill: style.color ?? this.theme.buttonText,
-        align: 'center',
+        align,
         baseline: 'middle',
       },
     });

@@ -234,14 +234,14 @@ export class WorkspaceSwitcher extends Abject {
     const workspaces = this.cachedWorkspaces;
     const hasWorkspaces = workspaces.length > 0;
 
-    const btnW = 100;
+    const btnW = 120;
     const btnH = 30;
     const labelH = 20;
     const padding = 16;
     const spacing = 6;
 
-    // Workspace section: label + all workspace buttons + "+" button + Browse button
-    const wsBtnCount = hasWorkspaces ? workspaces.length + 2 : 0; // +2 for "+" and "Browse"
+    // Workspace section: label + all workspace buttons + Browse button ("+" is in header row)
+    const wsBtnCount = hasWorkspaces ? workspaces.length + 1 : 0; // +1 for "Browse"
     const wsLabelCount = hasWorkspaces ? 1 : 0;
     const extraHeight = wsLabelCount * (labelH + spacing);
     const barWidth = btnW + padding * 2;
@@ -289,33 +289,36 @@ export class WorkspaceSwitcher extends Abject {
       }));
 
       // Batch create all widgets: header label, settings button, workspace buttons, +, Browse
-      const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
+      const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown>; tooltip?: string }> = [];
       // 0: header label
       specs.push({ type: 'label', windowId: this.windowId!, text: '\u25C8 Spaces', style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } });
-      // 1: settings gear button
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13 } });
-      // 2..N-1: workspace buttons
+      // 1: "+" button (in header row)
+      specs.push({ type: 'button', windowId: this.windowId!, text: '+', style: { fontSize: 13, align: 'center' }, tooltip: 'Create a new space' });
+      // 2: settings gear button
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13, align: 'center' }, tooltip: 'Space Settings' });
+      // 3..N+2: workspace buttons
       for (const ws of workspaces) {
         const isActive = ws.id === this.cachedActiveWorkspaceId;
         const accessIcon = ws.accessMode === 'public' ? '\uD83C\uDF0D' : ws.accessMode === 'private' ? '\uD83D\uDD11' : '\uD83D\uDD12';
-        specs.push({ type: 'button', windowId: this.windowId!, text: `${accessIcon} ${ws.name}`, ...(isActive ? { style: wsActiveStyle } : {}) });
+        const accessLabel = ws.accessMode === 'public' ? 'public' : ws.accessMode === 'private' ? 'private' : 'protected';
+        specs.push({ type: 'button', windowId: this.windowId!, text: `${accessIcon} ${ws.name}`, tooltip: `${ws.name} \u2014 ${accessLabel} space`, ...(isActive ? { style: wsActiveStyle } : {}) });
       }
-      // N: "+" button
-      specs.push({ type: 'button', windowId: this.windowId!, text: '+' });
-      // N+1: Browse button
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0E Browse' });
+      // Browse button
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0E Browse', tooltip: 'Browse \u2014 Discover and join remote spaces' });
 
       const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs })
       );
 
       const spacesHeaderLabelId = widgetIds[0];
-      this.settingsBtnId = widgetIds[1];
+      this.workspaceCreateBtnId = widgetIds[1];
+      this.settingsBtnId = widgetIds[2];
 
-      // Add header row children
+      // Add header row children: label + "+" + gear
       await this.request(request(this.id, spacesHeaderRowId, 'addLayoutChildren', {
         children: [
           { widgetId: spacesHeaderLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: labelH } },
+          { widgetId: this.workspaceCreateBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } },
           { widgetId: this.settingsBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } },
         ],
       }));
@@ -323,13 +326,10 @@ export class WorkspaceSwitcher extends Abject {
       // Map workspace buttons and build root layout children
       const rootChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize: Record<string, number> }> = [];
       for (let i = 0; i < workspaces.length; i++) {
-        const btnId = widgetIds[2 + i];
+        const btnId = widgetIds[3 + i];
         this.workspaceSwitchButtons.set(btnId, workspaces[i].id);
         rootChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
       }
-
-      this.workspaceCreateBtnId = widgetIds[2 + workspaces.length];
-      rootChildren.push({ widgetId: this.workspaceCreateBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
 
       this.browseBtnId = widgetIds[3 + workspaces.length];
       rootChildren.push({ widgetId: this.browseBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
@@ -340,11 +340,11 @@ export class WorkspaceSwitcher extends Abject {
       }));
 
       // Fire-and-forget: register as dependent for all interactive buttons
+      this.send(request(this.id, this.workspaceCreateBtnId, 'addDependent', {}));
       this.send(request(this.id, this.settingsBtnId, 'addDependent', {}));
       for (let i = 0; i < workspaces.length; i++) {
-        this.send(request(this.id, widgetIds[2 + i], 'addDependent', {}));
+        this.send(request(this.id, widgetIds[3 + i], 'addDependent', {}));
       }
-      this.send(request(this.id, this.workspaceCreateBtnId, 'addDependent', {}));
       this.send(request(this.id, this.browseBtnId, 'addDependent', {}));
 
     }

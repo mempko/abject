@@ -276,7 +276,7 @@ export class Taskbar extends Abject {
     // Add buttons for newly showable objects
     const existingTargets = new Set(this.userObjButtons.values());
 
-    const btnW = 100;
+    const btnW = 120;
     const btnH = 30;
     const activeStyle = { background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
 
@@ -295,12 +295,17 @@ export class Taskbar extends Abject {
       );
 
       // Batch create buttons
-      const specs = newObjects.map((obj, i) => ({
-        type: 'button' as const,
-        windowId: this.windowId!,
-        text: obj.manifest.name,
-        ...(visResults[i] ? { style: activeStyle } : {}),
-      }));
+      const specs = newObjects.map((obj, i) => {
+        const desc = obj.manifest.description;
+        const tooltipText = desc ? `${obj.manifest.name} \u2014 ${desc}` : obj.manifest.name;
+        return {
+          type: 'button' as const,
+          windowId: this.windowId!,
+          text: obj.manifest.name,
+          tooltip: tooltipText,
+          ...(visResults[i] ? { style: activeStyle } : {}),
+        };
+      });
 
       const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs })
@@ -386,7 +391,7 @@ export class Taskbar extends Abject {
     const labelH = 20;
     const padding = 16;
     const spacing = 6;
-    const btnW = 100;
+    const btnW = 120;
     const systemBtnCount = 2 + (this.webBrowserViewerId ? 1 : 0);
     const minimizedCount = this.minimizedWindows.size;
     const userBtnCount = this.userObjButtons.size;
@@ -436,7 +441,7 @@ export class Taskbar extends Abject {
 
     const showableObjects = await this.discoverShowableObjects();
 
-    const btnW = 100;
+    const btnW = 120;
     const btnH = 30;
     const labelH = 20;
     const padding = 16;
@@ -515,32 +520,35 @@ export class Taskbar extends Abject {
     log.info(`visibility: registry=${registryVis} chat=${chatVis} jobs=${jobsVis} browser=${browserViewerVis}`);
 
     // Batch create all widgets: header label, gear button, system buttons, user buttons, minimize section
-    const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
+    const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown>; tooltip?: string }> = [];
 
     // 0: Abjects header label
     specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A0 Abjects', style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } });
     // 1: Gear button
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13, ...(registryVis ? activeStyle : {}) } });
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13, ...(registryVis ? activeStyle : {}) }, tooltip: 'App Explorer' });
     // 2: Chat button
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCAC Chat', ...(chatVis ? { style: activeStyle } : {}) });
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCAC Chat', tooltip: 'Chat \u2014 Talk to the LLM assistant', ...(chatVis ? { style: activeStyle } : {}) });
     // 3: Jobs button
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCCB Jobs', ...(jobsVis ? { style: activeStyle } : {}) });
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCCB Jobs', tooltip: 'Jobs \u2014 View running tasks', ...(jobsVis ? { style: activeStyle } : {}) });
     // 4?: Browser button (optional)
     if (this.webBrowserViewerId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Web', ...(browserViewerVis ? { style: activeStyle } : {}) });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Web', tooltip: 'Web View \u2014 Displays pages loaded by the web agent', ...(browserViewerVis ? { style: activeStyle } : {}) });
     }
     // User object buttons
     const userObjStartIdx = specs.length;
     for (let i = 0; i < showableObjects.length; i++) {
       const vis = showableVisResults[i];
-      specs.push({ type: 'button', windowId: this.windowId!, text: showableObjects[i].manifest.name, ...(vis ? { style: activeStyle } : {}) });
+      const obj = showableObjects[i];
+      const desc = obj.manifest.description;
+      const tooltipText = desc ? `${obj.manifest.name} \u2014 ${desc}` : obj.manifest.name;
+      specs.push({ type: 'button', windowId: this.windowId!, text: obj.manifest.name, tooltip: tooltipText, ...(vis ? { style: activeStyle } : {}) });
     }
     // Minimized window section
     const minimizedStartIdx = specs.length;
     if (minimizedCount > 0) {
       specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A1 Windows', style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } });
       for (const [, { title }] of this.minimizedWindows) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: title });
+        specs.push({ type: 'button', windowId: this.windowId!, text: title, tooltip: title });
       }
     }
 

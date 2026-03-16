@@ -733,12 +733,16 @@ method calls on 'abjects:widgets' interface:
     const cx = e.x ?? 0;
     const cy = (e.y ?? 0) - (this.chromeless ? 0 : TITLE_BAR_HEIGHT);
 
+    // Compute global coordinates for tooltip positioning
+    const globalX = this.rect.x + (e.x ?? 0);
+    const globalY = this.rect.y + (e.y ?? 0);
+
     // Forward mousemove to expanded selects for hover
     for (const childId of this.expandedSelects) {
       try {
         await this.request<{ consumed: boolean }>(
           request(this.id, childId, 'handleInput', {
-            type: 'mousemove', x: cx, y: cy,
+            type: 'mousemove', x: cx, y: cy, globalX, globalY,
           })
         );
       } catch {
@@ -780,7 +784,7 @@ method calls on 'abjects:widgets' interface:
         try {
           await this.request<{ consumed: boolean }>(
             request(this.id, hitChildId, 'handleInput', {
-              type: 'mousemove', x: cx, y: cy,
+              type: 'mousemove', x: cx, y: cy, globalX, globalY,
             })
           );
         } catch {
@@ -792,7 +796,7 @@ method calls on 'abjects:widgets' interface:
       try {
         await this.request<{ consumed: boolean }>(
           request(this.id, hitChildId, 'handleInput', {
-            type: 'mousemove', x: cx, y: cy,
+            type: 'mousemove', x: cx, y: cy, globalX, globalY,
           })
         );
       } catch {
@@ -806,7 +810,7 @@ method calls on 'abjects:widgets' interface:
       try {
         await this.request<{ consumed: boolean }>(
           request(this.id, this.focusedParentChildId, 'handleInput', {
-            type: 'mousemove', x: cx, y: cy,
+            type: 'mousemove', x: cx, y: cy, globalX, globalY,
           })
         );
       } catch {
