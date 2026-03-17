@@ -15,6 +15,25 @@ export class VBoxLayout extends LayoutAbject {
     super(config, 'vbox');
   }
 
+  protected override computePreferredHeight(): number {
+    const children = this.layoutChildren.filter(c => {
+      if (isSpacer(c)) return false;
+      return !this.hiddenChildren.has(c.widgetId);
+    });
+    if (children.length === 0) return this.margins.top + this.margins.bottom;
+
+    let total = 0;
+    for (const child of children) {
+      if (isSpacer(child)) continue;
+      total += child.preferredSize?.height ?? 0;
+    }
+    // Add spacing between children
+    if (children.length > 1) {
+      total += (children.length - 1) * this.spacing;
+    }
+    return total + this.margins.top + this.margins.bottom;
+  }
+
   protected calculateChildRects(contentRect: Rect): ChildRect[] {
     const children = this.layoutChildren.filter(c => {
       if (isSpacer(c)) return true;

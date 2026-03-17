@@ -2208,6 +2208,119 @@ async getState(msg) {
 })
 \`\`\`
 
+### Content Display App (Phase 2 — content-rich UI with scrollable items)
+
+Dependencies: WidgetManager
+
+\`\`\`javascript
+({
+  _windowId: null,
+  _scrollAreaId: null,
+
+  async init() {
+    const wm = this.dep('WidgetManager');
+
+    // Create window with createWindowAbject (rect-based API)
+    this._windowId = await this.call(wm, 'createWindowAbject', {
+      title: 'News Feed', rect: { x: 100, y: 80, width: 520, height: 480 }
+    });
+
+    // Root vertical layout
+    const rootLayout = await this.call(wm, 'createVBox', {
+      windowId: this._windowId,
+      margins: { top: 16, right: 16, bottom: 16, left: 16 },
+      spacing: 8
+    });
+
+    // Header row (HBox with title + status)
+    const headerRow = await this.call(wm, 'createNestedHBox', {
+      parentLayoutId: rootLayout, spacing: 8
+    });
+    // Override header to fixed height
+    await this.call(rootLayout, 'updateLayoutChild', {
+      widgetId: headerRow, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 28 }
+    });
+    const { widgetIds: [titleLabel, statusLabel] } = await this.call(wm, 'create', {
+      specs: [
+        { type: 'label', windowId: this._windowId, text: 'Latest News',
+          style: { fontSize: 18, fontWeight: 'bold' } },
+        { type: 'label', windowId: this._windowId, text: 'Updated just now',
+          style: { fontSize: 12, color: '#8a8a9e' } },
+      ]
+    });
+    await this.call(headerRow, 'addLayoutChildren', {
+      children: [
+        { widgetId: titleLabel, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 28 } },
+        { widgetId: statusLabel, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 130, height: 28 } },
+      ]
+    });
+
+    // Divider below header
+    const { widgetIds: [divider] } = await this.call(wm, 'create', {
+      specs: [{ type: 'divider', windowId: this._windowId }]
+    });
+    await this.call(rootLayout, 'addLayoutChild', {
+      widgetId: divider, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 1 }
+    });
+
+    // Scrollable content area (auto-added to rootLayout with expanding policy)
+    this._scrollAreaId = await this.call(wm, 'createNestedScrollableVBox', {
+      parentLayoutId: rootLayout, spacing: 4
+    });
+
+    await this._loadItems();
+  },
+
+  async _loadItems() {
+    const wm = this.dep('WidgetManager');
+    const items = [
+      { title: 'Breaking: New Discovery', date: 'March 15, 2026',
+        summary: 'Scientists have announced a breakthrough in quantum computing that could revolutionize data processing.' },
+      { title: 'Tech Update', date: 'March 14, 2026',
+        summary: 'Major software companies release coordinated security patches addressing critical vulnerabilities.' },
+      { title: 'Weather Alert', date: 'March 14, 2026',
+        summary: 'Severe weather expected across the eastern seaboard this weekend with heavy rainfall and strong winds.' },
+    ];
+
+    // Flat layout approach: add all widgets directly into the scroll area
+    for (let i = 0; i < items.length; i++) {
+      if (i > 0) {
+        const { widgetIds: [sep] } = await this.call(wm, 'create', {
+          specs: [{ type: 'divider', windowId: this._windowId }]
+        });
+        await this.call(this._scrollAreaId, 'addLayoutChild', {
+          widgetId: sep, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 1 }
+        });
+      }
+      // Create card as a nested VBox
+      const cardBox = await this.call(wm, 'createNestedVBox', {
+        parentLayoutId: this._scrollAreaId, autoSize: true, spacing: 4,
+        margins: { top: 4, right: 0, bottom: 4, left: 0 }
+      });
+      const { widgetIds: [titleLbl, dateLbl, summaryLbl] } = await this.call(wm, 'create', {
+        specs: [
+          { type: 'label', windowId: this._windowId, text: items[i].title,
+            style: { fontSize: 15, fontWeight: 'bold' } },
+          { type: 'label', windowId: this._windowId, text: items[i].date,
+            style: { fontSize: 12, color: '#8a8a9e' } },
+          { type: 'label', windowId: this._windowId, text: items[i].summary,
+            style: { fontSize: 13 }, wordWrap: true },
+        ]
+      });
+      await this.call(cardBox, 'addLayoutChildren', {
+        children: [
+          { widgetId: titleLbl, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 22 } },
+          { widgetId: dateLbl, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 18 } },
+          { widgetId: summaryLbl, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 54 } },
+        ]
+      });
+    }
+  },
+
+  async changed(msg) {}
+})
+\`\`\`
+
 ## Tool Selection for Web Access
 - **HttpClient + WebParser**: Default choice for reading web content. Use HttpClient.get() to fetch HTML/RSS/JSON, then WebParser to extract data. Fast and reliable.
   Example: fetch RSS feed → parse <item> tags → display headlines. Fetch HTML page → WebParser.querySelector to extract article text.

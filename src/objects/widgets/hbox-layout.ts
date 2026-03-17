@@ -15,6 +15,21 @@ export class HBoxLayout extends LayoutAbject {
     super(config, 'hbox');
   }
 
+  protected override computePreferredHeight(): number {
+    const children = this.layoutChildren.filter(c => {
+      if (isSpacer(c)) return false;
+      return !this.hiddenChildren.has(c.widgetId);
+    });
+    if (children.length === 0) return this.margins.top + this.margins.bottom;
+
+    let maxHeight = 0;
+    for (const child of children) {
+      if (isSpacer(child)) continue;
+      maxHeight = Math.max(maxHeight, child.preferredSize?.height ?? 0);
+    }
+    return maxHeight + this.margins.top + this.margins.bottom;
+  }
+
   protected calculateChildRects(contentRect: Rect): ChildRect[] {
     const children = this.layoutChildren.filter(c => {
       if (isSpacer(c)) return true;

@@ -670,7 +670,12 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
 
       return { observation };
     } catch (err) {
-      return { observation: `Observation error: ${err instanceof Error ? err.message : String(err)}` };
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('Unknown page handle')) {
+        extra.pageId = undefined;
+        throw new Error(`Page lost: ${msg}`);
+      }
+      return { observation: `Observation error: ${msg}` };
     }
   }
 
@@ -766,7 +771,12 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
           return { success: false, error: `Unknown action: ${action.action}` };
       }
     } catch (err) {
-      return { success: false, error: err instanceof Error ? err.message : String(err) };
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('Unknown page handle')) {
+        extra.pageId = undefined;
+        throw new Error(`Page lost: ${msg}`);
+      }
+      return { success: false, error: msg };
     }
   }
 
@@ -776,6 +786,8 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
 
   private buildSystemPrompt(taskText: string): string {
     return `You are WebAgent, an autonomous browser agent with vision. You receive a screenshot of the current page alongside text observations. Use the visual information to understand page layout, identify elements, and verify your actions succeeded. You complete web tasks by observing the page state, thinking about what to do, and taking actions.
+
+You have a limited number of steps. Be efficient — extract what you can quickly and use "done" rather than perfecting the result.
 
 ## Task
 ${taskText}
@@ -806,11 +818,21 @@ Respond with ONE action as a JSON object in a \`\`\`json code block:
 - wait: Wait for an element. { "action": "wait", "selector": "CSS selector", "timeout": 5000 }
 
 ### Extraction
-- extract: Run JavaScript on the page. { "action": "extract", "script": "return document.title" }
+- extract: Run JavaScript in the page context. The script is evaluated as an expression.
+  Simple: { "action": "extract", "script": "document.title" }
+  Complex: { "action": "extract", "script": "(() => { const items = []; document.querySelectorAll('h2 a').forEach(a => items.push({title: a.textContent.trim(), url: a.href})); return items.slice(0, 10); })()" }
+  IMPORTANT: For multi-statement scripts, wrap in an IIFE: (() => { ...code...; return result; })()
 
 ### Terminal
 - done: Task complete. { "action": "done", "result": "extracted data or summary" }
 - fail: Cannot complete. { "action": "fail", "reason": "why it cannot be done" }
+
+## Extraction Tips
+- Start simple: extract document.body.innerText first, then parse the text.
+- Use broad selectors: 'h1, h2, h3' or 'article' rather than site-specific class names.
+- For news headlines: 'h2 a, h3 a, [class*="headline"] a, article a' catches most sites.
+- Keep scripts under 500 chars — shorter scripts have fewer bugs.
+- Always use an IIFE for multi-statement scripts: (() => { ... return result; })()
 
 ## Rules
 1. Use CSS selectors from the observation. Prefer #id selectors when available.
@@ -819,7 +841,10 @@ Respond with ONE action as a JSON object in a \`\`\`json code block:
 4. If a page is loading or elements aren't visible yet, use "wait".
 5. When the task is complete, use "done" with the result.
 6. If stuck after several attempts, use "fail" with a clear reason.
-7. Keep reasoning brief (1-2 sentences).`;
+7. If an extract script fails, try a simpler approach (e.g., just get document.title or document.body.innerText).
+8. If a page returns an error or is blocked by bot detection, use "fail" with a clear reason instead of retrying the same page.
+9. Do not retry the same action more than twice. If it fails twice, try a different approach or fail.
+10. Keep reasoning brief (1-2 sentences).`;
   }
 }
 

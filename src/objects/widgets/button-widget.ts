@@ -80,7 +80,7 @@ export class ButtonWidget extends WidgetAbject {
     const maxTextWidth = w - padding * 2;
     const displayText = await this.truncateWithEllipsis(surfaceId, this.text, maxTextWidth, font);
 
-    const align = style.align ?? 'left';
+    const align = style.align ?? 'center';
     const textX = align === 'center' ? ox + w / 2
       : align === 'right' ? ox + w - padding
       : ox + padding;

@@ -1005,7 +1005,11 @@ export class WebBrowser extends Abject {
     // -- evaluate --
     this.deferredPageHandler('evaluate', async (tracked, payload) => {
       const t0 = Date.now();
-      const result = await tracked.page.evaluate(payload.script as string);
+      const script = (payload.script as string).trim();
+      const safeScript = /\breturn\b/.test(script)
+        ? `(function(){ ${script} })()`
+        : script;
+      const result = await tracked.page.evaluate(safeScript);
       log.info(`evaluate (${payload.pageId}) [${Date.now() - t0}ms]`);
       return { result };
     });

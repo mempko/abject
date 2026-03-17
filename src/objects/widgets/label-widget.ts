@@ -225,7 +225,7 @@ export class LabelWidget extends WidgetAbject {
     }
 
     const align = style.align ?? 'left';
-    const fill = style.color ?? this.theme.textTertiary;
+    const fill = style.color ?? this.theme.textPrimary;
     const sel = this.style.selectable ? this.getSelection() : null;
 
     if (style.wordWrap && w > 0) {

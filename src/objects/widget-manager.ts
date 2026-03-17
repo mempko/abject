@@ -152,9 +152,10 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'createNestedVBox',
-                description: 'Create a nested vertical box layout inside a parent layout. Returns the layout AbjectId.',
+                description: 'Create a nested vertical box layout inside a parent layout. Returns the layout AbjectId. Pass autoSize: true when inside a ScrollableVBox so it auto-computes its preferred height from children.',
                 parameters: [
                   { name: 'parentLayoutId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent layout AbjectId' },
+                  { name: 'autoSize', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Auto-compute preferred height from children (use inside ScrollableVBox)', optional: true },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
                 ],
@@ -162,9 +163,10 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'createNestedHBox',
-                description: 'Create a nested horizontal box layout inside a parent layout. Returns the layout AbjectId.',
+                description: 'Create a nested horizontal box layout inside a parent layout. Returns the layout AbjectId. Pass autoSize: true when inside a ScrollableVBox so it auto-computes its preferred height from children.',
                 parameters: [
                   { name: 'parentLayoutId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent layout AbjectId' },
+                  { name: 'autoSize', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Auto-compute preferred height from children (use inside ScrollableVBox)', optional: true },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
                 ],
@@ -471,6 +473,7 @@ export class WidgetManager extends Abject {
     this.on('createNestedVBox', async (msg: AbjectMessage) => {
       const payload = msg.payload as {
         parentLayoutId: AbjectId;
+        autoSize?: boolean;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
       };
@@ -479,12 +482,13 @@ export class WidgetManager extends Abject {
         uiServerId: this.uiServerId!,
         margins: payload.margins,
         spacing: payload.spacing,
-      }));
+      }), payload.autoSize);
     });
 
     this.on('createNestedHBox', async (msg: AbjectMessage) => {
       const payload = msg.payload as {
         parentLayoutId: AbjectId;
+        autoSize?: boolean;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
       };
@@ -493,7 +497,7 @@ export class WidgetManager extends Abject {
         uiServerId: this.uiServerId!,
         margins: payload.margins,
         spacing: payload.spacing,
-      }));
+      }), payload.autoSize);
     });
 
     this.on('createScrollableVBox', async (msg: AbjectMessage) => {
@@ -513,6 +517,7 @@ export class WidgetManager extends Abject {
     this.on('createNestedScrollableVBox', async (msg: AbjectMessage) => {
       const payload = msg.payload as {
         parentLayoutId: AbjectId;
+        autoSize?: boolean;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
       };
@@ -521,7 +526,7 @@ export class WidgetManager extends Abject {
         uiServerId: this.uiServerId!,
         margins: payload.margins,
         spacing: payload.spacing,
-      }));
+      }), payload.autoSize);
     });
 
     // ── Canvas widget factory ──
@@ -1005,8 +1010,8 @@ await this.call(btnId, 'update', { style: { disabled: false } });
 
 createVBox - Vertical stack layout
 createHBox - Horizontal row layout
-createNestedVBox - Nested vertical layout inside another layout
-createNestedHBox - Nested horizontal layout inside another layout
+createNestedVBox - Nested vertical layout inside another layout. Pass autoSize: true for auto-computed preferred height (use inside ScrollableVBox for card items).
+createNestedHBox - Nested horizontal layout inside another layout. Pass autoSize: true for auto-computed preferred height.
 createScrollableVBox - Scrollable vertical stack layout (clips overflow, scrolls via mouse wheel)
 createNestedScrollableVBox - Nested scrollable vertical layout inside another layout
 
@@ -1213,6 +1218,47 @@ await this.call(timerId, 'addDependent', {});
 
 // Stop animation:
 // await this.call(timerId, 'clearInterval', { intervalId });
+
+### UI Design Best Practices
+
+**Window Sizing** — Match window size to content complexity:
+- Simple dialogs/forms: 350×250
+- Content apps (readers, lists): 500×450 or larger
+- Dashboards/multi-panel: 600×500 or larger
+
+**Typography Hierarchy** — Create visual hierarchy with font size and weight:
+- Headings: 16–18px, bold
+- Body text: 14px, normal weight
+- Metadata/secondary info: 12px, color '#8a8a9e'
+- Use bold sparingly for emphasis within body text
+
+**Spacing** — Consistent spacing creates a polished look:
+- Root container margins: 16px on all sides
+- Standard spacing between elements: 8px
+- Tight spacing (related items): 4px
+- Loose spacing (section breaks): 12px
+
+**Content Lists / Card Patterns** — For apps that display collections of items:
+- Use a ScrollableVBox (grow: 1) as the main content area
+- Each item is a VBox with: bold 15px title, 12px secondary-color date, 13px word-wrapped summary
+- Add a Divider between items for visual separation
+- Add a header row (HBox) with a bold title and a right-aligned status label in secondary color
+
+**Word-Wrapped Labels** — Labels with wordWrap: true need height estimates:
+- Use sizePolicy: { vertical: 'fixed' } and estimate height (~18px per line at fontSize 14)
+- Rough formula: lines = ceil(textLength * fontSize * 0.55 / containerWidth), height = lines * (fontSize + 4)
+- When in doubt, over-estimate slightly — extra whitespace is better than clipped text
+
+**Nested Layouts in ScrollableVBox** — Use autoSize: true for nested layouts inside a ScrollableVBox:
+- Pass autoSize: true when creating nested VBox/HBox inside a ScrollableVBox (e.g. card items)
+- The nested layout auto-computes its preferred height from children and reports it to the parent
+- Just ensure inner widgets have proper preferredSize set (especially height for labels)
+- Do NOT use autoSize for layouts that should fill available space (expanding policy)
+
+**Flat vs Nested Layouts** — Choose the simplest structure:
+- For simple card lists, prefer flat layout: all widgets directly in the scroll box with dividers
+- Use nested VBox only when you need a group of related items with different spacing/margins
+- Deeply nested structures add overhead — keep nesting to 2 levels max when possible
 
 `;
   }
@@ -1455,9 +1501,18 @@ await this.call(timerId, 'addDependent', {});
 
   private async createNestedLayout(
     parentLayoutId: AbjectId,
-    layout: LayoutAbject
+    layout: LayoutAbject,
+    autoSize?: boolean,
   ): Promise<AbjectId> {
     require(this.uiServerId !== undefined, 'UIServer not set');
+
+    // When autoSize is enabled, the nested layout will auto-compute its
+    // preferred height from children and report it to the parent. This
+    // switches the child's sizePolicy to 'preferred' so the parent
+    // allocates the exact height needed (essential inside ScrollableVBox).
+    if (autoSize) {
+      layout.setParentLayoutId(parentLayoutId);
+    }
 
     await layout.init(this.bus, this.id);
     this.spawnedWidgets.add(layout.id);

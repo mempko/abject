@@ -120,6 +120,7 @@ export abstract class LayoutAbject extends WidgetAbject {
   protected expandedChildren: Set<AbjectId> = new Set();
   protected hiddenChildren: Set<AbjectId> = new Set();
   private layoutDirty = false;
+  protected parentLayoutId: AbjectId | null = null;
 
   constructor(config: LayoutConfig, layoutType: 'vbox' | 'hbox') {
     super({
@@ -212,6 +213,7 @@ export abstract class LayoutAbject extends WidgetAbject {
       );
       this.layoutDirty = true;
       this.scheduleRelayout();
+      this.notifyParentOfSizeChange().catch(() => {});
       return true;
     });
 
@@ -267,6 +269,7 @@ export abstract class LayoutAbject extends WidgetAbject {
       }
       this.layoutDirty = true;
       this.scheduleRelayout();
+      this.notifyParentOfSizeChange().catch(() => {});
       return true;
     });
 
@@ -286,6 +289,7 @@ export abstract class LayoutAbject extends WidgetAbject {
       this.hiddenChildren.delete(widgetId);
       this.layoutDirty = true;
       this.scheduleRelayout();
+      this.notifyParentOfSizeChange().catch(() => {});
       return true;
     });
 
@@ -297,6 +301,7 @@ export abstract class LayoutAbject extends WidgetAbject {
       this.hiddenChildren.clear();
       this.layoutDirty = true;
       this.scheduleRelayout();
+      this.notifyParentOfSizeChange().catch(() => {});
       return true;
     });
 
@@ -674,6 +679,45 @@ export abstract class LayoutAbject extends WidgetAbject {
         // Widget may have been destroyed
       }
     }));
+  }
+
+  /**
+   * Set the parent layout ID so this nested layout can notify the parent
+   * when its computed preferred height changes.
+   */
+  setParentLayoutId(parentId: AbjectId): void {
+    this.parentLayoutId = parentId;
+  }
+
+  /**
+   * Compute the total preferred height of this layout from its children.
+   * Subclasses override this for their specific layout direction.
+   * Returns the sum of children heights + spacing + margins (for VBox)
+   * or the max child height + margins (for HBox).
+   */
+  protected computePreferredHeight(): number {
+    return this.margins.top + this.margins.bottom;
+  }
+
+  /**
+   * Notify the parent layout that this nested layout's preferred height
+   * has changed, so the parent can re-lay-out correctly.
+   */
+  protected async notifyParentOfSizeChange(): Promise<void> {
+    if (!this.parentLayoutId) return;
+    const height = this.computePreferredHeight();
+    if (height <= 0) return;
+    try {
+      await this.request(
+        request(this.id, this.parentLayoutId, 'updateLayoutChild', {
+          widgetId: this.id,
+          preferredSize: { height },
+          sizePolicy: { vertical: 'preferred' },
+        })
+      );
+    } catch {
+      // Parent may have been destroyed
+    }
   }
 
   /**
