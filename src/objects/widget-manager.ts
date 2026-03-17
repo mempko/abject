@@ -428,7 +428,6 @@ export class WidgetManager extends Abject {
           items?: ListItem[];
           searchable?: boolean;
           itemHeight?: number;
-          tooltip?: string;
         }>;
       };
       const widgetIds: AbjectId[] = [];
@@ -976,11 +975,6 @@ All widgets accept a \`style\` object with these optional properties:
 - disabled — when true, widget renders at 50% opacity and ignores all input (except textInput/textArea which still allow text selection and copy)
 - visible — when false, widget renders nothing and ignores input (default: true)
 
-### Tooltips
-
-Any widget spec can include \`tooltip: 'text'\` to show a hover tooltip after 500ms.
-Example: { type: 'button', windowId: winId, text: 'Save', tooltip: 'Save the current document' }
-
 ### Disabling Widgets During Async Operations
 
 // Disable a button while an operation is in progress:
@@ -1505,11 +1499,10 @@ await this.call(timerId, 'addDependent', {});
     items?: ListItem[];
     searchable?: boolean;
     itemHeight?: number;
-    tooltip?: string;
   }): Promise<AbjectId> {
     const rect = spec.rect ?? { x: 0, y: 0, width: 0, height: 0 };
     const theme = this.getThemeForWindow(spec.windowId);
-    const base = { ownerId: spec.windowId, uiServerId: this.uiServerId!, theme, tooltip: spec.tooltip };
+    const base = { ownerId: spec.windowId, uiServerId: this.uiServerId!, theme };
 
     switch (spec.type) {
       case 'label':

@@ -22,7 +22,7 @@ import {
   WIDGET_INTERFACE,
   WIDGET_FONT,
 } from './widget-types.js';
-import { TooltipSurface } from './tooltip-surface.js';
+
 
 
 /**
@@ -99,7 +99,6 @@ export interface WidgetConfig {
   ownerId: AbjectId;
   uiServerId: AbjectId;
   theme?: ThemeData;
-  tooltip?: string;
 }
 
 /**
@@ -116,8 +115,7 @@ export abstract class WidgetAbject extends Abject {
   protected visible = true;
   protected widgetType: WidgetType;
   protected override theme: ThemeData;
-  protected tooltip: string | undefined;
-  private tooltipSurface?: TooltipSurface;
+
 
   constructor(config: WidgetConfig) {
     super({
@@ -139,7 +137,6 @@ export abstract class WidgetAbject extends Abject {
     this.ownerId = config.ownerId;
     this.uiServerId = config.uiServerId;
     this.theme = config.theme ?? MIDNIGHT_BLOOM;
-    this.tooltip = config.tooltip;
     this.syncDisabledVisible();
 
     this.setupWidgetHandlers();
@@ -180,25 +177,6 @@ export abstract class WidgetAbject extends Abject {
       if (this.disabled && !this.acceptsInputWhenDisabled()) return { consumed: false };
       const input = msg.payload as Record<string, unknown>;
 
-      // Tooltip handling — before delegating to subclass
-      if (this.tooltip) {
-        if (input.type === 'mousemove' && input.globalX !== undefined) {
-          this.ensureTooltipSurface();
-          this.tooltipSurface!.scheduleShow(
-            this.tooltip,
-            input.globalX as number,
-            input.globalY as number,
-            this.theme,
-          );
-        }
-        if (input.type === 'mouseleave') {
-          this.tooltipSurface?.hide();
-        }
-        if (input.type === 'mousedown') {
-          this.tooltipSurface?.hide();
-        }
-      }
-
       return this.processInput(input);
     });
 
@@ -209,9 +187,6 @@ export abstract class WidgetAbject extends Abject {
     });
 
     this.on('destroy', async () => {
-      if (this.tooltipSurface) {
-        await this.tooltipSurface.destroyAsync();
-      }
       await this.stop();
       return true;
     });
@@ -235,7 +210,6 @@ export abstract class WidgetAbject extends Abject {
     // Support top-level visible/disabled as shorthand for style.visible/style.disabled
     if (updates.visible !== undefined) this.style = { ...this.style, visible: updates.visible as boolean };
     if (updates.disabled !== undefined) this.style = { ...this.style, disabled: updates.disabled as boolean };
-    if (updates.tooltip !== undefined) this.tooltip = updates.tooltip as string | undefined;
     this.syncDisabledVisible();
   }
 
@@ -268,19 +242,6 @@ export abstract class WidgetAbject extends Abject {
     await this.send(event(this.id, this.ownerId, 'childDirty', {
       widgetId: this.id,
     }));
-  }
-
-  /**
-   * Lazy-init the tooltip surface helper.
-   */
-  private ensureTooltipSurface(): void {
-    if (!this.tooltipSurface) {
-      this.tooltipSurface = new TooltipSurface(
-        this.uiServerId,
-        <T>(targetId: AbjectId, method: string, payload: Record<string, unknown>) =>
-          this.request<T>(request(this.id, targetId, method, payload)),
-      );
-    }
   }
 
   /**

@@ -289,22 +289,22 @@ export class WorkspaceSwitcher extends Abject {
       }));
 
       // Batch create all widgets: header label, settings button, workspace buttons, +, Browse
-      const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown>; tooltip?: string }> = [];
+      const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
       // 0: header label
       specs.push({ type: 'label', windowId: this.windowId!, text: '\u25C8 Spaces', style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } });
       // 1: "+" button (in header row)
-      specs.push({ type: 'button', windowId: this.windowId!, text: '+', style: { fontSize: 13, align: 'center' }, tooltip: 'Create a new space' });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '+', style: { fontSize: 13, align: 'center' } });
       // 2: settings gear button
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13, align: 'center' }, tooltip: 'Space Settings' });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13, align: 'center' } });
       // 3..N+2: workspace buttons
       for (const ws of workspaces) {
         const isActive = ws.id === this.cachedActiveWorkspaceId;
         const accessIcon = ws.accessMode === 'public' ? '\uD83C\uDF0D' : ws.accessMode === 'private' ? '\uD83D\uDD11' : '\uD83D\uDD12';
         const accessLabel = ws.accessMode === 'public' ? 'public' : ws.accessMode === 'private' ? 'private' : 'protected';
-        specs.push({ type: 'button', windowId: this.windowId!, text: `${accessIcon} ${ws.name}`, tooltip: `${ws.name} \u2014 ${accessLabel} space`, ...(isActive ? { style: wsActiveStyle } : {}) });
+        specs.push({ type: 'button', windowId: this.windowId!, text: `${accessIcon} ${ws.name}`, ...(isActive ? { style: wsActiveStyle } : {}) });
       }
       // Browse button
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0E Browse', tooltip: 'Browse \u2014 Discover and join remote spaces' });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0E Browse' });
 
       const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs })

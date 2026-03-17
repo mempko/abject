@@ -296,13 +296,10 @@ export class Taskbar extends Abject {
 
       // Batch create buttons
       const specs = newObjects.map((obj, i) => {
-        const desc = obj.manifest.description;
-        const tooltipText = desc ? `${obj.manifest.name} \u2014 ${desc}` : obj.manifest.name;
         return {
           type: 'button' as const,
           windowId: this.windowId!,
           text: obj.manifest.name,
-          tooltip: tooltipText,
           ...(visResults[i] ? { style: activeStyle } : {}),
         };
       });
@@ -520,35 +517,33 @@ export class Taskbar extends Abject {
     log.info(`visibility: registry=${registryVis} chat=${chatVis} jobs=${jobsVis} browser=${browserViewerVis}`);
 
     // Batch create all widgets: header label, gear button, system buttons, user buttons, minimize section
-    const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown>; tooltip?: string }> = [];
+    const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
 
     // 0: Abjects header label
     specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A0 Abjects', style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } });
     // 1: Gear button
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13, ...(registryVis ? activeStyle : {}) }, tooltip: 'App Explorer' });
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13, ...(registryVis ? activeStyle : {}) } });
     // 2: Chat button
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCAC Chat', tooltip: 'Chat \u2014 Talk to the LLM assistant', ...(chatVis ? { style: activeStyle } : {}) });
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCAC Chat', ...(chatVis ? { style: activeStyle } : {}) });
     // 3: Jobs button
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCCB Jobs', tooltip: 'Jobs \u2014 View running tasks', ...(jobsVis ? { style: activeStyle } : {}) });
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCCB Jobs', ...(jobsVis ? { style: activeStyle } : {}) });
     // 4?: Browser button (optional)
     if (this.webBrowserViewerId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Web', tooltip: 'Web View \u2014 Displays pages loaded by the web agent', ...(browserViewerVis ? { style: activeStyle } : {}) });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Web', ...(browserViewerVis ? { style: activeStyle } : {}) });
     }
     // User object buttons
     const userObjStartIdx = specs.length;
     for (let i = 0; i < showableObjects.length; i++) {
       const vis = showableVisResults[i];
       const obj = showableObjects[i];
-      const desc = obj.manifest.description;
-      const tooltipText = desc ? `${obj.manifest.name} \u2014 ${desc}` : obj.manifest.name;
-      specs.push({ type: 'button', windowId: this.windowId!, text: obj.manifest.name, tooltip: tooltipText, ...(vis ? { style: activeStyle } : {}) });
+      specs.push({ type: 'button', windowId: this.windowId!, text: obj.manifest.name, ...(vis ? { style: activeStyle } : {}) });
     }
     // Minimized window section
     const minimizedStartIdx = specs.length;
     if (minimizedCount > 0) {
       specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A1 Windows', style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } });
       for (const [, { title }] of this.minimizedWindows) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: title, tooltip: title });
+        specs.push({ type: 'button', windowId: this.windowId!, text: title });
       }
     }
 

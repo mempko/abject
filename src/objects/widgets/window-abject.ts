@@ -261,7 +261,7 @@ export class WindowAbject extends Abject {
       this.windowFocused = focused;
 
       // When window loses focus, send mouseleave to hovered child so it
-      // clears hover highlight and hides tooltips (the mouse may never
+      // clears hover highlight (the mouse may never
       // re-enter this window before entering the newly focused one).
       if (!focused && this.hoveredChildId) {
         try {
@@ -781,7 +781,7 @@ method calls on 'abjects:widgets' interface:
     const cx = e.x ?? 0;
     const cy = (e.y ?? 0) - (this.chromeless ? 0 : TITLE_BAR_HEIGHT);
 
-    // Compute global coordinates for tooltip positioning
+    // Compute global coordinates for child widgets
     const globalX = this.rect.x + (e.x ?? 0);
     const globalY = this.rect.y + (e.y ?? 0);
 

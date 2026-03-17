@@ -245,10 +245,10 @@ export class GlobalToolbar extends Abject {
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
           { type: 'label', windowId: this.windowId!, text: '\u2699 System', style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } },
-          { type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13 }, tooltip: 'System Settings' },
-          { type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Network', tooltip: 'Network \u2014 View connected peers and connection status' },
-          { type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0D Explorer', tooltip: 'Explorer \u2014 Browse registered objects and their interfaces' },
-          { type: 'button', windowId: this.windowId!, text: '\u2699\uFE0F Procs', tooltip: 'Processes \u2014 View running objects and system health' },
+          { type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13 } },
+          { type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Network' },
+          { type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0D Explorer' },
+          { type: 'button', windowId: this.windowId!, text: '\u2699\uFE0F Procs' },
         ],
       })
     );
