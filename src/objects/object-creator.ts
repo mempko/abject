@@ -711,11 +711,13 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         'Study each object\'s description — including any listed use cases — to determine if the new object needs its methods or will receive its events. ' +
         'IMPORTANT: Objects run in a sandboxed environment with NO access to browser globals (fetch, setTimeout, localStorage, etc). ' +
         'If the new object needs HTTP requests, timers, storage, or other capabilities, it MUST depend on the object that provides them. ' +
-        'CRITICAL: If the task mentions a specific website or platform by name (e.g. "Instagram app", "Twitter client", "YouTube viewer", "Reddit browser"), ' +
-        'this means "build an app that USES the web automation object to interact with that actual website" — NOT a local clone or imitation of it. ' +
-        'Social media sites, email, and web apps require JavaScript rendering and login — always choose the web automation object (WebBrowser), not just HttpClient. ' +
-        'Only choose HttpClient WITHOUT WebBrowser for tasks that explicitly mention REST APIs, JSON endpoints, or RSS feeds. ' +
-        'Do NOT create objects that merely display links or mock data — the user expects actual interaction with the real website. ' +
+        'TOOL SELECTION HIERARCHY for web access:\n' +
+        '1. HttpClient (+ WebParser for HTML) — DEFAULT for fetching web content: news sites, RSS feeds, APIs, HTML scraping. Most sites serve usable HTML or RSS without JavaScript. Fast (1-2 seconds) and reliable.\n' +
+        '2. WebBrowser — best suited for pages that require JavaScript rendering or interactive control (login flows, form filling, SPAs like social media sites).\n' +
+        '3. WebAgent — best suited for tasks where the user explicitly asks for autonomous multi-step browsing with AI planning. Very heavy (launches browser + LLM loop). Reserve WebAgent for complex autonomous browsing tasks.\n' +
+        'If the task mentions fetching content from websites (news, articles, data, headlines), prefer HttpClient + WebParser. "Create a news app from CNN" means fetch CNN\'s RSS/HTML, not automate a browser.\n' +
+        'Choose WebBrowser when JavaScript rendering or login is required (e.g. "Instagram app", "Twitter client" that need authentication). ' +
+        'Always fetch real content from real websites — the user expects actual data. ' +
         'Return one name per line, nothing else. If no dependencies are needed, return "None".'
       ),
       userMessage(`Available objects:\n${summaryText}\n\nNew object to create: ${prompt}\n\nWhich objects does it need?`),
@@ -1838,9 +1840,18 @@ Manifest MUST include these methods:
 - hide: destroys the window
 - changed: receives widget interaction events (aspect, value) from widget dependencies
 
-### Web Automation Objects (interact with external websites: login, scrape, fill forms)
-Use when the object needs to interact with external web pages (login flows, form filling, scraping JS-rendered content).
-CRITICAL: "create an X app" where X is a website or platform (Instagram, Twitter, YouTube, Reddit, Gmail, etc.) means "create an app that uses WebBrowser to interact with the REAL X website" — NOT a local clone or imitation of X. The object should navigate to the actual site, log in, and interact with real content.
+### Web Data Objects (fetch content from websites: news, RSS, APIs, HTML scraping)
+Use when the object needs to READ content from websites without interaction.
+Dependencies needed: HttpClient (required), WebParser (for HTML parsing)
+Most websites serve usable content as HTML or RSS. Use HttpClient.get() to fetch, then WebParser.querySelector/extractLinks/extractText to parse.
+For RSS feeds, HttpClient.get() returns XML that can be parsed with simple string matching.
+This is fast (1-2 seconds) and reliable. Always prefer HttpClient + WebParser for simple fetching — it's the fastest and most reliable option.
+Manifest MUST include methods for the specific data task (e.g. fetchHeadlines, refreshFeed, show, hide).
+
+### Web Automation Objects (INTERACTIVE websites: login, form filling, JS-rendered SPAs)
+Use when the object needs to interact with external web pages — login flows, form filling, clicking through JS-rendered content.
+For simple content fetching (news, RSS, articles), use HttpClient + WebParser — it's faster and more reliable.
+"Create an X app" where X is a social media site requiring login (Instagram, Twitter, Gmail) means use WebBrowser. But "create a news app from CNN/BBC" means use HttpClient + WebParser.
 Dependencies needed: WebBrowser (required), WidgetManager (if showing status/results UI)
 Manifest MUST include these methods:
 - show: creates a status/control window via WidgetManager
@@ -2197,15 +2208,20 @@ async getState(msg) {
 })
 \`\`\`
 
+## Tool Selection for Web Access
+- **HttpClient + WebParser**: Default choice for reading web content. Use HttpClient.get() to fetch HTML/RSS/JSON, then WebParser to extract data. Fast and reliable.
+  Example: fetch RSS feed → parse <item> tags → display headlines. Fetch HTML page → WebParser.querySelector to extract article text.
+- **WebBrowser**: Only for pages requiring JavaScript rendering or user interaction (login flows, SPAs, clicking through menus). Heavy — launches a real browser.
+- **WebAgent**: Reserve WebAgent for complex autonomous browsing tasks where the user explicitly needs multi-step browsing with AI decision-making. Very heavy — launches browser + LLM planning loop per task.
+
 ## IMPORTANT
 - The methods available on \`this\` are: call(), dep(), find(), changed(), and this.id
-- NEVER hardcode object UUIDs. Use this.find('name') for local, this.find('peer.workspace.name') for remote.
+- Always resolve objects dynamically: use this.find('name') for local, this.find('peer.workspace.name') for remote.
 - Study the dependency descriptions to learn their method names and event names
-- Do NOT use browser globals: fetch(), setTimeout(), setInterval(), localStorage, sessionStorage, XMLHttpRequest are NOT available. Use the corresponding dependency objects via this.call() instead.
-- If a dependency is WebBrowser, the object MUST actually navigate to and interact with the real website. Use the stateful page API: openPage → navigateTo(url) → waitForSelector → fill/click/type → getContent → closePage. Do NOT create a local imitation or mock — browse the actual site. Do NOT try to use OAuth, window.open(), or browser redirects.
-- Do NOT invent wrapper APIs — no api.*, no Host.*, no this.services.*, no this.ui.*, no window.*, no document.*
-- The ONLY way to call another object is: this.call(this.dep('Name'), method, payload)
-- There are NO shortcuts, wrappers, or helper objects. Always use this.call() directly.
+- All capabilities (HTTP, timers, storage) are provided by dependency objects — access them via this.call().
+- If a dependency is WebBrowser, the object MUST actually navigate to and interact with the real website. Use the stateful page API: openPage → navigateTo(url) → waitForSelector → fill/click/type → getContent → closePage. Always navigate to and interact with the real website using the stateful page API.
+- Always call other objects directly: this.call(this.dep('Name'), method, payload) is the single API for all inter-object communication.
+- There are no shortcuts, wrappers, or helper objects. Always use this.call() directly.
 - For canvas objects, use WidgetManager.createCanvas inside a window instead of UIServer.createSurface. The canvas widget handles input routing and coordinate transforms automatically.
 - The surfaceId in draw commands sent to a canvas widget can be any placeholder string (e.g. 'c') — the canvas widget replaces it with the window's actual surfaceId.
 
