@@ -35,6 +35,7 @@ const SETTINGS_INTERFACE = 'abjects:settings' as InterfaceId;
 const CHAT_INTERFACE = 'abjects:chat' as InterfaceId;
 const APP_EXPLORER_INTERFACE = 'abjects:app-explorer' as InterfaceId;
 const JOB_BROWSER_INTERFACE = 'abjects:job-browser' as InterfaceId;
+const GOAL_BROWSER_INTERFACE = 'abjects:goal-browser' as InterfaceId;
 const WORKSPACE_SWITCHER_INTERFACE = 'abjects:workspace-switcher' as InterfaceId;
 const GLOBAL_TOOLBAR_INTERFACE = 'abjects:global-toolbar' as InterfaceId;
 
@@ -46,12 +47,12 @@ const wsLog = new Log('WORKSPACE-MANAGER');
 /** Infrastructure objects — always spawned for every workspace (no UI). */
 const INFRA_OBJECTS = [
   'AbjectStore', 'SharedState', 'FileTransfer', 'MediaStream', 'Theme',
-  'JobManager', 'AgentAbject', 'WebAgent',
+  'GoalManager', 'JobManager', 'AgentAbject', 'WebAgent',
 ] as const;
 
 /** UI objects — deferred for inactive workspaces, spawned on first switch. */
 const UI_OBJECTS = [
-  'Settings', 'AppExplorer', 'JobBrowser',
+  'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser',
   'WebBrowserViewer', 'Chat', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
 ] as const;
 
@@ -478,7 +479,7 @@ export class WorkspaceManager extends Abject {
               ws.childTypeIds.set(objectId as AbjectId, typeId as TypeId);
             }
             if (ws.accessMode !== 'local') {
-              await this.changed('workspaceObjectsChanged', {
+              this.changed('workspaceObjectsChanged', {
                 workspaceId: ws.id, objectId,
               });
             }
@@ -785,23 +786,23 @@ export class WorkspaceManager extends Abject {
     await this.persistWorkspaceList();
 
     // Emit access change event for PeerRouter cache invalidation
-    await this.changed('workspaceAccessChanged', {
+    this.changed('workspaceAccessChanged', {
       workspaceId, accessMode, whitelist: ws.whitelist,
       exposedObjectIds: ws.exposedObjectIds,
     });
 
     // Emit sharing events for dependents
     if (accessMode !== 'local' && prevMode === 'local') {
-      await this.changed('workspaceShared', {
+      this.changed('workspaceShared', {
         workspaceId, name: ws.name, description: ws.description, tags: ws.tags,
         accessMode, whitelist: ws.whitelist, exposedObjectIds: ws.exposedObjectIds,
         registryId: ws.registryId,
       });
     } else if (accessMode === 'local' && prevMode !== 'local') {
-      await this.changed('workspaceUnshared', { workspaceId, name: ws.name });
+      this.changed('workspaceUnshared', { workspaceId, name: ws.name });
     } else if (accessMode !== 'local') {
       // Mode changed between private/public
-      await this.changed('workspaceShared', {
+      this.changed('workspaceShared', {
         workspaceId, name: ws.name, description: ws.description, tags: ws.tags,
         accessMode, whitelist: ws.whitelist, exposedObjectIds: ws.exposedObjectIds,
         registryId: ws.registryId,
@@ -824,7 +825,7 @@ export class WorkspaceManager extends Abject {
     await this.persistWorkspaceList();
 
     // Emit access change event for PeerRouter cache invalidation
-    await this.changed('workspaceAccessChanged', {
+    this.changed('workspaceAccessChanged', {
       workspaceId, accessMode: ws.accessMode, whitelist: ws.whitelist,
       exposedObjectIds: ws.exposedObjectIds,
     });
@@ -853,7 +854,7 @@ export class WorkspaceManager extends Abject {
     await this.syncExposedToRegistry(ws);
     await this.persistWorkspaceList();
 
-    await this.changed('workspaceAccessChanged', {
+    this.changed('workspaceAccessChanged', {
       workspaceId, accessMode: ws.accessMode, whitelist: ws.whitelist,
       exposedObjectIds: ws.exposedObjectIds,
     });
@@ -872,7 +873,7 @@ export class WorkspaceManager extends Abject {
     if (!ws) return false;
     ws.description = description;
     await this.persistWorkspaceList();
-    await this.changed('workspaceMetadataChanged', { workspaceId, description, tags: ws.tags });
+    this.changed('workspaceMetadataChanged', { workspaceId, description, tags: ws.tags });
     return true;
   }
 
@@ -887,7 +888,7 @@ export class WorkspaceManager extends Abject {
     if (!ws) return false;
     ws.tags = [...tags];
     await this.persistWorkspaceList();
-    await this.changed('workspaceMetadataChanged', { workspaceId, description: ws.description, tags: ws.tags });
+    this.changed('workspaceMetadataChanged', { workspaceId, description: ws.description, tags: ws.tags });
     return true;
   }
 
@@ -989,6 +990,7 @@ export class WorkspaceManager extends Abject {
     const uiIfaceMap: Record<string, InterfaceId> = {
       Settings: SETTINGS_INTERFACE,
       AppExplorer: APP_EXPLORER_INTERFACE,
+      GoalBrowser: GOAL_BROWSER_INTERFACE,
       JobBrowser: JOB_BROWSER_INTERFACE,
       Chat: CHAT_INTERFACE,
     };
@@ -1152,6 +1154,7 @@ export class WorkspaceManager extends Abject {
     const uiIfaceMap: Record<string, InterfaceId> = {
       Settings: SETTINGS_INTERFACE,
       AppExplorer: APP_EXPLORER_INTERFACE,
+      GoalBrowser: GOAL_BROWSER_INTERFACE,
       JobBrowser: JOB_BROWSER_INTERFACE,
       Chat: CHAT_INTERFACE,
     };
@@ -1399,7 +1402,7 @@ export class WorkspaceManager extends Abject {
 
   private async syncExposedToRegistry(ws: WorkspaceInfo): Promise<void> {
     try {
-      await this.send(
+      this.send(
         request(this.id, ws.registryId, 'setExposedObjectIds', {
           ids: ws.exposedObjectIds,
         })

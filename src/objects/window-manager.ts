@@ -195,7 +195,7 @@ export class WindowManager extends Abject {
         // If the window was minimized, notify Taskbar to clean up its entry
         if (info.minimized && this.taskbarId) {
           try {
-            await this.send(
+            this.send(
               event(this.id, this.taskbarId, 'windowRestored', {
                 surfaceId: sid, windowId: info.windowId,
               })
@@ -265,7 +265,7 @@ export class WindowManager extends Abject {
         info.rect.x = x;
         info.rect.y = y;
         // Notify WindowAbject of final rect so it can update its state
-        await this.send(
+        this.send(
           event(this.id, info.windowId, 'windowRect', {
             x, y, width: info.rect.width, height: info.rect.height,
           })
@@ -315,7 +315,7 @@ export class WindowManager extends Abject {
         startMouseY: globalY,
         startRect: { ...info.rect },
       };
-      this.raiseWindow(surfaceId).catch(() => { /* best-effort */ });
+      this.raiseWindow(surfaceId);
     });
 
     // WorkspaceManager registers per-workspace Taskbars
@@ -440,13 +440,13 @@ Restore (via 'restoreWindow' method or Taskbar click):
     if (!info.chromeless && localY < info.titleBarHeight) {
       const btn = this.detectTitleButton(info, localX, localY);
       if (btn === 'close') {
-        await this.send(
+        this.send(
           event(this.id, info.windowId, 'titleBarAction', { action: 'close' })
         );
         return { grab: false };
       }
       if (btn === 'minimize') {
-        this.minimizeWindow(surfaceId).catch(() => {});
+        this.minimizeWindow(surfaceId);
         return { grab: false, minimize: surfaceId };
       }
 
@@ -501,7 +501,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
       } catch { /* UIServer may be gone */ }
 
       // Notify WindowAbject of rect change (it will update children and re-render)
-      await this.send(
+      this.send(
         event(this.id, this.dragState.windowId, 'windowRect', {
           x: newRect.x, y: newRect.y, width: newRect.width, height: newRect.height,
         })
@@ -544,7 +544,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     }
 
     // Send final windowRect event to WindowAbject
-    await this.send(
+    this.send(
       event(this.id, this.dragState.windowId, 'windowRect', {
         x: newRect.x, y: newRect.y, width: newRect.width, height: newRect.height,
       })
@@ -679,11 +679,11 @@ Restore (via 'restoreWindow' method or Taskbar click):
         event(this.id, this.uiServerId, 'setSurfaceVisible', {
           surfaceId, visible: false,
         })
-      ).catch(() => {});
+      );
     }
 
     // Notify WindowAbject
-    await this.send(
+    this.send(
       event(this.id, info.windowId, 'titleBarAction', { action: 'minimize' })
     );
 
@@ -691,7 +691,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     const taskbarId = await this.getTaskbarForWindow(surfaceId);
     if (taskbarId) {
       try {
-        await this.send(
+        this.send(
           event(this.id, taskbarId, 'windowMinimized', {
             surfaceId, windowId: info.windowId, title: info.title,
           })
@@ -712,13 +712,13 @@ Restore (via 'restoreWindow' method or Taskbar click):
         event(this.id, this.uiServerId, 'setSurfaceVisible', {
           surfaceId, visible: true,
         })
-      ).catch(() => {});
+      );
     }
 
     await this.raiseWindow(surfaceId);
 
     // Notify WindowAbject
-    await this.send(
+    this.send(
       event(this.id, info.windowId, 'titleBarAction', { action: 'restore' })
     );
 
@@ -726,7 +726,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     const taskbarId = await this.getTaskbarForWindow(surfaceId);
     if (taskbarId) {
       try {
-        await this.send(
+        this.send(
           event(this.id, taskbarId, 'windowRestored', {
             surfaceId, windowId: info.windowId,
           })

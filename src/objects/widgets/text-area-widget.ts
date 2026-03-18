@@ -127,7 +127,7 @@ export class TextAreaWidget extends WidgetAbject {
 
   private async notifySelectionChanged(): Promise<void> {
     const selectedText = this.getSelectedText();
-    await this.send(event(
+    this.send(event(
       this.id, this.uiServerId,
       'selectionChanged',
       { selectedText },

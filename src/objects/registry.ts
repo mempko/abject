@@ -579,7 +579,7 @@ export class Registry extends Abject {
   ): Promise<void> {
     for (const subscriberId of this.subscribers) {
       try {
-        await this.send(
+        this.send(
           event(this.id, subscriberId, eventName, payload)
         );
       } catch (err) {

@@ -380,7 +380,7 @@ export class Settings extends Abject {
       await this.buildAccessTab(r0);
     }
 
-    await this.changed('visibility', true);
+    this.changed('visibility', true);
     return true;
   }
 
@@ -1022,7 +1022,7 @@ export class Settings extends Abject {
     this.accessSearchInputId = undefined;
     this.accessSearchText = '';
 
-    await this.changed('visibility', false);
+    this.changed('visibility', false);
     return true;
   }
 

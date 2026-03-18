@@ -338,7 +338,7 @@ export class ProcessExplorer extends Abject {
     );
 
     await this.populateView();
-    await this.changed('visibility', true);
+    this.changed('visibility', true);
     return true;
   }
 
@@ -353,7 +353,7 @@ export class ProcessExplorer extends Abject {
 
     this.windowId = undefined;
     this.clearViewTracking();
-    await this.changed('visibility', false);
+    this.changed('visibility', false);
     return true;
   }
 

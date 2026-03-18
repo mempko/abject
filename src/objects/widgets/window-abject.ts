@@ -295,11 +295,11 @@ export class WindowAbject extends Abject {
     this.on('titleBarAction', async (msg: AbjectMessage) => {
       const { action } = msg.payload as { action: string };
       if (action === 'close') {
-        await this.changed('windowCloseRequested', {});
+        this.changed('windowCloseRequested', {});
       } else if (action === 'minimize') {
-        await this.changed('windowMinimized', {});
+        this.changed('windowMinimized', {});
       } else if (action === 'restore') {
-        await this.changed('windowRestored', {});
+        this.changed('windowRestored', {});
         this.scheduleFrame();
       }
     });
@@ -330,7 +330,7 @@ export class WindowAbject extends Abject {
         await this.updateChildrenOnResize();
         await this.renderWindow();
       }
-      await this.changed('windowRect', { x, y, width, height });
+      this.changed('windowRect', { x, y, width, height });
     });
   }
 
@@ -766,7 +766,7 @@ method calls on 'abjects:widgets' interface:
     // If no child consumed the click and this window is draggable,
     // request a drag from UIServer (two-phase grab for chromeless+draggable windows)
     if (!childConsumed && this.draggable) {
-      await this.send(
+      this.send(
         event(this.id, this.uiServerId, 'requestDrag', {
           surfaceId: this.surfaceId,
         })

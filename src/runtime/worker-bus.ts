@@ -26,10 +26,21 @@ export type PostToMainFn = (data: unknown) => void;
  * Works in both Web Workers (self.postMessage) and Node.js worker_threads
  * (parentPort.postMessage) via the configurable postToMain callback.
  */
+/** Message types sent between peer workers via direct MessagePort channels. */
+export interface PeerMessage {
+  type: 'peer:msg' | 'peer:reply';
+  message: AbjectMessage;
+}
+
 export class WorkerBus implements MessageBusLike {
   private mailboxes: Map<AbjectId, Mailbox> = new Map();
   private replyHandlers: Map<AbjectId, ReplyHandler> = new Map();
   private postToMain: PostToMainFn;
+
+  /** Direct MessagePort channels to peer workers, keyed by worker index. */
+  private peerPorts: Map<number, MessagePort> = new Map();
+  /** Maps remote object IDs to the peer worker index that hosts them. */
+  private peerObjects: Map<AbjectId, number> = new Map();
 
   constructor(postToMain?: PostToMainFn) {
     this.postToMain = postToMain ?? ((data: unknown) => self.postMessage(data));
@@ -74,13 +85,46 @@ export class WorkerBus implements MessageBusLike {
   }
 
   /**
-   * Send a message. If the recipient is local, deliver directly.
-   * Otherwise forward to the main thread for cross-worker routing.
+   * Add a direct MessagePort channel to a peer worker.
+   * Messages from the peer are delivered locally via deliverFromPeer().
    */
-  async send(message: AbjectMessage): Promise<void> {
+  addPeerPort(workerIndex: number, port: MessagePort): void {
+    this.peerPorts.set(workerIndex, port);
+    port.onmessage = (event: MessageEvent<PeerMessage>) => {
+      const { type, message } = event.data;
+      if (type === 'peer:reply') {
+        this.deliverReplyFromPeer(message);
+      } else {
+        this.deliverFromPeer(message);
+      }
+    };
+    port.start?.();
+  }
+
+  /**
+   * Record that an object lives in a specific peer worker.
+   */
+  addPeerObject(objectId: AbjectId, workerIndex: number): void {
+    this.peerObjects.set(objectId, workerIndex);
+  }
+
+  /**
+   * Remove a peer object placement record.
+   */
+  removePeerObject(objectId: AbjectId): void {
+    this.peerObjects.delete(objectId);
+  }
+
+  /**
+   * Send a message. Three-tier routing:
+   * 1. Local mailbox — deliver directly
+   * 2. Known peer worker — send via direct MessagePort
+   * 3. Neither — forward to main thread for routing
+   */
+  send(message: AbjectMessage): void {
     const recipient = message.routing.to;
 
-    // Check if recipient is local to this worker
+    // 1. Local delivery
     if (this.mailboxes.has(recipient)) {
       // Reply fast-path: resolve pending Promise directly, bypass mailbox
       if ((message.header.type === 'reply' || message.header.type === 'error')
@@ -98,7 +142,23 @@ export class WorkerBus implements MessageBusLike {
       return;
     }
 
-    // Recipient not local — forward to main thread for routing
+    // 2. Direct peer delivery
+    const peerIdx = this.peerObjects.get(recipient);
+    if (peerIdx !== undefined) {
+      const port = this.peerPorts.get(peerIdx);
+      if (port) {
+        const isReply = (message.header.type === 'reply' || message.header.type === 'error')
+                        && message.header.correlationId;
+        const peerMsg: PeerMessage = {
+          type: isReply ? 'peer:reply' : 'peer:msg',
+          message,
+        };
+        port.postMessage(peerMsg);
+        return;
+      }
+    }
+
+    // 3. Main thread fallback (main-thread objects, dedicated workers, unknown recipients)
     this.postToMain({ type: 'bus:send', message });
   }
 
@@ -135,6 +195,32 @@ export class WorkerBus implements MessageBusLike {
     } else {
       // Fall back to mailbox delivery
       this.deliverFromMain(message);
+    }
+  }
+
+  /**
+   * Deliver a message from a peer worker via direct MessagePort.
+   */
+  deliverFromPeer(message: AbjectMessage): void {
+    const recipient = message.routing.to;
+    const mailbox = this.mailboxes.get(recipient);
+    if (!mailbox) {
+      log.warn(`Cannot deliver peer message to ${recipient}: not registered locally`);
+      return;
+    }
+    mailbox.send(message);
+  }
+
+  /**
+   * Deliver a reply from a peer worker via the fast-path.
+   */
+  deliverReplyFromPeer(message: AbjectMessage): void {
+    const recipient = message.routing.to;
+    const replyHandler = this.replyHandlers.get(recipient);
+    if (replyHandler) {
+      replyHandler(message);
+    } else {
+      this.deliverFromPeer(message);
     }
   }
 }

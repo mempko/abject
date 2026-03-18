@@ -14,7 +14,6 @@ import {
   ImagePart,
   getTextContent,
 } from './provider.js';
-import { require } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('OLLAMA');
@@ -132,8 +131,6 @@ export class OllamaProvider extends BaseLLMProvider {
     messages: LLMMessage[],
     options: LLMCompletionOptions = {}
   ): AsyncIterable<LLMStreamChunk> {
-    require(!this.fetchFn, 'Streaming is not supported when using HttpClient delegate');
-
     const request: OllamaRequest = {
       model: this.resolveModel(options.tier),
       messages: messages.map((m) => this.mapMessage(m)),

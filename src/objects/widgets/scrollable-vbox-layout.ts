@@ -15,14 +15,23 @@ import { LayoutConfig, ChildRect, isSpacer } from './layout-abject.js';
 const SCROLLBAR_WIDTH = 8;
 const SCROLL_STEP = 30;
 
+export interface ScrollableVBoxConfig extends LayoutConfig {
+  autoScroll?: boolean;
+}
+
 export class ScrollableVBoxLayout extends VBoxLayout {
   private scrollTop = 0;
 
-  constructor(config: LayoutConfig) {
+  constructor(config: ScrollableVBoxConfig) {
     super(config);
 
     // Override manifest name
     (this as unknown as { manifest: { name: string } }).manifest.name = 'ScrollableVBoxLayout';
+
+    if (config.autoScroll) {
+      this.autoScrollEnabled = true;
+      this.autoScroll = true;
+    }
   }
 
   /**
@@ -201,16 +210,26 @@ export class ScrollableVBoxLayout extends VBoxLayout {
   protected override async processInput(input: Record<string, unknown>): Promise<{ consumed: boolean; focusWidgetId?: AbjectId }> {
     const inputType = input.type as string;
 
-    // Handle wheel events for scrolling
+    // Handle wheel events for scrolling — delegate to children first
     if (inputType === 'wheel') {
+      // Try forwarding to a nested scrollable child (with Y adjusted for scroll offset)
+      const adjusted = { ...input, y: (input.y as number) + this.scrollTop };
+      const childResult = await super.processInput(adjusted);
+      if (childResult.consumed) return childResult;
+
+      // No child consumed it — scroll ourselves
       const delta = input.deltaY as number;
       const oldScroll = this.scrollTop;
       this.scrollTop += delta > 0 ? SCROLL_STEP : -SCROLL_STEP;
       this.clampScrollTop();
       if (this.scrollTop !== oldScroll) {
+        // Disable auto-scroll when user scrolls up, re-enable at bottom
+        this.autoScroll = this.scrollTop >= this.maxScroll;
         await this.requestRedraw();
+        return { consumed: true };
       }
-      return { consumed: true };
+      // Already at scroll limit — let parent handle it
+      return { consumed: false };
     }
 
     // For mouse events, offset Y by scrollTop before delegating to parent
@@ -220,6 +239,25 @@ export class ScrollableVBoxLayout extends VBoxLayout {
     }
 
     return super.processInput(input);
+  }
+
+  // ── Auto-scroll ─────────────────────────────────────────────────
+
+  /** Whether auto-scroll to bottom is enabled for this widget. Off by default; opt in for chat/log widgets. */
+  private autoScrollEnabled = false;
+  /** Runtime state: tracks whether the user has scrolled away from the bottom. */
+  private autoScroll = false;
+
+  /**
+   * After relayout completes, auto-scroll to bottom if we were near the bottom.
+   * Called from flushPendingRelayout via scheduleRelayout.
+   */
+  protected override async flushPendingRelayout(): Promise<void> {
+    const wasNearBottom = this.maxScroll <= 0 || (this.maxScroll - this.scrollTop) <= SCROLL_STEP * 2;
+    await super.flushPendingRelayout();
+    if (this.autoScrollEnabled && this.autoScroll && wasNearBottom) {
+      this.scrollTop = this.maxScroll;
+    }
   }
 
   // ── Resize handling ───────────────────────────────────────────────

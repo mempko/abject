@@ -748,7 +748,7 @@ export class GlobalSettings extends Abject {
       preferredSize: { height: 18 },
     }));
 
-    await this.changed('visibility', true);
+    this.changed('visibility', true);
     return true;
   }
 
@@ -784,7 +784,7 @@ export class GlobalSettings extends Abject {
     this.authSaveBtnId = undefined;
     this.unmasked.clear();
 
-    await this.changed('visibility', false);
+    this.changed('visibility', false);
     return true;
   }
 

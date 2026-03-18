@@ -71,12 +71,12 @@ export class ModalDialog extends Abject {
       this.handleShow(msg).then(
         async (confirmed) => {
           await this.destroyWindows();
-          await this.sendDeferredReply(msg, confirmed).catch(() => {});
+          this.sendDeferredReply(msg, confirmed);
           this.stop().catch(() => {});
         },
         async () => {
           await this.destroyWindows();
-          await this.sendDeferredReply(msg, false).catch(() => {});
+          this.sendDeferredReply(msg, false);
           this.stop().catch(() => {});
         },
       );
@@ -122,11 +122,11 @@ export class ModalDialog extends Abject {
     const wmId = this.widgetManagerId;
     if (!wmId) return;
     if (this.dialogWindowId) {
-      try { await this.send(request(this.id, wmId, 'destroyWindowAbject',
+      try { this.send(request(this.id, wmId, 'destroyWindowAbject',
         { windowId: this.dialogWindowId })); } catch { /* gone */ }
     }
     if (this.backdropWindowId) {
-      try { await this.send(request(this.id, wmId, 'destroyWindowAbject',
+      try { this.send(request(this.id, wmId, 'destroyWindowAbject',
         { windowId: this.backdropWindowId })); } catch { /* gone */ }
     }
   }

@@ -135,7 +135,6 @@ export class OpenAIProvider extends BaseLLMProvider {
     options: LLMCompletionOptions = {}
   ): AsyncIterable<LLMStreamChunk> {
     require(this.apiKey !== undefined, 'API key is required');
-    require(!this.fetchFn, 'Streaming is not supported when using HttpClient delegate');
 
     const request: OpenAIRequest = {
       model: this.resolveModel(options.tier),

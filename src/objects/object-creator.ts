@@ -46,6 +46,7 @@ interface CreationTaskExtra {
   callerId?: AbjectId;
   deferredMsg: AbjectMessage;
   result?: CreationResult;
+  goalId?: string;
 }
 
 
@@ -98,7 +99,15 @@ export class ObjectCreator extends Abject {
   private widgetManagerId?: AbjectId;
   private agentAbjectId?: AbjectId;
   private _currentCallerId?: AbjectId;
+  private _currentGoalId?: string;
+  private goalManagerId?: AbjectId;
   private creationTasks = new Map<string, CreationTaskExtra>();
+
+  /** Pending ticket promises: ticketId → resolve/reject. */
+  private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+
+  /** Maps inner agent ticketId → caller AbjectId for forwarding stream/progress events. */
+  private ticketToCallerId = new Map<string, AbjectId>();
 
   constructor() {
     super({
@@ -229,9 +238,54 @@ export class ObjectCreator extends Abject {
     this.setupHandlers();
   }
 
+  private waitForTaskResult(ticketId: string, timeoutMs: number): Promise<{
+    ticketId: string; success: boolean; result?: unknown; error?: string;
+    steps: number; maxStepsReached?: boolean;
+  }> {
+    type TaskResult = { ticketId: string; success: boolean; result?: unknown; error?: string; steps: number; maxStepsReached?: boolean };
+    return new Promise<TaskResult>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingTickets.delete(ticketId);
+        reject(new Error(`Task ${ticketId} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.pendingTickets.set(ticketId, {
+        resolve: (v) => { clearTimeout(timer); resolve(v as TaskResult); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+    });
+  }
+
   private setupHandlers(): void {
+    // ── Ticket result handler ──
+    this.on('taskResult', async (msg: AbjectMessage) => {
+      const payload = msg.payload as { ticketId: string };
+      const pending = this.pendingTickets.get(payload.ticketId);
+      if (pending) {
+        this.pendingTickets.delete(payload.ticketId);
+        pending.resolve(payload);
+      }
+    });
+
+    this.on('taskStream', async (msg: AbjectMessage) => {
+      const { ticketId, content, done } = msg.payload as { ticketId: string; content: string; done: boolean };
+      const callerId = this.ticketToCallerId.get(ticketId);
+      if (callerId) {
+        this.send(event(this.id, callerId, 'taskStream', { content, done }));
+      }
+    });
+
+    this.on('taskProgress', async (msg: AbjectMessage) => {
+      const { ticketId, step, maxSteps, phase, action } = msg.payload as {
+        ticketId: string; step: number; maxSteps: number; phase: string; action?: string;
+      };
+      const callerId = this.ticketToCallerId.get(ticketId);
+      if (callerId) {
+        this.send(event(this.id, callerId, 'taskProgress', { step, maxSteps, phase, action }));
+      }
+    });
+
     this.on('create', async (msg: AbjectMessage) => {
-      const { prompt, context } = msg.payload as CreateObjectRequest;
+      const { prompt, context, goalId } = msg.payload as CreateObjectRequest & { goalId?: string };
 
       // Route through AgentAbject if available — jobs become visible in JobBrowser
       if (this.agentAbjectId) {
@@ -241,6 +295,7 @@ export class ObjectCreator extends Abject {
           context,
           callerId: msg.routing.from,
           deferredMsg: msg,
+          goalId,
         });
         this.runCreationViaAgent(taskId);
         return DEFERRED_REPLY;
@@ -303,6 +358,9 @@ export class ObjectCreator extends Abject {
       const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
       const extra = this.creationTasks.get(taskId);
 
+      // Set current goal ID for progress reporting during creation
+      this._currentGoalId = extra?.goalId;
+
       switch (action.action) {
         case 'create_object': {
           const prompt = extra?.prompt ?? (action.prompt ?? action.description ?? action.task) as string;
@@ -310,6 +368,7 @@ export class ObjectCreator extends Abject {
           const context = extra?.context ?? (action.context as string | undefined);
           const result = await this.createObject(prompt, context, extra?.callerId ?? msg.routing.from);
           if (extra) extra.result = result;
+          this._currentGoalId = undefined;
           return { success: result.success, data: result, error: result.error };
         }
         case 'modify_object': {
@@ -339,6 +398,7 @@ export class ObjectCreator extends Abject {
     this.systemRegistryId = await this.discoverDep('SystemRegistry') ?? undefined;
     this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
     this.agentAbjectId = await this.discoverDep('AgentAbject') ?? undefined;
+    this.goalManagerId = await this.discoverDep('GoalManager') ?? undefined;
 
     // Register as an agent for discoverability and delegation
     if (this.agentAbjectId) {
@@ -364,36 +424,45 @@ export class ObjectCreator extends Abject {
   /**
    * Route a creation task through AgentAbject so each phase appears as a job
    * in JobBrowser. Uses DEFERRED_REPLY on the original `create` message.
+   * Submits a ticket to AgentAbject and awaits the taskResult event.
    */
   private async runCreationViaAgent(taskId: string): Promise<void> {
     const extra = this.creationTasks.get(taskId)!;
+    let innerTicketId: string | undefined;
     try {
-      const result = await this.request<{ success: boolean; error?: string }>(
+      // Submit ticket — returns immediately
+      const { ticketId } = await this.request<{ ticketId: string }>(
         request(this.id, this.agentAbjectId!, 'startTask', {
           taskId,
           task: extra.prompt,
           systemPrompt: this.buildCreationSystemPrompt(),
+          goalId: extra.goalId,
           config: {
             maxSteps: 10,
             skipFirstObservation: true,
             queueName: `object-creator-${this.id}`,
           },
         }),
-        310000,
       );
+      innerTicketId = ticketId;
+      if (extra.callerId) this.ticketToCallerId.set(ticketId, extra.callerId);
+
+      // Wait for taskResult event
+      const result = await this.waitForTaskResult(ticketId, 310000);
 
       // Build a CreationResult from agent task result + stored creation state
       const creationResult: CreationResult = extra.result ?? {
         success: result.success,
         error: result.error,
       };
-      await this.sendDeferredReply(extra.deferredMsg, creationResult);
+      this.sendDeferredReply(extra.deferredMsg, creationResult);
     } catch (err) {
-      await this.sendDeferredReply(extra.deferredMsg, {
+      this.sendDeferredReply(extra.deferredMsg, {
         success: false,
         error: err instanceof Error ? err.message : String(err),
-      } as CreationResult).catch(() => {});
+      } as CreationResult);
     } finally {
+      if (innerTicketId) this.ticketToCallerId.delete(innerTicketId);
       this.creationTasks.delete(taskId);
     }
   }
@@ -419,7 +488,7 @@ Always begin by executing create_object. After it completes, report done or fail
 
   const result = await call(
     await dep('ObjectCreator'), 'create',
-    { prompt: 'a simple counter widget' });
+    { prompt: 'a simple counter widget', goalId: 'optional-goal-id' });
   // result: { success: boolean, objectId?: string, manifest?: AbjectManifest,
   //           code?: string, error?: string, usedObjects?: string[] }
 
@@ -450,7 +519,8 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
 - The interface ID is 'abjects:object-creator' (NOT 'abjects:objectcreator').
 - create is a long-running operation (may take 30-60 seconds). ObjectCreator emits 'progress' events during creation.
 - The returned objectId is ready to use immediately. Do NOT look it up in the registry or call init().
-- The returned objectId can be called directly — interface IDs are resolved automatically.`;
+- The returned objectId can be called directly — interface IDs are resolved automatically.
+- Pass goalId to link creation progress to an existing Goal (from GoalManager). If omitted, a goal is auto-created by AgentAbject.`;
   }
 
   /**
@@ -528,8 +598,18 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
   }
 
   private async reportProgress(callerId: AbjectId, phase: string, message: string): Promise<void> {
+    // Update goal if available (GoalManager updates display via changed events)
+    if (this._currentGoalId && this.goalManagerId) {
+      this.send(event(this.id, this.goalManagerId, 'updateProgress', {
+        goalId: this._currentGoalId,
+        message,
+        phase,
+        agentName: 'ObjectCreator',
+      }));
+    }
+    // Also send progress event to caller (backward compat)
     try {
-      await this.send(
+      this.send(
         event(this.id, callerId, 'progress', { phase, message })
       );
     } catch { /* best-effort */ }
@@ -1964,7 +2044,10 @@ CRITICAL RULES:
 
 The ONLY way to communicate with other objects is:
 
-  this.call(objectId, method, payload) → Promise<result>
+  this.call(objectId, method, payload, options?) → Promise<result>
+
+Options: { timeout?: number } — override the default 30s request timeout.
+Use a longer timeout for long-running calls (e.g. WebAgent.runTask).
 
 To get the ID of a dependency object, use:
 
@@ -1999,6 +2082,9 @@ Translate dependency descriptions into this.call() invocations:
 \`\`\`javascript
 // Calling a method:
 const result = await this.call(this.dep('SomeService'), 'doThing', { x: 'hello' });
+
+// Calling a long-running method with extended timeout (default is 30s):
+const result = await this.call(this.dep('WebAgent'), 'runTask', { task: '...' }, { timeout: 300000 });
 
 // Handling an event (add a handler in your handler map):
 async thingHappened(msg) {

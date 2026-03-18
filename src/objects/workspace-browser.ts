@@ -270,7 +270,7 @@ export class WorkspaceBrowser extends Abject {
       ).catch(() => { /* best-effort background refresh */ });
     }
 
-    await this.changed('visibility', true);
+    this.changed('visibility', true);
     return true;
   }
 
@@ -286,7 +286,7 @@ export class WorkspaceBrowser extends Abject {
     this.windowId = undefined;
     this.clearWidgetTracking();
 
-    await this.changed('visibility', false);
+    this.changed('visibility', false);
     return true;
   }
 

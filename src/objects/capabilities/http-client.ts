@@ -188,11 +188,11 @@ export class HttpClient extends Abject {
     this.on('request', async (msg: AbjectMessage) => {
       const req = msg.payload as HttpRequest;
       this.makeRequest(req).then(
-        (result) => this.sendDeferredReply(msg, result).catch(() => {}),
+        (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'HTTP_ERROR',
             err instanceof Error ? err.message : String(err)
-          )).catch(() => {});
+          ));
         },
       );
       return DEFERRED_REPLY;
@@ -204,11 +204,11 @@ export class HttpClient extends Abject {
         headers?: Record<string, string>;
       };
       this.makeRequest({ method: 'GET', url, headers }).then(
-        (result) => this.sendDeferredReply(msg, result).catch(() => {}),
+        (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'HTTP_ERROR',
             err instanceof Error ? err.message : String(err)
-          )).catch(() => {});
+          ));
         },
       );
       return DEFERRED_REPLY;
@@ -221,11 +221,11 @@ export class HttpClient extends Abject {
         headers?: Record<string, string>;
       };
       this.makeRequest({ method: 'POST', url, body, headers }).then(
-        (result) => this.sendDeferredReply(msg, result).catch(() => {}),
+        (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'HTTP_ERROR',
             err instanceof Error ? err.message : String(err)
-          )).catch(() => {});
+          ));
         },
       );
       return DEFERRED_REPLY;
@@ -237,11 +237,11 @@ export class HttpClient extends Abject {
         headers?: Record<string, string>;
       };
       this.fetchBase64(url, headers).then(
-        (result) => this.sendDeferredReply(msg, result).catch(() => {}),
+        (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'HTTP_ERROR',
             err instanceof Error ? err.message : String(err)
-          )).catch(() => {});
+          ));
         },
       );
       return DEFERRED_REPLY;
@@ -258,11 +258,11 @@ export class HttpClient extends Abject {
         body: data,
         headers: { 'Content-Type': 'application/json' },
       }).then(
-        (result) => this.sendDeferredReply(msg, result).catch(() => {}),
+        (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'HTTP_ERROR',
             err instanceof Error ? err.message : String(err)
-          )).catch(() => {});
+          ));
         },
       );
       return DEFERRED_REPLY;

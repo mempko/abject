@@ -159,10 +159,11 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
       })
     );
 
-    // Scrollable VBox for job list (expanding)
+    // Scrollable VBox for job list (expanding, auto-scroll to follow new jobs)
     this.jobListId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
         parentLayoutId: this.rootLayoutId,
+        autoScroll: true,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
@@ -212,7 +213,7 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
     // Populate existing jobs
     await this.populateExistingJobs();
 
-    await this.changed('visibility', true);
+    this.changed('visibility', true);
     return true;
   }
 
@@ -237,7 +238,7 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
     this.jobListId = undefined;
     this.clearBtnId = undefined;
     this.jobLabelMap.clear();
-    await this.changed('visibility', false);
+    this.changed('visibility', false);
     return true;
   }
 

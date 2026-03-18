@@ -642,7 +642,7 @@ export class HealthMonitor extends Abject {
     }
 
     try {
-      await this.send(event(this.id, this.supervisorId,
+      this.send(event(this.id, this.supervisorId,
         'childFailed', {
           childId: objectId,
           error: {
@@ -684,7 +684,7 @@ export class HealthMonitor extends Abject {
     log.info(`Triggering renegotiation for ${agreementId}`);
 
     // Notify listeners
-    await this.send(
+    this.send(
       event(
         this.id,
         this.id, // Self-notification for logging

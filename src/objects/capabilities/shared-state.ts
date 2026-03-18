@@ -295,7 +295,7 @@ export class SharedState extends Abject {
         for (const remoteSSId of this.remotePeers.values()) {
           this.send(createEvent(this.id, remoteSSId, '_requestSync', {
             names: [name],
-          })).catch(() => { /* best-effort */ });
+          }));
         }
       }
       return true;
@@ -346,7 +346,7 @@ export class SharedState extends Abject {
         for (const remoteSSId of selected) {
           this.send(createEvent(this.id, remoteSSId, '_syncEntry', {
             name, key, entry, propagationId, hopsRemaining: (hopsRemaining ?? 0) - 1,
-          })).catch(() => { /* best-effort */ });
+          }));
         }
       }
     });
@@ -390,7 +390,7 @@ export class SharedState extends Abject {
         if (entries.length === 0) continue;
         this.send(createEvent(this.id, fromId, '_syncFull', {
           name, entries,
-        })).catch(() => { /* best-effort */ });
+        }));
       }
     });
 
@@ -461,7 +461,7 @@ export class SharedState extends Abject {
 
     // Phase 4: Anti-entropy — every 30s, pick one random remote peer and exchange state digests
     this.antiEntropyTimer = setInterval(() => {
-      this.antiEntropyExchange().catch(() => { /* best-effort */ });
+      this.antiEntropyExchange();
     }, ANTI_ENTROPY_INTERVAL);
 
     log.info(`[${this.id.slice(0, 8)}] onInit complete`);
@@ -624,9 +624,7 @@ export class SharedState extends Abject {
       log.info(`[${this.id.slice(0, 8)}] sending _requestSync to ${remoteSSId.slice(0, 8)} for names=${JSON.stringify(subscribedNames)}`);
       this.send(createEvent(this.id, remoteSSId, '_requestSync', {
         names: subscribedNames,
-      })).catch((err) => {
-        log.warn(`[${this.id.slice(0, 8)}] _requestSync send failed to ${remoteSSId.slice(0, 8)}:`, err);
-      });
+      }));
     }
   }
 
@@ -724,7 +722,7 @@ export class SharedState extends Abject {
       this.send(createEvent(this.id, subId, 'changed', {
         aspect: 'stateChanged',
         value: { name, key, value },
-      })).catch(() => { /* best-effort */ });
+      }));
     }
   }
 
@@ -748,9 +746,7 @@ export class SharedState extends Abject {
     for (const remoteSSId of selected) {
       this.send(createEvent(this.id, remoteSSId, '_syncEntry', {
         name, key, entry, propagationId, hopsRemaining: 3,
-      })).catch((err) => {
-        log.warn(`[${this.id.slice(0, 8)}] gossipBroadcast send failed to ${remoteSSId.slice(0, 8)}:`, err);
-      });
+      }));
     }
   }
 
@@ -855,7 +851,7 @@ export class SharedState extends Abject {
     // Request sync for names where we may have gaps
     this.send(createEvent(this.id, targetPeer, '_requestSync', {
       names: subscribedNames,
-    })).catch(() => { /* best-effort */ });
+    }));
   }
 
   private selectRandom<T>(arr: T[], n: number): T[] {

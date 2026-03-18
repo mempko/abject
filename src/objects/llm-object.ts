@@ -129,6 +129,29 @@ export class LLMObject extends Abject {
                 returns: { kind: 'primitive', primitive: 'string' },
               },
               {
+                name: 'stream',
+                description: 'Stream a conversation completion. Sends llmChunk events for each token, returns full accumulated content.',
+                parameters: [
+                  {
+                    name: 'messages',
+                    type: {
+                      kind: 'array',
+                      elementType: { kind: 'reference', reference: 'LLMMessage' },
+                    },
+                    description: 'Conversation messages',
+                  },
+                  {
+                    name: 'options',
+                    type: { kind: 'reference', reference: 'LLMCompletionOptions' },
+                    description: 'Completion options',
+                    optional: true,
+                  },
+                ],
+                returns: { kind: 'object', properties: {
+                  content: { kind: 'primitive', primitive: 'string' },
+                } },
+              },
+              {
                 name: 'listProviders',
                 description: 'List available LLM providers',
                 parameters: [],
@@ -174,6 +197,48 @@ export class LLMObject extends Abject {
     this.on('analyze', async (msg: AbjectMessage) => {
       const { content, task } = msg.payload as LLMAnalyzePayload;
       return this.analyze(content, task);
+    });
+
+    this.on('stream', async (msg: AbjectMessage) => {
+      const { messages, options, provider: providerName } = msg.payload as LLMQueryPayload;
+      const provider = this.getProvider(providerName);
+      require(provider !== undefined, 'No LLM provider available');
+
+      const callerId = msg.routing.from;
+      const correlationId = msg.header.messageId;
+
+      // If provider doesn't support streaming, fall back to complete
+      if (!provider!.stream) {
+        const result = await this.complete(messages, options, providerName, callerId);
+        return { content: result.content };
+      }
+
+      const totalChars = messages.reduce((sum, m) => sum + getTextContent(m).length, 0);
+      log.info(`→ ${provider!.name} stream | ${messages.length} msgs | ${totalChars} chars`);
+      const start = Date.now();
+
+      let fullContent = '';
+      try {
+        for await (const chunk of provider!.stream(messages, options)) {
+          fullContent += chunk.content;
+          // Send each chunk as an event back to the requester
+          this.send(event(this.id, callerId, 'llmChunk', {
+            correlationId,
+            content: chunk.content,
+            done: chunk.done,
+          }));
+        }
+      } catch (err) {
+        const elapsed = Date.now() - start;
+        const errMsg = err instanceof Error ? err.message : String(err);
+
+        log.error(`${provider!.name} stream | ${elapsed}ms | ${errMsg}`);
+        throw err;
+      }
+
+      const elapsed = Date.now() - start;
+      log.info(`← ${provider!.name} stream | ${fullContent.length} chars | ${elapsed}ms`);
+      return { content: fullContent };
     });
 
     this.on('listProviders', async () => {
@@ -307,7 +372,7 @@ export class LLMObject extends Abject {
             phase: 'llm-waiting',
             message: `LLM request in progress (${Math.round((Date.now() - start) / 1000)}s)`,
           })
-        ).catch(() => {});
+        );
       }, KEEPALIVE_MS);
     }
 

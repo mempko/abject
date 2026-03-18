@@ -279,10 +279,17 @@ export class ScriptableAbject extends Abject {
     this.on('updateSource', async (msg: AbjectMessage) => {
       const { source } = msg.payload as { source: string };
       if (msg.routing.from !== this._owner) {
-        log.warn(
-          `updateSource rejected: ${msg.routing.from} is not owner ${this._owner}`
-        );
-        return { success: false, error: 'Only the owner can update source' };
+        // Ownership may be stale after restart (ObjectCreator gets new ID each session).
+        // Resolve the current ObjectCreator via registry and accept if it matches the sender.
+        const creatorId = await this.discoverDep('ObjectCreator');
+        if (msg.routing.from !== creatorId) {
+          log.warn(
+            `updateSource rejected: ${msg.routing.from} is not owner ${this._owner}`
+          );
+          return { success: false, error: 'Only the owner can update source' };
+        }
+        // Adopt new ObjectCreator as owner
+        this._owner = msg.routing.from;
       }
 
       // Hot-reload: tear down current UI via old hide() handler
@@ -331,23 +338,35 @@ export class ScriptableAbject extends Abject {
    * Call a method on another object via message passing.
    * The `to` parameter accepts a Promise (from this.dep()) or a plain ID.
    *
+   * Options: { timeout?: number } — override the default 30s request timeout.
+   * Long-running calls (e.g. WebAgent.runTask) should pass a longer timeout.
+   *
    * Backward compat: detects 4-arg calls (to, interfaceId, method, payload)
    * from stored user objects and skips the second arg.
    */
-  async call<T>(to: AbjectId | string | Promise<AbjectId>, method: string, payload?: unknown, _unused?: unknown): Promise<T> {
+  async call<T>(
+    to: AbjectId | string | Promise<AbjectId>,
+    method: string,
+    payload?: unknown,
+    options?: { timeout?: number } | unknown,
+  ): Promise<T> {
     // Backward compat: if called with 4 args and the 2nd looks like an interface ID, skip it
-    if (_unused !== undefined && typeof method === 'string' && typeof payload === 'string') {
+    if (options !== undefined && typeof method === 'string' && typeof payload === 'string') {
       // Old call signature: call(to, interfaceId, method, payload)
       const actualMethod = payload as unknown as string;
-      const actualPayload = _unused;
+      const actualPayload = options;
       const resolvedTo = await to;
       return this.request<T>(
         request(this.id, resolvedTo as AbjectId, actualMethod, actualPayload)
       );
     }
     const resolvedTo = await to;
+    const timeoutMs = (options && typeof options === 'object' && 'timeout' in options)
+      ? (options as { timeout?: number }).timeout
+      : undefined;
     return this.request<T>(
-      request(this.id, resolvedTo as AbjectId, method, payload ?? {})
+      request(this.id, resolvedTo as AbjectId, method, payload ?? {}),
+      timeoutMs,
     );
   }
 
@@ -357,7 +376,7 @@ export class ScriptableAbject extends Abject {
    */
   async emit(to: AbjectId | string | Promise<AbjectId>, eventName: string, payload?: unknown): Promise<void> {
     const resolvedTo = await to;
-    await this.send(event(this.id, resolvedTo as AbjectId, eventName, payload ?? {}));
+    this.send(event(this.id, resolvedTo as AbjectId, eventName, payload ?? {}));
   }
 
   /**
@@ -393,6 +412,16 @@ export class ScriptableAbject extends Abject {
    * Non-function properties (e.g. _windowId: null) are set on the instance so handlers
    * can share state via `this`.
    */
+  // System handlers that must never be overridden by user source code.
+  // System handlers that must never be overridden by user source code.
+  // LLM-generated code often includes stubs for these that bypass the
+  // hot-reload logic (updateSource), return stale introspection data
+  // (describe, ask), or break lifecycle management (windowCloseRequested).
+  private static readonly PROTECTED_HANDLERS = new Set([
+    'getSource', 'updateSource', 'probe', 'windowCloseRequested',
+    'describe', 'ask', 'getRegistry',
+  ]);
+
   private compileAndInstall(source: string): void {
     const handlerMap = new Function('return ' + source)() as Record<string, MessageHandlerFn>;
     contractRequire(
@@ -409,7 +438,7 @@ export class ScriptableAbject extends Abject {
         if (!(key in proto) && !baseProps.has(key)) {
           (this as Record<string, unknown>)[key] = bound;
         }
-        if (!key.startsWith('_')) {
+        if (!key.startsWith('_') && !ScriptableAbject.PROTECTED_HANDLERS.has(key)) {
           // Message handler — also registered on bus
           this.on(key, bound);
           this._userMethods.add(key);
@@ -468,7 +497,7 @@ export class ScriptableAbject extends Abject {
         if (!(key in proto) && !baseProps.has(key)) {
           (this as Record<string, unknown>)[key] = bound;
         }
-        if (!key.startsWith('_')) {
+        if (!key.startsWith('_') && !ScriptableAbject.PROTECTED_HANDLERS.has(key)) {
           // Message handler — also registered on bus
           this.on(key, bound);
           this._userMethods.add(key);
@@ -498,7 +527,7 @@ export class ScriptableAbject extends Abject {
         'sourceUpdated',
         { objectId: this.id, methods: newMethods }
       )
-    ).catch(() => { /* best-effort notification */ });
+    );
 
     return { success: true };
   }

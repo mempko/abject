@@ -106,7 +106,7 @@ async function bootstrapP2P(config: P2PConfig): Promise<void> {
           resolve(msg.payload as { peerId: string });
         }
       });
-      workerBus.send(createRequest(BOOT_ID, identityId, 'getIdentity', {})).catch(reject);
+      workerBus.send(createRequest(BOOT_ID, identityId, 'getIdentity', {}));
     });
     port.postMessage({ type: 'peer-id', peerId: identity.peerId });
     log.info(`Local peerId: ${identity.peerId.slice(0, 16)}...`);

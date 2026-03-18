@@ -127,7 +127,7 @@ export class JobManager extends Abject {
   private async log(level: string, message: string, data?: unknown): Promise<void> {
     if (!this.consoleId) return;
     try {
-      await this.send(
+      this.send(
         request(this.id, this.consoleId, level, { message, data })
       );
     } catch { /* logging should never break the caller */ }
@@ -154,7 +154,7 @@ export class JobManager extends Abject {
           this.send(
             event(this.id, q.currentJobCallerId, 'progress',
               msg.payload ?? {})
-          ).catch(() => {});
+          );
         }
       }
     });
@@ -185,7 +185,7 @@ export class JobManager extends Abject {
       q.queue.push(jobId);
 
       // Broadcast jobQueued to dependents (JobBrowser)
-      await this.changed('jobQueued', { jobId, description, queue: resolvedQueue, position: q.queue.length });
+      this.changed('jobQueued', { jobId, description, queue: resolvedQueue, position: q.queue.length });
 
       // Create a Promise that resolves when the job finishes
       const jobDone = new Promise<Job>((resolve) => {
@@ -198,7 +198,7 @@ export class JobManager extends Abject {
       // Send the reply when the job completes (non-blocking)
       jobDone.then(async (finished) => {
         try {
-          await this.sendDeferredReply(msg, {
+          this.sendDeferredReply(msg, {
             jobId: finished.id,
             status: finished.status,
             result: finished.result,
@@ -245,7 +245,7 @@ export class JobManager extends Abject {
         resolver(job);
       }
 
-      await this.changed('jobFailed', { jobId, description: job.description, queue: job.queue, error: 'Cancelled' });
+      this.changed('jobFailed', { jobId, description: job.description, queue: job.queue, error: 'Cancelled' });
       return true;
     });
 
@@ -259,7 +259,7 @@ export class JobManager extends Abject {
       for (const jobId of toRemove) {
         this.jobs.delete(jobId);
       }
-      await this.changed('historyCleared', {});
+      this.changed('historyCleared', {});
       return true;
     });
 
@@ -283,19 +283,19 @@ export class JobManager extends Abject {
         job.startedAt = Date.now();
         q.currentJobId = jobId;
 
-        await this.changed('jobStarted', { jobId, description: job.description, queue: job.queue });
+        this.changed('jobStarted', { jobId, description: job.description, queue: job.queue });
         await this.log('info', `Job started: ${job.description}`, { jobId, queue: job.queue });
 
         try {
           const result = await this.executeCode(job.code, job.callerId, q);
           job.status = 'completed';
           job.result = result;
-          await this.changed('jobCompleted', { jobId, description: job.description, queue: job.queue, result });
+          this.changed('jobCompleted', { jobId, description: job.description, queue: job.queue, result });
           await this.log('info', `Job completed: ${job.description}`, { jobId, queue: job.queue, result });
         } catch (err) {
           job.status = 'failed';
           job.error = err instanceof Error ? err.message : String(err);
-          await this.changed('jobFailed', { jobId, description: job.description, queue: job.queue, error: job.error });
+          this.changed('jobFailed', { jobId, description: job.description, queue: job.queue, error: job.error });
           await this.log('error', `Job failed: ${job.description}`, { jobId, queue: job.queue, error: job.error });
         }
 
@@ -347,10 +347,10 @@ export class JobManager extends Abject {
 
     const progressFn = async (message?: string) => {
       if (q.currentJobCallerId) {
-        await this.send(
+        this.send(
           event(this.id, q.currentJobCallerId, 'progress',
             { message: message ?? 'working' })
-        ).catch(() => {});
+        );
       }
     };
 

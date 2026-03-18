@@ -142,9 +142,19 @@ export abstract class WidgetAbject extends Abject {
     this.setupWidgetHandlers();
   }
 
+  /** Render-time snapshot: consistent state across async draw commands. */
+  protected _renderText: string = '';
+  protected _renderRect: Rect = { x: 0, y: 0, width: 0, height: 0 };
+  protected _renderStyle: WidgetStyle = {};
+
   private setupWidgetHandlers(): void {
     this.on('render', async (msg: AbjectMessage) => {
       if (!this.visible) return [];
+      // Snapshot mutable state so buildDrawCommands sees consistent values
+      // across await points even when concurrent update handlers modify them.
+      this._renderText = this.text;
+      this._renderRect = { ...this.rect };
+      this._renderStyle = { ...this.style };
       const { surfaceId, ox, oy } = msg.payload as { surfaceId: string; ox: number; oy: number };
       return this.buildDrawCommands(surfaceId, ox, oy);
     });
@@ -159,7 +169,7 @@ export abstract class WidgetAbject extends Abject {
       this.applyCommonUpdates(updates);
       await this.applyUpdate(updates);
       if (this.visible !== oldVisible) {
-        await this.changed('visibility', this.visible);
+        this.changed('visibility', this.visible);
       }
       await this.requestRedraw();
       return true;
@@ -239,7 +249,7 @@ export abstract class WidgetAbject extends Abject {
    * Request parent window to redraw (sends childDirty event).
    */
   protected async requestRedraw(): Promise<void> {
-    await this.send(event(this.id, this.ownerId, 'childDirty', {
+    this.send(event(this.id, this.ownerId, 'childDirty', {
       widgetId: this.id,
     }));
   }

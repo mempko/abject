@@ -22,6 +22,7 @@ export class Taskbar extends Abject {
   private chatId?: AbjectId;
   private jobBrowserId?: AbjectId;
   private webBrowserViewerId?: AbjectId;
+  private goalBrowserId?: AbjectId;
   private registryId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
@@ -34,6 +35,7 @@ export class Taskbar extends Abject {
   private chatBtnId?: AbjectId;
   private jobsBtnId?: AbjectId;
   private browserViewerBtnId?: AbjectId;
+  private goalsBtnId?: AbjectId;
 
   // Dynamic user object buttons: button widget AbjectId → target object AbjectId
   private userObjButtons: Map<AbjectId, AbjectId> = new Map();
@@ -94,6 +96,7 @@ export class Taskbar extends Abject {
     this.chatId = await this.requireDep('Chat');
     this.jobBrowserId = await this.requireDep('JobBrowser');
     this.webBrowserViewerId = await this.discoverDep('WebBrowserViewer') ?? undefined;
+    this.goalBrowserId = await this.discoverDep('GoalBrowser') ?? undefined;
     this.registryId = await this.requireDep('Registry');
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
 
@@ -105,6 +108,7 @@ export class Taskbar extends Abject {
     // Subscribe as dependent of each system object to receive visibility changes
     const depIds = [this.appExplorerId!, this.chatId!, this.jobBrowserId!];
     if (this.webBrowserViewerId) depIds.push(this.webBrowserViewerId);
+    if (this.goalBrowserId) depIds.push(this.goalBrowserId);
     for (const depId of depIds) {
       await this.request(request(this.id, depId, 'addDependent', {}));
     }
@@ -178,6 +182,10 @@ export class Taskbar extends Abject {
       } else if (fromId === this.browserViewerBtnId && this.webBrowserViewerId) {
         await this.request(
           request(this.id, this.webBrowserViewerId, 'show', {})
+        );
+      } else if (fromId === this.goalsBtnId && this.goalBrowserId) {
+        await this.request(
+          request(this.id, this.goalBrowserId, 'show', {})
         );
       } else if (this.restoreButtons.has(fromId)) {
         // Restore a minimized window
@@ -354,6 +362,7 @@ export class Taskbar extends Abject {
       [this.chatBtnId, this.chatId],
       [this.jobsBtnId, this.jobBrowserId],
       [this.browserViewerBtnId, this.webBrowserViewerId],
+      [this.goalsBtnId, this.goalBrowserId],
     ];
 
     const updates = systemPairs
@@ -389,7 +398,7 @@ export class Taskbar extends Abject {
     const padding = 16;
     const spacing = 6;
     const btnW = 120;
-    const systemBtnCount = 2 + (this.webBrowserViewerId ? 1 : 0);
+    const systemBtnCount = 2 + (this.webBrowserViewerId ? 1 : 0) + (this.goalBrowserId ? 1 : 0);
     const minimizedCount = this.minimizedWindows.size;
     const userBtnCount = this.userObjButtons.size;
     const totalBtnCount = systemBtnCount + userBtnCount + minimizedCount;
@@ -432,6 +441,7 @@ export class Taskbar extends Abject {
     this.chatBtnId = undefined;
     this.jobsBtnId = undefined;
     this.browserViewerBtnId = undefined;
+    this.goalsBtnId = undefined;
     this.rootLayoutId = undefined;
     this.userObjButtons.clear();
     this.restoreButtons.clear();
@@ -443,7 +453,7 @@ export class Taskbar extends Abject {
     const labelH = 20;
     const padding = 16;
     const spacing = 6;
-    const systemBtnCount = 2 + (this.webBrowserViewerId ? 1 : 0);
+    const systemBtnCount = 2 + (this.webBrowserViewerId ? 1 : 0) + (this.goalBrowserId ? 1 : 0);
     const minimizedCount = this.minimizedWindows.size;
     const totalBtnCount = systemBtnCount + showableObjects.length + minimizedCount;
     const extraHeight = (labelH + spacing)
@@ -503,6 +513,7 @@ export class Taskbar extends Abject {
       isVisible(this.jobBrowserId!),
     ];
     if (this.webBrowserViewerId) visPromises.push(isVisible(this.webBrowserViewerId));
+    if (this.goalBrowserId) visPromises.push(isVisible(this.goalBrowserId));
 
     // Query showable object visibility in parallel
     const showableVisPromises = showableObjects.map(obj => isVisible(obj.id));
@@ -512,9 +523,11 @@ export class Taskbar extends Abject {
       Promise.all(showableVisPromises),
     ]);
     const [registryVis, chatVis, jobsVis] = visResults;
-    const browserViewerVis = this.webBrowserViewerId ? visResults[3] : false;
+    let visIdx = 3;
+    const browserViewerVis = this.webBrowserViewerId ? visResults[visIdx++] : false;
+    const goalBrowserVis = this.goalBrowserId ? visResults[visIdx++] : false;
 
-    log.info(`visibility: registry=${registryVis} chat=${chatVis} jobs=${jobsVis} browser=${browserViewerVis}`);
+    log.info(`visibility: registry=${registryVis} chat=${chatVis} jobs=${jobsVis} browser=${browserViewerVis} goals=${goalBrowserVis}`);
 
     // Batch create all widgets: header label, gear button, system buttons, user buttons, minimize section
     const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
@@ -530,6 +543,10 @@ export class Taskbar extends Abject {
     // 4?: Browser button (optional)
     if (this.webBrowserViewerId) {
       specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Web', ...(browserViewerVis ? { style: activeStyle } : {}) });
+    }
+    // 5?: Goals button (optional)
+    if (this.goalBrowserId) {
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDFAF Goals', ...(goalBrowserVis ? { style: activeStyle } : {}) });
     }
     // User object buttons
     const userObjStartIdx = specs.length;
@@ -561,6 +578,9 @@ export class Taskbar extends Abject {
     if (this.webBrowserViewerId) {
       this.browserViewerBtnId = widgetIds[nextIdx++];
     }
+    if (this.goalBrowserId) {
+      this.goalsBtnId = widgetIds[nextIdx++];
+    }
 
     // Map user object buttons
     for (let i = 0; i < showableObjects.length; i++) {
@@ -579,6 +599,7 @@ export class Taskbar extends Abject {
     const rootChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize: Record<string, number> }> = [];
     const allButtonIds = [this.chatBtnId, this.jobsBtnId];
     if (this.browserViewerBtnId) allButtonIds.push(this.browserViewerBtnId);
+    if (this.goalsBtnId) allButtonIds.push(this.goalsBtnId);
     for (const btnId of allButtonIds) {
       rootChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
     }
@@ -637,6 +658,7 @@ export class Taskbar extends Abject {
     this.chatBtnId = undefined;
     this.jobsBtnId = undefined;
     this.browserViewerBtnId = undefined;
+    this.goalsBtnId = undefined;
     this.userObjButtons.clear();
     return true;
   }

@@ -573,7 +573,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
    * If the recipient is a known remote object, forward via transport.
    * All routing is done via UUID lookup in the routing table.
    */
-  async intercept(message: AbjectMessage): Promise<'pass' | 'drop' | AbjectMessage> {
+  intercept(message: AbjectMessage): 'pass' | 'drop' | AbjectMessage {
     const recipient = message.routing.to;
 
     if (!this.hasPeerAccess) {
@@ -592,12 +592,11 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       // No explicit route — try speculative forwarding before giving up
       const specPeer = this.speculateNextHop(message.routing.from as AbjectId, recipient);
       if (specPeer && this.isPeerConnected(specPeer)) {
-        try {
-          const outMsg = this.filterOutboundReply(message);
-          await this.sendToPeerTransport(specPeer, outMsg);
-          this.trackOutboundConnection(message.routing.from as AbjectId, specPeer);
-          return 'drop';
-        } catch { /* fall through to 'pass' */ }
+        const outMsg = this.filterOutboundReply(message);
+        // Fire-and-forget: transport send is async but bus must not block
+        this.sendToPeerTransport(specPeer, outMsg).catch(() => { /* best-effort */ });
+        this.trackOutboundConnection(message.routing.from as AbjectId, specPeer);
+        return 'drop';
       }
       return 'pass'; // Local delivery
     }
@@ -607,17 +606,15 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       return 'pass'; // Fall through to normal undeliverable handling
     }
 
-    try {
-      // Filter list replies to enforce exposed-objects policy
-      const outMsg = this.filterOutboundReply(message);
-      await this.sendToPeerTransport(route.nextHop, outMsg);
-      // NAT-like: record that this local object talked to this peer
-      this.trackOutboundConnection(message.routing.from as AbjectId, route.nextHop);
-      return 'drop'; // We handled delivery
-    } catch (err) {
+    // Filter list replies to enforce exposed-objects policy
+    const outMsg = this.filterOutboundReply(message);
+    // Fire-and-forget: transport send is async but bus must not block
+    this.sendToPeerTransport(route.nextHop, outMsg).catch((err) => {
       log.error(`Failed to forward message to peer ${route.nextHop.slice(0, 16)}:`, err);
-      return 'pass';
-    }
+    });
+    // NAT-like: record that this local object talked to this peer
+    this.trackOutboundConnection(message.routing.from as AbjectId, route.nextHop);
+    return 'drop'; // We handled delivery
   }
 
   /**
@@ -778,9 +775,11 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       }
 
       // Inject into local bus
-      this._messageBus.send(msg).catch((err) => {
+      try {
+        this._messageBus.send(msg);
+      } catch (err) {
         log.error('Failed to inject remote message:', err);
-      });
+      }
       return;
     }
 

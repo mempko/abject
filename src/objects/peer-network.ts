@@ -1107,7 +1107,7 @@ export class PeerNetwork extends Abject {
       }
     }
 
-    await this.changed('visibility', true);
+    this.changed('visibility', true);
     return true;
   }
 
@@ -1144,7 +1144,7 @@ export class PeerNetwork extends Abject {
     this.unblockButtons.clear();
     this.signalingPeerAddButtons.clear();
 
-    await this.changed('visibility', false);
+    this.changed('visibility', false);
     return true;
   }
 

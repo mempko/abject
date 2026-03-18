@@ -130,7 +130,7 @@ export class CanvasWidget extends WidgetAbject {
 
     // Forward mouse/key events to the ScriptableAbject
     try {
-      await this.send(event(
+      this.send(event(
         this.id,
         this.inputTargetId,
         'input',
@@ -168,7 +168,7 @@ export class CanvasWidget extends WidgetAbject {
       const newRect = updates.rect as Rect;
       if (newRect.width > 0 && newRect.height > 0) {
         try {
-          await this.send(event(
+          this.send(event(
             this.id,
             this.inputTargetId,
             'input',

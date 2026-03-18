@@ -34,6 +34,8 @@ import { WindowManager } from '../src/objects/window-manager.js';
 import { AbjectEditor } from '../src/objects/abject-editor.js';
 import { JobManager } from '../src/objects/job-manager.js';
 import { JobBrowser } from '../src/objects/job-browser.js';
+import { GoalManager } from '../src/objects/goal-manager.js';
+import { GoalBrowser } from '../src/objects/goal-browser.js';
 import { Chat } from '../src/objects/chat.js';
 import { AgentAbject } from '../src/objects/agent-abject.js';
 import { AbjectStore } from '../src/objects/abject-store.js';
@@ -171,7 +173,7 @@ async function main(): Promise<void> {
       pendingReplies.set(msg.header.messageId, {
         resolve: resolve as (v: unknown) => void, reject,
       });
-      bus.send(msg).catch(reject);
+      bus.send(msg);
     });
   }
 
@@ -222,7 +224,7 @@ async function main(): Promise<void> {
     // Worker mode: intercept updateAuth messages going TO BackendUI so we
     // update the main-thread authConfig used by the WS connection handler.
     bus.addInterceptor({
-      async intercept(msg: AbjectMessage): Promise<'pass' | 'drop' | AbjectMessage> {
+      intercept(msg: AbjectMessage): 'pass' | 'drop' | AbjectMessage {
         if (msg.routing.to === backendUIId && msg.routing.method === 'updateAuth') {
           const { enabled, username, password } = msg.payload as {
             enabled: boolean; username: string; password: string;
@@ -346,6 +348,8 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('ObjectBrowser', () => new ObjectBrowser());
   runtime.objectFactory.registerConstructor('JobManager', () => new JobManager());
   runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
+  runtime.objectFactory.registerConstructor('GoalManager', () => new GoalManager());
+  runtime.objectFactory.registerConstructor('GoalBrowser', () => new GoalBrowser());
   runtime.objectFactory.registerConstructor('Chat', () => new Chat());
   runtime.objectFactory.registerConstructor('AgentAbject', () => new AgentAbject());
   runtime.objectFactory.registerConstructor('AbjectStore', () => new AbjectStore());
@@ -385,6 +389,7 @@ async function main(): Promise<void> {
       'GlobalSettings', 'PeerNetwork', 'ObjectBrowser', 'ProcessExplorer', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
       // Per-workspace objects (use workspace registry via registryHint)
       'AbjectStore', 'Theme', 'Settings', 'AppExplorer',
+      'GoalManager', 'GoalBrowser',
       'JobManager', 'JobBrowser',
       'Chat', 'AbjectEditor', 'Taskbar',
     ];

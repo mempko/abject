@@ -188,7 +188,7 @@ export class WorkerRuntime {
 
         // Route through message bus
         if (this.bus) {
-          this.bus.send(msg).catch(console.error);
+          this.bus.send(msg);
         }
         break;
       }

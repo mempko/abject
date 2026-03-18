@@ -27,13 +27,16 @@ export interface WorkerLike {
 
 /** Message types sent from main thread to worker. */
 export interface WorkerInboundMessage {
-  type: 'init' | 'spawn' | 'kill' | 'bus:deliver' | 'bus:reply';
+  type: 'init' | 'spawn' | 'kill' | 'bus:deliver' | 'bus:reply'
+      | 'peer:port' | 'peer:place' | 'peer:remove';
   objectId?: AbjectId;
   constructorName?: string;
   constructorArgs?: unknown;
   registryId?: AbjectId;
   parentId?: AbjectId;
   message?: AbjectMessage;
+  workerIndex?: number;
+  port?: unknown;  // MessagePort (transferred)
 }
 
 /** Message types sent from worker to main thread. */
@@ -140,6 +143,31 @@ export class WorkerBridge {
   }
 
   /**
+   * Send a direct MessagePort to this worker for peer-to-peer communication.
+   * The port is transferred (not cloned) to the worker.
+   */
+  sendPeerPort(workerIndex: number, port: unknown): void {
+    this.worker.postMessage(
+      { type: 'peer:port', workerIndex, port } as WorkerInboundMessage,
+      [port as unknown as Transferable],
+    );
+  }
+
+  /**
+   * Notify this worker that an object has been placed in a peer worker.
+   */
+  sendPeerPlace(objectId: AbjectId, workerIndex: number): void {
+    this.worker.postMessage({ type: 'peer:place', objectId, workerIndex } as WorkerInboundMessage);
+  }
+
+  /**
+   * Notify this worker that an object has been removed from a peer worker.
+   */
+  sendPeerRemove(objectId: AbjectId): void {
+    this.worker.postMessage({ type: 'peer:remove', objectId } as WorkerInboundMessage);
+  }
+
+  /**
    * Terminate the worker.
    */
   terminate(): void {
@@ -198,9 +226,7 @@ export class WorkerBridge {
       case 'bus:send': {
         // Worker-side object wants to send a message — route through main bus
         const message = data.message!;
-        this.bus.send(message).catch((err) => {
-          log.error('Failed to route message from worker:', err);
-        });
+        this.bus.send(message);
         break;
       }
 

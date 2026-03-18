@@ -55,6 +55,9 @@ export class WebAgent extends Abject {
   private keptOpenPages = new Map<string, ReturnType<typeof setTimeout>>();
   private static readonly PAGE_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
+  /** Pending ticket promises: ticketId → resolve/reject. */
+  private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+
   constructor() {
     super({
       manifest: {
@@ -181,8 +184,8 @@ export class WebAgent extends Abject {
   const result = await call(await dep('WebAgent'), 'runTask', {
     task: 'Search for "abjects" on Google and return the first result',
     options: { startUrl: 'https://www.google.com', maxSteps: 15, timeout: 120000 },
-  });
-  // result: { success, result, steps, error? }
+  }, { timeout: 300000 });  // long-running — extend the default 30s call timeout
+  // result: { success, result, steps, error?, maxStepsReached? }
 
 ### Run a Web Task with Structured Result
 
@@ -190,6 +193,7 @@ export class WebAgent extends Abject {
     task: 'Extract the top 5 stories from the front page',
     options: {
       startUrl: 'https://news.ycombinator.com',
+      maxSteps: 10,
       responseSchema: {
         type: 'object',
         properties: {
@@ -209,8 +213,8 @@ export class WebAgent extends Abject {
         required: ['stories'],
       },
     },
-  });
-  // result: { success, result: { stories: [...] }, steps, validationErrors? }
+  }, { timeout: 300000 });  // long-running — extend the default 30s call timeout
+  // result: { success, result: { stories: [...] }, steps, validationErrors?, maxStepsReached? }
 
 Use responseSchema (JSON Schema format) when you need structured data back.
 Without it, the result is free text. validationErrors is undefined on success.
@@ -271,8 +275,9 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
 - The method is **runTask** (not "run" or "navigate").
 - Options: startUrl, maxSteps, timeout, pageOptions, responseSchema, pageId, keepPageOpen.
 - WebAgent opens and closes browser pages automatically — do NOT call WebBrowser directly.
-- runTask is long-running — the reply arrives when the task completes.
-- Kept-open pages auto-close after 5 minutes of inactivity.`;
+- **runTask is long-running** — always pass \`{ timeout: 300000 }\` as the 4th argument to \`call()\` (the default 30s timeout is too short).
+- Kept-open pages auto-close after 5 minutes of inactivity.
+- Internally, WebAgent uses a ticket pattern with AgentAbject — startTask returns a ticketId and results arrive via taskResult events.`;
   }
 
   protected override async onInit(): Promise<void> {
@@ -296,6 +301,16 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
   }
 
   private setupHandlers(): void {
+    // ── Ticket result handler ──
+    this.on('taskResult', async (msg: AbjectMessage) => {
+      const payload = msg.payload as { ticketId: string };
+      const pending = this.pendingTickets.get(payload.ticketId);
+      if (pending) {
+        this.pendingTickets.delete(payload.ticketId);
+        pending.resolve(payload);
+      }
+    });
+
     this.on('runTask', async (msg: AbjectMessage) => {
       const { task, options } = msg.payload as { task: string; options?: WebTaskOptions };
       contractRequire(typeof task === 'string' && task.trim().length > 0, 'task must be a non-empty string');
@@ -319,6 +334,7 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
 
       // Fire-and-forget: run task asynchronously via AgentAbject
       this.runTaskAsync(msg, taskId, task.trim(), extra, options);
+      // Return deferred — we still reply to the original caller via sendDeferredReply
       return DEFERRED_REPLY;
     });
 
@@ -331,13 +347,7 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
       this.taskExtras.set(taskId, { pageId });
 
       // For single steps, use directExecution to avoid queue deadlocks
-      const result = await this.request<{
-        taskId: string;
-        success: boolean;
-        result?: unknown;
-        error?: string;
-        steps: number;
-      }>(
+      const { ticketId } = await this.request<{ ticketId: string }>(
         request(this.id, this.agentAbjectId!, 'startTask', {
           taskId,
           task: instruction,
@@ -349,8 +359,8 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
             queueName: `web-agent-${this.id}`,
           },
         }),
-        130000,
       );
+      const result = await this.waitForTaskResult(ticketId, 130000);
 
       return { success: result.success, result: result.result, error: result.error };
     });
@@ -402,11 +412,11 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
         msg.payload as { taskId: string; step: number; oldPhase: string; newPhase: string; action?: string };
 
       // Emit taskProgress for dependents
-      this.changed('taskProgress', { taskId, step, phase: newPhase, action }).catch(() => {});
+      this.changed('taskProgress', { taskId, step, phase: newPhase, action });
 
       // Forward progress to JobManager to keep the outer call alive
       if (this.jobManagerId) {
-        this.send(event(this.id, this.jobManagerId, 'progress', { phase: newPhase })).catch(() => {});
+        this.send(event(this.id, this.jobManagerId, 'progress', { phase: newPhase }));
       }
     });
 
@@ -445,6 +455,28 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
   protected override async onStop(): Promise<void> {
     for (const timeout of this.keptOpenPages.values()) clearTimeout(timeout);
     this.keptOpenPages.clear();
+    // Reject any pending tickets
+    for (const [id, pending] of this.pendingTickets) {
+      pending.reject(new Error('WebAgent stopped'));
+    }
+    this.pendingTickets.clear();
+  }
+
+  private waitForTaskResult(ticketId: string, timeoutMs: number): Promise<{
+    ticketId: string; success: boolean; result?: unknown; error?: string;
+    steps: number; maxStepsReached?: boolean; validationErrors?: string[];
+  }> {
+    type TaskResult = { ticketId: string; success: boolean; result?: unknown; error?: string; steps: number; maxStepsReached?: boolean; validationErrors?: string[] };
+    return new Promise<TaskResult>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingTickets.delete(ticketId);
+        reject(new Error(`Task ${ticketId} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.pendingTickets.set(ticketId, {
+        resolve: (v) => { clearTimeout(timer); resolve(v as TaskResult); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -458,7 +490,7 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
     extra: WebTaskExtra,
     options?: WebTaskOptions,
   ): Promise<void> {
-    let result: { taskId: string; success: boolean; result?: unknown; error?: string; steps: number };
+    let result: { success: boolean; result?: unknown; error?: string; steps: number; maxStepsReached?: boolean };
 
     try {
       // Open page (or reuse an existing kept-open page)
@@ -485,30 +517,26 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
         log.info(`Reusing existing page ${extra.pageId} (${taskId})`);
       }
 
-      // Run task via AgentAbject
-      result = await this.request<{
-        taskId: string;
-        success: boolean;
-        result?: unknown;
-        error?: string;
-        steps: number;
-      }>(
+      // Run task via AgentAbject — submit ticket + await result event.
+      // Each task gets its own queue so concurrent runTask calls can execute in parallel.
+      const taskTimeout = (options?.timeout ?? 300000) + 10000;
+      const { ticketId } = await this.request<{ ticketId: string }>(
         request(this.id, this.agentAbjectId!, 'startTask', {
           taskId,
           task: taskText,
-          systemPrompt: this.buildSystemPrompt(taskText),
+          systemPrompt: this.buildSystemPrompt(taskText, options?.maxSteps),
           responseSchema: extra.responseSchema,
           config: {
             maxSteps: options?.maxSteps,
             timeout: options?.timeout,
-            queueName: `web-agent-${this.id}`,
+            queueName: `web-agent-${taskId}`,
           },
         }),
-        (options?.timeout ?? 300000) + 10000,
       );
+      const ticketResult = await this.waitForTaskResult(ticketId, taskTimeout);
+      result = { success: ticketResult.success, result: ticketResult.result, error: ticketResult.error, steps: ticketResult.steps, maxStepsReached: ticketResult.maxStepsReached };
     } catch (err) {
       result = {
-        taskId,
         success: false,
         error: err instanceof Error ? err.message : String(err),
         steps: 0,
@@ -543,11 +571,12 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
       ? extra.pageId : undefined;
 
     try {
-      await this.sendDeferredReply(originalMsg, {
+      this.sendDeferredReply(originalMsg, {
         success: result.success,
         result: result.result,
         error: result.error,
         steps: result.steps,
+        ...(result.maxStepsReached ? { maxStepsReached: true } : {}),
         ...(replyPageId ? { pageId: replyPageId } : {}),
       });
     } catch { /* caller may be gone */ }
@@ -784,10 +813,11 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
   // System prompt
   // ═══════════════════════════════════════════════════════════════════
 
-  private buildSystemPrompt(taskText: string): string {
+  private buildSystemPrompt(taskText: string, maxSteps?: number): string {
+    const stepLimit = maxSteps ?? 15;
     return `You are WebAgent, an autonomous browser agent with vision. You receive a screenshot of the current page alongside text observations. Use the visual information to understand page layout, identify elements, and verify your actions succeeded. You complete web tasks by observing the page state, thinking about what to do, and taking actions.
 
-You have a limited number of steps. Be efficient — extract what you can quickly and use "done" rather than perfecting the result.
+You have a maximum of ${stepLimit} steps. Be efficient — extract what you can quickly and call "done" as soon as you have useful data. Do NOT keep refining or perfecting the result.
 
 ## Task
 ${taskText}
@@ -839,12 +869,13 @@ Respond with ONE action as a JSON object in a \`\`\`json code block:
 2. One action per response. Always include "reasoning" explaining why.
 3. After filling a form, remember to submit it (click submit button or press Enter).
 4. If a page is loading or elements aren't visible yet, use "wait".
-5. When the task is complete, use "done" with the result.
+5. **As soon as you have extracted useful data, call "done" immediately.** Do not keep refining or extracting more. Good enough is good enough.
 6. If stuck after several attempts, use "fail" with a clear reason.
 7. If an extract script fails, try a simpler approach (e.g., just get document.title or document.body.innerText).
 8. If a page returns an error or is blocked by bot detection, use "fail" with a clear reason instead of retrying the same page.
 9. Do not retry the same action more than twice. If it fails twice, try a different approach or fail.
-10. Keep reasoning brief (1-2 sentences).`;
+10. Keep reasoning brief (1-2 sentences).
+11. Pay attention to the step counter in observations. When steps are running low, call "done" with whatever you have.`;
   }
 }
 

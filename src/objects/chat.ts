@@ -7,8 +7,8 @@
  */
 
 import { AbjectId, AbjectManifest, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
-import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { Abject, DEFERRED_REPLY } from '../core/abject.js';
+import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { formatManifestAsDescription } from '../core/introspect.js';
 import type { AgentAction } from './agent-abject.js';
@@ -60,6 +60,24 @@ export class Chat extends Abject {
   /** Label ID for the current "Thinking..." indicator. */
   private thinkingLabelId?: AbjectId;
 
+  /** Label IDs for progress lines appended during the current task. */
+  private progressLabelIds: AbjectId[] = [];
+
+  /** Pending ticket promises: ticketId → resolve/reject. */
+  private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+
+  /** Current active ticket ID (for progress/stream routing). */
+  private _currentTicketId?: string;
+
+  /** Accumulated streaming buffer for current task. */
+  private _streamBuffer = '';
+
+  /** GoalManager ID for cross-agent progress tracking. */
+  private goalManagerId?: AbjectId;
+
+  /** Current goal ID for the active task. */
+  private _currentGoalId?: string;
+
   constructor() {
     super({
       manifest: {
@@ -100,6 +118,7 @@ export class Chat extends Abject {
                   phase: { kind: 'primitive', primitive: 'string' },
                   messageCount: { kind: 'primitive', primitive: 'number' },
                   visible: { kind: 'primitive', primitive: 'boolean' },
+                  currentGoalId: { kind: 'primitive', primitive: 'string' },
                 }},
               },
               {
@@ -127,6 +146,12 @@ export class Chat extends Abject {
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.registryId = await this.requireDep('Registry');
     this.agentAbjectId = await this.requireDep('AgentAbject');
+    this.goalManagerId = await this.discoverDep('GoalManager') ?? undefined;
+
+    // Subscribe to GoalManager for real-time goal updates
+    if (this.goalManagerId) {
+      this.send(request(this.id, this.goalManagerId, 'addDependent', {}));
+    }
 
     // Register with AgentAbject
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
@@ -169,6 +194,7 @@ export class Chat extends Abject {
         phase: this.uiPhase,
         messageCount: this.conversationHistory.length,
         visible: !!this.windowId,
+        currentGoalId: this._currentGoalId ?? null,
       };
     });
 
@@ -213,6 +239,58 @@ export class Chat extends Abject {
         } catch { /* layout may be gone */ }
         return;
       }
+
+      // GoalManager goal progress events — append progress labels for sub-agent updates.
+      // Skip Chat's own updates (agentName === 'Chat') since agentPhaseChanged already covers those.
+      if (fromId === this.goalManagerId && this._currentGoalId) {
+        const { value } = msg.payload as { aspect: string; value: unknown };
+        const data = value as { goalId: string; message?: string; phase?: string; agentName?: string };
+        if (data.goalId !== this._currentGoalId) return;
+        if (aspect === 'goalUpdated' && data.message && data.agentName && data.agentName !== 'Chat') {
+          await this.appendProgressLabel(`  ${data.agentName}: ${data.message}`);
+        }
+      }
+    });
+
+    // ── Ticket result/progress/stream handlers ──
+
+    this.on('taskResult', async (msg: AbjectMessage) => {
+      const payload = msg.payload as { ticketId: string };
+      const pending = this.pendingTickets.get(payload.ticketId);
+      if (pending) {
+        this.pendingTickets.delete(payload.ticketId);
+        pending.resolve(payload);
+      }
+    });
+
+    this.on('taskProgress', async (msg: AbjectMessage) => {
+      const { ticketId, step, maxSteps, phase, action } =
+        msg.payload as { ticketId: string; step: number; maxSteps: number; phase: string; action?: string };
+      if (!this._currentTicketId) return;
+      if (ticketId && ticketId !== this._currentTicketId) return;
+
+      // Update thinking label with progress
+      if (this.thinkingLabelId) {
+        if (phase === 'thinking') {
+          this.updateLabel(this.thinkingLabelId, `Thinking... (step ${step + 1}/${maxSteps})`, this.theme.statusNeutral);
+        } else if (phase === 'observing') {
+          this.updateLabel(this.thinkingLabelId, `Observing... (step ${step + 1}/${maxSteps})`, this.theme.statusNeutral);
+        }
+      }
+    });
+
+    this.on('taskStream', async (msg: AbjectMessage) => {
+      const { ticketId, content } =
+        msg.payload as { ticketId: string; content: string; done: boolean };
+      if (!this._currentTicketId) return;
+      if (ticketId && ticketId !== this._currentTicketId) return;
+      this._streamBuffer += content;
+    });
+
+    this.on('progress', async (msg: AbjectMessage) => {
+      const { message } = msg.payload as { phase?: string; message?: string };
+      if (!this._currentTicketId || !this.thinkingLabelId || !message) return;
+      this.updateLabel(this.thinkingLabelId, `  ${message}`, this.theme.statusNeutral);
     });
 
     // ── AgentAbject callback handlers ──
@@ -236,21 +314,27 @@ export class Chat extends Abject {
       return { observation: lines.join('\n') || 'No objects available.' };
     });
 
-    this.on('agentAct', async (msg: AbjectMessage) => {
+    this.on('agentAct', (msg: AbjectMessage) => {
       const { action } = msg.payload as { taskId: string; step: number; action: AgentAction };
-      return this.handleAgentAct(action);
+      this.handleAgentAct(action).then(
+        (result) => this.sendDeferredReply(msg, result),
+        (err) => this.sendDeferredReply(msg, {
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+      return DEFERRED_REPLY;
     });
 
     this.on('agentPhaseChanged', async (msg: AbjectMessage) => {
       const { step, newPhase, action } =
         msg.payload as { taskId: string; step: number; oldPhase: string; newPhase: string; action?: string };
 
-      // Update UI thinking label
       if (this.thinkingLabelId) {
         if (newPhase === 'thinking') {
-          this.updateLabel(this.thinkingLabelId, `Thinking... (step ${step + 1})`, this.theme.statusNeutral).catch(() => {});
+          this.updateLabel(this.thinkingLabelId, `Thinking... (step ${step + 1})`, this.theme.statusNeutral);
         } else if (newPhase === 'acting' && action) {
-          this.updateLabel(this.thinkingLabelId, `  ▸ ${action}...`, this.theme.actionBg).catch(() => {});
+          await this.appendProgressLabel(`  ▸ ${action}...`);
         }
       }
     });
@@ -275,15 +359,35 @@ export class Chat extends Abject {
       const { action, result } =
         msg.payload as { taskId: string; action: AgentAction; result: { success: boolean; error?: string } };
 
-      // Update UI with action result
       if (this.thinkingLabelId) {
         const desc = action?.reasoning ?? action?.action ?? '';
         if (result.success) {
-          this.updateLabel(this.thinkingLabelId, `  ✓ ${desc}`, this.theme.statusNeutral).catch(() => {});
+          await this.appendProgressLabel(`  ✓ ${desc}`);
         } else {
-          this.updateLabel(this.thinkingLabelId, `  ✗ ${desc}`, this.theme.statusError).catch(() => {});
+          await this.appendProgressLabel(`  ✗ ${desc}`);
         }
       }
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Ticket helpers
+  // ═══════════════════════════════════════════════════════════════════
+
+  private waitForTaskResult(ticketId: string, timeoutMs: number): Promise<{
+    ticketId: string; success: boolean; result?: unknown; error?: string;
+    steps: number; maxStepsReached?: boolean; validationErrors?: string[];
+  }> {
+    type TaskResult = { ticketId: string; success: boolean; result?: unknown; error?: string; steps: number; maxStepsReached?: boolean; validationErrors?: string[] };
+    return new Promise<TaskResult>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingTickets.delete(ticketId);
+        reject(new Error(`Task ${ticketId} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.pendingTickets.set(ticketId, {
+        resolve: (v) => { clearTimeout(timer); resolve(v as TaskResult); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
     });
   }
 
@@ -332,6 +436,13 @@ export class Chat extends Abject {
         if (!objectId) return { success: false, error: `Object "${targetStr}" not found` };
 
         const method = action.method as string;
+
+        // Fire-and-forget for show/hide — no need to wait
+        if (method === 'show' || method === 'hide') {
+          this.send(event(this.id, objectId, method, action.payload ?? {}));
+          return { success: true, data: `${method} sent` };
+        }
+
         const timeout = method === 'runTask' || method === 'create' ? 310000 : 120000;
         try {
           const result = await this.request(
@@ -349,9 +460,22 @@ export class Chat extends Abject {
         if (!creatorId) return { success: false, error: 'ObjectCreator not found' };
         try {
           const result = await this.request(
-            request(this.id, creatorId, 'create', { prompt: action.description as string }),
+            request(this.id, creatorId, 'create', {
+              prompt: action.description as string,
+              goalId: this._currentGoalId,
+            }),
             310000,
           );
+          // Unwrap: if ObjectCreator reports inner failure, surface it
+          const payload = result as { success?: boolean; error?: string; objectId?: AbjectId };
+          if (payload && payload.success === false) {
+            return { success: false, error: payload.error ?? 'Create failed' };
+          }
+          // Auto-show created object
+          const objectId = payload?.objectId;
+          if (objectId) {
+            this.send(event(this.id, objectId, 'show', {}));
+          }
           return { success: true, data: result };
         } catch (err) {
           return { success: false, error: err instanceof Error ? err.message : String(err) };
@@ -368,9 +492,15 @@ export class Chat extends Abject {
             request(this.id, creatorId, 'modify', {
               objectId,
               prompt: action.description as string,
+              goalId: this._currentGoalId,
             }),
             310000,
           );
+          // Unwrap: if ObjectCreator reports inner failure, surface it
+          const modPayload = result as { success?: boolean; error?: string };
+          if (modPayload && modPayload.success === false) {
+            return { success: false, error: modPayload.error ?? 'Modify failed' };
+          }
           return { success: true, data: result };
         } catch (err) {
           return { success: false, error: err instanceof Error ? err.message : String(err) };
@@ -450,23 +580,26 @@ export class Chat extends Abject {
       }
 
       case 'delegate': {
-        // Delegate a task to another registered agent
+        // Delegate a task to another registered agent via ticket pattern
         try {
           const agents = await this.request<Array<{ agentId: AbjectId; name: string }>>(
             request(this.id, this.agentAbjectId!, 'listAgents', {})
           );
           const agent = agents.find(a => a.name === action.agent);
           if (!agent) return { success: false, error: `Agent "${action.agent}" not found` };
-          const result = await this.request(
+          const { ticketId } = await this.request<{ ticketId: string }>(
             request(this.id, this.agentAbjectId!, 'startTask', {
               agentId: agent.agentId,
               task: action.task as string,
               responseSchema: action.responseSchema as Record<string, unknown> | undefined,
             }),
-            310000,
           );
+          this._currentTicketId = ticketId;
+          const result = await this.waitForTaskResult(ticketId, 310000);
+          this._currentTicketId = undefined;
           return { success: true, data: result };
         } catch (err) {
+          this._currentTicketId = undefined;
           return { success: false, error: err instanceof Error ? err.message : String(err) };
         }
       }
@@ -526,7 +659,7 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 - **call**: Send a message to an object (message passing).
   \`{ "action": "call", "object": "ObjectName", "method": "methodName", "payload": { ... } }\`
   For "object" you can use a name (e.g. "Timer") or an AbjectId (e.g. "abjects:timer").
-- **create**: Create a new object via ObjectCreator.
+- **create**: Create a new object via ObjectCreator. The created object is auto-shown — no need to call show separately.
   \`{ "action": "create", "description": "A counter widget that shows a number and has +/- buttons" }\`
 - **modify**: Modify an existing object via ObjectCreator.
   \`{ "action": "modify", "object": "<name or id>", "description": "Add a reset button that clears the counter" }\`
@@ -586,8 +719,9 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
 6. Keep reasoning brief (1-2 sentences before the JSON block).
 7. Every object supports: describe (get manifest), ask (get usage advice), addDependent/removeDependent (observe state changes).
 8. IMPORTANT: If the user asks to fix, change, update, or improve something and a matching object exists in "Your Objects" above, you MUST use **modify** with its [id: ...] — NEVER re-create it with **create**.
-9. P2P: Use qualified names to reference remote objects: this.find('peer.workspace.ObjectName'). NEVER hardcode UUIDs.
-10. For web tasks: message WebAgent with runTask on your FIRST action — include ALL details from the user's message (credentials, URLs, specific instructions) in the task description. Do not ask the user to repeat information they already gave you.`;
+9. If an action fails with a transient error (overloaded, timeout, 529, 503), **retry the same action** — do NOT switch from modify to create. Transient errors are temporary and unrelated to your action choice.
+10. P2P: Use qualified names to reference remote objects: this.find('peer.workspace.ObjectName'). NEVER hardcode UUIDs.
+11. For web tasks: message WebAgent with runTask on your FIRST action — include ALL details from the user's message (credentials, URLs, specific instructions) in the task description. Do not ask the user to repeat information they already gave you.`;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -629,10 +763,11 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
       })
     );
 
-    // Scrollable VBox for message log (expanding)
+    // Scrollable VBox for message log (expanding, auto-scroll to follow new messages)
     this.messageLogId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
         parentLayoutId: this.rootLayoutId,
+        autoScroll: true,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
@@ -684,7 +819,7 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
     // Show greeting
     await this.appendMessageLabel('Agent', 'How can I help you?', this.theme.statusSuccess);
 
-    await this.changed('visibility', true);
+    this.changed('visibility', true);
     return true;
   }
 
@@ -706,7 +841,8 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
     this.textInputId = undefined;
     this.sendBtnId = undefined;
     this.messageLabelIds = [];
-    await this.changed('visibility', false);
+    this.progressLabelIds = [];
+    this.changed('visibility', false);
     return true;
   }
 
@@ -755,21 +891,37 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
         initialMessages.push({ role: entry.role, content: entry.content });
       }
 
-      const result = await this.request<{
-        taskId: string;
-        success: boolean;
-        result?: unknown;
-        error?: string;
-        steps: number;
-      }>(
+      // Create a goal for this task
+      let goalId: string | undefined;
+      if (this.goalManagerId) {
+        try {
+          const goalResult = await this.request<{ goalId: string }>(
+            request(this.id, this.goalManagerId, 'createGoal', {
+              title: userText.slice(0, 100),
+            })
+          );
+          goalId = goalResult.goalId;
+          this._currentGoalId = goalId;
+        } catch { /* GoalManager may not be ready */ }
+      }
+
+      // Submit task — returns ticketId immediately
+      this._streamBuffer = '';
+      const { ticketId } = await this.request<{ ticketId: string }>(
         request(this.id, this.agentAbjectId!, 'startTask', {
           task: userText,
           systemPrompt: this.buildSystemPrompt(),
           initialMessages,
+          goalId,
           config: { queueName: `chat-${this.id}` },
         }),
-        310000,
       );
+      this._currentTicketId = ticketId;
+
+      // Wait for taskResult event
+      const result = await this.waitForTaskResult(ticketId, 310000);
+      this._currentTicketId = undefined;
+      this._currentGoalId = undefined;
 
       // Post-task UI cleanup
       if (this.thinkingLabelId) {
@@ -782,16 +934,22 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
           }
         } else {
           await this.removeLabel(this.thinkingLabelId);
-          await this.appendMessageLabel('Error', (result.error ?? 'Unknown error').slice(0, 100), this.theme.statusError);
+          const errorText = (result.error ?? 'Unknown error').slice(0, 100);
+          const note = result.maxStepsReached ? ' (step limit reached)' : '';
+          await this.appendMessageLabel('Error', errorText + note, this.theme.statusError);
         }
         this.thinkingLabelId = undefined;
       }
+      this.progressLabelIds = [];
     } catch (err) {
+      this._currentTicketId = undefined;
+      this._currentGoalId = undefined;
       // Remove thinking indicator if still there
       if (this.thinkingLabelId) {
         await this.removeLabel(this.thinkingLabelId);
         this.thinkingLabelId = undefined;
       }
+      this.progressLabelIds = [];
       const errMsg = err instanceof Error ? err.message : String(err);
       await this.appendMessageLabel('Error', errMsg.slice(0, 100), this.theme.statusError);
     }
@@ -939,6 +1097,34 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
     return labelId;
   }
 
+  private async appendProgressLabel(text: string): Promise<void> {
+    if (!this.messageLogId || !this.windowId) return;
+
+    // Move thinking label to the bottom so progress lines appear above it.
+    // Remove → append progress → re-add thinking label at end.
+    if (this.thinkingLabelId) {
+      try {
+        await this.request(request(this.id, this.messageLogId, 'removeLayoutChild', {
+          widgetId: this.thinkingLabelId,
+        }));
+      } catch { /* may already be gone */ }
+    }
+
+    const labelId = await this.appendMessageLabel('', text, this.theme.statusNeutral);
+    this.progressLabelIds.push(labelId);
+
+    // Re-add thinking label at the bottom
+    if (this.thinkingLabelId) {
+      try {
+        await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
+          widgetId: this.thinkingLabelId,
+          sizePolicy: { vertical: 'fixed' },
+          preferredSize: { height: 24 },
+        }));
+      } catch { /* may already be gone */ }
+    }
+  }
+
   private async updateLabel(labelId: AbjectId, text: string, color: string): Promise<void> {
     if (!labelId) return;
     try {
@@ -997,17 +1183,31 @@ Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests 
 ### Get current state
 
   const state = await call(await dep('Chat'), 'getState', {});
-  // state: { visible, messageCount, ... }
+  // state: { phase, messageCount, visible, currentGoalId }
 
 ### Clear conversation history
 
   await call(await dep('Chat'), 'clearHistory', {});
 
+### Goal Tracking
+
+Chat creates a Goal (via GoalManager) for each user message it processes.
+Query the current goal to observe Chat's progress:
+
+  const state = await call(await dep('Chat'), 'getState', {});
+  if (state.currentGoalId) {
+    const goal = await call(await dep('GoalManager'), 'getGoal', { goalId: state.currentGoalId });
+    // goal.progress has step-by-step updates
+  }
+
+Subscribe to GoalManager's changed events (goalUpdated, goalCompleted, goalFailed) for real-time updates.
+
 ### IMPORTANT
 - The interface ID is 'abjects:chat'.
 - Chat is an agent — it uses AgentAbject's observe-think-act loop to process messages.
 - sendMessage triggers the full agent cycle: the LLM decides what actions to take.
-- Actions can include creating objects, calling other services, or replying with text.`;
+- Actions can include creating objects, calling other services, or replying with text.
+- getState returns currentGoalId when Chat is actively processing a message (null otherwise).`;
   }
 }
 

@@ -325,7 +325,7 @@ export class Timer extends Abject {
       return;
     }
 
-    await this.send(
+    this.send(
       event(this.id, timer.info.objectId, 'timerFired', {
         timerId,
         data,

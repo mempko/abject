@@ -21,6 +21,7 @@ const WEB_BROWSER_INTERFACE = 'abjects:web-browser';
 
 interface BrowseOptions {
   waitFor?: string;
+  waitUntil?: 'load' | 'domcontentloaded' | 'networkidle' | 'commit';
   timeout?: number;
   userAgent?: string;
   viewport?: { width: number; height: number };
@@ -747,17 +748,17 @@ export class WebBrowser extends Abject {
       try {
         const tracked = this.getTrackedPage(payload.pageId as string, msg.routing.from);
         fn(tracked, payload, msg).then(
-          (result) => this.sendDeferredReply(msg, result).catch(() => {}),
+          (result) => this.sendDeferredReply(msg, result),
           (err) => {
             this.send(error(msg, 'BROWSER_ERROR',
               err instanceof Error ? err.message : String(err)
-            )).catch(() => {});
+            ));
           },
         );
       } catch (err) {
         this.send(error(msg, 'BROWSER_ERROR',
           err instanceof Error ? err.message : String(err)
-        )).catch(() => {});
+        ));
       }
       return DEFERRED_REPLY;
     });
@@ -771,11 +772,11 @@ export class WebBrowser extends Abject {
     this.on('getRenderedHtml', (msg: AbjectMessage) => {
       const { url, options } = msg.payload as { url: string; options?: BrowseOptions };
       this.doGetRenderedHtml(url, options).then(
-        (result) => this.sendDeferredReply(msg, result).catch(() => {}),
+        (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'BROWSER_ERROR',
             err instanceof Error ? err.message : String(err)
-          )).catch(() => {});
+          ));
         },
       );
       return DEFERRED_REPLY;
@@ -784,11 +785,11 @@ export class WebBrowser extends Abject {
     this.on('screenshot', (msg: AbjectMessage) => {
       const { url, options } = msg.payload as { url: string; options?: BrowseOptions };
       this.doScreenshot(url, options).then(
-        (result) => this.sendDeferredReply(msg, result).catch(() => {}),
+        (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'BROWSER_ERROR',
             err instanceof Error ? err.message : String(err)
-          )).catch(() => {});
+          ));
         },
       );
       return DEFERRED_REPLY;
@@ -799,11 +800,11 @@ export class WebBrowser extends Abject {
         url: string; selector: string; options?: BrowseOptions;
       };
       this.doExtractFromPage(url, selector, options).then(
-        (result) => this.sendDeferredReply(msg, result).catch(() => {}),
+        (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'BROWSER_ERROR',
             err instanceof Error ? err.message : String(err)
-          )).catch(() => {});
+          ));
         },
       );
       return DEFERRED_REPLY;
@@ -819,20 +820,20 @@ export class WebBrowser extends Abject {
     this.on('openPage', (msg: AbjectMessage) => {
       const { options } = msg.payload as { options?: BrowseOptions };
       this.doOpenPage(msg.routing.from, options).then(
-        (result) => this.sendDeferredReply(msg, result).catch(() => {}),
+        (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'BROWSER_ERROR',
             err instanceof Error ? err.message : String(err)
-          )).catch(() => {});
+          ));
         },
       );
       return DEFERRED_REPLY;
     });
 
     // -- closePage --
-    this.deferredPageHandler('closePage', async (tracked, payload) => {
+    this.deferredPageHandler('closePage', async (tracked, payload, msg) => {
       const pageId = payload.pageId as string;
-      log.info(`closePage (${pageId})`);
+      log.info(`closePage (${pageId}) caller=${msg.routing.from}`);
       this.pages.delete(pageId);
       try { await tracked.page.close(); } catch { /* already closed */ }
       this.changed('pageClosed', { pageId });
@@ -842,11 +843,11 @@ export class WebBrowser extends Abject {
     // -- closeAllPages: special case — no pageId, uses msg.routing.from --
     this.on('closeAllPages', (msg: AbjectMessage) => {
       this.closePagesForOwner(msg.routing.from).then(
-        (closed) => this.sendDeferredReply(msg, { closed }).catch(() => {}),
+        (closed) => this.sendDeferredReply(msg, { closed }),
         (err) => {
           this.send(error(msg, 'BROWSER_ERROR',
             err instanceof Error ? err.message : String(err)
-          )).catch(() => {});
+          ));
         },
       );
       return DEFERRED_REPLY;
@@ -1032,12 +1033,12 @@ export class WebBrowser extends Abject {
         };
         results.push(entry);
         titlePromises.push(
-          tracked.page.title().then((t) => { entry.title = t; }).catch(() => {}),
+          tracked.page.title().then((t) => { entry.title = t; }),
         );
       }
       Promise.all(titlePromises).then(
-        () => this.sendDeferredReply(msg, results).catch(() => {}),
-        () => this.sendDeferredReply(msg, results).catch(() => {}),
+        () => this.sendDeferredReply(msg, results),
+        () => this.sendDeferredReply(msg, results),
       );
       return DEFERRED_REPLY;
     });
@@ -1049,7 +1050,7 @@ export class WebBrowser extends Abject {
       };
       const tracked = this.pages.get(pageId);
       if (!tracked) {
-        this.send(error(msg, 'BROWSER_ERROR', `Unknown page handle: ${pageId}`)).catch(() => {});
+        this.send(error(msg, 'BROWSER_ERROR', `Unknown page handle: ${pageId}`));
         return DEFERRED_REPLY;
       }
       tracked.page.screenshot({
@@ -1062,11 +1063,11 @@ export class WebBrowser extends Abject {
           dataUri: `data:image/png;base64,${b64}`,
           width: viewport.width,
           height: viewport.height,
-        }).catch(() => {});
+        });
       }).catch((err) => {
         this.send(error(msg, 'BROWSER_ERROR',
           err instanceof Error ? err.message : String(err)
-        )).catch(() => {});
+        ));
       });
       return DEFERRED_REPLY;
     });
@@ -1181,7 +1182,7 @@ export class WebBrowser extends Abject {
   ): Promise<void> {
     const timeout = options?.timeout ?? 30000;
     await page.goto(url, {
-      waitUntil: 'networkidle',
+      waitUntil: options?.waitUntil ?? 'domcontentloaded',
       timeout,
     });
     if (options?.waitFor) {

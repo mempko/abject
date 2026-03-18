@@ -153,7 +153,7 @@ export class WorkspaceSwitcher extends Abject {
       if (this.workspaceSwitchButtons.has(fromId)) {
         const wsId = this.workspaceSwitchButtons.get(fromId)!;
         if (this.workspaceManagerId) {
-          await this.send(request(this.id, this.workspaceManagerId,
+          this.send(request(this.id, this.workspaceManagerId,
             'switchWorkspace', { workspaceId: wsId }));
         }
         return;
@@ -172,7 +172,7 @@ export class WorkspaceSwitcher extends Abject {
                 'listWorkspaces', {}));
             await this.show();
             // Tell WM to refresh the taskbar position (switcher height may have changed)
-            await this.send(request(this.id, this.workspaceManagerId,
+            this.send(request(this.id, this.workspaceManagerId,
               'refreshTaskbar', {}));
           } catch (err) {
             log.warn('Failed to create workspace:', err);

@@ -67,6 +67,14 @@ export class AppExplorer extends Abject {
   private selectedKindIsSystem = false;
   private selectedInstanceIndex = -1;
 
+  // ── Workspace picker modal ──
+  private pickerBackdropId?: AbjectId;
+  private pickerDialogId?: AbjectId;
+  private pickerSelectId?: AbjectId;
+  private pickerCloneBtnId?: AbjectId;
+  private pickerCancelBtnId?: AbjectId;
+  private pickerResolve?: (index: number | null) => void;
+
   constructor() {
     super({
       manifest: {
@@ -239,6 +247,14 @@ export class AppExplorer extends Abject {
       await this.handleWidgetEvent(fromId, aspect, value);
     });
 
+    // Backdrop click dismisses the workspace picker
+    this.on('input', async (msg: AbjectMessage) => {
+      const input = msg.payload as { type?: string };
+      if (input.type === 'mousedown' && this.pickerResolve) {
+        this.pickerResolve(null);
+      }
+    });
+
     this.on('objectRegistered', async () => {
       this.cachedObjects = await this.registryList();
       if (this.windowId) {
@@ -268,7 +284,7 @@ export class AppExplorer extends Abject {
     this.selectedInstanceIndex = -1;
     this.cachedObjects = await this.registryList();
     await this.buildUI();
-    await this.changed('visibility', true);
+    this.changed('visibility', true);
     return true;
   }
 
@@ -286,7 +302,7 @@ export class AppExplorer extends Abject {
     this.selectedKindIsSystem = false;
     this.selectedInstanceIndex = -1;
     this.clearWidgetTracking();
-    await this.changed('visibility', false);
+    this.changed('visibility', false);
     return true;
   }
 
@@ -606,7 +622,7 @@ export class AppExplorer extends Abject {
       }
       if (!this.selectedKindIsSystem) {
         specs.push({ type: 'button', windowId, rect: r0,
-          text: 'Clone', style: { fontSize: 12 }, action: 'clone' });
+          text: 'Clone to...', style: { fontSize: 12 }, action: 'cloneTo' });
         specs.push({ type: 'button', windowId, rect: r0,
           text: 'Delete',
           style: { fontSize: 12, background: this.theme.destructiveText, color: '#ffffff', borderColor: this.theme.destructiveText },
@@ -723,15 +739,31 @@ export class AppExplorer extends Abject {
       return;
     }
 
+    // Workspace picker events
+    if (this.pickerResolve) {
+      if (fromId === this.pickerCloneBtnId && aspect === 'click') {
+        this.pickerResolve(this.pickerSelectedIndex);
+        return;
+      }
+      if (fromId === this.pickerCancelBtnId && aspect === 'click') {
+        this.pickerResolve(null);
+        return;
+      }
+      if (fromId === this.pickerDialogId && aspect === 'windowCloseRequested') {
+        this.pickerResolve(null);
+        return;
+      }
+      if (fromId === this.pickerSelectId && aspect === 'change') {
+        this.pickerSelectedIndex = parseInt(value as string, 10);
+        return;
+      }
+    }
+
     // Detail pane button clicks
     const action = this.detailButtonIds.get(fromId);
     if (action && aspect === 'click') {
       if (action === 'browse') {
         await this.browseSelectedKind();
-      } else if (action === 'clone') {
-        if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
-          await this.cloneObject(this.instanceEntries[this.selectedInstanceIndex].id);
-        }
       } else if (action === 'delete') {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
           await this.deleteObject(this.instanceEntries[this.selectedInstanceIndex].id);
@@ -739,6 +771,10 @@ export class AppExplorer extends Abject {
       } else if (action === 'editSource') {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
           await this.editSource(this.instanceEntries[this.selectedInstanceIndex].id);
+        }
+      } else if (action === 'cloneTo') {
+        if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
+          await this.cloneToWorkspace(this.instanceEntries[this.selectedInstanceIndex]);
         }
       } else if (action === 'cloneToLocal') {
         if (this.selectedInstanceIndex >= 0 && this.selectedInstanceIndex < this.instanceEntries.length) {
@@ -765,24 +801,6 @@ export class AppExplorer extends Abject {
       );
     } catch (err) {
       log.warn('Browse error:', err);
-    }
-  }
-
-  private async cloneObject(objectId: AbjectId): Promise<void> {
-    if (!this.factoryId) return;
-
-    try {
-      await this.request(request(this.id, this.factoryId,
-        'clone', { objectId, registryHint: this.registryId }));
-    } catch (err) {
-      log.warn('Clone error:', err);
-      return;
-    }
-
-    this.cachedObjects = await this.registryList();
-    await this.rebuildKindList();
-    if (this.selectedKindName) {
-      await this.rebuildInstanceList();
     }
   }
 
@@ -898,6 +916,203 @@ export class AppExplorer extends Abject {
     return this.registryId;
   }
 
+  /** Clone an object into a different workspace, chosen via a picker dialog. */
+  private async cloneToWorkspace(obj: ObjectRegistration): Promise<void> {
+    if (!this.workspaceManagerId || !this.factoryId) return;
+
+    const source = (obj as unknown as { source?: string }).source;
+    if (!source) return;
+
+    // Get all workspaces with registryIds
+    const allWorkspaces = await this.request<Array<{
+      workspaceId: string; name: string; registryId: AbjectId;
+    }>>(request(this.id, this.workspaceManagerId, 'listWorkspacesDetailed', {}));
+
+    if (allWorkspaces.length === 0) return;
+
+    // Show workspace picker with all workspaces
+    const selectedIdx = await this.showWorkspacePicker(
+      allWorkspaces.map(ws => ws.name)
+    );
+    if (selectedIdx === null) return; // cancelled
+    const targetRegistryId = allWorkspaces[selectedIdx].registryId;
+
+    try {
+      const result = await this.request<SpawnResult>(request(this.id, this.factoryId,
+        'spawn', {
+          manifest: obj.manifest,
+          source,
+          registryHint: targetRegistryId,
+        }));
+
+      // Persist to AbjectStore so it survives restart
+      const abjectStoreId = await this.findAbjectStore(targetRegistryId);
+      if (abjectStoreId) {
+        try {
+          await this.request(request(this.id, abjectStoreId,
+            'save', {
+              objectId: result.objectId,
+              manifest: obj.manifest,
+              source,
+              owner: this.id,
+            }));
+        } catch { /* best-effort persist */ }
+      }
+
+      log.info('Cloned to workspace');
+    } catch (err) {
+      log.warn('Clone to workspace error:', err);
+    }
+  }
+
+  /**
+   * Show a modal workspace picker dialog. Returns the selected index or null if cancelled.
+   */
+  private async showWorkspacePicker(workspaceNames: string[]): Promise<number | null> {
+    const wmId = this.widgetManagerId!;
+
+    const displayInfo = await this.request<{ width: number; height: number }>(
+      request(this.id, wmId, 'getDisplayInfo', {})
+    );
+
+    // Backdrop
+    this.pickerBackdropId = await this.request<AbjectId>(
+      request(this.id, wmId, 'createWindowAbject', {
+        title: '',
+        rect: { x: 0, y: 0, width: displayInfo.width, height: displayInfo.height },
+        chromeless: true,
+        transparent: true,
+        zIndex: 5000,
+      })
+    );
+
+    const canvasId = await this.request<AbjectId>(
+      request(this.id, wmId, 'createCanvas', {
+        windowId: this.pickerBackdropId,
+        inputTargetId: this.id,
+      })
+    );
+    await this.request(request(this.id, canvasId, 'draw', {
+      commands: [
+        { type: 'rect', surfaceId: 'c', params: { x: 0, y: 0, width: displayInfo.width, height: displayInfo.height, fill: 'rgba(0,0,0,0.5)' } },
+      ],
+    }));
+
+    // Dialog window
+    const dialogW = 360;
+    const dialogH = 200;
+    const dialogX = Math.max(0, Math.floor((displayInfo.width - dialogW) / 2));
+    const dialogY = Math.max(0, Math.floor((displayInfo.height - dialogH) / 2));
+
+    this.pickerDialogId = await this.request<AbjectId>(
+      request(this.id, wmId, 'createWindowAbject', {
+        title: 'Clone to Workspace',
+        rect: { x: dialogX, y: dialogY, width: dialogW, height: dialogH },
+        zIndex: 5001,
+      })
+    );
+
+    const rootLayout = await this.request<AbjectId>(
+      request(this.id, wmId, 'createVBox', {
+        windowId: this.pickerDialogId,
+        margins: { top: 16, right: 20, bottom: 16, left: 20 },
+        spacing: 12,
+      })
+    );
+
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+    const options = workspaceNames.map((name, i) => ({ label: name, value: String(i) }));
+
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, wmId, 'create', {
+        specs: [
+          { type: 'label', windowId: this.pickerDialogId, rect: r0,
+            text: 'Select target workspace:',
+            style: { color: this.theme.textPrimary, fontSize: 12 } },
+          { type: 'select', windowId: this.pickerDialogId, rect: r0,
+            options, selectedIndex: 0 },
+          { type: 'button', windowId: this.pickerDialogId, rect: r0,
+            text: 'Cancel' },
+          { type: 'button', windowId: this.pickerDialogId, rect: r0,
+            text: 'Clone', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+        ],
+      })
+    );
+
+    const [labelId, selectId, cancelBtnId, cloneBtnId] = widgetIds;
+    this.pickerSelectId = selectId;
+    this.pickerCancelBtnId = cancelBtnId;
+    this.pickerCloneBtnId = cloneBtnId;
+
+    // Subscribe to interactive widgets
+    this.send(request(this.id, selectId, 'addDependent', {}));
+    await this.request(request(this.id, cancelBtnId, 'addDependent', {}));
+    await this.request(request(this.id, cloneBtnId, 'addDependent', {}));
+    await this.request(request(this.id, this.pickerDialogId, 'addDependent', {}));
+
+    // Layout: label, select, spacer, button row
+    await this.request(request(this.id, rootLayout, 'addLayoutChildren', {
+      children: [
+        { widgetId: labelId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 } },
+        { widgetId: selectId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 32 } },
+      ],
+    }));
+
+    await this.request(request(this.id, rootLayout, 'addLayoutSpacer', {}));
+
+    const buttonRow = await this.request<AbjectId>(
+      request(this.id, wmId, 'createNestedHBox', {
+        parentLayoutId: rootLayout,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, rootLayout, 'addLayoutChild', {
+      widgetId: buttonRow,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 36 },
+    }));
+
+    await this.request(request(this.id, buttonRow, 'addLayoutSpacer', {}));
+    await this.request(request(this.id, buttonRow, 'addLayoutChildren', {
+      children: [
+        { widgetId: cancelBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 100, height: 36 } },
+        { widgetId: cloneBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 100, height: 36 } },
+      ],
+    }));
+
+    // Wait for user response
+    const selectedIndex = await new Promise<number | null>((resolve) => {
+      this.pickerResolve = resolve;
+    });
+
+    // Cleanup
+    await this.dismissWorkspacePicker();
+    return selectedIndex;
+  }
+
+  private pickerSelectedIndex = 0;
+
+  private async dismissWorkspacePicker(): Promise<void> {
+    const wmId = this.widgetManagerId;
+    if (!wmId) return;
+    if (this.pickerDialogId) {
+      try { this.send(request(this.id, wmId, 'destroyWindowAbject',
+        { windowId: this.pickerDialogId })); } catch { /* gone */ }
+    }
+    if (this.pickerBackdropId) {
+      try { this.send(request(this.id, wmId, 'destroyWindowAbject',
+        { windowId: this.pickerBackdropId })); } catch { /* gone */ }
+    }
+    this.pickerBackdropId = undefined;
+    this.pickerDialogId = undefined;
+    this.pickerSelectId = undefined;
+    this.pickerCloneBtnId = undefined;
+    this.pickerCancelBtnId = undefined;
+    this.pickerResolve = undefined;
+    this.pickerSelectedIndex = 0;
+  }
+
   /** Find AbjectStore registered in a given registry. */
   private async findAbjectStore(registryId: AbjectId): Promise<AbjectId | undefined> {
     try {
@@ -928,6 +1143,7 @@ export class AppExplorer extends Abject {
 ### Actions
 - **Browse** — Open ObjectBrowser for the selected kind.
 - **Clone** / **Delete** — Local mode only.
+- **Clone to...** — Local mode: clone a user object into a different workspace.
 - **Clone to Local** — Remote mode: copies source into active local workspace.
 
 ### Interface ID

@@ -64,8 +64,18 @@ export class WorkerPool {
     // Wait for all workers to report ready
     await Promise.all(this.bridges.map((b) => b.waitReady()));
 
+    // Create full mesh of direct MessagePort channels between pool workers.
+    // For N workers this creates N*(N-1)/2 channels — at most 28 for N=8.
+    for (let i = 0; i < this.bridges.length; i++) {
+      for (let j = i + 1; j < this.bridges.length; j++) {
+        const { port1, port2 } = new MessageChannel();
+        this.bridges[i].sendPeerPort(j, port1);
+        this.bridges[j].sendPeerPort(i, port2);
+      }
+    }
+
     this.started = true;
-    log.info(`${this.config.workerCount} workers ready`);
+    log.info(`${this.config.workerCount} workers ready (${this.bridges.length * (this.bridges.length - 1) / 2} peer channels)`);
   }
 
   /**
@@ -102,6 +112,13 @@ export class WorkerPool {
       this.bus.unregisterWorkerObject(objectId);
       throw err;
     }
+
+    // Broadcast placement to all OTHER pool workers so they can route directly
+    for (let i = 0; i < this.bridges.length; i++) {
+      if (i !== index) {
+        this.bridges[i].sendPeerPlace(objectId, index);
+      }
+    }
   }
 
   /**
@@ -115,6 +132,11 @@ export class WorkerPool {
 
     this.objectToBridge.delete(objectId);
     this.bus.unregisterWorkerObject(objectId);
+
+    // Broadcast removal to all pool workers
+    for (const b of this.bridges) {
+      b.sendPeerRemove(objectId);
+    }
   }
 
   /**

@@ -159,7 +159,6 @@ export class AnthropicProvider extends BaseLLMProvider {
     options: LLMCompletionOptions = {}
   ): AsyncIterable<LLMStreamChunk> {
     require(this.apiKey !== undefined, 'API key is required');
-    require(!this.fetchFn, 'Streaming is not supported when using HttpClient delegate');
 
     const systemMsg = messages.find((m) => m.role === 'system');
     const conversationMessages = messages.filter((m) => m.role !== 'system');

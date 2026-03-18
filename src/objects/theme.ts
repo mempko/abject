@@ -74,7 +74,7 @@ export class ThemeAbject extends Abject {
       this.currentTheme = { ...this.currentTheme, ...partial };
       this.applyBodyBackground();
       await this.persistTheme();
-      await this.changed('themeChanged', { ...this.currentTheme });
+      this.changed('themeChanged', { ...this.currentTheme });
       return { ...this.currentTheme };
     });
 
@@ -82,7 +82,7 @@ export class ThemeAbject extends Abject {
       this.currentTheme = { ...MIDNIGHT_BLOOM };
       this.applyBodyBackground();
       await this.persistTheme();
-      await this.changed('themeChanged', { ...this.currentTheme });
+      this.changed('themeChanged', { ...this.currentTheme });
       return { ...this.currentTheme };
     });
   }

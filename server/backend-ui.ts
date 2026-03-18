@@ -479,7 +479,7 @@ export class BackendUI extends Abject {
   private async log(level: string, message: string, data?: unknown): Promise<void> {
     if (!this.consoleId) return;
     try {
-      await this.send(
+      this.send(
         request(this.id, this.consoleId, level, { message, data })
       );
     } catch { /* logging should never break the caller */ }
@@ -1256,7 +1256,7 @@ IMPORTANT:
     objectId: AbjectId,
     inputEvent: InputEvent
   ): Promise<void> {
-    await this.send(
+    this.send(
       event(this.id, objectId, 'input', inputEvent)
     );
   }
@@ -1266,7 +1266,7 @@ IMPORTANT:
     surfaceId: string,
     focused: boolean
   ): Promise<void> {
-    await this.send(
+    this.send(
       event(this.id, objectId, 'focus', { surfaceId, focused })
     );
   }

@@ -177,6 +177,7 @@ export class WidgetManager extends Abject {
                 description: 'Create a scrollable vertical box layout inside a window. Returns the layout AbjectId. Content that overflows is clipped and scrollable via mouse wheel.',
                 parameters: [
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
+                  { name: 'autoScroll', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Pin to bottom when new content is added (for chat/log views). Default false.', optional: true },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
                 ],
@@ -187,6 +188,7 @@ export class WidgetManager extends Abject {
                 description: 'Create a nested scrollable vertical box layout inside a parent layout. Returns the layout AbjectId.',
                 parameters: [
                   { name: 'parentLayoutId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent layout AbjectId' },
+                  { name: 'autoScroll', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Pin to bottom when new content is added (for chat/log views). Default false.', optional: true },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
                 ],
@@ -432,6 +434,9 @@ export class WidgetManager extends Abject {
           itemHeight?: number;
         }>;
       };
+      if (!Array.isArray(specs)) {
+        throw new Error(`WidgetManager.create: expected specs array, got ${typeof specs}`);
+      }
       const widgetIds: AbjectId[] = [];
       for (const spec of specs) {
         const id = await this.createWidgetFromSpec(spec);
@@ -503,12 +508,14 @@ export class WidgetManager extends Abject {
     this.on('createScrollableVBox', async (msg: AbjectMessage) => {
       const payload = msg.payload as {
         windowId: AbjectId;
+        autoScroll?: boolean;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
       };
       return this.createLayoutWidget(payload.windowId, new ScrollableVBoxLayout({
         ownerId: payload.windowId,
         uiServerId: this.uiServerId!,
+        autoScroll: payload.autoScroll,
         margins: payload.margins,
         spacing: payload.spacing,
       }));
@@ -518,12 +525,14 @@ export class WidgetManager extends Abject {
       const payload = msg.payload as {
         parentLayoutId: AbjectId;
         autoSize?: boolean;
+        autoScroll?: boolean;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
       };
       return this.createNestedLayout(payload.parentLayoutId, new ScrollableVBoxLayout({
         ownerId: payload.parentLayoutId,
         uiServerId: this.uiServerId!,
+        autoScroll: payload.autoScroll,
         margins: payload.margins,
         spacing: payload.spacing,
       }), payload.autoSize);
@@ -678,8 +687,8 @@ export class WidgetManager extends Abject {
 
       this.spawnModalDialog(title, dialogMessage, { confirmLabel, cancelLabel, destructive })
         .then(
-          (confirmed) => this.sendDeferredReply(msg, confirmed).catch(() => {}),
-          () => this.sendDeferredReply(msg, false).catch(() => {}),
+          (confirmed) => this.sendDeferredReply(msg, confirmed),
+          () => this.sendDeferredReply(msg, false),
         );
 
       return DEFERRED_REPLY;
@@ -711,12 +720,12 @@ export class WidgetManager extends Abject {
           // Propagate only to widgets/windows in this workspace
           for (const id of this.spawnedWidgets) {
             if (this.getWorkspaceForWidgetOrWindow(id) === changedWorkspaceId) {
-              try { await this.send(event(this.id, id, 'updateTheme', newTheme)); } catch { /* gone */ }
+              try { this.send(event(this.id, id, 'updateTheme', newTheme)); } catch { /* gone */ }
             }
           }
           for (const id of this.spawnedWindows) {
             if (this.getWorkspaceForWidgetOrWindow(id) === changedWorkspaceId) {
-              try { await this.send(event(this.id, id, 'updateTheme', newTheme)); } catch { /* gone */ }
+              try { this.send(event(this.id, id, 'updateTheme', newTheme)); } catch { /* gone */ }
             }
           }
           return;
@@ -727,7 +736,7 @@ export class WidgetManager extends Abject {
       if (aspect === 'windowCloseRequested' || aspect === 'windowMinimized' || aspect === 'windowRestored') {
         const ownerId = this.windowOwners.get(fromId);
         if (ownerId) {
-          await this.send(event(this.id, ownerId,aspect, { windowId: fromId }));
+          this.send(event(this.id, ownerId,aspect, { windowId: fromId }));
         }
         return;
       }
@@ -750,7 +759,7 @@ export class WidgetManager extends Abject {
       else if (aspect === 'submit') eventType = 'submit';
 
       if (eventType) {
-        await this.send(
+        this.send(
           event(this.id, ownerId, 'widgetEvent', {
             windowId: windowShimId,
             widgetId: shimId,
@@ -763,10 +772,10 @@ export class WidgetManager extends Abject {
       // Forward window events
       if (aspect === 'windowRect') {
         const { x, y, width, height } = value as { x: number; y: number; width: number; height: number };
-        await this.send(
+        this.send(
           event(this.id, ownerId, 'windowMoved', { windowId: windowShimId, x, y })
         );
-        await this.send(
+        this.send(
           event(this.id, ownerId, 'windowResized', { windowId: windowShimId, width, height })
         );
         // Keep WindowManager's tracked rect in sync (programmatic resize from owner)
@@ -775,19 +784,19 @@ export class WidgetManager extends Abject {
           if (surfaceId) {
             this.send(event(this.id, this.windowManagerId, 'updateWindowRect', {
               surfaceId, x, y, width, height,
-            })).catch(() => {});
+            }));
           }
         }
       }
       if (aspect === 'windowMoved') {
         const { x, y } = value as { x: number; y: number };
-        await this.send(
+        this.send(
           event(this.id, ownerId, 'windowMoved', { windowId: windowShimId, x, y })
         );
       }
       if (aspect === 'windowResized') {
         const { width, height } = value as { width: number; height: number };
-        await this.send(
+        this.send(
           event(this.id, ownerId, 'windowResized', { windowId: windowShimId, width, height })
         );
       }
@@ -814,7 +823,7 @@ export class WidgetManager extends Abject {
     // The objectUnregistered event only covers the global registry; user apps in
     // workspace registries need this safety net.
     this.orphanSweepTimer = setInterval(() => {
-      this.sweepOrphanedWindows().catch(() => {});
+      this.sweepOrphanedWindows();
     }, 5000);
   }
 
@@ -883,7 +892,7 @@ export class WidgetManager extends Abject {
   private async log(level: string, message: string, data?: unknown): Promise<void> {
     if (!this.consoleId) return;
     try {
-      await this.send(
+      this.send(
         request(this.id, this.consoleId, level, { message, data })
       );
     } catch { /* logging should never break the caller */ }
@@ -1012,8 +1021,8 @@ createVBox - Vertical stack layout
 createHBox - Horizontal row layout
 createNestedVBox - Nested vertical layout inside another layout. Pass autoSize: true for auto-computed preferred height (use inside ScrollableVBox for card items).
 createNestedHBox - Nested horizontal layout inside another layout. Pass autoSize: true for auto-computed preferred height.
-createScrollableVBox - Scrollable vertical stack layout (clips overflow, scrolls via mouse wheel)
-createNestedScrollableVBox - Nested scrollable vertical layout inside another layout
+createScrollableVBox - Scrollable vertical stack layout (clips overflow, scrolls via mouse wheel). Pass autoScroll: true to pin to bottom when content is added (for chat/log views).
+createNestedScrollableVBox - Nested scrollable vertical layout inside another layout. Pass autoScroll: true to pin to bottom when content is added (for chat/log views).
 
 ### Canvas Drawing (games, animations, visualizations)
 

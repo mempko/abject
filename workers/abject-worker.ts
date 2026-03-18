@@ -24,6 +24,8 @@ import { Console } from '../src/objects/capabilities/console.js';
 import { FileSystem } from '../src/objects/capabilities/filesystem.js';
 import { AbjectEditor } from '../src/objects/abject-editor.js';
 import { JobManager } from '../src/objects/job-manager.js';
+import { GoalManager } from '../src/objects/goal-manager.js';
+import { GoalBrowser } from '../src/objects/goal-browser.js';
 import { AbjectStore } from '../src/objects/abject-store.js';
 import { Settings } from '../src/objects/settings.js';
 import { AppExplorer } from '../src/objects/app-explorer.js';
@@ -59,6 +61,8 @@ constructors.set('Settings', () => new Settings());
 constructors.set('AppExplorer', () => new AppExplorer());
 constructors.set('JobManager', () => new JobManager());
 constructors.set('JobBrowser', () => new JobBrowser());
+constructors.set('GoalManager', () => new GoalManager());
+constructors.set('GoalBrowser', () => new GoalBrowser());
 constructors.set('Chat', () => new Chat());
 constructors.set('AbjectStore', () => new AbjectStore());
 constructors.set('Theme', () => new ThemeAbject());
@@ -164,6 +168,31 @@ self.onmessage = async (event: MessageEvent<WorkerInboundMessage>) => {
       const { message } = event.data;
       if (message) {
         workerBus.deliverReplyFromMain(message);
+      }
+      break;
+    }
+
+    case 'peer:port': {
+      // Direct MessagePort from a peer worker — transferred in the message data
+      const { workerIndex, port } = event.data as { workerIndex?: number; port?: MessagePort };
+      if (port && workerIndex !== undefined) {
+        workerBus.addPeerPort(workerIndex, port);
+      }
+      break;
+    }
+
+    case 'peer:place': {
+      const { objectId, workerIndex } = event.data;
+      if (objectId && workerIndex !== undefined) {
+        workerBus.addPeerObject(objectId, workerIndex!);
+      }
+      break;
+    }
+
+    case 'peer:remove': {
+      const { objectId } = event.data;
+      if (objectId) {
+        workerBus.removePeerObject(objectId);
       }
       break;
     }

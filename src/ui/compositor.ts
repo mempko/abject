@@ -23,6 +23,7 @@ export interface Surface {
   canvas: OffscreenCanvas;
   ctx: OffscreenCanvasRenderingContext2D;
   dirty: boolean;
+  drawn: boolean;        // false until first draw batch; prevents rendering empty surfaces
   workspaceId?: string;  // undefined = always visible (global objects)
 }
 
@@ -262,6 +263,7 @@ export class Compositor {
       canvas: offscreen,
       ctx: ctx!,
       dirty: true,
+      drawn: false,
     };
 
     this.surfaces.set(id, surface);
@@ -526,16 +528,24 @@ export class Compositor {
           const entry = { img: new Image(), loaded: false };
           this.imageCache.set(p.url, entry);
           const sid = command.surfaceId;
+          // Capture the current transform so the async onload callback
+          // can draw at the correct translated position.  Without this,
+          // the image would be drawn at raw (p.x, p.y) relative to
+          // the surface origin, ignoring the canvas widget's translate.
+          const savedTransform = ctx.getTransform();
           const drawToSurface = (image: HTMLImageElement) => {
             entry.img = image;
             entry.loaded = true;
             const surf = this.surfaces.get(sid);
             if (surf) {
+              surf.ctx.save();
+              surf.ctx.setTransform(savedTransform);
               if (p.width && p.height) {
                 surf.ctx.drawImage(image, p.x, p.y, p.width, p.height);
               } else {
                 surf.ctx.drawImage(image, p.x, p.y);
               }
+              surf.ctx.restore();
               surf.dirty = true;
             }
             this.needsRender = true;
@@ -762,6 +772,7 @@ export class Compositor {
     }
 
     surface.dirty = true;
+    surface.drawn = true;
     this.needsRender = true;
   }
 
@@ -835,7 +846,7 @@ export class Compositor {
 
     // Draw surfaces in z-order
     for (const surface of this.sortedSurfaces) {
-      if (!surface.visible) continue;
+      if (!surface.visible || !surface.drawn) continue;
       if (this.isWorkspaceFiltered(surface)) continue;
 
       this.ctx.drawImage(
@@ -855,7 +866,7 @@ export class Compositor {
     // Iterate in reverse z-order (top to bottom)
     for (let i = this.sortedSurfaces.length - 1; i >= 0; i--) {
       const surface = this.sortedSurfaces[i];
-      if (!surface.visible) continue;
+      if (!surface.visible || !surface.drawn) continue;
       if (this.isWorkspaceFiltered(surface)) continue;
       if (surface.inputPassthrough) continue;
 

@@ -16,7 +16,7 @@ const WEB_BROWSER_VIEWER_INTERFACE: InterfaceId = 'abjects:web-browser-viewer';
 
 const WIN_W = 640;
 const WIN_H = 480;
-const REFRESH_INTERVAL_MS = 3000;
+const REFRESH_INTERVAL_MS = 1000;
 
 interface PageInfo {
   pageId: string;
@@ -213,7 +213,7 @@ export class WebBrowserViewer extends Abject {
     await this.refreshPageList();
     await this.refreshScreenshot();
 
-    await this.changed('visibility', true);
+    this.changed('visibility', true);
     return true;
   }
 
@@ -247,7 +247,7 @@ export class WebBrowserViewer extends Abject {
     this.pages = [];
     this.selectedPageIndex = 0;
 
-    await this.changed('visibility', false);
+    this.changed('visibility', false);
     return true;
   }
 

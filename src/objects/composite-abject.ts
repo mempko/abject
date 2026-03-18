@@ -262,7 +262,7 @@ export class CompositeAbject extends Abject {
 
         // Send addDependent FROM the observer child TO the observed child.
         // Use bus.send directly since we need the 'from' to be the observer.
-        await this.bus.send(
+        this.bus.send(
           request(
             observerId,
             observedId!,

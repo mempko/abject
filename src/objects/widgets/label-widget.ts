@@ -53,7 +53,7 @@ export class LabelWidget extends WidgetAbject {
 
   private async notifySelectionChanged(): Promise<void> {
     const selectedText = this.getSelectedText();
-    await this.send(event(
+    this.send(event(
       this.id, this.uiServerId,
       'selectionChanged',
       { selectedText },
@@ -71,7 +71,7 @@ export class LabelWidget extends WidgetAbject {
     if (this.style.wordWrap && this.rect.width > 0) {
       const fontSize = this.style.fontSize ?? 14;
       const lineHeight = fontSize + 4;
-      const lines = await this.getWrappedLines(surfaceId, font);
+      const lines = await this.getWrappedLines(surfaceId, font, this.text, this.rect.width, fontSize);
       const lineIndex = Math.max(0, Math.min(Math.floor((clickY - oy) / lineHeight), lines.length - 1));
 
       // Find character offset within this line
@@ -183,20 +183,19 @@ export class LabelWidget extends WidgetAbject {
     return { start, end };
   }
 
-  private async getWrappedLines(surfaceId: string, font: string): Promise<string[]> {
-    const fontSize = this.style.fontSize ?? 14;
+  private async getWrappedLines(surfaceId: string, font: string, text: string, width: number, fontSize: number): Promise<string[]> {
     const textPadding = 4;
-    const maxWidth = this.rect.width - textPadding * 2;
+    const maxWidth = width - textPadding * 2;
 
     if (
       this.cachedWrappedLines === null ||
-      this.cachedWrapText !== this.text ||
+      this.cachedWrapText !== text ||
       this.cachedWrapWidth !== maxWidth ||
       this.cachedWrapFontSize !== fontSize
     ) {
       const measureFn = (t: string) => this.measureText(surfaceId, t, font);
-      this.cachedWrappedLines = await wrapText(this.text, maxWidth, measureFn);
-      this.cachedWrapText = this.text;
+      this.cachedWrappedLines = await wrapText(text, maxWidth, measureFn);
+      this.cachedWrapText = text;
       this.cachedWrapWidth = maxWidth;
       this.cachedWrapFontSize = fontSize;
     }
@@ -209,10 +208,12 @@ export class LabelWidget extends WidgetAbject {
     // Cache surfaceId so processInput can use it for measureText
     this.lastSurfaceId = surfaceId;
 
+    // Use render-time snapshots for consistency across await points
+    const text = this._renderText;
     const commands: unknown[] = [];
-    const w = this.rect.width;
-    const h = this.rect.height;
-    const style = this.style;
+    const w = this._renderRect.width;
+    const h = this._renderRect.height;
+    const style = this._renderStyle;
     const font = buildFont(style);
     const radius = style.radius ?? this.theme.widgetRadius;
 
@@ -234,7 +235,7 @@ export class LabelWidget extends WidgetAbject {
       const lineHeight = fontSize + 4;
       const textPadding = 4;
 
-      const lines = await this.getWrappedLines(surfaceId, font);
+      const lines = await this.getWrappedLines(surfaceId, font, text, w, fontSize);
 
       // Clip to prevent overflow
       commands.push({ type: 'save', surfaceId, params: {} });

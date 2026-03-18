@@ -453,7 +453,7 @@ export class UIServer extends Abject {
   private async log(level: string, message: string, data?: unknown): Promise<void> {
     if (!this.consoleId) return;
     try {
-      await this.send(
+      this.send(
         request(this.id, this.consoleId, level, { message, data })
       );
     } catch { /* logging should never break the caller */ }
@@ -1130,7 +1130,7 @@ Example handler with keyboard dispatch:
     objectId: AbjectId,
     inputEvent: InputEvent
   ): Promise<void> {
-    await this.send(
+    this.send(
       event(this.id, objectId, 'input', inputEvent)
     );
   }
@@ -1143,7 +1143,7 @@ Example handler with keyboard dispatch:
     surfaceId: string,
     focused: boolean
   ): Promise<void> {
-    await this.send(
+    this.send(
       event(this.id, objectId, 'focus', { surfaceId, focused })
     );
   }

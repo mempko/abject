@@ -13,7 +13,7 @@
 
 import Ajv from 'ajv';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
-import { Abject, DEFERRED_REPLY } from '../core/abject.js';
+import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { requireDefined } from '../core/contracts.js';
 import type { JobResult } from './job-manager.js';
@@ -113,8 +113,8 @@ interface TaskEntry {
   lastObservationLlmContent?: ContentPart[];
   /** JSON Schema for structured result validation. */
   responseSchema?: Record<string, unknown>;
-  /** Original message from startTask caller, for deferred reply. */
-  originalMsg: AbjectMessage;
+  /** Goal ID for cross-agent progress tracking via GoalManager. */
+  goalId?: string;
 }
 
 // ─── AgentAbject ─────────────────────────────────────────────────────
@@ -174,6 +174,7 @@ function mergeConfig(base: ResolvedAgentConfig, override?: Partial<AgentConfig>)
 export class AgentAbject extends Abject {
   private llmId?: AbjectId;
   private jobManagerId?: AbjectId;
+  private goalManagerId?: AbjectId;
 
   private registeredAgents = new Map<AbjectId, RegisteredAgent>();
   private taskEntries = new Map<string, TaskEntry>();
@@ -181,6 +182,9 @@ export class AgentAbject extends Abject {
 
   /** Job submission heartbeat message ID for resetting request timeouts. */
   private _currentJobMsgId?: string;
+
+  /** Active task entry during LLM streaming — links llmChunk events to the right ticket. */
+  private activeStreamEntry?: TaskEntry;
 
   /** Lazy Ajv instance for response schema validation. */
   private _ajv?: Ajv;
@@ -232,7 +236,7 @@ export class AgentAbject extends Abject {
             },
             {
               name: 'startTask',
-              description: 'Start a task on a registered agent. Returns when the task completes.',
+              description: 'Start a task on a registered agent. Returns a ticketId immediately; result arrives via taskResult event.',
               parameters: [
                 { name: 'agentId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target agent (defaults to caller if registered)', optional: true },
                 { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-provided task ID', optional: true },
@@ -243,12 +247,23 @@ export class AgentAbject extends Abject {
                 { name: 'responseSchema', type: { kind: 'object', properties: {} }, description: 'JSON Schema for structured result', optional: true },
               ],
               returns: { kind: 'object', properties: {
-                taskId: { kind: 'primitive', primitive: 'string' },
-                success: { kind: 'primitive', primitive: 'boolean' },
+                ticketId: { kind: 'primitive', primitive: 'string' },
+              } },
+            },
+            {
+              name: 'getTicket',
+              description: 'Poll a ticket for its current status and result',
+              parameters: [
+                { name: 'ticketId', type: { kind: 'primitive', primitive: 'string' }, description: 'Ticket ID from startTask' },
+              ],
+              returns: { kind: 'object', properties: {
+                ticketId: { kind: 'primitive', primitive: 'string' },
+                status: { kind: 'primitive', primitive: 'string' },
+                phase: { kind: 'primitive', primitive: 'string' },
+                step: { kind: 'primitive', primitive: 'number' },
+                maxSteps: { kind: 'primitive', primitive: 'number' },
                 result: { kind: 'primitive', primitive: 'string' },
                 error: { kind: 'primitive', primitive: 'string' },
-                steps: { kind: 'primitive', primitive: 'number' },
-                validationErrors: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
               } },
             },
             {
@@ -277,7 +292,28 @@ export class AgentAbject extends Abject {
                 phase: { kind: 'primitive', primitive: 'string' },
                 task: { kind: 'primitive', primitive: 'string' },
                 step: { kind: 'primitive', primitive: 'number' },
+                goalId: { kind: 'primitive', primitive: 'string' },
               } } },
+            },
+            {
+              name: 'getAgentState',
+              description: 'Get detailed state for a registered agent including its current tasks and goals',
+              parameters: [
+                { name: 'agentId', type: { kind: 'primitive', primitive: 'string' }, description: 'Agent ID' },
+              ],
+              returns: { kind: 'object', properties: {
+                agentId: { kind: 'primitive', primitive: 'string' },
+                name: { kind: 'primitive', primitive: 'string' },
+                description: { kind: 'primitive', primitive: 'string' },
+                status: { kind: 'primitive', primitive: 'string' },
+                tasks: { kind: 'array', elementType: { kind: 'object', properties: {
+                  id: { kind: 'primitive', primitive: 'string' },
+                  phase: { kind: 'primitive', primitive: 'string' },
+                  task: { kind: 'primitive', primitive: 'string' },
+                  step: { kind: 'primitive', primitive: 'number' },
+                  goalId: { kind: 'primitive', primitive: 'string' },
+                } } },
+              } },
             },
             {
               name: 'cancelTask',
@@ -299,11 +335,46 @@ export class AgentAbject extends Abject {
             },
             {
               name: 'taskCompleted',
-              description: 'A task completed',
+              description: 'A task completed (broadcast)',
               payload: { kind: 'object', properties: {
                 taskId: { kind: 'primitive', primitive: 'string' },
                 agentId: { kind: 'primitive', primitive: 'string' },
                 success: { kind: 'primitive', primitive: 'boolean' },
+                result: { kind: 'primitive', primitive: 'string' },
+                error: { kind: 'primitive', primitive: 'string' },
+              } },
+            },
+            {
+              name: 'taskResult',
+              description: 'Sent to the ticket holder when a task completes',
+              payload: { kind: 'object', properties: {
+                ticketId: { kind: 'primitive', primitive: 'string' },
+                success: { kind: 'primitive', primitive: 'boolean' },
+                result: { kind: 'primitive', primitive: 'string' },
+                error: { kind: 'primitive', primitive: 'string' },
+                steps: { kind: 'primitive', primitive: 'number' },
+                maxStepsReached: { kind: 'primitive', primitive: 'boolean' },
+                validationErrors: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+              } },
+            },
+            {
+              name: 'taskProgress',
+              description: 'Sent to the ticket holder on each phase transition',
+              payload: { kind: 'object', properties: {
+                ticketId: { kind: 'primitive', primitive: 'string' },
+                step: { kind: 'primitive', primitive: 'number' },
+                maxSteps: { kind: 'primitive', primitive: 'number' },
+                phase: { kind: 'primitive', primitive: 'string' },
+                action: { kind: 'primitive', primitive: 'string' },
+              } },
+            },
+            {
+              name: 'taskStream',
+              description: 'Sent to the ticket holder with streaming LLM tokens',
+              payload: { kind: 'object', properties: {
+                ticketId: { kind: 'primitive', primitive: 'string' },
+                content: { kind: 'primitive', primitive: 'string' },
+                done: { kind: 'primitive', primitive: 'boolean' },
               } },
             },
           ],
@@ -337,18 +408,36 @@ Your object must implement these callback handlers:
 - agentObserve(msg) — return { observation: string, llmContent?: ContentPart[] }
 - agentAct(msg) — return { success: boolean, data?: unknown, error?: string }
 
-### Start a Task (free-text result)
+### Start a Task (ticket pattern)
 
-  const result = await call(await dep('AgentAbject'), 'startTask', {
+startTask returns a ticketId immediately. The result arrives as a taskResult event.
+
+  // 1. Register a taskResult handler to receive results
+  this.on('taskResult', (msg) => {
+    const { ticketId, success, result, error, steps, maxStepsReached } = msg.payload;
+    // Handle the result...
+  });
+
+  // 2. Submit the task — returns immediately with { ticketId }
+  const { ticketId } = await call(await dep('AgentAbject'), 'startTask', {
     agentId: 'target-agent-id',  // optional if caller is a registered agent
     task: 'Describe the task in natural language',
     config: { maxSteps: 10, timeout: 60000 },
   });
-  // result: { taskId, success, result, error, steps }
 
-### Start a Task (structured result with responseSchema)
+  // 3. Optionally handle taskProgress events for live updates
+  this.on('taskProgress', (msg) => {
+    const { ticketId, step, maxSteps, phase, action } = msg.payload;
+  });
 
-  const result = await call(await dep('AgentAbject'), 'startTask', {
+  // 4. Optionally handle taskStream events for streaming LLM tokens
+  this.on('taskStream', (msg) => {
+    const { ticketId, content, done } = msg.payload;
+  });
+
+### Structured Result with responseSchema
+
+  const { ticketId } = await call(await dep('AgentAbject'), 'startTask', {
     agentId: 'target-agent-id',
     task: 'Extract product info from the page',
     responseSchema: {
@@ -361,32 +450,58 @@ Your object must implement these callback handlers:
       required: ['name', 'price'],
     },
   });
-  // result: { taskId, success, result: { name, price, inStock }, steps, validationErrors? }
-  // validationErrors is undefined when validation passes, or string[] on mismatch
+  // taskResult event: { ticketId, success, result: { name, price, inStock }, steps, validationErrors? }
 
-responseSchema is a JSON Schema object. When provided:
-- The agent's LLM is instructed to return structured JSON matching the schema
-- The result is validated with ajv after completion (soft validation — warns but doesn't reject)
-- The result field contains the parsed JSON object instead of a plain string
+### Poll a Ticket
+
+  const status = await call(await dep('AgentAbject'), 'getTicket', { ticketId });
+  // status: { ticketId, status: 'pending'|'running'|'completed'|'failed', phase, step, maxSteps, result?, error? }
 
 ### List Registered Agents
 
   const agents = await call(await dep('AgentAbject'), 'listAgents', {});
   // agents: [{ agentId, name, description, status, activeTasks }]
 
+### Get Agent State (with current tasks and goals)
+
+  const state = await call(await dep('AgentAbject'), 'getAgentState', { agentId: 'some-agent-id' });
+  // state: { agentId, name, description, status, tasks: [{ id, phase, task, step, goalId }] }
+  // Each active task includes its goalId for cross-referencing with GoalManager
+
 ### Cancel a Task
 
-  await call(await dep('AgentAbject'), 'cancelTask', { taskId: 'task-id' });
+  await call(await dep('AgentAbject'), 'cancelTask', { taskId: 'ticket-id' });
+
+### Goal Tracking
+
+Every task automatically gets a Goal (via GoalManager) for cross-agent progress tracking.
+Pass an existing goalId to link a task to a parent goal:
+
+  const { ticketId } = await call(await dep('AgentAbject'), 'startTask', {
+    task: 'Do something',
+    goalId: 'existing-goal-id',  // optional — auto-created if omitted
+  });
+
+Inside job code, goal helpers are available automatically:
+- await updateGoal('Building UI...', 'phase-name')
+- await getGoal()  // returns current Goal object
+- await completeGoal(result)
+- await failGoal('reason')
 
 ### IMPORTANT
-- startTask is a long-running operation — it drives an observe→think→act loop until done/fail.
+- startTask returns { ticketId } immediately — it does NOT block until completion.
+- Results arrive asynchronously via a taskResult event sent to the caller.
+- taskProgress events provide live step/phase updates during execution.
+- taskStream events provide streaming LLM tokens during the think phase.
 - Agents must be registered before tasks can be sent to them.
-- The caller receives a deferred reply when the task completes.`;
+- listTasks includes goalId on each task entry for cross-referencing with GoalManager.
+- getAgentState returns an agent's active tasks with their goalIds — use it to see what an agent is working on.`;
   }
 
   protected override async onInit(): Promise<void> {
     this.llmId = await this.discoverDep('LLM') ?? undefined;
     this.jobManagerId = await this.discoverDep('JobManager') ?? undefined;
+    this.goalManagerId = await this.discoverDep('GoalManager') ?? undefined;
   }
 
   /** Resolve a required dependency lazily. */
@@ -415,7 +530,7 @@ responseSchema is a JSON Schema object. When provided:
       });
 
       log.info(`Agent registered: "${name}" (${agentId})`);
-      this.changed('agentRegistered', { agentId, name }).catch(() => {});
+      this.changed('agentRegistered', { agentId, name });
       return { agentId };
     });
 
@@ -449,6 +564,7 @@ responseSchema is a JSON Schema object. When provided:
         initialMessages,
         config: taskConfig,
         responseSchema,
+        goalId: incomingGoalId,
       } = msg.payload as {
         agentId?: AbjectId;
         taskId?: string;
@@ -457,6 +573,7 @@ responseSchema is a JSON Schema object. When provided:
         initialMessages?: { role: string; content: string | ContentPart[] }[];
         config?: Partial<AgentConfig>;
         responseSchema?: Record<string, unknown>;
+        goalId?: string;
       };
 
       const callerId = msg.routing.from;
@@ -474,6 +591,19 @@ responseSchema is a JSON Schema object. When provided:
 
       const taskState = this.createTask(taskId, task, { maxSteps: config.maxSteps, timeout: config.timeout });
 
+      // Every task has a goal — use provided one or auto-create
+      let goalId = incomingGoalId;
+      if (!goalId && this.goalManagerId) {
+        try {
+          const goalResult = await this.request<{ goalId: string }>(
+            request(this.id, this.goalManagerId, 'createGoal', {
+              title: task.slice(0, 100),
+            })
+          );
+          goalId = goalResult.goalId;
+        } catch { /* GoalManager may not be ready */ }
+      }
+
       const entry: TaskEntry = {
         state: taskState,
         agentId,
@@ -482,13 +612,13 @@ responseSchema is a JSON Schema object. When provided:
         systemPrompt: prompt,
         initialMessages,
         responseSchema,
-        originalMsg: msg,
+        goalId,
       };
       this.taskEntries.set(taskId, entry);
 
       // Fire-and-forget: run the state machine asynchronously
       this.runTaskAsync(entry);
-      return DEFERRED_REPLY;
+      return { ticketId: taskId };
     });
 
     this.on('getTaskStatus', async (msg: AbjectMessage) => {
@@ -515,7 +645,52 @@ responseSchema is a JSON Schema object. When provided:
           phase: e.state.phase,
           task: e.state.task.slice(0, 100),
           step: e.state.step,
+          goalId: e.goalId ?? null,
         }));
+    });
+
+    this.on('getAgentState', async (msg: AbjectMessage) => {
+      const { agentId } = msg.payload as { agentId: AbjectId };
+      const agent = this.registeredAgents.get(agentId);
+      if (!agent) return { error: 'Agent not found' };
+      const tasks: { id: string; phase: string; task: string; step: number; goalId: string | null }[] = [];
+      for (const entry of this.taskEntries.values()) {
+        if (entry.agentId === agentId && entry.state.phase !== 'done' && entry.state.phase !== 'error') {
+          tasks.push({
+            id: entry.state.id,
+            phase: entry.state.phase,
+            task: entry.state.task.slice(0, 100),
+            step: entry.state.step,
+            goalId: entry.goalId ?? null,
+          });
+        }
+      }
+      return {
+        agentId: agent.agentId,
+        name: agent.name,
+        description: agent.description,
+        status: tasks.length > 0 ? 'busy' : 'idle',
+        tasks,
+      };
+    });
+
+    this.on('getTicket', async (msg: AbjectMessage) => {
+      const { ticketId } = msg.payload as { ticketId: string };
+      const entry = this.taskEntries.get(ticketId);
+      if (!entry) return { ticketId, status: 'unknown' };
+      const phase = entry.state.phase;
+      const status = phase === 'done' ? 'completed'
+        : phase === 'error' ? 'failed'
+        : phase === 'idle' ? 'pending' : 'running';
+      return {
+        ticketId,
+        status,
+        phase,
+        step: entry.state.step,
+        maxSteps: entry.state.maxSteps,
+        result: phase === 'done' ? entry.state.result : undefined,
+        error: phase === 'error' ? entry.state.error : undefined,
+      };
     });
 
     this.on('cancelTask', async (msg: AbjectMessage) => {
@@ -537,6 +712,21 @@ responseSchema is a JSON Schema object. When provided:
       const { taskId } = msg.payload as { taskId: string };
       const entry = requireDefined(this.taskEntries.get(taskId), `Task ${taskId} not found`);
       return this.think(entry);
+    });
+
+    // ── LLM streaming chunk forwarding ──
+    this.on('llmChunk', async (msg: AbjectMessage) => {
+      const { correlationId, content, done } = msg.payload as {
+        correlationId: string; content: string; done: boolean;
+      };
+      const entry = this.activeStreamEntry;
+      if (!entry) return;
+      // Forward to ticket caller via taskStream event
+      this.send(event(this.id, entry.callerId, 'taskStream', {
+        ticketId: entry.state.id,
+        content,
+        done,
+      }));
     });
 
     this.on('progress', () => {
@@ -619,14 +809,38 @@ responseSchema is a JSON Schema object. When provided:
       oldPhase,
       newPhase,
       action: entry.state.action?.action,
-    })).catch(() => {});
+    }));
+
+    // Always forward progress to ticket caller (even if caller is the agent itself —
+    // agentPhaseChanged and taskProgress are distinct event types, no duplication)
+    this.send(event(this.id, entry.callerId, 'taskProgress', {
+      ticketId: entry.state.id,
+      step: entry.state.step,
+      maxSteps: entry.state.maxSteps,
+      phase: newPhase,
+      action: entry.state.action?.action,
+    }));
+
+    // Update goal progress via GoalManager
+    if (entry.goalId && this.goalManagerId) {
+      const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Agent';
+      const msg = newPhase === 'acting' && entry.state.action?.action
+        ? `${entry.state.action.action}...`
+        : `${newPhase} (step ${entry.state.step + 1}/${entry.state.maxSteps})`;
+      this.send(event(this.id, this.goalManagerId, 'updateProgress', {
+        goalId: entry.goalId,
+        message: msg,
+        phase: newPhase,
+        agentName,
+      }));
+    }
   }
 
   private emitIntermediateAction(entry: TaskEntry): void {
     this.send(event(this.id, entry.agentId, 'agentIntermediateAction', {
       taskId: entry.state.id,
       action: entry.state.action,
-    })).catch(() => {});
+    }));
   }
 
   private emitActionResult(entry: TaskEntry): void {
@@ -634,7 +848,7 @@ responseSchema is a JSON Schema object. When provided:
       taskId: entry.state.id,
       action: entry.state.action,
       result: entry.state.lastResult,
-    })).catch(() => {});
+    }));
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -709,22 +923,38 @@ responseSchema is a JSON Schema object. When provided:
       }
     }
 
-    try {
-      await this.sendDeferredReply(entry.originalMsg, {
-        taskId: entry.state.id,
-        success,
-        result: entry.state.result,
-        error: entry.state.error,
-        steps: entry.state.step,
-        validationErrors,
-      });
-    } catch { /* caller may be gone */ }
+    // Complete or fail the goal via GoalManager
+    if (entry.goalId && this.goalManagerId) {
+      if (success) {
+        this.send(event(this.id, this.goalManagerId, 'completeGoal', {
+          goalId: entry.goalId,
+        }));
+      } else {
+        this.send(event(this.id, this.goalManagerId, 'failGoal', {
+          goalId: entry.goalId,
+          error: entry.state.error,
+        }));
+      }
+    }
+
+    // Send taskResult event to the ticket holder (caller)
+    this.send(event(this.id, entry.callerId, 'taskResult', {
+      ticketId: entry.state.id,
+      success,
+      result: entry.state.result,
+      error: entry.state.error,
+      steps: entry.state.step,
+      maxStepsReached: entry.state.step >= entry.state.maxSteps,
+      validationErrors,
+    }));
 
     this.changed('taskCompleted', {
       taskId: entry.state.id,
       agentId: entry.agentId,
       success,
-    }).catch(() => {});
+      result: success ? entry.state.result : undefined,
+      error: success ? undefined : entry.state.error,
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -811,8 +1041,7 @@ responseSchema is a JSON Schema object. When provided:
               this.emitIntermediateAction(entry);
               task.step++;
               if (task.step >= task.maxSteps) {
-                setPhase('error');
-                task.error = `Max steps (${task.maxSteps}) reached`;
+                await this.handleMaxStepsReached(entry, agentName, setPhase);
                 break;
               }
               setPhase('observing');
@@ -846,8 +1075,7 @@ responseSchema is a JSON Schema object. When provided:
             task.step++;
 
             if (task.step >= task.maxSteps) {
-              setPhase('error');
-              task.error = `Max steps (${task.maxSteps}) reached`;
+              await this.handleMaxStepsReached(entry, agentName, setPhase);
               break;
             }
 
@@ -862,6 +1090,78 @@ responseSchema is a JSON Schema object. When provided:
       } else if (task.phase === 'error') {
         log.info(`[${agentName}] Task error at step ${task.step}: ${task.error}`);
       }
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Max-steps handling: forced final LLM call + salvage fallback
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * When the step budget is exhausted, attempt to salvage a result:
+   * 1. Make one forced final LLM call asking the model to synthesize a "done"
+   *    response from everything it has gathered so far (inspired by LangChain's
+   *    early_stopping_method="generate" and CrewAI's "requesting final answer").
+   * 2. If the forced call produces a terminal "done" action, use it.
+   * 3. Otherwise fall back to salvaging the last successful action result.
+   * 4. If nothing is salvageable, set phase to error.
+   */
+  private async handleMaxStepsReached(
+    entry: TaskEntry,
+    agentName: string,
+    setPhase: (p: AgentPhase) => void,
+  ): Promise<void> {
+    const task = entry.state;
+    log.info(`[${agentName}] Max steps (${task.maxSteps}) reached — attempting forced final LLM call`);
+
+    // Try one final LLM call to synthesize accumulated data
+    try {
+      task.llmMessages.push({
+        role: 'user',
+        content: `[BUDGET EXHAUSTED — Final Step]\nYou have used all ${task.maxSteps} steps. You MUST respond with a "done" or "fail" action NOW.\nIf you have extracted ANY useful data during this task, respond with:\n\`\`\`json\n{"action": "done", "result": <your best result so far>}\n\`\`\`\nOtherwise respond with:\n\`\`\`json\n{"action": "fail", "reason": "Could not complete task in ${task.maxSteps} steps"}\n\`\`\``,
+      });
+
+      this.trimConversation(entry);
+
+      this.llmId = await this.resolveDep('LLM', this.llmId);
+      const llmResult = await this.request<{ content: string }>(
+        request(this.id, this.llmId, 'complete', {
+          messages: task.llmMessages,
+          options: { tier: 'balanced', maxTokens: 2048 },
+        }),
+        60000,
+      );
+
+      task.llmMessages.push({ role: 'assistant', content: llmResult.content });
+
+      const parsed = this.parseAction(entry, llmResult.content);
+      log.info(`[${agentName}] Forced final LLM response: ${parsed.action}`);
+
+      const terminal = this.isTerminalAction(entry, parsed);
+      if (terminal === 'success') {
+        setPhase('done');
+        log.info(`[${agentName}] Max steps reached — forced LLM call produced a result`);
+        return;
+      }
+      if (terminal === 'error') {
+        setPhase('error');
+        return;
+      }
+      // LLM didn't produce a terminal action — fall through to salvage
+    } catch (err) {
+      log.warn(`[${agentName}] Forced final LLM call failed: ${err instanceof Error ? err.message : String(err)}`);
+      // Fall through to salvage logic
+    }
+
+    // Fallback: salvage last successful action result
+    if (task.lastResult?.success && task.lastResult.data != null && task.lastResult.data !== '') {
+      task.result = task.lastResult.data;
+      task.error = `Max steps (${task.maxSteps}) reached — returning last successful result`;
+      setPhase('done');
+      log.info(`[${agentName}] Max steps reached — salvaging last successful result`);
+    } else {
+      setPhase('error');
+      task.error = `Max steps (${task.maxSteps}) reached`;
     }
   }
 
@@ -902,10 +1202,26 @@ responseSchema is a JSON Schema object. When provided:
     code: string,
   ): Promise<AgentActionResult> {
     try {
+      // Prepend goal helper closures so job code can update goals
+      const goalPreamble = entry.goalId && this.goalManagerId
+        ? `const _goalId = '${entry.goalId}';
+           const _goalMgrId = '${this.goalManagerId}';
+           const getGoal = async () => call(_goalMgrId, 'getGoal', { goalId: _goalId });
+           const updateGoal = async (message, phase) => call(_goalMgrId, 'updateProgress', { goalId: _goalId, message, phase });
+           const completeGoal = async (result) => call(_goalMgrId, 'completeGoal', { goalId: _goalId, result });
+           const failGoal = async (error) => call(_goalMgrId, 'failGoal', { goalId: _goalId, error });
+          `
+        : `const getGoal = async () => null;
+           const updateGoal = async () => {};
+           const completeGoal = async () => {};
+           const failGoal = async () => {};
+          `;
+      const fullCode = goalPreamble + code;
+
       const jobMgrId = await this.resolveDep('JobManager', this.jobManagerId);
       const submitMsg = request(this.id, jobMgrId, 'submitJob', {
         description,
-        code,
+        code: fullCode,
         ...(entry.config.queueName ? { queue: entry.config.queueName } : {}),
       });
       this._currentJobMsgId = submitMsg.header.messageId;
@@ -916,6 +1232,17 @@ responseSchema is a JSON Schema object. When provided:
         this._currentJobMsgId = undefined;
       }
       if (jobResult.status === 'completed') {
+        // If the agent's callback returned an AgentActionResult-shaped object
+        // (with its own success/error), unwrap it so the caller sees the real
+        // success status rather than always getting success: true from the job.
+        const r = jobResult.result as Record<string, unknown> | undefined;
+        if (r && typeof r === 'object' && typeof r.success === 'boolean') {
+          return {
+            success: r.success as boolean,
+            data: r.data ?? r.result,
+            error: r.error as string | undefined,
+          };
+        }
         return { success: true, data: jobResult.result };
       }
       return { success: false, error: jobResult.error ?? 'Job failed' };
@@ -946,13 +1273,20 @@ responseSchema is a JSON Schema object. When provided:
     this.trimConversation(entry);
 
     this.llmId = await this.resolveDep('LLM', this.llmId);
-    const llmResult = await this.request<{ content: string }>(
-      request(this.id, this.llmId, 'complete', {
-        messages: task.llmMessages,
-        options: { tier: 'balanced', maxTokens: 2048 },
-      }),
-      120000,
-    );
+    // Use streaming — llmChunk events are forwarded to the ticket caller
+    this.activeStreamEntry = entry;
+    let llmResult: { content: string };
+    try {
+      llmResult = await this.request<{ content: string }>(
+        request(this.id, this.llmId, 'stream', {
+          messages: task.llmMessages,
+          options: { tier: 'balanced', maxTokens: 2048 },
+        }),
+        120000,
+      );
+    } finally {
+      this.activeStreamEntry = undefined;
+    }
 
     // Add assistant response
     task.llmMessages.push({ role: 'assistant', content: llmResult.content });
@@ -996,11 +1330,25 @@ responseSchema is a JSON Schema object. When provided:
 
     if (!task.observation) return;
 
+    const stepsRemaining = task.maxSteps - task.step;
+    const urgency = stepsRemaining <= 2
+      ? `\n⚠️ LAST STEP — you MUST call "done" now with whatever data you have. No more actions after this.`
+      : stepsRemaining <= 5
+        ? `\n⚠️ WARNING: Only ${stepsRemaining} steps remaining! Wrap up and call "done" soon.`
+        : '';
+
     // If agent provided llmContent (e.g. screenshot), use it directly
     if (entry.lastObservationLlmContent) {
+      // Prepend step info to the first text part
+      const content = entry.lastObservationLlmContent.map((part, i) => {
+        if (i === 0 && part.type === 'text') {
+          return { ...part, text: `[Step ${task.step + 1}/${task.maxSteps}]${urgency}\n${part.text}` };
+        }
+        return part;
+      });
       task.llmMessages.push({
         role: 'user',
-        content: entry.lastObservationLlmContent,
+        content,
       });
       entry.lastObservationLlmContent = undefined;
       return;
@@ -1008,7 +1356,7 @@ responseSchema is a JSON Schema object. When provided:
 
     task.llmMessages.push({
       role: 'user',
-      content: `[Observation - Step ${task.step + 1}]\n${task.observation}`,
+      content: `[Step ${task.step + 1}/${task.maxSteps}]${urgency}\n${task.observation}`,
     });
   }
 

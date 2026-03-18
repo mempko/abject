@@ -69,7 +69,7 @@ export abstract class Abject {
   private _parentId?: AbjectId;
   private _registryId?: AbjectId;
   private _processingLoop?: Promise<void>;
-  private _insideHandler = false;
+  private _handlerCount = 0;
   private _stoppedDuringHandler = false;
   protected handlers: Map<string, MessageHandlerFn> = new Map();
   private dependents: Set<AbjectId> = new Set();
@@ -230,8 +230,8 @@ export abstract class Abject {
 
       // Fire off the LLM work async, send deferred reply when done
       this.handleAsk(question).then(
-        (result) => this.sendDeferredReply(msg, result).catch(() => {}),
-        () => this.sendDeferredReply(msg, `[No LLM available] ${formatManifestAsDescription(this.manifest)}`).catch(() => {}),
+        (result) => { try { this.sendDeferredReply(msg, result); } catch { /* stopped */ } },
+        () => { try { this.sendDeferredReply(msg, `[No LLM available] ${formatManifestAsDescription(this.manifest)}`); } catch { /* stopped */ } },
       );
 
       return DEFERRED_REPLY;
@@ -249,7 +249,7 @@ export abstract class Abject {
     // Notify parent after full initialization
     if (this._parentId) {
       try {
-        await this.send(event(this.id, this._parentId, 'childReady', {
+        this.send(event(this.id, this._parentId, 'childReady', {
           childId: this.id, name: this.manifest.name,
         }));
       } catch {
@@ -412,7 +412,7 @@ export abstract class Abject {
 
   /**
    * Per-object processing loop. Pulls messages from mailbox and handles them.
-   * Runs until the object is stopped.
+   * Runs until the object is stopped. Only await point is mailbox.receive().
    */
   private async processMessages(): Promise<void> {
     const isStopped = () => (this._status as string) === 'stopped';
@@ -424,11 +424,7 @@ export abstract class Abject {
         break; // Mailbox closed — exit loop
       }
       if (isStopped()) break;
-      try {
-        await this.handleMessage(msg);
-      } catch (err) {
-        log.error(`[${this.id}] Processing loop error:`, err);
-      }
+      this.handleMessage(msg); // Synchronous — never blocks the loop
     }
   }
 
@@ -473,7 +469,7 @@ export abstract class Abject {
     // If called from inside a handler, defer only the processing-loop await
     // to avoid a circular Promise chain (stop awaits processingLoop which
     // awaits handleMessage which called stop).
-    if (this._insideHandler) {
+    if (this._handlerCount > 0) {
       this._stoppedDuringHandler = true;
       this.dependents.clear();
       return;
@@ -523,9 +519,9 @@ export abstract class Abject {
    * Notify all dependents of a change (Smalltalk changed: protocol).
    * Sends a 'changed' event message to each dependent via the bus.
    */
-  protected async changed(aspect: string, value?: unknown): Promise<void> {
+  protected changed(aspect: string, value?: unknown): void {
     for (const depId of this.dependents) {
-      await this.send(event(this.id, depId, 'changed', {
+      this.send(event(this.id, depId, 'changed', {
         aspect,
         value,
       }));
@@ -533,14 +529,14 @@ export abstract class Abject {
   }
 
   /**
-   * Send a message to another object.
+   * Send a message to another object (synchronous — bus never blocks).
    */
-  protected async send(message: AbjectMessage): Promise<void> {
+  protected send(message: AbjectMessage): void {
     require(this._bus !== undefined, 'Object not initialized');
     require(this._status === 'ready' || this._status === 'busy', 'Object not ready');
 
     this.lastActivity = Date.now();
-    await this._bus!.send(message);
+    this._bus!.send(message);
   }
 
   /**
@@ -571,7 +567,11 @@ export abstract class Abject {
         timeoutMsg,
       });
 
-      this.send(message).catch(reject);
+      try {
+        this.send(message);
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 
@@ -593,8 +593,8 @@ export abstract class Abject {
   /**
    * Send a deferred reply to a request whose auto-reply was suppressed via DEFERRED_REPLY.
    */
-  protected async sendDeferredReply(originalMessage: AbjectMessage, result: unknown): Promise<void> {
-    await this.send(reply(originalMessage, result !== undefined ? result : null));
+  protected sendDeferredReply(originalMessage: AbjectMessage, result: unknown): void {
+    this.send(reply(originalMessage, result !== undefined ? result : null));
   }
 
   /**
@@ -617,10 +617,14 @@ export abstract class Abject {
   }
 
   /**
-   * Handle an incoming message from the processing loop.
-   * Replies are handled via handleReply() fast-path, not here.
+   * Handle an incoming message from the processing loop (synchronous).
+   *
+   * Calls the handler but never awaits it. If the handler returns a Promise
+   * (async), the reply is auto-sent when the Promise resolves. If the handler
+   * returns a value (sync), the reply is sent immediately. This makes every
+   * async handler implicitly non-blocking (Erlang-style deferred work).
    */
-  private async handleMessage(message: AbjectMessage): Promise<void> {
+  private handleMessage(message: AbjectMessage): void {
     if (message === undefined) {
       log.error(`[${this.id}] handleMessage called with undefined message`);
       return;
@@ -641,55 +645,29 @@ export abstract class Abject {
     // Save status to handle re-entrant message delivery
     const prevStatus = this._status;
 
+    // Find handler
+    const method = message.routing.method ?? '';
+    const handler = this.handlers.get(method) ?? this.handlers.get('*');
+
+    if (!handler) {
+      if (isRequest(message)) {
+        this.send(
+          error(message, 'METHOD_NOT_FOUND', `No handler for method: ${method}`)
+        );
+      }
+      return;
+    }
+
+    // Execute handler — don't await
+    this._status = 'busy';
+    this._handlerCount++;
+
+    let result: unknown;
     try {
-      // Find handler
-      const method = message.routing.method ?? '';
-      const handler = this.handlers.get(method) ?? this.handlers.get('*');
-
-      if (!handler) {
-        if (isRequest(message)) {
-          await this.send(
-            error(message, 'METHOD_NOT_FOUND', `No handler for method: ${method}`)
-          );
-        }
-        return;
-      }
-
-      // Execute handler (track _insideHandler for stop() deadlock avoidance)
-      this._status = 'busy';
-      this._insideHandler = true;
-      let result: unknown;
-      try {
-        result = await handler(message);
-      } finally {
-        this._insideHandler = false;
-      }
-
-      // If stop() was called during the handler, finalize deferred cleanup
-      if (this._stoppedDuringHandler) {
-        this._stoppedDuringHandler = false;
-
-        // Send the reply directly via the bus (this.send() rejects on stopped status)
-        if (isRequest(message) && this._bus && result !== DEFERRED_REPLY) {
-          try {
-            await this._bus.send(reply(message, result !== undefined ? result : null));
-          } catch {
-            // Bus may already have unregistered — that's OK
-          }
-        }
-
-        // Finalize deferred cleanup (bus.unregister already done in stop())
-        this._processingLoop = undefined;
-        return; // Skip invariant check — the object is dead
-      }
-
-      this._status = prevStatus === 'busy' ? 'busy' : 'ready';
-
-      // Send reply if this was a request (skip if handler returned DEFERRED_REPLY)
-      if (isRequest(message) && result !== DEFERRED_REPLY) {
-        await this.send(reply(message, result !== undefined ? result : null));
-      }
+      result = handler(message); // Call handler — don't await
     } catch (err) {
+      // Sync handler threw — send error reply immediately
+      this._handlerCount--;
       this.errorCount++;
       this.lastError = {
         code: 'HANDLER_ERROR',
@@ -697,48 +675,104 @@ export abstract class Abject {
         stack: err instanceof Error ? err.stack : undefined,
       };
 
-      // If stop() was called during the handler that threw, finalize deferred cleanup
       if (this._stoppedDuringHandler) {
         this._stoppedDuringHandler = false;
-
-        // Send error reply directly via bus
         if (isRequest(message) && this._bus) {
-          try {
-            await this._bus.send(errorFromException(message, err));
-          } catch {
-            // Bus may already have unregistered
-          }
+          try { this._bus.send(errorFromException(message, err)); } catch { /* bus gone */ }
         }
-
-        // Finalize deferred cleanup (bus.unregister already done in stop())
         this._processingLoop = undefined;
         log.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
         return;
       }
 
-      // Send error reply while status is still 'busy' (send requires 'ready' or 'busy')
       if (isRequest(message)) {
-        try {
-          await this.send(errorFromException(message, err));
-        } catch (sendErr) {
+        try { this.send(errorFromException(message, err)); } catch (sendErr) {
           log.error(`[${this.id}] Failed to send error reply:`, sendErr);
         }
       }
-
-      // Only set error status if this is the outermost handler (not re-entrant)
-      if (prevStatus !== 'busy') {
-        this._status = 'error';
-      }
+      if (prevStatus !== 'busy') this._status = 'error';
       log.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
+      return;
     }
 
-    try {
-      this.checkInvariants();
-    } catch (err) {
-      log.error(`[${this.id}] Invariant violation after message handling:`, err);
-      this.errorCount++;
-      if (this._status !== 'stopped') {
-        this._status = 'error';
+    if (result instanceof Promise) {
+      // Async handler — reply when Promise resolves (non-blocking)
+      result.then(
+        (val) => {
+          this._handlerCount--;
+
+          if (this._stoppedDuringHandler) {
+            this._stoppedDuringHandler = false;
+            if (isRequest(message) && this._bus && val !== DEFERRED_REPLY) {
+              try { this._bus.send(reply(message, val !== undefined ? val : null)); } catch { /* bus gone */ }
+            }
+            this._processingLoop = undefined;
+            return;
+          }
+
+          this._status = prevStatus === 'busy' ? 'busy' : 'ready';
+
+          if (isRequest(message) && val !== DEFERRED_REPLY) {
+            this.send(reply(message, val !== undefined ? val : null));
+          }
+
+          try { this.checkInvariants(); } catch (err) {
+            log.error(`[${this.id}] Invariant violation after message handling:`, err);
+            this.errorCount++;
+            if ((this._status as string) !== 'stopped') this._status = 'error';
+          }
+        },
+        (err) => {
+          this._handlerCount--;
+          this.errorCount++;
+          this.lastError = {
+            code: 'HANDLER_ERROR',
+            message: err instanceof Error ? err.message : String(err),
+            stack: err instanceof Error ? err.stack : undefined,
+          };
+
+          if (this._stoppedDuringHandler) {
+            this._stoppedDuringHandler = false;
+            if (isRequest(message) && this._bus) {
+              try { this._bus.send(errorFromException(message, err)); } catch { /* bus gone */ }
+            }
+            this._processingLoop = undefined;
+            log.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
+            return;
+          }
+
+          if (isRequest(message)) {
+            try { this.send(errorFromException(message, err)); } catch (sendErr) {
+              log.error(`[${this.id}] Failed to send error reply:`, sendErr);
+            }
+          }
+          if (prevStatus !== 'busy') this._status = 'error';
+          log.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
+        },
+      );
+    } else {
+      // Sync handler — reply immediately
+      this._handlerCount--;
+
+      if (this._stoppedDuringHandler) {
+        this._stoppedDuringHandler = false;
+        if (isRequest(message) && this._bus && result !== DEFERRED_REPLY) {
+          try { this._bus.send(reply(message, result !== undefined ? result : null)); } catch { /* bus gone */ }
+        }
+        this._processingLoop = undefined;
+        return;
+      }
+
+      this._status = prevStatus === 'busy' ? 'busy' : 'ready';
+
+      if (isRequest(message) && result !== DEFERRED_REPLY) {
+        this.send(reply(message, result !== undefined ? result : null));
+      }
+
+      try { this.checkInvariants(); } catch (err) {
+        log.error(`[${this.id}] Invariant violation after message handling:`, err);
+        this.errorCount++;
+        if ((this._status as string) !== 'stopped') this._status = 'error';
       }
     }
   }

@@ -28,7 +28,7 @@ export interface MessageBusLike {
   setReplyHandler(objectId: AbjectId, handler: ReplyHandler): void;
   removeReplyHandler(objectId: AbjectId): void;
   unregister(objectId: AbjectId): void;
-  send(message: AbjectMessage): Promise<void>;
+  send(message: AbjectMessage): void;
   isRegistered(objectId: AbjectId): boolean;
 }
 
@@ -131,16 +131,16 @@ export class MessageBus implements MessageBusLike {
    * recipient's pending Promise directly, bypassing the mailbox.
    * Normal path: message is enqueued in the recipient's mailbox.
    */
-  async send(message: AbjectMessage): Promise<void> {
+  send(message: AbjectMessage): void {
     const oldCount = this.messageCount;
 
     // Preconditions
     require(message.header.messageId !== '', 'messageId must not be empty');
     requireNonEmpty(message.routing.to, 'recipient');
 
-    // Run interceptors
+    // Run interceptors synchronously
     for (const interceptor of this.interceptors) {
-      const result = await interceptor.intercept(message);
+      const result = interceptor.intercept(message);
       if (result === 'drop') {
         return;
       }
@@ -384,11 +384,11 @@ export class MessageBus implements MessageBusLike {
  */
 export interface MessageInterceptor {
   /**
-   * Intercept a message before delivery.
+   * Intercept a message before delivery (synchronous — bus never awaits).
    * Return 'pass' to deliver unchanged, 'drop' to discard,
    * or a new message to deliver instead.
    */
-  intercept(message: AbjectMessage): Promise<'pass' | 'drop' | AbjectMessage>;
+  intercept(message: AbjectMessage): 'pass' | 'drop' | AbjectMessage;
 }
 
 /**
@@ -403,7 +403,7 @@ export class LoggingInterceptor implements MessageInterceptor {
     this._log = new Log(prefix.replace(/^\[|\]$/g, ''));
   }
 
-  async intercept(message: AbjectMessage): Promise<'pass'> {
+  intercept(message: AbjectMessage): 'pass' {
     if (!this.filter || this.filter(message)) {
       this._log.info(
         `${message.header.type} ` +
@@ -425,7 +425,7 @@ export class ProxyInterceptor implements MessageInterceptor {
     private readonly proxyId: AbjectId
   ) {}
 
-  async intercept(message: AbjectMessage): Promise<'pass' | AbjectMessage> {
+  intercept(message: AbjectMessage): 'pass' | AbjectMessage {
     // Route messages between source and target through proxy
     if (
       message.routing.from === this.sourceId &&
@@ -483,13 +483,13 @@ export class HealthInterceptor implements MessageInterceptor {
     this.trackedPairs.delete(`${targetId}-${sourceId}`);
   }
 
-  async intercept(message: AbjectMessage): Promise<'pass'> {
+  intercept(message: AbjectMessage): 'pass' {
     const pairKey = `${message.routing.from}-${message.routing.to}`;
     const agreementId = this.trackedPairs.get(pairKey);
 
     if (agreementId) {
       if (message.header.type === 'error') {
-        // Report error to HealthMonitor
+        // Report error to HealthMonitor (fire-and-forget)
         const errorPayload = message.payload as AbjectError;
         this.bus.send(
           createRequest(
@@ -498,9 +498,9 @@ export class HealthInterceptor implements MessageInterceptor {
             'recordError',
             { agreementId, error: errorPayload }
           )
-        ).catch(() => { /* best-effort */ });
+        );
       } else if (message.header.type === 'reply') {
-        // Report success to HealthMonitor
+        // Report success to HealthMonitor (fire-and-forget)
         this.bus.send(
           createRequest(
             'health-interceptor' as AbjectId,
@@ -508,7 +508,7 @@ export class HealthInterceptor implements MessageInterceptor {
             'recordSuccess',
             { agreementId }
           )
-        ).catch(() => { /* best-effort */ });
+        );
       }
     }
 

@@ -25,6 +25,8 @@ import { Console } from '../src/objects/capabilities/console.js';
 import { FileSystem } from '../src/objects/capabilities/filesystem.js';
 import { AbjectEditor } from '../src/objects/abject-editor.js';
 import { JobManager } from '../src/objects/job-manager.js';
+import { GoalManager } from '../src/objects/goal-manager.js';
+import { GoalBrowser } from '../src/objects/goal-browser.js';
 import { AbjectStore } from '../src/objects/abject-store.js';
 import { Settings } from '../src/objects/settings.js';
 import { AppExplorer } from '../src/objects/app-explorer.js';
@@ -74,6 +76,8 @@ constructors.set('AppExplorer', () => new AppExplorer());
 constructors.set('ObjectBrowser', () => new ObjectBrowser());
 constructors.set('JobManager', () => new JobManager());
 constructors.set('JobBrowser', () => new JobBrowser());
+constructors.set('GoalManager', () => new GoalManager());
+constructors.set('GoalBrowser', () => new GoalBrowser());
 constructors.set('Chat', () => new Chat());
 constructors.set('AbjectStore', () => new AbjectStore());
 constructors.set('Theme', () => new ThemeAbject());
@@ -179,6 +183,32 @@ port.on('message', async (data: WorkerInboundMessage) => {
       const { message } = data;
       if (message) {
         workerBus.deliverReplyFromMain(message);
+      }
+      break;
+    }
+
+    case 'peer:port': {
+      // Direct MessagePort from a peer worker — transferred in the message data
+      const { workerIndex } = data;
+      const peerPort = (data as { port?: import('node:worker_threads').MessagePort }).port;
+      if (peerPort && workerIndex !== undefined) {
+        workerBus.addPeerPort(workerIndex, peerPort as unknown as MessagePort);
+      }
+      break;
+    }
+
+    case 'peer:place': {
+      const { objectId, workerIndex } = data;
+      if (objectId && workerIndex !== undefined) {
+        workerBus.addPeerObject(objectId, workerIndex);
+      }
+      break;
+    }
+
+    case 'peer:remove': {
+      const { objectId } = data;
+      if (objectId) {
+        workerBus.removePeerObject(objectId);
       }
       break;
     }

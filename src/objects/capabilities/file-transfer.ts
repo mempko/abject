@@ -249,7 +249,7 @@ export class FileTransfer extends Abject {
     this.transfers.set(transferId, transfer);
 
     // Send offer to remote peer
-    await this.send(createEvent(this.id, FILE_TRANSFER_ID, '_fileOffer', {
+    this.send(createEvent(this.id, FILE_TRANSFER_ID, '_fileOffer', {
       transferId, fileName, fileSize, mimeType, fromPeerId: peerId,
     }));
 
@@ -284,7 +284,7 @@ export class FileTransfer extends Abject {
       const end = Math.min(start + CHUNK_SIZE, fullData.length);
       const chunk = fullData.slice(start, end);
 
-      await this.send(createEvent(this.id, FILE_TRANSFER_ID, '_fileChunk', {
+      this.send(createEvent(this.id, FILE_TRANSFER_ID, '_fileChunk', {
         transferId: transfer.id,
         chunkIndex: i,
         data: chunk,

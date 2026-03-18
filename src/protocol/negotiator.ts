@@ -479,7 +479,7 @@ The Negotiator introspects both objects, generates a proxy if their interfaces d
     agreement: ProtocolAgreement
   ): Promise<void> {
     for (const participantId of agreement.participants) {
-      await this.send(
+      this.send(
         event(
           this.id,
           participantId,
