@@ -538,15 +538,15 @@ export class Taskbar extends Abject {
     specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13, ...(registryVis ? activeStyle : {}) } });
     // 2: Chat button
     specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCAC Chat', ...(chatVis ? { style: activeStyle } : {}) });
-    // 3: Jobs button
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCCB Jobs', ...(jobsVis ? { style: activeStyle } : {}) });
-    // 4?: Browser button (optional)
-    if (this.webBrowserViewerId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Web', ...(browserViewerVis ? { style: activeStyle } : {}) });
-    }
-    // 5?: Goals button (optional)
+    // 3?: Goals button (optional)
     if (this.goalBrowserId) {
       specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDFAF Goals', ...(goalBrowserVis ? { style: activeStyle } : {}) });
+    }
+    // 4: Jobs button
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCCB Jobs', ...(jobsVis ? { style: activeStyle } : {}) });
+    // 5?: Browser button (optional)
+    if (this.webBrowserViewerId) {
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Web', ...(browserViewerVis ? { style: activeStyle } : {}) });
     }
     // User object buttons
     const userObjStartIdx = specs.length;
@@ -573,13 +573,13 @@ export class Taskbar extends Abject {
     const appsLabelId = widgetIds[0];
     this.registryBtnId = widgetIds[1];
     this.chatBtnId = widgetIds[2];
-    this.jobsBtnId = widgetIds[3];
-    let nextIdx = 4;
-    if (this.webBrowserViewerId) {
-      this.browserViewerBtnId = widgetIds[nextIdx++];
-    }
+    let nextIdx = 3;
     if (this.goalBrowserId) {
       this.goalsBtnId = widgetIds[nextIdx++];
+    }
+    this.jobsBtnId = widgetIds[nextIdx++];
+    if (this.webBrowserViewerId) {
+      this.browserViewerBtnId = widgetIds[nextIdx++];
     }
 
     // Map user object buttons
@@ -597,9 +597,10 @@ export class Taskbar extends Abject {
 
     // Build root layout children: all system buttons + user buttons
     const rootChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize: Record<string, number> }> = [];
-    const allButtonIds = [this.chatBtnId, this.jobsBtnId];
-    if (this.browserViewerBtnId) allButtonIds.push(this.browserViewerBtnId);
+    const allButtonIds = [this.chatBtnId];
     if (this.goalsBtnId) allButtonIds.push(this.goalsBtnId);
+    allButtonIds.push(this.jobsBtnId);
+    if (this.browserViewerBtnId) allButtonIds.push(this.browserViewerBtnId);
     for (const btnId of allButtonIds) {
       rootChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
     }
