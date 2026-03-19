@@ -104,6 +104,16 @@ Cryptographic identity and peer-to-peer networking.
 | `peer-network.ts` | `PeerNetwork` | Modal window for managing identity, signaling servers, and contacts |
 | `remote-registry.ts` | `RemoteRegistry` | Distributed object discovery across connected peers with 5-min TTL cache |
 
+## Coordination
+
+Cross-agent task coordination and progress tracking.
+
+| File | Class | Well-known ID | Description |
+|------|-------|---------------|-------------|
+| `goal-manager.ts` | `GoalManager` | `GOAL_MANAGER_ID` | Shared coordination surface for cross-agent progress tracking. Persists goals to SharedState for peer visibility. Task convenience methods delegate to TupleSpace |
+| `goal-browser.ts` | `GoalBrowser` | `GOAL_BROWSER_ID` | UI for viewing cross-agent goal progress in real-time |
+| `tuple-space.ts` | `TupleSpace` | `TUPLE_SPACE_ID` | CRDT-backed coordination primitive for task distribution. Agents put tasks, claim them optimistically (LWW), and post results |
+
 ## Common Pattern
 
 Every object follows the same structure:
@@ -112,7 +122,23 @@ Every object follows the same structure:
 3. Dependencies injected via `set*()` methods or discovered via Registry
 4. Well-known ID exported as `const FOO_ID = 'abjects:foo' as AbjectId`
 
+## Adding a Per-Workspace Abject
+
+Per-workspace Abjects are spawned automatically for every workspace by `WorkspaceManager`. They run in worker threads when workers are enabled. To add one:
+
+1. **Create the Abject** in `src/objects/` (or `src/objects/capabilities/` for capabilities)
+2. **Register its constructor in three places:**
+   - `server/index.ts` — `runtime.objectFactory.registerConstructor('MyAbject', () => new MyAbject())`
+   - `workers/abject-worker-node.ts` — import the class and add `constructors.set('MyAbject', () => new MyAbject())`
+   - (Optional) Mark worker-eligible in `server/index.ts` if it should run in workers
+3. **Add to workspace spawn list** in `src/objects/workspace-manager.ts`:
+   - `INFRA_OBJECTS` — for non-UI Abjects (always spawned, even for inactive workspaces)
+   - `UI_OBJECTS` — for Abjects with windows/UI (only spawned for active workspaces)
+4. **Export** from `src/index.ts`
+
+**Critical**: If you register the constructor in `server/index.ts` but forget `workers/abject-worker-node.ts`, the Abject will fail to spawn silently when workers are enabled (the default). Both files must have the constructor.
+
 ## Subdirectories
 
-- `capabilities/`: 8 built-in capability objects (HTTP, storage, timer, clipboard, console, filesystem, web-browser, web-parser)
+- `capabilities/`: Built-in capability objects (HTTP, storage, timer, clipboard, console, filesystem, shared-state, web-browser, web-parser, file-transfer, media-stream)
 - `widgets/`: Canvas widget toolkit (20 files: windows, layouts, input/display widgets)

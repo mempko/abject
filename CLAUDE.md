@@ -102,7 +102,9 @@ Every system service follows this pattern:
 
 ## How to Add Things
 
-### New Object
+### New Global Object
+
+Global objects are singletons spawned once during bootstrap in `server/index.ts`.
 
 1. Create file in appropriate directory
 2. Extend `Abject` with full manifest (include complete `InterfaceDeclaration` with method params, returns, descriptions)
@@ -111,7 +113,23 @@ Every system service follows this pattern:
 5. Override `checkInvariants()` calling `super.checkInvariants()` first
 6. Export well-known ID constant
 7. Add to `src/index.ts` exports
-8. Register its constructor and spawn it in `server/index.ts` `main()` if it's a system object
+8. Register its constructor and spawn it in `server/index.ts` `main()`
+
+### New Per-Workspace Object
+
+Per-workspace objects are spawned automatically for every workspace by `WorkspaceManager`. They run in worker threads when workers are enabled (the default). **You must register the constructor in both the main thread AND the worker.**
+
+1. Create file in `src/objects/`
+2. Extend `Abject` with full manifest, handlers, contracts, well-known ID (same as global)
+3. Register constructor in **`server/index.ts`**: `runtime.objectFactory.registerConstructor('Name', () => new MyAbject())`
+4. Register constructor in **`workers/abject-worker-node.ts`**: import + `constructors.set('Name', () => new MyAbject())`
+5. (Optional) Mark worker-eligible in `server/index.ts` `workerEligible` array if it should run in a worker thread
+6. Add to spawn list in **`src/objects/workspace-manager.ts`**:
+   - `INFRA_OBJECTS` — non-UI Abjects (always spawned, including for inactive workspaces)
+   - `UI_OBJECTS` — Abjects with show/hide windows (only spawned for active workspaces)
+7. Export from `src/index.ts`
+
+**CRITICAL**: Forgetting the `workers/abject-worker-node.ts` registration causes silent spawn failures when workers are enabled. Always register in both places.
 
 ### New Capability Object
 
@@ -137,7 +155,8 @@ Every system service follows this pattern:
 - **Compositor**: Needs a real `HTMLCanvasElement`
 - **Sequence numbers**: Per-sender, tracked in module-level state in `message.ts`; use `resetSequence()` in tests
 - **Import extensions**: Always use `.js` in imports even though source files are `.ts`
-- **Bootstrap**: System objects must be registered and spawned in `server/index.ts`.
+- **Bootstrap**: Global system objects must be registered and spawned in `server/index.ts`.
+- **Worker constructors**: Per-workspace Abjects must have their constructors registered in BOTH `server/index.ts` AND `workers/abject-worker-node.ts`. Missing the worker registration causes silent spawn failures.
 
 ## Bootstrap Order
 
@@ -149,7 +168,8 @@ Bootstrap happens in `server/index.ts`:
 4. `main()` spawns: ProxyGenerator, Negotiator, HealthMonitor, ObjectCreator
 5. `main()` spawns: Workspaces, P2P, and remaining system objects
 
-When adding a new system object, register its constructor and spawn it in `server/index.ts`.
+When adding a new global system object, register its constructor and spawn it in `server/index.ts`.
+Per-workspace objects are spawned by `WorkspaceManager` — add them to `INFRA_OBJECTS` or `UI_OBJECTS` in `workspace-manager.ts`, and register their constructors in both `server/index.ts` and `workers/abject-worker-node.ts`.
 
 ## Dependencies
 
