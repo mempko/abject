@@ -13,6 +13,7 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { require as precondition, requireNonEmpty } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
+import type { AgentPlan } from './agent-abject.js';
 
 const log = new Log('GoalManager');
 
@@ -48,6 +49,7 @@ export interface Goal {
   childIds: GoalId[];
   result?: unknown;
   error?: string;
+  plan?: AgentPlan;
   createdAt: number;
   updatedAt: number;
 }
@@ -222,6 +224,23 @@ export class GoalManager extends Abject {
             {
               name: 'cancelTasksForGoal',
               description: 'Cancel all tasks for a goal — releases claims, removes tuples from TupleSpace',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+              ],
+              returns: { kind: 'object', properties: { cancelled: { kind: 'primitive', primitive: 'number' } } },
+            },
+            {
+              name: 'updatePlan',
+              description: 'Store or update a structured plan on a goal',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+                { name: 'plan', type: { kind: 'object', properties: {} }, description: 'Agent plan with summary and steps' },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+            },
+            {
+              name: 'cancelPendingTasks',
+              description: 'Cancel all pending tasks for a goal (used during replan)',
               parameters: [
                 { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
               ],
@@ -491,6 +510,7 @@ Goals have automatic lifecycle management:
           childIds: goal.childIds,
           result: goal.result,
           error: goal.error,
+          plan: goal.plan,
           createdAt: goal.createdAt,
           updatedAt: goal.updatedAt,
         },
@@ -883,6 +903,42 @@ Goals have automatic lifecycle management:
       this.goalOrder.push(goalId as GoalId);
       this.saveGoalIndex();
       return null;
+    });
+
+    this.on('updatePlan', async (msg: AbjectMessage) => {
+      const { goalId, plan } = msg.payload as { goalId: GoalId; plan: AgentPlan };
+      const goal = this.goals.get(goalId);
+      if (!goal) return { success: false };
+      goal.plan = plan;
+      goal.updatedAt = Date.now();
+      this.changed('goalUpdated', { goalId, plan });
+      this.syncGoalToSharedState(goal);
+      return { success: true };
+    });
+
+    this.on('cancelPendingTasks', async (msg: AbjectMessage) => {
+      const { goalId } = msg.payload as { goalId: string };
+      requireNonEmpty(goalId, 'goalId');
+      if (!this.tupleSpaceId) return { cancelled: 0 };
+
+      const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(
+        request(this.id, this.tupleSpaceId, 'scan', { pattern: { goalId, status: 'pending' } })
+      );
+
+      let cancelled = 0;
+      for (const task of tasks) {
+        try {
+          if (task.claimedBy) {
+            try {
+              await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: task.id }));
+            } catch { /* best effort */ }
+          }
+          await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id }));
+          cancelled++;
+        } catch { /* best effort */ }
+      }
+
+      return { cancelled };
     });
 
     this.on('cancelTasksForGoal', async (msg: AbjectMessage) => {

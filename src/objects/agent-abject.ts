@@ -26,6 +26,20 @@ const log = new Log('AgentAbject');
 
 export type AgentPhase = 'idle' | 'observing' | 'thinking' | 'acting' | 'done' | 'error';
 
+export interface AgentPlan {
+  summary: string;
+  steps: AgentPlanStep[];
+  revision: number;        // 0 = initial, increments on replan
+}
+
+export interface AgentPlanStep {
+  id: string;              // "step-1", "step-2", ...
+  description: string;
+  taskType: string;        // Required — every step becomes a TupleSpace task
+  taskId?: string;         // Set after TupleSpace task is created
+  data?: unknown;          // Optional task-specific payload
+}
+
 export interface AgentAction {
   action: string;
   reasoning?: string;
@@ -51,6 +65,7 @@ export interface AgentTaskState {
   error?: string;
   llmMessages: { role: string; content: string | ContentPart[] }[];
   timeout: number;
+  plan?: AgentPlan;
 }
 
 export interface AgentTaskOptions {
@@ -116,6 +131,12 @@ interface TaskEntry {
   responseSchema?: Record<string, unknown>;
   /** Goal ID for cross-agent progress tracking via GoalManager. */
   goalId?: string;
+  /** Set when task came from dispatch (the parent goal). */
+  incomingGoalId?: string;
+  /** Set when planning creates a child goal for a dispatched task. */
+  childGoalId?: string;
+  /** Active child goal IDs created by decompose. */
+  childGoalIds?: string[];
 }
 
 // ─── AgentAbject ─────────────────────────────────────────────────────
@@ -190,6 +211,12 @@ export class AgentAbject extends Abject {
 
   /** Active task entry during LLM streaming — links llmChunk events to the right ticket. */
   private activeStreamEntry?: TaskEntry;
+
+  /** Resolvers for event-driven child goal observation. */
+  private childGoalEventResolvers = new Map<string, {
+    resolve: (evt: { aspect: string; goalId: string; taskId?: string; result?: unknown; error?: string }) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
 
   /** Lazy Ajv instance for response schema validation. */
   private _ajv?: Ajv;
@@ -514,6 +541,11 @@ Inside job code, goal helpers are available automatically:
     if (this.tupleSpaceId) {
       this.send(request(this.id, this.tupleSpaceId, 'addDependent', {}));
     }
+
+    // Subscribe to GoalManager for child goal completion events
+    if (this.goalManagerId) {
+      this.send(request(this.id, this.goalManagerId, 'addDependent', {}));
+    }
   }
 
   /** Resolve a required dependency lazily. */
@@ -748,9 +780,17 @@ Inside job code, goal helpers are available automatically:
       }
     });
 
-    // ── TupleSpace watcher — centralized task dispatch ──
+    // ── TupleSpace + GoalManager watcher ──
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value: unknown };
+
+      // Handle GoalManager child goal events (completion, failure, task updates)
+      if (aspect === 'goalCompleted' || aspect === 'goalFailed'
+          || aspect === 'taskCompleted' || aspect === 'taskPermanentlyFailed') {
+        this.handleChildGoalEvent(aspect, value);
+        return;
+      }
+
       // Watch both tuplePut (new tasks) and tupleUpdated (retried tasks released back to pending)
       if (aspect !== 'tuplePut' && aspect !== 'tupleUpdated') return;
 
@@ -907,15 +947,21 @@ Inside job code, goal helpers are available automatically:
       const elapsed = Date.now() - dispatchStart;
       log.info(`DISPATCH-INNER ${tupleId} — executeTask SUCCESS (${elapsed}ms), completing task`);
 
-      // 7. Complete task
-      await this.request(
-        request(this.id, this.goalManagerId!, 'completeTask', {
-          taskId: claimed.tuple.id,
-          goalId: taskGoalId,
-          result,
-        })
-      );
-      log.info(`DISPATCH-INNER ${tupleId} — task completed`);
+      // 7. Complete task — or watch child goal if one was spawned
+      const resultObj = result as Record<string, unknown> | undefined;
+      if (resultObj && resultObj.childGoalId) {
+        log.info(`DISPATCH-INNER ${tupleId} — task spawned child goal ${(resultObj.childGoalId as string).slice(0, 8)}, watching`);
+        this.watchChildGoal(resultObj.childGoalId as string, claimed.tuple.id, taskGoalId!);
+      } else {
+        await this.request(
+          request(this.id, this.goalManagerId!, 'completeTask', {
+            taskId: claimed.tuple.id,
+            goalId: taskGoalId,
+            result,
+          })
+        );
+        log.info(`DISPATCH-INNER ${tupleId} — task completed`);
+      }
     } catch (err) {
       const elapsed = Date.now() - dispatchStart;
       log.info(`DISPATCH-INNER ${tupleId} — executeTask FAILED (${elapsed}ms): ${(err as Error).message?.slice(0, 120)}`);
@@ -1242,6 +1288,71 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
             task.observation = obsData.observation;
             if (obsData.llmContent) entry.lastObservationLlmContent = obsData.llmContent;
             else entry.lastObservationLlmContent = undefined;
+
+            // If there are active child goals, wait for next event then check status
+            if (entry.childGoalIds && entry.childGoalIds.length > 0 && this.goalManagerId) {
+              const statusLines: string[] = [];
+              const stillActive: string[] = [];
+
+              for (const cgId of entry.childGoalIds) {
+                try {
+                  const goal = await this.request<{ id: string; status: string; title: string; result?: unknown; error?: string } | null>(
+                    request(this.id, this.goalManagerId, 'getGoal', { goalId: cgId }),
+                  );
+                  if (!goal) continue;
+
+                  if (goal.status === 'completed' || goal.status === 'failed') {
+                    statusLines.push(goal.status === 'completed'
+                      ? `[Child Goal "${goal.title}"] COMPLETED: ${JSON.stringify(goal.result)?.slice(0, 300)}`
+                      : `[Child Goal "${goal.title}"] FAILED: ${goal.error ?? 'unknown'}`);
+                    continue;
+                  }
+
+                  // Active — check task progress
+                  const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
+                    request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId: cgId }),
+                  );
+                  const doneT = tasks.filter(t => t.fields.status === 'done');
+                  const pending = tasks.filter(t => t.fields.status === 'pending');
+                  const inProgress = tasks.filter(t => t.fields.claimedBy);
+                  const permFailed = tasks.filter(t => t.fields.status === 'permanently_failed');
+
+                  // Agent decides: all tasks done → complete the child goal
+                  if (pending.length === 0 && inProgress.length === 0 && doneT.length > 0) {
+                    const results = doneT.map(t => ({
+                      type: t.fields.type, description: t.fields.description, result: t.fields.result,
+                    }));
+                    await this.request(request(this.id, this.goalManagerId, 'completeGoal', {
+                      goalId: cgId, result: results,
+                    }));
+                    statusLines.push(`[Child Goal "${goal.title}"] COMPLETED (${doneT.length} tasks): ${JSON.stringify(results)?.slice(0, 300)}`);
+                  } else if (pending.length === 0 && inProgress.length === 0 && permFailed.length > 0 && doneT.length === 0) {
+                    // All tasks permanently failed → fail the child goal
+                    await this.request(request(this.id, this.goalManagerId, 'failGoal', {
+                      goalId: cgId, error: `All ${permFailed.length} tasks permanently failed`,
+                    }));
+                    statusLines.push(`[Child Goal "${goal.title}"] FAILED: all tasks permanently failed`);
+                  } else {
+                    // Still in progress — keep tracking
+                    stillActive.push(cgId);
+                    statusLines.push(`[Child Goal "${goal.title}"] ${doneT.length}/${tasks.length} tasks done, ${pending.length} pending`);
+                  }
+                } catch { /* best effort */ }
+              }
+
+              entry.childGoalIds = stillActive;
+
+              // If any child goals still active, wait for next event before thinking
+              if (stillActive.length > 0) {
+                log.info(`[${agentName}] Waiting for child goal event...`);
+                await this.waitForChildGoalEvent(stillActive, entry.state.timeout);
+                // Re-check status will happen on next observe cycle
+              }
+
+              // Inject child goal status into observation
+              task.observation = (task.observation ?? '') + '\n\n' + statusLines.join('\n');
+            }
+
             setPhase('thinking');
             break;
           }
@@ -1260,6 +1371,59 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
               break;
             }
             task.action = thinkResult.data as AgentAction;
+
+            // ── Decompose: create child goal + tasks, return to observing ──
+            if (task.action.action === 'decompose') {
+              const subtasks = task.action.subtasks as Array<{
+                type: string; description: string; data?: unknown;
+              }>;
+              if (!subtasks?.length) {
+                task.llmMessages.push({
+                  role: 'user',
+                  content: '[Error] decompose requires a non-empty "subtasks" array.',
+                });
+                break; // re-enter thinking
+              }
+              if (!this.goalManagerId || !entry.goalId) {
+                task.llmMessages.push({
+                  role: 'user',
+                  content: '[Error] Cannot decompose — GoalManager not available.',
+                });
+                break;
+              }
+
+              log.info(`[${agentName}] Decomposing into ${subtasks.length} sub-tasks`);
+              try {
+                const childGoalId = await this.createChildGoalWithTasks(entry, subtasks, agentName);
+                if (!entry.childGoalIds) entry.childGoalIds = [];
+                entry.childGoalIds.push(childGoalId);
+              } catch (err) {
+                task.llmMessages.push({
+                  role: 'user',
+                  content: `[Decomposition Error] ${err instanceof Error ? err.message : String(err)}`,
+                });
+              }
+              task.step++;
+              if (task.step >= task.maxSteps) {
+                await this.handleMaxStepsReached(entry, agentName, setPhase);
+                break;
+              }
+              // Back to observing — the event-driven wait will kick in
+              setPhase('observing');
+              break;
+            }
+
+            // ── Replan: clear state, re-observe ──
+            if (task.action.action === 'replan') {
+              task.plan = undefined;
+              task.step++;
+              if (task.step >= task.maxSteps) {
+                await this.handleMaxStepsReached(entry, agentName, setPhase);
+                break;
+              }
+              setPhase('observing');
+              break;
+            }
 
             // Check terminal
             const terminal = this.isTerminalAction(entry, task.action);
@@ -1541,6 +1705,127 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
     const parsed = this.parseAction(entry, llmResult.content);
     log.info(`[${agentName}] Step ${task.step + 1} — LLM action: ${parsed.action}${parsed.reasoning ? ' (' + parsed.reasoning.slice(0, 60) + ')' : ''}`);
     return parsed;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Child Goal Watching
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** Maps child goal ID → { parentTaskId, parentGoalId } for completion tracking. */
+  private watchedChildGoals = new Map<string, { parentTaskId: string; parentGoalId: string }>();
+
+  private watchChildGoal(childGoalId: string, parentTaskId: string, parentGoalId: string): void {
+    this.watchedChildGoals.set(childGoalId, { parentTaskId, parentGoalId });
+  }
+
+  /**
+   * Called from the `changed` handler when GoalManager emits goalCompleted/goalFailed/taskCompleted/taskPermanentlyFailed.
+   * Resolves event waiters (from observe phase) and handles dispatch-level child goal watching.
+   */
+  private handleChildGoalEvent(aspect: string, value: unknown): void {
+    if (aspect !== 'goalCompleted' && aspect !== 'goalFailed'
+        && aspect !== 'taskCompleted' && aspect !== 'taskPermanentlyFailed') return;
+
+    const { goalId, taskId, result, error } = value as {
+      goalId: string; taskId?: string; result?: unknown; error?: string;
+    };
+
+    // Resolve event waiters (from observe phase waiting on child goals)
+    const resolver = this.childGoalEventResolvers.get(goalId);
+    if (resolver) {
+      resolver.resolve({ aspect, goalId, taskId, result, error });
+      // resolve callback cleans up all resolvers in the wait group
+    }
+
+    // Existing dispatch-level child goal watching (unchanged)
+    const watched = this.watchedChildGoals.get(goalId);
+    if (!watched) return;
+    this.watchedChildGoals.delete(goalId);
+
+    if (aspect === 'goalCompleted') {
+      this.request(request(this.id, this.goalManagerId!, 'completeTask', {
+        taskId: watched.parentTaskId, result, goalId: watched.parentGoalId,
+      }));
+    } else if (aspect === 'goalFailed') {
+      this.request(request(this.id, this.goalManagerId!, 'failTask', {
+        taskId: watched.parentTaskId, error: error ?? 'Child goal failed', goalId: watched.parentGoalId,
+      }));
+    }
+  }
+
+  /**
+   * Wait for the next event related to any of the child goals.
+   * Resolved by handleChildGoalEvent when a matching event arrives.
+   */
+  private waitForChildGoalEvent(
+    childGoalIds: string[],
+    timeoutMs: number,
+  ): Promise<{ aspect: string; goalId: string; taskId?: string; result?: unknown; error?: string }> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        for (const id of childGoalIds) this.childGoalEventResolvers.delete(id);
+        resolve({ aspect: 'timeout', goalId: childGoalIds[0] ?? '' });
+      }, timeoutMs);
+
+      for (const id of childGoalIds) {
+        this.childGoalEventResolvers.set(id, {
+          resolve: (evt) => {
+            clearTimeout(timer);
+            // Clean up all resolvers for this wait group
+            for (const gid of childGoalIds) this.childGoalEventResolvers.delete(gid);
+            resolve(evt);
+          },
+          timer,
+        });
+      }
+    });
+  }
+
+  /**
+   * Create a child goal with tasks for the decompose action.
+   */
+  private async createChildGoalWithTasks(
+    entry: TaskEntry,
+    subtasks: Array<{ type: string; description: string; data?: unknown }>,
+    agentName: string,
+  ): Promise<string> {
+    const goalMgrId = this.goalManagerId!;
+    const summary = (entry.state.action?.reasoning as string)
+      ?? `Decomposed: ${subtasks.map(s => s.description).join(', ').slice(0, 100)}`;
+
+    const { goalId: childGoalId } = await this.request<{ goalId: string }>(
+      request(this.id, goalMgrId, 'createGoal', {
+        title: summary.slice(0, 200),
+        parentId: entry.goalId,
+      }),
+    );
+    log.info(`[${agentName}] Child goal ${childGoalId.slice(0, 8)} with ${subtasks.length} tasks`);
+
+    const taskIds: string[] = [];
+    for (const sub of subtasks) {
+      const { taskId } = await this.request<{ taskId: string }>(
+        request(this.id, goalMgrId, 'addTask', {
+          goalId: childGoalId, type: sub.type,
+          description: sub.description, data: sub.data,
+        }),
+      );
+      taskIds.push(taskId);
+    }
+
+    // Store plan on child goal for visibility
+    this.send(event(this.id, goalMgrId, 'updatePlan', {
+      goalId: childGoalId,
+      plan: {
+        summary,
+        steps: subtasks.map((s, i) => ({
+          id: `step-${i + 1}`, description: s.description,
+          taskType: s.type, taskId: taskIds[i], data: s.data,
+        })),
+        revision: 0,
+      },
+    }));
+
+    return childGoalId;
   }
 
   // ═══════════════════════════════════════════════════════════════════

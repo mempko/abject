@@ -120,7 +120,7 @@ export type { TupleEntry, TuplePattern } from './objects/tuple-space.js';
 export { FileTransfer, FILE_TRANSFER_ID } from './objects/capabilities/file-transfer.js';
 export { MediaStreamCapability, MEDIA_STREAM_ID } from './objects/capabilities/media-stream.js';
 export { AgentAbject, AGENT_ABJECT_ID } from './objects/agent-abject.js';
-export type { AgentPhase, AgentAction, AgentActionResult, AgentTaskState, AgentTaskOptions, AgentConfig, TerminalActionConfig } from './objects/agent-abject.js';
+export type { AgentPhase, AgentAction, AgentActionResult, AgentTaskState, AgentTaskOptions, AgentConfig, TerminalActionConfig, AgentPlan, AgentPlanStep } from './objects/agent-abject.js';
 export { WebBrowserViewer, WEB_BROWSER_VIEWER_ID } from './objects/web-browser-viewer.js';
 // WebParser, WebBrowser, and WebAgent are server-only — import directly from their files:
 // import { WebParser } from './objects/capabilities/web-parser.js';

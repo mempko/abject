@@ -714,43 +714,6 @@ export class Chat extends Abject {
         }
       }
 
-      case 'decompose': {
-        // Break a complex request into parallel sub-tasks via TupleSpace
-        const subtasks = action.subtasks as Array<{
-          type: string;
-          description: string;
-          data?: unknown;
-        }>;
-        if (!subtasks || !Array.isArray(subtasks) || subtasks.length === 0) {
-          return { success: false, error: 'decompose requires a non-empty subtasks array' };
-        }
-        if (!this.goalManagerId || !this._currentGoalId) {
-          return { success: false, error: 'GoalManager or current goal not available' };
-        }
-
-        const taskIds: string[] = [];
-        for (const sub of subtasks) {
-          try {
-            const { taskId } = await this.request<{ taskId: string }>(
-              request(this.id, this.goalManagerId, 'addTask', {
-                goalId: this._currentGoalId,
-                type: sub.type,
-                description: sub.description,
-                data: sub.data,
-              })
-            );
-            taskIds.push(taskId);
-          } catch (err) {
-            return { success: false, error: `Failed to add subtask: ${err instanceof Error ? err.message : String(err)}` };
-          }
-        }
-
-        // Tasks are now in TupleSpace — agents watching will claim them autonomously.
-        // No explicit dispatch needed.
-
-        return { success: true, data: { taskIds, count: taskIds.length } };
-      }
-
       case 'delegate': {
         // Delegate a task to another registered agent via ticket pattern
         try {
@@ -841,13 +804,13 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   Use the qualified name shown next to "(clonable)" objects in Connected Peers.
 
 ### Task Decomposition
-- **decompose**: Break a complex request into parallel sub-tasks. Each sub-task is added to the TupleSpace and agents autonomously claim matching tasks (ObjectCreator watches for "create"/"modify", WebAgent watches for "browse"/"research"/"web").
+- **decompose**: Break a complex request into parallel sub-tasks. Creates a child goal
+  and the agent automatically monitors progress. Sub-tasks are claimed by agents autonomously.
   \`{ "action": "decompose", "reasoning": "why splitting", "subtasks": [
     { "type": "create", "description": "Build a counter widget" },
-    { "type": "create", "description": "Build a todo list widget" },
-    { "type": "browse", "description": "Research best practices for X", "data": { "startUrl": "https://..." } }
+    { "type": "browse", "description": "Research X", "data": { "startUrl": "https://..." } }
   ] }\`
-  Valid task types: "create", "modify", "browse", "research", "web".
+  After decomposing, you'll observe sub-task progress and can synthesize results when done.
 
 ### Agent Delegation
 - **delegate**: Delegate a task to another registered agent.
