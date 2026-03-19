@@ -294,7 +294,8 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
 - WebAgent opens and closes browser pages automatically — do NOT call WebBrowser directly.
 - **runTask is long-running** — always pass \`{ timeout: 300000 }\` as the 4th argument to \`call()\` (the default 30s timeout is too short).
 - Kept-open pages auto-close after 5 minutes of inactivity.
-- Internally, WebAgent uses a ticket pattern with AgentAbject — startTask returns a ticketId and results arrive via taskResult events.`;
+- Internally, WebAgent uses a ticket pattern with AgentAbject — startTask returns a ticketId and results arrive via taskResult events.
+- WebAgent can receive tasks via LLM semantic fallback even for task types it doesn't explicitly declare.`;
   }
 
   protected override async onInit(): Promise<void> {

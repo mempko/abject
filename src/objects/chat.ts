@@ -1351,7 +1351,8 @@ Subscribe to GoalManager's changed events (goalUpdated, goalCompleted, goalFaile
 - Chat is an agent — it uses AgentAbject's observe-think-act loop to process messages.
 - sendMessage triggers the full agent cycle: the LLM decides what actions to take.
 - Actions can include creating objects, calling other services, or replying with text.
-- getState returns currentGoalId when Chat is actively processing a message (null otherwise).`;
+- getState returns currentGoalId when Chat is actively processing a message (null otherwise).
+- Chat can receive tasks via LLM semantic fallback even for task types it doesn't explicitly declare.`;
   }
 }
 

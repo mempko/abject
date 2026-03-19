@@ -521,6 +521,18 @@ Inside job code, goal helpers are available automatically:
 - await completeGoal(result)
 - await failGoal('reason')
 
+### Task Dispatch & Semantic Matching
+
+Tasks are dispatched to agents via TupleSpace. Dispatch uses two strategies:
+
+1. **Exact type match** — agents whose taskTypes include the task's type are preferred.
+2. **LLM semantic fallback** — if no agent declares the type, a fast LLM call picks
+   the best agent based on its name and description.
+
+This means agents can receive tasks outside their declared taskTypes if the LLM
+determines they are a good fit. Write clear, descriptive agent descriptions to
+improve semantic matching accuracy.
+
 ### IMPORTANT
 - startTask returns { ticketId } immediately — it does NOT block until completion.
 - Results arrive asynchronously via a taskResult event sent to the caller.
@@ -528,7 +540,8 @@ Inside job code, goal helpers are available automatically:
 - taskStream events provide streaming LLM tokens during the think phase.
 - Agents must be registered before tasks can be sent to them.
 - listTasks includes goalId on each task entry for cross-referencing with GoalManager.
-- getAgentState returns an agent's active tasks with their goalIds — use it to see what an agent is working on.`;
+- getAgentState returns an agent's active tasks with their goalIds — use it to see what an agent is working on.
+- Tasks are never silently dropped — if no exact type match exists, LLM semantic fallback finds the best agent by description.`;
   }
 
   protected override async onInit(): Promise<void> {
@@ -877,18 +890,31 @@ Inside job code, goal helpers are available automatically:
     const candidates = [...this.registeredAgents.values()]
       .filter(a => a.taskTypes.includes(taskType));
 
-    if (candidates.length === 0) {
-      log.info(`DISPATCH-INNER ${tupleId} — no agents handle type=${taskType}`);
-      return;
-    }
-
-    // 2. Filter out agents that already failed this task
     const failedAgentIds = new Set(failureHistory.map(f => f.agentId));
-    const eligibleCandidates = candidates.filter(a => !failedAgentIds.has(a.agentId));
+    let eligibleCandidates: RegisteredAgent[];
 
-    if (eligibleCandidates.length === 0) {
-      log.info(`DISPATCH-INNER ${tupleId} — all ${candidates.length} agents already failed`);
-      return;
+    if (candidates.length === 0) {
+      // No exact type match — try semantic fallback via LLM
+      const allAgents = [...this.registeredAgents.values()]
+        .filter(a => !failedAgentIds.has(a.agentId));
+      if (allAgents.length === 0) {
+        log.info(`DISPATCH-INNER ${tupleId} — no registered agents available for fallback`);
+        return;
+      }
+      const matched = await this.semanticMatchAgent(allAgents, taskType, description);
+      if (!matched) {
+        log.info(`DISPATCH-INNER ${tupleId} — LLM fallback found no suitable agent for type=${taskType}`);
+        return;
+      }
+      log.info(`DISPATCH-INNER ${tupleId} — LLM fallback matched: ${matched.name}`);
+      eligibleCandidates = [matched];
+    } else {
+      // Exact type match — filter out failed agents
+      eligibleCandidates = candidates.filter(a => !failedAgentIds.has(a.agentId));
+      if (eligibleCandidates.length === 0) {
+        log.info(`DISPATCH-INNER ${tupleId} — all ${candidates.length} agents already failed`);
+        return;
+      }
     }
 
     // 3. Pick the best agent
@@ -1016,6 +1042,49 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
     } catch { /* fallback */ }
 
     return candidates[0];
+  }
+
+  /**
+   * Semantic fallback: when no agent declares the task type, ask the LLM
+   * which registered agent (if any) can handle it based on descriptions.
+   */
+  private async semanticMatchAgent(
+    allAgents: RegisteredAgent[],
+    taskType: string,
+    description: string,
+  ): Promise<RegisteredAgent | null> {
+    if (!this.llmId) return null;
+
+    const agentList = allAgents
+      .map((a, i) => `${i}: ${a.name} (types: ${a.taskTypes.join(', ')}) — ${a.description}`)
+      .join('\n');
+    const prompt = `No agent explicitly declares task type "${taskType}".
+Task description: "${description.slice(0, 200)}"
+
+Based on the agent descriptions below, which agent (if any) could handle this task?
+
+Agents:
+${agentList}
+
+Reply with ONLY the index number of the best match, or "none" if no agent is suitable.`;
+
+    try {
+      const result = await this.request<{ content: string }>(
+        request(this.id, this.llmId, 'complete', {
+          messages: [{ role: 'user', content: prompt }],
+          options: { maxTokens: 20 },
+        }),
+        10000,
+      );
+      const content = (result.content ?? '').trim().toLowerCase();
+      if (content === 'none') return null;
+      const idx = parseInt(content, 10);
+      if (!isNaN(idx) && idx >= 0 && idx < allAgents.length) {
+        return allAgents[idx];
+      }
+    } catch { /* LLM unavailable — no match */ }
+
+    return null;
   }
 
   // ═══════════════════════════════════════════════════════════════════

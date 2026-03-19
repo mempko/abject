@@ -418,6 +418,10 @@ Goals have automatic lifecycle management:
   // Get completed tasks with results
   const results = await call(await dep('GoalManager'), 'getResultsForGoal', { goalId });
 
+Note: The task type does not need to match an agent's declared taskTypes exactly.
+If no agent declares the type, AgentAbject uses LLM semantic fallback to find a
+suitable agent based on descriptions.
+
 ### IMPORTANT
 - The interface ID is 'abjects:goal-manager'.
 - Goals are automatically created by AgentAbject for every task — you usually don't need to create them manually.
@@ -425,7 +429,8 @@ Goals have automatic lifecycle management:
 - clearCompleted archives (not deletes) completed/failed goals. Archived goals auto-delete after 1 hour.
 - listGoals excludes archived goals by default. Pass includeArchived: true to see them.
 - Tasks are backed by TupleSpace (CRDT-synced) — they persist across restarts and sync across peers.
-- Goals metadata syncs to SharedState for cross-peer visibility.`;
+- Goals metadata syncs to SharedState for cross-peer visibility.
+- Task types are flexible — AgentAbject uses LLM semantic fallback when no agent declares the exact type.`;
   }
 
   private async sweepGoals(): Promise<void> {
