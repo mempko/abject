@@ -80,7 +80,7 @@ export class AppExplorer extends Abject {
       manifest: {
         name: 'AppExplorer',
         description:
-          'Workspace app explorer — browse, clone, and delete registered objects.',
+          'Workspace Abject explorer — browse, clone, and delete registered Abjects.',
         version: '1.0.0',
         interface: {
             id: APP_EXPLORER_INTERFACE,
@@ -1136,7 +1136,7 @@ export class AppExplorer extends Abject {
 - \`browseRemote({ registryId, peerId, label })\` — Open in remote read-only mode.
 
 ### Three-Pane Layout (vertical, like ObjectBrowser)
-1. **Kind List** (left) — All registered object types grouped into "User Apps" and "System" sections. Searchable.
+1. **Kind List** (left) — All registered Abject types grouped into "User Apps" and "System" sections. Searchable.
 2. **Instance List** (middle) — Instances of the selected kind.
 3. **Detail Pane** (right) — Description, manifest info, and action buttons.
 

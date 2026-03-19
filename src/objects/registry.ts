@@ -54,45 +54,45 @@ export class Registry extends Abject {
         interface: {
             id: REGISTRY_INTERFACE,
             name: 'Registry',
-            description: 'Object registration and discovery',
+            description: 'Abject registration and discovery',
             methods: [
               {
                 name: 'register',
-                description: 'Register an object with the registry',
+                description: 'Register an Abject with the registry',
                 parameters: [
                   {
                     name: 'objectId',
                     type: { kind: 'primitive', primitive: 'string' },
-                    description: 'The ID of the object to register',
+                    description: 'The ID of the Abject to register',
                   },
                   {
                     name: 'manifest',
                     type: { kind: 'reference', reference: 'AbjectManifest' },
-                    description: 'The object manifest',
+                    description: 'The Abject manifest',
                   },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'unregister',
-                description: 'Remove an object from the registry',
+                description: 'Remove an Abject from the registry',
                 parameters: [
                   {
                     name: 'objectId',
                     type: { kind: 'primitive', primitive: 'string' },
-                    description: 'The ID of the object to unregister',
+                    description: 'The ID of the Abject to unregister',
                   },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'lookup',
-                description: 'Look up an object by ID',
+                description: 'Look up an Abject by ID',
                 parameters: [
                   {
                     name: 'objectId',
                     type: { kind: 'primitive', primitive: 'string' },
-                    description: 'The ID of the object to look up',
+                    description: 'The ID of the Abject to look up',
                   },
                 ],
                 returns: {
@@ -105,7 +105,7 @@ export class Registry extends Abject {
               },
               {
                 name: 'discover',
-                description: 'Find objects matching a query',
+                description: 'Find Abjects matching a query',
                 parameters: [
                   {
                     name: 'query',
@@ -132,7 +132,7 @@ export class Registry extends Abject {
               },
               {
                 name: 'list',
-                description: 'List all registered objects',
+                description: 'List all registered Abjects',
                 parameters: [],
                 returns: {
                   kind: 'array',
@@ -141,12 +141,12 @@ export class Registry extends Abject {
               },
               {
                 name: 'updateManifest',
-                description: 'Update an object\'s manifest and re-index it',
+                description: 'Update an Abject\'s manifest and re-index it',
                 parameters: [
                   {
                     name: 'objectId',
                     type: { kind: 'primitive', primitive: 'string' },
-                    description: 'The ID of the object to update',
+                    description: 'The ID of the Abject to update',
                   },
                   {
                     name: 'manifest',
@@ -160,12 +160,12 @@ export class Registry extends Abject {
             events: [
               {
                 name: 'objectRegistered',
-                description: 'Emitted when an object is registered',
+                description: 'Emitted when an Abject is registered',
                 payload: { kind: 'reference', reference: 'ObjectRegistration' },
               },
               {
                 name: 'objectUnregistered',
-                description: 'Emitted when an object is unregistered',
+                description: 'Emitted when an Abject is unregistered',
                 payload: { kind: 'primitive', primitive: 'string' },
               },
             ],

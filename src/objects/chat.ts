@@ -83,7 +83,7 @@ export class Chat extends Abject {
       manifest: {
         name: 'Chat',
         description:
-          'Conversational LLM agent. Chat naturally to explore, create, and control objects. Uses a think-act-observe loop with structured actions.',
+          'Conversational LLM agent. Chat naturally to explore, create, and control Abjects. Uses a think-act-observe loop with structured actions.',
         version: '1.0.0',
         interface: {
             id: CHAT_INTERFACE,
@@ -156,7 +156,7 @@ export class Chat extends Abject {
     // Register with AgentAbject
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'Chat',
-      description: 'Conversational LLM agent for interacting with objects',
+      description: 'Conversational LLM agent for interacting with Abjects',
       config: {
         pinnedMessageCount: 1,
         terminalActions: {
@@ -298,12 +298,12 @@ export class Chat extends Abject {
     this.on('agentObserve', async (_msg: AbjectMessage) => {
       const lines: string[] = [];
       if (this.userObjectSummaries) {
-        lines.push('Your objects (user-created — use "modify" to update):');
+        lines.push('Your Abjects (user-created — use "modify" to update):');
         lines.push(this.userObjectSummaries);
       }
       if (this.systemObjectSummaries) {
         lines.push('');
-        lines.push('System objects (built-in):');
+        lines.push('System Abjects (built-in):');
         lines.push(this.systemObjectSummaries);
       }
       if (this.remotePeerContext) {
@@ -752,11 +752,11 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 - **done**: Task complete, send final reply.
   \`{ "action": "done", "text": "Here are the results: ..." }\`
 
-## Your Objects (user-created — use "modify" to fix or update these)
+## Your Abjects (user-created — use "modify" to fix or update these)
 
 ${this.userObjectSummaries || '(Loading...)'}
 
-## System Objects (built-in — use "call" to interact, "ask" to learn their API)
+## System Abjects (built-in — use "call" to interact, "ask" to learn their API)
 
 ${this.systemObjectSummaries || '(Loading...)'}
 ${this.remotePeerContext ? `

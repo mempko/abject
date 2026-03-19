@@ -120,22 +120,22 @@ export class ObjectBrowser extends Abject {
       manifest: {
         name: 'ObjectBrowser',
         description:
-          'Smalltalk-inspired four-pane object explorer. Browse categories, object kinds, methods/events, and details with navigation history and investigation tabs.',
+          'Smalltalk-inspired four-pane Abject explorer. Browse categories, Abject kinds, methods/events, and details with navigation history and investigation tabs.',
         version: '1.0.0',
         interface: {
           id: OBJECT_BROWSER_INTERFACE,
           name: 'ObjectBrowser',
-          description: 'Four-pane object explorer with navigation history',
+          description: 'Four-pane Abject explorer with navigation history',
           methods: [
             {
               name: 'show',
-              description: 'Show the object browser window',
+              description: 'Show the Abject explorer window',
               parameters: [],
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
             {
               name: 'hide',
-              description: 'Hide the object browser window',
+              description: 'Hide the Abject explorer window',
               parameters: [],
               returns: { kind: 'primitive', primitive: 'boolean' },
             },
@@ -644,7 +644,7 @@ export class ObjectBrowser extends Abject {
 
     // Create window
     this.windowId = await wm('createWindowAbject', {
-      title: '\uD83D\uDD0D Object Explorer',
+      title: '\uD83D\uDD0D Abject Explorer',
       rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
       resizable: true,
     }) as AbjectId;
@@ -1965,7 +1965,7 @@ export class ObjectBrowser extends Abject {
 
     const objectName = regs[0].name || state.selectedKind;
     const confirmed = await this.confirm({
-      title: 'Delete Object',
+      title: 'Delete Abject',
       message: `Delete "${objectName}"? This cannot be undone.`,
       confirmLabel: 'Delete',
       destructive: true,

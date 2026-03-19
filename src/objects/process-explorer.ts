@@ -69,7 +69,7 @@ export class ProcessExplorer extends Abject {
       manifest: {
         name: 'ProcessExplorer',
         description:
-          'Process manager for running Abjects. Shows all objects with state, worker placement, and stop/restart actions.',
+          'Process manager for running Abjects. Shows all Abjects with state, worker placement, and stop/restart actions.',
         version: '1.0.0',
         interface: {
             id: PROCESS_EXPLORER_INTERFACE,
@@ -687,8 +687,8 @@ export class ProcessExplorer extends Abject {
       const row = this.currentRows[stopIdx];
       if (row && this.factoryId) {
         const confirmed = await this.confirm({
-          title: 'Stop Object',
-          message: `Stop "${row.name}"? This will kill the running object.`,
+          title: 'Stop Abject',
+          message: `Stop "${row.name}"? This will kill the running Abject.`,
           confirmLabel: 'Stop',
           destructive: true,
         });

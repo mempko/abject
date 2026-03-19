@@ -52,11 +52,11 @@ export class Factory extends Abject {
         interface: {
             id: FACTORY_INTERFACE,
             name: 'Factory',
-            description: 'Object creation and lifecycle management',
+            description: 'Abject creation and lifecycle management',
             methods: [
               {
                 name: 'spawn',
-                description: 'Create a new object from manifest',
+                description: 'Create a new Abject from manifest',
                 parameters: [
                   {
                     name: 'request',
@@ -68,24 +68,24 @@ export class Factory extends Abject {
               },
               {
                 name: 'kill',
-                description: 'Stop and destroy an object',
+                description: 'Stop and destroy an Abject',
                 parameters: [
                   {
                     name: 'objectId',
                     type: { kind: 'primitive', primitive: 'string' },
-                    description: 'The ID of the object to kill',
+                    description: 'The ID of the Abject to kill',
                   },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'respawn',
-                description: 'Kill an object and respawn a fresh instance with the same ID',
+                description: 'Kill an Abject and respawn a fresh instance with the same ID',
                 parameters: [
                   {
                     name: 'objectId',
                     type: { kind: 'primitive', primitive: 'string' },
-                    description: 'The ID of the object to respawn',
+                    description: 'The ID of the Abject to respawn',
                   },
                   {
                     name: 'constructorName',
@@ -97,12 +97,12 @@ export class Factory extends Abject {
               },
               {
                 name: 'clone',
-                description: 'Clone an existing object (new instance with same manifest/source). Searches local registry first, then remote workspace registries. Pass registryHint to control which registry the clone lands in.',
+                description: 'Clone an existing Abject (new instance with same manifest/source). Searches local registry first, then remote workspace registries. Pass registryHint to control which registry the clone lands in.',
                 parameters: [
                   {
                     name: 'objectId',
                     type: { kind: 'primitive', primitive: 'string' },
-                    description: 'The ID of the object to clone',
+                    description: 'The ID of the Abject to clone',
                   },
                   {
                     name: 'registryHint',
@@ -115,24 +115,24 @@ export class Factory extends Abject {
               },
               {
                 name: 'registerConstructor',
-                description: 'Register a constructor for a named object type',
+                description: 'Register a constructor for a named Abject type',
                 parameters: [
                   {
                     name: 'name',
                     type: { kind: 'primitive', primitive: 'string' },
-                    description: 'Object type name',
+                    description: 'Abject type name',
                   },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'getObjectInfo',
-                description: 'Get worker placement info for an object',
+                description: 'Get worker placement info for an Abject',
                 parameters: [
                   {
                     name: 'objectId',
                     type: { kind: 'primitive', primitive: 'string' },
-                    description: 'The ID of the object to query',
+                    description: 'The ID of the Abject to query',
                   },
                 ],
                 returns: { kind: 'object', properties: {

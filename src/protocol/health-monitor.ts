@@ -87,12 +87,12 @@ export class HealthMonitor extends Abject {
       manifest: {
         name: 'HealthMonitor',
         description:
-          'Monitors connection health and object liveness. Triggers proxy regeneration when error rates exceed threshold and notifies Supervisor when objects stop responding to pings.',
+          'Monitors connection health and Abject liveness. Triggers proxy regeneration when error rates exceed threshold and notifies Supervisor when Abjects stop responding to pings.',
         version: '1.0.0',
         interface: {
             id: HEALTH_MONITOR_INTERFACE,
             name: 'HealthMonitor',
-            description: 'Connection health and object liveness monitoring',
+            description: 'Connection health and Abject liveness monitoring',
             methods: [
               {
                 name: 'getStatus',
@@ -170,12 +170,12 @@ export class HealthMonitor extends Abject {
               },
               {
                 name: 'monitorObject',
-                description: 'Start monitoring an object for liveness',
+                description: 'Start monitoring an Abject for liveness',
                 parameters: [
                   {
                     name: 'objectId',
                     type: { kind: 'primitive', primitive: 'string' },
-                    description: 'Object to monitor',
+                    description: 'Abject to monitor',
                   },
                   {
                     name: 'maxFailures',
@@ -188,31 +188,31 @@ export class HealthMonitor extends Abject {
               },
               {
                 name: 'unmonitorObject',
-                description: 'Stop monitoring an object for liveness',
+                description: 'Stop monitoring an Abject for liveness',
                 parameters: [
                   {
                     name: 'objectId',
                     type: { kind: 'primitive', primitive: 'string' },
-                    description: 'Object to stop monitoring',
+                    description: 'Abject to stop monitoring',
                   },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'getObjectLiveness',
-                description: 'Get liveness status for a monitored object',
+                description: 'Get liveness status for a monitored Abject',
                 parameters: [
                   {
                     name: 'objectId',
                     type: { kind: 'primitive', primitive: 'string' },
-                    description: 'Object to check',
+                    description: 'Abject to check',
                   },
                 ],
                 returns: { kind: 'reference', reference: 'ObjectLivenessStatus' },
               },
               {
                 name: 'getAllObjectLiveness',
-                description: 'Get liveness status for all monitored objects',
+                description: 'Get liveness status for all monitored Abjects',
                 parameters: [],
                 returns: {
                   kind: 'array',
@@ -221,12 +221,12 @@ export class HealthMonitor extends Abject {
               },
               {
                 name: 'markObjectReady',
-                description: 'Mark a monitored object as ready for liveness pings',
+                description: 'Mark a monitored Abject as ready for liveness pings',
                 parameters: [
                   {
                     name: 'objectId',
                     type: { kind: 'primitive', primitive: 'string' },
-                    description: 'Object to mark as ready',
+                    description: 'Abject to mark as ready',
                   },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
@@ -245,7 +245,7 @@ export class HealthMonitor extends Abject {
               },
               {
                 name: 'objectDead',
-                description: 'A monitored object stopped responding to pings',
+                description: 'A monitored Abject stopped responding to pings',
                 payload: { kind: 'primitive', primitive: 'string' },
               },
             ],

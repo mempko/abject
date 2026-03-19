@@ -61,12 +61,12 @@ export class Supervisor extends Abject {
     super({
       manifest: {
         name: 'Supervisor',
-        description: `Erlang-style supervisor using ${config.strategy} strategy. Monitors child objects and restarts them on failure.`,
+        description: `Erlang-style supervisor using ${config.strategy} strategy. Monitors child Abjects and restarts them on failure.`,
         version: '1.0.0',
         interface: {
             id: SUPERVISOR_INTERFACE,
             name: 'Supervisor',
-            description: 'Object supervision and restart management',
+            description: 'Abject supervision and restart management',
             methods: [
               {
                 name: 'addChild',

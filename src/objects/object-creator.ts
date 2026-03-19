@@ -114,12 +114,12 @@ export class ObjectCreator extends Abject {
       manifest: {
         name: 'ObjectCreator',
         description:
-          'Create and modify objects using natural language. Discovers existing objects and generates new ones that compose with them.',
+          'Create and modify Abjects using natural language. Discovers existing Abjects and generates new ones that compose with them.',
         version: '1.0.0',
         interface: {
             id: OBJECT_CREATOR_INTERFACE,
             name: 'ObjectCreator',
-            description: 'Object creation via natural language',
+            description: 'Abject creation via natural language',
             methods: [
               {
                 name: 'create',
