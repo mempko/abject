@@ -579,6 +579,51 @@ export class Chat extends Abject {
         }
       }
 
+      case 'decompose': {
+        // Break a complex request into parallel sub-tasks via TupleSpace
+        const subtasks = action.subtasks as Array<{
+          type: string;
+          description: string;
+          data?: unknown;
+        }>;
+        if (!subtasks || !Array.isArray(subtasks) || subtasks.length === 0) {
+          return { success: false, error: 'decompose requires a non-empty subtasks array' };
+        }
+        if (!this.goalManagerId || !this._currentGoalId) {
+          return { success: false, error: 'GoalManager or current goal not available' };
+        }
+
+        const taskIds: string[] = [];
+        for (const sub of subtasks) {
+          try {
+            const { taskId } = await this.request<{ taskId: string }>(
+              request(this.id, this.goalManagerId, 'addTask', {
+                goalId: this._currentGoalId,
+                type: sub.type,
+                description: sub.description,
+                data: sub.data,
+              })
+            );
+            taskIds.push(taskId);
+          } catch (err) {
+            return { success: false, error: `Failed to add subtask: ${err instanceof Error ? err.message : String(err)}` };
+          }
+        }
+
+        // Dispatch tasks to appropriate agents
+        for (let i = 0; i < subtasks.length; i++) {
+          const agentId = await this.routeTaskType(subtasks[i].type);
+          if (agentId) {
+            this.send(event(this.id, agentId, 'claimAndProcess', {
+              goalId: this._currentGoalId,
+              type: subtasks[i].type,
+            }));
+          }
+        }
+
+        return { success: true, data: { taskIds, count: taskIds.length } };
+      }
+
       case 'delegate': {
         // Delegate a task to another registered agent via ticket pattern
         try {
@@ -612,6 +657,25 @@ export class Chat extends Abject {
   // ═══════════════════════════════════════════════════════════════════
   // System prompt
   // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Map a task type to the appropriate agent AbjectId.
+   */
+  private async routeTaskType(type: string): Promise<AbjectId | null> {
+    switch (type) {
+      case 'create':
+      case 'modify': {
+        return this.discoverDep('ObjectCreator');
+      }
+      case 'browse':
+      case 'research':
+      case 'web': {
+        return this.discoverDep('WebAgent');
+      }
+      default:
+        return null;
+    }
+  }
 
   private buildSystemPrompt(): string {
     return `You are Chat Agent, a helpful assistant inside the Abjects system. You help users by interacting with objects via structured actions.
@@ -667,6 +731,15 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 - **clone**: Clone a clonable object from a remote peer's workspace into your local workspace.
   \`{ "action": "clone", "object": "peer.workspace.ObjectName" }\`
   Use the qualified name shown next to "(clonable)" objects in Connected Peers.
+
+### Task Decomposition
+- **decompose**: Break a complex request into parallel sub-tasks. Each sub-task is added to the TupleSpace and dispatched to the appropriate agent (ObjectCreator for "create", WebAgent for "browse"/"research").
+  \`{ "action": "decompose", "reasoning": "why splitting", "subtasks": [
+    { "type": "create", "description": "Build a counter widget" },
+    { "type": "create", "description": "Build a todo list widget" },
+    { "type": "browse", "description": "Research best practices for X", "data": { "startUrl": "https://..." } }
+  ] }\`
+  Valid task types: "create", "modify", "browse", "research", "web".
 
 ### Agent Delegation
 - **delegate**: Delegate a task to another registered agent.

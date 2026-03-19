@@ -59,6 +59,9 @@ export const Capabilities = {
 
   // Agent capabilities
   WEB_AGENT: 'abjects:web-agent' as CapabilityId,
+
+  // Coordination capabilities
+  TUPLE_SPACE: 'abjects:tuple-space' as CapabilityId,
 } as const;
 
 // =============================================================================

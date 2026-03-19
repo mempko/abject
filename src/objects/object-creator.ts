@@ -181,6 +181,19 @@ export class ObjectCreator extends Abject {
                 },
               },
               {
+                name: 'claimAndProcess',
+                description: 'Claim a pending creation task from the TupleSpace and execute it',
+                parameters: [
+                  { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Filter by goal ID', optional: true },
+                  { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: 'Filter by task type', optional: true },
+                ],
+                returns: { kind: 'object', properties: {
+                  claimed: { kind: 'primitive', primitive: 'boolean' },
+                  result: { kind: 'reference', reference: 'CreationResult' },
+                  error: { kind: 'primitive', primitive: 'string' },
+                }},
+              },
+              {
                 name: 'getObjectGraph',
                 description: 'Get the object dependency graph',
                 parameters: [],
@@ -380,6 +393,53 @@ export class ObjectCreator extends Abject {
         }
         default:
           return { success: false, error: `Unknown action: ${action.action}` };
+      }
+    });
+
+    this.on('claimAndProcess', async (msg: AbjectMessage) => {
+      const { goalId, type } = (msg.payload ?? {}) as { goalId?: string; type?: string };
+      if (!this.goalManagerId) return { claimed: false, error: 'GoalManager not available' };
+
+      // Claim a pending task from the TupleSpace via GoalManager
+      const result = await this.request<{ tuple: { id: string; fields: Record<string, unknown> }; claimed: boolean } | null>(
+        request(this.id, this.goalManagerId, 'claimTask', {
+          goalId,
+          type: type ?? 'create',
+        })
+      );
+      if (!result) return { claimed: false };
+
+      const task = result.tuple;
+      const { description, data } = task.fields;
+      const taskGoalId = task.fields.goalId as string | undefined;
+
+      try {
+        // Set current goal for progress reporting
+        this._currentGoalId = taskGoalId;
+        const createResult = await this.createObject(
+          description as string,
+          data as string | undefined,
+          msg.routing.from,
+        );
+        this._currentGoalId = undefined;
+
+        // Mark task done
+        await this.request(
+          request(this.id, this.goalManagerId!, 'completeTask', {
+            taskId: task.id,
+            result: createResult,
+          })
+        );
+        return { claimed: true, result: createResult };
+      } catch (err) {
+        this._currentGoalId = undefined;
+        await this.request(
+          request(this.id, this.goalManagerId!, 'failTask', {
+            taskId: task.id,
+            error: (err as Error).message,
+          })
+        );
+        return { claimed: true, error: (err as Error).message };
       }
     });
 

@@ -55,6 +55,7 @@ import { PeerRouter } from '../src/network/peer-router.js';
 import { SignalingRelayObject } from '../src/objects/signaling-relay.js';
 import { PeerDiscoveryObject } from '../src/objects/peer-discovery.js';
 import { SharedState } from '../src/objects/capabilities/shared-state.js';
+import { TupleSpace } from '../src/objects/tuple-space.js';
 import { FileTransfer } from '../src/objects/capabilities/file-transfer.js';
 import { MediaStreamCapability } from '../src/objects/capabilities/media-stream.js';
 import { WorkspaceShareRegistry, WORKSPACE_SHARE_REGISTRY_ID } from '../src/objects/workspace-share-registry.js';
@@ -375,6 +376,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('WebAgent', () => new WebAgent());
   runtime.objectFactory.registerConstructor('WebBrowserViewer', () => new WebBrowserViewer());
   runtime.objectFactory.registerConstructor('SharedState', () => new SharedState());
+  runtime.objectFactory.registerConstructor('TupleSpace', () => new TupleSpace());
   runtime.objectFactory.registerConstructor('FileTransfer', () => new FileTransfer());
   runtime.objectFactory.registerConstructor('MediaStream', () => new MediaStreamCapability());
 
@@ -389,6 +391,7 @@ async function main(): Promise<void> {
       'GlobalSettings', 'PeerNetwork', 'ObjectBrowser', 'ProcessExplorer', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
       // Per-workspace objects (use workspace registry via registryHint)
       'AbjectStore', 'Theme', 'Settings', 'AppExplorer',
+      'TupleSpace',
       'GoalManager', 'GoalBrowser',
       'JobManager', 'JobBrowser',
       'Chat', 'AbjectEditor', 'Taskbar',

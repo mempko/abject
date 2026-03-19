@@ -1210,11 +1210,21 @@ Inside job code, goal helpers are available automatically:
            const updateGoal = async (message, phase) => call(_goalMgrId, 'updateProgress', { goalId: _goalId, message, phase });
            const completeGoal = async (result) => call(_goalMgrId, 'completeGoal', { goalId: _goalId, result });
            const failGoal = async (error) => call(_goalMgrId, 'failGoal', { goalId: _goalId, error });
+           const addTask = async (type, description, data) => call(_goalMgrId, 'addTask', { goalId: _goalId, type, description, data });
+           const claimTask = async (type) => call(_goalMgrId, 'claimTask', { goalId: _goalId, type });
+           const completeTask = async (taskId, result) => call(_goalMgrId, 'completeTask', { taskId, result });
+           const failTask = async (taskId, error) => call(_goalMgrId, 'failTask', { taskId, error });
+           const getTasksForGoal = async (status) => call(_goalMgrId, 'getTasksForGoal', { goalId: _goalId, status });
           `
         : `const getGoal = async () => null;
            const updateGoal = async () => {};
            const completeGoal = async () => {};
            const failGoal = async () => {};
+           const addTask = async () => null;
+           const claimTask = async () => null;
+           const completeTask = async () => false;
+           const failTask = async () => false;
+           const getTasksForGoal = async () => [];
           `;
       const fullCode = goalPreamble + code;
 

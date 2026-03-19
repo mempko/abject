@@ -114,6 +114,8 @@ export { Clipboard, CLIPBOARD_ID } from './objects/capabilities/clipboard.js';
 export { Console, CONSOLE_ID } from './objects/capabilities/console.js';
 export { FileSystem, FILESYSTEM_ID } from './objects/capabilities/filesystem.js';
 export { SharedState, SHARED_STATE_ID } from './objects/capabilities/shared-state.js';
+export { TupleSpace, TUPLE_SPACE_ID } from './objects/tuple-space.js';
+export type { TupleEntry, TuplePattern } from './objects/tuple-space.js';
 export { FileTransfer, FILE_TRANSFER_ID } from './objects/capabilities/file-transfer.js';
 export { MediaStreamCapability, MEDIA_STREAM_ID } from './objects/capabilities/media-stream.js';
 export { AgentAbject, AGENT_ABJECT_ID } from './objects/agent-abject.js';

@@ -47,6 +47,7 @@ export class WebAgent extends Abject {
   private consoleId?: AbjectId;
   private agentAbjectId?: AbjectId;
   private jobManagerId?: AbjectId;
+  private goalManagerId?: AbjectId;
 
   /** Per-task extra state (page IDs, startUrl, etc.). */
   private taskExtras = new Map<string, WebTaskExtra>();
@@ -137,6 +138,19 @@ export class WebAgent extends Abject {
                 url: { kind: 'primitive', primitive: 'string' },
                 title: { kind: 'primitive', primitive: 'string' },
               }}},
+            },
+            {
+              name: 'claimAndProcess',
+              description: 'Claim a pending browse/research task from the TupleSpace and execute it',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Filter by goal ID', optional: true },
+                { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: 'Filter by task type', optional: true },
+              ],
+              returns: { kind: 'object', properties: {
+                claimed: { kind: 'primitive', primitive: 'boolean' },
+                result: { kind: 'primitive', primitive: 'string' },
+                error: { kind: 'primitive', primitive: 'string' },
+              }},
             },
             {
               name: 'listTasks',
@@ -285,6 +299,7 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
     this.consoleId = await this.discoverDep('Console') ?? undefined;
     this.agentAbjectId = await this.requireDep('AgentAbject');
     this.jobManagerId = await this.discoverDep('JobManager') ?? undefined;
+    this.goalManagerId = await this.discoverDep('GoalManager') ?? undefined;
 
     // Register with AgentAbject
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
@@ -393,6 +408,93 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
     this.on('listTasks', async () => {
       // Forward to AgentAbject, filtered by our agentId
       return this.request(request(this.id, this.agentAbjectId!, 'listTasks', { agentId: this.id }));
+    });
+
+    this.on('claimAndProcess', async (msg: AbjectMessage) => {
+      const { goalId, type } = (msg.payload ?? {}) as { goalId?: string; type?: string };
+      if (!this.goalManagerId) return { claimed: false, error: 'GoalManager not available' };
+
+      // Claim a pending task from the TupleSpace via GoalManager
+      const result = await this.request<{ tuple: { id: string; fields: Record<string, unknown> }; claimed: boolean } | null>(
+        request(this.id, this.goalManagerId, 'claimTask', {
+          goalId,
+          type: type ?? 'browse',
+        })
+      );
+      if (!result) return { claimed: false };
+
+      const task = result.tuple;
+      const { description, data } = task.fields;
+
+      try {
+        // Report progress
+        if (this.goalManagerId && task.fields.goalId) {
+          this.send(event(this.id, this.goalManagerId, 'updateProgress', {
+            goalId: task.fields.goalId,
+            message: `WebAgent claiming task: ${(description as string).slice(0, 60)}`,
+            phase: 'setup',
+            agentName: 'WebAgent',
+          }));
+        }
+
+        // Build a runTask-compatible call
+        const taskId = `web-claim-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const taskText = description as string;
+        const startUrl = (data as Record<string, unknown> | undefined)?.startUrl as string | undefined;
+
+        const extra: WebTaskExtra = { startUrl };
+        this.taskExtras.set(taskId, extra);
+
+        // Open page
+        const pageResult = await this.request<{ pageId: string }>(
+          request(this.id, this.webBrowserId!, 'openPage', {})
+        );
+        extra.pageId = pageResult.pageId;
+        extra.pageOpenedByThisTask = true;
+
+        if (startUrl) {
+          await this.request(
+            request(this.id, this.webBrowserId!, 'navigateTo', { pageId: extra.pageId, url: startUrl })
+          );
+        }
+
+        // Run task via AgentAbject
+        const { ticketId } = await this.request<{ ticketId: string }>(
+          request(this.id, this.agentAbjectId!, 'startTask', {
+            taskId,
+            task: taskText,
+            systemPrompt: this.buildSystemPrompt(taskText),
+            config: {
+              maxSteps: 15,
+              timeout: 300000,
+              queueName: `web-agent-${taskId}`,
+            },
+          }),
+        );
+        const ticketResult = await this.waitForTaskResult(ticketId, 310000);
+
+        // Close page
+        try {
+          await this.request(request(this.id, this.webBrowserId!, 'closePage', { pageId: extra.pageId }));
+        } catch { /* best effort */ }
+
+        // Mark task done in TupleSpace
+        await this.request(
+          request(this.id, this.goalManagerId!, 'completeTask', {
+            taskId: task.id,
+            result: ticketResult.result,
+          })
+        );
+        return { claimed: true, result: ticketResult.result };
+      } catch (err) {
+        await this.request(
+          request(this.id, this.goalManagerId!, 'failTask', {
+            taskId: task.id,
+            error: (err as Error).message,
+          })
+        );
+        return { claimed: true, error: (err as Error).message };
+      }
     });
 
     // ── AgentAbject callback handlers ──
