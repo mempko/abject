@@ -1302,6 +1302,12 @@ export class WorkspaceManager extends Abject {
     if (info.accessMode !== 'local') {
       await this.ensureSharedStateExposed(info);
       await this.syncExposedToRegistry(info);
+      this.changed('workspaceShared', {
+        workspaceId, name, description, tags,
+        accessMode, whitelist,
+        exposedObjectIds: info.exposedObjectIds,
+        registryId: info.registryId,
+      });
     }
     wsLog.info(`Restored workspace '${name}' (${workspaceId})`);
   }
