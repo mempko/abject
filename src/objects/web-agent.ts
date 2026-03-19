@@ -140,14 +140,17 @@ export class WebAgent extends Abject {
               }}},
             },
             {
-              name: 'claimAndProcess',
-              description: 'Claim a pending browse/research task from the TupleSpace and execute it',
+              name: 'executeTask',
+              description: 'Execute a task dispatched by AgentAbject (browse, research, or web)',
               parameters: [
-                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Filter by goal ID', optional: true },
-                { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: 'Filter by task type', optional: true },
+                { name: 'tupleId', type: { kind: 'primitive', primitive: 'string' }, description: 'TupleSpace tuple ID' },
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID', optional: true },
+                { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'Task description' },
+                { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: 'Task type (browse, research, web)' },
+                { name: 'data', type: { kind: 'object', properties: {} }, description: 'Task-specific data', optional: true },
               ],
               returns: { kind: 'object', properties: {
-                claimed: { kind: 'primitive', primitive: 'boolean' },
+                success: { kind: 'primitive', primitive: 'boolean' },
                 result: { kind: 'primitive', primitive: 'string' },
                 error: { kind: 'primitive', primitive: 'string' },
               }},
@@ -305,6 +308,7 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'WebAgent',
       description: 'Autonomous browser agent for web tasks',
+      taskTypes: ['browse', 'research', 'web'],
       config: {
         terminalActions: {
           done: { type: 'success', resultFields: ['result'] },
@@ -410,60 +414,39 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
       return this.request(request(this.id, this.agentAbjectId!, 'listTasks', { agentId: this.id }));
     });
 
-    this.on('claimAndProcess', async (msg: AbjectMessage) => {
-      const { goalId, type } = (msg.payload ?? {}) as { goalId?: string; type?: string };
-      if (!this.goalManagerId) return { claimed: false, error: 'GoalManager not available' };
+    this.on('executeTask', async (msg: AbjectMessage) => {
+      const { goalId, description, data } = msg.payload as {
+        tupleId: string; goalId?: string; description: string;
+        data?: Record<string, unknown>; type: string;
+      };
 
-      // Claim a pending task from the TupleSpace via GoalManager
-      const result = await this.request<{ tuple: { id: string; fields: Record<string, unknown> }; claimed: boolean } | null>(
-        request(this.id, this.goalManagerId, 'claimTask', {
-          goalId,
-          type: type ?? 'browse',
-        })
+      const taskId = `web-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const startUrl = data?.startUrl as string | undefined;
+
+      const extra: WebTaskExtra = { startUrl };
+      this.taskExtras.set(taskId, extra);
+
+      // Open page
+      const pageResult = await this.request<{ pageId: string }>(
+        request(this.id, this.webBrowserId!, 'openPage', {})
       );
-      if (!result) return { claimed: false };
+      extra.pageId = pageResult.pageId;
+      extra.pageOpenedByThisTask = true;
 
-      const task = result.tuple;
-      const { description, data } = task.fields;
+      if (startUrl) {
+        await this.request(
+          request(this.id, this.webBrowserId!, 'navigateTo', { pageId: extra.pageId, url: startUrl })
+        );
+      }
 
       try {
-        // Report progress
-        if (this.goalManagerId && task.fields.goalId) {
-          this.send(event(this.id, this.goalManagerId, 'updateProgress', {
-            goalId: task.fields.goalId,
-            message: `WebAgent claiming task: ${(description as string).slice(0, 60)}`,
-            phase: 'setup',
-            agentName: 'WebAgent',
-          }));
-        }
-
-        // Build a runTask-compatible call
-        const taskId = `web-claim-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        const taskText = description as string;
-        const startUrl = (data as Record<string, unknown> | undefined)?.startUrl as string | undefined;
-
-        const extra: WebTaskExtra = { startUrl };
-        this.taskExtras.set(taskId, extra);
-
-        // Open page
-        const pageResult = await this.request<{ pageId: string }>(
-          request(this.id, this.webBrowserId!, 'openPage', {})
-        );
-        extra.pageId = pageResult.pageId;
-        extra.pageOpenedByThisTask = true;
-
-        if (startUrl) {
-          await this.request(
-            request(this.id, this.webBrowserId!, 'navigateTo', { pageId: extra.pageId, url: startUrl })
-          );
-        }
-
         // Run task via AgentAbject
         const { ticketId } = await this.request<{ ticketId: string }>(
           request(this.id, this.agentAbjectId!, 'startTask', {
             taskId,
-            task: taskText,
-            systemPrompt: this.buildSystemPrompt(taskText),
+            task: description,
+            systemPrompt: this.buildSystemPrompt(description),
+            goalId,
             config: {
               maxSteps: 15,
               timeout: 300000,
@@ -478,22 +461,15 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
           await this.request(request(this.id, this.webBrowserId!, 'closePage', { pageId: extra.pageId }));
         } catch { /* best effort */ }
 
-        // Mark task done in TupleSpace
-        await this.request(
-          request(this.id, this.goalManagerId!, 'completeTask', {
-            taskId: task.id,
-            result: ticketResult.result,
-          })
-        );
-        return { claimed: true, result: ticketResult.result };
+        return { success: ticketResult.success, result: ticketResult.result, error: ticketResult.error };
       } catch (err) {
-        await this.request(
-          request(this.id, this.goalManagerId!, 'failTask', {
-            taskId: task.id,
-            error: (err as Error).message,
-          })
-        );
-        return { claimed: true, error: (err as Error).message };
+        // Close page on failure too
+        try {
+          if (extra.pageId) {
+            await this.request(request(this.id, this.webBrowserId!, 'closePage', { pageId: extra.pageId }));
+          }
+        } catch { /* best effort */ }
+        throw err; // Re-throw so AgentAbject's dispatchToAgent records the failure
       }
     });
 

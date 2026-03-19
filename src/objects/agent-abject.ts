@@ -100,6 +100,7 @@ interface RegisteredAgent {
   description: string;
   systemPrompt?: string;
   config: ResolvedAgentConfig;
+  taskTypes: string[];
   registeredAt: number;
 }
 
@@ -175,10 +176,14 @@ export class AgentAbject extends Abject {
   private llmId?: AbjectId;
   private jobManagerId?: AbjectId;
   private goalManagerId?: AbjectId;
+  private tupleSpaceId?: AbjectId;
 
   private registeredAgents = new Map<AbjectId, RegisteredAgent>();
   private taskEntries = new Map<string, TaskEntry>();
   private taskOrder: string[] = [];
+
+  /** Guard: tuple IDs currently being dispatched — prevents concurrent dispatch loops. */
+  private dispatchingTuples = new Set<string>();
 
   /** Job submission heartbeat message ID for resetting request timeouts. */
   private _currentJobMsgId?: string;
@@ -213,6 +218,7 @@ export class AgentAbject extends Abject {
                 { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'What this agent does' },
                 { name: 'systemPrompt', type: { kind: 'primitive', primitive: 'string' }, description: 'Default system prompt', optional: true },
                 { name: 'config', type: { kind: 'object', properties: {} }, description: 'Default agent config', optional: true },
+                { name: 'taskTypes', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Task types this agent can handle (e.g. create, modify, browse, research, web)', optional: true },
               ],
               returns: { kind: 'object', properties: { agentId: { kind: 'primitive', primitive: 'string' } } },
             },
@@ -502,6 +508,12 @@ Inside job code, goal helpers are available automatically:
     this.llmId = await this.discoverDep('LLM') ?? undefined;
     this.jobManagerId = await this.discoverDep('JobManager') ?? undefined;
     this.goalManagerId = await this.discoverDep('GoalManager') ?? undefined;
+    this.tupleSpaceId = await this.discoverDep('TupleSpace') ?? undefined;
+
+    // Subscribe to TupleSpace for centralized task dispatch
+    if (this.tupleSpaceId) {
+      this.send(request(this.id, this.tupleSpaceId, 'addDependent', {}));
+    }
   }
 
   /** Resolve a required dependency lazily. */
@@ -515,8 +527,8 @@ Inside job code, goal helpers are available automatically:
   private setupHandlers(): void {
     // ── Registration ──
     this.on('registerAgent', async (msg: AbjectMessage) => {
-      const { name, description, systemPrompt, config } =
-        msg.payload as { name: string; description: string; systemPrompt?: string; config?: AgentConfig };
+      const { name, description, systemPrompt, config, taskTypes } =
+        msg.payload as { name: string; description: string; systemPrompt?: string; config?: AgentConfig; taskTypes?: string[] };
       const agentId = msg.routing.from;
       const resolved = resolveConfig(config);
 
@@ -526,6 +538,7 @@ Inside job code, goal helpers are available automatically:
         description,
         systemPrompt,
         config: resolved,
+        taskTypes: taskTypes ?? [],
         registeredAt: Date.now(),
       });
 
@@ -734,6 +747,229 @@ Inside job code, goal helpers are available automatically:
         this.resetRequestTimeout(this._currentJobMsgId);
       }
     });
+
+    // ── TupleSpace watcher — centralized task dispatch ──
+    this.on('changed', async (msg: AbjectMessage) => {
+      const { aspect, value } = msg.payload as { aspect: string; value: unknown };
+      // Watch both tuplePut (new tasks) and tupleUpdated (retried tasks released back to pending)
+      if (aspect !== 'tuplePut' && aspect !== 'tupleUpdated') return;
+
+      const tuple = value as { id: string; fields: Record<string, unknown>; claimedBy?: string };
+      if (!tuple?.fields) {
+        log.info(`WATCHER ${aspect} — no fields, skipping`);
+        return;
+      }
+
+      const tupleId = tuple.id?.slice(0, 8) ?? '?';
+      const status = tuple.fields.status as string ?? '?';
+      const type = tuple.fields.type as string ?? '?';
+      const attempts = (tuple.fields.attempts as number) ?? 0;
+      const maxAttempts = (tuple.fields.maxAttempts as number) ?? 3;
+
+      if (status !== 'pending') {
+        log.info(`WATCHER ${aspect} ${tupleId} type=${type} — skip: status=${status}`);
+        return;
+      }
+      if (tuple.claimedBy) {
+        log.info(`WATCHER ${aspect} ${tupleId} type=${type} — skip: claimedBy=${tuple.claimedBy.slice(0, 8)}`);
+        return;
+      }
+      if (attempts >= maxAttempts) {
+        log.info(`WATCHER ${aspect} ${tupleId} type=${type} — skip: attempts=${attempts}>=${maxAttempts}`);
+        return;
+      }
+
+      // Prevent concurrent dispatches for the same tuple
+      if (this.dispatchingTuples.has(tuple.id)) {
+        log.info(`WATCHER ${aspect} ${tupleId} type=${type} — skip: already dispatching`);
+        return;
+      }
+
+      log.info(`WATCHER ${aspect} ${tupleId} type=${type} attempts=${attempts}/${maxAttempts} — DISPATCHING`);
+      // Dispatch asynchronously — don't block the changed handler
+      this.dispatchToAgent(tuple);
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Centralized Task Dispatch
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Centralized claim + dispatch for TupleSpace tasks.
+   * Finds agents by taskType, filters out agents in failureHistory, optionally
+   * uses LLM to pick the best agent, claims via GoalManager, sends executeTask
+   * to the chosen agent, and handles success/failure.
+   */
+  private async dispatchToAgent(tuple: { id: string; fields: Record<string, unknown> }): Promise<void> {
+    if (!this.goalManagerId) return;
+
+    const tupleId = tuple.id.slice(0, 8);
+    log.info(`DISPATCH ${tupleId} — start (dispatchingTuples size=${this.dispatchingTuples.size})`);
+    this.dispatchingTuples.add(tuple.id);
+
+    try {
+      await this.dispatchToAgentInner(tuple);
+      log.info(`DISPATCH ${tupleId} — completed normally`);
+    } catch (err) {
+      log.info(`DISPATCH ${tupleId} — threw: ${(err as Error).message?.slice(0, 120)}`);
+    } finally {
+      // Keep guard for 5 seconds to prevent rapid re-dispatch from CRDT sync duplicates
+      log.info(`DISPATCH ${tupleId} — cooldown 5s before removing from dispatchingTuples`);
+      setTimeout(() => {
+        this.dispatchingTuples.delete(tuple.id);
+        log.info(`DISPATCH ${tupleId} — cooldown expired, removed from dispatchingTuples`);
+      }, 5000);
+    }
+  }
+
+  private async dispatchToAgentInner(tuple: { id: string; fields: Record<string, unknown> }): Promise<void> {
+    const tupleId = tuple.id.slice(0, 8);
+    const taskType = tuple.fields.type as string;
+    const description = tuple.fields.description as string;
+    const data = tuple.fields.data as Record<string, unknown> | undefined;
+    const taskGoalId = tuple.fields.goalId as string | undefined;
+    const failureHistory = (tuple.fields.failureHistory as Array<{ agent: string; agentId: string }>) ?? [];
+
+    log.info(`DISPATCH-INNER ${tupleId} type=${taskType} goalId=${taskGoalId?.slice(0, 8) ?? '?'} failureHistory=${failureHistory.length}`);
+
+    // 1. Find agents whose taskTypes include this task type
+    const candidates = [...this.registeredAgents.values()]
+      .filter(a => a.taskTypes.includes(taskType));
+
+    if (candidates.length === 0) {
+      log.info(`DISPATCH-INNER ${tupleId} — no agents handle type=${taskType}`);
+      return;
+    }
+
+    // 2. Filter out agents that already failed this task
+    const failedAgentIds = new Set(failureHistory.map(f => f.agentId));
+    const eligibleCandidates = candidates.filter(a => !failedAgentIds.has(a.agentId));
+
+    if (eligibleCandidates.length === 0) {
+      log.info(`DISPATCH-INNER ${tupleId} — all ${candidates.length} agents already failed`);
+      return;
+    }
+
+    // 3. Pick the best agent
+    let chosen: RegisteredAgent;
+    if (eligibleCandidates.length === 1) {
+      chosen = eligibleCandidates[0];
+    } else {
+      chosen = await this.classifyBestAgent(eligibleCandidates, description);
+    }
+
+    // 4. Claim via GoalManager
+    log.info(`DISPATCH-INNER ${tupleId} — claiming for ${chosen.name}`);
+    let claimed: { tuple: { id: string; fields: Record<string, unknown> }; claimed: boolean } | null;
+    try {
+      claimed = await this.request<{ tuple: { id: string; fields: Record<string, unknown> }; claimed: boolean } | null>(
+        request(this.id, this.goalManagerId!, 'claimTask', {
+          goalId: taskGoalId,
+          type: taskType,
+        })
+      );
+    } catch (err) {
+      log.info(`DISPATCH-INNER ${tupleId} — claim failed: ${(err as Error).message}`);
+      return;
+    }
+
+    if (!claimed) {
+      log.info(`DISPATCH-INNER ${tupleId} — no claimable tuple found`);
+      return;
+    }
+    log.info(`DISPATCH-INNER ${tupleId} — claimed, sending executeTask to ${chosen.name}`);
+
+    // 5. Report progress (attempts are tracked by failTask, not here)
+    if (taskGoalId) {
+      this.send(event(this.id, this.goalManagerId!, 'updateProgress', {
+        goalId: taskGoalId,
+        message: `${chosen.name} claiming task: ${description.slice(0, 60)}`,
+        phase: 'dispatch',
+        agentName: 'AgentAbject',
+      }));
+    }
+
+    // 6. Send executeTask to chosen agent (long timeout: 310s)
+    const dispatchStart = Date.now();
+    try {
+      const result = await this.request<unknown>(
+        request(this.id, chosen.agentId, 'executeTask', {
+          tupleId: claimed.tuple.id,
+          goalId: taskGoalId,
+          description,
+          data,
+          type: taskType,
+        }),
+        310000,
+      );
+
+      const elapsed = Date.now() - dispatchStart;
+      log.info(`DISPATCH-INNER ${tupleId} — executeTask SUCCESS (${elapsed}ms), completing task`);
+
+      // 7. Complete task
+      await this.request(
+        request(this.id, this.goalManagerId!, 'completeTask', {
+          taskId: claimed.tuple.id,
+          goalId: taskGoalId,
+          result,
+        })
+      );
+      log.info(`DISPATCH-INNER ${tupleId} — task completed`);
+    } catch (err) {
+      const elapsed = Date.now() - dispatchStart;
+      log.info(`DISPATCH-INNER ${tupleId} — executeTask FAILED (${elapsed}ms): ${(err as Error).message?.slice(0, 120)}`);
+      // 8. Fail task with agent identity for history tracking
+      try {
+        await this.request(
+          request(this.id, this.goalManagerId!, 'failTask', {
+            taskId: claimed.tuple.id,
+            goalId: taskGoalId,
+            error: (err as Error).message,
+            agentName: chosen.name,
+            agentId: chosen.agentId,
+          })
+        );
+        log.info(`DISPATCH-INNER ${tupleId} — failTask sent`);
+      } catch (err2) {
+        log.info(`DISPATCH-INNER ${tupleId} — failTask also failed: ${(err2 as Error).message?.slice(0, 80)}`);
+      }
+    }
+  }
+
+  /**
+   * Use a short LLM call to classify which agent is best suited for a task.
+   * Falls back to the first candidate if LLM is unavailable or fails.
+   */
+  private async classifyBestAgent(candidates: RegisteredAgent[], description: string): Promise<RegisteredAgent> {
+    if (!this.llmId) return candidates[0];
+
+    const agentList = candidates.map((a, i) => `${i}: ${a.name} — ${a.description}`).join('\n');
+    const prompt = `Given this task: "${description.slice(0, 200)}"
+
+Which agent is best suited? Pick one by index number.
+
+Agents:
+${agentList}
+
+Reply with ONLY the index number (e.g. "0" or "1").`;
+
+    try {
+      const result = await this.request<{ content: string }>(
+        request(this.id, this.llmId, 'complete', {
+          messages: [{ role: 'user', content: prompt }],
+          options: { maxTokens: 20 },
+        }),
+        10000,
+      );
+      const content = result.content ?? '';
+      const idx = parseInt(content.trim(), 10);
+      if (!isNaN(idx) && idx >= 0 && idx < candidates.length) {
+        return candidates[idx];
+      }
+    } catch { /* fallback */ }
+
+    return candidates[0];
   }
 
   // ═══════════════════════════════════════════════════════════════════

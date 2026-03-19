@@ -181,17 +181,16 @@ export class ObjectCreator extends Abject {
                 },
               },
               {
-                name: 'claimAndProcess',
-                description: 'Claim a pending creation task from the TupleSpace and execute it',
+                name: 'executeTask',
+                description: 'Execute a task dispatched by AgentAbject (create or modify)',
                 parameters: [
-                  { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Filter by goal ID', optional: true },
-                  { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: 'Filter by task type', optional: true },
+                  { name: 'tupleId', type: { kind: 'primitive', primitive: 'string' }, description: 'TupleSpace tuple ID' },
+                  { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID', optional: true },
+                  { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'Task description' },
+                  { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: 'Task type (create or modify)' },
+                  { name: 'data', type: { kind: 'object', properties: {} }, description: 'Task-specific data', optional: true },
                 ],
-                returns: { kind: 'object', properties: {
-                  claimed: { kind: 'primitive', primitive: 'boolean' },
-                  result: { kind: 'reference', reference: 'CreationResult' },
-                  error: { kind: 'primitive', primitive: 'string' },
-                }},
+                returns: { kind: 'reference', reference: 'CreationResult' },
               },
               {
                 name: 'getObjectGraph',
@@ -338,7 +337,8 @@ export class ObjectCreator extends Abject {
 
     // Forward LLM keep-alive progress events to the upstream caller
     this.on('progress', async (msg: AbjectMessage) => {
-      if (this._currentCallerId) {
+      // Guard: never forward progress to ourselves — that creates an infinite loop
+      if (this._currentCallerId && this._currentCallerId !== this.id) {
         const payload = msg.payload as { phase?: string; message?: string };
         await this.reportProgress(
           this._currentCallerId,
@@ -396,56 +396,33 @@ export class ObjectCreator extends Abject {
       }
     });
 
-    this.on('claimAndProcess', async (msg: AbjectMessage) => {
-      const { goalId, type } = (msg.payload ?? {}) as { goalId?: string; type?: string };
-      if (!this.goalManagerId) return { claimed: false, error: 'GoalManager not available' };
-
-      // Claim a pending task from the TupleSpace via GoalManager
-      const result = await this.request<{ tuple: { id: string; fields: Record<string, unknown> }; claimed: boolean } | null>(
-        request(this.id, this.goalManagerId, 'claimTask', {
-          goalId,
-          type: type ?? 'create',
-        })
-      );
-      if (!result) return { claimed: false };
-
-      const task = result.tuple;
-      const { description, data } = task.fields;
-      const taskGoalId = task.fields.goalId as string | undefined;
-
+    this.on('executeTask', async (msg: AbjectMessage) => {
+      const { goalId, description, data, type } = msg.payload as {
+        tupleId: string; goalId?: string; description: string;
+        data?: Record<string, unknown>; type: string;
+      };
+      this._currentGoalId = goalId;
+      // Use the caller (AgentAbject) as the progress recipient — NOT this.id,
+      // because reportProgress sends 'progress' events to callerId, and our own
+      // 'progress' handler re-sends to _currentCallerId, creating an infinite
+      // loop when callerId === this.id.
+      const callerId = msg.routing.from;
       try {
-        // Set current goal for progress reporting
-        this._currentGoalId = taskGoalId;
-        const createResult = await this.createObject(
-          description as string,
-          data as string | undefined,
-          msg.routing.from,
-        );
+        if (type === 'modify') {
+          const objectId = data?.objectId as string;
+          if (!objectId) throw new Error('modify task missing objectId');
+          return await this.modifyObject(objectId as AbjectId, description, callerId);
+        }
+        return await this.createObject(description, undefined, callerId);
+      } finally {
         this._currentGoalId = undefined;
-
-        // Mark task done
-        await this.request(
-          request(this.id, this.goalManagerId!, 'completeTask', {
-            taskId: task.id,
-            result: createResult,
-          })
-        );
-        return { claimed: true, result: createResult };
-      } catch (err) {
-        this._currentGoalId = undefined;
-        await this.request(
-          request(this.id, this.goalManagerId!, 'failTask', {
-            taskId: task.id,
-            error: (err as Error).message,
-          })
-        );
-        return { claimed: true, error: (err as Error).message };
       }
     });
 
     this.on('agentPhaseChanged', async () => { /* no-op */ });
     this.on('agentIntermediateAction', async () => { /* no-op */ });
     this.on('agentActionResult', async () => { /* no-op */ });
+
   }
 
   protected override async onInit(): Promise<void> {
@@ -466,6 +443,7 @@ export class ObjectCreator extends Abject {
         await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
           name: 'ObjectCreator',
           description: 'Creates and modifies objects from natural language prompts',
+          taskTypes: ['create', 'modify'],
           config: {
             maxSteps: 10,
             skipFirstObservation: true,

@@ -7,7 +7,7 @@
 
 import { parentPort } from 'node:worker_threads';
 import * as path from 'node:path';
-import { AbjectId } from '../src/core/types.js';
+import { AbjectId, AbjectManifest } from '../src/core/types.js';
 import { Abject } from '../src/core/abject.js';
 import { WorkerBus } from '../src/runtime/worker-bus.js';
 import type { WorkerInboundMessage } from '../src/runtime/worker-bridge.js';
@@ -39,6 +39,8 @@ import { Taskbar } from '../src/objects/taskbar.js';
 import { ProcessExplorer } from '../src/objects/process-explorer.js';
 import { GlobalSettings } from '../src/objects/global-settings.js';
 import { PeerNetwork } from '../src/objects/peer-network.js';
+import { GoalObserver } from '../src/objects/goal-observer.js';
+import { AgentAbject } from '../src/objects/agent-abject.js';
 import { ScriptableAbject } from '../src/objects/scriptable-abject.js';
 import { NodeStorage } from '../server/node-storage.js';
 
@@ -87,9 +89,11 @@ constructors.set('Taskbar', () => new Taskbar());
 constructors.set('ProcessExplorer', () => new ProcessExplorer());
 constructors.set('GlobalSettings', () => new GlobalSettings());
 constructors.set('PeerNetwork', () => new PeerNetwork());
+constructors.set('GoalObserver', () => new GoalObserver());
+constructors.set('AgentAbject', () => new AgentAbject());
 constructors.set('ScriptableAbject', (args?: unknown) => {
-  const opts = args as { manifest: import('../src/core/types.js').AbjectManifest; source: string; owner: string };
-  return new ScriptableAbject(opts.manifest, opts.source, opts.owner as import('../src/core/types.js').AbjectId);
+  const opts = args as { manifest: AbjectManifest; source: string; owner: string };
+  return new ScriptableAbject(opts.manifest, opts.source, opts.owner as AbjectId);
 });
 
 // Worker state — pass parentPort.postMessage so WorkerBus routes via worker_threads

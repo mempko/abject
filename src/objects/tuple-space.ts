@@ -256,7 +256,8 @@ export class TupleSpace extends Abject {
       };
 
       await this.writeTuple(tuple);
-      log.info(`Put tuple ${tuple.id} (${fields.type ?? 'unknown'})`);
+      const tupleCount = (await this.getAllTuples()).size;
+      log.info(`PUT ${tuple.id} type=${fields.type ?? '?'} status=${fields.status ?? '?'} goalId=${(fields.goalId as string)?.slice(0, 8) ?? '?'} (${tupleCount} total)`);
       this.changed('tuplePut', tuple);
 
       return { tupleId: tuple.id };
@@ -287,6 +288,7 @@ export class TupleSpace extends Abject {
     this.on('claim', async (msg: AbjectMessage) => {
       const { pattern } = msg.payload as { pattern: TuplePattern };
       const tuples = await this.getAllTuples();
+      log.info(`CLAIM scanning ${tuples.size} tuples, pattern=${JSON.stringify(pattern)}`);
 
       for (const tuple of tuples.values()) {
         if (this.matchesPattern(tuple, pattern) && this.isUnclaimed(tuple)) {
@@ -294,11 +296,12 @@ export class TupleSpace extends Abject {
           tuple.claimedBy = this.localPeerId || this.id;
           tuple.claimedAt = Date.now();
           await this.writeTuple(tuple);
-          log.info(`Claimed tuple ${tuple.id}`);
+          log.info(`CLAIMED ${tuple.id} type=${tuple.fields.type ?? '?'} attempts=${tuple.fields.attempts ?? 0}`);
           this.changed('tupleClaimed', tuple);
           return { tuple, claimed: true };
         }
       }
+      log.info(`CLAIM no match found`);
       return null;
     });
 
@@ -308,15 +311,23 @@ export class TupleSpace extends Abject {
 
       const tuples = await this.getAllTuples();
       const tuple = tuples.get(tupleId);
-      if (!tuple) return false;
+      if (!tuple) {
+        log.info(`RELEASE ${tupleId} — not found`);
+        return false;
+      }
 
       const myId = this.localPeerId || this.id;
-      if (tuple.claimedBy !== myId) return false;
+      if (tuple.claimedBy !== myId) {
+        log.info(`RELEASE ${tupleId} — not claimed by us (claimedBy=${tuple.claimedBy}, us=${myId})`);
+        return false;
+      }
 
       tuple.claimedBy = undefined;
       tuple.claimedAt = undefined;
       await this.writeTuple(tuple);
-      log.info(`Released tuple ${tupleId}`);
+      log.info(`RELEASED ${tupleId} status=${tuple.fields.status ?? '?'} attempts=${tuple.fields.attempts ?? 0}`);
+      // Emit tupleUpdated so watchers (AgentAbject) can re-dispatch retried tasks
+      this.changed('tupleUpdated', tuple);
       return true;
     });
 
@@ -328,7 +339,8 @@ export class TupleSpace extends Abject {
       await this.request(request(this.id, this.sharedStateId, 'delete', {
         name: STATE_NAME, key: tupleId,
       }));
-      log.info(`Removed tuple ${tupleId}`);
+      const tupleCount = (await this.getAllTuples()).size;
+      log.info(`REMOVED ${tupleId} (${tupleCount} remaining)`);
       this.changed('tupleRemoved', { tupleId });
       return true;
     });
@@ -340,11 +352,14 @@ export class TupleSpace extends Abject {
 
       const tuples = await this.getAllTuples();
       const tuple = tuples.get(tupleId);
-      if (!tuple) return false;
+      if (!tuple) {
+        log.info(`UPDATE ${tupleId} — not found`);
+        return false;
+      }
 
       Object.assign(tuple.fields, fields);
       await this.writeTuple(tuple);
-      log.info(`Updated tuple ${tupleId}`);
+      log.info(`UPDATED ${tupleId} status=${tuple.fields.status ?? '?'} attempts=${tuple.fields.attempts ?? 0} claimedBy=${tuple.claimedBy ?? 'none'}`);
       this.changed('tupleUpdated', tuple);
       return true;
     });
@@ -352,10 +367,10 @@ export class TupleSpace extends Abject {
     // Forward SharedState change events as typed tuple events
     this.on('changed', async (msg: AbjectMessage) => {
       if (msg.routing.from === this.sharedStateId) {
-        const { aspect, value } = msg.payload as { aspect: string; value: { key: string; value: unknown } };
-        if (aspect === 'stateChanged') {
-          // SharedState notifies us of remote changes — we could emit more granular events
-          // but for now the tuple events are emitted on local mutations.
+        const { aspect, value } = msg.payload as { aspect: string; value: { name?: string; key?: string; value?: unknown } };
+        if (aspect === 'stateChanged' && value?.name === STATE_NAME) {
+          const entry = value.value as TupleEntry | undefined;
+          log.info(`SHARED-STATE-CHANGE key=${value.key ?? '?'} status=${entry?.fields?.status ?? '?'} claimedBy=${entry?.claimedBy ?? 'none'}`);
         }
       }
     });

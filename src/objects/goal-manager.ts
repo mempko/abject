@@ -7,6 +7,7 @@
  * update. Subscribers (GoalBrowser, Chat) receive `changed` events for real-time UI.
  */
 
+import { v4 as uuidv4 } from 'uuid';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
@@ -56,9 +57,9 @@ export interface Goal {
 export class GoalManager extends Abject {
   private goals: Map<GoalId, Goal> = new Map();
   private goalOrder: GoalId[] = [];
-  private goalCounter = 0;
   private tupleSpaceId?: AbjectId;
   private sharedStateId?: AbjectId;
+  private storageId?: AbjectId;
   private localPeerId = '';
 
   constructor() {
@@ -195,12 +196,36 @@ export class GoalManager extends Abject {
               returns: { kind: 'array', elementType: { kind: 'reference', reference: 'TupleEntry' } },
             },
             {
+              name: 'updateTaskAttempts',
+              description: 'Increment the attempts counter on a task tuple',
+              parameters: [
+                { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Task tuple ID' },
+              ],
+              returns: { kind: 'primitive', primitive: 'boolean' },
+            },
+            {
               name: 'getResultsForGoal',
               description: 'Get completed tasks with results for a goal',
               parameters: [
                 { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
               ],
               returns: { kind: 'array', elementType: { kind: 'reference', reference: 'TupleEntry' } },
+            },
+            {
+              name: 'subscribeGoal',
+              description: 'Subscribe to a remote goal by ID — creates + subscribes to its SharedState namespace and adds it to the local index',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal UUID to subscribe to' },
+              ],
+              returns: { kind: 'reference', reference: 'Goal' },
+            },
+            {
+              name: 'cancelTasksForGoal',
+              description: 'Cancel all tasks for a goal — releases claims, removes tuples from TupleSpace',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+              ],
+              returns: { kind: 'object', properties: { cancelled: { kind: 'primitive', primitive: 'number' } } },
             },
           ],
           events: [
@@ -210,6 +235,9 @@ export class GoalManager extends Abject {
             { name: 'goalFailed', description: 'A goal failed', payload: { kind: 'reference', reference: 'Goal' } },
             { name: 'goalsCleared', description: 'Completed/failed goals were cleared', payload: { kind: 'primitive', primitive: 'undefined' } },
             { name: 'goalsSwept', description: 'Goals were archived or deleted by lifecycle sweep', payload: { kind: 'primitive', primitive: 'undefined' } },
+            { name: 'taskCompleted', description: 'A task was completed', payload: { kind: 'object', properties: { taskId: { kind: 'primitive', primitive: 'string' }, goalId: { kind: 'primitive', primitive: 'string' }, result: { kind: 'primitive', primitive: 'string' } } } },
+            { name: 'taskRetrying', description: 'A task failed but will be retried', payload: { kind: 'object', properties: { taskId: { kind: 'primitive', primitive: 'string' }, goalId: { kind: 'primitive', primitive: 'string' }, error: { kind: 'primitive', primitive: 'string' }, attempts: { kind: 'primitive', primitive: 'number' }, maxAttempts: { kind: 'primitive', primitive: 'number' } } } },
+            { name: 'taskPermanentlyFailed', description: 'A task exhausted all retry attempts', payload: { kind: 'object', properties: { taskId: { kind: 'primitive', primitive: 'string' }, goalId: { kind: 'primitive', primitive: 'string' }, error: { kind: 'primitive', primitive: 'string' }, attempts: { kind: 'primitive', primitive: 'number' } } } },
           ],
         },
         requiredCapabilities: [],
@@ -224,6 +252,7 @@ export class GoalManager extends Abject {
   protected override async onInit(): Promise<void> {
     this.tupleSpaceId = await this.discoverDep('TupleSpace') ?? undefined;
     this.sharedStateId = await this.discoverDep('SharedState') ?? undefined;
+    this.storageId = await this.discoverDep('Storage') ?? undefined;
 
     // Get local peerId from Identity
     const identityId = await this.discoverDep('Identity');
@@ -236,37 +265,62 @@ export class GoalManager extends Abject {
       } catch { /* Identity may not be ready */ }
     }
 
-    // Create and subscribe to goals shared state for cross-peer visibility
-    if (this.sharedStateId) {
-      await this.request(request(this.id, this.sharedStateId, 'create', { name: 'goals' }));
-      await this.request(request(this.id, this.sharedStateId, 'subscribe', { name: 'goals' }));
+    // Load goal index from local Storage and subscribe to each goal's SharedState
+    await this.loadGoalIndex();
+  }
 
-      // Load persisted goals
+  /** Load the local goal index from Storage and subscribe to each goal's per-goal SharedState. */
+  private async loadGoalIndex(): Promise<void> {
+    if (!this.storageId) return;
+
+    let goalIds: string[] = [];
+    try {
+      const stored = await this.request<string[] | null>(
+        request(this.id, this.storageId, 'get', { key: 'goals:index' })
+      );
+      if (Array.isArray(stored)) goalIds = stored;
+    } catch { /* No index yet */ }
+
+    if (goalIds.length === 0) return;
+
+    // Subscribe to each goal's SharedState and load metadata
+    for (const goalId of goalIds) {
+      const ns = `goal-${goalId}`;
       try {
-        const all = await this.request<Record<string, unknown>>(
-          request(this.id, this.sharedStateId, 'getAll', { name: 'goals' })
-        );
-        for (const [key, value] of Object.entries(all)) {
-          if (value && typeof value === 'object' && 'id' in (value as object)) {
-            const goalData = value as Goal;
-            if (!this.goals.has(goalData.id)) {
-              // Restore from persisted state — progress array stays empty (too chatty for CRDT)
-              const goal: Goal = {
-                ...goalData,
-                progress: goalData.progress ?? [],
-              };
-              this.goals.set(goal.id, goal);
-              if (!this.goalOrder.includes(goal.id)) {
-                this.goalOrder.push(goal.id);
-              }
+        if (this.sharedStateId) {
+          await this.request(request(this.id, this.sharedStateId, 'create', { name: ns }));
+          await this.request(request(this.id, this.sharedStateId, 'subscribe', { name: ns }));
+
+          const all = await this.request<Record<string, unknown>>(
+            request(this.id, this.sharedStateId, 'getAll', { name: ns })
+          );
+          const meta = all?.meta;
+          if (meta && typeof meta === 'object' && 'id' in (meta as object)) {
+            const goalData = meta as Goal;
+            const goal: Goal = { ...goalData, progress: goalData.progress ?? [] };
+            this.goals.set(goal.id, goal);
+            if (!this.goalOrder.includes(goal.id)) {
+              this.goalOrder.push(goal.id);
             }
           }
         }
-        if (this.goals.size > 0) {
-          log.info(`Loaded ${this.goals.size} persisted goals`);
-        }
-      } catch { /* SharedState may not have goals yet */ }
+      } catch { /* Goal may have been deleted by another peer */ }
     }
+
+    if (this.goals.size > 0) {
+      log.info(`Loaded ${this.goals.size} persisted goals from index`);
+    }
+  }
+
+  /** Persist the local goal index to Storage. */
+  private async saveGoalIndex(): Promise<void> {
+    if (!this.storageId) return;
+    try {
+      await this.request(request(this.id, this.storageId, 'set', {
+        key: 'goals:index',
+        value: this.goalOrder,
+      }));
+    } catch { /* best effort */ }
   }
 
   protected override getSourceForAsk(): string | undefined {
@@ -418,15 +472,15 @@ Goals have automatic lifecycle management:
   }
 
   /**
-   * Sync goal metadata to SharedState for cross-peer visibility.
-   * Progress entries array stays local (too chatty for CRDT sync).
+   * Sync goal metadata to its per-goal SharedState namespace.
+   * Each goal gets namespace `goal-{uuid}` for selective cross-peer sync.
    */
   private async syncGoalToSharedState(goal: Goal): Promise<void> {
     if (!this.sharedStateId) return;
     try {
       await this.request(request(this.id, this.sharedStateId, 'set', {
-        name: 'goals',
-        key: goal.id,
+        name: `goal-${goal.id}`,
+        key: 'meta',
         value: {
           id: goal.id,
           parentId: goal.parentId,
@@ -451,7 +505,7 @@ Goals have automatic lifecycle management:
       const { title, parentId } = msg.payload as { title: string; parentId?: GoalId };
       requireNonEmpty(title, 'title');
 
-      const goalId = `goal-${++this.goalCounter}-${Date.now()}` as GoalId;
+      const goalId = uuidv4() as GoalId;
       const callerId = msg.routing.from;
 
       const goal: Goal = {
@@ -460,7 +514,7 @@ Goals have automatic lifecycle management:
         title: title.slice(0, 200),
         status: 'active',
         createdBy: callerId,
-        creatorName: '', // Will be filled from agent context if available
+        creatorName: '',
         progress: [],
         childIds: [],
         createdAt: Date.now(),
@@ -479,9 +533,19 @@ Goals have automatic lifecycle management:
         }
       }
 
+      // Create + subscribe to per-goal SharedState namespace
+      if (this.sharedStateId) {
+        const ns = `goal-${goalId}`;
+        try {
+          await this.request(request(this.id, this.sharedStateId, 'create', { name: ns }));
+          await this.request(request(this.id, this.sharedStateId, 'subscribe', { name: ns }));
+        } catch { /* best effort */ }
+      }
+
       log.info(`Goal created: "${goal.title}" (${goalId})`);
       this.changed('goalCreated', { goalId, title: goal.title, parentId });
       this.syncGoalToSharedState(goal);
+      this.saveGoalIndex();
 
       return { goalId };
     });
@@ -561,13 +625,54 @@ Goals have automatic lifecycle management:
     });
 
     this.on('clearCompleted', async () => {
+      const goalsToClear: Goal[] = [];
       const now = Date.now();
+
       for (const [, goal] of this.goals) {
-        if (goal.status === 'completed' || goal.status === 'failed') {
-          goal.status = 'archived';
-          goal.updatedAt = now;
+        if (goal.status === 'completed' || goal.status === 'failed' || goal.status === 'archived') {
+          goalsToClear.push(goal);
         }
       }
+
+      for (const goal of goalsToClear) {
+        // Remove task tuples from TupleSpace
+        if (this.tupleSpaceId) {
+          try {
+            const tasks = await this.request<Array<{ id: string; claimedBy?: string }>>(
+              request(this.id, this.tupleSpaceId, 'scan', { pattern: { goalId: goal.id } })
+            );
+            for (const task of tasks) {
+              try {
+                if (task.claimedBy) {
+                  await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: task.id }));
+                }
+                await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id }));
+              } catch { /* best effort */ }
+            }
+          } catch { /* best effort */ }
+        }
+
+        // Delete meta from per-goal SharedState and unsubscribe
+        if (this.sharedStateId) {
+          const ns = `goal-${goal.id}`;
+          try {
+            await this.request(request(this.id, this.sharedStateId, 'delete', {
+              name: ns,
+              key: 'meta',
+            }));
+          } catch { /* best effort */ }
+          try {
+            await this.request(request(this.id, this.sharedStateId, 'unsubscribe', { name: ns }));
+          } catch { /* best effort */ }
+        }
+
+        // Remove from in-memory map entirely (not just archive)
+        this.goals.delete(goal.id);
+        const idx = this.goalOrder.indexOf(goal.id);
+        if (idx !== -1) this.goalOrder.splice(idx, 1);
+      }
+
+      this.saveGoalIndex();
       this.changed('goalsCleared', {});
     });
 
@@ -602,7 +707,7 @@ Goals have automatic lifecycle management:
 
       const result = await this.request<{ tupleId: string }>(
         request(this.id, this.tupleSpaceId, 'put', {
-          fields: { goalId, type, status: 'pending', description, data },
+          fields: { goalId, type, status: 'pending', description, data, attempts: 0, maxAttempts: 3, failureHistory: [] },
         })
       );
       log.info(`Task added for goal ${goalId}: ${type} — "${description.slice(0, 60)}"`);
@@ -611,46 +716,108 @@ Goals have automatic lifecycle management:
 
     this.on('claimTask', async (msg: AbjectMessage) => {
       const { goalId, type } = (msg.payload ?? {}) as { goalId?: string; type?: string };
-      if (!this.tupleSpaceId) return null;
+      if (!this.tupleSpaceId) { log.info(`claimTask — no TupleSpace`); return null; }
 
       const pattern: Record<string, unknown> = { status: 'pending' };
       if (goalId) pattern.goalId = goalId;
       if (type) pattern.type = type;
+      log.info(`claimTask pattern=${JSON.stringify(pattern)} from=${msg.routing.from.slice(0, 8)}`);
 
-      return this.request(
+      const result = await this.request(
         request(this.id, this.tupleSpaceId, 'claim', { pattern })
       );
+      log.info(`claimTask result=${result ? 'claimed' : 'none'}`);
+      return result;
     });
 
     this.on('completeTask', async (msg: AbjectMessage) => {
-      const { taskId, result } = msg.payload as { taskId: string; result?: unknown };
+      const { taskId, result, goalId } = msg.payload as { taskId: string; result?: unknown; goalId?: string };
       requireNonEmpty(taskId, 'taskId');
       if (!this.tupleSpaceId) return false;
 
-      return this.request(
+      log.info(`completeTask ${taskId.slice(0, 8)} goalId=${goalId?.slice(0, 8) ?? '?'} from=${msg.routing.from.slice(0, 8)}`);
+      const updateResult = await this.request(
         request(this.id, this.tupleSpaceId, 'update', {
           tupleId: taskId,
           fields: { status: 'done', result },
         })
       );
+
+      log.info(`completeTask ${taskId.slice(0, 8)} — emitting taskCompleted`);
+      this.changed('taskCompleted', { taskId, goalId, result });
+      return updateResult;
     });
 
     this.on('failTask', async (msg: AbjectMessage) => {
-      const { taskId, error } = msg.payload as { taskId: string; error?: string };
+      const { taskId, error, goalId, agentName, agentId } = msg.payload as {
+        taskId: string; error?: string; goalId?: string; agentName?: string; agentId?: string;
+      };
       requireNonEmpty(taskId, 'taskId');
       if (!this.tupleSpaceId) return false;
+
+      log.info(`failTask ${taskId.slice(0, 8)} agent=${agentName ?? '?'} error="${(error ?? '').slice(0, 80)}" from=${msg.routing.from.slice(0, 8)}`);
+
+      // Read current tuple to get failure tracking fields
+      let currentFields: Record<string, unknown> = {};
+      try {
+        const scanResult = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
+          request(this.id, this.tupleSpaceId, 'scan', { pattern: {} })
+        );
+        const tuple = scanResult.find(t => t.id === taskId);
+        if (tuple) currentFields = tuple.fields;
+      } catch { /* best effort */ }
+
+      const failureHistory = (currentFields.failureHistory as Array<{ agent: string; agentId: string; error: string; timestamp: number }>) ?? [];
+      const attempts = ((currentFields.attempts as number) ?? 0) + 1;
+      const maxAttempts = (currentFields.maxAttempts as number) ?? 3;
+
+      log.info(`failTask ${taskId.slice(0, 8)} attempts=${attempts}/${maxAttempts}`);
+
+      // Append failure record
+      failureHistory.push({
+        agent: agentName ?? 'unknown',
+        agentId: agentId ?? 'unknown',
+        error: error ?? 'unknown error',
+        timestamp: Date.now(),
+      });
+
+      if (attempts >= maxAttempts) {
+        log.info(`failTask ${taskId.slice(0, 8)} — PERMANENTLY FAILED (${attempts}/${maxAttempts})`);
+        // Permanently failed — no more retries.
+        // Update fields BEFORE release so tuplePut from release carries correct state.
+        const updateResult = await this.request(
+          request(this.id, this.tupleSpaceId, 'update', {
+            tupleId: taskId,
+            fields: { status: 'permanently_failed', error, attempts, failureHistory },
+          })
+        );
+        try {
+          await this.request(request(this.id, this.tupleSpaceId, 'release', { tupleId: taskId }));
+        } catch { /* best effort */ }
+        this.changed('taskPermanentlyFailed', { taskId, goalId, error, attempts });
+        return updateResult;
+      }
+
+      log.info(`failTask ${taskId.slice(0, 8)} — RETRYING (${attempts}/${maxAttempts}), updating tuple then releasing`);
+      // Update fields BEFORE release so that the tupleUpdated event triggered by
+      // release already carries the incremented attempts count.  Without this
+      // ordering, observers see status=pending + old attempts and immediately
+      // re-dispatch, creating a tight infinite loop.
+      const updateResult = await this.request(
+        request(this.id, this.tupleSpaceId, 'update', {
+          tupleId: taskId,
+          fields: { status: 'pending', error, attempts, failureHistory },
+        })
+      );
 
       // Release the claim so others can retry
       try {
         await this.request(request(this.id, this.tupleSpaceId, 'release', { tupleId: taskId }));
       } catch { /* best effort */ }
 
-      return this.request(
-        request(this.id, this.tupleSpaceId, 'update', {
-          tupleId: taskId,
-          fields: { status: 'failed', error },
-        })
-      );
+      log.info(`failTask ${taskId.slice(0, 8)} — emitting taskRetrying`);
+      this.changed('taskRetrying', { taskId, goalId, error, attempts, maxAttempts });
+      return updateResult;
     });
 
     this.on('getTasksForGoal', async (msg: AbjectMessage) => {
@@ -678,31 +845,152 @@ Goals have automatic lifecycle management:
       );
     });
 
-    // ── Remote goal visibility via SharedState ──
+    this.on('subscribeGoal', async (msg: AbjectMessage) => {
+      const { goalId } = msg.payload as { goalId: string };
+      requireNonEmpty(goalId, 'goalId');
 
-    this.on('changed', async (msg: AbjectMessage) => {
-      if (msg.routing.from === this.sharedStateId) {
-        const { value } = msg.payload as { aspect: string; value: { key: string; value: unknown } };
-        if (value?.value && typeof value.value === 'object' && 'id' in (value.value as object)) {
-          const remoteGoal = value.value as Goal;
-          // Merge remote goal if we don't have it or it's newer
-          const existing = this.goals.get(remoteGoal.id);
-          if (!existing || existing.updatedAt < remoteGoal.updatedAt) {
-            const goal: Goal = {
-              ...remoteGoal,
-              progress: existing?.progress ?? [],
-            };
-            this.goals.set(goal.id, goal);
-            if (!this.goalOrder.includes(goal.id)) {
-              this.goalOrder.push(goal.id);
-            }
-            this.changed('goalUpdated', {
-              goalId: goal.id,
-              message: `Remote update: ${goal.status}`,
-              agentName: 'remote',
-            });
+      // Already tracking this goal locally
+      if (this.goals.has(goalId as GoalId)) {
+        return this.goals.get(goalId as GoalId) ?? null;
+      }
+
+      if (!this.sharedStateId) return null;
+
+      const ns = `goal-${goalId}`;
+      await this.request(request(this.id, this.sharedStateId, 'create', { name: ns }));
+      await this.request(request(this.id, this.sharedStateId, 'subscribe', { name: ns }));
+
+      // Load current metadata
+      try {
+        const all = await this.request<Record<string, unknown>>(
+          request(this.id, this.sharedStateId, 'getAll', { name: ns })
+        );
+        const meta = all?.meta;
+        if (meta && typeof meta === 'object' && 'id' in (meta as object)) {
+          const goalData = meta as Goal;
+          const goal: Goal = { ...goalData, progress: goalData.progress ?? [] };
+          this.goals.set(goal.id, goal);
+          if (!this.goalOrder.includes(goal.id)) {
+            this.goalOrder.push(goal.id);
           }
+          this.saveGoalIndex();
+          this.changed('goalCreated', { goalId: goal.id, title: goal.title, parentId: goal.parentId });
+          return goal;
         }
+      } catch { /* Goal may not exist yet */ }
+
+      // Namespace exists but no meta yet — add to index so we get updates
+      this.goalOrder.push(goalId as GoalId);
+      this.saveGoalIndex();
+      return null;
+    });
+
+    this.on('cancelTasksForGoal', async (msg: AbjectMessage) => {
+      const { goalId } = msg.payload as { goalId: string };
+      requireNonEmpty(goalId, 'goalId');
+      if (!this.tupleSpaceId) return { cancelled: 0 };
+
+      // Find all tasks for this goal
+      const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(
+        request(this.id, this.tupleSpaceId, 'scan', { pattern: { goalId } })
+      );
+
+      let cancelled = 0;
+      for (const task of tasks) {
+        try {
+          // Release claim if held
+          if (task.claimedBy) {
+            try {
+              await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: task.id }));
+            } catch { /* best effort */ }
+          }
+          // Remove tuple from TupleSpace entirely
+          await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id }));
+          cancelled++;
+        } catch { /* best effort — tuple may already be gone */ }
+      }
+
+      // Clean up per-goal SharedState namespace
+      if (this.sharedStateId) {
+        const ns = `goal-${goalId}`;
+        try {
+          await this.request(request(this.id, this.sharedStateId, 'delete', {
+            name: ns,
+            key: 'meta',
+          }));
+        } catch { /* best effort */ }
+        try {
+          await this.request(request(this.id, this.sharedStateId, 'unsubscribe', { name: ns }));
+        } catch { /* best effort */ }
+      }
+
+      return { cancelled };
+    });
+
+    this.on('updateTaskAttempts', async (msg: AbjectMessage) => {
+      const { taskId } = msg.payload as { taskId: string };
+      requireNonEmpty(taskId, 'taskId');
+      if (!this.tupleSpaceId) return false;
+
+      // Read current tuple to get attempts
+      let currentAttempts = 0;
+      try {
+        const scanResult = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
+          request(this.id, this.tupleSpaceId, 'scan', { pattern: {} })
+        );
+        const tuple = scanResult.find(t => t.id === taskId);
+        if (tuple) currentAttempts = (tuple.fields.attempts as number) ?? 0;
+      } catch { /* best effort */ }
+
+      return this.request(
+        request(this.id, this.tupleSpaceId, 'update', {
+          tupleId: taskId,
+          fields: { attempts: currentAttempts + 1 },
+        })
+      );
+    });
+
+    // SharedState changed handler — merge remote updates for per-goal namespaces
+    // SharedState sends events with method 'changed' and aspect 'stateChanged'.
+    this.on('changed', async (msg: AbjectMessage) => {
+      if (msg.routing.from !== this.sharedStateId) return;
+      const { aspect, value: eventValue } = msg.payload as { aspect: string; value?: unknown };
+      if (aspect !== 'stateChanged') return;
+
+      const stateChange = eventValue as { name?: string; key?: string; value?: unknown } | undefined;
+      if (!stateChange) return;
+      const { name: namespace, key, value } = stateChange;
+      log.info(`SharedState changed: ns=${namespace ?? '?'} key=${key ?? '?'}`);
+      if (!namespace || !key || key !== 'meta') return;
+      if (!namespace.startsWith('goal-')) return;
+
+      const goalId = namespace.slice('goal-'.length) as GoalId;
+      if (!value || typeof value !== 'object' || !('id' in (value as object))) return;
+
+      const remote = value as Goal;
+      const local = this.goals.get(goalId);
+
+      if (!local) {
+        // New goal from remote peer — add it
+        const goal: Goal = { ...remote, progress: remote.progress ?? [] };
+        this.goals.set(goal.id, goal);
+        if (!this.goalOrder.includes(goal.id)) {
+          this.goalOrder.push(goal.id);
+        }
+        this.saveGoalIndex();
+        this.changed('goalCreated', { goalId: goal.id, title: goal.title, parentId: goal.parentId });
+        return;
+      }
+
+      // Merge: newer updatedAt wins
+      if (remote.updatedAt > local.updatedAt) {
+        local.title = remote.title;
+        local.status = remote.status;
+        local.childIds = remote.childIds;
+        local.result = remote.result;
+        local.error = remote.error;
+        local.updatedAt = remote.updatedAt;
+        this.changed('goalUpdated', { goalId, message: 'Remote update', progress: local.progress });
       }
     });
   }

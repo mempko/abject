@@ -18,12 +18,32 @@ const GOAL_BROWSER_INTERFACE: InterfaceId = 'abjects:goal-browser';
 const WIN_W = 400;
 const WIN_H = 350;
 
+/** Minimal task info extracted from TupleSpace scan results. */
+interface TaskInfo {
+  id: string;
+  type: string;
+  status: string;
+  description: string;
+  attempts: number;
+  maxAttempts: number;
+}
+
+const TASK_STATUS_ICONS: Record<string, string> = {
+  pending: '\u25CB',              // ○
+  in_progress: '\u25D4',         // ◔
+  done: '\u25CF',                // ●
+  failed: '\u2716',              // ✖
+  permanently_failed: '\u2718',  // ✘
+};
+
 export class GoalBrowser extends Abject {
   private goalManagerId?: AbjectId;
+  private goalObserverId?: AbjectId;
   private widgetManagerId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
   private goalListId?: AbjectId;
+  private stopAllBtnId?: AbjectId;
   private clearBtnId?: AbjectId;
   private goalLabelMap: Map<GoalId, AbjectId> = new Map();
 
@@ -77,6 +97,7 @@ export class GoalBrowser extends Abject {
     await this.fetchTheme();
     this.goalManagerId = await this.requireDep('GoalManager');
     this.widgetManagerId = await this.requireDep('WidgetManager');
+    this.goalObserverId = await this.discoverDep('GoalObserver') ?? undefined;
   }
 
   private setupHandlers(): void {
@@ -183,27 +204,31 @@ Sub-goals are indented under their parent goal.
       ],
     }));
 
-    // Spacer pushes button right
+    // Spacer pushes buttons right
     await this.request(request(this.id, bottomRowId, 'addLayoutSpacer', {}));
 
-    // Create clear button
+    // Create Stop All + Clear buttons
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
+          { type: 'button', windowId: this.windowId, text: 'Stop All' },
           { type: 'button', windowId: this.windowId, text: 'Clear' },
         ],
       })
     );
-    this.clearBtnId = widgetIds[0];
+    this.stopAllBtnId = widgetIds[0];
+    this.clearBtnId = widgetIds[1];
 
     // Add to layout
     await this.request(request(this.id, bottomRowId, 'addLayoutChildren', {
       children: [
+        { widgetId: this.stopAllBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 80, height: 36 } },
         { widgetId: this.clearBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 80, height: 36 } },
       ],
     }));
 
     // Fire-and-forget: register as dependent
+    this.send(request(this.id, this.stopAllBtnId, 'addDependent', {}));
     this.send(request(this.id, this.clearBtnId, 'addDependent', {}));
     this.send(request(this.id, this.goalManagerId!, 'addDependent', {}));
 
@@ -233,6 +258,7 @@ Sub-goals are indented under their parent goal.
     this.windowId = undefined;
     this.rootLayoutId = undefined;
     this.goalListId = undefined;
+    this.stopAllBtnId = undefined;
     this.clearBtnId = undefined;
     this.goalLabelMap.clear();
     this.changed('visibility', false);
@@ -253,9 +279,14 @@ Sub-goals are indented under their parent goal.
       const lineHeight = fontSize + 4;
       const availableWidth = WIN_W - 32 - 8;
 
-      // Build specs for all goal labels
-      const specs = goals.map(goal => {
-        const { text, color } = this.formatGoalLabel(goal);
+      // Fetch tasks for each goal in parallel
+      const tasksByGoal = await Promise.all(
+        goals.map(goal => this.fetchTasksForGoal(goal.id))
+      );
+
+      // Build specs for all goal labels (including task lines)
+      const specs = goals.map((goal, i) => {
+        const { text, color } = this.formatGoalLabel(goal, tasksByGoal[i]);
         return { type: 'label' as const, windowId: this.windowId!, text, style: { color, fontSize, wordWrap: true, selectable: true } };
       });
 
@@ -266,7 +297,7 @@ Sub-goals are indented under their parent goal.
 
       // Build layout children specs
       const children = goals.map((goal, i) => {
-        const { text } = this.formatGoalLabel(goal);
+        const { text } = this.formatGoalLabel(goal, tasksByGoal[i]);
         const lineCount = estimateWrappedLineCount(text, availableWidth, fontSize);
         const estimatedHeight = Math.max(20, lineCount * lineHeight + 4);
         this.goalLabelMap.set(goal.id, widgetIds[i]);
@@ -278,26 +309,91 @@ Sub-goals are indented under their parent goal.
     } catch { /* GoalManager may not have any goals yet */ }
   }
 
-  private formatGoalLabel(goal: Goal): { text: string; color: string } {
+  private formatGoalLabel(goal: Goal, tasks?: TaskInfo[]): { text: string; color: string } {
     const indent = goal.parentId ? '  \u2514\u2500 ' : '';
     const latestProgress = goal.progress.length > 0
       ? goal.progress[goal.progress.length - 1].message
       : '';
 
+    let goalLine: string;
+    let color: string;
+
     switch (goal.status) {
       case 'active': {
         const progressLine = latestProgress ? `\n${indent}  ${latestProgress}` : '';
-        return { text: `${indent}\u25B8 ${goal.title}${progressLine}`, color: this.theme.statusWarning };
+        goalLine = `${indent}\u25B8 ${goal.title}${progressLine}`;
+        color = this.theme.statusWarning;
+        break;
       }
       case 'completed':
-        return { text: `${indent}\u2713 ${goal.title}`, color: this.theme.statusSuccess };
+        goalLine = `${indent}\u2713 ${goal.title}`;
+        color = this.theme.statusSuccess;
+        break;
       case 'failed': {
         const errorSuffix = goal.error ? ` \u2014 ${goal.error.slice(0, 40)}` : '';
-        return { text: `${indent}\u2717 ${goal.title}${errorSuffix}`, color: this.theme.statusError };
+        goalLine = `${indent}\u2717 ${goal.title}${errorSuffix}`;
+        color = this.theme.statusError;
+        break;
       }
       default:
-        return { text: `${indent}? ${goal.title}`, color: this.theme.statusNeutral };
+        goalLine = `${indent}? ${goal.title}`;
+        color = this.theme.statusNeutral;
+        break;
     }
+
+    // Append task lines if present
+    if (tasks && tasks.length > 0) {
+      const taskIndent = indent ? '      ' : '   ';
+      const taskLines = tasks.map(t => {
+        const icon = TASK_STATUS_ICONS[t.status] ?? '\u2022';
+        const attempts = t.attempts > 0 ? ` (attempt ${t.attempts}/${t.maxAttempts})` : '';
+        const desc = t.description.slice(0, 50);
+        return `${taskIndent}${icon} [${t.type}] ${desc}${attempts}`;
+      });
+      goalLine += '\n' + taskLines.join('\n');
+    }
+
+    return { text: goalLine, color };
+  }
+
+  /**
+   * Refresh a goal label by fetching the full goal + tasks.
+   * Falls back to a simple text/color if the goal can't be fetched.
+   */
+  private async refreshGoalLabel(goalId: GoalId, fallbackText?: string, fallbackColor?: string): Promise<void> {
+    try {
+      const [goal, tasks] = await Promise.all([
+        this.request<Goal>(request(this.id, this.goalManagerId!, 'getGoal', { goalId })),
+        this.fetchTasksForGoal(goalId),
+      ]);
+      if (goal) {
+        const { text, color } = this.formatGoalLabel(goal, tasks);
+        await this.updateGoalLabel(goalId, text, color);
+        return;
+      }
+    } catch { /* fallback below */ }
+
+    if (fallbackText) {
+      await this.updateGoalLabel(goalId, fallbackText, fallbackColor ?? this.theme.statusNeutral);
+    }
+  }
+
+  /** Fetch tasks for a goal from GoalManager → TupleSpace. */
+  private async fetchTasksForGoal(goalId: GoalId): Promise<TaskInfo[]> {
+    if (!this.goalManagerId) return [];
+    try {
+      const tuples = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
+        request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId })
+      );
+      return tuples.map(t => ({
+        id: t.id,
+        type: (t.fields.type as string) ?? 'unknown',
+        status: (t.fields.status as string) ?? 'unknown',
+        description: (t.fields.description as string) ?? '',
+        attempts: (t.fields.attempts as number) ?? 0,
+        maxAttempts: (t.fields.maxAttempts as number) ?? 3,
+      }));
+    } catch { return []; }
   }
 
   private async appendGoalLabel(goalId: GoalId, text: string, color: string): Promise<void> {
@@ -352,6 +448,30 @@ Sub-goals are indented under their parent goal.
   }
 
   private async handleChanged(fromId: AbjectId, aspect: string, value?: unknown): Promise<void> {
+    // Stop All button click — fail all active goals and cancel tasks
+    if (fromId === this.stopAllBtnId && aspect === 'click') {
+      if (!this.goalObserverId) return;
+
+      const confirmed = await this.confirm({
+        title: 'Stop All Goals',
+        message: 'Stop all active goals and cancel their tasks? This will fail all running goals and remove pending tasks.',
+        confirmLabel: 'Stop All',
+        destructive: true,
+      });
+      if (!confirmed) return;
+
+      try {
+        await this.request(
+          request(this.id, this.goalObserverId, 'failAllGoals', {}),
+          30000,
+        );
+      } catch { /* best effort */ }
+
+      await this.clearGoalLabels();
+      await this.populateExistingGoals();
+      return;
+    }
+
     // Clear button click
     if (fromId === this.clearBtnId && aspect === 'click') {
       const confirmed = await this.confirm({
@@ -388,48 +508,25 @@ Sub-goals are indented under their parent goal.
         }
         case 'goalUpdated': {
           const message = data.message as string;
-          // Fetch the full goal to get context for formatting
-          try {
-            const goal = await this.request<Goal>(
-              request(this.id, this.goalManagerId!, 'getGoal', { goalId })
-            );
-            if (goal) {
-              const { text, color } = this.formatGoalLabel(goal);
-              await this.updateGoalLabel(goalId, text, color);
-            }
-          } catch {
-            // Fallback: just update with message
-            await this.updateGoalLabel(goalId, `\u25B8 ${message}`, this.theme.statusWarning);
-          }
+          await this.refreshGoalLabel(goalId, `\u25B8 ${message}`, this.theme.statusWarning);
           break;
         }
         case 'goalCompleted': {
-          try {
-            const goal = await this.request<Goal>(
-              request(this.id, this.goalManagerId!, 'getGoal', { goalId })
-            );
-            if (goal) {
-              const { text, color } = this.formatGoalLabel(goal);
-              await this.updateGoalLabel(goalId, text, color);
-            }
-          } catch {
-            await this.updateGoalLabel(goalId, `\u2713 completed`, this.theme.statusSuccess);
-          }
+          await this.refreshGoalLabel(goalId, `\u2713 completed`, this.theme.statusSuccess);
           break;
         }
         case 'goalFailed': {
           const error = data.error as string | undefined;
-          try {
-            const goal = await this.request<Goal>(
-              request(this.id, this.goalManagerId!, 'getGoal', { goalId })
-            );
-            if (goal) {
-              const { text, color } = this.formatGoalLabel(goal);
-              await this.updateGoalLabel(goalId, text, color);
-            }
-          } catch {
-            const errorSuffix = error ? ` \u2014 ${error.slice(0, 30)}` : '';
-            await this.updateGoalLabel(goalId, `\u2717 failed${errorSuffix}`, this.theme.statusError);
+          const errorSuffix = error ? ` \u2014 ${error.slice(0, 30)}` : '';
+          await this.refreshGoalLabel(goalId, `\u2717 failed${errorSuffix}`, this.theme.statusError);
+          break;
+        }
+        case 'taskCompleted':
+        case 'taskFailed':
+        case 'taskPermanentlyFailed': {
+          // Task status changed — refresh the parent goal label to show updated task list
+          if (goalId) {
+            await this.refreshGoalLabel(goalId);
           }
           break;
         }

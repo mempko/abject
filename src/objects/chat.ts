@@ -14,7 +14,9 @@ import { formatManifestAsDescription } from '../core/introspect.js';
 import type { AgentAction } from './agent-abject.js';
 import type { DiscoveredWorkspace } from './workspace-share-registry.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
+import { Log } from '../core/timed-log.js';
 
+const log = new Log('Chat');
 const CHAT_INTERFACE: InterfaceId = 'abjects:chat';
 
 const WIN_W = 500;
@@ -77,6 +79,9 @@ export class Chat extends Abject {
 
   /** Current goal ID for the active task. */
   private _currentGoalId?: string;
+
+  /** Pending task completion promises: taskId → resolve/reject. */
+  private pendingTaskCompletions = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
 
   constructor() {
     super({
@@ -240,14 +245,48 @@ export class Chat extends Abject {
         return;
       }
 
-      // GoalManager goal progress events — append progress labels for sub-agent updates.
-      // Skip Chat's own updates (agentName === 'Chat') since agentPhaseChanged already covers those.
-      if (fromId === this.goalManagerId && this._currentGoalId) {
+      // GoalManager events
+      if (fromId === this.goalManagerId) {
         const { value } = msg.payload as { aspect: string; value: unknown };
-        const data = value as { goalId: string; message?: string; phase?: string; agentName?: string };
-        if (data.goalId !== this._currentGoalId) return;
-        if (aspect === 'goalUpdated' && data.message && data.agentName && data.agentName !== 'Chat') {
-          await this.appendProgressLabel(`  ${data.agentName}: ${data.message}`);
+
+        // Task completion/failure — resolve pending waitForTaskCompletion promises
+        if (aspect === 'taskCompleted') {
+          const data = value as { taskId: string; goalId?: string; result?: unknown };
+          const hasPending = this.pendingTaskCompletions.has(data.taskId);
+          log.info(`[Chat] GoalManager taskCompleted ${data.taskId.slice(0, 8)} hasPending=${hasPending}`);
+          const pending = this.pendingTaskCompletions.get(data.taskId);
+          if (pending) {
+            this.pendingTaskCompletions.delete(data.taskId);
+            pending.resolve({ taskId: data.taskId, result: data.result });
+          }
+          return;
+        }
+        if (aspect === 'taskPermanentlyFailed') {
+          const data = value as { taskId: string; goalId?: string; error?: string; attempts?: number };
+          const hasPending = this.pendingTaskCompletions.has(data.taskId);
+          log.info(`[Chat] GoalManager taskPermanentlyFailed ${data.taskId.slice(0, 8)} attempts=${data.attempts ?? '?'} hasPending=${hasPending} error="${(data.error ?? '').slice(0, 60)}"`);
+          const pending = this.pendingTaskCompletions.get(data.taskId);
+          if (pending) {
+            this.pendingTaskCompletions.delete(data.taskId);
+            pending.reject(new Error(data.error ?? 'Task permanently failed'));
+          }
+          return;
+        }
+        // taskRetrying — task will be re-dispatched, don't reject the promise
+        if (aspect === 'taskRetrying') {
+          const data = value as { taskId: string; attempts?: number; maxAttempts?: number; error?: string };
+          log.info(`[Chat] GoalManager taskRetrying ${data.taskId.slice(0, 8)} attempts=${data.attempts ?? '?'}/${data.maxAttempts ?? '?'} — NOT rejecting promise`);
+          return;
+        }
+
+        // Goal progress events — append progress labels for sub-agent updates.
+        // Skip Chat's own updates (agentName === 'Chat') since agentPhaseChanged already covers those.
+        if (this._currentGoalId) {
+          const data = value as { goalId: string; message?: string; phase?: string; agentName?: string };
+          if (data.goalId !== this._currentGoalId) return;
+          if (aspect === 'goalUpdated' && data.message && data.agentName && data.agentName !== 'Chat') {
+            await this.appendProgressLabel(`  ${data.agentName}: ${data.message}`);
+          }
         }
       }
     });
@@ -391,6 +430,33 @@ export class Chat extends Abject {
     });
   }
 
+  /**
+   * Wait for a TupleSpace task to complete or fail via GoalManager events.
+   * Resolves with { taskId, result } or rejects with error.
+   */
+  private waitForTaskCompletion(taskId: string, timeoutMs: number): Promise<{ taskId: string; result?: unknown }> {
+    log.info(`[Chat] waitForTaskCompletion ${taskId.slice(0, 8)} timeout=${timeoutMs}ms pendingCount=${this.pendingTaskCompletions.size}`);
+    return new Promise<{ taskId: string; result?: unknown }>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingTaskCompletions.delete(taskId);
+        log.info(`[Chat] waitForTaskCompletion ${taskId.slice(0, 8)} — TIMED OUT after ${timeoutMs}ms`);
+        reject(new Error(`Task ${taskId} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.pendingTaskCompletions.set(taskId, {
+        resolve: (v) => {
+          clearTimeout(timer);
+          log.info(`[Chat] waitForTaskCompletion ${taskId.slice(0, 8)} — RESOLVED`);
+          resolve(v as { taskId: string; result?: unknown });
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          log.info(`[Chat] waitForTaskCompletion ${taskId.slice(0, 8)} — REJECTED: ${e.message?.slice(0, 80)}`);
+          reject(e);
+        },
+      });
+    });
+  }
+
   // ═══════════════════════════════════════════════════════════════════
   // Agent act handler
   // ═══════════════════════════════════════════════════════════════════
@@ -443,6 +509,25 @@ export class Chat extends Abject {
           return { success: true, data: `${method} sent` };
         }
 
+        // Route runTask calls to WebAgent-like objects through TupleSpace
+        if (method === 'runTask' && this.goalManagerId && this._currentGoalId) {
+          try {
+            const taskPayload = action.payload as { task?: string; options?: Record<string, unknown> } | undefined;
+            const { taskId } = await this.request<{ taskId: string }>(
+              request(this.id, this.goalManagerId, 'addTask', {
+                goalId: this._currentGoalId,
+                type: 'browse',
+                description: taskPayload?.task ?? 'Web task',
+                data: taskPayload?.options,
+              })
+            );
+            const completion = await this.waitForTaskCompletion(taskId, 310000);
+            return { success: true, data: completion.result };
+          } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+          }
+        }
+
         const timeout = method === 'runTask' || method === 'create' ? 310000 : 120000;
         try {
           const result = await this.request(
@@ -456,6 +541,35 @@ export class Chat extends Abject {
       }
 
       case 'create': {
+        // Route through TupleSpace — agents claim autonomously
+        if (this.goalManagerId && this._currentGoalId) {
+          try {
+            log.info(`[Chat] create action — adding task to TupleSpace, goalId=${this._currentGoalId.slice(0, 8)}`);
+            const { taskId } = await this.request<{ taskId: string }>(
+              request(this.id, this.goalManagerId, 'addTask', {
+                goalId: this._currentGoalId,
+                type: 'create',
+                description: action.description as string,
+              })
+            );
+            log.info(`[Chat] create task added: ${taskId.slice(0, 8)}, waiting for completion...`);
+            const completion = await this.waitForTaskCompletion(taskId, 310000);
+            const result = completion.result as { success?: boolean; error?: string; objectId?: AbjectId } | undefined;
+            if (result && result.success === false) {
+              return { success: false, error: result.error ?? 'Create failed' };
+            }
+            // Auto-show created object
+            const objectId = result?.objectId;
+            if (objectId) {
+              this.send(event(this.id, objectId, 'show', {}));
+            }
+            return { success: true, data: result };
+          } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+          }
+        }
+
+        // Fallback: direct call if GoalManager unavailable
         const creatorId = await this.discoverDep('ObjectCreator');
         if (!creatorId) return { success: false, error: 'ObjectCreator not found' };
         try {
@@ -466,12 +580,10 @@ export class Chat extends Abject {
             }),
             310000,
           );
-          // Unwrap: if ObjectCreator reports inner failure, surface it
           const payload = result as { success?: boolean; error?: string; objectId?: AbjectId };
           if (payload && payload.success === false) {
             return { success: false, error: payload.error ?? 'Create failed' };
           }
-          // Auto-show created object
           const objectId = payload?.objectId;
           if (objectId) {
             this.send(event(this.id, objectId, 'show', {}));
@@ -483,10 +595,34 @@ export class Chat extends Abject {
       }
 
       case 'modify': {
-        const creatorId = await this.discoverDep('ObjectCreator');
-        if (!creatorId) return { success: false, error: 'ObjectCreator not found' };
         const objectId = await this.resolveObject(action.object as string);
         if (!objectId) return { success: false, error: `Object "${action.object}" not found` };
+
+        // Route through TupleSpace — agents claim autonomously
+        if (this.goalManagerId && this._currentGoalId) {
+          try {
+            const { taskId } = await this.request<{ taskId: string }>(
+              request(this.id, this.goalManagerId, 'addTask', {
+                goalId: this._currentGoalId,
+                type: 'modify',
+                description: action.description as string,
+                data: { objectId },
+              })
+            );
+            const completion = await this.waitForTaskCompletion(taskId, 310000);
+            const result = completion.result as { success?: boolean; error?: string } | undefined;
+            if (result && result.success === false) {
+              return { success: false, error: result.error ?? 'Modify failed' };
+            }
+            return { success: true, data: result };
+          } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+          }
+        }
+
+        // Fallback: direct call if GoalManager unavailable
+        const creatorId = await this.discoverDep('ObjectCreator');
+        if (!creatorId) return { success: false, error: 'ObjectCreator not found' };
         try {
           const result = await this.request(
             request(this.id, creatorId, 'modify', {
@@ -496,7 +632,6 @@ export class Chat extends Abject {
             }),
             310000,
           );
-          // Unwrap: if ObjectCreator reports inner failure, surface it
           const modPayload = result as { success?: boolean; error?: string };
           if (modPayload && modPayload.success === false) {
             return { success: false, error: modPayload.error ?? 'Modify failed' };
@@ -610,16 +745,8 @@ export class Chat extends Abject {
           }
         }
 
-        // Dispatch tasks to appropriate agents
-        for (let i = 0; i < subtasks.length; i++) {
-          const agentId = await this.routeTaskType(subtasks[i].type);
-          if (agentId) {
-            this.send(event(this.id, agentId, 'claimAndProcess', {
-              goalId: this._currentGoalId,
-              type: subtasks[i].type,
-            }));
-          }
-        }
+        // Tasks are now in TupleSpace — agents watching will claim them autonomously.
+        // No explicit dispatch needed.
 
         return { success: true, data: { taskIds, count: taskIds.length } };
       }
@@ -657,25 +784,6 @@ export class Chat extends Abject {
   // ═══════════════════════════════════════════════════════════════════
   // System prompt
   // ═══════════════════════════════════════════════════════════════════
-
-  /**
-   * Map a task type to the appropriate agent AbjectId.
-   */
-  private async routeTaskType(type: string): Promise<AbjectId | null> {
-    switch (type) {
-      case 'create':
-      case 'modify': {
-        return this.discoverDep('ObjectCreator');
-      }
-      case 'browse':
-      case 'research':
-      case 'web': {
-        return this.discoverDep('WebAgent');
-      }
-      default:
-        return null;
-    }
-  }
 
   private buildSystemPrompt(): string {
     return `You are Chat Agent, a helpful assistant inside the Abjects system. You help users by interacting with objects via structured actions.
@@ -723,9 +831,9 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 - **call**: Send a message to an object (message passing).
   \`{ "action": "call", "object": "ObjectName", "method": "methodName", "payload": { ... } }\`
   For "object" you can use a name (e.g. "Timer") or an AbjectId (e.g. "abjects:timer").
-- **create**: Create a new object via ObjectCreator. The created object is auto-shown — no need to call show separately.
+- **create**: Create a new object. Creates a task in the TupleSpace that an agent (ObjectCreator) claims autonomously. The created object is auto-shown.
   \`{ "action": "create", "description": "A counter widget that shows a number and has +/- buttons" }\`
-- **modify**: Modify an existing object via ObjectCreator.
+- **modify**: Modify an existing object. Creates a task in the TupleSpace that an agent claims autonomously.
   \`{ "action": "modify", "object": "<name or id>", "description": "Add a reset button that clears the counter" }\`
   Use the \`[id: ...]\` from the object list for reliable targeting.
 - **clone**: Clone a clonable object from a remote peer's workspace into your local workspace.
@@ -733,7 +841,7 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   Use the qualified name shown next to "(clonable)" objects in Connected Peers.
 
 ### Task Decomposition
-- **decompose**: Break a complex request into parallel sub-tasks. Each sub-task is added to the TupleSpace and dispatched to the appropriate agent (ObjectCreator for "create", WebAgent for "browse"/"research").
+- **decompose**: Break a complex request into parallel sub-tasks. Each sub-task is added to the TupleSpace and agents autonomously claim matching tasks (ObjectCreator watches for "create"/"modify", WebAgent watches for "browse"/"research"/"web").
   \`{ "action": "decompose", "reasoning": "why splitting", "subtasks": [
     { "type": "create", "description": "Build a counter widget" },
     { "type": "create", "description": "Build a todo list widget" },

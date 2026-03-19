@@ -92,6 +92,8 @@ export class ObjectBrowser extends Abject {
   private leftSplitId?: AbjectId;
   private rightSplitId?: AbjectId;
   private pane1VBoxId?: AbjectId;
+  private pane1TabBarId?: AbjectId;
+  private activePaneTab = 0;
   private scopeListId?: AbjectId;
   private localWsListId?: AbjectId;
   private remoteWsListId?: AbjectId;
@@ -309,10 +311,13 @@ export class ObjectBrowser extends Abject {
       this.activeTabIndex = 0;
     }
 
-    await this.discoverRegistrySources();
-    await this.refreshCaches();
     await this.buildUI();
     this.startAutoRefresh();
+    // Populate local data immediately, then fetch remote in the background
+    await this.discoverRegistrySources();
+    await this.refreshCaches('local');
+    await this.rebuildAllPanes();
+    this.refreshCaches('remote').then(() => this.rebuildPane1()).catch(() => {});
   }
 
   async hide(): Promise<void> {
@@ -358,6 +363,8 @@ export class ObjectBrowser extends Abject {
     this.leftSplitId = undefined;
     this.rightSplitId = undefined;
     this.pane1VBoxId = undefined;
+    this.pane1TabBarId = undefined;
+    this.activePaneTab = 0;
     this.scopeListId = undefined;
     this.localWsListId = undefined;
     this.remoteWsListId = undefined;
@@ -504,8 +511,13 @@ export class ObjectBrowser extends Abject {
 
   // ── Data loading ──────────────────────────────────────────────────
 
-  private async refreshCaches(): Promise<void> {
-    const entries = [...this.registrySources.entries()];
+  private async refreshCaches(filter?: 'local' | 'remote'): Promise<void> {
+    const entries = [...this.registrySources.entries()]
+      .filter(([, source]) => {
+        if (filter === 'local') return !source.isRemote;
+        if (filter === 'remote') return source.isRemote;
+        return true;
+      });
     const results = await Promise.allSettled(
       entries.map(async ([key, source]) => {
         // Use a shorter timeout for remote registries to avoid UI hangs
@@ -531,7 +543,9 @@ export class ObjectBrowser extends Abject {
     if (scope === 'all') {
       const combined: ObjectRegistration[] = [];
       const seen = new Set<string>();
-      for (const [, regs] of this.registryObjects) {
+      for (const [key, source] of this.registrySources) {
+        if (source.isRemote) continue;
+        const regs = this.registryObjects.get(key) ?? [];
         for (const reg of regs) {
           if (!seen.has(reg.id)) {
             seen.add(reg.id);
@@ -716,28 +730,29 @@ export class ObjectBrowser extends Abject {
     }) as AbjectId;
     await this.addToLayout(paneHBox, this.pane1VBoxId, { horizontal: 'expanding' }, { width: 180 });
 
-    // Batch create pane1 widgets: scopeList, localLabel, localWsList, remoteLabel, remoteWsList
-    const { widgetIds: [scopeListId, localLabelId, localWsListId, remoteLabelId, remoteWsListId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    // Batch create pane1 widgets: pane1TabBar, scopeList, localWsList, remoteWsList
+    const { widgetIds: [pane1TabBarId, scopeListId, localWsListId, remoteWsListId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'tabBar', windowId: this.windowId, tabs: ['Scope', 'Mine', 'Remote'], selectedIndex: this.activePaneTab, closable: false },
         { type: 'list', windowId: this.windowId, items: [] },
-        { type: 'label', windowId: this.windowId, text: 'Local', style: { color: this.theme.sectionLabel, fontSize: 11, fontWeight: 'bold' } },
         { type: 'list', windowId: this.windowId, items: [], searchable: true },
-        { type: 'label', windowId: this.windowId, text: 'Discovered', style: { color: this.theme.sectionLabel, fontSize: 11, fontWeight: 'bold' } },
         { type: 'list', windowId: this.windowId, items: [] },
       ]})
     );
+    this.pane1TabBarId = pane1TabBarId;
     this.scopeListId = scopeListId;
     this.localWsListId = localWsListId;
     this.remoteWsListId = remoteWsListId;
 
+    await this.addDep(this.pane1TabBarId);
+    await this.addToLayout(this.pane1VBoxId, this.pane1TabBarId, { vertical: 'fixed' }, { height: 32 });
     await this.addDep(this.scopeListId);
-    await this.addToLayout(this.pane1VBoxId, this.scopeListId, { vertical: 'fixed' }, { height: 60 });
-    await this.addToLayout(this.pane1VBoxId, localLabelId, { vertical: 'fixed' }, { height: 20 });
+    await this.addToLayout(this.pane1VBoxId, this.scopeListId, { vertical: 'expanding' });
     await this.addDep(this.localWsListId);
     await this.addToLayout(this.pane1VBoxId, this.localWsListId, { vertical: 'expanding' });
-    await this.addToLayout(this.pane1VBoxId, remoteLabelId, { vertical: 'fixed' }, { height: 20 });
     await this.addDep(this.remoteWsListId);
     await this.addToLayout(this.pane1VBoxId, this.remoteWsListId, { vertical: 'expanding' });
+    await this.switchPane1TabVisibility();
 
     // Pane 2 + Pane 3: Object Kinds list + Methods/Events list (batch)
     const { widgetIds: [pane2ListId, pane3ListId] } = await this.request<{ widgetIds: AbjectId[] }>(
@@ -783,8 +798,8 @@ export class ObjectBrowser extends Abject {
 
     // Scope list (All, System)
     const scopeItems = [
-      { label: scope === 'all' ? '\u25CF All' : '\u25CB All', value: 'scope:all' },
-      { label: scope === 'system' ? '\u25CF System' : '\u25CB System', value: 'scope:system' },
+      { label: 'All', value: 'scope:all' },
+      { label: 'System', value: 'scope:system' },
     ];
     const scopeSelected = scope === 'all' ? 0 : scope === 'system' ? 1 : -1;
     await this.request(request(this.id, this.scopeListId, 'update', {
@@ -795,7 +810,7 @@ export class ObjectBrowser extends Abject {
     const localSources = [...this.registrySources.entries()]
       .filter(([, s]) => s.kind === 'local-workspace');
     const localItems = localSources.map(([key, source]) => ({
-      label: scope === key ? `\u25CF ${source.label}` : `\u25CB ${source.label}`,
+      label: source.label,
       value: `scope:${key}`,
     }));
     const localSelected = localSources.findIndex(([key]) => scope === key);
@@ -807,13 +822,26 @@ export class ObjectBrowser extends Abject {
     const remoteSources = [...this.registrySources.entries()]
       .filter(([, s]) => s.kind === 'remote-workspace');
     const remoteItems = remoteSources.map(([key, source]) => ({
-      label: scope === key ? `\u25CF ${source.label}` : `\u25CB ${source.label}`,
+      label: source.label,
       value: `scope:${key}`,
     }));
     const remoteSelected = remoteSources.findIndex(([key]) => scope === key);
     await this.request(request(this.id, this.remoteWsListId, 'update', {
       items: remoteItems, selectedIndex: remoteSelected,
     }));
+  }
+
+  private async switchPane1TabVisibility(): Promise<void> {
+    const ids = [this.scopeListId, this.localWsListId, this.remoteWsListId];
+    for (let i = 0; i < ids.length; i++) {
+      if (ids[i]) {
+        try {
+          await this.request(request(this.id, ids[i]!, 'update', {
+            style: { visible: i === this.activePaneTab },
+          }));
+        } catch { /* widget gone */ }
+      }
+    }
   }
 
   private async rebuildPane2(): Promise<void> {
@@ -1760,6 +1788,16 @@ export class ObjectBrowser extends Abject {
         await this.request(request(this.id, this.tabBarId!, 'update', {
           tabs: tabNames,
         }));
+      }
+      return;
+    }
+
+    // Pane 1 tab bar (Scope / Local / Discovered)
+    if (fromId === this.pane1TabBarId && aspect === 'change') {
+      const idx = typeof value === 'number' ? value : parseInt(String(value), 10);
+      if (idx >= 0 && idx <= 2) {
+        this.activePaneTab = idx;
+        await this.switchPane1TabVisibility();
       }
       return;
     }
