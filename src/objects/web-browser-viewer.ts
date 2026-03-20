@@ -256,12 +256,11 @@ export class WebBrowserViewer extends Abject {
   private async startRefreshTimer(): Promise<void> {
     if (!this.timerId) return;
     try {
-      const result = await this.request<{ timerId: string }>(
+      this.refreshTimerId = await this.request<string>(
         request(this.id, this.timerId, 'setInterval', {
           intervalMs: REFRESH_INTERVAL_MS,
         })
       );
-      this.refreshTimerId = result.timerId;
     } catch { /* Timer may not be available */ }
   }
 
@@ -269,7 +268,7 @@ export class WebBrowserViewer extends Abject {
     if (!this.timerId || !this.refreshTimerId) return;
     try {
       await this.request(
-        request(this.id, this.timerId, 'clearInterval', {
+        request(this.id, this.timerId, 'clearTimer', {
           timerId: this.refreshTimerId,
         })
       );
