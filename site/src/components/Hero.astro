@@ -9,15 +9,15 @@
       The Things That <span class="accent">Think</span>
     </h1>
     <p class="hero-desc">
-      The world's first self-aware object runtime.
-      Ask any object what it does. It answers in its own words.
+      The world's first self-aware abject runtime.
+      Ask any abject what it does. It answers in its own words.
     </p>
     <p class="hero-tagline">
       abject <span class="dim">(n.)</span> - AI Object. Also: cosmic dread. Both apply.
     </p>
     <div class="hero-actions">
       <a href="#summon" class="btn btn-primary">Begin the Ritual</a>
-      <a href="#architecture" class="btn btn-outline">Witness the Architecture</a>
+      <a href="#ask-protocol" class="btn btn-outline">Witness the Ask Protocol</a>
     </div>
     <div class="hero-tags">
       <span>TypeScript</span>
@@ -25,6 +25,11 @@
       <span>WebRTC</span>
       <span>P2P</span>
       <span>Canvas</span>
+    </div>
+    <div class="hero-demo">
+      <video autoplay loop muted playsinline>
+        <source src="/abject_demo_720p.webm" type="video/webm" />
+      </video>
     </div>
   </div>
 </section>
@@ -118,6 +123,20 @@
     border: 1px solid var(--border);
     padding: 0.3rem 0.75rem;
     border-radius: 20px;
+  }
+
+  .hero-demo {
+    margin-top: 3rem;
+    max-width: 900px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+
+  .hero-demo video {
+    width: 100%;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    box-shadow: 0 0 40px rgba(57, 255, 142, 0.08);
   }
 
   @media (max-width: 600px) {
