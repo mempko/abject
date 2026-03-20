@@ -201,6 +201,7 @@ export class Compositor {
   private activeWorkspaceId?: string;
   private imageCache: Map<string, { img: HTMLImageElement; loaded: boolean }> = new Map();
   private static IMAGE_CACHE_MAX = 100;
+  private liveDataImages: Map<string, { img: HTMLImageElement; width: number; height: number }> = new Map();
 
   constructor(canvas: HTMLCanvasElement) {
     require(canvas !== null, 'canvas is required');
@@ -280,6 +281,7 @@ export class Compositor {
   destroySurface(surfaceId: string): boolean {
     const deleted = this.surfaces.delete(surfaceId);
     if (deleted) {
+      this.liveDataImages.delete(surfaceId);
       this.sortSurfaces();
       this.needsRender = true;
     }
@@ -292,6 +294,7 @@ export class Compositor {
   clearAllSurfaces(): void {
     this.surfaces.clear();
     this.sortedSurfaces = [];
+    this.liveDataImages.clear();
     this.needsRender = true;
   }
 
@@ -512,57 +515,88 @@ export class Compositor {
 
       case 'imageUrl': {
         const p = command.params as ImageUrlParams;
-        const cached = this.imageCache.get(p.url);
-        if (cached && cached.loaded) {
-          if (p.width && p.height) {
-            ctx.drawImage(cached.img, p.x, p.y, p.width, p.height);
-          } else {
-            ctx.drawImage(cached.img, p.x, p.y);
+        const sid = command.surfaceId;
+
+        if (p.url.startsWith('data:')) {
+          // Data URI path: show previous screenshot synchronously while loading new one.
+          // This prevents the blank flash between surface clear and async decode.
+          const live = this.liveDataImages.get(sid);
+          if (live) {
+            if (p.width && p.height) {
+              ctx.drawImage(live.img, p.x, p.y, p.width, p.height);
+            } else {
+              ctx.drawImage(live.img, p.x, p.y);
+            }
           }
-        } else if (!cached) {
-          // Evict oldest entries if cache is full
-          if (this.imageCache.size >= Compositor.IMAGE_CACHE_MAX) {
-            const firstKey = this.imageCache.keys().next().value!;
-            this.imageCache.delete(firstKey);
-          }
-          const entry = { img: new Image(), loaded: false };
-          this.imageCache.set(p.url, entry);
-          const sid = command.surfaceId;
-          // Capture the current transform so the async onload callback
-          // can draw at the correct translated position.  Without this,
-          // the image would be drawn at raw (p.x, p.y) relative to
-          // the surface origin, ignoring the canvas widget's translate.
+
+          // Async load of the new data URI
+          const img = new Image();
           const savedTransform = ctx.getTransform();
-          const drawToSurface = (image: HTMLImageElement) => {
-            entry.img = image;
-            entry.loaded = true;
+          img.onload = () => {
+            this.liveDataImages.set(sid, { img, width: img.naturalWidth, height: img.naturalHeight });
             const surf = this.surfaces.get(sid);
             if (surf) {
               surf.ctx.save();
               surf.ctx.setTransform(savedTransform);
               if (p.width && p.height) {
-                surf.ctx.drawImage(image, p.x, p.y, p.width, p.height);
+                surf.ctx.drawImage(img, p.x, p.y, p.width, p.height);
               } else {
-                surf.ctx.drawImage(image, p.x, p.y);
+                surf.ctx.drawImage(img, p.x, p.y);
               }
               surf.ctx.restore();
               surf.dirty = true;
             }
             this.needsRender = true;
           };
-          // Try with CORS first (preserves canvas readability for hit testing).
-          // Fall back without CORS so cross-origin images still display.
-          entry.img.crossOrigin = 'anonymous';
-          entry.img.onload = () => drawToSurface(entry.img);
-          entry.img.onerror = () => {
-            const fallback = new Image();
-            fallback.onload = () => drawToSurface(fallback);
-            fallback.onerror = () => this.imageCache.delete(p.url);
-            fallback.src = p.url;
-          };
-          entry.img.src = p.url;
+          // On error, keep showing the old image (don't update liveDataImages)
+          img.src = p.url;
+        } else {
+          // Regular URL path: use imageCache with CORS fallback
+          const cached = this.imageCache.get(p.url);
+          if (cached && cached.loaded) {
+            if (p.width && p.height) {
+              ctx.drawImage(cached.img, p.x, p.y, p.width, p.height);
+            } else {
+              ctx.drawImage(cached.img, p.x, p.y);
+            }
+          } else if (!cached) {
+            // Evict oldest entries if cache is full
+            if (this.imageCache.size >= Compositor.IMAGE_CACHE_MAX) {
+              const firstKey = this.imageCache.keys().next().value!;
+              this.imageCache.delete(firstKey);
+            }
+            const entry = { img: new Image(), loaded: false };
+            this.imageCache.set(p.url, entry);
+            const savedTransform = ctx.getTransform();
+            const drawToSurface = (image: HTMLImageElement) => {
+              entry.img = image;
+              entry.loaded = true;
+              const surf = this.surfaces.get(sid);
+              if (surf) {
+                surf.ctx.save();
+                surf.ctx.setTransform(savedTransform);
+                if (p.width && p.height) {
+                  surf.ctx.drawImage(image, p.x, p.y, p.width, p.height);
+                } else {
+                  surf.ctx.drawImage(image, p.x, p.y);
+                }
+                surf.ctx.restore();
+                surf.dirty = true;
+              }
+              this.needsRender = true;
+            };
+            entry.img.crossOrigin = 'anonymous';
+            entry.img.onload = () => drawToSurface(entry.img);
+            entry.img.onerror = () => {
+              const fallback = new Image();
+              fallback.onload = () => drawToSurface(fallback);
+              fallback.onerror = () => this.imageCache.delete(p.url);
+              fallback.src = p.url;
+            };
+            entry.img.src = p.url;
+          }
+          // If cached but not yet loaded, skip — will render on next frame when load completes
         }
-        // If cached but not yet loaded, skip — will render on next frame when load completes
         break;
       }
 

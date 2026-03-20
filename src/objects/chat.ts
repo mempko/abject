@@ -847,7 +847,7 @@ This system runs on the user's own computer. All capability objects are user-con
 - \`{ "action": "call", "object": "WebAgent", "method": "runTask", "payload": { "task": "...", "options": { "startUrl": "https://...", "responseSchema": { "type": "object", "properties": { ... } } } } }\`
 - The message method is **runTask** (not "run" or "navigate"). Options: startUrl, maxSteps, timeout, responseSchema, pageId, keepPageOpen.
 - Use \`responseSchema\` in options when you need structured data back (e.g., extracted page content as JSON). Without it, results are free text.
-- For multi-step flows (login → 2FA → action): use \`keepPageOpen: true\` in options to keep the browser page alive, then pass the returned \`pageId\` in subsequent runTask calls. Omit \`keepPageOpen\` on the final step to auto-close.
+- Pages stay open by default after task completion (5-minute idle timeout). Pass the returned \`pageId\` in subsequent runTask calls to reuse the same browser page. Set \`keepPageOpen: false\` to explicitly close the page when done.
 - **Always prefer WebAgent for any multi-step web task** (logging in, browsing, extracting data). Do NOT message WebBrowser directly — WebAgent manages WebBrowser internally.
 
 When the user asks to interact with a website, **always message WebAgent** via \`{ "action": "call", "object": "WebAgent", "method": "runTask", ... }\`. Describe the full task in the payload's "task" field — WebAgent will handle all navigation, form filling, clicking, and data extraction.

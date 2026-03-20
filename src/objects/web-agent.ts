@@ -256,27 +256,29 @@ Without it, the result is free text. validationErrors is undefined on success.
   const tasks = await call(await dep('WebAgent'), 'listTasks', {});
   // tasks: [{ id, phase, task, step }]
 
-### Multi-Step Workflow (keepPageOpen)
+### Multi-Step Workflow (page reuse)
 
-Use keepPageOpen to maintain browser session across multiple runTask calls (e.g., login → 2FA → fetch data):
+Pages are kept open by default after task completion (with a 5-minute idle timeout).
+Pass the returned pageId to subsequent runTask calls to reuse the same page.
+Set keepPageOpen: false to explicitly close the page when done.
 
-  // Step 1: Login — keep page open
+  // Step 1: Login — page stays open by default
   const result = await call(await dep('WebAgent'), 'runTask', {
     task: 'Go to site and log in with user/pass',
-    options: { startUrl: 'https://example.com/login', keepPageOpen: true },
+    options: { startUrl: 'https://example.com/login' },
   });
   // result.pageId is available for reuse
 
   // Step 2: 2FA — reuse same page
   const result2 = await call(await dep('WebAgent'), 'runTask', {
     task: 'Enter 2FA code 123456 and submit',
-    options: { pageId: result.pageId, keepPageOpen: true },
+    options: { pageId: result.pageId },
   });
 
-  // Step 3: Final action — page closes automatically (no keepPageOpen)
+  // Step 3: Final action — explicitly close the page
   const result3 = await call(await dep('WebAgent'), 'runTask', {
     task: 'Extract dashboard data',
-    options: { pageId: result2.pageId },
+    options: { pageId: result2.pageId, keepPageOpen: false },
   });
 
 ### List Kept-Open Pages
@@ -291,7 +293,8 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
 ### IMPORTANT
 - The method is **runTask** (not "run" or "navigate").
 - Options: startUrl, maxSteps, timeout, pageOptions, responseSchema, pageId, keepPageOpen.
-- WebAgent opens and closes browser pages automatically — do NOT call WebBrowser directly.
+- Pages stay open by default after task completion (5-minute idle timeout). Pass keepPageOpen: false to close immediately.
+- WebAgent manages browser pages — do NOT call WebBrowser directly.
 - **runTask is long-running** — always pass \`{ timeout: 300000 }\` as the 4th argument to \`call()\` (the default 30s timeout is too short).
 - Kept-open pages auto-close after 5 minutes of inactivity.
 - Internally, WebAgent uses a ticket pattern with AgentAbject — startTask returns a ticketId and results arrive via taskResult events.
@@ -343,7 +346,7 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
         pageId: options?.pageId,
         pageOptions: options?.pageOptions,
         responseSchema: options?.responseSchema,
-        keepPageOpen: options?.keepPageOpen,
+        keepPageOpen: options?.keepPageOpen ?? true,
       };
       this.taskExtras.set(taskId, extra);
 
@@ -457,19 +460,17 @@ Use keepPageOpen to maintain browser session across multiple runTask calls (e.g.
         );
         const ticketResult = await this.waitForTaskResult(ticketId, 310000);
 
-        // Close page
-        try {
-          await this.request(request(this.id, this.webBrowserId!, 'closePage', { pageId: extra.pageId }));
-        } catch { /* best effort */ }
+        // Keep page open with idle timeout (same as runTask default)
+        if (extra.pageId) {
+          this.trackKeptOpenPage(extra.pageId);
+        }
 
         return { success: ticketResult.success, result: ticketResult.result, error: ticketResult.error };
       } catch (err) {
-        // Close page on failure too
-        try {
-          if (extra.pageId) {
-            await this.request(request(this.id, this.webBrowserId!, 'closePage', { pageId: extra.pageId }));
-          }
-        } catch { /* best effort */ }
+        // On failure, keep page open for inspection if we opened it
+        if (extra.pageId) {
+          this.trackKeptOpenPage(extra.pageId);
+        }
         throw err; // Re-throw so AgentAbject's dispatchToAgent records the failure
       }
     });
