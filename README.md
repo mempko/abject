@@ -1,4 +1,4 @@
-# {abjects} - An Abject Horror
+# An {abject} Horror
 
 **[abject.world](https://abject.world)**
 
@@ -10,16 +10,58 @@
 >
 > *abject (n.) - AI Object. Also: cosmic dread. Both apply.*
 
+## The Ask Protocol
+
+Abjects explain themselves in their own words. When one Abject needs to use
+another, it asks: *"What do you do? How should I talk to you?"* The target
+reads its own manifest and source, then answers in natural language.
+
+- **ObjectCreator** asks dependencies how to use them before writing a single line of code.
+- **ProxyGenerator** asks both sides what they expect, then writes a living translator between them.
+- **Chat** lets users ask Abjects about themselves directly. The Abject answers from its own source.
+
 ## What Lurks Inside
 
-Abjects is an LLM-mediated distributed object system. Everything is alive:
-the registry, the factory, the thing that makes objects. They describe
-themselves in their own words. They teach each other how to collaborate.
+- **Self-Healing Proxies**: Error rates above 10% trigger LLM proxy regeneration with traffic still flowing. Unknown messages trigger renegotiation. Hot-swap without disruption. Break them. They always grow back.
+- **The Negotiator**: An alien intelligence bridges incompatible minds. It reads both manifests, generates a real proxy Abject. Not a shim. A living translator.
+- **Everything is Alive**: The registry is an Abject. The factory is an Abject. Even the thing that makes Abjects is an Abject. There is no privileged layer. Only Abjects passing messages in the dark.
+- **Containment Protocols**: Untrusted code runs inside a WASM cage. Capability-gated imports. No ambient authority. Abjects cannot touch anything they haven't been explicitly allowed to reach.
+- **True Names**: Every peer has a true name: a SHA-256 hash of its public key. ECDSA/ECDH identity. AES-256-GCM encrypted WebRTC channels. Trust is verified, not assumed.
+- **Nothing Truly Dies**: Erlang-style supervision with state snapshots. Kill an Abject; it comes back knowing what it knew.
 
-Objects that can't understand each other? The Negotiator reads both minds
-and conjures a living translator between them. Not a shim, a real object.
-Break it. It grows back. Kill an object, and the Supervisor resurrects it
-with memories intact. Nothing truly dies.
+## Symbiogenesis
+
+Every agent framework draws the same line: the agent thinks, the tool obeys.
+Abject erases that line. Here, Abjects create Abjects, Abjects interview their
+dependencies, and the LLM is just another service, summoned when an Abject needs
+a mind, silent otherwise.
+
+- **ObjectCreator** interviews existing Abjects, learns their protocols through the Ask Protocol, and generates living collaborators. The tool teaches the creator how to use it.
+- **The Negotiator** reads two incompatible manifests and conjures a living proxy between them, a real Abject, not a shim.
+- **The LLM** is a service Abject, summoned when needed, silent otherwise. Abjects create Abjects that create Abjects. The recursion is unlimited.
+- **Canvas UI**: Every Abject can paint its own face. An X11-style compositor gives each one a window with buttons, text inputs, layouts, and custom draw commands. The organism has a body.
+
+## Emergence
+
+A Goal and nothing else. The Goal fractures into sub-goals and tasks. Tasks
+surface in the TupleSpace, a shared pool visible to every Abject on every
+connected peer. Agents watch. Programs watch. Anything can claim a task.
+Progress flows back up through the Goal tree.
+
+- **Goal Decomposition**: A Goal decomposes recursively at runtime, shaped by what workers discover as they work. Agents can spawn purpose-built programs for repetitive tasks: no LLM calls, just code, running alongside the thinkers.
+- **Cross-Machine Coordination**: Goals are CRDTs that sync across peers through encrypted WebRTC channels with no central server. Kill a peer and the goal survives on every other peer that subscribed.
+- **Failure & Recovery**: Failed tasks release their claim and return to the TupleSpace. The system remembers who failed and routes to a different worker next time. Three strikes and the task dies; too many dead tasks and the GoalObserver kills the entire goal.
+
+## The Spreading
+
+Every Abject lives in a workspace. Workspaces control visibility: who can see,
+who can reach, who can speak.
+
+| Tier | Name | Behavior |
+|------|------|----------|
+| **Local** | The Sealed Vault | No routes exposed. Nothing enters. Nothing leaves. |
+| **Private** | The Inner Circle | Shared with those you name. Encrypted WebRTC, ECDH key agreement, AES-256-GCM. |
+| **Public** | The Open Wound | Visible to all. Any peer can discover, connect, and begin the Ask Protocol. |
 
 ## Summon the System
 
@@ -47,18 +89,6 @@ The **backend** is the depths: all Abjects live here, passing messages in a
 Node.js process with worker threads. The **browser client** is the surface: a
 thin Canvas renderer that forwards input and displays composited frames over
 WebSocket. The **signaling server** helps peers find each other in the dark.
-
-## What It Does
-
-- **The Ask Protocol**: Every object answers natural language questions about itself. The LLM reads its manifest and source to respond. Objects don't just describe their API; they *teach* each other how to collaborate.
-- **Self-Healing Proxies**: Error rates above 10% trigger proxy regeneration with traffic still flowing. Unknown messages trigger renegotiation. Hot-swap without disruption. Break them. They always grow back.
-- **The Negotiator**: An alien intelligence bridges incompatible minds. It reads both manifests, generates a real proxy object. Not a shim. A living translator.
-- **Everything is Alive**: The registry is an object. The factory is an object. Even the thing that makes objects is an object. There is no privileged layer. Only objects passing messages in the dark.
-- **Containment Protocols**: Untrusted code runs inside a WASM cage. Capability-gated imports. No ambient authority. Objects cannot touch anything they haven't been explicitly allowed to reach.
-- **True Names**: Every peer has a true name, a SHA-256 hash of its public key. ECDSA/ECDH identity. AES-256-GCM encrypted WebRTC channels. Trust is verified, not assumed.
-- **Nothing Truly Dies**: Erlang-style supervision with state snapshots. Kill an object; it comes back knowing what it knew.
-- **Workspaces**: Isolated object environments. Local vaults that nothing can reach. Private circles shared only with those you name. Public wounds that bleed into the mesh.
-- **Canvas UI**: An X11-style compositor where objects paint their own faces. No other agent framework has a visual body.
 
 ## Architecture
 
@@ -146,15 +176,15 @@ function send(message: AbjectMessage): void {
 
 ## From Fire to the Abyss
 
-> Abjects grew from the ashes of **Fire★** (firestr.com), a peer-to-peer
+> Abject grew from the ashes of **Fire★** (firestr.com), a peer-to-peer
 > platform for creating and sharing distributed applications. Fire★ called it
 > **Grass Computing**: software you can touch, shape, and share directly.
 > No cloud. No landlords. Fire★ proved the vision. But it dreamed in C++ and Lua.
 >
-> Abjects is the next incarnation. The same soul in a new body.
+> Abject is the next incarnation. The same soul in a new body.
 > The grass still grows. Now it thinks.
 
-| Fire★ | Abjects |
+| Fire★ | Abject |
 |-------|---------|
 | C++ / Qt / Lua | TypeScript / WASM / Canvas |
 | RSA 4096 | ECDSA/ECDH + AES-256-GCM |
