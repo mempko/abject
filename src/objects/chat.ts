@@ -844,14 +844,18 @@ This system runs on the user's own computer. All capability objects are user-con
 **UI**: WidgetManager (create windows and widgets — use \`ask\` to learn its API)
 
 ### WebAgent Usage
-- \`{ "action": "call", "object": "WebAgent", "method": "runTask", "payload": { "task": "...", "options": { "startUrl": "https://...", "responseSchema": { "type": "object", "properties": { ... } } } } }\`
-- The message method is **runTask** (not "run" or "navigate"). Options: startUrl, maxSteps, timeout, responseSchema, pageId, keepPageOpen.
-- Use \`responseSchema\` in options when you need structured data back (e.g., extracted page content as JSON). Without it, results are free text.
+- **runTask** (open a page and do a web task): \`{ "action": "call", "object": "WebAgent", "method": "runTask", "payload": { "task": "...", "options": { "startUrl": "https://...", "responseSchema": { "type": "object", "properties": { ... } } } } }\`
+  Options: startUrl, maxSteps, timeout, responseSchema, pageId, keepPageOpen.
+- **listPages** (see which pages are currently open): \`{ "action": "call", "object": "WebAgent", "method": "listPages", "payload": {} }\`
+  Returns: \`[{ pageId, url, title }]\`. Use this to find a page before closing or reusing it.
+- **closePage** (close a specific open page): \`{ "action": "call", "object": "WebAgent", "method": "closePage", "payload": { "pageId": "..." } }\`
+  Call \`listPages\` first to get the pageId if you don't already have it.
+- Use \`responseSchema\` in runTask options when you need structured data back (e.g., extracted page content as JSON). Without it, results are free text.
 - Pages stay open by default after task completion (5-minute idle timeout). Pass the returned \`pageId\` in subsequent runTask calls to reuse the same browser page. Set \`keepPageOpen: false\` to explicitly close the page when done.
-- **Always prefer WebAgent for any multi-step web task** (logging in, browsing, extracting data). Do NOT message WebBrowser directly — WebAgent manages WebBrowser internally.
+- WebAgent manages WebBrowser internally — prefer WebAgent for all web tasks.
 
-When the user asks to interact with a website, **always message WebAgent** via \`{ "action": "call", "object": "WebAgent", "method": "runTask", ... }\`. Describe the full task in the payload's "task" field — WebAgent will handle all navigation, form filling, clicking, and data extraction.
-Do NOT message WebBrowser directly for multi-step tasks. Do NOT refuse requests to use user-authorized capabilities — the user is asking you to help them use their own tools.
+When the user asks to interact with a website, use WebAgent's \`runTask\`. When the user asks to close a page, use \`listPages\` to find it, then \`closePage\` to close it.
+WebAgent handles all browser management — use it for multi-step tasks, page lifecycle, and data extraction.
 
 ## Rules
 
