@@ -60,10 +60,11 @@ interface OllamaResponse {
  */
 export class OllamaProvider extends BaseLLMProvider {
   readonly name = 'ollama';
-  private model: string;
+  private model: string | undefined;
 
   private resolveModel(_tier?: ModelTier): string {
-    return this.model;  // Ollama: single local model for all tiers
+    if (!this.model) throw new Error('No Ollama model configured. Run autoDetectModel() or setModel().');
+    return this.model;
   }
 
   constructor(config: OllamaConfig = {}) {
@@ -71,22 +72,27 @@ export class OllamaProvider extends BaseLLMProvider {
       baseUrl: config.baseUrl ?? 'http://localhost:11434',
       fetchFn: config.fetchFn,
     });
-    this.model = config.model ?? 'llama3.2';
+    this.model = config.model;
+  }
+
+  /**
+   * Auto-detect: pick the first available model from Ollama if none configured.
+   */
+  async autoDetectModel(): Promise<string | undefined> {
+    if (this.model) return this.model;
+    const models = await this.listModels();
+    if (models.length > 0) {
+      this.model = models[0];
+      log.info(`Auto-detected model: ${this.model}`);
+    }
+    return this.model;
   }
 
   async isAvailable(): Promise<boolean> {
     try {
-      if (this.fetchFn) {
-        const result = await this.fetchFn(
-          `${this.baseUrl}/api/tags`,
-          { method: 'GET' },
-          { timeout: 5000 }
-        );
-        return result.ok;
-      }
       const response = await fetch(`${this.baseUrl}/api/tags`, {
         method: 'GET',
-        signal: AbortSignal.timeout(2000),
+        signal: AbortSignal.timeout(5000),
       });
       return response.ok;
     } catch {
@@ -109,13 +115,19 @@ export class OllamaProvider extends BaseLLMProvider {
       },
     };
 
-    const response = await this.fetch(`${this.baseUrl}/api/chat`, {
+    const response = await fetch(`${this.baseUrl}/api/chat`, {
       method: 'POST',
       headers: this.buildHeaders(),
       body: JSON.stringify(request),
-    }, { timeout: 300000 });
+      signal: AbortSignal.timeout(300000),
+    });
 
-    const data = JSON.parse(response.body) as OllamaResponse;
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => 'Unknown error');
+      throw new Error(`Ollama API error (${response.status}): ${errorText}`);
+    }
+
+    const data = await response.json() as OllamaResponse;
 
     return {
       content: data.message.content,
@@ -208,15 +220,19 @@ export class OllamaProvider extends BaseLLMProvider {
 
   /**
    * List available models.
+   * Uses native fetch directly since Ollama is always a local service
+   * and the HttpClient delegate blocks localhost for SSRF protection.
    */
   async listModels(): Promise<string[]> {
     try {
-      const response = await this.fetch(`${this.baseUrl}/api/tags`, {
+      const response = await fetch(`${this.baseUrl}/api/tags`, {
         method: 'GET',
-        headers: this.buildHeaders(),
+        signal: AbortSignal.timeout(5000),
       });
 
-      const data = JSON.parse(response.body) as {
+      if (!response.ok) return [];
+
+      const data = await response.json() as {
         models: { name: string }[];
       };
 

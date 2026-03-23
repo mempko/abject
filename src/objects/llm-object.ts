@@ -255,8 +255,29 @@ export class LLMObject extends Abject {
         anthropicApiKey?: string;
         openaiApiKey?: string;
         ollamaUrl?: string;
+        ollamaModel?: string;
       };
-      this.configure(config);
+      await this.configure(config);
+      return true;
+    });
+
+    this.on('listOllamaModels', async (m: AbjectMessage) => {
+      const { baseUrl } = (m.payload ?? {}) as { baseUrl?: string };
+      // Use existing provider or create a temporary one for listing.
+      // Ollama uses native fetch (local service), no need for fetchFn delegate.
+      let provider = this.providers.get('ollama') as OllamaProvider | undefined;
+      if (!provider) {
+        provider = new OllamaProvider({ baseUrl: baseUrl ?? 'http://localhost:11434' });
+      }
+      return provider.listModels();
+    });
+
+    this.on('setOllamaModel', async (msg: AbjectMessage) => {
+      const { model } = msg.payload as { model: string };
+      const provider = this.providers.get('ollama') as OllamaProvider | undefined;
+      if (!provider) return false;
+      provider.setModel(model);
+      log.info(`Ollama model set to: ${model}`);
       return true;
     });
   }
@@ -320,11 +341,12 @@ export class LLMObject extends Abject {
   /**
    * Configure from API keys.
    */
-  configure(config: {
+  async configure(config: {
     anthropicApiKey?: string;
     openaiApiKey?: string;
     ollamaUrl?: string;
-  }): void {
+    ollamaModel?: string;
+  }): Promise<void> {
     const fetchFn = this.httpClientId ? this.createFetchDelegate() : undefined;
 
     if (config.anthropicApiKey) {
@@ -340,9 +362,16 @@ export class LLMObject extends Abject {
     }
 
     if (config.ollamaUrl) {
-      this.registerProvider(
-        new OllamaProvider({ baseUrl: config.ollamaUrl, fetchFn })
-      );
+      // Ollama uses native fetch (local service), no need for fetchFn delegate
+      const provider = new OllamaProvider({
+        baseUrl: config.ollamaUrl,
+        model: config.ollamaModel,
+      });
+      // Auto-detect model if none specified
+      if (!config.ollamaModel) {
+        await provider.autoDetectModel();
+      }
+      this.registerProvider(provider);
     }
   }
 

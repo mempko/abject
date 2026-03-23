@@ -23,6 +23,7 @@ const STORAGE_KEY_ANTHROPIC = 'global-settings:anthropicApiKey';
 const STORAGE_KEY_OPENAI = 'global-settings:openaiApiKey';
 const STORAGE_KEY_PROVIDER = 'global-settings:llmProvider';
 const STORAGE_KEY_OLLAMA_URL = 'global-settings:ollamaUrl';
+const STORAGE_KEY_OLLAMA_MODEL = 'global-settings:ollamaModel';
 const STORAGE_KEY_AUTH_ENABLED = 'global-settings:authEnabled';
 const STORAGE_KEY_AUTH_USER = 'global-settings:authUser';
 const STORAGE_KEY_AUTH_PASS = 'global-settings:authPass';
@@ -66,6 +67,7 @@ export class GlobalSettings extends Abject {
 
   // Ollama section widgets
   private ollamaUrlId?: AbjectId;
+  private ollamaModelSelectId?: AbjectId;
   private ollamaSectionIds: AbjectId[] = [];
 
   private saveBtnId?: AbjectId;
@@ -129,6 +131,7 @@ export class GlobalSettings extends Abject {
     let anthropicKey: string | null = null;
     let openaiKey: string | null = null;
     let ollamaUrl: string | null = null;
+    let ollamaModel: string | null = null;
     let savedProvider: string | null = null;
 
     if (this.storageId) {
@@ -140,6 +143,9 @@ export class GlobalSettings extends Abject {
       );
       ollamaUrl = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_URL })
+      );
+      ollamaModel = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL })
       );
       savedProvider = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_PROVIDER })
@@ -198,7 +204,7 @@ export class GlobalSettings extends Abject {
     // Configure the selected provider
     const hasConfig = this.providerHasConfig(this.selectedProvider, anthropicKey, openaiKey, ollamaUrl);
     if (hasConfig && this.llmId) {
-      await this.configureSelectedProvider(anthropicKey, openaiKey, ollamaUrl);
+      await this.configureSelectedProvider(anthropicKey, openaiKey, ollamaUrl, ollamaModel);
       log.info(`Loaded saved provider: ${this.selectedProvider}`);
     } else {
       await this.show();
@@ -222,6 +228,7 @@ export class GlobalSettings extends Abject {
     anthropicKey: string | null,
     openaiKey: string | null,
     ollamaUrl: string | null,
+    ollamaModel: string | null = null,
   ): Promise<void> {
     if (!this.llmId) return;
 
@@ -235,6 +242,7 @@ export class GlobalSettings extends Abject {
         break;
       case 'ollama':
         config.ollamaUrl = ollamaUrl || 'http://localhost:11434';
+        if (ollamaModel) config.ollamaModel = ollamaModel;
         break;
     }
 
@@ -355,6 +363,7 @@ export class GlobalSettings extends Abject {
     let savedAnthropicKey: string | null = null;
     let savedOpenaiKey: string | null = null;
     let savedOllamaUrl: string | null = null;
+    let savedOllamaModel: string | null = null;
     if (this.storageId) {
       savedAnthropicKey = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_ANTHROPIC })
@@ -364,6 +373,9 @@ export class GlobalSettings extends Abject {
       );
       savedOllamaUrl = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_URL })
+      );
+      savedOllamaModel = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL })
       );
     }
 
@@ -524,6 +536,48 @@ export class GlobalSettings extends Abject {
     await this.request(request(this.id, this.ollamaUrlId, 'addDependent', {}));
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: this.ollamaUrlId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    // Model dropdown
+    let ollamaModels: string[] = [];
+    if (this.llmId) {
+      try {
+        ollamaModels = await this.request<string[]>(
+          request(this.id, this.llmId, 'listOllamaModels', {
+            baseUrl: savedOllamaUrl || 'http://localhost:11434',
+          })
+        );
+      } catch { /* Ollama not running */ }
+    }
+    const modelOptions = ollamaModels.length > 0 ? ollamaModels : ['(no models found)'];
+    let modelSelectedIndex = 0;
+    if (savedOllamaModel && ollamaModels.length > 0) {
+      const idx = ollamaModels.indexOf(savedOllamaModel);
+      if (idx >= 0) modelSelectedIndex = idx;
+    }
+
+    const { widgetIds: [ollamaModelLabelId, ollamaModelSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Model',
+          style: { color: this.theme.textHeading, fontSize: 13 } },
+        { type: 'select', windowId: this.windowId,
+          options: modelOptions,
+          selectedIndex: modelSelectedIndex },
+      ]})
+    );
+    this.ollamaModelSelectId = ollamaModelSelectId;
+    this.ollamaSectionIds.push(ollamaModelLabelId);
+    this.ollamaSectionIds.push(this.ollamaModelSelectId);
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: ollamaModelLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+    await this.request(request(this.id, this.ollamaModelSelectId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.ollamaModelSelectId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
@@ -774,6 +828,7 @@ export class GlobalSettings extends Abject {
     this.openaiToggleId = undefined;
     this.openaiSectionIds = [];
     this.ollamaUrlId = undefined;
+    this.ollamaModelSelectId = undefined;
     this.ollamaSectionIds = [];
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
@@ -827,7 +882,7 @@ export class GlobalSettings extends Abject {
 
   private async setSaveControlsDisabled(disabled: boolean): Promise<void> {
     const style = { disabled };
-    const ids = [this.saveBtnId, this.providerSelectId, this.anthropicKeyId, this.openaiKeyId, this.ollamaUrlId];
+    const ids = [this.saveBtnId, this.providerSelectId, this.anthropicKeyId, this.openaiKeyId, this.ollamaUrlId, this.ollamaModelSelectId];
     for (const id of ids) {
       if (id) {
         try { await this.request(request(this.id, id, 'update', { style })); } catch { /* widget gone */ }
@@ -989,6 +1044,16 @@ export class GlobalSettings extends Abject {
         break;
     }
 
+    // Read Ollama model if applicable
+    let ollamaModel = '';
+    if (provider === 'ollama' && this.ollamaModelSelectId) {
+      ollamaModel = await this.request<string>(
+        request(this.id, this.ollamaModelSelectId, 'getValue', {})
+      );
+      // Ignore placeholder
+      if (ollamaModel === '(no models found)') ollamaModel = '';
+    }
+
     // Persist to storage
     if (this.storageId) {
       await this.request(
@@ -1008,6 +1073,11 @@ export class GlobalSettings extends Abject {
         await this.request(
           request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OLLAMA_URL, value: ollamaUrl })
         );
+        if (ollamaModel) {
+          await this.request(
+            request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OLLAMA_MODEL, value: ollamaModel })
+          );
+        }
       }
     }
 
@@ -1016,6 +1086,7 @@ export class GlobalSettings extends Abject {
       anthropicKey || null,
       openaiKey || null,
       ollamaUrl || null,
+      ollamaModel || null,
     );
 
     log.info(`Saved provider: ${provider}`);
