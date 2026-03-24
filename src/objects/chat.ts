@@ -66,7 +66,7 @@ export class Chat extends Abject {
   private progressLabelIds: AbjectId[] = [];
 
   /** Pending ticket promises: ticketId → resolve/reject. */
-  private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
 
   /** Current active ticket ID (for progress/stream routing). */
   private _currentTicketId?: string;
@@ -81,7 +81,7 @@ export class Chat extends Abject {
   private _currentGoalId?: string;
 
   /** Pending task completion promises: taskId → resolve/reject. */
-  private pendingTaskCompletions = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  private pendingTaskCompletions = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
 
   constructor() {
     super({
@@ -284,8 +284,13 @@ export class Chat extends Abject {
         if (this._currentGoalId) {
           const data = value as { goalId: string; message?: string; phase?: string; agentName?: string };
           if (data.goalId !== this._currentGoalId) return;
-          if (aspect === 'goalUpdated' && data.message && data.agentName && data.agentName !== 'Chat') {
-            await this.appendProgressLabel(`  ${data.agentName}: ${data.message}`);
+          if (aspect === 'goalUpdated') {
+            // Any goal progress resets ALL pending timeouts
+            this.resetTaskCompletionTimeouts();
+            this.resetPendingTicketTimeouts();
+            if (data.message && data.agentName && data.agentName !== 'Chat') {
+              await this.appendProgressLabel(`  ${data.agentName}: ${data.message}`);
+            }
           }
         }
       }
@@ -303,6 +308,9 @@ export class Chat extends Abject {
     });
 
     this.on('taskProgress', async (msg: AbjectMessage) => {
+      // Reset pending ticket timeouts on agent progress
+      this.resetPendingTicketTimeouts();
+
       const { ticketId, step, maxSteps, phase, action } =
         msg.payload as { ticketId: string; step: number; maxSteps: number; phase: string; action?: string };
       if (!this._currentTicketId) return;
@@ -327,6 +335,9 @@ export class Chat extends Abject {
     });
 
     this.on('progress', async (msg: AbjectMessage) => {
+      // Reset pending ticket + task completion timeouts on any progress signal
+      this.resetPendingTicketTimeouts();
+      this.resetTaskCompletionTimeouts();
       const { message } = msg.payload as { phase?: string; message?: string };
       if (!this._currentTicketId || !this.thinkingLabelId || !message) return;
       this.updateLabel(this.thinkingLabelId, `  ${message}`, this.theme.statusNeutral);
@@ -419,15 +430,29 @@ export class Chat extends Abject {
   }> {
     type TaskResult = { ticketId: string; success: boolean; result?: unknown; error?: string; steps: number; maxStepsReached?: boolean; validationErrors?: string[] };
     return new Promise<TaskResult>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const makeTimer = () => setTimeout(() => {
         this.pendingTickets.delete(ticketId);
         reject(new Error(`Task ${ticketId} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
-      this.pendingTickets.set(ticketId, {
-        resolve: (v) => { clearTimeout(timer); resolve(v as TaskResult); },
-        reject: (e) => { clearTimeout(timer); reject(e); },
-      });
+      const entry = {
+        timeoutMs,
+        timer: makeTimer(),
+        resolve: (v: unknown) => { clearTimeout(entry.timer); this.pendingTickets.delete(ticketId); resolve(v as TaskResult); },
+        reject: (e: Error) => { clearTimeout(entry.timer); this.pendingTickets.delete(ticketId); reject(e); },
+      };
+      this.pendingTickets.set(ticketId, entry);
     });
+  }
+
+  /** Reset all pending ticket timeouts (called on progress events). */
+  private resetPendingTicketTimeouts(): void {
+    for (const [ticketId, entry] of this.pendingTickets) {
+      clearTimeout(entry.timer);
+      entry.timer = setTimeout(() => {
+        this.pendingTickets.delete(ticketId);
+        entry.reject(new Error(`Task ${ticketId} timed out after ${entry.timeoutMs}ms`));
+      }, entry.timeoutMs);
+    }
   }
 
   /**
@@ -437,24 +462,39 @@ export class Chat extends Abject {
   private waitForTaskCompletion(taskId: string, timeoutMs: number): Promise<{ taskId: string; result?: unknown }> {
     log.info(`[Chat] waitForTaskCompletion ${taskId.slice(0, 8)} timeout=${timeoutMs}ms pendingCount=${this.pendingTaskCompletions.size}`);
     return new Promise<{ taskId: string; result?: unknown }>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const makeTimer = () => setTimeout(() => {
         this.pendingTaskCompletions.delete(taskId);
         log.info(`[Chat] waitForTaskCompletion ${taskId.slice(0, 8)} — TIMED OUT after ${timeoutMs}ms`);
         reject(new Error(`Task ${taskId} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
-      this.pendingTaskCompletions.set(taskId, {
-        resolve: (v) => {
-          clearTimeout(timer);
+      const entry = {
+        timer: makeTimer(),
+        timeoutMs,
+        resolve: (v: unknown) => {
+          clearTimeout(entry.timer);
           log.info(`[Chat] waitForTaskCompletion ${taskId.slice(0, 8)} — RESOLVED`);
           resolve(v as { taskId: string; result?: unknown });
         },
-        reject: (e) => {
-          clearTimeout(timer);
+        reject: (e: Error) => {
+          clearTimeout(entry.timer);
           log.info(`[Chat] waitForTaskCompletion ${taskId.slice(0, 8)} — REJECTED: ${e.message?.slice(0, 80)}`);
           reject(e);
         },
-      });
+      };
+      this.pendingTaskCompletions.set(taskId, entry);
     });
+  }
+
+  /** Reset all pending task completion timeouts (called on progress events). */
+  private resetTaskCompletionTimeouts(): void {
+    for (const [taskId, entry] of this.pendingTaskCompletions) {
+      clearTimeout(entry.timer);
+      entry.timer = setTimeout(() => {
+        this.pendingTaskCompletions.delete(taskId);
+        log.info(`[Chat] waitForTaskCompletion ${taskId.slice(0, 8)} — TIMED OUT after ${entry.timeoutMs}ms`);
+        entry.reject(new Error(`Task ${taskId} timed out after ${entry.timeoutMs}ms`));
+      }, entry.timeoutMs);
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════

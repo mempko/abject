@@ -209,6 +209,9 @@ export class AgentAbject extends Abject {
   /** Job submission heartbeat message ID for resetting request timeouts. */
   private _currentJobMsgId?: string;
 
+  /** Active executeTask dispatch message ID for resetting request timeouts on progress. */
+  private _currentDispatchMsgId?: string;
+
   /** Active task entry during LLM streaming — links llmChunk events to the right ticket. */
   private activeStreamEntry?: TaskEntry;
 
@@ -787,9 +790,13 @@ improve semantic matching accuracy.
       }));
     });
 
-    this.on('progress', () => {
-      if (this._currentJobMsgId) {
-        this.resetRequestTimeout(this._currentJobMsgId);
+    this.on('progress', (msg: AbjectMessage) => {
+      if (this._currentJobMsgId) this.resetRequestTimeout(this._currentJobMsgId);
+      if (this._currentDispatchMsgId) this.resetRequestTimeout(this._currentDispatchMsgId);
+      // Forward progress to JobManager so its internal callFn timeouts get reset,
+      // but ONLY if this event did not originate from JobManager (avoid ping-pong loop).
+      if (this.jobManagerId && msg.routing.from !== this.jobManagerId) {
+        this.send(event(this.id, this.jobManagerId, 'progress', msg.payload ?? {}));
       }
     });
 
@@ -958,17 +965,16 @@ improve semantic matching accuracy.
 
     // 6. Send executeTask to chosen agent (long timeout: 310s)
     const dispatchStart = Date.now();
+    const executeMsg = request(this.id, chosen.agentId, 'executeTask', {
+      tupleId: claimed.tuple.id,
+      goalId: taskGoalId,
+      description,
+      data,
+      type: taskType,
+    });
+    this._currentDispatchMsgId = executeMsg.header.messageId;
     try {
-      const result = await this.request<unknown>(
-        request(this.id, chosen.agentId, 'executeTask', {
-          tupleId: claimed.tuple.id,
-          goalId: taskGoalId,
-          description,
-          data,
-          type: taskType,
-        }),
-        310000,
-      );
+      const result = await this.request<unknown>(executeMsg, 310000);
 
       const elapsed = Date.now() - dispatchStart;
       log.info(`DISPATCH-INNER ${tupleId} — executeTask SUCCESS (${elapsed}ms), completing task`);
@@ -1006,6 +1012,8 @@ improve semantic matching accuracy.
       } catch (err2) {
         log.info(`DISPATCH-INNER ${tupleId} — failTask also failed: ${(err2 as Error).message?.slice(0, 80)}`);
       }
+    } finally {
+      this._currentDispatchMsgId = undefined;
     }
   }
 

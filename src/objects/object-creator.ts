@@ -103,11 +103,14 @@ export class ObjectCreator extends Abject {
   private goalManagerId?: AbjectId;
   private creationTasks = new Map<string, CreationTaskExtra>();
 
-  /** Pending ticket promises: ticketId → resolve/reject. */
-  private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  /** Pending ticket promises: ticketId → resolve/reject + resettable timer. */
+  private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
 
   /** Maps inner agent ticketId → caller AbjectId for forwarding stream/progress events. */
   private ticketToCallerId = new Map<string, AbjectId>();
+
+  /** Active LLM request message ID for resetting request timeouts on progress keepalives. */
+  private _currentLlmMsgId?: string;
 
   constructor() {
     super({
@@ -256,15 +259,29 @@ export class ObjectCreator extends Abject {
   }> {
     type TaskResult = { ticketId: string; success: boolean; result?: unknown; error?: string; steps: number; maxStepsReached?: boolean };
     return new Promise<TaskResult>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const makeTimer = () => setTimeout(() => {
         this.pendingTickets.delete(ticketId);
         reject(new Error(`Task ${ticketId} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
-      this.pendingTickets.set(ticketId, {
-        resolve: (v) => { clearTimeout(timer); resolve(v as TaskResult); },
-        reject: (e) => { clearTimeout(timer); reject(e); },
-      });
+      const entry = {
+        timeoutMs,
+        timer: makeTimer(),
+        resolve: (v: unknown) => { clearTimeout(entry.timer); this.pendingTickets.delete(ticketId); resolve(v as TaskResult); },
+        reject: (e: Error) => { clearTimeout(entry.timer); this.pendingTickets.delete(ticketId); reject(e); },
+      };
+      this.pendingTickets.set(ticketId, entry);
     });
+  }
+
+  /** Reset all pending ticket timeouts (called on progress events). */
+  private resetPendingTicketTimeouts(): void {
+    for (const [ticketId, entry] of this.pendingTickets) {
+      clearTimeout(entry.timer);
+      entry.timer = setTimeout(() => {
+        this.pendingTickets.delete(ticketId);
+        entry.reject(new Error(`Task ${ticketId} timed out after ${entry.timeoutMs}ms`));
+      }, entry.timeoutMs);
+    }
   }
 
   private setupHandlers(): void {
@@ -287,6 +304,9 @@ export class ObjectCreator extends Abject {
     });
 
     this.on('taskProgress', async (msg: AbjectMessage) => {
+      // Reset pending ticket timeouts on agent progress
+      this.resetPendingTicketTimeouts();
+
       const { ticketId, step, maxSteps, phase, action } = msg.payload as {
         ticketId: string; step: number; maxSteps: number; phase: string; action?: string;
       };
@@ -337,6 +357,11 @@ export class ObjectCreator extends Abject {
 
     // Forward LLM keep-alive progress events to the upstream caller
     this.on('progress', async (msg: AbjectMessage) => {
+      // Reset the active LLM request timeout so long-running calls don't expire
+      if (this._currentLlmMsgId) this.resetRequestTimeout(this._currentLlmMsgId);
+      // Reset pending ticket timeouts (waitForTaskResult timers)
+      this.resetPendingTicketTimeouts();
+
       // Guard: never forward progress to ourselves — that creates an infinite loop
       if (this._currentCallerId && this._currentCallerId !== this.id) {
         const payload = msg.payload as { phase?: string; message?: string };
@@ -565,10 +590,13 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
    * Call LLM complete via message passing.
    */
   private async llmComplete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
-    return this.request<LLMCompletionResult>(
-      request(this.id, this.llmId!, 'complete', { messages, options }),
-      310000
-    );
+    const msg = request(this.id, this.llmId!, 'complete', { messages, options });
+    this._currentLlmMsgId = msg.header.messageId;
+    try {
+      return await this.request<LLMCompletionResult>(msg, 310000);
+    } finally {
+      this._currentLlmMsgId = undefined;
+    }
   }
 
   /**

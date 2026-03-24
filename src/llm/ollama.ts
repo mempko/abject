@@ -2,6 +2,7 @@
  * Ollama local LLM integration.
  */
 
+import * as http from 'node:http';
 import {
   BaseLLMProvider,
   FetchDelegate,
@@ -104,46 +105,10 @@ export class OllamaProvider extends BaseLLMProvider {
     messages: LLMMessage[],
     options: LLMCompletionOptions = {}
   ): Promise<LLMCompletionResult> {
-    const request: OllamaRequest = {
-      model: this.resolveModel(options.tier),
-      messages: messages.map((m) => this.mapMessage(m)),
-      stream: false,
-      options: {
-        temperature: options.temperature,
-        num_predict: options.maxTokens,
-        stop: options.stopSequences,
-      },
-    };
-
-    const response = await fetch(`${this.baseUrl}/api/chat`, {
-      method: 'POST',
-      headers: this.buildHeaders(),
-      body: JSON.stringify(request),
-      signal: AbortSignal.timeout(300000),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => 'Unknown error');
-      throw new Error(`Ollama API error (${response.status}): ${errorText}`);
-    }
-
-    const data = await response.json() as OllamaResponse;
-
-    return {
-      content: data.message.content,
-      finishReason: data.done ? 'stop' : 'length',
-      usage: {
-        inputTokens: data.prompt_eval_count ?? 0,
-        outputTokens: data.eval_count ?? 0,
-      },
-    };
-  }
-
-  async *stream(
-    messages: LLMMessage[],
-    options: LLMCompletionOptions = {}
-  ): AsyncIterable<LLMStreamChunk> {
-    const request: OllamaRequest = {
+    // Use Node.js http.request directly to bypass undici's headersTimeout (300s)
+    // and bodyTimeout (300s) which silently kill long-running Ollama requests.
+    // Ollama is always localhost so we don't need TLS or fancy HTTP features.
+    const req: OllamaRequest = {
       model: this.resolveModel(options.tier),
       messages: messages.map((m) => this.mapMessage(m)),
       stream: true,
@@ -154,55 +119,157 @@ export class OllamaProvider extends BaseLLMProvider {
       },
     };
 
-    const response = await fetch(`${this.baseUrl}/api/chat`, {
-      method: 'POST',
-      headers: this.buildHeaders(),
-      body: JSON.stringify(request),
-    });
+    const url = new URL(`${this.baseUrl}/api/chat`);
+    const body = JSON.stringify(req);
 
-    if (!response.ok) {
-      throw new Error(`Ollama API error: ${response.status}`);
-    }
-
-    const reader = response.body?.getReader();
-    if (!reader) {
-      throw new Error('No response body');
-    }
-
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-
-      // Ollama sends newline-delimited JSON
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-
-      for (const line of lines) {
-        if (!line.trim()) continue;
-
-        try {
-          const data = JSON.parse(line) as OllamaResponse;
-
-          yield {
-            content: data.message?.content ?? '',
-            done: data.done,
-          };
-
-          if (data.done) {
+    return new Promise<LLMCompletionResult>((resolve, reject) => {
+      const httpReq = http.request(
+        {
+          hostname: url.hostname,
+          port: url.port || 11434,
+          path: url.pathname,
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+          timeout: 1800000, // 30 minutes socket timeout
+        },
+        (res) => {
+          if (res.statusCode && res.statusCode >= 400) {
+            let errBody = '';
+            res.on('data', (chunk: Buffer) => { errBody += chunk.toString(); });
+            res.on('end', () => reject(new Error(`Ollama API error (${res.statusCode}): ${errBody}`)));
             return;
           }
-        } catch {
-          // Ignore parse errors
+
+          let buffer = '';
+          let content = '';
+          let lastData: OllamaResponse | undefined;
+
+          res.on('data', (chunk: Buffer) => {
+            buffer += chunk.toString();
+            const lines = buffer.split('\n');
+            buffer = lines.pop() ?? '';
+
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              try {
+                const data = JSON.parse(line) as OllamaResponse;
+                content += data.message?.content ?? '';
+                if (data.done) lastData = data;
+              } catch { /* ignore parse errors */ }
+            }
+          });
+
+          res.on('end', () => {
+            resolve({
+              content,
+              finishReason: lastData?.done ? 'stop' : 'length',
+              usage: {
+                inputTokens: lastData?.prompt_eval_count ?? 0,
+                outputTokens: lastData?.eval_count ?? 0,
+              },
+            });
+          });
+
+          res.on('error', (err) => reject(new Error(`Ollama response error: ${err.message}`)));
+        },
+      );
+
+      httpReq.on('error', (err) => reject(new Error(`Ollama request error: ${err.message}`)));
+      httpReq.on('timeout', () => { httpReq.destroy(); reject(new Error('Ollama request timed out (30min)')); });
+      httpReq.write(body);
+      httpReq.end();
+    });
+  }
+
+  async *stream(
+    messages: LLMMessage[],
+    options: LLMCompletionOptions = {}
+  ): AsyncIterable<LLMStreamChunk> {
+    const req: OllamaRequest = {
+      model: this.resolveModel(options.tier),
+      messages: messages.map((m) => this.mapMessage(m)),
+      stream: true,
+      options: {
+        temperature: options.temperature,
+        num_predict: options.maxTokens,
+        stop: options.stopSequences,
+      },
+    };
+
+    const url = new URL(`${this.baseUrl}/api/chat`);
+    const body = JSON.stringify(req);
+
+    // Use an async iterator backed by http.request to avoid undici timeout issues
+    const chunks: LLMStreamChunk[] = [];
+    let streamResolve: (() => void) | undefined;
+    let streamReject: ((err: Error) => void) | undefined;
+    let streamDone = false;
+    let streamError: Error | undefined;
+
+    const waitForData = () => new Promise<void>((resolve, reject) => {
+      if (streamError) { reject(streamError); return; }
+      if (chunks.length > 0 || streamDone) { resolve(); return; }
+      streamResolve = resolve;
+      streamReject = reject;
+    });
+
+    const notify = () => { if (streamResolve) { const r = streamResolve; streamResolve = undefined; streamReject = undefined; r(); } };
+    const fail = (err: Error) => { streamError = err; if (streamReject) { const r = streamReject; streamResolve = undefined; streamReject = undefined; r(err); } };
+
+    const httpReq = http.request(
+      {
+        hostname: url.hostname,
+        port: url.port || 11434,
+        path: url.pathname,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        timeout: 1800000,
+      },
+      (res) => {
+        if (res.statusCode && res.statusCode >= 400) {
+          let errBody = '';
+          res.on('data', (chunk: Buffer) => { errBody += chunk.toString(); });
+          res.on('end', () => fail(new Error(`Ollama API error: ${res.statusCode} ${errBody}`)));
+          return;
         }
+
+        let buffer = '';
+        res.on('data', (chunk: Buffer) => {
+          buffer += chunk.toString();
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const data = JSON.parse(line) as OllamaResponse;
+              chunks.push({ content: data.message?.content ?? '', done: data.done });
+            } catch { /* ignore */ }
+          }
+          notify();
+        });
+        res.on('end', () => { streamDone = true; notify(); });
+        res.on('error', (err) => fail(new Error(`Ollama stream error: ${err.message}`)));
+      },
+    );
+
+    httpReq.on('error', (err) => fail(new Error(`Ollama request error: ${err.message}`)));
+    httpReq.on('timeout', () => { httpReq.destroy(); fail(new Error('Ollama stream timed out (30min)')); });
+    httpReq.write(body);
+    httpReq.end();
+
+    while (true) {
+      await waitForData();
+      while (chunks.length > 0) {
+        const chunk = chunks.shift()!;
+        yield chunk;
+        if (chunk.done) return;
+      }
+      if (streamDone) {
+        yield { content: '', done: true };
+        return;
       }
     }
-
-    yield { content: '', done: true };
   }
 
   /**
