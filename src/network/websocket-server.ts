@@ -73,13 +73,17 @@ export class NodeWebSocketServer {
   }
 
   /**
-   * Close the server.
+   * Close the server and release the port immediately.
+   * Force-terminates all connections so the port is freed without TIME_WAIT.
    */
   async close(): Promise<void> {
+    // Terminate all connections immediately (don't wait for graceful close)
+    for (const ws of this.connections) {
+      ws.terminate();
+    }
+    this.connections.clear();
+
     return new Promise((resolve, reject) => {
-      for (const ws of this.connections) {
-        ws.close(1000, 'Server shutting down');
-      }
       this.wss.close((err) => {
         if (err) reject(err);
         else resolve();

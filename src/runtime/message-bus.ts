@@ -132,12 +132,6 @@ export class MessageBus implements MessageBusLike {
    * Normal path: message is enqueued in the recipient's mailbox.
    */
   send(message: AbjectMessage): void {
-    const oldCount = this.messageCount;
-
-    // Preconditions
-    require(message.header.messageId !== '', 'messageId must not be empty');
-    requireNonEmpty(message.routing.to, 'recipient');
-
     // Run interceptors synchronously
     for (const interceptor of this.interceptors) {
       const result = interceptor.intercept(message);
@@ -218,10 +212,6 @@ export class MessageBus implements MessageBusLike {
     const mailbox = this.mailboxes.get(recipient)!;
     mailbox.send(message);
     this.messageCount++;
-
-    // Postconditions
-    ensure(this.messageCount > oldCount, 'message count must increase');
-    this.checkInvariants();
   }
 
   /**

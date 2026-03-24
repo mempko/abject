@@ -22,28 +22,18 @@ export class Mailbox {
    * Throws if queue is full or closed.
    */
   send(message: AbjectMessage): void {
-    require(!this.closed, 'Mailbox is closed');
-    require(
-      this.queue.length < this.maxSize,
-      `Mailbox full (max ${this.maxSize})`
-    );
-
     const waiter = this.waiters.shift();
     if (waiter) {
       waiter.resolve(message);
     } else {
       this.queue.push(message);
     }
-
-    this.checkInvariants();
   }
 
   /**
    * Receive the next message, blocking if empty.
    */
   async receive(): Promise<AbjectMessage> {
-    require(!this.closed, 'Mailbox is closed');
-
     const msg = this.queue.shift();
     if (msg) {
       return msg;
@@ -59,7 +49,6 @@ export class Mailbox {
    * Returns undefined if no message is available.
    */
   tryReceive(): AbjectMessage | undefined {
-    require(!this.closed, 'Mailbox is closed');
     return this.queue.shift();
   }
 

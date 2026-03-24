@@ -49,6 +49,7 @@ import { GlobalSettings } from '../src/objects/global-settings.js';
 import { GlobalToolbar } from '../src/objects/global-toolbar.js';
 import { PeerNetwork } from '../src/objects/peer-network.js';
 import { ProcessExplorer } from '../src/objects/process-explorer.js';
+import { LLMMonitor } from '../src/objects/llm-monitor.js';
 import { IdentityObject } from '../src/objects/identity.js';
 import { PeerRegistry } from '../src/objects/peer-registry.js';
 import { RemoteRegistry } from '../src/objects/remote-registry.js';
@@ -365,6 +366,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('GlobalToolbar', () => new GlobalToolbar());
   runtime.objectFactory.registerConstructor('PeerNetwork', () => new PeerNetwork());
   runtime.objectFactory.registerConstructor('ProcessExplorer', () => new ProcessExplorer());
+  runtime.objectFactory.registerConstructor('LLMMonitor', () => new LLMMonitor());
   runtime.objectFactory.registerConstructor('Identity', () => new IdentityObject());
   runtime.objectFactory.registerConstructor('PeerRegistry', () => new PeerRegistry());
   runtime.objectFactory.registerConstructor('RemoteRegistry', () => new RemoteRegistry());
@@ -390,7 +392,7 @@ async function main(): Promise<void> {
       'LLMObject', 'HttpClient', 'Timer',
       'Clipboard', 'Console', 'FileSystem',
       // Global services
-      'GlobalSettings', 'PeerNetwork', 'ObjectBrowser', 'ProcessExplorer', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
+      'GlobalSettings', 'PeerNetwork', 'ObjectBrowser', 'ProcessExplorer', 'LLMMonitor', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
       // Per-workspace objects (use workspace registry via registryHint)
       'AbjectStore', 'Theme', 'Settings', 'AppExplorer',
       'TupleSpace',
@@ -611,6 +613,7 @@ async function main(): Promise<void> {
   const globalToolbarId = await supervisedSpawn('GlobalToolbar', 'permanent', systemTypeId('GlobalToolbar'));
   const objectBrowserId = await supervisedSpawn('ObjectBrowser', 'permanent', systemTypeId('ObjectBrowser'));
   const processExplorerId = await supervisedSpawn('ProcessExplorer', 'permanent', systemTypeId('ProcessExplorer'));
+  const llmMonitorId = await supervisedSpawn('LLMMonitor', 'permanent', systemTypeId('LLMMonitor'));
 
   const proxyGenId = await supervisedSpawn('ProxyGenerator', 'permanent', systemTypeId('ProxyGenerator'));
   const negotiatorId = await supervisedSpawn('Negotiator', 'permanent', systemTypeId('Negotiator'));
@@ -672,12 +675,19 @@ async function main(): Promise<void> {
   console.log('');
 
   // Handle graceful shutdown
-  const shutdown = async () => {
+  let shuttingDown = false;
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     alog.info('Shutting down...');
     sessionStore.destroy();
-    await wsServer.close();
-    await runtime.stop();
-    process.exit(0);
+    // Close WS server first to release the port, then clean up runtime
+    wsServer.close()
+      .then(() => runtime.stop())
+      .catch(() => {})
+      .finally(() => process.exit(0));
+    // If cleanup takes too long, force exit
+    setTimeout(() => process.exit(1), 3000);
   };
 
   process.on('SIGINT', shutdown);

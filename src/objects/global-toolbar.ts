@@ -26,6 +26,7 @@ export class GlobalToolbar extends Abject {
   private objectBrowserId?: AbjectId;
 
   private objectManagerId?: AbjectId;
+  private llmMonitorId?: AbjectId;
 
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
@@ -33,6 +34,7 @@ export class GlobalToolbar extends Abject {
   private networkBtnId?: AbjectId;
   private explorerBtnId?: AbjectId;
   private processesBtnId?: AbjectId;
+  private llmMonitorBtnId?: AbjectId;
 
   /** Current window height (queried by WorkspaceManager for Taskbar positioning) */
   private currentHeight = 0;
@@ -174,6 +176,22 @@ export class GlobalToolbar extends Abject {
         }
         return;
       }
+
+      // LLM Monitor button
+      if (fromId === this.llmMonitorBtnId) {
+        if (!this.llmMonitorId) {
+          this.llmMonitorId = await this.discoverDep('LLMMonitor') ?? undefined;
+        }
+        if (this.llmMonitorId) {
+          try {
+            await this.request(request(this.id, this.llmMonitorId,
+              'show', {}));
+          } catch (err) {
+            log.warn('Failed to show LLMMonitor:', err);
+          }
+        }
+        return;
+      }
     });
   }
 
@@ -193,6 +211,7 @@ export class GlobalToolbar extends Abject {
     this.networkBtnId = undefined;
     this.explorerBtnId = undefined;
     this.processesBtnId = undefined;
+    this.llmMonitorBtnId = undefined;
     this.rootLayoutId = undefined;
 
     const btnW = 120;
@@ -201,8 +220,8 @@ export class GlobalToolbar extends Abject {
     const padding = 16;
     const spacing = 6;
 
-    // Height: padding + label row + 3 buttons + padding
-    const barHeight = padding + labelH + (spacing + btnH) * 3 + padding;
+    // Height: padding + label row + 4 buttons + padding
+    const barHeight = padding + labelH + (spacing + btnH) * 4 + padding;
     const barWidth = btnW + padding * 2;
 
     this.currentHeight = barHeight;
@@ -249,6 +268,7 @@ export class GlobalToolbar extends Abject {
           { type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Network' },
           { type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0D Explorer' },
           { type: 'button', windowId: this.windowId!, text: '\u2699\uFE0F Procs' },
+          { type: 'button', windowId: this.windowId!, text: '\uD83D\uDC41 The Eye' },
         ],
       })
     );
@@ -258,6 +278,7 @@ export class GlobalToolbar extends Abject {
     this.networkBtnId = widgetIds[2];
     this.explorerBtnId = widgetIds[3];
     this.processesBtnId = widgetIds[4];
+    this.llmMonitorBtnId = widgetIds[5];
 
     // Add header row children: label + gear button
     await this.request(request(this.id, headerRowId, 'addLayoutChildren', {
@@ -273,6 +294,7 @@ export class GlobalToolbar extends Abject {
         { widgetId: this.networkBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
         { widgetId: this.explorerBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
         { widgetId: this.processesBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
+        { widgetId: this.llmMonitorBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
       ],
     }));
 
@@ -281,6 +303,7 @@ export class GlobalToolbar extends Abject {
     this.send(request(this.id, this.networkBtnId, 'addDependent', {}));
     this.send(request(this.id, this.explorerBtnId, 'addDependent', {}));
     this.send(request(this.id, this.processesBtnId, 'addDependent', {}));
+    this.send(request(this.id, this.llmMonitorBtnId, 'addDependent', {}));
 
     return true;
   }
@@ -300,6 +323,7 @@ export class GlobalToolbar extends Abject {
     this.networkBtnId = undefined;
     this.explorerBtnId = undefined;
     this.processesBtnId = undefined;
+    this.llmMonitorBtnId = undefined;
     return true;
   }
 }

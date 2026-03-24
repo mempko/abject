@@ -76,16 +76,7 @@ export class FrontendClient {
     clog('WebSocket constructor returned');
     this.authenticated = false;
 
-    // Abort stuck TCP connections quickly — browser default timeout is ~5s
-    const connectTimeout = setTimeout(() => {
-      if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
-        clog('connect timeout (500ms), aborting');
-        this.ws.close();
-      }
-    }, 500);
-
     this.ws.onopen = () => {
-      clearTimeout(connectTimeout);
       clog('onopen fired');
       console.log('[Frontend] Connected to backend');
       this.reconnectAttempt = 0;
@@ -121,13 +112,15 @@ export class FrontendClient {
     };
 
     this.ws.onclose = (ev) => {
-      clearTimeout(connectTimeout);
       clog(`onclose fired (code=${ev.code})`);
       console.log(`[Frontend] Disconnected from backend (code=${ev.code})`);
       this.ws = null;
       this.authenticated = false;
 
-      // Auto-reconnect with progressive delay (100ms → 200ms → 500ms → 1000ms)
+      // Auto-reconnect. ECONNREFUSED returns instantly on localhost so
+      // fast retries when the server is down don't waste resources.
+      // Don't force-close CONNECTING sockets — that poisons Firefox's
+      // connection cache and causes minutes of phantom failures.
       const delays = FrontendClient.RECONNECT_DELAYS;
       const delay = delays[Math.min(this.reconnectAttempt, delays.length - 1)];
       this.reconnectAttempt++;
