@@ -204,7 +204,26 @@ See [PHILOSOPHY.md](PHILOSOPHY.md) for the principles that carry the fire forwar
 | `ABJECTS_DATA_DIR` | `.abjects` | Persistent storage directory |
 | `ABJECTS_WORKER_COUNT` | CPU cores - 1 (max 8) | Worker thread pool size |
 
-API keys can also be configured through the Global Settings UI at runtime. For local LLM, run Ollama on localhost:11434.
+API keys can also be configured through the Global Settings UI at runtime.
+
+### Using with Ollama (Local LLM)
+
+Abject works with [Ollama](https://ollama.com) for fully local, private AI. Pull the recommended models:
+
+```bash
+ollama pull qwen3:32b     # Smart tier (complex reasoning, code generation)
+ollama pull qwen3:8b      # Balanced tier (general purpose)
+ollama pull qwen3:4b      # Fast tier (quick tasks, low latency)
+```
+
+Start Ollama, then configure in the Global Settings UI:
+1. Click the gear icon in the System toolbar
+2. Select **Ollama** as the provider
+3. Set the Ollama URL (default: `http://localhost:11434`)
+4. Assign models to each tier (Smart, Balanced, Fast)
+5. Click Save
+
+The tier system lets Abject pick the right model for each task: heavy reasoning uses the smart tier, routine work uses balanced, and quick lookups use fast.
 
 ## License
 
