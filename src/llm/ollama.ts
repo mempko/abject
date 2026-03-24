@@ -21,6 +21,7 @@ const log = new Log('OLLAMA');
 
 export interface OllamaConfig {
   model?: string;
+  tierModels?: Partial<Record<ModelTier, string>>;
   baseUrl?: string;
   fetchFn?: FetchDelegate;
 }
@@ -62,10 +63,13 @@ interface OllamaResponse {
 export class OllamaProvider extends BaseLLMProvider {
   readonly name = 'ollama';
   private model: string | undefined;
+  private tierModels: Partial<Record<ModelTier, string>> = {};
 
-  private resolveModel(_tier?: ModelTier): string {
-    if (!this.model) throw new Error('No Ollama model configured. Run autoDetectModel() or setModel().');
-    return this.model;
+  private resolveModel(tier?: ModelTier): string {
+    if (tier && this.tierModels[tier]) return this.tierModels[tier]!;
+    if (this.tierModels.balanced) return this.tierModels.balanced;
+    if (this.model) return this.model;
+    throw new Error('No Ollama model configured. Run autoDetectModel() or setModel().');
   }
 
   constructor(config: OllamaConfig = {}) {
@@ -74,13 +78,14 @@ export class OllamaProvider extends BaseLLMProvider {
       fetchFn: config.fetchFn,
     });
     this.model = config.model;
+    this.tierModels = config.tierModels ?? {};
   }
 
   /**
    * Auto-detect: pick the first available model from Ollama if none configured.
    */
   async autoDetectModel(): Promise<string | undefined> {
-    if (this.model) return this.model;
+    if (this.model || Object.keys(this.tierModels).length > 0) return this.model;
     const models = await this.listModels();
     if (models.length > 0) {
       this.model = models[0];
@@ -314,6 +319,18 @@ export class OllamaProvider extends BaseLLMProvider {
    */
   setModel(model: string): void {
     this.model = model;
+  }
+
+  setTierModel(tier: ModelTier, model: string): void {
+    this.tierModels[tier] = model;
+  }
+
+  setTierModels(models: Partial<Record<ModelTier, string>>): void {
+    this.tierModels = { ...models };
+  }
+
+  getTierModels(): Partial<Record<ModelTier, string>> {
+    return { ...this.tierModels };
   }
 }
 

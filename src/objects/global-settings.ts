@@ -23,7 +23,10 @@ const STORAGE_KEY_ANTHROPIC = 'global-settings:anthropicApiKey';
 const STORAGE_KEY_OPENAI = 'global-settings:openaiApiKey';
 const STORAGE_KEY_PROVIDER = 'global-settings:llmProvider';
 const STORAGE_KEY_OLLAMA_URL = 'global-settings:ollamaUrl';
-const STORAGE_KEY_OLLAMA_MODEL = 'global-settings:ollamaModel';
+const STORAGE_KEY_OLLAMA_MODEL = 'global-settings:ollamaModel'; // legacy, used for migration
+const STORAGE_KEY_OLLAMA_MODEL_SMART = 'global-settings:ollamaModelSmart';
+const STORAGE_KEY_OLLAMA_MODEL_BALANCED = 'global-settings:ollamaModelBalanced';
+const STORAGE_KEY_OLLAMA_MODEL_FAST = 'global-settings:ollamaModelFast';
 const STORAGE_KEY_AUTH_ENABLED = 'global-settings:authEnabled';
 const STORAGE_KEY_AUTH_USER = 'global-settings:authUser';
 const STORAGE_KEY_AUTH_PASS = 'global-settings:authPass';
@@ -67,7 +70,9 @@ export class GlobalSettings extends Abject {
 
   // Ollama section widgets
   private ollamaUrlId?: AbjectId;
-  private ollamaModelSelectId?: AbjectId;
+  private ollamaModelSmartSelectId?: AbjectId;
+  private ollamaModelBalancedSelectId?: AbjectId;
+  private ollamaModelFastSelectId?: AbjectId;
   private ollamaSectionIds: AbjectId[] = [];
 
   private saveBtnId?: AbjectId;
@@ -131,7 +136,7 @@ export class GlobalSettings extends Abject {
     let anthropicKey: string | null = null;
     let openaiKey: string | null = null;
     let ollamaUrl: string | null = null;
-    let ollamaModel: string | null = null;
+    let ollamaTierModels: { smart: string | null; balanced: string | null; fast: string | null } = { smart: null, balanced: null, fast: null };
     let savedProvider: string | null = null;
 
     if (this.storageId) {
@@ -144,9 +149,24 @@ export class GlobalSettings extends Abject {
       ollamaUrl = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_URL })
       );
-      ollamaModel = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL })
+      ollamaTierModels.smart = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL_SMART })
       );
+      ollamaTierModels.balanced = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL_BALANCED })
+      );
+      ollamaTierModels.fast = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL_FAST })
+      );
+      // Legacy migration: old single model key populates all tiers
+      if (!ollamaTierModels.smart && !ollamaTierModels.balanced && !ollamaTierModels.fast) {
+        const legacyModel = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL })
+        );
+        if (legacyModel) {
+          ollamaTierModels = { smart: legacyModel, balanced: legacyModel, fast: legacyModel };
+        }
+      }
       savedProvider = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_PROVIDER })
       );
@@ -204,7 +224,7 @@ export class GlobalSettings extends Abject {
     // Configure the selected provider
     const hasConfig = this.providerHasConfig(this.selectedProvider, anthropicKey, openaiKey, ollamaUrl);
     if (hasConfig && this.llmId) {
-      await this.configureSelectedProvider(anthropicKey, openaiKey, ollamaUrl, ollamaModel);
+      await this.configureSelectedProvider(anthropicKey, openaiKey, ollamaUrl, ollamaTierModels);
       log.info(`Loaded saved provider: ${this.selectedProvider}`);
     } else {
       await this.show();
@@ -228,11 +248,11 @@ export class GlobalSettings extends Abject {
     anthropicKey: string | null,
     openaiKey: string | null,
     ollamaUrl: string | null,
-    ollamaModel: string | null = null,
+    ollamaTierModels: { smart: string | null; balanced: string | null; fast: string | null } = { smart: null, balanced: null, fast: null },
   ): Promise<void> {
     if (!this.llmId) return;
 
-    const config: Record<string, string | undefined> = {};
+    const config: Record<string, unknown> = {};
     switch (this.selectedProvider) {
       case 'anthropic':
         config.anthropicApiKey = anthropicKey ?? undefined;
@@ -240,10 +260,17 @@ export class GlobalSettings extends Abject {
       case 'openai':
         config.openaiApiKey = openaiKey ?? undefined;
         break;
-      case 'ollama':
+      case 'ollama': {
         config.ollamaUrl = ollamaUrl || 'http://localhost:11434';
-        if (ollamaModel) config.ollamaModel = ollamaModel;
+        const tierModels: Record<string, string> = {};
+        if (ollamaTierModels.smart) tierModels.smart = ollamaTierModels.smart;
+        if (ollamaTierModels.balanced) tierModels.balanced = ollamaTierModels.balanced;
+        if (ollamaTierModels.fast) tierModels.fast = ollamaTierModels.fast;
+        if (Object.keys(tierModels).length > 0) {
+          config.ollamaTierModels = tierModels;
+        }
         break;
+      }
     }
 
     await this.request(request(this.id, this.llmId, 'configure', config));
@@ -335,7 +362,7 @@ export class GlobalSettings extends Abject {
     );
 
     const winW = 440;
-    const winH = 640;
+    const winH = 750;
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
@@ -363,7 +390,9 @@ export class GlobalSettings extends Abject {
     let savedAnthropicKey: string | null = null;
     let savedOpenaiKey: string | null = null;
     let savedOllamaUrl: string | null = null;
-    let savedOllamaModel: string | null = null;
+    let savedOllamaModelSmart: string | null = null;
+    let savedOllamaModelBalanced: string | null = null;
+    let savedOllamaModelFast: string | null = null;
     if (this.storageId) {
       savedAnthropicKey = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_ANTHROPIC })
@@ -374,9 +403,26 @@ export class GlobalSettings extends Abject {
       savedOllamaUrl = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_URL })
       );
-      savedOllamaModel = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL })
+      savedOllamaModelSmart = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL_SMART })
       );
+      savedOllamaModelBalanced = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL_BALANCED })
+      );
+      savedOllamaModelFast = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL_FAST })
+      );
+      // Legacy migration for show()
+      if (!savedOllamaModelSmart && !savedOllamaModelBalanced && !savedOllamaModelFast) {
+        const legacyModel = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL })
+        );
+        if (legacyModel) {
+          savedOllamaModelSmart = legacyModel;
+          savedOllamaModelBalanced = legacyModel;
+          savedOllamaModelFast = legacyModel;
+        }
+      }
     }
 
     // Section header + description + provider dropdown
@@ -540,7 +586,7 @@ export class GlobalSettings extends Abject {
       preferredSize: { height: 32 },
     }));
 
-    // Model dropdown
+    // Model tier dropdowns
     let ollamaModels: string[] = [];
     if (this.llmId) {
       try {
@@ -552,35 +598,44 @@ export class GlobalSettings extends Abject {
       } catch { /* Ollama not running */ }
     }
     const modelOptions = ollamaModels.length > 0 ? ollamaModels : ['(no models found)'];
-    let modelSelectedIndex = 0;
-    if (savedOllamaModel && ollamaModels.length > 0) {
-      const idx = ollamaModels.indexOf(savedOllamaModel);
-      if (idx >= 0) modelSelectedIndex = idx;
-    }
 
-    const { widgetIds: [ollamaModelLabelId, ollamaModelSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Model',
-          style: { color: this.theme.textHeading, fontSize: 13 } },
-        { type: 'select', windowId: this.windowId,
-          options: modelOptions,
-          selectedIndex: modelSelectedIndex },
-      ]})
-    );
-    this.ollamaModelSelectId = ollamaModelSelectId;
-    this.ollamaSectionIds.push(ollamaModelLabelId);
-    this.ollamaSectionIds.push(this.ollamaModelSelectId);
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: ollamaModelLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-    await this.request(request(this.id, this.ollamaModelSelectId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: this.ollamaModelSelectId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
+    const tierConfigs: { label: string; saved: string | null; field: 'ollamaModelSmartSelectId' | 'ollamaModelBalancedSelectId' | 'ollamaModelFastSelectId' }[] = [
+      { label: 'Smart Model', saved: savedOllamaModelSmart, field: 'ollamaModelSmartSelectId' },
+      { label: 'Balanced Model', saved: savedOllamaModelBalanced, field: 'ollamaModelBalancedSelectId' },
+      { label: 'Fast Model', saved: savedOllamaModelFast, field: 'ollamaModelFastSelectId' },
+    ];
+
+    for (const tier of tierConfigs) {
+      let selectedIndex = 0;
+      if (tier.saved && ollamaModels.length > 0) {
+        const idx = ollamaModels.indexOf(tier.saved);
+        if (idx >= 0) selectedIndex = idx;
+      }
+
+      const { widgetIds: [tierLabelId, tierSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: tier.label,
+            style: { color: this.theme.textHeading, fontSize: 13 } },
+          { type: 'select', windowId: this.windowId,
+            options: modelOptions,
+            selectedIndex },
+        ]})
+      );
+      this[tier.field] = tierSelectId;
+      this.ollamaSectionIds.push(tierLabelId);
+      this.ollamaSectionIds.push(tierSelectId);
+      await this.request(request(this.id, cId, 'addLayoutChild', {
+        widgetId: tierLabelId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 20 },
+      }));
+      await this.request(request(this.id, tierSelectId, 'addDependent', {}));
+      await this.request(request(this.id, cId, 'addLayoutChild', {
+        widgetId: tierSelectId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 32 },
+      }));
+    }
 
     // Hide non-selected provider sections
     await this.switchProviderFields(this.selectedProvider);
@@ -828,7 +883,9 @@ export class GlobalSettings extends Abject {
     this.openaiToggleId = undefined;
     this.openaiSectionIds = [];
     this.ollamaUrlId = undefined;
-    this.ollamaModelSelectId = undefined;
+    this.ollamaModelSmartSelectId = undefined;
+    this.ollamaModelBalancedSelectId = undefined;
+    this.ollamaModelFastSelectId = undefined;
     this.ollamaSectionIds = [];
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
@@ -882,7 +939,7 @@ export class GlobalSettings extends Abject {
 
   private async setSaveControlsDisabled(disabled: boolean): Promise<void> {
     const style = { disabled };
-    const ids = [this.saveBtnId, this.providerSelectId, this.anthropicKeyId, this.openaiKeyId, this.ollamaUrlId, this.ollamaModelSelectId];
+    const ids = [this.saveBtnId, this.providerSelectId, this.anthropicKeyId, this.openaiKeyId, this.ollamaUrlId, this.ollamaModelSmartSelectId, this.ollamaModelBalancedSelectId, this.ollamaModelFastSelectId];
     for (const id of ids) {
       if (id) {
         try { await this.request(request(this.id, id, 'update', { style })); } catch { /* widget gone */ }
@@ -1044,14 +1101,17 @@ export class GlobalSettings extends Abject {
         break;
     }
 
-    // Read Ollama model if applicable
-    let ollamaModel = '';
-    if (provider === 'ollama' && this.ollamaModelSelectId) {
-      ollamaModel = await this.request<string>(
-        request(this.id, this.ollamaModelSelectId, 'getValue', {})
-      );
-      // Ignore placeholder
-      if (ollamaModel === '(no models found)') ollamaModel = '';
+    // Read Ollama tier models if applicable
+    const ollamaTierModels = { smart: '', balanced: '', fast: '' };
+    if (provider === 'ollama') {
+      const readSelect = async (selectId: AbjectId | undefined) => {
+        if (!selectId) return '';
+        const val = await this.request<string>(request(this.id, selectId, 'getValue', {}));
+        return val === '(no models found)' ? '' : val;
+      };
+      ollamaTierModels.smart = await readSelect(this.ollamaModelSmartSelectId);
+      ollamaTierModels.balanced = await readSelect(this.ollamaModelBalancedSelectId);
+      ollamaTierModels.fast = await readSelect(this.ollamaModelFastSelectId);
     }
 
     // Persist to storage
@@ -1073,9 +1133,19 @@ export class GlobalSettings extends Abject {
         await this.request(
           request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OLLAMA_URL, value: ollamaUrl })
         );
-        if (ollamaModel) {
+        if (ollamaTierModels.smart) {
           await this.request(
-            request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OLLAMA_MODEL, value: ollamaModel })
+            request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OLLAMA_MODEL_SMART, value: ollamaTierModels.smart })
+          );
+        }
+        if (ollamaTierModels.balanced) {
+          await this.request(
+            request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OLLAMA_MODEL_BALANCED, value: ollamaTierModels.balanced })
+          );
+        }
+        if (ollamaTierModels.fast) {
+          await this.request(
+            request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OLLAMA_MODEL_FAST, value: ollamaTierModels.fast })
           );
         }
       }
@@ -1086,7 +1156,7 @@ export class GlobalSettings extends Abject {
       anthropicKey || null,
       openaiKey || null,
       ollamaUrl || null,
-      ollamaModel || null,
+      { smart: ollamaTierModels.smart || null, balanced: ollamaTierModels.balanced || null, fast: ollamaTierModels.fast || null },
     );
 
     log.info(`Saved provider: ${provider}`);
