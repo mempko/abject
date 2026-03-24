@@ -68,9 +68,9 @@ export class OpenAIProvider extends BaseLLMProvider {
   private model: string;
 
   private static readonly TIER_MODELS: Record<ModelTier, string> = {
-    smart: 'gpt-4o',
-    balanced: 'gpt-4-turbo-preview',
-    fast: 'gpt-4o-mini',
+    smart: 'gpt-5.4',
+    balanced: 'gpt-5.4-mini',
+    fast: 'gpt-5.4-nano',
   };
 
   private resolveModel(tier?: ModelTier): string {
@@ -83,7 +83,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       baseUrl: config.baseUrl ?? 'https://api.openai.com',
       fetchFn: config.fetchFn,
     });
-    this.model = config.model ?? 'gpt-4-turbo-preview';
+    this.model = config.model ?? 'gpt-5.4-mini';
   }
 
   async isAvailable(): Promise<boolean> {

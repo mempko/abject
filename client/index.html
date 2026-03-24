@@ -7,7 +7,7 @@
     <title>Abjects</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
     <style>
       * {
         margin: 0;
@@ -21,7 +21,7 @@
         background: #030308;
         font-family: "Inter", system-ui, -apple-system, sans-serif;
       }
-      /* Abyss background layers */
+      /* Abyss background layers — hidden until landing */
       body::before {
         content: '';
         position: fixed;
@@ -33,6 +33,11 @@
           radial-gradient(ellipse 50% 50% at 10% 80%, rgba(155, 89, 255, 0.035) 0%, transparent 50%),
           radial-gradient(ellipse 40% 40% at 90% 70%, rgba(57, 255, 142, 0.03) 0%, transparent 50%),
           radial-gradient(ellipse 60% 30% at 50% 0%, rgba(155, 89, 255, 0.02) 0%, transparent 50%);
+        opacity: 0;
+        transition: opacity 1.5s ease-in;
+      }
+      body.landed::before {
+        opacity: 1;
         animation: abyss-breathe 12s ease-in-out infinite;
       }
       @keyframes abyss-breathe {
@@ -50,6 +55,13 @@
         z-index: 1;
         width: 100%;
         height: 100%;
+        transform: translateY(40px);
+        opacity: 0;
+        transition: transform 0.8s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.6s ease-out;
+      }
+      #app.landed {
+        transform: translateY(0);
+        opacity: 1;
       }
       canvas {
         display: block;
@@ -127,6 +139,61 @@
         margin-bottom: 0.75rem;
         min-height: 1.2em;
       }
+
+      /* Connecting overlay */
+      #connecting-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        pointer-events: none;
+        transition: opacity 0.4s ease-out;
+      }
+      #connecting-overlay.hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+      #connecting-overlay.landed .connecting-logo {
+        transform: translateY(-60px);
+        opacity: 0;
+      }
+      #connecting-overlay.landed .connecting-status {
+        opacity: 0;
+      }
+      .connecting-logo {
+        font-family: "JetBrains Mono", "Fira Code", monospace;
+        font-size: 1.6rem;
+        font-weight: 700;
+        color: #e0e0ea;
+        margin-bottom: 1.25rem;
+        text-shadow: 0 0 40px rgba(57, 255, 142, 0.1);
+        transition: transform 0.7s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.5s ease-out;
+      }
+      .connecting-logo .accent {
+        color: #39ff8e;
+        text-shadow: 0 0 30px rgba(57, 255, 142, 0.3);
+      }
+      .connecting-status {
+        font-family: "JetBrains Mono", "Fira Code", monospace;
+        font-size: 0.8rem;
+        color: #5a5a70;
+        letter-spacing: 0.1em;
+        transition: opacity 0.3s ease-out;
+      }
+      .connecting-dots::after {
+        content: '';
+        animation: dots 1.5s steps(4, end) infinite;
+      }
+      @keyframes dots {
+        0%   { content: ''; }
+        25%  { content: '.'; }
+        50%  { content: '..'; }
+        75%  { content: '...'; }
+        100% { content: ''; }
+      }
     </style>
   </head>
   <body>
@@ -142,6 +209,10 @@
           <button type="submit">Sign in</button>
         </form>
       </div>
+    </div>
+    <div id="connecting-overlay">
+      <div class="connecting-logo"><span class="accent">{abject}</span></div>
+      <div class="connecting-status">Descending into the depths<span class="connecting-dots"></span></div>
     </div>
     <canvas id="abyss-bg"></canvas>
     <div id="app"></div>

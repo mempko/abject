@@ -17,6 +17,7 @@ import type {
   StartWindowDragMsg,
   AuthResultMsg,
 } from '../server/ws-protocol.js';
+import type { AbyssBgControl } from './abyss-bg.js';
 
 /**
  * The thin browser frontend that owns the Canvas and Compositor.
@@ -57,9 +58,11 @@ export class FrontendClient {
   /** Track last canvas-space mouse position for drag start */
   private lastCanvasX = 0;
   private lastCanvasY = 0;
+  private abyssBg?: AbyssBgControl;
 
-  constructor(canvas: HTMLCanvasElement) {
+  constructor(canvas: HTMLCanvasElement, abyssBg?: AbyssBgControl) {
     this.canvas = canvas;
+    this.abyssBg = abyssBg;
     this.compositor = new Compositor(canvas);
     this.setupInputListeners();
   }
@@ -70,6 +73,8 @@ export class FrontendClient {
   connect(url: string): void {
     const t0 = performance.now();
     const clog = (msg: string) => console.log(`[WS-CLIENT T+${Math.round(performance.now() - t0)}ms] ${msg}`);
+
+    this.showConnecting();
 
     clog(`new WebSocket(${url})`);
     this.ws = new WebSocket(url);
@@ -159,6 +164,7 @@ export class FrontendClient {
     switch (msg.type) {
       case 'authNotRequired':
         this.authenticated = true;
+        this.hideConnecting();
         this.hideLoginForm();
         this.sendFontMetricsWhenReady();
         break;
@@ -179,6 +185,7 @@ export class FrontendClient {
         if (result.success && result.token) {
           localStorage.setItem('abjects_auth_token', result.token);
           this.authenticated = true;
+          this.hideConnecting();
           this.hideLoginForm();
           this.sendFontMetricsWhenReady();
         } else {
@@ -223,6 +230,32 @@ export class FrontendClient {
       form?.removeEventListener('submit', this.loginFormHandler);
       this.loginFormHandler = null;
     }
+  }
+
+  private showConnecting(): void {
+    const overlay = document.getElementById('connecting-overlay');
+    if (overlay) {
+      overlay.classList.remove('hidden', 'landed');
+    }
+    const app = document.getElementById('app');
+    if (app) app.classList.remove('landed');
+    document.body.classList.remove('landed');
+    this.abyssBg?.setDescending(true);
+  }
+
+  private hideConnecting(): void {
+    const overlay = document.getElementById('connecting-overlay');
+    if (overlay) {
+      // Animate logo up and status out
+      overlay.classList.add('landed');
+      // Fade away the overlay after the animation
+      setTimeout(() => overlay.classList.add('hidden'), 700);
+    }
+    // Animate the UI rising into view + clouds appearing
+    const app = document.getElementById('app');
+    if (app) app.classList.add('landed');
+    document.body.classList.add('landed');
+    this.abyssBg?.setDescending(false);
   }
 
   /**

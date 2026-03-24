@@ -355,6 +355,23 @@ export class ObjectCreator extends Abject {
       return this.getObjectGraph();
     });
 
+    // Reset timeouts on streaming LLM chunks and forward progress upstream (throttled)
+    let lastChunkForward = 0;
+    this.on('llmChunk', async () => {
+      if (this._currentLlmMsgId) this.resetRequestTimeout(this._currentLlmMsgId);
+      this.resetPendingTicketTimeouts();
+      // Forward upstream at most once per second to reset AgentAbject's dispatch timer
+      const now = Date.now();
+      if (this._currentCallerId && this._currentCallerId !== this.id && now - lastChunkForward >= 1000) {
+        lastChunkForward = now;
+        this.send(
+          event(this.id, this._currentCallerId, 'progress', {
+            phase: 'llm-streaming', message: 'LLM generating...',
+          })
+        );
+      }
+    });
+
     // Forward LLM keep-alive progress events to the upstream caller
     this.on('progress', async (msg: AbjectMessage) => {
       // Reset the active LLM request timeout so long-running calls don't expire
@@ -587,13 +604,18 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
   }
 
   /**
-   * Call LLM complete via message passing.
+   * Call LLM via streaming to prevent timeouts on long code generation.
+   * Returns the same shape as complete() for caller compatibility.
    */
   private async llmComplete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
-    const msg = request(this.id, this.llmId!, 'complete', { messages, options });
+    const msg = request(this.id, this.llmId!, 'stream', { messages, options });
     this._currentLlmMsgId = msg.header.messageId;
     try {
-      return await this.request<LLMCompletionResult>(msg, 310000);
+      const result = await this.request<{ content: string }>(msg, 310000);
+      return {
+        content: result.content,
+        finishReason: 'stop',
+      };
     } finally {
       this._currentLlmMsgId = undefined;
     }
@@ -867,7 +889,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         'Return one name per line, nothing else. If no dependencies are needed, return "None".'
       ),
       userMessage(`Available objects:\n${summaryText}\n\nNew object to create: ${prompt}\n\nWhich objects does it need?`),
-    ], { tier: 'smart' });
+    ], { tier: 'balanced' });
 
     const content = result.content.trim();
     if (content.toLowerCase() === 'none') return [];
@@ -1354,7 +1376,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
       ),
     ];
 
-    const result = await this.llmComplete(messages, { tier: 'smart' });
+    const result = await this.llmComplete(messages, { tier: 'balanced' });
     return this.parseManifestResponse(result.content);
   }
 
@@ -1388,7 +1410,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
       ),
     ];
 
-    const result = await this.llmComplete(messages, { tier: 'balanced', maxTokens: 16384 });
+    const result = await this.llmComplete(messages, { tier: 'smart', maxTokens: 16384 });
     log.info(`Modify Phase 2 LLM response (${result.content.length} chars):\n${result.content.slice(0, 500)}`);
     return this.parseCodeResponse(result.content);
   }
@@ -1689,7 +1711,7 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
       userMessage(`Available dependencies:\n${depContext}\n\n${context ? `Additional context: ${context}\n\n` : ''}User request: ${prompt}\n\nDesign the manifest for this object.`),
     ];
 
-    const result = await this.llmComplete(messages, { tier: 'smart' });
+    const result = await this.llmComplete(messages, { tier: 'balanced' });
     return this.parseManifestResponse(result.content);
   }
 
@@ -1710,7 +1732,7 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
       userMessage(`Manifest:\n\`\`\`json\n${JSON.stringify(manifest, null, 2)}\n\`\`\`\n\nYou MUST implement handlers for these methods: ${methodList.join(', ')}\n\nAvailable dependencies:\n${depContext}\n\nUsed objects: ${usedObjects.length > 0 ? usedObjects.join(', ') : 'None'}\n\n${context ? `Additional context: ${context}\n\n` : ''}Original user request: ${prompt}\n\nGenerate the handler map.`),
     ];
 
-    const result = await this.llmComplete(messages, { tier: 'balanced', maxTokens: 16384 });
+    const result = await this.llmComplete(messages, { tier: 'smart', maxTokens: 16384 });
     log.info(`Phase 2 LLM response (${result.content.length} chars):\n${result.content.slice(0, 500)}`);
     return this.parseCodeResponse(result.content);
   }
@@ -1735,7 +1757,7 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
       systemMessage(`Your previous attempt failed with this error:\n${errorFeedback}\n\n${previousCode ? `Previous code:\n\`\`\`javascript\n${previousCode}\n\`\`\`\n\n` : ''}Fix these issues. Remember:\n- The handler map MUST be a FLAT parenthesized object: ({ method(msg) { ... } })\n- You MUST implement ALL methods listed above: ${methodList.join(', ')}\n- Each handler takes a single msg argument\n- MUST be plain JavaScript, NOT TypeScript\n- Do NOT nest handlers under interface keys\n\nGenerate the corrected handler map.`),
     ];
 
-    const result = await this.llmComplete(messages, { tier: 'balanced', maxTokens: 16384 });
+    const result = await this.llmComplete(messages, { tier: 'smart', maxTokens: 16384 });
     log.info(`Phase 2 retry LLM response (${result.content.length} chars):\n${result.content.slice(0, 500)}`);
     return this.parseCodeResponse(result.content);
   }

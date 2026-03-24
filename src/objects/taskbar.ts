@@ -8,7 +8,7 @@
 
 import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { event, request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 
@@ -30,14 +30,8 @@ export class Taskbar extends Abject {
   // Y-offset for positioning below WorkspaceSwitcher
   private yOffset = 8;
 
-  // Button AbjectIds for system buttons
-  private registryBtnId?: AbjectId;
-  private chatBtnId?: AbjectId;
-  private jobsBtnId?: AbjectId;
-  private browserViewerBtnId?: AbjectId;
-  private goalsBtnId?: AbjectId;
-
-  // Dynamic user object buttons: button widget AbjectId → target object AbjectId
+  // Button widget AbjectId → target object AbjectId (for click dispatch and state updates)
+  private systemButtons: Map<AbjectId, AbjectId> = new Map();
   private userObjButtons: Map<AbjectId, AbjectId> = new Map();
 
   // Debounce timer for incremental updates
@@ -167,56 +161,14 @@ export class Taskbar extends Abject {
 
       const fromId = msg.routing.from;
 
-      if (fromId === this.registryBtnId) {
-        await this.request(
-          request(this.id, this.appExplorerId!, 'show', {})
-        );
-      } else if (fromId === this.chatBtnId) {
-        await this.request(
-          request(this.id, this.chatId!, 'show', {})
-        );
-      } else if (fromId === this.jobsBtnId) {
-        await this.request(
-          request(this.id, this.jobBrowserId!, 'show', {})
-        );
-      } else if (fromId === this.browserViewerBtnId && this.webBrowserViewerId) {
-        await this.request(
-          request(this.id, this.webBrowserViewerId, 'show', {})
-        );
-      } else if (fromId === this.goalsBtnId && this.goalBrowserId) {
-        await this.request(
-          request(this.id, this.goalBrowserId, 'show', {})
-        );
+      // System and user object buttons all map button → target
+      const targetId = this.systemButtons.get(fromId) ?? this.userObjButtons.get(fromId);
+      if (targetId) {
+        this.send(event(this.id, targetId, 'show', {}));
       } else if (this.restoreButtons.has(fromId)) {
-        // Restore a minimized window
         const surfaceId = this.restoreButtons.get(fromId)!;
         if (this.windowManagerId) {
-          try {
-            await this.request(request(this.id, this.windowManagerId, 'restoreWindow', { surfaceId }));
-          } catch (err) {
-            log.warn('Failed to restore window:', err);
-          }
-        }
-      } else {
-        // Check dynamic user object buttons
-        const targetId = this.userObjButtons.get(fromId);
-        if (targetId) {
-          const reg = await this.registryLookup(targetId);
-          if (reg) {
-            const iface = reg.manifest.interface;
-            const hasShow = iface && iface.methods.some((m) => m.name === 'show');
-            if (hasShow) {
-              try {
-                await this.request(request(this.id, targetId, 'show', {}));
-              } catch (err) {
-                log.warn(`Failed to show ${reg.manifest.name}:`, err);
-              }
-            } else {
-              log.warn(`No show method found for ${reg.manifest.name}`);
-            }
-          } else {
-            log.warn(`Registry lookup failed for ${targetId}`);
-          }
+          this.send(event(this.id, this.windowManagerId, 'restoreWindow', { surfaceId }));
         }
       }
     });
@@ -356,33 +308,14 @@ export class Taskbar extends Abject {
       } catch { return false; }
     };
 
-    // System buttons
-    const systemPairs: [AbjectId | undefined, AbjectId | undefined][] = [
-      [this.registryBtnId, this.appExplorerId],
-      [this.chatBtnId, this.chatId],
-      [this.jobsBtnId, this.jobBrowserId],
-      [this.browserViewerBtnId, this.webBrowserViewerId],
-      [this.goalsBtnId, this.goalBrowserId],
-    ];
-
-    const updates = systemPairs
-      .filter(([btnId, objId]) => btnId && objId)
-      .map(async ([btnId, objId]) => {
-        const vis = await isVisible(objId!);
-        await this.request(request(this.id, btnId!, 'update', {
-          style: vis ? activeStyle : inactiveStyle,
-        }));
-      });
-
-    // User object buttons
-    for (const [btnId, targetId] of this.userObjButtons) {
-      updates.push((async () => {
-        const vis = await isVisible(targetId);
-        await this.request(request(this.id, btnId, 'update', {
-          style: vis ? activeStyle : inactiveStyle,
-        }));
-      })());
-    }
+    // Update all buttons (system + user) in parallel
+    const allButtons = [...this.systemButtons, ...this.userObjButtons];
+    const updates = allButtons.map(async ([btnId, targetId]) => {
+      const vis = await isVisible(targetId);
+      await this.request(request(this.id, btnId, 'update', {
+        style: vis ? activeStyle : inactiveStyle,
+      }));
+    });
 
     await Promise.all(updates);
   }
@@ -398,10 +331,8 @@ export class Taskbar extends Abject {
     const padding = 16;
     const spacing = 6;
     const btnW = 120;
-    const systemBtnCount = 2 + (this.webBrowserViewerId ? 1 : 0) + (this.goalBrowserId ? 1 : 0);
     const minimizedCount = this.minimizedWindows.size;
-    const userBtnCount = this.userObjButtons.size;
-    const totalBtnCount = systemBtnCount + userBtnCount + minimizedCount;
+    const totalBtnCount = this.systemButtons.size + this.userObjButtons.size + minimizedCount;
     const extraHeight = (labelH + spacing)
       + (minimizedCount > 0 ? (labelH + spacing) : 0);
     const barWidth = btnW + padding * 2;
@@ -436,12 +367,7 @@ export class Taskbar extends Abject {
     }
 
     // Reset all button tracking since window is destroyed and rebuilt
-    this.registryBtnId = undefined;
-
-    this.chatBtnId = undefined;
-    this.jobsBtnId = undefined;
-    this.browserViewerBtnId = undefined;
-    this.goalsBtnId = undefined;
+    this.systemButtons.clear();
     this.rootLayoutId = undefined;
     this.userObjButtons.clear();
     this.restoreButtons.clear();
@@ -569,17 +495,18 @@ export class Taskbar extends Abject {
       request(this.id, this.widgetManagerId!, 'create', { specs })
     );
 
-    // Assign IDs
+    // Assign IDs — map each button widget to its target object
     const appsLabelId = widgetIds[0];
-    this.registryBtnId = widgetIds[1];
-    this.chatBtnId = widgetIds[2];
+    const registryBtnId = widgetIds[1];
+    this.systemButtons.set(registryBtnId, this.appExplorerId!);
     let nextIdx = 3;
+    this.systemButtons.set(widgetIds[2], this.chatId!);
     if (this.goalBrowserId) {
-      this.goalsBtnId = widgetIds[nextIdx++];
+      this.systemButtons.set(widgetIds[nextIdx++], this.goalBrowserId);
     }
-    this.jobsBtnId = widgetIds[nextIdx++];
+    this.systemButtons.set(widgetIds[nextIdx++], this.jobBrowserId!);
     if (this.webBrowserViewerId) {
-      this.browserViewerBtnId = widgetIds[nextIdx++];
+      this.systemButtons.set(widgetIds[nextIdx++], this.webBrowserViewerId);
     }
 
     // Map user object buttons
@@ -591,17 +518,14 @@ export class Taskbar extends Abject {
     await this.request(request(this.id, appsHeaderRowId, 'addLayoutChildren', {
       children: [
         { widgetId: appsLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: labelH } },
-        { widgetId: this.registryBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } },
+        { widgetId: registryBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } },
       ],
     }));
 
-    // Build root layout children: all system buttons + user buttons
+    // Build root layout children: all system buttons (except registry gear) + user buttons
     const rootChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize: Record<string, number> }> = [];
-    const allButtonIds = [this.chatBtnId];
-    if (this.goalsBtnId) allButtonIds.push(this.goalsBtnId);
-    allButtonIds.push(this.jobsBtnId);
-    if (this.browserViewerBtnId) allButtonIds.push(this.browserViewerBtnId);
-    for (const btnId of allButtonIds) {
+    for (const [btnId] of this.systemButtons) {
+      if (btnId === registryBtnId) continue; // registry gear is in the header row
       rootChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
     }
     for (let i = 0; i < showableObjects.length; i++) {
@@ -627,8 +551,7 @@ export class Taskbar extends Abject {
     }));
 
     // Fire-and-forget: register as dependent for all interactive buttons
-    this.send(request(this.id, this.registryBtnId, 'addDependent', {}));
-    for (const btnId of allButtonIds) {
+    for (const [btnId] of this.systemButtons) {
       this.send(request(this.id, btnId, 'addDependent', {}));
     }
     for (let i = 0; i < showableObjects.length; i++) {
@@ -654,12 +577,7 @@ export class Taskbar extends Abject {
 
     this.windowId = undefined;
     this.rootLayoutId = undefined;
-    this.registryBtnId = undefined;
-
-    this.chatBtnId = undefined;
-    this.jobsBtnId = undefined;
-    this.browserViewerBtnId = undefined;
-    this.goalsBtnId = undefined;
+    this.systemButtons.clear();
     this.userObjButtons.clear();
     return true;
   }

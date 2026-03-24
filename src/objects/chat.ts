@@ -836,9 +836,9 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   For "object" you can use a name (e.g. "Timer") or an AbjectId (e.g. "abjects:timer").
 - **create**: Create a new object. Creates a task in the TupleSpace that an agent (ObjectCreator) claims autonomously. The created object is auto-shown.
   \`{ "action": "create", "description": "A counter widget that shows a number and has +/- buttons" }\`
-- **modify**: Modify an existing object. Creates a task in the TupleSpace that an agent claims autonomously.
-  \`{ "action": "modify", "object": "<name or id>", "description": "Add a reset button that clears the counter" }\`
-  Use the \`[id: ...]\` from the object list for reliable targeting.
+- **modify**: Modify an existing object. REQUIRED fields: "object" and "description". Creates a task in the TupleSpace that an agent claims autonomously.
+  \`{ "action": "modify", "object": "ObjectName", "description": "Add a reset button that clears the counter" }\`
+  The "object" field MUST be the object's name or [id: ...] from "Your Abjects" list above. Without "object", modify will fail.
 - **clone**: Clone a clonable object from a remote peer's workspace into your local workspace.
   \`{ "action": "clone", "object": "peer.workspace.ObjectName" }\`
   Use the qualified name shown next to "(clonable)" objects in Connected Peers.
@@ -906,7 +906,7 @@ WebAgent handles all browser management — use it for multi-step tasks, page li
 5. Always end a conversation turn with **done** when the task is complete.
 6. Keep reasoning brief (1-2 sentences before the JSON block).
 7. Every object supports: describe (get manifest), ask (get usage advice), addDependent/removeDependent (observe state changes).
-8. IMPORTANT: If the user asks to fix, change, update, or improve something and a matching object exists in "Your Objects" above, you MUST use **modify** with its [id: ...] — NEVER re-create it with **create**.
+8. IMPORTANT: If the user asks to fix, change, update, or improve something and a matching object exists in "Your Abjects" above, you MUST use **modify** with its name in the "object" field and a "description" of the change. Example: \`{ "action": "modify", "object": "PongGame", "description": "use mouse for controls" }\`. NEVER omit "object" or "description". NEVER re-create with **create** when an object already exists.
 9. If an action fails with a transient error (overloaded, timeout, 529, 503), **retry the same action** — do NOT switch from modify to create. Transient errors are temporary and unrelated to your action choice.
 10. P2P: Use qualified names to reference remote objects: this.find('peer.workspace.ObjectName'). NEVER hardcode UUIDs.
 11. For web tasks: message WebAgent with runTask on your FIRST action — include ALL details from the user's message (credentials, URLs, specific instructions) in the task description. Do not ask the user to repeat information they already gave you.`;

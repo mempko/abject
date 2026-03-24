@@ -327,12 +327,29 @@ export class LLMObject extends Abject {
         correlationId, callerId, 'stream', provider!.name, totalChars, true, messages,
       );
 
+      // Send keep-alive progress while waiting for the first chunk (model load time).
+      // Once tokens start flowing, llmChunk events act as the heartbeat.
+      const KEEPALIVE_MS = 30000;
+      let keepaliveTimer: ReturnType<typeof setInterval> | undefined = setInterval(() => {
+        this.send(
+          event(this.id, callerId, 'progress', {
+            phase: 'llm-waiting',
+            message: `Waiting for LLM (${Math.round((Date.now() - start) / 1000)}s)`,
+          })
+        );
+      }, KEEPALIVE_MS);
+
       let fullContent = '';
       try {
         for await (const chunk of provider!.stream(messages, options)) {
           if (activeReq.killed) {
             log.info(`Request ${correlationId} killed during streaming`);
             break;
+          }
+          // First chunk arrived -- stop keepalive, chunks are the heartbeat now
+          if (keepaliveTimer) {
+            clearInterval(keepaliveTimer);
+            keepaliveTimer = undefined;
           }
           fullContent += chunk.content;
           activeReq.outputChars = fullContent.length;
@@ -349,6 +366,8 @@ export class LLMObject extends Abject {
         log.error(`${provider!.name} stream | ${elapsed}ms | ${errMsg}`);
         this.trackRequestError(correlationId, errMsg);
         throw err;
+      } finally {
+        if (keepaliveTimer) clearInterval(keepaliveTimer);
       }
 
       const elapsed = Date.now() - start;

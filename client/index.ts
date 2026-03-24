@@ -43,16 +43,16 @@ function start(): void {
     return;
   }
 
-  // Start abyss background animation
+  // Start abyss background animation (descending while connecting)
   const abyssBg = document.getElementById('abyss-bg') as HTMLCanvasElement | null;
-  if (abyssBg) startAbyssBg(abyssBg);
+  const abyssControl = abyssBg ? startAbyssBg(abyssBg) : undefined;
 
   const canvas = document.createElement('canvas');
   canvas.style.width = '100%';
   canvas.style.height = '100%';
   container.appendChild(canvas);
 
-  const client = new FrontendClient(canvas);
+  const client = new FrontendClient(canvas, abyssControl);
   clog('Calling connect()...');
   client.connect(WS_URL);
 

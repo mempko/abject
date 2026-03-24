@@ -84,7 +84,12 @@ function createTendril(w: number, h: number): Tendril {
   };
 }
 
-export function startAbyssBg(canvas: HTMLCanvasElement): () => void {
+export interface AbyssBgControl {
+  stop: () => void;
+  setDescending: (descending: boolean) => void;
+}
+
+export function startAbyssBg(canvas: HTMLCanvasElement): AbyssBgControl {
   const ctx = canvas.getContext('2d')!;
   let w = 0;
   let h = 0;
@@ -92,6 +97,8 @@ export function startAbyssBg(canvas: HTMLCanvasElement): () => void {
   let particles: Particle[] = [];
   let tendrils: Tendril[] = [];
   let frame = 0;
+  let descending = true;
+  let descentSpeed = 1.0;  // 1.0 = full descent, 0.0 = ambient
 
   function resize(): void {
     const dpr = window.devicePixelRatio || 1;
@@ -112,7 +119,9 @@ export function startAbyssBg(canvas: HTMLCanvasElement): () => void {
 
   function updateParticle(p: Particle): void {
     p.x += p.vx;
-    p.y += p.vy;
+    // During descent, particles rush upward (we're falling past them)
+    const descentBoost = descentSpeed * -2.5;
+    p.y += p.vy + descentBoost;
     p.pulse += p.pulseSpeed;
 
     // Wrap around edges
@@ -125,10 +134,11 @@ export function startAbyssBg(canvas: HTMLCanvasElement): () => void {
   }
 
   function updateTendril(t: Tendril): void {
+    const descentBoost = descentSpeed * -1.5;
     for (const pt of t.points) {
-      // Slow sinusoidal drift
+      // Slow sinusoidal drift + descent rush
       pt.x += Math.sin(frame * 0.002 + pt.y * 0.01) * 0.15;
-      pt.y += pt.vy * 0.02;
+      pt.y += pt.vy * 0.02 + descentBoost;
     }
     // Slowly regenerate if drifted too far up
     if (t.points[t.points.length - 1].y < -100) {
@@ -189,6 +199,12 @@ export function startAbyssBg(canvas: HTMLCanvasElement): () => void {
 
   function render(): void {
     frame++;
+
+    // Smoothly decelerate when no longer descending
+    if (!descending && descentSpeed > 0) {
+      descentSpeed = Math.max(0, descentSpeed - 0.008);
+    }
+
     ctx.clearRect(0, 0, w, h);
 
     // Draw tendrils behind particles
@@ -210,9 +226,14 @@ export function startAbyssBg(canvas: HTMLCanvasElement): () => void {
   window.addEventListener('resize', resize);
   animId = requestAnimationFrame(render);
 
-  // Return cleanup function
-  return () => {
-    cancelAnimationFrame(animId);
-    window.removeEventListener('resize', resize);
+  return {
+    stop: () => {
+      cancelAnimationFrame(animId);
+      window.removeEventListener('resize', resize);
+    },
+    setDescending: (d: boolean) => {
+      descending = d;
+      if (d) descentSpeed = 1.0;
+    },
   };
 }
