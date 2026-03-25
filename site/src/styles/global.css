@@ -66,16 +66,44 @@ html {
   scroll-behavior: smooth;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  background: var(--bg-deep);
 }
 
 body {
   font-family: var(--font-body);
-  background: var(--bg-deep);
+  background: transparent;
   color: var(--text-primary);
   line-height: 1.7;
   font-size: 16px;
   overflow-x: hidden;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='600' height='600' viewBox='0 0 600 600'%3E%3Cpath d='M300 50 Q350 200 250 300 Q150 400 300 550' stroke='%2339ff8e' stroke-width='0.5' fill='none' opacity='0.03'/%3E%3Cpath d='M100 100 Q200 250 150 400 Q100 500 200 550' stroke='%239b59ff' stroke-width='0.5' fill='none' opacity='0.02'/%3E%3Cpath d='M500 80 Q400 200 450 350 Q500 450 400 550' stroke='%2339ff8e' stroke-width='0.5' fill='none' opacity='0.025'/%3E%3Cpath d='M50 300 Q150 250 300 300 Q450 350 550 300' stroke='%239b59ff' stroke-width='0.5' fill='none' opacity='0.02'/%3E%3C/svg%3E");
+}
+
+/* Abyss background layers */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 80% 60% at 50% 100%, rgba(57, 255, 142, 0.04) 0%, transparent 60%),
+    radial-gradient(ellipse 50% 50% at 10% 80%, rgba(155, 89, 255, 0.035) 0%, transparent 50%),
+    radial-gradient(ellipse 40% 40% at 90% 70%, rgba(57, 255, 142, 0.03) 0%, transparent 50%),
+    radial-gradient(ellipse 60% 30% at 50% 0%, rgba(155, 89, 255, 0.02) 0%, transparent 50%);
+  animation: abyss-breathe 12s ease-in-out infinite;
+}
+
+@keyframes abyss-breathe {
+  0%, 100% { opacity: 0.7; }
+  50% { opacity: 1; }
+}
+
+#abyss-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  display: block;
 }
 
 /* ── Typography ── */
@@ -104,6 +132,11 @@ a:hover {
   max-width: var(--max-width);
   margin: 0 auto;
   padding: 0 1.5rem;
+}
+
+main, footer {
+  position: relative;
+  z-index: 1;
 }
 
 section {
