@@ -412,14 +412,15 @@ export class ScriptableAbject extends Abject {
    * Non-function properties (e.g. _windowId: null) are set on the instance so handlers
    * can share state via `this`.
    */
-  // System handlers that must never be overridden by user source code.
-  // System handlers that must never be overridden by user source code.
-  // LLM-generated code often includes stubs for these that bypass the
-  // hot-reload logic (updateSource), return stale introspection data
-  // (describe, ask), or break lifecycle management (windowCloseRequested).
-  private static readonly PROTECTED_HANDLERS = new Set([
+  /**
+   * Handlers auto-provided by the framework (Abject base + ScriptableAbject).
+   * User code cannot override these; they are silently skipped during compile.
+   * ObjectCreator imports this set to exclude them from verification and LLM prompts.
+   */
+  static readonly PROTECTED_HANDLERS = new Set([
     'getSource', 'updateSource', 'probe', 'windowCloseRequested',
     'describe', 'ask', 'getRegistry',
+    'ping', 'addDependent', 'removeDependent',
   ]);
 
   private compileAndInstall(source: string): void {

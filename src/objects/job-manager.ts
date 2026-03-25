@@ -204,7 +204,9 @@ export class JobManager extends Abject {
             result: finished.result,
             error: finished.error,
           } as JobResult);
-        } catch { /* caller may be gone */ }
+        } catch (err) {
+          this.log('warn', `Deferred reply for ${finished.id} failed (caller may be gone): ${err instanceof Error ? err.message : String(err)}`);
+        }
       });
 
       // Return DEFERRED_REPLY to suppress auto-reply and free the processing loop
@@ -226,6 +228,7 @@ export class JobManager extends Abject {
       const { jobId } = msg.payload as { jobId: string };
       const job = this.jobs.get(jobId);
       if (!job || job.status !== 'queued') return false;
+      this.log('info', `cancelJob ${jobId} (${job.description})`);
 
       // Remove from the job's named queue
       const q = this.queues.get(job.queue);

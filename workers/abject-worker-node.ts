@@ -98,6 +98,14 @@ constructors.set('ScriptableAbject', (args?: unknown) => {
   return new ScriptableAbject(opts.manifest, opts.source, opts.owner as AbjectId);
 });
 
+// Global error handlers — report to main thread before the worker dies
+process.on('uncaughtException', (err) => {
+  try { port.postMessage({ type: 'error', error: `uncaughtException: ${err.message}\n${err.stack}` }); } catch { /* dying */ }
+});
+process.on('unhandledRejection', (reason) => {
+  try { port.postMessage({ type: 'error', error: `unhandledRejection: ${reason}` }); } catch { /* dying */ }
+});
+
 // Worker state — pass parentPort.postMessage so WorkerBus routes via worker_threads
 const workerBus = new WorkerBus((data) => port.postMessage(data));
 const objects = new Map<AbjectId, Abject>();

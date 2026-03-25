@@ -12,6 +12,7 @@ export class NodeWorkerAdapter implements WorkerLike {
   private worker: NodeWorker;
   onmessage: ((event: { data: unknown }) => void) | null = null;
   onerror: ((event: { message: string }) => void) | null = null;
+  onexit: ((event: { code: number }) => void) | null = null;
 
   constructor(scriptPath: string | URL) {
     // worker_threads doesn't inherit tsx's TypeScript loader, so we use
@@ -29,6 +30,10 @@ export class NodeWorkerAdapter implements WorkerLike {
 
     this.worker.on('error', (err: Error) => {
       this.onerror?.({ message: err.message });
+    });
+
+    this.worker.on('exit', (code: number) => {
+      this.onexit?.({ code });
     });
   }
 

@@ -571,11 +571,17 @@ improve semantic matching accuracy.
 
     // Periodic scan for missed/pre-existing tasks (every 30s)
     this.scanTimer = setInterval(() => {
-      this.periodicScan().catch(() => {});
+      this.periodicScan().catch(err => {
+        log.warn('Periodic scan failed:', err instanceof Error ? err.message : String(err));
+      });
     }, 30_000);
 
     // Initial scan after 5s delay (give agents time to register)
-    setTimeout(() => { this.periodicScan().catch(() => {}); }, 5000);
+    setTimeout(() => {
+      this.periodicScan().catch(err => {
+        log.warn('Initial scan failed:', err instanceof Error ? err.message : String(err));
+      });
+    }, 5000);
   }
 
   protected override async onStop(): Promise<void> {
@@ -1114,7 +1120,9 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       if (!isNaN(idx) && idx >= 0 && idx < candidates.length) {
         return candidates[idx];
       }
-    } catch { /* fallback */ }
+    } catch (err) {
+      log.warn(`classifyBestAgent LLM failed, using first candidate:`, err instanceof Error ? err.message : String(err));
+    }
 
     return candidates[0];
   }
@@ -1157,7 +1165,9 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
       if (!isNaN(idx) && idx >= 0 && idx < allAgents.length) {
         return allAgents[idx];
       }
-    } catch { /* LLM unavailable — no match */ }
+    } catch (err) {
+      log.warn(`semanticMatchAgent LLM failed, no match:`, err instanceof Error ? err.message : String(err));
+    }
 
     return null;
   }

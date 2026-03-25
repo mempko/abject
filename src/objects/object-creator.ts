@@ -39,6 +39,9 @@ import { Log } from '../core/timed-log.js';
 
 const log = new Log('OBJECT-CREATOR');
 
+/** Methods auto-provided by Abject/ScriptableAbject framework. User code should not implement these. */
+const FRAMEWORK_PROVIDED_METHODS = ScriptableAbject.PROTECTED_HANDLERS;
+
 /** Per-creation-task state for tracking agent-driven creation. */
 interface CreationTaskExtra {
   prompt: string;
@@ -443,8 +446,9 @@ export class ObjectCreator extends Abject {
         tupleId: string; goalId?: string; description: string;
         data?: Record<string, unknown>; type: string;
       };
+      log.info(`executeTask type=${type} goalId=${goalId?.slice(0, 8) ?? '?'} desc="${description.slice(0, 60)}"`);
       this._currentGoalId = goalId;
-      // Use the caller (AgentAbject) as the progress recipient — NOT this.id,
+      // Use the caller (AgentAbject) as the progress recipient -- NOT this.id,
       // because reportProgress sends 'progress' events to callerId, and our own
       // 'progress' handler re-sends to _currentCallerId, creating an infinite
       // loop when callerId === this.id.
@@ -453,8 +457,10 @@ export class ObjectCreator extends Abject {
         if (type === 'modify') {
           const objectId = data?.objectId as string;
           if (!objectId) throw new Error('modify task missing objectId');
+          log.info(`executeTask modify object=${objectId.slice(0, 8)}`);
           return await this.modifyObject(objectId as AbjectId, description, callerId);
         }
+        log.info(`executeTask create`);
         return await this.createObject(description, undefined, callerId);
       } finally {
         this._currentGoalId = undefined;
@@ -908,7 +914,8 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
       return await this.request<IntrospectResult>(
         request(this.id, objectId, 'describe', {})
       );
-    } catch {
+    } catch (err) {
+      log.warn(`introspect ${objectId.slice(0, 8)} failed:`, err instanceof Error ? err.message : String(err));
       return null;
     }
   }
@@ -952,7 +959,8 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         request(this.id, objectId, 'ask', { question }),
         60000
       );
-    } catch {
+    } catch (err) {
+      log.warn(`askDependency ${objectId.slice(0, 8)} failed:`, err instanceof Error ? err.message : String(err));
       return null;
     }
   }
@@ -1391,7 +1399,8 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
     usedObjects: string[],
     currentSource: string | null
   ): Promise<string | undefined> {
-    const methodList = manifest.interface.methods.map((m) => m.name);
+    const methodList = manifest.interface.methods.map((m) => m.name)
+      .filter(n => !FRAMEWORK_PROVIDED_METHODS.has(n));
 
     const existingCodeBlock = currentSource
       ? `\n\nExisting handler code to modify (preserve working logic, add/change only what the modification requires):\n\`\`\`javascript\n${currentSource}\n\`\`\`\n`
@@ -1725,7 +1734,8 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
     usedObjects: string[],
     context?: string
   ): Promise<string | undefined> {
-    const methodList = manifest.interface.methods.map((m) => m.name);
+    const methodList = manifest.interface.methods.map((m) => m.name)
+      .filter(n => !FRAMEWORK_PROVIDED_METHODS.has(n));
 
     const messages: LLMMessage[] = [
       systemMessage(this.getPhase2SystemPrompt()),
@@ -1749,7 +1759,8 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
     errorFeedback: string,
     context?: string
   ): Promise<string | undefined> {
-    const methodList = manifest.interface.methods.map((m) => m.name);
+    const methodList = manifest.interface.methods.map((m) => m.name)
+      .filter(n => !FRAMEWORK_PROVIDED_METHODS.has(n));
 
     const messages: LLMMessage[] = [
       systemMessage(this.getPhase2SystemPrompt()),
@@ -1803,12 +1814,14 @@ Suggest 3-5 objects that would help achieve this goal. Format: one suggestion pe
     const implementedMethods = new Set(handlerNames);
 
     for (const method of declaredMethods) {
+      if (FRAMEWORK_PROVIDED_METHODS.has(method)) continue;
       if (!implementedMethods.has(method)) {
         mismatches.push(`Missing handler: '${method}' declared in manifest but not implemented`);
       }
     }
 
     for (const handler of implementedMethods) {
+      if (FRAMEWORK_PROVIDED_METHODS.has(handler)) continue;
       if (!declaredMethods.has(handler)) {
         mismatches.push(`Extra handler: '${handler}' implemented but not declared in manifest`);
       }
@@ -2085,7 +2098,8 @@ CRITICAL RULES:
   _status, _bus, _mailbox, _parentId, _registryId, _source, _owner, id, manifest, state,
   handlers, dependents, pendingReplies, capabilities, errorCount, lastError, startedAt, lastActivity
   Use descriptive alternatives: _gameState instead of _status, _inputKeys instead of _keys, etc.
-- You MUST implement a handler for EVERY method listed in the manifest. No exceptions.
+- You MUST implement a handler for EVERY method listed in the manifest, EXCEPT these framework-provided methods which are auto-registered and must NOT appear in your handler map:
+  ${[...FRAMEWORK_PROVIDED_METHODS].join(', ')}
 - FUNCTION NAME PREFIX RULE:
   - Functions WITHOUT '_' prefix become MESSAGE HANDLERS only — NOT callable as this.foo().
     Calling this.foo() where foo has no '_' prefix will throw "this.foo is not a function".
@@ -2554,7 +2568,7 @@ Use this for dynamic composition — objects can learn about each other at runti
     return `You are an Abjects consistency checker. You verify that a manifest and handler code match exactly.
 
 Rules:
-- Every method declared in the manifest MUST have a corresponding handler in the code.
+- Every method declared in the manifest MUST have a corresponding handler in the code, EXCEPT these framework-provided methods which are auto-registered and should NOT be in the handler map: ${[...FRAMEWORK_PROVIDED_METHODS].join(', ')}.
 - Every public handler (not prefixed with _) in the code MUST be declared in the manifest.
 - The handler map MUST be a FLAT parenthesized object: ({ method(msg) { ... } })
 - Handlers must NOT be nested under interface keys like { "my:interface": { method() {} } }

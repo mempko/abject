@@ -23,6 +23,7 @@ export interface WorkerLike {
   terminate(): void;
   onmessage: ((event: { data: unknown }) => void) | null;
   onerror: ((event: { message: string }) => void) | null;
+  onexit: ((event: { code: number }) => void) | null;
 }
 
 /** Message types sent from main thread to worker. */
@@ -62,6 +63,9 @@ export class WorkerBridge {
   private readyPromise: Promise<void>;
   private pendingSpawns: Map<AbjectId, { resolve: () => void; reject: (err: Error) => void }> = new Map();
   private pendingKills: Map<AbjectId, { resolve: () => void; reject: (err: Error) => void }> = new Map();
+  private _dead = false;
+
+  get isDead(): boolean { return this._dead; }
 
   constructor(worker: WorkerLike, bus: MessageBus) {
     this.worker = worker;
@@ -74,6 +78,29 @@ export class WorkerBridge {
     this.worker.onmessage = this.handleWorkerMessage.bind(this);
     this.worker.onerror = (e) => {
       log.error('Worker error:', e.message);
+      // Reject pending ready if worker errors during init
+      if (this.readyResolve) {
+        this.readyResolve = undefined;
+      }
+    };
+    this.worker.onexit = (e) => {
+      this._dead = true;
+      const objectIds = [...this.hostedObjects];
+      log.error(`Worker exited (code ${e.code}), lost ${objectIds.length} objects: [${objectIds.map(id => id.slice(0, 8)).join(', ')}]`);
+      // Unregister all hosted objects from the bus so senders get immediate errors
+      for (const objectId of objectIds) {
+        this.bus.unregister(objectId);
+      }
+      this.hostedObjects.clear();
+      // Reject all pending operations
+      for (const [, pending] of this.pendingSpawns) {
+        pending.reject(new Error(`Worker exited with code ${e.code}`));
+      }
+      this.pendingSpawns.clear();
+      for (const [, pending] of this.pendingKills) {
+        pending.reject(new Error(`Worker exited with code ${e.code}`));
+      }
+      this.pendingKills.clear();
     };
   }
 
@@ -88,6 +115,10 @@ export class WorkerBridge {
    * Deliver a normal message to an object in this worker.
    */
   deliverMessage(message: AbjectMessage): void {
+    if (this._dead) {
+      log.warn(`DEAD WORKER: dropping ${message.header.type} ${message.routing.method ?? '?'} to=${message.routing.to.slice(0, 8)}`);
+      return;
+    }
     const msg: WorkerInboundMessage = {
       type: 'bus:deliver',
       message,
@@ -103,6 +134,10 @@ export class WorkerBridge {
    * Deliver a reply/error message to an object in this worker via fast-path.
    */
   deliverReply(message: AbjectMessage): void {
+    if (this._dead) {
+      log.warn(`DEAD WORKER: dropping reply ${message.routing.method ?? '?'} to=${message.routing.to.slice(0, 8)}`);
+      return;
+    }
     const msg: WorkerInboundMessage = {
       type: 'bus:reply',
       message,

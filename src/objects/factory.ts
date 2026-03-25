@@ -16,6 +16,9 @@ import { v4 as uuidv4 } from 'uuid';
 import { Abject } from '../core/abject.js';
 import { require, invariant } from '../core/contracts.js';
 import { Capabilities } from '../core/capability.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('Factory');
 import { request } from '../core/message.js';
 import type { MessageBusLike } from '../runtime/message-bus.js';
 import { type WorkerPool, workerIndexForId } from '../runtime/worker-pool.js';
@@ -634,11 +637,16 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
 
     // Spawn in worker — pass registryId and parentId so the worker-side
     // object can discover dependencies and communicate with the bus hub
-    await this._workerPool!.spawnInWorker(objectId, req.manifest.name, {
-      constructorArgs: req.constructorArgs,
-      registryId: req.registryHint ?? this._factoryRegistryId,
-      parentId: req.parentId ?? this.id,
-    });
+    try {
+      await this._workerPool!.spawnInWorker(objectId, req.manifest.name, {
+        constructorArgs: req.constructorArgs,
+        registryId: req.registryHint ?? this._factoryRegistryId,
+        parentId: req.parentId ?? this.id,
+      });
+    } catch (err) {
+      log.error(`Failed to spawn ${req.manifest.name} (${objectId.slice(0, 8)}) in worker:`, err);
+      throw err;
+    }
 
     // Track as worker-spawned
     this.workerSpawned.set(objectId, req.manifest.name);

@@ -581,6 +581,7 @@ suitable agent based on descriptions.
       };
       const goal = this.goals.get(goalId);
       if (!goal) return;
+      log.info(`updateProgress ${goalId.slice(0, 8)} phase=${phase ?? '?'} agent=${agentName ?? '?'}: ${message.slice(0, 80)}`);
 
       goal.progress.push({
         timestamp: Date.now(),
@@ -790,7 +791,9 @@ suitable agent based on descriptions.
         );
         const tuple = scanResult.find(t => t.id === taskId);
         if (tuple) currentFields = tuple.fields;
-      } catch { /* best effort */ }
+      } catch (err) {
+        log.warn(`failTask ${taskId.slice(0, 8)} scan failed:`, err instanceof Error ? err.message : String(err));
+      }
 
       const failureHistory = (currentFields.failureHistory as Array<{ agent: string; agentId: string; error: string; timestamp: number }>) ?? [];
       const attempts = ((currentFields.attempts as number) ?? 0) + 1;

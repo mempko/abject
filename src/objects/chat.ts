@@ -190,6 +190,7 @@ export class Chat extends Abject {
     this.on('sendMessage', async (msg: AbjectMessage) => {
       const { message } = msg.payload as { message: string };
       if (!message?.trim()) return false;
+      log.info(`[Chat] sendMessage: "${message.trim().slice(0, 80)}"`);
       this.triggerSend(message.trim());
       return true;
     });
@@ -502,6 +503,7 @@ export class Chat extends Abject {
   // ═══════════════════════════════════════════════════════════════════
 
   private async handleAgentAct(action: AgentAction): Promise<unknown> {
+    log.info(`[Chat] handleAgentAct: action=${action.action} object=${(action as Record<string, unknown>).object ?? ''}`);
     switch (action.action) {
       case 'list': {
         const objects = await this.request<ObjectRegistration[]>(
