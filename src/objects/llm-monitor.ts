@@ -58,7 +58,6 @@ export class LLMMonitor extends Abject {
   private killButtons: Map<AbjectId, string> = new Map();
   private viewButtons: Map<AbjectId, string> = new Map();
   private refreshTimer?: ReturnType<typeof setInterval>;
-  private refreshInProgress = false;
 
   // Row tracking for in-place updates
   private activeRows: RowWidgets[] = [];
@@ -337,17 +336,6 @@ export class LLMMonitor extends Abject {
    * update labels in-place to avoid flicker. Otherwise do a full rebuild.
    */
   private async refreshView(): Promise<void> {
-    if (!this.scrollableListId || !this.rootLayoutId || !this.windowId) return;
-    if (this.refreshInProgress) return;
-    this.refreshInProgress = true;
-    try {
-      await this._refreshViewImpl();
-    } finally {
-      this.refreshInProgress = false;
-    }
-  }
-
-  private async _refreshViewImpl(): Promise<void> {
     if (!this.scrollableListId || !this.rootLayoutId || !this.windowId) return;
 
     // Fetch snapshot

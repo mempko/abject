@@ -10,8 +10,11 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { Log } from '../core/timed-log.js';
 import type { Job } from './job-manager.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
+
+const log = new Log('JobBrowser');
 
 const JOB_BROWSER_INTERFACE: InterfaceId = 'abjects:job-browser';
 
@@ -220,12 +223,8 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
   async hide(): Promise<boolean> {
     if (!this.windowId) return true;
 
-    // Unsubscribe from JobManager
-    try {
-      await this.request(
-        request(this.id, this.jobManagerId!, 'removeDependent', {})
-      );
-    } catch { /* best effort */ }
+    // Fire-and-forget: unsubscribe from JobManager
+    this.send(request(this.id, this.jobManagerId!, 'removeDependent', {}));
 
     await this.request(
       request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
@@ -280,7 +279,9 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
 
       // Batch add to layout
       await this.request(request(this.id, this.jobListId, 'addLayoutChildren', { children }));
-    } catch { /* JobManager may not have any jobs yet */ }
+    } catch (err) {
+      log.warn('Failed to populate existing jobs:', err);
+    }
   }
 
   private formatJobLabel(job: Job): { text: string; color: string } {
@@ -352,13 +353,11 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
       });
       if (!confirmed) return;
       if (this.jobManagerId) {
-        await this.request(
-          request(this.id, this.jobManagerId, 'clearHistory', {})
-        );
+        // Fire-and-forget: historyCleared event will trigger rebuild
+        this.send(request(this.id, this.jobManagerId, 'clearHistory', {}));
       }
-      // Rebuild the job list
+      // Optimistically clear the UI
       await this.clearJobLabels();
-      await this.populateExistingJobs();
       return;
     }
 
@@ -374,18 +373,18 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
 
       switch (aspect) {
         case 'jobQueued':
-          await this.appendJobLabel(jobId, `○ #${jobId.replace('job-', '')} ${queueTag}${description}`, this.theme.statusNeutral);
+          await this.appendJobLabel(jobId, `\u25CB #${jobId.replace('job-', '')} ${queueTag}${description}`, this.theme.statusNeutral);
           break;
         case 'jobStarted':
-          await this.updateJobLabel(jobId, `▸ #${jobId.replace('job-', '')} ${queueTag}${description}`, this.theme.statusWarning);
+          await this.updateJobLabel(jobId, `\u25B8 #${jobId.replace('job-', '')} ${queueTag}${description}`, this.theme.statusWarning);
           break;
         case 'jobCompleted':
-          await this.updateJobLabel(jobId, `✓ #${jobId.replace('job-', '')} ${queueTag}${description}`, this.theme.statusSuccess);
+          await this.updateJobLabel(jobId, `\u2713 #${jobId.replace('job-', '')} ${queueTag}${description}`, this.theme.statusSuccess);
           break;
         case 'jobFailed': {
           const error = data.error as string | undefined;
-          const errorSuffix = error ? ` — ${error.slice(0, 30)}` : '';
-          await this.updateJobLabel(jobId, `✗ #${jobId.replace('job-', '')} ${queueTag}${description}${errorSuffix}`, this.theme.statusError);
+          const errorSuffix = error ? ` \u2014 ${error.slice(0, 30)}` : '';
+          await this.updateJobLabel(jobId, `\u2717 #${jobId.replace('job-', '')} ${queueTag}${description}${errorSuffix}`, this.theme.statusError);
           break;
         }
         case 'historyCleared':
