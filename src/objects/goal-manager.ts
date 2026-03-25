@@ -63,6 +63,8 @@ export class GoalManager extends Abject {
   private sharedStateId?: AbjectId;
   private storageId?: AbjectId;
   private localPeerId = '';
+  /** Track taskIds for which we already emitted terminal events (idempotency guard). */
+  private emittedTerminalTasks: Set<string> = new Set();
 
   constructor() {
     super({
@@ -272,6 +274,13 @@ export class GoalManager extends Abject {
     this.tupleSpaceId = await this.discoverDep('TupleSpace') ?? undefined;
     this.sharedStateId = await this.discoverDep('SharedState') ?? undefined;
     this.storageId = await this.discoverDep('Storage') ?? undefined;
+
+    // Subscribe to TupleSpace events so we detect remote permanently_failed/done transitions
+    if (this.tupleSpaceId) {
+      try {
+        await this.request(request(this.id, this.tupleSpaceId, 'addDependent', {}));
+      } catch { /* TupleSpace may not be ready yet */ }
+    }
 
     // Get local peerId from Identity
     const identityId = await this.discoverDep('Identity');
@@ -673,6 +682,7 @@ suitable agent based on descriptions.
                   await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: task.id }));
                 }
                 await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id }));
+                this.emittedTerminalTasks.delete(task.id);
               } catch { /* best effort */ }
             }
           } catch { /* best effort */ }
@@ -770,6 +780,7 @@ suitable agent based on descriptions.
       );
 
       log.info(`completeTask ${taskId.slice(0, 8)} — emitting taskCompleted`);
+      this.emittedTerminalTasks.add(taskId);
       this.changed('taskCompleted', { taskId, goalId, result });
       return updateResult;
     });
@@ -822,6 +833,7 @@ suitable agent based on descriptions.
         try {
           await this.request(request(this.id, this.tupleSpaceId, 'release', { tupleId: taskId }));
         } catch { /* best effort */ }
+        this.emittedTerminalTasks.add(taskId);
         this.changed('taskPermanentlyFailed', { taskId, goalId, error, attempts });
         return updateResult;
       }
@@ -942,6 +954,7 @@ suitable agent based on descriptions.
             } catch { /* best effort */ }
           }
           await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id }));
+          this.emittedTerminalTasks.delete(task.id);
           cancelled++;
         } catch { /* best effort */ }
       }
@@ -970,6 +983,7 @@ suitable agent based on descriptions.
           }
           // Remove tuple from TupleSpace entirely
           await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id }));
+          this.emittedTerminalTasks.delete(task.id);
           cancelled++;
         } catch { /* best effort — tuple may already be gone */ }
       }
@@ -1014,11 +1028,36 @@ suitable agent based on descriptions.
       );
     });
 
-    // SharedState changed handler — merge remote updates for per-goal namespaces
-    // SharedState sends events with method 'changed' and aspect 'stateChanged'.
+    // Changed handler — routes TupleSpace and SharedState events
     this.on('changed', async (msg: AbjectMessage) => {
-      if (msg.routing.from !== this.sharedStateId) return;
+      const fromId = msg.routing.from;
       const { aspect, value: eventValue } = msg.payload as { aspect: string; value?: unknown };
+
+      // ── TupleSpace tupleUpdated: detect remote terminal status transitions ──
+      if (fromId === this.tupleSpaceId && aspect === 'tupleUpdated' && eventValue) {
+        const tuple = eventValue as { id: string; fields: Record<string, unknown> };
+        const taskId = tuple.id;
+        const status = tuple.fields?.status as string | undefined;
+        const goalId = tuple.fields?.goalId as string | undefined;
+
+        if (status === 'permanently_failed' && !this.emittedTerminalTasks.has(taskId)) {
+          this.emittedTerminalTasks.add(taskId);
+          const err = (tuple.fields?.error as string) ?? 'Task permanently failed (remote)';
+          const attempts = (tuple.fields?.attempts as number) ?? 0;
+          log.info(`Remote permanently_failed detected for ${taskId.slice(0, 8)}`);
+          this.changed('taskPermanentlyFailed', { taskId, goalId, error: err, attempts });
+        }
+        if (status === 'done' && !this.emittedTerminalTasks.has(taskId)) {
+          this.emittedTerminalTasks.add(taskId);
+          const result = tuple.fields?.result;
+          log.info(`Remote task completion detected for ${taskId.slice(0, 8)}`);
+          this.changed('taskCompleted', { taskId, goalId, result });
+        }
+        return;
+      }
+
+      // ── SharedState: merge remote updates for per-goal namespaces ──
+      if (fromId !== this.sharedStateId) return;
       if (aspect !== 'stateChanged') return;
 
       const stateChange = eventValue as { name?: string; key?: string; value?: unknown } | undefined;

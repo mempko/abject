@@ -861,7 +861,7 @@ export class WebBrowser extends Abject {
       const t0 = Date.now();
       await this.navigatePage(tracked.page, url, options);
       const finalUrl = tracked.page.url();
-      const title = await tracked.page.title();
+      const title = await this.safeTitle(tracked.page, finalUrl);
       log.info(`navigateTo (${payload.pageId}) → ${url} [${Date.now() - t0}ms]`);
       this.changed('pageNavigated', { pageId: payload.pageId, url: finalUrl, title });
       return { url: finalUrl, title };
@@ -956,10 +956,11 @@ export class WebBrowser extends Abject {
 
     // -- getContent --
     this.deferredPageHandler('getContent', async (tracked) => {
+      const url = tracked.page.url();
       return {
-        html: await tracked.page.content(),
-        url: tracked.page.url(),
-        title: await tracked.page.title(),
+        html: await this.safeContent(tracked.page, `<!-- content unavailable for ${url} -->`),
+        url,
+        title: await this.safeTitle(tracked.page, url),
       };
     });
 
@@ -971,7 +972,7 @@ export class WebBrowser extends Abject {
         fullPage: options?.fullPage ?? false,
       });
       const b64 = Buffer.from(buffer).toString('base64');
-      const viewport = tracked.page.viewportSize() ?? { width: 1280, height: 720 };
+      const viewport = this.safeViewportSize(tracked.page);
       return {
         dataUri: `data:image/png;base64,${b64}`,
         width: viewport.width,
@@ -1034,11 +1035,10 @@ export class WebBrowser extends Abject {
         };
         results.push(entry);
         titlePromises.push(
-          tracked.page.title().then((t) => { entry.title = t; }),
+          tracked.page.title().then((t) => { entry.title = t; }).catch(() => { /* title stays '' */ }),
         );
       }
       Promise.all(titlePromises).then(
-        () => this.sendDeferredReply(msg, results),
         () => this.sendDeferredReply(msg, results),
       );
       return DEFERRED_REPLY;
@@ -1059,7 +1059,7 @@ export class WebBrowser extends Abject {
         fullPage: options?.fullPage ?? false,
       }).then((buffer) => {
         const b64 = Buffer.from(buffer).toString('base64');
-        const viewport = tracked.page.viewportSize() ?? { width: 1280, height: 720 };
+        const viewport = this.safeViewportSize(tracked.page);
         this.sendDeferredReply(msg, {
           dataUri: `data:image/png;base64,${b64}`,
           width: viewport.width,
@@ -1175,6 +1175,35 @@ export class WebBrowser extends Abject {
     return browser.newPage(pageOpts);
   }
 
+  /** Safely read page title, returning fallback if execution context was destroyed. */
+  private async safeTitle(page: PlaywrightPage, fallback = ''): Promise<string> {
+    try {
+      return await page.title();
+    } catch {
+      log.info('safeTitle: execution context unavailable, returning fallback');
+      return fallback;
+    }
+  }
+
+  /** Safely read page content, returning fallback if execution context was destroyed. */
+  private async safeContent(page: PlaywrightPage, fallback = ''): Promise<string> {
+    try {
+      return await page.content();
+    } catch {
+      log.info('safeContent: execution context unavailable, returning fallback');
+      return fallback;
+    }
+  }
+
+  /** Safely read viewport size, returning defaults if page context is unavailable. */
+  private safeViewportSize(page: PlaywrightPage): { width: number; height: number } {
+    try {
+      return page.viewportSize() ?? { width: 1280, height: 720 };
+    } catch {
+      return { width: 1280, height: 720 };
+    }
+  }
+
   /**
    * Navigate a page to a URL and wait for content.
    */
@@ -1225,9 +1254,9 @@ export class WebBrowser extends Abject {
     const page = await this.createPage(options) as PlaywrightPage;
     try {
       await this.navigatePage(page, url, options);
-      const html = await page.content();
       const finalUrl = page.url();
-      const title = await page.title();
+      const html = await this.safeContent(page, `<!-- content unavailable for ${finalUrl} -->`);
+      const title = await this.safeTitle(page, finalUrl);
       return { html, url: finalUrl, title };
     } finally {
       await page.close();
@@ -1244,7 +1273,7 @@ export class WebBrowser extends Abject {
       const buffer = await page.screenshot({ type: 'png', fullPage: false });
       const b64 = Buffer.from(buffer).toString('base64');
       const dataUri = `data:image/png;base64,${b64}`;
-      const viewport = page.viewportSize() ?? { width: 1280, height: 720 };
+      const viewport = this.safeViewportSize(page);
       return { dataUri, width: viewport.width, height: viewport.height };
     } finally {
       await page.close();

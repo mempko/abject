@@ -371,6 +371,10 @@ export class TupleSpace extends Abject {
         if (aspect === 'stateChanged' && value?.name === STATE_NAME) {
           const entry = value.value as TupleEntry | undefined;
           log.info(`SHARED-STATE-CHANGE key=${value.key ?? '?'} status=${entry?.fields?.status ?? '?'} claimedBy=${entry?.claimedBy ?? 'none'}`);
+          // Emit tupleUpdated so dependents (GoalManager) can react to remote status changes
+          if (entry) {
+            this.changed('tupleUpdated', entry);
+          }
         }
       }
     });
