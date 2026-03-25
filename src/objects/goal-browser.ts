@@ -232,10 +232,10 @@ Sub-goals are indented under their parent goal.
       ],
     }));
 
-    // Register as dependent (await GoalManager so we know we'll get events)
+    // Fire-and-forget: register as dependent
     this.send(request(this.id, this.stopAllBtnId, 'addDependent', {}));
     this.send(request(this.id, this.clearBtnId, 'addDependent', {}));
-    await this.request(request(this.id, this.goalManagerId!, 'addDependent', {}));
+    this.send(request(this.id, this.goalManagerId!, 'addDependent', {}));
 
     // Populate existing goals
     await this.populateExistingGoals();
