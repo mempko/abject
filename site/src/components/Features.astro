@@ -1,40 +1,40 @@
 ---
 const features = [
   {
-    icon: '{!}',
-    title: 'Self-Healing Proxies',
-    hook: 'Break them. They grow back. They always grow back.',
-    desc: 'Error rates above 10% trigger LLM proxy regeneration with traffic still flowing. Unknown messages trigger renegotiation. Hot-swap without disruption.',
+    icon: '{>}',
+    title: 'Spoken Into Being',
+    hook: 'Describe what you want. It appears. Alive. Watching.',
+    desc: 'Say "a todo list that syncs with my calendar" in plain English. The ObjectCreator writes a manifest, generates handler code via LLM, and spawns a running object with its own window. From words to living software in seconds.',
   },
   {
     icon: '{~}',
-    title: 'The Negotiator',
-    hook: 'An alien intelligence bridges incompatible minds.',
-    desc: 'The LLM reads both manifests, generates a real proxy Abject for protocol translation. Not a shim. A living translator with its own manifest and handlers.',
+    title: 'Living Code',
+    hook: 'Its source code changes while it runs. It does not notice.',
+    desc: 'Every ScriptableAbject can have its handlers rewritten at runtime. Old behavior is uninstalled, new behavior compiled and bound, all without restart. If the new code fails to compile, the old handlers stay. The object never breaks.',
   },
   {
-    icon: '{*}',
-    title: 'Everything is Alive',
-    hook: 'The registry is an Abject. The factory is an Abject. Even the thing that makes Abjects is an Abject.',
-    desc: 'System services follow the same Abject pattern: manifests, handlers, contracts. There is no privileged layer. Only Abjects passing messages in the dark.',
-  },
-  {
-    icon: '{=}',
-    title: 'Containment Protocols',
-    hook: 'Untrusted code runs inside a WASM cage. It can see nothing. Unless you grant it permission.',
-    desc: 'Sandboxed execution with capability-gated imports. No ambient authority. Abjects cannot touch anything they haven\'t been explicitly allowed to reach.',
+    icon: '{?}',
+    title: 'Objects That Interview',
+    hook: 'Before writing a line of code, the creator asks its dependencies: how should I use you?',
+    desc: 'The ObjectCreator generates targeted questions for each dependency based on your goal, sends them via the ask protocol, and uses the answers as context for code generation. Objects teach the next generation how to compose with them.',
   },
   {
     icon: '{@}',
-    title: 'True Names',
-    hook: 'Every peer has a true name: a SHA-256 hash of its public key.',
-    desc: 'Cryptographic P2P identity with ECDSA/ECDH. AES-256-GCM encrypted WebRTC channels. Trust is verified, not assumed.',
+    title: 'No Servers, No Masters',
+    hook: 'Your identity is your public key. Your network is your contacts. No cloud required.',
+    desc: "Every peer's true name is the SHA-256 hash of its signing key. Connect directly over encrypted WebRTC channels. Peers find each other through stateless signaling relays, then talk peer-to-peer. Networks grow by introduction, not registration.",
   },
   {
-    icon: '{+}',
-    title: 'Nothing Truly Dies',
-    hook: 'Dead Abjects restart. Crashed processes respawn. The supervisor ensures nothing stays buried.',
-    desc: 'Erlang-style supervision with state snapshots for resurrection with memories intact. Kill an Abject; it comes back knowing what it knew.',
+    icon: '{=}',
+    title: 'Shared Goals, Many Minds',
+    hook: 'One goal, many agents, many peers. All working. None coordinating.',
+    desc: 'Goals decompose into tasks that land in a CRDT-backed TupleSpace synced across peers. Agents on any machine watch and claim work autonomously. If one peer crashes, stale claims expire and others pick up where it left off. Progress bubbles up in real-time without a central dispatcher.',
+  },
+  {
+    icon: '{!}',
+    title: 'Scars That Teach',
+    hook: 'Every failure is fed back into the wound. The proxy that grows back is smarter.',
+    desc: 'When error rates cross 10%, the HealthMonitor collects recent failures and feeds them to the Negotiator. A new proxy is generated with the error history as context. The replacement accounts for exactly the mistakes that killed its predecessor.',
   },
 ];
 ---
@@ -42,7 +42,7 @@ const features = [
 <section id="features">
   <div class="container">
     <h2 class="section-title">What Lurks Inside</h2>
-    <div class="grid-2">
+    <div class="feature-grid">
       {features.map((f) => (
         <div class="card feature-card">
           <span class="card-icon">{f.icon}</span>
@@ -56,6 +56,18 @@ const features = [
 </section>
 
 <style>
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.25rem;
+  }
+
+  @media (max-width: 768px) {
+    .feature-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+
   .card-icon {
     display: inline-block;
     font-family: var(--font-mono);
