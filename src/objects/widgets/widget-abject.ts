@@ -96,6 +96,7 @@ export interface WidgetConfig {
   rect: Rect;
   text?: string;
   style?: WidgetStyle;
+  href?: string;
   ownerId: AbjectId;
   uiServerId: AbjectId;
   theme?: ThemeData;
@@ -110,6 +111,7 @@ export abstract class WidgetAbject extends Abject {
   protected text: string;
   protected ownerId: AbjectId;
   protected uiServerId: AbjectId;
+  protected href: string = '';
   protected focused = false;
   protected disabled = false;
   protected visible = true;
@@ -135,6 +137,7 @@ export abstract class WidgetAbject extends Abject {
     this.style = config.style ? { ...config.style } : {};
     this.text = config.text ?? '';
     this.ownerId = config.ownerId;
+    this.href = config.href ?? '';
     this.uiServerId = config.uiServerId;
     this.theme = config.theme ?? MIDNIGHT_BLOOM;
     this.syncDisabledVisible();
@@ -187,6 +190,11 @@ export abstract class WidgetAbject extends Abject {
       if (this.disabled && !this.acceptsInputWhenDisabled()) return { consumed: false };
       const input = msg.payload as Record<string, unknown>;
 
+      // Open URL in browser when any widget with href is clicked
+      if (input.type === 'mousedown' && this.href) {
+        this.send(event(this.id, this.uiServerId, 'openUrl', { url: this.href }));
+      }
+
       return this.processInput(input);
     });
 
@@ -215,6 +223,7 @@ export abstract class WidgetAbject extends Abject {
    */
   private applyCommonUpdates(updates: Record<string, unknown>): void {
     if (updates.text !== undefined) this.text = updates.text as string;
+    if (updates.href !== undefined) this.href = updates.href as string;
     if (updates.style !== undefined) this.style = { ...this.style, ...(updates.style as WidgetStyle) };
     if (updates.rect !== undefined) this.rect = updates.rect as Rect;
     // Support top-level visible/disabled as shorthand for style.visible/style.disabled

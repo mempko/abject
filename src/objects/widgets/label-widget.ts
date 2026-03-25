@@ -5,6 +5,8 @@
  * When style.wordWrap is true, text is wrapped to fit the widget width
  * and rendered as multiple lines. Emits 'click' to dependents on mousedown
  * (useful for clickable lists, cards, and interactive label grids).
+ * When href is set, renders with theme link color and underline; clicking
+ * opens the URL in the user's browser (via the base class openUrl protocol).
  * When style.selectable is true, additionally enables click-drag, double-click
  * word select, Shift+click, Ctrl+A, and Ctrl+C for read-only selection.
  */
@@ -227,7 +229,8 @@ export class LabelWidget extends WidgetAbject {
     }
 
     const align = style.align ?? 'left';
-    const fill = style.color ?? this.theme.textPrimary;
+    const isLink = !!this.href;
+    const fill = isLink ? (style.color ?? this.theme.linkColor) : (style.color ?? this.theme.textPrimary);
     const sel = this.style.selectable ? this.getSelection() : null;
 
     if (style.wordWrap && w > 0) {
@@ -316,6 +319,20 @@ export class LabelWidget extends WidgetAbject {
             baseline: 'alphabetic',
           },
         });
+
+        // Underline for link labels (word-wrapped)
+        if (isLink && lines[i].length > 0) {
+          const lineWidth = await this.measureText(surfaceId, lines[i], font);
+          let lineX = textX;
+          if (align === 'center') lineX -= lineWidth / 2;
+          else if (align === 'right') lineX -= lineWidth;
+          const underY = textY + 2;
+          commands.push({
+            type: 'line',
+            surfaceId,
+            params: { x1: lineX, y1: underY, x2: lineX + lineWidth, y2: underY, stroke: fill, lineWidth: 1 },
+          });
+        }
       }
 
       commands.push({ type: 'restore', surfaceId, params: {} });
@@ -365,6 +382,20 @@ export class LabelWidget extends WidgetAbject {
           baseline: 'middle',
         },
       });
+
+      // Underline for link labels
+      if (isLink && text.length > 0) {
+        const textWidth = await this.measureText(surfaceId, text, font);
+        let lineX = textX;
+        if (align === 'center') lineX -= textWidth / 2;
+        else if (align === 'right') lineX -= textWidth;
+        const lineY = oy + h / 2 + (style.fontSize ?? 14) * 0.35;
+        commands.push({
+          type: 'line',
+          surfaceId,
+          params: { x1: lineX, y1: lineY, x2: lineX + textWidth, y2: lineY, stroke: fill, lineWidth: 1 },
+        });
+      }
     }
 
     return commands;

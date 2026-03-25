@@ -108,6 +108,11 @@ export interface ClipboardWriteMsg extends WsEnvelope {
   text: string;
 }
 
+export interface OpenUrlMsg extends WsEnvelope {
+  type: 'openUrl';
+  url: string;
+}
+
 export interface StartWindowDragMsg extends WsEnvelope {
   type: 'startWindowDrag';
   surfaceId: string;
@@ -148,6 +153,7 @@ export type BackendToFrontendMsg =
   | SetSurfaceWorkspaceMsg
   | SetActiveWorkspaceMsg
   | ClipboardWriteMsg
+  | OpenUrlMsg
   | StartWindowDragMsg
   | AuthRequiredMsg
   | AuthNotRequiredMsg

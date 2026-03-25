@@ -407,6 +407,11 @@ export class BackendUI extends Abject {
       this.sendToFrontend({ type: 'setSelectedText', text: selectedText });
     });
 
+    this.on('openUrl', async (msg: AbjectMessage) => {
+      const { url } = msg.payload as { url: string };
+      this.sendToFrontend({ type: 'openUrl', url });
+    });
+
     this.on('registerWindowManager', async (msg: AbjectMessage) => {
       this.windowManagerId = msg.routing.from;
       return true;

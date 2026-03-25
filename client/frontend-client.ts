@@ -363,6 +363,10 @@ export class FrontendClient {
         );
         break;
 
+      case 'openUrl':
+        window.open((msg as { url: string }).url, '_blank');
+        break;
+
       case 'startWindowDrag':
         this.handleStartWindowDrag(msg as StartWindowDragMsg);
         break;

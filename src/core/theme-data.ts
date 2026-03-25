@@ -87,6 +87,9 @@ export interface ThemeData {
   // ── Shadow ──
   shadowColor: string;
   dropdownShadow: string;
+
+  // ── Links ──
+  linkColor: string;
 }
 
 export const MIDNIGHT_BLOOM: ThemeData = {
@@ -168,4 +171,7 @@ export const MIDNIGHT_BLOOM: ThemeData = {
   // ── Shadow ──
   shadowColor: 'rgba(0,0,0,0.7)',
   dropdownShadow: 'rgba(0,0,0,0.4)',
+
+  // ── Links ──
+  linkColor: '#6ea8fe',
 };

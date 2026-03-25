@@ -79,7 +79,7 @@ Size Policies:
 
 | File | Class | Description |
 |------|-------|-------------|
-| `button-widget.ts` | `ButtonWidget` | Rounded rect with gradient. States: normal, hovered, focused (glow), disabled. Fires `click` on mousedown or Enter/Space |
+| `button-widget.ts` | `ButtonWidget` | Rounded rect with gradient. States: normal, hovered, focused (glow), disabled. Fires `click` on mousedown or Enter/Space. Set `href` to also open URL in browser |
 | `text-input-widget.ts` | `TextInputWidget` | Single-line input with cursor, selection, copy/cut/paste. Optional password masking. Fires `change` and `submit` |
 | `text-area-widget.ts` | `TextAreaWidget` | Multi-line editor with scrolling. Line-by-line cursor navigation, Tab inserts spaces. Optional monospace font |
 | `checkbox-widget.ts` | `CheckboxWidget` | 16x16 box with checkmark + label. Toggle on click or Space. Fires `change` with `'true'`/`'false'` |
@@ -91,10 +91,10 @@ Size Policies:
 
 | File | Class | Description |
 |------|-------|-------------|
-| `label-widget.ts` | `LabelWidget` | Static text with word-wrap. Fires `click` on mousedown (via addDependent). Alignment: left/center/right. Caches wrapped lines |
+| `label-widget.ts` | `LabelWidget` | Static text with word-wrap. Fires `click` on mousedown (via addDependent). Set `href` to render as clickable link (underlined, opens in browser). Alignment: left/center/right |
 | `progress-widget.ts` | `ProgressWidget` | Read-only bar (0-1 range). Gradient fill with optional percentage text |
 | `divider-widget.ts` | `DividerWidget` | Single line separator. Auto-detects horizontal vs vertical from dimensions |
-| `image-widget.ts` | `ImageWidget` | Displays image via URL. Fires `click` on mousedown (via addDependent). Fit modes: contain/cover/fill. Alt text fallback |
+| `image-widget.ts` | `ImageWidget` | Displays image via URL. Fires `click` on mousedown (via addDependent). Set `href` to make clickable (opens in browser). Fit modes: contain/cover/fill. Alt text fallback |
 
 ### Advanced Widgets
 
