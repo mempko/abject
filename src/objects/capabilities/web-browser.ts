@@ -57,6 +57,7 @@ type PlaywrightPage = {
   evaluate: (script: string | Function) => Promise<unknown>;
   $$eval: (selector: string, fn: (els: Element[]) => unknown) => Promise<unknown>;
   keyboard: { press: (key: string) => Promise<void> };
+  setContent: (html: string) => Promise<void>;
   on: (event: string, fn: () => void) => void;
 };
 
@@ -1165,26 +1166,49 @@ export class WebBrowser extends Abject {
       newPage: (opts?: unknown) => Promise<unknown>;
     };
 
-    const pageOpts: Record<string, unknown> = {};
+    const pageOpts: Record<string, unknown> = {
+      acceptDownloads: true,  // Prevent "Download is starting" errors for non-HTML responses
+    };
     if (options?.userAgent) pageOpts.userAgent = options.userAgent;
     if (options?.viewport) pageOpts.viewport = options.viewport;
 
-    return browser.newPage(Object.keys(pageOpts).length > 0 ? pageOpts : undefined);
+    return browser.newPage(pageOpts);
   }
 
   /**
    * Navigate a page to a URL and wait for content.
    */
   private async navigatePage(
-    page: Pick<PlaywrightPage, 'goto' | 'waitForSelector'>,
+    page: Pick<PlaywrightPage, 'goto' | 'waitForSelector' | 'setContent'>,
     url: string,
     options?: BrowseOptions,
   ): Promise<void> {
     const timeout = options?.timeout ?? 30000;
-    await page.goto(url, {
-      waitUntil: options?.waitUntil ?? 'domcontentloaded',
-      timeout,
-    });
+    try {
+      await page.goto(url, {
+        waitUntil: options?.waitUntil ?? 'domcontentloaded',
+        timeout,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('Download is starting')) {
+        // Non-HTML response (text/plain, application/octet-stream, etc.)
+        // Fetch the content directly and inject it into the page as preformatted text
+        log.info(`navigatePage: download triggered for ${url}, fetching content directly`);
+        try {
+          const resp = await fetch(url);
+          const text = await resp.text();
+          const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          await page.setContent(
+            `<html><head><title>${url}</title></head><body><pre>${escaped}</pre></body></html>`
+          );
+        } catch (fetchErr) {
+          throw new Error(`Download response from ${url} and fetch fallback failed: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`);
+        }
+        return;
+      }
+      throw err;
+    }
     if (options?.waitFor) {
       await page.waitForSelector(options.waitFor, { timeout });
     }

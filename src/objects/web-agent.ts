@@ -943,6 +943,9 @@ Respond with ONE action as a JSON object in a \`\`\`json code block:
 - For news headlines: 'h2 a, h3 a, [class*="headline"] a, article a' catches most sites.
 - Keep scripts under 500 chars — shorter scripts have fewer bugs.
 - Always use an IIFE for multi-statement scripts: (() => { ... return result; })()
+- For APIs or plain-text endpoints (like wttr.in, jsonplaceholder, etc.), use extract with fetch:
+  { "action": "extract", "script": "fetch('https://wttr.in/NYC?format=4').then(r => r.text())" }
+  This avoids navigation issues with non-HTML responses.
 
 ## Rules
 1. Use CSS selectors from the observation. Prefer #id selectors when available.

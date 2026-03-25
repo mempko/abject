@@ -206,6 +206,12 @@ export class AgentAbject extends Abject {
   /** Guard: tuple IDs currently being dispatched — prevents concurrent dispatch loops. */
   private dispatchingTuples = new Set<string>();
 
+  /** Agents currently executing a dispatched TupleSpace task (one task at a time per agent). */
+  private busyAgents = new Set<AbjectId>();
+
+  /** Periodic scan timer for catching missed/pre-existing tasks. */
+  private scanTimer?: ReturnType<typeof setInterval>;
+
   /** Job submission heartbeat message ID for resetting request timeouts. */
   private _currentJobMsgId?: string;
 
@@ -562,6 +568,21 @@ improve semantic matching accuracy.
     if (this.goalManagerId) {
       this.send(request(this.id, this.goalManagerId, 'addDependent', {}));
     }
+
+    // Periodic scan for missed/pre-existing tasks (every 30s)
+    this.scanTimer = setInterval(() => {
+      this.periodicScan().catch(() => {});
+    }, 30_000);
+
+    // Initial scan after 5s delay (give agents time to register)
+    setTimeout(() => { this.periodicScan().catch(() => {}); }, 5000);
+  }
+
+  protected override async onStop(): Promise<void> {
+    if (this.scanTimer) {
+      clearInterval(this.scanTimer);
+      this.scanTimer = undefined;
+    }
   }
 
   /** Resolve a required dependency lazily. */
@@ -903,9 +924,10 @@ improve semantic matching accuracy.
     if (candidates.length === 0) {
       // No exact type match — try semantic fallback via LLM
       const allAgents = [...this.registeredAgents.values()]
-        .filter(a => !failedAgentIds.has(a.agentId));
+        .filter(a => !failedAgentIds.has(a.agentId))
+        .filter(a => !this.busyAgents.has(a.agentId));
       if (allAgents.length === 0) {
-        log.info(`DISPATCH-INNER ${tupleId} — no registered agents available for fallback`);
+        log.info(`DISPATCH-INNER ${tupleId} — no registered agents available for fallback (failed or busy)`);
         return;
       }
       const matched = await this.semanticMatchAgent(allAgents, taskType, description);
@@ -916,10 +938,12 @@ improve semantic matching accuracy.
       log.info(`DISPATCH-INNER ${tupleId} — LLM fallback matched: ${matched.name}`);
       eligibleCandidates = [matched];
     } else {
-      // Exact type match — filter out failed agents
-      eligibleCandidates = candidates.filter(a => !failedAgentIds.has(a.agentId));
+      // Exact type match — filter out failed and busy agents
+      eligibleCandidates = candidates
+        .filter(a => !failedAgentIds.has(a.agentId))
+        .filter(a => !this.busyAgents.has(a.agentId));
       if (eligibleCandidates.length === 0) {
-        log.info(`DISPATCH-INNER ${tupleId} — all ${candidates.length} agents already failed`);
+        log.info(`DISPATCH-INNER ${tupleId} — all ${candidates.length} agents failed or busy`);
         return;
       }
     }
@@ -952,6 +976,14 @@ improve semantic matching accuracy.
       return;
     }
     log.info(`DISPATCH-INNER ${tupleId} — claimed, sending executeTask to ${chosen.name}`);
+
+    // Per-agent concurrency: final race-safe check before executeTask
+    if (this.busyAgents.has(chosen.agentId)) {
+      log.info(`DISPATCH-INNER ${tupleId} — agent ${chosen.name} became busy during claim, releasing`);
+      try { await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: claimed.tuple.id })); } catch { /* best effort */ }
+      return;
+    }
+    this.busyAgents.add(chosen.agentId);
 
     // 5. Report progress (attempts are tracked by failTask, not here)
     if (taskGoalId) {
@@ -1014,6 +1046,41 @@ improve semantic matching accuracy.
       }
     } finally {
       this._currentDispatchMsgId = undefined;
+      this.busyAgents.delete(chosen.agentId);
+    }
+  }
+
+  /**
+   * Scan TupleSpace for pending/unclaimed tasks and dispatch eligible ones.
+   * Catches tasks missed during cooldown, pre-existing at boot, or lost events.
+   */
+  private async periodicScan(): Promise<void> {
+    if (!this.tupleSpaceId) return;
+
+    try {
+      const tuples = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(
+        request(this.id, this.tupleSpaceId, 'scan', {
+          pattern: { status: 'pending' },
+        })
+      );
+
+      let dispatched = 0;
+      for (const tuple of tuples) {
+        if (tuple.claimedBy) continue;
+        const attempts = (tuple.fields.attempts as number) ?? 0;
+        const maxAttempts = (tuple.fields.maxAttempts as number) ?? 3;
+        if (attempts >= maxAttempts) continue;
+        if (this.dispatchingTuples.has(tuple.id)) continue;
+
+        log.info(`SCAN ${tuple.id.slice(0, 8)} type=${tuple.fields.type ?? '?'} attempts=${attempts}/${maxAttempts} — DISPATCHING`);
+        this.dispatchToAgent(tuple);
+        dispatched++;
+      }
+      if (dispatched > 0) {
+        log.info(`SCAN dispatched ${dispatched} pending task(s)`);
+      }
+    } catch (err) {
+      log.info(`SCAN failed: ${(err as Error).message?.slice(0, 120)}`);
     }
   }
 
