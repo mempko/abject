@@ -1017,9 +1017,26 @@ improve semantic matching accuracy.
       const elapsed = Date.now() - dispatchStart;
       log.info(`DISPATCH-INNER ${tupleId} — executeTask SUCCESS (${elapsed}ms), completing task`);
 
-      // 7. Complete task — or watch child goal if one was spawned
+      // 7. Check result — fail, watch child goal, or complete
       const resultObj = result as Record<string, unknown> | undefined;
-      if (resultObj && resultObj.childGoalId) {
+      if (resultObj && resultObj.success === false) {
+        // Agent returned an explicit failure (e.g. "Object not found") — treat as failTask so it can retry
+        const errorMsg = (resultObj.error as string) ?? 'Task returned success: false';
+        log.info(`DISPATCH-INNER ${tupleId} — executeTask returned failure: ${errorMsg.slice(0, 120)}`);
+        try {
+          await this.request(
+            request(this.id, this.goalManagerId!, 'failTask', {
+              taskId: claimed.tuple.id,
+              goalId: taskGoalId,
+              error: errorMsg,
+              agentName: chosen.name,
+              agentId: chosen.agentId,
+            })
+          );
+        } catch (err2) {
+          log.info(`DISPATCH-INNER ${tupleId} — failTask also failed: ${(err2 as Error).message?.slice(0, 80)}`);
+        }
+      } else if (resultObj && resultObj.childGoalId) {
         log.info(`DISPATCH-INNER ${tupleId} — task spawned child goal ${(resultObj.childGoalId as string).slice(0, 8)}, watching`);
         this.watchChildGoal(resultObj.childGoalId as string, claimed.tuple.id, taskGoalId!);
       } else {
@@ -1059,13 +1076,30 @@ improve semantic matching accuracy.
   /**
    * Scan TupleSpace for pending/unclaimed tasks and dispatch eligible ones.
    * Catches tasks missed during cooldown, pre-existing at boot, or lost events.
+   * Queries GoalManager for active top-level goals and scans each namespace.
    */
   private async periodicScan(): Promise<void> {
-    if (!this.tupleSpaceId) return;
+    if (!this.tupleSpaceId || !this.goalManagerId) return;
 
+    try {
+      const goals = await this.request<Array<{ id: string; parentId?: string }>>(
+        request(this.id, this.goalManagerId, 'listGoals', { status: 'active' })
+      );
+      const topLevel = goals.filter(g => !g.parentId);
+      for (const goal of topLevel) {
+        await this.scanNamespace(goal.id);
+      }
+    } catch (err) {
+      log.info(`SCAN failed: ${(err as Error).message?.slice(0, 120)}`);
+    }
+  }
+
+  private async scanNamespace(namespace: string): Promise<void> {
+    if (!this.tupleSpaceId) return;
     try {
       const tuples = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(
         request(this.id, this.tupleSpaceId, 'scan', {
+          namespace,
           pattern: { status: 'pending' },
         })
       );
@@ -1083,10 +1117,10 @@ improve semantic matching accuracy.
         dispatched++;
       }
       if (dispatched > 0) {
-        log.info(`SCAN dispatched ${dispatched} pending task(s)`);
+        log.info(`SCAN dispatched ${dispatched} pending task(s) from ns=${namespace.slice(0, 8)}`);
       }
     } catch (err) {
-      log.info(`SCAN failed: ${(err as Error).message?.slice(0, 120)}`);
+      log.info(`SCAN ns=${namespace.slice(0, 8)} failed: ${(err as Error).message?.slice(0, 120)}`);
     }
   }
 
@@ -2088,6 +2122,12 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
     // Try whole content as JSON
     const parsed = this.tryParseActionJson(content);
     if (parsed) return parsed;
+
+    // Detect hallucinated tool calls -- these are never valid results
+    const hallucinationPatterns = ['<function_calls>', '<tool_call>', '<invoke name='];
+    if (hallucinationPatterns.some(p => content.includes(p))) {
+      return { action: 'fail', reason: 'LLM hallucinated tool calls instead of producing a valid action' };
+    }
 
     // Config-driven fallback
     return { action: entry.config.fallbackActionName, result: content, reasoning: 'Could not parse action, returning raw response' };

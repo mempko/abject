@@ -66,6 +66,17 @@ export class GoalManager extends Abject {
   /** Track taskIds for which we already emitted terminal events (idempotency guard). */
   private emittedTerminalTasks: Set<string> = new Set();
 
+  /** Walk up the parent chain to find the top-level goal ID, which is the TupleSpace namespace. */
+  private getTupleNamespace(goalId: GoalId): string {
+    let current = this.goals.get(goalId);
+    while (current?.parentId) {
+      const parent = this.goals.get(current.parentId);
+      if (!parent) break;
+      current = parent;
+    }
+    return current?.id ?? goalId;
+  }
+
   constructor() {
     super({
       manifest: {
@@ -461,6 +472,11 @@ suitable agent based on descriptions.
             goal.status = 'archived';
             goal.updatedAt = now;
             changed = true;
+            if (this.tupleSpaceId && !goal.parentId) {
+              try {
+                await this.request(request(this.id, this.tupleSpaceId, 'removeNamespace', { namespace: goal.id }));
+              } catch { /* best effort */ }
+            }
           }
           break;
         case 'failed':
@@ -468,6 +484,11 @@ suitable agent based on descriptions.
             goal.status = 'archived';
             goal.updatedAt = now;
             changed = true;
+            if (this.tupleSpaceId && !goal.parentId) {
+              try {
+                await this.request(request(this.id, this.tupleSpaceId, 'removeNamespace', { namespace: goal.id }));
+              } catch { /* best effort */ }
+            }
           }
           break;
         case 'archived':
@@ -672,16 +693,17 @@ suitable agent based on descriptions.
       for (const goal of goalsToClear) {
         // Remove task tuples from TupleSpace
         if (this.tupleSpaceId) {
+          const ns = this.getTupleNamespace(goal.id as GoalId);
           try {
             const tasks = await this.request<Array<{ id: string; claimedBy?: string }>>(
-              request(this.id, this.tupleSpaceId, 'scan', { pattern: { goalId: goal.id } })
+              request(this.id, this.tupleSpaceId, 'scan', { pattern: { goalId: goal.id }, namespace: ns })
             );
             for (const task of tasks) {
               try {
                 if (task.claimedBy) {
-                  await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: task.id }));
+                  await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: task.id, namespace: ns }));
                 }
-                await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id }));
+                await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id, namespace: ns }));
                 this.emittedTerminalTasks.delete(task.id);
               } catch { /* best effort */ }
             }
@@ -741,8 +763,10 @@ suitable agent based on descriptions.
 
       if (!this.tupleSpaceId) return { error: 'TupleSpace not available' };
 
+      const ns = this.getTupleNamespace(goalId as GoalId);
       const result = await this.request<{ tupleId: string }>(
         request(this.id, this.tupleSpaceId, 'put', {
+          namespace: ns,
           fields: { goalId, type, status: 'pending', description, data, attempts: 0, maxAttempts: 3, failureHistory: [] },
         })
       );
@@ -759,8 +783,9 @@ suitable agent based on descriptions.
       if (type) pattern.type = type;
       log.info(`claimTask pattern=${JSON.stringify(pattern)} from=${msg.routing.from.slice(0, 8)}`);
 
+      const ns = goalId ? this.getTupleNamespace(goalId as GoalId) : undefined;
       const result = await this.request(
-        request(this.id, this.tupleSpaceId, 'claim', { pattern })
+        request(this.id, this.tupleSpaceId, 'claim', { pattern, ...(ns ? { namespace: ns } : {}) })
       );
       log.info(`claimTask result=${result ? 'claimed' : 'none'}`);
       return result;
@@ -772,10 +797,12 @@ suitable agent based on descriptions.
       if (!this.tupleSpaceId) return false;
 
       log.info(`completeTask ${taskId.slice(0, 8)} goalId=${goalId?.slice(0, 8) ?? '?'} from=${msg.routing.from.slice(0, 8)}`);
+      const ns = goalId ? this.getTupleNamespace(goalId as GoalId) : undefined;
       const updateResult = await this.request(
         request(this.id, this.tupleSpaceId, 'update', {
           tupleId: taskId,
           fields: { status: 'done', result },
+          ...(ns ? { namespace: ns } : {}),
         })
       );
 
@@ -794,11 +821,13 @@ suitable agent based on descriptions.
 
       log.info(`failTask ${taskId.slice(0, 8)} agent=${agentName ?? '?'} error="${(error ?? '').slice(0, 80)}" from=${msg.routing.from.slice(0, 8)}`);
 
+      const ns = goalId ? this.getTupleNamespace(goalId as GoalId) : undefined;
+
       // Read current tuple to get failure tracking fields
       let currentFields: Record<string, unknown> = {};
       try {
         const scanResult = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
-          request(this.id, this.tupleSpaceId, 'scan', { pattern: {} })
+          request(this.id, this.tupleSpaceId, 'scan', { pattern: {}, ...(ns ? { namespace: ns } : {}) })
         );
         const tuple = scanResult.find(t => t.id === taskId);
         if (tuple) currentFields = tuple.fields;
@@ -828,10 +857,11 @@ suitable agent based on descriptions.
           request(this.id, this.tupleSpaceId, 'update', {
             tupleId: taskId,
             fields: { status: 'permanently_failed', error, attempts, failureHistory },
+            ...(ns ? { namespace: ns } : {}),
           })
         );
         try {
-          await this.request(request(this.id, this.tupleSpaceId, 'release', { tupleId: taskId }));
+          await this.request(request(this.id, this.tupleSpaceId, 'release', { tupleId: taskId, ...(ns ? { namespace: ns } : {}) }));
         } catch { /* best effort */ }
         this.emittedTerminalTasks.add(taskId);
         this.changed('taskPermanentlyFailed', { taskId, goalId, error, attempts });
@@ -847,12 +877,13 @@ suitable agent based on descriptions.
         request(this.id, this.tupleSpaceId, 'update', {
           tupleId: taskId,
           fields: { status: 'pending', error, attempts, failureHistory },
+          ...(ns ? { namespace: ns } : {}),
         })
       );
 
       // Release the claim so others can retry
       try {
-        await this.request(request(this.id, this.tupleSpaceId, 'release', { tupleId: taskId }));
+        await this.request(request(this.id, this.tupleSpaceId, 'release', { tupleId: taskId, ...(ns ? { namespace: ns } : {}) }));
       } catch { /* best effort */ }
 
       log.info(`failTask ${taskId.slice(0, 8)} — emitting taskRetrying`);
@@ -865,11 +896,12 @@ suitable agent based on descriptions.
       requireNonEmpty(goalId, 'goalId');
       if (!this.tupleSpaceId) return [];
 
+      const ns = this.getTupleNamespace(goalId as GoalId);
       const pattern: Record<string, unknown> = { goalId };
       if (status) pattern.status = status;
 
       return this.request(
-        request(this.id, this.tupleSpaceId, 'scan', { pattern })
+        request(this.id, this.tupleSpaceId, 'scan', { pattern, namespace: ns })
       );
     });
 
@@ -878,9 +910,11 @@ suitable agent based on descriptions.
       requireNonEmpty(goalId, 'goalId');
       if (!this.tupleSpaceId) return [];
 
+      const ns = this.getTupleNamespace(goalId as GoalId);
       return this.request(
         request(this.id, this.tupleSpaceId, 'scan', {
           pattern: { goalId, status: 'done' },
+          namespace: ns,
         })
       );
     });
@@ -899,6 +933,13 @@ suitable agent based on descriptions.
       const ns = `goal-${goalId}`;
       await this.request(request(this.id, this.sharedStateId, 'create', { name: ns }));
       await this.request(request(this.id, this.sharedStateId, 'subscribe', { name: ns }));
+
+      if (this.tupleSpaceId) {
+        try {
+          const tupleNs = this.getTupleNamespace(goalId as GoalId);
+          await this.request(request(this.id, this.tupleSpaceId, 'ensureNamespace', { namespace: tupleNs }));
+        } catch { /* best effort */ }
+      }
 
       // Load current metadata
       try {
@@ -941,8 +982,9 @@ suitable agent based on descriptions.
       requireNonEmpty(goalId, 'goalId');
       if (!this.tupleSpaceId) return { cancelled: 0 };
 
+      const ns = this.getTupleNamespace(goalId as GoalId);
       const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(
-        request(this.id, this.tupleSpaceId, 'scan', { pattern: { goalId, status: 'pending' } })
+        request(this.id, this.tupleSpaceId, 'scan', { pattern: { goalId, status: 'pending' }, namespace: ns })
       );
 
       let cancelled = 0;
@@ -950,10 +992,10 @@ suitable agent based on descriptions.
         try {
           if (task.claimedBy) {
             try {
-              await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: task.id }));
+              await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: task.id, namespace: ns }));
             } catch { /* best effort */ }
           }
-          await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id }));
+          await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id, namespace: ns }));
           this.emittedTerminalTasks.delete(task.id);
           cancelled++;
         } catch { /* best effort */ }
@@ -967,9 +1009,11 @@ suitable agent based on descriptions.
       requireNonEmpty(goalId, 'goalId');
       if (!this.tupleSpaceId) return { cancelled: 0 };
 
+      const ns = this.getTupleNamespace(goalId as GoalId);
+
       // Find all tasks for this goal
       const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(
-        request(this.id, this.tupleSpaceId, 'scan', { pattern: { goalId } })
+        request(this.id, this.tupleSpaceId, 'scan', { pattern: { goalId }, namespace: ns })
       );
 
       let cancelled = 0;
@@ -978,14 +1022,14 @@ suitable agent based on descriptions.
           // Release claim if held
           if (task.claimedBy) {
             try {
-              await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: task.id }));
+              await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: task.id, namespace: ns }));
             } catch { /* best effort */ }
           }
           // Remove tuple from TupleSpace entirely
-          await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id }));
+          await this.request(request(this.id, this.tupleSpaceId!, 'remove', { tupleId: task.id, namespace: ns }));
           this.emittedTerminalTasks.delete(task.id);
           cancelled++;
-        } catch { /* best effort — tuple may already be gone */ }
+        } catch { /* best effort -- tuple may already be gone */ }
       }
 
       // Clean up per-goal SharedState namespace
@@ -1006,15 +1050,17 @@ suitable agent based on descriptions.
     });
 
     this.on('updateTaskAttempts', async (msg: AbjectMessage) => {
-      const { taskId } = msg.payload as { taskId: string };
+      const { taskId, goalId } = msg.payload as { taskId: string; goalId?: string };
       requireNonEmpty(taskId, 'taskId');
       if (!this.tupleSpaceId) return false;
+
+      const ns = goalId ? this.getTupleNamespace(goalId as GoalId) : undefined;
 
       // Read current tuple to get attempts
       let currentAttempts = 0;
       try {
         const scanResult = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
-          request(this.id, this.tupleSpaceId, 'scan', { pattern: {} })
+          request(this.id, this.tupleSpaceId, 'scan', { pattern: {}, ...(ns ? { namespace: ns } : {}) })
         );
         const tuple = scanResult.find(t => t.id === taskId);
         if (tuple) currentAttempts = (tuple.fields.attempts as number) ?? 0;
@@ -1024,6 +1070,7 @@ suitable agent based on descriptions.
         request(this.id, this.tupleSpaceId, 'update', {
           tupleId: taskId,
           fields: { attempts: currentAttempts + 1 },
+          ...(ns ? { namespace: ns } : {}),
         })
       );
     });
