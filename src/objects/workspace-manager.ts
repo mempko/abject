@@ -619,9 +619,11 @@ export class WorkspaceManager extends Abject {
     }
 
     // Hide workspace taskbar
-    try {
-      await this.request(request(this.id, ws.taskbarId, 'hide', {}));
-    } catch { /* may already be hidden */ }
+    if (ws.taskbarId) {
+      try {
+        await this.request(request(this.id, ws.taskbarId, 'hide', {}));
+      } catch { /* may already be hidden */ }
+    }
 
     // Kill all per-workspace objects (in reverse order)
     for (const childId of [...ws.childIds].reverse()) {
@@ -721,12 +723,14 @@ export class WorkspaceManager extends Abject {
       } catch { /* use default */ }
     }
 
-    try {
-      await this.request(request(this.id, ws.taskbarId, 'show', {
-        yOffset,
-      }));
-    } catch (err) {
-      wsLog.warn('Failed to refresh taskbar:', err);
+    if (ws.taskbarId) {
+      try {
+        await this.request(request(this.id, ws.taskbarId, 'show', {
+          yOffset,
+        }));
+      } catch (err) {
+        wsLog.warn('Failed to refresh taskbar:', err);
+      }
     }
 
     return true;
@@ -986,6 +990,7 @@ export class WorkspaceManager extends Abject {
   private async spawnUIObjects(workspaceId: string): Promise<void> {
     const ws = this.workspaces.get(workspaceId);
     if (!ws || ws.uiSpawned) return;
+    ws.uiSpawned = true;  // Set early to prevent re-entry during concurrent switches
 
     const uiIfaceMap: Record<string, InterfaceId> = {
       Settings: SETTINGS_INTERFACE,
@@ -1038,7 +1043,6 @@ export class WorkspaceManager extends Abject {
       }
     }
 
-    ws.uiSpawned = true;
     wsLog.info(`Spawned deferred UI objects for workspace '${ws.name}' (${workspaceId})`);
   }
 

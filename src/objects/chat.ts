@@ -158,8 +158,8 @@ export class Chat extends Abject {
       this.send(request(this.id, this.goalManagerId, 'addDependent', {}));
     }
 
-    // Register with AgentAbject
-    await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
+    // Register with AgentAbject (fire-and-forget: handler is idempotent)
+    this.send(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'Chat',
       description: 'Conversational LLM agent for interacting with Abjects',
       config: {

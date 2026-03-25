@@ -19,9 +19,11 @@ export class Mailbox {
 
   /**
    * Add a message to the queue.
-   * Throws if queue is full or closed.
+   * Silently drops if closed or full.
    */
   send(message: AbjectMessage): void {
+    if (this.closed) return;
+    if (this.queue.length >= this.maxSize) return;
     const waiter = this.waiters.shift();
     if (waiter) {
       waiter.resolve(message);

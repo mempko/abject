@@ -159,6 +159,10 @@ export class MessageBus implements MessageBusLike {
         this.messageCount++;
         return;
       }
+      // Worker object registered but bridge is gone (worker crashed or cleanup race)
+      log.warn(`UNDELIVERABLE (no worker bridge): ${message.header.type} ${message.routing.method ?? '?'} from=${message.routing.from.slice(0,8)} to=${recipient.slice(0,8)}`);
+      this.notifyUndeliverable(message);
+      return;
     }
 
     // Check if recipient exists locally

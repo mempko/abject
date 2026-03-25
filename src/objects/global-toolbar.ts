@@ -119,12 +119,7 @@ export class GlobalToolbar extends Abject {
           this.globalSettingsId = await this.discoverDep('GlobalSettings') ?? undefined;
         }
         if (this.globalSettingsId) {
-          try {
-            await this.request(request(this.id, this.globalSettingsId,
-              'show', {}));
-          } catch (err) {
-            log.warn('Failed to show GlobalSettings:', err);
-          }
+          this.send(request(this.id, this.globalSettingsId, 'show', {}));
         }
         return;
       }
@@ -135,12 +130,7 @@ export class GlobalToolbar extends Abject {
           this.peerNetworkId = await this.discoverDep('PeerNetwork') ?? undefined;
         }
         if (this.peerNetworkId) {
-          try {
-            await this.request(request(this.id, this.peerNetworkId,
-              'show', {}));
-          } catch (err) {
-            log.warn('Failed to show PeerNetwork:', err);
-          }
+          this.send(request(this.id, this.peerNetworkId, 'show', {}));
         }
         return;
       }
@@ -151,12 +141,7 @@ export class GlobalToolbar extends Abject {
           this.objectBrowserId = await this.discoverDep('ObjectBrowser') ?? undefined;
         }
         if (this.objectBrowserId) {
-          try {
-            await this.request(request(this.id, this.objectBrowserId,
-              'show', {}));
-          } catch (err) {
-            log.warn('Failed to show ObjectBrowser:', err);
-          }
+          this.send(request(this.id, this.objectBrowserId, 'show', {}));
         }
         return;
       }
@@ -167,12 +152,7 @@ export class GlobalToolbar extends Abject {
           this.objectManagerId = await this.discoverDep('ProcessExplorer') ?? undefined;
         }
         if (this.objectManagerId) {
-          try {
-            await this.request(request(this.id, this.objectManagerId,
-              'show', {}));
-          } catch (err) {
-            log.warn('Failed to show ProcessExplorer:', err);
-          }
+          this.send(request(this.id, this.objectManagerId, 'show', {}));
         }
         return;
       }
@@ -183,12 +163,7 @@ export class GlobalToolbar extends Abject {
           this.llmMonitorId = await this.discoverDep('LLMMonitor') ?? undefined;
         }
         if (this.llmMonitorId) {
-          try {
-            await this.request(request(this.id, this.llmMonitorId,
-              'show', {}));
-          } catch (err) {
-            log.warn('Failed to show LLMMonitor:', err);
-          }
+          this.send(request(this.id, this.llmMonitorId, 'show', {}));
         }
         return;
       }

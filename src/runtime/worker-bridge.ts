@@ -92,7 +92,11 @@ export class WorkerBridge {
       type: 'bus:deliver',
       message,
     };
-    this.worker.postMessage(msg);
+    try {
+      this.worker.postMessage(msg);
+    } catch (err) {
+      log.error(`Failed to deliver ${message.header.type} ${message.routing.method ?? '?'} to worker (to=${message.routing.to.slice(0,8)}):`, err);
+    }
   }
 
   /**
@@ -103,7 +107,11 @@ export class WorkerBridge {
       type: 'bus:reply',
       message,
     };
-    this.worker.postMessage(msg);
+    try {
+      this.worker.postMessage(msg);
+    } catch (err) {
+      log.error(`Failed to deliver reply to worker (to=${message.routing.to.slice(0,8)}):`, err);
+    }
   }
 
   /**
