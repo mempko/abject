@@ -1,9 +1,10 @@
 /**
  * ImageWidget — a lightweight image display widget.
  *
- * Renders an image via the imageUrl draw command. Non-interactive.
- * Supports 'contain', 'cover', and 'fill' fit modes. Alt text
- * is displayed as a fallback when no URL is provided.
+ * Renders an image via the imageUrl draw command. Emits 'click' to
+ * dependents on mousedown (useful for clickable thumbnails, avatars,
+ * and image grids). Supports 'contain', 'cover', and 'fill' fit modes.
+ * Alt text is displayed as a fallback when no URL is provided.
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
@@ -78,7 +79,10 @@ export class ImageWidget extends WidgetAbject {
     return commands;
   }
 
-  protected async processInput(_input: Record<string, unknown>): Promise<{ consumed: boolean }> {
+  protected async processInput(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
+    if (input.type === 'mousedown') {
+      this.changed('click', this.url);
+    }
     return { consumed: false };
   }
 

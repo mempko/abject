@@ -3,8 +3,9 @@
  *
  * Renders text with optional background and configurable alignment.
  * When style.wordWrap is true, text is wrapped to fit the widget width
- * and rendered as multiple lines. Labels do not consume any input events
- * unless style.selectable is true, which enables click-drag, double-click
+ * and rendered as multiple lines. Emits 'click' to dependents on mousedown
+ * (useful for clickable lists, cards, and interactive label grids).
+ * When style.selectable is true, additionally enables click-drag, double-click
  * word select, Shift+click, Ctrl+A, and Ctrl+C for read-only selection.
  */
 
@@ -372,7 +373,14 @@ export class LabelWidget extends WidgetAbject {
   // ── Input handling ───────────────────────────────────────────────────
 
   protected async processInput(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
-    if (!this.style.selectable) return { consumed: false };
+    if (!this.style.selectable) {
+      // Emit click to dependents so Abjects that called addDependent
+      // can react to label clicks (e.g. clickable contact card lists)
+      if (input.type === 'mousedown') {
+        this.changed('click', this.text);
+      }
+      return { consumed: false };
+    }
 
     const type = input.type as string;
     const surfaceId = this.lastSurfaceId;

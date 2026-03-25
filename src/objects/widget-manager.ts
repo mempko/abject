@@ -935,7 +935,7 @@ await this.call(layoutId, 'addLayoutChildren', {
 // Add a spacer to push widgets apart:
 await this.call(layoutId, 'addLayoutSpacer', {});
 
-// 5. Register for button click events
+// 5. Register for widget events (buttons, labels, images, inputs, etc.)
 await this.call(btnId, 'addDependent', {});
 
 // 6. Handle events — implement a 'changed' handler in your handler map:
@@ -964,7 +964,7 @@ await this.call(this.dep('WidgetManager'), 'destroyWindowAbject', { windowId: wi
 
 ### Widget Types (used as \`type\` in create() specs)
 
-label - Static text display. Style: { wordWrap: true } for multi-line text. Style: { selectable: true } to allow users to click-drag, double-click, Shift+click, Ctrl+A, and Ctrl+C to select and copy text (read-only).
+label - Static text display. Fires 'click' on mousedown (register via addDependent to receive). Style: { wordWrap: true } for multi-line text. Style: { selectable: true } to allow users to click-drag, double-click, Shift+click, Ctrl+A, and Ctrl+C to select and copy text (read-only).
 button - Clickable button (listen for 'changed' with aspect 'click'). Keyboard: Enter/Space when focused.
 textInput - Single-line text input (aspects: 'change', 'submit')
 textArea - Multi-line text area (params: monospace?)
@@ -974,7 +974,7 @@ divider - Horizontal divider line
 select - Dropdown select (params: options[], selectedIndex). Keyboard: Enter/Space to open, ArrowUp/Down to navigate, Enter to select, Escape to close.
 tabBar - Tab bar (params: tabs[] of labels, selectedIndex). Fires 'change' event with selected index. Keyboard: ArrowLeft/Right to switch tabs.
 slider - Numeric range slider (params: min, max, step, value). Fires 'change' event with numeric value as string. Keyboard: ArrowLeft/Right ±step, Home/End for min/max. Click track or drag thumb.
-image - Image display (params: url, fit 'contain'|'cover'|'fill', alt). Non-interactive. Update URL via this.call(imgId, 'update', { url: '...' }).
+image - Image display (params: url, fit 'contain'|'cover'|'fill', alt). Fires 'click' on mousedown (register via addDependent to receive). Update URL via this.call(imgId, 'update', { url: '...' }).
 list - Scrollable list (params: items[], selectedIndex?, searchable?, itemHeight?). Fires 'selectionChanged'.
 splitPane - Resizable split view (params: orientation?, dividerPosition?, minSize?).
 

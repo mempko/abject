@@ -91,10 +91,10 @@ Size Policies:
 
 | File | Class | Description |
 |------|-------|-------------|
-| `label-widget.ts` | `LabelWidget` | Static text with word-wrap. Alignment: left/center/right. Caches wrapped lines |
+| `label-widget.ts` | `LabelWidget` | Static text with word-wrap. Fires `click` on mousedown (via addDependent). Alignment: left/center/right. Caches wrapped lines |
 | `progress-widget.ts` | `ProgressWidget` | Read-only bar (0-1 range). Gradient fill with optional percentage text |
 | `divider-widget.ts` | `DividerWidget` | Single line separator. Auto-detects horizontal vs vertical from dimensions |
-| `image-widget.ts` | `ImageWidget` | Displays image via URL. Fit modes: contain/cover/fill. Alt text fallback |
+| `image-widget.ts` | `ImageWidget` | Displays image via URL. Fires `click` on mousedown (via addDependent). Fit modes: contain/cover/fill. Alt text fallback |
 
 ### Advanced Widgets
 
