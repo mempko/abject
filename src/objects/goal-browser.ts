@@ -10,8 +10,11 @@ import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import { Log } from '../core/timed-log.js';
 import type { Goal, GoalId } from './goal-manager.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
+
+const log = new Log('GoalBrowser');
 
 const GOAL_BROWSER_INTERFACE: InterfaceId = 'abjects:goal-browser';
 
@@ -46,6 +49,8 @@ export class GoalBrowser extends Abject {
   private stopAllBtnId?: AbjectId;
   private clearBtnId?: AbjectId;
   private goalLabelMap: Map<GoalId, AbjectId> = new Map();
+  private updateInProgress = false;
+  private updatePending = false;
 
   constructor() {
     super({
@@ -227,10 +232,10 @@ Sub-goals are indented under their parent goal.
       ],
     }));
 
-    // Fire-and-forget: register as dependent
+    // Register as dependent (await GoalManager so we know we'll get events)
     this.send(request(this.id, this.stopAllBtnId, 'addDependent', {}));
     this.send(request(this.id, this.clearBtnId, 'addDependent', {}));
-    this.send(request(this.id, this.goalManagerId!, 'addDependent', {}));
+    await this.request(request(this.id, this.goalManagerId!, 'addDependent', {}));
 
     // Populate existing goals
     await this.populateExistingGoals();
@@ -306,7 +311,9 @@ Sub-goals are indented under their parent goal.
 
       // Batch add to layout
       await this.request(request(this.id, this.goalListId, 'addLayoutChildren', { children }));
-    } catch { /* GoalManager may not have any goals yet */ }
+    } catch (err) {
+      log.warn('Failed to populate existing goals:', err);
+    }
   }
 
   private formatGoalLabel(goal: Goal, tasks?: TaskInfo[]): { text: string; color: string } {
@@ -448,7 +455,7 @@ Sub-goals are indented under their parent goal.
   }
 
   private async handleChanged(fromId: AbjectId, aspect: string, value?: unknown): Promise<void> {
-    // Stop All button click — fail all active goals and cancel tasks
+    // Stop All button click -- fail all active goals and cancel tasks
     if (fromId === this.stopAllBtnId && aspect === 'click') {
       if (!this.goalObserverId) return;
 
@@ -491,51 +498,68 @@ Sub-goals are indented under their parent goal.
       return;
     }
 
-    // GoalManager events
+    // GoalManager events -- guard against concurrent UI updates
     if (fromId === this.goalManagerId) {
-      const data = value as Record<string, unknown> | undefined;
-      if (!data) return;
-
-      const goalId = data.goalId as GoalId;
-
-      switch (aspect) {
-        case 'goalCreated': {
-          const title = data.title as string;
-          const parentId = data.parentId as GoalId | undefined;
-          const indent = parentId ? '  \u2514\u2500 ' : '';
-          await this.appendGoalLabel(goalId, `${indent}\u25B8 ${title}`, this.theme.statusWarning);
-          break;
-        }
-        case 'goalUpdated': {
-          const message = data.message as string;
-          await this.refreshGoalLabel(goalId, `\u25B8 ${message}`, this.theme.statusWarning);
-          break;
-        }
-        case 'goalCompleted': {
-          await this.refreshGoalLabel(goalId, `\u2713 completed`, this.theme.statusSuccess);
-          break;
-        }
-        case 'goalFailed': {
-          const error = data.error as string | undefined;
-          const errorSuffix = error ? ` \u2014 ${error.slice(0, 30)}` : '';
-          await this.refreshGoalLabel(goalId, `\u2717 failed${errorSuffix}`, this.theme.statusError);
-          break;
-        }
-        case 'taskCompleted':
-        case 'taskFailed':
-        case 'taskPermanentlyFailed': {
-          // Task status changed — refresh the parent goal label to show updated task list
-          if (goalId) {
-            await this.refreshGoalLabel(goalId);
-          }
-          break;
-        }
-        case 'goalsCleared':
-        case 'goalsSwept':
+      if (this.updateInProgress) {
+        this.updatePending = true;
+        return;
+      }
+      this.updateInProgress = true;
+      try {
+        await this.handleGoalManagerEvent(aspect, value);
+      } finally {
+        this.updateInProgress = false;
+        if (this.updatePending) {
+          this.updatePending = false;
           await this.clearGoalLabels();
           await this.populateExistingGoals();
-          break;
+        }
       }
+    }
+  }
+
+  private async handleGoalManagerEvent(aspect: string, value?: unknown): Promise<void> {
+    const data = value as Record<string, unknown> | undefined;
+    if (!data) return;
+
+    const goalId = data.goalId as GoalId;
+
+    switch (aspect) {
+      case 'goalCreated': {
+        const title = data.title as string;
+        const parentId = data.parentId as GoalId | undefined;
+        const indent = parentId ? '  \u2514\u2500 ' : '';
+        await this.appendGoalLabel(goalId, `${indent}\u25B8 ${title}`, this.theme.statusWarning);
+        break;
+      }
+      case 'goalUpdated': {
+        const message = data.message as string;
+        await this.refreshGoalLabel(goalId, `\u25B8 ${message}`, this.theme.statusWarning);
+        break;
+      }
+      case 'goalCompleted': {
+        await this.refreshGoalLabel(goalId, `\u2713 completed`, this.theme.statusSuccess);
+        break;
+      }
+      case 'goalFailed': {
+        const error = data.error as string | undefined;
+        const errorSuffix = error ? ` \u2014 ${error.slice(0, 30)}` : '';
+        await this.refreshGoalLabel(goalId, `\u2717 failed${errorSuffix}`, this.theme.statusError);
+        break;
+      }
+      case 'taskCompleted':
+      case 'taskFailed':
+      case 'taskPermanentlyFailed': {
+        if (goalId) {
+          await this.refreshGoalLabel(goalId);
+        }
+        break;
+      }
+      case 'goalsCleared':
+      case 'goalsSwept':
+        await this.clearGoalLabels();
+        await this.populateExistingGoals();
+        break;
     }
   }
 

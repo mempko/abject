@@ -1103,6 +1103,7 @@ WebAgent handles all browser management — use it for multi-step tasks, page li
           goalId,
           config: { queueName: `chat-${this.id}` },
         }),
+        60000,
       );
       this._currentTicketId = ticketId;
 
