@@ -765,8 +765,19 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     if (this._messageBus && isReg) {
       // This peer is the destination — check permissions
       if (!permOk) {
+        // Distinguish cache miss (no entry or expired) from explicit deny
+        const cached = this.permissionCache.get(targetId);
+        const isCacheMiss = !cached || (Date.now() - cached.cachedAt >= PERMISSION_CACHE_TTL);
+
+        if (isCacheMiss && !isReply) {
+          // Cache miss on a request or event: defer decision until async refresh completes
+          log.info(`permission cache miss for ${targetId.slice(0, 8)}, deferring check`);
+          this.deferPermissionCheck(msg, targetId, fromPeerId);
+          return;
+        }
+
+        // Explicit deny from cache, or non-request message type
         log.warn(`ACCESS_DENIED: ${fromPeerId.slice(0, 16)} → ${targetId.slice(0, 8)}`);
-        // Send error reply back if it was a request
         if (msg.header.type === 'request') {
           const errMsg = createError(msg, 'ACCESS_DENIED', `Access denied to object ${targetId}`);
           this.sendToPeerTransport(fromPeerId, errMsg).catch(() => { /* best-effort */ });
@@ -837,9 +848,32 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       return this.evaluatePermission(cached, fromPeerId, targetId);
     }
 
-    // No cache — trigger async lookup for next time, deny until populated (fail-closed)
-    this.refreshPermissionCache(targetId).catch(() => { /* best-effort */ });
+    // No cache — caller (handleInboundMessage) will defer the check asynchronously
     return false;
+  }
+
+  /**
+   * Deferred permission check for cache misses.
+   * Refreshes the cache and re-evaluates instead of fail-closed denial.
+   */
+  private async deferPermissionCheck(
+    msg: AbjectMessage, targetId: AbjectId, fromPeerId: PeerId,
+  ): Promise<void> {
+    try {
+      await this.refreshPermissionCache(targetId);
+      const cached = this.permissionCache.get(targetId);
+      if (cached && this.evaluatePermission(cached, fromPeerId, targetId)) {
+        log.info(`deferred permission ALLOWED: ${fromPeerId.slice(0, 16)} → ${targetId.slice(0, 8)}`);
+        this._messageBus?.send(msg);
+        return;
+      }
+    } catch { /* refresh failed */ }
+
+    log.warn(`ACCESS_DENIED (deferred): ${fromPeerId.slice(0, 16)} → ${targetId.slice(0, 8)}`);
+    if (msg.header.type === 'request') {
+      const errMsg = createError(msg, 'ACCESS_DENIED', `Access denied to object ${targetId}`);
+      this.sendToPeerTransport(fromPeerId, errMsg).catch(() => { /* best-effort */ });
+    }
   }
 
   private evaluatePermission(entry: PermissionCacheEntry, fromPeerId: PeerId, targetId?: AbjectId): boolean {
