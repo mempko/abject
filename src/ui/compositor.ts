@@ -442,6 +442,14 @@ export class Compositor {
 
     switch (command.type) {
       case 'clear': {
+        // Reset canvas state to prevent leaks from a previous frame's
+        // unbalanced save/restore (e.g. a disabled widget or dynamically
+        // generated code that left globalAlpha < 1.0 or shadow active).
+        ctx.globalAlpha = 1.0;
+        ctx.shadowColor = 'transparent';
+        ctx.shadowBlur = 0;
+        ctx.shadowOffsetX = 0;
+        ctx.shadowOffsetY = 0;
         ctx.clearRect(0, 0, surface.rect.width, surface.rect.height);
         const p = command.params as { color?: string };
         if (p?.color) {
