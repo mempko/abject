@@ -124,6 +124,12 @@ export class SharedState extends Abject {
   // When true, next discovery will prune peers not found (triggered by disconnect events)
   private pruneOnNextDiscovery = false;
 
+  // Names requested by peers that we don't locally subscribe to.
+  // Used to bridge data between workspaces: if a peer asks for names
+  // this SharedState doesn't have, we include them in anti-entropy requests
+  // so data can flow through this SharedState as a relay.
+  private bridgedNames: Set<string> = new Set();
+
   // Phase 4: Gossip propagation state
   private seenPropagations: Map<string, number> = new Map(); // propagationId → expiry
   private antiEntropyTimer?: ReturnType<typeof setInterval>;
@@ -383,6 +389,7 @@ export class SharedState extends Abject {
         const map = this.stateMaps.get(name);
         if (!map) {
           log.info(`[${this.id.slice(0, 8)}] _requestSync: no map for '${name}'`);
+          this.bridgedNames.add(name);
           continue;
         }
         const entries = map.exportEntries();
@@ -632,6 +639,12 @@ export class SharedState extends Abject {
     const names: string[] = [];
     for (const [name, subs] of this.subscribers) {
       if (subs.size > 0 || this.stateMaps.has(name)) {
+        names.push(name);
+      }
+    }
+    // Include bridged names so data from other peers can relay through us
+    for (const name of this.bridgedNames) {
+      if (!names.includes(name)) {
         names.push(name);
       }
     }
