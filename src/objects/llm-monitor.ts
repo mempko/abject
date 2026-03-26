@@ -48,12 +48,18 @@ export class LLMMonitor extends Abject {
   // Main window
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
-  private scrollableListId?: AbjectId;
   private pauseBtnId?: AbjectId;
   private unpauseBtnId?: AbjectId;
   private refreshBtnId?: AbjectId;
   private statsLabelId?: AbjectId;
   private pauseStatusLabelId?: AbjectId;
+
+  // Tab state
+  private tabBarId?: AbjectId;
+  private tabContents: AbjectId[] = [];       // [activeTab, historyTab]
+  private activeTabListId?: AbjectId;
+  private historyTabListId?: AbjectId;
+  private selectedTabIndex: number = 0;
 
   private killButtons: Map<AbjectId, string> = new Map();
   private viewButtons: Map<AbjectId, string> = new Map();
@@ -134,7 +140,19 @@ export class LLMMonitor extends Abject {
     });
 
     this.on('changed', async (msg: AbjectMessage) => {
-      const { aspect } = msg.payload as { aspect: string; value?: unknown };
+      const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
+
+      // Tab bar change -- show/hide tab content
+      if (msg.routing.from === this.tabBarId && aspect === 'change') {
+        const idx = parseInt(value as string);
+        this.selectedTabIndex = idx;
+        for (let i = 0; i < this.tabContents.length; i++) {
+          await this.request(request(this.id, this.tabContents[i], 'update', {
+            style: { visible: i === idx },
+          }));
+        }
+        return;
+      }
 
       if (aspect === 'click') {
         const fromId = msg.routing.from;
@@ -224,7 +242,11 @@ export class LLMMonitor extends Abject {
 
   private clearViewTracking(): void {
     this.rootLayoutId = undefined;
-    this.scrollableListId = undefined;
+    this.tabBarId = undefined;
+    this.tabContents = [];
+    this.activeTabListId = undefined;
+    this.historyTabListId = undefined;
+    this.selectedTabIndex = 0;
     this.pauseBtnId = undefined;
     this.unpauseBtnId = undefined;
     this.refreshBtnId = undefined;
@@ -312,18 +334,49 @@ export class LLMMonitor extends Abject {
       preferredSize: { height: 18 },
     }));
 
-    // Scrollable list
-    this.scrollableListId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
-        parentLayoutId: this.rootLayoutId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 2,
+    // Tab bar
+    const { widgetIds: [tabBarWidgetId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [{
+          type: 'tabBar',
+          windowId: this.windowId!,
+          tabs: ['Active Requests', 'Recent History'],
+          selectedIndex: 0,
+          closable: false,
+        }],
       })
     );
+    this.tabBarId = tabBarWidgetId;
+    await this.addDep(this.tabBarId);
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.scrollableListId,
-      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+      widgetId: this.tabBarId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 36 },
     }));
+
+    // Two tab content ScrollableVBoxes
+    this.tabContents = [];
+    for (let i = 0; i < 2; i++) {
+      const tabVBox = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createScrollableVBox', {
+          windowId: this.windowId!,
+          margins: { top: 4, right: 0, bottom: 0, left: 0 },
+          spacing: 2,
+        })
+      );
+      await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+        widgetId: tabVBox,
+        sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+      }));
+      if (i > 0) {
+        await this.request(request(this.id, tabVBox, 'update', {
+          style: { visible: false },
+        }));
+      }
+      this.tabContents.push(tabVBox);
+    }
+    this.activeTabListId = this.tabContents[0];
+    this.historyTabListId = this.tabContents[1];
 
     // Force a full rebuild for initial population
     this.lastActiveIds = [];
@@ -336,7 +389,7 @@ export class LLMMonitor extends Abject {
    * update labels in-place to avoid flicker. Otherwise do a full rebuild.
    */
   private async refreshView(): Promise<void> {
-    if (!this.scrollableListId || !this.rootLayoutId || !this.windowId) return;
+    if (!this.activeTabListId || !this.historyTabListId || !this.rootLayoutId || !this.windowId) return;
 
     // Fetch snapshot
     let snapshot: StatsSnapshot | null = null;
@@ -419,37 +472,15 @@ export class LLMMonitor extends Abject {
   }
 
   /**
-   * Full rebuild of the scrollable list area. Called when structure changes.
+   * Full rebuild of both tab content areas. Called when structure changes.
    */
   private async rebuildScrollableList(snapshot: StatsSnapshot | null): Promise<void> {
-    if (!this.scrollableListId || !this.rootLayoutId || !this.windowId) return;
+    if (!this.activeTabListId || !this.historyTabListId || !this.rootLayoutId || !this.windowId) return;
 
     this.killButtons.clear();
     this.viewButtons.clear();
     this.activeRows = [];
     this.historyRows = [];
-
-    // Destroy and recreate scrollable list
-    try {
-      await this.request(request(this.id, this.rootLayoutId, 'removeLayoutChild', {
-        widgetId: this.scrollableListId,
-      }));
-    } catch { /* may be gone */ }
-    try {
-      await this.request(request(this.id, this.scrollableListId!, 'destroy', {}));
-    } catch { /* may be gone */ }
-
-    this.scrollableListId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
-        parentLayoutId: this.rootLayoutId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 2,
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.scrollableListId,
-      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
-    }));
 
     const now = Date.now();
     const activeRequests = snapshot?.activeRequests ?? [];
@@ -459,58 +490,108 @@ export class LLMMonitor extends Abject {
     this.lastActiveIds = activeRequests.map(r => r.id);
     this.lastHistoryIds = history.map(h => h.id);
 
-    // -- Active Requests Section --
-    await this.addSectionLabel('Active Requests');
-    await this.addHeaderRow();
-
-    if (activeRequests.length === 0) {
-      await this.addEmptyLabel('No active requests');
-    } else {
-      for (const req of activeRequests) {
-        const elapsedSec = Math.round((now - req.startTime) / 1000);
-        const row = await this.addRequestRow(
-          req.callerName ?? req.callerId.slice(0, 8),
-          req.method,
-          req.provider,
-          `${elapsedSec}s`,
-          `${req.outputChars}`,
-          req.streaming ? this.theme.statusSuccess : this.theme.textMeta,
-          'Kill',
-          req.id,
-          true,
-        );
-        this.activeRows.push(row);
+    // Rebuild Active Requests tab
+    await this.rebuildTabContent(0, async (targetId) => {
+      await this.addHeaderRow(targetId);
+      if (activeRequests.length === 0) {
+        await this.addEmptyLabel(targetId, 'No active requests');
+      } else {
+        for (const req of activeRequests) {
+          const elapsedSec = Math.round((now - req.startTime) / 1000);
+          const row = await this.addRequestRow(
+            targetId,
+            req.callerName ?? req.callerId.slice(0, 8),
+            req.method,
+            req.provider,
+            `${elapsedSec}s`,
+            `${req.outputChars}`,
+            req.streaming ? this.theme.statusSuccess : this.theme.textMeta,
+            'Kill',
+            req.id,
+            true,
+          );
+          this.activeRows.push(row);
+        }
       }
+    });
+
+    // Rebuild Recent History tab
+    await this.rebuildTabContent(1, async (targetId) => {
+      if (history.length > 0) {
+        await this.addHeaderRow(targetId);
+        for (let i = history.length - 1; i >= 0; i--) {
+          const entry = history[i];
+          const timeSec = (entry.elapsedMs / 1000).toFixed(1);
+          const nameColor = entry.error ? this.theme.statusError : this.theme.textHeading;
+          const row = await this.addRequestRow(
+            targetId,
+            entry.callerName ?? entry.callerId.slice(0, 8),
+            entry.method,
+            entry.provider,
+            `${timeSec}s`,
+            `${entry.outputChars}`,
+            nameColor,
+            'View',
+            entry.id,
+            false,
+          );
+          this.historyRows.push(row);
+        }
+      } else {
+        await this.addEmptyLabel(targetId, 'No history yet');
+      }
+    });
+  }
+
+  /**
+   * Destroy a tab's ScrollableVBox, recreate it, preserve visibility, and populate.
+   */
+  private async rebuildTabContent(
+    tabIndex: number,
+    populate: (targetLayoutId: AbjectId) => Promise<void>,
+  ): Promise<void> {
+    const oldId = this.tabContents[tabIndex];
+
+    // Remove old from layout
+    try {
+      await this.request(request(this.id, this.rootLayoutId!, 'removeLayoutChild', {
+        widgetId: oldId,
+      }));
+    } catch { /* may be gone */ }
+    try {
+      await this.request(request(this.id, oldId, 'destroy', {}));
+    } catch { /* may be gone */ }
+
+    // Create replacement
+    const newId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createScrollableVBox', {
+        windowId: this.windowId!,
+        margins: { top: 4, right: 0, bottom: 0, left: 0 },
+        spacing: 2,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
+      widgetId: newId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
+    // Hide if not the selected tab
+    if (tabIndex !== this.selectedTabIndex) {
+      await this.request(request(this.id, newId, 'update', {
+        style: { visible: false },
+      }));
     }
 
-    // -- History Section --
-    if (history.length > 0) {
-      await this.addSectionLabel('Recent History');
-      await this.addHeaderRow();
+    this.tabContents[tabIndex] = newId;
+    if (tabIndex === 0) this.activeTabListId = newId;
+    else this.historyTabListId = newId;
 
-      for (let i = history.length - 1; i >= 0; i--) {
-        const entry = history[i];
-        const timeSec = (entry.elapsedMs / 1000).toFixed(1);
-        const nameColor = entry.error ? this.theme.statusError : this.theme.textHeading;
-        const row = await this.addRequestRow(
-          entry.callerName ?? entry.callerId.slice(0, 8),
-          entry.method,
-          entry.provider,
-          `${timeSec}s`,
-          `${entry.outputChars}`,
-          nameColor,
-          'View',
-          entry.id,
-          false,
-        );
-        this.historyRows.push(row);
-      }
-    }
+    await populate(newId);
   }
 
   // -- Row Helpers --
 
-  private async addSectionLabel(text: string): Promise<void> {
+  private async addSectionLabel(targetLayoutId: AbjectId, text: string): Promise<void> {
     const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
@@ -518,26 +599,26 @@ export class LLMMonitor extends Abject {
         ],
       })
     );
-    await this.request(request(this.id, this.scrollableListId!, 'addLayoutChild', {
+    await this.request(request(this.id, targetLayoutId, 'addLayoutChild', {
       widgetId: labelId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 20 },
     }));
   }
 
-  private async addHeaderRow(): Promise<void> {
+  private async addHeaderRow(targetLayoutId: AbjectId): Promise<void> {
     const headerStyle = { color: this.theme.sectionLabel, fontSize: 10, fontWeight: 'bold' };
     const headerTexts = ['Requester', 'Method', 'Provider', 'Time', 'Output', ''];
     const headerWidths: Array<number | undefined> = [undefined, 70, 80, 50, 60, 50];
 
     const headerRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: this.scrollableListId!,
+        parentLayoutId: targetLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
     );
-    await this.request(request(this.id, this.scrollableListId!, 'addLayoutChild', {
+    await this.request(request(this.id, targetLayoutId, 'addLayoutChild', {
       widgetId: headerRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 18 },
@@ -561,7 +642,7 @@ export class LLMMonitor extends Abject {
     }
   }
 
-  private async addEmptyLabel(text: string): Promise<void> {
+  private async addEmptyLabel(targetLayoutId: AbjectId, text: string): Promise<void> {
     const { widgetIds: [emptyId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
@@ -569,7 +650,7 @@ export class LLMMonitor extends Abject {
         ],
       })
     );
-    await this.request(request(this.id, this.scrollableListId!, 'addLayoutChild', {
+    await this.request(request(this.id, targetLayoutId, 'addLayoutChild', {
       widgetId: emptyId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 26 },
@@ -577,6 +658,7 @@ export class LLMMonitor extends Abject {
   }
 
   private async addRequestRow(
+    targetLayoutId: AbjectId,
     requesterName: string,
     method: string,
     provider: string,
@@ -590,12 +672,12 @@ export class LLMMonitor extends Abject {
     const rowH = 26;
     const rowLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: this.scrollableListId!,
+        parentLayoutId: targetLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
     );
-    await this.request(request(this.id, this.scrollableListId!, 'addLayoutChild', {
+    await this.request(request(this.id, targetLayoutId, 'addLayoutChild', {
       widgetId: rowLayoutId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: rowH },
