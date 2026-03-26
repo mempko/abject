@@ -1,5 +1,5 @@
 /**
- * GlobalToolbar — persistent chromeless panel positioned below WorkspaceSwitcher.
+ * GlobalToolbar -- persistent chromeless panel positioned below WorkspaceSwitcher.
  *
  * Provides quick-access buttons for GlobalSettings (API Keys) and
  * PeerNetwork (identity, signaling, contacts).

@@ -2,7 +2,7 @@
  * DedicatedWorkerBridge — extends WorkerBridge for dedicated workers
  * (UI, P2P) that need custom init and bidirectional non-Abject messages.
  *
- * Standard Abject message routing (bus:deliver, bus:reply, bus:send)
+ * Standard Abject message routing (bus:deliver, bus:send)
  * is inherited from WorkerBridge. This class adds:
  *   - sendConfig() / transferPort() for worker initialization
  *   - sendCustom() for arbitrary main→worker messages

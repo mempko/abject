@@ -9,7 +9,7 @@
  *   5. Worker posts { type: 'ready' }
  *
  * After ready:
- *   - Abject messages are routed via WorkerBus ↔ main bus (standard bus:deliver/bus:reply)
+ *   - Abject messages are routed via WorkerBus ↔ main bus (standard bus:deliver)
  *   - Frontend WS data is relayed via the MessagePort (main thread relays ws ↔ port)
  */
 
@@ -89,14 +89,6 @@ port.on('message', async (data: { type: string; [key: string]: unknown }) => {
       const msg = (data as WorkerInboundMessage).message;
       if (msg) {
         workerBus.deliverFromMain(msg);
-      }
-      break;
-    }
-
-    case 'bus:reply': {
-      const msg = (data as WorkerInboundMessage).message;
-      if (msg) {
-        workerBus.deliverReplyFromMain(msg);
       }
       break;
     }

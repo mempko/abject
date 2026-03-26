@@ -122,20 +122,25 @@ export async function bootAbjectsCore(opts: BootOptions): Promise<BootResult> {
   const registryId = runtime.objectRegistry.id;
   const BOOTSTRAP_ID = 'bootstrap' as AbjectId;
 
-  // Register a temporary bootstrap sender on the bus for request-reply
+  // Register a temporary bootstrap sender. Replies arrive via the mailbox.
   const pendingReplies = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
-  bus.register(BOOTSTRAP_ID);
-  bus.setReplyHandler(BOOTSTRAP_ID, (msg: AbjectMessage) => {
-    const pending = pendingReplies.get(msg.header.correlationId!);
-    if (pending) {
-      pendingReplies.delete(msg.header.correlationId!);
-      if (msg.header.type === 'error') {
-        pending.reject(new Error((msg.payload as { message: string }).message));
-      } else {
-        pending.resolve(msg.payload);
+  const bootMailbox = bus.register(BOOTSTRAP_ID);
+  let bootDone = false;
+  const bootLoop = (async () => {
+    while (!bootDone) {
+      let msg: AbjectMessage;
+      try { msg = await bootMailbox.receive(); } catch { break; }
+      const pending = pendingReplies.get(msg.header.correlationId!);
+      if (pending) {
+        pendingReplies.delete(msg.header.correlationId!);
+        if (msg.header.type === 'error') {
+          pending.reject(new Error((msg.payload as { message: string }).message));
+        } else {
+          pending.resolve(msg.payload);
+        }
       }
     }
-  });
+  })();
 
   function bootstrapRequest<T>(target: AbjectId, method: string, payload: unknown): Promise<T> {
     return new Promise((resolve, reject) => {
@@ -318,9 +323,9 @@ export async function bootAbjectsCore(opts: BootOptions): Promise<BootResult> {
   peerRouterObj.announceRoutesToAll().catch(() => {});
   await supervisedSpawn('WorkspaceBrowser', 'permanent', systemTypeId('WorkspaceBrowser'));
 
-  // Clean up bootstrap handler
+  // Clean up bootstrap sender
   function cleanup() {
-    bus.removeReplyHandler(BOOTSTRAP_ID);
+    bootDone = true;
     bus.unregister(BOOTSTRAP_ID);
   }
 

@@ -1,9 +1,9 @@
 /**
- * Taskbar — persistent bottom bar with launch buttons for system UI.
+ * Taskbar -- persistent vertical bar with launch buttons for workspace apps.
  *
- * Migrated to direct widget Abject interaction: creates windows and buttons
- * via createWindowAbject/createButton factory methods, registers as dependent
- * of each button, and listens for 'changed' events with aspect === 'click'.
+ * Uses the standard show/hide pattern: destroys and rebuilds the window on
+ * each show(). On data changes (registry events, minimize/restore), rebuilds
+ * the content by clearing the root layout and repopulating it.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
@@ -16,6 +16,12 @@ const log = new Log('Taskbar');
 
 const TASKBAR_INTERFACE: InterfaceId = 'abjects:taskbar';
 
+const BTN_W = 120;
+const BTN_H = 30;
+const LABEL_H = 20;
+const PADDING = 16;
+const SPACING = 6;
+
 export class Taskbar extends Abject {
   private widgetManagerId?: AbjectId;
   private appExplorerId?: AbjectId;
@@ -24,34 +30,29 @@ export class Taskbar extends Abject {
   private webBrowserViewerId?: AbjectId;
   private goalBrowserId?: AbjectId;
   private registryId?: AbjectId;
+  private windowManagerId?: AbjectId;
+
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
-
-  // Y-offset for positioning below WorkspaceSwitcher
   private yOffset = 8;
 
-  // Button widget AbjectId → target object AbjectId (for click dispatch and state updates)
+  // Button -> target maps for click dispatch
   private systemButtons: Map<AbjectId, AbjectId> = new Map();
   private userObjButtons: Map<AbjectId, AbjectId> = new Map();
-
-  // Debounce timer for incremental updates
-  private updateTimer?: ReturnType<typeof setTimeout>;
-
-  // Guard against concurrent show() rebuilds (prevents double rendering)
-  private showInProgress = false;
-
-  // Minimized window tracking
-  private minimizedWindows: Map<string, { windowId: AbjectId; title: string }> = new Map();
-  // Button widget AbjectId → surfaceId for restore buttons
   private restoreButtons: Map<AbjectId, string> = new Map();
-  private windowManagerId?: AbjectId;
+
+  // Minimized window state (survives rebuilds)
+  private minimizedWindows: Map<string, { windowId: AbjectId; title: string }> = new Map();
+
+  // Debounce timer for registry events
+  private updateTimer?: ReturnType<typeof setTimeout>;
 
   constructor() {
     super({
       manifest: {
         name: 'Taskbar',
         description:
-          'Persistent vertical toolbar in the top-left with launch buttons for Settings, Registry Browser, Chat, and Jobs.',
+          'Persistent vertical toolbar with launch buttons for workspace apps.',
         version: '1.0.0',
         interface: {
             id: TASKBAR_INTERFACE,
@@ -69,6 +70,14 @@ export class Taskbar extends Abject {
                 description: 'Hide the taskbar',
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'getState',
+                description: 'Return current state',
+                parameters: [],
+                returns: { kind: 'object', properties: {
+                  visible: { kind: 'primitive', primitive: 'boolean' },
+                }},
               },
             ],
           },
@@ -94,34 +103,309 @@ export class Taskbar extends Abject {
     this.registryId = await this.requireDep('Registry');
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
 
-    // Subscribe to registry for auto-refresh when new objects are registered
     if (this.registryId) {
       await this.request(request(this.id, this.registryId, 'subscribe', {}));
     }
+  }
 
-    // Subscribe as dependent of each system object to receive visibility changes
+  private setupHandlers(): void {
+    this.on('show', async (msg: AbjectMessage) => {
+      const payload = msg.payload as { yOffset?: number } | undefined;
+      if (payload?.yOffset !== undefined) {
+        this.yOffset = payload.yOffset;
+      }
+      return this.show();
+    });
+
+    this.on('hide', async () => this.hide());
+
+    this.on('getState', async () => ({ visible: !!this.windowId }));
+
+    this.on('windowCloseRequested', async () => { await this.hide(); });
+
+    this.on('changed', async (msg: AbjectMessage) => {
+      const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
+      if (aspect === 'visibility') {
+        // Update single button style in-place (no rebuild)
+        const fromId = msg.routing.from;
+        await this.updateButtonStyle(fromId, !!value);
+        return;
+      }
+      if (aspect !== 'click') return;
+
+      const fromId = msg.routing.from;
+
+      // Launch button clicked
+      const targetId = this.systemButtons.get(fromId) ?? this.userObjButtons.get(fromId);
+      if (targetId) {
+        this.send(event(this.id, targetId, 'show', {}));
+        return;
+      }
+
+      // Restore button clicked
+      if (this.restoreButtons.has(fromId)) {
+        const surfaceId = this.restoreButtons.get(fromId)!;
+        if (this.windowManagerId) {
+          this.send(event(this.id, this.windowManagerId, 'restoreWindow', { surfaceId }));
+        }
+      }
+    });
+
+    this.on('windowMinimized', async (msg: AbjectMessage) => {
+      const { surfaceId, windowId, title } = msg.payload as {
+        surfaceId: string; windowId: AbjectId; title: string;
+      };
+      this.minimizedWindows.set(surfaceId, { windowId, title });
+      if (this.windowId) await this.rebuild();
+    });
+
+    this.on('windowRestored', async (msg: AbjectMessage) => {
+      const { surfaceId } = msg.payload as { surfaceId: string };
+      this.minimizedWindows.delete(surfaceId);
+      if (this.windowId) await this.rebuild();
+    });
+
+    this.on('objectRegistered', async () => this.scheduleRebuild());
+    this.on('objectUnregistered', async () => this.scheduleRebuild());
+  }
+
+  // ---- Show / Hide / Rebuild ----
+
+  async show(): Promise<boolean> {
+    if (this.windowId) {
+      // Already visible, just reposition
+      await this.resizeWindow();
+      return true;
+    }
+    await this.buildUI();
+    this.changed('visibility', true);
+    return true;
+  }
+
+  async hide(): Promise<boolean> {
+    if (!this.windowId) return true;
+    await this.request(
+      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
+        windowId: this.windowId,
+      })
+    );
+    this.windowId = undefined;
+    this.rootLayoutId = undefined;
+    this.systemButtons.clear();
+    this.userObjButtons.clear();
+    this.restoreButtons.clear();
+    this.changed('visibility', false);
+    return true;
+  }
+
+  private scheduleRebuild(): void {
+    if (this.updateTimer) return;
+    this.updateTimer = setTimeout(async () => {
+      this.updateTimer = undefined;
+      if (this.windowId) await this.rebuild();
+    }, 100);
+  }
+
+  /**
+   * Rebuild content inside the existing window. Clears root layout and repopulates.
+   */
+  private async rebuild(): Promise<void> {
+    if (!this.windowId || !this.rootLayoutId) return;
+
+    // Clear all children from root layout
+    await this.request(request(this.id, this.rootLayoutId, 'clearLayoutChildren', {}));
+    this.systemButtons.clear();
+    this.userObjButtons.clear();
+    this.restoreButtons.clear();
+
+    await this.populateContent();
+    await this.resizeWindow();
+  }
+
+  // ---- UI Construction ----
+
+  private async buildUI(): Promise<void> {
+    const showableObjects = await this.discoverShowableObjects();
+    const barHeight = this.computeHeight(showableObjects.length);
+
+    this.windowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createWindowAbject', {
+        title: '',
+        rect: { x: 8, y: this.yOffset, width: BTN_W + PADDING * 2, height: barHeight },
+        zIndex: 999,
+        chromeless: true,
+        draggable: true,
+      })
+    );
+
+    this.rootLayoutId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createVBox', {
+        windowId: this.windowId,
+        margins: { top: PADDING, right: PADDING, bottom: PADDING, left: PADDING },
+        spacing: SPACING,
+      })
+    );
+
+    await this.populateContent();
+  }
+
+  private async populateContent(): Promise<void> {
+    const showableObjects = await this.discoverShowableObjects();
+
+    // No blocking getState queries. Buttons render unstyled immediately.
+    // Visibility events from system objects update styles via updateButtonStyle().
+
+    // ---- Header row: "Abjects" label + gear button ----
+    const headerRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId!,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 4,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
+      widgetId: headerRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: LABEL_H },
+    }));
+
+    // ---- Batch create all widgets ----
+    const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
+
+    // [0] Header label
+    specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A0 Abjects',
+      style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } });
+    // [1] Gear button (AppExplorer)
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699',
+      style: { fontSize: 13 } });
+    // [2] Chat
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCAC Chat' });
+    // [3?] Goals (optional)
+    if (this.goalBrowserId) {
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDFAF Goals' });
+    }
+    // [4] Jobs
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCCB Jobs' });
+    // [5?] Web (optional)
+    if (this.webBrowserViewerId) {
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Web' });
+    }
+
+    // User object buttons
+    const userObjStartIdx = specs.length;
+    for (const obj of showableObjects) {
+      specs.push({ type: 'button', windowId: this.windowId!, text: obj.manifest.name });
+    }
+
+    // Minimized window section
+    const minimizedStartIdx = specs.length;
+    const minimizedCount = this.minimizedWindows.size;
+    if (minimizedCount > 0) {
+      specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A1 Windows',
+        style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } });
+      for (const [, { title }] of this.minimizedWindows) {
+        specs.push({ type: 'button', windowId: this.windowId!, text: title });
+      }
+    }
+
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs })
+    );
+
+    // ---- Map button IDs to targets ----
+    const headerLabelId = widgetIds[0];
+    const gearBtnId = widgetIds[1];
+    this.systemButtons.set(gearBtnId, this.appExplorerId!);
+
+    let idx = 2;
+    this.systemButtons.set(widgetIds[idx++], this.chatId!);
+    if (this.goalBrowserId) this.systemButtons.set(widgetIds[idx++], this.goalBrowserId);
+    this.systemButtons.set(widgetIds[idx++], this.jobBrowserId!);
+    if (this.webBrowserViewerId) this.systemButtons.set(widgetIds[idx++], this.webBrowserViewerId);
+
+    for (let i = 0; i < showableObjects.length; i++) {
+      this.userObjButtons.set(widgetIds[userObjStartIdx + i], showableObjects[i].id);
+    }
+
+    // ---- Add header row children ----
+    await this.request(request(this.id, headerRowId, 'addLayoutChildren', {
+      children: [
+        { widgetId: headerLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: LABEL_H } },
+        { widgetId: gearBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: LABEL_H } },
+      ],
+    }));
+
+    // ---- Add root layout children ----
+    const rootChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize: Record<string, number> }> = [];
+
+    // System buttons (skip gear, it's in the header row)
+    for (const [btnId] of this.systemButtons) {
+      if (btnId === gearBtnId) continue;
+      rootChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: BTN_H } });
+    }
+
+    // User object buttons
+    for (let i = 0; i < showableObjects.length; i++) {
+      rootChildren.push({ widgetId: widgetIds[userObjStartIdx + i], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: BTN_H } });
+    }
+
+    // Minimized window section
+    if (minimizedCount > 0) {
+      let mIdx = minimizedStartIdx;
+      rootChildren.push({ widgetId: widgetIds[mIdx++], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: LABEL_H } });
+      let surfaceIdx = 0;
+      for (const [surfaceId] of this.minimizedWindows) {
+        const btnId = widgetIds[mIdx + surfaceIdx];
+        this.restoreButtons.set(btnId, surfaceId);
+        rootChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: BTN_H } });
+        surfaceIdx++;
+      }
+    }
+
+    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChildren', {
+      children: rootChildren,
+    }));
+
+    // Register as dependent of all buttons (for click events)
+    for (const [btnId] of this.systemButtons) {
+      this.send(request(this.id, btnId, 'addDependent', {}));
+    }
+    for (let i = 0; i < showableObjects.length; i++) {
+      this.send(request(this.id, widgetIds[userObjStartIdx + i], 'addDependent', {}));
+    }
+    for (const [btnId] of this.restoreButtons) {
+      this.send(request(this.id, btnId, 'addDependent', {}));
+    }
+
+    // Subscribe as dependent of system objects for visibility change events
     const depIds = [this.appExplorerId!, this.chatId!, this.jobBrowserId!];
     if (this.webBrowserViewerId) depIds.push(this.webBrowserViewerId);
     if (this.goalBrowserId) depIds.push(this.goalBrowserId);
     for (const depId of depIds) {
-      await this.request(request(this.id, depId, 'addDependent', {}));
+      this.send(request(this.id, depId, 'addDependent', {}));
     }
 
+    // Fire-and-forget: query visibility and update button styles asynchronously.
+    // This doesn't block rendering; buttons appear immediately, styles follow.
+    void this.refreshButtonStyles();
   }
 
-  /**
-   * Look up an object in the registry via message passing.
-   */
-  private async registryLookup(objectId: AbjectId): Promise<ObjectRegistration | null> {
-    if (!this.registryId) return null;
-    return this.request<ObjectRegistration | null>(
-      request(this.id, this.registryId, 'lookup', { objectId })
-    );
+  private async refreshButtonStyles(): Promise<void> {
+    const allButtons = [...this.systemButtons, ...this.userObjButtons];
+    for (const [, targetId] of allButtons) {
+      try {
+        const state = await this.request<{ visible?: boolean }>(
+          request(this.id, targetId, 'getState', {}), 2000
+        );
+        if (state?.visible) {
+          await this.updateButtonStyle(targetId, true);
+        }
+      } catch { /* object unavailable */ }
+    }
   }
 
-  /**
-   * Discover registered objects that have both show and hide methods (non-system).
-   */
+  // ---- Helpers ----
+
   private async discoverShowableObjects(): Promise<ObjectRegistration[]> {
     if (!this.registryId) return [];
     const allObjects = await this.request<ObjectRegistration[]>(
@@ -135,451 +419,46 @@ export class Taskbar extends Abject {
     });
   }
 
-  private setupHandlers(): void {
-    this.on('show', async (msg: AbjectMessage) => {
-      const payload = msg.payload as { yOffset?: number } | undefined;
-      if (payload?.yOffset !== undefined) {
-        this.yOffset = payload.yOffset;
-      }
-      return this.show();
-    });
-
-    this.on('hide', async () => {
-      return this.hide();
-    });
-
-    // Handle 'changed' events from button widget Abjects (dependency protocol)
-    this.on('changed', async (msg: AbjectMessage) => {
-      const { aspect } = msg.payload as { aspect: string; value?: unknown };
-
-      if (aspect === 'visibility') {
-        await this.updateButtonStates();
-        return;
-      }
-
-      if (aspect !== 'click') return;
-
-      const fromId = msg.routing.from;
-
-      // System and user object buttons all map button → target
-      const targetId = this.systemButtons.get(fromId) ?? this.userObjButtons.get(fromId);
-      if (targetId) {
-        this.send(event(this.id, targetId, 'show', {}));
-      } else if (this.restoreButtons.has(fromId)) {
-        const surfaceId = this.restoreButtons.get(fromId)!;
-        if (this.windowManagerId) {
-          this.send(event(this.id, this.windowManagerId, 'restoreWindow', { surfaceId }));
-        }
-      }
-    });
-
-    // Handle windowMinimized event from WindowManager
-    this.on('windowMinimized', async (msg: AbjectMessage) => {
-      const { surfaceId, windowId, title } = msg.payload as {
-        surfaceId: string; windowId: AbjectId; title: string;
-      };
-      this.minimizedWindows.set(surfaceId, { windowId, title });
-      await this.show();
-    });
-
-    // Handle windowRestored event from WindowManager
-    this.on('windowRestored', async (msg: AbjectMessage) => {
-      const { surfaceId } = msg.payload as { surfaceId: string };
-      this.minimizedWindows.delete(surfaceId);
-      await this.show();
-    });
-
-    // Auto-refresh taskbar when new objects are registered
-    this.on('objectRegistered', async () => {
-      this.scheduleUpdate();
-    });
-
-    // Auto-refresh taskbar when objects are unregistered (killed)
-    this.on('objectUnregistered', async () => {
-      this.scheduleUpdate();
-    });
-  }
-
-  /**
-   * Schedule a debounced incremental update (coalesces rapid-fire registry events).
-   */
-  private scheduleUpdate(): void {
-    if (this.updateTimer) return;
-    this.updateTimer = setTimeout(async () => {
-      this.updateTimer = undefined;
-      await this.update();
-    }, 100);
-  }
-
-  /**
-   * Incremental update: diff current buttons against desired state and patch.
-   */
-  private async update(): Promise<void> {
-    if (this.showInProgress) return;
-    if (!this.windowId || !this.rootLayoutId) {
-      await this.show();
-      return;
-    }
-
-    const showableObjects = await this.discoverShowableObjects();
-    const desiredIds = new Set(showableObjects.map(o => o.id));
-
-    // Remove buttons for objects no longer showable
-    for (const [btnId, targetId] of this.userObjButtons) {
-      if (!desiredIds.has(targetId)) {
-        await this.request(request(this.id, this.rootLayoutId!, 'removeLayoutChild', { widgetId: btnId }));
-        await this.request(request(this.id, btnId, 'destroy', {}));
-        this.userObjButtons.delete(btnId);
-      }
-    }
-
-    // Add buttons for newly showable objects
-    const existingTargets = new Set(this.userObjButtons.values());
-
-    const btnW = 120;
-    const btnH = 30;
-    const activeStyle = { background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
-
-    const newObjects = showableObjects.filter(obj => !existingTargets.has(obj.id));
-    if (newObjects.length > 0) {
-      // Query visibility in parallel
-      const visResults = await Promise.all(
-        newObjects.map(async (obj) => {
-          try {
-            const state = await this.request<{ visible?: boolean }>(
-              request(this.id, obj.id, 'getState', {})
-            );
-            return !!state?.visible;
-          } catch { return false; }
-        })
-      );
-
-      // Batch create buttons
-      const specs = newObjects.map((obj, i) => {
-        return {
-          type: 'button' as const,
-          windowId: this.windowId!,
-          text: obj.manifest.name,
-          ...(visResults[i] ? { style: activeStyle } : {}),
-        };
-      });
-
-      const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs })
-      );
-
-      // Batch add to layout
-      const children = widgetIds.map(id => ({
-        widgetId: id,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { width: btnW, height: btnH },
-      }));
-      await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChildren', { children }));
-
-      // Track and fire-and-forget addDep
-      for (let i = 0; i < newObjects.length; i++) {
-        this.userObjButtons.set(widgetIds[i], newObjects[i].id);
-        this.send(request(this.id, widgetIds[i], 'addDependent', {}));
-      }
-    }
-
-    // Update button active states
-    await this.updateButtonStates();
-
-    // Resize window to fit current button count
-    await this.resizeWindow();
-  }
-
-  /**
-   * Update active/inactive style on all buttons without destroying them.
-   */
-  private async updateButtonStates(): Promise<void> {
-    if (!this.windowId) return;
-
-    const activeStyle = { background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
-    const inactiveStyle = { background: undefined, borderColor: undefined };
-
-    const isVisible = async (objectId: AbjectId): Promise<boolean> => {
-      try {
-        const state = await this.request<{ visible?: boolean }>(
-          request(this.id, objectId, 'getState', {})
-        );
-        return !!state?.visible;
-      } catch { return false; }
-    };
-
-    // Update all buttons (system + user) in parallel
-    const allButtons = [...this.systemButtons, ...this.userObjButtons];
-    const updates = allButtons.map(async ([btnId, targetId]) => {
-      const vis = await isVisible(targetId);
-      await this.request(request(this.id, btnId, 'update', {
-        style: vis ? activeStyle : inactiveStyle,
-      }));
-    });
-
-    await Promise.all(updates);
-  }
-
-  /**
-   * Resize the taskbar window to fit the current number of buttons.
-   */
-  private async resizeWindow(): Promise<void> {
-    if (!this.windowId) return;
-
-    const btnH = 30;
-    const labelH = 20;
-    const padding = 16;
-    const spacing = 6;
-    const btnW = 120;
-    const minimizedCount = this.minimizedWindows.size;
-    const totalBtnCount = this.systemButtons.size + this.userObjButtons.size + minimizedCount;
-    const extraHeight = (labelH + spacing)
-      + (minimizedCount > 0 ? (labelH + spacing) : 0);
-    const barWidth = btnW + padding * 2;
-    const barHeight = padding + extraHeight + totalBtnCount * (btnH + spacing) - spacing + padding;
-
-    await this.request(request(this.id, this.windowId, 'windowRect', {
-      x: 8, y: this.yOffset, width: barWidth, height: barHeight,
-    }));
-  }
-
-  async show(): Promise<boolean> {
-    if (this.showInProgress) return false; // Skip concurrent rebuild
-    this.showInProgress = true;
-    try {
-    return await this._showImpl();
-    } finally {
-      this.showInProgress = false;
-    }
-  }
-
-  private async _showImpl(): Promise<boolean> {
-    // Always destroy and rebuild to pick up new objects
-    if (this.windowId) {
-      log.info(`show() — destroying old window ${this.windowId}`);
-      await this.request(
-        request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
-          windowId: this.windowId,
-        })
-      );
-      log.info('show() — old window destroyed');
-      this.windowId = undefined;
-    }
-
-    // Reset all button tracking since window is destroyed and rebuilt
-    this.systemButtons.clear();
-    this.rootLayoutId = undefined;
-    this.userObjButtons.clear();
-    this.restoreButtons.clear();
-
-    const showableObjects = await this.discoverShowableObjects();
-
-    const btnW = 120;
-    const btnH = 30;
-    const labelH = 20;
-    const padding = 16;
-    const spacing = 6;
+  private computeHeight(userObjectCount: number): number {
     const systemBtnCount = 2 + (this.webBrowserViewerId ? 1 : 0) + (this.goalBrowserId ? 1 : 0);
     const minimizedCount = this.minimizedWindows.size;
-    const totalBtnCount = systemBtnCount + showableObjects.length + minimizedCount;
-    const extraHeight = (labelH + spacing)
-      + (minimizedCount > 0 ? (labelH + spacing) : 0);
-    const barWidth = btnW + padding * 2;
-    const barHeight = padding + extraHeight + totalBtnCount * (btnH + spacing) - spacing + padding;
-
-    this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: '',
-        rect: { x: 8, y: this.yOffset, width: barWidth, height: barHeight },
-        zIndex: 999,
-        chromeless: true,
-        draggable: true,
-      })
-    );
-
-    // Create root VBox layout (vertical stack)
-    this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createVBox', {
-        windowId: this.windowId,
-        margins: { top: padding, right: padding, bottom: padding, left: padding },
-        spacing,
-      })
-    );
-
-    // Helper to query visibility of a system object
-    const isVisible = async (objectId: AbjectId): Promise<boolean> => {
-      try {
-        const state = await this.request<{ visible?: boolean }>(
-          request(this.id, objectId, 'getState', {})
-        );
-        return !!state?.visible;
-      } catch { return false; }
-    };
-
-    const activeStyle = { background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
-
-    // ── Apps section header row: "■ Apps" label + gear button ──
-    const appsHeaderRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 4,
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
-      widgetId: appsHeaderRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: labelH },
-    }));
-
-    // Query visibility of all system objects in parallel
-    const visPromises: Promise<boolean>[] = [
-      isVisible(this.appExplorerId!),
-      isVisible(this.chatId!),
-      isVisible(this.jobBrowserId!),
-    ];
-    if (this.webBrowserViewerId) visPromises.push(isVisible(this.webBrowserViewerId));
-    if (this.goalBrowserId) visPromises.push(isVisible(this.goalBrowserId));
-
-    // Query showable object visibility in parallel
-    const showableVisPromises = showableObjects.map(obj => isVisible(obj.id));
-
-    const [visResults, showableVisResults] = await Promise.all([
-      Promise.all(visPromises),
-      Promise.all(showableVisPromises),
-    ]);
-    const [registryVis, chatVis, jobsVis] = visResults;
-    let visIdx = 3;
-    const browserViewerVis = this.webBrowserViewerId ? visResults[visIdx++] : false;
-    const goalBrowserVis = this.goalBrowserId ? visResults[visIdx++] : false;
-
-    log.info(`visibility: registry=${registryVis} chat=${chatVis} jobs=${jobsVis} browser=${browserViewerVis} goals=${goalBrowserVis}`);
-
-    // Batch create all widgets: header label, gear button, system buttons, user buttons, minimize section
-    const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
-
-    // 0: Abjects header label
-    specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A0 Abjects', style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } });
-    // 1: Gear button
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13, ...(registryVis ? activeStyle : {}) } });
-    // 2: Chat button
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCAC Chat', ...(chatVis ? { style: activeStyle } : {}) });
-    // 3?: Goals button (optional)
-    if (this.goalBrowserId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDFAF Goals', ...(goalBrowserVis ? { style: activeStyle } : {}) });
-    }
-    // 4: Jobs button
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCCB Jobs', ...(jobsVis ? { style: activeStyle } : {}) });
-    // 5?: Browser button (optional)
-    if (this.webBrowserViewerId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Web', ...(browserViewerVis ? { style: activeStyle } : {}) });
-    }
-    // User object buttons
-    const userObjStartIdx = specs.length;
-    for (let i = 0; i < showableObjects.length; i++) {
-      const vis = showableVisResults[i];
-      const obj = showableObjects[i];
-      specs.push({ type: 'button', windowId: this.windowId!, text: obj.manifest.name, ...(vis ? { style: activeStyle } : {}) });
-    }
-    // Minimized window section
-    const minimizedStartIdx = specs.length;
-    if (minimizedCount > 0) {
-      specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A1 Windows', style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } });
-      for (const [, { title }] of this.minimizedWindows) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: title });
-      }
-    }
-
-    // One batch create for all widgets
-    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs })
-    );
-
-    // Assign IDs — map each button widget to its target object
-    const appsLabelId = widgetIds[0];
-    const registryBtnId = widgetIds[1];
-    this.systemButtons.set(registryBtnId, this.appExplorerId!);
-    let nextIdx = 3;
-    this.systemButtons.set(widgetIds[2], this.chatId!);
-    if (this.goalBrowserId) {
-      this.systemButtons.set(widgetIds[nextIdx++], this.goalBrowserId);
-    }
-    this.systemButtons.set(widgetIds[nextIdx++], this.jobBrowserId!);
-    if (this.webBrowserViewerId) {
-      this.systemButtons.set(widgetIds[nextIdx++], this.webBrowserViewerId);
-    }
-
-    // Map user object buttons
-    for (let i = 0; i < showableObjects.length; i++) {
-      this.userObjButtons.set(widgetIds[userObjStartIdx + i], showableObjects[i].id);
-    }
-
-    // Add header row children
-    await this.request(request(this.id, appsHeaderRowId, 'addLayoutChildren', {
-      children: [
-        { widgetId: appsLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: labelH } },
-        { widgetId: registryBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } },
-      ],
-    }));
-
-    // Build root layout children: all system buttons (except registry gear) + user buttons
-    const rootChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize: Record<string, number> }> = [];
-    for (const [btnId] of this.systemButtons) {
-      if (btnId === registryBtnId) continue; // registry gear is in the header row
-      rootChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
-    }
-    for (let i = 0; i < showableObjects.length; i++) {
-      rootChildren.push({ widgetId: widgetIds[userObjStartIdx + i], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
-    }
-
-    // Minimized section
-    if (minimizedCount > 0) {
-      let mIdx = minimizedStartIdx;
-      rootChildren.push({ widgetId: widgetIds[mIdx++], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: labelH } }); // label
-      let surfaceIdx = 0;
-      for (const [surfaceId] of this.minimizedWindows) {
-        const btnId = widgetIds[mIdx + surfaceIdx];
-        this.restoreButtons.set(btnId, surfaceId);
-        rootChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
-        surfaceIdx++;
-      }
-    }
-
-    // Batch add all to root layout
-    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChildren', {
-      children: rootChildren,
-    }));
-
-    // Fire-and-forget: register as dependent for all interactive buttons
-    for (const [btnId] of this.systemButtons) {
-      this.send(request(this.id, btnId, 'addDependent', {}));
-    }
-    for (let i = 0; i < showableObjects.length; i++) {
-      this.send(request(this.id, widgetIds[userObjStartIdx + i], 'addDependent', {}));
-    }
-    if (minimizedCount > 0) {
-      for (const [btnId] of this.restoreButtons) {
-        this.send(request(this.id, btnId, 'addDependent', {}));
-      }
-    }
-
-    return true;
+    const totalBtnCount = systemBtnCount + userObjectCount + minimizedCount;
+    const extraHeight = (LABEL_H + SPACING)
+      + (minimizedCount > 0 ? (LABEL_H + SPACING) : 0);
+    return PADDING + extraHeight + totalBtnCount * (BTN_H + SPACING) - SPACING + PADDING;
   }
 
-  async hide(): Promise<boolean> {
-    if (!this.windowId) return true;
+  private async resizeWindow(): Promise<void> {
+    if (!this.windowId) return;
+    const showableObjects = await this.discoverShowableObjects();
+    const barHeight = this.computeHeight(showableObjects.length);
+    await this.request(request(this.id, this.windowId, 'windowRect', {
+      x: 8, y: this.yOffset, width: BTN_W + PADDING * 2, height: barHeight,
+    }));
+  }
 
-    await this.request(
-      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
-        windowId: this.windowId,
-      })
-    );
+  /**
+   * Update a single button's active/inactive style by target object ID.
+   * Cheap: one message to one button widget, no layout rebuild.
+   */
+  private async updateButtonStyle(targetId: AbjectId, visible: boolean): Promise<void> {
+    if (!this.windowId) return;
+    const activeStyle = { background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
+    const inactiveStyle = { background: undefined, borderColor: undefined };
+    const style = visible ? activeStyle : inactiveStyle;
 
-    this.windowId = undefined;
-    this.rootLayoutId = undefined;
-    this.systemButtons.clear();
-    this.userObjButtons.clear();
-    return true;
+    for (const [btnId, tid] of this.systemButtons) {
+      if (tid === targetId) {
+        this.send(request(this.id, btnId, 'update', { style }));
+        return;
+      }
+    }
+    for (const [btnId, tid] of this.userObjButtons) {
+      if (tid === targetId) {
+        this.send(request(this.id, btnId, 'update', { style }));
+        return;
+      }
+    }
   }
 }
 

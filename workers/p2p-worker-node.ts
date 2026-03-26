@@ -12,7 +12,7 @@
  *   7. Worker posts { type: 'ready' }
  *
  * After ready:
- *   - Abject messages are routed via WorkerBus ↔ main bus (standard bus:deliver/bus:reply)
+ *   - Abject messages are routed via WorkerBus ↔ main bus (standard bus:deliver)
  *   - Peer transport send/receive uses custom messages (send-to-peer, remote-message)
  */
 
@@ -93,21 +93,15 @@ async function bootstrapP2P(config: P2PConfig): Promise<void> {
   // Get peerId by sending a message to Identity (it's local to this worker)
   try {
     const BOOT_ID = 'p2p-boot' as AbjectId;
-    workerBus.register(BOOT_ID);
-    const identity = await new Promise<{ peerId: string }>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('getIdentity timed out')), 5000);
-      workerBus.setReplyHandler(BOOT_ID, (msg) => {
-        clearTimeout(timeout);
-        workerBus.removeReplyHandler(BOOT_ID);
-        workerBus.unregister(BOOT_ID);
-        if (msg.header.type === 'error') {
-          reject(new Error((msg.payload as { message: string }).message));
-        } else {
-          resolve(msg.payload as { peerId: string });
-        }
-      });
-      workerBus.send(createRequest(BOOT_ID, identityId, 'getIdentity', {}));
-    });
+    const bootMailbox = workerBus.register(BOOT_ID);
+    workerBus.send(createRequest(BOOT_ID, identityId, 'getIdentity', {}));
+    const reply = await bootMailbox.receiveTimeout(5000);
+    workerBus.unregister(BOOT_ID);
+    if (!reply) throw new Error('getIdentity timed out');
+    if (reply.header.type === 'error') {
+      throw new Error((reply.payload as { message: string }).message);
+    }
+    const identity = reply.payload as { peerId: string };
     port.postMessage({ type: 'peer-id', peerId: identity.peerId });
     log.info(`Local peerId: ${identity.peerId.slice(0, 16)}...`);
   } catch (err) {
@@ -259,14 +253,6 @@ port.on('message', async (data: { type: string; [key: string]: unknown }) => {
       const msg = (data as WorkerInboundMessage).message;
       if (msg) {
         workerBus.deliverFromMain(msg);
-      }
-      break;
-    }
-
-    case 'bus:reply': {
-      const msg = (data as WorkerInboundMessage).message;
-      if (msg) {
-        workerBus.deliverReplyFromMain(msg);
       }
       break;
     }

@@ -192,15 +192,18 @@ export class WindowManager extends Abject {
     this.on('unregisterWindow', async (msg: AbjectMessage) => {
       const { surfaceId } = msg.payload as { surfaceId?: string; windowId?: AbjectId };
       const removeWindow = async (sid: string, info: WindowInfo) => {
-        // If the window was minimized, notify Taskbar to clean up its entry
-        if (info.minimized && this.taskbarId) {
-          try {
-            this.send(
-              event(this.id, this.taskbarId, 'windowRestored', {
-                surfaceId: sid, windowId: info.windowId,
-              })
-            );
-          } catch { /* Taskbar may be gone */ }
+        // If the window was minimized, notify the correct target to clean up its entry
+        if (info.minimized) {
+          const targetId = await this.getTaskbarForWindow(sid);
+          if (targetId) {
+            try {
+              this.send(
+                event(this.id, targetId, 'windowRestored', {
+                  surfaceId: sid, windowId: info.windowId,
+                })
+              );
+            } catch { /* target may be gone */ }
+          }
         }
         this.windows.delete(sid);
       };
@@ -330,6 +333,7 @@ export class WindowManager extends Abject {
       this.taskbarsByWorkspace.delete(workspaceId);
       return true;
     });
+
   }
 
   protected override getSourceForAsk(): string | undefined {
@@ -647,15 +651,22 @@ Restore (via 'restoreWindow' method or Taskbar click):
   // ── Taskbar resolution by workspace ─────────────────────────────────
 
   /**
-   * Resolve the correct Taskbar for a window.
-   * Uses the window's workspace tag to find the per-workspace Taskbar;
-   * falls back to the globally discovered Taskbar for untagged windows.
+   * Resolve the correct minimize/restore target for a window.
+   * Workspace windows route to their per-workspace Taskbar.
+   * System windows (no workspaceId) route to any available workspace Taskbar.
    */
   private async getTaskbarForWindow(surfaceId: string): Promise<AbjectId | undefined> {
     const info = this.windows.get(surfaceId);
     if (info?.workspaceId) {
       const wsTaskbar = this.taskbarsByWorkspace.get(info.workspaceId);
       if (wsTaskbar) return wsTaskbar;
+    }
+    // System windows: use any registered workspace Taskbar
+    if (this.taskbarsByWorkspace.size > 0) {
+      // Pick the first available workspace Taskbar
+      for (const [, taskbarId] of this.taskbarsByWorkspace) {
+        return taskbarId;
+      }
     }
     // Fallback: lazy-discover a global Taskbar (pre-workspace compat)
     if (!this.taskbarId) {

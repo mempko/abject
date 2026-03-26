@@ -209,7 +209,7 @@ async function main(): Promise<void> {
 
   // Helper to send a request to a remote object via PeerRouter
   const ATTACK_ID = 'attacker' as AbjectId;
-  bus.register(ATTACK_ID);
+  const attackMailbox = bus.register(ATTACK_ID);
 
   const attackPending = new Map<string, {
     resolve: (v: unknown) => void;
@@ -217,18 +217,24 @@ async function main(): Promise<void> {
     timer: ReturnType<typeof setTimeout>;
   }>();
 
-  bus.setReplyHandler(ATTACK_ID, (msg) => {
-    const pending = attackPending.get(msg.header.correlationId!);
-    if (pending) {
-      clearTimeout(pending.timer);
-      attackPending.delete(msg.header.correlationId!);
-      if (msg.header.type === 'error') {
-        pending.reject(new Error((msg.payload as { code?: string; message: string }).code ?? (msg.payload as { message: string }).message));
-      } else {
-        pending.resolve(msg.payload);
+  // Background loop reads replies from the attacker mailbox
+  let attackDone = false;
+  const attackLoop = (async () => {
+    while (!attackDone) {
+      let msg: AbjectMessage;
+      try { msg = await attackMailbox.receive(); } catch { break; }
+      const pending = attackPending.get(msg.header.correlationId!);
+      if (pending) {
+        clearTimeout(pending.timer);
+        attackPending.delete(msg.header.correlationId!);
+        if (msg.header.type === 'error') {
+          pending.reject(new Error((msg.payload as { code?: string; message: string }).code ?? (msg.payload as { message: string }).message));
+        } else {
+          pending.resolve(msg.payload);
+        }
       }
     }
-  });
+  })();
 
   async function attackRequest<T>(target: AbjectId, method: string, payload: unknown, timeoutMs = 8000): Promise<T> {
     return new Promise((resolve, reject) => {
@@ -708,7 +714,7 @@ async function main(): Promise<void> {
   }
 
   // Clean up
-  bus.removeReplyHandler(ATTACK_ID);
+  attackDone = true;
   bus.unregister(ATTACK_ID);
 
   // Send results to orchestrator

@@ -155,20 +155,28 @@ async function main(): Promise<void> {
   const registryId = runtime.objectRegistry.id;
   const BOOTSTRAP_ID = 'bootstrap' as AbjectId;
 
-  // Register a temporary bootstrap sender on the bus for request-reply
+  // Register a temporary bootstrap sender on the bus for request-reply.
+  // Replies arrive via the mailbox (same path as all other messages).
   const pendingReplies = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
-  bus.register(BOOTSTRAP_ID);
-  bus.setReplyHandler(BOOTSTRAP_ID, (msg: AbjectMessage) => {
-    const pending = pendingReplies.get(msg.header.correlationId!);
-    if (pending) {
-      pendingReplies.delete(msg.header.correlationId!);
-      if (msg.header.type === 'error') {
-        pending.reject(new Error((msg.payload as { message: string }).message));
-      } else {
-        pending.resolve(msg.payload);
+  const bootMailbox = bus.register(BOOTSTRAP_ID);
+
+  // Background loop reads replies from the bootstrap mailbox
+  let bootDone = false;
+  const bootLoop = (async () => {
+    while (!bootDone) {
+      let msg: AbjectMessage;
+      try { msg = await bootMailbox.receive(); } catch { break; }
+      const pending = pendingReplies.get(msg.header.correlationId!);
+      if (pending) {
+        pendingReplies.delete(msg.header.correlationId!);
+        if (msg.header.type === 'error') {
+          pending.reject(new Error((msg.payload as { message: string }).message));
+        } else {
+          pending.resolve(msg.payload);
+        }
       }
     }
-  });
+  })();
 
   function bootstrapRequest<T>(target: AbjectId, method: string, payload: unknown): Promise<T> {
     return new Promise((resolve, reject) => {
@@ -660,9 +668,10 @@ async function main(): Promise<void> {
   }));
   await bootstrapRequest(healthMonitorId, 'startMonitoring', {});
 
-  // Clean up bootstrap handler
-  bus.removeReplyHandler(BOOTSTRAP_ID);
-  bus.unregister(BOOTSTRAP_ID);
+  // Clean up bootstrap sender
+  bootDone = true;
+  bus.unregister(BOOTSTRAP_ID); // closes mailbox, breaks boot loop
+  await bootLoop;
 
   log.summary('server ready');
   console.log('');

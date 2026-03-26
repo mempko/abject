@@ -194,15 +194,6 @@ port.on('message', async (data: WorkerInboundMessage) => {
       break;
     }
 
-    case 'bus:reply': {
-      // Main thread routing a reply to a local object via fast-path
-      const { message } = data;
-      if (message) {
-        workerBus.deliverReplyFromMain(message);
-      }
-      break;
-    }
-
     case 'peer:port': {
       // Direct MessagePort from a peer worker — transferred in the message data
       const { workerIndex } = data;

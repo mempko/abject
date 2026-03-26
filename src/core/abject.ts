@@ -181,9 +181,6 @@ export abstract class Abject {
     this._parentId = parentId;
     this._mailbox = bus.register(this.id);
 
-    // Set up reply fast-path handler
-    bus.setReplyHandler(this.id, this.handleReply.bind(this));
-
     // Register the introspect handler on every Abject
     this.on('describe', () => ({
       manifest: this.manifest,
@@ -412,7 +409,8 @@ export abstract class Abject {
 
   /**
    * Per-object processing loop. Pulls messages from mailbox and handles them.
-   * Runs until the object is stopped. Only await point is mailbox.receive().
+   * Replies are resolved here (Erlang-style: replies are just messages in the mailbox).
+   * Only await point is mailbox.receive().
    */
   private async processMessages(): Promise<void> {
     const isStopped = () => (this._status as string) === 'stopped';
@@ -421,29 +419,28 @@ export abstract class Abject {
       try {
         msg = await this._mailbox!.receive();
       } catch {
-        break; // Mailbox closed — exit loop
+        break; // Mailbox closed
       }
       if (isStopped()) break;
-      this.handleMessage(msg); // Synchronous — never blocks the loop
-    }
-  }
 
-  /**
-   * Handle a reply/error message via the fast-path (called by bus, not via mailbox).
-   * Resolves the pending Promise for the corresponding request.
-   */
-  private handleReply(message: AbjectMessage): void {
-    const pending = this.pendingReplies.get(message.header.correlationId!);
-    if (pending) {
-      clearTimeout(pending.timeout);
-      this.pendingReplies.delete(message.header.correlationId!);
-
-      if (isError(message)) {
-        const err = message.payload as AbjectError;
-        pending.reject(new Error(`${err.code}: ${err.message}`));
-      } else {
-        pending.resolve(message.payload);
+      // Reply/error messages resolve pending request Promises directly
+      if ((msg.header.type === 'reply' || msg.header.type === 'error')
+          && msg.header.correlationId) {
+        const pending = this.pendingReplies.get(msg.header.correlationId);
+        if (pending) {
+          clearTimeout(pending.timeout);
+          this.pendingReplies.delete(msg.header.correlationId);
+          if (isError(msg)) {
+            const err = msg.payload as AbjectError;
+            pending.reject(new Error(`${err.code}: ${err.message}`));
+          } else {
+            pending.resolve(msg.payload);
+          }
+        }
+        continue; // Never dispatch replies to handlers
       }
+
+      this.handleMessage(msg);
     }
   }
 

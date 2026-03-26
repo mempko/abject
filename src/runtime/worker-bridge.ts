@@ -28,7 +28,7 @@ export interface WorkerLike {
 
 /** Message types sent from main thread to worker. */
 export interface WorkerInboundMessage {
-  type: 'init' | 'spawn' | 'kill' | 'bus:deliver' | 'bus:reply'
+  type: 'init' | 'spawn' | 'kill' | 'bus:deliver'
       | 'peer:port' | 'peer:place' | 'peer:remove';
   objectId?: AbjectId;
   constructorName?: string;
@@ -127,25 +127,6 @@ export class WorkerBridge {
       this.worker.postMessage(msg);
     } catch (err) {
       log.error(`Failed to deliver ${message.header.type} ${message.routing.method ?? '?'} to worker (to=${message.routing.to.slice(0,8)}):`, err);
-    }
-  }
-
-  /**
-   * Deliver a reply/error message to an object in this worker via fast-path.
-   */
-  deliverReply(message: AbjectMessage): void {
-    if (this._dead) {
-      log.warn(`DEAD WORKER: dropping reply ${message.routing.method ?? '?'} to=${message.routing.to.slice(0, 8)}`);
-      return;
-    }
-    const msg: WorkerInboundMessage = {
-      type: 'bus:reply',
-      message,
-    };
-    try {
-      this.worker.postMessage(msg);
-    } catch (err) {
-      log.error(`Failed to deliver reply to worker (to=${message.routing.to.slice(0,8)}):`, err);
     }
   }
 

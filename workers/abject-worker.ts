@@ -163,15 +163,6 @@ self.onmessage = async (event: MessageEvent<WorkerInboundMessage>) => {
       break;
     }
 
-    case 'bus:reply': {
-      // Main thread routing a reply to a local object via fast-path
-      const { message } = event.data;
-      if (message) {
-        workerBus.deliverReplyFromMain(message);
-      }
-      break;
-    }
-
     case 'peer:port': {
       // Direct MessagePort from a peer worker — transferred in the message data
       const { workerIndex, port } = event.data as { workerIndex?: number; port?: MessagePort };

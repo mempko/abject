@@ -3,7 +3,7 @@
  *
  * Non-blocking design: send() enqueues messages in the recipient's mailbox
  * and returns immediately. Each object runs its own processing loop.
- * Replies bypass the mailbox via a fast-path to avoid deadlocks.
+ * All messages (including replies) flow through the mailbox.
  */
 
 import { AbjectMessage, AbjectId, AbjectError } from '../core/types.js';
@@ -17,7 +17,6 @@ import { Log } from '../core/timed-log.js';
 const log = new Log('MessageBus');
 
 export type MessageHandler = (message: AbjectMessage) => void | Promise<void>;
-export type ReplyHandler = (message: AbjectMessage) => void;
 
 /**
  * The subset of MessageBus that Abject.init() depends on.
@@ -25,8 +24,6 @@ export type ReplyHandler = (message: AbjectMessage) => void;
  */
 export interface MessageBusLike {
   register(objectId: AbjectId): Mailbox;
-  setReplyHandler(objectId: AbjectId, handler: ReplyHandler): void;
-  removeReplyHandler(objectId: AbjectId): void;
   unregister(objectId: AbjectId): void;
   send(message: AbjectMessage): void;
   isRegistered(objectId: AbjectId): boolean;
@@ -42,11 +39,10 @@ interface Subscription {
  * Central message routing for local objects.
  *
  * Non-blocking: send() enqueues in mailbox, never awaits handler completion.
- * Reply fast-path: replies resolve pending Promises directly, bypassing mailbox.
+ * All messages (including replies) are delivered via mailbox.
  */
 export class MessageBus implements MessageBusLike {
   private mailboxes: Map<AbjectId, Mailbox> = new Map();
-  private replyHandlers: Map<AbjectId, ReplyHandler> = new Map();
   private subscriptions: Subscription[] = [];
   private interceptors: MessageInterceptor[] = [];
   private messageCount = 0;
@@ -74,21 +70,6 @@ export class MessageBus implements MessageBusLike {
   }
 
   /**
-   * Set a reply handler for an object (fast-path for reply/error messages).
-   */
-  setReplyHandler(objectId: AbjectId, handler: ReplyHandler): void {
-    requireNonEmpty(objectId, 'objectId');
-    this.replyHandlers.set(objectId, handler);
-  }
-
-  /**
-   * Remove the reply handler for an object.
-   */
-  removeReplyHandler(objectId: AbjectId): void {
-    this.replyHandlers.delete(objectId);
-  }
-
-  /**
    * Unregister an object from the bus.
    */
   unregister(objectId: AbjectId): void {
@@ -100,7 +81,6 @@ export class MessageBus implements MessageBusLike {
     }
 
     this.mailboxes.delete(objectId);
-    this.replyHandlers.delete(objectId);
 
     // Remove subscriptions for this object
     this.subscriptions = this.subscriptions.filter(
@@ -126,10 +106,7 @@ export class MessageBus implements MessageBusLike {
 
   /**
    * Send a message to a target object (non-blocking).
-   *
-   * Reply fast-path: reply/error messages with correlationId resolve the
-   * recipient's pending Promise directly, bypassing the mailbox.
-   * Normal path: message is enqueued in the recipient's mailbox.
+   * All messages (including replies) are delivered via the recipient's mailbox.
    */
   send(message: AbjectMessage): void {
     // Run interceptors synchronously
@@ -145,21 +122,14 @@ export class MessageBus implements MessageBusLike {
 
     const recipient = message.routing.to;
 
-    // Worker routing: if recipient is in a worker, forward via dedicated bridge or WorkerPool
+    // Worker routing: if recipient is in a worker, forward via bridge
     if (this.workerObjects.has(recipient)) {
       const bridge = this.getBridgeForObject(recipient);
       if (bridge) {
-        // Reply fast-path: forward replies directly for fast resolution
-        if ((message.header.type === 'reply' || message.header.type === 'error')
-            && message.header.correlationId) {
-          bridge.deliverReply(message);
-        } else {
-          bridge.deliverMessage(message);
-        }
+        bridge.deliverMessage(message);
         this.messageCount++;
         return;
       }
-      // Worker object registered but bridge is gone (worker crashed or cleanup race)
       log.warn(`UNDELIVERABLE (no worker bridge): ${message.header.type} ${message.routing.method ?? '?'} from=${message.routing.from.slice(0,8)} to=${recipient.slice(0,8)}`);
       this.notifyUndeliverable(message);
       return;
@@ -169,50 +139,33 @@ export class MessageBus implements MessageBusLike {
     if (!this.mailboxes.has(recipient)) {
       log.warn(`UNDELIVERABLE: ${message.header.type} ${message.routing.method ?? '?'} from=${message.routing.from.slice(0,8)} to=${recipient.slice(0,8)} (not registered)`);
 
-      // For undeliverable requests, immediately send an error reply via the
-      // fast-path so the sender's request() rejects instantly instead of
-      // waiting for a 30s timeout.
+      // For undeliverable requests, send an error reply to the sender's
+      // mailbox so request() rejects instantly instead of timing out.
       if (message.header.type === 'request') {
         const sender = message.routing.from;
-        const replyHandler = this.replyHandlers.get(sender);
-        if (replyHandler) {
-          replyHandler(createError(
-            message,
-            'RECIPIENT_NOT_FOUND',
-            `Recipient ${recipient} is not registered`,
-          ));
+        const errorReply = createError(
+          message,
+          'RECIPIENT_NOT_FOUND',
+          `Recipient ${recipient} is not registered`,
+        );
+        const senderMailbox = this.mailboxes.get(sender);
+        if (senderMailbox) {
+          senderMailbox.send(errorReply);
           this.messageCount++;
         } else if (this.workerObjects.has(sender)) {
-          // Sender is in a worker — route error reply through bridge
           const senderBridge = this.getBridgeForObject(sender);
           if (senderBridge) {
-            senderBridge.deliverReply(createError(
-              message,
-              'RECIPIENT_NOT_FOUND',
-              `Recipient ${recipient} is not registered`,
-            ));
+            senderBridge.deliverMessage(errorReply);
             this.messageCount++;
           }
         }
       }
 
-      // Could be a remote object - emit event for network layer
       this.notifyUndeliverable(message);
       return;
     }
 
-    // Reply fast-path: resolve pending Promise directly, bypass mailbox
-    if ((message.header.type === 'reply' || message.header.type === 'error')
-        && message.header.correlationId) {
-      const replyHandler = this.replyHandlers.get(recipient);
-      if (replyHandler) {
-        replyHandler(message);
-        this.messageCount++;
-        return;
-      }
-    }
-
-    // Normal path: enqueue in mailbox (non-blocking)
+    // Deliver to mailbox (non-blocking)
     const mailbox = this.mailboxes.get(recipient)!;
     mailbox.send(message);
     this.messageCount++;
