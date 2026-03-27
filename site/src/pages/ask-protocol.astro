@@ -1,0 +1,906 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+
+const messageEnvelope = `AbjectMessage {
+  header: {
+    messageId:      string    // unique identifier
+    correlationId:  string?   // links replies to requests
+    sequenceNumber: number    // per-sender ordering
+    timestamp:      number    // milliseconds since epoch
+    type:           "request" | "reply" | "event" | "error"
+  }
+  routing: {
+    from:   AbjectId         // sender's runtime identity
+    to:     AbjectId         // recipient's runtime identity
+    method: string?          // handler name ("ask")
+  }
+  payload: T                 // method-specific data
+  protocol: {
+    version:       string    // protocol version
+    negotiationId: string?   // agreement context
+  }
+}`;
+
+const manifestStructure = `AbjectManifest {
+  name:                 string
+  description:          string
+  version:              string
+  interface: {
+    id:          InterfaceId
+    name:        string
+    description: string
+    methods: [{
+      name:        string
+      description: string
+      params:      [{ name, type, description }]
+      returns:     { type, description }
+    }]
+    events:  [{ name, description, dataSchema }]
+  }
+  requiredCapabilities: CapabilityRequest[]
+  providedCapabilities: CapabilityId[]
+  tags:                 string[]
+}`;
+---
+
+<Layout title="The Ask Protocol - Technical Specification" description="Technical specification for the Ask Protocol: the object-oriented primitive that lets networked objects describe themselves, teach each other, and recover from misunderstanding.">
+  <Header />
+  <main class="spec">
+    <div class="spec-container">
+
+      <!-- Hero -->
+      <header class="spec-hero">
+        <p class="spec-version">Technical Specification v1.0</p>
+        <h1>The Ask Protocol</h1>
+        <p class="spec-thesis">
+          The internet is already an object-oriented system. Computers are objects. They pass messages. That is what TCP/IP does.
+          The web imposed a document-oriented abstraction on top, and we forgot what was underneath.
+          The Ask Protocol returns to the internet's true nature and extends it: objects that identify themselves,
+          explain their capabilities in natural language, teach each other how to collaborate,
+          and recover from misunderstanding.
+        </p>
+      </header>
+
+      <!-- Table of Contents -->
+      <nav class="spec-toc">
+        <h2>Contents</h2>
+        <ol>
+          <li><a href="#fundamentals">Protocol Fundamentals</a></li>
+          <li><a href="#message-format">Message Format and Flow</a></li>
+          <li><a href="#self-describing">Self-Describing Objects</a></li>
+          <li><a href="#use-cases">Use Cases</a></li>
+          <li><a href="#comparison">Comparison with Existing Approaches</a></li>
+          <li><a href="#thesis">The Internet Was Always Object-Oriented</a></li>
+        </ol>
+      </nav>
+
+      <!-- Section 1: Protocol Fundamentals -->
+      <section id="fundamentals">
+        <h2><span class="section-num">1</span> Protocol Fundamentals</h2>
+
+        <p>
+          Every Abject has a built-in <code>ask</code> handler. Send it a natural-language question,
+          and it answers using its own manifest and source code as context, via an LLM.
+          If no LLM is available, it falls back to a plain manifest description.
+        </p>
+
+        <p>
+          The protocol is a single primitive: one method, one question, one answer.
+        </p>
+
+        <div class="spec-card">
+          <h3>The Primitive</h3>
+          <pre><code>ask(question: string) -> string</code></pre>
+          <p>
+            The caller sends a natural-language question. The target consults an LLM using its own
+            manifest (name, description, interfaces, capabilities) and optionally its source code
+            as context. The LLM's answer is returned to the caller.
+          </p>
+          <p>
+            This is the entire protocol. Its power comes from what you build on top of it.
+          </p>
+        </div>
+
+        <p>
+          Because every object in the system implements <code>ask</code>, any object can
+          query any other object about its behavior. No shared documentation, no schema registry,
+          no out-of-band coordination. The knowledge lives where the behavior lives: in the object itself.
+        </p>
+      </section>
+
+      <!-- Section 2: Message Format & Flow -->
+      <section id="message-format">
+        <h2><span class="section-num">2</span> Message Format and Flow</h2>
+
+        <h3>Message Envelope</h3>
+        <p>
+          All communication in the system uses a uniform message envelope. The Ask Protocol is not special;
+          it uses the same <code>AbjectMessage</code> structure as every other interaction.
+        </p>
+
+        <pre><code set:text={messageEnvelope} /></pre>
+
+        <p>
+          For the Ask Protocol, the request payload is <code>{'{ question: string }'}</code> and
+          the reply payload is a plain string containing the object's answer.
+        </p>
+
+        <h3>Flow</h3>
+
+        <div class="flow-diagram">
+          <svg class="spec-svg" viewBox="0 0 750 280" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <filter id="sg">
+                <feGaussianBlur stdDeviation="2.5" result="blur"/>
+                <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+              </filter>
+              <filter id="sp">
+                <feGaussianBlur stdDeviation="2.5" result="blur"/>
+                <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+              </filter>
+              <marker id="sa-g" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#39ff8e"/>
+              </marker>
+              <marker id="sa-p" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#9b59ff"/>
+              </marker>
+              <marker id="sa-d" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a5a70"/>
+              </marker>
+            </defs>
+
+            <!-- Caller -->
+            <rect x="20" y="30" width="120" height="60" rx="8" fill="#12121e" stroke="rgba(57,255,142,0.35)" stroke-width="1.5"/>
+            <text x="80" y="65" text-anchor="middle" fill="#39ff8e" font-weight="600" font-size="14" font-family="monospace">Caller</text>
+
+            <!-- Target -->
+            <rect x="300" y="30" width="120" height="60" rx="8" fill="#12121e" stroke="rgba(155,89,255,0.35)" stroke-width="1.5"/>
+            <text x="360" y="65" text-anchor="middle" fill="#9b59ff" font-weight="600" font-size="14" font-family="monospace">Target</text>
+
+            <!-- LLM -->
+            <rect x="580" y="30" width="120" height="60" rx="8" fill="#12121e" stroke="rgba(90,90,112,0.35)" stroke-width="1.5"/>
+            <text x="640" y="65" text-anchor="middle" fill="#5a5a70" font-weight="600" font-size="14" font-family="monospace">LLM</text>
+
+            <!-- Step 1: Caller -> Target (ask request) -->
+            <line x1="140" y1="55" x2="295" y2="55" stroke="#39ff8e" stroke-width="1.5" marker-end="url(#sa-g)" filter="url(#sg)"/>
+            <text x="218" y="47" text-anchor="middle" fill="#e0e0ea" font-size="10" font-family="monospace">{"ask({ question })"}</text>
+
+            <!-- Step 2: Target -> LLM (with context) -->
+            <line x1="420" y1="55" x2="575" y2="55" stroke="#5a5a70" stroke-width="1.5" marker-end="url(#sa-d)"/>
+            <text x="498" y="47" text-anchor="middle" fill="#8a8a9e" font-size="10" font-family="monospace">manifest + source</text>
+
+            <!-- Step 3: LLM -> Target (answer) -->
+            <line x1="575" y1="75" x2="425" y2="75" stroke="#5a5a70" stroke-width="1.5" marker-end="url(#sa-d)"/>
+            <text x="498" y="93" text-anchor="middle" fill="#8a8a9e" font-size="10" font-family="monospace">LLM response</text>
+
+            <!-- Step 4: Target -> Caller (reply) -->
+            <line x1="295" y1="75" x2="145" y2="75" stroke="#9b59ff" stroke-width="1.5" marker-end="url(#sa-p)" filter="url(#sp)"/>
+            <text x="218" y="93" text-anchor="middle" fill="#e0e0ea" font-size="10" font-family="monospace">answer (string)</text>
+
+            <!-- Step labels -->
+            <text x="80" y="130" text-anchor="middle" fill="#39ff8e" font-size="11" font-family="monospace" font-weight="600">1. Send question</text>
+            <text x="360" y="130" text-anchor="middle" fill="#9b59ff" font-size="11" font-family="monospace" font-weight="600">2. Assemble context</text>
+            <text x="640" y="130" text-anchor="middle" fill="#5a5a70" font-size="11" font-family="monospace" font-weight="600">3. Generate answer</text>
+
+            <!-- Fallback note -->
+            <rect x="170" y="160" width="400" height="48" rx="6" fill="rgba(18,18,30,0.8)" stroke="rgba(90,90,112,0.25)" stroke-width="1"/>
+            <text x="370" y="180" text-anchor="middle" fill="#8a8a9e" font-size="11" font-family="monospace">Fallback: if no LLM is available, the target returns</text>
+            <text x="370" y="196" text-anchor="middle" fill="#8a8a9e" font-size="11" font-family="monospace">its manifest description as a plain-text answer.</text>
+          </svg>
+        </div>
+
+        <ol class="flow-steps">
+          <li>The <strong>caller</strong> sends an <code>ask</code> request to the target with a natural-language question.</li>
+          <li>The <strong>target</strong> discovers the LLM service via the Registry and assembles context from its own manifest and source code.</li>
+          <li>The <strong>LLM</strong> answers the question using that context.</li>
+          <li>The <strong>target</strong> returns the answer to the caller.</li>
+          <li>If no LLM is available, the target falls back to a plain manifest description.</li>
+        </ol>
+
+        <p>
+          The target acts as its own authority. It does not defer to an external schema or documentation service.
+          The answer comes from the object that owns the behavior.
+        </p>
+      </section>
+
+      <!-- Section 3: Self-Describing Objects -->
+      <section id="self-describing">
+        <h2><span class="section-num">3</span> Self-Describing Objects</h2>
+
+        <p>
+          Every Abject carries a structured manifest that declares its identity, capabilities, and interface.
+          The Ask Protocol builds on this foundation.
+        </p>
+
+        <h3>The Manifest</h3>
+        <pre><code set:text={manifestStructure} /></pre>
+
+        <p>
+          The manifest is a structured declaration: what the object is, what methods it exposes,
+          what events it emits, what capabilities it needs and provides.
+          The function <code>formatManifestAsDescription()</code> converts this structure into
+          natural-language English, which becomes the LLM's system context when answering questions.
+        </p>
+
+        <h3>Static and Dynamic Context</h3>
+
+        <div class="spec-grid">
+          <div class="spec-card">
+            <h4>Manifest (static)</h4>
+            <p>
+              Every object has a manifest. It is defined at construction time and does not change.
+              It provides the structural foundation: names, types, capability requirements.
+            </p>
+          </div>
+          <div class="spec-card">
+            <h4>Source Code (dynamic)</h4>
+            <p>
+              ScriptableAbjects (objects whose code is generated or modified at runtime) override
+              <code>getSourceForAsk()</code> to include their live source code in the LLM context.
+              As the code changes, the answers change with it.
+            </p>
+          </div>
+        </div>
+
+        <h3>The Introspect Interface</h3>
+        <p>
+          Every Abject automatically implements the <code>abjects:introspect</code> interface with two methods:
+        </p>
+        <ul>
+          <li><code>describe</code> returns the manifest and a formatted English description.</li>
+          <li><code>ask</code> accepts a natural-language question and returns an LLM-powered answer using the manifest and source as context.</li>
+        </ul>
+        <p>
+          These methods are not opt-in. Every object in the system has them. This means any object can
+          query any other object about its behavior, without prior arrangement.
+        </p>
+
+        <div class="spec-callout">
+          <strong>Key insight:</strong> Descriptions are dynamic. They change as the code changes.
+          There is no separate documentation to keep in sync. The schema is the object.
+        </div>
+      </section>
+
+      <!-- Section 4: Use Cases -->
+      <section id="use-cases">
+        <h2><span class="section-num">4</span> Use Cases</h2>
+
+        <p>
+          The Ask Protocol is a primitive. These are the patterns built on top of it.
+        </p>
+
+        <div class="use-case">
+          <h3>ObjectCreator: Code Generation</h3>
+          <p>
+            When a user describes a new object in natural language, the ObjectCreator
+            selects dependencies, then generates targeted questions for each one.
+            It sends these questions via the Ask Protocol and uses the answers as context
+            when generating the new object's code.
+          </p>
+          <p>
+            Objects teach the next generation how to compose with them.
+          </p>
+        </div>
+
+        <div class="use-case">
+          <h3>ProxyGenerator: Protocol Translation</h3>
+          <p>
+            When two objects need to communicate but have incompatible interfaces,
+            the ProxyGenerator asks both sides: "How should a proxy use your methods?"
+            It includes both answers in the LLM prompt when generating a translator
+            proxy between them.
+          </p>
+          <p>
+            The proxy is not a static shim. It is a real Abject, generated from the self-descriptions
+            of the objects it bridges.
+          </p>
+        </div>
+
+        <div class="use-case">
+          <h3>Self-Healing: Error Recovery</h3>
+          <p>
+            When communication between two objects degrades, the system asks both objects
+            for fresh usage guides via the Ask Protocol, collects recent errors, and
+            regenerates the proxy with that context. The replacement accounts for exactly
+            the errors that killed its predecessor.
+          </p>
+          <p>
+            Each regeneration is informed by the failures that preceded it.
+            The system learns from its wounds.
+          </p>
+        </div>
+
+        <div class="use-case">
+          <h3>Chat: Human Interaction</h3>
+          <p>
+            Users ask Abjects about themselves directly. The object answers from its own
+            manifest and source. Any object in the system is queryable by a human in natural language.
+          </p>
+          <p>
+            There is no separate user manual. The object is the manual.
+          </p>
+        </div>
+      </section>
+
+      <!-- Section 5: Comparison -->
+      <section id="comparison">
+        <h2><span class="section-num">5</span> Comparison with Existing Approaches</h2>
+
+        <h3>Web Protocols</h3>
+        <p>
+          REST, GraphQL, and gRPC are the dominant protocols for service communication on the web.
+          All three require a human in the loop to read documentation, write integration code, and update it when things change.
+        </p>
+
+        <div class="comparison-table">
+          <div class="comparison-header">
+            <div class="comparison-cell label-cell"></div>
+            <div class="comparison-cell">REST</div>
+            <div class="comparison-cell">GraphQL</div>
+            <div class="comparison-cell">gRPC</div>
+            <div class="comparison-cell highlight-cell">Ask Protocol</div>
+          </div>
+
+          <div class="comparison-row">
+            <div class="comparison-cell label-cell">Self-Description</div>
+            <div class="comparison-cell">OpenAPI specs. Static. External to the service.</div>
+            <div class="comparison-cell">Schema introspection. Structural, not behavioral.</div>
+            <div class="comparison-cell">Proto reflection. Method listing, not explanation.</div>
+            <div class="comparison-cell highlight-cell">LLM-powered answers from manifest and live source. Dynamic.</div>
+          </div>
+
+          <div class="comparison-row">
+            <div class="comparison-cell label-cell">Runtime Adaptation</div>
+            <div class="comparison-cell">None. Versioned endpoints.</div>
+            <div class="comparison-cell">None. Schema evolution.</div>
+            <div class="comparison-cell">None. Proto versioning.</div>
+            <div class="comparison-cell highlight-cell">Proxy regeneration with error context.</div>
+          </div>
+
+          <div class="comparison-row">
+            <div class="comparison-cell label-cell">Natural Language</div>
+            <div class="comparison-cell">No.</div>
+            <div class="comparison-cell">No.</div>
+            <div class="comparison-cell">No.</div>
+            <div class="comparison-cell highlight-cell">Yes. Objects answer in English.</div>
+          </div>
+
+          <div class="comparison-row">
+            <div class="comparison-cell label-cell">Composition</div>
+            <div class="comparison-cell">Human reads docs, writes client.</div>
+            <div class="comparison-cell">Human writes queries against schema.</div>
+            <div class="comparison-cell">Human writes client from proto.</div>
+            <div class="comparison-cell highlight-cell">Objects interview each other.</div>
+          </div>
+
+          <div class="comparison-row">
+            <div class="comparison-cell label-cell">Error Recovery</div>
+            <div class="comparison-cell">Retry. Circuit breaker.</div>
+            <div class="comparison-cell">Partial results.</div>
+            <div class="comparison-cell">Retry policy.</div>
+            <div class="comparison-cell highlight-cell">Regenerate translator with error history.</div>
+          </div>
+        </div>
+
+        <h3>LLM and Agent Protocols</h3>
+        <p>
+          A new generation of protocols has emerged around LLM integration and agent interoperability.
+          MCP, A2A, and OpenAI's function calling each address a piece of the puzzle.
+          The Ask Protocol occupies a different position: it is not a tool-calling convention or an agent orchestration layer,
+          but a self-description primitive embedded in the objects themselves.
+        </p>
+
+        <div class="comparison-table">
+          <div class="comparison-header">
+            <div class="comparison-cell label-cell"></div>
+            <div class="comparison-cell">MCP</div>
+            <div class="comparison-cell">A2A</div>
+            <div class="comparison-cell">OpenAI Function Calling</div>
+            <div class="comparison-cell highlight-cell">Ask Protocol</div>
+          </div>
+
+          <div class="comparison-row">
+            <div class="comparison-cell label-cell">Purpose</div>
+            <div class="comparison-cell">Connect LLM apps to external tools and data sources.</div>
+            <div class="comparison-cell">Agent-to-agent task delegation and coordination.</div>
+            <div class="comparison-cell">Let models invoke developer-defined functions.</div>
+            <div class="comparison-cell highlight-cell">Let objects explain themselves and teach each other.</div>
+          </div>
+
+          <div class="comparison-row">
+            <div class="comparison-cell label-cell">Architecture</div>
+            <div class="comparison-cell">Client-host-server. JSON-RPC. LLM at the center.</div>
+            <div class="comparison-cell">Peer-to-peer. JSON-RPC, gRPC, or HTTP.</div>
+            <div class="comparison-cell">Hub-spoke API. Stateless between calls.</div>
+            <div class="comparison-cell highlight-cell">Peer-to-peer message passing. Every object is both client and server.</div>
+          </div>
+
+          <div class="comparison-row">
+            <div class="comparison-cell label-cell">Self-Description</div>
+            <div class="comparison-cell">Servers declare tools, resources, prompts at connect time. Static JSON schemas.</div>
+            <div class="comparison-cell">Agent Cards: signed JSON with identity, skills, security schemes.</div>
+            <div class="comparison-cell">Developer provides JSON schemas with descriptions per function.</div>
+            <div class="comparison-cell highlight-cell">LLM answers from manifest + live source code. Descriptions change as the code changes.</div>
+          </div>
+
+          <div class="comparison-row">
+            <div class="comparison-cell label-cell">Who Describes?</div>
+            <div class="comparison-cell">The server developer writes tool descriptions.</div>
+            <div class="comparison-cell">The agent developer writes the Agent Card.</div>
+            <div class="comparison-cell">The app developer defines function schemas.</div>
+            <div class="comparison-cell highlight-cell">The object describes itself. No developer in the loop at query time.</div>
+          </div>
+
+          <div class="comparison-row">
+            <div class="comparison-cell label-cell">Object-to-Object</div>
+            <div class="comparison-cell">No. Tools serve the LLM, not each other.</div>
+            <div class="comparison-cell">Yes. Agents delegate tasks to other agents.</div>
+            <div class="comparison-cell">No. Functions serve the model.</div>
+            <div class="comparison-cell highlight-cell">Yes. Any object can ask any other object. No central coordinator.</div>
+          </div>
+
+          <div class="comparison-row">
+            <div class="comparison-cell label-cell">Error Recovery</div>
+            <div class="comparison-cell">JSON-RPC errors + isError flag for LLM self-correction.</div>
+            <div class="comparison-cell">Task state machine (failed state with details).</div>
+            <div class="comparison-cell">Developer-managed. Model retries from error strings.</div>
+            <div class="comparison-cell highlight-cell">Regenerate translator using error history as LLM context. Each failure teaches the next attempt.</div>
+          </div>
+
+          <div class="comparison-row">
+            <div class="comparison-cell label-cell">Governance</div>
+            <div class="comparison-cell">Linux Foundation (AAIF). Anthropic, OpenAI, Google, Microsoft.</div>
+            <div class="comparison-cell">Linux Foundation. Google, IBM, 100+ partners.</div>
+            <div class="comparison-cell">Proprietary API. SDK is open-source.</div>
+            <div class="comparison-cell highlight-cell">Open source (GPL-3.0).</div>
+          </div>
+        </div>
+
+        <div class="spec-callout">
+          <strong>The key distinction:</strong> MCP, A2A, and function calling are all plumbing.
+          They define how to call tools, how to route messages, how to negotiate capabilities.
+          The Ask Protocol is not plumbing. It is a cognitive primitive: the ability for an object to explain itself
+          in its own words, using its own source code as evidence. The plumbing protocols tell you <em>how</em> to call something.
+          The Ask Protocol tells you <em>what</em> something is and <em>why</em> you would call it.
+        </div>
+
+        <p>
+          These approaches are complementary, not competing. MCP could transport an <code>ask</code> call.
+          A2A could route it between peers. But neither provides the self-description primitive itself.
+          The Ask Protocol is the content; the others are the envelope.
+        </p>
+      </section>
+
+      <!-- Section 6: Thesis -->
+      <section id="thesis">
+        <h2><span class="section-num">6</span> The Internet Was Always Object-Oriented</h2>
+
+        <p>
+          The internet is computers passing messages.
+          TCP/IP, DNS, BGP: these are protocols between machines that identify themselves,
+          negotiate capabilities, and exchange structured data.
+          The internet is already object-oriented.
+        </p>
+
+        <p>
+          The web is an application on top of the internet. HTTP imposed a document metaphor:
+          URLs as resource locators, verbs as CRUD operations. GraphQL imposed a query metaphor.
+          gRPC imposed a procedure metaphor. All three obscure the underlying reality: that the
+          network is made of objects communicating.
+        </p>
+
+        <p>
+          The Ask Protocol does not add object-orientation to the internet. It reveals it.
+          It gives networked objects what they have been missing: the ability to describe themselves,
+          teach strangers how to use them, and adapt when communication breaks down.
+        </p>
+
+        <div class="thesis-properties">
+          <div class="spec-card">
+            <h4>Identity</h4>
+            <p>Every object has a PeerId (the SHA-256 hash of its signing key) and a TypeId (a scoped, durable name). Identity is cryptographic, not assigned by a registry.</p>
+          </div>
+          <div class="spec-card">
+            <h4>Behavior</h4>
+            <p>Every object has handlers: named methods that process messages. Behavior is declared in the manifest and implemented in code. It can be inspected, queried, and modified at runtime.</p>
+          </div>
+          <div class="spec-card">
+            <h4>Self-Knowledge</h4>
+            <p>Every object carries its own manifest and can answer questions about itself via the Ask Protocol. There is no external documentation to consult.</p>
+          </div>
+          <div class="spec-card">
+            <h4>Negotiation</h4>
+            <p>When two objects with incompatible interfaces meet, the system generates a translator proxy using both objects' self-descriptions. Strangers can collaborate without prior agreement.</p>
+          </div>
+        </div>
+
+        <p>
+          Combined with peer-to-peer transport (WebRTC with identity-based addressing),
+          objects across machines discover each other, ask what the other does, and compose dynamically.
+        </p>
+
+        <p>
+          No central schema registry. No shared proto files. No API documentation site.
+        </p>
+
+        <p class="thesis-conclusion">
+          The schema is the object, and the object can explain itself.
+        </p>
+      </section>
+
+    </div>
+  </main>
+  <Footer />
+</Layout>
+
+<style>
+  /* ── Page layout ── */
+  .spec {
+    padding-top: 80px;
+  }
+
+  .spec-container {
+    max-width: 780px;
+    margin: 0 auto;
+    padding: 0 1.5rem 4rem;
+  }
+
+  /* ── Hero ── */
+  .spec-hero {
+    padding: 3rem 0 2rem;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 2.5rem;
+  }
+
+  .spec-version {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--void-purple);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 0.75rem;
+  }
+
+  .spec-hero h1 {
+    font-size: clamp(2rem, 4vw, 3rem);
+    margin-bottom: 1.5rem;
+    color: var(--text-primary);
+  }
+
+  .spec-thesis {
+    color: var(--text-secondary);
+    font-size: 1.05rem;
+    line-height: 1.8;
+    max-width: 680px;
+  }
+
+  /* ── Table of Contents ── */
+  .spec-toc {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem 2rem;
+    margin-bottom: 3rem;
+  }
+
+  .spec-toc h2 {
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin-bottom: 1rem;
+  }
+
+  .spec-toc ol {
+    list-style: none;
+    counter-reset: toc;
+    padding: 0;
+  }
+
+  .spec-toc li {
+    counter-increment: toc;
+    padding: 0.3rem 0;
+  }
+
+  .spec-toc li::before {
+    content: counter(toc) ".";
+    font-family: var(--font-mono);
+    color: var(--eldritch);
+    margin-right: 0.75rem;
+    font-size: 0.9rem;
+  }
+
+  .spec-toc a {
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+    transition: color 0.2s;
+  }
+
+  .spec-toc a:hover {
+    color: var(--eldritch);
+  }
+
+  /* ── Sections ── */
+  section {
+    padding: 3rem 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  section:last-child {
+    border-bottom: none;
+  }
+
+  section h2 {
+    font-size: 1.6rem;
+    margin-bottom: 1.5rem;
+    color: var(--text-primary);
+    text-align: left;
+  }
+
+  section h2::after {
+    display: none;
+  }
+
+  .section-num {
+    font-family: var(--font-mono);
+    color: var(--eldritch);
+    margin-right: 0.5rem;
+    font-size: 0.9em;
+  }
+
+  section h3 {
+    font-size: 1.15rem;
+    color: var(--eldritch);
+    margin-top: 2rem;
+    margin-bottom: 0.75rem;
+  }
+
+  section h4 {
+    font-size: 1rem;
+    color: var(--eldritch);
+    margin-bottom: 0.5rem;
+  }
+
+  section p {
+    color: var(--text-secondary);
+    line-height: 1.8;
+    margin-bottom: 1rem;
+    font-size: 0.95rem;
+  }
+
+  section ul, section ol {
+    color: var(--text-secondary);
+    line-height: 1.8;
+    margin-bottom: 1rem;
+    padding-left: 1.5rem;
+    font-size: 0.95rem;
+  }
+
+  section li {
+    margin-bottom: 0.4rem;
+  }
+
+  section pre {
+    margin-bottom: 1.5rem;
+  }
+
+  /* ── Cards ── */
+  .spec-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem 1.75rem;
+    margin-bottom: 1.25rem;
+    transition: border-color 0.3s;
+  }
+
+  .spec-card:hover {
+    border-color: var(--border-accent);
+  }
+
+  .spec-card h3, .spec-card h4 {
+    margin-top: 0;
+  }
+
+  .spec-card p:last-child {
+    margin-bottom: 0;
+  }
+
+  .spec-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 1.25rem;
+    margin-bottom: 1.5rem;
+  }
+
+  /* ── Callout ── */
+  .spec-callout {
+    background: var(--eldritch-glow);
+    border: 1px solid var(--border-accent);
+    border-radius: 8px;
+    padding: 1.25rem 1.5rem;
+    margin: 1.5rem 0;
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+    line-height: 1.7;
+  }
+
+  .spec-callout strong {
+    color: var(--eldritch);
+  }
+
+  /* ── Flow diagram ── */
+  .flow-diagram {
+    display: flex;
+    justify-content: center;
+    margin: 1.5rem 0;
+  }
+
+  .spec-svg {
+    width: 100%;
+    max-width: 750px;
+    display: block;
+  }
+
+  .flow-steps {
+    max-width: 600px;
+  }
+
+  .flow-steps li {
+    margin-bottom: 0.5rem;
+  }
+
+  .flow-steps strong {
+    color: var(--text-primary);
+  }
+
+  /* ── Use cases ── */
+  .use-case {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.75rem 2rem;
+    margin-bottom: 1.25rem;
+    transition: border-color 0.3s, box-shadow 0.3s;
+  }
+
+  .use-case:hover {
+    border-color: var(--border-accent);
+    box-shadow: 0 0 20px var(--eldritch-glow);
+  }
+
+  .use-case h3 {
+    margin-top: 0;
+    margin-bottom: 0.75rem;
+  }
+
+  .use-case p:last-child {
+    margin-bottom: 0;
+    color: var(--text-dim);
+    font-style: italic;
+    font-size: 0.9rem;
+  }
+
+  /* ── Comparison table ── */
+  .comparison-table {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0;
+    margin: 1.5rem 0;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+
+  .comparison-header,
+  .comparison-row {
+    display: grid;
+    grid-template-columns: 140px repeat(4, 1fr);
+  }
+
+  .comparison-header {
+    background: var(--bg-card);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .comparison-header .comparison-cell {
+    font-weight: 700;
+    color: var(--text-primary);
+    font-size: 0.85rem;
+    font-family: var(--font-mono);
+  }
+
+  .comparison-row {
+    border-bottom: 1px solid var(--border);
+  }
+
+  .comparison-row:last-child {
+    border-bottom: none;
+  }
+
+  .comparison-cell {
+    padding: 0.9rem 1rem;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+
+  .label-cell {
+    font-weight: 600;
+    color: var(--text-primary);
+    font-size: 0.8rem;
+    background: rgba(18, 18, 30, 0.5);
+  }
+
+  .highlight-cell {
+    background: var(--eldritch-glow);
+    color: var(--text-primary);
+  }
+
+  .comparison-note {
+    margin-top: 1.5rem;
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 0.9rem;
+  }
+
+  /* ── Thesis section ── */
+  .thesis-properties {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 1.25rem;
+    margin: 2rem 0;
+  }
+
+  .thesis-conclusion {
+    font-size: 1.15rem;
+    color: var(--eldritch);
+    font-weight: 600;
+    margin-top: 2rem;
+    text-align: center;
+    line-height: 1.6;
+  }
+
+  /* ── Responsive ── */
+  @media (max-width: 768px) {
+    .comparison-header,
+    .comparison-row {
+      grid-template-columns: 1fr;
+    }
+
+    .comparison-header {
+      display: none;
+    }
+
+    .comparison-row {
+      padding: 0.75rem 0;
+    }
+
+    .comparison-cell {
+      padding: 0.4rem 1rem;
+    }
+
+    .label-cell {
+      font-size: 0.85rem;
+      color: var(--eldritch);
+      background: transparent;
+      padding-bottom: 0.2rem;
+    }
+
+    .highlight-cell {
+      background: transparent;
+      color: var(--eldritch);
+      font-weight: 600;
+    }
+
+    .thesis-properties {
+      grid-template-columns: 1fr;
+    }
+
+    .spec-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>
