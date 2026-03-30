@@ -2020,6 +2020,7 @@ Manifest MUST include these methods:
 - show: creates a window with widgets via WidgetManager
 - hide: destroys the window
 - changed: receives widget interaction events (aspect, value) from widget dependencies
+Labels support markdown rendering via style: { markdown: true, wordWrap: true } for rich formatted text (bold, italic, code, links, headings, bullets, code blocks).
 
 ### Web Data Objects (fetch content from websites: news, RSS, APIs, HTML scraping)
 Use when the object needs to READ content from websites without interaction.
@@ -2492,7 +2493,7 @@ Dependencies: WidgetManager
           { type: 'label', windowId: this._windowId, text: items[i].date,
             style: { fontSize: 12, color: '#8a8a9e' } },
           { type: 'label', windowId: this._windowId, text: items[i].summary,
-            style: { fontSize: 13 }, wordWrap: true },
+            style: { fontSize: 13, wordWrap: true, markdown: true } },
         ]
       });
       await this.call(cardBox, 'addLayoutChildren', {
@@ -2508,6 +2509,10 @@ Dependencies: WidgetManager
   async changed(msg) {}
 })
 \`\`\`
+
+## Markdown Labels
+
+Use \`style: { markdown: true, wordWrap: true }\` on labels that display rich content (descriptions, articles, help text, formatted output). Markdown supports **bold**, *italic*, \`code\`, [links](url), headings (#), bullet lists (- item), code blocks, and blockquotes (> text). Inline links are clickable.
 
 ## Tool Selection for Web Access
 - **HttpClient + WebParser**: Default choice for reading web content. Use HttpClient.get() to fetch HTML/RSS/JSON, then WebParser to extract data. Fast and reliable.

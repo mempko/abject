@@ -29,6 +29,7 @@ export interface WidgetStyle {
   disabled?: boolean;
   visible?: boolean;  // default true; when false, widget renders nothing and ignores input
   selectable?: boolean;  // labels only: enable text selection (read-only)
+  markdown?: boolean;    // labels only: parse text as markdown and render with rich formatting
 }
 
 export type WidgetType = 'label' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image';

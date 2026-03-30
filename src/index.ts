@@ -69,6 +69,8 @@ export { WidgetAbject, buildFont, WIDGET_INTERFACE_DECL } from './objects/widget
 export type { WidgetConfig } from './objects/widgets/widget-abject.js';
 export { WindowAbject } from './objects/widgets/window-abject.js';
 export { LabelWidget } from './objects/widgets/label-widget.js';
+export { parseMarkdown, estimateMarkdownHeight } from './objects/widgets/markdown.js';
+export type { ParsedMarkdown, MarkdownBlock, TextSpan, SpanStyle, BlockType } from './objects/widgets/markdown.js';
 export { ButtonWidget } from './objects/widgets/button-widget.js';
 export { TextInputWidget } from './objects/widgets/text-input-widget.js';
 export { TextAreaWidget } from './objects/widgets/text-area-widget.js';

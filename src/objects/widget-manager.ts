@@ -964,7 +964,7 @@ await this.call(this.dep('WidgetManager'), 'destroyWindowAbject', { windowId: wi
 
 ### Widget Types (used as \`type\` in create() specs)
 
-label - Static text display. Fires 'click' on mousedown (register via addDependent to receive). Param: href — when set, renders as a clickable link (underlined, link color) that opens in the user's browser. Style: { wordWrap: true } for multi-line text. Style: { selectable: true } to allow users to click-drag, double-click, Shift+click, Ctrl+A, and Ctrl+C to select and copy text (read-only).
+label - Static text display. Fires 'click' on mousedown (register via addDependent to receive). Param: href — when set, renders as a clickable link (underlined, link color) that opens in the user's browser. Style: { wordWrap: true } for multi-line text. Style: { selectable: true } to allow users to click-drag, double-click, Shift+click, Ctrl+A, and Ctrl+C to select and copy text (read-only). Style: { markdown: true, wordWrap: true } for rich text rendering (bold, italic, inline code, clickable links, headings, bullet lists, code blocks, blockquotes).
 button - Clickable button (listen for 'changed' with aspect 'click'). Param: href — when set, clicking also opens the URL in the user's browser. Keyboard: Enter/Space when focused.
 textInput - Single-line text input (aspects: 'change', 'submit')
 textArea - Multi-line text area (params: monospace?)
@@ -986,6 +986,7 @@ All widgets accept a \`style\` object with these optional properties:
 - radius — border radius
 - wordWrap — enable word wrapping on labels
 - selectable — labels only: enable read-only text selection (click-drag, double-click word select, Shift+click, Ctrl+A, Ctrl+C)
+- markdown — labels only: parse text as markdown and render with rich formatting (bold, italic, code, links, headings, bullets, code blocks, blockquotes). Requires wordWrap: true.
 - disabled — when true, widget renders at 50% opacity and ignores all input (except textInput/textArea which still allow text selection and copy)
 - visible — when false, widget renders nothing and ignores input (default: true)
 

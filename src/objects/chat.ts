@@ -14,6 +14,7 @@ import { formatManifestAsDescription } from '../core/introspect.js';
 import type { AgentAction } from './agent-abject.js';
 import type { DiscoveredWorkspace } from './workspace-share-registry.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
+import { estimateMarkdownHeight } from './widgets/markdown.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('Chat');
@@ -209,7 +210,7 @@ export class Chat extends Abject {
       this.conversationHistory = [];
       if (this.windowId) {
         await this.clearMessageLabels();
-        await this.appendMessageLabel('Agent', 'How can I help you?', this.theme.statusSuccess);
+        await this.appendMessageLabel('Agent', 'How can I help you?', this.theme.statusSuccess, true);
       }
       return true;
     });
@@ -399,7 +400,7 @@ export class Chat extends Abject {
         const text = (action.text as string) ?? '';
         if (text && this.thinkingLabelId) {
           await this.removeLabel(this.thinkingLabelId);
-          await this.appendMessageLabel('Agent', text, this.theme.statusSuccess);
+          await this.appendMessageLabel('Agent', text, this.theme.statusSuccess, true);
           this.thinkingLabelId = undefined;
           // Re-show thinking indicator for next step
           this.thinkingLabelId = await this.appendMessageLabel('', 'Thinking...', this.theme.statusNeutral);
@@ -844,6 +845,8 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 - **done**: Task complete, send final reply.
   \`{ "action": "done", "text": "Here are the results: ..." }\`
 
+The chat window renders markdown. Use **bold**, *italic*, \`inline code\`, headings, bullet lists, code blocks, and [links](url) in your reply and done text for readable formatting.
+
 ## Your Abjects (user-created — use "modify" to fix or update these)
 
 ${this.userObjectSummaries || '(Loading...)'}
@@ -992,7 +995,7 @@ When a user's request matches an enabled skill's capabilities, use **decompose**
     this.uiPhase = 'idle';
 
     // Show greeting
-    await this.appendMessageLabel('Agent', 'How can I help you?', this.theme.statusSuccess);
+    await this.appendMessageLabel('Agent', 'How can I help you?', this.theme.statusSuccess, true);
 
     this.changed('visibility', true);
     return true;
@@ -1049,7 +1052,7 @@ When a user's request matches an enabled skill's capabilities, use **decompose**
     await this.setInputDisabled(true);
 
     // Show user message
-    await this.appendMessageLabel('You', userText, this.theme.textHeading);
+    await this.appendMessageLabel('You', userText, this.theme.textHeading, true);
     this.conversationHistory.push({ role: 'user', content: userText });
 
     // Show thinking indicator
@@ -1105,7 +1108,7 @@ When a user's request matches an enabled skill's capabilities, use **decompose**
           await this.removeLabel(this.thinkingLabelId);
           const text = (result.result as string) ?? '';
           if (text) {
-            await this.appendMessageLabel('Agent', text, this.theme.statusSuccess);
+            await this.appendMessageLabel('Agent', text, this.theme.statusSuccess, true);
             this.conversationHistory.push({ role: 'assistant', content: text });
           }
         } else {
@@ -1268,20 +1271,43 @@ When a user's request matches an enabled skill's capabilities, use **decompose**
     }
   }
 
-  private async appendMessageLabel(prefix: string, text: string, color: string): Promise<AbjectId> {
+  private async appendMessageLabel(prefix: string, text: string, color: string, markdown = false): Promise<AbjectId> {
     if (!this.messageLogId || !this.windowId) return '' as AbjectId;
 
-    const displayText = prefix ? `${prefix}: ${text}` : text;
     const fontSize = 13;
     const lineHeight = fontSize + 4;
     const availableWidth = WIN_W - 32 - 8; // margins + scrollbar
-    const lineCount = estimateWrappedLineCount(displayText, availableWidth, fontSize);
-    const estimatedHeight = Math.max(20, lineCount * lineHeight + 4);
+
+    // For markdown labels, emit the prefix as a separate bold label so the
+    // markdown body parses correctly (headings, bullets, etc. need to start at
+    // column 0). For plain labels, combine prefix and text as before.
+    if (markdown && prefix) {
+      const prefixText = `${prefix}:`;
+      const prefixHeight = Math.max(20, lineHeight + 4);
+      const { widgetIds: [prefixLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', {
+          specs: [
+            { type: 'label', windowId: this.windowId, text: prefixText, style: { color, fontSize, fontWeight: 'bold' as const, wordWrap: false, selectable: false } },
+          ],
+        })
+      );
+      await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
+        widgetId: prefixLabelId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: prefixHeight },
+      }));
+      this.messageLabelIds.push(prefixLabelId);
+    }
+
+    const displayText = (!markdown && prefix) ? `${prefix}: ${text}` : text;
+    const estimatedHeight = markdown
+      ? estimateMarkdownHeight(displayText, availableWidth, fontSize)
+      : Math.max(20, estimateWrappedLineCount(displayText, availableWidth, fontSize) * lineHeight + 4);
 
     const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'label', windowId: this.windowId, text: displayText, style: { color, fontSize, wordWrap: true, selectable: true } },
+          { type: 'label', windowId: this.windowId, text: displayText, style: { color, fontSize, wordWrap: true, selectable: true, markdown } },
         ],
       })
     );
