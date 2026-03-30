@@ -302,7 +302,7 @@ async function main(): Promise<void> {
       alog.info('Frontend WebSocket relayed to UI worker via MessagePort');
     } else if (backendUI) {
       // Non-worker mode: direct WebSocket
-      backendUI.setWebSocket(ws);
+      backendUI.addWebSocket(ws);
     }
   }
 

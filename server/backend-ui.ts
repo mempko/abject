@@ -67,13 +67,24 @@ export interface InputEvent {
  * Surface commands are forwarded to the browser frontend over WebSocket.
  * Input events from the frontend are routed to surface owners.
  */
+/** Per-client connection state for multi-client broadcast. */
+interface ClientConnection {
+  id: string;
+  transport: UITransport;
+  ready: boolean;
+  sendQueue: BackendToFrontendMsg[];
+  flushScheduled: boolean;
+}
+
 export class BackendUI extends Abject {
   private surfaces: Map<string, SurfaceState> = new Map();
   private focusedSurface?: string;
   private mouseGrabAbject?: AbjectId;  // WindowManager grabs mouse during drag
+  private mouseGrabClientId?: string;  // Which client owns the current resize grab
   private pendingRequests: Map<string, { resolve: (value: unknown) => void; reject: (e: Error) => void }> = new Map();
-  private transport: UITransport | null = null;
-  private frontendReady = false;
+  /** All connected frontend clients, keyed by clientId. */
+  private clients: Map<string, ClientConnection> = new Map();
+  private clientCounter = 0;
   private surfaceCounter = 0;
   private consoleId?: AbjectId;
   private windowManagerId?: AbjectId;
@@ -81,17 +92,16 @@ export class BackendUI extends Abject {
   private lastDisplayInfo: { width: number; height: number } = { width: 1280, height: 720 };
   private lastMouseX = 0;
   private lastMouseY = 0;
+  /** Which client sent the last mousedown (for requestDrag targeting). */
+  private lastInputClientId?: string;
   private lastMonitorMoveTime = 0;
   private activeWorkspaceId?: string;
   private authConfig?: AuthConfig;
   private sessionStore?: SessionStore;
-  /** Font metrics from frontend: font → char → pixel width */
+  /** Font metrics from frontend: font -> char -> pixel width */
   private fontMetrics: Map<string, Map<string, number>> = new Map();
   /** Hash of last draw commands per surface for dedup */
   private lastDrawHash: Map<string, string> = new Map();
-  /** Frame-rate batching: queued messages flushed once per event loop tick */
-  private sendQueue: BackendToFrontendMsg[] = [];
-  private flushScheduled = false;
 
   constructor() {
     super({
@@ -431,12 +441,14 @@ export class BackendUI extends Abject {
           globalX: this.lastMouseX,
           globalY: this.lastMouseY,
         }));
-      // Client handles the move drag locally
-      this.sendToFrontend({
-        type: 'startWindowDrag',
-        surfaceId,
-        dragType: 'move',
-      });
+      // Tell only the client that sent the mousedown to handle the drag locally
+      if (this.lastInputClientId) {
+        this.sendToClient({
+          type: 'startWindowDrag',
+          surfaceId,
+          dragType: 'move',
+        }, this.lastInputClientId);
+      }
     });
 
     this.on('objectUnregistered', async (msg: AbjectMessage) => {
@@ -564,97 +576,169 @@ IMPORTANT:
   }
 
   /**
-   * Force-disconnect the current frontend WebSocket.
-   * The frontend will reconnect automatically and go through the auth gate.
+   * Force-disconnect all frontend WebSockets.
+   * Frontends will reconnect automatically and go through the auth gate.
    */
   disconnectFrontend(): void {
-    if (this.transport) {
-      this.transport.close(4001, 'Auth config changed');
+    for (const client of this.clients.values()) {
+      client.transport.close(4001, 'Auth config changed');
     }
   }
 
   // ── WebSocket management ────────────────────────────────────────────
 
-  /**
-   * Set the WebSocket connection to the frontend (convenience wrapper).
-   * Wraps the WebSocket in a WebSocketUITransport and calls setTransport().
-   */
-  setWebSocket(ws: WebSocket): void {
-    this.setTransport(new WebSocketUITransport(ws));
+  private nextClientId(): string {
+    return `client-${++this.clientCounter}`;
+  }
+
+  /** Whether any client is connected and ready. */
+  private get hasReadyClient(): boolean {
+    for (const client of this.clients.values()) {
+      if (client.ready) return true;
+    }
+    return false;
+  }
+
+  /** Return the first ready client, or undefined. */
+  private get firstReadyClient(): ClientConnection | undefined {
+    for (const client of this.clients.values()) {
+      if (client.ready) return client;
+    }
+    return undefined;
   }
 
   /**
-   * Set the transport used to communicate with the frontend.
-   * Works with any UITransport: WebSocket, MessagePort, etc.
+   * Add a WebSocket connection as a new client (convenience wrapper).
    */
-  setTransport(newTransport: UITransport): void {
-    // Clean up state from previous connection
-    this.frontendReady = false;
-    this.sendQueue = [];
-    this.flushScheduled = false;
-    for (const [, pending] of this.pendingRequests) {
-      pending.reject(new Error('Frontend reconnected'));
-    }
-    this.pendingRequests.clear();
+  addWebSocket(ws: WebSocket): string {
+    return this.addTransport(new WebSocketUITransport(ws));
+  }
 
-    this.transport = newTransport;
+  /**
+   * Add a transport as a new client. Multiple clients can be connected
+   * simultaneously; all receive broadcasts.
+   */
+  addTransport(newTransport: UITransport): string {
+    const clientId = this.nextClientId();
+    const conn: ClientConnection = {
+      id: clientId,
+      transport: newTransport,
+      ready: false,
+      sendQueue: [],
+      flushScheduled: false,
+    };
+    this.clients.set(clientId, conn);
+    log.info(`Client ${clientId} connected (${this.clients.size} total)`);
+
     newTransport.onMessage((str: string) => {
       try {
         const msg = JSON.parse(str) as FrontendToBackendMsg;
-        this.handleFrontendMessage(msg);
+        this.handleFrontendMessage(msg, clientId);
       } catch (err) {
         log.error('Failed to parse frontend message:', err);
       }
     });
     newTransport.onClose(() => {
-      if (this.transport === newTransport) {
-        this.transport = null;
-        this.frontendReady = false;
-        this.sendQueue = [];
-        this.flushScheduled = false;
-        // Reject any pending frontend requests so they don't hang forever
-        for (const [reqId, pending] of this.pendingRequests) {
-          pending.reject(new Error('Frontend disconnected'));
+      this.clients.delete(clientId);
+      log.info(`Client ${clientId} disconnected (${this.clients.size} remaining)`);
+      // Release resize grab if this client owned it
+      if (this.mouseGrabClientId === clientId) {
+        this.mouseGrabAbject = undefined;
+        this.mouseGrabClientId = undefined;
+      }
+      // Reject pending requests that can no longer be answered if no clients remain
+      if (this.clients.size === 0) {
+        for (const [, pending] of this.pendingRequests) {
+          pending.reject(new Error('All frontends disconnected'));
         }
         this.pendingRequests.clear();
       }
     });
+
+    return clientId;
   }
 
   /**
-   * Send a message to the frontend (batched).
-   * Messages are queued and flushed via setTimeout(0) so that draw flushing
-   * and scheduleRelayout timers fire in the same event-loop phase.
+   * Backward-compatible aliases. setTransport disconnects all existing
+   * clients first (old single-transport behavior).
+   */
+  setWebSocket(ws: WebSocket): void {
+    this.addWebSocket(ws);
+  }
+
+  setTransport(newTransport: UITransport): void {
+    this.addTransport(newTransport);
+  }
+
+  /**
+   * Broadcast a message to all ready clients (batched).
+   * Messages are queued per-client and flushed via setTimeout(0).
    */
   private sendToFrontend(msg: BackendToFrontendMsg): void {
-    if (!this.transport || !this.transport.ready) return;
-    this.sendQueue.push(msg);
-    if (!this.flushScheduled) {
-      this.flushScheduled = true;
-      setTimeout(() => this.flushSendQueue(), 0);
+    for (const client of this.clients.values()) {
+      if (!client.ready || !client.transport.ready) continue;
+      client.sendQueue.push(msg);
+      if (!client.flushScheduled) {
+        client.flushScheduled = true;
+        const cid = client.id;
+        setTimeout(() => this.flushClientQueue(cid), 0);
+      }
     }
   }
 
   /**
-   * Send a message to the frontend immediately (bypasses batching).
-   * Used for request/reply messages where the caller awaits a response.
+   * Send a message to one specific client (batched).
    */
-  private sendToFrontendImmediate(msg: BackendToFrontendMsg): void {
-    if (this.transport && this.transport.ready) {
-      this.transport.send(JSON.stringify(msg));
+  private sendToClient(msg: BackendToFrontendMsg, clientId: string): void {
+    const client = this.clients.get(clientId);
+    if (!client || !client.ready || !client.transport.ready) return;
+    client.sendQueue.push(msg);
+    if (!client.flushScheduled) {
+      client.flushScheduled = true;
+      setTimeout(() => this.flushClientQueue(clientId), 0);
     }
   }
 
-  private flushSendQueue(): void {
-    this.flushScheduled = false;
-    if (!this.transport || !this.transport.ready || this.sendQueue.length === 0) return;
-
-    if (this.sendQueue.length === 1) {
-      this.transport.send(JSON.stringify(this.sendQueue[0]));
-    } else {
-      this.transport.send(JSON.stringify(this.sendQueue));
+  /**
+   * Broadcast a message to all ready clients except one (batched).
+   * Used when one client already has the state (e.g. local drag).
+   */
+  private sendToFrontendExcept(msg: BackendToFrontendMsg, excludeClientId: string): void {
+    for (const client of this.clients.values()) {
+      if (client.id === excludeClientId) continue;
+      if (!client.ready || !client.transport.ready) continue;
+      client.sendQueue.push(msg);
+      if (!client.flushScheduled) {
+        client.flushScheduled = true;
+        const cid = client.id;
+        setTimeout(() => this.flushClientQueue(cid), 0);
+      }
     }
-    this.sendQueue = [];
+  }
+
+  /**
+   * Send a message to one specific client immediately (bypasses batching).
+   * Used for request/reply messages where the caller awaits a response.
+   */
+  private sendToClientImmediate(msg: BackendToFrontendMsg, clientId: string): void {
+    const client = this.clients.get(clientId);
+    if (client && client.ready && client.transport.ready) {
+      client.transport.send(JSON.stringify(msg));
+    }
+  }
+
+  private flushClientQueue(clientId: string): void {
+    const client = this.clients.get(clientId);
+    if (!client) return;
+    client.flushScheduled = false;
+    if (!client.transport.ready || client.sendQueue.length === 0) return;
+
+    if (client.sendQueue.length === 1) {
+      client.transport.send(JSON.stringify(client.sendQueue[0]));
+    } else {
+      client.transport.send(JSON.stringify(client.sendQueue));
+    }
+    client.sendQueue = [];
   }
 
   // ── Surface API ──────────────────────────────────────────────────────
@@ -872,7 +956,7 @@ IMPORTANT:
   }
 
   private async handleGetDisplayInfo(): Promise<{ width: number; height: number }> {
-    if (!this.transport || !this.transport.ready || !this.frontendReady) {
+    if (!this.hasReadyClient) {
       return { ...this.lastDisplayInfo };
     }
     try {
@@ -905,8 +989,8 @@ IMPORTANT:
       return width;
     }
 
-    // No metrics yet — fall back to round-trip or estimate
-    if (!this.transport || !this.transport.ready || !this.frontendReady) {
+    // No metrics yet -- fall back to round-trip or estimate
+    if (!this.hasReadyClient) {
       return text.length * 7.5;
     }
 
@@ -933,6 +1017,10 @@ IMPORTANT:
   }
 
   private requestFromFrontend<T>(msg: BackendToFrontendMsg & { requestId: string }, timeoutMs = 10000): Promise<T> {
+    const target = this.firstReadyClient;
+    if (!target) {
+      return Promise.reject(new Error('No ready frontend client'));
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(msg.requestId);
@@ -949,16 +1037,16 @@ IMPORTANT:
           reject(err);
         },
       });
-      this.sendToFrontendImmediate(msg);
+      this.sendToClientImmediate(msg, target.id);
     });
   }
 
   // ── Frontend message handling ───────────────────────────────────────
 
-  private handleFrontendMessage(msg: FrontendToBackendMsg): void {
+  private handleFrontendMessage(msg: FrontendToBackendMsg, clientId: string): void {
     switch (msg.type) {
       case 'input':
-        this.handleFrontendInput(msg as InputMsg);
+        this.handleFrontendInput(msg as InputMsg, clientId);
         break;
 
       case 'measureTextReply': {
@@ -982,6 +1070,7 @@ IMPORTANT:
 
       case 'fontMetrics': {
         const fmMsg = msg as FontMetricsMsg;
+        const hadMetrics = this.fontMetrics.size > 0;
         for (const [font, chars] of Object.entries(fmMsg.metrics)) {
           const charMap = new Map<string, number>();
           for (const [ch, w] of Object.entries(chars)) {
@@ -989,32 +1078,48 @@ IMPORTANT:
           }
           this.fontMetrics.set(font, charMap);
         }
-        log.info(`Received font metrics for ${Object.keys(fmMsg.metrics).length} fonts`);
+        log.info(`Received font metrics from ${clientId} for ${Object.keys(fmMsg.metrics).length} fonts`);
+        // Only fire fontMetricsChanged on first metrics arrival
+        if (!hadMetrics) {
+          this.lastDrawHash.clear();
+          const notifiedOwners = new Set<string>();
+          for (const state of this.surfaces.values()) {
+            if (!notifiedOwners.has(state.objectId)) {
+              notifiedOwners.add(state.objectId);
+              this.send(event(this.id, state.objectId as AbjectId, 'fontMetricsChanged', {}));
+            }
+          }
+        }
         break;
       }
 
-      case 'ready':
-        log.info('Frontend connected and ready');
-        this.frontendReady = true;
-        this.replayStateToFrontend();
+      case 'ready': {
+        const client = this.clients.get(clientId);
+        if (client) {
+          client.ready = true;
+        }
+        log.info(`Client ${clientId} ready (${this.clients.size} total)`);
+        this.replayStateToClient(clientId);
         break;
+      }
 
       case 'endWindowDrag':
-        this.handleEndWindowDrag(msg as EndWindowDragMsg);
+        this.handleEndWindowDrag(msg as EndWindowDragMsg, clientId);
         break;
 
       case 'surfaceCreated':
-        // Acknowledgment from frontend — no action needed
+        // Acknowledgment from frontend -- no action needed
         break;
     }
   }
 
-  private async handleFrontendInput(msg: InputMsg): Promise<void> {
-    // Track last mouse position (global coords) for requestDrag
+  private async handleFrontendInput(msg: InputMsg, clientId: string): Promise<void> {
+    // Track last mouse position and client (global coords) for requestDrag
     if (msg.inputType === 'mousedown' || msg.inputType === 'mousemove') {
       const surfState = msg.surfaceId ? this.surfaces.get(msg.surfaceId) : undefined;
       this.lastMouseX = (msg.x ?? 0) + (surfState?.rect.x ?? 0);
       this.lastMouseY = (msg.y ?? 0) + (surfState?.rect.y ?? 0);
+      this.lastInputClientId = clientId;
     }
 
     // ── Input monitors: broadcast mouse/wheel events to all monitor surfaces ──
@@ -1047,9 +1152,9 @@ IMPORTANT:
 
     // ── WindowManager grab: route drag events to WindowManager (resize only) ──
     // Move drags are handled client-side; resize drags still go through the server.
-    if (this.mouseGrabAbject) {
+    // Only the client that owns the grab sends drag events.
+    if (this.mouseGrabAbject && this.mouseGrabClientId === clientId) {
       if (msg.inputType === 'mousemove') {
-        // Prefer globalX/globalY from client (avoids stale local→global reconstruction)
         const state = msg.surfaceId ? this.surfaces.get(msg.surfaceId) : undefined;
         const globalX = msg.globalX ?? ((msg.x ?? 0) + (state?.rect.x ?? 0));
         const globalY = msg.globalY ?? ((msg.y ?? 0) + (state?.rect.y ?? 0));
@@ -1066,6 +1171,7 @@ IMPORTANT:
           globalX, globalY,
         }));
         this.mouseGrabAbject = undefined;
+        this.mouseGrabClientId = undefined;
         return;
       }
     }
@@ -1096,12 +1202,12 @@ IMPORTANT:
               'startDrag', {
                 surfaceId: msg.surfaceId, globalX, globalY,
               }));
-            // Tell client to handle the move drag locally (zero latency)
-            this.sendToFrontend({
+            // Tell only the initiating client to handle the move drag locally
+            this.sendToClient({
               type: 'startWindowDrag',
               surfaceId: msg.surfaceId,
               dragType: 'move',
-            });
+            }, clientId);
             this.handleFocus(state.objectId, msg.surfaceId);
             return;
           }
@@ -1117,33 +1223,34 @@ IMPORTANT:
                 })
             );
 
-            // WindowManager requested a minimize — hide the surface directly
+            // WindowManager requested a minimize -- hide the surface directly
             if (reply.minimize) {
               this.sendToFrontend({ type: 'setSurfaceVisible', surfaceId: reply.minimize, visible: false });
               return;
             }
 
             if (reply.grab) {
-              // Tell client about the drag start
-              this.sendToFrontend({
+              // Tell only the initiating client about the drag start
+              this.sendToClient({
                 type: 'startWindowDrag',
                 surfaceId: msg.surfaceId,
                 dragType: reply.dragType ?? 'move',
-              });
+              }, clientId);
 
               if (reply.dragType === 'resize') {
                 // Resize drags still go through server (needs content re-rendering)
                 this.mouseGrabAbject = this.windowManagerId;
+                this.mouseGrabClientId = clientId;
               }
-              // Move drags: no mouseGrabAbject — client handles it locally
+              // Move drags: no mouseGrabAbject -- client handles it locally
               this.handleFocus(state.objectId, msg.surfaceId);
               return;
             }
           } catch (err) {
-            // WindowManager not available — fall through to original behavior
+            // WindowManager not available -- fall through to original behavior
           }
 
-          // WindowManager didn't grab — proceed with normal input routing
+          // WindowManager didn't grab -- proceed with normal input routing
           await this.sendInputEvent(state.objectId, inputEvent);
           this.handleFocus(state.objectId, msg.surfaceId);
           return;
@@ -1157,10 +1264,10 @@ IMPORTANT:
   // ── Client-side drag end ────────────────────────────────────────────
 
   /**
-   * Handle endWindowDrag from client — client did the move locally,
-   * now sync final position to server state and WindowManager.
+   * Handle endWindowDrag from client -- client did the move locally,
+   * now sync final position to server state, WindowManager, and other clients.
    */
-  private handleEndWindowDrag(msg: EndWindowDragMsg): void {
+  private handleEndWindowDrag(msg: EndWindowDragMsg, fromClientId: string): void {
     const state = this.surfaces.get(msg.surfaceId);
     if (state) {
       state.rect.x = msg.x;
@@ -1176,83 +1283,77 @@ IMPORTANT:
       }));
     }
 
-    // Do NOT send moveSurface back to client — it already has the correct position
+    // Broadcast moveSurface to all OTHER clients so they see the window move.
+    // The originating client already has the correct position from local drag.
+    this.sendToFrontendExcept({
+      type: 'moveSurface',
+      surfaceId: msg.surfaceId,
+      x: msg.x,
+      y: msg.y,
+    }, fromClientId);
   }
 
   // ── State replay ────────────────────────────────────────────────────
 
   /**
-   * Replay all current surface state to the frontend.
-   * Called when a frontend sends 'ready' (initial connect or reconnect).
+   * Replay all current surface state to a specific client.
+   * Called when a client sends 'ready' (initial connect or reconnect).
    */
-  private replayStateToFrontend(): void {
+  private replayStateToClient(clientId: string): void {
     // 1. Recreate all surfaces
     for (const state of this.surfaces.values()) {
-      this.sendToFrontend({
+      this.sendToClient({
         type: 'createSurface',
         surfaceId: state.surfaceId,
         objectId: state.objectId,
         rect: { ...state.rect },
         zIndex: state.zIndex,
         inputPassthrough: state.inputPassthrough,
-      });
+      }, clientId);
     }
 
     // 2. Replay last draw commands for each surface
     for (const state of this.surfaces.values()) {
       if (state.lastDrawCommands.length > 0) {
-        this.sendToFrontend({
+        this.sendToClient({
           type: 'draw',
           commands: state.lastDrawCommands,
-        });
+        }, clientId);
       }
     }
 
     // 3. Replay workspace assignments
     for (const state of this.surfaces.values()) {
       if (state.workspaceId) {
-        this.sendToFrontend({
+        this.sendToClient({
           type: 'setSurfaceWorkspace',
           surfaceId: state.surfaceId,
           workspaceId: state.workspaceId,
-        });
+        }, clientId);
       }
     }
 
     // 4. Replay active workspace filter
     if (this.activeWorkspaceId) {
-      this.sendToFrontend({
+      this.sendToClient({
         type: 'setActiveWorkspace',
         workspaceId: this.activeWorkspaceId,
-      });
+      }, clientId);
     }
 
     // 5. Restore focus
     if (this.focusedSurface && this.surfaces.has(this.focusedSurface)) {
-      this.sendToFrontend({
+      this.sendToClient({
         type: 'setFocused',
         surfaceId: this.focusedSurface,
-      });
+      }, clientId);
     }
 
     let totalDrawCmds = 0;
     for (const state of this.surfaces.values()) {
       totalDrawCmds += state.lastDrawCommands.length;
     }
-    log.info(`Replayed ${this.surfaces.size} surfaces (${totalDrawCmds} draw commands) to frontend`);
-
-    // 6. Trigger all surface owners to redraw with fresh font metrics.
-    // The replayed draw commands used metrics from the previous browser session;
-    // if the new browser has different fonts, layouts need recomputing.
-    this.lastDrawHash.clear();
-    const notifiedOwners = new Set<string>();
-    for (const state of this.surfaces.values()) {
-      const ownerId = state.objectId;
-      if (!notifiedOwners.has(ownerId)) {
-        notifiedOwners.add(ownerId);
-        this.send(event(this.id, ownerId as AbjectId, 'fontMetricsChanged', {}));
-      }
-    }
+    log.info(`Replayed ${this.surfaces.size} surfaces (${totalDrawCmds} draw commands) to ${clientId}`);
   }
 
   // ── Event sending ───────────────────────────────────────────────────
