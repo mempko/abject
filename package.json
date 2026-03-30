@@ -21,7 +21,8 @@
     "node-datachannel": "^0.32.1",
     "playwright": "^1.40.0",
     "uuid": "^9.0.0",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "yaml": "^2.8.3"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

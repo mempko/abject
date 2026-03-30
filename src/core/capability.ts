@@ -62,6 +62,16 @@ export const Capabilities = {
 
   // Coordination capabilities
   TUPLE_SPACE: 'abjects:tuple-space' as CapabilityId,
+
+  // Host capabilities (real filesystem, shell, web)
+  SHELL_EXECUTE: 'abjects:shell:execute' as CapabilityId,
+  HOSTFS_READ: 'abjects:hostfs:read' as CapabilityId,
+  HOSTFS_WRITE: 'abjects:hostfs:write' as CapabilityId,
+  WEB_SEARCH: 'abjects:web:search' as CapabilityId,
+  WEB_FETCH: 'abjects:web:fetch' as CapabilityId,
+
+  // Skill management
+  SKILL_MANAGE: 'abjects:skill:manage' as CapabilityId,
 } as const;
 
 // =============================================================================

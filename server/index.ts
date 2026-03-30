@@ -61,6 +61,13 @@ import { TupleSpace } from '../src/objects/tuple-space.js';
 import { FileTransfer } from '../src/objects/capabilities/file-transfer.js';
 import { MediaStreamCapability } from '../src/objects/capabilities/media-stream.js';
 import { WorkspaceShareRegistry, WORKSPACE_SHARE_REGISTRY_ID } from '../src/objects/workspace-share-registry.js';
+import { ShellExecutor } from '../src/objects/capabilities/shell-executor.js';
+import { HostFileSystem } from '../src/objects/capabilities/host-filesystem.js';
+import { WebSearch } from '../src/objects/capabilities/web-search.js';
+import { WebFetch } from '../src/objects/capabilities/web-fetch.js';
+import { SkillRegistry } from '../src/objects/skill-registry.js';
+import { SkillBrowser } from '../src/objects/skill-browser.js';
+import { SkillAgent } from '../src/objects/skill-agent.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
 import { NodeWorkerAdapter } from './node-worker-adapter.js';
@@ -391,6 +398,13 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('TupleSpace', () => new TupleSpace());
   runtime.objectFactory.registerConstructor('FileTransfer', () => new FileTransfer());
   runtime.objectFactory.registerConstructor('MediaStream', () => new MediaStreamCapability());
+  runtime.objectFactory.registerConstructor('ShellExecutor', () => new ShellExecutor());
+  runtime.objectFactory.registerConstructor('HostFileSystem', () => new HostFileSystem());
+  runtime.objectFactory.registerConstructor('WebSearch', () => new WebSearch());
+  runtime.objectFactory.registerConstructor('WebFetch', () => new WebFetch());
+  runtime.objectFactory.registerConstructor('SkillRegistry', () => new SkillRegistry(path.join(process.cwd(), DATA_DIR, 'skills')));
+  runtime.objectFactory.registerConstructor('SkillBrowser', () => new SkillBrowser());
+  runtime.objectFactory.registerConstructor('SkillAgent', () => new SkillAgent());
 
   // Mark worker-eligible constructors (only used when workerEnabled).
   // Per-workspace objects use registryHint to discover workspace dependencies.
@@ -449,6 +463,10 @@ async function main(): Promise<void> {
   const webParserId = await supervisedSpawn('WebParser');
   const webBrowserId = await supervisedSpawn('WebBrowser');
   // WebAgent is per-workspace (spawned by WorkspaceManager), not global
+  const shellExecutorId = await supervisedSpawn('ShellExecutor');
+  const hostFilesystemId = await supervisedSpawn('HostFileSystem');
+  const webSearchId = await supervisedSpawn('WebSearch');
+  const webFetchId = await supervisedSpawn('WebFetch');
   const windowManagerId = await supervisedSpawn('WindowManager');
   const widgetManagerId = await supervisedSpawn('WidgetManager');
 
@@ -622,6 +640,8 @@ async function main(): Promise<void> {
   const objectBrowserId = await supervisedSpawn('ObjectBrowser', 'permanent', systemTypeId('ObjectBrowser'));
   const processExplorerId = await supervisedSpawn('ProcessExplorer', 'permanent', systemTypeId('ProcessExplorer'));
   const llmMonitorId = await supervisedSpawn('LLMMonitor', 'permanent', systemTypeId('LLMMonitor'));
+  const skillRegistryId = await supervisedSpawn('SkillRegistry', 'permanent', systemTypeId('SkillRegistry'));
+  const skillBrowserId = await supervisedSpawn('SkillBrowser', 'permanent', systemTypeId('SkillBrowser'));
 
   const proxyGenId = await supervisedSpawn('ProxyGenerator', 'permanent', systemTypeId('ProxyGenerator'));
   const negotiatorId = await supervisedSpawn('Negotiator', 'permanent', systemTypeId('Negotiator'));
@@ -654,11 +674,12 @@ async function main(): Promise<void> {
   const monitoredIds = [
     httpClientId, llmId, storageId, timerId, clipboardId,
     consoleId, filesystemId, webParserId, webBrowserId,
+    shellExecutorId, hostFilesystemId, webSearchId, webFetchId,
     windowManagerId, widgetManagerId,
     identityId, peerRegistryId, remoteRegistryId, peerRouterId,
     signalingRelayId, peerDiscoveryId,
     workspaceShareRegistryId, workspaceBrowserId,
-    globalSettingsId, peerNetworkId, globalToolbarId, objectBrowserId, processExplorerId,
+    globalSettingsId, peerNetworkId, globalToolbarId, objectBrowserId, processExplorerId, skillRegistryId, skillBrowserId,
     proxyGenId, negotiatorId,
     workspaceSwitcherId, workspaceManagerId,
   ];

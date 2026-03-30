@@ -18,6 +18,7 @@ import { request, event } from '../core/message.js';
 import { requireDefined } from '../core/contracts.js';
 import type { JobResult } from './job-manager.js';
 import type { ContentPart } from '../llm/provider.js';
+import type { EnabledSkillSummary } from '../core/skill-types.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('AgentAbject');
@@ -137,6 +138,8 @@ interface TaskEntry {
   childGoalId?: string;
   /** Active child goal IDs created by decompose. */
   childGoalIds?: string[];
+  /** Cached skill instructions appended to system prompt. */
+  skillPromptSuffix?: string;
 }
 
 // ─── AgentAbject ─────────────────────────────────────────────────────
@@ -702,6 +705,25 @@ improve semantic matching accuracy.
         responseSchema,
         goalId,
       };
+
+      // Pre-fetch enabled skill instructions for prompt injection
+      try {
+        const skillRegistryId = await this.discoverDep('SkillRegistry');
+        if (skillRegistryId) {
+          const skills = await this.request<EnabledSkillSummary[]>(
+            request(this.id, skillRegistryId, 'getEnabledSkills', {}),
+          );
+          if (skills.length > 0) {
+            let suffix = '\n\n## Available Skills\n';
+            for (const skill of skills) {
+              suffix += `### ${skill.name}\n${skill.description}\n`;
+              suffix += skill.instructions + '\n\n';
+            }
+            entry.skillPromptSuffix = suffix;
+          }
+        }
+      } catch { /* SkillRegistry not available, continue without skills */ }
+
       this.taskEntries.set(taskId, entry);
 
       // Fire-and-forget: run the state machine asynchronously
@@ -1398,6 +1420,7 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
       if (success) {
         this.send(event(this.id, this.goalManagerId, 'completeGoal', {
           goalId: entry.goalId,
+          result: entry.state.result,
         }));
       } else {
         this.send(event(this.id, this.goalManagerId, 'failGoal', {
@@ -2024,6 +2047,9 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
     const messages: { role: string; content: string | ContentPart[] }[] = [];
 
     let prompt = entry.systemPrompt;
+    if (entry.skillPromptSuffix) {
+      prompt += entry.skillPromptSuffix;
+    }
     if (entry.responseSchema) {
       prompt += `\n\n## Response Schema\nWhen you complete the task, the "result" field of your terminal action MUST be a JSON object (not a string) conforming to this schema:\n\`\`\`json\n${JSON.stringify(entry.responseSchema, null, 2)}\n\`\`\`\nIMPORTANT: The "result" value must be a structured JSON object, NOT a string. Include all required fields. Use exact property names from the schema.`;
     }

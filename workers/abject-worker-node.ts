@@ -44,6 +44,13 @@ import { GoalObserver } from '../src/objects/goal-observer.js';
 import { AgentAbject } from '../src/objects/agent-abject.js';
 import { ScriptableAbject } from '../src/objects/scriptable-abject.js';
 import { NodeStorage } from '../server/node-storage.js';
+import { ShellExecutor } from '../src/objects/capabilities/shell-executor.js';
+import { HostFileSystem } from '../src/objects/capabilities/host-filesystem.js';
+import { WebSearch } from '../src/objects/capabilities/web-search.js';
+import { WebFetch } from '../src/objects/capabilities/web-fetch.js';
+import { SkillRegistry } from '../src/objects/skill-registry.js';
+import { SkillBrowser } from '../src/objects/skill-browser.js';
+import { SkillAgent } from '../src/objects/skill-agent.js';
 
 if (!parentPort) {
   throw new Error('abject-worker-node.ts must be run inside a worker_threads Worker');
@@ -93,6 +100,16 @@ constructors.set('GlobalSettings', () => new GlobalSettings());
 constructors.set('PeerNetwork', () => new PeerNetwork());
 constructors.set('GoalObserver', () => new GoalObserver());
 constructors.set('AgentAbject', () => new AgentAbject());
+constructors.set('ShellExecutor', () => new ShellExecutor());
+constructors.set('HostFileSystem', () => new HostFileSystem());
+constructors.set('WebSearch', () => new WebSearch());
+constructors.set('WebFetch', () => new WebFetch());
+constructors.set('SkillRegistry', () => {
+  const dataDir = process.env.ABJECTS_DATA_DIR ?? '.abjects';
+  return new SkillRegistry(path.join(process.cwd(), dataDir, 'skills'));
+});
+constructors.set('SkillBrowser', () => new SkillBrowser());
+constructors.set('SkillAgent', () => new SkillAgent());
 constructors.set('ScriptableAbject', (args?: unknown) => {
   const opts = args as { manifest: AbjectManifest; source: string; owner: string };
   return new ScriptableAbject(opts.manifest, opts.source, opts.owner as AbjectId);

@@ -57,6 +57,7 @@ export class Chat extends Abject {
   private userObjectSummaries = '';
   private systemObjectSummaries = '';
   private remotePeerContext = '';
+  private enabledSkillsSummary = '';
   private uiPhase: UiPhase = 'closed';
 
   /** Label ID for the current "Thinking..." indicator. */
@@ -756,31 +757,6 @@ export class Chat extends Abject {
         }
       }
 
-      case 'delegate': {
-        // Delegate a task to another registered agent via ticket pattern
-        try {
-          const agents = await this.request<Array<{ agentId: AbjectId; name: string }>>(
-            request(this.id, this.agentAbjectId!, 'listAgents', {})
-          );
-          const agent = agents.find(a => a.name === action.agent);
-          if (!agent) return { success: false, error: `Agent "${action.agent}" not found` };
-          const { ticketId } = await this.request<{ ticketId: string }>(
-            request(this.id, this.agentAbjectId!, 'startTask', {
-              agentId: agent.agentId,
-              task: action.task as string,
-              responseSchema: action.responseSchema as Record<string, unknown> | undefined,
-            }),
-          );
-          this._currentTicketId = ticketId;
-          const result = await this.waitForTaskResult(ticketId, 310000);
-          this._currentTicketId = undefined;
-          return { success: true, data: result };
-        } catch (err) {
-          this._currentTicketId = undefined;
-          return { success: false, error: err instanceof Error ? err.message : String(err) };
-        }
-      }
-
       default:
         return { success: false, error: `Unknown action: ${action.action}` };
     }
@@ -850,14 +826,17 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   and the agent automatically monitors progress. Sub-tasks are claimed by agents autonomously.
   \`{ "action": "decompose", "reasoning": "why splitting", "subtasks": [
     { "type": "create", "description": "Build a counter widget" },
-    { "type": "browse", "description": "Research X", "data": { "startUrl": "https://..." } }
+    { "type": "browse", "description": "Research X", "data": { "startUrl": "https://..." } },
+    { "type": "skill", "description": "Fetch data using the configured API" }
   ] }\`
   After decomposing, you'll observe sub-task progress and can synthesize results when done.
 
-### Agent Delegation
-- **delegate**: Delegate a task to another registered agent.
-  \`{ "action": "delegate", "agent": "AgentName", "task": "what to do", "responseSchema": { ... } }\`
-  Use \`responseSchema\` (JSON Schema) when you need structured data back from the agent. Use \`list\` to discover available agents via AgentAbject.
+  Task types and which agent claims them:
+  - **browse** / **research** / **web**: WebAgent (browser automation, navigating real websites, weather, general web queries)
+  - **create** / **modify**: ObjectCreator (build/edit UI objects)
+  - **skill**: SkillAgent (only for queries that specifically match an enabled skill listed below)
+
+  Use type "skill" only when the user's request directly relates to an enabled skill's specific domain. For general questions, web lookups, weather, or anything not covered by an enabled skill, use type "browse".
 
 ### Communication
 - **reply**: Send intermediate text to the user (continue working after).
@@ -898,7 +877,13 @@ This system runs on the user's own computer. All capability objects are user-con
 
 When the user asks to interact with a website, use WebAgent's \`runTask\`. When the user asks to close a page, use \`listPages\` to find it, then \`closePage\` to close it.
 WebAgent handles all browser management — use it for multi-step tasks, page lifecycle, and data extraction.
+${this.enabledSkillsSummary ? `
+## Enabled Skills (use task type "skill" to invoke via SkillAgent)
 
+${this.enabledSkillsSummary}
+
+When a user's request matches an enabled skill's capabilities, use **decompose** with \`"type": "skill"\` to route the task to SkillAgent.
+` : ''}
 ## Rules
 
 1. Always respond with valid JSON in a \`\`\`json block. ONE action per response.
@@ -1200,6 +1185,7 @@ WebAgent handles all browser management — use it for multi-step tasks, page li
     }
 
     await this.refreshRemotePeerContext();
+    await this.refreshEnabledSkills();
   }
 
   private async refreshRemotePeerContext(): Promise<void> {
@@ -1245,6 +1231,26 @@ WebAgent handles all browser management — use it for multi-step tasks, page li
       }
     } catch {
       // Best-effort — leave remotePeerContext unchanged
+    }
+  }
+
+  private async refreshEnabledSkills(): Promise<void> {
+    try {
+      const skillRegistryId = await this.discoverDep('SkillRegistry');
+      if (!skillRegistryId) { this.enabledSkillsSummary = ''; return; }
+
+      const skills = await this.request<Array<{ name: string; description: string }>>(
+        request(this.id, skillRegistryId, 'getEnabledSkills', {}),
+      );
+      if (skills.length === 0) {
+        this.enabledSkillsSummary = '';
+        return;
+      }
+      this.enabledSkillsSummary = skills
+        .map(s => `- **${s.name}**: ${s.description}`)
+        .join('\n');
+    } catch {
+      // Best-effort
     }
   }
 

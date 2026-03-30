@@ -77,6 +77,13 @@ export class GlobalSettings extends Abject {
 
   private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
+  private skillBrowserBtnId?: AbjectId;
+
+  // Tab state
+  private tabBarId?: AbjectId;
+  private activeTab: 'ai' | 'auth' = 'ai';
+  private aiContainerId?: AbjectId;
+  private authContainerId?: AbjectId;
 
   // Auth widgets
   private authCheckboxId?: AbjectId;
@@ -297,6 +304,14 @@ export class GlobalSettings extends Abject {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
 
+      // Tab bar changed
+      if (fromId === this.tabBarId && aspect === 'change') {
+        const idx = value as number;
+        this.activeTab = idx === 0 ? 'ai' : 'auth';
+        await this.switchTab();
+        return;
+      }
+
       // Provider dropdown changed
       if (fromId === this.providerSelectId && aspect === 'change') {
         const label = value as string;
@@ -339,6 +354,15 @@ export class GlobalSettings extends Abject {
         return;
       }
 
+      // Open Skill Browser
+      if (fromId === this.skillBrowserBtnId && aspect === 'click') {
+        const skillBrowserId = await this.discoverDep('SkillBrowser');
+        if (skillBrowserId) {
+          await this.request(request(this.id, skillBrowserId, 'show', {}));
+        }
+        return;
+      }
+
       // Text input submit triggers save
       if (aspect === 'submit') {
         if (fromId === this.authUserInputId || fromId === this.authPassInputId) {
@@ -362,7 +386,7 @@ export class GlobalSettings extends Abject {
     );
 
     const winW = 440;
-    const winH = 750;
+    const winH = 460;
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
@@ -384,7 +408,77 @@ export class GlobalSettings extends Abject {
       })
     );
 
-    const cId = this.rootLayoutId;
+    // Tab bar: AI | Auth
+    const { widgetIds: [tabBarId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'tabBar', windowId: this.windowId,
+          tabs: ['AI', 'Auth'],
+          closable: false,
+          selectedIndex: this.activeTab === 'ai' ? 0 : 1 },
+      ]})
+    );
+    this.tabBarId = tabBarId;
+    await this.request(request(this.id, this.tabBarId, 'addDependent', {}));
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.tabBarId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 30 },
+    }));
+
+    // AI container (scrollable VBox)
+    this.aiContainerId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.aiContainerId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
+    // Auth container (scrollable VBox, initially hidden)
+    this.authContainerId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.authContainerId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
+    // Status label at bottom (always visible)
+    const { widgetIds: [statusLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId!, text: '',
+          style: { color: this.theme.textDescription, fontSize: 12, align: 'right' } },
+      ]})
+    );
+    this.statusLabelId = statusLabelId;
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.statusLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
+
+    // Build AI tab content
+    await this.buildAiTab();
+    // Build Auth tab content
+    await this.buildAuthTab();
+    // Show correct tab
+    await this.switchTab();
+
+    this.changed('visibility', true);
+    return true;
+  }
+
+  /** Build AI tab content into aiContainerId. */
+  private async buildAiTab(): Promise<void> {
+    const cId = this.aiContainerId!;
 
     // Load saved values to populate inputs
     let savedAnthropicKey: string | null = null;
@@ -670,21 +764,72 @@ export class GlobalSettings extends Abject {
       preferredSize: { width: 130, height: 36 },
     }));
 
-    // ── Auth section ──────────────────────────────────────────────────
+    // ── Skills section ─────────────────────────────────────────────────
 
-    // Divider + auth section header
-    const { widgetIds: [authDividerId, authHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    // Skills label
+    const { widgetIds: [skillsSectionLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'divider', windowId: this.windowId },
+        { type: 'label', windowId: this.windowId, text: 'Skills', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 14 } },
+      ]})
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: skillsSectionLabelId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 24 },
+    }));
+
+    const { widgetIds: [skillsDescId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Manage SKILL.md files in ~/.abject/skills/', style: { fontSize: 12, color: this.theme.textDescription } },
+      ]})
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: skillsDescId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 18 },
+    }));
+
+    // Skill Browser button row
+    const skillRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: cId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: skillRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 36 },
+    }));
+    await this.request(request(this.id, skillRowId, 'addLayoutSpacer', {}));
+
+    const { widgetIds: [skillBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Open Skill Browser',
+          style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+      ]})
+    );
+    this.skillBrowserBtnId = skillBtnId;
+    await this.request(request(this.id, this.skillBrowserBtnId, 'addDependent', {}));
+    await this.request(request(this.id, skillRowId, 'addLayoutChild', {
+      widgetId: this.skillBrowserBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 160, height: 36 },
+    }));
+  }
+
+  /** Build Auth tab content into authContainerId. */
+  private async buildAuthTab(): Promise<void> {
+    const cId = this.authContainerId!;
+
+    // Auth section header
+    const { widgetIds: [authHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId, text: 'Authentication',
           style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
       ]})
     );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: authDividerId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 12 },
-    }));
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: authHeaderId,
       sizePolicy: { vertical: 'fixed' },
@@ -841,24 +986,6 @@ export class GlobalSettings extends Abject {
       preferredSize: { width: 120, height: 36 },
     }));
 
-    // Spacer + status label
-    await this.request(request(this.id, cId, 'addLayoutSpacer', {}));
-
-    const { widgetIds: [statusLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId!, text: '',
-          style: { color: this.theme.textDescription, fontSize: 12, align: 'right' } },
-      ]})
-    );
-    this.statusLabelId = statusLabelId;
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: this.statusLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 18 },
-    }));
-
-    this.changed('visibility', true);
-    return true;
   }
 
   /**
@@ -894,10 +1021,22 @@ export class GlobalSettings extends Abject {
     this.authPassInputId = undefined;
     this.authPassToggleId = undefined;
     this.authSaveBtnId = undefined;
+    this.skillBrowserBtnId = undefined;
+    this.tabBarId = undefined;
+    this.aiContainerId = undefined;
+    this.authContainerId = undefined;
     this.unmasked.clear();
 
     this.changed('visibility', false);
     return true;
+  }
+
+  /** Show/hide tab containers based on activeTab. */
+  private async switchTab(): Promise<void> {
+    if (!this.aiContainerId || !this.authContainerId) return;
+    const showAi = this.activeTab === 'ai';
+    await this.request(request(this.id, this.aiContainerId, 'update', { style: { visible: showAi } }));
+    await this.request(request(this.id, this.authContainerId, 'update', { style: { visible: !showAi } }));
   }
 
   // ========== HELPERS ==========

@@ -123,6 +123,16 @@ export { MediaStreamCapability, MEDIA_STREAM_ID } from './objects/capabilities/m
 export { AgentAbject, AGENT_ABJECT_ID } from './objects/agent-abject.js';
 export type { AgentPhase, AgentAction, AgentActionResult, AgentTaskState, AgentTaskOptions, AgentConfig, TerminalActionConfig, AgentPlan, AgentPlanStep } from './objects/agent-abject.js';
 export { WebBrowserViewer, WEB_BROWSER_VIEWER_ID } from './objects/web-browser-viewer.js';
+export { ShellExecutor, SHELL_EXECUTOR_ID } from './objects/capabilities/shell-executor.js';
+export { HostFileSystem, HOST_FILESYSTEM_ID } from './objects/capabilities/host-filesystem.js';
+export { WebSearch, WEB_SEARCH_ID } from './objects/capabilities/web-search.js';
+export { WebFetch, WEB_FETCH_ID } from './objects/capabilities/web-fetch.js';
+export { SkillRegistry, SKILL_REGISTRY_ID } from './objects/skill-registry.js';
+export { SkillAgent, SKILL_AGENT_ID } from './objects/skill-agent.js';
+export { SkillBrowser, SKILL_BROWSER_ID } from './objects/skill-browser.js';
+export { parseSkillMd } from './core/skill-parser.js';
+export type { ParsedSkill } from './core/skill-parser.js';
+export type { SkillInfo, SkillConfig, EnabledSkillSummary } from './core/skill-types.js';
 // WebParser, WebBrowser, and WebAgent are server-only — import directly from their files:
 // import { WebParser } from './objects/capabilities/web-parser.js';
 // import { WebBrowser } from './objects/capabilities/web-browser.js';
