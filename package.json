@@ -25,7 +25,8 @@
     "incarnate:linux": "pnpm incarnate --linux",
     "incarnate:win": "pnpm incarnate --win",
     "incarnate:mac": "pnpm incarnate --mac",
-    "incarnate:all": "pnpm incarnate -wlm"
+    "incarnate:all": "pnpm incarnate -wlm",
+    "release": "node release.mjs"
   },
   "dependencies": {
     "ajv": "^8.12.0",
