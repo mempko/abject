@@ -76,6 +76,7 @@ export class FrontendClient {
     this.detectMobileMode();
     this.setupInputListeners();
     this.setupMobileKeyboard();
+    this.setupViewportShift();
   }
 
   private detectMobileMode(): void {
@@ -152,6 +153,28 @@ export class FrontendClient {
         this.mobileKeyboardProxy.style.left = '-9999px';
       }
     });
+  }
+
+  /**
+   * Listen for visual viewport changes (keyboard show/hide) and shift
+   * the canvas up so content stays visible above the keyboard.
+   */
+  private setupViewportShift(): void {
+    if (!window.visualViewport) return;
+    const vv = window.visualViewport;
+    const update = () => {
+      // When the keyboard opens, visualViewport.height shrinks.
+      // Shift the canvas up by the difference.
+      const keyboardHeight = window.innerHeight - vv.height;
+      if (keyboardHeight > 50) {
+        // Keyboard is open -- shift canvas up
+        this.canvas.style.transform = `translateY(-${keyboardHeight}px)`;
+      } else {
+        this.canvas.style.transform = '';
+      }
+    };
+    vv.addEventListener('resize', update);
+    vv.addEventListener('scroll', update);
   }
 
   /**
@@ -888,6 +911,10 @@ export class FrontendClient {
 
   private handleKeyEvent(e: KeyboardEvent, type: 'keydown' | 'keyup'): void {
     if (!this.focusedSurface) return;
+
+    // On mobile, the hidden proxy input handles keyboard events -- skip
+    // the document-level handler to avoid sending duplicate characters.
+    if (this.mobileKeyboardProxy && e.target === this.mobileKeyboardProxy) return;
 
     // Let clipboard shortcuts through so browser fires paste/copy/cut events
     if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'c' || e.key === 'x')) {
