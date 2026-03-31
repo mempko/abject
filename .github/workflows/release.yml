@@ -40,6 +40,8 @@ jobs:
         run: pnpm install
 
       - name: Build desktop app
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: ${{ matrix.cmd }}
 
       - name: Upload artifacts
