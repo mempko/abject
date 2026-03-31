@@ -65,6 +65,13 @@ who can reach, who can speak.
 
 ## Summon the System
 
+### Prerequisites
+
+- **Node.js 20+** (recommended). Node 18 works but requires the `--experimental-global-webcrypto` flag. Download from [nodejs.org](https://nodejs.org) or use [nvm](https://github.com/nvm-sh/nvm).
+- **pnpm** - install via `npm install -g pnpm` or see [pnpm.io/installation](https://pnpm.io/installation) for other methods (Homebrew, Corepack, standalone script, etc.).
+
+### Setup
+
 ```bash
 # Clone the repository
 git clone https://github.com/mempko/abjects
