@@ -42,9 +42,13 @@ pkg.version = version;
 writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
 console.log(`Version: ${oldVersion} → ${version}`);
 
-// Commit, tag, push
-run('git add package.json');
-run(`git commit -m "Release v${version}"`);
+// Commit only if version actually changed
+if (oldVersion !== version) {
+  run('git add package.json');
+  run(`git commit -m "Release v${version}"`);
+}
+
+// Tag and push
 run(`git tag -a "v${version}" -m "v${version}"`);
 run('git push');
 run('git push --tags');
