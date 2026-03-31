@@ -670,27 +670,27 @@ export class WorkspaceBrowser extends Abject {
     // Access mode
     specs.push({ type: 'label', windowId, rect: r0,
       text: `Access: ${ws.accessMode}`,
-      style: { color: this.theme.textMeta, fontSize: 11 } });
+      style: { color: this.theme.textMeta, fontSize: 11, wordWrap: true } });
 
     // Owner
     const ownerLabel = ws.ownerName || ws.ownerPeerId.slice(0, 16) + '...';
     specs.push({ type: 'label', windowId, rect: r0,
       text: `Owner: ${ownerLabel}`,
-      style: { color: this.theme.textMeta, fontSize: 11 } });
+      style: { color: this.theme.textMeta, fontSize: 11, wordWrap: true } });
 
     // Tags
     const tags = ws.tags ?? [];
     if (tags.length > 0) {
       specs.push({ type: 'label', windowId, rect: r0,
         text: `Tags: ${tags.join(', ')}`,
-        style: { color: this.theme.textMeta, fontSize: 11 } });
+        style: { color: this.theme.textMeta, fontSize: 11, wordWrap: true } });
     }
 
     // Hops
     if (ws.hops > 0) {
       specs.push({ type: 'label', windowId, rect: r0,
         text: `Hops: ${ws.hops}`,
-        style: { color: this.theme.textMeta, fontSize: 11 } });
+        style: { color: this.theme.textMeta, fontSize: 11, wordWrap: true } });
     }
 
     // Browse button
