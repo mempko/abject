@@ -253,7 +253,7 @@ export class WorkspaceSwitcher extends Abject {
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: '',
+        title: '\u25C8 Spaces',
         rect: { x: 8, y: this.cachedYOffset, width: barWidth, height: barHeight },
         zIndex: 1000,
         chromeless: true,

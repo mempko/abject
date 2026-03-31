@@ -41,6 +41,7 @@ export interface SurfaceState {
   inputMonitor: boolean;
   lastDrawCommands: Array<{ type: string; surfaceId: string; params: unknown }>;
   workspaceId?: string;
+  title?: string;
 }
 
 export interface InputEvent {
@@ -380,6 +381,14 @@ export class BackendUI extends Abject {
         font?: string;
       };
       return this.handleMeasureText(surfaceId, text, font ?? WIDGET_FONT);
+    });
+
+    this.on('setSurfaceTitle', async (msg: AbjectMessage) => {
+      const { surfaceId, title } = msg.payload as { surfaceId: string; title: string };
+      const state = this.surfaces.get(surfaceId);
+      if (state) state.title = title;
+      this.sendToFrontend({ type: 'setSurfaceTitle', surfaceId, title });
+      return true;
     });
 
     this.on('setSurfaceVisible', async (msg: AbjectMessage) => {
@@ -1309,6 +1318,7 @@ IMPORTANT:
         rect: { ...state.rect },
         zIndex: state.zIndex,
         inputPassthrough: state.inputPassthrough,
+        title: state.title,
       }, clientId);
     }
 

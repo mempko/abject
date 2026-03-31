@@ -27,6 +27,13 @@ export interface CreateSurfaceMsg extends WsEnvelope {
   rect: { x: number; y: number; width: number; height: number };
   zIndex: number;
   inputPassthrough?: boolean;
+  title?: string;
+}
+
+export interface SetSurfaceTitleMsg extends WsEnvelope {
+  type: 'setSurfaceTitle';
+  surfaceId: string;
+  title: string;
 }
 
 export interface DestroySurfaceMsg extends WsEnvelope {
@@ -149,6 +156,7 @@ export type BackendToFrontendMsg =
   | MeasureTextRequestMsg
   | DisplayInfoRequestMsg
   | SetSelectedTextMsg
+  | SetSurfaceTitleMsg
   | SetSurfaceVisibleMsg
   | SetSurfaceWorkspaceMsg
   | SetActiveWorkspaceMsg

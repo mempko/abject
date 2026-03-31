@@ -230,7 +230,7 @@ export class Taskbar extends Abject {
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: '',
+        title: '\u25A0 Abjects',
         rect: { x: 8, y: this.yOffset, width: BTN_W + PADDING * 2, height: barHeight },
         zIndex: 999,
         chromeless: true,

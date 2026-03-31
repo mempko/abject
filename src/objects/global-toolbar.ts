@@ -203,7 +203,7 @@ export class GlobalToolbar extends Abject {
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: '',
+        title: '\u2699 System',
         rect: { x: 8, y: yOffset, width: barWidth, height: barHeight },
         zIndex: 1000,
         chromeless: true,

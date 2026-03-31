@@ -42,6 +42,14 @@ export class FrontendClient {
   private pendingMouseMove: FrontendToBackendMsg | null = null;
   private mouseMoveRafId = 0;
   private reconnectAttempt = 0;
+  private mobileMode = false;
+  private mobileTabTouchStartX?: number;  // track start X for tap vs scroll detection
+  // Pinch-zoom state
+  private pinchStartDist?: number;
+  private pinchStartZoom?: number;
+  // Two-finger pan state
+  private panLastMidX?: number;
+  private panLastMidY?: number;
   // Stay at 200ms for many attempts to catch tsx --watch restarts quickly,
   // then back off to 1s. ECONNREFUSED returns instantly on localhost so
   // fast retries don't waste resources.
@@ -64,7 +72,26 @@ export class FrontendClient {
     this.canvas = canvas;
     this.abyssBg = abyssBg;
     this.compositor = new Compositor(canvas);
+    this.detectMobileMode();
     this.setupInputListeners();
+  }
+
+  private detectMobileMode(): void {
+    const coarse = window.matchMedia('(pointer: coarse)').matches;
+    const narrow = window.innerWidth < 768;
+    const touch = 'ontouchstart' in window;
+    this.mobileMode = (coarse || touch) && narrow;
+    this.compositor.setMobileMode(this.mobileMode);
+
+    // Re-detect on resize (tablet rotation)
+    window.addEventListener('resize', () => {
+      const wasMobile = this.mobileMode;
+      const nowNarrow = window.innerWidth < 768;
+      this.mobileMode = (coarse || touch) && nowNarrow;
+      if (this.mobileMode !== wasMobile) {
+        this.compositor.setMobileMode(this.mobileMode);
+      }
+    });
   }
 
   /**
@@ -345,6 +372,10 @@ export class FrontendClient {
         this.currentSelectedText = (msg as SetSelectedTextMsg).text;
         break;
 
+      case 'setSurfaceTitle':
+        this.compositor.setSurfaceTitle(msg.surfaceId, msg.title);
+        break;
+
       case 'setSurfaceVisible':
         this.compositor.setVisible(msg.surfaceId, msg.visible);
         break;
@@ -379,7 +410,9 @@ export class FrontendClient {
       msg.rect,
       msg.zIndex,
       msg.surfaceId,
-      msg.inputPassthrough ?? false
+      msg.inputPassthrough ?? false,
+      false, // inputMonitor
+      msg.title,
     );
 
     this.sendToBackend({
@@ -395,6 +428,9 @@ export class FrontendClient {
   }
 
   private handleStartWindowDrag(msg: StartWindowDragMsg): void {
+    // No window drag/resize on mobile
+    if (this.mobileMode) return;
+
     if (msg.dragType === 'move') {
       // Enter client-side local drag mode for zero-latency window moves
       const surface = this.compositor.getSurface(msg.surfaceId);
@@ -481,6 +517,160 @@ export class FrontendClient {
     document.addEventListener('paste', (e) => this.handlePasteEvent(e));
     document.addEventListener('copy', (e) => this.handleCopyEvent(e));
     document.addEventListener('cut', (e) => this.handleCutEvent(e));
+
+    // Touch events for mobile
+    this.canvas.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      this.canvas.focus();
+      const canvasRect = this.canvas.getBoundingClientRect();
+
+      // Two-finger touch: start pinch-zoom
+      if (e.touches.length === 2) {
+        const t0 = e.touches[0], t1 = e.touches[1];
+        this.pinchStartDist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+        this.pinchStartZoom = 1; // relative
+        this.panLastMidX = (t0.clientX + t1.clientX) / 2 - canvasRect.left;
+        this.panLastMidY = (t0.clientY + t1.clientY) / 2 - canvasRect.top;
+        return;
+      }
+
+      const touch = e.touches[0];
+      if (!touch) return;
+      const cy = touch.clientY - canvasRect.top;
+      const cx = touch.clientX - canvasRect.left;
+      // Start tab bar scroll gesture if touching the tab bar
+      if (this.compositor.isInMobileTabBar(cy)) {
+        this.mobileTabTouchStartX = cx;
+        this.compositor.mobileTabDragStart(cx);
+        return;
+      }
+      this.handleTouchEvent(touch, 'mousedown');
+    }, { passive: false });
+
+    this.canvas.addEventListener('touchmove', (e) => {
+      e.preventDefault();
+      const canvasRect = this.canvas.getBoundingClientRect();
+
+      // Two-finger move: pinch-zoom + pan
+      if (e.touches.length === 2 && this.pinchStartDist) {
+        const t0 = e.touches[0], t1 = e.touches[1];
+        const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+        const zoomDelta = dist / this.pinchStartDist;
+        const midX = (t0.clientX + t1.clientX) / 2 - canvasRect.left;
+        const midY = (t0.clientY + t1.clientY) / 2 - canvasRect.top;
+
+        this.compositor.mobilePinchZoom(zoomDelta, midX, midY);
+        this.pinchStartDist = dist; // reset for incremental zoom
+
+        // Pan with two-finger drag
+        if (this.panLastMidX !== undefined && this.panLastMidY !== undefined) {
+          this.compositor.mobilePan(midX - this.panLastMidX, midY - this.panLastMidY);
+        }
+        this.panLastMidX = midX;
+        this.panLastMidY = midY;
+        return;
+      }
+
+      const touch = e.touches[0];
+      if (!touch) return;
+      const cx = touch.clientX - canvasRect.left;
+      const cy = touch.clientY - canvasRect.top;
+      // Continue tab bar scroll gesture
+      if (this.compositor.isInMobileTabBar(cy) || this.compositor.isMobileTabDragging) {
+        this.compositor.mobileTabDragMove(cx);
+        return;
+      }
+      this.handleTouchEvent(touch, 'mousemove');
+    }, { passive: false });
+
+    this.canvas.addEventListener('touchend', (e) => {
+      e.preventDefault();
+
+      // End pinch if fewer than 2 fingers remain
+      if (this.pinchStartDist !== undefined && e.touches.length < 2) {
+        this.pinchStartDist = undefined;
+        this.pinchStartZoom = undefined;
+        this.panLastMidX = undefined;
+        this.panLastMidY = undefined;
+        // If one finger remains, don't generate mouseup
+        if (e.touches.length === 1) return;
+      }
+
+      const touch = e.changedTouches[0];
+      if (!touch) return;
+      const canvasRect = this.canvas.getBoundingClientRect();
+      const cx = touch.clientX - canvasRect.left;
+      const cy = touch.clientY - canvasRect.top;
+      // End tab bar scroll gesture -- if barely moved, treat as tap
+      if (this.compositor.isMobileTabDragging) {
+        const moved = Math.abs(cx - (this.mobileTabTouchStartX ?? cx));
+        this.mobileTabTouchStartX = undefined;
+        this.compositor.mobileTabDragEnd();
+        if (moved < 10) {
+          this.compositor.handleMobileTabTap(cx, cy);
+        }
+        return;
+      }
+      this.handleTouchEvent(touch, 'mouseup');
+    }, { passive: false });
+  }
+
+  private handleTouchEvent(
+    touch: Touch,
+    type: 'mousedown' | 'mouseup' | 'mousemove'
+  ): void {
+    const canvasRect = this.canvas.getBoundingClientRect();
+    const canvasX = touch.clientX - canvasRect.left;
+    const canvasY = touch.clientY - canvasRect.top;
+
+    this.lastCanvasX = canvasX;
+    this.lastCanvasY = canvasY;
+
+    // In mobile mode, check tab bar taps first
+    if (this.mobileMode && type === 'mousedown') {
+      if (this.compositor.handleMobileTabTap(canvasX, canvasY)) {
+        return; // tab bar consumed the tap
+      }
+    }
+
+    // Hit test
+    const hitSurface = this.compositor.surfaceAt(canvasX, canvasY);
+    const grabbed = this.grabbedSurface
+      ? this.compositor.getSurface(this.grabbedSurface)
+      : undefined;
+    const surface = grabbed ?? hitSurface;
+
+    if (!surface) return;
+
+    // In mobile mode, transform coordinates through the mobile scale
+    let localX: number;
+    let localY: number;
+    if (this.mobileMode) {
+      const coords = this.compositor.mobileToSurfaceCoords(canvasX, canvasY);
+      localX = coords.x;
+      localY = coords.y;
+    } else {
+      localX = canvasX - surface.rect.x;
+      localY = canvasY - surface.rect.y;
+    }
+
+    this.sendToBackend({
+      type: 'input',
+      inputType: type,
+      surfaceId: surface.id,
+      x: localX,
+      y: localY,
+      button: 0,
+      modifiers: { shift: false, ctrl: false, alt: false, meta: false },
+    } as FrontendToBackendMsg);
+
+    if (type === 'mousedown') {
+      this.grabbedSurface = surface.id;
+      this.focusedSurface = surface.id;
+    }
+    if (type === 'mouseup') {
+      this.grabbedSurface = undefined;
+    }
   }
 
   private handleMouseEvent(

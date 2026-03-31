@@ -25,6 +25,7 @@ export interface Surface {
   dirty: boolean;
   drawn: boolean;        // false until first draw batch; prevents rendering empty surfaces
   workspaceId?: string;  // undefined = always visible (global objects)
+  title?: string;        // window title for mobile tab bar
 }
 
 export interface DrawCommand {
@@ -203,6 +204,22 @@ export class Compositor {
   private static IMAGE_CACHE_MAX = 100;
   private liveDataImages: Map<string, { img: HTMLImageElement; width: number; height: number }> = new Map();
 
+  // ── Mobile mode state ──
+  private mobileMode = false;
+  private mobileFocusedSurfaceId?: string;
+  private static readonly MOBILE_TAB_BAR_HEIGHT = 44;
+  private static readonly MOBILE_TAB_WIDTH = 100;  // fixed width per tab
+  private mobileTabScrollX = 0;  // horizontal scroll offset for tab bar
+  private mobileTabDragStartX?: number;  // for swipe-to-scroll
+  private mobileTabDragStartScroll?: number;
+  /** Cached mobile transform for coordinate mapping */
+  private mobileTransform = { scale: 1, offsetX: 0, offsetY: 0 };
+  // Pinch-zoom state: userZoom multiplies the fit-to-screen base scale
+  private mobileUserZoom = 1;
+  private static readonly MOBILE_MAX_ZOOM = 3;  // 3x beyond fit-to-screen
+  private mobilePanX = 0;  // pan offset when zoomed in
+  private mobilePanY = 0;
+
   constructor(canvas: HTMLCanvasElement) {
     require(canvas !== null, 'canvas is required');
 
@@ -242,7 +259,8 @@ export class Compositor {
     zIndex = 0,
     surfaceId?: string,
     inputPassthrough = false,
-    inputMonitor = false
+    inputMonitor = false,
+    title?: string,
   ): string {
     require(objectId !== '', 'objectId is required');
     require(rect.width > 0 && rect.height > 0, 'Surface must have positive dimensions');
@@ -265,6 +283,7 @@ export class Compositor {
       ctx: ctx!,
       dirty: true,
       drawn: false,
+      title,
     };
 
     this.surfaces.set(id, surface);
@@ -404,6 +423,17 @@ export class Compositor {
     const surface = this.surfaces.get(surfaceId);
     if (surface) {
       surface.visible = visible;
+      this.needsRender = true;
+    }
+  }
+
+  /**
+   * Set a surface's title (used for mobile tab bar labels).
+   */
+  setSurfaceTitle(surfaceId: string, title: string): void {
+    const surface = this.surfaces.get(surfaceId);
+    if (surface) {
+      surface.title = title;
       this.needsRender = true;
     }
   }
@@ -886,7 +916,14 @@ export class Compositor {
       this.canvas.height / (window.devicePixelRatio || 1)
     );
 
-    // Draw surfaces in z-order
+    if (this.mobileMode) {
+      this.renderMobile();
+    } else {
+      this.renderDesktop();
+    }
+  }
+
+  private renderDesktop(): void {
     for (const surface of this.sortedSurfaces) {
       if (!surface.visible || !surface.drawn) continue;
       if (this.isWorkspaceFiltered(surface)) continue;
@@ -901,10 +938,122 @@ export class Compositor {
     }
   }
 
+  private renderMobile(): void {
+    const tabH = Compositor.MOBILE_TAB_BAR_HEIGHT;
+    const availW = this.width;
+    const availH = this.height - tabH;
+
+    // Find focused surface (or fallback to top visible)
+    const surface = this.mobileFocusedSurfaceId
+      ? this.surfaces.get(this.mobileFocusedSurfaceId)
+      : this.getTopVisibleSurface();
+
+    if (surface && surface.drawn && surface.visible) {
+      // Base scale: fit window into available area
+      const baseScale = Math.min(availW / surface.rect.width, availH / surface.rect.height);
+      // Final scale: base * user pinch-zoom (min zoom = fit-to-screen)
+      const scale = baseScale * this.mobileUserZoom;
+
+      // When zoomed in, allow panning. Clamp pan so content stays visible.
+      const scaledW = surface.rect.width * scale;
+      const scaledH = surface.rect.height * scale;
+      const maxPanX = Math.max(0, (scaledW - availW) / 2);
+      const maxPanY = Math.max(0, (scaledH - availH) / 2);
+      this.mobilePanX = Math.max(-maxPanX, Math.min(maxPanX, this.mobilePanX));
+      this.mobilePanY = Math.max(-maxPanY, Math.min(maxPanY, this.mobilePanY));
+
+      const offsetX = (availW - scaledW) / 2 + this.mobilePanX;
+      const offsetY = (availH - scaledH) / 2 + this.mobilePanY;
+
+      // Cache transform for coordinate mapping
+      this.mobileTransform = { scale, offsetX, offsetY };
+
+      // Clip to content area (above tab bar)
+      this.ctx.save();
+      this.ctx.beginPath();
+      this.ctx.rect(0, 0, availW, availH);
+      this.ctx.clip();
+      this.ctx.translate(offsetX, offsetY);
+      this.ctx.scale(scale, scale);
+      this.ctx.drawImage(surface.canvas, 0, 0, surface.rect.width, surface.rect.height);
+      this.ctx.restore();
+    }
+
+    this.renderMobileTabBar();
+  }
+
+  private renderMobileTabBar(): void {
+    const tabH = Compositor.MOBILE_TAB_BAR_HEIGHT;
+    const tabW = Compositor.MOBILE_TAB_WIDTH;
+    const w = this.width;
+    const barY = this.height - tabH;
+
+    // Background
+    this.ctx.fillStyle = '#0d0d14';
+    this.ctx.fillRect(0, barY, w, tabH);
+
+    // Top border
+    this.ctx.strokeStyle = '#2a2a3a';
+    this.ctx.lineWidth = 1;
+    this.ctx.beginPath();
+    this.ctx.moveTo(0, barY);
+    this.ctx.lineTo(w, barY);
+    this.ctx.stroke();
+
+    const tabs = this.getMobileVisibleSurfaces();
+    if (tabs.length === 0) return;
+
+    // Clamp scroll offset
+    const totalWidth = tabs.length * tabW;
+    const maxScroll = Math.max(0, totalWidth - w);
+    this.mobileTabScrollX = Math.max(0, Math.min(this.mobileTabScrollX, maxScroll));
+
+    // Clip to tab bar area and draw scrolled tabs
+    this.ctx.save();
+    this.ctx.beginPath();
+    this.ctx.rect(0, barY, w, tabH);
+    this.ctx.clip();
+
+    this.ctx.font = '12px "Inter", system-ui, sans-serif';
+    this.ctx.textAlign = 'center';
+    this.ctx.textBaseline = 'middle';
+
+    for (let i = 0; i < tabs.length; i++) {
+      const tab = tabs[i];
+      const tx = i * tabW - this.mobileTabScrollX;
+
+      // Skip tabs fully outside viewport
+      if (tx + tabW < 0 || tx > w) continue;
+
+      const isActive = tab.id === this.mobileFocusedSurfaceId ||
+        (!this.mobileFocusedSurfaceId && tab === this.getTopVisibleSurface());
+
+      if (isActive) {
+        this.ctx.fillStyle = '#1a1a2e';
+        this.ctx.fillRect(tx + 2, barY + 2, tabW - 4, tabH - 4);
+        this.ctx.fillStyle = '#8b8bff';
+      } else {
+        this.ctx.fillStyle = '#666680';
+      }
+
+      const label = (tab.title || tab.id.slice(0, 10)).slice(0, 12);
+      this.ctx.fillText(label, tx + tabW / 2, barY + tabH / 2);
+    }
+
+    this.ctx.restore();
+  }
+
   /**
    * Find surface at a point.
    */
   surfaceAt(x: number, y: number): Surface | undefined {
+    if (this.mobileMode) {
+      return this.mobileHitTest(x, y);
+    }
+    return this.desktopHitTest(x, y);
+  }
+
+  private desktopHitTest(x: number, y: number): Surface | undefined {
     // Iterate in reverse z-order (top to bottom)
     for (let i = this.sortedSurfaces.length - 1; i >= 0; i--) {
       const surface = this.sortedSurfaces[i];
@@ -937,6 +1086,196 @@ export class Compositor {
       }
     }
     return undefined;
+  }
+
+  private mobileHitTest(x: number, y: number): Surface | undefined {
+    const tabH = Compositor.MOBILE_TAB_BAR_HEIGHT;
+
+    // Tab bar area -- handled separately by handleMobileTabTap
+    if (y >= this.height - tabH) return undefined;
+
+    // Reverse-transform through mobile scale/offset to get surface-local coords
+    const surface = this.mobileFocusedSurfaceId
+      ? this.surfaces.get(this.mobileFocusedSurfaceId)
+      : this.getTopVisibleSurface();
+
+    if (!surface || !surface.drawn || !surface.visible) return undefined;
+
+    const { scale, offsetX, offsetY } = this.mobileTransform;
+    const sx = (x - offsetX) / scale;
+    const sy = (y - offsetY) / scale;
+
+    if (sx >= 0 && sx < surface.rect.width && sy >= 0 && sy < surface.rect.height) {
+      return surface;
+    }
+    return undefined;
+  }
+
+  /**
+   * Transform canvas-space coordinates to surface-local coordinates in mobile mode.
+   * Returns [localX, localY] relative to the surface's rect origin.
+   */
+  mobileToSurfaceCoords(canvasX: number, canvasY: number): { x: number; y: number } {
+    const { scale, offsetX, offsetY } = this.mobileTransform;
+    return {
+      x: (canvasX - offsetX) / scale,
+      y: (canvasY - offsetY) / scale,
+    };
+  }
+
+  /**
+   * Check if a point is in the mobile tab bar area.
+   */
+  isInMobileTabBar(y: number): boolean {
+    return this.mobileMode && y >= this.height - Compositor.MOBILE_TAB_BAR_HEIGHT;
+  }
+
+  /**
+   * Handle a tap on the mobile tab bar. Returns true if a tab was tapped.
+   */
+  handleMobileTabTap(x: number, y: number): boolean {
+    const tabH = Compositor.MOBILE_TAB_BAR_HEIGHT;
+    if (y < this.height - tabH) return false;
+
+    const tabs = this.getMobileVisibleSurfaces();
+    if (tabs.length === 0) return false;
+
+    const tabW = Compositor.MOBILE_TAB_WIDTH;
+    const tabIndex = Math.floor((x + this.mobileTabScrollX) / tabW);
+    if (tabIndex >= 0 && tabIndex < tabs.length) {
+      this.mobileFocusedSurfaceId = tabs[tabIndex].id;
+      this.resetMobileZoom();
+      this.needsRender = true;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Begin a swipe-to-scroll gesture on the tab bar.
+   */
+  mobileTabDragStart(x: number): void {
+    this.mobileTabDragStartX = x;
+    this.mobileTabDragStartScroll = this.mobileTabScrollX;
+  }
+
+  /**
+   * Continue a swipe-to-scroll gesture on the tab bar.
+   */
+  mobileTabDragMove(x: number): void {
+    if (this.mobileTabDragStartX === undefined || this.mobileTabDragStartScroll === undefined) return;
+    const dx = this.mobileTabDragStartX - x;
+    this.mobileTabScrollX = this.mobileTabDragStartScroll + dx;
+
+    const tabs = this.getMobileVisibleSurfaces();
+    const maxScroll = Math.max(0, tabs.length * Compositor.MOBILE_TAB_WIDTH - this.width);
+    this.mobileTabScrollX = Math.max(0, Math.min(this.mobileTabScrollX, maxScroll));
+    this.needsRender = true;
+  }
+
+  /**
+   * End a swipe-to-scroll gesture on the tab bar.
+   */
+  mobileTabDragEnd(): void {
+    this.mobileTabDragStartX = undefined;
+    this.mobileTabDragStartScroll = undefined;
+  }
+
+  /**
+   * Whether a tab bar drag gesture is in progress.
+   */
+  get isMobileTabDragging(): boolean {
+    return this.mobileTabDragStartX !== undefined;
+  }
+
+  // ── Mobile mode API ─────────────────────────────────────────────────
+
+  /**
+   * Apply a pinch-zoom delta. zoomDelta > 1 zooms in, < 1 zooms out.
+   * Zoom is clamped: min = 1 (fit-to-screen), max = MOBILE_MAX_ZOOM.
+   * Zoom is centered on the pinch midpoint.
+   */
+  mobilePinchZoom(zoomDelta: number, centerX: number, centerY: number): void {
+    const oldZoom = this.mobileUserZoom;
+    const newZoom = Math.max(1, Math.min(Compositor.MOBILE_MAX_ZOOM, oldZoom * zoomDelta));
+    if (newZoom === oldZoom) return;
+
+    // Adjust pan so the pinch center stays fixed on screen
+    const { scale: oldScale, offsetX: oldOX, offsetY: oldOY } = this.mobileTransform;
+    // Point in surface space under the pinch center
+    const sx = (centerX - oldOX) / oldScale;
+    const sy = (centerY - oldOY) / oldScale;
+
+    this.mobileUserZoom = newZoom;
+
+    // Recompute base scale to get new offset
+    const surface = this.mobileFocusedSurfaceId
+      ? this.surfaces.get(this.mobileFocusedSurfaceId)
+      : this.getTopVisibleSurface();
+    if (surface) {
+      const tabH = Compositor.MOBILE_TAB_BAR_HEIGHT;
+      const availW = this.width;
+      const availH = this.height - tabH;
+      const baseScale = Math.min(availW / surface.rect.width, availH / surface.rect.height);
+      const newScale = baseScale * newZoom;
+      const scaledW = surface.rect.width * newScale;
+      const scaledH = surface.rect.height * newScale;
+
+      // Where the pinch center should map to in the new scale
+      const newCenterX = sx * newScale;
+      const newCenterY = sy * newScale;
+      // Desired offset so the surface point stays under the finger
+      this.mobilePanX = centerX - (availW / 2) - (newCenterX - scaledW / 2);
+      this.mobilePanY = centerY - (availH / 2) - (newCenterY - scaledH / 2);
+    }
+
+    this.needsRender = true;
+  }
+
+  /**
+   * Pan the zoomed view by a delta in canvas pixels.
+   */
+  mobilePan(dx: number, dy: number): void {
+    if (this.mobileUserZoom <= 1) return; // no panning at fit-to-screen
+    this.mobilePanX += dx;
+    this.mobilePanY += dy;
+    this.needsRender = true;
+  }
+
+  /**
+   * Reset zoom and pan (called when switching windows).
+   */
+  private resetMobileZoom(): void {
+    this.mobileUserZoom = 1;
+    this.mobilePanX = 0;
+    this.mobilePanY = 0;
+  }
+
+  setMobileMode(enabled: boolean): void {
+    this.mobileMode = enabled;
+    this.resetMobileZoom();
+    this.needsRender = true;
+  }
+
+  getMobileMode(): boolean {
+    return this.mobileMode;
+  }
+
+  setMobileFocusSurface(surfaceId: string): void {
+    this.mobileFocusedSurfaceId = surfaceId;
+    this.resetMobileZoom();
+    this.needsRender = true;
+  }
+
+  private getMobileVisibleSurfaces(): Surface[] {
+    return this.sortedSurfaces.filter(s =>
+      s.visible && s.drawn && !s.inputPassthrough && !this.isWorkspaceFiltered(s)
+    );
+  }
+
+  private getTopVisibleSurface(): Surface | undefined {
+    const visible = this.getMobileVisibleSurfaces();
+    return visible.length > 0 ? visible[visible.length - 1] : undefined;
   }
 
   /**

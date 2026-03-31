@@ -206,6 +206,11 @@ export class WindowAbject extends Abject {
     this.on('setTitle', async (msg: AbjectMessage) => {
       const { title } = msg.payload as { title: string };
       this.title = title;
+      if (this.surfaceId) {
+        this.send(request(this.id, this.uiServerId, 'setSurfaceTitle', {
+          surfaceId: this.surfaceId, title,
+        }));
+      }
       this.scheduleFrame();
       return true;
     });
@@ -383,6 +388,11 @@ method calls on 'abjects:widgets' interface:
         zIndex: this.zIndex,
       })
     );
+    // Forward title to frontend for mobile tab bar
+    this.send(request(this.id, this.uiServerId, 'setSurfaceTitle', {
+      surfaceId: this.surfaceId,
+      title: this.title,
+    }));
     await this.request<boolean>(
       request(this.id, this.uiServerId, 'focus', {
         surfaceId: this.surfaceId,
