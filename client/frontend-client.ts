@@ -44,6 +44,7 @@ export class FrontendClient {
   private reconnectAttempt = 0;
   private mobileMode = false;
   private mobileTabTouchStartX?: number;  // track start X for tap vs scroll detection
+  private mobileKeyboardProxy?: HTMLInputElement;  // hidden input for virtual keyboard
   // Pinch-zoom state
   private pinchStartDist?: number;
   private pinchStartZoom?: number;
@@ -74,6 +75,7 @@ export class FrontendClient {
     this.compositor = new Compositor(canvas);
     this.detectMobileMode();
     this.setupInputListeners();
+    this.setupMobileKeyboard();
   }
 
   private detectMobileMode(): void {
@@ -90,6 +92,64 @@ export class FrontendClient {
       this.mobileMode = (coarse || touch) && nowNarrow;
       if (this.mobileMode !== wasMobile) {
         this.compositor.setMobileMode(this.mobileMode);
+      }
+    });
+  }
+
+  private setupMobileKeyboard(): void {
+    const proxy = document.getElementById('mobile-keyboard-proxy') as HTMLInputElement | null;
+    if (!proxy) return;
+    this.mobileKeyboardProxy = proxy;
+
+    // Capture typed text via input events (fires for each character on mobile keyboards)
+    proxy.addEventListener('input', () => {
+      if (!this.focusedSurface || !proxy.value) return;
+      // Send each character as a keydown event
+      for (const ch of proxy.value) {
+        this.sendToBackend({
+          type: 'input',
+          inputType: 'keydown',
+          surfaceId: this.focusedSurface,
+          key: ch,
+          code: '',
+          modifiers: { shift: false, ctrl: false, alt: false, meta: false },
+        } as FrontendToBackendMsg);
+      }
+      proxy.value = '';
+    });
+
+    // Capture special keys (Backspace, Enter, etc.) that don't fire 'input'
+    proxy.addEventListener('keydown', (e) => {
+      if (!this.focusedSurface) return;
+      // Let printable characters go through the 'input' event instead
+      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      this.sendToBackend({
+        type: 'input',
+        inputType: 'keydown',
+        surfaceId: this.focusedSurface,
+        key: e.key,
+        code: e.code,
+        modifiers: {
+          shift: e.shiftKey,
+          ctrl: e.ctrlKey,
+          alt: e.altKey,
+          meta: e.metaKey,
+        },
+      } as FrontendToBackendMsg);
+    });
+  }
+
+  /** Focus the hidden input proxy to trigger the mobile virtual keyboard. */
+  private focusMobileKeyboard(): void {
+    if (!this.mobileMode || !this.mobileKeyboardProxy) return;
+    // Move proxy on-screen briefly so iOS respects the focus
+    this.mobileKeyboardProxy.style.left = '0';
+    this.mobileKeyboardProxy.focus();
+    // Move it back off-screen after focus is established
+    requestAnimationFrame(() => {
+      if (this.mobileKeyboardProxy) {
+        this.mobileKeyboardProxy.style.left = '-9999px';
       }
     });
   }
@@ -400,6 +460,14 @@ export class FrontendClient {
 
       case 'startWindowDrag':
         this.handleStartWindowDrag(msg as StartWindowDragMsg);
+        break;
+
+      case 'showMobileKeyboard':
+        if (msg.show) {
+          this.focusMobileKeyboard();
+        } else if (this.mobileKeyboardProxy) {
+          this.mobileKeyboardProxy.blur();
+        }
         break;
     }
   }

@@ -181,6 +181,10 @@ export abstract class WidgetAbject extends Abject {
     this.on('setFocused', async (msg: AbjectMessage) => {
       const { focused } = msg.payload as { focused: boolean };
       this.focused = focused;
+      // Tell mobile clients to show/hide the virtual keyboard
+      if (this.wantsMobileKeyboard()) {
+        this.send(request(this.id, this.uiServerId, 'showMobileKeyboard', { show: focused }));
+      }
       await this.requestRedraw();
       return true;
     });
@@ -215,6 +219,14 @@ export abstract class WidgetAbject extends Abject {
    * Used by text widgets to allow selection/copy while blocking edits.
    */
   protected acceptsInputWhenDisabled(): boolean {
+    return false;
+  }
+
+  /**
+   * Override to return true if this widget needs the mobile virtual keyboard
+   * when focused (e.g. text input, text area).
+   */
+  protected wantsMobileKeyboard(): boolean {
     return false;
   }
 

@@ -61,6 +61,10 @@ export class TextInputWidget extends WidgetAbject {
     return true;
   }
 
+  protected override wantsMobileKeyboard(): boolean {
+    return true;
+  }
+
   // ── Visual position mapping ────────────────────────────────────────
 
   private cursorToVisualPos(wrappedLines: string[]): { line: number; col: number } {

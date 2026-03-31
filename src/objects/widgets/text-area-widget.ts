@@ -43,6 +43,10 @@ export class TextAreaWidget extends WidgetAbject {
     return true;
   }
 
+  protected override wantsMobileKeyboard(): boolean {
+    return true;
+  }
+
   // ── Selection helpers ──────────────────────────────────────────────
 
   private getSelection(): { startLine: number; startCol: number; endLine: number; endCol: number } | null {

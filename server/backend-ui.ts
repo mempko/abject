@@ -391,6 +391,12 @@ export class BackendUI extends Abject {
       return true;
     });
 
+    this.on('showMobileKeyboard', async (msg: AbjectMessage) => {
+      const { show } = msg.payload as { show: boolean };
+      this.sendToFrontend({ type: 'showMobileKeyboard', show });
+      return true;
+    });
+
     this.on('setSurfaceVisible', async (msg: AbjectMessage) => {
       const { surfaceId, visible } = msg.payload as { surfaceId: string; visible: boolean };
       this.sendToFrontend({ type: 'setSurfaceVisible', surfaceId, visible });

@@ -217,6 +217,9 @@
     </div>
     <canvas id="abyss-bg"></canvas>
     <div id="app"></div>
+    <!-- Hidden input to trigger mobile virtual keyboard -->
+    <input id="mobile-keyboard-proxy" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+      style="position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1;" />
     <script type="module" src="./index.ts"></script>
   </body>
 </html>

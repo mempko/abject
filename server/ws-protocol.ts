@@ -126,6 +126,11 @@ export interface StartWindowDragMsg extends WsEnvelope {
   dragType: 'move' | 'resize';
 }
 
+export interface ShowMobileKeyboardMsg extends WsEnvelope {
+  type: 'showMobileKeyboard';
+  show: boolean;
+}
+
 // =============================================================================
 // Auth messages (server -> client)
 // =============================================================================
@@ -163,6 +168,7 @@ export type BackendToFrontendMsg =
   | ClipboardWriteMsg
   | OpenUrlMsg
   | StartWindowDragMsg
+  | ShowMobileKeyboardMsg
   | AuthRequiredMsg
   | AuthNotRequiredMsg
   | AuthResultMsg;
