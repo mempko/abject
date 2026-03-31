@@ -16,6 +16,12 @@
  *   - Peer transport send/receive uses custom messages (send-to-peer, remote-message)
  */
 
+// Polyfill Web Crypto API for Node.js worker threads (not global before Node 19)
+import { webcrypto } from 'node:crypto';
+if (!globalThis.crypto) {
+  Object.assign(globalThis, { crypto: webcrypto });
+}
+
 // Polyfill WebRTC APIs for Node.js before any imports that use them
 import {
   RTCPeerConnection,
