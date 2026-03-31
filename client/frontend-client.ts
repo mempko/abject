@@ -102,28 +102,75 @@ export class FrontendClient {
     if (!proxy) return;
     this.mobileKeyboardProxy = proxy;
 
-    // Capture typed text via input events (fires for each character on mobile keyboards)
-    proxy.addEventListener('input', () => {
-      if (!this.focusedSurface || !proxy.value) return;
-      // Send each character as a keydown event
-      for (const ch of proxy.value) {
+    // Track composition state to avoid double-sending during autocomplete/predictive text
+    let composing = false;
+    proxy.addEventListener('compositionstart', () => { composing = true; });
+    proxy.addEventListener('compositionend', () => {
+      composing = false;
+      // Flush whatever the composition produced
+      this.flushProxyInput(proxy);
+    });
+
+    // Use beforeinput for the most reliable character capture on mobile.
+    // Only handle insertText (typed characters) and insertCompositionText here.
+    proxy.addEventListener('beforeinput', (e: InputEvent) => {
+      if (!this.focusedSurface) return;
+
+      // During composition, let compositionend handle the final text
+      if (composing && e.inputType === 'insertCompositionText') return;
+
+      if (e.inputType === 'insertText' && e.data) {
+        e.preventDefault();
+        for (const ch of e.data) {
+          this.sendToBackend({
+            type: 'input',
+            inputType: 'keydown',
+            surfaceId: this.focusedSurface,
+            key: ch,
+            code: '',
+            modifiers: { shift: false, ctrl: false, alt: false, meta: false },
+          } as FrontendToBackendMsg);
+        }
+        proxy.value = '';
+        return;
+      }
+
+      // deleteContentBackward = Backspace on mobile
+      if (e.inputType === 'deleteContentBackward') {
+        e.preventDefault();
         this.sendToBackend({
           type: 'input',
           inputType: 'keydown',
           surfaceId: this.focusedSurface,
-          key: ch,
-          code: '',
+          key: 'Backspace',
+          code: 'Backspace',
           modifiers: { shift: false, ctrl: false, alt: false, meta: false },
         } as FrontendToBackendMsg);
+        return;
       }
-      proxy.value = '';
+
+      // insertLineBreak = Enter on mobile
+      if (e.inputType === 'insertLineBreak') {
+        e.preventDefault();
+        this.sendToBackend({
+          type: 'input',
+          inputType: 'keydown',
+          surfaceId: this.focusedSurface,
+          key: 'Enter',
+          code: 'Enter',
+          modifiers: { shift: false, ctrl: false, alt: false, meta: false },
+        } as FrontendToBackendMsg);
+        return;
+      }
     });
 
-    // Capture special keys (Backspace, Enter, etc.) that don't fire 'input'
+    // Fallback: capture special keys that don't fire beforeinput (arrows, Tab, Escape)
     proxy.addEventListener('keydown', (e) => {
       if (!this.focusedSurface) return;
-      // Let printable characters go through the 'input' event instead
+      // Skip printable characters -- handled by beforeinput
       if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) return;
+      // Skip keys already handled by beforeinput
+      if (e.key === 'Backspace' || e.key === 'Enter') return;
       e.preventDefault();
       this.sendToBackend({
         type: 'input',
@@ -139,6 +186,22 @@ export class FrontendClient {
         },
       } as FrontendToBackendMsg);
     });
+  }
+
+  /** Flush any remaining text in the proxy input (after composition ends). */
+  private flushProxyInput(proxy: HTMLInputElement): void {
+    if (!this.focusedSurface || !proxy.value) return;
+    for (const ch of proxy.value) {
+      this.sendToBackend({
+        type: 'input',
+        inputType: 'keydown',
+        surfaceId: this.focusedSurface,
+        key: ch,
+        code: '',
+        modifiers: { shift: false, ctrl: false, alt: false, meta: false },
+      } as FrontendToBackendMsg);
+    }
+    proxy.value = '';
   }
 
   /** Focus the hidden input proxy to trigger the mobile virtual keyboard. */
