@@ -30,6 +30,7 @@ const log = new Log('PeerTransport');
 const PONG_MISS_LIMIT = 3;
 const MAX_CHUNK_SIZE = 200_000; // 200KB per chunk (safe under 256KB SCTP limit)
 const CHUNK_REASSEMBLY_TIMEOUT = 30_000; // 30s to receive all chunks
+const CONNECTION_TIMEOUT = 20_000; // 20s max to establish DataChannel
 
 export interface PeerTransportConfig extends TransportConfig {
   localPeerId: PeerId;
@@ -61,13 +62,15 @@ export class PeerTransport extends Transport {
   private handshakeState: HandshakeState = 'none';
   private iceServers: RTCIceServer[];
   private pendingCandidates: RTCIceCandidateInit[] = [];
+  private offerGeneration = 0;  // incremented on each new SDP offer/answer cycle
   private pingInterval?: ReturnType<typeof setInterval>;
   private lastPongReceived: number = 0;
   private chunkCounter = 0;
   private pendingChunks: Map<string, { total: number; parts: Map<number, string>; timer: ReturnType<typeof setTimeout> }> = new Map();
+  private connectionTimer?: ReturnType<typeof setTimeout>;
 
   constructor(config: PeerTransportConfig) {
-    super({ ...config, heartbeatInterval: config.heartbeatInterval ?? 15_000 });
+    super({ ...config, heartbeatInterval: config.heartbeatInterval ?? 10_000 });
     this.localPeerId = config.localPeerId;
     this.remotePeerId = config.remotePeerId;
     this.signalingClient = config.signalingClient;
@@ -85,6 +88,7 @@ export class PeerTransport extends Transport {
    */
   async connect(_endpoint: string): Promise<void> {
     this.setState('connecting');
+    this.offerGeneration++;
     this.createPeerConnection();
 
     // Create DataChannel (caller creates it)
@@ -101,6 +105,14 @@ export class PeerTransport extends Transport {
       this.remotePeerId,
       offer,
     );
+
+    // Auto-disconnect if DataChannel doesn't open within timeout
+    this.connectionTimer = setTimeout(() => {
+      if (this.state === 'connecting') {
+        log.warn(`Connection timeout for ${this.remotePeerId.slice(0, 16)} (${CONNECTION_TIMEOUT / 1000}s)`);
+        this.disconnect();
+      }
+    }, CONNECTION_TIMEOUT);
   }
 
   /**
@@ -113,6 +125,10 @@ export class PeerTransport extends Transport {
       this.createPeerConnection();
     }
 
+    // New negotiation context — increment generation so stale candidates are ignored
+    this.offerGeneration++;
+    const gen = this.offerGeneration;
+
     try {
       await this.peerConnection!.setRemoteDescription(new RTCSessionDescription(sdp));
     } catch (err) {
@@ -122,8 +138,10 @@ export class PeerTransport extends Transport {
       throw err;
     }
 
-    // Apply any ICE candidates that arrived before the remote description
+    // Apply only ICE candidates from the current generation
     for (const candidate of this.pendingCandidates) {
+      const candidateGen = (candidate as RTCIceCandidateInit & { _generation?: number })._generation;
+      if (candidateGen !== undefined && candidateGen !== gen) continue; // stale
       try {
         await this.peerConnection!.addIceCandidate(new RTCIceCandidate(candidate));
       } catch {
@@ -147,6 +165,8 @@ export class PeerTransport extends Transport {
   async handleSdpAnswer(sdp: RTCSessionDescriptionInit): Promise<void> {
     precondition(this.peerConnection !== undefined, 'No peer connection');
 
+    const gen = this.offerGeneration;
+
     try {
       await this.peerConnection!.setRemoteDescription(new RTCSessionDescription(sdp));
     } catch (err) {
@@ -154,8 +174,10 @@ export class PeerTransport extends Transport {
       throw err;
     }
 
-    // Apply any ICE candidates that arrived before the remote description
+    // Apply only ICE candidates from the current generation
     for (const candidate of this.pendingCandidates) {
+      const candidateGen = (candidate as RTCIceCandidateInit & { _generation?: number })._generation;
+      if (candidateGen !== undefined && candidateGen !== gen) continue; // stale
       try {
         await this.peerConnection!.addIceCandidate(new RTCIceCandidate(candidate));
       } catch {
@@ -173,7 +195,9 @@ export class PeerTransport extends Transport {
         !this.peerConnection.remoteDescription ||
         this.peerConnection.signalingState === 'have-local-offer') {
       // Queue if remote description not yet set (includes ICE glare scenarios
-      // where candidates arrive for a rejected offer)
+      // where candidates arrive for a rejected offer).
+      // Tag with current generation so stale candidates can be filtered later.
+      (candidate as RTCIceCandidateInit & { _generation?: number })._generation = this.offerGeneration;
       this.pendingCandidates.push(candidate);
       return;
     }
@@ -215,15 +239,22 @@ export class PeerTransport extends Transport {
     }
 
     this.stopPing();
+    if (this.connectionTimer) { clearTimeout(this.connectionTimer); this.connectionTimer = undefined; }
     this.sessionKey = undefined;
     this.handshakeState = 'none';
-    // NOTE: pendingCandidates intentionally preserved
+    // Clear stale candidates from previous negotiation context.
+    // Old candidates have ufrag/pwd that won't match the new offer,
+    // causing libdatachannel to reject the SDP with "Invalid ICE settings".
+    // Fresh candidates will arrive after the new offer/answer exchange.
+    this.pendingCandidates = [];
   }
 
   async disconnect(): Promise<void> {
     this.stopPing();
+    if (this.connectionTimer) { clearTimeout(this.connectionTimer); this.connectionTimer = undefined; }
     this.sessionKey = undefined;
     this.handshakeState = 'none';
+    this.pendingCandidates = [];
     if (this.dataChannel) {
       this.dataChannel.close();
       this.dataChannel = undefined;
@@ -327,8 +358,20 @@ export class PeerTransport extends Transport {
     // Handle ICE connection state changes
     this.peerConnection.oniceconnectionstatechange = () => {
       const state = this.peerConnection?.iceConnectionState;
-      if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+      if (state === 'failed' || state === 'closed') {
         this.handleDisconnect(`ICE ${state}`);
+      } else if (state === 'disconnected') {
+        // Temporary disconnection (network blip, laptop sleep/wake).
+        // Wait 3s, then disconnect if still not recovered.
+        // ICE restart would be ideal but node-datachannel doesn't support
+        // iceRestart in createOffer options reliably, so we fall back to
+        // a timed disconnect that triggers fast reconnect in PeerRegistry.
+        log.info(`ICE disconnected for ${this.remotePeerId.slice(0, 16)}, waiting 3s for recovery...`);
+        setTimeout(() => {
+          if (this.peerConnection?.iceConnectionState === 'disconnected') {
+            this.handleDisconnect('ICE disconnected (no recovery)');
+          }
+        }, 3_000);
       }
     };
 
@@ -349,6 +392,11 @@ export class PeerTransport extends Transport {
     const onOpen = () => {
       if (opened) return;
       opened = true;
+      // Clear connection timeout — DataChannel is open
+      if (this.connectionTimer) {
+        clearTimeout(this.connectionTimer);
+        this.connectionTimer = undefined;
+      }
       log.info(`DataChannel open with ${this.remotePeerId.slice(0, 16)}`);
       // Don't call handleConnect() here — defer until handshake completes
       // so PeerRouter knows about the connection before messages arrive.

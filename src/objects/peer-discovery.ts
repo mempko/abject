@@ -26,7 +26,7 @@ export const PEER_DISCOVERY_ID = 'abjects:peer-discovery' as AbjectId;
 
 const MAX_CACHE = 200;
 const CACHE_TTL = 10 * 60 * 1000;  // 10 minutes
-const EXCHANGE_INTERVAL = 3 * 60 * 1000;  // 3 minutes
+const EXCHANGE_INTERVAL = 90 * 1000;  // 90s (reduced from 3 min for faster mesh formation)
 const MAX_PER_EXCHANGE = 50;
 const FIND_TIMEOUT = 5000;  // 5 seconds
 const FIND_MAX_TTL = 2;

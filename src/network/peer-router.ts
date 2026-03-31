@@ -31,9 +31,11 @@ const PEER_ROUTER_INTERFACE = 'abjects:peer-router';
 
 export const PEER_ROUTER_ID = 'abjects:peer-router' as AbjectId;
 
-const ROUTE_TTL = 5 * 60 * 1000; // 5 minutes
-const ANNOUNCE_INTERVAL = 60_000; // 60s periodic anti-entropy
-const GOSSIP_FANOUT = 4; // Phase 3: number of peers to gossip to
+const ROUTE_TTL = 3 * 60 * 1000; // 3 minutes (reduced from 5 for faster stale cleanup)
+const ANNOUNCE_INTERVAL = 30_000; // 30s periodic anti-entropy (reduced from 60s)
+const ANNOUNCE_JITTER = 15_000; // jitter range added to anti-entropy interval
+const GOSSIP_FANOUT = 4; // Phase 3: max peers to gossip to
+const GOSSIP_FANOUT_MIN = 2; // Phase 3: always gossip to at least 2 peers
 const MAX_CHANGELOG = 500; // Phase 2: max changelog entries
 const PROPAGATION_EXPIRY = 30_000; // Phase 3: propagation dedup window
 const MAX_GOSSIP_HOPS = 3; // Phase 3: max hops for gossip propagation
@@ -139,8 +141,8 @@ export class PeerRouter extends Abject implements MessageInterceptor {
   private peerRegistryId?: AbjectId;
   private workspaceManagerId?: AbjectId;
 
-  /** Periodic announcement timer */
-  private announceTimer?: ReturnType<typeof setInterval>;
+  /** Anti-entropy timer (setTimeout with jitter, reschedules itself) */
+  private announceTimer?: ReturnType<typeof setTimeout>;
 
   /** Debounce timer for re-announcements triggered by incoming routes */
   private reannounceTimer?: ReturnType<typeof setTimeout>;
@@ -532,10 +534,8 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     }
 
     // Phase 3: Anti-entropy replaces periodic full announcements.
-    // Every 60s, pick ONE random peer and exchange route digests.
-    this.announceTimer = setInterval(() => {
-      this.antiEntropyExchange().catch(() => { /* best-effort */ });
-    }, ANNOUNCE_INTERVAL);
+    // Every ~30-45s (with jitter), pick ONE random peer and exchange route digests.
+    this.scheduleAntiEntropy();
 
     // Phase 3: Clean up expired propagation IDs
     this.propagationCleanupTimer = setInterval(() => {
@@ -553,9 +553,19 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     }, 10000);
   }
 
+  private scheduleAntiEntropy(): void {
+    if (this.announceTimer) return;
+    const delay = ANNOUNCE_INTERVAL + Math.floor(Math.random() * ANNOUNCE_JITTER);
+    this.announceTimer = setTimeout(() => {
+      this.announceTimer = undefined;
+      this.antiEntropyExchange().catch(() => { /* best-effort */ });
+      this.scheduleAntiEntropy(); // schedule next round
+    }, delay);
+  }
+
   protected override async onStop(): Promise<void> {
     if (this.announceTimer) {
-      clearInterval(this.announceTimer);
+      clearTimeout(this.announceTimer);
       this.announceTimer = undefined;
     }
     if (this.propagationCleanupTimer) {
@@ -1315,6 +1325,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
         return true;
       } catch (err) {
         log.error(`Failed to announce diff to ${peerId.slice(0, 16)}:`, err);
+        this.scheduleAnnouncementRetry(peerId);
         return false;
       }
     }
@@ -1363,10 +1374,22 @@ export class PeerRouter extends Abject implements MessageInterceptor {
       log.info(`announceRoutesToPeer(${peerId.slice(0, 16)}) — sent FULL OK`);
     } catch (err) {
       log.error(`Failed to announce routes to ${peerId.slice(0, 16)}:`, err);
+      this.scheduleAnnouncementRetry(peerId);
       return false;
     }
 
     return true;
+  }
+
+  /**
+   * Schedule a retry announcement after a failed attempt (5s delay).
+   */
+  private scheduleAnnouncementRetry(peerId: PeerId): void {
+    setTimeout(() => {
+      if (this.isPeerConnected(peerId)) {
+        this.announceRoutesToPeer(peerId).catch(() => { /* give up after retry */ });
+      }
+    }, 5_000);
   }
 
   /**
@@ -1744,10 +1767,11 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 
     if (connectedPeers.length === 0) return;
 
-    // Pick ceil(log2(connectedPeers)) random peers, capped at GOSSIP_FANOUT
+    // Pick ceil(log2(connectedPeers)) random peers, with floor of GOSSIP_FANOUT_MIN
+    // and cap of GOSSIP_FANOUT. The floor ensures routes propagate even in small clusters.
     const fanout = Math.min(
       GOSSIP_FANOUT,
-      Math.max(1, Math.ceil(Math.log2(connectedPeers.length + 1))),
+      Math.max(GOSSIP_FANOUT_MIN, Math.ceil(Math.log2(connectedPeers.length + 1))),
       connectedPeers.length,
     );
 
@@ -1762,7 +1786,7 @@ export class PeerRouter extends Abject implements MessageInterceptor {
 
   /**
    * Phase 3: Anti-entropy exchange.
-   * Every 60s, pick ONE random peer and exchange route digests.
+   * Every ~30-45s (with jitter), pick ONE random peer and exchange route digests.
    */
   private async antiEntropyExchange(): Promise<void> {
     if (!this.hasPeerAccess) return;

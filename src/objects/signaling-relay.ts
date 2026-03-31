@@ -22,7 +22,7 @@ const PEER_REGISTRY_INTERFACE = 'abjects:peer-registry' as InterfaceId;
 
 export const SIGNALING_RELAY_ID = 'abjects:signaling-relay' as AbjectId;
 
-const MAX_TTL = 2;
+const MAX_TTL = 3;  // increased from 2 for larger mesh networks
 
 export class SignalingRelayObject extends Abject implements SignalingRelay {
   private peerRegistry?: PeerRegistry;
@@ -193,14 +193,15 @@ export class SignalingRelayObject extends Abject implements SignalingRelay {
     // If target is directly connected, deliver to them
     if (this.peerRegistry.hasTransportTo(targetPeerId)) {
       this.peerRegistry.sendToPeer(targetPeerId, relayMsg).catch(e => log.error('relay error', e));
+      log.info(`relay ${type} to ${targetPeerId.slice(0, 12)} — direct delivery`);
       return true;
     }
 
-    // Otherwise forward to all connected peers with TTL-1
+    // Otherwise forward to connected peers with TTL-1
     if (ttl > 1) {
       const connectedPeers = this.peerRegistry.getConnectedPeers();
-      for (const peerId of connectedPeers) {
-        if (peerId === fromPeerId) continue; // don't send back to sender
+      const forwardPeers = connectedPeers.filter(p => p !== fromPeerId);
+      for (const peerId of forwardPeers) {
         const fwdMsg = createEvent(this.id, 'abjects:peer-registry' as AbjectId, '_signalingRelay', {
           relayType: type,
           fromPeerId,
@@ -210,6 +211,9 @@ export class SignalingRelayObject extends Abject implements SignalingRelay {
         });
         this.peerRegistry.sendToPeer(peerId, fwdMsg).catch(e => log.error('relay error', e));
       }
+      log.info(`relay ${type} for ${targetPeerId.slice(0, 12)} — forwarded to ${forwardPeers.length} peers (ttl=${ttl - 1})`);
+    } else {
+      log.warn(`relay ${type} for ${targetPeerId.slice(0, 12)} — TTL exhausted, not forwarding`);
     }
 
     return true;

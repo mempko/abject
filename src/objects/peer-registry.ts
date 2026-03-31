@@ -74,8 +74,10 @@ export class PeerRegistry extends Abject {
   private manuallyDisconnected: Set<PeerId> = new Set();
   private autoConnectTimer?: ReturnType<typeof setInterval>;
   private static readonly AUTO_CONNECT_INTERVAL = 30_000; // 30s
-  private static readonly STALE_OFFER_TIMEOUT = 15_000; // 15s
+  private static readonly STALE_OFFER_TIMEOUT = 10_000; // 10s (reduced from 15s for faster cleanup)
   private offerTimestamps: Map<string, number> = new Map();
+  // Exponential backoff per peer: tracks consecutive failures and next eligible retry time
+  private peerRetryState: Map<PeerId, { failures: number; nextRetryAt: number }> = new Map();
 
   // Network peers (non-contact connected peers, transient — not persisted)
   private networkPeers: Map<PeerId, NetworkPeerEntry> = new Map();
@@ -1141,8 +1143,20 @@ export class PeerRegistry extends Abject {
       if (this.manuallyDisconnected.has(peerId)) continue;
       if (this.transports.has(peerId)) continue;
 
-      this.connectToPeer(peerId).catch(() => {
-        // Silently ignore — will retry on next interval
+      // Exponential backoff: skip peers whose retry time hasn't arrived yet
+      const retryState = this.peerRetryState.get(peerId);
+      if (retryState && now < retryState.nextRetryAt) continue;
+
+      this.connectToPeer(peerId).then(connected => {
+        if (connected) {
+          this.peerRetryState.delete(peerId); // reset on success
+        }
+      }).catch(() => {
+        // Record failure for exponential backoff: 2s, 4s, 8s, 16s, 30s cap
+        const prev = this.peerRetryState.get(peerId);
+        const failures = (prev?.failures ?? 0) + 1;
+        const delay = Math.min(30_000, 2_000 * Math.pow(2, failures - 1));
+        this.peerRetryState.set(peerId, { failures, nextRetryAt: Date.now() + delay });
       });
     }
   }
@@ -1279,6 +1293,18 @@ export class PeerRegistry extends Abject {
         }
         this.transports.delete(peerId);
         this.changed('contactDisconnected', { peerId });
+
+        // Fast reconnect for contacts: attempt after 2s instead of waiting
+        // for the next auto-connect cycle (30s)
+        if (this.contacts.has(peerId) &&
+            !this.manuallyDisconnected.has(peerId) &&
+            !this.blockedPeers.has(peerId)) {
+          setTimeout(() => {
+            if (!this.transports.has(peerId) && this.contacts.get(peerId)?.state === 'offline') {
+              this.connectToPeer(peerId).catch(() => {});
+            }
+          }, 2_000);
+        }
       },
       onMessage: (message) => {
         // Intercept introduction messages before forwarding
