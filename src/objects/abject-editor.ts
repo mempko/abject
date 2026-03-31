@@ -1,9 +1,10 @@
 /**
- * AbjectEditor — standalone source editor for ScriptableAbjects.
+ * AbjectEditor -- Smalltalk-style code browser for ScriptableAbjects.
  *
- * Provides a window with a source code textarea, Save/Cancel buttons,
- * and status label. Can be opened by any abject to edit the source of
- * a given ScriptableAbject.
+ * Split-pane layout: handler list on the left, syntax-highlighted code
+ * editor on the right. Handlers are grouped by type (properties, message
+ * handlers, private helpers). Supports add/delete handlers, live save
+ * with error display, and per-handler editing.
  */
 
 import {
@@ -14,59 +15,81 @@ import {
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
+import {
+  parseHandlerMap,
+  reassembleHandlerMap,
+  type HandlerEntry,
+  type EntryType,
+} from './widgets/handler-parser.js';
 
 const ABJECT_EDITOR_INTERFACE: InterfaceId = 'abjects:abject-editor' as InterfaceId;
+
+// Icons for entry types in the handler list
+const ICON: Record<EntryType, string> = {
+  property: '\u25B8',  // small right triangle
+  handler:  '\u25CF',  // filled circle
+  helper:   '\u25C6',  // filled diamond
+};
 
 export class AbjectEditor extends Abject {
   private widgetManagerId?: AbjectId;
   private registryId?: AbjectId;
-
 
   // Window and layout
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
 
   // Widget tracking
+  private splitPaneId?: AbjectId;
+  private handlerListId?: AbjectId;
   private sourceEditorId?: AbjectId;
   private saveBtnId?: AbjectId;
   private cancelBtnId?: AbjectId;
+  private addBtnId?: AbjectId;
+  private deleteBtnId?: AbjectId;
   private editStatusId?: AbjectId;
+  private addInputId?: AbjectId;
+  private addConfirmBtnId?: AbjectId;
+  private addRowId?: AbjectId;
 
   // State
   private editingObjectId?: AbjectId;
+  private entries: HandlerEntry[] = [];
+  private selectedIndex = -1;
+  private addMode = false;
 
   constructor() {
     super({
       manifest: {
         name: 'AbjectEditor',
         description:
-          'Standalone source editor for ScriptableAbjects. Opens a window with source editing and save/cancel.',
-        version: '1.0.0',
+          'Smalltalk-style code browser for ScriptableAbjects. Split-pane with handler list and syntax-highlighted editor.',
+        version: '2.0.0',
         interface: {
-            id: ABJECT_EDITOR_INTERFACE,
-            name: 'AbjectEditor',
-            description: 'Source editor for editable abjects',
-            methods: [
-              {
-                name: 'show',
-                description: 'Open editor for a given ScriptableAbject',
-                parameters: [
-                  {
-                    name: 'objectId',
-                    type: { kind: 'primitive', primitive: 'string' },
-                    description: 'ID of the ScriptableAbject to edit',
-                  },
-                ],
-                returns: { kind: 'primitive', primitive: 'boolean' },
-              },
-              {
-                name: 'hide',
-                description: 'Close the editor window',
-                parameters: [],
-                returns: { kind: 'primitive', primitive: 'boolean' },
-              },
-            ],
-          },
+          id: ABJECT_EDITOR_INTERFACE,
+          name: 'AbjectEditor',
+          description: 'Source editor for editable abjects',
+          methods: [
+            {
+              name: 'show',
+              description: 'Open editor for a given ScriptableAbject',
+              parameters: [
+                {
+                  name: 'objectId',
+                  type: { kind: 'primitive', primitive: 'string' },
+                  description: 'ID of the ScriptableAbject to edit',
+                },
+              ],
+              returns: { kind: 'primitive', primitive: 'boolean' },
+            },
+            {
+              name: 'hide',
+              description: 'Close the editor window',
+              parameters: [],
+              returns: { kind: 'primitive', primitive: 'boolean' },
+            },
+          ],
+        },
         requiredCapabilities: [
           { capability: Capabilities.UI_SURFACE, reason: 'Display editor window', required: true },
         ],
@@ -82,7 +105,6 @@ export class AbjectEditor extends Abject {
     await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.registryId = await this.requireDep('Registry');
-
   }
 
   private setupHandlers(): void {
@@ -99,7 +121,6 @@ export class AbjectEditor extends Abject {
 
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
-      if (aspect !== 'click' && aspect !== 'submit') return;
       const fromId = msg.routing.from;
       await this.handleWidgetEvent(fromId, aspect, value);
     });
@@ -111,68 +132,82 @@ export class AbjectEditor extends Abject {
 
   private clearViewTracking(): void {
     this.rootLayoutId = undefined;
+    this.splitPaneId = undefined;
+    this.handlerListId = undefined;
     this.sourceEditorId = undefined;
     this.saveBtnId = undefined;
     this.cancelBtnId = undefined;
+    this.addBtnId = undefined;
+    this.deleteBtnId = undefined;
     this.editStatusId = undefined;
+    this.addInputId = undefined;
+    this.addConfirmBtnId = undefined;
+    this.addRowId = undefined;
+    this.entries = [];
+    this.selectedIndex = -1;
+    this.addMode = false;
   }
 
   async hide(): Promise<boolean> {
     if (!this.windowId) return true;
-
     await this.request(
       request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
         windowId: this.windowId,
       })
     );
-
     this.windowId = undefined;
     this.editingObjectId = undefined;
     this.clearViewTracking();
     return true;
   }
 
+  // ── Show Editor ──────────────────────────────────────────────────────
+
   private async showEditor(objectId: AbjectId): Promise<boolean> {
-    // Fetch source from the target object
+    if (!objectId) return false;
+
+    // Fetch source
     let source: string;
     try {
-      source = await this.request<string>(
-        request(this.id, objectId, 'getSource', {})
-      );
-    } catch {
-      return false;
-    }
+      source = await this.request<string>(request(this.id, objectId, 'getSource', {}));
+    } catch { return false; }
 
-    // Look up name from registry
+    // Look up name — try registry first, then ask the object directly
     let objectName = 'Unknown';
     if (this.registryId) {
       try {
-        const reg = await this.request<{ manifest: { name: string } } | null>(
+        const reg = await this.request<{ name: string; manifest: { name: string } } | null>(
           request(this.id, this.registryId, 'lookup', { objectId })
         );
-        if (reg) objectName = reg.manifest.name;
-      } catch { /* use default name */ }
+        if (reg) objectName = reg.name || reg.manifest.name;
+      } catch { /* registry lookup failed */ }
+    }
+    if (objectName === 'Unknown') {
+      try {
+        const desc = await this.request<{ manifest?: { name?: string } }>(
+          request(this.id, objectId, 'describe', {})
+        );
+        if (desc?.manifest?.name) objectName = desc.manifest.name;
+      } catch { /* fallback to Unknown */ }
     }
 
-    // Destroy existing window if open
+    // Destroy existing window
     if (this.windowId) {
-      await this.request(
-        request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
-          windowId: this.windowId,
-        })
-      );
+      await this.request(request(this.id, this.widgetManagerId!, 'destroyWindowAbject', { windowId: this.windowId }));
       this.windowId = undefined;
     }
-
     this.clearViewTracking();
     this.editingObjectId = objectId;
 
+    // Parse handler map into entries
+    this.entries = parseHandlerMap(source);
+
+    // Window sizing
     const displayInfo = await this.request<{ width: number; height: number }>(
       request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
-
-    const editW = 600;
-    const editH = 500;
+    const editW = 750;
+    const editH = 550;
     const winX = Math.max(20, Math.floor((displayInfo.width - editW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - editH) / 2));
 
@@ -185,138 +220,397 @@ export class AbjectEditor extends Abject {
       })
     );
 
-    // Create root VBox layout
+    // Root VBox
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 8, right: 16, bottom: 8, left: 16 },
-        spacing: 8,
+        margins: { top: 4, right: 8, bottom: 4, left: 8 },
+        spacing: 4,
       })
     );
 
-    // Batch create all widgets
+    // Create all widgets in a batch
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'label', windowId: this.windowId, text: `Source: ${objectName}` },
-          { type: 'textArea', windowId: this.windowId, text: source, monospace: true },
+          // 0: split pane
+          { type: 'splitPane', windowId: this.windowId, orientation: 'horizontal', dividerPosition: 0.25, minSize: 100 },
+          // 1: handler list (left)
+          { type: 'list', windowId: this.windowId, items: this.buildListItems(), selectedIndex: -1, itemHeight: 24 },
+          // 2: source editor (right)
+          { type: 'textArea', windowId: this.windowId, text: '', monospace: true,
+            style: { syntaxHighlight: true } },
+          // 3: save button
           { type: 'button', windowId: this.windowId, text: 'Save',
             style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+          // 4: cancel button
           { type: 'button', windowId: this.windowId, text: 'Cancel' },
-          { type: 'label', windowId: this.windowId, text: '' },
+          // 5: add handler button
+          { type: 'button', windowId: this.windowId, text: '+ Add' },
+          // 6: delete handler button
+          { type: 'button', windowId: this.windowId, text: 'Delete',
+            style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder } },
+          // 7: status label
+          { type: 'label', windowId: this.windowId, text: '',
+            style: { fontSize: 12, wordWrap: true, markdown: true } },
+          // 8: add handler text input (hidden initially)
+          { type: 'textInput', windowId: this.windowId, placeholder: 'handler name...',
+            style: { visible: false } },
+          // 9: add confirm button (hidden initially)
+          { type: 'button', windowId: this.windowId, text: 'OK',
+            style: { visible: false, background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
         ],
       })
     );
-    const [nameLabelId, sourceEditorId, saveBtnId, cancelBtnId, editStatusId] = widgetIds;
+
+    const [splitPaneId, handlerListId, sourceEditorId,
+      saveBtnId, cancelBtnId, addBtnId, deleteBtnId, editStatusId,
+      addInputId, addConfirmBtnId] = widgetIds;
+
+    this.splitPaneId = splitPaneId;
+    this.handlerListId = handlerListId;
     this.sourceEditorId = sourceEditorId;
     this.saveBtnId = saveBtnId;
     this.cancelBtnId = cancelBtnId;
+    this.addBtnId = addBtnId;
+    this.deleteBtnId = deleteBtnId;
     this.editStatusId = editStatusId;
+    this.addInputId = addInputId;
+    this.addConfirmBtnId = addConfirmBtnId;
 
-    // Add nameLabel and sourceEditor to root layout first
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChildren', {
+    // Set up split pane children
+    await this.request(request(this.id, this.splitPaneId, 'setLeftChild', { widgetId: this.handlerListId }));
+    await this.request(request(this.id, this.splitPaneId, 'setRightChild', { widgetId: this.sourceEditorId }));
+
+    // Add splitPane to root (expanding, takes most space)
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.splitPaneId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+      stretch: 1,
+    }));
+
+    // Add handler name input row (hidden initially)
+    this.addRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 4,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, 'updateLayoutChild', {
+      widgetId: this.addRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 0 }, // hidden
+    }));
+    await this.request(request(this.id, this.addRowId, 'addLayoutChildren', {
       children: [
-        { widgetId: nameLabelId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 } },
-        { widgetId: this.sourceEditorId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' }, stretch: 1 },
+        { widgetId: this.addInputId, sizePolicy: { horizontal: 'expanding', vertical: 'fixed' }, preferredSize: { height: 28 } },
+        { widgetId: this.addConfirmBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 50, height: 28 } },
       ],
     }));
 
-    // Create button row AFTER the above children so it auto-appends in the correct position
+    // Button row
     const btnRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
+        spacing: 6,
       })
     );
-    // Update btnRowId's layout properties (auto-added with expanding defaults)
     await this.request(request(this.id, this.rootLayoutId, 'updateLayoutChild', {
       widgetId: btnRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
+      preferredSize: { height: 30 },
     }));
 
-    // Add editStatus after btnRow
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.editStatusId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-
-    // Add buttons to button row
     await this.request(request(this.id, btnRowId, 'addLayoutChildren', {
       children: [
-        { widgetId: this.saveBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 80, height: 32 } },
-        { widgetId: this.cancelBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 80, height: 32 } },
+        { widgetId: this.saveBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 28 } },
+        { widgetId: this.cancelBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 28 } },
+        { widgetId: this.addBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 28 } },
+        { widgetId: this.deleteBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 28 } },
       ],
     }));
     await this.request(request(this.id, btnRowId, 'addLayoutSpacer', {}));
 
-    // Register as dependent for interactive widgets
+    // Status label
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.editStatusId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
+
+    // Register dependencies
+    await this.addDep(this.handlerListId);
     await this.addDep(this.saveBtnId);
     await this.addDep(this.cancelBtnId);
+    await this.addDep(this.addBtnId);
+    await this.addDep(this.deleteBtnId);
+    await this.addDep(this.addConfirmBtnId);
+    await this.addDep(this.addInputId);
+
+    // Select first handler if any exist
+    if (this.entries.length > 0) {
+      await this.selectEntry(0);
+    }
 
     return true;
   }
 
-  private async updateEditStatus(text: string): Promise<void> {
-    if (!this.editStatusId) return;
-    await this.request(
-      request(this.id, this.editStatusId, 'update', { text })
-    );
+  // ── List Items ───────────────────────────────────────────────────────
+
+  private buildListItems(): Array<{ label: string; value: string; secondary?: string }> {
+    return this.entries.map((entry, i) => ({
+      label: `${ICON[entry.type]} ${entry.name}`,
+      value: String(i),
+      secondary: entry.type === 'property' ? 'prop' : entry.type === 'helper' ? 'fn' : 'msg',
+    }));
   }
 
-  private async setAllControlsDisabled(disabled: boolean): Promise<void> {
+  private async refreshList(): Promise<void> {
+    if (!this.handlerListId) return;
+    await this.request(request(this.id, this.handlerListId, 'update', {
+      items: this.buildListItems(),
+      selectedIndex: this.selectedIndex,
+    }));
+  }
+
+  // ── Entry Selection ──────────────────────────────────────────────────
+
+  private async storeCurrentEditorText(): Promise<void> {
+    if (this.selectedIndex < 0 || this.selectedIndex >= this.entries.length) return;
+    if (!this.sourceEditorId) return;
+
+    const currentText = await this.request<string>(
+      request(this.id, this.sourceEditorId, 'getValue', {})
+    );
+
+    const entry = this.entries[this.selectedIndex];
+    if (entry.type === 'property') {
+      // For properties, the body is "name: value"
+      entry.body = `${entry.name}: ${currentText}`;
+    } else {
+      entry.body = currentText;
+    }
+  }
+
+  private async selectEntry(index: number): Promise<void> {
+    // Save current editor text before switching
+    if (this.selectedIndex >= 0) {
+      await this.storeCurrentEditorText();
+    }
+
+    this.selectedIndex = index;
+
+    if (index < 0 || index >= this.entries.length) {
+      if (this.sourceEditorId) {
+        await this.request(request(this.id, this.sourceEditorId, 'update', { text: '' }));
+      }
+      return;
+    }
+
+    const entry = this.entries[index];
+    let displayText: string;
+
+    if (entry.type === 'property') {
+      // Show just the value part (after "name: ")
+      const colonIdx = entry.body.indexOf(':');
+      displayText = colonIdx >= 0 ? entry.body.slice(colonIdx + 1).trim() : entry.body;
+    } else {
+      displayText = entry.body;
+    }
+
+    if (this.sourceEditorId) {
+      await this.request(request(this.id, this.sourceEditorId, 'update', { text: displayText }));
+    }
+    if (this.handlerListId) {
+      await this.request(request(this.id, this.handlerListId, 'update', { selectedIndex: index }));
+    }
+  }
+
+  // ── Event Handling ───────────────────────────────────────────────────
+
+  private async handleWidgetEvent(fromId: AbjectId, aspect: string, value?: unknown): Promise<void> {
+    // Handler list selection
+    if (fromId === this.handlerListId && aspect === 'selectionChanged') {
+      // ListWidget emits value as JSON string: { index, value, label }
+      // The value field contains the entry index as a string
+      const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+      const entryIndex = parseInt(parsed.value, 10);
+      if (!isNaN(entryIndex) && entryIndex >= 0 && entryIndex < this.entries.length) {
+        await this.selectEntry(entryIndex);
+      }
+      return;
+    }
+
+    // Save
+    if (fromId === this.saveBtnId && aspect === 'click') {
+      await this.handleSave();
+      return;
+    }
+
+    // Cancel
+    if (fromId === this.cancelBtnId && aspect === 'click') {
+      await this.hide();
+      return;
+    }
+
+    // Add handler
+    if (fromId === this.addBtnId && aspect === 'click') {
+      await this.showAddInput();
+      return;
+    }
+
+    // Confirm add
+    if (fromId === this.addConfirmBtnId && aspect === 'click') {
+      await this.confirmAdd();
+      return;
+    }
+
+    // Add input submit (Enter key)
+    if (fromId === this.addInputId && aspect === 'submit') {
+      await this.confirmAdd();
+      return;
+    }
+
+    // Delete handler
+    if (fromId === this.deleteBtnId && aspect === 'click') {
+      await this.handleDelete();
+      return;
+    }
+  }
+
+  // ── Save ─────────────────────────────────────────────────────────────
+
+  private async handleSave(): Promise<void> {
+    if (!this.editingObjectId) return;
+
+    // Store current editor text
+    await this.storeCurrentEditorText();
+
+    // Reassemble full source
+    const source = reassembleHandlerMap(this.entries);
+
+    await this.setControlsDisabled(true);
+    try {
+      const result = await this.request<{ success: boolean; error?: string }>(
+        request(this.id, this.editingObjectId, 'updateSource', { source })
+      );
+
+      if (result.success) {
+        if (this.registryId) {
+          try {
+            await this.request(request(this.id, this.registryId, 'updateSource', {
+              objectId: this.editingObjectId, source,
+            }));
+          } catch { /* registry sync not critical */ }
+        }
+        await this.updateStatus('Saved', this.theme.statusSuccess);
+      } else {
+        await this.updateStatus(`**Error:** ${result.error ?? 'Unknown'}`, this.theme.statusError);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await this.updateStatus(`**Error:** ${msg}`, this.theme.statusError);
+    }
+    await this.setControlsDisabled(false);
+  }
+
+  // ── Add Handler ──────────────────────────────────────────────────────
+
+  private async showAddInput(): Promise<void> {
+    if (!this.addInputId || !this.addConfirmBtnId || !this.addRowId) return;
+    this.addMode = true;
+    // Show the add row
+    await this.request(request(this.id, this.addInputId, 'update', { style: { visible: true }, text: '' }));
+    await this.request(request(this.id, this.addConfirmBtnId, 'update', { style: { visible: true } }));
+    await this.request(request(this.id, this.rootLayoutId!, 'updateLayoutChild', {
+      widgetId: this.addRowId,
+      preferredSize: { height: 32 },
+    }));
+  }
+
+  private async hideAddInput(): Promise<void> {
+    if (!this.addInputId || !this.addConfirmBtnId || !this.addRowId) return;
+    this.addMode = false;
+    await this.request(request(this.id, this.addInputId, 'update', { style: { visible: false } }));
+    await this.request(request(this.id, this.addConfirmBtnId, 'update', { style: { visible: false } }));
+    await this.request(request(this.id, this.rootLayoutId!, 'updateLayoutChild', {
+      widgetId: this.addRowId,
+      preferredSize: { height: 0 },
+    }));
+  }
+
+  private async confirmAdd(): Promise<void> {
+    if (!this.addInputId) return;
+    const name = (await this.request<string>(
+      request(this.id, this.addInputId, 'getValue', {})
+    )).trim();
+
+    if (!name) {
+      await this.hideAddInput();
+      return;
+    }
+
+    // Determine type from name
+    const isPrivate = name.startsWith('_');
+    const type: EntryType = isPrivate ? 'helper' : 'handler';
+    const body = `async ${name}(msg) {\n  \n}`;
+
+    // Store current editor before adding
+    await this.storeCurrentEditorText();
+
+    this.entries.push({ name, type, body });
+    await this.refreshList();
+    await this.hideAddInput();
+
+    // Select the new entry
+    await this.selectEntry(this.entries.length - 1);
+    await this.updateStatus(`Added ${name}`, this.theme.statusNeutral);
+  }
+
+  // ── Delete Handler ───────────────────────────────────────────────────
+
+  private async handleDelete(): Promise<void> {
+    if (this.selectedIndex < 0 || this.selectedIndex >= this.entries.length) return;
+    const removed = this.entries[this.selectedIndex];
+    this.entries.splice(this.selectedIndex, 1);
+
+    // Adjust selection
+    if (this.selectedIndex >= this.entries.length) {
+      this.selectedIndex = this.entries.length - 1;
+    }
+
+    await this.refreshList();
+    if (this.entries.length > 0) {
+      await this.selectEntry(this.selectedIndex);
+    } else {
+      this.selectedIndex = -1;
+      if (this.sourceEditorId) {
+        await this.request(request(this.id, this.sourceEditorId, 'update', { text: '' }));
+      }
+    }
+    await this.updateStatus(`Deleted ${removed.name}`, this.theme.statusNeutral);
+  }
+
+  // ── Helpers ──────────────────────────────────────────────────────────
+
+  private async updateStatus(text: string, color: string): Promise<void> {
+    if (!this.editStatusId) return;
+    await this.request(request(this.id, this.editStatusId, 'update', {
+      text,
+      style: { color, fontSize: 12, wordWrap: true, markdown: true },
+    }));
+  }
+
+  private async setControlsDisabled(disabled: boolean): Promise<void> {
     const style = { disabled };
-    const ids = [this.saveBtnId, this.cancelBtnId, this.sourceEditorId];
+    const ids = [this.saveBtnId, this.cancelBtnId, this.addBtnId, this.deleteBtnId, this.sourceEditorId];
     for (const id of ids) {
       if (id) {
         try { await this.request(request(this.id, id, 'update', { style })); } catch { /* widget gone */ }
       }
     }
-  }
-
-  private async handleWidgetEvent(fromId: AbjectId, aspect: string, _value?: unknown): Promise<void> {
-    // ── Save button ──
-    if (fromId === this.saveBtnId && this.editingObjectId) {
-      await this.setAllControlsDisabled(true);
-      const source = await this.request<string>(
-        request(this.id, this.sourceEditorId!, 'getValue', {})
-      );
-
-      try {
-        const result = await this.request<{ success: boolean; error?: string }>(
-          request(this.id, this.editingObjectId, 'updateSource', {
-            source,
-          })
-        );
-
-        if (result.success) {
-          if (this.registryId) {
-            await this.request(
-              request(this.id, this.registryId, 'updateSource', {
-                objectId: this.editingObjectId, source,
-              })
-            );
-          }
-          await this.updateEditStatus('Saved successfully');
-        } else {
-          await this.updateEditStatus(`Error: ${result.error ?? 'Unknown'}`);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await this.updateEditStatus(`Error: ${msg}`);
-      }
-      await this.setAllControlsDisabled(false);
-      return;
-    }
-
-    // ── Cancel button ──
-    if (fromId === this.cancelBtnId) {
-      await this.hide();
-      return;
-    }
-
   }
 
   protected override getSourceForAsk(): string | undefined {
@@ -325,7 +619,7 @@ export class AbjectEditor extends Abject {
 ### Open the editor for a ScriptableAbject
 
   await call(await dep('AbjectEditor'), 'show', { objectId: 'the-object-id' });
-  // Opens a window with the object's source code for editing
+  // Opens a Smalltalk-style code browser with handler list and syntax-highlighted editor
 
 ### Hide the editor
 
@@ -334,7 +628,9 @@ export class AbjectEditor extends Abject {
 ### IMPORTANT
 - The interface ID is 'abjects:abject-editor'.
 - The editor only works with ScriptableAbject instances (objects that have source code).
-- Changes are applied live — the object is recompiled and re-initialized when saved.`;
+- Changes are applied live — the object is recompiled and re-initialized when saved.
+- Handlers are shown individually in a list — click to view/edit each one.
+- Syntax highlighting is enabled for JavaScript code.`;
   }
 }
 

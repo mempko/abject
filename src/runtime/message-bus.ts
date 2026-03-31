@@ -136,8 +136,8 @@ export class MessageBus implements MessageBusLike {
     }
 
     // Check if recipient exists locally
-    if (!this.mailboxes.has(recipient)) {
-      log.warn(`UNDELIVERABLE: ${message.header.type} ${message.routing.method ?? '?'} from=${message.routing.from.slice(0,8)} to=${recipient.slice(0,8)} (not registered)`);
+    if (!recipient || !this.mailboxes.has(recipient)) {
+      log.warn(`UNDELIVERABLE: ${message.header.type} ${message.routing.method ?? '?'} from=${message.routing.from?.slice(0,8) ?? '?'} to=${recipient?.slice(0,8) ?? 'undefined'} (not registered)`);
 
       // For undeliverable requests, send an error reply to the sender's
       // mailbox so request() rejects instantly instead of timing out.

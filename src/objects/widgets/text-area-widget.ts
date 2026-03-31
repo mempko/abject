@@ -12,6 +12,7 @@
 import { event } from '../../core/message.js';
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
 import { WidgetStyle, Rect, WIDGET_FONT, CODE_FONT, DEFAULT_LINE_HEIGHT } from './widget-types.js';
+import { tokenizeLine, type Token, type TokenType } from './handler-parser.js';
 
 export interface TextAreaWidgetConfig extends WidgetConfig {
   monospace?: boolean;
@@ -134,6 +135,23 @@ export class TextAreaWidget extends WidgetAbject {
     ));
   }
 
+  // ── Syntax highlight colors ────────────────────────────────────────
+
+  private tokenColor(type: TokenType, style: WidgetStyle): string {
+    switch (type) {
+      case 'keyword': return this.theme.accentTertiary;
+      case 'this': return this.theme.accentTertiary;
+      case 'string': return this.theme.statusSuccess;
+      case 'number': return this.theme.accentSecondary;
+      case 'comment': return this.theme.textTertiary;
+      case 'operator': return this.theme.textSecondary;
+      case 'punctuation': return this.theme.textSecondary;
+      case 'property': return this.theme.accent;
+      case 'function': return this.theme.statusInfo;
+      default: return style.color ?? this.theme.textPrimary;
+    }
+  }
+
   // ── Rendering ──────────────────────────────────────────────────────
 
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
@@ -231,18 +249,34 @@ export class TextAreaWidget extends WidgetAbject {
         }
       }
 
-      commands.push({
-        type: 'text',
-        surfaceId,
-        params: {
-          x: ox + textPadding,
-          y: lineTextY,
-          text: lines[i],
-          font: taFont,
-          fill: style.color ?? this.theme.textSecondary,
-          baseline: 'alphabetic',
-        },
-      });
+      // Render line text - with or without syntax highlighting
+      if (style.syntaxHighlight && lines[i].length > 0) {
+        const tokens = tokenizeLine(lines[i]);
+        let tokenX = ox + textPadding;
+        for (const token of tokens) {
+          if (token.text.length === 0) continue;
+          const fill = this.tokenColor(token.type, style);
+          commands.push({
+            type: 'text', surfaceId,
+            params: { x: tokenX, y: lineTextY, text: token.text, font: taFont, fill, baseline: 'alphabetic' },
+          });
+          const tokenWidth = await this.measureText(surfaceId, token.text, taFont);
+          tokenX += tokenWidth;
+        }
+      } else {
+        commands.push({
+          type: 'text',
+          surfaceId,
+          params: {
+            x: ox + textPadding,
+            y: lineTextY,
+            text: lines[i],
+            font: taFont,
+            fill: style.color ?? this.theme.textSecondary,
+            baseline: 'alphabetic',
+          },
+        });
+      }
     }
 
     // Cursor when focused

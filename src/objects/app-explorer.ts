@@ -830,10 +830,9 @@ export class AppExplorer extends Abject {
     await this.rebuildInstanceList();
   }
 
-  /** Find an AbjectEditor in the workspace registry. */
+  /** Find the AbjectEditor in this workspace's own registry (not the browsed workspace). */
   private async findAbjectEditor(): Promise<AbjectId | undefined> {
-    if (this.isRemote) return undefined;
-    const regId = this.effectiveRegistryId;
+    const regId = this.registryId;
     if (!regId) return undefined;
     try {
       const regs = await this.request<ObjectRegistration[]>(

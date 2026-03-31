@@ -432,6 +432,9 @@ export class WidgetManager extends Abject {
           items?: ListItem[];
           searchable?: boolean;
           itemHeight?: number;
+          orientation?: 'horizontal' | 'vertical';
+          dividerPosition?: number;
+          minSize?: number;
         }>;
       };
       if (!Array.isArray(specs)) {
@@ -987,6 +990,7 @@ All widgets accept a \`style\` object with these optional properties:
 - wordWrap — enable word wrapping on labels
 - selectable — labels only: enable read-only text selection (click-drag, double-click word select, Shift+click, Ctrl+A, Ctrl+C)
 - markdown — labels only: parse text as markdown and render with rich formatting (bold, italic, code, links, headings, bullets, code blocks, blockquotes). Requires wordWrap: true.
+- syntaxHighlight — textArea only: colorize JavaScript tokens (keywords, strings, numbers, comments, functions, properties) with theme colors.
 - disabled — when true, widget renders at 50% opacity and ignores all input (except textInput/textArea which still allow text selection and copy)
 - visible — when false, widget renders nothing and ignores input (default: true)
 
@@ -1565,6 +1569,9 @@ await this.call(timerId, 'addDependent', {});
     items?: ListItem[];
     searchable?: boolean;
     itemHeight?: number;
+    orientation?: 'horizontal' | 'vertical';
+    dividerPosition?: number;
+    minSize?: number;
   }): Promise<AbjectId> {
     const rect = spec.rect ?? { x: 0, y: 0, width: 0, height: 0 };
     const theme = this.getThemeForWindow(spec.windowId);
@@ -1630,6 +1637,12 @@ await this.call(timerId, 'addDependent', {});
           type: 'label' as WidgetType, rect, style: spec.style,
           items: spec.items, selectedIndex: spec.selectedIndex,
           searchable: spec.searchable, itemHeight: spec.itemHeight, ...base,
+        }), rect);
+      case 'splitPane':
+        return this.createTypedWidget(spec.windowId, new SplitPaneWidget({
+          type: 'label' as WidgetType, rect, style: spec.style,
+          orientation: spec.orientation, dividerPosition: spec.dividerPosition,
+          minSize: spec.minSize, ...base,
         }), rect);
       default:
         throw new Error(`Unknown widget type in create: ${spec.type}`);

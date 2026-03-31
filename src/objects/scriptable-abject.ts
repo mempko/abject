@@ -280,15 +280,16 @@ export class ScriptableAbject extends Abject {
       const { source } = msg.payload as { source: string };
       if (msg.routing.from !== this._owner) {
         // Ownership may be stale after restart (ObjectCreator gets new ID each session).
-        // Resolve the current ObjectCreator via registry and accept if it matches the sender.
+        // Resolve the current ObjectCreator and AbjectEditor via registry and accept if the sender matches either.
         const creatorId = await this.discoverDep('ObjectCreator');
-        if (msg.routing.from !== creatorId) {
+        const editorId = await this.discoverDep('AbjectEditor');
+        if (msg.routing.from !== creatorId && msg.routing.from !== editorId) {
           log.warn(
             `updateSource rejected: ${msg.routing.from} is not owner ${this._owner}`
           );
           return { success: false, error: 'Only the owner can update source' };
         }
-        // Adopt new ObjectCreator as owner
+        // Adopt sender as owner
         this._owner = msg.routing.from;
       }
 
