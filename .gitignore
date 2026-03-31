@@ -1,5 +1,9 @@
 node_modules/
 dist/
+dist-server/
+dist-client/
+dist-electron/
+release/
 .env*
 playwright-report/
 test-results/

@@ -92,6 +92,28 @@ pnpm whisper         # :7720
 
 Three processes. One living system.
 
+### Incarnation (Desktop App)
+
+Give the organism a body. Package Abjects as a standalone desktop app for
+Linux, Windows, or macOS.
+
+```bash
+# Incarnate for your platform (binds and etches automatically)
+pnpm incarnate:linux    # AppImage, .deb
+pnpm incarnate:win      # NSIS installer, portable
+pnpm incarnate:mac      # .dmg, .zip
+
+# Manifest across all realms
+pnpm incarnate:all
+```
+
+You can also run the compilation steps alone: `pnpm bind` (compile server)
+and `pnpm etch` (compile client).
+
+Requires Electron. Cross-compilation from Linux to Windows works out of the
+box. macOS builds from Linux produce unsigned binaries (code signing requires
+macOS).
+
 The **backend** is the depths: all Abjects live here, passing messages in a
 Node.js process with worker threads. The **browser client** is the surface: a
 thin Canvas renderer that forwards input and displays composited frames over

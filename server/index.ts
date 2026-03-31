@@ -344,10 +344,10 @@ async function main(): Promise<void> {
     // For workspace storage, use a separate file path
     if (opts?.dbName) {
       const wsId = opts.dbName.replace('abjects-storage-', '');
-      const storagePath = path.join(process.cwd(), DATA_DIR, `ws-${wsId}`, 'storage.json');
+      const storagePath = path.resolve(DATA_DIR, `ws-${wsId}`, 'storage.json');
       return new NodeStorage(storagePath);
     }
-    return new NodeStorage(path.join(process.cwd(), DATA_DIR, 'storage.json'));
+    return new NodeStorage(path.resolve(DATA_DIR, 'storage.json'));
   });
   runtime.objectFactory.registerConstructor('Timer', () => new Timer());
   runtime.objectFactory.registerConstructor('Clipboard', () => new Clipboard());
@@ -402,7 +402,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('HostFileSystem', () => new HostFileSystem());
   runtime.objectFactory.registerConstructor('WebSearch', () => new WebSearch());
   runtime.objectFactory.registerConstructor('WebFetch', () => new WebFetch());
-  runtime.objectFactory.registerConstructor('SkillRegistry', () => new SkillRegistry(path.join(process.cwd(), DATA_DIR, 'skills')));
+  runtime.objectFactory.registerConstructor('SkillRegistry', () => new SkillRegistry(path.resolve(DATA_DIR, 'skills')));
   runtime.objectFactory.registerConstructor('SkillBrowser', () => new SkillBrowser());
   runtime.objectFactory.registerConstructor('SkillAgent', () => new SkillAgent());
 

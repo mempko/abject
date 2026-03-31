@@ -1,0 +1,45 @@
+appId: world.abject.app
+productName: Abject
+copyright: Copyright © 2024-2026
+
+afterPack: electron/afterPack.cjs
+
+directories:
+  output: release
+
+files:
+  - dist-electron/**/*
+  - dist-server/**/*
+  - dist-client/**/*
+  - node_modules/node-datachannel/**/*
+  - node_modules/ws/**/*
+  - node_modules/uuid/**/*
+  - node_modules/ajv/**/*
+  - node_modules/yaml/**/*
+  - package.json
+
+# Workers and native .node binaries must be unpacked from asar
+# (worker_threads and dlopen cannot load from inside asar archives)
+asarUnpack:
+  - dist-server/workers/**/*
+  - node_modules/node-datachannel/**/*.node
+  - node_modules/node-datachannel/**/prebuilds/**/*
+
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Utility
+
+win:
+  target:
+    - nsis
+
+mac:
+  target:
+    - zip
+  category: public.app-category.utilities
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
