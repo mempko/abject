@@ -195,6 +195,37 @@ export class WidgetManager extends Abject {
                 returns: { kind: 'primitive', primitive: 'string' },
               },
               {
+                name: 'createDetachedVBox',
+                description: 'Create a detached vertical box layout (not auto-added to any window or parent). Use as a split pane child via setLeftChild/setRightChild. Returns the layout AbjectId.',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window AbjectId (used as ownerId for removeChild routing)' },
+                  { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
+                  { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createDetachedHBox',
+                description: 'Create a detached horizontal box layout (not auto-added to any window or parent). Use as a split pane child via setLeftChild/setRightChild. Returns the layout AbjectId.',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window AbjectId (used as ownerId for removeChild routing)' },
+                  { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
+                  { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'createDetachedScrollableVBox',
+                description: 'Create a detached scrollable vertical box layout (not auto-added to any window or parent). Use as a split pane child via setLeftChild/setRightChild. Returns the layout AbjectId.',
+                parameters: [
+                  { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window AbjectId (used as ownerId for removeChild routing)' },
+                  { name: 'autoScroll', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Pin to bottom when new content is added. Default false.', optional: true },
+                  { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
+                  { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
                 name: 'createCanvas',
                 description: 'Create a canvas drawing widget inside a window. Returns the canvas widget AbjectId. Draw to it via this.call(canvasId, "abjects:canvas", "draw", { commands: [...] }). Get size via this.call(canvasId, "abjects:canvas", "getCanvasSize", {}).',
                 parameters: [
@@ -539,6 +570,52 @@ export class WidgetManager extends Abject {
         margins: payload.margins,
         spacing: payload.spacing,
       }), payload.autoSize);
+    });
+
+    // ── Detached layout factories (for split pane children) ──
+
+    this.on('createDetachedVBox', async (msg: AbjectMessage) => {
+      const payload = msg.payload as {
+        windowId: AbjectId;
+        margins?: Partial<LayoutMargins>;
+        spacing?: number;
+      };
+      return this.createDetachedLayout(new VBoxLayout({
+        ownerId: payload.windowId,
+        uiServerId: this.uiServerId!,
+        margins: payload.margins,
+        spacing: payload.spacing,
+      }));
+    });
+
+    this.on('createDetachedHBox', async (msg: AbjectMessage) => {
+      const payload = msg.payload as {
+        windowId: AbjectId;
+        margins?: Partial<LayoutMargins>;
+        spacing?: number;
+      };
+      return this.createDetachedLayout(new HBoxLayout({
+        ownerId: payload.windowId,
+        uiServerId: this.uiServerId!,
+        margins: payload.margins,
+        spacing: payload.spacing,
+      }));
+    });
+
+    this.on('createDetachedScrollableVBox', async (msg: AbjectMessage) => {
+      const payload = msg.payload as {
+        windowId: AbjectId;
+        autoScroll?: boolean;
+        margins?: Partial<LayoutMargins>;
+        spacing?: number;
+      };
+      return this.createDetachedLayout(new ScrollableVBoxLayout({
+        ownerId: payload.windowId,
+        uiServerId: this.uiServerId!,
+        autoScroll: payload.autoScroll,
+        margins: payload.margins,
+        spacing: payload.spacing,
+      }));
     });
 
     // ── Canvas widget factory ──
@@ -1028,6 +1105,9 @@ createNestedVBox - Nested vertical layout inside another layout. Pass autoSize: 
 createNestedHBox - Nested horizontal layout inside another layout. Pass autoSize: true for auto-computed preferred height.
 createScrollableVBox - Scrollable vertical stack layout (clips overflow, scrolls via mouse wheel). Pass autoScroll: true to pin to bottom when content is added (for chat/log views).
 createNestedScrollableVBox - Nested scrollable vertical layout inside another layout. Pass autoScroll: true to pin to bottom when content is added (for chat/log views).
+createDetachedVBox - Detached vertical layout (not auto-added to any parent). Use as a split pane child.
+createDetachedHBox - Detached horizontal layout (not auto-added to any parent). Use as a split pane child.
+createDetachedScrollableVBox - Detached scrollable vertical layout (not auto-added to any parent). Use as a split pane child.
 
 ### Canvas Drawing (games, animations, visualizations)
 
@@ -1536,6 +1616,18 @@ await this.call(timerId, 'addDependent', {});
       widgetId: layout.id,
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
+
+    return layout.id;
+  }
+
+  // ── Factory: createDetachedLayout — init layout without adding to any parent ──
+  // Used for layouts that will be split pane children (managed via setLeftChild/setRightChild).
+
+  private async createDetachedLayout(layout: LayoutAbject): Promise<AbjectId> {
+    require(this.uiServerId !== undefined, 'UIServer not set');
+
+    await layout.init(this.bus, this.id);
+    this.spawnedWidgets.add(layout.id);
 
     return layout.id;
   }

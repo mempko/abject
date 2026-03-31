@@ -36,6 +36,8 @@ export class AppExplorer extends Abject {
   private workspaceManagerId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
+  private outerSplitId?: AbjectId;
+  private innerSplitId?: AbjectId;
   private cachedObjects: ObjectRegistration[] = [];
 
   // ── Remote mode ──
@@ -177,6 +179,8 @@ export class AppExplorer extends Abject {
 
   private clearWidgetTracking(): void {
     this.rootLayoutId = undefined;
+    this.outerSplitId = undefined;
+    this.innerSplitId = undefined;
     this.kindPaneVBoxId = undefined;
     this.kindTabBarId = undefined;
     this.userKindListId = undefined;
@@ -338,24 +342,34 @@ export class AppExplorer extends Abject {
       spacing: 4,
     });
 
-    // ── Three-pane HBox ──
-    const paneHBox = await wm('createNestedHBox', {
-      parentLayoutId: this.rootLayoutId,
-      margins: { top: 0, right: 0, bottom: 0, left: 0 },
-      spacing: 4,
-    });
-    await this.addToLayout(this.rootLayoutId, paneHBox, { vertical: 'expanding', horizontal: 'expanding' });
+    // ── Three-pane area using nested split panes ──
+    // outerSplit: left=kindPane, right=innerSplit
+    // innerSplit: left=instanceList, right=detailPane
+    const r0 = { x: 0, y: 0, width: 0, height: 0 };
+    const windowId = this.windowId;
 
-    // ── Pane 1: Kind lists (user + system) in a VBox ──
-    this.kindPaneVBoxId = await wm('createNestedVBox', {
-      parentLayoutId: paneHBox,
+    const { widgetIds: splitIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          // [0] Outer split pane
+          { type: 'splitPane', windowId, orientation: 'horizontal',
+            dividerPosition: 0.25, minSize: 150 },
+          // [1] Inner split pane (instance | detail)
+          { type: 'splitPane', windowId, orientation: 'horizontal',
+            dividerPosition: 0.42, minSize: 150 },
+        ],
+      })
+    );
+    this.outerSplitId = splitIds[0];
+    this.innerSplitId = splitIds[1];
+    await this.addToLayout(this.rootLayoutId, this.outerSplitId, { vertical: 'expanding', horizontal: 'expanding' });
+
+    // ── Pane 1: Kind lists (user + system) in a detached VBox ──
+    this.kindPaneVBoxId = await wm('createDetachedVBox', {
+      windowId,
       margins: { top: 0, right: 0, bottom: 0, left: 0 },
       spacing: 2,
     });
-    await this.addToLayout(paneHBox, this.kindPaneVBoxId, { horizontal: 'expanding' }, { width: 200 });
-
-    const r0 = { x: 0, y: 0, width: 0, height: 0 };
-    const windowId = this.windowId;
 
     // ── Batch create all non-layout widgets ──
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
@@ -389,17 +403,18 @@ export class AppExplorer extends Abject {
       ],
     }));
 
-    // ── Add instance list to paneHBox BEFORE creating detail pane,
-    //    so createNestedScrollableVBox auto-appends detail pane last ──
-    await this.addToLayout(paneHBox, this.instanceListId, { horizontal: 'expanding' }, { width: 220 });
-
-    // ── Pane 3: Detail (scrollable VBox) — created after instanceList so it appends in the correct position ──
-    this.detailPaneId = await wm('createNestedScrollableVBox', {
-      parentLayoutId: paneHBox,
+    // ── Pane 3: Detail (detached scrollable VBox) ──
+    this.detailPaneId = await wm('createDetachedScrollableVBox', {
+      windowId,
       margins: { top: 4, right: 8, bottom: 4, left: 8 },
       spacing: 4,
     });
-    await this.addToLayout(paneHBox, this.detailPaneId, { horizontal: 'expanding' }, { width: 300 });
+
+    // Wire split pane children
+    await this.request(request(this.id, this.innerSplitId, 'setLeftChild', { widgetId: this.instanceListId }));
+    await this.request(request(this.id, this.innerSplitId, 'setRightChild', { widgetId: this.detailPaneId }));
+    await this.request(request(this.id, this.outerSplitId, 'setLeftChild', { widgetId: this.kindPaneVBoxId }));
+    await this.request(request(this.id, this.outerSplitId, 'setRightChild', { widgetId: this.innerSplitId }));
 
     // Fire-and-forget addDep for interactive widgets
     this.send(request(this.id, this.kindTabBarId, 'addDependent', {}));

@@ -24,6 +24,7 @@ export class SkillBrowser extends Abject {
   private skillRegistryId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
+  private splitPaneId?: AbjectId;
 
   // Left pane
   private leftPaneId?: AbjectId;
@@ -215,29 +216,33 @@ export class SkillBrowser extends Abject {
       spacing: 0,
     }) as AbjectId;
 
-    // Two-pane area: HBox
-    const paneHBox = await this.wm('createNestedHBox', {
-      parentLayoutId: this.rootLayoutId,
-      margins: { top: 0, right: 0, bottom: 0, left: 0 },
-      spacing: 1,
-    }) as AbjectId;
-    await this.addToLayout(this.rootLayoutId, paneHBox, { vertical: 'expanding' });
+    // Two-pane area: SplitPane
+    const { widgetIds: [splitId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId, 'create', { specs: [
+        { type: 'splitPane', windowId: this.windowId, orientation: 'horizontal',
+          dividerPosition: 0.30, minSize: 150 },
+      ]}),
+    );
+    this.splitPaneId = splitId;
+    await this.addToLayout(this.rootLayoutId, this.splitPaneId, { vertical: 'expanding' });
 
-    // Left pane: VBox with button + list
-    this.leftPaneId = await this.wm('createNestedVBox', {
-      parentLayoutId: paneHBox,
+    // Left pane: detached VBox (split pane child)
+    this.leftPaneId = await this.wm('createDetachedVBox', {
+      windowId: this.windowId,
       margins: { top: 4, right: 0, bottom: 4, left: 4 },
       spacing: 4,
     }) as AbjectId;
-    await this.addToLayout(paneHBox, this.leftPaneId, { horizontal: 'fixed' }, { width: 200 });
 
-    // Right pane: scrollable VBox for detail
-    this.detailPaneId = await this.wm('createNestedScrollableVBox', {
-      parentLayoutId: paneHBox,
+    // Right pane: detached scrollable VBox (split pane child)
+    this.detailPaneId = await this.wm('createDetachedScrollableVBox', {
+      windowId: this.windowId,
       margins: { top: 4, right: 8, bottom: 4, left: 8 },
       spacing: 4,
     }) as AbjectId;
-    await this.addToLayout(paneHBox, this.detailPaneId, { horizontal: 'expanding' });
+
+    // Wire split pane children
+    await this.request(request(this.id, this.splitPaneId, 'setLeftChild', { widgetId: this.leftPaneId }));
+    await this.request(request(this.id, this.splitPaneId, 'setRightChild', { widgetId: this.detailPaneId }));
 
     // Batch create scan button + list widget
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
@@ -262,6 +267,7 @@ export class SkillBrowser extends Abject {
     await this.wm('destroyWindowAbject', { windowId: this.windowId });
     this.windowId = undefined;
     this.rootLayoutId = undefined;
+    this.splitPaneId = undefined;
     this.leftPaneId = undefined;
     this.detailPaneId = undefined;
     this.listWidgetId = undefined;

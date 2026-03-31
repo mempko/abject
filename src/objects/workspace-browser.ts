@@ -26,6 +26,8 @@ export class WorkspaceBrowser extends Abject {
   private shareRegistryId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
+  private outerSplitId?: AbjectId;
+  private innerSplitId?: AbjectId;
   private refreshBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
 
@@ -129,6 +131,8 @@ export class WorkspaceBrowser extends Abject {
 
   private clearWidgetTracking(): void {
     this.rootLayoutId = undefined;
+    this.outerSplitId = undefined;
+    this.innerSplitId = undefined;
     this.peerPaneVBoxId = undefined;
     this.peerTabBarId = undefined;
     this.publicPeerListId = undefined;
@@ -372,62 +376,65 @@ export class WorkspaceBrowser extends Abject {
     await this.addToLayout(this.rootLayoutId, headerRowId,
       { vertical: 'fixed', horizontal: 'expanding' }, { height: 30 });
 
-    // Three-pane HBox (auto-added to root at pos 1)
-    const paneHBox = await wm('createNestedHBox', {
-      parentLayoutId: this.rootLayoutId,
-      margins: { top: 0, right: 0, bottom: 0, left: 0 },
-      spacing: 4,
-    });
-    await this.addToLayout(this.rootLayoutId, paneHBox,
-      { vertical: 'expanding', horizontal: 'expanding' });
-
-    // Pane 1: Peer list VBox (auto-added to paneHBox at pos 0)
-    this.peerPaneVBoxId = await wm('createNestedVBox', {
-      parentLayoutId: paneHBox,
-      margins: { top: 0, right: 0, bottom: 0, left: 0 },
-      spacing: 2,
-    });
-    await this.addToLayout(paneHBox, this.peerPaneVBoxId,
-      { horizontal: 'expanding' }, { width: 200 });
-
+    // Three-pane area using nested split panes
+    // outerSplit: left=peerPane, right=innerSplit
+    // innerSplit: left=workspaceList, right=detailPane
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
     const windowId = this.windowId;
 
-    // Batch create non-layout widgets
+    // Batch create split panes + all non-layout widgets
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          // [0] Title label
+          // [0] Outer split pane
+          { type: 'splitPane', windowId, orientation: 'horizontal',
+            dividerPosition: 0.24, minSize: 150 },
+          // [1] Inner split pane (workspaces | detail)
+          { type: 'splitPane', windowId, orientation: 'horizontal',
+            dividerPosition: 0.45, minSize: 150 },
+          // [2] Title label
           { type: 'label', windowId, rect: r0, text: 'Workspace Browser',
             style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
-          // [1] Refresh button
+          // [3] Refresh button
           { type: 'button', windowId, rect: r0, text: 'Refresh',
             style: { fontSize: 12 } },
-          // [2] Peer tab bar (Public / Private)
+          // [4] Peer tab bar (Public / Private)
           { type: 'tabBar', windowId, rect: r0,
             tabs: ['Public', 'Private'], selectedIndex: this.activePeerTab, closable: false },
-          // [3] Public peer list (searchable)
+          // [5] Public peer list (searchable)
           { type: 'list', windowId, rect: r0, items: [], searchable: true },
-          // [4] Private peer list
+          // [6] Private peer list
           { type: 'list', windowId, rect: r0, items: [] },
-          // [5] Workspace list (Pane 2)
+          // [7] Workspace list (Pane 2)
           { type: 'list', windowId, rect: r0, items: [] },
-          // [6] Status label
+          // [8] Status label
           { type: 'label', windowId, rect: r0, text: '',
             style: { color: this.theme.statusNeutral, fontSize: 11 } },
         ],
       })
     );
 
-    const [titleLabel, refreshBtn, peerTabBar, publicPeerList,
-      privatePeerList, workspaceList, statusLabel] = widgetIds;
+    const [outerSplit, innerSplit, titleLabel, refreshBtn, peerTabBar,
+      publicPeerList, privatePeerList, workspaceList, statusLabel] = widgetIds;
 
+    this.outerSplitId = outerSplit;
+    this.innerSplitId = innerSplit;
     this.refreshBtnId = refreshBtn;
     this.peerTabBarId = peerTabBar;
     this.publicPeerListId = publicPeerList;
     this.privatePeerListId = privatePeerList;
     this.workspaceListId = workspaceList;
     this.statusLabelId = statusLabel;
+
+    await this.addToLayout(this.rootLayoutId, this.outerSplitId,
+      { vertical: 'expanding', horizontal: 'expanding' });
+
+    // Pane 1: Peer list in a detached VBox
+    this.peerPaneVBoxId = await wm('createDetachedVBox', {
+      windowId,
+      margins: { top: 0, right: 0, bottom: 0, left: 0 },
+      spacing: 2,
+    });
 
     // Header row children
     await this.request(request(this.id, headerRowId, 'addLayoutChildren', {
@@ -446,18 +453,18 @@ export class WorkspaceBrowser extends Abject {
       ],
     }));
 
-    // Pane 2: workspace list added to paneHBox BEFORE creating detail pane
-    await this.addToLayout(paneHBox, this.workspaceListId,
-      { horizontal: 'expanding' }, { width: 280 });
-
-    // Pane 3: detail pane (created AFTER workspace list for correct auto-append order)
-    this.detailPaneId = await wm('createNestedScrollableVBox', {
-      parentLayoutId: paneHBox,
+    // Pane 3: detail pane (detached scrollable VBox)
+    this.detailPaneId = await wm('createDetachedScrollableVBox', {
+      windowId,
       margins: { top: 4, right: 8, bottom: 4, left: 8 },
       spacing: 4,
     });
-    await this.addToLayout(paneHBox, this.detailPaneId,
-      { horizontal: 'expanding' }, { width: 340 });
+
+    // Wire split pane children
+    await this.request(request(this.id, this.innerSplitId, 'setLeftChild', { widgetId: this.workspaceListId }));
+    await this.request(request(this.id, this.innerSplitId, 'setRightChild', { widgetId: this.detailPaneId }));
+    await this.request(request(this.id, this.outerSplitId, 'setLeftChild', { widgetId: this.peerPaneVBoxId }));
+    await this.request(request(this.id, this.outerSplitId, 'setRightChild', { widgetId: this.innerSplitId }));
 
     // Status label at bottom of root
     await this.addToLayout(this.rootLayoutId, this.statusLabelId,

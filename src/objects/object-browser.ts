@@ -714,21 +714,31 @@ export class ObjectBrowser extends Abject {
     );
     await this.addToLayout(this.rootLayoutId, divId, { vertical: 'fixed' }, { height: 1 });
 
-    // ── Four-pane area using HBox ──
-    const paneHBox = await wm('createNestedHBox', {
-      parentLayoutId: this.rootLayoutId,
-      margins: { top: 0, right: 0, bottom: 0, left: 0 },
-      spacing: 1,
-    }) as AbjectId;
-    await this.addToLayout(this.rootLayoutId, paneHBox, { vertical: 'expanding' });
+    // ── Four-pane area using nested split panes ──
+    // outerSplit: left=leftSplit, right=rightSplit
+    // leftSplit: left=pane1(scope), right=pane2(kinds)
+    // rightSplit: left=pane3(methods), right=pane4(detail)
+    const { widgetIds: [outerSplitWidget, leftSplitWidget, rightSplitWidget] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'splitPane', windowId: this.windowId, orientation: 'horizontal',
+          dividerPosition: 0.42, minSize: 150 },
+        { type: 'splitPane', windowId: this.windowId, orientation: 'horizontal',
+          dividerPosition: 0.47, minSize: 120 },
+        { type: 'splitPane', windowId: this.windowId, orientation: 'horizontal',
+          dividerPosition: 0.40, minSize: 120 },
+      ]})
+    );
+    this.outerSplitId = outerSplitWidget;
+    this.leftSplitId = leftSplitWidget;
+    this.rightSplitId = rightSplitWidget;
+    await this.addToLayout(this.rootLayoutId, this.outerSplitId, { vertical: 'expanding' });
 
-    // Pane 1: Scope lists in a VBox
-    this.pane1VBoxId = await wm('createNestedVBox', {
-      parentLayoutId: paneHBox,
+    // Pane 1: Scope lists in a detached VBox (left child of leftSplit)
+    this.pane1VBoxId = await wm('createDetachedVBox', {
+      windowId: this.windowId,
       margins: { top: 0, right: 0, bottom: 0, left: 0 },
       spacing: 2,
     }) as AbjectId;
-    await this.addToLayout(paneHBox, this.pane1VBoxId, { horizontal: 'expanding' }, { width: 180 });
 
     // Batch create pane1 widgets: pane1TabBar, scopeList, localWsList, remoteWsList
     const { widgetIds: [pane1TabBarId, scopeListId, localWsListId, remoteWsListId] } = await this.request<{ widgetIds: AbjectId[] }>(
@@ -764,18 +774,22 @@ export class ObjectBrowser extends Abject {
     this.pane2ListId = pane2ListId;
     this.pane3ListId = pane3ListId;
     await this.addDep(this.pane2ListId);
-    await this.addToLayout(paneHBox, this.pane2ListId, { horizontal: 'expanding' }, { width: 200 });
     await this.addDep(this.pane3ListId);
-    await this.addToLayout(paneHBox, this.pane3ListId, { horizontal: 'expanding' }, { width: 200 });
 
-    // Pane 4: Detail (scrollable vbox)
-    this.pane4LayoutId = await wm('createNestedScrollableVBox', {
-      parentLayoutId: paneHBox,
+    // Pane 4: Detail (detached scrollable vbox, right child of rightSplit)
+    this.pane4LayoutId = await wm('createDetachedScrollableVBox', {
+      windowId: this.windowId,
       margins: { top: 4, right: 8, bottom: 4, left: 8 },
       spacing: 4,
     }) as AbjectId;
-    await this.addToLayout(paneHBox, this.pane4LayoutId,
-      { horizontal: 'expanding' }, { width: 300 });
+
+    // Wire nested split pane children
+    await this.request(request(this.id, this.leftSplitId, 'setLeftChild', { widgetId: this.pane1VBoxId }));
+    await this.request(request(this.id, this.leftSplitId, 'setRightChild', { widgetId: this.pane2ListId }));
+    await this.request(request(this.id, this.rightSplitId, 'setLeftChild', { widgetId: this.pane3ListId }));
+    await this.request(request(this.id, this.rightSplitId, 'setRightChild', { widgetId: this.pane4LayoutId }));
+    await this.request(request(this.id, this.outerSplitId, 'setLeftChild', { widgetId: this.leftSplitId }));
+    await this.request(request(this.id, this.outerSplitId, 'setRightChild', { widgetId: this.rightSplitId }));
 
     // Populate all panes
     await this.rebuildAllPanes();
