@@ -463,15 +463,29 @@ export class ScriptableAbject extends Abject {
    * Apply new source at runtime. Returns success/error.
    * On failure, old handlers remain — the object never enters a broken state.
    */
-  applySource(source: string): { success: boolean; error?: string } {
+  applySource(source: string): { success: boolean; error?: string; errorLine?: number } {
     // Compile first — if this fails, nothing changes
     let handlerMap: Record<string, MessageHandlerFn>;
     try {
       handlerMap = new Function('return ' + source)() as Record<string, MessageHandlerFn>;
     } catch (err) {
+      // Try to extract the error line number using vm.Script for better diagnostics
+      let errorLine: number | undefined;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { Script } = require('vm');
+        new Script('(function(){\nreturn ' + source + '\n})()');
+      } catch (vmErr: unknown) {
+        const stack = (vmErr as Error).stack ?? '';
+        const match = stack.match(/evalmachine\.<anonymous>:(\d+)/);
+        if (match) {
+          errorLine = parseInt(match[1], 10) - 1; // subtract 1 for the function wrapper line
+        }
+      }
       return {
         success: false,
         error: err instanceof Error ? err.message : String(err),
+        errorLine,
       };
     }
 

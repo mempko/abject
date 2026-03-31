@@ -43,10 +43,10 @@ export class AbjectEditor extends Abject {
   private splitPaneId?: AbjectId;
   private handlerListId?: AbjectId;
   private sourceEditorId?: AbjectId;
+  private testBtnId?: AbjectId;
   private saveBtnId?: AbjectId;
   private cancelBtnId?: AbjectId;
   private addBtnId?: AbjectId;
-  private deleteBtnId?: AbjectId;
   private editStatusId?: AbjectId;
   private addInputId?: AbjectId;
   private addConfirmBtnId?: AbjectId;
@@ -54,6 +54,7 @@ export class AbjectEditor extends Abject {
 
   // State
   private editingObjectId?: AbjectId;
+  private abjectStoreId?: AbjectId;
   private entries: HandlerEntry[] = [];
   private selectedIndex = -1;
   private addMode = false;
@@ -105,6 +106,7 @@ export class AbjectEditor extends Abject {
     await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.registryId = await this.requireDep('Registry');
+    this.abjectStoreId = await this.discoverDep('AbjectStore') ?? undefined;
   }
 
   private setupHandlers(): void {
@@ -135,10 +137,10 @@ export class AbjectEditor extends Abject {
     this.splitPaneId = undefined;
     this.handlerListId = undefined;
     this.sourceEditorId = undefined;
+    this.testBtnId = undefined;
     this.saveBtnId = undefined;
     this.cancelBtnId = undefined;
     this.addBtnId = undefined;
-    this.deleteBtnId = undefined;
     this.editStatusId = undefined;
     this.addInputId = undefined;
     this.addConfirmBtnId = undefined;
@@ -240,16 +242,16 @@ export class AbjectEditor extends Abject {
           // 2: source editor (right)
           { type: 'textArea', windowId: this.windowId, text: '', monospace: true,
             style: { syntaxHighlight: true } },
-          // 3: save button
+          // 3: test button (apply live without persisting)
+          { type: 'button', windowId: this.windowId, text: 'Test',
+            style: { background: this.theme.statusWarning, color: this.theme.actionText, borderColor: this.theme.statusWarning } },
+          // 4: save button (apply live + persist)
           { type: 'button', windowId: this.windowId, text: 'Save',
             style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
-          // 4: cancel button
+          // 5: cancel button
           { type: 'button', windowId: this.windowId, text: 'Cancel' },
-          // 5: add handler button
+          // 6: add handler button
           { type: 'button', windowId: this.windowId, text: '+ Add' },
-          // 6: delete handler button
-          { type: 'button', windowId: this.windowId, text: 'Delete',
-            style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveBorder } },
           // 7: status label
           { type: 'label', windowId: this.windowId, text: '',
             style: { fontSize: 12, wordWrap: true, markdown: true } },
@@ -264,16 +266,16 @@ export class AbjectEditor extends Abject {
     );
 
     const [splitPaneId, handlerListId, sourceEditorId,
-      saveBtnId, cancelBtnId, addBtnId, deleteBtnId, editStatusId,
+      testBtnId, saveBtnId, cancelBtnId, addBtnId, editStatusId,
       addInputId, addConfirmBtnId] = widgetIds;
 
     this.splitPaneId = splitPaneId;
     this.handlerListId = handlerListId;
     this.sourceEditorId = sourceEditorId;
+    this.testBtnId = testBtnId;
     this.saveBtnId = saveBtnId;
     this.cancelBtnId = cancelBtnId;
     this.addBtnId = addBtnId;
-    this.deleteBtnId = deleteBtnId;
     this.editStatusId = editStatusId;
     this.addInputId = addInputId;
     this.addConfirmBtnId = addConfirmBtnId;
@@ -325,10 +327,10 @@ export class AbjectEditor extends Abject {
 
     await this.request(request(this.id, btnRowId, 'addLayoutChildren', {
       children: [
-        { widgetId: this.saveBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 28 } },
-        { widgetId: this.cancelBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 28 } },
-        { widgetId: this.addBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 28 } },
-        { widgetId: this.deleteBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 28 } },
+        { widgetId: this.testBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 60, height: 28 } },
+        { widgetId: this.saveBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 60, height: 28 } },
+        { widgetId: this.cancelBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 65, height: 28 } },
+        { widgetId: this.addBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 55, height: 28 } },
       ],
     }));
     await this.request(request(this.id, btnRowId, 'addLayoutSpacer', {}));
@@ -342,10 +344,10 @@ export class AbjectEditor extends Abject {
 
     // Register dependencies
     await this.addDep(this.handlerListId);
+    await this.addDep(this.testBtnId);
     await this.addDep(this.saveBtnId);
     await this.addDep(this.cancelBtnId);
     await this.addDep(this.addBtnId);
-    await this.addDep(this.deleteBtnId);
     await this.addDep(this.addConfirmBtnId);
     await this.addDep(this.addInputId);
 
@@ -443,9 +445,15 @@ export class AbjectEditor extends Abject {
       return;
     }
 
-    // Save
+    // Test (apply live, no persist)
+    if (fromId === this.testBtnId && aspect === 'click') {
+      await this.handleApply(false);
+      return;
+    }
+
+    // Save (apply live + persist)
     if (fromId === this.saveBtnId && aspect === 'click') {
-      await this.handleSave();
+      await this.handleApply(true);
       return;
     }
 
@@ -473,17 +481,17 @@ export class AbjectEditor extends Abject {
       return;
     }
 
-    // Delete handler
-    if (fromId === this.deleteBtnId && aspect === 'click') {
-      await this.handleDelete();
-      return;
-    }
   }
 
-  // ── Save ─────────────────────────────────────────────────────────────
+  // ── Apply / Save ──────────────────────────────────────────────────────
 
-  private async handleSave(): Promise<void> {
+  private async handleApply(persist: boolean): Promise<void> {
     if (!this.editingObjectId) return;
+
+    // Clear any previous error highlight
+    if (this.sourceEditorId) {
+      await this.request(request(this.id, this.sourceEditorId, 'update', { errorLine: -1 }));
+    }
 
     // Store current editor text
     await this.storeCurrentEditorText();
@@ -493,11 +501,12 @@ export class AbjectEditor extends Abject {
 
     await this.setControlsDisabled(true);
     try {
-      const result = await this.request<{ success: boolean; error?: string }>(
+      const result = await this.request<{ success: boolean; error?: string; errorLine?: number }>(
         request(this.id, this.editingObjectId, 'updateSource', { source })
       );
 
       if (result.success) {
+        // Sync to registry
         if (this.registryId) {
           try {
             await this.request(request(this.id, this.registryId, 'updateSource', {
@@ -505,15 +514,96 @@ export class AbjectEditor extends Abject {
             }));
           } catch { /* registry sync not critical */ }
         }
-        await this.updateStatus('Saved', this.theme.statusSuccess);
+
+        // Persist to AbjectStore if requested
+        if (persist && this.abjectStoreId) {
+          try {
+            // Get manifest and owner from registry
+            const reg = await this.request<{ manifest: unknown; owner?: string } | null>(
+              request(this.id, this.registryId!, 'lookup', { objectId: this.editingObjectId })
+            );
+            if (reg) {
+              await this.request(request(this.id, this.abjectStoreId, 'save', {
+                objectId: this.editingObjectId,
+                manifest: reg.manifest,
+                source,
+                owner: reg.owner ?? this.id,
+              }));
+            }
+          } catch { /* persist not critical for apply */ }
+          await this.updateStatus('Saved and persisted', this.theme.statusSuccess);
+        } else {
+          await this.updateStatus(persist ? 'Applied (store unavailable)' : 'Applied (not persisted)', this.theme.statusSuccess);
+        }
       } else {
         await this.updateStatus(`**Error:** ${result.error ?? 'Unknown'}`, this.theme.statusError);
+        await this.highlightErrorLine(source, result.errorLine, result.error);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await this.updateStatus(`**Error:** ${msg}`, this.theme.statusError);
     }
     await this.setControlsDisabled(false);
+  }
+
+  /**
+   * Map an error line from the full reassembled source to a handler entry
+   * and highlight the corresponding line in the editor.
+   *
+   * Mirrors the reassembleHandlerMap format exactly:
+   *   Line 1: "({"
+   *   Then for each entry: "  " + body (multi-line), joined by ",\n\n"
+   *   Last line: "})"
+   */
+  private async highlightErrorLine(_fullSource: string, errorLine: number | undefined, errorMsg: string | undefined): Promise<void> {
+    // Strategy 1: Extract a token from the error message and search for it in handler bodies.
+    // Error messages often mention the problematic token, e.g. "Unexpected token ';'" or
+    // "Private field '#foo' must be declared". This is more reliable than V8's line numbers
+    // which can point to the enclosing function rather than the exact error location.
+    const tokenMatch = errorMsg?.match(/['`]([^'`]+)['`]/) ?? errorMsg?.match(/token\s+(\S+)/);
+    if (tokenMatch) {
+      const token = tokenMatch[1];
+      for (let i = 0; i < this.entries.length; i++) {
+        const entry = this.entries[i];
+        const displayText = entry.type === 'property'
+          ? (entry.body.indexOf(':') >= 0 ? entry.body.slice(entry.body.indexOf(':') + 1).trim() : entry.body)
+          : entry.body;
+        const displayLines = displayText.split('\n');
+        for (let li = 0; li < displayLines.length; li++) {
+          if (displayLines[li].includes(token)) {
+            await this.selectEntry(i);
+            if (this.sourceEditorId) {
+              await this.request(request(this.id, this.sourceEditorId, 'update', { errorLine: li }));
+            }
+            return;
+          }
+        }
+      }
+    }
+
+    // Strategy 2: Fall back to line-number mapping from the reassembled source.
+    if (errorLine === undefined || errorLine < 1) return;
+
+    let line = 2; // line 1 is "({", first entry body starts at line 2
+    for (let i = 0; i < this.entries.length; i++) {
+      const bodyLineCount = this.entries[i].body.split('\n').length;
+      const entryStart = line;
+      const entryEnd = line + bodyLineCount - 1;
+
+      if (errorLine >= entryStart && errorLine <= entryEnd) {
+        await this.selectEntry(i);
+        const lineInBody = errorLine - entryStart;
+        const entry = this.entries[i];
+        const displayLineIdx = entry.type === 'property' ? 0 : lineInBody;
+        if (this.sourceEditorId) {
+          await this.request(request(this.id, this.sourceEditorId, 'update', { errorLine: displayLineIdx }));
+        }
+        return;
+      }
+
+      line = entryEnd + 1;
+      if (i < this.entries.length - 1) line += 1;
+    }
   }
 
   // ── Add Handler ──────────────────────────────────────────────────────
@@ -571,28 +661,6 @@ export class AbjectEditor extends Abject {
 
   // ── Delete Handler ───────────────────────────────────────────────────
 
-  private async handleDelete(): Promise<void> {
-    if (this.selectedIndex < 0 || this.selectedIndex >= this.entries.length) return;
-    const removed = this.entries[this.selectedIndex];
-    this.entries.splice(this.selectedIndex, 1);
-
-    // Adjust selection
-    if (this.selectedIndex >= this.entries.length) {
-      this.selectedIndex = this.entries.length - 1;
-    }
-
-    await this.refreshList();
-    if (this.entries.length > 0) {
-      await this.selectEntry(this.selectedIndex);
-    } else {
-      this.selectedIndex = -1;
-      if (this.sourceEditorId) {
-        await this.request(request(this.id, this.sourceEditorId, 'update', { text: '' }));
-      }
-    }
-    await this.updateStatus(`Deleted ${removed.name}`, this.theme.statusNeutral);
-  }
-
   // ── Helpers ──────────────────────────────────────────────────────────
 
   private async updateStatus(text: string, color: string): Promise<void> {
@@ -605,7 +673,7 @@ export class AbjectEditor extends Abject {
 
   private async setControlsDisabled(disabled: boolean): Promise<void> {
     const style = { disabled };
-    const ids = [this.saveBtnId, this.cancelBtnId, this.addBtnId, this.deleteBtnId, this.sourceEditorId];
+    const ids = [this.testBtnId, this.saveBtnId, this.cancelBtnId, this.addBtnId, this.sourceEditorId];
     for (const id of ids) {
       if (id) {
         try { await this.request(request(this.id, id, 'update', { style })); } catch { /* widget gone */ }

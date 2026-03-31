@@ -31,6 +31,7 @@ export class TextAreaWidget extends WidgetAbject {
   private lastClickLine = 0;
   private lastClickCol = 0;
   private lastSurfaceId = '';
+  private errorLine = -1; // line index to highlight as error (-1 = none)
 
   constructor(config: TextAreaWidgetConfig) {
     super(config);
@@ -203,6 +204,27 @@ export class TextAreaWidget extends WidgetAbject {
     for (let i = scrollTop; i < Math.min(lines.length, scrollTop + visibleLines); i++) {
       const lineY = oy + (i - scrollTop) * lineHeight;
       const lineTextY = lineY + lineHeight * 0.7;
+
+      // Error line highlight
+      if (i === this.errorLine) {
+        commands.push({
+          type: 'rect', surfaceId,
+          params: {
+            x: ox + 1, y: lineY,
+            width: w - 2, height: lineHeight,
+            fill: 'rgba(224, 85, 97, 0.15)',
+          },
+        });
+        // Left edge error indicator
+        commands.push({
+          type: 'rect', surfaceId,
+          params: {
+            x: ox + 1, y: lineY,
+            width: 3, height: lineHeight,
+            fill: this.theme.statusError,
+          },
+        });
+      }
 
       // Selection highlight for this line
       if (sel && focused && i >= sel.startLine && i <= sel.endLine) {
@@ -892,12 +914,14 @@ export class TextAreaWidget extends WidgetAbject {
 
   protected applyUpdate(updates: Record<string, unknown>): void {
     if (updates.monospace !== undefined) this.monospace = updates.monospace as boolean;
+    if (updates.errorLine !== undefined) this.errorLine = updates.errorLine as number;
     // When text is set externally, reset cursor to start and clear selection
     if (updates.text !== undefined) {
       this.cursorLine = 0;
       this.cursorCol = 0;
       this.selAnchorLine = null;
       this.selAnchorCol = null;
+      this.errorLine = -1; // clear error on new text
     }
   }
 }
