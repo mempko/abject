@@ -21,11 +21,11 @@
     "hack": "tsx hack/security-audit.ts",
     "bind": "node build-server.mjs",
     "etch": "vite build --config vite.client.config.ts",
-    "incarnate": "node build-electron.mjs && pnpm bind && pnpm etch && electron-builder",
-    "incarnate:linux": "pnpm incarnate --linux",
-    "incarnate:win": "pnpm incarnate --win",
-    "incarnate:mac": "pnpm incarnate --mac",
-    "incarnate:all": "pnpm incarnate -wlm",
+    "incarnate": "node build-electron.mjs && pnpm bind && pnpm etch",
+    "incarnate:linux": "pnpm incarnate && node download-playwright-browser.mjs linux-x64 && electron-builder --linux",
+    "incarnate:win": "pnpm incarnate && node download-playwright-browser.mjs win-x64 && electron-builder --win",
+    "incarnate:mac": "pnpm incarnate && node download-playwright-browser.mjs mac-x64 mac-arm64 && electron-builder --mac",
+    "incarnate:all": "pnpm incarnate:linux && pnpm incarnate:win && pnpm incarnate:mac",
     "release": "node release.mjs"
   },
   "dependencies": {

@@ -32,6 +32,12 @@ if (!process.env.ABJECTS_DATA_DIR) {
   }
 }
 
+// Point Playwright at the bundled headless shell (unpacked from asar)
+const resourcesDir = path.dirname(app.getAppPath());
+process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(
+  resourcesDir, 'app.asar.unpacked', 'playwright-browsers'
+);
+
 const WS_PORT = parseInt(process.env.WS_PORT ?? '7719', 10);
 const CLIENT_PORT = 0; // OS assigns a free port
 

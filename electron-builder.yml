@@ -16,6 +16,7 @@ files:
   - node_modules/uuid/**/*
   - node_modules/ajv/**/*
   - node_modules/yaml/**/*
+  - playwright-browsers/**/*
   - package.json
 
 # Workers and native .node binaries must be unpacked from asar
@@ -24,6 +25,7 @@ asarUnpack:
   - dist-server/workers/**/*
   - node_modules/node-datachannel/**/*.node
   - node_modules/node-datachannel/**/prebuilds/**/*
+  - playwright-browsers/**/*
 
 linux:
   target:

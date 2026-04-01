@@ -1139,9 +1139,16 @@ export class WebBrowser extends Abject {
     try {
       const pw = await import('playwright');
       this.chromium = pw.chromium;
-      this.browser = await (this.chromium as { launch: (opts: unknown) => Promise<unknown> }).launch({
-        headless: true,
-      });
+      const launchOptions: Record<string, unknown> = { headless: true };
+
+      // Inside an Electron AppImage, the Chromium sandbox requires SUID or
+      // user namespaces which are restricted. Same issue afterPack.cjs solves
+      // for the Electron binary itself.
+      if (process.env.ELECTRON_PACKAGED) {
+        launchOptions.args = ['--no-sandbox', '--disable-setuid-sandbox'];
+      }
+
+      this.browser = await (this.chromium as { launch: (opts: unknown) => Promise<unknown> }).launch(launchOptions);
 
       // If the browser disconnects unexpectedly, clear all tracked pages
       (this.browser as { on: (event: string, fn: () => void) => void }).on('disconnected', () => {

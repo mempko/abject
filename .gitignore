@@ -12,3 +12,4 @@ test-results/
 .abjects3/
 *.log
 *.har
+playwright-browsers/
