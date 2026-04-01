@@ -333,6 +333,7 @@ export abstract class LayoutAbject extends WidgetAbject {
 
     // Track expanded state of child widgets (e.g. select dropdowns)
     // so we can render them on top and give them priority hit-testing.
+    // Propagate upward so parent layouts also give us priority.
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       if (aspect === 'expanded') {
@@ -341,6 +342,9 @@ export abstract class LayoutAbject extends WidgetAbject {
         } else {
           this.expandedChildren.delete(msg.routing.from);
         }
+        // Propagate: tell our parent layout we have an expanded child
+        // so it gives us priority hit-testing beyond our bounds.
+        this.changed('expanded', this.expandedChildren.size > 0);
         await this.requestRedraw();
       }
       if (aspect === 'visibility') {

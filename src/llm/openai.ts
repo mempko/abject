@@ -10,6 +10,7 @@ import {
   LLMCompletionResult,
   LLMStreamChunk,
   ModelTier,
+  ModelInfo,
   ContentPart,
 } from './provider.js';
 import { require } from '../core/contracts.js';
@@ -73,8 +74,17 @@ export class OpenAIProvider extends BaseLLMProvider {
     fast: 'gpt-5.4-nano',
   };
 
-  private resolveModel(tier?: ModelTier): string {
-    return tier ? OpenAIProvider.TIER_MODELS[tier] : this.model;
+  private resolveModel(options?: LLMCompletionOptions): string {
+    if (options?.model) return options.model;
+    return options?.tier ? OpenAIProvider.TIER_MODELS[options.tier] : this.model;
+  }
+
+  async listModels(): Promise<ModelInfo[]> {
+    return [
+      { id: 'gpt-5.4', name: 'GPT-5.4' },
+      { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
+      { id: 'gpt-5.4-nano', name: 'GPT-5.4 Nano' },
+    ];
   }
 
   constructor(config: OpenAIConfig) {
@@ -97,7 +107,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     require(this.apiKey !== undefined, 'API key is required');
 
     const request: OpenAIRequest = {
-      model: this.resolveModel(options.tier),
+      model: this.resolveModel(options),
       messages: messages.map((m) => ({
         role: m.role,
         content: this.mapContent(m.content),
@@ -137,7 +147,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     require(this.apiKey !== undefined, 'API key is required');
 
     const request: OpenAIRequest = {
-      model: this.resolveModel(options.tier),
+      model: this.resolveModel(options),
       messages: messages.map((m) => ({
         role: m.role,
         content: this.mapContent(m.content),

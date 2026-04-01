@@ -32,6 +32,7 @@ export class ScrollableVBoxLayout extends VBoxLayout {
       this.autoScrollEnabled = true;
       this.autoScroll = true;
     }
+
   }
 
   /**

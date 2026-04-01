@@ -21,6 +21,12 @@ export interface LLMCompletionOptions {
   stopSequences?: string[];
   stream?: boolean;
   tier?: ModelTier;
+  model?: string;
+}
+
+export interface ModelInfo {
+  id: string;
+  name: string;
 }
 
 export interface LLMCompletionResult {
@@ -80,6 +86,11 @@ export interface LLMProvider {
     messages: LLMMessage[],
     options?: LLMCompletionOptions
   ): AsyncIterable<LLMStreamChunk>;
+
+  /**
+   * List available models for this provider.
+   */
+  listModels(): Promise<ModelInfo[]>;
 }
 
 /**
@@ -102,6 +113,10 @@ export abstract class BaseLLMProvider implements LLMProvider {
     messages: LLMMessage[],
     options?: LLMCompletionOptions
   ): Promise<LLMCompletionResult>;
+
+  async listModels(): Promise<ModelInfo[]> {
+    return [];
+  }
 
   /**
    * Make an HTTP request to the API.

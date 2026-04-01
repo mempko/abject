@@ -21,23 +21,44 @@ const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 
 const STORAGE_KEY_ANTHROPIC = 'global-settings:anthropicApiKey';
 const STORAGE_KEY_OPENAI = 'global-settings:openaiApiKey';
-const STORAGE_KEY_PROVIDER = 'global-settings:llmProvider';
 const STORAGE_KEY_OLLAMA_URL = 'global-settings:ollamaUrl';
-const STORAGE_KEY_OLLAMA_MODEL = 'global-settings:ollamaModel'; // legacy, used for migration
-const STORAGE_KEY_OLLAMA_MODEL_SMART = 'global-settings:ollamaModelSmart';
-const STORAGE_KEY_OLLAMA_MODEL_BALANCED = 'global-settings:ollamaModelBalanced';
-const STORAGE_KEY_OLLAMA_MODEL_FAST = 'global-settings:ollamaModelFast';
 const STORAGE_KEY_AUTH_ENABLED = 'global-settings:authEnabled';
 const STORAGE_KEY_AUTH_USER = 'global-settings:authUser';
 const STORAGE_KEY_AUTH_PASS = 'global-settings:authPass';
+
+// Per-tier routing storage keys
+const STORAGE_KEY_TIER_SMART_PROVIDER = 'global-settings:tierSmartProvider';
+const STORAGE_KEY_TIER_SMART_MODEL = 'global-settings:tierSmartModel';
+const STORAGE_KEY_TIER_BALANCED_PROVIDER = 'global-settings:tierBalancedProvider';
+const STORAGE_KEY_TIER_BALANCED_MODEL = 'global-settings:tierBalancedModel';
+const STORAGE_KEY_TIER_FAST_PROVIDER = 'global-settings:tierFastProvider';
+const STORAGE_KEY_TIER_FAST_MODEL = 'global-settings:tierFastModel';
 
 type LLMProviderName = 'anthropic' | 'openai' | 'ollama';
 const PROVIDER_LABELS: string[] = ['Anthropic', 'OpenAI', 'Ollama'];
 const PROVIDER_NAMES: LLMProviderName[] = ['anthropic', 'openai', 'ollama'];
 
-// Legacy keys for migration from per-workspace Settings
+type ModelTierName = 'smart' | 'balanced' | 'fast';
+const TIER_LABELS: string[] = ['Smart', 'Balanced', 'Fast'];
+const TIER_NAMES: ModelTierName[] = ['smart', 'balanced', 'fast'];
+
+// Default tier models per provider (for migration from old single-provider setting)
+const DEFAULT_TIER_MODELS: Record<LLMProviderName, Record<ModelTierName, string>> = {
+  anthropic: { smart: 'claude-opus-4-6', balanced: 'claude-sonnet-4-6', fast: 'claude-haiku-4-5-20251001' },
+  openai: { smart: 'gpt-5.4', balanced: 'gpt-5.4-mini', fast: 'gpt-5.4-nano' },
+  ollama: { smart: '', balanced: '', fast: '' },
+};
+
+// Legacy keys for migration
 const LEGACY_KEY_ANTHROPIC = 'settings:anthropicApiKey';
 const LEGACY_KEY_OPENAI = 'settings:openaiApiKey';
+const LEGACY_KEY_PROVIDER = 'global-settings:llmProvider';
+const LEGACY_KEY_OLLAMA_MODEL = 'global-settings:ollamaModel';
+const LEGACY_KEY_OLLAMA_MODEL_SMART = 'global-settings:ollamaModelSmart';
+const LEGACY_KEY_OLLAMA_MODEL_BALANCED = 'global-settings:ollamaModelBalanced';
+const LEGACY_KEY_OLLAMA_MODEL_FAST = 'global-settings:ollamaModelFast';
+
+interface ModelInfo { id: string; name: string; }
 
 /**
  * GlobalSettings object that provides a configuration UI for LLM API keys.
@@ -54,26 +75,16 @@ export class GlobalSettings extends Abject {
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
 
-  // Provider selection
-  private selectedProvider: LLMProviderName = 'anthropic';
-  private providerSelectId?: AbjectId;
-
-  // Anthropic section widgets
+  // Credential widgets (always visible)
   private anthropicKeyId?: AbjectId;
   private anthropicToggleId?: AbjectId;
-  private anthropicSectionIds: AbjectId[] = [];
-
-  // OpenAI section widgets
   private openaiKeyId?: AbjectId;
   private openaiToggleId?: AbjectId;
-  private openaiSectionIds: AbjectId[] = [];
-
-  // Ollama section widgets
   private ollamaUrlId?: AbjectId;
-  private ollamaModelSmartSelectId?: AbjectId;
-  private ollamaModelBalancedSelectId?: AbjectId;
-  private ollamaModelFastSelectId?: AbjectId;
-  private ollamaSectionIds: AbjectId[] = [];
+
+  // Per-tier provider + model select widgets
+  private tierProviderSelectIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined };
+  private tierModelSelectIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined };
 
   private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
@@ -93,6 +104,13 @@ export class GlobalSettings extends Abject {
   private authSaveBtnId?: AbjectId;
 
   private unmasked: Set<AbjectId> = new Set();
+
+  // Cached model lists per provider (refreshed when credentials change)
+  private providerModelCache: Record<LLMProviderName, ModelInfo[]> = {
+    anthropic: [],
+    openai: [],
+    ollama: [],
+  };
 
   constructor() {
     super({
@@ -143,8 +161,11 @@ export class GlobalSettings extends Abject {
     let anthropicKey: string | null = null;
     let openaiKey: string | null = null;
     let ollamaUrl: string | null = null;
-    let ollamaTierModels: { smart: string | null; balanced: string | null; fast: string | null } = { smart: null, balanced: null, fast: null };
-    let savedProvider: string | null = null;
+    const tierRouting: Record<ModelTierName, { provider: string | null; model: string | null }> = {
+      smart: { provider: null, model: null },
+      balanced: { provider: null, model: null },
+      fast: { provider: null, model: null },
+    };
 
     if (this.storageId) {
       anthropicKey = await this.request<string | null>(
@@ -156,26 +177,25 @@ export class GlobalSettings extends Abject {
       ollamaUrl = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_URL })
       );
-      ollamaTierModels.smart = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL_SMART })
+
+      // Load per-tier routing
+      tierRouting.smart.provider = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_SMART_PROVIDER })
       );
-      ollamaTierModels.balanced = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL_BALANCED })
+      tierRouting.smart.model = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_SMART_MODEL })
       );
-      ollamaTierModels.fast = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL_FAST })
+      tierRouting.balanced.provider = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_BALANCED_PROVIDER })
       );
-      // Legacy migration: old single model key populates all tiers
-      if (!ollamaTierModels.smart && !ollamaTierModels.balanced && !ollamaTierModels.fast) {
-        const legacyModel = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL })
-        );
-        if (legacyModel) {
-          ollamaTierModels = { smart: legacyModel, balanced: legacyModel, fast: legacyModel };
-        }
-      }
-      savedProvider = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_PROVIDER })
+      tierRouting.balanced.model = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_BALANCED_MODEL })
+      );
+      tierRouting.fast.provider = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_FAST_PROVIDER })
+      );
+      tierRouting.fast.model = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_FAST_MODEL })
       );
 
       // Legacy migration from per-workspace keys
@@ -186,7 +206,6 @@ export class GlobalSettings extends Abject {
         const legacyOpenai = await this.request<string | null>(
           request(this.id, this.storageId, 'get', { key: LEGACY_KEY_OPENAI })
         );
-
         if (legacyAnthropic || legacyOpenai) {
           anthropicKey = legacyAnthropic;
           openaiKey = legacyOpenai;
@@ -204,84 +223,104 @@ export class GlobalSettings extends Abject {
         }
       }
 
+      // Legacy migration: old single-provider setting to per-tier routing
+      const hasTierRouting = tierRouting.smart.provider || tierRouting.balanced.provider || tierRouting.fast.provider;
+      if (!hasTierRouting) {
+        const oldProvider = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key: LEGACY_KEY_PROVIDER })
+        );
+        if (oldProvider && PROVIDER_NAMES.includes(oldProvider as LLMProviderName)) {
+          const providerName = oldProvider as LLMProviderName;
+          const defaults = DEFAULT_TIER_MODELS[providerName];
+
+          // For Ollama, check old per-tier model keys
+          if (providerName === 'ollama') {
+            const oldSmart = await this.request<string | null>(
+              request(this.id, this.storageId, 'get', { key: LEGACY_KEY_OLLAMA_MODEL_SMART })
+            );
+            const oldBalanced = await this.request<string | null>(
+              request(this.id, this.storageId, 'get', { key: LEGACY_KEY_OLLAMA_MODEL_BALANCED })
+            );
+            const oldFast = await this.request<string | null>(
+              request(this.id, this.storageId, 'get', { key: LEGACY_KEY_OLLAMA_MODEL_FAST })
+            );
+            // Check legacy single model key
+            const legacyModel = await this.request<string | null>(
+              request(this.id, this.storageId, 'get', { key: LEGACY_KEY_OLLAMA_MODEL })
+            );
+            tierRouting.smart = { provider: providerName, model: oldSmart || legacyModel || '' };
+            tierRouting.balanced = { provider: providerName, model: oldBalanced || legacyModel || '' };
+            tierRouting.fast = { provider: providerName, model: oldFast || legacyModel || '' };
+          } else {
+            for (const tier of TIER_NAMES) {
+              tierRouting[tier] = { provider: providerName, model: defaults[tier] };
+            }
+          }
+
+          // Persist migrated tier routing
+          await this.persistTierRouting(tierRouting);
+          log.info(`Migrated single-provider '${providerName}' to per-tier routing`);
+        }
+      }
+
       await this.applySavedAuthConfig();
     }
 
-    // Determine selected provider
-    if (savedProvider && PROVIDER_NAMES.includes(savedProvider as LLMProviderName)) {
-      this.selectedProvider = savedProvider as LLMProviderName;
-    } else if (anthropicKey) {
-      this.selectedProvider = 'anthropic';
-      if (this.storageId) {
-        await this.request(
-          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_PROVIDER, value: 'anthropic' })
-        );
-      }
-    } else if (openaiKey) {
-      this.selectedProvider = 'openai';
-      if (this.storageId) {
-        await this.request(
-          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_PROVIDER, value: 'openai' })
-        );
-      }
-    } else {
-      this.selectedProvider = 'anthropic';
-    }
-
-    // Configure the selected provider
-    const hasConfig = this.providerHasConfig(this.selectedProvider, anthropicKey, openaiKey, ollamaUrl);
-    if (hasConfig && this.llmId) {
-      await this.configureSelectedProvider(anthropicKey, openaiKey, ollamaUrl, ollamaTierModels);
-      log.info(`Loaded saved provider: ${this.selectedProvider}`);
+    // Configure all providers and tier routing
+    const hasAnyConfig = anthropicKey || openaiKey || ollamaUrl;
+    const hasTierConfig = tierRouting.smart.provider || tierRouting.balanced.provider || tierRouting.fast.provider;
+    if ((hasAnyConfig || hasTierConfig) && this.llmId) {
+      await this.configureProviders(anthropicKey, openaiKey, ollamaUrl, tierRouting);
+      log.info('Loaded saved provider configuration');
     } else {
       await this.show();
     }
   }
 
-  private providerHasConfig(
-    provider: LLMProviderName,
-    anthropicKey: string | null,
-    openaiKey: string | null,
-    ollamaUrl: string | null,
-  ): boolean {
-    switch (provider) {
-      case 'anthropic': return !!anthropicKey;
-      case 'openai': return !!openaiKey;
-      case 'ollama': return true; // Ollama works with default URL
+  private async persistTierRouting(
+    tierRouting: Record<ModelTierName, { provider: string | null; model: string | null }>,
+  ): Promise<void> {
+    if (!this.storageId) return;
+    const keys: [string, string | null][] = [
+      [STORAGE_KEY_TIER_SMART_PROVIDER, tierRouting.smart.provider],
+      [STORAGE_KEY_TIER_SMART_MODEL, tierRouting.smart.model],
+      [STORAGE_KEY_TIER_BALANCED_PROVIDER, tierRouting.balanced.provider],
+      [STORAGE_KEY_TIER_BALANCED_MODEL, tierRouting.balanced.model],
+      [STORAGE_KEY_TIER_FAST_PROVIDER, tierRouting.fast.provider],
+      [STORAGE_KEY_TIER_FAST_MODEL, tierRouting.fast.model],
+    ];
+    for (const [key, value] of keys) {
+      if (value) {
+        await this.request(request(this.id, this.storageId, 'set', { key, value }));
+      }
     }
   }
 
-  private async configureSelectedProvider(
+  private async configureProviders(
     anthropicKey: string | null,
     openaiKey: string | null,
     ollamaUrl: string | null,
-    ollamaTierModels: { smart: string | null; balanced: string | null; fast: string | null } = { smart: null, balanced: null, fast: null },
+    tierRouting: Record<ModelTierName, { provider: string | null; model: string | null }>,
   ): Promise<void> {
     if (!this.llmId) return;
 
-    const config: Record<string, unknown> = {};
-    switch (this.selectedProvider) {
-      case 'anthropic':
-        config.anthropicApiKey = anthropicKey ?? undefined;
-        break;
-      case 'openai':
-        config.openaiApiKey = openaiKey ?? undefined;
-        break;
-      case 'ollama': {
-        config.ollamaUrl = ollamaUrl || 'http://localhost:11434';
-        const tierModels: Record<string, string> = {};
-        if (ollamaTierModels.smart) tierModels.smart = ollamaTierModels.smart;
-        if (ollamaTierModels.balanced) tierModels.balanced = ollamaTierModels.balanced;
-        if (ollamaTierModels.fast) tierModels.fast = ollamaTierModels.fast;
-        if (Object.keys(tierModels).length > 0) {
-          config.ollamaTierModels = tierModels;
-        }
-        break;
+    // Build tier routing for LLMObject (only include tiers with both provider and model)
+    const routing: Record<string, { provider: string; model: string }> = {};
+    for (const tier of TIER_NAMES) {
+      const { provider, model } = tierRouting[tier];
+      if (provider && model) {
+        routing[tier] = { provider, model };
       }
     }
 
+    const config: Record<string, unknown> = {
+      anthropicApiKey: anthropicKey ?? undefined,
+      openaiApiKey: openaiKey ?? undefined,
+      ollamaUrl: ollamaUrl || undefined,
+      tierRouting: Object.keys(routing).length > 0 ? routing : undefined,
+    };
+
     await this.request(request(this.id, this.llmId, 'configure', config));
-    await this.request(request(this.id, this.llmId, 'setProvider', { name: this.selectedProvider }));
   }
 
   private setupHandlers(): void {
@@ -300,26 +339,15 @@ export class GlobalSettings extends Abject {
     });
 
     // Handle 'changed' events from widget dependents
-    this.on('changed', async (msg: AbjectMessage) => {
-      const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
-      const fromId = msg.routing.from;
+    this.on('changed', async (m: AbjectMessage) => {
+      const { aspect, value } = m.payload as { aspect: string; value?: unknown };
+      const fromId = m.routing.from;
 
       // Tab bar changed
       if (fromId === this.tabBarId && aspect === 'change') {
         const idx = value as number;
         this.activeTab = idx === 0 ? 'ai' : 'auth';
         await this.switchTab();
-        return;
-      }
-
-      // Provider dropdown changed
-      if (fromId === this.providerSelectId && aspect === 'change') {
-        const label = value as string;
-        const idx = PROVIDER_LABELS.indexOf(label);
-        if (idx >= 0) {
-          this.selectedProvider = PROVIDER_NAMES[idx];
-          await this.switchProviderFields(this.selectedProvider);
-        }
         return;
       }
 
@@ -338,7 +366,15 @@ export class GlobalSettings extends Abject {
         return;
       }
 
-      // Auth checkbox toggled — enable/disable auth credential fields
+      // Tier provider dropdown changed -- refresh model list for that tier
+      for (const tier of TIER_NAMES) {
+        if (fromId === this.tierProviderSelectIds[tier] && aspect === 'change') {
+          await this.refreshTierModelOptions(tier);
+          return;
+        }
+      }
+
+      // Auth checkbox toggled
       if (fromId === this.authCheckboxId && aspect === 'change') {
         await this.setAuthFieldsDisabled(!(value as boolean));
         return;
@@ -385,8 +421,8 @@ export class GlobalSettings extends Abject {
       request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
 
-    const winW = 440;
-    const winH = 460;
+    const winW = 520;
+    const winH = 580;
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
@@ -484,9 +520,11 @@ export class GlobalSettings extends Abject {
     let savedAnthropicKey: string | null = null;
     let savedOpenaiKey: string | null = null;
     let savedOllamaUrl: string | null = null;
-    let savedOllamaModelSmart: string | null = null;
-    let savedOllamaModelBalanced: string | null = null;
-    let savedOllamaModelFast: string | null = null;
+    const savedTierRouting: Record<ModelTierName, { provider: string | null; model: string | null }> = {
+      smart: { provider: null, model: null },
+      balanced: { provider: null, model: null },
+      fast: { provider: null, model: null },
+    };
     if (this.storageId) {
       savedAnthropicKey = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_ANTHROPIC })
@@ -497,69 +535,56 @@ export class GlobalSettings extends Abject {
       savedOllamaUrl = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_URL })
       );
-      savedOllamaModelSmart = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL_SMART })
+      savedTierRouting.smart.provider = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_SMART_PROVIDER })
       );
-      savedOllamaModelBalanced = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL_BALANCED })
+      savedTierRouting.smart.model = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_SMART_MODEL })
       );
-      savedOllamaModelFast = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL_FAST })
+      savedTierRouting.balanced.provider = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_BALANCED_PROVIDER })
       );
-      // Legacy migration for show()
-      if (!savedOllamaModelSmart && !savedOllamaModelBalanced && !savedOllamaModelFast) {
-        const legacyModel = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_MODEL })
-        );
-        if (legacyModel) {
-          savedOllamaModelSmart = legacyModel;
-          savedOllamaModelBalanced = legacyModel;
-          savedOllamaModelFast = legacyModel;
-        }
-      }
+      savedTierRouting.balanced.model = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_BALANCED_MODEL })
+      );
+      savedTierRouting.fast.provider = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_FAST_PROVIDER })
+      );
+      savedTierRouting.fast.model = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_FAST_MODEL })
+      );
     }
 
-    // Section header + description + provider dropdown
-    const selectedIndex = PROVIDER_NAMES.indexOf(this.selectedProvider);
-    const { widgetIds: [sectionHeaderId, descLabelId, providerSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    // Fetch model lists for all providers
+    await this.fetchAllProviderModels(savedOllamaUrl);
+
+    // ── Credentials section ──
+    const { widgetIds: [credHeaderId, credDescId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'LLM Provider',
+        { type: 'label', windowId: this.windowId, text: 'Credentials',
           style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
-        { type: 'label', windowId: this.windowId, text: 'Select your LLM provider and enter credentials.',
+        { type: 'label', windowId: this.windowId, text: 'Enter API keys for cloud providers. Ollama runs locally.',
           style: { color: this.theme.textDescription, fontSize: 12 } },
-        { type: 'select', windowId: this.windowId,
-          options: PROVIDER_LABELS,
-          selectedIndex: selectedIndex >= 0 ? selectedIndex : 0 },
       ]})
     );
-    this.providerSelectId = providerSelectId;
     await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: sectionHeaderId,
+      widgetId: credHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 24 },
     }));
     await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: descLabelId,
+      widgetId: credDescId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
     }));
-    await this.request(request(this.id, this.providerSelectId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: this.providerSelectId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
 
-    // ── Anthropic section ──
-    this.anthropicSectionIds = [];
-
+    // Anthropic API Key row
     const { widgetIds: [anthropicLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'API Key',
+        { type: 'label', windowId: this.windowId, text: 'Anthropic API Key',
           style: { color: this.theme.textHeading, fontSize: 13 } },
       ]})
     );
-    this.anthropicSectionIds.push(anthropicLabelId);
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: anthropicLabelId,
       sizePolicy: { vertical: 'fixed' },
@@ -573,7 +598,6 @@ export class GlobalSettings extends Abject {
         spacing: 8,
       })
     );
-    this.anthropicSectionIds.push(anthropicRowId);
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: anthropicRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
@@ -602,16 +626,13 @@ export class GlobalSettings extends Abject {
       preferredSize: { width: 56, height: 32 },
     }));
 
-    // ── OpenAI section ──
-    this.openaiSectionIds = [];
-
+    // OpenAI API Key row
     const { widgetIds: [openaiLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'API Key',
+        { type: 'label', windowId: this.windowId, text: 'OpenAI API Key',
           style: { color: this.theme.textHeading, fontSize: 13 } },
       ]})
     );
-    this.openaiSectionIds.push(openaiLabelId);
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: openaiLabelId,
       sizePolicy: { vertical: 'fixed' },
@@ -625,7 +646,6 @@ export class GlobalSettings extends Abject {
         spacing: 8,
       })
     );
-    this.openaiSectionIds.push(openaiRowId);
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: openaiRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
@@ -654,25 +674,26 @@ export class GlobalSettings extends Abject {
       preferredSize: { width: 56, height: 32 },
     }));
 
-    // ── Ollama section ──
-    this.ollamaSectionIds = [];
-
-    const { widgetIds: [ollamaLabelId, ollamaUrlId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    // Ollama URL row
+    const { widgetIds: [ollamaLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Base URL',
+        { type: 'label', windowId: this.windowId, text: 'Ollama URL',
           style: { color: this.theme.textHeading, fontSize: 13 } },
-        { type: 'textInput', windowId: this.windowId, placeholder: 'http://localhost:11434',
-          text: savedOllamaUrl || 'http://localhost:11434' },
       ]})
     );
-    this.ollamaUrlId = ollamaUrlId;
-    this.ollamaSectionIds.push(ollamaLabelId);
-    this.ollamaSectionIds.push(this.ollamaUrlId);
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: ollamaLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
+
+    const { widgetIds: [ollamaUrlId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, placeholder: 'http://localhost:11434',
+          text: savedOllamaUrl || 'http://localhost:11434' },
+      ]})
+    );
+    this.ollamaUrlId = ollamaUrlId;
     await this.request(request(this.id, this.ollamaUrlId, 'addDependent', {}));
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: this.ollamaUrlId,
@@ -680,59 +701,104 @@ export class GlobalSettings extends Abject {
       preferredSize: { height: 32 },
     }));
 
-    // Model tier dropdowns
-    let ollamaModels: string[] = [];
-    if (this.llmId) {
-      try {
-        ollamaModels = await this.request<string[]>(
-          request(this.id, this.llmId, 'listOllamaModels', {
-            baseUrl: savedOllamaUrl || 'http://localhost:11434',
-          })
-        );
-      } catch { /* Ollama not running */ }
-    }
-    const modelOptions = ollamaModels.length > 0 ? ollamaModels : ['(no models found)'];
+    // ── Model Tiers section ──
+    const { widgetIds: [tierHeaderId, tierDescId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Model Tiers',
+          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
+        { type: 'label', windowId: this.windowId, text: 'Choose a provider and model for each quality tier.',
+          style: { color: this.theme.textDescription, fontSize: 12 } },
+      ]})
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: tierHeaderId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 24 },
+    }));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: tierDescId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
 
-    const tierConfigs: { label: string; saved: string | null; field: 'ollamaModelSmartSelectId' | 'ollamaModelBalancedSelectId' | 'ollamaModelFastSelectId' }[] = [
-      { label: 'Smart Model', saved: savedOllamaModelSmart, field: 'ollamaModelSmartSelectId' },
-      { label: 'Balanced Model', saved: savedOllamaModelBalanced, field: 'ollamaModelBalancedSelectId' },
-      { label: 'Fast Model', saved: savedOllamaModelFast, field: 'ollamaModelFastSelectId' },
-    ];
+    // Per-tier rows: [Label] [Provider dropdown] [Model dropdown]
+    for (let i = 0; i < TIER_NAMES.length; i++) {
+      const tier = TIER_NAMES[i];
+      const tierLabel = TIER_LABELS[i];
+      const savedProvider = savedTierRouting[tier].provider as LLMProviderName | null;
+      const savedModel = savedTierRouting[tier].model;
 
-    for (const tier of tierConfigs) {
-      let selectedIndex = 0;
-      if (tier.saved && ollamaModels.length > 0) {
-        const idx = ollamaModels.indexOf(tier.saved);
-        if (idx >= 0) selectedIndex = idx;
-      }
-
-      const { widgetIds: [tierLabelId, tierSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId, text: tier.label,
-            style: { color: this.theme.textHeading, fontSize: 13 } },
-          { type: 'select', windowId: this.windowId,
-            options: modelOptions,
-            selectedIndex },
-        ]})
+      // Row container
+      const tierRowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+          parentLayoutId: cId,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 8,
+        })
       );
-      this[tier.field] = tierSelectId;
-      this.ollamaSectionIds.push(tierLabelId);
-      this.ollamaSectionIds.push(tierSelectId);
       await this.request(request(this.id, cId, 'addLayoutChild', {
-        widgetId: tierLabelId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: 20 },
-      }));
-      await this.request(request(this.id, tierSelectId, 'addDependent', {}));
-      await this.request(request(this.id, cId, 'addLayoutChild', {
-        widgetId: tierSelectId,
+        widgetId: tierRowId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: 32 },
       }));
-    }
 
-    // Hide non-selected provider sections
-    await this.switchProviderFields(this.selectedProvider);
+      // Tier label
+      const { widgetIds: [tierLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: tierLabel,
+            style: { color: this.theme.textHeading, fontSize: 13 } },
+        ]})
+      );
+      await this.request(request(this.id, tierRowId, 'addLayoutChild', {
+        widgetId: tierLabelId,
+        sizePolicy: { horizontal: 'fixed' },
+        preferredSize: { width: 65, height: 32 },
+      }));
+
+      // Provider dropdown
+      const providerIdx = savedProvider ? PROVIDER_NAMES.indexOf(savedProvider) : 0;
+      const { widgetIds: [providerSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'select', windowId: this.windowId,
+            options: PROVIDER_LABELS,
+            selectedIndex: providerIdx >= 0 ? providerIdx : 0 },
+        ]})
+      );
+      this.tierProviderSelectIds[tier] = providerSelectId;
+      await this.request(request(this.id, providerSelectId, 'addDependent', {}));
+      await this.request(request(this.id, tierRowId, 'addLayoutChild', {
+        widgetId: providerSelectId,
+        sizePolicy: { horizontal: 'fixed' },
+        preferredSize: { width: 120, height: 32 },
+      }));
+
+      // Model dropdown (populated from provider's model list)
+      const activeProvider = savedProvider && PROVIDER_NAMES.includes(savedProvider) ? savedProvider : PROVIDER_NAMES[0];
+      const modelList = this.providerModelCache[activeProvider];
+      const modelOptions = modelList.length > 0
+        ? modelList.map(m => m.name)
+        : ['(no models)'];
+      let modelIdx = 0;
+      if (savedModel && modelList.length > 0) {
+        const idx = modelList.findIndex(m => m.id === savedModel);
+        if (idx >= 0) modelIdx = idx;
+      }
+
+      const { widgetIds: [modelSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'select', windowId: this.windowId,
+            options: modelOptions,
+            selectedIndex: modelIdx },
+        ]})
+      );
+      this.tierModelSelectIds[tier] = modelSelectId;
+      await this.request(request(this.id, modelSelectId, 'addDependent', {}));
+      await this.request(request(this.id, tierRowId, 'addLayoutChild', {
+        widgetId: modelSelectId,
+        sizePolicy: { horizontal: 'expanding' },
+        preferredSize: { height: 32 },
+      }));
+    }
 
     // Save button row (HBox: spacer + button)
     const saveRowId = await this.request<AbjectId>(
@@ -752,7 +818,7 @@ export class GlobalSettings extends Abject {
 
     const { widgetIds: [saveBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'button', windowId: this.windowId, text: 'Save Provider',
+        { type: 'button', windowId: this.windowId, text: 'Save Settings',
           style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
       ]})
     );
@@ -764,9 +830,7 @@ export class GlobalSettings extends Abject {
       preferredSize: { width: 130, height: 36 },
     }));
 
-    // ── Skills section ─────────────────────────────────────────────────
-
-    // Skills label
+    // ── Skills section ──
     const { widgetIds: [skillsSectionLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId, text: 'Skills', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 14 } },
@@ -1002,18 +1066,13 @@ export class GlobalSettings extends Abject {
 
     this.windowId = undefined;
     this.rootLayoutId = undefined;
-    this.providerSelectId = undefined;
     this.anthropicKeyId = undefined;
     this.anthropicToggleId = undefined;
-    this.anthropicSectionIds = [];
     this.openaiKeyId = undefined;
     this.openaiToggleId = undefined;
-    this.openaiSectionIds = [];
     this.ollamaUrlId = undefined;
-    this.ollamaModelSmartSelectId = undefined;
-    this.ollamaModelBalancedSelectId = undefined;
-    this.ollamaModelFastSelectId = undefined;
-    this.ollamaSectionIds = [];
+    this.tierProviderSelectIds = { smart: undefined, balanced: undefined, fast: undefined };
+    this.tierModelSelectIds = { smart: undefined, balanced: undefined, fast: undefined };
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
     this.authCheckboxId = undefined;
@@ -1078,7 +1137,11 @@ export class GlobalSettings extends Abject {
 
   private async setSaveControlsDisabled(disabled: boolean): Promise<void> {
     const style = { disabled };
-    const ids = [this.saveBtnId, this.providerSelectId, this.anthropicKeyId, this.openaiKeyId, this.ollamaUrlId, this.ollamaModelSmartSelectId, this.ollamaModelBalancedSelectId, this.ollamaModelFastSelectId];
+    const ids: (AbjectId | undefined)[] = [
+      this.saveBtnId, this.anthropicKeyId, this.openaiKeyId, this.ollamaUrlId,
+      ...Object.values(this.tierProviderSelectIds),
+      ...Object.values(this.tierModelSelectIds),
+    ];
     for (const id of ids) {
       if (id) {
         try { await this.request(request(this.id, id, 'update', { style })); } catch { /* widget gone */ }
@@ -1086,23 +1149,59 @@ export class GlobalSettings extends Abject {
     }
   }
 
-  // ========== PROVIDER VISIBILITY ==========
+  // ========== TIER MODEL REFRESH ==========
 
-  private async switchProviderFields(provider: LLMProviderName): Promise<void> {
-    const sections: Record<LLMProviderName, AbjectId[]> = {
-      anthropic: this.anthropicSectionIds,
-      openai: this.openaiSectionIds,
-      ollama: this.ollamaSectionIds,
-    };
-
-    for (const [name, ids] of Object.entries(sections)) {
-      const visible = name === provider;
-      for (const id of ids) {
-        try {
-          await this.request(request(this.id, id, 'update', { style: { visible } }));
-        } catch { /* widget gone */ }
-      }
+  /**
+   * Fetch model lists for all providers and cache them.
+   */
+  private async fetchAllProviderModels(ollamaUrl?: string | null): Promise<void> {
+    // Anthropic and OpenAI have static model lists; Ollama is dynamic
+    this.providerModelCache.anthropic = [
+      { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
+      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
+      { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
+    ];
+    this.providerModelCache.openai = [
+      { id: 'gpt-5.4', name: 'GPT-5.4' },
+      { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
+      { id: 'gpt-5.4-nano', name: 'GPT-5.4 Nano' },
+    ];
+    this.providerModelCache.ollama = [];
+    if (this.llmId) {
+      try {
+        const models = await this.request<ModelInfo[]>(
+          request(this.id, this.llmId, 'listProviderModels', {
+            provider: 'ollama',
+            ollamaUrl: ollamaUrl || 'http://localhost:11434',
+          })
+        );
+        this.providerModelCache.ollama = models;
+      } catch { /* Ollama not running */ }
     }
+  }
+
+  /**
+   * Refresh the model dropdown for a specific tier after its provider changed.
+   */
+  private async refreshTierModelOptions(tier: ModelTierName): Promise<void> {
+    const providerSelectId = this.tierProviderSelectIds[tier];
+    const modelSelectId = this.tierModelSelectIds[tier];
+    if (!providerSelectId || !modelSelectId) return;
+
+    const providerLabel = await this.request<string>(
+      request(this.id, providerSelectId, 'getValue', {})
+    );
+    const providerIdx = PROVIDER_LABELS.indexOf(providerLabel);
+    const providerName = providerIdx >= 0 ? PROVIDER_NAMES[providerIdx] : PROVIDER_NAMES[0];
+
+    const modelList = this.providerModelCache[providerName];
+    const options = modelList.length > 0
+      ? modelList.map(m => m.name)
+      : ['(no models)'];
+
+    await this.request(
+      request(this.id, modelSelectId, 'update', { options, selectedIndex: 0 })
+    );
   }
 
   // ========== AUTH HELPERS ==========
@@ -1204,60 +1303,77 @@ export class GlobalSettings extends Abject {
 
     await this.setSaveControlsDisabled(true);
 
-    const provider = this.selectedProvider;
+    // Read all credential values
+    const anthropicKey = this.anthropicKeyId
+      ? await this.request<string>(request(this.id, this.anthropicKeyId, 'getValue', {}))
+      : '';
+    const openaiKey = this.openaiKeyId
+      ? await this.request<string>(request(this.id, this.openaiKeyId, 'getValue', {}))
+      : '';
+    let ollamaUrl = this.ollamaUrlId
+      ? await this.request<string>(request(this.id, this.ollamaUrlId, 'getValue', {}))
+      : '';
+    if (!ollamaUrl) ollamaUrl = 'http://localhost:11434';
 
-    // Read values for the active provider
-    let anthropicKey = '';
-    let openaiKey = '';
-    let ollamaUrl = '';
+    // Read per-tier provider + model selections
+    const tierRouting: Record<ModelTierName, { provider: string | null; model: string | null }> = {
+      smart: { provider: null, model: null },
+      balanced: { provider: null, model: null },
+      fast: { provider: null, model: null },
+    };
 
-    switch (provider) {
-      case 'anthropic':
-        anthropicKey = await this.request<string>(
-          request(this.id, this.anthropicKeyId!, 'getValue', {})
-        );
-        if (!anthropicKey) {
-          await this.setStatus('Anthropic API key is required.', this.theme.statusErrorBright);
-          await this.setSaveControlsDisabled(false);
-          return;
-        }
-        break;
-      case 'openai':
-        openaiKey = await this.request<string>(
-          request(this.id, this.openaiKeyId!, 'getValue', {})
-        );
-        if (!openaiKey) {
-          await this.setStatus('OpenAI API key is required.', this.theme.statusErrorBright);
-          await this.setSaveControlsDisabled(false);
-          return;
-        }
-        break;
-      case 'ollama':
-        ollamaUrl = await this.request<string>(
-          request(this.id, this.ollamaUrlId!, 'getValue', {})
-        );
-        if (!ollamaUrl) ollamaUrl = 'http://localhost:11434';
-        break;
-    }
+    for (const tier of TIER_NAMES) {
+      const providerSelectId = this.tierProviderSelectIds[tier];
+      const modelSelectId = this.tierModelSelectIds[tier];
+      if (!providerSelectId || !modelSelectId) continue;
 
-    // Read Ollama tier models if applicable
-    const ollamaTierModels = { smart: '', balanced: '', fast: '' };
-    if (provider === 'ollama') {
-      const readSelect = async (selectId: AbjectId | undefined) => {
-        if (!selectId) return '';
-        const val = await this.request<string>(request(this.id, selectId, 'getValue', {}));
-        return val === '(no models found)' ? '' : val;
-      };
-      ollamaTierModels.smart = await readSelect(this.ollamaModelSmartSelectId);
-      ollamaTierModels.balanced = await readSelect(this.ollamaModelBalancedSelectId);
-      ollamaTierModels.fast = await readSelect(this.ollamaModelFastSelectId);
-    }
-
-    // Persist to storage
-    if (this.storageId) {
-      await this.request(
-        request(this.id, this.storageId, 'set', { key: STORAGE_KEY_PROVIDER, value: provider })
+      const providerLabel = await this.request<string>(
+        request(this.id, providerSelectId, 'getValue', {})
       );
+      const providerIdx = PROVIDER_LABELS.indexOf(providerLabel);
+      const providerName = providerIdx >= 0 ? PROVIDER_NAMES[providerIdx] : null;
+
+      const modelName = await this.request<string>(
+        request(this.id, modelSelectId, 'getValue', {})
+      );
+
+      if (providerName && modelName && modelName !== '(no models)') {
+        // Resolve display name back to model id
+        const modelList = this.providerModelCache[providerName];
+        const modelInfo = modelList.find(m => m.name === modelName);
+        tierRouting[tier] = {
+          provider: providerName,
+          model: modelInfo ? modelInfo.id : modelName,
+        };
+      }
+    }
+
+    // Validate: at least one tier must have a valid config
+    const hasAnyTier = TIER_NAMES.some(t => tierRouting[t].provider && tierRouting[t].model);
+    if (!hasAnyTier) {
+      await this.setStatus('Configure at least one model tier.', this.theme.statusErrorBright);
+      await this.setSaveControlsDisabled(false);
+      return;
+    }
+
+    // Validate: each configured tier's provider must have credentials
+    for (const tier of TIER_NAMES) {
+      const { provider } = tierRouting[tier];
+      if (!provider) continue;
+      if (provider === 'anthropic' && !anthropicKey) {
+        await this.setStatus(`${TIER_LABELS[TIER_NAMES.indexOf(tier)]} tier uses Anthropic but no API key provided.`, this.theme.statusErrorBright);
+        await this.setSaveControlsDisabled(false);
+        return;
+      }
+      if (provider === 'openai' && !openaiKey) {
+        await this.setStatus(`${TIER_LABELS[TIER_NAMES.indexOf(tier)]} tier uses OpenAI but no API key provided.`, this.theme.statusErrorBright);
+        await this.setSaveControlsDisabled(false);
+        return;
+      }
+    }
+
+    // Persist credentials to storage
+    if (this.storageId) {
       if (anthropicKey) {
         await this.request(
           request(this.id, this.storageId, 'set', { key: STORAGE_KEY_ANTHROPIC, value: anthropicKey })
@@ -1268,38 +1384,24 @@ export class GlobalSettings extends Abject {
           request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OPENAI, value: openaiKey })
         );
       }
-      if (provider === 'ollama') {
-        await this.request(
-          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OLLAMA_URL, value: ollamaUrl })
-        );
-        if (ollamaTierModels.smart) {
-          await this.request(
-            request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OLLAMA_MODEL_SMART, value: ollamaTierModels.smart })
-          );
-        }
-        if (ollamaTierModels.balanced) {
-          await this.request(
-            request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OLLAMA_MODEL_BALANCED, value: ollamaTierModels.balanced })
-          );
-        }
-        if (ollamaTierModels.fast) {
-          await this.request(
-            request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OLLAMA_MODEL_FAST, value: ollamaTierModels.fast })
-          );
-        }
-      }
+      await this.request(
+        request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OLLAMA_URL, value: ollamaUrl })
+      );
+
+      // Persist tier routing
+      await this.persistTierRouting(tierRouting);
     }
 
-    // Configure LLM with the selected provider
-    await this.configureSelectedProvider(
+    // Configure all providers and tier routing
+    await this.configureProviders(
       anthropicKey || null,
       openaiKey || null,
       ollamaUrl || null,
-      { smart: ollamaTierModels.smart || null, balanced: ollamaTierModels.balanced || null, fast: ollamaTierModels.fast || null },
+      tierRouting,
     );
 
-    log.info(`Saved provider: ${provider}`);
-    await this.setStatus('Provider settings saved!');
+    log.info('Saved provider settings with per-tier routing');
+    await this.setStatus('Settings saved!');
     await this.setSaveControlsDisabled(false);
   }
 }

@@ -10,6 +10,7 @@ import {
   LLMCompletionResult,
   LLMStreamChunk,
   ModelTier,
+  ModelInfo,
   ContentPart,
   getTextContent,
 } from './provider.js';
@@ -74,8 +75,17 @@ export class AnthropicProvider extends BaseLLMProvider {
     fast: 'claude-haiku-4-5-20251001',
   };
 
-  private resolveModel(tier?: ModelTier): string {
-    return tier ? AnthropicProvider.TIER_MODELS[tier] : this.model;
+  private resolveModel(options?: LLMCompletionOptions): string {
+    if (options?.model) return options.model;
+    return options?.tier ? AnthropicProvider.TIER_MODELS[options.tier] : this.model;
+  }
+
+  async listModels(): Promise<ModelInfo[]> {
+    return [
+      { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
+      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
+      { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
+    ];
   }
 
   constructor(config: AnthropicConfig) {
@@ -114,7 +124,7 @@ export class AnthropicProvider extends BaseLLMProvider {
     );
 
     const request: AnthropicRequest = {
-      model: this.resolveModel(options.tier),
+      model: this.resolveModel(options),
       max_tokens: options.maxTokens ?? 4096,
       messages: anthropicMessages,
       temperature: options.temperature,
@@ -171,7 +181,7 @@ export class AnthropicProvider extends BaseLLMProvider {
     );
 
     const request: AnthropicRequest = {
-      model: this.resolveModel(options.tier),
+      model: this.resolveModel(options),
       max_tokens: options.maxTokens ?? 4096,
       messages: anthropicMessages,
       temperature: options.temperature,

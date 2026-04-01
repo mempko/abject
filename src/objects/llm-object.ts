@@ -16,11 +16,19 @@ import {
   LLMMessage,
   LLMCompletionOptions,
   LLMCompletionResult,
+  ModelTier,
   getTextContent,
 
   systemMessage,
   userMessage,
 } from '../llm/provider.js';
+
+export interface TierConfig {
+  provider: string;
+  model: string;
+}
+
+export type TierRouting = Partial<Record<ModelTier, TierConfig>>;
 import { AnthropicProvider } from '../llm/anthropic.js';
 import { OpenAIProvider } from '../llm/openai.js';
 import { OllamaProvider } from '../llm/ollama.js';
@@ -93,6 +101,7 @@ export interface LLMStats {
 export class LLMObject extends Abject {
   private providers: Map<string, LLMProvider> = new Map();
   private defaultProvider?: string;
+  private tierRouting: TierRouting = {};
   private httpClientId?: AbjectId;
 
   // Stats and request tracking
@@ -266,6 +275,29 @@ export class LLMObject extends Abject {
                 ],
                 returns: { kind: 'reference', reference: 'LLMHistoryEntry' },
               },
+              {
+                name: 'listProviderModels',
+                description: 'List available models for a specific provider',
+                parameters: [
+                  { name: 'provider', type: { kind: 'primitive', primitive: 'string' }, description: 'Provider name' },
+                  { name: 'ollamaUrl', type: { kind: 'primitive', primitive: 'string' }, description: 'Ollama base URL (optional, for listing before registration)', optional: true },
+                ],
+                returns: { kind: 'array', elementType: { kind: 'reference', reference: 'ModelInfo' } },
+              },
+              {
+                name: 'setTierRouting',
+                description: 'Set per-tier provider and model routing',
+                parameters: [
+                  { name: 'tierRouting', type: { kind: 'reference', reference: 'TierRouting' }, description: 'Mapping from tier to provider+model' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'getTierRouting',
+                description: 'Get current per-tier provider and model routing',
+                parameters: [],
+                returns: { kind: 'reference', reference: 'TierRouting' },
+              },
             ],
             events: [
               { name: 'requestStarted', description: 'Emitted when a new LLM request begins', payload: { kind: 'reference', reference: 'LLMActiveRequest' } },
@@ -307,24 +339,26 @@ export class LLMObject extends Abject {
     this.on('stream', async (m: AbjectMessage) => {
       require(!this._paused, 'LLM is paused');
       const { messages, options, provider: providerName } = m.payload as LLMQueryPayload;
-      const provider = this.getProvider(providerName);
-      require(provider !== undefined, 'No LLM provider available');
+      const { provider, modelOverride } = this.resolveProviderAndModel(providerName, options?.tier);
+      const effectiveOptions = modelOverride
+        ? { ...options, model: modelOverride }
+        : options;
 
       const callerId = m.routing.from;
       const correlationId = m.header.messageId;
 
       // If provider doesn't support streaming, fall back to complete
-      if (!provider!.stream) {
+      if (!provider.stream) {
         const result = await this.complete(messages, options, providerName, callerId, correlationId);
         return { content: result.content };
       }
 
       const totalChars = messages.reduce((sum, m2) => sum + getTextContent(m2).length, 0);
-      log.info(`→ ${provider!.name} stream | ${messages.length} msgs | ${totalChars} chars`);
+      log.info(`→ ${provider.name} stream | ${messages.length} msgs | ${totalChars} chars | model=${modelOverride ?? 'provider-default'}`);
       const start = Date.now();
 
       const activeReq = await this.trackRequestStart(
-        correlationId, callerId, 'stream', provider!.name, totalChars, true, messages,
+        correlationId, callerId, 'stream', provider.name, totalChars, true, messages,
       );
 
       // Send keep-alive progress while waiting for the first chunk (model load time).
@@ -341,7 +375,7 @@ export class LLMObject extends Abject {
 
       let fullContent = '';
       try {
-        for await (const chunk of provider!.stream(messages, options)) {
+        for await (const chunk of provider.stream(messages, effectiveOptions)) {
           if (activeReq.killed) {
             log.info(`Request ${correlationId} killed during streaming`);
             break;
@@ -363,7 +397,7 @@ export class LLMObject extends Abject {
       } catch (err) {
         const elapsed = Date.now() - start;
         const errMsg = err instanceof Error ? err.message : String(err);
-        log.error(`${provider!.name} stream | ${elapsed}ms | ${errMsg}`);
+        log.error(`${provider.name} stream | ${elapsed}ms | ${errMsg}`);
         this.trackRequestError(correlationId, errMsg);
         throw err;
       } finally {
@@ -371,7 +405,7 @@ export class LLMObject extends Abject {
       }
 
       const elapsed = Date.now() - start;
-      log.info(`← ${provider!.name} stream | ${fullContent.length} chars | ${elapsed}ms`);
+      log.info(`← ${provider.name} stream | ${fullContent.length} chars | ${elapsed}ms`);
       this.trackRequestEnd(correlationId, fullContent);
       return { content: fullContent };
     });
@@ -390,40 +424,36 @@ export class LLMObject extends Abject {
         anthropicApiKey?: string;
         openaiApiKey?: string;
         ollamaUrl?: string;
-        ollamaModel?: string;
-        ollamaTierModels?: Partial<Record<string, string>>;
+        tierRouting?: TierRouting;
       };
       await this.configure(config);
       return true;
     });
 
-    this.on('listOllamaModels', async (m: AbjectMessage) => {
-      const { baseUrl } = (m.payload ?? {}) as { baseUrl?: string };
-      // Use existing provider or create a temporary one for listing.
-      // Ollama uses native fetch (local service), no need for fetchFn delegate.
-      let provider = this.providers.get('ollama') as OllamaProvider | undefined;
-      if (!provider) {
-        provider = new OllamaProvider({ baseUrl: baseUrl ?? 'http://localhost:11434' });
+    this.on('listProviderModels', async (m: AbjectMessage) => {
+      const { provider: providerName, ollamaUrl } = m.payload as { provider: string; ollamaUrl?: string };
+      // For Ollama, allow listing models from a URL even if provider not yet registered
+      if (providerName === 'ollama') {
+        let provider = this.providers.get('ollama') as OllamaProvider | undefined;
+        if (!provider) {
+          provider = new OllamaProvider({ baseUrl: ollamaUrl ?? 'http://localhost:11434' });
+        }
+        return provider.listModels();
       }
+      const provider = this.providers.get(providerName);
+      if (!provider) return [];
       return provider.listModels();
     });
 
-    this.on('setOllamaModel', async (msg: AbjectMessage) => {
-      const { model } = msg.payload as { model: string };
-      const provider = this.providers.get('ollama') as OllamaProvider | undefined;
-      if (!provider) return false;
-      provider.setModel(model);
-      log.info(`Ollama model set to: ${model}`);
+    this.on('setTierRouting', async (msg: AbjectMessage) => {
+      const { tierRouting } = msg.payload as { tierRouting: TierRouting };
+      this.tierRouting = { ...tierRouting };
+      log.info(`Tier routing updated: ${JSON.stringify(this.tierRouting)}`);
       return true;
     });
 
-    this.on('setOllamaTierModels', async (msg: AbjectMessage) => {
-      const { tierModels } = msg.payload as { tierModels: Partial<Record<string, string>> };
-      const provider = this.providers.get('ollama') as OllamaProvider | undefined;
-      if (!provider) return false;
-      provider.setTierModels(tierModels as Partial<Record<import('../llm/provider.js').ModelTier, string>>);
-      log.info(`Ollama tier models set: ${JSON.stringify(tierModels)}`);
-      return true;
+    this.on('getTierRouting', async () => {
+      return { ...this.tierRouting };
     });
 
     this.on('getStats', async () => {
@@ -542,14 +572,14 @@ export class LLMObject extends Abject {
   }
 
   /**
-   * Configure from API keys.
+   * Configure providers and tier routing.
+   * All providers with valid credentials are registered simultaneously.
    */
   async configure(config: {
     anthropicApiKey?: string;
     openaiApiKey?: string;
     ollamaUrl?: string;
-    ollamaModel?: string;
-    ollamaTierModels?: Partial<Record<string, string>>;
+    tierRouting?: TierRouting;
   }): Promise<void> {
     const fetchFn = this.httpClientId ? this.createFetchDelegate() : undefined;
 
@@ -565,18 +595,21 @@ export class LLMObject extends Abject {
       );
     }
 
-    if (config.ollamaUrl) {
-      // Ollama uses native fetch (local service), no need for fetchFn delegate
-      const provider = new OllamaProvider({
-        baseUrl: config.ollamaUrl,
-        model: config.ollamaModel,
-        tierModels: config.ollamaTierModels as Partial<Record<import('../llm/provider.js').ModelTier, string>> | undefined,
-      });
-      // Auto-detect model only if neither single model nor tier models specified
-      if (!config.ollamaModel && !config.ollamaTierModels) {
-        await provider.autoDetectModel();
-      }
-      this.registerProvider(provider);
+    // Always register Ollama if URL provided (defaults to localhost)
+    const ollamaUrl = config.ollamaUrl || 'http://localhost:11434';
+    const ollamaProvider = new OllamaProvider({ baseUrl: ollamaUrl });
+    if (await ollamaProvider.isAvailable()) {
+      await ollamaProvider.autoDetectModel();
+      this.registerProvider(ollamaProvider);
+    } else if (config.ollamaUrl) {
+      // Explicitly configured URL -- register even if not reachable yet
+      this.registerProvider(ollamaProvider);
+    }
+
+    // Apply tier routing
+    if (config.tierRouting) {
+      this.tierRouting = { ...config.tierRouting };
+      log.info(`Tier routing configured: ${JSON.stringify(this.tierRouting)}`);
     }
   }
 
@@ -590,17 +623,19 @@ export class LLMObject extends Abject {
     callerId?: AbjectId,
     requestId?: string,
   ): Promise<LLMCompletionResult> {
-    const provider = this.getProvider(providerName);
-    require(provider !== undefined, 'No LLM provider available');
+    const { provider, modelOverride } = this.resolveProviderAndModel(providerName, options?.tier);
+    const effectiveOptions = modelOverride
+      ? { ...options, model: modelOverride }
+      : options;
 
     const totalChars = messages.reduce((sum, m2) => sum + getTextContent(m2).length, 0);
-    log.info(`→ ${provider!.name} | ${messages.length} msgs | ${totalChars} chars | tier=${options?.tier ?? 'default'} maxTokens=${options?.maxTokens ?? 'default'}`);
+    log.info(`→ ${provider.name} | ${messages.length} msgs | ${totalChars} chars | tier=${options?.tier ?? 'default'} model=${modelOverride ?? 'provider-default'} maxTokens=${options?.maxTokens ?? 'default'}`);
     const start = Date.now();
 
     // Track active request
     const trackId = requestId ?? `internal-${Date.now()}`;
     if (callerId) {
-      await this.trackRequestStart(trackId, callerId, 'complete', provider!.name, totalChars, false, messages);
+      await this.trackRequestStart(trackId, callerId, 'complete', provider.name, totalChars, false, messages);
     }
 
     // Send keep-alive progress events every 30s so upstream timeouts don't fire
@@ -618,15 +653,15 @@ export class LLMObject extends Abject {
     }
 
     try {
-      const result = await provider!.complete(messages, options);
+      const result = await provider.complete(messages, effectiveOptions);
       const elapsed = Date.now() - start;
-      log.info(`← ${provider!.name} | ${result.content.length} chars | ${elapsed}ms | reason=${result.finishReason} | tokens=${result.usage?.inputTokens ?? '?'}in/${result.usage?.outputTokens ?? '?'}out`);
+      log.info(`← ${provider.name} | ${result.content.length} chars | ${elapsed}ms | reason=${result.finishReason} | tokens=${result.usage?.inputTokens ?? '?'}in/${result.usage?.outputTokens ?? '?'}out`);
       if (callerId) this.trackRequestEnd(trackId, result.content, result.usage);
       return result;
     } catch (err) {
       const elapsed = Date.now() - start;
       const errMsg = err instanceof Error ? err.message : String(err);
-      log.error(`${provider!.name} | ${elapsed}ms | ${errMsg}`);
+      log.error(`${provider.name} | ${elapsed}ms | ${errMsg}`);
       if (callerId) this.trackRequestError(trackId, errMsg);
       throw err;
     } finally {
@@ -860,6 +895,37 @@ Only output the code, no explanations. Use proper formatting and comments.`;
   }
 
   /**
+   * Resolve the provider and optional model override for a request.
+   * Priority: explicit providerName > tier routing > default provider.
+   */
+  private resolveProviderAndModel(
+    providerName?: string,
+    tier?: ModelTier,
+  ): { provider: LLMProvider; modelOverride?: string } {
+    // Explicit provider name takes priority (backward compat)
+    if (providerName) {
+      const provider = this.providers.get(providerName);
+      require(provider !== undefined, `Provider '${providerName}' not registered`);
+      return { provider: provider! };
+    }
+
+    // Tier routing: look up per-tier provider+model
+    if (tier && this.tierRouting[tier]) {
+      const config = this.tierRouting[tier]!;
+      const provider = this.providers.get(config.provider);
+      if (provider) {
+        return { provider, modelOverride: config.model };
+      }
+      log.warn(`Tier '${tier}' routes to provider '${config.provider}' which is not registered, falling back to default`);
+    }
+
+    // Fall back to default provider
+    const provider = this.getProvider();
+    require(provider !== undefined, 'No LLM provider available');
+    return { provider: provider! };
+  }
+
+  /**
    * Extract code from markdown-formatted response.
    */
   private extractCode(content: string, language: string): string {
@@ -917,18 +983,32 @@ The \`options\` object in \`complete\` accepts:
 - maxTokens: number — limit response length
 - stopSequences: string[] — stop generation at these strings
 
+### Per-Tier Routing
+
+Each tier (smart, balanced, fast) can route to a different provider and model.
+This is configured via the Settings UI or the \`setTierRouting\` method:
+
+  await this.call(this.dep('LLM'), 'setTierRouting', {
+    tierRouting: {
+      smart: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      balanced: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      fast: { provider: 'ollama', model: 'llama3:latest' },
+    }
+  });
+
 ### Provider Management
 
   const providers = await this.call(this.dep('LLM'), 'listProviders', {});
-  // providers: [{ name: 'anthropic', available: true }, { name: 'openai', available: false }, ...]
+  // providers: ['anthropic', 'openai', 'ollama']
 
-  await this.call(this.dep('LLM'), 'setProvider', { name: 'ollama' });
-  // Switch the active/default provider
+  const models = await this.call(this.dep('LLM'), 'listProviderModels', { provider: 'anthropic' });
+  // models: [{ id: 'claude-opus-4-6', name: 'Claude Opus 4.6' }, ...]
 
   await this.call(this.dep('LLM'), 'configure', {
-    anthropicApiKey: '...', openaiApiKey: '...', ollamaUrl: 'http://localhost:11434'
+    anthropicApiKey: '...', openaiApiKey: '...', ollamaUrl: 'http://localhost:11434',
+    tierRouting: { smart: { provider: 'anthropic', model: 'claude-opus-4-6' } }
   });
-  // Configure provider settings (all fields optional)
+  // Configure all providers and tier routing (all fields optional)
 
 ### IMPORTANT
 - The interface ID is 'abjects:llm' (NOT 'abjects:llm-object').

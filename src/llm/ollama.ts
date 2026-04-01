@@ -11,6 +11,7 @@ import {
   LLMCompletionResult,
   LLMStreamChunk,
   ModelTier,
+  ModelInfo,
   ContentPart,
   ImagePart,
   getTextContent,
@@ -65,7 +66,9 @@ export class OllamaProvider extends BaseLLMProvider {
   private model: string | undefined;
   private tierModels: Partial<Record<ModelTier, string>> = {};
 
-  private resolveModel(tier?: ModelTier): string {
+  private resolveModel(options?: LLMCompletionOptions): string {
+    if (options?.model) return options.model;
+    const tier = options?.tier;
     if (tier && this.tierModels[tier]) return this.tierModels[tier]!;
     if (this.tierModels.balanced) return this.tierModels.balanced;
     if (this.model) return this.model;
@@ -88,7 +91,7 @@ export class OllamaProvider extends BaseLLMProvider {
     if (this.model || Object.keys(this.tierModels).length > 0) return this.model;
     const models = await this.listModels();
     if (models.length > 0) {
-      this.model = models[0];
+      this.model = models[0].id;
       log.info(`Auto-detected model: ${this.model}`);
     }
     return this.model;
@@ -114,7 +117,7 @@ export class OllamaProvider extends BaseLLMProvider {
     // and bodyTimeout (300s) which silently kill long-running Ollama requests.
     // Ollama is always localhost so we don't need TLS or fancy HTTP features.
     const req: OllamaRequest = {
-      model: this.resolveModel(options.tier),
+      model: this.resolveModel(options),
       messages: messages.map((m) => this.mapMessage(m)),
       stream: true,
       options: {
@@ -191,7 +194,7 @@ export class OllamaProvider extends BaseLLMProvider {
     options: LLMCompletionOptions = {}
   ): AsyncIterable<LLMStreamChunk> {
     const req: OllamaRequest = {
-      model: this.resolveModel(options.tier),
+      model: this.resolveModel(options),
       messages: messages.map((m) => this.mapMessage(m)),
       stream: true,
       options: {
@@ -295,7 +298,7 @@ export class OllamaProvider extends BaseLLMProvider {
    * Uses native fetch directly since Ollama is always a local service
    * and the HttpClient delegate blocks localhost for SSRF protection.
    */
-  async listModels(): Promise<string[]> {
+  async listModels(): Promise<ModelInfo[]> {
     try {
       const response = await fetch(`${this.baseUrl}/api/tags`, {
         method: 'GET',
@@ -308,7 +311,7 @@ export class OllamaProvider extends BaseLLMProvider {
         models: { name: string }[];
       };
 
-      return data.models.map((m) => m.name);
+      return data.models.map((m) => ({ id: m.name, name: m.name }));
     } catch {
       return [];
     }
