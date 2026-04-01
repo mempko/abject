@@ -1,0 +1,145 @@
+---
+const repo = 'mempko/abject';
+const latestUrl = `https://github.com/${repo}/releases/latest`;
+---
+
+<section id="downloads">
+  <div class="container">
+    <h2 class="section-title">Incarnate the Organism</h2>
+    <p class="dl-subtitle">
+      Download Abject as a standalone desktop app. No setup required.
+    </p>
+    <div class="dl-grid">
+      <a href={latestUrl} class="dl-card" target="_blank" rel="noopener">
+        <svg class="dl-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/>
+          <path d="M12 8v4l2.5 2.5"/>
+          <path d="M8 3.5C5.5 5 3.5 8 3.5 12c0 4.5 3.5 8.5 8.5 8.5s8.5-4 8.5-8.5c0-4-2-7-4.5-8.5"/>
+          <circle cx="12" cy="12" r="2"/>
+        </svg>
+        <span class="dl-platform">Linux</span>
+        <span class="dl-formats">AppImage, .deb</span>
+      </a>
+      <a href={latestUrl} class="dl-card" target="_blank" rel="noopener">
+        <svg class="dl-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <rect x="3" y="3" width="18" height="18" rx="2"/>
+          <path d="M3 9h18"/>
+          <path d="M9 3v6"/>
+          <path d="M3 9l4 4-4 4"/>
+          <path d="M21 9l-4 4 4 4"/>
+        </svg>
+        <span class="dl-platform">Windows</span>
+        <span class="dl-formats">Installer (.exe)</span>
+      </a>
+      <a href={latestUrl} class="dl-card" target="_blank" rel="noopener">
+        <svg class="dl-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M12 2a10 10 0 100 20 10 10 0 000-20z"/>
+          <path d="M12 2c3 3 4.5 7 4.5 10S15 19 12 22"/>
+          <path d="M12 2c-3 3-4.5 7-4.5 10S9 19 12 22"/>
+          <path d="M2 12h20"/>
+        </svg>
+        <span class="dl-platform">macOS</span>
+        <span class="dl-formats">.dmg, .zip</span>
+      </a>
+    </div>
+    <p class="dl-invite">
+      Try it. Break it. Build something horrible with it.
+    </p>
+    <p class="dl-note">
+      All downloads point to the
+      <a href={latestUrl} target="_blank" rel="noopener">latest release</a>
+      on GitHub.
+    </p>
+  </div>
+</section>
+
+<style>
+  #downloads {
+    padding: var(--section-gap) 0;
+  }
+
+  .dl-subtitle {
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 1.05rem;
+    margin-bottom: 2.5rem;
+  }
+
+  .dl-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.5rem;
+    max-width: 720px;
+    margin: 0 auto;
+  }
+
+  .dl-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 2rem 1.5rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    text-decoration: none;
+    transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;
+  }
+
+  .dl-card:hover {
+    border-color: var(--border-accent);
+    box-shadow: 0 0 24px var(--eldritch-glow);
+    transform: translateY(-2px);
+  }
+
+  .dl-icon {
+    width: 36px;
+    height: 36px;
+    color: var(--eldritch);
+  }
+
+  .dl-platform {
+    font-family: var(--font-mono);
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .dl-formats {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+  }
+
+  .dl-invite {
+    text-align: center;
+    margin-top: 2rem;
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    font-style: italic;
+  }
+
+  .dl-note {
+    text-align: center;
+    margin-top: 1.5rem;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+  }
+
+  .dl-note a {
+    color: var(--eldritch-dim);
+    text-decoration: none;
+  }
+
+  .dl-note a:hover {
+    color: var(--eldritch);
+    text-decoration: underline;
+  }
+
+  @media (max-width: 600px) {
+    .dl-grid {
+      grid-template-columns: 1fr;
+      max-width: 300px;
+    }
+  }
+</style>

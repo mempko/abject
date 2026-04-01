@@ -4,19 +4,7 @@ const features = [
     icon: '{>}',
     title: 'Spoken Into Being',
     hook: 'Describe what you want. It appears. Alive. Watching.',
-    desc: 'Say "a todo list that syncs with my calendar" in plain English. The ObjectCreator writes a manifest, generates handler code via LLM, and spawns a running object with its own window. From words to living software in seconds.',
-  },
-  {
-    icon: '{~}',
-    title: 'Living Code',
-    hook: 'Its source code changes while it runs. It does not notice.',
-    desc: 'Every ScriptableAbject can have its handlers rewritten at runtime. Old behavior is uninstalled, new behavior compiled and bound, all without restart. If the new code fails to compile, the old handlers stay. The object never breaks.',
-  },
-  {
-    icon: '{?}',
-    title: 'Objects That Interview',
-    hook: 'Before writing a line of code, the creator asks its dependencies: how should I use you?',
-    desc: 'The ObjectCreator generates targeted questions for each dependency based on your goal, sends them via the ask protocol, and uses the answers as context for code generation. Objects teach the next generation how to compose with them.',
+    desc: 'Say "a todo list that syncs with my calendar" in plain English. The system writes a manifest, generates code via LLM, and spawns a running object with its own window. From words to living software in seconds.',
   },
   {
     icon: '{@}',
@@ -28,13 +16,13 @@ const features = [
     icon: '{=}',
     title: 'Shared Goals, Many Minds',
     hook: 'One goal, many agents, many peers. All working. None coordinating.',
-    desc: 'Goals decompose into tasks that land in a CRDT-backed TupleSpace synced across peers. Agents on any machine watch and claim work autonomously. If one peer crashes, stale claims expire and others pick up where it left off. Progress bubbles up in real-time without a central dispatcher.',
+    desc: 'Goals decompose into tasks that land in a shared pool synced across peers. Agents on any machine watch and claim work autonomously. If one peer crashes, stale claims expire and others pick up where it left off.',
   },
   {
     icon: '{!}',
     title: 'Scars That Teach',
     hook: 'Every failure is fed back into the wound. The proxy that grows back is smarter.',
-    desc: 'When error rates cross 10%, the HealthMonitor collects recent failures and feeds them to the Negotiator. A new proxy is generated with the error history as context. The replacement accounts for exactly the mistakes that killed its predecessor.',
+    desc: 'When error rates cross 10%, the system collects recent failures and generates a new proxy with the error history as context. The replacement accounts for exactly the mistakes that killed its predecessor.',
   },
 ];
 ---
@@ -58,7 +46,7 @@ const features = [
 <style>
   .feature-grid {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(2, 1fr);
     gap: 1.25rem;
   }
 
