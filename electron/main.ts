@@ -100,6 +100,12 @@ app.on('window-all-closed', () => {
   app.quit();
 });
 
+// The backend spawns worker threads and a WebSocket server that keep the
+// process alive after Electron closes. Force exit after a brief grace period.
+app.on('will-quit', () => {
+  setTimeout(() => process.exit(0), 500);
+});
+
 app.setName('Abject');
 
 app.whenReady().then(async () => {
