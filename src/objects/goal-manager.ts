@@ -623,6 +623,7 @@ suitable agent based on descriptions.
 
       this.changed('goalUpdated', {
         goalId,
+        parentId: goal.parentId,
         message,
         phase,
         agentName,

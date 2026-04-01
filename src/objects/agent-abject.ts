@@ -984,6 +984,15 @@ improve semantic matching accuracy.
       chosen = await this.classifyBestAgent(eligibleCandidates, description);
     }
 
+    // 3a. Mark agent busy BEFORE the async claim to prevent concurrent
+    // dispatches from claiming tasks for the same agent (JS is single-threaded,
+    // so this is visible to any dispatch that runs between our await points).
+    if (this.busyAgents.has(chosen.agentId)) {
+      log.info(`DISPATCH-INNER ${tupleId} — agent ${chosen.name} became busy, aborting before claim`);
+      return;
+    }
+    this.busyAgents.add(chosen.agentId);
+
     // 4. Claim via GoalManager
     log.info(`DISPATCH-INNER ${tupleId} — claiming for ${chosen.name}`);
     let claimed: { tuple: { id: string; fields: Record<string, unknown> }; claimed: boolean } | null;
@@ -996,22 +1005,16 @@ improve semantic matching accuracy.
       );
     } catch (err) {
       log.info(`DISPATCH-INNER ${tupleId} — claim failed: ${(err as Error).message}`);
+      this.busyAgents.delete(chosen.agentId);
       return;
     }
 
     if (!claimed) {
       log.info(`DISPATCH-INNER ${tupleId} — no claimable tuple found`);
+      this.busyAgents.delete(chosen.agentId);
       return;
     }
     log.info(`DISPATCH-INNER ${tupleId} — claimed, sending executeTask to ${chosen.name}`);
-
-    // Per-agent concurrency: final race-safe check before executeTask
-    if (this.busyAgents.has(chosen.agentId)) {
-      log.info(`DISPATCH-INNER ${tupleId} — agent ${chosen.name} became busy during claim, releasing`);
-      try { await this.request(request(this.id, this.tupleSpaceId!, 'release', { tupleId: claimed.tuple.id })); } catch { /* best effort */ }
-      return;
-    }
-    this.busyAgents.add(chosen.agentId);
 
     // 5. Report progress (attempts are tracked by failTask, not here)
     if (taskGoalId) {
@@ -1023,18 +1026,28 @@ improve semantic matching accuracy.
       }));
     }
 
-    // 6. Send executeTask to chosen agent (long timeout: 310s)
+    // 6. Route executeTask through JobManager so it appears in the Jobs panel
     const dispatchStart = Date.now();
-    const executeMsg = request(this.id, chosen.agentId, 'executeTask', {
+    const executePayload = {
       tupleId: claimed.tuple.id,
       goalId: taskGoalId,
       description,
       data,
       type: taskType,
+      callerId: this.id,
+    };
+    const jobCode = `return await call(${JSON.stringify(chosen.agentId)}, 'executeTask', ${JSON.stringify(executePayload)});`;
+    const jobMgrId = await this.resolveDep('JobManager', this.jobManagerId);
+    const submitMsg = request(this.id, jobMgrId, 'submitJob', {
+      description: `[${chosen.name}] ${description.slice(0, 80)}`,
+      code: jobCode,
+      queue: chosen.name,
     });
-    this._currentDispatchMsgId = executeMsg.header.messageId;
+    this._currentDispatchMsgId = submitMsg.header.messageId;
     try {
-      const result = await this.request<unknown>(executeMsg, 310000);
+      const jobResult = await this.request<JobResult>(submitMsg, 400000);
+      if (jobResult.status === 'failed') throw new Error(jobResult.error ?? 'Job failed');
+      const result = jobResult.result;
 
       const elapsed = Date.now() - dispatchStart;
       log.info(`DISPATCH-INNER ${tupleId} — executeTask SUCCESS (${elapsed}ms), completing task`);
@@ -1092,6 +1105,8 @@ improve semantic matching accuracy.
     } finally {
       this._currentDispatchMsgId = undefined;
       this.busyAgents.delete(chosen.agentId);
+      // Immediate re-scan: pick up next pending task for this now-free agent
+      this.periodicScan().catch(() => {});
     }
   }
 
@@ -1601,6 +1616,17 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
                   content: '[Error] Cannot decompose — GoalManager not available.',
                 });
                 break;
+              }
+
+              // Resolve object names to IDs for modify subtasks
+              for (const sub of subtasks) {
+                if (sub.type === 'modify' && sub.data) {
+                  const d = sub.data as Record<string, unknown>;
+                  if (d.object && !d.objectId) {
+                    const resolved = await this.discoverDep(d.object as string);
+                    if (resolved) d.objectId = resolved;
+                  }
+                }
               }
 
               log.info(`[${agentName}] Decomposing into ${subtasks.length} sub-tasks`);

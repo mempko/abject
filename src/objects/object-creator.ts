@@ -442,21 +442,24 @@ export class ObjectCreator extends Abject {
     });
 
     this.on('executeTask', async (msg: AbjectMessage) => {
-      const { goalId, description, data, type } = msg.payload as {
+      const { goalId, description, data, type, callerId: explicitCallerId } = msg.payload as {
         tupleId: string; goalId?: string; description: string;
-        data?: Record<string, unknown>; type: string;
+        data?: Record<string, unknown>; type: string; callerId?: string;
       };
       log.info(`executeTask type=${type} goalId=${goalId?.slice(0, 8) ?? '?'} desc="${description.slice(0, 60)}"`);
       this._currentGoalId = goalId;
-      // Use the caller (AgentAbject) as the progress recipient -- NOT this.id,
-      // because reportProgress sends 'progress' events to callerId, and our own
-      // 'progress' handler re-sends to _currentCallerId, creating an infinite
-      // loop when callerId === this.id.
-      const callerId = msg.routing.from;
+      // Use explicit callerId (from AgentAbject via JobManager) or fall back to
+      // msg.routing.from. This ensures progress reaches AgentAbject even when
+      // the executeTask is routed through JobManager.
+      const callerId = (explicitCallerId as AbjectId) ?? msg.routing.from;
       try {
         if (type === 'modify') {
-          const objectId = data?.objectId as string;
-          if (!objectId) throw new Error('modify task missing objectId');
+          let objectId = data?.objectId as string | undefined;
+          if (!objectId && data?.object) {
+            const resolved = await this.discoverDep(data.object as string);
+            if (resolved) objectId = resolved;
+          }
+          if (!objectId) throw new Error('modify task missing objectId (include data.object or data.objectId)');
           log.info(`executeTask modify object=${objectId.slice(0, 8)}`);
           return await this.modifyObject(objectId as AbjectId, description, callerId);
         }

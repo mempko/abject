@@ -284,9 +284,12 @@ export class Chat extends Abject {
 
         // Goal progress events — append progress labels for sub-agent updates.
         // Skip Chat's own updates (agentName === 'Chat') since agentPhaseChanged already covers those.
+        // Accept progress from the current goal AND its child goals (parentId match).
         if (this._currentGoalId) {
-          const data = value as { goalId: string; message?: string; phase?: string; agentName?: string };
-          if (data.goalId !== this._currentGoalId) return;
+          const data = value as { goalId: string; parentId?: string; message?: string; phase?: string; agentName?: string };
+          const isCurrentGoal = data.goalId === this._currentGoalId;
+          const isChildGoal = data.parentId === this._currentGoalId;
+          if (!isCurrentGoal && !isChildGoal) return;
           if (aspect === 'goalUpdated') {
             // Any goal progress resets ALL pending timeouts
             this.resetTaskCompletionTimeouts();
@@ -827,10 +830,13 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   and the agent automatically monitors progress. Sub-tasks are claimed by agents autonomously.
   \`{ "action": "decompose", "reasoning": "why splitting", "subtasks": [
     { "type": "create", "description": "Build a counter widget" },
+    { "type": "modify", "description": "Add a reset button", "data": { "object": "Counter" } },
     { "type": "browse", "description": "Research X", "data": { "startUrl": "https://..." } },
     { "type": "skill", "description": "Fetch data using the configured API" }
   ] }\`
   After decomposing, you'll observe sub-task progress and can synthesize results when done.
+
+  For **modify** subtasks, you MUST include \`"data": { "object": "ObjectName" }\` with the exact object name from "Your Abjects". Without it, the modify task will fail.
 
   Task types and which agent claims them:
   - **browse** / **research** / **web**: WebAgent (browser automation, navigating real websites, weather, general web queries)

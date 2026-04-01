@@ -29,14 +29,15 @@ interface TaskInfo {
   description: string;
   attempts: number;
   maxAttempts: number;
+  claimedBy?: string;
 }
 
 const TASK_STATUS_ICONS: Record<string, string> = {
-  pending: '\u25CB',              // ○
-  in_progress: '\u25D4',         // ◔
-  done: '\u25CF',                // ●
-  failed: '\u2716',              // ✖
-  permanently_failed: '\u2718',  // ✘
+  pending: '\u25CB',              // ○  unclaimed
+  claimed: '\u25D1',              // ◑  claimed / in-progress
+  in_progress: '\u25D1',         // ◑  claimed / in-progress
+  done: '\u2713',                // ✓  completed
+  permanently_failed: '\u2717',  // ✗  exhausted retries
 };
 
 export class GoalBrowser extends Abject {
@@ -346,7 +347,9 @@ Sub-goals are indented under their parent goal.
     if (tasks && tasks.length > 0) {
       const taskIndent = indent ? '      ' : '   ';
       const taskLines = tasks.map(t => {
-        const icon = TASK_STATUS_ICONS[t.status] ?? '\u2022';
+        // Derive effective status: pending + claimedBy = claimed (in-progress)
+        const effectiveStatus = t.status === 'pending' && t.claimedBy ? 'claimed' : t.status;
+        const icon = TASK_STATUS_ICONS[effectiveStatus] ?? '\u2022';
         const attempts = t.attempts > 0 ? ` (attempt ${t.attempts}/${t.maxAttempts})` : '';
         const desc = t.description.slice(0, 50);
         return `${taskIndent}${icon} [${t.type}] ${desc}${attempts}`;
@@ -383,7 +386,7 @@ Sub-goals are indented under their parent goal.
   private async fetchTasksForGoal(goalId: GoalId): Promise<TaskInfo[]> {
     if (!this.goalManagerId) return [];
     try {
-      const tuples = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
+      const tuples = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(
         request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId })
       );
       return tuples.map(t => ({
@@ -393,6 +396,7 @@ Sub-goals are indented under their parent goal.
         description: (t.fields.description as string) ?? '',
         attempts: (t.fields.attempts as number) ?? 0,
         maxAttempts: (t.fields.maxAttempts as number) ?? 3,
+        claimedBy: t.claimedBy,
       }));
     } catch { return []; }
   }
