@@ -434,7 +434,7 @@ export class LabelWidget extends WidgetAbject {
     const sel = this.style.selectable ? this.getSelection() : null;
 
     // Markdown rendering path
-    if (style.markdown && style.wordWrap && w > 0) {
+    if (style.markdown && w > 0) {
       if (style.background) {
         // background already pushed above
       }
@@ -645,6 +645,16 @@ export class LabelWidget extends WidgetAbject {
       // can react to label clicks (e.g. clickable contact card lists)
       if (input.type === 'mousedown') {
         this.changed('click', this.text);
+        // Markdown inline link: open URL on click
+        if (this.style.markdown && this.cachedRichLayout) {
+          const x = input.x as number ?? 0;
+          const y = input.y as number ?? 0;
+          const run = this.runAtClick(x, y);
+          if (run?.href) {
+            this.send(event(this.id, this.uiServerId, 'openUrl', { url: run.href }));
+            return { consumed: true };
+          }
+        }
       }
       return { consumed: false };
     }
