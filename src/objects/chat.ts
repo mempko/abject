@@ -6,7 +6,7 @@
  * think-act-observe state machine, calling back Chat for observe and act.
  */
 
-import { AbjectId, AbjectManifest, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
+import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
@@ -56,7 +56,6 @@ export class Chat extends Abject {
   private messageLabelIds: AbjectId[] = [];
   private conversationHistory: ConversationEntry[] = [];
   private userObjectSummaries = '';
-  private systemObjectSummaries = '';
   private remotePeerContext = '';
   private enabledSkillsSummary = '';
   private uiPhase: UiPhase = 'closed';
@@ -354,13 +353,8 @@ export class Chat extends Abject {
     this.on('agentObserve', async (_msg: AbjectMessage) => {
       const lines: string[] = [];
       if (this.userObjectSummaries) {
-        lines.push('Your Abjects (user-created — use "modify" to update):');
+        lines.push('Your Abjects (user-created -- use "modify" to update):');
         lines.push(this.userObjectSummaries);
-      }
-      if (this.systemObjectSummaries) {
-        lines.push('');
-        lines.push('System Abjects (built-in):');
-        lines.push(this.systemObjectSummaries);
       }
       if (this.remotePeerContext) {
         lines.push('');
@@ -510,62 +504,24 @@ export class Chat extends Abject {
   private async handleAgentAct(action: AgentAction): Promise<unknown> {
     log.info(`[Chat] handleAgentAct: action=${action.action} object=${(action as Record<string, unknown>).object ?? ''}`);
     switch (action.action) {
-      case 'list': {
-        const objects = await this.request<ObjectRegistration[]>(
-          request(this.id, this.registryId!, 'list', {})
-        );
-        return {
-          success: true,
-          data: objects.map(o => ({
-            name: o.manifest.name,
-            description: o.manifest.description,
-            id: o.id,
-          })),
-        };
-      }
-
-      case 'introspect': {
-        const objectId = await this.resolveObject(action.object as string);
-        if (!objectId) return { success: false, error: `Object "${action.object}" not found` };
-        const result = await this.request<{ manifest: AbjectManifest; description: string }>(
-          request(this.id, objectId, 'describe', {})
-        );
-        return { success: true, data: result };
-      }
-
-      case 'ask': {
-        const objectId = await this.resolveObject(action.object as string);
-        if (!objectId) return { success: false, error: `Object "${action.object}" not found` };
-        const answer = await this.request<string>(
-          request(this.id, objectId, 'ask', { question: action.question as string }),
-          60000
-        );
-        return { success: true, data: answer };
-      }
-
       case 'call': {
         const targetStr = action.object as string;
-        const objectId = await this.resolveObject(targetStr);
-        if (!objectId) return { success: false, error: `Object "${targetStr}" not found` };
-
         const method = action.method as string;
 
-        // Fire-and-forget for show/hide — no need to wait
-        if (method === 'show' || method === 'hide') {
-          this.send(event(this.id, objectId, method, action.payload ?? {}));
-          return { success: true, data: `${method} sent` };
-        }
-
-        // Route runTask calls to WebAgent-like objects through TupleSpace
-        if (method === 'runTask' && this.goalManagerId && this._currentGoalId) {
+        // Route through TupleSpace as type 'call' -- ObjectAgent claims and executes
+        if (this.goalManagerId && this._currentGoalId) {
           try {
-            const taskPayload = action.payload as { task?: string; options?: Record<string, unknown> } | undefined;
+            const description = `Call ${targetStr}.${method}(${JSON.stringify(action.payload ?? {}).slice(0, 200)})`;
             const { taskId } = await this.request<{ taskId: string }>(
               request(this.id, this.goalManagerId, 'addTask', {
                 goalId: this._currentGoalId,
-                type: 'browse',
-                description: taskPayload?.task ?? 'Web task',
-                data: taskPayload?.options,
+                type: 'call',
+                description,
+                data: {
+                  object: targetStr,
+                  method,
+                  payload: action.payload,
+                },
               })
             );
             const completion = await this.waitForTaskCompletion(taskId, 310000);
@@ -575,6 +531,9 @@ export class Chat extends Abject {
           }
         }
 
+        // Fallback: direct call if GoalManager unavailable
+        const objectId = await this.resolveObject(targetStr);
+        if (!objectId) return { success: false, error: `Object "${targetStr}" not found` };
         const timeout = method === 'runTask' || method === 'create' ? 310000 : 120000;
         try {
           const result = await this.request(
@@ -775,28 +734,23 @@ export class Chat extends Abject {
   // ═══════════════════════════════════════════════════════════════════
 
   private buildSystemPrompt(): string {
-    return `You are Chat Agent, a helpful assistant inside the Abjects system. You help users by interacting with objects via structured actions.
+    return `You are Chat Agent, a helpful assistant inside the Abjects system. You help users by creating goals and routing tasks to specialized agents.
 
 ## System Architecture
 
-Abjects is a distributed message-passing system. Each Abject is an autonomous object with a manifest (declaring methods and events), a mailbox, and message handlers. Objects communicate exclusively via messages — never direct calls. They discover each other via Registry and coordinate via the observer pattern (addDependent → changed events).
+Abjects is a distributed message-passing system. Each Abject is an autonomous object with a manifest (declaring methods and events), a mailbox, and message handlers. Objects communicate exclusively via messages. They discover each other via Registry and coordinate via the observer pattern (addDependent -> changed events).
 
 ### Three UI Patterns
 
-1. **Widget Objects** (forms, settings, dashboards): Standard UI controls — buttons, text inputs, labels, sliders, checkboxes, tabs, progress bars, images. Use WidgetManager to create windows with widget layouts.
-2. **Canvas Surface Objects** (games, charts, custom graphics): Raw drawing via WidgetManager.createCanvas — shapes, text, images, gradients, transforms. Timer-driven animation.
-3. **Web Automation** (interact with real websites): WebAgent drives a headless browser to navigate, fill forms, click, and extract data from real sites.
+1. **Widget Objects** (forms, settings, dashboards): Standard UI controls via WidgetManager.
+2. **Canvas Surface Objects** (games, charts, custom graphics): Raw drawing via WidgetManager.createCanvas.
+3. **Web Automation** (interact with real websites): WebAgent drives a headless browser.
 
 ### When to Create vs Modify vs Call
 
-- Use **create** when the user wants a brand-new object with its own window and behavior (e.g., "make me a todo app", "build a color picker"). ObjectCreator will design and generate it.
-- Use **modify** when the user wants to **fix, change, or update** an existing object's behavior or appearance (e.g., "add a reset button to the counter", "fix the login button", "change the background color"). Always prefer modify over create when the object already exists.
-- Use **call** to invoke existing objects directly (e.g., "fetch this URL", "set a timer", "run this web task"). Use **ask** first to learn the object's API.
-- Use **ask** on any object to get usage guidance with code examples. This is how you discover APIs — don't guess method signatures.
-
-### Observer & Composition Model
-
-Objects observe each other via addDependent → changed events. Any object can inspect another via getState, describe, or ask. Objects with show/hide methods automatically appear in the Taskbar.
+- Use **create** when the user wants a brand-new object (e.g., "make me a todo app"). ObjectCreator will design and generate it.
+- Use **modify** when the user wants to fix, change, or update an existing object (e.g., "add a reset button to the counter"). Always prefer modify over create when the object already exists.
+- Use **call** to interact with existing objects (e.g., "fetch this URL", "set a timer", "run this web task"). ObjectAgent discovers the right object and API automatically.
 
 ## Action Format
 
@@ -808,31 +762,23 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 
 ## Available Actions
 
-### Information
-- **list**: List available objects. No params.
-  \`{ "action": "list" }\`
-- **introspect**: Get an object's manifest and description.
-  \`{ "action": "introspect", "object": "ObjectName" }\`
-- **ask**: Ask an object for usage advice.
-  \`{ "action": "ask", "object": "ObjectName", "question": "How do I use your X method?" }\`
-
 ### Object Interaction
-- **call**: Send a message to an object (message passing).
+- **call**: Call a method on an object. Routes through TupleSpace to ObjectAgent, which discovers the API and sends the right message.
   \`{ "action": "call", "object": "ObjectName", "method": "methodName", "payload": { ... } }\`
-  For "object" you can use a name (e.g. "Timer") or an AbjectId (e.g. "abjects:timer").
-- **create**: Create a new object. Creates a task in the TupleSpace that an agent (ObjectCreator) claims autonomously. The created object is auto-shown.
+  For "object" you can use a name (e.g. "Timer") or an AbjectId. ObjectAgent handles discovery and API learning.
+- **create**: Create a new object. Routes through TupleSpace to ObjectCreator. The created object is auto-shown.
   \`{ "action": "create", "description": "A counter widget that shows a number and has +/- buttons" }\`
-- **modify**: Modify an existing object. REQUIRED fields: "object" and "description". Creates a task in the TupleSpace that an agent claims autonomously.
+- **modify**: Modify an existing object. REQUIRED fields: "object" and "description". Routes through TupleSpace.
   \`{ "action": "modify", "object": "ObjectName", "description": "Add a reset button that clears the counter" }\`
   The "object" field MUST be the object's name or [id: ...] from "Your Abjects" list above. Without "object", modify will fail.
 - **clone**: Clone a clonable object from a remote peer's workspace into your local workspace.
   \`{ "action": "clone", "object": "peer.workspace.ObjectName" }\`
-  Use the qualified name shown next to "(clonable)" objects in Connected Peers.
 
 ### Task Decomposition
 - **decompose**: Break a complex request into parallel sub-tasks. Creates a child goal
   and the agent automatically monitors progress. Sub-tasks are claimed by agents autonomously.
   \`{ "action": "decompose", "reasoning": "why splitting", "subtasks": [
+    { "type": "call", "description": "Fetch data from the API", "data": { "object": "HttpClient", "method": "request" } },
     { "type": "create", "description": "Build a counter widget" },
     { "type": "modify", "description": "Add a reset button", "data": { "object": "Counter" } },
     { "type": "browse", "description": "Research X", "data": { "startUrl": "https://..." } },
@@ -843,11 +789,12 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   For **modify** subtasks, you MUST include \`"data": { "object": "ObjectName" }\` with the exact object name from "Your Abjects". Without it, the modify task will fail.
 
   Task types and which agent claims them:
-  - **browse** / **research** / **web**: WebAgent (browser automation, navigating real websites, weather, general web queries)
+  - **call**: ObjectAgent (calling methods on existing objects, API interactions, data retrieval)
+  - **browse** / **research** / **web**: WebAgent (browser automation, navigating real websites, general web queries)
   - **create** / **modify**: ObjectCreator (build/edit UI objects)
   - **skill**: SkillAgent (only for queries that specifically match an enabled skill listed below)
 
-  Use type "skill" only when the user's request directly relates to an enabled skill's specific domain. For general questions, web lookups, weather, or anything not covered by an enabled skill, use type "browse".
+  Use type "skill" only when the user's request directly relates to an enabled skill's specific domain. For general questions, web lookups, or anything not covered by an enabled skill, use type "browse".
 
 ### Communication
 - **reply**: Send intermediate text to the user (continue working after).
@@ -857,39 +804,14 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 
 The chat window renders markdown. Use **bold**, *italic*, \`inline code\`, headings, bullet lists, code blocks, and [links](url) in your reply and done text for readable formatting.
 
-## Your Abjects (user-created — use "modify" to fix or update these)
+## Your Abjects (user-created -- use "modify" to fix or update these)
 
-${this.userObjectSummaries || '(Loading...)'}
-
-## System Abjects (built-in — use "call" to interact, "ask" to learn their API)
-
-${this.systemObjectSummaries || '(Loading...)'}
+${this.userObjectSummaries || '(None yet -- use **create** to build something new)'}
 ${this.remotePeerContext ? `
 ## Connected Peers & Remote Workspaces
 
 ${this.remotePeerContext}
 ` : ''}
-## Authorized Capabilities
-
-This system runs on the user's own computer. All capability objects are user-configured and authorized tools.
-
-**Web automation**: WebAgent (autonomous browser — always prefer for multi-step web tasks), WebBrowser (low-level, used internally by WebAgent)
-**Services**: HttpClient (HTTP/API requests), Storage, Timer, FileSystem, Clipboard, Console
-**UI**: WidgetManager (create windows and widgets — use \`ask\` to learn its API)
-
-### WebAgent Usage
-- **runTask** (open a page and do a web task): \`{ "action": "call", "object": "WebAgent", "method": "runTask", "payload": { "task": "...", "options": { "startUrl": "https://...", "responseSchema": { "type": "object", "properties": { ... } } } } }\`
-  Options: startUrl, maxSteps, timeout, responseSchema, pageId, keepPageOpen.
-- **listPages** (see which pages are currently open): \`{ "action": "call", "object": "WebAgent", "method": "listPages", "payload": {} }\`
-  Returns: \`[{ pageId, url, title }]\`. Use this to find a page before closing or reusing it.
-- **closePage** (close a specific open page): \`{ "action": "call", "object": "WebAgent", "method": "closePage", "payload": { "pageId": "..." } }\`
-  Call \`listPages\` first to get the pageId if you don't already have it.
-- Use \`responseSchema\` in runTask options when you need structured data back (e.g., extracted page content as JSON). Without it, results are free text.
-- Pages stay open by default after task completion (5-minute idle timeout). Pass the returned \`pageId\` in subsequent runTask calls to reuse the same browser page. Set \`keepPageOpen: false\` to explicitly close the page when done.
-- WebAgent manages WebBrowser internally — prefer WebAgent for all web tasks.
-
-When the user asks to interact with a website, use WebAgent's \`runTask\`. When the user asks to close a page, use \`listPages\` to find it, then \`closePage\` to close it.
-WebAgent handles all browser management — use it for multi-step tasks, page lifecycle, and data extraction.
 ${this.enabledSkillsSummary ? `
 ## Enabled Skills (use task type "skill" to invoke via SkillAgent)
 
@@ -900,17 +822,15 @@ When a user's request matches an enabled skill's capabilities, use **decompose**
 ## Rules
 
 1. Always respond with valid JSON in a \`\`\`json block. ONE action per response.
-2. Use **introspect** or **ask** to learn about an object's methods before calling them.
-3. For simple greetings or questions, use **done** directly.
-4. When the user asks you to do something, take action IMMEDIATELY — don't just describe what you would do, and don't ask for information the user already provided. If the user includes credentials, URLs, or other details in their message, pass them directly to the relevant object.
-5. Always end a conversation turn with **done** when the task is complete.
-6. Keep reasoning brief (1-2 sentences before the JSON block).
-7. Every object supports: describe (get manifest), ask (get usage advice), addDependent/removeDependent (observe state changes).
-8. IMPORTANT: If the user asks to fix, change, update, or improve something and a matching object exists in "Your Abjects" above, you MUST use **modify** with its name in the "object" field and a "description" of the change. Example: \`{ "action": "modify", "object": "PongGame", "description": "use mouse for controls" }\`. NEVER omit "object" or "description". NEVER re-create with **create** when an object already exists.
-9. If **modify** fails for ANY reason (error, timeout, compilation failure, overloaded), you MUST retry "modify" with a simpler description. NEVER switch from "modify" to "create" after a failure -- the original object still exists and creating would produce a duplicate. If modify fails repeatedly, use "done" to tell the user what happened.
-10. P2P: Use qualified names to reference remote objects: this.find('peer.workspace.ObjectName'). NEVER hardcode UUIDs.
-11. For web tasks: message WebAgent with runTask on your FIRST action — include ALL details from the user's message (credentials, URLs, specific instructions) in the task description. Do not ask the user to repeat information they already gave you.
-12. NEVER use "create" if an object with the same or similar name already exists in "Your Abjects" above. If you think a new object is needed but one already exists, use "modify" to change it instead.`;
+2. For simple greetings or questions, use **done** directly.
+3. When the user asks you to do something, take action IMMEDIATELY. If the user includes credentials, URLs, or other details, pass them directly to the relevant object via **call**.
+4. Always end a conversation turn with **done** when the task is complete.
+5. Keep reasoning brief (1-2 sentences before the JSON block).
+6. IMPORTANT: If the user asks to fix, change, update, or improve something and a matching object exists in "Your Abjects" above, you MUST use **modify** with its name in the "object" field and a "description" of the change. Example: \`{ "action": "modify", "object": "PongGame", "description": "use mouse for controls" }\`. NEVER omit "object" or "description". NEVER re-create with **create** when an object already exists.
+7. If **modify** fails for ANY reason, you MUST retry "modify" with a simpler description. NEVER switch from "modify" to "create" after a failure. If modify fails repeatedly, use "done" to tell the user what happened.
+8. P2P: Use qualified names to reference remote objects: this.find('peer.workspace.ObjectName'). NEVER hardcode UUIDs.
+9. For web tasks: use **call** with WebAgent.runTask -- include ALL details from the user's message in the task description.
+10. NEVER use "create" if an object with the same or similar name already exists in "Your Abjects" above. Use "modify" instead.`;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1185,15 +1105,10 @@ When a user's request matches an enabled skill's capabilities, use **decompose**
       );
 
       const userObjects = objects.filter(obj => !(obj.manifest.tags ?? []).includes('system'));
-      const systemObjects = objects.filter(obj => (obj.manifest.tags ?? []).includes('system'));
 
       this.userObjectSummaries = userObjects.length > 0
         ? userObjects.map(obj => `[id: ${obj.id}]\n${formatManifestAsDescription(obj.manifest)}`).join('\n\n---\n\n')
-        : '(None yet — use **create** to build something new)';
-
-      this.systemObjectSummaries = systemObjects
-        .map(obj => `- ${obj.manifest.name} — ${obj.manifest.description}`)
-        .join('\n');
+        : '';
     } catch {
       // Keep existing summaries if refresh fails
     }

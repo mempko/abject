@@ -132,6 +132,7 @@ export { WebSearch, WEB_SEARCH_ID } from './objects/capabilities/web-search.js';
 export { WebFetch, WEB_FETCH_ID } from './objects/capabilities/web-fetch.js';
 export { SkillRegistry, SKILL_REGISTRY_ID } from './objects/skill-registry.js';
 export { SkillAgent, SKILL_AGENT_ID } from './objects/skill-agent.js';
+export { ObjectAgent, OBJECT_AGENT_ID } from './objects/object-agent.js';
 export { SkillBrowser, SKILL_BROWSER_ID } from './objects/skill-browser.js';
 export { parseSkillMd } from './core/skill-parser.js';
 export type { ParsedSkill } from './core/skill-parser.js';

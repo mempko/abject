@@ -2,8 +2,7 @@
  * Object Creator - user-facing object for creating and modifying objects via natural language.
  *
  * Uses a multi-phase pipeline:
- *   Phase 0a: discoverObjectSummaries() — registry.list() → name + description
- *   Phase 0b: llmSelectDependencies()   — LLM picks relevant objects from summaries
+ *   Phase 0:  askRegistryForDependencies() — Registry ask protocol selects deps
  *   Phase 0c: fetchFullManifests()       — registry.lookup() for selected objects
  *   Phase 0c5: generateTargetedQuestions() — LLM generates goal-specific questions per dep
  *   Phase 0d: fetchUsageGuides()         — ask each dep with targeted (or generic) questions
@@ -740,17 +739,16 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
     prompt: string,
     previousCode: string,
     probeError: string,
-    summaries: ObjectSummary[],
     originalDeps: SelectedDependency[],
     usedObjects: string[],
     context: string | undefined,
     callerId: AbjectId | undefined
   ): Promise<{ success: boolean; code?: string; deps?: SelectedDependency[]; error?: string }> {
-    // 1. Re-run Phase 0b with augmented prompt including probe error
+    // 1. Re-ask Registry with augmented prompt including probe error
     if (callerId) await this.reportProgress(callerId, '5c', 'Re-selecting dependencies with probe feedback...');
     const augmentedPrompt =
-      `${prompt}\n\nIMPORTANT: A previous attempt failed because these dependencies are missing: ${probeError}. Make sure to select them.`;
-    const newSelectedNames = await this.llmSelectDependencies(augmentedPrompt, summaries);
+      `${prompt}\n\nIMPORTANT: A previous attempt failed because these dependencies are missing: ${probeError}. Make sure to include them.`;
+    const newSelectedNames = await this.askRegistryForDependencies(augmentedPrompt);
     log.info('probe-retry Re-selected dependencies:', newSelectedNames);
 
     // 2. Identify newly discovered deps (diff against originals)
@@ -763,7 +761,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
 
     if (newNames.length > 0) {
       if (callerId) await this.reportProgress(callerId, '5c', `Learning about new deps: ${newNames.join(', ')}...`);
-      const newDeps = await this.fetchFullManifests(newNames, summaries);
+      const newDeps = await this.fetchFullManifests(newNames);
       const newQuestions = await this.generateTargetedQuestions(prompt, newDeps);
       const newGuides = await this.fetchUsageGuides(newDeps, newQuestions, callerId);
 
@@ -852,61 +850,71 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
    * Phase 0a: Get summaries (name + description) of all registered objects.
    * Queries both the workspace registry and the system registry, deduplicating by ID.
    */
-  private async discoverObjectSummaries(): Promise<ObjectSummary[]> {
-    const allObjects: ObjectRegistration[] = [];
-    if (this.registryId) allObjects.push(...await this.registryList());
-    if (this.systemRegistryId) allObjects.push(...await this.systemRegistryList());
-    // Deduplicate by ID
-    const seen = new Set<string>();
-    return allObjects.filter(o => {
-      if (seen.has(o.id)) return false;
-      seen.add(o.id);
-      return true;
-    }).map(o => ({
-      id: o.id,
-      name: o.manifest.name,
-      description: o.manifest.description,
-    }));
+  /**
+   * Phase 0: Ask the Registry which objects the new object needs as dependencies.
+   * Uses the Registry's ask protocol, which has access to the full catalog of
+   * registered objects and their capabilities.
+   */
+  private async askRegistryForDependencies(prompt: string): Promise<string[]> {
+    const registryId = this.registryId ?? this.systemRegistryId;
+    if (!registryId) return [];
+
+    const question =
+      `I'm building an object that: ${prompt}\n\n` +
+      'IMPORTANT: Objects run in a sandboxed environment with NO access to browser globals (fetch, setTimeout, localStorage, etc). ' +
+      'If the object needs HTTP requests, timers, storage, or other capabilities, it MUST depend on the registered object that provides them.\n\n' +
+      'TOOL SELECTION HIERARCHY for web access:\n' +
+      '1. HttpClient (+ WebParser for HTML) -- DEFAULT for fetching web content: news sites, RSS feeds, APIs, HTML scraping.\n' +
+      '2. WebBrowser -- for pages that require JavaScript rendering or interactive control.\n' +
+      '3. WebAgent -- for autonomous multi-step browsing with AI planning (very heavy).\n\n' +
+      'Which registered objects should it depend on? Return just the object names, one per line. If no dependencies are needed, return "None".';
+
+    try {
+      const answer = await this.request<string>(
+        request(this.id, registryId, 'ask', { question }),
+        60000,
+      );
+      const content = (typeof answer === 'string' ? answer : String(answer)).trim();
+      if (content.toLowerCase() === 'none') return [];
+      return content
+        .split('\n')
+        .map((n) => n.trim().replace(/^[-*•]\s*/, '').replace(/\*\*/g, ''))
+        .filter((n) => n.length > 0 && n.toLowerCase() !== 'none');
+    } catch (err) {
+      log.warn('askRegistryForDependencies failed:', err instanceof Error ? err.message : String(err));
+      return [];
+    }
   }
 
   /**
-   * Phase 0b: Ask LLM to select which objects the new object needs as dependencies.
+   * Resolve an object name to an ID via Registry discover message.
    */
-  private async llmSelectDependencies(
-    prompt: string,
-    summaries: ObjectSummary[]
-  ): Promise<string[]> {
-    if (summaries.length === 0 || !this.llmId) return [];
+  private async resolveObjectByName(name: string): Promise<ObjectSummary | null> {
+    if (!this.registryId) return null;
+    try {
+      const results = await this.request<ObjectRegistration[]>(
+        request(this.id, this.registryId, 'discover', { name })
+      );
+      if (results.length > 0) {
+        const r = results[0];
+        return { id: r.id, name: r.name ?? r.manifest.name, description: r.manifest.description };
+      }
+    } catch { /* not found in workspace registry */ }
 
-    const summaryText = summaries
-      .map((s) => `- ${s.name}: ${s.description}`)
-      .join('\n');
+    // Try system registry
+    if (this.systemRegistryId) {
+      try {
+        const results = await this.request<ObjectRegistration[]>(
+          request(this.id, this.systemRegistryId, 'discover', { name })
+        );
+        if (results.length > 0) {
+          const r = results[0];
+          return { id: r.id, name: r.name ?? r.manifest.name, description: r.manifest.description };
+        }
+      } catch { /* not found */ }
+    }
 
-    const result = await this.llmComplete([
-      systemMessage(
-        'Given a list of object names and descriptions, return ONLY the names the new object needs as dependencies. ' +
-        'Study each object\'s description — including any listed use cases — to determine if the new object needs its methods or will receive its events. ' +
-        'IMPORTANT: Objects run in a sandboxed environment with NO access to browser globals (fetch, setTimeout, localStorage, etc). ' +
-        'If the new object needs HTTP requests, timers, storage, or other capabilities, it MUST depend on the object that provides them. ' +
-        'TOOL SELECTION HIERARCHY for web access:\n' +
-        '1. HttpClient (+ WebParser for HTML) — DEFAULT for fetching web content: news sites, RSS feeds, APIs, HTML scraping. Most sites serve usable HTML or RSS without JavaScript. Fast (1-2 seconds) and reliable.\n' +
-        '2. WebBrowser — best suited for pages that require JavaScript rendering or interactive control (login flows, form filling, SPAs like social media sites).\n' +
-        '3. WebAgent — best suited for tasks where the user explicitly asks for autonomous multi-step browsing with AI planning. Very heavy (launches browser + LLM loop). Reserve WebAgent for complex autonomous browsing tasks.\n' +
-        'If the task mentions fetching content from websites (news, articles, data, headlines), prefer HttpClient + WebParser. "Create a news app from CNN" means fetch CNN\'s RSS/HTML, not automate a browser.\n' +
-        'Choose WebBrowser when JavaScript rendering or login is required (e.g. "Instagram app", "Twitter client" that need authentication). ' +
-        'Always fetch real content from real websites — the user expects actual data. ' +
-        'Return one name per line, nothing else. If no dependencies are needed, return "None".'
-      ),
-      userMessage(`Available objects:\n${summaryText}\n\nNew object to create: ${prompt}\n\nWhich objects does it need?`),
-    ], { tier: 'balanced' });
-
-    const content = result.content.trim();
-    if (content.toLowerCase() === 'none') return [];
-
-    return content
-      .split('\n')
-      .map((n) => n.trim().replace(/^-\s*/, ''))
-      .filter((n) => n.length > 0 && n.toLowerCase() !== 'none');
+    return null;
   }
 
   /**
@@ -928,20 +936,17 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
    */
   private async fetchFullManifests(
     selectedNames: string[],
-    summaries: ObjectSummary[]
   ): Promise<SelectedDependency[]> {
     const deps: SelectedDependency[] = [];
 
     for (const name of selectedNames) {
-      const summary = summaries.find(
-        (s) => s.name.toLowerCase() === name.toLowerCase()
-      );
-      if (!summary) continue;
+      const resolved = await this.resolveObjectByName(name);
+      if (!resolved) continue;
 
-      const result = await this.introspect(summary.id);
+      const result = await this.introspect(resolved.id);
       if (result) {
         deps.push({
-          id: summary.id,
+          id: resolved.id,
           name: result.manifest.name,
           manifest: result.manifest,
           description: result.description,
@@ -1099,19 +1104,15 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
     try {
       this._currentCallerId = callerId;
 
-      // Phase 0a: Get object summaries
-      if (callerId) await this.reportProgress(callerId, '0a', 'Discovering available objects...');
-      const summaries = await this.discoverObjectSummaries();
-
-      // Phase 0b: LLM selects dependencies
-      if (callerId) await this.reportProgress(callerId, '0b', 'Choosing dependencies...');
-      const selectedNames = await this.llmSelectDependencies(prompt, summaries);
+      // Phase 0: Ask Registry which objects the new object needs
+      if (callerId) await this.reportProgress(callerId, '0', 'Asking Registry for dependencies...');
+      const selectedNames = await this.askRegistryForDependencies(prompt);
       log.info('Selected dependencies:', selectedNames);
 
       // Phase 0c: Fetch full manifests for selected dependencies
       const depNames = selectedNames.join(', ') || 'none';
       if (callerId) await this.reportProgress(callerId, '0c', `Learning about ${depNames}...`);
-      let deps = await this.fetchFullManifests(selectedNames, summaries);
+      let deps = await this.fetchFullManifests(selectedNames);
       log.info('Fetched manifests for:', deps.map((d) => d.name));
 
       // Phase 0c5: Generate targeted questions for each dependency
@@ -1262,7 +1263,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
 
               const retryResult = await this.retryWithProbeFeedback(
                 spawnResult.objectId, manifest, prompt, code!, probeResult.error,
-                summaries, deps, phase1.usedObjects, context, callerId
+                deps, phase1.usedObjects, context, callerId
               );
 
               if (!retryResult.success) {
@@ -1447,19 +1448,15 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
     try {
       this._currentCallerId = callerId;
 
-      // Phase 0a: Get object summaries
-      if (callerId) await this.reportProgress(callerId, '0a', 'Discovering available objects...');
-      const summaries = await this.discoverObjectSummaries();
-
-      // Phase 0b: LLM selects dependencies
-      if (callerId) await this.reportProgress(callerId, '0b', 'Choosing dependencies...');
-      const selectedNames = await this.llmSelectDependencies(prompt, summaries);
+      // Phase 0: Ask Registry which objects the modified object needs
+      if (callerId) await this.reportProgress(callerId, '0', 'Asking Registry for dependencies...');
+      const selectedNames = await this.askRegistryForDependencies(prompt);
       log.info('modify Selected dependencies:', selectedNames);
 
       // Phase 0c: Fetch full manifests for selected dependencies
       const depNames = selectedNames.join(', ') || 'none';
       if (callerId) await this.reportProgress(callerId, '0c', `Learning about ${depNames}...`);
-      const deps = await this.fetchFullManifests(selectedNames, summaries);
+      const deps = await this.fetchFullManifests(selectedNames);
       log.info('modify Fetched manifests for:', deps.map((d) => d.name));
 
       // Phase 0c5: Generate targeted questions for each dependency

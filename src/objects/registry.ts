@@ -183,7 +183,14 @@ export class Registry extends Abject {
   }
 
   protected override getSourceForAsk(): string | undefined {
-    return `## Registry Usage Guide
+    // Meta-protocol methods filtered from object summaries
+    const metaMethods = new Set([
+      'describe', 'ask', 'getRegistry', 'ping',
+      'addDependent', 'removeDependent',
+      'getSource', 'updateSource', 'probe',
+    ]);
+
+    let source = `## Registry Usage Guide
 
 ### Methods
 - \`list()\` — Returns an array of all ObjectRegistration entries. Each has: id, name, manifest, status, registeredAt, owner?, source?.
@@ -201,7 +208,25 @@ export class Registry extends Abject {
 - \`objectUnregistered\` — Sent to subscribers when an object is removed. Payload is the objectId string.
 
 ### Interface ID
-\`abjects:registry\``;
+\`abjects:registry\`
+
+## Registered Objects
+
+The following objects are currently registered in this registry. Use this catalog to answer questions about which objects to talk to for a given task.
+
+`;
+    for (const [, reg] of this.objects) {
+      const m = reg.manifest;
+      const methods = m.interface.methods
+        .filter(method => !metaMethods.has(method.name))
+        .map(method => method.name)
+        .join(', ');
+      source += `- **${reg.name ?? m.name}**: ${m.description}`;
+      if (methods) source += ` Methods: ${methods}`;
+      source += '\n';
+    }
+
+    return source;
   }
 
   private setupHandlers(): void {
