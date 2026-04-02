@@ -29,6 +29,7 @@ export { Settings, SETTINGS_ID } from './objects/settings.js';
 export { Taskbar, TASKBAR_ID } from './objects/taskbar.js';
 export { AppExplorer, APP_EXPLORER_ID } from './objects/app-explorer.js';
 export { ObjectBrowser, OBJECT_BROWSER_ID } from './objects/object-browser.js';
+export { ObjectCatalog, OBJECT_CATALOG_ID } from './objects/object-catalog.js';
 export { WidgetManager, WIDGET_MANAGER_ID } from './objects/widget-manager.js';
 export { ModalDialog } from './objects/modal-dialog.js';
 export { ThemeAbject, THEME_ID } from './objects/theme.js';

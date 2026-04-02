@@ -28,6 +28,7 @@ import { Settings } from '../src/objects/settings.js';
 import { Taskbar } from '../src/objects/taskbar.js';
 import { AppExplorer } from '../src/objects/app-explorer.js';
 import { ObjectBrowser } from '../src/objects/object-browser.js';
+import { ObjectCatalog } from '../src/objects/object-catalog.js';
 import { WidgetManager } from '../src/objects/widget-manager.js';
 import { ThemeAbject } from '../src/objects/theme.js';
 import { WindowManager } from '../src/objects/window-manager.js';
@@ -365,6 +366,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('Settings', () => new Settings());
   runtime.objectFactory.registerConstructor('AppExplorer', () => new AppExplorer());
   runtime.objectFactory.registerConstructor('ObjectBrowser', () => new ObjectBrowser());
+  runtime.objectFactory.registerConstructor('ObjectCatalog', () => new ObjectCatalog());
   runtime.objectFactory.registerConstructor('JobManager', () => new JobManager());
   runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
   runtime.objectFactory.registerConstructor('GoalManager', () => new GoalManager());
@@ -416,7 +418,7 @@ async function main(): Promise<void> {
       'LLMObject', 'HttpClient', 'Timer',
       'Clipboard', 'Console', 'FileSystem',
       // Global services
-      'GlobalSettings', 'PeerNetwork', 'ObjectBrowser', 'ProcessExplorer', 'LLMMonitor', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
+      'GlobalSettings', 'PeerNetwork', 'ObjectCatalog', 'ObjectBrowser', 'ProcessExplorer', 'LLMMonitor', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
       // Per-workspace objects (use workspace registry via registryHint)
       'AbjectStore', 'Theme', 'Settings', 'AppExplorer',
       'TupleSpace',
@@ -672,6 +674,9 @@ async function main(): Promise<void> {
   peerRouterObj.announceRoutesToAll().catch(() => {});
   const workspaceBrowserId = await supervisedSpawn('WorkspaceBrowser', 'permanent', systemTypeId('WorkspaceBrowser'));
 
+  // ObjectCatalog: background service maintaining live cache of all registrations
+  const objectCatalogId = await supervisedSpawn('ObjectCatalog', 'permanent', systemTypeId('ObjectCatalog'));
+
   // ALL objects are now spawned and init'd — safe to start health monitoring.
   const monitoredIds = [
     httpClientId, llmId, storageId, timerId, clipboardId,
@@ -680,7 +685,7 @@ async function main(): Promise<void> {
     windowManagerId, widgetManagerId,
     identityId, peerRegistryId, remoteRegistryId, peerRouterId,
     signalingRelayId, peerDiscoveryId,
-    workspaceShareRegistryId, workspaceBrowserId,
+    workspaceShareRegistryId, workspaceBrowserId, objectCatalogId,
     globalSettingsId, peerNetworkId, globalToolbarId, objectBrowserId, processExplorerId, skillRegistryId, skillBrowserId,
     proxyGenId, negotiatorId,
     workspaceSwitcherId, workspaceManagerId,

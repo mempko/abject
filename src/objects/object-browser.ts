@@ -26,7 +26,7 @@ import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('ObjectBrowser');
-import type { DiscoveredWorkspace } from './workspace-share-registry.js';
+import type { CatalogSnapshot, CatalogRegistrySource } from './object-catalog.js';
 
 const OBJECT_BROWSER_INTERFACE: InterfaceId = 'abjects:object-browser' as InterfaceId;
 
@@ -35,14 +35,7 @@ const WIN_H = 600;
 
 // ── Data Model ─────────────────────────────────────────────────────
 
-interface RegistrySource {
-  id: AbjectId;
-  label: string;
-  kind: 'system' | 'local-workspace' | 'remote-workspace';
-  workspaceId?: string;
-  peerId?: string;
-  isRemote: boolean;
-}
+type RegistrySource = CatalogRegistrySource;
 
 interface NavState {
   pane1Filter: { scope: string };
@@ -65,16 +58,15 @@ export class ObjectBrowser extends Abject {
   // ── Dependencies ──
   private widgetManagerId?: AbjectId;
   private factoryId?: AbjectId;
-  private workspaceManagerId?: AbjectId;
-  private shareRegistryId?: AbjectId;
+  private objectCatalogId?: AbjectId;
   private systemRegistryId?: AbjectId;
 
   // ── Multi-registry data ──
   private registrySources: Map<string, RegistrySource> = new Map();
   private registryObjects: Map<string, ObjectRegistration[]> = new Map();
 
-  // ── Auto-refresh timer ──
-  private refreshTimer?: ReturnType<typeof setTimeout>;
+  // ── Catalog subscription ──
+  private catalogSubscribed = false;
 
   // ── Window & layout ──
   private windowId?: AbjectId;
@@ -184,16 +176,8 @@ export class ObjectBrowser extends Abject {
     await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.factoryId = await this.discoverDep('Factory') ?? undefined;
-    this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
-    this.shareRegistryId = await this.discoverDep('WorkspaceShareRegistry') ?? undefined;
+    this.objectCatalogId = await this.discoverDep('ObjectCatalog') ?? undefined;
     this.systemRegistryId = await this.discoverDep('Registry') ?? undefined;
-
-    // Subscribe to system registry changes
-    if (this.systemRegistryId) {
-      try {
-        await this.request(request(this.id, this.systemRegistryId, 'subscribe', {}));
-      } catch { /* may not support subscribe */ }
-    }
   }
 
   private setupHandlers(): void {
@@ -227,7 +211,7 @@ export class ObjectBrowser extends Abject {
     this.on('browseScope', async (msg: AbjectMessage) => {
       const { scope } = msg.payload as { scope: string };
       await this.show();
-      await this.discoverRegistrySources();
+      await this.readCatalogSnapshot();
       const source = this.registrySources.get(scope);
       const label = source?.label ?? scope;
       const state: NavState = {
@@ -244,39 +228,17 @@ export class ObjectBrowser extends Abject {
       await this.hide();
     });
 
-    // Registry update notifications
-    this.on('objectRegistered', async () => {
+    // Catalog push updates (ObjectCatalog fires these when its cache changes)
+    this.on('catalogUpdated', async () => {
       if (this.windowId) {
-        await this.refreshCaches();
+        await this.readCatalogSnapshot();
+        await this.rebuildPane1();
         await this.rebuildPane2();
       }
     });
-    this.on('objectUnregistered', async () => {
+    this.on('sourcesChanged', async () => {
       if (this.windowId) {
-        await this.refreshCaches();
-        await this.rebuildPane2();
-      }
-    });
-
-    // Workspace lifecycle events
-    this.on('workspaceCreated', async () => {
-      if (this.windowId) {
-        await this.discoverRegistrySources();
-        await this.refreshCaches();
-        await this.rebuildAllPanes();
-      }
-    });
-    this.on('workspaceDeleted', async () => {
-      if (this.windowId) {
-        await this.discoverRegistrySources();
-        await this.refreshCaches();
-        await this.rebuildAllPanes();
-      }
-    });
-    this.on('workspacesDiscovered', async () => {
-      if (this.windowId) {
-        await this.discoverRegistrySources();
-        await this.refreshCaches();
+        await this.readCatalogSnapshot();
         await this.rebuildAllPanes();
       }
     });
@@ -312,16 +274,18 @@ export class ObjectBrowser extends Abject {
     }
 
     await this.buildUI();
-    this.startAutoRefresh();
-    // Populate local data immediately, then fetch remote in the background
-    await this.discoverRegistrySources();
-    await this.refreshCaches('local');
+    this.subscribeToCatalog();
+    // Read whatever data the catalog has right now (zero network I/O)
+    await this.readCatalogSnapshot();
     await this.rebuildAllPanes();
-    this.refreshCaches('remote').then(() => this.rebuildPane1()).catch(() => {});
+    // Ask catalog to force-refresh in the background
+    if (this.objectCatalogId) {
+      this.send(request(this.id, this.objectCatalogId, 'forceRefresh', {}));
+    }
   }
 
   async hide(): Promise<void> {
-    this.stopAutoRefresh();
+    this.unsubscribeFromCatalog();
     if (!this.windowId) return;
     try {
       await this.request(request(this.id, this.widgetManagerId!,
@@ -331,26 +295,37 @@ export class ObjectBrowser extends Abject {
     this.clearWidgetTracking();
   }
 
-  private startAutoRefresh(): void {
-    this.stopAutoRefresh();
-    this.refreshTimer = setInterval(async () => {
-      if (!this.windowId) return;
-      try {
-        await this.discoverRegistrySources();
-        await this.refreshCaches();
-        await this.rebuildPane1();
-        // Only rebuild pane2 if the user's selected scope data changed
-        await this.rebuildPane2();
-      } catch { /* best-effort */ }
-    }, 15_000);
+  private subscribeToCatalog(): void {
+    if (this.catalogSubscribed || !this.objectCatalogId) return;
+    this.send(request(this.id, this.objectCatalogId, 'addDependent', {}));
+    this.catalogSubscribed = true;
   }
 
-  private stopAutoRefresh(): void {
-    if (this.refreshTimer) {
-      clearInterval(this.refreshTimer);
-      this.refreshTimer = undefined;
+  private unsubscribeFromCatalog(): void {
+    if (!this.catalogSubscribed || !this.objectCatalogId) return;
+    this.send(request(this.id, this.objectCatalogId, 'removeDependent', {}));
+    this.catalogSubscribed = false;
+  }
+
+  // ── Catalog data reading (zero network I/O) ──────────────────────
+
+  private async readCatalogSnapshot(): Promise<void> {
+    if (!this.objectCatalogId) {
+      this.objectCatalogId = await this.discoverDep('ObjectCatalog') ?? undefined;
+    }
+    if (!this.objectCatalogId) return;
+
+    try {
+      const snapshot = await this.request<CatalogSnapshot>(
+        request(this.id, this.objectCatalogId, 'getSnapshot', {})
+      );
+      this.registrySources = new Map(snapshot.sources);
+      this.registryObjects = new Map(snapshot.objects);
+    } catch {
+      log.warn('Failed to read catalog snapshot');
     }
   }
+
 
   private clearWidgetTracking(): void {
     this.rootLayoutId = undefined;
@@ -415,127 +390,7 @@ export class ObjectBrowser extends Abject {
     return false;
   }
 
-  // ── Registry Source Discovery ─────────────────────────────────────
-
-  private async discoverRegistrySources(): Promise<void> {
-    // Lazy-discover dependencies that may not have been available at onInit time
-    if (!this.workspaceManagerId) {
-      this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
-    }
-    if (!this.shareRegistryId) {
-      this.shareRegistryId = await this.discoverDep('WorkspaceShareRegistry') ?? undefined;
-    }
-    if (!this.systemRegistryId) {
-      this.systemRegistryId = await this.discoverDep('Registry') ?? undefined;
-    }
-
-    const oldKeys = new Set(this.registrySources.keys());
-
-    // System registry is always present
-    if (this.systemRegistryId) {
-      const key = 'system';
-      this.registrySources.set(key, {
-        id: this.systemRegistryId,
-        label: 'System',
-        kind: 'system',
-        isRemote: false,
-      });
-      oldKeys.delete(key);
-    }
-
-    // Discover local workspaces via WorkspaceManager
-    if (this.workspaceManagerId) {
-      try {
-        const detailed = await this.request<Array<{
-          workspaceId: string;
-          name: string;
-          registryId: AbjectId;
-        }>>(request(this.id, this.workspaceManagerId, 'listWorkspacesDetailed', {}));
-
-        for (const ws of detailed) {
-          const key = `ws:${ws.workspaceId}`;
-          this.registrySources.set(key, {
-            id: ws.registryId,
-            label: ws.name,
-            kind: 'local-workspace',
-            workspaceId: ws.workspaceId,
-            isRemote: false,
-          });
-          oldKeys.delete(key);
-
-          // Subscribe to each workspace registry for live updates
-          try {
-            await this.request(request(this.id, ws.registryId, 'subscribe', {}));
-          } catch { /* may not support subscribe */ }
-        }
-      } catch {
-        log.warn('Failed to list workspaces');
-      }
-    }
-
-    // Discover remote workspaces via WorkspaceShareRegistry
-    if (this.shareRegistryId) {
-      try {
-        const discovered = await this.request<DiscoveredWorkspace[]>(
-          request(this.id, this.shareRegistryId, 'getDiscoveredWorkspaces', {})
-        );
-
-        for (const dw of discovered) {
-          // Skip workspaces without a routable registry ID
-          if (!dw.registryId) continue;
-
-          const key = `remote:${dw.ownerPeerId}/${dw.workspaceId}`;
-          const ownerLabel = dw.ownerName || dw.ownerPeerId.slice(0, 8);
-          this.registrySources.set(key, {
-            id: dw.registryId as AbjectId,
-            label: `${ownerLabel} / ${dw.name}`,
-            kind: 'remote-workspace',
-            workspaceId: dw.workspaceId,
-            peerId: dw.ownerPeerId,
-            isRemote: true,
-          });
-          oldKeys.delete(key);
-        }
-      } catch {
-        log.warn('Failed to get discovered workspaces');
-      }
-    }
-
-    // Clean up stale entries
-    for (const staleKey of oldKeys) {
-      if (staleKey === 'system') continue; // never remove system
-      this.registrySources.delete(staleKey);
-      this.registryObjects.delete(staleKey);
-    }
-  }
-
-  // ── Data loading ──────────────────────────────────────────────────
-
-  private async refreshCaches(filter?: 'local' | 'remote'): Promise<void> {
-    const entries = [...this.registrySources.entries()]
-      .filter(([, source]) => {
-        if (filter === 'local') return !source.isRemote;
-        if (filter === 'remote') return source.isRemote;
-        return true;
-      });
-    const results = await Promise.allSettled(
-      entries.map(async ([key, source]) => {
-        // Use a shorter timeout for remote registries to avoid UI hangs
-        const timeoutMs = source.isRemote ? 8000 : 30000;
-        const objects = await this.request<ObjectRegistration[]>(
-          request(this.id, source.id, 'list', {}),
-          timeoutMs,
-        );
-        return { key, objects };
-      })
-    );
-
-    for (const result of results) {
-      if (result.status === 'fulfilled') {
-        this.registryObjects.set(result.value.key, result.value.objects);
-      }
-    }
-  }
+  // ── Data loading (delegated to ObjectCatalog) ─────────────────────
 
   private getFilteredRegistrations(): ObjectRegistration[] {
     const scope = this.currentState.pane1Filter.scope;
@@ -2035,7 +1890,7 @@ export class ObjectBrowser extends Abject {
     }
 
     // Refresh and navigate back
-    await this.refreshCaches();
+    await this.readCatalogSnapshot();
     await this.rebuildPane2();
     await this.rebuildPane3();
     await this.rebuildPane4();
@@ -2101,7 +1956,7 @@ export class ObjectBrowser extends Abject {
       await this.showFeedback(`Clone error: ${msg.slice(0, 50)}`);
     }
 
-    await this.refreshCaches();
+    await this.readCatalogSnapshot();
     await this.rebuildPane2();
   }
 
@@ -2116,10 +1971,11 @@ export class ObjectBrowser extends Abject {
     }
 
     // Otherwise find the active workspace registry
-    if (this.workspaceManagerId) {
+    const wmId = await this.discoverDep('WorkspaceManager');
+    if (wmId) {
       try {
         const active = await this.request<{ id: string; name: string }>(
-          request(this.id, this.workspaceManagerId, 'getActiveWorkspace', {})
+          request(this.id, wmId, 'getActiveWorkspace', {})
         );
         const wsKey = `ws:${active.id}`;
         const source = this.registrySources.get(wsKey);
