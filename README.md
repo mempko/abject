@@ -86,7 +86,7 @@ pnpm awaken                     # ws://localhost:7719
 # Start the browser client (new terminal)
 pnpm scry                       # http://localhost:5174
 
-# Start the P2P signaling server (new terminal)
+# Start a local signaling server (optional, signal.abject.world is used by default)
 pnpm whisper                    # :7720
 ```
 
@@ -95,7 +95,7 @@ pnpm whisper                    # :7720
 | `pnpm conjure` | Install dependencies (`pnpm install`) |
 | `pnpm awaken` | Start the Node.js backend where all Abjects live |
 | `pnpm scry` | Start the thin browser client (Canvas UI over WebSocket) |
-| `pnpm whisper` | Start the signaling server for P2P peer discovery |
+| `pnpm whisper` | Start a local signaling server (optional, `signal.abject.world` is used by default) |
 
 Three processes. One living system.
 
