@@ -77,18 +77,25 @@ who can reach, who can speak.
 git clone https://github.com/mempko/abjects
 cd abjects
 
-# Gather the ritual components
+# Install dependencies
 pnpm conjure
 
-# Awaken the depths
-pnpm awaken
+# Start the backend server (Node.js + worker threads)
+pnpm awaken                     # ws://localhost:7719
 
-# Scry into the abyss (new terminal)
-pnpm scry            # http://localhost:5174
+# Start the browser client (new terminal)
+pnpm scry                       # http://localhost:5174
 
-# Let them find each other in the dark (new terminal)
-pnpm whisper         # :7720
+# Start the P2P signaling server (new terminal)
+pnpm whisper                    # :7720
 ```
+
+| Command | What it does |
+|---------|-------------|
+| `pnpm conjure` | Install dependencies (`pnpm install`) |
+| `pnpm awaken` | Start the Node.js backend where all Abjects live |
+| `pnpm scry` | Start the thin browser client (Canvas UI over WebSocket) |
+| `pnpm whisper` | Start the signaling server for P2P peer discovery |
 
 Three processes. One living system.
 
@@ -98,17 +105,20 @@ Give the organism a body. Package Abjects as a standalone desktop app for
 Linux, Windows, or macOS.
 
 ```bash
-# Incarnate for your platform (binds and etches automatically)
+# Build desktop app for your platform
 pnpm incarnate:linux    # AppImage, .deb
 pnpm incarnate:win      # NSIS installer, portable
 pnpm incarnate:mac      # .dmg, .zip
 
-# Manifest across all realms
+# Build for all platforms
 pnpm incarnate:all
 ```
 
-You can also run the compilation steps alone: `pnpm bind` (compile server)
-and `pnpm etch` (compile client).
+| Command | What it does |
+|---------|-------------|
+| `pnpm incarnate:<platform>` | Package as a standalone Electron desktop app |
+| `pnpm bind` | Compile the server bundle only |
+| `pnpm etch` | Compile the client bundle only |
 
 Requires Electron. Cross-compilation from Linux to Windows works out of the
 box. macOS builds from Linux produce unsigned binaries (code signing requires
