@@ -1044,6 +1044,20 @@ improve semantic matching accuracy.
       queue: chosen.name,
     });
     this._currentDispatchMsgId = submitMsg.header.messageId;
+
+    // Heartbeat: send periodic progress while the job is queued/running so that
+    // upstream waitForTaskCompletion timeouts in Chat get reset.
+    const heartbeat = setInterval(() => {
+      if (taskGoalId && this.goalManagerId) {
+        this.send(event(this.id, this.goalManagerId, 'updateProgress', {
+          goalId: taskGoalId,
+          message: `${chosen.name} working...`,
+          phase: 'dispatch',
+          agentName: 'AgentAbject',
+        }));
+      }
+    }, 30000);
+
     try {
       const jobResult = await this.request<JobResult>(submitMsg, 400000);
       if (jobResult.status === 'failed') throw new Error(jobResult.error ?? 'Job failed');
@@ -1103,6 +1117,7 @@ improve semantic matching accuracy.
         log.info(`DISPATCH-INNER ${tupleId} — failTask also failed: ${(err2 as Error).message?.slice(0, 80)}`);
       }
     } finally {
+      clearInterval(heartbeat);
       this._currentDispatchMsgId = undefined;
       this.busyAgents.delete(chosen.agentId);
       // Immediate re-scan: pick up next pending task for this now-free agent
@@ -2139,7 +2154,12 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
     const resultStr = task.lastResult.success
       ? `Action "${action?.action}" succeeded: ${JSON.stringify(task.lastResult.data)?.slice(0, 500) ?? 'ok'}`
       : `Action "${action?.action}" failed: ${task.lastResult.error}`;
-    task.llmMessages.push({ role: 'user', content: `[Action Result]\n${resultStr}` });
+
+    let hint = '';
+    if (!task.lastResult.success && action?.action === 'modify') {
+      hint = '\n\nThe object still exists. You MUST retry with "modify" (try a simpler description), or report the failure to the user with "done". Do NOT use "create" -- that would produce a duplicate.';
+    }
+    task.llmMessages.push({ role: 'user', content: `[Action Result]\n${resultStr}${hint}` });
   }
 
   private trimConversation(entry: TaskEntry): void {

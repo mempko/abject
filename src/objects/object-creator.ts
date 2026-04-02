@@ -446,7 +446,7 @@ export class ObjectCreator extends Abject {
         tupleId: string; goalId?: string; description: string;
         data?: Record<string, unknown>; type: string; callerId?: string;
       };
-      log.info(`executeTask type=${type} goalId=${goalId?.slice(0, 8) ?? '?'} desc="${description.slice(0, 60)}"`);
+      log.info(`executeTask type=${type} goalId=${goalId?.slice(0, 8) ?? '?'} data=${JSON.stringify(data)?.slice(0, 200)} from=${msg.routing.from.slice(0, 8)} callerId=${explicitCallerId?.slice(0, 8) ?? 'none'} desc="${description.slice(0, 60)}"`);
       this._currentGoalId = goalId;
       // Use explicit callerId (from AgentAbject via JobManager) or fall back to
       // msg.routing.from. This ensures progress reaches AgentAbject even when
@@ -1436,8 +1436,11 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
 
     const registration = await this.registryLookup(objectId);
     if (!registration) {
+      log.warn(`modifyObject FAILED: object ${objectId.slice(0, 8)} not found in registry`);
       return { success: false, error: 'Object not found' };
     }
+    log.info(`modifyObject objectId=${objectId.slice(0, 8)} name=${registration.manifest.name} prompt="${prompt.slice(0, 80)}"`);
+
 
     const currentSource = await this.registryGetSource(objectId);
 
@@ -1641,6 +1644,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
       };
     } catch (err) {
       this._currentCallerId = undefined;
+      log.warn(`modifyObject FAILED: ${err instanceof Error ? err.message : String(err)}`);
       return {
         success: false,
         error: err instanceof Error ? err.message : String(err),

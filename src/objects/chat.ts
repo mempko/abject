@@ -659,11 +659,13 @@ export class Chat extends Abject {
             const completion = await this.waitForTaskCompletion(taskId, 310000);
             const result = completion.result as { success?: boolean; error?: string } | undefined;
             if (result && result.success === false) {
-              return { success: false, error: result.error ?? 'Modify failed' };
+              const reason = result.error ?? 'Modify failed';
+              return { success: false, error: `${reason}. The object "${action.object}" still exists -- retry "modify" with a simpler description, or use "done" to report the issue. Do NOT use "create".` };
             }
             return { success: true, data: result };
           } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
+            const reason = err instanceof Error ? err.message : String(err);
+            return { success: false, error: `Modify failed: ${reason}. The object "${action.object}" still exists -- retry "modify" with a simpler description, or use "done" to report the issue. Do NOT use "create".` };
           }
         }
 
@@ -681,11 +683,13 @@ export class Chat extends Abject {
           );
           const modPayload = result as { success?: boolean; error?: string };
           if (modPayload && modPayload.success === false) {
-            return { success: false, error: modPayload.error ?? 'Modify failed' };
+            const reason = modPayload.error ?? 'Modify failed';
+            return { success: false, error: `${reason}. The object "${action.object}" still exists -- retry "modify" with a simpler description, or use "done" to report the issue. Do NOT use "create".` };
           }
           return { success: true, data: result };
         } catch (err) {
-          return { success: false, error: err instanceof Error ? err.message : String(err) };
+          const reason = err instanceof Error ? err.message : String(err);
+          return { success: false, error: `Modify failed: ${reason}. The object "${action.object}" still exists -- retry "modify" with a simpler description, or use "done" to report the issue. Do NOT use "create".` };
         }
       }
 
@@ -903,9 +907,10 @@ When a user's request matches an enabled skill's capabilities, use **decompose**
 6. Keep reasoning brief (1-2 sentences before the JSON block).
 7. Every object supports: describe (get manifest), ask (get usage advice), addDependent/removeDependent (observe state changes).
 8. IMPORTANT: If the user asks to fix, change, update, or improve something and a matching object exists in "Your Abjects" above, you MUST use **modify** with its name in the "object" field and a "description" of the change. Example: \`{ "action": "modify", "object": "PongGame", "description": "use mouse for controls" }\`. NEVER omit "object" or "description". NEVER re-create with **create** when an object already exists.
-9. If an action fails with a transient error (overloaded, timeout, 529, 503), **retry the same action** — do NOT switch from modify to create. Transient errors are temporary and unrelated to your action choice.
+9. If **modify** fails for ANY reason (error, timeout, compilation failure, overloaded), you MUST retry "modify" with a simpler description. NEVER switch from "modify" to "create" after a failure -- the original object still exists and creating would produce a duplicate. If modify fails repeatedly, use "done" to tell the user what happened.
 10. P2P: Use qualified names to reference remote objects: this.find('peer.workspace.ObjectName'). NEVER hardcode UUIDs.
-11. For web tasks: message WebAgent with runTask on your FIRST action — include ALL details from the user's message (credentials, URLs, specific instructions) in the task description. Do not ask the user to repeat information they already gave you.`;
+11. For web tasks: message WebAgent with runTask on your FIRST action — include ALL details from the user's message (credentials, URLs, specific instructions) in the task description. Do not ask the user to repeat information they already gave you.
+12. NEVER use "create" if an object with the same or similar name already exists in "Your Abjects" above. If you think a new object is needed but one already exists, use "modify" to change it instead.`;
   }
 
   // ═══════════════════════════════════════════════════════════════════
