@@ -460,9 +460,14 @@ Set keepPageOpen: false to explicitly close the page when done.
         );
         const ticketResult = await this.waitForTaskResult(ticketId, 310000);
 
-        // Keep page open with idle timeout (same as runTask default)
-        if (extra.pageId) {
+        // Respect the LLM's keepPageOpen signal; default to closing
+        const agentWantsOpen = ticketResult.lastAction?.keepPageOpen === true;
+        if (agentWantsOpen && extra.pageId) {
           this.trackKeptOpenPage(extra.pageId);
+        } else if (extra.pageId) {
+          try {
+            await this.request(request(this.id, this.webBrowserId!, 'closePage', { pageId: extra.pageId }));
+          } catch { /* best effort */ }
         }
 
         return { success: ticketResult.success, result: ticketResult.result, error: ticketResult.error };
@@ -545,8 +550,9 @@ Set keepPageOpen: false to explicitly close the page when done.
   private waitForTaskResult(ticketId: string, timeoutMs: number): Promise<{
     ticketId: string; success: boolean; result?: unknown; error?: string;
     steps: number; maxStepsReached?: boolean; validationErrors?: string[];
+    lastAction?: Record<string, unknown>;
   }> {
-    type TaskResult = { ticketId: string; success: boolean; result?: unknown; error?: string; steps: number; maxStepsReached?: boolean; validationErrors?: string[] };
+    type TaskResult = { ticketId: string; success: boolean; result?: unknown; error?: string; steps: number; maxStepsReached?: boolean; validationErrors?: string[]; lastAction?: Record<string, unknown> };
     return new Promise<TaskResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingTickets.delete(ticketId);
@@ -615,6 +621,11 @@ Set keepPageOpen: false to explicitly close the page when done.
       );
       const ticketResult = await this.waitForTaskResult(ticketId, taskTimeout);
       result = { success: ticketResult.success, result: ticketResult.result, error: ticketResult.error, steps: ticketResult.steps, maxStepsReached: ticketResult.maxStepsReached };
+
+      // Let the LLM's done action override the caller's keepPageOpen preference
+      if (ticketResult.lastAction?.keepPageOpen !== undefined) {
+        extra.keepPageOpen = Boolean(ticketResult.lastAction.keepPageOpen);
+      }
     } catch (err) {
       result = {
         success: false,
@@ -633,7 +644,8 @@ Set keepPageOpen: false to explicitly close the page when done.
       log.info(`Task failed on pre-existing page ${extra.pageId}, leaving open`);
       this.trackKeptOpenPage(extra.pageId);
     } else if (extra.pageId) {
-      // Default: close the page (preserves existing behavior)
+      // Close the page
+      log.info(`Closing page ${extra.pageId}`);
       try {
         await this.request(
           request(this.id, this.webBrowserId!, 'closePage', { pageId: extra.pageId })
@@ -666,95 +678,33 @@ Set keepPageOpen: false to explicitly close the page when done.
   // Observe callback — page scraping + screenshot
   // ═══════════════════════════════════════════════════════════════════
 
+  private static readonly MAX_SNAPSHOT_CHARS = 25000;
+
   private async handleObserve(taskId: string): Promise<{ observation: string; llmContent?: ContentPart[] }> {
     const extra = this.taskExtras.get(taskId);
     if (!extra?.pageId) return { observation: 'No page open.' };
 
     try {
-      const urlResult = await this.request<{ url: string }>(
-        request(this.id, this.webBrowserId!, 'getUrl', { pageId: extra.pageId })
-      );
-      const titleResult = await this.request<{ title: string }>(
-        request(this.id, this.webBrowserId!, 'getTitle', { pageId: extra.pageId })
+      // Get ARIA snapshot (includes URL, title, and ref-annotated accessibility tree)
+      const { snapshot, url, title } = await this.request<{ snapshot: string; url: string; title: string }>(
+        request(this.id, this.webBrowserId!, 'getAriaSnapshot', { pageId: extra.pageId })
       );
 
-      const extractionScript = `
-        (() => {
-          const interactiveSelectors = 'input, button, a, select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="tab"], [onclick]';
-          const elements = [];
-          const seen = new Set();
-          for (const el of document.querySelectorAll(interactiveSelectors)) {
-            if (elements.length >= 100) break;
-            const tag = el.tagName.toLowerCase();
-            const type = el.getAttribute('type') || '';
-            const text = (el.textContent || '').trim().slice(0, 80);
-            const placeholder = el.getAttribute('placeholder') || '';
-            const href = el.getAttribute('href') || '';
-            const value = el instanceof HTMLInputElement ? el.value.slice(0, 80) : '';
-            const ariaLabel = el.getAttribute('aria-label') || '';
-            const name = el.getAttribute('name') || '';
-            const id = el.getAttribute('id') || '';
-            const role = el.getAttribute('role') || '';
+      const refCount = (snapshot.match(/\[ref=e\d+\]/g) || []).length;
+      log.info(`Observe: URL=${url} | ${refCount} elements (ARIA snapshot, ${snapshot.length} chars)`);
 
-            let selector = tag;
-            let canQuery = true;
-            if (id) selector = '#' + CSS.escape(id);
-            else if (name) selector = tag + '[name="' + name.replace(/"/g, '\\\\"') + '"]';
-            else if (ariaLabel) selector = tag + '[aria-label="' + ariaLabel.replace(/"/g, '\\\\"') + '"]';
-            else if (type && tag === 'input') selector = 'input[type="' + type + '"]';
-            else if (text && tag !== 'input') {
-              // Use XPath-style hint for LLM readability (not a CSS selector)
-              selector = tag + '[text="' + text.slice(0, 40).replace(/"/g, '\\\\"') + '"]';
-              canQuery = false;
-            }
-
-            if (seen.has(selector) && canQuery) {
-              try {
-                const siblings = document.querySelectorAll(selector);
-                const idx = Array.from(siblings).indexOf(el);
-                if (idx >= 0) selector += ':nth-of-type(' + (idx + 1) + ')';
-              } catch (_e) { /* selector not queryable */ }
-            }
-            seen.add(selector);
-
-            elements.push({ tag, type, selector, text, placeholder, href, value, ariaLabel, role });
-          }
-
-          const bodyText = document.body ? document.body.innerText.slice(0, 15000) : '';
-          return { elements, bodyText };
-        })()
-      `;
-
-      const evalResult = await this.request<{ result: unknown }>(
-        request(this.id, this.webBrowserId!, 'evaluate', {
-          pageId: extra.pageId,
-          script: extractionScript,
-        })
-      );
-
-      const pageData = evalResult.result as { elements: Array<Record<string, string>>; bodyText: string };
-
-      const elementCount = (pageData?.elements ?? []).length;
-      log.info(`Observe: URL=${urlResult.url} | ${elementCount} elements`);
+      // Truncate very large snapshots to stay within token budget
+      let truncatedSnapshot = snapshot;
+      if (snapshot.length > WebAgent.MAX_SNAPSHOT_CHARS) {
+        truncatedSnapshot = snapshot.slice(0, WebAgent.MAX_SNAPSHOT_CHARS) + '\n... (snapshot truncated)';
+      }
 
       const lines: string[] = [];
-      lines.push(`URL: ${urlResult.url}`);
-      lines.push(`Title: ${titleResult.title}`);
+      lines.push(`URL: ${url}`);
+      lines.push(`Title: ${title}`);
       lines.push('');
-      lines.push('Interactive elements:');
-      for (const el of (pageData?.elements ?? [])) {
-        const parts = [`[${el.tag}${el.type ? ' type=' + el.type : ''}]`];
-        parts.push(`selector="${el.selector}"`);
-        if (el.text) parts.push(`text="${el.text}"`);
-        if (el.placeholder) parts.push(`placeholder="${el.placeholder}"`);
-        if (el.href) parts.push(`href="${el.href}"`);
-        if (el.value) parts.push(`value="${el.value}"`);
-        if (el.ariaLabel) parts.push(`aria-label="${el.ariaLabel}"`);
-        lines.push('  ' + parts.join(' '));
-      }
-      lines.push('');
-      lines.push('Page text (truncated):');
-      lines.push((pageData?.bodyText ?? '').slice(0, 8000));
+      lines.push('Page structure (ARIA snapshot):');
+      lines.push(truncatedSnapshot);
 
       const observation = lines.join('\n');
 
@@ -798,9 +748,10 @@ Set keepPageOpen: false to explicitly close the page when done.
 
     const webId = this.webBrowserId!;
     const pageId = extra.pageId;
+    const ref = action.ref as string | undefined;
 
     // Log the action with its key parameter
-    const actionParam = action.selector ?? action.url ?? action.key ?? action.script?.toString().slice(0, 40) ?? '';
+    const actionParam = ref ?? action.selector ?? action.url ?? action.key ?? action.script?.toString().slice(0, 40) ?? '';
     log.info(`Act: ${action.action}${actionParam ? ' ' + actionParam : ''}${action.value ? ' value="' + String(action.value).slice(0, 30) + '"' : ''}`);
 
     try {
@@ -812,52 +763,68 @@ Set keepPageOpen: false to explicitly close the page when done.
           return { success: true, data: { navigated: action.url } };
 
         case 'click':
-          await this.request(request(this.id, webId, 'click', {
-            pageId, selector: action.selector as string,
-          }));
-          return { success: true, data: { clicked: action.selector } };
+          if (ref) {
+            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'click' }));
+          } else {
+            await this.request(request(this.id, webId, 'click', { pageId, selector: action.selector as string }));
+          }
+          return { success: true, data: { clicked: ref ?? action.selector } };
 
         case 'fill':
-          await this.request(request(this.id, webId, 'fill', {
-            pageId, selector: action.selector as string, value: action.value as string,
-          }));
-          return { success: true, data: { filled: action.selector } };
+          if (ref) {
+            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'fill', value: action.value as string }));
+          } else {
+            await this.request(request(this.id, webId, 'fill', { pageId, selector: action.selector as string, value: action.value as string }));
+          }
+          return { success: true, data: { filled: ref ?? action.selector } };
 
         case 'type':
-          await this.request(request(this.id, webId, 'type', {
-            pageId, selector: action.selector as string, text: action.text as string,
-          }));
-          return { success: true, data: { typed: action.selector } };
+          if (ref) {
+            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'type', value: action.text as string }));
+          } else {
+            await this.request(request(this.id, webId, 'type', { pageId, selector: action.selector as string, text: action.text as string }));
+          }
+          return { success: true, data: { typed: ref ?? action.selector } };
 
         case 'press':
-          await this.request(request(this.id, webId, 'press', {
-            pageId, key: action.key as string,
-          }));
+          if (ref) {
+            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'press', value: action.key as string }));
+          } else {
+            await this.request(request(this.id, webId, 'press', { pageId, key: action.key as string }));
+          }
           return { success: true, data: { pressed: action.key } };
 
         case 'select':
-          await this.request(request(this.id, webId, 'select', {
-            pageId, selector: action.selector as string, values: action.values as string[],
-          }));
-          return { success: true, data: { selected: action.selector } };
+          if (ref) {
+            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'selectOption', value: (action.values as string[])?.[0] }));
+          } else {
+            await this.request(request(this.id, webId, 'select', { pageId, selector: action.selector as string, values: action.values as string[] }));
+          }
+          return { success: true, data: { selected: ref ?? action.selector } };
 
         case 'hover':
-          await this.request(request(this.id, webId, 'hover', {
-            pageId, selector: action.selector as string,
-          }));
-          return { success: true, data: { hovered: action.selector } };
+          if (ref) {
+            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'hover' }));
+          } else {
+            await this.request(request(this.id, webId, 'hover', { pageId, selector: action.selector as string }));
+          }
+          return { success: true, data: { hovered: ref ?? action.selector } };
 
         case 'check':
-          await this.request(request(this.id, webId, 'check', {
-            pageId, selector: action.selector as string,
-          }));
-          return { success: true, data: { checked: action.selector } };
+          if (ref) {
+            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'check' }));
+          } else {
+            await this.request(request(this.id, webId, 'check', { pageId, selector: action.selector as string }));
+          }
+          return { success: true, data: { checked: ref ?? action.selector } };
 
         case 'uncheck':
-          await this.request(request(this.id, webId, 'uncheck', {
-            pageId, selector: action.selector as string,
-          }));
-          return { success: true, data: { unchecked: action.selector } };
+          if (ref) {
+            await this.request(request(this.id, webId, 'refAction', { pageId, ref, action: 'uncheck' }));
+          } else {
+            await this.request(request(this.id, webId, 'uncheck', { pageId, selector: action.selector as string }));
+          }
+          return { success: true, data: { unchecked: ref ?? action.selector } };
 
         case 'wait':
           await this.request(request(this.id, webId, 'waitForSelector', {
@@ -895,18 +862,34 @@ Set keepPageOpen: false to explicitly close the page when done.
 
   private buildSystemPrompt(taskText: string, maxSteps?: number): string {
     const stepLimit = maxSteps ?? 15;
-    return `You are WebAgent, an autonomous browser agent with vision. You receive a screenshot of the current page alongside text observations. Use the visual information to understand page layout, identify elements, and verify your actions succeeded. You complete web tasks by observing the page state, thinking about what to do, and taking actions.
+    return `You are WebAgent, an autonomous browser agent with vision. You receive an accessibility tree snapshot of the page alongside a screenshot. Each interactive element has a ref like [ref=e5]. Use refs to target elements in your actions.
 
-You have a maximum of ${stepLimit} steps. Be efficient — extract what you can quickly and call "done" as soon as you have useful data. Do NOT keep refining or perfecting the result.
+You have a maximum of ${stepLimit} steps. Be efficient and call "done" as soon as you have useful data.
 
 ## Task
 ${taskText}
+
+## ARIA Snapshot Format
+The observation contains an accessibility tree in YAML-like format. Example:
+- navigation [ref=e1]:
+  - link "Home" [ref=e2]
+  - link "About" [ref=e3]
+- main [ref=e4]:
+  - heading "Welcome" [level=1] [ref=e5]
+  - textbox "Email" [ref=e6]
+  - textbox "Password" [ref=e7]
+  - button "Submit" [ref=e8]
+  - combobox [ref=e9]:
+    - option "Option A" [selected]
+    - option "Option B"
+
+Each element shows its role, name/label in quotes, attributes in brackets, and [ref=eN] for targeting.
 
 ## Action Format
 Respond with ONE action as a JSON object in a \`\`\`json code block:
 
 \`\`\`json
-{ "action": "click", "selector": "#login-btn", "reasoning": "Click the login button" }
+{ "action": "click", "ref": "e8", "reasoning": "Click the Submit button" }
 \`\`\`
 
 ## Available Actions
@@ -914,51 +897,53 @@ Respond with ONE action as a JSON object in a \`\`\`json code block:
 ### Navigation
 - navigate: Go to a URL. { "action": "navigate", "url": "https://..." }
 
-### Interaction
-- click: Click an element. { "action": "click", "selector": "CSS selector" }
-- fill: Clear and fill an input. { "action": "fill", "selector": "CSS selector", "value": "text" }
-- type: Type text without clearing. { "action": "type", "selector": "CSS selector", "text": "text" }
+### Interaction (use "ref" to target elements from the ARIA snapshot)
+- click: Click an element. { "action": "click", "ref": "e5" }
+- fill: Clear and fill an input. { "action": "fill", "ref": "e6", "value": "text" }
+- type: Type text without clearing. { "action": "type", "ref": "e6", "text": "text" }
 - press: Press a keyboard key. { "action": "press", "key": "Enter" }
-- select: Select dropdown option(s). { "action": "select", "selector": "CSS selector", "values": ["option"] }
-- hover: Hover over an element. { "action": "hover", "selector": "CSS selector" }
-- check: Check a checkbox. { "action": "check", "selector": "CSS selector" }
-- uncheck: Uncheck a checkbox. { "action": "uncheck", "selector": "CSS selector" }
+  Or press a key on a specific element: { "action": "press", "ref": "e6", "key": "Enter" }
+- select: Select dropdown option. { "action": "select", "ref": "e9", "values": ["Option B"] }
+- hover: Hover over an element. { "action": "hover", "ref": "e5" }
+- check: Check a checkbox. { "action": "check", "ref": "e10" }
+- uncheck: Uncheck a checkbox. { "action": "uncheck", "ref": "e10" }
 
-### Waiting
-- wait: Wait for an element. { "action": "wait", "selector": "CSS selector", "timeout": 5000 }
-
-### Extraction
+### Extraction (escape hatch for complex JavaScript)
 - extract: Run JavaScript in the page context. The script is evaluated as an expression.
   Simple: { "action": "extract", "script": "document.title" }
   Complex: { "action": "extract", "script": "(() => { const items = []; document.querySelectorAll('h2 a').forEach(a => items.push({title: a.textContent.trim(), url: a.href})); return items.slice(0, 10); })()" }
-  IMPORTANT: For multi-statement scripts, wrap in an IIFE: (() => { ...code...; return result; })()
+  For multi-statement scripts, wrap in an IIFE: (() => { ...code...; return result; })()
+  For APIs or plain-text endpoints, use fetch: { "action": "extract", "script": "fetch('https://api.example.com/data').then(r => r.json())" }
 
 ### Terminal
 - done: Task complete. { "action": "done", "result": "extracted data or summary" }
+  To keep the page open for follow-up tasks: { "action": "done", "result": "...", "keepPageOpen": true }
 - fail: Cannot complete. { "action": "fail", "reason": "why it cannot be done" }
 
-## Extraction Tips
-- Start simple: extract document.body.innerText first, then parse the text.
-- Use broad selectors: 'h1, h2, h3' or 'article' rather than site-specific class names.
-- For news headlines: 'h2 a, h3 a, [class*="headline"] a, article a' catches most sites.
-- Keep scripts under 500 chars — shorter scripts have fewer bugs.
-- Always use an IIFE for multi-statement scripts: (() => { ... return result; })()
-- For APIs or plain-text endpoints (like wttr.in, jsonplaceholder, etc.), use extract with fetch:
-  { "action": "extract", "script": "fetch('https://wttr.in/NYC?format=4').then(r => r.text())" }
-  This avoids navigation issues with non-HTML responses.
+## Page Lifecycle
+By default, the browser page closes when you call "done" or "fail".
+Add "keepPageOpen": true to your "done" action ONLY when:
+- You logged into an account and the session should persist for follow-up tasks
+- The page has state (filled forms, selected filters) that would be lost on reload
+- The task description explicitly asks to keep the page open
+
+Do NOT keep the page open when:
+- You just extracted data or read content (the data is already in the result)
+- You navigated to a public page with no session state
+- The task is a one-shot lookup (weather, search, news headlines)
+
+When in doubt, close the page (omit "keepPageOpen"). Pages left open consume resources.
 
 ## Rules
-1. Use CSS selectors from the observation. Prefer #id selectors when available.
+1. Use "ref" from the ARIA snapshot to target elements. The ref (e.g. "e5") comes from [ref=eN] annotations.
 2. One action per response. Always include "reasoning" explaining why.
-3. After filling a form, remember to submit it (click submit button or press Enter).
-4. If a page is loading or elements aren't visible yet, use "wait".
-5. **As soon as you have extracted useful data, call "done" immediately.** Do not keep refining or extracting more. Good enough is good enough.
+3. After filling a form, submit it (click the submit button or press Enter).
+4. The ARIA snapshot shows the page's semantic structure and text content. Use it to understand the page before resorting to "extract".
+5. As soon as you have useful data, call "done" immediately. Good enough is good enough.
 6. If stuck after several attempts, use "fail" with a clear reason.
-7. If an extract script fails, try a simpler approach (e.g., just get document.title or document.body.innerText).
-8. If a page returns an error or is blocked by bot detection, use "fail" with a clear reason instead of retrying the same page.
-9. Do not retry the same action more than twice. If it fails twice, try a different approach or fail.
-10. Keep reasoning brief (1-2 sentences).
-11. Pay attention to the step counter in observations. When steps are running low, call "done" with whatever you have.`;
+7. Do not retry the same action more than twice. If it fails twice, try a different approach or fail.
+8. Keep reasoning brief (1-2 sentences).
+9. Pay attention to the step counter. When steps are running low, call "done" with whatever you have.`;
   }
 }
 

@@ -59,6 +59,22 @@ type PlaywrightPage = {
   keyboard: { press: (key: string) => Promise<void> };
   setContent: (html: string) => Promise<void>;
   on: (event: string, fn: () => void) => void;
+  // ARIA snapshot for AI (private Playwright API, stable since ~1.49)
+  _snapshotForAI: (opts: { track: string }) => Promise<{ full: string; incremental?: string }>;
+  // Locator-based interaction
+  locator: (selector: string) => PlaywrightLocator;
+};
+
+type PlaywrightLocator = {
+  click: (opts?: unknown) => Promise<void>;
+  fill: (value: string) => Promise<void>;
+  type: (text: string, opts?: unknown) => Promise<void>;
+  selectOption: (values: string | string[] | { label: string }) => Promise<string[]>;
+  hover: () => Promise<void>;
+  check: () => Promise<void>;
+  uncheck: () => Promise<void>;
+  textContent: () => Promise<string | null>;
+  press: (key: string) => Promise<void>;
 };
 
 interface TrackedPage {
@@ -596,6 +612,42 @@ const STATEFUL_METHODS: MethodDeclaration[] = [
       },
     },
   },
+  // -- ARIA snapshot --
+  {
+    name: 'getAriaSnapshot',
+    description: 'Get an accessibility tree snapshot of a persistent page with element refs for targeting.',
+    parameters: [
+      {
+        name: 'pageId',
+        type: { kind: 'primitive', primitive: 'string' },
+        description: 'Page handle',
+      },
+    ],
+    returns: {
+      kind: 'object',
+      properties: {
+        snapshot: { kind: 'primitive', primitive: 'string' },
+        url: { kind: 'primitive', primitive: 'string' },
+        title: { kind: 'primitive', primitive: 'string' },
+      },
+    },
+  },
+  {
+    name: 'refAction',
+    description: 'Perform an action on an element identified by its ARIA snapshot ref.',
+    parameters: [
+      { name: 'pageId', type: { kind: 'primitive', primitive: 'string' }, description: 'Page handle' },
+      { name: 'ref', type: { kind: 'primitive', primitive: 'string' }, description: 'Element ref from ARIA snapshot (e.g. "e5")' },
+      { name: 'action', type: { kind: 'primitive', primitive: 'string' }, description: 'Action: click, fill, type, hover, check, uncheck, selectOption, press' },
+      { name: 'value', type: { kind: 'primitive', primitive: 'string' }, description: 'Value for fill/type/selectOption actions', optional: true },
+    ],
+    returns: {
+      kind: 'object',
+      properties: {
+        success: { kind: 'primitive', primitive: 'boolean' },
+      },
+    },
+  },
   // -- Escape hatch --
   // -- Viewer methods (no ownership check) --
   {
@@ -1003,6 +1055,58 @@ export class WebBrowser extends Abject {
     // -- getTitle --
     this.deferredPageHandler('getTitle', async (tracked) => {
       return { title: await tracked.page.title() };
+    });
+
+    // -- getAriaSnapshot --
+    this.deferredPageHandler('getAriaSnapshot', async (tracked) => {
+      const t0 = Date.now();
+      const url = tracked.page.url();
+      const title = await this.safeTitle(tracked.page, url);
+      const result = await tracked.page._snapshotForAI({ track: 'response' });
+      log.info(`getAriaSnapshot (url=${url}) [${Date.now() - t0}ms]`);
+      return { snapshot: result.full, url, title };
+    });
+
+    // -- refAction --
+    this.deferredPageHandler('refAction', async (tracked, payload) => {
+      const ref = payload.ref as string;
+      const action = payload.action as string;
+      const value = payload.value as string | undefined;
+      const t0 = Date.now();
+
+      const locator = tracked.page.locator(`aria-ref=${ref}`);
+
+      switch (action) {
+        case 'click':
+          await locator.click();
+          break;
+        case 'fill':
+          await locator.fill(value ?? '');
+          break;
+        case 'type':
+          await locator.type(value ?? '');
+          break;
+        case 'hover':
+          await locator.hover();
+          break;
+        case 'check':
+          await locator.check();
+          break;
+        case 'uncheck':
+          await locator.uncheck();
+          break;
+        case 'selectOption':
+          await locator.selectOption(value ? { label: value } : '');
+          break;
+        case 'press':
+          await locator.press(value ?? '');
+          break;
+        default:
+          throw new Error(`Unknown ref action: ${action}`);
+      }
+
+      log.info(`refAction (${payload.pageId}) ${action} ref=${ref} [${Date.now() - t0}ms]`);
+      return { success: true };
     });
 
     // -- evaluate --

@@ -157,6 +157,14 @@ export async function layoutRichText(
       continue;
     }
 
+    if (block.type === 'table' && block.cells) {
+      y += 4; // top padding
+      await layoutTable(block, lines, y, maxWidth, baseFontSize, theme, measureFn);
+      y = lines.length > 0 ? lines[lines.length - 1].y + lines[lines.length - 1].height : y;
+      y += 4; // bottom padding
+      continue;
+    }
+
     const headingScale = block.type === 'heading'
       ? (block.level === 1 ? 1.4 : block.level === 2 ? 1.25 : 1.1)
       : 1;
@@ -235,6 +243,63 @@ async function layoutCodeBlock(
       blockType: 'code-block',
       blockStart: i === 0,
       codeBackground: true,
+    });
+    y += lineHeight;
+  }
+}
+
+async function layoutTable(
+  block: MarkdownBlock,
+  lines: LayoutLine[],
+  startY: number,
+  _maxWidth: number,
+  baseFontSize: number,
+  theme: ThemeData,
+  measureFn: MeasureFn,
+): Promise<void> {
+  const rows = block.cells ?? [];
+  if (rows.length === 0) return;
+
+  const codeFontSize = baseFontSize - 1;
+  const lineHeight = codeFontSize + 4;
+  const font = `${codeFontSize}px "JetBrains Mono", "Fira Code", monospace`;
+  const headerFont = `bold ${codeFontSize}px "JetBrains Mono", "Fira Code", monospace`;
+  const fill = theme.textPrimary;
+  const headerFill = theme.accent;
+
+  // Compute max column count and widths (in characters)
+  const colCount = Math.max(...rows.map(r => r.length));
+  const colWidths: number[] = new Array(colCount).fill(0);
+  for (const row of rows) {
+    for (let c = 0; c < row.length; c++) {
+      colWidths[c] = Math.max(colWidths[c], row[c].length);
+    }
+  }
+
+  // Format each row as a padded string and create layout lines
+  let y = startY;
+  for (let ri = 0; ri < rows.length; ri++) {
+    const row = rows[ri];
+    const isHeader = ri === 0;
+    const padded = row.map((cell, c) => cell.padEnd(colWidths[c] ?? cell.length)).join('  ');
+    const rowFont = isHeader ? headerFont : font;
+    const rowFill = isHeader ? headerFill : fill;
+    const width = padded.length > 0 ? await measureFn(padded, rowFont) : 0;
+
+    lines.push({
+      runs: [{
+        text: padded,
+        font: rowFont,
+        fill: rowFill,
+        width,
+        sourceStart: block.sourceStart,
+        sourceEnd: block.sourceEnd,
+      }],
+      y,
+      height: lineHeight,
+      indent: 8,
+      blockType: 'table',
+      blockStart: ri === 0,
     });
     y += lineHeight;
   }

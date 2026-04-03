@@ -1469,6 +1469,7 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
       steps: entry.state.step,
       maxStepsReached: entry.state.step >= entry.state.maxSteps,
       validationErrors,
+      lastAction: entry.state.action,
     }));
 
     this.changed('taskCompleted', {

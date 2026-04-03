@@ -21,7 +21,7 @@ export interface TextSpan {
   sourceEnd: number;
 }
 
-export type BlockType = 'paragraph' | 'heading' | 'bullet' | 'code-block' | 'blockquote';
+export type BlockType = 'paragraph' | 'heading' | 'bullet' | 'code-block' | 'blockquote' | 'table';
 
 export interface MarkdownBlock {
   type: BlockType;
@@ -30,6 +30,8 @@ export interface MarkdownBlock {
   spans: TextSpan[];
   /** Optional language hint for code blocks. */
   language?: string;
+  /** Table cells: rows of cell strings (for type 'table'). */
+  cells?: string[][];
   sourceStart: number;
   sourceEnd: number;
 }
@@ -288,6 +290,43 @@ export function parseMarkdown(text: string): ParsedMarkdown {
       continue;
     }
 
+    // Table: lines starting with |
+    if (line.trimStart().startsWith('|')) {
+      const tableStart = offset;
+      const tableLines: string[] = [line];
+      let tableEnd = lineEnd;
+      i++;
+      offset = lineEnd + 1;
+
+      while (i < lines.length && lines[i].trimStart().startsWith('|')) {
+        tableLines.push(lines[i]);
+        tableEnd = offset + lines[i].length;
+        offset = tableEnd + 1;
+        i++;
+      }
+
+      // Parse cells: split each row by |, trim, skip separator rows (|---|---|)
+      const rows: string[][] = [];
+      for (const tl of tableLines) {
+        const stripped = tl.trim().replace(/^\|/, '').replace(/\|$/, '');
+        const cells = stripped.split('|').map(c => c.trim());
+        // Skip separator rows like |---|---|
+        if (cells.every(c => /^[-:]+$/.test(c))) continue;
+        rows.push(cells);
+      }
+
+      if (rows.length > 0) {
+        blocks.push({
+          type: 'table',
+          cells: rows,
+          spans: [], // not used for tables; layout reads cells directly
+          sourceStart: tableStart,
+          sourceEnd: tableEnd,
+        });
+      }
+      continue;
+    }
+
     // Paragraph: merge adjacent non-empty, non-special lines
     const paraLines: string[] = [line];
     let paraEnd = lineEnd;
@@ -301,7 +340,8 @@ export function parseMarkdown(text: string): ParsedMarkdown {
         nextLine.match(/^#{1,3}\s/) ||
         nextLine.match(/^\s*[-*]\s+/) ||
         nextLine.startsWith('> ') ||
-        nextLine.trimStart().startsWith('```')
+        nextLine.trimStart().startsWith('```') ||
+        nextLine.trimStart().startsWith('|')
       ) {
         break;
       }
@@ -398,6 +438,23 @@ export function estimateMarkdownHeight(
       totalHeight += estimateTextHeight(quoteText, availWidth, baseFontSize);
       prevBlock = true;
       i++;
+      continue;
+    }
+
+    // Table: lines starting with |
+    if (line.trimStart().startsWith('|')) {
+      if (prevBlock) totalHeight += 4;
+      let rowCount = 0;
+      while (i < lines.length && lines[i].trimStart().startsWith('|')) {
+        const stripped = lines[i].trim().replace(/^\|/, '').replace(/\|$/, '');
+        const cells = stripped.split('|').map(c => c.trim());
+        // Count non-separator rows
+        if (!cells.every(c => /^[-:]+$/.test(c))) rowCount++;
+        i++;
+      }
+      const codeFontSize = baseFontSize - 1;
+      totalHeight += rowCount * (codeFontSize + 4) + 8; // similar to code blocks
+      prevBlock = true;
       continue;
     }
 

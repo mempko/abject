@@ -370,8 +370,8 @@ export class LabelWidget extends WidgetAbject {
       for (const run of line.runs) {
         if (run.text.length === 0) continue;
 
-        // Inline code background (not for code-block lines which already have full background)
-        if (!line.codeBackground && run.fill === this.theme.accent && run.font.includes('Mono')) {
+        // Inline code background (not for code-block/table lines which already have their own styling)
+        if (!line.codeBackground && line.blockType !== 'table' && run.fill === this.theme.accent && run.font.includes('Mono')) {
           const codePadH = 2;
           const codePadV = 1;
           commands.push({
