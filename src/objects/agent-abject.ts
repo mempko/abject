@@ -281,14 +281,14 @@ export class AgentAbject extends Abject {
             },
             {
               name: 'startTask',
-              description: 'Start a task on a registered agent. Returns a ticketId immediately; result arrives via taskResult event.',
+              description: 'Start a task on a registered agent. Returns a ticketId immediately; result arrives via taskResult event. Default maxSteps is 25. When the step limit is reached, the agent makes one final LLM call to return collected data, then salvages the last successful result, or errors. Pass config.maxSteps to override.',
               parameters: [
                 { name: 'agentId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target agent (defaults to caller if registered)', optional: true },
                 { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-provided task ID', optional: true },
                 { name: 'task', type: { kind: 'primitive', primitive: 'string' }, description: 'Task description' },
                 { name: 'systemPrompt', type: { kind: 'primitive', primitive: 'string' }, description: 'Override system prompt', optional: true },
                 { name: 'initialMessages', type: { kind: 'array', elementType: { kind: 'object', properties: {} } }, description: 'Initial conversation messages', optional: true },
-                { name: 'config', type: { kind: 'object', properties: {} }, description: 'Per-task config overrides', optional: true },
+                { name: 'config', type: { kind: 'object', properties: {} }, description: 'Per-task config overrides: { maxSteps?: number (default 25), timeout?: number (default 300000ms) }', optional: true },
                 { name: 'responseSchema', type: { kind: 'object', properties: {} }, description: 'JSON Schema for structured result', optional: true },
               ],
               returns: { kind: 'object', properties: {
@@ -469,6 +469,14 @@ startTask returns a ticketId immediately. The result arrives as a taskResult eve
     task: 'Describe the task in natural language',
     config: { maxSteps: 10, timeout: 60000 },
   });
+
+### Step Limits
+- **maxSteps defaults to 25.** Each observe-think-act cycle counts as one step.
+- When the limit is reached, the agent makes one final LLM call asking for a done/fail response.
+- If that fails, it salvages the last successful action result.
+- If nothing was collected, the task errors with "Max steps reached".
+- The taskResult event includes \`maxStepsReached: true\` when the limit was hit.
+- For complex tasks (pagination, multi-step workflows), pass a higher maxSteps (e.g. 30-50).
 
   // 3. Optionally handle taskProgress events for live updates
   this.on('taskProgress', (msg) => {

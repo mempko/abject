@@ -73,7 +73,7 @@ export class WebAgent extends Abject {
           methods: [
             {
               name: 'runTask',
-              description: 'Run a full autonomous web task. Returns when complete.',
+              description: 'Run a full autonomous web task. Returns when complete. Default maxSteps is 15. When the step limit is reached, the agent makes one final attempt to return whatever data it has collected, then errors if nothing was gathered. For complex tasks requiring pagination or many interactions, pass a higher maxSteps (e.g. 30-50).',
               parameters: [
                 { name: 'task', type: { kind: 'primitive', primitive: 'string' }, description: 'Natural language task description' },
                 {
@@ -84,7 +84,7 @@ export class WebAgent extends Abject {
                     responseSchema: { kind: 'object', properties: {} },
                     pageId: { kind: 'primitive', primitive: 'string' },
                     keepPageOpen: { kind: 'primitive', primitive: 'boolean' },
-                  }}, description: 'Task options', optional: true,
+                  }}, description: 'Task options. maxSteps defaults to 15; increase for multi-page or paginated tasks.', optional: true,
                 },
               ],
               returns: { kind: 'object', properties: {
@@ -289,6 +289,12 @@ Set keepPageOpen: false to explicitly close the page when done.
 ### Close a Kept-Open Page Manually
 
   await call(await dep('WebAgent'), 'closePage', { pageId: 'page-id' });
+
+### Step Limits
+- **maxSteps defaults to 15.** Each observe-think-act cycle counts as one step.
+- When the limit is reached, the agent makes one final LLM call to return whatever data it has, then errors if nothing was gathered.
+- For complex tasks (pagination, multi-step forms, scraping many items), pass a higher maxSteps: 30-50.
+- The result includes \`maxStepsReached: true\` when the limit was hit.
 
 ### IMPORTANT
 - The method is **runTask** (not "run" or "navigate").
