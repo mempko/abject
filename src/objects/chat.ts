@@ -505,22 +505,26 @@ export class Chat extends Abject {
     log.info(`[Chat] handleAgentAct: action=${action.action} object=${(action as Record<string, unknown>).object ?? ''}`);
     switch (action.action) {
       case 'call': {
-        const targetStr = action.object as string;
-        const method = action.method as string;
+        const targetStr = action.object as string | undefined;
+        const method = action.method as string | undefined;
+        const actionDescription = action.description as string | undefined;
+
+        // Build task description: prefer the LLM's description, fall back to method-based format
+        const description = actionDescription
+          ?? (targetStr && method ? `Call ${targetStr}.${method}(${JSON.stringify(action.payload ?? {}).slice(0, 200)})` : 'Call an object');
 
         // Route through TupleSpace as type 'call' -- ObjectAgent claims and executes
         if (this.goalManagerId && this._currentGoalId) {
           try {
-            const description = `Call ${targetStr}.${method}(${JSON.stringify(action.payload ?? {}).slice(0, 200)})`;
             const { taskId } = await this.request<{ taskId: string }>(
               request(this.id, this.goalManagerId, 'addTask', {
                 goalId: this._currentGoalId,
                 type: 'call',
                 description,
                 data: {
-                  object: targetStr,
-                  method,
-                  payload: action.payload,
+                  ...(targetStr ? { object: targetStr } : {}),
+                  ...(method ? { method } : {}),
+                  ...(action.payload ? { payload: action.payload } : {}),
                 },
               })
             );
@@ -531,7 +535,8 @@ export class Chat extends Abject {
           }
         }
 
-        // Fallback: direct call if GoalManager unavailable
+        // Fallback: direct call if GoalManager unavailable (requires method)
+        if (!targetStr || !method) return { success: false, error: 'Direct call requires object and method' };
         const objectId = await this.resolveObject(targetStr);
         if (!objectId) return { success: false, error: `Object "${targetStr}" not found` };
         const timeout = method === 'runTask' || method === 'create' ? 310000 : 120000;
@@ -763,9 +768,10 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 ## Available Actions
 
 ### Object Interaction
-- **call**: Call a method on an object. Routes through TupleSpace to ObjectAgent, which discovers the API and sends the right message.
-  \`{ "action": "call", "object": "ObjectName", "method": "methodName", "payload": { ... } }\`
-  For "object" you can use a name (e.g. "Timer") or an AbjectId. ObjectAgent handles discovery and API learning.
+- **call**: Ask ObjectAgent to accomplish something with an object. ObjectAgent discovers the right API via the ask protocol automatically.
+  \`{ "action": "call", "description": "Fetch the current weather from WeatherAPI" }\`
+  Or with a specific object hint: \`{ "action": "call", "object": "Timer", "description": "Set a 5 minute countdown timer" }\`
+  Describe the GOAL, not the exact method. ObjectAgent will ask the target object how to use its API and send the right message.
 - **create**: Create a new object. Routes through TupleSpace to ObjectCreator. The created object is auto-shown.
   \`{ "action": "create", "description": "A counter widget that shows a number and has +/- buttons" }\`
 - **modify**: Modify an existing object. REQUIRED fields: "object" and "description". Routes through TupleSpace.
@@ -787,6 +793,8 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   After decomposing, you'll observe sub-task progress and can synthesize results when done.
 
   For **modify** subtasks, you MUST include \`"data": { "object": "ObjectName" }\` with the exact object name from "Your Abjects". Without it, the modify task will fail.
+
+  For **call** subtasks, describe the goal, not specific method names. ObjectAgent discovers APIs automatically via the ask protocol. Example: \`{ "type": "call", "description": "Get the current canvas size from WidgetManager" }\` instead of guessing method names.
 
   Task types and which agent claims them:
   - **call**: ObjectAgent (calling methods on existing objects, API interactions, data retrieval)

@@ -686,7 +686,10 @@ Set keepPageOpen: false to explicitly close the page when done.
 
   private static readonly MAX_SNAPSHOT_CHARS = 25000;
 
-  private async handleObserve(taskId: string): Promise<{ observation: string; llmContent?: ContentPart[] }> {
+  private static readonly FAST_TIER_REF_THRESHOLD = 30;
+  private static readonly FAST_TIER_CHAR_THRESHOLD = 8000;
+
+  private async handleObserve(taskId: string): Promise<{ observation: string; llmContent?: ContentPart[]; tier?: string }> {
     const extra = this.taskExtras.get(taskId);
     if (!extra?.pageId) return { observation: 'No page open.' };
 
@@ -697,7 +700,11 @@ Set keepPageOpen: false to explicitly close the page when done.
       );
 
       const refCount = (snapshot.match(/\[ref=e\d+\]/g) || []).length;
-      log.info(`Observe: URL=${url} | ${refCount} elements (ARIA snapshot, ${snapshot.length} chars)`);
+
+      // Pick LLM tier based on page complexity
+      const tier = (refCount <= WebAgent.FAST_TIER_REF_THRESHOLD && snapshot.length <= WebAgent.FAST_TIER_CHAR_THRESHOLD)
+        ? 'fast' : 'balanced';
+      log.info(`Observe: URL=${url} | ${refCount} elements (ARIA snapshot, ${snapshot.length} chars) tier=${tier}`);
 
       // Truncate very large snapshots to stay within token budget
       let truncatedSnapshot = snapshot;
@@ -726,6 +733,7 @@ Set keepPageOpen: false to explicitly close the page when done.
       if (extra.lastScreenshot) {
         return {
           observation,
+          tier,
           llmContent: [
             { type: 'text' as const, text: `[Observation - Step]\n${observation}` },
             { type: 'image' as const, mediaType: 'image/png' as const, data: extra.lastScreenshot },
@@ -733,7 +741,7 @@ Set keepPageOpen: false to explicitly close the page when done.
         };
       }
 
-      return { observation };
+      return { observation, tier };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('Unknown page handle')) {

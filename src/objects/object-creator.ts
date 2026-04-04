@@ -2156,6 +2156,10 @@ The ONLY way to communicate with other objects is:
 Options: { timeout?: number } — override the default 30s request timeout.
 Use a longer timeout for long-running calls (e.g. WebAgent.runTask).
 
+Dependency IDs are opaque strings, not objects with methods. Calling methods directly
+on them will crash: wm.drawCanvas(), timer.start(), http.get() are all WRONG.
+Always use this.call(objectId, 'methodName', { payload }).
+
 To get the ID of a dependency object, use:
 
   this.dep('ObjectName')
@@ -2183,7 +2187,7 @@ this.id — this object's own ID
 
 ## Using Dependencies
 
-Each dependency's description lists its interfaces, methods, and events. If a dependency also has a "Usage Guide" section, study it carefully — it contains working this.call() examples and event handler patterns provided by the object itself.
+Each dependency's description lists its interfaces, methods, and events. If a dependency also has a "Usage Guide" section, study it carefully and follow its examples exactly. The guides contain tested this.call() invocations. Copy the call patterns directly -- do not invent alternative method names or shorthand APIs.
 
 Translate dependency descriptions into this.call() invocations:
 \`\`\`javascript

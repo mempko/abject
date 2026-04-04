@@ -128,6 +128,8 @@ interface TaskEntry {
   systemPrompt: string;
   initialMessages?: { role: string; content: string | ContentPart[] }[];
   lastObservationLlmContent?: ContentPart[];
+  /** LLM tier hint from the last observe callback (e.g. 'fast', 'balanced'). */
+  observeTier?: string;
   /** JSON Schema for structured result validation. */
   responseSchema?: Record<string, unknown>;
   /** Goal ID for cross-agent progress tracking via GoalManager. */
@@ -1303,8 +1305,8 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
    * Returns the full result (observation + optional llmContent).
    * Used by directExecution mode; job mode calls the agent directly.
    */
-  private async observeStep(entry: TaskEntry): Promise<{ observation: string; llmContent?: ContentPart[] }> {
-    return this.request<{ observation: string; llmContent?: ContentPart[] }>(
+  private async observeStep(entry: TaskEntry): Promise<{ observation: string; llmContent?: ContentPart[]; tier?: string }> {
+    return this.request<{ observation: string; llmContent?: ContentPart[]; tier?: string }>(
       request(this.id, entry.agentId, 'agentObserve', {
         taskId: entry.state.id,
         step: entry.state.step,
@@ -1534,10 +1536,11 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
               task.error = obsResult.error;
               break;
             }
-            const obsData = obsResult.data as { observation: string; llmContent?: ContentPart[] };
+            const obsData = obsResult.data as { observation: string; llmContent?: ContentPart[]; tier?: string };
             task.observation = obsData.observation;
             if (obsData.llmContent) entry.lastObservationLlmContent = obsData.llmContent;
             else entry.lastObservationLlmContent = undefined;
+            if (obsData.tier) entry.observeTier = obsData.tier;
 
             // If there are active child goals, wait for next event then check status
             if (entry.childGoalIds && entry.childGoalIds.length > 0 && this.goalManagerId) {
@@ -1788,7 +1791,7 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
       const llmResult = await this.request<{ content: string }>(
         request(this.id, this.llmId, 'complete', {
           messages: task.llmMessages,
-          options: { tier: 'balanced', maxTokens: 2048 },
+          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 2048 },
         }),
         60000,
       );
@@ -1951,7 +1954,7 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
       llmResult = await this.request<{ content: string }>(
         request(this.id, this.llmId, 'stream', {
           messages: task.llmMessages,
-          options: { tier: 'balanced', maxTokens: 2048 },
+          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 2048 },
         }),
         120000,
       );

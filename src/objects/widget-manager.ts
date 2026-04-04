@@ -981,6 +981,21 @@ export class WidgetManager extends Abject {
   protected override getSourceForAsk(): string | undefined {
     return `## WidgetManager Usage Guide
 
+### Quick Reference
+
+All operations use this.call(). There are no shorthand methods.
+
+Window:   this.call(this.dep('WidgetManager'), 'createWindowAbject', { title, rect, resizable })
+Layout:   this.call(this.dep('WidgetManager'), 'createVBox', { windowId, margins, spacing })
+Widgets:  this.call(this.dep('WidgetManager'), 'create', { specs: [{ type, windowId, ... }] })
+Canvas:   this.call(this.dep('WidgetManager'), 'createCanvas', { windowId })
+Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', params }] })
+Size:     this.call(canvasId, 'getCanvasSize', {})
+Input:    this.call(canvasId, 'addDependent', {})   // then implement input(msg) handler
+Events:   this.call(widgetId, 'addDependent', {})   // then implement changed(msg) handler
+Update:   this.call(widgetId, 'update', { text, style, ... })
+Destroy:  this.call(this.dep('WidgetManager'), 'destroyWindowAbject', { windowId })
+
 ### Complete Workflow Example
 
 // 1. Create a window
@@ -1113,6 +1128,12 @@ createDetachedScrollableVBox - Detached scrollable vertical layout (not auto-add
 
 createCanvas - Drawing area inside a window. Returns canvasId (AbjectId).
 
+IMPORTANT: All canvas operations use this.call(). There are no shorthand methods.
+- Draw: this.call(canvasId, 'draw', { commands: [...] })
+- Get size: this.call(canvasId, 'getCanvasSize', {})
+- Receive input: this.call(canvasId, 'addDependent', {})
+Methods like drawCanvas(), addCanvasInputListener(), getCanvasSize() on WidgetManager do NOT exist.
+
 const canvasId = await this.call(this.dep('WidgetManager'), 'createCanvas', {
   windowId: winId
 });
@@ -1180,6 +1201,67 @@ async input(msg) {
     // Adjust layout for new canvas dimensions
   }
 }
+
+### Canvas State Management
+
+Window and canvas creation happens exactly once, inside show(). All subsequent user
+interactions (filter clicks, page navigation, mode switches) should only update internal
+state and call _draw() to redraw. This is the single most important pattern for canvas apps.
+
+The correct flow for handling user interaction on a canvas:
+1. User clicks/presses a key (arrives in your input handler)
+2. Update internal state: this._currentPage = 2, this._filter = 'active', etc.
+3. Call await this._draw() to redraw the entire canvas with the new state
+4. That's it. No window creation, no canvas creation, no layout changes.
+
+// Example: canvas app with clickable filter tabs drawn on the canvas
+async input(msg) {
+  const { type, x, y } = msg.payload;
+  if (type === 'mousedown') {
+    // Check if click is in the filter tab region (y < 40)
+    if (y < 40) {
+      if (x < 80) this._filter = 'all';
+      else if (x < 160) this._filter = 'active';
+      else this._filter = 'done';
+      this._filteredItems = this._items.filter(i => this._filter === 'all' || i.category === this._filter);
+      await this._draw();  // redraw canvas with new filter -- no window creation
+    }
+    // Check if click is on prev/next buttons
+    if (y > this._canvasH - 40) {
+      if (x < this._canvasW / 2) this._page = Math.max(0, this._page - 1);
+      else this._page = Math.min(this._maxPage, this._page + 1);
+      await this._draw();
+    }
+  }
+}
+
+// show() creates the window and canvas exactly once:
+async show(msg) {
+  if (this._windowId) return true;  // already visible -- do not recreate
+  this._windowId = await this.call(this.dep('WidgetManager'), 'createWindowAbject', { ... });
+  this._canvasId = await this.call(this.dep('WidgetManager'), 'createCanvas', { windowId: this._windowId });
+  // ... setup, then initial draw:
+  await this._draw();
+  return true;
+}
+
+// _draw() always clears the full canvas first, then draws everything:
+async _draw() {
+  if (!this._canvasId) return;
+  const W = this._canvasW, H = this._canvasH;
+  const cmds = [];
+  cmds.push({ type: 'clear', surfaceId: 'c', params: { color: '#1a1a2e' } });
+  // Draw header, filter tabs, content, navigation -- all in one batch
+  // ... build up cmds array ...
+  await this.call(this._canvasId, 'draw', { commands: cmds });
+}
+
+Rules for canvas apps:
+- show() must be idempotent: start with "if (this._windowId) return true;"
+- createWindowAbject and createCanvas are called only inside show(), never elsewhere
+- _draw() must always start with a clear command covering the full canvas
+- input(), timerFired(), and changed() handlers update state and call _draw(), nothing more
+- Use this._canvasW and this._canvasH for layout calculations, not hardcoded pixel values
 
 ### Updating Layout Children
 
