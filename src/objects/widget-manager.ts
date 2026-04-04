@@ -1147,15 +1147,82 @@ await this.call(rootLayout, 'addLayoutChildren', {
   }]
 });
 
+### Canvas with Toolbar (Drawing App, Game HUD, etc.)
+
+// CRITICAL: When combining a canvas with widgets (toolbar, sidebar, status bar),
+// you MUST add the canvas to the layout via addLayoutChildren.
+// Without this, the canvas gets 0x0 dimensions and nothing is visible.
+
+// 1. Create window and root vertical layout
+const winId = await this.call(this.dep('WidgetManager'), 'createWindowAbject', {
+  title: 'My App', rect: { x: 80, y: 60, width: 600, height: 500 }, resizable: true
+});
+const rootLayout = await this.call(this.dep('WidgetManager'), 'createVBox', {
+  windowId: winId, margins: { top: 0, right: 0, bottom: 0, left: 0 }, spacing: 0
+});
+
+// 2. Create toolbar as nested HBox (auto-added to rootLayout with expanding policy)
+const toolbar = await this.call(this.dep('WidgetManager'), 'createNestedHBox', {
+  parentLayoutId: rootLayout, margins: { top: 4, right: 8, bottom: 4, left: 8 }, spacing: 8
+});
+// Make toolbar fixed height (default expanding would split space 50/50 with canvas)
+await this.call(rootLayout, 'updateLayoutChild', {
+  widgetId: toolbar, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 40 }
+});
+// Create toolbar buttons and add them to the toolbar layout...
+
+// 3. Create canvas and ADD IT TO THE LAYOUT
+const canvasId = await this.call(this.dep('WidgetManager'), 'createCanvas', { windowId: winId });
+await this.call(rootLayout, 'addLayoutChildren', {
+  children: [{
+    widgetId: canvasId,
+    sizePolicy: { horizontal: 'expanding', vertical: 'expanding' }
+  }]
+});
+
+// 4. Register for input and get initial size
+await this.call(canvasId, 'addDependent', {});
+const { width, height } = await this.call(canvasId, 'getCanvasSize', {});
+
+### Common Canvas Mistakes (AVOID THESE)
+
+// WRONG: Canvas not added to layout when using widgets. Gets 0x0 size, invisible.
+//   const canvasId = await this.call(wm, 'createCanvas', { windowId });
+//   // Missing: await this.call(rootLayout, 'addLayoutChildren', { children: [{ widgetId: canvasId, ... }] });
+// FIX: Always call addLayoutChildren to add the canvas to your root layout.
+
+// WRONG: Using 'r' instead of 'radius' for circles.
+//   { type: 'circle', params: { cx: 50, cy: 50, r: 10, fill: '#f00' } }  <-- silently draws nothing
+// FIX: { type: 'circle', params: { cx: 50, cy: 50, radius: 10, fill: '#f00' } }
+
+// WRONG: Using 'fontSize' for text.
+//   { type: 'text', params: { text: 'hi', x: 0, y: 0, fontSize: 14 } }  <-- ignored
+// FIX: { type: 'text', params: { text: 'hi', x: 0, y: 0, font: '14px sans-serif' } }
+
+// WRONG: Using 'textAlign' or 'textBaseline'.
+// FIX: Use 'align' and 'baseline'.
+
 // Get canvas dimensions (set by layout or window content area):
 const { width, height } = await this.call(canvasId, 'getCanvasSize', {});
 
-// Available draw command types:
-// Shapes: clear, rect, text, line, path, circle, arc, ellipse, polygon, bezierCurve, quadraticCurve, imageUrl
-// State: save, restore, clip
-// Transforms: translate, rotate, scale
-// Effects: globalAlpha, shadow, setLineDash, linearGradient, radialGradient
-// Text supports maxWidth: { type: 'text', params: { ..., maxWidth: 200 } } — auto-shrinks text to fit
+// Draw command parameter reference (params object for each type):
+// clear:     { color?: '#1a1a2e' }
+// rect:      { x, y, width, height, fill?, stroke?, lineWidth?, radius? }
+// text:      { text, x, y, fill?, stroke?, font?: '14px sans-serif', align?: 'left'|'center'|'right', baseline?: 'top'|'middle'|'alphabetic', maxWidth? }
+//            NOTE: use "font" (not fontSize), "align" (not textAlign), "baseline" (not textBaseline)
+// line:      { x1, y1, x2, y2, stroke?, lineWidth?, lineCap?, lineJoin? }
+// circle:    { cx, cy, radius, fill?, stroke?, lineWidth? }
+// ellipse:   { cx, cy, radiusX, radiusY, rotation?, fill?, stroke?, lineWidth? }
+// arc:       { cx, cy, radius, startAngle, endAngle, fill?, stroke?, lineWidth? }
+// path:      { path: 'M10,10 L50,50 Q75,25 100,50 Z' (SVG path string), fill?, stroke?, lineWidth?, lineCap?, lineJoin? }
+//            For freehand drawing, build an SVG path string: 'M' + points.map(p => p.x+','+p.y).join(' L')
+// polygon:   { points: [{x,y}, ...], fill?, stroke?, lineWidth?, closePath?, lineCap?, lineJoin? }
+// imageUrl:  { url, x, y, width?, height? }
+// save, restore: {} (no params)
+// clip:      { x, y, width, height }
+// translate: { x, y }  |  rotate: { angle }  |  scale: { x, y }
+// globalAlpha: { alpha }  |  shadow: { color, blur, offsetX?, offsetY? }
+// setLineDash: { segments: [dashLength, gapLength] }
 
 // Draw using standard draw commands (coordinates are canvas-local, starting at 0,0):
 await this.call(canvasId, 'draw', {

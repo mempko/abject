@@ -68,6 +68,8 @@ export interface LineParams {
   y2: number;
   stroke?: string;
   lineWidth?: number;
+  lineCap?: CanvasLineCap;
+  lineJoin?: CanvasLineJoin;
 }
 
 export interface ImageParams {
@@ -91,6 +93,8 @@ export interface PathParams {
   fill?: string;
   stroke?: string;
   lineWidth?: number;
+  lineCap?: CanvasLineCap;
+  lineJoin?: CanvasLineJoin;
 }
 
 export interface CircleParams {
@@ -131,6 +135,8 @@ export interface PolygonParams {
   stroke?: string;
   lineWidth?: number;
   closePath?: boolean;
+  lineCap?: CanvasLineCap;
+  lineJoin?: CanvasLineJoin;
 }
 
 export interface BezierCurveParams {
@@ -145,6 +151,8 @@ export interface BezierCurveParams {
   stroke?: string;
   lineWidth?: number;
   fill?: string;
+  lineCap?: CanvasLineCap;
+  lineJoin?: CanvasLineJoin;
 }
 
 export interface QuadraticCurveParams {
@@ -157,6 +165,8 @@ export interface QuadraticCurveParams {
   stroke?: string;
   lineWidth?: number;
   fill?: string;
+  lineCap?: CanvasLineCap;
+  lineJoin?: CanvasLineJoin;
 }
 
 export interface ShadowParams {
@@ -543,6 +553,8 @@ export class Compositor {
         ctx.lineTo(p.x2, p.y2);
         ctx.strokeStyle = p.stroke ?? '#000';
         ctx.lineWidth = p.lineWidth ?? 1;
+        if (p.lineCap) ctx.lineCap = p.lineCap;
+        if (p.lineJoin) ctx.lineJoin = p.lineJoin;
         ctx.stroke();
         break;
       }
@@ -655,6 +667,8 @@ export class Compositor {
         if (p.stroke) {
           ctx.strokeStyle = p.stroke;
           ctx.lineWidth = p.lineWidth ?? 1;
+          if (p.lineCap) ctx.lineCap = p.lineCap;
+          if (p.lineJoin) ctx.lineJoin = p.lineJoin;
           ctx.stroke(path);
         }
         break;
@@ -752,6 +766,8 @@ export class Compositor {
         if (p.stroke) {
           ctx.strokeStyle = p.stroke;
           ctx.lineWidth = p.lineWidth ?? 1;
+          if (p.lineCap) ctx.lineCap = p.lineCap;
+          if (p.lineJoin) ctx.lineJoin = p.lineJoin;
           ctx.stroke();
         }
         break;
@@ -825,6 +841,8 @@ export class Compositor {
         if (p.stroke !== undefined || !p.fill) {
           ctx.strokeStyle = p.stroke ?? '#000';
           ctx.lineWidth = p.lineWidth ?? 1;
+          if (p.lineCap) ctx.lineCap = p.lineCap;
+          if (p.lineJoin) ctx.lineJoin = p.lineJoin;
           ctx.stroke();
         }
         break;
@@ -843,6 +861,8 @@ export class Compositor {
         if (p.stroke !== undefined || !p.fill) {
           ctx.strokeStyle = p.stroke ?? '#000';
           ctx.lineWidth = p.lineWidth ?? 1;
+          if (p.lineCap) ctx.lineCap = p.lineCap;
+          if (p.lineJoin) ctx.lineJoin = p.lineJoin;
           ctx.stroke();
         }
         break;

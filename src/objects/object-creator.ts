@@ -2117,6 +2117,10 @@ CRITICAL RULES:
   The fix: rename spawnBall to _spawnBall (add '_' prefix):
     async _spawnBall(x, y) { ... }
     await this._spawnBall(x, y);  // CORRECT — '_' prefix makes it callable
+- COMMON BUG — CANVAS WITH WIDGETS:
+    When combining canvas with widgets (toolbar, sidebar, etc.), the canvas MUST be added
+    to the layout via addLayoutChildren. Without this, the canvas gets 0x0 size and is invisible.
+    Consult the WidgetManager usage guide for the correct canvas+toolbar pattern.
 - The handler map is a FLAT parenthesized object expression: ({ method(msg) { ... } })
 - Each handler receives a SINGLE argument: a message object (msg).
 - msg.payload IS the parameters directly — destructure from it: const { x, y } = msg.payload;
@@ -2230,6 +2234,30 @@ async getState(msg) {
 }
 \`\`\`
 
+## Complete Example: Non-UI Object (service / data object)
+
+\`\`\`javascript
+({
+  _count: 0,
+
+  async increment(msg) {
+    this._count++;
+    this.changed('count', this._count);  // broadcast to observers
+    return { count: this._count };
+  },
+
+  async reset(msg) {
+    this._count = 0;
+    this.changed('count', this._count);
+    return { count: this._count };
+  },
+
+  async getState(msg) {
+    return { count: this._count };
+  }
+})
+\`\`\`
+
 ## Complete Example: Canvas Surface Object
 
 \`\`\`javascript
@@ -2249,6 +2277,8 @@ async getState(msg) {
       this.dep('WidgetManager'), 'createWindowAbject',
       { title: 'My Canvas', rect: { x: 100, y: 80, width: 420, height: 340 }, resizable: false });
 
+    // NOTE: This example is canvas-only (no toolbar/widgets).
+    // If combining canvas with widgets, add the canvas to the layout -- see WidgetManager's usage guide.
     this._canvasId = await this.call(
       this.dep('WidgetManager'), 'createCanvas',
       { windowId: this._windowId });
@@ -2283,11 +2313,22 @@ async getState(msg) {
   },
 
   async input(msg) {
-    const { type, x, y, key } = msg.payload;
+    const { type, x, y, key, width, height } = msg.payload;
+    if (type === 'canvasResize') {
+      this._canvasW = width;
+      this._canvasH = height;
+      await this._draw();
+      return;
+    }
     if (type === 'mousemove') {
       this._mouseX = x;
       this._mouseY = y;
-      this.changed('position', { x: this._mouseX, y: this._mouseY });
+    }
+    if (type === 'mousedown') {
+      this._mouseX = x;
+      this._mouseY = y;
+      this.changed('position', { x, y });
+      await this._draw();  // state changed — redraw (no window creation here)
     }
   },
 
@@ -2304,12 +2345,7 @@ async getState(msg) {
 
   // _draw has '_' prefix so it's callable as this._draw().
   // Without the prefix, calling this.draw() would throw "not a function".
-  // Draw command types: clear, rect, text, line, path, circle, arc, ellipse, polygon,
-  //   bezierCurve, quadraticCurve, imageUrl,
-  //   save, restore, clip, translate, rotate, scale,
-  //   globalAlpha, shadow, setLineDash, linearGradient, radialGradient
-  // Text supports maxWidth param: { type: 'text', ..., params: { ..., maxWidth: 200 } }
-  // For images: use 'imageUrl' with { url } param (URLs or data URIs from HttpClient.getBase64()).
+  // See WidgetManager's usage guide for full draw command parameter reference.
   async _draw() {
     if (!this._canvasId) return;
     const W = this._canvasW, H = this._canvasH;
@@ -2405,118 +2441,7 @@ async getState(msg) {
 })
 \`\`\`
 
-### Content Display App (Phase 2 — content-rich UI with scrollable items)
-
-Dependencies: WidgetManager
-
-\`\`\`javascript
-({
-  _windowId: null,
-  _scrollAreaId: null,
-
-  async init() {
-    const wm = this.dep('WidgetManager');
-
-    // Create window with createWindowAbject (rect-based API)
-    this._windowId = await this.call(wm, 'createWindowAbject', {
-      title: 'News Feed', rect: { x: 100, y: 80, width: 520, height: 480 }
-    });
-
-    // Root vertical layout
-    const rootLayout = await this.call(wm, 'createVBox', {
-      windowId: this._windowId,
-      margins: { top: 16, right: 16, bottom: 16, left: 16 },
-      spacing: 8
-    });
-
-    // Header row (HBox with title + status)
-    const headerRow = await this.call(wm, 'createNestedHBox', {
-      parentLayoutId: rootLayout, spacing: 8
-    });
-    // Override header to fixed height
-    await this.call(rootLayout, 'updateLayoutChild', {
-      widgetId: headerRow, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 28 }
-    });
-    const { widgetIds: [titleLabel, statusLabel] } = await this.call(wm, 'create', {
-      specs: [
-        { type: 'label', windowId: this._windowId, text: 'Latest News',
-          style: { fontSize: 18, fontWeight: 'bold' } },
-        { type: 'label', windowId: this._windowId, text: 'Updated just now',
-          style: { fontSize: 12, color: '#8a8a9e' } },
-      ]
-    });
-    await this.call(headerRow, 'addLayoutChildren', {
-      children: [
-        { widgetId: titleLabel, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 28 } },
-        { widgetId: statusLabel, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 130, height: 28 } },
-      ]
-    });
-
-    // Divider below header
-    const { widgetIds: [divider] } = await this.call(wm, 'create', {
-      specs: [{ type: 'divider', windowId: this._windowId }]
-    });
-    await this.call(rootLayout, 'addLayoutChild', {
-      widgetId: divider, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 1 }
-    });
-
-    // Scrollable content area (auto-added to rootLayout with expanding policy)
-    this._scrollAreaId = await this.call(wm, 'createNestedScrollableVBox', {
-      parentLayoutId: rootLayout, spacing: 4
-    });
-
-    await this._loadItems();
-  },
-
-  async _loadItems() {
-    const wm = this.dep('WidgetManager');
-    const items = [
-      { title: 'Breaking: New Discovery', date: 'March 15, 2026',
-        summary: 'Scientists have announced a breakthrough in quantum computing that could revolutionize data processing.' },
-      { title: 'Tech Update', date: 'March 14, 2026',
-        summary: 'Major software companies release coordinated security patches addressing critical vulnerabilities.' },
-      { title: 'Weather Alert', date: 'March 14, 2026',
-        summary: 'Severe weather expected across the eastern seaboard this weekend with heavy rainfall and strong winds.' },
-    ];
-
-    // Flat layout approach: add all widgets directly into the scroll area
-    for (let i = 0; i < items.length; i++) {
-      if (i > 0) {
-        const { widgetIds: [sep] } = await this.call(wm, 'create', {
-          specs: [{ type: 'divider', windowId: this._windowId }]
-        });
-        await this.call(this._scrollAreaId, 'addLayoutChild', {
-          widgetId: sep, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 1 }
-        });
-      }
-      // Create card as a nested VBox
-      const cardBox = await this.call(wm, 'createNestedVBox', {
-        parentLayoutId: this._scrollAreaId, autoSize: true, spacing: 4,
-        margins: { top: 4, right: 0, bottom: 4, left: 0 }
-      });
-      const { widgetIds: [titleLbl, dateLbl, summaryLbl] } = await this.call(wm, 'create', {
-        specs: [
-          { type: 'label', windowId: this._windowId, text: items[i].title,
-            style: { fontSize: 15, fontWeight: 'bold' } },
-          { type: 'label', windowId: this._windowId, text: items[i].date,
-            style: { fontSize: 12, color: '#8a8a9e' } },
-          { type: 'label', windowId: this._windowId, text: items[i].summary,
-            style: { fontSize: 13, wordWrap: true, markdown: true } },
-        ]
-      });
-      await this.call(cardBox, 'addLayoutChildren', {
-        children: [
-          { widgetId: titleLbl, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 22 } },
-          { widgetId: dateLbl, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 18 } },
-          { widgetId: summaryLbl, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 54 } },
-        ]
-      });
-    }
-  },
-
-  async changed(msg) {}
-})
-\`\`\`
+Widget and content display patterns are documented in the WidgetManager usage guide. Consult it for layouts, scrollable lists, tabs, forms, and other widget patterns.
 
 ## Markdown Labels
 
