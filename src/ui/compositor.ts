@@ -472,9 +472,15 @@ export class Compositor {
 
     switch (command.type) {
       case 'clear': {
-        // Reset canvas state to prevent leaks from a previous frame's
-        // unbalanced save/restore (e.g. a disabled widget or dynamically
-        // generated code that left globalAlpha < 1.0 or shadow active).
+        // Fully reset canvas state to prevent leaks from a previous frame's
+        // unbalanced save/restore (e.g. a child render that errored mid-draw,
+        // leaving residual translate/clip on the context). Without this, clearRect
+        // operates in the wrong coordinate space and fails to clear the full surface.
+        if (typeof (ctx as unknown as { reset?: () => void }).reset === 'function') {
+          (ctx as unknown as { reset: () => void }).reset();
+        } else {
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+        }
         ctx.globalAlpha = 1.0;
         ctx.shadowColor = 'transparent';
         ctx.shadowBlur = 0;
