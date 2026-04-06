@@ -287,6 +287,125 @@ export class BackendUI extends Abject {
                 ],
                 returns: { kind: 'primitive', primitive: 'number' },
               },
+              {
+                name: 'injectInput',
+                description: 'Inject a synthetic input event into a surface (click, keypress, etc.)',
+                parameters: [
+                  {
+                    name: 'surfaceId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Target surface ID',
+                  },
+                  {
+                    name: 'type',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Event type: mousedown, mouseup, mousemove, keydown, keyup',
+                  },
+                  {
+                    name: 'x',
+                    type: { kind: 'primitive', primitive: 'number' },
+                    description: 'X coordinate (surface-local)',
+                    optional: true,
+                  },
+                  {
+                    name: 'y',
+                    type: { kind: 'primitive', primitive: 'number' },
+                    description: 'Y coordinate (surface-local)',
+                    optional: true,
+                  },
+                  {
+                    name: 'button',
+                    type: { kind: 'primitive', primitive: 'number' },
+                    description: 'Mouse button (0=left, 1=middle, 2=right)',
+                    optional: true,
+                  },
+                  {
+                    name: 'key',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Key value for keyboard events',
+                    optional: true,
+                  },
+                  {
+                    name: 'code',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Key code for keyboard events',
+                    optional: true,
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'click',
+                description: 'Simulate a mouse click (mousedown + mouseup) at a position on a surface',
+                parameters: [
+                  { name: 'surfaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target surface ID' },
+                  { name: 'x', type: { kind: 'primitive', primitive: 'number' }, description: 'X coordinate (surface-local)' },
+                  { name: 'y', type: { kind: 'primitive', primitive: 'number' }, description: 'Y coordinate (surface-local)' },
+                  { name: 'button', type: { kind: 'primitive', primitive: 'number' }, description: 'Mouse button (0=left, 1=middle, 2=right)', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'type',
+                description: 'Simulate typing a string of text by sending keydown/keyup for each character',
+                parameters: [
+                  { name: 'surfaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target surface ID' },
+                  { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Text to type' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'keyPress',
+                description: 'Simulate a single key press (keydown + keyup)',
+                parameters: [
+                  { name: 'surfaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target surface ID' },
+                  { name: 'key', type: { kind: 'primitive', primitive: 'string' }, description: 'Key value (e.g. "Enter", "Escape", "a")' },
+                  { name: 'code', type: { kind: 'primitive', primitive: 'string' }, description: 'Key code (e.g. "Enter", "KeyA")', optional: true },
+                  { name: 'modifiers', type: { kind: 'reference', reference: 'Modifiers' }, description: 'Modifier keys: { shift, ctrl, alt, meta }', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'captureScreenshot',
+                description: 'Capture a screenshot of an object\'s window as base64-encoded PNG',
+                parameters: [
+                  {
+                    name: 'objectId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'AbjectId of the object whose window to capture',
+                  },
+                ],
+                returns: {
+                  kind: 'object',
+                  properties: {
+                    imageBase64: { kind: 'primitive', primitive: 'string' },
+                    width: { kind: 'primitive', primitive: 'number' },
+                    height: { kind: 'primitive', primitive: 'number' },
+                  },
+                },
+              },
+              {
+                name: 'captureDesktop',
+                description: 'Capture a screenshot of the entire desktop as base64-encoded PNG',
+                parameters: [],
+                returns: {
+                  kind: 'object',
+                  properties: {
+                    imageBase64: { kind: 'primitive', primitive: 'string' },
+                    width: { kind: 'primitive', primitive: 'number' },
+                    height: { kind: 'primitive', primitive: 'number' },
+                  },
+                },
+              },
+              {
+                name: 'listWindows',
+                description: 'List all visible windows with their objectId, title, and position',
+                parameters: [],
+                returns: {
+                  kind: 'array',
+                  elementType: { kind: 'reference', reference: 'WindowInfo' },
+                },
+              },
             ],
             events: [
               {
@@ -494,6 +613,88 @@ export class BackendUI extends Abject {
       }
       return true;
     });
+
+    this.on('injectInput', async (msg: AbjectMessage) => {
+      const { surfaceId, type, x, y, button, key, code, modifiers } = msg.payload as {
+        surfaceId: string;
+        type: InputEvent['type'];
+        x?: number;
+        y?: number;
+        button?: number;
+        key?: string;
+        code?: string;
+        modifiers?: InputEvent['modifiers'];
+      };
+      const state = this.surfaces.get(surfaceId);
+      if (!state) return false;
+      await this.sendInputEvent(state.objectId, {
+        type,
+        surfaceId,
+        x,
+        y,
+        button,
+        key,
+        code,
+        modifiers,
+      });
+      return true;
+    });
+
+    this.on('click', async (msg: AbjectMessage) => {
+      const { surfaceId, x, y, button } = msg.payload as {
+        surfaceId: string; x: number; y: number; button?: number;
+      };
+      const state = this.surfaces.get(surfaceId);
+      if (!state) return false;
+      const btn = button ?? 0;
+      await this.sendInputEvent(state.objectId, { type: 'mousedown', surfaceId, x, y, button: btn });
+      await this.sendInputEvent(state.objectId, { type: 'mouseup', surfaceId, x, y, button: btn });
+      return true;
+    });
+
+    this.on('type', async (msg: AbjectMessage) => {
+      const { surfaceId, text } = msg.payload as { surfaceId: string; text: string };
+      const state = this.surfaces.get(surfaceId);
+      if (!state) return false;
+      for (const char of text) {
+        await this.sendInputEvent(state.objectId, {
+          type: 'keydown', surfaceId, key: char, code: `Key${char.toUpperCase()}`,
+        });
+        await this.sendInputEvent(state.objectId, {
+          type: 'keyup', surfaceId, key: char, code: `Key${char.toUpperCase()}`,
+        });
+      }
+      return true;
+    });
+
+    this.on('keyPress', async (msg: AbjectMessage) => {
+      const { surfaceId, key, code, modifiers } = msg.payload as {
+        surfaceId: string; key: string; code?: string;
+        modifiers?: { shift: boolean; ctrl: boolean; alt: boolean; meta: boolean };
+      };
+      const state = this.surfaces.get(surfaceId);
+      if (!state) return false;
+      await this.sendInputEvent(state.objectId, {
+        type: 'keydown', surfaceId, key, code: code ?? key, modifiers,
+      });
+      await this.sendInputEvent(state.objectId, {
+        type: 'keyup', surfaceId, key, code: code ?? key, modifiers,
+      });
+      return true;
+    });
+
+    this.on('captureScreenshot', async (msg: AbjectMessage) => {
+      const { objectId } = msg.payload as { objectId: AbjectId };
+      return this.handleCaptureScreenshot(objectId);
+    });
+
+    this.on('captureDesktop', async () => {
+      return this.handleCaptureDesktop();
+    });
+
+    this.on('listWindows', async () => {
+      return this.handleListWindows();
+    });
   }
 
   protected override async onInit(): Promise<void> {
@@ -572,11 +773,51 @@ Each draw command has exactly 3 fields: { type, surfaceId, params }
 'shadow' - Set shadow. params: { color, blur, offsetX?, offsetY? }
 'linearGradient'/'radialGradient' - Set gradient fill+stroke
 
+### Input Injection
+
+Simulate a mouse click on a surface (mousedown + mouseup):
+  await this.call(this.dep('UIServer'), 'click',
+    { surfaceId, x: 150, y: 30 });
+  // button: 0=left (default), 1=middle, 2=right
+
+Type a string of text (keydown/keyup per character):
+  await this.call(this.dep('UIServer'), 'type',
+    { surfaceId, text: 'hello world' });
+
+Press a single key:
+  await this.call(this.dep('UIServer'), 'keyPress',
+    { surfaceId, key: 'Enter' });
+
+  // With modifiers:
+  await this.call(this.dep('UIServer'), 'keyPress',
+    { surfaceId, key: 'a', code: 'KeyA',
+      modifiers: { ctrl: true, shift: false, alt: false, meta: false } });
+
+Low-level input injection (single event):
+  await this.call(this.dep('UIServer'), 'injectInput',
+    { surfaceId, type: 'mousedown', x: 100, y: 50, button: 0 });
+
+### Screenshots
+
+Capture a screenshot of an object's window (returns base64 PNG):
+  const img = await this.call(this.dep('UIServer'), 'captureScreenshot',
+    { objectId: targetObjectId });
+  // img = { imageBase64: '...', width: 800, height: 600 } or null
+
+Capture the entire desktop:
+  const desktop = await this.call(this.dep('UIServer'), 'captureDesktop', {});
+
+List all visible windows:
+  const windows = await this.call(this.dep('UIServer'), 'listWindows', {});
+  // [{ objectId, title, surfaceId, rect: { x, y, width, height } }, ...]
+
 IMPORTANT:
 - Use 'fill' for fill color, NOT 'color'
 - Use 'rect' NOT 'fillRect', 'text' NOT 'fillText'
 - Always nest parameters inside 'params'
-- Transparent pixels do NOT receive mouse input — use opaque backgrounds`;
+- Transparent pixels do NOT receive mouse input -- use opaque backgrounds
+- Click/type/keyPress coordinates are relative to the surface (0,0 = top-left of the window)
+- Use listWindows to discover surfaceIds for input injection targets`;
   }
 
   // ── Auth gate ───────────────────────────────────────────────────────
@@ -1023,6 +1264,63 @@ IMPORTANT:
     }
   }
 
+  private async handleCaptureScreenshot(
+    objectId: AbjectId
+  ): Promise<{ imageBase64: string; width: number; height: number } | null> {
+    const objectSurfaces = Array.from(this.surfaces.values())
+      .filter(s => s.objectId === objectId);
+    if (objectSurfaces.length === 0) return null;
+    if (!this.hasReadyClient) return null;
+
+    const surface = objectSurfaces[0];
+    try {
+      return await this.requestFromFrontend<{ imageBase64: string; width: number; height: number }>({
+        type: 'captureSurfaceRequest',
+        requestId: this.nextRequestId(),
+        surfaceId: surface.surfaceId,
+      }, 15000);
+    } catch {
+      return null;
+    }
+  }
+
+  private async handleCaptureDesktop(): Promise<{ imageBase64: string; width: number; height: number }> {
+    if (!this.hasReadyClient) {
+      return { imageBase64: '', width: 0, height: 0 };
+    }
+    try {
+      return await this.requestFromFrontend<{ imageBase64: string; width: number; height: number }>({
+        type: 'captureDesktopRequest',
+        requestId: this.nextRequestId(),
+      }, 15000);
+    } catch {
+      return { imageBase64: '', width: 0, height: 0 };
+    }
+  }
+
+  private handleListWindows(): Array<{
+    objectId: AbjectId;
+    title: string;
+    surfaceId: string;
+    rect: { x: number; y: number; width: number; height: number };
+  }> {
+    const windows: Array<{
+      objectId: AbjectId;
+      title: string;
+      surfaceId: string;
+      rect: { x: number; y: number; width: number; height: number };
+    }> = [];
+    for (const state of this.surfaces.values()) {
+      windows.push({
+        objectId: state.objectId as AbjectId,
+        title: state.title ?? '',
+        surfaceId: state.surfaceId,
+        rect: { ...state.rect },
+      });
+    }
+    return windows;
+  }
+
   // ── Request/reply with frontend ─────────────────────────────────────
 
   private requestIdCounter = 0;
@@ -1079,6 +1377,24 @@ IMPORTANT:
         if (pending) {
           this.pendingRequests.delete(msg.requestId!);
           pending.resolve({ width: msg.width, height: msg.height });
+        }
+        break;
+      }
+
+      case 'captureSurfaceReply': {
+        const pending = this.pendingRequests.get(msg.requestId!);
+        if (pending) {
+          this.pendingRequests.delete(msg.requestId!);
+          pending.resolve({ imageBase64: msg.imageBase64, width: msg.width, height: msg.height });
+        }
+        break;
+      }
+
+      case 'captureDesktopReply': {
+        const pending = this.pendingRequests.get(msg.requestId!);
+        if (pending) {
+          this.pendingRequests.delete(msg.requestId!);
+          pending.resolve({ imageBase64: msg.imageBase64, width: msg.width, height: msg.height });
         }
         break;
       }

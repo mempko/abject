@@ -555,6 +555,14 @@ export class FrontendClient {
           this.mobileKeyboardProxy.blur();
         }
         break;
+
+      case 'captureSurfaceRequest':
+        this.handleCaptureSurfaceRequest(msg.requestId!, msg.surfaceId);
+        break;
+
+      case 'captureDesktopRequest':
+        this.handleCaptureDesktopRequest(msg.requestId!);
+        break;
     }
   }
 
@@ -648,6 +656,28 @@ export class FrontendClient {
       requestId,
       width: this.compositor.width,
       height: this.compositor.height,
+    });
+  }
+
+  private async handleCaptureSurfaceRequest(requestId: string, surfaceId: string): Promise<void> {
+    const result = await this.compositor.captureSurface(surfaceId);
+    this.sendToBackend({
+      type: 'captureSurfaceReply',
+      requestId,
+      imageBase64: result?.imageBase64 ?? '',
+      width: result?.width ?? 0,
+      height: result?.height ?? 0,
+    });
+  }
+
+  private handleCaptureDesktopRequest(requestId: string): void {
+    const result = this.compositor.captureDesktop();
+    this.sendToBackend({
+      type: 'captureDesktopReply',
+      requestId,
+      imageBase64: result.imageBase64,
+      width: result.width,
+      height: result.height,
     });
   }
 

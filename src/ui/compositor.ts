@@ -344,6 +344,38 @@ export class Compositor {
   }
 
   /**
+   * Capture a surface as a base64-encoded PNG.
+   */
+  async captureSurface(surfaceId: string): Promise<{ imageBase64: string; width: number; height: number } | null> {
+    const surface = this.surfaces.get(surfaceId);
+    if (!surface || !surface.drawn) return null;
+
+    const blob = await surface.canvas.convertToBlob({ type: 'image/png' });
+    const buffer = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return {
+      imageBase64: btoa(binary),
+      width: surface.rect.width,
+      height: surface.rect.height,
+    };
+  }
+
+  /**
+   * Capture the entire desktop as a base64-encoded PNG.
+   */
+  captureDesktop(): { imageBase64: string; width: number; height: number } {
+    const dataUrl = this.canvas.toDataURL('image/png');
+    const imageBase64 = dataUrl.split(',')[1] ?? '';
+    return {
+      imageBase64,
+      width: this.width,
+      height: this.height,
+    };
+  }
+
+  /**
    * Check if a surface is filtered out by the active workspace.
    */
   private isWorkspaceFiltered(surface: Surface): boolean {

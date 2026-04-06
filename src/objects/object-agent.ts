@@ -12,6 +12,7 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
+import type { ContentPart } from '../llm/provider.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('ObjectAgent');
@@ -20,6 +21,7 @@ const OBJECT_AGENT_INTERFACE: InterfaceId = 'abjects:object-agent';
 
 interface TaskExtra {
   lastResult?: string;
+  lastLlmContent?: ContentPart[];
   taskData?: Record<string, unknown>;
 }
 
@@ -210,7 +212,7 @@ You can also send a runTask message directly with a task description.`;
   // Observe / Act
   // ═══════════════════════════════════════════════════════════════════
 
-  private async handleObserve(taskId: string): Promise<{ observation: string }> {
+  private async handleObserve(taskId: string): Promise<{ observation: string; llmContent?: ContentPart[] }> {
     const extra = this.taskExtras.get(taskId);
     const lines: string[] = [];
 
@@ -230,7 +232,19 @@ You can also send a runTask message directly with a task description.`;
       if (payload !== undefined) lines.push(`Hint: payload is ${JSON.stringify(payload).slice(0, 500)}`);
     }
 
-    return { observation: lines.join('\n') };
+    const observation = lines.join('\n');
+
+    // If the last action produced image content, include it for the LLM
+    if (extra?.lastLlmContent) {
+      const llmContent: ContentPart[] = [
+        { type: 'text', text: observation },
+        ...extra.lastLlmContent,
+      ];
+      extra.lastLlmContent = undefined;
+      return { observation, llmContent };
+    }
+
+    return { observation };
   }
 
   private async handleAct(taskId: string, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string }> {
@@ -286,6 +300,21 @@ You can also send a runTask message directly with a task description.`;
             request(this.id, objectId, method, action.payload ?? {}),
             timeout,
           );
+
+          // Detect screenshot results and store image data for LLM vision
+          if (callResult && typeof callResult === 'object' && 'imageBase64' in (callResult as Record<string, unknown>)) {
+            const img = callResult as { imageBase64: string; width: number; height: number };
+            if (img.imageBase64) {
+              extra.lastLlmContent = [{
+                type: 'image',
+                mediaType: 'image/png',
+                data: img.imageBase64,
+              }];
+              result = `Screenshot captured (${img.width}x${img.height}). The image is attached for your analysis.`;
+              break;
+            }
+          }
+
           result = typeof callResult === 'string' ? callResult : JSON.stringify(callResult);
           break;
         }
@@ -382,6 +411,7 @@ Every action can include a "reasoning" field explaining your thinking.
 - Results from one call can inform the next. Chain calls when needed.
 - If a call fails, try "ask" on the object to understand the correct method signature.
 - The "ask" protocol is LLM-powered: objects give intelligent, contextual answers.
+- You can capture screenshots and interact with windows. Ask the Registry to discover the right objects for visual capture and input injection.
 `;
 
     if (taskData) {

@@ -32,7 +32,7 @@ import { request, event } from '../core/message.js';
 import { IntrospectResult } from '../core/introspect.js';
 
 import { ScriptableAbject } from './scriptable-abject.js';
-import { systemMessage, userMessage, LLMMessage, LLMCompletionResult, LLMCompletionOptions } from '../llm/provider.js';
+import { systemMessage, userMessage, userMessageWithImages, LLMMessage, LLMCompletionResult, LLMCompletionOptions } from '../llm/provider.js';
 import type { AgentAction } from './agent-abject.js';
 import { Log } from '../core/timed-log.js';
 
@@ -103,6 +103,7 @@ export class ObjectCreator extends Abject {
   private _currentCallerId?: AbjectId;
   private _currentGoalId?: string;
   private goalManagerId?: AbjectId;
+  private screenshotId?: AbjectId;
   private creationTasks = new Map<string, CreationTaskExtra>();
 
   /** Pending ticket promises: ticketId → resolve/reject + resettable timer. */
@@ -486,6 +487,7 @@ export class ObjectCreator extends Abject {
     this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
     this.agentAbjectId = await this.discoverDep('AgentAbject') ?? undefined;
     this.goalManagerId = await this.discoverDep('GoalManager') ?? undefined;
+    this.screenshotId = await this.discoverDep('Screenshot') ?? undefined;
 
     // Register as an agent for discoverability and delegation
     if (this.agentAbjectId) {
@@ -842,6 +844,77 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
     }
 
     return { success: true, code, deps: allDeps };
+  }
+
+  /**
+   * Phase 5d: Visual inspection — ask the LLM to evaluate a screenshot of the
+   * newly created object's window and provide corrective code if needed.
+   * Single iteration, non-fatal.
+   */
+  private async visualInspection(
+    objectId: AbjectId,
+    manifest: AbjectManifest,
+    prompt: string,
+    currentCode: string,
+    screenshot: { imageBase64: string; width: number; height: number },
+    callerId: AbjectId | undefined,
+  ): Promise<{ code?: string }> {
+    const messages: LLMMessage[] = [
+      systemMessage(
+        'You are reviewing a visual UI object that was just created. ' +
+        'A screenshot of its window is attached. Evaluate whether it looks correct ' +
+        'for the user\'s request. If it looks good, respond with just "LOOKS_GOOD". ' +
+        'If there are visual issues (wrong layout, missing elements, broken rendering, etc.), ' +
+        'provide the corrected handler map in a ```javascript code block.'
+      ),
+      userMessageWithImages(
+        `User requested: "${prompt}"\n\nObject: ${manifest.name}\n\n` +
+        `Current handler code:\n\`\`\`javascript\n${currentCode}\n\`\`\`\n\n` +
+        `Screenshot of the result (${screenshot.width}x${screenshot.height}):`,
+        [{ mediaType: 'image/png' as const, data: screenshot.imageBase64 }],
+      ),
+    ];
+
+    const result = await this.llmComplete(messages, { tier: 'smart' });
+
+    if (result.content.includes('LOOKS_GOOD')) {
+      log.info('Visual inspection: looks good');
+      return {};
+    }
+
+    // Extract corrected code
+    const codeMatch = result.content.match(/```(?:javascript|js)\s*([\s\S]*?)\s*```/);
+    if (!codeMatch) {
+      log.info('Visual inspection: LLM provided feedback but no code block');
+      return {};
+    }
+
+    let newCode = codeMatch[1];
+    log.info('Visual inspection: applying corrective code');
+
+    // Verify and compile
+    const verified = this.verifyAndFix(manifest, newCode);
+    newCode = verified.code;
+    const compileError = ScriptableAbject.tryCompile(newCode);
+    if (compileError) {
+      log.warn('Visual inspection: corrective code failed to compile:', compileError);
+      return {};
+    }
+
+    // Apply to live object
+    try {
+      await this.request(
+        request(this.id, objectId, 'updateSource', { source: newCode }),
+        30000,
+      );
+      if (this.registryId) {
+        await this.registryUpdateSource(objectId, newCode);
+      }
+      return { code: newCode };
+    } catch (err) {
+      log.warn('Visual inspection: failed to apply corrective code:', err instanceof Error ? err.message : String(err));
+      return {};
+    }
   }
 
   // ── Multi-Phase Discovery Pipeline ────────────────────────────────
@@ -1291,6 +1364,29 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           }
         }
 
+        // Phase 5d: Visual inspection — capture screenshot and ask LLM to evaluate
+        if (spawnResult.objectId && this.screenshotId) {
+          try {
+            if (callerId) await this.reportProgress(callerId, '5d', 'Visually inspecting...');
+            // Wait for initial render
+            await new Promise(resolve => setTimeout(resolve, 500));
+
+            const screenshot = await this.request<{ imageBase64: string; width: number; height: number } | null>(
+              request(this.id, this.screenshotId, 'captureWindow', { objectId: spawnResult.objectId }),
+              15000,
+            );
+
+            if (screenshot && screenshot.imageBase64) {
+              const visualResult = await this.visualInspection(
+                spawnResult.objectId, manifest, prompt, code!, screenshot, callerId,
+              );
+              if (visualResult.code) code = visualResult.code;
+            }
+          } catch (err) {
+            log.warn('Visual inspection failed (non-fatal):', err instanceof Error ? err.message : String(err));
+          }
+        }
+
         // Phase 6: Connect to dependencies via Negotiator (fire-and-forget)
         if (callerId && deps.length > 0) {
           const connectNames = deps.map((d) => d.name).join(', ');
@@ -1611,6 +1707,28 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
             objectId: objectId as string, manifest, source: code, owner: this.id as string,
           })
         ).catch(err => log.warn('modify Failed to persist:', err));
+      }
+
+      // Phase 5d: Visual inspection after modify
+      if (this.screenshotId && code) {
+        try {
+          if (callerId) await this.reportProgress(callerId, '5d', 'Visually inspecting...');
+          await new Promise(resolve => setTimeout(resolve, 500));
+
+          const screenshot = await this.request<{ imageBase64: string; width: number; height: number } | null>(
+            request(this.id, this.screenshotId, 'captureWindow', { objectId }),
+            15000,
+          );
+
+          if (screenshot && screenshot.imageBase64) {
+            const visualResult = await this.visualInspection(
+              objectId, manifest, prompt, code, screenshot, callerId,
+            );
+            if (visualResult.code) code = visualResult.code;
+          }
+        } catch (err) {
+          log.warn('modify visual inspection failed (non-fatal):', err instanceof Error ? err.message : String(err));
+        }
       }
 
       // Phase 6: Connect to any new dependencies via Negotiator
@@ -2081,7 +2199,14 @@ Objects should be designed so that OTHER objects (which don't exist yet) can:
 
 4. **Discover them**: Use clear, descriptive interface IDs and method names. Another object might find you via Registry.discover().
 
-The more observable, inspectable, and controllable your object is, the more emergent behaviors become possible.`;
+The more observable, inspectable, and controllable your object is, the more emergent behaviors become possible.
+
+### Visual Inspection
+
+After your object is created or modified, a screenshot of its window will be captured and evaluated.
+Make sure the UI renders correctly on the first frame: draw all elements in your show() handler,
+use proper layout and spacing, and ensure text is readable. If the visual inspection finds issues,
+your code will be corrected automatically.`;
   }
 
   /**
@@ -2496,7 +2621,16 @@ Every object in the system supports the introspect protocol (abjects:introspect)
   const guide = await this.call(targetId, 'ask',
     { question: 'How do I subscribe to your events?' });
 
-Use this for dynamic composition — objects can learn about each other at runtime.`;
+Use this for dynamic composition — objects can learn about each other at runtime.
+
+## Visual Inspection
+
+After your object is spawned or modified, a screenshot of its window will be captured and
+evaluated. Your UI must render correctly on the very first frame. Ensure:
+- show() draws the complete initial UI before returning
+- Text is readable with proper contrast against the background
+- Layout elements are properly sized and positioned
+- No blank or empty windows -- always draw meaningful content in show()`;
   }
 
   /**

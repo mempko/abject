@@ -131,6 +131,7 @@ export { ShellExecutor, SHELL_EXECUTOR_ID } from './objects/capabilities/shell-e
 export { HostFileSystem, HOST_FILESYSTEM_ID } from './objects/capabilities/host-filesystem.js';
 export { WebSearch, WEB_SEARCH_ID } from './objects/capabilities/web-search.js';
 export { WebFetch, WEB_FETCH_ID } from './objects/capabilities/web-fetch.js';
+export { Screenshot, SCREENSHOT_ID } from './objects/capabilities/screenshot.js';
 export { SkillRegistry, SKILL_REGISTRY_ID } from './objects/skill-registry.js';
 export { SkillAgent, SKILL_AGENT_ID } from './objects/skill-agent.js';
 export { ObjectAgent, OBJECT_AGENT_ID } from './objects/object-agent.js';

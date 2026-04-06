@@ -66,6 +66,7 @@ import { ShellExecutor } from '../src/objects/capabilities/shell-executor.js';
 import { HostFileSystem } from '../src/objects/capabilities/host-filesystem.js';
 import { WebSearch } from '../src/objects/capabilities/web-search.js';
 import { WebFetch } from '../src/objects/capabilities/web-fetch.js';
+import { Screenshot } from '../src/objects/capabilities/screenshot.js';
 import { SkillRegistry } from '../src/objects/skill-registry.js';
 import { SkillBrowser } from '../src/objects/skill-browser.js';
 import { SkillAgent } from '../src/objects/skill-agent.js';
@@ -405,6 +406,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('HostFileSystem', () => new HostFileSystem());
   runtime.objectFactory.registerConstructor('WebSearch', () => new WebSearch());
   runtime.objectFactory.registerConstructor('WebFetch', () => new WebFetch());
+  runtime.objectFactory.registerConstructor('Screenshot', () => new Screenshot());
   runtime.objectFactory.registerConstructor('SkillRegistry', () => new SkillRegistry(path.resolve(DATA_DIR, 'skills')));
   runtime.objectFactory.registerConstructor('SkillBrowser', () => new SkillBrowser());
   runtime.objectFactory.registerConstructor('SkillAgent', () => new SkillAgent());
@@ -471,6 +473,7 @@ async function main(): Promise<void> {
   const hostFilesystemId = await supervisedSpawn('HostFileSystem');
   const webSearchId = await supervisedSpawn('WebSearch');
   const webFetchId = await supervisedSpawn('WebFetch');
+  const screenshotId = await supervisedSpawn('Screenshot');
   const windowManagerId = await supervisedSpawn('WindowManager');
   const widgetManagerId = await supervisedSpawn('WidgetManager');
 

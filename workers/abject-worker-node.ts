@@ -49,6 +49,7 @@ import { ShellExecutor } from '../src/objects/capabilities/shell-executor.js';
 import { HostFileSystem } from '../src/objects/capabilities/host-filesystem.js';
 import { WebSearch } from '../src/objects/capabilities/web-search.js';
 import { WebFetch } from '../src/objects/capabilities/web-fetch.js';
+import { Screenshot } from '../src/objects/capabilities/screenshot.js';
 import { SkillRegistry } from '../src/objects/skill-registry.js';
 import { SkillBrowser } from '../src/objects/skill-browser.js';
 import { SkillAgent } from '../src/objects/skill-agent.js';
@@ -107,6 +108,7 @@ constructors.set('ShellExecutor', () => new ShellExecutor());
 constructors.set('HostFileSystem', () => new HostFileSystem());
 constructors.set('WebSearch', () => new WebSearch());
 constructors.set('WebFetch', () => new WebFetch());
+constructors.set('Screenshot', () => new Screenshot());
 constructors.set('SkillRegistry', () => {
   const dataDir = process.env.ABJECTS_DATA_DIR ?? '.abjects';
   return new SkillRegistry(path.join(process.cwd(), dataDir, 'skills'));

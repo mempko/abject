@@ -131,6 +131,17 @@ export interface ShowMobileKeyboardMsg extends WsEnvelope {
   show: boolean;
 }
 
+export interface CaptureSurfaceRequestMsg extends WsEnvelope {
+  type: 'captureSurfaceRequest';
+  requestId: string;
+  surfaceId: string;
+}
+
+export interface CaptureDesktopRequestMsg extends WsEnvelope {
+  type: 'captureDesktopRequest';
+  requestId: string;
+}
+
 // =============================================================================
 // Auth messages (server -> client)
 // =============================================================================
@@ -169,6 +180,8 @@ export type BackendToFrontendMsg =
   | OpenUrlMsg
   | StartWindowDragMsg
   | ShowMobileKeyboardMsg
+  | CaptureSurfaceRequestMsg
+  | CaptureDesktopRequestMsg
   | AuthRequiredMsg
   | AuthNotRequiredMsg
   | AuthResultMsg;
@@ -219,6 +232,22 @@ export interface DisplayInfoReplyMsg extends WsEnvelope {
   height: number;
 }
 
+export interface CaptureSurfaceReplyMsg extends WsEnvelope {
+  type: 'captureSurfaceReply';
+  requestId: string;
+  imageBase64: string;
+  width: number;
+  height: number;
+}
+
+export interface CaptureDesktopReplyMsg extends WsEnvelope {
+  type: 'captureDesktopReply';
+  requestId: string;
+  imageBase64: string;
+  width: number;
+  height: number;
+}
+
 export interface SurfaceCreatedMsg extends WsEnvelope {
   type: 'surfaceCreated';
   surfaceId: string;
@@ -254,6 +283,8 @@ export type FrontendToBackendMsg =
   | EndWindowDragMsg
   | MeasureTextReplyMsg
   | DisplayInfoReplyMsg
+  | CaptureSurfaceReplyMsg
+  | CaptureDesktopReplyMsg
   | SurfaceCreatedMsg
   | ReadyMsg
   | FontMetricsMsg

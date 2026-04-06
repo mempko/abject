@@ -70,6 +70,9 @@ export const Capabilities = {
   WEB_SEARCH: 'abjects:web:search' as CapabilityId,
   WEB_FETCH: 'abjects:web:fetch' as CapabilityId,
 
+  // Screenshot
+  SCREENSHOT: 'abjects:screenshot:capture' as CapabilityId,
+
   // Skill management
   SKILL_MANAGE: 'abjects:skill:manage' as CapabilityId,
 } as const;
