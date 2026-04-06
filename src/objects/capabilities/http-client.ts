@@ -31,6 +31,9 @@ export interface HttpResponse {
 export class HttpClient extends Abject {
   private allowedDomains?: Set<string>;
   private deniedDomains?: Set<string>;
+  private webDisabled = false;
+  /** The only AbjectId allowed to call updatePermissions. Set once at bootstrap. */
+  private permissionsAuthorityId?: AbjectId;
 
   constructor(config?: {
     allowedDomains?: string[];
@@ -267,12 +270,38 @@ export class HttpClient extends Abject {
       );
       return DEFERRED_REPLY;
     });
+
+    this.on('setPermissionsAuthority', async (msg: AbjectMessage) => {
+      if (this.permissionsAuthorityId) return { success: false, error: 'Authority already set' };
+      this.permissionsAuthorityId = msg.routing.from;
+      return { success: true };
+    });
+
+    this.on('updatePermissions', async (msg: AbjectMessage) => {
+      if (this.permissionsAuthorityId && msg.routing.from !== this.permissionsAuthorityId) {
+        return { success: false, error: 'Unauthorized: only the permissions authority can update permissions' };
+      }
+      const { enabled, allowedDomains, deniedDomains } = msg.payload as {
+        enabled?: boolean;
+        allowedDomains?: string[];
+        deniedDomains?: string[];
+      };
+      if (enabled !== undefined) this.webDisabled = !enabled;
+      if (allowedDomains !== undefined) {
+        this.allowedDomains = allowedDomains.length > 0 ? new Set(allowedDomains) : undefined;
+      }
+      if (deniedDomains !== undefined) {
+        this.deniedDomains = deniedDomains.length > 0 ? new Set(deniedDomains) : undefined;
+      }
+      return { success: true };
+    });
   }
 
   /**
    * Make an HTTP request with retry for transient errors.
    */
   async makeRequest(req: HttpRequest): Promise<HttpResponse> {
+    if (this.webDisabled) throw new Error('Web access is disabled. Enable it in Settings > Permissions.');
     // Validate URL
     const url = new URL(req.url);
     this.validateScheme(url.protocol);
@@ -536,7 +565,21 @@ Every response has: { status, statusText, headers, body, ok }
 ### IMPORTANT
 - Do NOT use fetch() directly — always go through the HttpClient object.
 - Supported methods: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS.
-- Requests auto-retry on 429 and 5xx errors (up to 3 attempts).`;
+- Requests auto-retry on 429 and 5xx errors (up to 3 attempts).` + this.getRestrictionsGuide();
+  }
+
+  private getRestrictionsGuide(): string {
+    if (this.webDisabled) {
+      return `\n\n### RESTRICTIONS\nWeb access is currently DISABLED.`;
+    }
+    const parts: string[] = [];
+    if (this.allowedDomains && this.allowedDomains.size > 0) {
+      parts.push(`Allowed domains: ${[...this.allowedDomains].join(', ')}`);
+    }
+    if (this.deniedDomains && this.deniedDomains.size > 0) {
+      parts.push(`Denied domains: ${[...this.deniedDomains].join(', ')}`);
+    }
+    return parts.length > 0 ? `\n\n### RESTRICTIONS\n${parts.join('\n')}` : '';
   }
 }
 

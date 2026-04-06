@@ -26,6 +26,16 @@ const STORAGE_KEY_AUTH_ENABLED = 'global-settings:authEnabled';
 const STORAGE_KEY_AUTH_USER = 'global-settings:authUser';
 const STORAGE_KEY_AUTH_PASS = 'global-settings:authPass';
 
+// Permissions storage keys
+const STORAGE_KEY_FS_ALLOWED_PATHS = 'global-settings:fsAllowedPaths';
+const STORAGE_KEY_FS_READ_ONLY = 'global-settings:fsReadOnly';
+const STORAGE_KEY_SHELL_ENABLED = 'global-settings:shellEnabled';
+const STORAGE_KEY_SHELL_ALLOWED_CMDS = 'global-settings:shellAllowedCmds';
+const STORAGE_KEY_SHELL_DENIED_CMDS = 'global-settings:shellDeniedCmds';
+const STORAGE_KEY_WEB_ENABLED = 'global-settings:webEnabled';
+const STORAGE_KEY_WEB_ALLOWED_DOMAINS = 'global-settings:webAllowedDomains';
+const STORAGE_KEY_WEB_DENIED_DOMAINS = 'global-settings:webDeniedDomains';
+
 // Per-tier routing storage keys
 const STORAGE_KEY_TIER_SMART_PROVIDER = 'global-settings:tierSmartProvider';
 const STORAGE_KEY_TIER_SMART_MODEL = 'global-settings:tierSmartModel';
@@ -92,7 +102,7 @@ export class GlobalSettings extends Abject {
 
   // Tab state
   private tabBarId?: AbjectId;
-  private activeTab: 'ai' | 'auth' = 'ai';
+  private activeTab: 'ai' | 'auth' | 'permissions' = 'ai';
   private aiContainerId?: AbjectId;
   private authContainerId?: AbjectId;
 
@@ -102,6 +112,47 @@ export class GlobalSettings extends Abject {
   private authPassInputId?: AbjectId;
   private authPassToggleId?: AbjectId;
   private authSaveBtnId?: AbjectId;
+
+  // Permissions tab
+  private permissionsContainerId?: AbjectId;
+  private platformLabelId?: AbjectId;
+  // Filesystem
+  private fsReadOnlyCheckboxId?: AbjectId;
+  private fsPathInputId?: AbjectId;
+  private fsAddBtnId?: AbjectId;
+  private fsPathListId?: AbjectId;
+  private fsRemoveBtnId?: AbjectId;
+  // Shell
+  private shellEnabledCheckboxId?: AbjectId;
+  private shellCmdInputId?: AbjectId;
+  private shellAddBtnId?: AbjectId;
+  private shellCmdListId?: AbjectId;
+  private shellRemoveBtnId?: AbjectId;
+  private shellDeniedInputId?: AbjectId;
+  private shellDeniedAddBtnId?: AbjectId;
+  private shellDeniedListId?: AbjectId;
+  private shellDeniedRemoveBtnId?: AbjectId;
+  // Web
+  private webEnabledCheckboxId?: AbjectId;
+  private webDomainInputId?: AbjectId;
+  private webAddBtnId?: AbjectId;
+  private webDomainListId?: AbjectId;
+  private webRemoveBtnId?: AbjectId;
+  private webDeniedInputId?: AbjectId;
+  private webDeniedAddBtnId?: AbjectId;
+  private webDeniedListId?: AbjectId;
+  private webDeniedRemoveBtnId?: AbjectId;
+  // Permissions save
+  private permsSaveBtnId?: AbjectId;
+  // In-memory permissions state
+  private fsAllowedPaths: string[] = [];
+  private fsReadOnly = false;
+  private shellEnabled = true;
+  private shellAllowedCmds: string[] = [];
+  private shellDeniedCmds: string[] = [];
+  private webEnabled = true;
+  private webAllowedDomains: string[] = [];
+  private webDeniedDomains: string[] = [];
 
   private unmasked: Set<AbjectId> = new Set();
 
@@ -264,6 +315,7 @@ export class GlobalSettings extends Abject {
       }
 
       await this.applySavedAuthConfig();
+      await this.applySavedPermissions();
     }
 
     // Configure all providers and tier routing
@@ -338,15 +390,37 @@ export class GlobalSettings extends Abject {
       return { visible: !!this.windowId };
     });
 
+    // Handle permission requests from capability objects
+    this.on('requestPermission', async (msg: AbjectMessage) => {
+      const { type, resource, description, skillName } = msg.payload as {
+        type: 'shell' | 'directory' | 'skill_shell';
+        resource: string;
+        description: string;
+        skillName?: string;
+      };
+      if (type === 'skill_shell' && skillName) {
+        return this.showSkillPermissionPrompt(skillName, resource, description);
+      }
+      return this.showPermissionPrompt(type as 'shell' | 'directory', resource, description);
+    });
+
     // Handle 'changed' events from widget dependents
     this.on('changed', async (m: AbjectMessage) => {
       const { aspect, value } = m.payload as { aspect: string; value?: unknown };
       const fromId = m.routing.from;
 
+      // Permission prompt buttons
+      if (this._pendingPermissionPrompt && aspect === 'click') {
+        if (fromId === this._promptAcceptOnceBtnId) { this._pendingPermissionPrompt.resolve('accept_once'); return; }
+        if (fromId === this._promptAcceptAlwaysBtnId) { this._pendingPermissionPrompt.resolve('accept_always'); return; }
+        if (fromId === this._promptDenyBtnId) { this._pendingPermissionPrompt.resolve('deny'); return; }
+        if (fromId === this._promptDenyAlwaysBtnId) { this._pendingPermissionPrompt.resolve('deny_always'); return; }
+      }
+
       // Tab bar changed
       if (fromId === this.tabBarId && aspect === 'change') {
         const idx = value as number;
-        this.activeTab = idx === 0 ? 'ai' : 'auth';
+        this.activeTab = idx === 0 ? 'ai' : idx === 1 ? 'auth' : 'permissions';
         await this.switchTab();
         return;
       }
@@ -399,6 +473,121 @@ export class GlobalSettings extends Abject {
         return;
       }
 
+      // ── Permissions tab handlers ──
+
+      // Filesystem: add path
+      if (fromId === this.fsAddBtnId && aspect === 'click') {
+        const val = await this.request<string>(request(this.id, this.fsPathInputId!, 'getValue', {}));
+        if (val && !this.fsAllowedPaths.includes(val)) {
+          this.fsAllowedPaths.push(val);
+          await this.request(request(this.id, this.fsPathListId!, 'update', { items: this.fsAllowedPaths }));
+          await this.request(request(this.id, this.fsPathInputId!, 'update', { text: '' }));
+        }
+        return;
+      }
+      if (fromId === this.fsRemoveBtnId && aspect === 'click') {
+        const sel = await this.request<string | null>(request(this.id, this.fsPathListId!, 'getValue', {}));
+        if (sel) {
+          this.fsAllowedPaths = this.fsAllowedPaths.filter(p => p !== sel);
+          await this.request(request(this.id, this.fsPathListId!, 'update', { items: this.fsAllowedPaths }));
+        }
+        return;
+      }
+      if (fromId === this.fsReadOnlyCheckboxId && aspect === 'change') {
+        this.fsReadOnly = value as boolean;
+        return;
+      }
+
+      // Shell: enabled checkbox
+      if (fromId === this.shellEnabledCheckboxId && aspect === 'change') {
+        this.shellEnabled = value as boolean;
+        return;
+      }
+      // Shell: add allowed command
+      if (fromId === this.shellAddBtnId && aspect === 'click') {
+        const val = await this.request<string>(request(this.id, this.shellCmdInputId!, 'getValue', {}));
+        if (val && !this.shellAllowedCmds.includes(val)) {
+          this.shellAllowedCmds.push(val);
+          await this.request(request(this.id, this.shellCmdListId!, 'update', { items: this.shellAllowedCmds }));
+          await this.request(request(this.id, this.shellCmdInputId!, 'update', { text: '' }));
+        }
+        return;
+      }
+      if (fromId === this.shellRemoveBtnId && aspect === 'click') {
+        const sel = await this.request<string | null>(request(this.id, this.shellCmdListId!, 'getValue', {}));
+        if (sel) {
+          this.shellAllowedCmds = this.shellAllowedCmds.filter(c => c !== sel);
+          await this.request(request(this.id, this.shellCmdListId!, 'update', { items: this.shellAllowedCmds }));
+        }
+        return;
+      }
+      // Shell: add denied command
+      if (fromId === this.shellDeniedAddBtnId && aspect === 'click') {
+        const val = await this.request<string>(request(this.id, this.shellDeniedInputId!, 'getValue', {}));
+        if (val && !this.shellDeniedCmds.includes(val)) {
+          this.shellDeniedCmds.push(val);
+          await this.request(request(this.id, this.shellDeniedListId!, 'update', { items: this.shellDeniedCmds }));
+          await this.request(request(this.id, this.shellDeniedInputId!, 'update', { text: '' }));
+        }
+        return;
+      }
+      if (fromId === this.shellDeniedRemoveBtnId && aspect === 'click') {
+        const sel = await this.request<string | null>(request(this.id, this.shellDeniedListId!, 'getValue', {}));
+        if (sel) {
+          this.shellDeniedCmds = this.shellDeniedCmds.filter(c => c !== sel);
+          await this.request(request(this.id, this.shellDeniedListId!, 'update', { items: this.shellDeniedCmds }));
+        }
+        return;
+      }
+
+      // Web: enabled checkbox
+      if (fromId === this.webEnabledCheckboxId && aspect === 'change') {
+        this.webEnabled = value as boolean;
+        return;
+      }
+      // Web: add allowed domain
+      if (fromId === this.webAddBtnId && aspect === 'click') {
+        const val = await this.request<string>(request(this.id, this.webDomainInputId!, 'getValue', {}));
+        if (val && !this.webAllowedDomains.includes(val)) {
+          this.webAllowedDomains.push(val);
+          await this.request(request(this.id, this.webDomainListId!, 'update', { items: this.webAllowedDomains }));
+          await this.request(request(this.id, this.webDomainInputId!, 'update', { text: '' }));
+        }
+        return;
+      }
+      if (fromId === this.webRemoveBtnId && aspect === 'click') {
+        const sel = await this.request<string | null>(request(this.id, this.webDomainListId!, 'getValue', {}));
+        if (sel) {
+          this.webAllowedDomains = this.webAllowedDomains.filter(d => d !== sel);
+          await this.request(request(this.id, this.webDomainListId!, 'update', { items: this.webAllowedDomains }));
+        }
+        return;
+      }
+      // Web: add denied domain
+      if (fromId === this.webDeniedAddBtnId && aspect === 'click') {
+        const val = await this.request<string>(request(this.id, this.webDeniedInputId!, 'getValue', {}));
+        if (val && !this.webDeniedDomains.includes(val)) {
+          this.webDeniedDomains.push(val);
+          await this.request(request(this.id, this.webDeniedListId!, 'update', { items: this.webDeniedDomains }));
+          await this.request(request(this.id, this.webDeniedInputId!, 'update', { text: '' }));
+        }
+        return;
+      }
+      if (fromId === this.webDeniedRemoveBtnId && aspect === 'click') {
+        const sel = await this.request<string | null>(request(this.id, this.webDeniedListId!, 'getValue', {}));
+        if (sel) {
+          this.webDeniedDomains = this.webDeniedDomains.filter(d => d !== sel);
+          await this.request(request(this.id, this.webDeniedListId!, 'update', { items: this.webDeniedDomains }));
+        }
+        return;
+      }
+
+      // Permissions save button
+      if (fromId === this.permsSaveBtnId && aspect === 'click') {
+        await this.savePermissions();
+        return;
+      }
+
       // Text input submit triggers save
       if (aspect === 'submit') {
         if (fromId === this.authUserInputId || fromId === this.authPassInputId) {
@@ -448,9 +637,9 @@ export class GlobalSettings extends Abject {
     const { widgetIds: [tabBarId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'tabBar', windowId: this.windowId,
-          tabs: ['AI', 'Auth'],
+          tabs: ['AI', 'Auth', 'Permissions'],
           closable: false,
-          selectedIndex: this.activeTab === 'ai' ? 0 : 1 },
+          selectedIndex: this.activeTab === 'ai' ? 0 : this.activeTab === 'auth' ? 1 : 2 },
       ]})
     );
     this.tabBarId = tabBarId;
@@ -487,6 +676,19 @@ export class GlobalSettings extends Abject {
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
 
+    // Permissions container (scrollable VBox, initially hidden)
+    this.permissionsContainerId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.permissionsContainerId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
     // Status label at bottom (always visible)
     const { widgetIds: [statusLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
@@ -505,6 +707,8 @@ export class GlobalSettings extends Abject {
     await this.buildAiTab();
     // Build Auth tab content
     await this.buildAuthTab();
+    // Build Permissions tab content
+    await this.buildPermissionsTab();
     // Show correct tab
     await this.switchTab();
 
@@ -1084,6 +1288,32 @@ export class GlobalSettings extends Abject {
     this.tabBarId = undefined;
     this.aiContainerId = undefined;
     this.authContainerId = undefined;
+    this.permissionsContainerId = undefined;
+    this.platformLabelId = undefined;
+    this.fsReadOnlyCheckboxId = undefined;
+    this.fsPathInputId = undefined;
+    this.fsAddBtnId = undefined;
+    this.fsPathListId = undefined;
+    this.fsRemoveBtnId = undefined;
+    this.shellEnabledCheckboxId = undefined;
+    this.shellCmdInputId = undefined;
+    this.shellAddBtnId = undefined;
+    this.shellCmdListId = undefined;
+    this.shellRemoveBtnId = undefined;
+    this.shellDeniedInputId = undefined;
+    this.shellDeniedAddBtnId = undefined;
+    this.shellDeniedListId = undefined;
+    this.shellDeniedRemoveBtnId = undefined;
+    this.webEnabledCheckboxId = undefined;
+    this.webDomainInputId = undefined;
+    this.webAddBtnId = undefined;
+    this.webDomainListId = undefined;
+    this.webRemoveBtnId = undefined;
+    this.webDeniedInputId = undefined;
+    this.webDeniedAddBtnId = undefined;
+    this.webDeniedListId = undefined;
+    this.webDeniedRemoveBtnId = undefined;
+    this.permsSaveBtnId = undefined;
     this.unmasked.clear();
 
     this.changed('visibility', false);
@@ -1092,10 +1322,10 @@ export class GlobalSettings extends Abject {
 
   /** Show/hide tab containers based on activeTab. */
   private async switchTab(): Promise<void> {
-    if (!this.aiContainerId || !this.authContainerId) return;
-    const showAi = this.activeTab === 'ai';
-    await this.request(request(this.id, this.aiContainerId, 'update', { style: { visible: showAi } }));
-    await this.request(request(this.id, this.authContainerId, 'update', { style: { visible: !showAi } }));
+    if (!this.aiContainerId || !this.authContainerId || !this.permissionsContainerId) return;
+    await this.request(request(this.id, this.aiContainerId, 'update', { style: { visible: this.activeTab === 'ai' } }));
+    await this.request(request(this.id, this.authContainerId, 'update', { style: { visible: this.activeTab === 'auth' } }));
+    await this.request(request(this.id, this.permissionsContainerId, 'update', { style: { visible: this.activeTab === 'permissions' } }));
   }
 
   // ========== HELPERS ==========
@@ -1291,6 +1521,1043 @@ export class GlobalSettings extends Abject {
 
     log.info(`Auth settings saved (enabled=${enabled})`);
     await this.setStatus(enabled ? 'Auth enabled. Reconnecting...' : 'Auth disabled.');
+  }
+
+  // ========== PERMISSIONS TAB ==========
+
+  /** Build Permissions tab content into permissionsContainerId. */
+  private async buildPermissionsTab(): Promise<void> {
+    const cId = this.permissionsContainerId!;
+
+    // Load saved permission values
+    if (this.storageId) {
+      const fsPathsJson = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_FS_ALLOWED_PATHS })
+      );
+      if (fsPathsJson) { try { this.fsAllowedPaths = JSON.parse(fsPathsJson); } catch { /* ignore */ } }
+
+      const fsRo = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_FS_READ_ONLY })
+      );
+      if (fsRo !== null) this.fsReadOnly = fsRo === 'true';
+
+      const shellEn = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_SHELL_ENABLED })
+      );
+      if (shellEn !== null) this.shellEnabled = shellEn === 'true';
+
+      const shellAllowJson = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_SHELL_ALLOWED_CMDS })
+      );
+      if (shellAllowJson) { try { this.shellAllowedCmds = JSON.parse(shellAllowJson); } catch { /* ignore */ } }
+
+      const shellDenyJson = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_SHELL_DENIED_CMDS })
+      );
+      if (shellDenyJson) { try { this.shellDeniedCmds = JSON.parse(shellDenyJson); } catch { /* ignore */ } }
+
+      const webEn = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_ENABLED })
+      );
+      if (webEn !== null) this.webEnabled = webEn === 'true';
+
+      const webAllowJson = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_ALLOWED_DOMAINS })
+      );
+      if (webAllowJson) { try { this.webAllowedDomains = JSON.parse(webAllowJson); } catch { /* ignore */ } }
+
+      const webDenyJson = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_DENIED_DOMAINS })
+      );
+      if (webDenyJson) { try { this.webDeniedDomains = JSON.parse(webDenyJson); } catch { /* ignore */ } }
+    }
+
+    // Platform info label
+    let platformText = 'Platform: unknown';
+    try {
+      const shellId = await this.discoverDep('ShellExecutor');
+      if (shellId) {
+        const info = await this.request<{ os: string; arch: string; shell: string }>(
+          request(this.id, shellId, 'getPlatformInfo', {})
+        );
+        platformText = `Platform: ${info.os} ${info.arch} (${info.shell})`;
+      }
+    } catch { /* ShellExecutor not available */ }
+
+    const { widgetIds: [platLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: platformText,
+          style: { color: this.theme.textDescription, fontSize: 12 } },
+      ]})
+    );
+    this.platformLabelId = platLabelId;
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.platformLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // ── Filesystem section ──
+    const { widgetIds: [fsHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Filesystem',
+          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
+      ]})
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: fsHeaderId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 24 },
+    }));
+
+    // Read-only checkbox
+    const { widgetIds: [fsRoCheckId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'checkbox', windowId: this.windowId, checked: this.fsReadOnly, text: 'Read-only mode' },
+      ]})
+    );
+    this.fsReadOnlyCheckboxId = fsRoCheckId;
+    await this.request(request(this.id, this.fsReadOnlyCheckboxId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.fsReadOnlyCheckboxId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 28 },
+    }));
+
+    // Allowed paths label
+    const { widgetIds: [fsPathLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Allowed paths (will prompt if not listed)',
+          style: { color: this.theme.textHeading, fontSize: 13 } },
+      ]})
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: fsPathLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // Path input + Add button row
+    const fsAddRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: cId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: fsAddRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    const { widgetIds: [fsPathInId, fsAddId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, placeholder: '/path/to/directory' },
+        { type: 'button', windowId: this.windowId, text: 'Add' },
+      ]})
+    );
+    this.fsPathInputId = fsPathInId;
+    this.fsAddBtnId = fsAddId;
+    await this.request(request(this.id, this.fsPathInputId, 'addDependent', {}));
+    await this.request(request(this.id, fsAddRowId, 'addLayoutChild', {
+      widgetId: this.fsPathInputId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+    await this.request(request(this.id, this.fsAddBtnId, 'addDependent', {}));
+    await this.request(request(this.id, fsAddRowId, 'addLayoutChild', {
+      widgetId: this.fsAddBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 56, height: 32 },
+    }));
+
+    // Path list
+    const { widgetIds: [fsListId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'list', windowId: this.windowId, items: this.fsAllowedPaths, searchable: false,
+          style: { height: 80 } },
+      ]})
+    );
+    this.fsPathListId = fsListId;
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.fsPathListId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 80 },
+    }));
+
+    // Remove button
+    const { widgetIds: [fsRemId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Remove Selected' },
+      ]})
+    );
+    this.fsRemoveBtnId = fsRemId;
+    await this.request(request(this.id, this.fsRemoveBtnId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.fsRemoveBtnId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: 130, height: 28 },
+    }));
+
+    // ── Shell section ──
+    const { widgetIds: [shellHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Shell Execution',
+          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
+      ]})
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: shellHeaderId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 24 },
+    }));
+
+    // Shell enabled checkbox
+    const { widgetIds: [shellEnCheckId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'checkbox', windowId: this.windowId, checked: this.shellEnabled, text: 'Enable shell execution' },
+      ]})
+    );
+    this.shellEnabledCheckboxId = shellEnCheckId;
+    await this.request(request(this.id, this.shellEnabledCheckboxId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.shellEnabledCheckboxId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 28 },
+    }));
+
+    // Allowed commands label
+    const { widgetIds: [shellAllowLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Allowed commands (will prompt if not listed)',
+          style: { color: this.theme.textHeading, fontSize: 13 } },
+      ]})
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: shellAllowLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // Allowed commands input + Add row
+    const shellAddRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: cId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: shellAddRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    const { widgetIds: [shellCmdInId, shellAddId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, placeholder: 'e.g. git, ls, npm' },
+        { type: 'button', windowId: this.windowId, text: 'Add' },
+      ]})
+    );
+    this.shellCmdInputId = shellCmdInId;
+    this.shellAddBtnId = shellAddId;
+    await this.request(request(this.id, this.shellCmdInputId, 'addDependent', {}));
+    await this.request(request(this.id, shellAddRowId, 'addLayoutChild', {
+      widgetId: this.shellCmdInputId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+    await this.request(request(this.id, this.shellAddBtnId, 'addDependent', {}));
+    await this.request(request(this.id, shellAddRowId, 'addLayoutChild', {
+      widgetId: this.shellAddBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 56, height: 32 },
+    }));
+
+    // Allowed commands list
+    const { widgetIds: [shellListId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'list', windowId: this.windowId, items: this.shellAllowedCmds, searchable: false,
+          style: { height: 80 } },
+      ]})
+    );
+    this.shellCmdListId = shellListId;
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.shellCmdListId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 80 },
+    }));
+
+    // Allowed commands remove button
+    const { widgetIds: [shellRemId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Remove Selected' },
+      ]})
+    );
+    this.shellRemoveBtnId = shellRemId;
+    await this.request(request(this.id, this.shellRemoveBtnId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.shellRemoveBtnId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: 130, height: 28 },
+    }));
+
+    // Denied commands label
+    const { widgetIds: [shellDenyLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Denied commands',
+          style: { color: this.theme.textHeading, fontSize: 13 } },
+      ]})
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: shellDenyLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // Denied commands input + Add row
+    const shellDenyAddRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: cId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: shellDenyAddRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    const { widgetIds: [shellDenyInId, shellDenyAddId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, placeholder: 'e.g. rm, sudo' },
+        { type: 'button', windowId: this.windowId, text: 'Add' },
+      ]})
+    );
+    this.shellDeniedInputId = shellDenyInId;
+    this.shellDeniedAddBtnId = shellDenyAddId;
+    await this.request(request(this.id, this.shellDeniedInputId, 'addDependent', {}));
+    await this.request(request(this.id, shellDenyAddRowId, 'addLayoutChild', {
+      widgetId: this.shellDeniedInputId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+    await this.request(request(this.id, this.shellDeniedAddBtnId, 'addDependent', {}));
+    await this.request(request(this.id, shellDenyAddRowId, 'addLayoutChild', {
+      widgetId: this.shellDeniedAddBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 56, height: 32 },
+    }));
+
+    // Denied commands list
+    const { widgetIds: [shellDenyListId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'list', windowId: this.windowId, items: this.shellDeniedCmds, searchable: false,
+          style: { height: 80 } },
+      ]})
+    );
+    this.shellDeniedListId = shellDenyListId;
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.shellDeniedListId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 80 },
+    }));
+
+    // Denied commands remove button
+    const { widgetIds: [shellDenyRemId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Remove Selected' },
+      ]})
+    );
+    this.shellDeniedRemoveBtnId = shellDenyRemId;
+    await this.request(request(this.id, this.shellDeniedRemoveBtnId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.shellDeniedRemoveBtnId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: 130, height: 28 },
+    }));
+
+    // ── Web (HTTP) section ──
+    const { widgetIds: [webHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Web / HTTP',
+          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
+      ]})
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: webHeaderId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 24 },
+    }));
+
+    // Web enabled checkbox
+    const { widgetIds: [webEnCheckId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'checkbox', windowId: this.windowId, checked: this.webEnabled, text: 'Enable HTTP requests' },
+      ]})
+    );
+    this.webEnabledCheckboxId = webEnCheckId;
+    await this.request(request(this.id, this.webEnabledCheckboxId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.webEnabledCheckboxId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 28 },
+    }));
+
+    // Allowed domains label
+    const { widgetIds: [webAllowLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Allowed domains (empty = allow all)',
+          style: { color: this.theme.textHeading, fontSize: 13 } },
+      ]})
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: webAllowLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // Allowed domains input + Add row
+    const webAddRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: cId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: webAddRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    const { widgetIds: [webDomInId, webAddId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, placeholder: 'e.g. api.example.com' },
+        { type: 'button', windowId: this.windowId, text: 'Add' },
+      ]})
+    );
+    this.webDomainInputId = webDomInId;
+    this.webAddBtnId = webAddId;
+    await this.request(request(this.id, this.webDomainInputId, 'addDependent', {}));
+    await this.request(request(this.id, webAddRowId, 'addLayoutChild', {
+      widgetId: this.webDomainInputId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+    await this.request(request(this.id, this.webAddBtnId, 'addDependent', {}));
+    await this.request(request(this.id, webAddRowId, 'addLayoutChild', {
+      widgetId: this.webAddBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 56, height: 32 },
+    }));
+
+    // Allowed domains list
+    const { widgetIds: [webListId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'list', windowId: this.windowId, items: this.webAllowedDomains, searchable: false,
+          style: { height: 80 } },
+      ]})
+    );
+    this.webDomainListId = webListId;
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.webDomainListId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 80 },
+    }));
+
+    // Allowed domains remove button
+    const { widgetIds: [webRemId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Remove Selected' },
+      ]})
+    );
+    this.webRemoveBtnId = webRemId;
+    await this.request(request(this.id, this.webRemoveBtnId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.webRemoveBtnId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: 130, height: 28 },
+    }));
+
+    // Denied domains label
+    const { widgetIds: [webDenyLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Denied domains',
+          style: { color: this.theme.textHeading, fontSize: 13 } },
+      ]})
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: webDenyLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // Denied domains input + Add row
+    const webDenyAddRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: cId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: webDenyAddRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    const { widgetIds: [webDenyInId, webDenyAddId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, placeholder: 'e.g. evil.example.com' },
+        { type: 'button', windowId: this.windowId, text: 'Add' },
+      ]})
+    );
+    this.webDeniedInputId = webDenyInId;
+    this.webDeniedAddBtnId = webDenyAddId;
+    await this.request(request(this.id, this.webDeniedInputId, 'addDependent', {}));
+    await this.request(request(this.id, webDenyAddRowId, 'addLayoutChild', {
+      widgetId: this.webDeniedInputId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+    await this.request(request(this.id, this.webDeniedAddBtnId, 'addDependent', {}));
+    await this.request(request(this.id, webDenyAddRowId, 'addLayoutChild', {
+      widgetId: this.webDeniedAddBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 56, height: 32 },
+    }));
+
+    // Denied domains list
+    const { widgetIds: [webDenyListId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'list', windowId: this.windowId, items: this.webDeniedDomains, searchable: false,
+          style: { height: 80 } },
+      ]})
+    );
+    this.webDeniedListId = webDenyListId;
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.webDeniedListId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 80 },
+    }));
+
+    // Denied domains remove button
+    const { widgetIds: [webDenyRemId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Remove Selected' },
+      ]})
+    );
+    this.webDeniedRemoveBtnId = webDenyRemId;
+    await this.request(request(this.id, this.webDeniedRemoveBtnId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.webDeniedRemoveBtnId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: 130, height: 28 },
+    }));
+
+    // ── Save button ──
+    const permsSaveRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: cId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: permsSaveRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 36 },
+    }));
+
+    await this.request(request(this.id, permsSaveRowId, 'addLayoutSpacer', {}));
+
+    const { widgetIds: [permsSaveId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Save Permissions',
+          style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+      ]})
+    );
+    this.permsSaveBtnId = permsSaveId;
+    await this.request(request(this.id, this.permsSaveBtnId, 'addDependent', {}));
+    await this.request(request(this.id, permsSaveRowId, 'addLayoutChild', {
+      widgetId: this.permsSaveBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 150, height: 36 },
+    }));
+  }
+
+  /**
+   * Persist permission state to Storage and propagate to target objects.
+   */
+  private async savePermissions(): Promise<void> {
+    if (!this.storageId) return;
+
+    await this.request(request(this.id, this.storageId, 'set', {
+      key: STORAGE_KEY_FS_ALLOWED_PATHS, value: JSON.stringify(this.fsAllowedPaths),
+    }));
+    await this.request(request(this.id, this.storageId, 'set', {
+      key: STORAGE_KEY_FS_READ_ONLY, value: String(this.fsReadOnly),
+    }));
+    await this.request(request(this.id, this.storageId, 'set', {
+      key: STORAGE_KEY_SHELL_ENABLED, value: String(this.shellEnabled),
+    }));
+    await this.request(request(this.id, this.storageId, 'set', {
+      key: STORAGE_KEY_SHELL_ALLOWED_CMDS, value: JSON.stringify(this.shellAllowedCmds),
+    }));
+    await this.request(request(this.id, this.storageId, 'set', {
+      key: STORAGE_KEY_SHELL_DENIED_CMDS, value: JSON.stringify(this.shellDeniedCmds),
+    }));
+    await this.request(request(this.id, this.storageId, 'set', {
+      key: STORAGE_KEY_WEB_ENABLED, value: String(this.webEnabled),
+    }));
+    await this.request(request(this.id, this.storageId, 'set', {
+      key: STORAGE_KEY_WEB_ALLOWED_DOMAINS, value: JSON.stringify(this.webAllowedDomains),
+    }));
+    await this.request(request(this.id, this.storageId, 'set', {
+      key: STORAGE_KEY_WEB_DENIED_DOMAINS, value: JSON.stringify(this.webDeniedDomains),
+    }));
+
+    await this.propagatePermissions();
+    log.info('Permissions saved and propagated');
+    await this.setStatus('Permissions saved!');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Permission Prompt
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** Active permission prompt: resolves when user clicks a button. */
+  private _pendingPermissionPrompt?: { resolve: (decision: string) => void };
+  private _promptWindowId?: AbjectId;
+  private _promptAcceptOnceBtnId?: AbjectId;
+  private _promptAcceptAlwaysBtnId?: AbjectId;
+  private _promptDenyBtnId?: AbjectId;
+  private _promptDenyAlwaysBtnId?: AbjectId;
+
+  private async showPermissionPrompt(
+    type: 'shell' | 'directory',
+    resource: string,
+    description: string,
+  ): Promise<{ decision: string }> {
+    if (!this.widgetManagerId) return { decision: 'deny' };
+
+    // If there's already a prompt open, deny (don't stack prompts)
+    if (this._pendingPermissionPrompt) return { decision: 'deny' };
+
+    try {
+      const title = type === 'shell' ? 'Shell Permission' : 'Filesystem Permission';
+      const windowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId, 'createWindowAbject', {
+          title,
+          rect: { x: 300, y: 200, width: 440, height: 200 },
+          resizable: false,
+          chromeless: false,
+        })
+      );
+      this._promptWindowId = windowId;
+
+      const layoutId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId, 'createVBox', {
+          windowId,
+          margins: { top: 16, right: 16, bottom: 16, left: 16 },
+          spacing: 12,
+        })
+      );
+
+      // Description label
+      const { widgetIds: [descLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId, 'create', { specs: [
+          { type: 'label', windowId, text: description,
+            style: { color: this.theme.textPrimary, fontSize: 14, wordWrap: true } },
+        ]})
+      );
+      await this.request(request(this.id, layoutId, 'addLayoutChild', {
+        widgetId: descLabelId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 40 },
+      }));
+
+      // Resource label
+      const { widgetIds: [resLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId, 'create', { specs: [
+          { type: 'label', windowId, text: `"${resource}"`,
+            style: { color: this.theme.statusWarning, fontSize: 13, fontFamily: 'monospace' } },
+        ]})
+      );
+      await this.request(request(this.id, layoutId, 'addLayoutChild', {
+        widgetId: resLabelId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 24 },
+      }));
+
+      // Button row
+      const btnRowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId, 'createHBox', {
+          windowId,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 8,
+        })
+      );
+      await this.request(request(this.id, layoutId, 'addLayoutChild', {
+        widgetId: btnRowId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 36 },
+      }));
+
+      const { widgetIds: [acceptOnceId, acceptAlwaysId, denyId, denyAlwaysId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId, 'create', { specs: [
+          { type: 'button', windowId, text: 'Once', style: { fontSize: 12 } },
+          { type: 'button', windowId, text: 'Always', style: { fontSize: 12, color: this.theme.statusSuccess } },
+          { type: 'button', windowId, text: 'Deny', style: { fontSize: 12 } },
+          { type: 'button', windowId, text: 'Never', style: { fontSize: 12, color: this.theme.statusError } },
+        ]})
+      );
+
+      this._promptAcceptOnceBtnId = acceptOnceId;
+      this._promptAcceptAlwaysBtnId = acceptAlwaysId;
+      this._promptDenyBtnId = denyId;
+      this._promptDenyAlwaysBtnId = denyAlwaysId;
+
+      for (const btnId of [acceptOnceId, acceptAlwaysId, denyId, denyAlwaysId]) {
+        await this.request(request(this.id, btnId, 'addDependent', {}));
+        await this.request(request(this.id, btnRowId, 'addLayoutChild', {
+          widgetId: btnId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 30 },
+        }));
+      }
+
+      // Wait for user decision
+      const decision = await new Promise<string>((resolve) => {
+        this._pendingPermissionPrompt = { resolve };
+      });
+
+      // Persist "always" decisions to storage and update lists
+      if (decision === 'accept_always') {
+        if (type === 'shell') {
+          if (!this.shellAllowedCmds.includes(resource)) this.shellAllowedCmds.push(resource);
+        } else {
+          if (!this.fsAllowedPaths.includes(resource)) this.fsAllowedPaths.push(resource);
+        }
+        await this.savePermissions();
+      } else if (decision === 'deny_always') {
+        if (type === 'shell') {
+          if (!this.shellDeniedCmds.includes(resource)) this.shellDeniedCmds.push(resource);
+        }
+        await this.savePermissions();
+      }
+
+      return { decision };
+    } finally {
+      // Clean up prompt window
+      this._pendingPermissionPrompt = undefined;
+      if (this._promptWindowId && this.widgetManagerId) {
+        try {
+          await this.request(request(this.id, this.widgetManagerId, 'destroyWindowAbject', {
+            windowId: this._promptWindowId,
+          }));
+        } catch { /* best effort */ }
+      }
+      this._promptWindowId = undefined;
+      this._promptAcceptOnceBtnId = undefined;
+      this._promptAcceptAlwaysBtnId = undefined;
+      this._promptDenyBtnId = undefined;
+      this._promptDenyAlwaysBtnId = undefined;
+    }
+  }
+
+  /** Per-skill allowed commands (persisted). */
+  private skillPermissions: Map<string, string[]> = new Map();
+
+  private async showSkillPermissionPrompt(
+    skillName: string,
+    cmdName: string,
+    description: string,
+  ): Promise<{ decision: string }> {
+    if (!this.widgetManagerId) return { decision: 'deny' };
+    if (this._pendingPermissionPrompt) return { decision: 'deny' };
+
+    try {
+      const windowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId, 'createWindowAbject', {
+          title: 'Skill Permission',
+          rect: { x: 300, y: 200, width: 440, height: 180 },
+          resizable: false,
+          chromeless: false,
+        })
+      );
+      this._promptWindowId = windowId;
+
+      const layoutId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId, 'createVBox', {
+          windowId,
+          margins: { top: 16, right: 16, bottom: 16, left: 16 },
+          spacing: 12,
+        })
+      );
+
+      const { widgetIds: [descLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId, 'create', { specs: [
+          { type: 'label', windowId, text: description,
+            style: { color: this.theme.textPrimary, fontSize: 14, wordWrap: true } },
+        ]})
+      );
+      await this.request(request(this.id, layoutId, 'addLayoutChild', {
+        widgetId: descLabelId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 40 },
+      }));
+
+      const { widgetIds: [resLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId, 'create', { specs: [
+          { type: 'label', windowId, text: `"${cmdName}"`,
+            style: { color: this.theme.statusWarning, fontSize: 13, fontFamily: 'monospace' } },
+        ]})
+      );
+      await this.request(request(this.id, layoutId, 'addLayoutChild', {
+        widgetId: resLabelId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 24 },
+      }));
+
+      // Two buttons only for skills: Allow / Deny
+      const btnRowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId, 'createHBox', {
+          windowId,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 8,
+        })
+      );
+      await this.request(request(this.id, layoutId, 'addLayoutChild', {
+        widgetId: btnRowId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 36 },
+      }));
+
+      const { widgetIds: [allowBtnId, denyBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId, 'create', { specs: [
+          { type: 'button', windowId, text: 'Allow', style: { fontSize: 12, color: this.theme.statusSuccess } },
+          { type: 'button', windowId, text: 'Deny', style: { fontSize: 12, color: this.theme.statusError } },
+        ]})
+      );
+
+      this._promptAcceptAlwaysBtnId = allowBtnId;
+      this._promptDenyBtnId = denyBtnId;
+
+      for (const btnId of [allowBtnId, denyBtnId]) {
+        await this.request(request(this.id, btnId, 'addDependent', {}));
+        await this.request(request(this.id, btnRowId, 'addLayoutChild', {
+          widgetId: btnId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: 30 },
+        }));
+      }
+
+      const decision = await new Promise<string>((resolve) => {
+        this._pendingPermissionPrompt = { resolve };
+      });
+
+      // Persist if allowed
+      if (decision === 'accept_always' || decision === 'accept') {
+        const existing = this.skillPermissions.get(skillName) ?? [];
+        if (!existing.includes(cmdName)) existing.push(cmdName);
+        this.skillPermissions.set(skillName, existing);
+
+        // Persist skill permissions + skill names index
+        if (this.storageId) {
+          try {
+            await this.request(request(this.id, this.storageId, 'set', {
+              key: `global-settings:skillPerms:${skillName}`,
+              value: JSON.stringify(existing),
+            }));
+            const allNames = Array.from(this.skillPermissions.keys());
+            await this.request(request(this.id, this.storageId, 'set', {
+              key: 'global-settings:skillPermNames',
+              value: JSON.stringify(allNames),
+            }));
+          } catch { /* best effort */ }
+        }
+
+        // Propagate to ShellExecutor
+        const shellId = await this.discoverDep('ShellExecutor');
+        if (shellId) {
+          try {
+            await this.request(request(this.id, shellId, 'updateSkillPermissions', {
+              skillName,
+              allowedCommands: existing,
+            }));
+          } catch { /* best effort */ }
+        }
+
+        return { decision: 'accept' };
+      }
+
+      return { decision: 'deny' };
+    } finally {
+      this._pendingPermissionPrompt = undefined;
+      if (this._promptWindowId && this.widgetManagerId) {
+        try {
+          await this.request(request(this.id, this.widgetManagerId, 'destroyWindowAbject', {
+            windowId: this._promptWindowId,
+          }));
+        } catch { /* best effort */ }
+      }
+      this._promptWindowId = undefined;
+      this._promptAcceptAlwaysBtnId = undefined;
+      this._promptDenyBtnId = undefined;
+    }
+  }
+
+  /** Whether we've claimed permissions authority on capability objects. */
+  private authorityClaimed = false;
+
+  /**
+   * Claim permissions authority on capability objects (first-caller-wins).
+   * Called once during the first propagation. After this, only messages
+   * from GlobalSettings will be accepted by updatePermissions handlers.
+   */
+  private async claimAuthority(): Promise<void> {
+    if (this.authorityClaimed) return;
+    this.authorityClaimed = true;
+
+    const targets = ['HostFileSystem', 'ShellExecutor', 'HttpClient'];
+    for (const name of targets) {
+      const id = await this.discoverDep(name);
+      if (id) {
+        try {
+          await this.request(request(this.id, id, 'setPermissionsAuthority', {}));
+        } catch { /* may already be claimed on restart */ }
+      }
+    }
+  }
+
+  private async propagatePermissions(): Promise<void> {
+    await this.claimAuthority();
+
+    // Filesystem permissions
+    const fsId = await this.discoverDep('HostFileSystem');
+    if (fsId) {
+      try {
+        await this.request(request(this.id, fsId, 'updatePermissions', {
+          allowedPaths: this.fsAllowedPaths,
+          readOnly: this.fsReadOnly,
+        }));
+      } catch (e) { log.warn('Failed to propagate FS permissions', e); }
+    }
+
+    // Shell permissions
+    const shellId = await this.discoverDep('ShellExecutor');
+    if (shellId) {
+      try {
+        await this.request(request(this.id, shellId, 'updatePermissions', {
+          enabled: this.shellEnabled,
+          allowedCommands: this.shellAllowedCmds,
+          deniedCommands: this.shellDeniedCmds,
+        }));
+      } catch (e) { log.warn('Failed to propagate Shell permissions', e); }
+    }
+
+    // Web/HTTP permissions
+    const httpId = await this.discoverDep('HttpClient');
+    if (httpId) {
+      try {
+        await this.request(request(this.id, httpId, 'updatePermissions', {
+          enabled: this.webEnabled,
+          allowedDomains: this.webAllowedDomains,
+          deniedDomains: this.webDeniedDomains,
+        }));
+      } catch (e) { log.warn('Failed to propagate HTTP permissions', e); }
+    }
+  }
+
+  /**
+   * Load saved permissions from Storage and propagate to target objects.
+   * Called once during onInit so persisted permissions are applied on boot.
+   */
+  private async applySavedPermissions(): Promise<void> {
+    if (!this.storageId) return;
+
+    // Check if any permission keys have been saved
+    const fsRo = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_FS_READ_ONLY })
+    );
+    const shellEn = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_SHELL_ENABLED })
+    );
+    const webEn = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_ENABLED })
+    );
+
+    // Always claim authority, even if no permissions saved yet
+    await this.claimAuthority();
+
+    // Only propagate saved values if at least one permission key was explicitly saved
+    if (fsRo === null && shellEn === null && webEn === null) return;
+
+    // Load all values
+    if (fsRo !== null) this.fsReadOnly = fsRo === 'true';
+    if (shellEn !== null) this.shellEnabled = shellEn === 'true';
+    if (webEn !== null) this.webEnabled = webEn === 'true';
+
+    const fsPathsJson = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_FS_ALLOWED_PATHS })
+    );
+    if (fsPathsJson) { try { this.fsAllowedPaths = JSON.parse(fsPathsJson); } catch { /* ignore */ } }
+
+    const shellAllowJson = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_SHELL_ALLOWED_CMDS })
+    );
+    if (shellAllowJson) { try { this.shellAllowedCmds = JSON.parse(shellAllowJson); } catch { /* ignore */ } }
+
+    const shellDenyJson = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_SHELL_DENIED_CMDS })
+    );
+    if (shellDenyJson) { try { this.shellDeniedCmds = JSON.parse(shellDenyJson); } catch { /* ignore */ } }
+
+    const webAllowJson = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_ALLOWED_DOMAINS })
+    );
+    if (webAllowJson) { try { this.webAllowedDomains = JSON.parse(webAllowJson); } catch { /* ignore */ } }
+
+    const webDenyJson = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_DENIED_DOMAINS })
+    );
+    if (webDenyJson) { try { this.webDeniedDomains = JSON.parse(webDenyJson); } catch { /* ignore */ } }
+
+    await this.propagatePermissions();
+
+    // Load per-skill permissions
+    const skillNamesJson = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: 'global-settings:skillPermNames' })
+    );
+    if (skillNamesJson) {
+      try {
+        const skillNames: string[] = JSON.parse(skillNamesJson);
+        const shellId = await this.discoverDep('ShellExecutor');
+        for (const name of skillNames) {
+          const permsJson = await this.request<string | null>(
+            request(this.id, this.storageId, 'get', { key: `global-settings:skillPerms:${name}` })
+          );
+          if (permsJson) {
+            try {
+              const cmds: string[] = JSON.parse(permsJson);
+              this.skillPermissions.set(name, cmds);
+              if (shellId) {
+                await this.request(request(this.id, shellId, 'updateSkillPermissions', {
+                  skillName: name,
+                  allowedCommands: cmds,
+                }));
+              }
+            } catch { /* ignore parse errors */ }
+          }
+        }
+      } catch { /* ignore */ }
+    }
+
+    log.info('Applied saved permissions');
   }
 
   // ========== API KEYS ACTIONS ==========

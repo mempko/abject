@@ -11,7 +11,7 @@ import * as fsSync from 'fs';
 import * as path from 'path';
 import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
-import { error as errorMsg } from '../../core/message.js';
+import { error as errorMsg, request } from '../../core/message.js';
 import { Capabilities } from '../../core/capability.js';
 import { require as contractRequire } from '../../core/contracts.js';
 import { Log } from '../../core/timed-log.js';
@@ -31,6 +31,8 @@ export interface FileInfo {
 export class HostFileSystem extends Abject {
   private allowedPaths?: string[];
   private readOnly: boolean;
+  /** The only AbjectId allowed to call updatePermissions. Set once at bootstrap. */
+  private permissionsAuthorityId?: AbjectId;
 
   constructor(config?: {
     allowedPaths?: string[];
@@ -267,6 +269,29 @@ export class HostFileSystem extends Abject {
       );
       return DEFERRED_REPLY;
     });
+
+    this.on('setPermissionsAuthority', async (msg: AbjectMessage) => {
+      if (this.permissionsAuthorityId) return { success: false, error: 'Authority already set' };
+      this.permissionsAuthorityId = msg.routing.from;
+      return { success: true };
+    });
+
+    this.on('updatePermissions', async (msg: AbjectMessage) => {
+      if (this.permissionsAuthorityId && msg.routing.from !== this.permissionsAuthorityId) {
+        return { success: false, error: 'Unauthorized: only the permissions authority can update permissions' };
+      }
+      const { allowedPaths, readOnly } = msg.payload as {
+        allowedPaths?: string[];
+        readOnly?: boolean;
+      };
+      if (allowedPaths !== undefined) {
+        this.allowedPaths = allowedPaths.length > 0 ? allowedPaths : undefined;
+      }
+      if (readOnly !== undefined) {
+        this.readOnly = readOnly;
+      }
+      return { success: true };
+    });
   }
 
   // ─── Implementations ────────────────────────────────────────────
@@ -274,7 +299,7 @@ export class HostFileSystem extends Abject {
   private async handleReadFile(filePath: string, offset?: number, limit?: number): Promise<{ content: string; lines: number }> {
     contractRequire(typeof filePath === 'string' && filePath.length > 0, 'path must be a non-empty string');
     log.info(`readFile: ${filePath}`);
-    this.validatePath(filePath);
+    await this.validatePath(filePath);
 
     const content = await fs.readFile(filePath, 'utf-8');
     const allLines = content.split('\n');
@@ -293,7 +318,7 @@ export class HostFileSystem extends Abject {
     contractRequire(typeof filePath === 'string' && filePath.length > 0, 'path must be a non-empty string');
     log.info(`writeFile: ${filePath} (${content.length} chars)`);
     this.requireWrite();
-    this.validatePath(filePath);
+    await this.validatePath(filePath);
 
     const dir = path.dirname(filePath);
     await fs.mkdir(dir, { recursive: true });
@@ -306,7 +331,7 @@ export class HostFileSystem extends Abject {
     log.info(`editFile: ${filePath}`);
     contractRequire(typeof oldText === 'string' && oldText.length > 0, 'oldText must be a non-empty string');
     this.requireWrite();
-    this.validatePath(filePath);
+    await this.validatePath(filePath);
 
     const content = await fs.readFile(filePath, 'utf-8');
     let replacements = 0;
@@ -327,7 +352,7 @@ export class HostFileSystem extends Abject {
     contractRequire(typeof pattern === 'string' && pattern.length > 0, 'pattern must be a non-empty string');
     log.info(`glob: ${pattern} (cwd=${cwd ?? 'default'})`);
     const baseDir = cwd ?? process.cwd();
-    this.validatePath(baseDir);
+    await this.validatePath(baseDir);
 
     // Simple recursive glob implementation using fs
     const files = await this.walkGlob(baseDir, pattern);
@@ -344,7 +369,7 @@ export class HostFileSystem extends Abject {
     log.info(`grep: ${pattern} (path=${searchPath ?? 'cwd'}, glob=${globFilter ?? 'none'})`);
 
     const baseDir = searchPath ?? process.cwd();
-    this.validatePath(baseDir);
+    await this.validatePath(baseDir);
 
     const regex = new RegExp(pattern);
     const max = maxResults ?? 100;
@@ -369,7 +394,7 @@ export class HostFileSystem extends Abject {
 
   private async handleStat(filePath: string): Promise<FileInfo> {
     contractRequire(typeof filePath === 'string' && filePath.length > 0, 'path must be a non-empty string');
-    this.validatePath(filePath);
+    await this.validatePath(filePath);
 
     const stat = await fs.stat(filePath);
     return {
@@ -384,7 +409,7 @@ export class HostFileSystem extends Abject {
   private async handleMkdir(dirPath: string): Promise<{ success: boolean }> {
     contractRequire(typeof dirPath === 'string' && dirPath.length > 0, 'path must be a non-empty string');
     this.requireWrite();
-    this.validatePath(dirPath);
+    await this.validatePath(dirPath);
 
     await fs.mkdir(dirPath, { recursive: true });
     return { success: true };
@@ -392,7 +417,7 @@ export class HostFileSystem extends Abject {
 
   private async handleReaddir(dirPath: string): Promise<{ entries: Array<{ name: string; isDirectory: boolean }> }> {
     contractRequire(typeof dirPath === 'string' && dirPath.length > 0, 'path must be a non-empty string');
-    this.validatePath(dirPath);
+    await this.validatePath(dirPath);
 
     const entries = await fs.readdir(dirPath, { withFileTypes: true });
     return {
@@ -402,7 +427,7 @@ export class HostFileSystem extends Abject {
 
   private async handleExists(filePath: string): Promise<{ exists: boolean }> {
     contractRequire(typeof filePath === 'string' && filePath.length > 0, 'path must be a non-empty string');
-    this.validatePath(filePath);
+    await this.validatePath(filePath);
 
     try {
       await fs.access(filePath);
@@ -415,7 +440,7 @@ export class HostFileSystem extends Abject {
   private async handleDeleteFile(filePath: string): Promise<{ success: boolean }> {
     contractRequire(typeof filePath === 'string' && filePath.length > 0, 'path must be a non-empty string');
     this.requireWrite();
-    this.validatePath(filePath);
+    await this.validatePath(filePath);
 
     await fs.unlink(filePath);
     return { success: true };
@@ -423,13 +448,36 @@ export class HostFileSystem extends Abject {
 
   // ─── Helpers ────────────────────────────────────────────────────
 
-  private validatePath(p: string): void {
-    if (!this.allowedPaths) return;
+  private async validatePath(p: string): Promise<void> {
     const resolved = path.resolve(p);
-    const allowed = this.allowedPaths.some(ap => resolved.startsWith(path.resolve(ap)));
-    if (!allowed) {
-      throw new Error(`Path "${p}" is not in allowed paths`);
+    if (this.allowedPaths?.some(ap => resolved.startsWith(path.resolve(ap)))) return;
+
+    // Path not in allow list -- ask the permissions authority
+    if (this.permissionsAuthorityId) {
+      const response = await this.request<{ decision: string }>(
+        request(this.id, this.permissionsAuthorityId, 'requestPermission', {
+          type: 'directory',
+          resource: resolved,
+          description: `Filesystem access: ${resolved}`,
+        }),
+        120000,
+      );
+
+      switch (response.decision) {
+        case 'accept_always':
+          if (!this.allowedPaths) this.allowedPaths = [];
+          this.allowedPaths.push(resolved);
+          return;
+        case 'accept_once':
+          return;
+        case 'deny_always':
+        case 'deny':
+        default:
+          throw new Error(`Access to "${p}" was denied by user`);
+      }
     }
+
+    throw new Error(`Path "${p}" is not allowed. Configure permissions in Settings > Permissions.`);
   }
 
   private requireWrite(): void {
@@ -496,6 +544,44 @@ export class HostFileSystem extends Abject {
         matches.push({ file: filePath, line: i + 1, content: lines[i] });
       }
     }
+  }
+
+  protected override getSourceForAsk(): string | undefined {
+    const lines = [
+      `## HostFileSystem Usage Guide`,
+      ``,
+      `### Read a file`,
+      `  const result = await this.call(this.dep('HostFileSystem'), 'readFile',`,
+      `    { path: '/absolute/path/to/file.txt' });`,
+      `  // result = { content: '...', lines: 42 }`,
+      ``,
+      `### Write a file`,
+      `  await this.call(this.dep('HostFileSystem'), 'writeFile',`,
+      `    { path: '/absolute/path/to/file.txt', content: 'hello' });`,
+      ``,
+      `### Search files by pattern (glob)`,
+      `  const files = await this.call(this.dep('HostFileSystem'), 'glob',`,
+      `    { pattern: '**/*.ts', cwd: '/project/src' });`,
+      ``,
+      `### Search file contents (grep)`,
+      `  const matches = await this.call(this.dep('HostFileSystem'), 'grep',`,
+      `    { pattern: 'TODO', cwd: '/project', glob: '*.ts' });`,
+      ``,
+      `### Restrictions`,
+    ];
+
+    if (this.readOnly) {
+      lines.push(`Filesystem is in READ-ONLY mode. Write, edit, mkdir, and delete are blocked.`);
+    }
+    if (this.allowedPaths && this.allowedPaths.length > 0) {
+      lines.push(`Allowed directories: ${this.allowedPaths.join(', ')}`);
+    } else if (!this.allowedPaths) {
+      lines.push(`No path restrictions configured.`);
+    } else {
+      lines.push(`No directories are allowed. All access will be denied.`);
+    }
+
+    return lines.join('\n');
   }
 }
 

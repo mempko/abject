@@ -283,6 +283,7 @@ Tasks are dispatched automatically by AgentAbject based on task type matching.`;
               args: action.args as string[] | undefined,
               shell: true,
               timeout: 30000,
+              skillName: 'skill-agent',
             }),
           );
           result = execResult.exitCode === 0

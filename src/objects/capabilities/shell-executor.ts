@@ -6,12 +6,29 @@
  */
 
 import { execFile, spawn as nodeSpawn } from 'child_process';
+import os from 'node:os';
 import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
-import { error as errorMsg } from '../../core/message.js';
+import { error as errorMsg, request } from '../../core/message.js';
 import { Capabilities } from '../../core/capability.js';
 import { require as contractRequire } from '../../core/contracts.js';
 import { Log } from '../../core/timed-log.js';
+
+interface PlatformInfo {
+  os: string;
+  arch: string;
+  shell: string;
+  homeDir: string;
+}
+
+const platformInfo: PlatformInfo = {
+  os: process.platform,
+  arch: os.arch(),
+  shell: process.platform === 'win32'
+    ? (process.env.COMSPEC ?? 'cmd.exe')
+    : (process.env.SHELL ?? '/bin/sh'),
+  homeDir: os.homedir(),
+};
 
 const log = new Log('ShellExecutor');
 const SHELL_INTERFACE: InterfaceId = 'abjects:shell';
@@ -24,6 +41,8 @@ export interface ExecRequest {
   timeout?: number;
   /** If true, run through the system shell (enables pipes, globs, etc.). */
   shell?: boolean;
+  /** If set, use command-name-only matching against the skill's whitelist. */
+  skillName?: string;
 }
 
 export interface ExecResult {
@@ -37,6 +56,12 @@ export class ShellExecutor extends Abject {
   private deniedCommands?: Set<string>;
   private allowedPaths?: string[];
   private defaultTimeout: number;
+  /** If true, all command execution is blocked. */
+  private shellDisabled = false;
+  /** The only AbjectId allowed to call updatePermissions. Set once at bootstrap. */
+  private permissionsAuthorityId?: AbjectId;
+  /** Per-skill command whitelists (command name only, no args). */
+  private skillAllowedCommands: Map<string, Set<string>> = new Map();
   /** Environment variables injected by skills (via SkillRegistry). */
   private skillEnv: Record<string, string> = {};
 
@@ -80,6 +105,31 @@ export class ShellExecutor extends Abject {
               },
             },
             {
+              name: 'getPlatformInfo',
+              description: 'Get information about the host platform (OS, architecture, shell)',
+              parameters: [],
+              returns: {
+                kind: 'object',
+                properties: {
+                  os: { kind: 'primitive', primitive: 'string' },
+                  arch: { kind: 'primitive', primitive: 'string' },
+                  shell: { kind: 'primitive', primitive: 'string' },
+                  homeDir: { kind: 'primitive', primitive: 'string' },
+                },
+              },
+            },
+            {
+              name: 'updatePermissions',
+              description: 'Update shell execution permissions at runtime',
+              parameters: [
+                { name: 'enabled', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Enable/disable shell execution', optional: true },
+                { name: 'allowedCommands', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Commands allowed to execute', optional: true },
+                { name: 'deniedCommands', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Commands denied from execution', optional: true },
+                { name: 'allowedPaths', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Allowed working directories', optional: true },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+            },
+            {
               name: 'setSkillEnv',
               description: 'Set environment variables injected by skills into all future command executions',
               parameters: [
@@ -104,6 +154,48 @@ export class ShellExecutor extends Abject {
   }
 
   private setupHandlers(): void {
+    this.on('getPlatformInfo', async () => {
+      return platformInfo;
+    });
+
+    this.on('setPermissionsAuthority', async (msg: AbjectMessage) => {
+      if (this.permissionsAuthorityId) return { success: false, error: 'Authority already set' };
+      this.permissionsAuthorityId = msg.routing.from;
+      return { success: true };
+    });
+
+    this.on('updatePermissions', async (msg: AbjectMessage) => {
+      if (this.permissionsAuthorityId && msg.routing.from !== this.permissionsAuthorityId) {
+        return { success: false, error: 'Unauthorized: only the permissions authority can update permissions' };
+      }
+      const { enabled, allowedCommands, deniedCommands, allowedPaths } = msg.payload as {
+        enabled?: boolean;
+        allowedCommands?: string[];
+        deniedCommands?: string[];
+        allowedPaths?: string[];
+      };
+      if (enabled !== undefined) this.shellDisabled = !enabled;
+      if (allowedCommands !== undefined) {
+        this.allowedCommands = allowedCommands.length > 0 ? new Set(allowedCommands) : undefined;
+      }
+      if (deniedCommands !== undefined) {
+        this.deniedCommands = deniedCommands.length > 0 ? new Set(deniedCommands) : undefined;
+      }
+      if (allowedPaths !== undefined) {
+        this.allowedPaths = allowedPaths.length > 0 ? allowedPaths : undefined;
+      }
+      return { success: true };
+    });
+
+    this.on('updateSkillPermissions', async (msg: AbjectMessage) => {
+      if (this.permissionsAuthorityId && msg.routing.from !== this.permissionsAuthorityId) {
+        return { success: false, error: 'Unauthorized' };
+      }
+      const { skillName, allowedCommands } = msg.payload as { skillName: string; allowedCommands: string[] };
+      this.skillAllowedCommands.set(skillName, new Set(allowedCommands));
+      return { success: true };
+    });
+
     this.on('setSkillEnv', async (msg: AbjectMessage) => {
       const { env } = msg.payload as { env: Record<string, string> };
       this.skillEnv = env ?? {};
@@ -129,6 +221,7 @@ export class ShellExecutor extends Abject {
   }
 
   private async executeCommand(req: ExecRequest): Promise<ExecResult> {
+    if (this.shellDisabled) throw new Error('Shell execution is disabled. Enable it in Settings > Permissions.');
     contractRequire(typeof req.command === 'string' && req.command.length > 0, 'command must be a non-empty string');
     log.info(`exec: ${req.command.slice(0, 120)}${req.command.length > 120 ? '...' : ''} (shell=${!!req.shell}, cwd=${req.cwd ?? 'default'})`);
 
@@ -136,12 +229,17 @@ export class ShellExecutor extends Abject {
     const args = req.args ?? [];
     const timeout = req.timeout ?? this.defaultTimeout;
 
-    // Validate command against allowlist/denylist
-    this.validateCommand(command);
+    // Validate command (may prompt user)
+    const fullCommand = args.length > 0 ? `${command} ${args.join(' ')}` : command;
+    if (req.skillName) {
+      await this.validateSkillCommand(req.skillName, fullCommand);
+    } else {
+      await this.validateCommand(fullCommand);
+    }
 
-    // Validate working directory
+    // Validate working directory (may prompt user)
     if (req.cwd) {
-      this.validatePath(req.cwd);
+      await this.validatePath(req.cwd);
     }
 
     // Build environment: process env + skill env + per-request env
@@ -190,26 +288,151 @@ export class ShellExecutor extends Abject {
     });
   }
 
-  private validateCommand(command: string): void {
-    // Extract base command name (strip path)
-    const base = command.split('/').pop() ?? command;
+  private async validateCommand(fullCommand: string): Promise<void> {
+    const trimmed = fullCommand.trim();
 
-    if (this.deniedCommands?.has(base)) {
-      throw new Error(`Command "${base}" is denied`);
+    if (this.deniedCommands?.has(trimmed)) {
+      throw new Error(`Command "${trimmed}" is permanently denied`);
     }
 
-    if (this.allowedCommands && !this.allowedCommands.has(base)) {
-      throw new Error(`Command "${base}" is not in allowed list`);
+    if (this.allowedCommands?.has(trimmed)) return;
+
+    // Command not in allow list -- ask the permissions authority
+    if (this.permissionsAuthorityId) {
+      const response = await this.request<{ decision: string }>(
+        request(this.id, this.permissionsAuthorityId, 'requestPermission', {
+          type: 'shell',
+          resource: trimmed,
+          description: `Shell command: ${trimmed}`,
+        }),
+        120000,
+      );
+
+      switch (response.decision) {
+        case 'accept_always':
+          if (!this.allowedCommands) this.allowedCommands = new Set();
+          this.allowedCommands.add(trimmed);
+          return;
+        case 'accept_once':
+          return;
+        case 'deny_always':
+          if (!this.deniedCommands) this.deniedCommands = new Set();
+          this.deniedCommands.add(trimmed);
+          throw new Error(`Command "${trimmed}" was permanently denied by user`);
+        case 'deny':
+        default:
+          throw new Error(`Command "${trimmed}" was denied by user`);
+      }
     }
+
+    // No authority registered -- deny by default
+    throw new Error(`Command "${trimmed}" is not allowed. Configure permissions in Settings > Permissions.`);
   }
 
-  private validatePath(cwd: string): void {
-    if (!this.allowedPaths) return;
+  private async validateSkillCommand(skillName: string, fullCommand: string): Promise<void> {
+    // Extract command name only (first word, basename) for skill matching
+    const firstWord = fullCommand.trim().split(/\s+/)[0] ?? fullCommand;
+    const cmdName = firstWord.split('/').pop() ?? firstWord;
 
-    const allowed = this.allowedPaths.some(p => cwd.startsWith(p));
-    if (!allowed) {
-      throw new Error(`Working directory "${cwd}" is not in allowed paths`);
+    // Check skill-specific whitelist
+    const skillWhitelist = this.skillAllowedCommands.get(skillName);
+    if (skillWhitelist?.has(cmdName)) return;
+
+    // Not whitelisted -- ask the permissions authority
+    if (this.permissionsAuthorityId) {
+      const response = await this.request<{ decision: string }>(
+        request(this.id, this.permissionsAuthorityId, 'requestPermission', {
+          type: 'skill_shell',
+          resource: cmdName,
+          skillName,
+          description: `Skill "${skillName}" wants to run: ${cmdName}`,
+        }),
+        120000,
+      );
+
+      if (response.decision === 'accept') {
+        if (!skillWhitelist) {
+          this.skillAllowedCommands.set(skillName, new Set([cmdName]));
+        } else {
+          skillWhitelist.add(cmdName);
+        }
+        return;
+      }
+      throw new Error(`Skill "${skillName}" was denied permission to run "${cmdName}"`);
     }
+
+    throw new Error(`Command "${cmdName}" from skill "${skillName}" is not allowed.`);
+  }
+
+  private async validatePath(cwd: string): Promise<void> {
+    if (this.allowedPaths?.some(p => cwd.startsWith(p))) return;
+
+    // Path not in allow list -- ask the permissions authority
+    if (this.permissionsAuthorityId) {
+      const response = await this.request<{ decision: string }>(
+        request(this.id, this.permissionsAuthorityId, 'requestPermission', {
+          type: 'directory',
+          resource: cwd,
+          description: `Directory access: ${cwd}`,
+        }),
+        120000,
+      );
+
+      switch (response.decision) {
+        case 'accept_always':
+          if (!this.allowedPaths) this.allowedPaths = [];
+          this.allowedPaths.push(cwd);
+          return;
+        case 'accept_once':
+          return;
+        case 'deny_always':
+        case 'deny':
+        default:
+          throw new Error(`Directory "${cwd}" access was denied by user`);
+      }
+    }
+
+    throw new Error(`Directory "${cwd}" is not allowed. Configure permissions in Settings > Permissions.`);
+  }
+
+  protected override getSourceForAsk(): string | undefined {
+    const p = platformInfo;
+    const lines = [
+      `## ShellExecutor Usage Guide`,
+      ``,
+      `### Platform`,
+      `OS: ${p.os}, Arch: ${p.arch}, Shell: ${p.shell}, Home: ${p.homeDir}`,
+      ``,
+      `### Execute a command`,
+      `  const result = await this.call(this.dep('ShellExecutor'), 'exec', {`,
+      `    command: 'ls', args: ['-la'], cwd: '/tmp' });`,
+      `  // result = { stdout: '...', stderr: '...', exitCode: 0 }`,
+      ``,
+      `### Shell mode (pipes, globs)`,
+      `  const result = await this.call(this.dep('ShellExecutor'), 'exec', {`,
+      `    command: 'cat file.txt | grep error', shell: true });`,
+      ``,
+      `### Restrictions`,
+    ];
+
+    if (this.shellDisabled) {
+      lines.push(`Shell execution is currently DISABLED.`);
+    } else {
+      if (this.allowedCommands) {
+        lines.push(`Allowed commands: ${[...this.allowedCommands].join(', ')}`);
+      }
+      if (this.deniedCommands) {
+        lines.push(`Denied commands: ${[...this.deniedCommands].join(', ')}`);
+      }
+      if (this.allowedPaths) {
+        lines.push(`Allowed working directories: ${this.allowedPaths.join(', ')}`);
+      }
+      if (!this.allowedCommands && !this.deniedCommands && !this.allowedPaths) {
+        lines.push(`No restrictions configured.`);
+      }
+    }
+
+    return lines.join('\n');
   }
 }
 
