@@ -167,6 +167,7 @@ export class Chat extends Abject {
         pinnedMessageCount: 1,
         terminalActions: {
           done: { type: 'success', resultFields: ['text', 'result', 'reasoning'] },
+          clarify: { type: 'success', resultFields: ['question'] },
           fail: { type: 'error', resultFields: ['reason'] },
         },
         intermediateActions: ['reply'],
@@ -403,6 +404,7 @@ export class Chat extends Abject {
           this.thinkingLabelId = await this.appendMessageLabel('', 'Thinking...', this.theme.statusNeutral);
         }
       }
+
     });
 
     this.on('agentActionResult', async (msg: AbjectMessage) => {
@@ -805,6 +807,12 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   Use type "skill" only when the user's request directly relates to an enabled skill's specific domain. For general questions, web lookups, or anything not covered by an enabled skill, use type "browse".
 
 ### Communication
+- **clarify**: Ask the user a clarifying question before proceeding. Use when your assumptions
+  about their request have low confidence. The user will see your question and respond.
+  \`{ "action": "clarify", "question": "Did you mean X or Y?", "assumptions": [
+    { "assumption": "User wants to modify the existing Counter", "confidence": "high" },
+    { "assumption": "The reset should set count to zero", "confidence": "low" }
+  ] }\`
 - **reply**: Send intermediate text to the user (continue working after).
   \`{ "action": "reply", "text": "I found the object, now let me check its methods..." }\`
 - **done**: Task complete, send final reply.
@@ -827,6 +835,23 @@ ${this.enabledSkillsSummary}
 
 When a user's request matches an enabled skill's capabilities, use **decompose** with \`"type": "skill"\` to route the task to SkillAgent.
 ` : ''}
+## Assumption Checking
+
+Before taking any non-trivial action (create, modify, call, decompose), consider what
+assumptions you are making about the user's request. For each assumption, estimate your
+confidence (high/medium/low).
+
+If ANY assumption has low confidence, use the **clarify** action FIRST to ask the user.
+Only proceed with the actual action once you are confident in your understanding.
+
+Examples of assumptions to check:
+- Which existing object the user is referring to (if ambiguous)
+- What specific behavior or appearance the user wants
+- Whether the user wants a new object or a change to an existing one
+- What data sources, APIs, or inputs are involved
+
+You do not need to clarify simple greetings, direct questions, or unambiguous requests.
+
 ## Rules
 
 1. Always respond with valid JSON in a \`\`\`json block. ONE action per response.

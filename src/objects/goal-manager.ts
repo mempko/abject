@@ -610,7 +610,7 @@ suitable agent based on descriptions.
         goalId: GoalId; message: string; phase?: string; agentName?: string;
       };
       const goal = this.goals.get(goalId);
-      if (!goal) return;
+      if (!goal || goal.status !== 'active') return;
       log.info(`updateProgress ${goalId.slice(0, 8)} phase=${phase ?? '?'} agent=${agentName ?? '?'}: ${message.slice(0, 80)}`);
 
       goal.progress.push({
@@ -1133,7 +1133,11 @@ suitable agent based on descriptions.
         return;
       }
 
-      // Merge: newer updatedAt wins
+      // Merge: newer updatedAt wins, but never revert a terminal status
+      const localTerminal = local.status === 'completed' || local.status === 'failed' || local.status === 'archived';
+      const remoteTerminal = remote.status === 'completed' || remote.status === 'failed' || remote.status === 'archived';
+      if (localTerminal && !remoteTerminal) return;
+
       if (remote.updatedAt > local.updatedAt) {
         local.title = remote.title;
         local.status = remote.status;
