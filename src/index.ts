@@ -95,6 +95,8 @@ export { HBoxLayout } from './objects/widgets/hbox-layout.js';
 export { ScrollableVBoxLayout } from './objects/widgets/scrollable-vbox-layout.js';
 export { ListWidget } from './objects/widgets/list-widget.js';
 export type { ListItem, ListWidgetConfig } from './objects/widgets/list-widget.js';
+export { TreeWidget } from './objects/widgets/tree-widget.js';
+export type { TreeItem, TreeWidgetConfig } from './objects/widgets/tree-widget.js';
 export { SplitPaneWidget } from './objects/widgets/split-pane-widget.js';
 export type { SplitPaneConfig } from './objects/widgets/split-pane-widget.js';
 export {

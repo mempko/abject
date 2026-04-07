@@ -1,9 +1,8 @@
 /**
- * JobBrowser — UI widget for viewing job execution status.
+ * JobBrowser -- UI widget for viewing job execution status.
  *
  * Shows/hides from Taskbar. Subscribes to JobManager as a dependent to
- * receive real-time job status updates. Similar to AppExplorer but
- * for jobs instead of registered objects.
+ * receive real-time job status updates. Uses a ListWidget for display.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
@@ -12,23 +11,32 @@ import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { Job } from './job-manager.js';
-import { estimateWrappedLineCount } from './widgets/word-wrap.js';
+import type { ListItem } from './widgets/list-widget.js';
 
 const log = new Log('JobBrowser');
 
 const JOB_BROWSER_INTERFACE: InterfaceId = 'abjects:job-browser';
 
-const WIN_W = 400;
+const WIN_W = 500;
 const WIN_H = 350;
+
+const STATUS_ICONS: Record<string, string> = {
+  queued:    '\u25CB',  // ○
+  running:   '\u25B8',  // ▸
+  completed: '\u2713',  // ✓
+  failed:    '\u2717',  // ✗
+};
 
 export class JobBrowser extends Abject {
   private jobManagerId?: AbjectId;
   private widgetManagerId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
-  private jobListId?: AbjectId;
+  private listWidgetId?: AbjectId;
   private clearBtnId?: AbjectId;
-  private jobLabelMap: Map<string, AbjectId> = new Map();
+
+  /** Cached jobs in display order (oldest first). */
+  private jobs: Job[] = [];
 
   constructor() {
     super({
@@ -83,24 +91,16 @@ export class JobBrowser extends Abject {
   }
 
   private setupHandlers(): void {
-    this.on('show', async () => {
-      return this.show();
-    });
-
-    this.on('hide', async () => {
-      return this.hide();
-    });
-
-    this.on('getState', async () => {
-      return { visible: !!this.windowId, jobCount: this.jobLabelMap.size };
-    });
-
+    this.on('show', async () => this.show());
+    this.on('hide', async () => this.hide());
+    this.on('getState', async () => ({
+      visible: !!this.windowId,
+      jobCount: this.jobs.length,
+    }));
     this.on('windowCloseRequested', async () => { await this.hide(); });
-
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
-      const fromId = msg.routing.from;
-      await this.handleChanged(fromId, aspect, value);
+      await this.handleChanged(msg.routing.from, aspect, value);
     });
   }
 
@@ -108,24 +108,19 @@ export class JobBrowser extends Abject {
     return `## JobBrowser Usage Guide
 
 ### Methods
-- \`show()\` — Open the job browser window. If already open, raises it to front.
-- \`hide()\` — Close the job browser window and unsubscribe from JobManager.
-- \`getState()\` — Returns { visible: boolean, jobCount: number }.
+- \`show()\` -- Open the job browser window. If already open, raises it to front.
+- \`hide()\` -- Close the job browser window and unsubscribe from JobManager.
+- \`getState()\` -- Returns { visible: boolean, jobCount: number }.
 
 ### Real-Time Job Monitoring
 JobBrowser registers as a dependent of JobManager to receive live status updates.
-Job status icons:
-- ○ queued — job is waiting to execute
-- ▸ running — job is currently executing
-- ✓ completed — job finished successfully (shows elapsed time)
-- ✗ failed — job encountered an error (shows error message)
-
-### Clear Button
-Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes the list.
+Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed.
 
 ### Interface ID
 \`abjects:job-browser\``;
   }
+
+  // -- Window lifecycle --
 
   async show(): Promise<boolean> {
     if (this.windowId) {
@@ -162,17 +157,20 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
       })
     );
 
-    // Scrollable VBox for job list (expanding, auto-scroll to follow new jobs)
-    this.jobListId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
-        parentLayoutId: this.rootLayoutId,
-        autoScroll: true,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 4,
+    // List widget -- add to layout first
+    const { widgetIds: [listId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [{ type: 'list', windowId: this.windowId, items: [], searchable: false }],
       })
     );
+    this.listWidgetId = listId;
 
-    // Bottom bar with Clear button
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.listWidgetId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
+    // Bottom bar (auto-adds after the list)
     const bottomRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
@@ -181,40 +179,35 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
       })
     );
 
-    // Add layouts to root
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChildren', {
-      children: [
-        { widgetId: this.jobListId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
-        { widgetId: bottomRowId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 36 } },
-      ],
+    await this.request(request(this.id, this.rootLayoutId, 'updateLayoutChild', {
+      widgetId: bottomRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 36 },
     }));
 
     // Spacer pushes button right
     await this.request(request(this.id, bottomRowId, 'addLayoutSpacer', {}));
 
-    // Create clear button
+    // Clear button
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
-        specs: [
-          { type: 'button', windowId: this.windowId, text: 'Clear' },
-        ],
+        specs: [{ type: 'button', windowId: this.windowId, text: 'Clear' }],
       })
     );
     this.clearBtnId = widgetIds[0];
 
-    // Add to layout
     await this.request(request(this.id, bottomRowId, 'addLayoutChildren', {
       children: [
         { widgetId: this.clearBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 80, height: 36 } },
       ],
     }));
 
-    // Fire-and-forget: register as dependent
+    // Subscribe
     this.send(request(this.id, this.clearBtnId, 'addDependent', {}));
     this.send(request(this.id, this.jobManagerId!, 'addDependent', {}));
 
-    // Populate existing jobs
-    await this.populateExistingJobs();
+    // Populate
+    await this.loadJobs();
 
     this.changed('visibility', true);
     return true;
@@ -223,7 +216,6 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
   async hide(): Promise<boolean> {
     if (!this.windowId) return true;
 
-    // Fire-and-forget: unsubscribe from JobManager
     this.send(request(this.id, this.jobManagerId!, 'removeDependent', {}));
 
     await this.request(
@@ -234,116 +226,59 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
 
     this.windowId = undefined;
     this.rootLayoutId = undefined;
-    this.jobListId = undefined;
+    this.listWidgetId = undefined;
     this.clearBtnId = undefined;
-    this.jobLabelMap.clear();
+    this.jobs = [];
     this.changed('visibility', false);
     return true;
   }
 
-  private async populateExistingJobs(): Promise<void> {
-    if (!this.jobManagerId || !this.jobListId || !this.windowId) return;
+  // -- Data --
 
+  private async loadJobs(): Promise<void> {
+    if (!this.jobManagerId) return;
     try {
       const jobs = await this.request<Job[]>(
         request(this.id, this.jobManagerId, 'listJobs', {})
       );
-
-      // Jobs come back most-recent-first; display oldest first (top to bottom)
-      const reversed = [...jobs].reverse();
-      if (reversed.length === 0) return;
-
-      const fontSize = 13;
-      const lineHeight = fontSize + 4;
-      const availableWidth = WIN_W - 32 - 8;
-
-      // Build specs for all job labels
-      const specs = reversed.map(job => {
-        const { text, color } = this.formatJobLabel(job);
-        return { type: 'label' as const, windowId: this.windowId!, text, style: { color, fontSize, wordWrap: true, selectable: true } };
-      });
-
-      // Batch create all labels
-      const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs })
-      );
-
-      // Build layout children specs
-      const children = reversed.map((job, i) => {
-        const { text } = this.formatJobLabel(job);
-        const lineCount = estimateWrappedLineCount(text, availableWidth, fontSize);
-        const estimatedHeight = Math.max(20, lineCount * lineHeight + 4);
-        this.jobLabelMap.set(job.id, widgetIds[i]);
-        return { widgetId: widgetIds[i], sizePolicy: { vertical: 'fixed' as const }, preferredSize: { height: estimatedHeight } };
-      });
-
-      // Batch add to layout
-      await this.request(request(this.id, this.jobListId, 'addLayoutChildren', { children }));
+      // listJobs returns most-recent-first; display oldest first
+      this.jobs = [...jobs].reverse();
     } catch (err) {
-      log.warn('Failed to populate existing jobs:', err);
+      log.warn('Failed to load jobs:', err);
     }
+    await this.rebuildList();
   }
 
-  private formatJobLabel(job: Job): { text: string; color: string } {
+  private formatJobItem(job: Job): ListItem {
+    const icon = STATUS_ICONS[job.status] ?? '?';
+    const num = job.id.replace('job-', '');
+    const queueTag = job.queue && job.queue !== 'default' ? `[${job.queue}] ` : '';
     const elapsed = job.completedAt && job.startedAt
       ? `${((job.completedAt - job.startedAt) / 1000).toFixed(1)}s`
       : '';
-    const queueTag = job.queue && job.queue !== 'default' ? `[${job.queue}] ` : '';
+    const errorSuffix = job.status === 'failed' && job.error
+      ? ` -- ${job.error.slice(0, 30)}`
+      : '';
 
-    switch (job.status) {
-      case 'queued':
-        return { text: `○ #${job.id.replace('job-', '')} ${queueTag}${job.description}`, color: this.theme.statusNeutral };
-      case 'running':
-        return { text: `▸ #${job.id.replace('job-', '')} ${queueTag}${job.description}`, color: this.theme.statusWarning };
-      case 'completed':
-        return { text: `✓ #${job.id.replace('job-', '')} ${queueTag}${job.description}${elapsed ? `  ${elapsed}` : ''}`, color: this.theme.statusSuccess };
-      case 'failed':
-        return { text: `✗ #${job.id.replace('job-', '')} ${queueTag}${job.description}`, color: this.theme.statusError };
-      default:
-        return { text: `? #${job.id.replace('job-', '')} ${queueTag}${job.description}`, color: this.theme.statusNeutral };
-    }
+    return {
+      label: `${icon} #${num} ${queueTag}${job.description}${errorSuffix}`,
+      value: job.id,
+      secondary: elapsed,
+    };
   }
 
-  private async appendJobLabel(jobId: string, text: string, color: string): Promise<void> {
-    if (!this.jobListId || !this.windowId) return;
-
-    const fontSize = 13;
-    const lineHeight = fontSize + 4;
-    const availableWidth = WIN_W - 32 - 8;
-    const lineCount = estimateWrappedLineCount(text, availableWidth, fontSize);
-    const estimatedHeight = Math.max(20, lineCount * lineHeight + 4);
-
-    const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', {
-        specs: [
-          { type: 'label', windowId: this.windowId, text, style: { color, fontSize, wordWrap: true, selectable: true } },
-        ],
-      })
-    );
-    await this.request(request(this.id, this.jobListId, 'addLayoutChild', {
-      widgetId: labelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: estimatedHeight },
-    }));
-    this.jobLabelMap.set(jobId, labelId);
-  }
-
-  private async updateJobLabel(jobId: string, text: string, color: string): Promise<void> {
-    const labelId = this.jobLabelMap.get(jobId);
-    if (!labelId) return;
-
+  private async rebuildList(): Promise<void> {
+    if (!this.listWidgetId) return;
+    const items = this.jobs.map(j => this.formatJobItem(j));
     try {
-      await this.request(
-        request(this.id, labelId, 'update', {
-          text,
-          style: { color, fontSize: 13, wordWrap: true },
-        })
-      );
-    } catch { /* label may be gone */ }
+      await this.request(request(this.id, this.listWidgetId, 'update', { items }));
+    } catch { /* widget may be gone */ }
   }
+
+  // -- Events --
 
   private async handleChanged(fromId: AbjectId, aspect: string, value?: unknown): Promise<void> {
-    // Clear button click
+    // Clear button
     if (fromId === this.clearBtnId && aspect === 'click') {
       const confirmed = await this.confirm({
         title: 'Clear Job History',
@@ -353,11 +288,10 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
       });
       if (!confirmed) return;
       if (this.jobManagerId) {
-        // Fire-and-forget: historyCleared event will trigger rebuild
         this.send(request(this.id, this.jobManagerId, 'clearHistory', {}));
       }
-      // Optimistically clear the UI
-      await this.clearJobLabels();
+      this.jobs = [];
+      await this.rebuildList();
       return;
     }
 
@@ -365,49 +299,50 @@ Calls JobManager.clearHistory() to remove completed/failed jobs, then refreshes 
     if (fromId === this.jobManagerId) {
       const data = value as Record<string, unknown> | undefined;
       if (!data) return;
-
       const jobId = data.jobId as string;
-      const description = data.description as string;
-      const queue = data.queue as string | undefined;
-      const queueTag = queue && queue !== 'default' ? `[${queue}] ` : '';
 
       switch (aspect) {
-        case 'jobQueued':
-          await this.appendJobLabel(jobId, `\u25CB #${jobId.replace('job-', '')} ${queueTag}${description}`, this.theme.statusNeutral);
+        case 'jobQueued': {
+          this.jobs.push({
+            id: jobId,
+            queue: (data.queue as string) ?? 'default',
+            description: (data.description as string) ?? '',
+            code: '',
+            callerId: '' as AbjectId,
+            status: 'queued',
+            queuedAt: Date.now(),
+          });
+          await this.rebuildList();
           break;
-        case 'jobStarted':
-          await this.updateJobLabel(jobId, `\u25B8 #${jobId.replace('job-', '')} ${queueTag}${description}`, this.theme.statusWarning);
+        }
+        case 'jobStarted': {
+          const job = this.jobs.find(j => j.id === jobId);
+          if (job) { job.status = 'running'; job.startedAt = Date.now(); }
+          await this.rebuildList();
           break;
-        case 'jobCompleted':
-          await this.updateJobLabel(jobId, `\u2713 #${jobId.replace('job-', '')} ${queueTag}${description}`, this.theme.statusSuccess);
+        }
+        case 'jobCompleted': {
+          const job = this.jobs.find(j => j.id === jobId);
+          if (job) { job.status = 'completed'; job.completedAt = Date.now(); }
+          await this.rebuildList();
           break;
+        }
         case 'jobFailed': {
-          const error = data.error as string | undefined;
-          const errorSuffix = error ? ` \u2014 ${error.slice(0, 30)}` : '';
-          await this.updateJobLabel(jobId, `\u2717 #${jobId.replace('job-', '')} ${queueTag}${description}${errorSuffix}`, this.theme.statusError);
+          const job = this.jobs.find(j => j.id === jobId);
+          if (job) {
+            job.status = 'failed';
+            job.error = (data.error as string) ?? undefined;
+            job.completedAt = Date.now();
+          }
+          await this.rebuildList();
           break;
         }
         case 'historyCleared':
-          await this.clearJobLabels();
-          await this.populateExistingJobs();
+          this.jobs = [];
+          await this.loadJobs();
           break;
       }
     }
-  }
-
-  private async clearJobLabels(): Promise<void> {
-    if (!this.jobListId) return;
-
-    // Clear layout in one request
-    try {
-      await this.request(request(this.id, this.jobListId, 'clearLayoutChildren', {}));
-    } catch { /* may already be gone */ }
-
-    // Fire-and-forget destroy all labels
-    for (const [, labelId] of this.jobLabelMap) {
-      this.send(request(this.id, labelId, 'destroy', {}));
-    }
-    this.jobLabelMap.clear();
   }
 }
 

@@ -41,6 +41,7 @@ import { TabBarWidget, TabBarConfig } from './widgets/tabbar-widget.js';
 import { SliderWidget, SliderWidgetConfig } from './widgets/slider-widget.js';
 import { ImageWidget, ImageWidgetConfig } from './widgets/image-widget.js';
 import { ListWidget, ListWidgetConfig, ListItem } from './widgets/list-widget.js';
+import { TreeWidget, TreeWidgetConfig, TreeItem } from './widgets/tree-widget.js';
 import { SplitPaneWidget, SplitPaneConfig } from './widgets/split-pane-widget.js';
 import { WidgetAbject, WidgetConfig } from './widgets/widget-abject.js';
 import { VBoxLayout } from './widgets/vbox-layout.js';
@@ -1071,6 +1072,7 @@ tabBar - Tab bar (params: tabs[] of labels, selectedIndex). Fires 'change' event
 slider - Numeric range slider (params: min, max, step, value). Fires 'change' event with numeric value as string. Keyboard: ArrowLeft/Right ±step, Home/End for min/max. Click track or drag thumb.
 image - Image display (params: url, fit 'contain'|'cover'|'fill', alt). Fires 'click' on mousedown (register via addDependent to receive). Param: href — when set, clicking opens the URL in the user's browser. Update URL via this.call(imgId, 'update', { url: '...' }).
 list - Scrollable list (params: items[], selectedIndex?, searchable?, itemHeight?). Fires 'selectionChanged'.
+tree - Hierarchical tree view (params: treeItems[], selectedId?, itemHeight?). Items have id, label, icon?, iconColor?, secondary?, depth, expanded?, hasChildren?. Fires 'selectionChanged' and 'toggle'.
 splitPane - Resizable split view (params: orientation?, dividerPosition?, minSize?).
 
 ### Widget Style Properties
@@ -1808,6 +1810,8 @@ await this.call(timerId, 'addDependent', {});
     fit?: 'contain' | 'cover' | 'fill';
     alt?: string;
     items?: ListItem[];
+    treeItems?: TreeItem[];
+    selectedId?: string;
     searchable?: boolean;
     itemHeight?: number;
     orientation?: 'horizontal' | 'vertical';
@@ -1878,6 +1882,12 @@ await this.call(timerId, 'addDependent', {});
           type: 'label' as WidgetType, rect, style: spec.style,
           items: spec.items, selectedIndex: spec.selectedIndex,
           searchable: spec.searchable, itemHeight: spec.itemHeight, ...base,
+        }), rect);
+      case 'tree':
+        return this.createTypedWidget(spec.windowId, new TreeWidget({
+          type: 'label' as WidgetType, rect, style: spec.style,
+          items: spec.treeItems, selectedId: spec.selectedId,
+          itemHeight: spec.itemHeight, ...base,
         }), rect);
       case 'splitPane':
         return this.createTypedWidget(spec.windowId, new SplitPaneWidget({
