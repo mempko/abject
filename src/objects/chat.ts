@@ -10,7 +10,6 @@ import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../cor
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
-import { formatManifestAsDescription } from '../core/introspect.js';
 import type { AgentAction } from './agent-abject.js';
 import type { DiscoveredWorkspace } from './workspace-share-registry.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
@@ -55,8 +54,6 @@ export class Chat extends Abject {
 
   private messageLabelIds: AbjectId[] = [];
   private conversationHistory: ConversationEntry[] = [];
-  private userObjectSummaries = '';
-  private remotePeerContext = '';
   private enabledSkillsSummary = '';
   private uiPhase: UiPhase = 'closed';
 
@@ -352,17 +349,7 @@ export class Chat extends Abject {
     // ── AgentAbject callback handlers ──
 
     this.on('agentObserve', async (_msg: AbjectMessage) => {
-      const lines: string[] = [];
-      if (this.userObjectSummaries) {
-        lines.push('Your Abjects (user-created -- use "modify" to update):');
-        lines.push(this.userObjectSummaries);
-      }
-      if (this.remotePeerContext) {
-        lines.push('');
-        lines.push('Connected peers:');
-        lines.push(this.remotePeerContext);
-      }
-      return { observation: lines.join('\n') || 'No objects available.' };
+      return { observation: '' };
     });
 
     this.on('agentAct', (msg: AbjectMessage) => {
@@ -770,7 +757,7 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 ## Available Actions
 
 ### Object Interaction
-- **call**: Ask ObjectAgent to accomplish something with an object. ObjectAgent discovers the right API via the ask protocol automatically.
+- **call**: Ask ObjectAgent to accomplish a task using any object or system capability. ObjectAgent discovers available APIs automatically via the ask protocol.
   \`{ "action": "call", "description": "Fetch the current weather from WeatherAPI" }\`
   Or with a specific object hint: \`{ "action": "call", "object": "Timer", "description": "Set a 5 minute countdown timer" }\`
   Describe the GOAL, not the exact method. ObjectAgent will ask the target object how to use its API and send the right message.
@@ -778,7 +765,7 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   \`{ "action": "create", "description": "A counter widget that shows a number and has +/- buttons" }\`
 - **modify**: Modify an existing object. REQUIRED fields: "object" and "description". Routes through TupleSpace.
   \`{ "action": "modify", "object": "ObjectName", "description": "Add a reset button that clears the counter" }\`
-  The "object" field MUST be the object's name or [id: ...] from "Your Abjects" list above. Without "object", modify will fail.
+  The "object" field is the object's name. Always include both "object" and "description".
 - **clone**: Clone a clonable object from a remote peer's workspace into your local workspace.
   \`{ "action": "clone", "object": "peer.workspace.ObjectName" }\`
 
@@ -794,7 +781,7 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   ] }\`
   After decomposing, you'll observe sub-task progress and can synthesize results when done.
 
-  For **modify** subtasks, you MUST include \`"data": { "object": "ObjectName" }\` with the exact object name from "Your Abjects". Without it, the modify task will fail.
+  For **modify** subtasks, include \`"data": { "object": "ObjectName" }\` with the object name. Without it, the modify task will fail.
 
   For **call** subtasks, describe the goal, not specific method names. ObjectAgent discovers APIs automatically via the ask protocol. Example: \`{ "type": "call", "description": "Get the current canvas size from WidgetManager" }\` instead of guessing method names.
 
@@ -820,14 +807,6 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 
 The chat window renders markdown. Use **bold**, *italic*, \`inline code\`, headings, bullet lists, code blocks, and [links](url) in your reply and done text for readable formatting.
 
-## Your Abjects (user-created -- use "modify" to fix or update these)
-
-${this.userObjectSummaries || '(None yet -- use **create** to build something new)'}
-${this.remotePeerContext ? `
-## Connected Peers & Remote Workspaces
-
-${this.remotePeerContext}
-` : ''}
 ${this.enabledSkillsSummary ? `
 ## Enabled Skills (use task type "skill" to invoke via SkillAgent)
 
@@ -859,11 +838,11 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
 3. When the user asks you to do something, take action IMMEDIATELY. If the user includes credentials, URLs, or other details, pass them directly to the relevant object via **call**.
 4. Always end a conversation turn with **done** when the task is complete.
 5. Keep reasoning brief (1-2 sentences before the JSON block).
-6. IMPORTANT: If the user asks to fix, change, update, or improve something and a matching object exists in "Your Abjects" above, you MUST use **modify** with its name in the "object" field and a "description" of the change. Example: \`{ "action": "modify", "object": "PongGame", "description": "use mouse for controls" }\`. NEVER omit "object" or "description". NEVER re-create with **create** when an object already exists.
-7. If **modify** fails for ANY reason, you MUST retry "modify" with a simpler description. NEVER switch from "modify" to "create" after a failure. If modify fails repeatedly, use "done" to tell the user what happened.
-8. P2P: Use qualified names to reference remote objects: this.find('peer.workspace.ObjectName'). NEVER hardcode UUIDs.
+6. When the user asks to fix, change, update, or improve an existing object, use **modify** with its name in the "object" field and a "description" of the change. Example: \`{ "action": "modify", "object": "PongGame", "description": "use mouse for controls" }\`. Always include both "object" and "description". Prefer **modify** over **create** for existing objects.
+7. If **modify** fails, retry with a simpler description. Stay with **modify** across retries. If it fails repeatedly, use "done" to tell the user what happened.
+8. P2P: Resolve remote objects by qualified name: this.find('peer.workspace.ObjectName'). Always use find() for dynamic ID resolution.
 9. For web tasks: use **call** with WebAgent.runTask -- include ALL details from the user's message in the task description.
-10. NEVER use "create" if an object with the same or similar name already exists in "Your Abjects" above. Use "modify" instead.`;
+10. Always route tasks to an agent and let it try. Use **call** as the default when unsure which action fits.`;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1024,7 +1003,7 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
 
     try {
       // Refresh object summaries for the system prompt
-      await this.refreshObjectSummaries();
+      await this.refreshContext();
 
       // Build initial messages: system prompt + conversation history + new user message
       const initialMessages: { role: string; content: string }[] = [];
@@ -1129,71 +1108,8 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
   // Context Refresh
   // ═══════════════════════════════════════════════════════════════════
 
-  private async refreshObjectSummaries(): Promise<void> {
-    if (this.userObjectSummaries && this.conversationHistory.length < 5) return;
-
-    try {
-      const objects = await this.request<ObjectRegistration[]>(
-        request(this.id, this.registryId!, 'list', {})
-      );
-
-      const userObjects = objects.filter(obj => !(obj.manifest.tags ?? []).includes('system'));
-
-      this.userObjectSummaries = userObjects.length > 0
-        ? userObjects.map(obj => `[id: ${obj.id}]\n${formatManifestAsDescription(obj.manifest)}`).join('\n\n---\n\n')
-        : '';
-    } catch {
-      // Keep existing summaries if refresh fails
-    }
-
-    await this.refreshRemotePeerContext();
+  private async refreshContext(): Promise<void> {
     await this.refreshEnabledSkills();
-  }
-
-  private async refreshRemotePeerContext(): Promise<void> {
-    try {
-      const wsrId = await this.discoverDep('WorkspaceShareRegistry');
-      if (!wsrId) return;
-
-      let workspaces = await this.request<DiscoveredWorkspace[]>(
-        request(this.id, wsrId, 'getDiscoveredWorkspaces', {})
-      );
-
-      if (workspaces.length === 0) {
-        workspaces = await this.request<DiscoveredWorkspace[]>(
-          request(this.id, wsrId, 'discoverWorkspaces', { hops: 1 })
-        );
-      }
-
-      if (workspaces.length === 0) {
-        this.remotePeerContext = '';
-        return;
-      }
-
-      const lines: string[] = [];
-      for (const ws of workspaces) {
-        try {
-          const remoteObjects = await this.request<ObjectRegistration[]>(
-            request(this.id, ws.registryId as AbjectId, 'list', {})
-          );
-          const objNames = remoteObjects.map(o => {
-            const clonable = (o as ObjectRegistration & { source?: string }).source ? ' (clonable)' : '';
-            const displayName = o.name ?? o.manifest.name;
-            const qualified = `${ws.ownerName}.${ws.name}.${displayName}`;
-            return `${displayName} → find('${qualified}')${clonable}`;
-          }).join(', ');
-          lines.push(`- Peer "${ws.ownerName}" workspace "${ws.name}" (registryId: ${ws.registryId})\n  Objects: ${objNames}`);
-        } catch {
-          lines.push(`- Peer "${ws.ownerName}" workspace "${ws.name}" (registryId: ${ws.registryId})\n  Objects: (could not query)`);
-        }
-      }
-      this.remotePeerContext = lines.join('\n');
-      if (lines.length > 0) {
-        this.remotePeerContext += "\n\nGenerated code should use this.find('peer.workspace.ObjectName') — never hardcode UUIDs. To copy a clonable object locally, use the clone action.";
-      }
-    } catch {
-      // Best-effort — leave remotePeerContext unchanged
-    }
   }
 
   private async refreshEnabledSkills(): Promise<void> {

@@ -321,12 +321,10 @@ Sub-goals are indented under their parent goal.
     let color: string;
 
     switch (goal.status) {
-      case 'active': {
-        const progressLine = latestProgress ? `\n${indent}  ${latestProgress}` : '';
-        goalLine = `${indent}\u25B8 ${goal.title}${progressLine}`;
+      case 'active':
+        goalLine = `${indent}\u25B8 ${goal.title}`;
         color = this.theme.statusWarning;
         break;
-      }
       case 'completed':
         goalLine = `${indent}\u2713 ${goal.title}`;
         color = this.theme.statusSuccess;
@@ -355,6 +353,12 @@ Sub-goals are indented under their parent goal.
         return `${taskIndent}${icon} [${t.type}] ${desc}${attempts}`;
       });
       goalLine += '\n' + taskLines.join('\n');
+    }
+
+    // Append progress after tasks so it appears at the bottom
+    if (goal.status === 'active' && latestProgress) {
+      const progressIndent = indent ? '      ' : '   ';
+      goalLine += `\n${progressIndent}${latestProgress}`;
     }
 
     return { text: goalLine, color };

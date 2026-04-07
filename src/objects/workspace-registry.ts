@@ -23,6 +23,7 @@ export class WorkspaceRegistry extends Registry {
     this.on('setFallback', async (msg: AbjectMessage) => {
       const { registryId } = msg.payload as { registryId: AbjectId };
       this.fallbackRegistryId = registryId;
+      await this.refreshGlobalCatalog();
       return true;
     });
   }
@@ -32,6 +33,52 @@ export class WorkspaceRegistry extends Registry {
    */
   setFallback(globalRegistryId: AbjectId): void {
     this.fallbackRegistryId = globalRegistryId;
+  }
+
+  /**
+   * Override ask catalog: include both workspace and global registry objects
+   * so the LLM-based ask handler can see system capabilities like ShellExecutor.
+   */
+  protected override getSourceForAsk(): string | undefined {
+    const local = super.getSourceForAsk() ?? '';
+    if (!this.fallbackRegistryId) return local;
+
+    // Append a note that global objects are discoverable via the fallback.
+    // The actual catalog is fetched asynchronously in getSourceForAskAsync().
+    return local + (this._globalCatalogCache
+      ? `\n## System Capabilities (global registry)\n\n${this._globalCatalogCache}`
+      : '');
+  }
+
+  /** Cached catalog from the global registry, refreshed on each ask. */
+  private _globalCatalogCache = '';
+
+  protected override async onInit(): Promise<void> {
+    await super.onInit();
+    await this.refreshGlobalCatalog();
+  }
+
+  private async refreshGlobalCatalog(): Promise<void> {
+    if (!this.fallbackRegistryId) return;
+    try {
+      const objects = await this.request<ObjectRegistration[]>(
+        request(this.id, this.fallbackRegistryId, 'list', {})
+      );
+      this._globalCatalogCache = objects
+        .map(reg => {
+          const m = reg.manifest;
+          const methods = m.interface.methods
+            .filter(method => !['describe', 'ask', 'ping', 'addDependent', 'removeDependent', 'checkHealth'].includes(method.name))
+            .map(method => method.name)
+            .join(', ');
+          let line = `- **${reg.name ?? m.name}**: ${m.description}`;
+          if (methods) line += ` Methods: ${methods}`;
+          return line;
+        })
+        .join('\n');
+    } catch {
+      // Keep existing cache on failure
+    }
   }
 
   /**

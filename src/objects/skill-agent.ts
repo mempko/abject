@@ -43,9 +43,8 @@ export class SkillAgent extends Abject {
       manifest: {
         name: 'SkillAgent',
         description:
-          'Agent that executes tasks using enabled skills. Has access to shell commands (curl, jq, etc.), ' +
-          'HTTP requests, file system, and web search. Use for API integrations, data lookups, ' +
-          'finance queries, and any task that installed skills can handle.',
+          'Agent that executes tasks only when they match an installed skill. ' +
+          'Routes tasks to skill-specific workflows for API integrations, data lookups, and other skill domains.',
         version: '1.0.0',
         interface: {
           id: SKILL_AGENT_INTERFACE,
@@ -220,8 +219,9 @@ Tasks are dispatched automatically by AgentAbject based on task type matching.`;
   private async registerWithAgentAbject(): Promise<void> {
     if (!this.agentAbjectId) return;
 
-    // Build description from enabled skills so semantic matching is accurate
-    let description = 'Executes tasks using installed skills via shell commands, HTTP requests, and file system.';
+    // Build description from enabled skills only -- no generic capability language
+    // so semantic matching only routes skill-specific tasks here.
+    let description = 'Executes tasks only when they match an installed skill.';
     const skillNames: string[] = [];
 
     if (this.skillRegistryId) {
@@ -231,8 +231,7 @@ Tasks are dispatched automatically by AgentAbject based on task type matching.`;
         );
         if (skills.length > 0) {
           skillNames.push(...skills.map(s => s.name));
-          description = `Executes tasks using enabled skills: ${skills.map(s => `${s.name} (${s.description.slice(0, 80)})`).join('; ')}. ` +
-            'Has access to shell commands, HTTP requests, file system, and web search.';
+          description = `Executes tasks for these installed skills only: ${skills.map(s => `${s.name} (${s.description.slice(0, 80)})`).join('; ')}.`;
         } else {
           description = 'Skill execution agent (no skills currently enabled).';
         }
