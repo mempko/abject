@@ -68,6 +68,7 @@ export class FrontendClient {
   private lastCanvasX = 0;
   private lastCanvasY = 0;
   private abyssBg?: AbyssBgControl;
+  private resizableSurfaces: Set<string> = new Set();
 
   constructor(canvas: HTMLCanvasElement, abyssBg?: AbyssBgControl) {
     this.canvas = canvas;
@@ -482,6 +483,7 @@ export class FrontendClient {
 
       case 'destroySurface':
         this.compositor.destroySurface(msg.surfaceId);
+        this.resizableSurfaces.delete(msg.surfaceId);
         break;
 
       case 'draw':
@@ -542,6 +544,14 @@ export class FrontendClient {
 
       case 'openUrl':
         window.open((msg as { url: string }).url, '_blank');
+        break;
+
+      case 'setSurfaceResizable':
+        if (msg.resizable) {
+          this.resizableSurfaces.add(msg.surfaceId);
+        } else {
+          this.resizableSurfaces.delete(msg.surfaceId);
+        }
         break;
 
       case 'startWindowDrag':
@@ -605,8 +615,10 @@ export class FrontendClient {
         startSurfaceX: surface.rect.x,
         startSurfaceY: surface.rect.y,
       };
+      this.canvas.style.cursor = 'move';
+    } else if (msg.dragType === 'resize' && msg.edge) {
+      this.canvas.style.cursor = FrontendClient.edgeToCursor(msg.edge);
     }
-    // For resize drags: no local handling — server sends moveSurface/resizeSurface
   }
 
   private handleMouseUp(e: MouseEvent): void {
@@ -623,11 +635,63 @@ export class FrontendClient {
       }
       this.localDragState = undefined;
       this.grabbedSurface = undefined;
+      this.canvas.style.cursor = 'default';
       return;
     }
 
-    // Normal mouseup path
+    // Normal mouseup path -- reset cursor when grab ends
+    if (this.grabbedSurface) {
+      this.canvas.style.cursor = 'default';
+    }
     this.handleMouseEvent(e, 'mouseup');
+  }
+
+  // ── Resize cursor helpers ─────────────────────────────────────────
+
+  private static readonly EDGE_SIZE = 10;
+
+  private static edgeToCursor(edge: string): string {
+    switch (edge) {
+      case 'n': case 's': return 'ns-resize';
+      case 'e': case 'w': return 'ew-resize';
+      case 'ne': case 'sw': return 'nesw-resize';
+      case 'nw': case 'se': return 'nwse-resize';
+      default: return 'default';
+    }
+  }
+
+  private detectResizeEdge(
+    rect: { width: number; height: number },
+    localX: number,
+    localY: number,
+  ): string | null {
+    const sz = FrontendClient.EDGE_SIZE;
+    const n = localY < sz;
+    const s = localY > rect.height - sz;
+    const w = localX < sz;
+    const e = localX > rect.width - sz;
+
+    if (n && w) return 'nw';
+    if (n && e) return 'ne';
+    if (s && w) return 'sw';
+    if (s && e) return 'se';
+    if (n) return 'n';
+    if (s) return 's';
+    if (w) return 'w';
+    if (e) return 'e';
+    return null;
+  }
+
+  private updateCursor(canvasX: number, canvasY: number): void {
+    const surface = this.compositor.surfaceAt(canvasX, canvasY);
+    if (surface && this.resizableSurfaces.has(surface.id)) {
+      const localX = canvasX - surface.rect.x;
+      const localY = canvasY - surface.rect.y;
+      const edge = this.detectResizeEdge(surface.rect, localX, localY);
+      this.canvas.style.cursor = edge ? FrontendClient.edgeToCursor(edge) : 'default';
+    } else {
+      this.canvas.style.cursor = 'default';
+    }
   }
 
   private handleMeasureTextRequest(
@@ -944,6 +1008,9 @@ export class FrontendClient {
     const y = e.clientY - canvasRect.top;
     this.lastCanvasX = x;
     this.lastCanvasY = y;
+
+    // Update resize cursor on hover (instant, no server round-trip)
+    this.updateCursor(x, y);
 
     const hitSurface = this.compositor.surfaceAt(x, y);
     const surface = hitSurface;

@@ -5,7 +5,6 @@
  */
 
 // Export public API
-export { App, createApp } from './ui/app.js';
 export { Runtime, getRuntime } from './runtime/runtime.js';
 export { MessageBus, HealthInterceptor } from './runtime/message-bus.js';
 export type { MessageBusLike } from './runtime/message-bus.js';
@@ -18,7 +17,6 @@ export { DedicatedWorkerBridge } from './runtime/dedicated-worker-bridge.js';
 export { Abject, SimpleAbject, DEFERRED_REPLY } from './core/abject.js';
 export { Registry, REGISTRY_ID } from './objects/registry.js';
 export { Factory, FACTORY_ID } from './objects/factory.js';
-export { UIServer, UI_SERVER_ID } from './objects/ui-server.js';
 export { LLMObject, LLM_OBJECT_ID } from './objects/llm-object.js';
 export type { TierConfig, TierRouting } from './objects/llm-object.js';
 export { ObjectCreator, OBJECT_CREATOR_ID } from './objects/object-creator.js';
@@ -43,6 +41,8 @@ export { GoalBrowser, GOAL_BROWSER_ID } from './objects/goal-browser.js';
 export { GoalObserver, GOAL_OBSERVER_ID } from './objects/goal-observer.js';
 export { Chat, CHAT_ID } from './objects/chat.js';
 export { AbjectStore, ABJECT_STORE_ID } from './objects/abject-store.js';
+export { KnowledgeBase, KNOWLEDGE_BASE_ID } from './objects/knowledge-base.js';
+export { KnowledgeBrowser, KNOWLEDGE_BROWSER_ID } from './objects/knowledge-browser.js';
 export { ScriptableAbject } from './objects/scriptable-abject.js';
 export { CompositeAbject, COMPOSITE_ABJECT_ID } from './objects/composite-abject.js';
 export type { CompositeSpec, CompositeChildSpec, RouteEntry } from './objects/composite-abject.js';

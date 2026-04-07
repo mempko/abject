@@ -173,11 +173,12 @@ export class WindowManager extends Abject {
         titleButtonMargin?: number;
         workspaceId?: string;
       };
+      const isChromeless = chromeless ?? false;
       this.windows.set(surfaceId, {
         windowId,
         zIndex,
         rect: rect ? { ...rect } : { x: 0, y: 0, width: 0, height: 0 },
-        chromeless: chromeless ?? false,
+        chromeless: isChromeless,
         draggable: draggable ?? false,
         minimized: false,
         title: title ?? '',
@@ -186,6 +187,9 @@ export class WindowManager extends Abject {
         titleButtonMargin: titleButtonMargin ?? 7,
         workspaceId,
       });
+      if (!isChromeless && this.uiServerId) {
+        this.send(event(this.id, this.uiServerId, 'markSurfaceResizable', { surfaceId }));
+      }
       return true;
     });
 
@@ -204,6 +208,9 @@ export class WindowManager extends Abject {
               );
             } catch { /* target may be gone */ }
           }
+        }
+        if (this.uiServerId) {
+          this.send(event(this.id, this.uiServerId, 'unmarkSurfaceResizable', { surfaceId: sid }));
         }
         this.windows.delete(sid);
       };
@@ -417,7 +424,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     surfaceId: string,
     localX: number,
     localY: number,
-  ): Promise<{ grab: boolean; dragType?: 'move' | 'resize'; minimize?: string }> {
+  ): Promise<{ grab: boolean; dragType?: 'move' | 'resize'; edge?: string; minimize?: string }> {
     const info = this.windows.get(surfaceId);
     log.info(`surfaceMouseDown surface=${surfaceId} found=${!!info} chromeless=${info?.chromeless} localY=${localY} titleBarHeight=${info?.titleBarHeight}`);
     if (!info) return { grab: false };
@@ -437,7 +444,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
         startMouseY: localY + info.rect.y,
         startRect: { ...info.rect },
       };
-      return { grab: true, dragType: 'resize' };
+      return { grab: true, dragType: 'resize', edge };
     }
 
     // Title bar: check close/minimize buttons before drag (non-chromeless windows)

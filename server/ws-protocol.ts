@@ -124,6 +124,13 @@ export interface StartWindowDragMsg extends WsEnvelope {
   type: 'startWindowDrag';
   surfaceId: string;
   dragType: 'move' | 'resize';
+  edge?: string;
+}
+
+export interface SetSurfaceResizableMsg extends WsEnvelope {
+  type: 'setSurfaceResizable';
+  surfaceId: string;
+  resizable: boolean;
 }
 
 export interface ShowMobileKeyboardMsg extends WsEnvelope {
@@ -179,6 +186,7 @@ export type BackendToFrontendMsg =
   | ClipboardWriteMsg
   | OpenUrlMsg
   | StartWindowDragMsg
+  | SetSurfaceResizableMsg
   | ShowMobileKeyboardMsg
   | CaptureSurfaceRequestMsg
   | CaptureDesktopRequestMsg

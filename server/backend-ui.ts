@@ -561,6 +561,16 @@ export class BackendUI extends Abject {
       return true;
     });
 
+    this.on('markSurfaceResizable', async (msg: AbjectMessage) => {
+      const { surfaceId } = msg.payload as { surfaceId: string };
+      this.sendToFrontend({ type: 'setSurfaceResizable', surfaceId, resizable: true });
+    });
+
+    this.on('unmarkSurfaceResizable', async (msg: AbjectMessage) => {
+      const { surfaceId } = msg.payload as { surfaceId: string };
+      this.sendToFrontend({ type: 'setSurfaceResizable', surfaceId, resizable: false });
+    });
+
     // Two-phase drag: WindowAbject sends requestDrag when a chromeless+draggable
     // window's empty area is clicked. We tell WindowManager to start the drag
     // and the client to handle the move locally (zero latency).
@@ -1547,7 +1557,7 @@ IMPORTANT:
           const localX = msg.x ?? 0;
           const localY = msg.y ?? 0;
           try {
-            const reply = await this.request<{ grab: boolean; dragType?: 'move' | 'resize'; minimize?: string }>(
+            const reply = await this.request<{ grab: boolean; dragType?: 'move' | 'resize'; edge?: string; minimize?: string }>(
               request(this.id, this.windowManagerId,
                 'surfaceMouseDown', {
                   surfaceId: msg.surfaceId, localX, localY,
@@ -1566,6 +1576,7 @@ IMPORTANT:
                 type: 'startWindowDrag',
                 surfaceId: msg.surfaceId,
                 dragType: reply.dragType ?? 'move',
+                edge: reply.edge,
               }, clientId);
 
               if (reply.dragType === 'resize') {
