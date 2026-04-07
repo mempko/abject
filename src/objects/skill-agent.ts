@@ -403,6 +403,7 @@ I'll fetch the accounts list first.
 | write_file | path, content | Write a file |
 | search | query | Search the web |
 | fetch | url | Fetch a URL as cleaned text |
+| decompose | subtasks | Break a complex task into parallel sub-tasks dispatched to other agents. Each subtask has type (call, browse, create, modify, skill), description, and optional data. |
 | done | result | Task complete. Include the answer in result. |
 | fail | reason | Task cannot be completed |
 | reply | message | Send a progress update to the user |

@@ -202,6 +202,38 @@ export class GlobalSettings extends Abject {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## GlobalSettings Usage Guide
+
+Interface: abjects:global-settings
+
+GlobalSettings provides the global configuration UI for LLM API keys,
+authentication, and permissions (filesystem, shell, web access).
+It is a singleton (not per-workspace) and persists settings in global Storage.
+
+### Show the Settings Window
+
+  await this.call(
+    this.dep('GlobalSettings'), 'show', {});
+  // Opens the settings window with tabs: AI, Auth, Permissions
+
+### Hide the Settings Window
+
+  await this.call(
+    this.dep('GlobalSettings'), 'hide', {});
+
+### What It Manages
+- AI tab: Anthropic/OpenAI API keys, Ollama URL, per-tier model routing (smart/balanced/fast)
+- Auth tab: optional HTTP basic auth for the UI server
+- Permissions tab: filesystem paths, shell commands, and web domain allow/deny lists
+
+### IMPORTANT
+- API keys are stored in global Storage (persisted across restarts).
+- On first boot with no keys configured, the settings window auto-shows.
+- Changes take effect after clicking Save and are applied to the LLM object.
+- This object manages UI only; use it to show/hide the configuration window.`;
+  }
+
   protected override async onInit(): Promise<void> {
     await this.fetchTheme();
     this.llmId = await this.requireDep('LLM');

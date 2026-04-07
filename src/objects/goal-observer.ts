@@ -93,6 +93,45 @@ export class GoalObserver extends Abject {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## GoalObserver Usage Guide
+
+Interface: abjects:goal-observer
+
+GoalObserver is a per-workspace watchdog that monitors goal health.
+It periodically sweeps active goals and auto-fails those that are stale,
+have runaway task counts, or have exhausted all retry attempts.
+
+### Get Monitoring Health
+
+  const health = await this.call(
+    this.dep('GoalObserver'), 'getHealth', {});
+  // health = { activeGoals: 3, warningCount: 1, autoFailedCount: 0 }
+
+### Fail All Active Goals
+
+  const result = await this.call(
+    this.dep('GoalObserver'), 'failAllGoals', {});
+  // result = { failedGoals: 2, cancelledTasks: 5 }
+  // Cancels all tasks (removes from TupleSpace) and fails all active goals.
+
+### Configure Thresholds
+
+  await this.call(
+    this.dep('GoalObserver'), 'configure',
+    { staleWarnMs: 600000, staleFailMs: 1200000, maxTasksPerGoal: 30 });
+  // All parameters are optional; only provided values are updated.
+
+### Events
+- goalWarning: emitted when a goal shows signs of trouble (stale, high usage)
+- goalAutoFailed: emitted when a goal is auto-failed by the observer
+
+### IMPORTANT
+- Default stale warning at 20 min, auto-fail at 30 min of no progress.
+- Default max 20 tasks per goal, 50 total attempts across all tasks.
+- failAllGoals cleans up TupleSpace and shared state entries.`;
+  }
+
   // Configurable thresholds
   private staleWarnMs = STALE_WARN_MS;
   private staleFailMs = STALE_FAIL_MS;

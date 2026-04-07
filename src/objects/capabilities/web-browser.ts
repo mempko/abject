@@ -732,7 +732,7 @@ export class WebBrowser extends Abject {
       manifest: {
         name: 'WebBrowser',
         description:
-          'Headless browser automation. Navigate to URLs, wait for JavaScript to render, extract rendered HTML, take screenshots, query elements, and interact with pages via a stateful page API (open → navigate → click/fill/type → read → close). Use cases: login to websites (social media, email, web apps), scrape JavaScript-rendered pages, take screenshots, automate form filling and multi-step web interactions.',
+          'Low-level headless browser engine. Provides raw page operations: navigate, click, fill forms, take screenshots, extract HTML, and query elements via a stateful page API (open, navigate, interact, read, close).',
         version: '2.0.0',
         interface: {
             id: WEB_BROWSER_INTERFACE,

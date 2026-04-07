@@ -67,6 +67,43 @@ export class WebFetch extends Abject {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## WebFetch Usage Guide
+
+Interface: abjects:web-fetch
+
+WebFetch fetches a URL and returns its content as cleaned, readable text.
+HTML pages are automatically converted to plain text (scripts/styles stripped).
+JSON responses are pretty-printed. Non-HTML/JSON is returned as-is.
+
+### Fetch a URL
+
+  const result = await this.call(
+    this.dep('WebFetch'), 'fetch',
+    { url: 'https://example.com/page' });
+  // result = { content: '...', title: 'Page Title', url: 'https://...', contentType: 'text/html' }
+
+### Fetch with Max Length
+
+  const result = await this.call(
+    this.dep('WebFetch'), 'fetch',
+    { url: 'https://example.com/long-article', maxLength: 10000 });
+  // Content truncated to 10000 chars (default is 50000)
+
+### Response Structure
+
+Every response has: { content, title, url, contentType }
+- content: cleaned text extracted from the page
+- title: page title (from <title> tag for HTML, empty otherwise)
+- url: the fetched URL
+- contentType: the Content-Type header value
+
+### IMPORTANT
+- Use WebFetch instead of HttpClient when you need readable text from web pages.
+- HTML is automatically cleaned: scripts, styles, and tags are removed.
+- JSON responses are pretty-printed for readability.`;
+  }
+
   protected override async onInit(): Promise<void> {
     this.httpClientId = await this.discoverDep('HttpClient') ?? undefined;
     this.webParserId = await this.discoverDep('WebParser') ?? undefined;

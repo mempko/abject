@@ -67,6 +67,41 @@ export class WebSearch extends Abject {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## WebSearch Usage Guide
+
+Interface: abjects:web-search
+
+WebSearch searches the web using DuckDuckGo (no API key required) and
+returns a list of results with titles, URLs, and snippets.
+
+### Search the Web
+
+  const result = await this.call(
+    this.dep('WebSearch'), 'search',
+    { query: 'TypeScript WASM sandbox' });
+  // result = { results: [{ title: '...', url: '...', snippet: '...' }, ...] }
+
+### Limit Number of Results
+
+  const result = await this.call(
+    this.dep('WebSearch'), 'search',
+    { query: 'distributed object systems', maxResults: 5 });
+  // Returns at most 5 results (default is 10)
+
+### Response Structure
+
+Returns { results: SearchResult[] } where each SearchResult has:
+- title: the result page title
+- url: the result page URL
+- snippet: a short text excerpt from the result
+
+### IMPORTANT
+- Use WebSearch to find information on the web before fetching full pages.
+- Combine with WebFetch to retrieve full content from search result URLs.
+- No API key is required; uses DuckDuckGo HTML search.`;
+  }
+
   protected override async onInit(): Promise<void> {
     this.httpClientId = await this.discoverDep('HttpClient') ?? undefined;
     this.webParserId = await this.discoverDep('WebParser') ?? undefined;

@@ -62,6 +62,38 @@ export class ModalDialog extends Abject {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## ModalDialog Usage Guide
+
+ModalDialog is an ephemeral confirmation dialog with a backdrop overlay.
+It is spawned on demand, shows a modal prompt, and returns the user's choice.
+
+### Show a confirmation dialog
+
+  const confirmed = await call(await dep('ModalDialog'), 'show', {
+    title: 'Delete item?',
+    message: 'This action cannot be undone.',
+    confirmLabel: 'Delete',
+    cancelLabel: 'Keep',
+    destructive: true
+  });
+  / confirmed: true if user clicked confirm, false if cancelled
+
+### Parameters
+- title (string) — dialog title
+- message (string) — dialog body text
+- confirmLabel (string, optional) — confirm button text (default: "Confirm")
+- cancelLabel (string, optional) — cancel button text (default: "Cancel")
+- destructive (boolean, optional) — if true, confirm button uses destructive styling
+- theme (ThemeData, optional) — custom theme for styling
+
+### Notes
+- Clicking the backdrop dismisses the dialog (returns false).
+- The dialog window is destroyed before the reply is delivered.
+
+Interface: abjects:modal-dialog`;
+  }
+
   setWidgetManagerId(id: AbjectId): void {
     this.widgetManagerId = id;
   }

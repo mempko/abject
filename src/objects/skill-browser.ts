@@ -93,6 +93,33 @@ export class SkillBrowser extends Abject {
     }
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## SkillBrowser Usage Guide
+
+SkillBrowser provides a two-pane UI for browsing and managing installed skills.
+The left pane lists all skills with their enable/disable state, and the right
+pane shows details, configuration, and actions for the selected skill.
+
+### Show / hide the skill browser window
+
+  await call(await dep('SkillBrowser'), 'show', {});
+  await call(await dep('SkillBrowser'), 'hide', {});
+
+### User interactions (handled internally)
+
+- Click a skill in the list to view its details (name, source, version, description, status).
+- Click "Enable" / "Disable" to toggle the skill.
+- Click "Uninstall" to remove a skill from disk.
+- Click "Scan Skills" to re-scan the skills directory for new SKILL.md files.
+- Configure environment variables for a skill and click "Save Config".
+- Click "Add Variable" to add custom environment variables.
+
+### IMPORTANT
+- The interface ID is '${SKILL_BROWSER_INTERFACE}'.
+- SkillBrowser is a UI-only object; it delegates all data operations to SkillRegistry.
+- Skills are SKILL.md files compatible with Claude Code and OpenClaw formats.`;
+  }
+
   // ─── Widget helpers (follow ObjectBrowser pattern) ──────────────
 
   private async wm(method: string, payload: Record<string, unknown>): Promise<unknown> {

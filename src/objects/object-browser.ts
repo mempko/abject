@@ -180,6 +180,50 @@ export class ObjectBrowser extends Abject {
     this.systemRegistryId = await this.discoverDep('Registry') ?? undefined;
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## ObjectBrowser Usage Guide
+
+ObjectBrowser is a Smalltalk-inspired four-pane Abject explorer for inspecting
+and interacting with all objects in the system.
+
+Pane 1: Scope filter (All objects, per-workspace, remote workspaces).
+Pane 2: Object kinds grouped by manifest name.
+Pane 3: Methods and events for the selected kind.
+Pane 4: Detail view with signature, status, source, send-message form,
+         and implementors/senders cross-references.
+
+### Show / hide the object browser window
+
+  await call(await dep('ObjectBrowser'), 'show', {});
+  await call(await dep('ObjectBrowser'), 'hide', {});
+
+### Navigate to a specific object kind
+
+  await call(await dep('ObjectBrowser'), 'browseKind', { name: 'Chat' });
+
+### Navigate to a specific scope
+
+  await call(await dep('ObjectBrowser'), 'browseScope', { scope: 'all' });
+
+### Get current state
+
+  const state = await call(await dep('ObjectBrowser'), 'getState', {});
+  // state: { visible }
+
+### User interactions (handled internally)
+
+- Click scope tabs or workspace lists to filter visible objects.
+- Select a kind in Pane 2 to see its methods/events in Pane 3.
+- Select a method/event in Pane 3 to see its detail in Pane 4.
+- Use the inline message form in Pane 4 to send messages to live instances.
+- Open investigation tabs for parallel browsing sessions with independent history.
+
+### IMPORTANT
+- The interface ID is '${OBJECT_BROWSER_INTERFACE}'.
+- ObjectBrowser reads from ObjectCatalog for unified multi-registry data.
+- Navigation history supports back/forward within each investigation tab.`;
+  }
+
   private setupHandlers(): void {
     this.on('show', async () => {
       await this.show();

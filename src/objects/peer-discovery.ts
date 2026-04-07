@@ -112,6 +112,42 @@ export class PeerDiscoveryObject extends Abject {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## PeerDiscovery Usage Guide
+
+PeerDiscovery enables gossip-based peer discovery across the mesh network.
+Peers exchange their peer lists periodically and can find specific peers
+through flood-based queries without relying on a central server.
+
+### Find a peer through gossip
+
+  const found = await call(await dep('PeerDiscovery'), 'findPeer', {
+    targetPeerId: 'abc123...'
+  });
+  / found: true if the peer was located (directly, via cache, or via gossip)
+
+### Get discovery statistics
+
+  const stats = await call(await dep('PeerDiscovery'), 'getDiscoveryStats', {});
+  / stats: { cacheSize: number, connectedNetworkPeers: number }
+
+### List all discovered peers
+
+  const peers = await call(await dep('PeerDiscovery'), 'getDiscoveredPeers', {});
+  / peers: PeerIdentity[] (peerId, publicSigningKey, publicExchangeKey, name)
+
+### Events
+- peerDiscovered — emitted when a new peer is found via gossip ({ peerId, name })
+- peerExchangeReceived — emitted when a peer exchange arrives ({ fromPeerId, peerCount })
+
+### Notes
+- Discovery cache entries expire after 10 minutes.
+- Peer exchanges happen every 90 seconds to connected peers.
+- Speculative mesh connections are attempted when new peers are discovered.
+
+Interface: abjects:peer-discovery`;
+  }
+
   /**
    * Wire dependencies.
    */

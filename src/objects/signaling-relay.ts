@@ -102,6 +102,58 @@ export class SignalingRelayObject extends Abject implements SignalingRelay {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## SignalingRelay Usage Guide
+
+SignalingRelay relays SDP/ICE signaling between peers over DataChannel,
+enabling new peer connections even when the central signaling server is down.
+Connected peers act as relay nodes, forwarding signaling messages with TTL.
+
+### Relay an SDP offer
+
+  const ok = await call(await dep('SignalingRelay'), 'relayOffer', {
+    fromPeerId: 'origin-peer-id',
+    targetPeerId: 'target-peer-id',
+    sdp: { type: 'offer', sdp: '...' },
+    ttl: 3
+  });
+  / ok: true if the message was forwarded
+
+### Relay an SDP answer
+
+  const ok = await call(await dep('SignalingRelay'), 'relayAnswer', {
+    fromPeerId: 'origin-peer-id',
+    targetPeerId: 'target-peer-id',
+    sdp: { type: 'answer', sdp: '...' },
+    ttl: 3
+  });
+
+### Relay an ICE candidate
+
+  const ok = await call(await dep('SignalingRelay'), 'relayIceCandidate', {
+    fromPeerId: 'origin-peer-id',
+    targetPeerId: 'target-peer-id',
+    candidate: { candidate: '...', sdpMid: '0' },
+    ttl: 3
+  });
+
+### Find a relay peer
+
+  const relayPeerId = await call(await dep('SignalingRelay'), 'findRelay', {
+    targetPeerId: 'target-peer-id'
+  });
+  / relayPeerId: string | null (peer ID that can reach the target, or null)
+
+### Events
+- relayReceived — emitted when a relay message is processed ({ type, fromPeerId, targetPeerId })
+
+### Notes
+- Messages are forwarded hop-by-hop with a TTL (max 3). TTL=0 messages are dropped.
+- If the target is directly connected, the message is delivered immediately.
+
+Interface: abjects:signaling-relay`;
+  }
+
   /**
    * Wire the PeerRegistry for transport access.
    */

@@ -30,6 +30,7 @@ interface TaskInfo {
   attempts: number;
   maxAttempts: number;
   claimedBy?: string;
+  agentName?: string;
 }
 
 const GOAL_STATUS_ICONS: Record<string, { icon: string; color: string }> = {
@@ -316,6 +317,7 @@ Click the arrow to expand/collapse a goal.
         attempts: (t.fields.attempts as number) ?? 0,
         maxAttempts: (t.fields.maxAttempts as number) ?? 3,
         claimedBy: t.claimedBy,
+        agentName: (t.fields.agentName as string) ?? undefined,
       }));
     } catch { return []; }
   }
@@ -325,15 +327,30 @@ Click the arrow to expand/collapse a goal.
   private buildTreeItems(): TreeItem[] {
     const items: TreeItem[] = [];
 
+    // Build parent -> children map for proper nesting
+    const childrenOf = new Map<string, Goal[]>();
+    const topLevel: Goal[] = [];
     for (const goal of this.goals) {
+      if (goal.parentId) {
+        const siblings = childrenOf.get(goal.parentId) ?? [];
+        siblings.push(goal);
+        childrenOf.set(goal.parentId, siblings);
+      } else {
+        topLevel.push(goal);
+      }
+    }
+
+    // Render a goal and its children recursively
+    const renderGoal = (goal: Goal, depth: number): void => {
       const isExpanded = this.expandedGoals.has(goal.id);
       const tasks = this.tasksByGoal.get(goal.id) ?? [];
+      const children = childrenOf.get(goal.id) ?? [];
       const latestProgress = goal.progress.length > 0
         ? goal.progress[goal.progress.length - 1].message
         : '';
-      const hasChildren = tasks.length > 0 || (goal.status === 'active' && !!latestProgress);
+      const hasChildren = tasks.length > 0 || children.length > 0
+        || (goal.status === 'active' && !!latestProgress);
 
-      // Goal status icon and color
       const statusInfo = GOAL_STATUS_ICONS[goal.status];
       const icon = statusInfo?.icon ?? '?';
       let iconColor: string;
@@ -353,12 +370,12 @@ Click the arrow to expand/collapse a goal.
         label: goal.title + errorSuffix,
         icon,
         iconColor,
-        depth: goal.parentId ? 1 : 0,
+        depth,
         expanded: isExpanded,
         hasChildren,
       });
 
-      if (!isExpanded) continue;
+      if (!isExpanded) return;
 
       // Task children
       for (const task of tasks) {
@@ -369,25 +386,34 @@ Click the arrow to expand/collapse a goal.
 
         items.push({
           id: `task:${task.id}`,
-          label: `[${task.type}] ${desc}${attempts}`,
+          label: task.agentName ? `[${task.agentName}] ${desc}${attempts}` : `${desc}${attempts}`,
           icon: taskIcon,
           iconColor: effectiveStatus === 'done' ? this.theme.statusSuccess
             : effectiveStatus === 'permanently_failed' ? this.theme.statusError
             : this.theme.textSecondary,
-          depth: goal.parentId ? 2 : 1,
+          depth: depth + 1,
         });
       }
 
-      // Progress line (child of the task, one level deeper)
+      // Sub-goals nested under this goal
+      for (const child of children) {
+        renderGoal(child, depth + 1);
+      }
+
+      // Progress line at the bottom
       if (goal.status === 'active' && latestProgress) {
         items.push({
           id: `progress:${goal.id}`,
           label: latestProgress,
-          icon: '\u2026', // …
+          icon: '\u2026',
           iconColor: this.theme.textTertiary,
-          depth: goal.parentId ? 3 : 2,
+          depth: depth + 1,
         });
       }
+    };
+
+    for (const goal of topLevel) {
+      renderGoal(goal, 0);
     }
 
     return items;

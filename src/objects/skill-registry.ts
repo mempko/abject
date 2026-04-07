@@ -166,6 +166,54 @@ export class SkillRegistry extends Abject {
     log.info(`Initialized with ${this.skills.size} skills in ${this.skillsDir}`);
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## SkillRegistry Usage Guide
+
+SkillRegistry manages the lifecycle of skills (SKILL.md files). It scans the
+skills directory, handles enable/disable state, configuration (env vars), and
+provides enabled skill summaries for agent prompt injection.
+
+### List all discovered skills
+
+  const skills = await call(await dep('SkillRegistry'), 'listSkills', {});
+  // Returns SkillInfo[]: { name, description, version, source, enabled, error, ... }
+
+### Enable / disable a skill
+
+  await call(await dep('SkillRegistry'), 'enableSkill', { name: 'my-skill' });
+  await call(await dep('SkillRegistry'), 'disableSkill', { name: 'my-skill' });
+
+### Re-scan the skills directory
+
+  const result = await call(await dep('SkillRegistry'), 'scanSkills', {});
+  // result: { found: <number> }
+
+### Install / uninstall a skill
+
+  await call(await dep('SkillRegistry'), 'installSkill', { name: 'my-skill', content: '---\\nname: my-skill\\n---\\nInstructions...' });
+  await call(await dep('SkillRegistry'), 'uninstallSkill', { name: 'my-skill' });
+
+### Get enabled skill summaries (for prompt injection)
+
+  const summaries = await call(await dep('SkillRegistry'), 'getEnabledSkills', {});
+  // Returns EnabledSkillSummary[]: { name, description, instructions, allowedTools, env }
+
+### Configure environment variables for a skill
+
+  await call(await dep('SkillRegistry'), 'setSkillConfig', { name: 'my-skill', env: { API_KEY: 'xxx' } });
+  const config = await call(await dep('SkillRegistry'), 'getSkillConfig', { name: 'my-skill' });
+
+### Events
+
+SkillRegistry emits 'skillsChanged' (with reason: enabled|disabled|scanned|installed|uninstalled|configured)
+whenever the skill set changes.
+
+### IMPORTANT
+- The interface ID is '${SKILL_REGISTRY_INTERFACE}'.
+- Skills are SKILL.md files in subdirectories of the skills/ folder.
+- Compatible with Claude Code and OpenClaw SKILL.md formats.`;
+  }
+
   private setupHandlers(): void {
     this.on('listSkills', async () => {
       return this.getSkillInfoList();

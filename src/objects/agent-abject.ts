@@ -534,7 +534,7 @@ Pass an existing goalId to link a task to a parent goal:
 
   const { ticketId } = await call(await dep('AgentAbject'), 'startTask', {
     task: 'Do something',
-    goalId: 'existing-goal-id',  // optional — auto-created if omitted
+    goalId: 'existing-goal-id',  // optional — task runs without a goal if omitted
   });
 
 Inside job code, goal helpers are available automatically:
@@ -692,18 +692,9 @@ improve semantic matching accuracy.
 
       const taskState = this.createTask(taskId, task, { maxSteps: config.maxSteps, timeout: config.timeout });
 
-      // Every task has a goal — use provided one or auto-create
-      let goalId = incomingGoalId;
-      if (!goalId && this.goalManagerId) {
-        try {
-          const goalResult = await this.request<{ goalId: string }>(
-            request(this.id, this.goalManagerId, 'createGoal', {
-              title: task.slice(0, 100),
-            })
-          );
-          goalId = goalResult.goalId;
-        } catch { /* GoalManager may not be ready */ }
-      }
+      // Use the provided goal if given. Goal creation is the responsibility
+      // of the calling agent, not the runtime.
+      const goalId = incomingGoalId;
 
       const entry: TaskEntry = {
         state: taskState,
@@ -950,49 +941,27 @@ improve semantic matching accuracy.
     const taskGoalId = tuple.fields.goalId as string | undefined;
     const failureHistory = (tuple.fields.failureHistory as Array<{ agent: string; agentId: string }>) ?? [];
 
-    log.info(`DISPATCH-INNER ${tupleId} type=${taskType} goalId=${taskGoalId?.slice(0, 8) ?? '?'} failureHistory=${failureHistory.length}`);
+    log.info(`DISPATCH-INNER ${tupleId} goalId=${taskGoalId?.slice(0, 8) ?? '?'} failureHistory=${failureHistory.length}`);
 
-    // 1. Find agents whose taskTypes include this task type
-    const candidates = [...this.registeredAgents.values()]
-      .filter(a => a.taskTypes.includes(taskType));
-
+    // 1. Find all eligible agents (not failed, not busy)
     const failedAgentIds = new Set(failureHistory.map(f => f.agentId));
-    let eligibleCandidates: RegisteredAgent[];
+    const eligible = [...this.registeredAgents.values()]
+      .filter(a => !failedAgentIds.has(a.agentId))
+      .filter(a => !this.busyAgents.has(a.agentId));
 
-    if (candidates.length === 0) {
-      // No exact type match — try semantic fallback via LLM
-      const allAgents = [...this.registeredAgents.values()]
-        .filter(a => !failedAgentIds.has(a.agentId))
-        .filter(a => !this.busyAgents.has(a.agentId));
-      if (allAgents.length === 0) {
-        log.info(`DISPATCH-INNER ${tupleId} — no registered agents available for fallback (failed or busy)`);
-        return;
-      }
-      const matched = await this.semanticMatchAgent(allAgents, taskType, description);
-      if (!matched) {
-        log.info(`DISPATCH-INNER ${tupleId} — LLM fallback found no suitable agent for type=${taskType}`);
-        return;
-      }
-      log.info(`DISPATCH-INNER ${tupleId} — LLM fallback matched: ${matched.name}`);
-      eligibleCandidates = [matched];
-    } else {
-      // Exact type match — filter out failed and busy agents
-      eligibleCandidates = candidates
-        .filter(a => !failedAgentIds.has(a.agentId))
-        .filter(a => !this.busyAgents.has(a.agentId));
-      if (eligibleCandidates.length === 0) {
-        log.info(`DISPATCH-INNER ${tupleId} — all ${candidates.length} agents failed or busy`);
-        return;
-      }
+    if (eligible.length === 0) {
+      log.info(`DISPATCH-INNER ${tupleId} — no agents available (all failed or busy)`);
+      return;
     }
 
-    // 3. Pick the best agent
-    let chosen: RegisteredAgent;
-    if (eligibleCandidates.length === 1) {
-      chosen = eligibleCandidates[0];
-    } else {
-      chosen = await this.classifyBestAgent(eligibleCandidates, description);
+    // 2. Semantic match: LLM picks the best agent based on descriptions
+    const matched = await this.semanticMatchAgent(eligible, taskType, description);
+    if (!matched) {
+      log.info(`DISPATCH-INNER ${tupleId} — no suitable agent found for: ${description.slice(0, 60)}`);
+      return;
     }
+    log.info(`DISPATCH-INNER ${tupleId} — matched: ${matched.name}`);
+    const chosen = matched;
 
     // 3a. Mark agent busy BEFORE the async claim to prevent concurrent
     // dispatches from claiming tasks for the same agent (JS is single-threaded,
@@ -1025,6 +994,17 @@ improve semantic matching accuracy.
       return;
     }
     log.info(`DISPATCH-INNER ${tupleId} — claimed, sending executeTask to ${chosen.name}`);
+
+    // 4b. Store agent name on the tuple so GoalBrowser can display it
+    if (this.goalManagerId && taskGoalId) {
+      try {
+        await this.request(request(this.id, this.goalManagerId, 'updateTaskFields', {
+          goalId: taskGoalId,
+          taskId: claimed.tuple.id,
+          fields: { agentName: chosen.name },
+        }));
+      } catch { /* best effort */ }
+    }
 
     // 5. Report progress (attempts are tracked by failTask, not here)
     if (taskGoalId) {
@@ -1235,12 +1215,11 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
     if (!this.llmId) return null;
 
     const agentList = allAgents
-      .map((a, i) => `${i}: ${a.name} (types: ${a.taskTypes.join(', ')}) — ${a.description}`)
+      .map((a, i) => `${i}: ${a.name} — ${a.description}`)
       .join('\n');
-    const prompt = `No agent explicitly declares task type "${taskType}".
-Task description: "${description.slice(0, 200)}"
+    const prompt = `Task: "${description.slice(0, 200)}"
 
-Based on the agent descriptions below, which agent (if any) could handle this task?
+Which agent is best suited to handle this task?
 
 Agents:
 ${agentList}
@@ -1251,7 +1230,7 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
       const result = await this.request<{ content: string }>(
         request(this.id, this.llmId, 'complete', {
           messages: [{ role: 'user', content: prompt }],
-          options: { maxTokens: 20 },
+          options: { tier: 'balanced' },
         }),
         10000,
       );
@@ -2207,10 +2186,14 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
     const parsed = this.tryParseActionJson(content);
     if (parsed) return parsed;
 
-    // Detect hallucinated tool calls -- these are never valid results
+    // Detect hallucinated tool calls -- strip them and inject a correction
     const hallucinationPatterns = ['<function_calls>', '<tool_call>', '<invoke name='];
     if (hallucinationPatterns.some(p => content.includes(p))) {
-      return { action: 'fail', reason: 'LLM hallucinated tool calls instead of producing a valid action' };
+      entry.state.llmMessages.push({
+        role: 'user',
+        content: '[Error] You produced XML tool calls, but this system uses JSON actions in ```json code blocks. Please respond with a valid JSON action.',
+      });
+      return { action: entry.config.fallbackActionName, result: undefined, reasoning: 'Retrying after hallucinated tool calls' };
     }
 
     // Config-driven fallback

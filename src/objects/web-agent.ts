@@ -64,7 +64,7 @@ export class WebAgent extends Abject {
       manifest: {
         name: 'WebAgent',
         description:
-          'Autonomous browser agent. Accepts a task description, opens a browser page, and uses an LLM-driven think-act-observe loop to complete web tasks. Each phase is a visible job in JobBrowser.',
+          'Autonomous web browsing agent. Give it a task description and it handles navigation, content extraction, form filling, screenshots, and error recovery automatically. Accepts natural language goals via runTask.',
         version: '1.0.0',
         interface: {
           id: WEB_AGENT_INTERFACE,
@@ -317,7 +317,7 @@ Set keepPageOpen: false to explicitly close the page when done.
     // Register with AgentAbject
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'WebAgent',
-      description: 'Autonomous browser agent for web tasks',
+      description: 'Autonomous web browsing agent. Handles visiting URLs, navigating websites, reading page content, filling forms, taking screenshots, extracting data, and researching topics on the web.',
       taskTypes: ['browse', 'research', 'web'],
       config: {
         terminalActions: {
@@ -928,6 +928,14 @@ Respond with ONE action as a JSON object in a \`\`\`json code block:
   Complex: { "action": "extract", "script": "(() => { const items = []; document.querySelectorAll('h2 a').forEach(a => items.push({title: a.textContent.trim(), url: a.href})); return items.slice(0, 10); })()" }
   For multi-statement scripts, wrap in an IIFE: (() => { ...code...; return result; })()
   For APIs or plain-text endpoints, use fetch: { "action": "extract", "script": "fetch('https://api.example.com/data').then(r => r.json())" }
+
+### Task Decomposition
+- decompose: Break a complex task into parallel sub-tasks dispatched to other agents.
+  { "action": "decompose", "subtasks": [
+    { "type": "browse", "description": "Navigate to page X and extract data" },
+    { "type": "call", "description": "Fetch API endpoint Y" }
+  ] }
+  Use when the task requires multiple independent steps that could run in parallel.
 
 ### Terminal
 - done: Task complete. { "action": "done", "result": "extracted data or summary" }

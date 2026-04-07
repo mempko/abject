@@ -88,6 +88,31 @@ export class GlobalToolbar extends Abject {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## GlobalToolbar Usage Guide
+
+### Overview
+Persistent chromeless toolbar positioned above the workspace area. Provides
+quick-access buttons for system-wide panels: GlobalSettings (API keys),
+PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
+(running processes), and LLMMonitor (The Eye).
+
+### Methods
+- \`show({ yOffset })\` -- Show the toolbar at the given vertical offset.
+- \`hide()\` -- Destroy the toolbar window.
+- \`getHeight()\` -- Returns the current window height (used by WorkspaceManager
+  for positioning elements below the toolbar).
+
+### Behavior
+- Each button lazily discovers its target object on first click.
+- Clicking a button sends \`show\` to the corresponding system panel.
+- The toolbar rebuilds from scratch on each \`show()\` call so its position
+  can be updated by the caller.
+
+### Interface ID
+\`abjects:global-toolbar\``;
+  }
+
   protected override async onInit(): Promise<void> {
     await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');

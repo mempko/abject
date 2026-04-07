@@ -103,6 +103,34 @@ export class WorkspaceSwitcher extends Abject {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## WorkspaceSwitcher Usage Guide
+
+### Overview
+Global chromeless bar for switching between workspaces. Shows one button per
+workspace (with access-mode icons), a "+" button to create new workspaces,
+a gear button to open workspace Settings, and a "Browse" button to open
+the WorkspaceBrowser for discovering remote workspaces.
+
+### Methods
+- \`show({ workspaces, activeWorkspaceId, settingsId?, yOffset? })\` -- Show or
+  rebuild the switcher with the given workspace list. The active workspace
+  button is highlighted.
+- \`hide()\` -- Destroy the switcher window.
+- \`getHeight()\` -- Returns the current window height (used by WorkspaceManager
+  for positioning the Taskbar below).
+
+### Behavior
+- Clicking a workspace button sends \`switchWorkspace\` to WorkspaceManager.
+- Clicking "+" creates a new workspace and refreshes the bar.
+- Clicking the gear opens the per-workspace Settings panel.
+- Clicking "Browse" opens WorkspaceBrowser for remote workspace discovery.
+- Exists outside any workspace to avoid deadlocks during workspace switches.
+
+### Interface ID
+\`abjects:workspace-switcher\``;
+  }
+
   protected override async onInit(): Promise<void> {
     await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');

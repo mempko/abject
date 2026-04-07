@@ -315,6 +315,25 @@ export class SharedState extends Abject {
       return true;
     });
 
+    this.on('removeNamespace', async (msg: AbjectMessage) => {
+      const { name } = msg.payload as { name: string };
+      // Delete all persisted entries from storage
+      const persisted = this.persistedKeys.get(name);
+      if (persisted && this.storageId) {
+        for (const key of persisted) {
+          try {
+            await this.request(createRequest(this.id, this.storageId, 'delete', { key: `shared-state:${name}:${key}` }));
+          } catch { /* best effort */ }
+        }
+      }
+      // Remove all in-memory state
+      this.persistedKeys.delete(name);
+      this.stateMaps.delete(name);
+      this.subscribers.delete(name);
+      await this.saveManifest();
+      return true;
+    });
+
     // Handle sync messages from remote SharedState instances
     this.on('_syncEntry', async (msg: AbjectMessage) => {
       const { name, key, entry, propagationId, hopsRemaining } = msg.payload as {
@@ -938,6 +957,10 @@ export class SharedState extends Abject {
 ### Delete a key
 
   await call(ssId, 'delete', { name: 'my-state', key: 'count' });
+
+### Remove an entire namespace (all keys, persistence, and subscribers)
+
+  await call(ssId, 'removeNamespace', { name: 'my-state' });
 
 ### IMPORTANT
 - State syncs automatically to connected peers via workspace-scoped discovery

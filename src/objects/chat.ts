@@ -6,12 +6,11 @@
  * think-act-observe state machine, calling back Chat for observe and act.
  */
 
-import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
+import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
-import type { DiscoveredWorkspace } from './workspace-share-registry.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 import { estimateMarkdownHeight } from './widgets/markdown.js';
 import { Log } from '../core/timed-log.js';
@@ -54,7 +53,6 @@ export class Chat extends Abject {
 
   private messageLabelIds: AbjectId[] = [];
   private conversationHistory: ConversationEntry[] = [];
-  private enabledSkillsSummary = '';
   private uiPhase: UiPhase = 'closed';
 
   /** Label ID for the current "Thinking..." indicator. */
@@ -490,236 +488,67 @@ export class Chat extends Abject {
   // Agent act handler
   // ═══════════════════════════════════════════════════════════════════
 
+  /**
+   * Lazily create a goal on first action, using the action's description
+   * as the title instead of the raw user query.
+   */
+  private async ensureGoal(description: string): Promise<string | undefined> {
+    if (this._currentGoalId) return this._currentGoalId;
+    if (!this.goalManagerId) return undefined;
+    try {
+      const { goalId } = await this.request<{ goalId: string }>(
+        request(this.id, this.goalManagerId, 'createGoal', {
+          title: description.slice(0, 100),
+        })
+      );
+      this._currentGoalId = goalId;
+      return goalId;
+    } catch { return undefined; }
+  }
+
   private async handleAgentAct(action: AgentAction): Promise<unknown> {
-    log.info(`[Chat] handleAgentAct: action=${action.action} object=${(action as Record<string, unknown>).object ?? ''}`);
-    switch (action.action) {
-      case 'call': {
-        const targetStr = action.object as string | undefined;
-        const method = action.method as string | undefined;
-        const actionDescription = action.description as string | undefined;
+    log.info(`[Chat] handleAgentAct: action=${action.action}`);
 
-        // Build task description: prefer the LLM's description, fall back to method-based format
-        const description = actionDescription
-          ?? (targetStr && method ? `Call ${targetStr}.${method}(${JSON.stringify(action.payload ?? {}).slice(0, 200)})` : 'Call an object');
+    const description = (action.description as string)
+      ?? `${action.action} ${(action.object as string) ?? ''}`.trim();
 
-        // Route through TupleSpace as type 'call' -- ObjectAgent claims and executes
-        if (this.goalManagerId && this._currentGoalId) {
-          try {
-            const { taskId } = await this.request<{ taskId: string }>(
-              request(this.id, this.goalManagerId, 'addTask', {
-                goalId: this._currentGoalId,
-                type: 'call',
-                description,
-                data: {
-                  ...(targetStr ? { object: targetStr } : {}),
-                  ...(method ? { method } : {}),
-                  ...(action.payload ? { payload: action.payload } : {}),
-                },
-              })
-            );
-            const completion = await this.waitForTaskCompletion(taskId, 310000);
-            return { success: true, data: completion.result };
-          } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
-          }
-        }
+    // Build optional data hints from action fields
+    const data: Record<string, unknown> = {};
+    if (action.object) {
+      const objectId = await this.resolveObject(action.object as string);
+      if (objectId) data.objectId = objectId;
+      data.object = action.object;
+    }
+    if (action.method) data.method = action.method;
+    if (action.payload) data.payload = action.payload;
 
-        // Fallback: direct call if GoalManager unavailable (requires method)
-        if (!targetStr || !method) return { success: false, error: 'Direct call requires object and method' };
-        const objectId = await this.resolveObject(targetStr);
-        if (!objectId) return { success: false, error: `Object "${targetStr}" not found` };
-        const timeout = method === 'runTask' || method === 'create' ? 310000 : 120000;
-        try {
-          const result = await this.request(
-            request(this.id, objectId, method, action.payload ?? {}),
-            timeout,
-          );
-          return { success: true, data: result };
-        } catch (err) {
-          return { success: false, error: err instanceof Error ? err.message : String(err) };
-        }
+    const goalId = await this.ensureGoal(description);
+    if (!this.goalManagerId || !goalId) {
+      return { success: false, error: 'GoalManager not available' };
+    }
+
+    try {
+      const { taskId } = await this.request<{ taskId: string }>(
+        request(this.id, this.goalManagerId, 'addTask', {
+          goalId,
+          description,
+          data: Object.keys(data).length > 0 ? data : undefined,
+        })
+      );
+      const completion = await this.waitForTaskCompletion(taskId, 310000);
+      const result = completion.result as Record<string, unknown> | undefined;
+
+      // Auto-show created objects
+      if (result?.objectId) {
+        this.send(event(this.id, result.objectId as AbjectId, 'show', {}));
       }
 
-      case 'create': {
-        // Route through TupleSpace — agents claim autonomously
-        if (this.goalManagerId && this._currentGoalId) {
-          try {
-            log.info(`[Chat] create action — adding task to TupleSpace, goalId=${this._currentGoalId.slice(0, 8)}`);
-            const { taskId } = await this.request<{ taskId: string }>(
-              request(this.id, this.goalManagerId, 'addTask', {
-                goalId: this._currentGoalId,
-                type: 'create',
-                description: action.description as string,
-              })
-            );
-            log.info(`[Chat] create task added: ${taskId.slice(0, 8)}, waiting for completion...`);
-            const completion = await this.waitForTaskCompletion(taskId, 310000);
-            const result = completion.result as { success?: boolean; error?: string; objectId?: AbjectId } | undefined;
-            if (result && result.success === false) {
-              return { success: false, error: result.error ?? 'Create failed' };
-            }
-            // Auto-show created object
-            const objectId = result?.objectId;
-            if (objectId) {
-              this.send(event(this.id, objectId, 'show', {}));
-            }
-            return { success: true, data: result };
-          } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
-          }
-        }
-
-        // Fallback: direct call if GoalManager unavailable
-        const creatorId = await this.discoverDep('ObjectCreator');
-        if (!creatorId) return { success: false, error: 'ObjectCreator not found' };
-        try {
-          const result = await this.request(
-            request(this.id, creatorId, 'create', {
-              prompt: action.description as string,
-              goalId: this._currentGoalId,
-            }),
-            310000,
-          );
-          const payload = result as { success?: boolean; error?: string; objectId?: AbjectId };
-          if (payload && payload.success === false) {
-            return { success: false, error: payload.error ?? 'Create failed' };
-          }
-          const objectId = payload?.objectId;
-          if (objectId) {
-            this.send(event(this.id, objectId, 'show', {}));
-          }
-          return { success: true, data: result };
-        } catch (err) {
-          return { success: false, error: err instanceof Error ? err.message : String(err) };
-        }
+      if (result && result.success === false) {
+        return { success: false, error: (result.error as string) ?? 'Task failed' };
       }
-
-      case 'modify': {
-        const objectId = await this.resolveObject(action.object as string);
-        if (!objectId) return { success: false, error: `Object "${action.object}" not found` };
-
-        // Route through TupleSpace — agents claim autonomously
-        if (this.goalManagerId && this._currentGoalId) {
-          try {
-            const { taskId } = await this.request<{ taskId: string }>(
-              request(this.id, this.goalManagerId, 'addTask', {
-                goalId: this._currentGoalId,
-                type: 'modify',
-                description: action.description as string,
-                data: { objectId },
-              })
-            );
-            const completion = await this.waitForTaskCompletion(taskId, 310000);
-            const result = completion.result as { success?: boolean; error?: string } | undefined;
-            if (result && result.success === false) {
-              const reason = result.error ?? 'Modify failed';
-              return { success: false, error: `${reason}. The object "${action.object}" still exists -- retry "modify" with a simpler description, or use "done" to report the issue. Do NOT use "create".` };
-            }
-            return { success: true, data: result };
-          } catch (err) {
-            const reason = err instanceof Error ? err.message : String(err);
-            return { success: false, error: `Modify failed: ${reason}. The object "${action.object}" still exists -- retry "modify" with a simpler description, or use "done" to report the issue. Do NOT use "create".` };
-          }
-        }
-
-        // Fallback: direct call if GoalManager unavailable
-        const creatorId = await this.discoverDep('ObjectCreator');
-        if (!creatorId) return { success: false, error: 'ObjectCreator not found' };
-        try {
-          const result = await this.request(
-            request(this.id, creatorId, 'modify', {
-              objectId,
-              prompt: action.description as string,
-              goalId: this._currentGoalId,
-            }),
-            310000,
-          );
-          const modPayload = result as { success?: boolean; error?: string };
-          if (modPayload && modPayload.success === false) {
-            const reason = modPayload.error ?? 'Modify failed';
-            return { success: false, error: `${reason}. The object "${action.object}" still exists -- retry "modify" with a simpler description, or use "done" to report the issue. Do NOT use "create".` };
-          }
-          return { success: true, data: result };
-        } catch (err) {
-          const reason = err instanceof Error ? err.message : String(err);
-          return { success: false, error: `Modify failed: ${reason}. The object "${action.object}" still exists -- retry "modify" with a simpler description, or use "done" to report the issue. Do NOT use "create".` };
-        }
-      }
-
-      case 'clone': {
-        // Clone a clonable object (local or remote) — Factory searches all registries
-        const qualifiedName = action.object as string;
-        if (!qualifiedName) return { success: false, error: 'Missing object name or qualified name (peer.workspace.ObjectName)' };
-
-        try {
-          // Resolve qualified name to an AbjectId via remote registry listing
-          const parts = qualifiedName.split('.');
-          let objectId: AbjectId | null = null;
-          let objectName = qualifiedName;
-
-          if (parts.length >= 3) {
-            // Qualified name: peer.workspace.ObjectName
-            const peerName = parts[0];
-            const wsName = parts[1];
-            objectName = parts.slice(2).join('.');
-
-            const wsrId = await this.discoverDep('WorkspaceShareRegistry');
-            if (!wsrId) return { success: false, error: 'WorkspaceShareRegistry not found' };
-
-            const workspaces = await this.request<DiscoveredWorkspace[]>(
-              request(this.id, wsrId, 'getDiscoveredWorkspaces', {})
-            );
-            const ws = workspaces.find(w => w.ownerName === peerName && w.name === wsName);
-            if (!ws) return { success: false, error: `Workspace "${peerName}.${wsName}" not found in discovered workspaces` };
-
-            const remoteObjects = await this.request<ObjectRegistration[]>(
-              request(this.id, ws.registryId as AbjectId, 'list', {})
-            );
-            const target = remoteObjects.find(o => (o.name ?? o.manifest.name) === objectName);
-            if (!target) return { success: false, error: `Object "${objectName}" not found in ${peerName}.${wsName}` };
-            objectId = target.id;
-          } else {
-            // Simple name or AbjectId — resolve locally
-            objectId = await this.resolveObject(qualifiedName);
-          }
-
-          if (!objectId) return { success: false, error: `Object "${qualifiedName}" not found` };
-
-          // Factory.clone searches local then remote registries automatically
-          const factoryId = await this.requireDep('Factory');
-          const result = await this.request<{ objectId: AbjectId }>(
-            request(this.id, factoryId, 'clone', { objectId, registryHint: this.registryId })
-          );
-
-          // Persist to AbjectStore so it survives reload
-          try {
-            const storeResults = await this.request<Array<{ id: AbjectId }>>(
-              request(this.id, this.registryId!, 'discover', { name: 'AbjectStore' })
-            );
-            if (storeResults.length > 0) {
-              // Look up the freshly cloned object's registration for manifest/source
-              const reg = await this.request<ObjectRegistration | null>(
-                request(this.id, this.registryId!, 'lookup', { objectId: result.objectId })
-              );
-              if (reg?.source) {
-                await this.request(request(this.id, storeResults[0].id, 'save', {
-                  objectId: result.objectId,
-                  manifest: reg.manifest,
-                  source: reg.source,
-                  owner: this.id,
-                }));
-              }
-            }
-          } catch { /* AbjectStore may not exist */ }
-
-          return { success: true, data: { clonedObjectId: result.objectId, name: objectName } };
-        } catch (err) {
-          return { success: false, error: err instanceof Error ? err.message : String(err) };
-        }
-      }
-
-      default:
-        return { success: false, error: `Unknown action: ${action.action}` };
+      return { success: true, data: result };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
     }
   }
 
@@ -771,27 +600,15 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 
 ### Task Decomposition
 - **decompose**: Break a complex request into parallel sub-tasks. Creates a child goal
-  and the agent automatically monitors progress. Sub-tasks are claimed by agents autonomously.
+  and the agent automatically monitors progress. Agents self-select tasks based on the description.
   \`{ "action": "decompose", "reasoning": "why splitting", "subtasks": [
-    { "type": "call", "description": "Fetch data from the API", "data": { "object": "HttpClient", "method": "request" } },
-    { "type": "create", "description": "Build a counter widget" },
-    { "type": "modify", "description": "Add a reset button", "data": { "object": "Counter" } },
-    { "type": "browse", "description": "Research X", "data": { "startUrl": "https://..." } },
-    { "type": "skill", "description": "Fetch data using the configured API" }
+    { "description": "Fetch the weather data from an API for Miami, FL" },
+    { "description": "Build a counter widget with + and - buttons" },
+    { "description": "Visit https://example.com and extract the main content" },
+    { "description": "Modify the Counter object to add a reset button", "data": { "object": "Counter" } }
   ] }\`
   After decomposing, you'll observe sub-task progress and can synthesize results when done.
-
-  For **modify** subtasks, include \`"data": { "object": "ObjectName" }\` with the object name. Without it, the modify task will fail.
-
-  For **call** subtasks, describe the goal, not specific method names. ObjectAgent discovers APIs automatically via the ask protocol. Example: \`{ "type": "call", "description": "Get the current canvas size from WidgetManager" }\` instead of guessing method names.
-
-  Task types and which agent claims them:
-  - **call**: ObjectAgent (calling methods on existing objects, API interactions, data retrieval)
-  - **browse** / **research** / **web**: WebAgent (browser automation, navigating real websites, general web queries)
-  - **create** / **modify**: ObjectCreator (build/edit UI objects)
-  - **skill**: SkillAgent (only for queries that specifically match an enabled skill listed below)
-
-  Use type "skill" only when the user's request directly relates to an enabled skill's specific domain. For general questions, web lookups, or anything not covered by an enabled skill, use type "browse".
+  Describe the GOAL of each subtask clearly. Agents will claim tasks they can handle based on the description.
 
 ### Communication
 - **clarify**: Ask the user a clarifying question before proceeding. Use when your assumptions
@@ -802,18 +619,11 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   ] }\`
 - **reply**: Send intermediate text to the user (continue working after).
   \`{ "action": "reply", "text": "I found the object, now let me check its methods..." }\`
-- **done**: Task complete, send final reply.
+- **done**: Task complete, send final reply. The user can only see what you put in the done text, so include the complete results from previous actions. Present all data fully, do not summarize or truncate.
   \`{ "action": "done", "text": "Here are the results: ..." }\`
 
 The chat window renders markdown. Use **bold**, *italic*, \`inline code\`, headings, bullet lists, code blocks, and [links](url) in your reply and done text for readable formatting.
 
-${this.enabledSkillsSummary ? `
-## Enabled Skills (use task type "skill" to invoke via SkillAgent)
-
-${this.enabledSkillsSummary}
-
-When a user's request matches an enabled skill's capabilities, use **decompose** with \`"type": "skill"\` to route the task to SkillAgent.
-` : ''}
 ## Assumption Checking
 
 Before taking any non-trivial action (create, modify, call, decompose), consider what
@@ -1002,9 +812,6 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
     this.thinkingLabelId = await this.appendMessageLabel('', 'Thinking...', this.theme.statusNeutral);
 
     try {
-      // Refresh object summaries for the system prompt
-      await this.refreshContext();
-
       // Build initial messages: system prompt + conversation history + new user message
       const initialMessages: { role: string; content: string }[] = [];
       const recent = this.conversationHistory.slice(-MAX_CONVERSATION_ENTRIES);
@@ -1012,19 +819,10 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
         initialMessages.push({ role: entry.role, content: entry.content });
       }
 
-      // Create a goal for this task
-      let goalId: string | undefined;
-      if (this.goalManagerId) {
-        try {
-          const goalResult = await this.request<{ goalId: string }>(
-            request(this.id, this.goalManagerId, 'createGoal', {
-              title: userText.slice(0, 100),
-            })
-          );
-          goalId = goalResult.goalId;
-          this._currentGoalId = goalId;
-        } catch { /* GoalManager may not be ready */ }
-      }
+      // Goal is created lazily on first action via ensureGoal(),
+      // using the action's description instead of the raw user query.
+      this._currentGoalId = undefined;
+      const goalId = undefined;
 
       // Submit task — returns ticketId immediately
       this._streamBuffer = '';
@@ -1108,29 +906,6 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
   // Context Refresh
   // ═══════════════════════════════════════════════════════════════════
 
-  private async refreshContext(): Promise<void> {
-    await this.refreshEnabledSkills();
-  }
-
-  private async refreshEnabledSkills(): Promise<void> {
-    try {
-      const skillRegistryId = await this.discoverDep('SkillRegistry');
-      if (!skillRegistryId) { this.enabledSkillsSummary = ''; return; }
-
-      const skills = await this.request<Array<{ name: string; description: string }>>(
-        request(this.id, skillRegistryId, 'getEnabledSkills', {}),
-      );
-      if (skills.length === 0) {
-        this.enabledSkillsSummary = '';
-        return;
-      }
-      this.enabledSkillsSummary = skills
-        .map(s => `- **${s.name}**: ${s.description}`)
-        .join('\n');
-    } catch {
-      // Best-effort
-    }
-  }
 
   // ═══════════════════════════════════════════════════════════════════
   // UI Helpers

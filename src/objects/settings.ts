@@ -139,6 +139,34 @@ export class Settings extends Abject {
     this.peerRegistryId = await this.discoverDep('PeerRegistry') ?? undefined;
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## Settings Usage Guide
+
+Settings provides a per-workspace configuration UI with General and Access tabs.
+
+General tab: edit workspace name, description, tags, manage created objects, and
+configure which objects are exposed to other peers.
+Access tab: set access mode (public/private) and manage the peer whitelist.
+
+### Show / hide the settings window
+
+  await call(await dep('Settings'), 'show', {});
+  await call(await dep('Settings'), 'hide', {});
+
+### User interactions (handled internally)
+
+- General tab: edit workspace name/description/tags, click "Save" to persist.
+- General tab: view and delete created objects, toggle "exposed" checkboxes.
+- Access tab: select access mode (public or private).
+- Access tab: search and toggle peer whitelist entries (private mode).
+- Danger Zone: delete the entire workspace.
+
+### IMPORTANT
+- The interface ID is '${SETTINGS_INTERFACE}'.
+- Settings is a UI object with show/hide methods only; all configuration is done through the window.
+- Changes are persisted via Storage and WorkspaceManager.`;
+  }
+
   /**
    * Lazy-discover which workspace this Settings instance belongs to
    * by querying WidgetManager.getObjectWorkspace (same pattern as AbjectStore).

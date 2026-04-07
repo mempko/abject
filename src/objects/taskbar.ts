@@ -92,6 +92,31 @@ export class Taskbar extends Abject {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## Taskbar Usage Guide
+
+### Overview
+Persistent vertical toolbar pinned to the left edge of the screen. Displays
+launch buttons for core workspace apps (Chat, Goals, Jobs, Web) and any
+user-created objects that expose show/hide methods. Also shows a "minimized
+windows" section so the user can restore windows from the taskbar.
+
+### Methods
+- \`show()\` -- Show the taskbar. Accepts optional \`{ yOffset }\` to position vertically.
+- \`hide()\` -- Destroy the taskbar window and clear all button state.
+- \`getState()\` -- Returns \`{ visible: boolean }\`.
+
+### Behavior
+- Subscribes to the Registry for objectRegistered/objectUnregistered events
+  and automatically rebuilds when user objects appear or disappear.
+- Listens for windowMinimized/windowRestored events from WindowManager.
+- Click events on buttons send \`show\` to the corresponding target object.
+- Button styles update in real-time to reflect whether a target is visible.
+
+### Interface ID
+\`abjects:taskbar\``;
+  }
+
   protected override async onInit(): Promise<void> {
     await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');

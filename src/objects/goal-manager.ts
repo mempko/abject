@@ -493,6 +493,12 @@ suitable agent based on descriptions.
           break;
         case 'archived':
           if (now - goal.updatedAt >= ARCHIVE_TTL_MS) {
+            // Clean up SharedState namespace to prevent sync floods
+            if (this.sharedStateId) {
+              try {
+                await this.request(request(this.id, this.sharedStateId, 'removeNamespace', { name: `goal-${id}` }));
+              } catch { /* best effort */ }
+            }
             this.goals.delete(id);
             const idx = this.goalOrder.indexOf(id);
             if (idx !== -1) this.goalOrder.splice(idx, 1);
@@ -513,6 +519,11 @@ suitable agent based on descriptions.
         .slice(0, archived.length - MAX_ARCHIVED);
 
       for (const goal of toEvict) {
+        if (this.sharedStateId) {
+          try {
+            await this.request(request(this.id, this.sharedStateId, 'removeNamespace', { name: `goal-${goal.id}` }));
+          } catch { /* best effort */ }
+        }
         this.goals.delete(goal.id);
         const idx = this.goalOrder.indexOf(goal.id);
         if (idx !== -1) this.goalOrder.splice(idx, 1);
@@ -711,17 +722,10 @@ suitable agent based on descriptions.
           } catch { /* best effort */ }
         }
 
-        // Delete meta from per-goal SharedState and unsubscribe
+        // Remove entire SharedState namespace (deletes persisted data + unsubscribes)
         if (this.sharedStateId) {
-          const ns = `goal-${goal.id}`;
           try {
-            await this.request(request(this.id, this.sharedStateId, 'delete', {
-              name: ns,
-              key: 'meta',
-            }));
-          } catch { /* best effort */ }
-          try {
-            await this.request(request(this.id, this.sharedStateId, 'unsubscribe', { name: ns }));
+            await this.request(request(this.id, this.sharedStateId, 'removeNamespace', { name: `goal-${goal.id}` }));
           } catch { /* best effort */ }
         }
 
@@ -790,6 +794,15 @@ suitable agent based on descriptions.
       );
       log.info(`claimTask result=${result ? 'claimed' : 'none'}`);
       return result;
+    });
+
+    this.on('updateTaskFields', async (msg: AbjectMessage) => {
+      const { goalId, taskId, fields } = msg.payload as { goalId: string; taskId: string; fields: Record<string, unknown> };
+      if (!this.tupleSpaceId) return false;
+      const ns = this.getTupleNamespace(goalId as GoalId);
+      return this.request(request(this.id, this.tupleSpaceId, 'update', {
+        namespace: ns, tupleId: taskId, fields,
+      }));
     });
 
     this.on('completeTask', async (msg: AbjectMessage) => {

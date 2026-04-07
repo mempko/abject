@@ -100,6 +100,35 @@ export class WorkspaceBrowser extends Abject {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## WorkspaceBrowser Usage Guide
+
+### Overview
+Three-pane browser for discovering and browsing remote workspaces shared by
+connected peers. Layout mirrors AppExplorer: peer list on the left, workspace
+list in the middle, and a detail pane on the right.
+
+### Methods
+- \`show()\` -- Open the workspace browser window (centered on screen).
+- \`hide()\` -- Close the window.
+- \`refresh()\` -- Trigger a new workspace discovery round via
+  WorkspaceShareRegistry and rebuild the UI with fresh results.
+
+### Three-Pane Layout
+1. **Peer List** (left) -- Peers grouped into Public and Private tabs.
+   Selecting a peer populates the workspace list.
+2. **Workspace List** (middle) -- Workspaces belonging to the selected peer.
+3. **Detail Pane** (right) -- Name, description, access mode, owner, tags,
+   hops, and a "Browse" button to open a remote AppExplorer for that workspace.
+
+### Auto-Refresh
+Subscribes to WorkspaceShareRegistry as a dependent. When new workspaces are
+discovered, the browser rebuilds automatically if it is visible.
+
+### Interface ID
+\`abjects:workspace-browser\``;
+  }
+
   protected override async onInit(): Promise<void> {
     await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');

@@ -100,6 +100,36 @@ export class PeerNetwork extends Abject {
     this.setupHandlers();
   }
 
+  protected override getSourceForAsk(): string | undefined {
+    return `## PeerNetwork Usage Guide
+
+PeerNetwork is the peer network management UI. It provides a modal window
+for managing your identity, signaling servers, and contacts.
+
+### Show the peer network window
+
+  await call(await dep('PeerNetwork'), 'show', {});
+  / returns true when the window is displayed
+
+### Hide the peer network window
+
+  await call(await dep('PeerNetwork'), 'hide', {});
+  / returns true when the window is hidden
+
+### What it manages
+- Identity: view/edit your peer name, copy your peer ID or full identity JSON
+- Signaling servers: add, connect, disconnect, and remove signaling server URLs
+- Contacts: add contacts by peer ID, connect/disconnect, introduce contacts to each other
+- Network peers: view connected peers discovered through signaling, promote to contacts
+- Discovered peers: view peers found via gossip-based discovery
+
+### Notes
+- This is a UI object; it renders its own window via WidgetManager.
+- Closing the window hides it (does not destroy it).
+
+Interface: abjects:peer-network`;
+  }
+
   protected override async onInit(): Promise<void> {
     await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');

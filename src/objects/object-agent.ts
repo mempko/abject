@@ -193,9 +193,9 @@ You can also send a runTask message directly with a task description.`;
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'ObjectAgent',
       description:
-        'Discovers and calls objects via message passing. Consults the Registry to find objects, ' +
-        'asks them about their API, then sends the right messages. ' +
-        'Handles API interactions, data retrieval, and multi-step call chains.',
+        'General-purpose agent for interacting with any object in the system. ' +
+        'Discovers objects via Registry, learns their API via the ask protocol, and calls their methods. ' +
+        'Handles any task that involves calling, querying, or controlling existing objects.',
       taskTypes: ['call'],
       config: {
         terminalActions: {
@@ -400,6 +400,7 @@ I'll ask the Registry which objects handle HTTP requests.
 | ask | object, question | Ask an object a question. Use on Registry to discover objects, or on any object to learn its API. |
 | introspect | object | Get an object's manifest and method descriptions. |
 | call | object, method, payload?, timeout? | Send a message to an object and get the result. |
+| decompose | subtasks | Break a complex task into parallel sub-tasks. Each subtask has type (call, browse, create, modify, skill), description, and optional data. Creates a child goal and dispatches tasks to specialized agents. |
 | done | result | Task complete. Include the answer in result. |
 | fail | reason | Task cannot be completed. |
 | reply | message | Send a progress update to the user. |
@@ -411,7 +412,8 @@ Every action can include a "reasoning" field explaining your thinking.
 - Results from one call can inform the next. Chain calls when needed.
 - If a call fails, try "ask" on the object to understand the correct method signature.
 - The "ask" protocol is LLM-powered: objects give intelligent, contextual answers.
-- You can capture screenshots and interact with windows. Ask the Registry to discover the right objects for visual capture and input injection.
+- If the task requires capabilities beyond calling object methods (browsing, research, creating objects, running skills), use **decompose** to break it into typed sub-tasks. This routes work to specialized agents through the task system with proper goal tracking.
+- Use **call** for direct object method invocations. Use **decompose** when the work needs a specialized agent's autonomous loop.
 `;
 
     if (taskData) {
