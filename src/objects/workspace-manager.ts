@@ -48,11 +48,12 @@ const wsLog = new Log('WORKSPACE-MANAGER');
 const INFRA_OBJECTS = [
   'AbjectStore', 'SharedState', 'TupleSpace', 'FileTransfer', 'MediaStream', 'Theme',
   'GoalManager', 'JobManager', 'AgentAbject', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
+  'KnowledgeBase',
 ] as const;
 
 /** UI objects — deferred for inactive workspaces, spawned on first switch. */
 const UI_OBJECTS = [
-  'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser',
+  'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser', 'KnowledgeBrowser',
   'WebBrowserViewer', 'Chat', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
 ] as const;
 

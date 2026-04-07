@@ -510,6 +510,27 @@ export class Chat extends Abject {
   private async handleAgentAct(action: AgentAction): Promise<unknown> {
     log.info(`[Chat] handleAgentAct: action=${action.action}`);
 
+    // Handle remember action directly (no agent dispatch needed)
+    if (action.action === 'remember') {
+      const knowledgeBaseId = await this.discoverDep('KnowledgeBase');
+      if (!knowledgeBaseId) return { success: false, error: 'KnowledgeBase not available' };
+      try {
+        const result = await this.request(
+          request(this.id, knowledgeBaseId, 'remember', {
+            title: action.title as string ?? action.description as string ?? 'Untitled',
+            content: action.content as string ?? action.description as string ?? '',
+            type: (action.type as string) ?? 'fact',
+            tags: (action.tags as string[]) ?? [],
+          }),
+          10000,
+        );
+        log.info(`[Chat] remembered: "${action.title ?? action.description}"`);
+        return { success: true, data: result };
+      } catch (err) {
+        return { success: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
     const description = (action.description as string)
       ?? `${action.action} ${(action.object as string) ?? ''}`.trim();
 
@@ -611,6 +632,11 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   After decomposing, you'll observe sub-task progress and can synthesize results when done.
   Describe the GOAL of each subtask clearly. Agents will claim tasks they can handle based on the description.
 
+### Memory
+- **remember**: Save a fact to the persistent knowledge base. Use whenever the user reveals personal info or you learn something useful for future conversations.
+  \`{ "action": "remember", "title": "User lives in Silverdale, WA", "content": "The user mentioned they live in Silverdale, Washington.", "type": "fact", "tags": ["user", "location"] }\`
+  Types: 'fact' (personal info, discovered truths), 'learned' (lessons from outcomes), 'insight' (patterns), 'reference' (pointers)
+
 ### Communication
 - **clarify**: Ask the user a clarifying question before proceeding. Use when your assumptions
   about their request have low confidence. The user will see your question and respond.
@@ -653,7 +679,8 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
 7. If **modify** fails, retry with a simpler description. Stay with **modify** across retries. If it fails repeatedly, use "done" to tell the user what happened.
 8. P2P: Resolve remote objects by qualified name: this.find('peer.workspace.ObjectName'). Always use find() for dynamic ID resolution.
 9. For web tasks: use **call** with WebAgent.runTask -- include ALL details from the user's message in the task description.
-10. Always route tasks to an agent and let it try. Use **call** as the default when unsure which action fits.`;
+10. Always route tasks to an agent and let it try. Use **call** as the default when unsure which action fits.
+11. When the user reveals personal facts (where they live, their name, preferences, job, etc.), always save them using \`remember()\` so you can recall them in future conversations.`;
   }
 
   // ═══════════════════════════════════════════════════════════════════

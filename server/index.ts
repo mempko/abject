@@ -37,6 +37,8 @@ import { JobManager } from '../src/objects/job-manager.js';
 import { JobBrowser } from '../src/objects/job-browser.js';
 import { GoalManager } from '../src/objects/goal-manager.js';
 import { GoalBrowser } from '../src/objects/goal-browser.js';
+import { KnowledgeBase } from '../src/objects/knowledge-base.js';
+import { KnowledgeBrowser } from '../src/objects/knowledge-browser.js';
 import { Chat } from '../src/objects/chat.js';
 import { AgentAbject } from '../src/objects/agent-abject.js';
 import { GoalObserver } from '../src/objects/goal-observer.js';
@@ -372,6 +374,8 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
   runtime.objectFactory.registerConstructor('GoalManager', () => new GoalManager());
   runtime.objectFactory.registerConstructor('GoalBrowser', () => new GoalBrowser());
+  runtime.objectFactory.registerConstructor('KnowledgeBase', () => new KnowledgeBase());
+  runtime.objectFactory.registerConstructor('KnowledgeBrowser', () => new KnowledgeBrowser());
   runtime.objectFactory.registerConstructor('Chat', () => new Chat());
   runtime.objectFactory.registerConstructor('AgentAbject', () => new AgentAbject());
   runtime.objectFactory.registerConstructor('GoalObserver', () => new GoalObserver());

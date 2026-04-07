@@ -942,7 +942,7 @@ improve semantic matching accuracy.
     const description = tuple.fields.description as string;
     const data = tuple.fields.data as Record<string, unknown> | undefined;
     const taskGoalId = tuple.fields.goalId as string | undefined;
-    const failureHistory = (tuple.fields.failureHistory as Array<{ agent: string; agentId: string }>) ?? [];
+    const failureHistory = (tuple.fields.failureHistory as Array<{ agent: string; agentId: string; error: string; timestamp: number }>) ?? [];
 
     log.info(`DISPATCH-INNER ${tupleId} goalId=${taskGoalId?.slice(0, 8) ?? '?'} failureHistory=${failureHistory.length}`);
 
@@ -959,12 +959,18 @@ improve semantic matching accuracy.
     }
 
     // 2. Ask each agent via the ask protocol if it can handle this task (in parallel)
+    let askQuestion = `Can you handle this task? Rate your confidence 0-10.\nTask: "${description.slice(0, 300)}"`;
+    if (failureHistory.length > 0) {
+      const failSummary = failureHistory.map(f => `- ${f.agent}: ${f.error}`).join('\n');
+      askQuestion += `\nPrevious attempts failed:\n${failSummary}`;
+    }
+
     const bids = await Promise.all(
       eligible.map(async (agent) => {
         try {
           const answer = await this.request<string>(
             request(this.id, agent.agentId, 'ask', {
-              question: `Can you handle this task? Rate your confidence 0-10.\nTask: "${description.slice(0, 300)}"`,
+              question: askQuestion,
             }),
             15000,
           );
@@ -1698,6 +1704,42 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
               break;
             }
 
+            // ── Remember: save to KnowledgeBase directly, continue thinking ──
+            if (task.action.action === 'remember') {
+              try {
+                const kbId = await this.discoverDep('KnowledgeBase');
+                if (kbId) {
+                  await this.request(
+                    request(this.id, kbId, 'remember', {
+                      title: (task.action.title as string) ?? (task.action.description as string) ?? 'Untitled',
+                      content: (task.action.content as string) ?? (task.action.description as string) ?? '',
+                      type: (task.action.type as string) ?? 'fact',
+                      tags: (task.action.tags as string[]) ?? [],
+                    }),
+                    10000,
+                  );
+                  log.info(`[${agentName}] Remembered: "${task.action.title ?? task.action.description}"`);
+                  task.llmMessages.push({
+                    role: 'user',
+                    content: '[Remember] Saved successfully. Continue with the task.',
+                  });
+                } else {
+                  task.llmMessages.push({ role: 'user', content: '[Remember] KnowledgeBase not available.' });
+                }
+              } catch (err) {
+                task.llmMessages.push({
+                  role: 'user',
+                  content: `[Remember Error] ${err instanceof Error ? err.message : String(err)}`,
+                });
+              }
+              task.step++;
+              if (task.step >= task.maxSteps) {
+                await this.handleMaxStepsReached(entry, agentName, setPhase);
+                break;
+              }
+              break; // re-enter thinking
+            }
+
             // Check terminal
             const terminal = this.isTerminalAction(entry, task.action);
             if (terminal === 'success') {
@@ -1888,6 +1930,18 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
            const completeTask = async (taskId, result) => call(_goalMgrId, 'completeTask', { taskId, result });
            const failTask = async (taskId, error) => call(_goalMgrId, 'failTask', { taskId, error });
            const getTasksForGoal = async (status) => call(_goalMgrId, 'getTasksForGoal', { goalId: _goalId, status });
+           const writeGoalData = async (key, value) => call(_goalMgrId, 'writeGoalData', { goalId: _goalId, key, value });
+           const readGoalData = async (key) => call(_goalMgrId, 'readGoalData', { goalId: _goalId, key });
+           const remember = async (title, content, type, tags) => {
+             const _kbId = await find('KnowledgeBase');
+             if (!_kbId) return null;
+             return call(_kbId, 'remember', { title, content, type: type ?? 'learned', tags: tags ?? [] });
+           };
+           const recall = async (query, type, tags) => {
+             const _kbId = await find('KnowledgeBase');
+             if (!_kbId) return [];
+             return call(_kbId, 'recall', { query, type, tags });
+           };
           `
         : `const getGoal = async () => null;
            const updateGoal = async () => {};
@@ -1898,6 +1952,18 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
            const completeTask = async () => false;
            const failTask = async () => false;
            const getTasksForGoal = async () => [];
+           const writeGoalData = async () => false;
+           const readGoalData = async () => null;
+           const remember = async (title, content, type, tags) => {
+             const _kbId = await find('KnowledgeBase');
+             if (!_kbId) return null;
+             return call(_kbId, 'remember', { title, content, type: type ?? 'learned', tags: tags ?? [] });
+           };
+           const recall = async (query, type, tags) => {
+             const _kbId = await find('KnowledgeBase');
+             if (!_kbId) return [];
+             return call(_kbId, 'recall', { query, type, tags });
+           };
           `;
       const fullCode = goalPreamble + code;
 
@@ -1943,7 +2009,7 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
 
     // Initialize conversation if empty
     if (task.llmMessages.length === 0) {
-      task.llmMessages = this.initializeConversation(entry);
+      task.llmMessages = await this.initializeConversation(entry);
     }
 
     // Add observation
@@ -2105,7 +2171,7 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
   // Conversation Management
   // ═══════════════════════════════════════════════════════════════════
 
-  private initializeConversation(entry: TaskEntry): { role: string; content: string | ContentPart[] }[] {
+  private async initializeConversation(entry: TaskEntry): Promise<{ role: string; content: string | ContentPart[] }[]> {
     const messages: { role: string; content: string | ContentPart[] }[] = [];
 
     let prompt = entry.systemPrompt;
@@ -2114,6 +2180,64 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
     }
     if (entry.responseSchema) {
       prompt += `\n\n## Response Schema\nWhen you complete the task, the "result" field of your terminal action MUST be a JSON object (not a string) conforming to this schema:\n\`\`\`json\n${JSON.stringify(entry.responseSchema, null, 2)}\n\`\`\`\nIMPORTANT: The "result" value must be a structured JSON object, NOT a string. Include all required fields. Use exact property names from the schema.`;
+    }
+
+    // Inject goal scratchpad data into context
+    if (entry.goalId && this.goalManagerId) {
+      try {
+        const goal = await this.request<{ scratchpad?: Record<string, unknown> } | null>(
+          request(this.id, this.goalManagerId, 'getGoal', { goalId: entry.goalId }),
+          5000,
+        );
+        if (goal?.scratchpad && Object.keys(goal.scratchpad).length > 0) {
+          prompt += `\n\n## Shared Goal Data (scratchpad)\nOther agents working on this goal have shared the following data. Use writeGoalData(key, value) to add your own findings.\n\`\`\`json\n${JSON.stringify(goal.scratchpad, null, 2)}\n\`\`\``;
+        }
+      } catch { /* best effort */ }
+    }
+
+    // Inject relevant knowledge from KnowledgeBase
+    try {
+      const knowledgeBaseId = await this.discoverDep('KnowledgeBase');
+      if (knowledgeBaseId) {
+        const entries = await this.request<Array<{ title: string; type: string; content: string }> | null>(
+          request(this.id, knowledgeBaseId, 'recall', {
+            query: entry.state.task,
+            limit: 5,
+          }),
+          5000,
+        );
+        if (entries && entries.length > 0) {
+          let kb = '\n\n## Relevant Knowledge\nPrevious agents have learned the following. Use remember(title, content, type, tags) to save new insights.\n';
+          for (const e of entries) {
+            kb += `- **${e.title}** (${e.type}): ${e.content.slice(0, 200)}\n`;
+          }
+          prompt += kb;
+        }
+      }
+    } catch { /* best effort */ }
+
+    // Always-present guidance on memory tools
+    prompt += `\n\n## Memory Tools
+
+**remember** action (persistent across all goals and restarts):
+You can emit a remember action to save knowledge for future tasks:
+\`\`\`json
+{ "action": "remember", "title": "short summary", "content": "detailed knowledge", "type": "fact", "tags": ["tag1", "tag2"] }
+\`\`\`
+Types: 'learned' (lessons from outcomes), 'fact' (discovered facts), 'insight' (analysis), 'reference' (pointers)
+When to remember:
+- User preferences or personal facts they share (location, name, job, etc.)
+- Lessons from task failures that would help future attempts
+- Useful patterns, shortcuts, or API details discovered while working
+After remembering, you will be prompted to continue with the task.`;
+
+    if (entry.goalId) {
+      prompt += `
+
+**Goal Scratchpad** (shared with agents working on this same goal):
+- \`writeGoalData(key, value)\` -- save intermediate findings for other agents in this goal
+- \`readGoalData(key)\` -- read data another agent saved to this goal
+- Use for: partial results, specs, data one agent discovers that another needs`;
     }
 
     if (prompt) {

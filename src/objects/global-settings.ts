@@ -14,6 +14,11 @@ import { Log } from '../core/timed-log.js';
 
 const log = new Log('GlobalSettings');
 
+/** Convert a string array to ListItem array for list widgets. */
+function toListItems(arr: string[]): Array<{ label: string; value: string }> {
+  return arr.map(s => ({ label: s, value: s }));
+}
+
 const GLOBAL_SETTINGS_INTERFACE: InterfaceId = 'abjects:global-settings';
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
@@ -512,7 +517,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const val = await this.request<string>(request(this.id, this.fsPathInputId!, 'getValue', {}));
         if (val && !this.fsAllowedPaths.includes(val)) {
           this.fsAllowedPaths.push(val);
-          await this.request(request(this.id, this.fsPathListId!, 'update', { items: this.fsAllowedPaths }));
+          await this.request(request(this.id, this.fsPathListId!, 'update', { items: toListItems(this.fsAllowedPaths) }));
           await this.request(request(this.id, this.fsPathInputId!, 'update', { text: '' }));
         }
         return;
@@ -521,7 +526,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const sel = await this.request<string | null>(request(this.id, this.fsPathListId!, 'getValue', {}));
         if (sel) {
           this.fsAllowedPaths = this.fsAllowedPaths.filter(p => p !== sel);
-          await this.request(request(this.id, this.fsPathListId!, 'update', { items: this.fsAllowedPaths }));
+          await this.request(request(this.id, this.fsPathListId!, 'update', { items: toListItems(this.fsAllowedPaths) }));
         }
         return;
       }
@@ -540,7 +545,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const val = await this.request<string>(request(this.id, this.shellCmdInputId!, 'getValue', {}));
         if (val && !this.shellAllowedCmds.includes(val)) {
           this.shellAllowedCmds.push(val);
-          await this.request(request(this.id, this.shellCmdListId!, 'update', { items: this.shellAllowedCmds }));
+          await this.request(request(this.id, this.shellCmdListId!, 'update', { items: toListItems(this.shellAllowedCmds) }));
           await this.request(request(this.id, this.shellCmdInputId!, 'update', { text: '' }));
         }
         return;
@@ -549,7 +554,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const sel = await this.request<string | null>(request(this.id, this.shellCmdListId!, 'getValue', {}));
         if (sel) {
           this.shellAllowedCmds = this.shellAllowedCmds.filter(c => c !== sel);
-          await this.request(request(this.id, this.shellCmdListId!, 'update', { items: this.shellAllowedCmds }));
+          await this.request(request(this.id, this.shellCmdListId!, 'update', { items: toListItems(this.shellAllowedCmds) }));
         }
         return;
       }
@@ -558,7 +563,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const val = await this.request<string>(request(this.id, this.shellDeniedInputId!, 'getValue', {}));
         if (val && !this.shellDeniedCmds.includes(val)) {
           this.shellDeniedCmds.push(val);
-          await this.request(request(this.id, this.shellDeniedListId!, 'update', { items: this.shellDeniedCmds }));
+          await this.request(request(this.id, this.shellDeniedListId!, 'update', { items: toListItems(this.shellDeniedCmds) }));
           await this.request(request(this.id, this.shellDeniedInputId!, 'update', { text: '' }));
         }
         return;
@@ -567,7 +572,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const sel = await this.request<string | null>(request(this.id, this.shellDeniedListId!, 'getValue', {}));
         if (sel) {
           this.shellDeniedCmds = this.shellDeniedCmds.filter(c => c !== sel);
-          await this.request(request(this.id, this.shellDeniedListId!, 'update', { items: this.shellDeniedCmds }));
+          await this.request(request(this.id, this.shellDeniedListId!, 'update', { items: toListItems(this.shellDeniedCmds) }));
         }
         return;
       }
@@ -582,7 +587,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const val = await this.request<string>(request(this.id, this.webDomainInputId!, 'getValue', {}));
         if (val && !this.webAllowedDomains.includes(val)) {
           this.webAllowedDomains.push(val);
-          await this.request(request(this.id, this.webDomainListId!, 'update', { items: this.webAllowedDomains }));
+          await this.request(request(this.id, this.webDomainListId!, 'update', { items: toListItems(this.webAllowedDomains) }));
           await this.request(request(this.id, this.webDomainInputId!, 'update', { text: '' }));
         }
         return;
@@ -591,7 +596,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const sel = await this.request<string | null>(request(this.id, this.webDomainListId!, 'getValue', {}));
         if (sel) {
           this.webAllowedDomains = this.webAllowedDomains.filter(d => d !== sel);
-          await this.request(request(this.id, this.webDomainListId!, 'update', { items: this.webAllowedDomains }));
+          await this.request(request(this.id, this.webDomainListId!, 'update', { items: toListItems(this.webAllowedDomains) }));
         }
         return;
       }
@@ -600,7 +605,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const val = await this.request<string>(request(this.id, this.webDeniedInputId!, 'getValue', {}));
         if (val && !this.webDeniedDomains.includes(val)) {
           this.webDeniedDomains.push(val);
-          await this.request(request(this.id, this.webDeniedListId!, 'update', { items: this.webDeniedDomains }));
+          await this.request(request(this.id, this.webDeniedListId!, 'update', { items: toListItems(this.webDeniedDomains) }));
           await this.request(request(this.id, this.webDeniedInputId!, 'update', { text: '' }));
         }
         return;
@@ -609,7 +614,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const sel = await this.request<string | null>(request(this.id, this.webDeniedListId!, 'getValue', {}));
         if (sel) {
           this.webDeniedDomains = this.webDeniedDomains.filter(d => d !== sel);
-          await this.request(request(this.id, this.webDeniedListId!, 'update', { items: this.webDeniedDomains }));
+          await this.request(request(this.id, this.webDeniedListId!, 'update', { items: toListItems(this.webDeniedDomains) }));
         }
         return;
       }
@@ -1707,7 +1712,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // Path list
     const { widgetIds: [fsListId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'list', windowId: this.windowId, items: this.fsAllowedPaths, searchable: false,
+        { type: 'list', windowId: this.windowId, items: toListItems(this.fsAllowedPaths), searchable: false,
           style: { height: 80 } },
       ]})
     );
@@ -1810,7 +1815,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // Allowed commands list
     const { widgetIds: [shellListId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'list', windowId: this.windowId, items: this.shellAllowedCmds, searchable: false,
+        { type: 'list', windowId: this.windowId, items: toListItems(this.shellAllowedCmds), searchable: false,
           style: { height: 80 } },
       ]})
     );
@@ -1886,7 +1891,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // Denied commands list
     const { widgetIds: [shellDenyListId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'list', windowId: this.windowId, items: this.shellDeniedCmds, searchable: false,
+        { type: 'list', windowId: this.windowId, items: toListItems(this.shellDeniedCmds), searchable: false,
           style: { height: 80 } },
       ]})
     );
@@ -1989,7 +1994,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // Allowed domains list
     const { widgetIds: [webListId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'list', windowId: this.windowId, items: this.webAllowedDomains, searchable: false,
+        { type: 'list', windowId: this.windowId, items: toListItems(this.webAllowedDomains), searchable: false,
           style: { height: 80 } },
       ]})
     );
@@ -2065,7 +2070,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // Denied domains list
     const { widgetIds: [webDenyListId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'list', windowId: this.windowId, items: this.webDeniedDomains, searchable: false,
+        { type: 'list', windowId: this.windowId, items: toListItems(this.webDeniedDomains), searchable: false,
           style: { height: 80 } },
       ]})
     );

@@ -52,6 +52,7 @@ export interface Goal {
   plan?: AgentPlan;
   createdAt: number;
   updatedAt: number;
+  scratchpad: Record<string, unknown>;
 }
 
 // ─── GoalManager ─────────────────────────────────────────────────────
@@ -259,6 +260,25 @@ export class GoalManager extends Abject {
               ],
               returns: { kind: 'object', properties: { cancelled: { kind: 'primitive', primitive: 'number' } } },
             },
+            {
+              name: 'writeGoalData',
+              description: 'Write a key-value pair to a goal\'s scratchpad for sharing data between agents',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+                { name: 'key', type: { kind: 'primitive', primitive: 'string' }, description: 'Scratchpad key' },
+                { name: 'value', type: { kind: 'primitive', primitive: 'string' }, description: 'Value to store (any JSON-serializable value)' },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+            },
+            {
+              name: 'readGoalData',
+              description: 'Read a key or the entire scratchpad from a goal',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+                { name: 'key', type: { kind: 'primitive', primitive: 'string' }, description: 'Scratchpad key (omit to read entire scratchpad)', optional: true },
+              ],
+              returns: { kind: 'primitive', primitive: 'string' },
+            },
           ],
           events: [
             { name: 'goalCreated', description: 'A new goal was created', payload: { kind: 'reference', reference: 'Goal' } },
@@ -336,7 +356,7 @@ export class GoalManager extends Abject {
           const meta = all?.meta;
           if (meta && typeof meta === 'object' && 'id' in (meta as object)) {
             const goalData = meta as Goal;
-            const goal: Goal = { ...goalData, progress: goalData.progress ?? [] };
+            const goal: Goal = { ...goalData, progress: goalData.progress ?? [], scratchpad: goalData.scratchpad ?? {} };
             this.goals.set(goal.id, goal);
             if (!this.goalOrder.includes(goal.id)) {
               this.goalOrder.push(goal.id);
@@ -441,6 +461,17 @@ Goals have automatic lifecycle management:
 Note: The task type does not need to match an agent's declared taskTypes exactly.
 If no agent declares the type, AgentAbject uses LLM semantic fallback to find a
 suitable agent based on descriptions.
+
+### Goal Scratchpad (shared key-value store)
+
+  // Write data to the goal's scratchpad (persists + syncs across peers)
+  await call(await dep('GoalManager'), 'writeGoalData', { goalId, key: 'spec', value: { ... } });
+
+  // Read a single key
+  const spec = await call(await dep('GoalManager'), 'readGoalData', { goalId, key: 'spec' });
+
+  // Read entire scratchpad
+  const all = await call(await dep('GoalManager'), 'readGoalData', { goalId });
 
 ### IMPORTANT
 - The interface ID is 'abjects:goal-manager'.
@@ -559,6 +590,7 @@ suitable agent based on descriptions.
           plan: goal.plan,
           createdAt: goal.createdAt,
           updatedAt: goal.updatedAt,
+          scratchpad: goal.scratchpad,
         },
         persist: true,
       }));
@@ -585,6 +617,7 @@ suitable agent based on descriptions.
         childIds: [],
         createdAt: Date.now(),
         updatedAt: Date.now(),
+        scratchpad: {},
       };
 
       this.goals.set(goalId, goal);
@@ -963,7 +996,7 @@ suitable agent based on descriptions.
         const meta = all?.meta;
         if (meta && typeof meta === 'object' && 'id' in (meta as object)) {
           const goalData = meta as Goal;
-          const goal: Goal = { ...goalData, progress: goalData.progress ?? [] };
+          const goal: Goal = { ...goalData, progress: goalData.progress ?? [], scratchpad: goalData.scratchpad ?? {} };
           this.goals.set(goal.id, goal);
           if (!this.goalOrder.includes(goal.id)) {
             this.goalOrder.push(goal.id);
@@ -989,6 +1022,28 @@ suitable agent based on descriptions.
       this.changed('goalUpdated', { goalId, plan });
       this.syncGoalToSharedState(goal);
       return { success: true };
+    });
+
+    this.on('writeGoalData', async (msg: AbjectMessage) => {
+      const { goalId, key, value } = msg.payload as { goalId: GoalId; key: string; value: unknown };
+      requireNonEmpty(goalId, 'goalId');
+      requireNonEmpty(key, 'key');
+      const goal = this.goals.get(goalId);
+      if (!goal) return { success: false };
+      goal.scratchpad[key] = value;
+      goal.updatedAt = Date.now();
+      this.changed('goalUpdated', { goalId, message: `scratchpad.${key} updated` });
+      this.syncGoalToSharedState(goal);
+      return { success: true };
+    });
+
+    this.on('readGoalData', async (msg: AbjectMessage) => {
+      const { goalId, key } = msg.payload as { goalId: GoalId; key?: string };
+      requireNonEmpty(goalId, 'goalId');
+      const goal = this.goals.get(goalId);
+      if (!goal) return null;
+      if (key) return goal.scratchpad[key] ?? null;
+      return goal.scratchpad;
     });
 
     this.on('cancelPendingTasks', async (msg: AbjectMessage) => {
@@ -1136,7 +1191,7 @@ suitable agent based on descriptions.
 
       if (!local) {
         // New goal from remote peer — add it
-        const goal: Goal = { ...remote, progress: remote.progress ?? [] };
+        const goal: Goal = { ...remote, progress: remote.progress ?? [], scratchpad: remote.scratchpad ?? {} };
         this.goals.set(goal.id, goal);
         if (!this.goalOrder.includes(goal.id)) {
           this.goalOrder.push(goal.id);
@@ -1157,6 +1212,7 @@ suitable agent based on descriptions.
         local.childIds = remote.childIds;
         local.result = remote.result;
         local.error = remote.error;
+        local.scratchpad = remote.scratchpad ?? local.scratchpad;
         local.updatedAt = remote.updatedAt;
         this.changed('goalUpdated', { goalId, message: 'Remote update', progress: local.progress });
       }
