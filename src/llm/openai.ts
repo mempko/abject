@@ -35,7 +35,7 @@ interface OpenAIMessage {
 interface OpenAIRequest {
   model: string;
   messages: OpenAIMessage[];
-  max_tokens?: number;
+  max_completion_tokens?: number;
   temperature?: number;
   stop?: string[];
   stream?: boolean;
@@ -112,7 +112,7 @@ export class OpenAIProvider extends BaseLLMProvider {
         role: m.role,
         content: this.mapContent(m.content),
       })),
-      max_tokens: options.maxTokens,
+      max_completion_tokens: options.maxTokens,
       temperature: options.temperature,
       stop: options.stopSequences,
     };
@@ -152,7 +152,7 @@ export class OpenAIProvider extends BaseLLMProvider {
         role: m.role,
         content: this.mapContent(m.content),
       })),
-      max_tokens: options.maxTokens,
+      max_completion_tokens: options.maxTokens,
       temperature: options.temperature,
       stop: options.stopSequences,
       stream: true,
@@ -165,7 +165,8 @@ export class OpenAIProvider extends BaseLLMProvider {
     });
 
     if (!response.ok) {
-      throw new Error(`OpenAI API error: ${response.status}`);
+      const body = await response.text();
+      throw new Error(`OpenAI API error: ${response.status} - ${body}`);
     }
 
     const reader = response.body?.getReader();
