@@ -572,7 +572,22 @@ Always begin by executing create_object. After it completes, report done or fail
   }
 
   protected override getSourceForAsk(): string | undefined {
-    return `## ObjectCreator Usage Guide
+    return `## ObjectCreator — Object Creation and Modification Agent
+
+### What I Handle
+I create brand-new objects and modify existing ones from natural language descriptions.
+I generate the code, manifest, and handlers for new Abjects.
+
+Examples of tasks I handle well:
+- "Create a todo list app" — I build a new widget from scratch
+- "Make a countdown timer" — I create a new object with UI
+- "Add a reset button to the Counter" — I modify existing object code
+- Any task that requires building or changing an object's implementation
+
+### What I Do NOT Handle
+- Interacting with existing objects (calling methods, fetching data)
+- Browsing websites or navigating web pages
+- Drawing on canvases or controlling existing apps at runtime — I create/modify their source code
 
 ### Create a New Object
 

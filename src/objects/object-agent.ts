@@ -79,16 +79,30 @@ export class ObjectAgent extends Abject {
   }
 
   protected override getSourceForAsk(): string | undefined {
-    return `## ObjectAgent Usage Guide
+    return `## ObjectAgent — General-Purpose Object Interaction Agent
 
-ObjectAgent discovers and calls objects via message passing. It:
-1. Asks the Registry which objects can help with a task
-2. Asks those objects about their API (via the ask protocol)
-3. Sends the right call messages with correct method and payload
-4. Chains results from one call into the next if needed
+### What I Handle
+I am the go-to agent for any task that involves interacting with existing objects in the system.
+I discover objects via the Registry, learn their API via the ask protocol, and call their methods.
 
-Tasks are dispatched automatically by AgentAbject based on task type matching (type: 'call').
-You can also send a runTask message directly with a task description.`;
+Examples of tasks I handle well:
+- Fetching data from APIs (weather, stocks, etc.)
+- Running shell commands
+- Reading/writing files
+- Drawing on canvas apps, controlling UI objects, setting timers
+- Any task that can be accomplished by calling methods on existing objects
+- Multi-step workflows chaining calls across multiple objects
+
+### What I Do NOT Handle
+- Creating brand-new objects from scratch
+- Browsing websites or navigating web pages
+- Tasks specific to an installed skill's domain
+
+### How I Work
+1. Ask the Registry which objects can help
+2. Ask those objects how to use their API
+3. Call the right methods with the right parameters
+4. Chain results across multiple calls if needed`;
   }
 
   private setupHandlers(): void {

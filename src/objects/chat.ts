@@ -158,6 +158,7 @@ export class Chat extends Abject {
     this.send(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'Chat',
       description: 'Conversational LLM agent for interacting with Abjects',
+      canExecute: false,
       config: {
         pinnedMessageCount: 1,
         terminalActions: {

@@ -117,6 +117,8 @@ interface RegisteredAgent {
   systemPrompt?: string;
   config: ResolvedAgentConfig;
   taskTypes: string[];
+  /** Whether this agent can execute tasks from TupleSpace. Agents that only create tasks (like Chat) set this to false. */
+  canExecute: boolean;
   registeredAt: number;
 }
 
@@ -615,8 +617,8 @@ improve semantic matching accuracy.
   private setupHandlers(): void {
     // ── Registration ──
     this.on('registerAgent', async (msg: AbjectMessage) => {
-      const { name, description, systemPrompt, config, taskTypes } =
-        msg.payload as { name: string; description: string; systemPrompt?: string; config?: AgentConfig; taskTypes?: string[] };
+      const { name, description, systemPrompt, config, taskTypes, canExecute } =
+        msg.payload as { name: string; description: string; systemPrompt?: string; config?: AgentConfig; taskTypes?: string[]; canExecute?: boolean };
       const agentId = msg.routing.from;
       const resolved = resolveConfig(config);
 
@@ -627,6 +629,7 @@ improve semantic matching accuracy.
         systemPrompt,
         config: resolved,
         taskTypes: taskTypes ?? [],
+        canExecute: canExecute ?? true,
         registeredAt: Date.now(),
       });
 
@@ -943,9 +946,10 @@ improve semantic matching accuracy.
 
     log.info(`DISPATCH-INNER ${tupleId} goalId=${taskGoalId?.slice(0, 8) ?? '?'} failureHistory=${failureHistory.length}`);
 
-    // 1. Find all eligible agents (not failed, not busy)
+    // 1. Find all eligible agents (can execute, not failed, not busy)
     const failedAgentIds = new Set(failureHistory.map(f => f.agentId));
     const eligible = [...this.registeredAgents.values()]
+      .filter(a => a.canExecute)
       .filter(a => !failedAgentIds.has(a.agentId))
       .filter(a => !this.busyAgents.has(a.agentId));
 
@@ -954,14 +958,40 @@ improve semantic matching accuracy.
       return;
     }
 
-    // 2. Semantic match: LLM picks the best agent based on descriptions
-    const matched = await this.semanticMatchAgent(eligible, taskType, description);
-    if (!matched) {
-      log.info(`DISPATCH-INNER ${tupleId} — no suitable agent found for: ${description.slice(0, 60)}`);
+    // 2. Ask each agent via the ask protocol if it can handle this task (in parallel)
+    const bids = await Promise.all(
+      eligible.map(async (agent) => {
+        try {
+          const answer = await this.request<string>(
+            request(this.id, agent.agentId, 'ask', {
+              question: `Can you handle this task? Rate your confidence 0-10.\nTask: "${description.slice(0, 300)}"`,
+            }),
+            15000,
+          );
+          const text = typeof answer === 'string' ? answer : String(answer);
+          // Extract a number from the response
+          const match = text.match(/\b(10|[0-9])\b/);
+          const confidence = match ? parseInt(match[1], 10) : 0;
+          return { agent, confidence };
+        } catch {
+          return { agent, confidence: 0 };
+        }
+      })
+    );
+
+    const MIN_CONFIDENCE = 3;
+    const willing = bids
+      .filter(b => b.confidence >= MIN_CONFIDENCE)
+      .sort((a, b) => b.confidence - a.confidence);
+
+    if (willing.length === 0) {
+      const bestBid = bids.sort((a, b) => b.confidence - a.confidence)[0];
+      log.info(`DISPATCH-INNER ${tupleId} — no agent confident enough (best: ${bestBid?.agent.name} at ${bestBid?.confidence}/10) for: ${description.slice(0, 60)}`);
       return;
     }
-    log.info(`DISPATCH-INNER ${tupleId} — matched: ${matched.name}`);
-    const chosen = matched;
+
+    const chosen = willing[0].agent;
+    log.info(`DISPATCH-INNER ${tupleId} — ${chosen.name} (confidence ${willing[0].confidence}/10) from ${willing.length} willing agents`);
 
     // 3a. Mark agent busy BEFORE the async claim to prevent concurrent
     // dispatches from claiming tasks for the same agent (JS is single-threaded,

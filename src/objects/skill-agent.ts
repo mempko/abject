@@ -34,6 +34,7 @@ export class SkillAgent extends Abject {
   private jobManagerId?: AbjectId;
 
   private taskExtras = new Map<string, TaskExtra>();
+  private installedSkillDescriptions = '(none)';
 
   /** Cached system prompt (rebuilt when skills change). */
   private cachedSystemPrompt?: string;
@@ -98,17 +99,26 @@ export class SkillAgent extends Abject {
   }
 
   protected override getSourceForAsk(): string | undefined {
-    return `## SkillAgent Usage Guide
+    return `## SkillAgent — Installed Skill Execution Agent
 
-SkillAgent executes tasks using enabled skills. It has access to:
-- Shell commands (curl, jq, git, etc.) via ShellExecutor
-- HTTP requests via HttpClient
-- File system (read/write/glob/grep) via HostFileSystem
-- Web search via WebSearch
-- URL content fetching via WebFetch
+### What I Handle
+I execute tasks that match an installed and enabled skill. Each skill has a specific domain
+(e.g., finance, analytics, data processing) and I only handle tasks within those domains.
 
-Enable skills in the Skill Browser and configure their API keys.
-Tasks are dispatched automatically by AgentAbject based on task type matching.`;
+Currently installed skills and their domains:
+${this.getInstalledSkillsSummary()}
+
+### What I Do NOT Handle
+- General object interaction or API calls
+- Web browsing or navigating websites
+- Creating new objects from scratch
+- Any task outside the domains of installed skills
+
+If no installed skill matches the task, my confidence is 0.`;
+  }
+
+  private getInstalledSkillsSummary(): string {
+    return this.installedSkillDescriptions;
   }
 
   private setupHandlers(): void {
@@ -232,8 +242,10 @@ Tasks are dispatched automatically by AgentAbject based on task type matching.`;
         if (skills.length > 0) {
           skillNames.push(...skills.map(s => s.name));
           description = `Executes tasks for these installed skills only: ${skills.map(s => `${s.name} (${s.description.slice(0, 80)})`).join('; ')}.`;
+          this.installedSkillDescriptions = skills.map(s => `- ${s.name}: ${s.description}`).join('\n');
         } else {
           description = 'Skill execution agent (no skills currently enabled).';
+          this.installedSkillDescriptions = '(none currently enabled)';
         }
       } catch { /* use default */ }
     }

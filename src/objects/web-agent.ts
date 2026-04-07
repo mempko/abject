@@ -194,7 +194,25 @@ export class WebAgent extends Abject {
   }
 
   protected override getSourceForAsk(): string | undefined {
-    return `## WebAgent Usage Guide
+    return `## WebAgent — Autonomous Web Browsing Agent
+
+### What I Handle
+I am the agent for any task that requires visiting websites or interacting with web pages.
+I open a headless browser, navigate to URLs, and use an LLM-driven loop to complete web tasks.
+
+Examples of tasks I handle well:
+- Visiting a URL and reading its content
+- Searching the web and extracting results
+- Filling out forms, clicking buttons, navigating multi-page workflows
+- Taking screenshots of web pages
+- Logging into websites (social media, email, web apps)
+- Scraping data from JavaScript-rendered pages
+- Any task that requires a real web browser
+
+### What I Do NOT Handle
+- Calling internal system APIs or objects directly
+- Creating new objects from scratch
+- Tasks that don't involve web pages
 
 ### Run a Full Web Task (free-text result)
 
