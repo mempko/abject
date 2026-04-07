@@ -453,13 +453,9 @@ export class ObjectCreator extends Abject {
       // the executeTask is routed through JobManager.
       const callerId = (explicitCallerId as AbjectId) ?? msg.routing.from;
       try {
-        if (type === 'modify') {
-          let objectId = data?.objectId as string | undefined;
-          if (!objectId && data?.object) {
-            const resolved = await this.discoverDep(data.object as string);
-            if (resolved) objectId = resolved;
-          }
-          if (!objectId) throw new Error('modify task missing objectId (include data.object or data.objectId)');
+        // Try to resolve a target object from any data field or the description
+        const objectId = await this.resolveModifyTarget(data, description);
+        if (objectId) {
           log.info(`executeTask modify object=${objectId.slice(0, 8)}`);
           return await this.modifyObject(objectId as AbjectId, description, callerId);
         }
@@ -1542,6 +1538,41 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
   /**
    * Modify an existing object using the full multi-phase pipeline.
    */
+  /**
+   * Resolve a modify target from task data or by asking the Registry.
+   * Returns an objectId if this is a modify task, null if it's a create.
+   */
+  private async resolveModifyTarget(
+    data: Record<string, unknown> | undefined,
+    description: string,
+  ): Promise<AbjectId | null> {
+    // 1. Check common field names in data
+    if (data) {
+      for (const key of ['objectId', 'object', 'targetObject', 'target_object', 'target']) {
+        const val = data[key] as string | undefined;
+        if (!val) continue;
+        if (val.includes('-') && val.length > 20) return val as AbjectId;
+        const resolved = await this.discoverDep(val);
+        if (resolved) return resolved;
+      }
+    }
+
+    // 2. Ask the Registry if the description refers to an existing object
+    try {
+      const answer = await this.request<string>(
+        request(this.id, this.registryId!, 'ask', {
+          question: `Does this task description refer to modifying an existing object? If yes, reply with ONLY the object's AbjectId (UUID). If this is about creating something new, reply "none".\n\nTask: "${description.slice(0, 300)}"`,
+        }),
+        10000,
+      );
+      const text = typeof answer === 'string' ? answer : '';
+      const idMatch = text.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+      if (idMatch) return idMatch[0] as AbjectId;
+    } catch { /* best effort */ }
+
+    return null;
+  }
+
   async modifyObject(objectId: AbjectId, prompt: string, callerId?: AbjectId): Promise<CreationResult> {
     require(this.llmId !== undefined, 'LLM not set');
     require(this.registryId !== undefined, 'Registry not set');
