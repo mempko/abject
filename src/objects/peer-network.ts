@@ -343,6 +343,35 @@ Interface: abjects:peer-network`;
       this.tabContents.push(tabVBox);
     }
 
+    await this.populateTabs();
+
+    this.changed('visibility', true);
+    return true;
+  }
+
+  /** Populate tab content. Called from show() and refresh(). */
+  private async populateTabs(): Promise<void> {
+    // Clear widget refs and button maps (old widgets destroyed by clearLayoutChildren)
+    this.nameInputId = undefined;
+    this.saveNameBtnId = undefined;
+    this.copyPeerIdBtnId = undefined;
+    this.copyIdentityBtnId = undefined;
+    this.statusLabelId = undefined;
+    this.addContactInputId = undefined;
+    this.addContactBtnId = undefined;
+    this.signalingInputId = undefined;
+    this.signalingConnectBtnId = undefined;
+    this.connectButtons.clear();
+    this.removeButtons.clear();
+    this.introduceButtons.clear();
+    this.acceptIntroButtons.clear();
+    this.rejectIntroButtons.clear();
+    this.signalingRemoveButtons.clear();
+    this.promoteButtons.clear();
+    this.blockButtons.clear();
+    this.unblockButtons.clear();
+    this.signalingPeerAddButtons.clear();
+
     // Fetch identity info
     let peerId = '';
     let peerName = '';
@@ -1137,8 +1166,6 @@ Interface: abjects:peer-network`;
       }
     }
 
-    this.changed('visibility', true);
-    return true;
   }
 
   async hide(): Promise<boolean> {
@@ -1182,8 +1209,11 @@ Interface: abjects:peer-network`;
 
   private async refresh(): Promise<void> {
     if (!this.windowId) return;
-    await this.hide();
-    await this.show();
+    // Clear tab content containers and repopulate (keeps window stable)
+    for (const tabId of this.tabContents) {
+      await this.request(request(this.id, tabId, 'clearLayoutChildren', {}));
+    }
+    await this.populateTabs();
   }
 
   private async addDivider(containerId: AbjectId): Promise<void> {
