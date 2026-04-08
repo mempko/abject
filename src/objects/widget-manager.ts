@@ -463,6 +463,7 @@ export class WidgetManager extends Abject {
           options?: string[];
           selectedIndex?: number;
           tabs?: string[];
+          closable?: boolean;
           min?: number;
           max?: number;
           step?: number;
@@ -1818,6 +1819,7 @@ await this.call(timerId, 'addDependent', {});
     options?: string[];
     selectedIndex?: number;
     tabs?: string[];
+    closable?: boolean;
     min?: number;
     max?: number;
     step?: number;
@@ -1880,7 +1882,7 @@ await this.call(timerId, 'addDependent', {});
       case 'tabBar':
         return this.createTypedWidget(spec.windowId, new TabBarWidget({
           type: 'tabBar', rect, style: spec.style,
-          tabs: spec.tabs, selectedIndex: spec.selectedIndex, ...base,
+          tabs: spec.tabs, selectedIndex: spec.selectedIndex, closable: spec.closable, ...base,
         }), rect);
       case 'slider':
         return this.createTypedWidget(spec.windowId, new SliderWidget({
@@ -2004,6 +2006,7 @@ await this.call(timerId, 'addDependent', {});
       monospace?: boolean;
       masked?: boolean;
       tabs?: string[];
+      closable?: boolean;
       min?: number;
       max?: number;
       step?: number;
@@ -2080,6 +2083,7 @@ await this.call(timerId, 'addDependent', {});
           ...baseConfig,
           tabs: config.tabs,
           selectedIndex: config.selectedIndex,
+          closable: config.closable,
         } as TabBarConfig);
         break;
       case 'slider':

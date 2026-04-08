@@ -167,7 +167,7 @@ export class WebBrowserViewer extends Abject {
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'tabBar', windowId: this.windowId, tabs: [], selectedIndex: 0 },
+          { type: 'tabBar', windowId: this.windowId, tabs: [], selectedIndex: 0, closable: true },
           { type: 'label', windowId: this.windowId, text: '', style: { color: '#8b8fa3', fontSize: 11 } },
           { type: 'label', windowId: this.windowId, text: 'No browser pages open', style: { color: '#6b7084', fontSize: 11 } },
         ],

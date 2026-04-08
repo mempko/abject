@@ -237,31 +237,53 @@ export class ListWidget extends WidgetAbject {
         });
       }
 
-      // Label
+      // Label + secondary as a single truncated line
       const labelColor = isSelected ? this.theme.accent : this.theme.textPrimary;
-      commands.push({
-        type: 'text',
-        surfaceId,
-        params: {
-          x: ox + 10, y: itemY + this.itemHeight / 2,
-          text: item.label,
-          font,
-          fill: labelColor,
-          baseline: 'middle',
-        },
-      });
+      const maxTextWidth = w - 24;
+      const secondary = item.secondary ?? '';
+      const fullText = secondary ? `${item.label}  ${secondary}` : item.label;
+      const displayText = await this.truncateWithEllipsis(surfaceId, fullText, maxTextWidth, font);
 
-      // Secondary text (right-aligned)
-      if (item.secondary) {
+      // If both parts fit (or partially), render label portion in label color
+      // and secondary portion in tertiary color
+      const labelPrefix = item.label;
+      const separator = '  ';
+      if (secondary && displayText.length > labelPrefix.length + separator.length) {
+        // Label part is fully visible; render it, then the secondary remainder
         commands.push({
           type: 'text',
           surfaceId,
           params: {
-            x: ox + w - 14, y: itemY + this.itemHeight / 2,
-            text: item.secondary,
+            x: ox + 10, y: itemY + this.itemHeight / 2,
+            text: labelPrefix + separator,
+            font,
+            fill: labelColor,
+            baseline: 'middle',
+          },
+        });
+        const labelPartWidth = await this.measureText(surfaceId, labelPrefix + separator, font);
+        const secondaryPart = displayText.slice(labelPrefix.length + separator.length);
+        commands.push({
+          type: 'text',
+          surfaceId,
+          params: {
+            x: ox + 10 + labelPartWidth, y: itemY + this.itemHeight / 2,
+            text: secondaryPart,
             font: secondaryFont,
             fill: this.theme.textTertiary,
-            align: 'right',
+            baseline: 'middle',
+          },
+        });
+      } else {
+        // Everything in label color (secondary didn't fit or doesn't exist)
+        commands.push({
+          type: 'text',
+          surfaceId,
+          params: {
+            x: ox + 10, y: itemY + this.itemHeight / 2,
+            text: displayText,
+            font,
+            fill: labelColor,
             baseline: 'middle',
           },
         });

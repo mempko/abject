@@ -151,7 +151,7 @@ export class KnowledgeBrowser extends Abject {
     // Tab bar for type filtering
     const { widgetIds: [tabBarId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
-        specs: [{ type: 'tabBar', windowId: this.windowId, tabs: TAB_LABELS, selectedIndex: 0 }],
+        specs: [{ type: 'tabBar', windowId: this.windowId, tabs: TAB_LABELS, selectedIndex: 0, closable: false }],
       })
     );
     this.tabBarId = tabBarId;
@@ -451,7 +451,7 @@ export class KnowledgeBrowser extends Abject {
 
   private async handleChanged(fromId: AbjectId, aspect: string, value?: unknown): Promise<void> {
     // Tab changed
-    if (fromId === this.tabBarId && aspect === 'tabSelected') {
+    if (fromId === this.tabBarId && aspect === 'change') {
       const idx = typeof value === 'number' ? value : parseInt(String(value), 10);
       if (!isNaN(idx) && idx >= 0 && idx < TAB_LABELS.length) {
         this.activeTab = idx;

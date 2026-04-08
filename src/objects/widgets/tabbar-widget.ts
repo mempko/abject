@@ -14,7 +14,7 @@ import { lightenColor } from './widget-types.js';
 export interface TabBarConfig extends WidgetConfig {
   tabs?: string[];
   selectedIndex?: number;
-  closable?: boolean;  // default true — show × close buttons
+  closable?: boolean;  // default false — show × close buttons when true
 }
 
 export class TabBarWidget extends WidgetAbject {
@@ -38,7 +38,7 @@ export class TabBarWidget extends WidgetAbject {
     super(config);
     this.tabs = config.tabs ?? [];
     this.selectedIndex = config.selectedIndex ?? 0;
-    this.closable = config.closable ?? true;
+    this.closable = config.closable ?? false;
   }
 
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {

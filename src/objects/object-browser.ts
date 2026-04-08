@@ -582,7 +582,7 @@ Pane 4: Detail view with signature, status, source, send-message form,
     tabNames.push('+');
     const { widgetIds: [tabBarId, backBtnId, forwardBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'tabBar', windowId: this.windowId, tabs: tabNames, selectedIndex: this.activeTabIndex },
+        { type: 'tabBar', windowId: this.windowId, tabs: tabNames, selectedIndex: this.activeTabIndex, closable: true },
         { type: 'button', windowId: this.windowId, text: '\u25C0', style: { fontSize: 12 } },
         { type: 'button', windowId: this.windowId, text: '\u25B6', style: { fontSize: 12 } },
       ]})
