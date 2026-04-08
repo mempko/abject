@@ -348,6 +348,14 @@ export abstract class Abject {
   }
 
   /**
+   * Return the LLM tier for the ask handler. Override in subclasses that
+   * need better reasoning (e.g., agents that participate in task dispatch).
+   */
+  protected getAskTier(): string {
+    return 'fast';
+  }
+
+  /**
    * Handle an 'ask' request: use LLM if available, else fall back to manifest description.
    */
   private async handleAsk(question: string): Promise<string> {
@@ -392,7 +400,7 @@ export abstract class Abject {
                 { role: 'system', content: `You are "${this.manifest.name}": ${this.manifest.description}\nAnswer questions from your perspective as this object. Use the provided manifest and source code to give accurate, concise answers.\n\n${context}` },
                 { role: 'user', content: question },
               ],
-              options: { tier: 'fast' },
+              options: { tier: this.getAskTier() },
             }),
             60000
           );

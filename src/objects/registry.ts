@@ -182,6 +182,8 @@ export class Registry extends Abject {
     this.setupHandlers();
   }
 
+  protected override getAskTier(): string { return 'balanced'; }
+
   protected override getSourceForAsk(): string | undefined {
     // Meta-protocol methods filtered from object summaries
     const metaMethods = new Set([

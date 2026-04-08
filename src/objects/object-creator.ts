@@ -568,6 +568,8 @@ Available actions (output ONE JSON object per turn):
 Always begin by executing create_object. After it completes, report done or fail.`;
   }
 
+  protected override getAskTier(): string { return 'balanced'; }
+
   protected override getSourceForAsk(): string | undefined {
     return `## ObjectCreator — Object Creation and Modification Agent
 

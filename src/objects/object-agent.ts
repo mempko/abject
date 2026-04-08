@@ -78,6 +78,8 @@ export class ObjectAgent extends Abject {
     log.info('Registered with AgentAbject');
   }
 
+  protected override getAskTier(): string { return 'balanced'; }
+
   protected override getSourceForAsk(): string | undefined {
     return `## ObjectAgent — General-Purpose Object Interaction Agent
 

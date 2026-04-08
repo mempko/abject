@@ -193,6 +193,8 @@ export class WebAgent extends Abject {
     this.setupHandlers();
   }
 
+  protected override getAskTier(): string { return 'balanced'; }
+
   protected override getSourceForAsk(): string | undefined {
     return `## WebAgent — Autonomous Web Browsing Agent
 
