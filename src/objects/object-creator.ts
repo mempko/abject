@@ -35,6 +35,8 @@ import { ScriptableAbject } from './scriptable-abject.js';
 import { systemMessage, userMessage, userMessageWithImages, LLMMessage, LLMCompletionResult, LLMCompletionOptions } from '../llm/provider.js';
 import type { AgentAction } from './agent-abject.js';
 import { Log } from '../core/timed-log.js';
+import { parseHandlerMap } from './widgets/handler-parser.js';
+import { applyHandlerDiff, parseDiffResponse, validateDiff } from './handler-diff.js';
 
 const log = new Log('OBJECT-CREATOR');
 
@@ -490,8 +492,7 @@ export class ObjectCreator extends Abject {
       try {
         await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
           name: 'ObjectCreator',
-          description: 'Creates and modifies objects from natural language prompts',
-          taskTypes: ['create', 'modify'],
+          description: 'Creates new objects and modifies existing objects from natural language. Users may refer to objects as "apps". Handles object creation, fixing object UIs, changing object behavior, adding features to objects, and redesigning objects. Any task about fixing, changing, updating, modifying, redesigning, or improving an existing object belongs to this agent.',
           config: {
             maxSteps: 10,
             skipFirstObservation: true,
@@ -1249,6 +1250,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         const verified = this.verifyAndFix(manifest, code);
         manifest = verified.manifest;
         code = verified.code;
+        log.info(`Phase 3 mismatches: ${verified.mismatches.length > 0 ? verified.mismatches.join('; ') : 'none'}`);
 
         // Phase 3b: LLM-assisted fix if needed
         if (verified.mismatches.length > 0) {
@@ -1258,6 +1260,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
             if (!ScriptableAbject.tryCompile(llmFixed.code)) {
               manifest = llmFixed.manifest;
               code = llmFixed.code;
+              log.info('Phase 3b: LLM fix accepted');
             } else {
               log.warn('Phase 3b produced non-compiling code, keeping original');
             }
@@ -1281,6 +1284,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         // Phase 4: Compile check
         if (callerId) await this.reportProgress(callerId, '4', 'Compiling...');
         const compileError = ScriptableAbject.tryCompile(code);
+        log.info(`Phase 4 compile: ${compileError ? 'FAILED: ' + compileError.slice(0, 200) : 'OK'} (code ${code.length} chars)`);
         if (compileError) {
           // Try a single LLM compile fix
           const fixResult = await this.llmComplete([
@@ -1295,6 +1299,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           const fixMatch = fixResult.content.match(/```(?:javascript|js)\s*([\s\S]*?)\s*```/);
           if (fixMatch && !ScriptableAbject.tryCompile(fixMatch[1])) {
             code = fixMatch[1];
+            log.info('Phase 4: LLM compile fix accepted');
           } else {
             lastError = `Compilation failed: ${compileError}`;
             log.warn(`Attempt ${attempt}: ${lastError}`);
@@ -1496,7 +1501,14 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
     ];
 
     const result = await this.llmComplete(messages, { tier: 'balanced' });
-    return this.parseManifestResponse(result.content);
+    log.info(`modify Phase M LLM response (${result.content.length} chars):\n${result.content.slice(0, 500)}`);
+    const parsed = this.parseManifestResponse(result.content);
+    if (parsed.manifest) {
+      log.info(`modify Phase M manifest: "${parsed.manifest.name}" methods=[${parsed.manifest.interface.methods.map(m => m.name).join(', ')}] usedObjects=[${parsed.usedObjects.join(', ')}]`);
+    } else {
+      log.warn('modify Phase M: failed to parse manifest from LLM response');
+    }
+    return parsed;
   }
 
   /**
@@ -1536,6 +1548,134 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
   }
 
   /**
+   * Heuristic: should we attempt handler-level diffs instead of full rewrite?
+   */
+  private shouldUseDiff(currentSource: string | null, prompt: string): boolean {
+    if (!currentSource) return false;
+    if (currentSource.length < 500) return false;
+    const entries = parseHandlerMap(currentSource);
+    if (entries.length <= 2) return false;
+    const rewriteKeywords = ['rewrite', 'redesign', 'start over', 'from scratch', 'completely change'];
+    const lowerPrompt = prompt.toLowerCase();
+    if (rewriteKeywords.some(kw => lowerPrompt.includes(kw))) return false;
+    return true;
+  }
+
+  /**
+   * Phase 2 (diff mode): Generate only the changed handlers instead of the full source.
+   * Returns the final merged source string, or undefined if the diff approach fails.
+   */
+  private async generateModifiedHandlerCodeDiff(
+    manifest: AbjectManifest,
+    prompt: string,
+    depContext: string,
+    usedObjects: string[],
+    currentSource: string
+  ): Promise<string | undefined> {
+    const entries = parseHandlerMap(currentSource);
+    const handlerSummary = entries.map(e =>
+      `  ${e.type}: ${e.name} (${e.body.split('\n').length} lines)`
+    ).join('\n');
+
+    const methodList = manifest.interface.methods.map((m) => m.name)
+      .filter(n => !FRAMEWORK_PROVIDED_METHODS.has(n));
+
+    const messages: LLMMessage[] = [
+      systemMessage(this.getPhase2DiffSystemPrompt()),
+      userMessage(
+        `Manifest:\n\`\`\`json\n${JSON.stringify(manifest, null, 2)}\n\`\`\`\n\n` +
+        `Required methods: ${methodList.join(', ')}\n\n` +
+        `Handler summary:\n${handlerSummary}\n\n` +
+        `Full current source:\n\`\`\`javascript\n${currentSource}\n\`\`\`\n\n` +
+        `Available dependencies:\n${depContext}\n\n` +
+        `Used objects: ${usedObjects.length > 0 ? usedObjects.join(', ') : 'None'}\n\n` +
+        `Modification request: ${prompt}\n\n` +
+        `Output ONLY the changes needed as a \`\`\`handler-diff block. If the change affects most handlers, use FULL_REWRITE with a \`\`\`javascript block instead.`
+      ),
+    ];
+
+    const result = await this.llmComplete(messages, { tier: 'smart', maxTokens: 16384 });
+    log.info(`Modify Phase 2 diff LLM response (${result.content.length} chars):\n${result.content.slice(0, 500)}`);
+
+    const parsed = parseDiffResponse(result.content);
+    if (!parsed) {
+      log.warn('Diff response: could not parse LLM output, falling back to full rewrite');
+      return undefined;
+    }
+
+    if (parsed.type === 'full-rewrite') {
+      log.info('Diff response: LLM chose FULL_REWRITE');
+      return parsed.code;
+    }
+
+    // Validate before applying
+    const errors = validateDiff(currentSource, parsed.diff);
+    if (errors.length > 0) {
+      log.warn('Diff validation errors:', errors);
+      // Still attempt application (lenient mode handles missing names)
+    }
+
+    const applied = applyHandlerDiff(currentSource, parsed.diff);
+    if (!applied.success) {
+      log.warn('Diff application failed:', applied.error);
+      return undefined;
+    }
+
+    const opSummary = parsed.diff.operations.map(op => `${op.action} ${op.name}`).join(', ');
+    log.info(`Diff applied successfully: ${parsed.diff.operations.length} operations: [${opSummary}]`);
+    return applied.source;
+  }
+
+  /**
+   * Phase 2 diff system prompt: generate handler-diff format instead of full source.
+   */
+  private getPhase2DiffSystemPrompt(): string {
+    // Reuse the core rules from the full Phase 2 prompt, then add diff-specific instructions
+    return this.getPhase2SystemPrompt() + `
+
+## DIFF MODE
+
+You are modifying an existing handler map, not writing one from scratch.
+The current source code is provided. Output ONLY the handlers that need to change.
+
+Use the \`\`\`handler-diff format with these operations:
+
+MODIFY handlerName:
+  Replace an existing handler/property with a new implementation.
+
+ADD handlerName:
+  Add a new handler/property that doesn't exist yet.
+
+REMOVE handlerName
+  Remove an existing handler/property (single line, no body).
+
+Example:
+\`\`\`handler-diff
+MODIFY show:
+async show(msg) {
+  if (this._windowId) return true;
+  // ... new implementation ...
+}
+
+ADD _calculateScore:
+_calculateScore(x, y) {
+  return x * y + this._bonus;
+}
+
+REMOVE _oldHelper
+\`\`\`
+
+Rules:
+- Each handler body must be complete and valid (same format as in a handler map)
+- Do NOT output unchanged handlers
+- Include ALL changes needed to fully accomplish the modification request.
+  Be thorough: if fixing the UI, modify every handler and property that affects the visual result.
+  If adding a feature, update the state properties, the relevant handlers, and any draw/render logic.
+- If the modification affects more than ~60% of handlers, output FULL_REWRITE
+  on the first line followed by the complete handler map in a \`\`\`javascript block instead`;
+  }
+
+  /**
    * Modify an existing object using the full multi-phase pipeline.
    */
   /**
@@ -1548,26 +1688,48 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
   ): Promise<AbjectId | null> {
     // 1. Check common field names in data
     if (data) {
-      for (const key of ['objectId', 'object', 'targetObject', 'target_object', 'target']) {
+      for (const key of ['objectId', 'object', 'objectName', 'targetObject', 'target_object', 'target']) {
         const val = data[key] as string | undefined;
         if (!val) continue;
-        if (val.includes('-') && val.length > 20) return val as AbjectId;
+        if (val.includes('-') && val.length > 20) {
+          log.info(`resolveModifyTarget: found UUID in data.${key} => ${val.slice(0, 8)}`);
+          return val as AbjectId;
+        }
         const resolved = await this.discoverDep(val);
-        if (resolved) return resolved;
+        if (resolved) {
+          log.info(`resolveModifyTarget: discovered data.${key}="${val}" => ${(resolved as string).slice(0, 8)}`);
+          return resolved;
+        }
       }
     }
 
-    // 2. Ask the Registry if the description refers to an existing object
+    // 2. Ask the Registry which object(s) the description refers to.
     try {
-      const answer = await this.request<string>(
-        request(this.id, this.registryId!, 'ask', {
-          question: `Does this task description refer to modifying an existing object? If yes, reply with ONLY the object's AbjectId (UUID). If this is about creating something new, reply "none".\n\nTask: "${description.slice(0, 300)}"`,
-        }),
-        10000,
-      );
-      const text = typeof answer === 'string' ? answer : '';
-      const idMatch = text.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-      if (idMatch) return idMatch[0] as AbjectId;
+      const allObjects = await this.registryList();
+      const userObjects = allObjects.filter(o => o.manifest.tags?.includes('scriptable'));
+      if (userObjects.length > 0) {
+        const objectList = userObjects.map(o => `- ${o.manifest.name}: ${o.manifest.description ?? 'No description'}`).join('\n');
+        const askPrompt = `Which of these objects does this task refer to? If multiple objects have similar names, pick the one that best matches the task description. Reply with ONLY the exact object name, or "none" if this is about creating something new.\n\nObjects:\n${objectList}\n\nTask: "${description.slice(0, 300)}"`;
+        log.info(`resolveModifyTarget: asking LLM with ${userObjects.length} objects:\n${objectList}`);
+        const llmResult = await this.request<{ content: string }>(
+          request(this.id, this.llmId!, 'complete', {
+            messages: [{ role: 'user', content: askPrompt }],
+            options: { tier: 'balanced' },
+          }),
+          10000,
+        );
+        const answer = llmResult.content;
+        const text = typeof answer === 'string' ? answer.trim() : '';
+        log.info(`resolveModifyTarget: Registry LLM answered: "${text}"`);
+        if (text && text.toLowerCase() !== 'none') {
+          // Find the object whose name matches the LLM response
+          const match = userObjects.find(o => text.includes(o.manifest.name));
+          if (match) {
+            log.info(`resolveModifyTarget: Registry matched "${match.manifest.name}" (${(match.id as string).slice(0, 8)})`);
+            return match.id;
+          }
+        }
+      }
     } catch { /* best effort */ }
 
     return null;
@@ -1628,10 +1790,25 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
       for (let attempt = 1; attempt <= MAX_CODE_ATTEMPTS; attempt++) {
         // Phase 2: Generate handler code (with feedback on retry)
         if (attempt === 1) {
-          if (callerId) await this.reportProgress(callerId, '2', 'Generating updated handler code...');
-          code = await this.generateModifiedHandlerCode(
-            manifest, prompt, depContext, phaseM.usedObjects, currentSource
-          );
+          // Try handler-level diff first for efficiency
+          if (currentSource && this.shouldUseDiff(currentSource, prompt)) {
+            if (callerId) await this.reportProgress(callerId, '2', 'Generating handler diff...');
+            code = await this.generateModifiedHandlerCodeDiff(
+              manifest, prompt, depContext, phaseM.usedObjects, currentSource
+            );
+            if (code) {
+              log.info('modify Phase 2: used handler-level diff');
+            } else {
+              log.info('modify Phase 2: diff failed, falling back to full rewrite');
+            }
+          }
+          // Fallback to full rewrite
+          if (!code) {
+            if (callerId) await this.reportProgress(callerId, '2', 'Generating updated handler code...');
+            code = await this.generateModifiedHandlerCode(
+              manifest, prompt, depContext, phaseM.usedObjects, currentSource
+            );
+          }
         } else {
           if (callerId) await this.reportProgress(callerId, '2', `Generating handler code (retry ${attempt}/${MAX_CODE_ATTEMPTS})...`);
           log.info(`modify Retry ${attempt}/${MAX_CODE_ATTEMPTS}: ${lastError}`);
@@ -1650,6 +1827,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         const verified = this.verifyAndFix(manifest, code);
         manifest = verified.manifest;
         code = verified.code;
+        log.info(`modify Phase 3 mismatches: ${verified.mismatches.length > 0 ? verified.mismatches.join('; ') : 'none'}`);
 
         // Phase 3b: LLM-assisted fix if needed
         if (verified.mismatches.length > 0) {
@@ -1659,6 +1837,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
             if (!ScriptableAbject.tryCompile(llmFixed.code)) {
               manifest = llmFixed.manifest;
               code = llmFixed.code;
+              log.info('modify Phase 3b: LLM fix accepted');
             } else {
               log.warn('modify Phase 3b produced non-compiling code, keeping original');
             }
@@ -1682,6 +1861,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
         // Phase 4: Compile check
         if (callerId) await this.reportProgress(callerId, '4', 'Compiling...');
         const compileError = ScriptableAbject.tryCompile(code);
+        log.info(`modify Phase 4 compile: ${compileError ? 'FAILED: ' + compileError.slice(0, 200) : 'OK'} (code ${code.length} chars)`);
         if (compileError) {
           // Try a single LLM compile fix
           const fixResult = await this.llmComplete([
@@ -1696,6 +1876,7 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           const fixMatch = fixResult.content.match(/```(?:javascript|js)\s*([\s\S]*?)\s*```/);
           if (fixMatch && !ScriptableAbject.tryCompile(fixMatch[1])) {
             code = fixMatch[1];
+            log.info('modify Phase 4: LLM compile fix accepted');
           } else {
             lastError = `Compilation failed: ${compileError}`;
             log.warn(`modify Attempt ${attempt}: ${lastError}`);
@@ -1727,14 +1908,17 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
       if (callerId) await this.reportProgress(callerId, '5', 'Applying changes...');
 
       // 5a: Update source on the live ScriptableAbject (hot-reload: hide → swap → show)
+      log.info(`modify Phase 5a: applying ${code!.length} chars to ${objectId.slice(0, 8)}`);
       try {
         const updateResult = await this.request<{ success: boolean; error?: string }>(
           request(this.id, objectId, 'updateSource', { source: code }),
           30000  // generous timeout — hide + applySource + show may take time
         );
         if (!updateResult.success) {
+          log.warn(`modify Phase 5a: updateSource failed: ${updateResult.error}`);
           return { success: false, error: `Failed to apply source to live object: ${updateResult.error}`, code };
         }
+        log.info('modify Phase 5a: updateSource succeeded');
       } catch (err) {
         log.warn('modify Failed to update live object source:', err);
         return { success: false, error: `Failed to apply source to live object: ${err instanceof Error ? err.message : String(err)}`, code };

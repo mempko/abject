@@ -36,7 +36,6 @@ export interface AgentPlan {
 export interface AgentPlanStep {
   id: string;              // "step-1", "step-2", ...
   description: string;
-  taskType: string;        // Required — every step becomes a TupleSpace task
   taskId?: string;         // Set after TupleSpace task is created
   data?: unknown;          // Optional task-specific payload
 }
@@ -116,7 +115,6 @@ interface RegisteredAgent {
   description: string;
   systemPrompt?: string;
   config: ResolvedAgentConfig;
-  taskTypes: string[];
   /** Whether this agent can execute tasks from TupleSpace. Agents that only create tasks (like Chat) set this to false. */
   canExecute: boolean;
   registeredAt: number;
@@ -261,7 +259,6 @@ export class AgentAbject extends Abject {
                 { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'What this agent does' },
                 { name: 'systemPrompt', type: { kind: 'primitive', primitive: 'string' }, description: 'Default system prompt', optional: true },
                 { name: 'config', type: { kind: 'object', properties: {} }, description: 'Default agent config', optional: true },
-                { name: 'taskTypes', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Task types this agent can handle (e.g. create, modify, browse, research, web)', optional: true },
               ],
               returns: { kind: 'object', properties: { agentId: { kind: 'primitive', primitive: 'string' } } },
             },
@@ -547,15 +544,10 @@ Inside job code, goal helpers are available automatically:
 
 ### Task Dispatch & Semantic Matching
 
-Tasks are dispatched to agents via TupleSpace. Dispatch uses two strategies:
-
-1. **Exact type match** — agents whose taskTypes include the task's type are preferred.
-2. **LLM semantic fallback** — if no agent declares the type, a fast LLM call picks
-   the best agent based on its name and description.
-
-This means agents can receive tasks outside their declared taskTypes if the LLM
-determines they are a good fit. Write clear, descriptive agent descriptions to
-improve semantic matching accuracy.
+Tasks are dispatched to agents via TupleSpace. Each agent is asked "can you handle
+this task?" via the ask protocol and rates its confidence 0-10. The most confident
+agent claims the task. Write clear, descriptive agent descriptions to improve
+semantic matching accuracy.
 
 ### IMPORTANT
 - startTask returns { ticketId } immediately — it does NOT block until completion.
@@ -564,8 +556,7 @@ improve semantic matching accuracy.
 - taskStream events provide streaming LLM tokens during the think phase.
 - Agents must be registered before tasks can be sent to them.
 - listTasks includes goalId on each task entry for cross-referencing with GoalManager.
-- getAgentState returns an agent's active tasks with their goalIds — use it to see what an agent is working on.
-- Tasks are never silently dropped — if no exact type match exists, LLM semantic fallback finds the best agent by description.`;
+- getAgentState returns an agent's active tasks with their goalIds — use it to see what an agent is working on.`;
   }
 
   protected override async onInit(): Promise<void> {
@@ -617,8 +608,8 @@ improve semantic matching accuracy.
   private setupHandlers(): void {
     // ── Registration ──
     this.on('registerAgent', async (msg: AbjectMessage) => {
-      const { name, description, systemPrompt, config, taskTypes, canExecute } =
-        msg.payload as { name: string; description: string; systemPrompt?: string; config?: AgentConfig; taskTypes?: string[]; canExecute?: boolean };
+      const { name, description, systemPrompt, config, canExecute } =
+        msg.payload as { name: string; description: string; systemPrompt?: string; config?: AgentConfig; canExecute?: boolean };
       const agentId = msg.routing.from;
       const resolved = resolveConfig(config);
 
@@ -628,7 +619,6 @@ improve semantic matching accuracy.
         description,
         systemPrompt,
         config: resolved,
-        taskTypes: taskTypes ?? [],
         canExecute: canExecute ?? true,
         registeredAt: Date.now(),
       });
@@ -875,30 +865,29 @@ improve semantic matching accuracy.
 
       const tupleId = tuple.id?.slice(0, 8) ?? '?';
       const status = tuple.fields.status as string ?? '?';
-      const type = tuple.fields.type as string ?? '?';
       const attempts = (tuple.fields.attempts as number) ?? 0;
       const maxAttempts = (tuple.fields.maxAttempts as number) ?? 3;
 
       if (status !== 'pending') {
-        log.info(`WATCHER ${aspect} ${tupleId} type=${type} — skip: status=${status}`);
+        log.info(`WATCHER ${aspect} ${tupleId} — skip: status=${status}`);
         return;
       }
       if (tuple.claimedBy) {
-        log.info(`WATCHER ${aspect} ${tupleId} type=${type} — skip: claimedBy=${tuple.claimedBy.slice(0, 8)}`);
+        log.info(`WATCHER ${aspect} ${tupleId} — skip: claimedBy=${tuple.claimedBy.slice(0, 8)}`);
         return;
       }
       if (attempts >= maxAttempts) {
-        log.info(`WATCHER ${aspect} ${tupleId} type=${type} — skip: attempts=${attempts}>=${maxAttempts}`);
+        log.info(`WATCHER ${aspect} ${tupleId} — skip: attempts=${attempts}>=${maxAttempts}`);
         return;
       }
 
       // Prevent concurrent dispatches for the same tuple
       if (this.dispatchingTuples.has(tuple.id)) {
-        log.info(`WATCHER ${aspect} ${tupleId} type=${type} — skip: already dispatching`);
+        log.info(`WATCHER ${aspect} ${tupleId} — skip: already dispatching`);
         return;
       }
 
-      log.info(`WATCHER ${aspect} ${tupleId} type=${type} attempts=${attempts}/${maxAttempts} — DISPATCHING`);
+      log.info(`WATCHER ${aspect} ${tupleId} attempts=${attempts}/${maxAttempts} — DISPATCHING`);
       // Dispatch asynchronously — don't block the changed handler
       this.dispatchToAgent(tuple);
     });
@@ -910,7 +899,7 @@ improve semantic matching accuracy.
 
   /**
    * Centralized claim + dispatch for TupleSpace tasks.
-   * Finds agents by taskType, filters out agents in failureHistory, optionally
+   * Asks agents via the ask protocol, filters out agents in failureHistory, optionally
    * uses LLM to pick the best agent, claims via GoalManager, sends executeTask
    * to the chosen agent, and handles success/failure.
    */
@@ -938,7 +927,6 @@ improve semantic matching accuracy.
 
   private async dispatchToAgentInner(tuple: { id: string; fields: Record<string, unknown> }): Promise<void> {
     const tupleId = tuple.id.slice(0, 8);
-    const taskType = tuple.fields.type as string;
     const description = tuple.fields.description as string;
     const data = tuple.fields.data as Record<string, unknown> | undefined;
     const taskGoalId = tuple.fields.goalId as string | undefined;
@@ -1015,7 +1003,6 @@ improve semantic matching accuracy.
       claimed = await this.request<{ tuple: { id: string; fields: Record<string, unknown> }; claimed: boolean } | null>(
         request(this.id, this.goalManagerId!, 'claimTask', {
           goalId: taskGoalId,
-          type: taskType,
         })
       );
     } catch (err) {
@@ -1059,7 +1046,6 @@ improve semantic matching accuracy.
       goalId: taskGoalId,
       description,
       data,
-      type: taskType,
       callerId: this.id,
     };
     const jobCode = `return await call(${JSON.stringify(chosen.agentId)}, 'executeTask', ${JSON.stringify(executePayload)});`;
@@ -1190,7 +1176,7 @@ improve semantic matching accuracy.
         if (attempts >= maxAttempts) continue;
         if (this.dispatchingTuples.has(tuple.id)) continue;
 
-        log.info(`SCAN ${tuple.id.slice(0, 8)} type=${tuple.fields.type ?? '?'} attempts=${attempts}/${maxAttempts} — DISPATCHING`);
+        log.info(`SCAN ${tuple.id.slice(0, 8)} attempts=${attempts}/${maxAttempts} — DISPATCHING`);
         this.dispatchToAgent(tuple);
         dispatched++;
       }
@@ -1237,50 +1223,6 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
     }
 
     return candidates[0];
-  }
-
-  /**
-   * Semantic fallback: when no agent declares the task type, ask the LLM
-   * which registered agent (if any) can handle it based on descriptions.
-   */
-  private async semanticMatchAgent(
-    allAgents: RegisteredAgent[],
-    taskType: string,
-    description: string,
-  ): Promise<RegisteredAgent | null> {
-    if (!this.llmId) return null;
-
-    const agentList = allAgents
-      .map((a, i) => `${i}: ${a.name} — ${a.description}`)
-      .join('\n');
-    const prompt = `Task: "${description.slice(0, 200)}"
-
-Which agent is best suited to handle this task?
-
-Agents:
-${agentList}
-
-Reply with ONLY the index number of the best match, or "none" if no agent is suitable.`;
-
-    try {
-      const result = await this.request<{ content: string }>(
-        request(this.id, this.llmId, 'complete', {
-          messages: [{ role: 'user', content: prompt }],
-          options: { tier: 'balanced' },
-        }),
-        10000,
-      );
-      const content = (result.content ?? '').trim().toLowerCase();
-      if (content === 'none') return null;
-      const idx = parseInt(content, 10);
-      if (!isNaN(idx) && idx >= 0 && idx < allAgents.length) {
-        return allAgents[idx];
-      }
-    } catch (err) {
-      log.warn(`semanticMatchAgent LLM failed, no match:`, err instanceof Error ? err.message : String(err));
-    }
-
-    return null;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1643,7 +1585,7 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
             // ── Decompose: create child goal + tasks, return to observing ──
             if (task.action.action === 'decompose') {
               const subtasks = task.action.subtasks as Array<{
-                type: string; description: string; data?: unknown;
+                description: string; data?: unknown;
               }>;
               if (!subtasks?.length) {
                 task.llmMessages.push({
@@ -1658,17 +1600,6 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
                   content: '[Error] Cannot decompose — GoalManager not available.',
                 });
                 break;
-              }
-
-              // Resolve object names to IDs for modify subtasks
-              for (const sub of subtasks) {
-                if (sub.type === 'modify' && sub.data) {
-                  const d = sub.data as Record<string, unknown>;
-                  if (d.object && !d.objectId) {
-                    const resolved = await this.discoverDep(d.object as string);
-                    if (resolved) d.objectId = resolved;
-                  }
-                }
               }
 
               log.info(`[${agentName}] Decomposing into ${subtasks.length} sub-tasks`);
@@ -1925,7 +1856,7 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
            const updateGoal = async (message, phase) => call(_goalMgrId, 'updateProgress', { goalId: _goalId, message, phase });
            const completeGoal = async (result) => call(_goalMgrId, 'completeGoal', { goalId: _goalId, result });
            const failGoal = async (error) => call(_goalMgrId, 'failGoal', { goalId: _goalId, error });
-           const addTask = async (type, description, data) => call(_goalMgrId, 'addTask', { goalId: _goalId, type, description, data });
+           const addTask = async (description, data) => call(_goalMgrId, 'addTask', { goalId: _goalId, description, data });
            const claimTask = async (type) => call(_goalMgrId, 'claimTask', { goalId: _goalId, type });
            const completeTask = async (taskId, result) => call(_goalMgrId, 'completeTask', { taskId, result });
            const failTask = async (taskId, error) => call(_goalMgrId, 'failTask', { taskId, error });
@@ -2125,7 +2056,7 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
    */
   private async createChildGoalWithTasks(
     entry: TaskEntry,
-    subtasks: Array<{ type: string; description: string; data?: unknown }>,
+    subtasks: Array<{ description: string; data?: unknown }>,
     agentName: string,
   ): Promise<string> {
     const goalMgrId = this.goalManagerId!;
@@ -2144,7 +2075,7 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
     for (const sub of subtasks) {
       const { taskId } = await this.request<{ taskId: string }>(
         request(this.id, goalMgrId, 'addTask', {
-          goalId: childGoalId, type: sub.type,
+          goalId: childGoalId,
           description: sub.description, data: sub.data,
         }),
       );
@@ -2158,7 +2089,7 @@ Reply with ONLY the index number of the best match, or "none" if no agent is sui
         summary,
         steps: subtasks.map((s, i) => ({
           id: `step-${i + 1}`, description: s.description,
-          taskType: s.type, taskId: taskIds[i], data: s.data,
+          taskId: taskIds[i], data: s.data,
         })),
         revision: 0,
       },
@@ -2300,11 +2231,7 @@ After remembering, you will be prompted to continue with the task.`;
       ? `Action "${action?.action}" succeeded: ${JSON.stringify(task.lastResult.data)?.slice(0, 500) ?? 'ok'}`
       : `Action "${action?.action}" failed: ${task.lastResult.error}`;
 
-    let hint = '';
-    if (!task.lastResult.success && action?.action === 'modify') {
-      hint = '\n\nThe object still exists. You MUST retry with "modify" (try a simpler description), or report the failure to the user with "done". Do NOT use "create" -- that would produce a duplicate.';
-    }
-    task.llmMessages.push({ role: 'user', content: `[Action Result]\n${resultStr}${hint}` });
+    task.llmMessages.push({ role: 'user', content: `[Action Result]\n${resultStr}` });
   }
 
   private trimConversation(entry: TaskEntry): void {

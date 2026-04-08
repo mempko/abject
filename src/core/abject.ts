@@ -389,7 +389,7 @@ export abstract class Abject {
           const llmResult = await this.request<{ content: string }>(
             request(this.id, llmId, 'complete', {
               messages: [
-                { role: 'system', content: `You are answering questions about an object in the Abjects system. Use the provided manifest and source code to give accurate, concise answers.\n\n${context}` },
+                { role: 'system', content: `You are "${this.manifest.name}": ${this.manifest.description}\nAnswer questions from your perspective as this object. Use the provided manifest and source code to give accurate, concise answers.\n\n${context}` },
                 { role: 'user', content: question },
               ],
               options: { tier: 'fast' },

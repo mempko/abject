@@ -169,7 +169,6 @@ export class GoalManager extends Abject {
               description: 'Add a task to the TupleSpace for a goal',
               parameters: [
                 { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
-                { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: 'Task type (create, browse, research, etc.)' },
                 { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'Task description' },
                 { name: 'data', type: { kind: 'object', properties: {} }, description: 'Task-specific payload', optional: true },
               ],
@@ -438,11 +437,11 @@ Goals have automatic lifecycle management:
 
   // Add a task to the TupleSpace for a goal
   const { taskId } = await call(await dep('GoalManager'), 'addTask', {
-    goalId, type: 'create', description: 'Build a counter widget', data: { extra: 'info' },
+    goalId, description: 'Build a counter widget', data: { extra: 'info' },
   });
 
   // Claim a pending task (returns null if none available)
-  const claimed = await call(await dep('GoalManager'), 'claimTask', { goalId, type: 'create' });
+  const claimed = await call(await dep('GoalManager'), 'claimTask', { goalId });
   if (claimed) {
     const task = claimed.tuple;  // TupleEntry with .id, .fields
     // ... do work ...
@@ -458,9 +457,8 @@ Goals have automatic lifecycle management:
   // Get completed tasks with results
   const results = await call(await dep('GoalManager'), 'getResultsForGoal', { goalId });
 
-Note: The task type does not need to match an agent's declared taskTypes exactly.
-If no agent declares the type, AgentAbject uses LLM semantic fallback to find a
-suitable agent based on descriptions.
+Tasks are routed to agents via the ask protocol. AgentAbject asks each agent
+if it can handle the task, and the most confident agent claims it.
 
 ### Goal Scratchpad (shared key-value store)
 
@@ -789,11 +787,10 @@ suitable agent based on descriptions.
     // ── Task convenience methods (delegate to TupleSpace) ──
 
     this.on('addTask', async (msg: AbjectMessage) => {
-      const { goalId, type, description, data } = msg.payload as {
-        goalId: string; type: string; description: string; data?: unknown;
+      const { goalId, description, data } = msg.payload as {
+        goalId: string; description: string; data?: unknown;
       };
       requireNonEmpty(goalId, 'goalId');
-      requireNonEmpty(type, 'type');
       requireNonEmpty(description, 'description');
 
       const goal = this.goals.get(goalId as GoalId);
@@ -805,10 +802,10 @@ suitable agent based on descriptions.
       const result = await this.request<{ tupleId: string }>(
         request(this.id, this.tupleSpaceId, 'put', {
           namespace: ns,
-          fields: { goalId, type, status: 'pending', description, data, attempts: 0, maxAttempts: 3, failureHistory: [] },
+          fields: { goalId, status: 'pending', description, data, attempts: 0, maxAttempts: 3, failureHistory: [] },
         })
       );
-      log.info(`Task added for goal ${goalId}: ${type} — "${description.slice(0, 60)}"`);
+      log.info(`Task added for goal ${goalId}: "${description.slice(0, 60)}"`);
       return { taskId: result.tupleId };
     });
 

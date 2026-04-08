@@ -1,7 +1,7 @@
 /**
  * ObjectAgent -- an agent that discovers and calls objects via message passing.
  *
- * Registers with AgentAbject and claims tasks of type 'call' from the
+ * Registers with AgentAbject and claims tasks from the
  * TupleSpace. Uses the Registry's ask protocol to discover which objects
  * to talk to, then sends ask/describe/call messages to target objects.
  * All interaction is via message passing through the MessageBus.
@@ -207,10 +207,9 @@ Examples of tasks I handle well:
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'ObjectAgent',
       description:
-        'General-purpose agent for interacting with any object in the system. ' +
+        'Interacts with existing objects by calling their methods, inspecting their state, and reading their data. ' +
         'Discovers objects via Registry, learns their API via the ask protocol, and calls their methods. ' +
-        'Handles any task that involves calling, querying, or controlling existing objects.',
-      taskTypes: ['call'],
+        'Handles API calls, data retrieval, object queries, and controlling existing objects.',
       config: {
         terminalActions: {
           done: { type: 'success' as const, resultFields: ['result'] },

@@ -335,8 +335,7 @@ Set keepPageOpen: false to explicitly close the page when done.
     // Register with AgentAbject
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'WebAgent',
-      description: 'Autonomous web browsing agent. Handles visiting URLs, navigating websites, reading page content, filling forms, taking screenshots, extracting data, and researching topics on the web.',
-      taskTypes: ['browse', 'research', 'web'],
+      description: 'Browses real websites using a headless browser. Handles web scraping, visiting URLs, navigating websites, reading page content, filling forms, taking screenshots, extracting data, and researching topics on the web. Only use for tasks involving real external websites.',
       config: {
         terminalActions: {
           done: { type: 'success', resultFields: ['result'] },

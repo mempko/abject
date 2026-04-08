@@ -253,7 +253,6 @@ If no installed skill matches the task, my confidence is 0.`;
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'SkillAgent',
       description,
-      taskTypes: ['skill'],
       config: {
         terminalActions: {
           done: { type: 'success' as const, resultFields: ['result'] },

@@ -531,47 +531,62 @@ export class Chat extends Abject {
       }
     }
 
-    const description = (action.description as string)
-      ?? `${action.action} ${(action.object as string) ?? ''}`.trim();
-
-    // Build optional data hints from action fields
-    const data: Record<string, unknown> = {};
-    if (action.object) {
-      const objectId = await this.resolveObject(action.object as string);
-      if (objectId) data.objectId = objectId;
-      data.object = action.object;
-    }
-    if (action.method) data.method = action.method;
-    if (action.payload) data.payload = action.payload;
-
-    const goalId = await this.ensureGoal(description);
-    if (!this.goalManagerId || !goalId) {
-      return { success: false, error: 'GoalManager not available' };
-    }
-
-    try {
-      const { taskId } = await this.request<{ taskId: string }>(
-        request(this.id, this.goalManagerId, 'addTask', {
-          goalId,
-          description,
-          data: Object.keys(data).length > 0 ? data : undefined,
-        })
-      );
-      const completion = await this.waitForTaskCompletion(taskId, 310000);
-      const result = completion.result as Record<string, unknown> | undefined;
-
-      // Auto-show created objects
-      if (result?.objectId) {
-        this.send(event(this.id, result.objectId as AbjectId, 'show', {}));
+    // Handle goal action: create goal + tasks, wait for completion
+    if (action.action === 'goal') {
+      const title = (action.title as string) ?? 'Untitled goal';
+      const tasks = (action.tasks as Array<{ description: string; data?: Record<string, unknown> }>) ?? [];
+      if (tasks.length === 0) {
+        return { success: false, error: 'Goal has no tasks' };
       }
 
-      if (result && result.success === false) {
-        return { success: false, error: (result.error as string) ?? 'Task failed' };
+      if (!this.goalManagerId) {
+        return { success: false, error: 'GoalManager not available' };
       }
-      return { success: true, data: result };
-    } catch (err) {
-      return { success: false, error: err instanceof Error ? err.message : String(err) };
+
+      const goalId = await this.ensureGoal(title);
+      if (!goalId) {
+        return { success: false, error: 'Failed to create goal' };
+      }
+
+      try {
+        // Add all tasks to the goal
+        const taskIds: string[] = [];
+        for (const task of tasks) {
+          const { taskId } = await this.request<{ taskId: string }>(
+            request(this.id, this.goalManagerId, 'addTask', {
+              goalId,
+              description: task.description,
+              data: task.data,
+            })
+          );
+          taskIds.push(taskId);
+        }
+
+        // Wait for all tasks to complete
+        const results: unknown[] = [];
+        for (const taskId of taskIds) {
+          const completion = await this.waitForTaskCompletion(taskId, 310000);
+          const result = completion.result as Record<string, unknown> | undefined;
+
+          // Auto-show created objects
+          if (result?.objectId) {
+            this.send(event(this.id, result.objectId as AbjectId, 'show', {}));
+          }
+          results.push(result);
+        }
+
+        const failures = results.filter(r => r && (r as Record<string, unknown>).success === false);
+        if (failures.length > 0) {
+          const errors = failures.map(f => (f as Record<string, unknown>).error ?? 'Unknown error');
+          return { success: false, error: errors.join('; '), data: results };
+        }
+        return { success: true, data: results.length === 1 ? results[0] : results };
+      } catch (err) {
+        return { success: false, error: err instanceof Error ? err.message : String(err) };
+      }
     }
+
+    return { success: false, error: `Unknown action: ${action.action}` };
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -585,18 +600,6 @@ export class Chat extends Abject {
 
 Abjects is a distributed message-passing system. Each Abject is an autonomous object with a manifest (declaring methods and events), a mailbox, and message handlers. Objects communicate exclusively via messages. They discover each other via Registry and coordinate via the observer pattern (addDependent -> changed events).
 
-### Three UI Patterns
-
-1. **Widget Objects** (forms, settings, dashboards): Standard UI controls via WidgetManager.
-2. **Canvas Surface Objects** (games, charts, custom graphics): Raw drawing via WidgetManager.createCanvas.
-3. **Web Automation** (interact with real websites): WebAgent drives a headless browser.
-
-### When to Create vs Modify vs Call
-
-- Use **create** when the user wants a brand-new object (e.g., "make me a todo app"). ObjectCreator will design and generate it.
-- Use **modify** when the user wants to fix, change, or update an existing object (e.g., "add a reset button to the counter"). Always prefer modify over create when the object already exists.
-- Use **call** to interact with existing objects (e.g., "fetch this URL", "set a timer", "run this web task"). ObjectAgent discovers the right object and API automatically.
-
 ## Action Format
 
 Respond with ONE action as a JSON object in a \`\`\`json code block. Include brief reasoning before the block.
@@ -607,30 +610,18 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 
 ## Available Actions
 
-### Object Interaction
-- **call**: Ask ObjectAgent to accomplish a task using any object or system capability. ObjectAgent discovers available APIs automatically via the ask protocol.
-  \`{ "action": "call", "description": "Fetch the current weather from WeatherAPI" }\`
-  Or with a specific object hint: \`{ "action": "call", "object": "Timer", "description": "Set a 5 minute countdown timer" }\`
-  Describe the GOAL, not the exact method. ObjectAgent will ask the target object how to use its API and send the right message.
-- **create**: Create a new object. Routes through TupleSpace to ObjectCreator. The created object is auto-shown.
-  \`{ "action": "create", "description": "A counter widget that shows a number and has +/- buttons" }\`
-- **modify**: Modify an existing object. REQUIRED fields: "object" and "description". Routes through TupleSpace.
-  \`{ "action": "modify", "object": "ObjectName", "description": "Add a reset button that clears the counter" }\`
-  The "object" field is the object's name. Always include both "object" and "description".
-- **clone**: Clone a clonable object from a remote peer's workspace into your local workspace.
-  \`{ "action": "clone", "object": "peer.workspace.ObjectName" }\`
-
-### Task Decomposition
-- **decompose**: Break a complex request into parallel sub-tasks. Creates a child goal
-  and the agent automatically monitors progress. Agents self-select tasks based on the description.
-  \`{ "action": "decompose", "reasoning": "why splitting", "subtasks": [
-    { "description": "Fetch the weather data from an API for Miami, FL" },
-    { "description": "Build a counter widget with + and - buttons" },
-    { "description": "Visit https://example.com and extract the main content" },
-    { "description": "Modify the Counter object to add a reset button", "data": { "object": "Counter" } }
+### Agent Work
+- **goal**: Create a goal with one or more tasks for specialized agents to handle. Describe each task clearly so the right agent self-selects based on what it can do.
+  Simple request (one task):
+  \`{ "action": "goal", "title": "Fix the HackerNews UI", "tasks": [
+    { "description": "Fix the UI of the HackerNews object: improve layout spacing, make the story list scrollable, fix text overflow" }
   ] }\`
-  After decomposing, you'll observe sub-task progress and can synthesize results when done.
-  Describe the GOAL of each subtask clearly. Agents will claim tasks they can handle based on the description.
+  Complex request (multiple parallel tasks):
+  \`{ "action": "goal", "title": "Weather dashboard", "tasks": [
+    { "description": "Fetch current weather data for Miami, FL using an HTTP API" },
+    { "description": "Create a new dashboard widget that displays temperature and humidity" }
+  ] }\`
+  Include the object name in the task description when relevant. Be specific about the desired outcome.
 
 ### Memory
 - **remember**: Save a fact to the persistent knowledge base. Use whenever the user reveals personal info or you learn something useful for future conversations.
@@ -645,42 +636,43 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
     { "assumption": "The reset should set count to zero", "confidence": "low" }
   ] }\`
 - **reply**: Send intermediate text to the user (continue working after).
-  \`{ "action": "reply", "text": "I found the object, now let me check its methods..." }\`
+  \`{ "action": "reply", "text": "Working on it, I've created the goal..." }\`
 - **done**: Task complete, send final reply. The user can only see what you put in the done text, so include the complete results from previous actions. Present all data fully, do not summarize or truncate.
   \`{ "action": "done", "text": "Here are the results: ..." }\`
 
 The chat window renders markdown. Use **bold**, *italic*, \`inline code\`, headings, bullet lists, code blocks, and [links](url) in your reply and done text for readable formatting.
 
+## Writing Good Task Descriptions
+
+Task descriptions are how agents decide whether they can handle a task. Be specific:
+- Include the object name when the task involves an existing object (e.g., "Modify the HackerNews object to..." not just "Fix the UI")
+- Describe the desired outcome, not just the problem (e.g., "Add a reset button to the Counter that sets the count back to zero")
+- For web tasks, mention that it involves a real website (e.g., "Browse https://example.com and extract the article text")
+- For new objects, describe what the object should do (e.g., "Create a todo list widget with add, remove, and mark-complete functionality")
+
 ## Assumption Checking
 
-Before taking any non-trivial action (create, modify, call, decompose), consider what
-assumptions you are making about the user's request. For each assumption, estimate your
-confidence (high/medium/low).
+Before creating a goal, consider what assumptions you are making. For each assumption, estimate your confidence (high/medium/low).
 
-If ANY assumption has low confidence, use the **clarify** action FIRST to ask the user.
-Only proceed with the actual action once you are confident in your understanding.
+If ANY assumption has low confidence, use **clarify** first.
 
 Examples of assumptions to check:
 - Which existing object the user is referring to (if ambiguous)
 - What specific behavior or appearance the user wants
 - Whether the user wants a new object or a change to an existing one
-- What data sources, APIs, or inputs are involved
 
 You do not need to clarify simple greetings, direct questions, or unambiguous requests.
 
 ## Rules
 
 1. Always respond with valid JSON in a \`\`\`json block. ONE action per response.
-2. For simple greetings or questions, use **done** directly.
-3. When the user asks you to do something, take action IMMEDIATELY. If the user includes credentials, URLs, or other details, pass them directly to the relevant object via **call**.
+2. For simple greetings, use **done** directly. For questions about objects or the system, create a **goal** to investigate rather than guessing. You do not have knowledge of what objects exist or what they can do. Always use the system to find out.
+3. When the user asks you to do something, create a **goal** immediately with well-described tasks.
 4. Always end a conversation turn with **done** when the task is complete.
 5. Keep reasoning brief (1-2 sentences before the JSON block).
-6. When the user asks to fix, change, update, or improve an existing object, use **modify** with its name in the "object" field and a "description" of the change. Example: \`{ "action": "modify", "object": "PongGame", "description": "use mouse for controls" }\`. Always include both "object" and "description". Prefer **modify** over **create** for existing objects.
-7. If **modify** fails, retry with a simpler description. Stay with **modify** across retries. If it fails repeatedly, use "done" to tell the user what happened.
-8. P2P: Resolve remote objects by qualified name: this.find('peer.workspace.ObjectName'). Always use find() for dynamic ID resolution.
-9. For web tasks: use **call** with WebAgent.runTask -- include ALL details from the user's message in the task description.
-10. Always route tasks to an agent and let it try. Use **call** as the default when unsure which action fits.
-11. When the user reveals personal facts (where they live, their name, preferences, job, etc.), always save them using \`remember()\` so you can recall them in future conversations.`;
+6. If a goal's tasks fail, you can retry by creating a new goal with a simpler task description. If it fails repeatedly, use "done" to tell the user what happened.
+7. P2P: Resolve remote objects by qualified name: this.find('peer.workspace.ObjectName'). Always use find() for dynamic ID resolution.
+8. When the user reveals personal facts (where they live, their name, preferences, job, etc.), save them using **remember** so you can recall them in future conversations.`;
   }
 
   // ═══════════════════════════════════════════════════════════════════

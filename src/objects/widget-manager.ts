@@ -301,6 +301,14 @@ export class WidgetManager extends Abject {
                   },
                 },
               },
+              {
+                name: 'openUrl',
+                description: 'Open a URL in the user\'s browser. Example: await this.call(this.dep("WidgetManager"), "openUrl", { url: "https://example.com" })',
+                parameters: [
+                  { name: 'url', type: { kind: 'primitive', primitive: 'string' }, description: 'URL to open in a new browser tab' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
               // Legacy shim methods for backward compatibility
               {
                 name: 'createWindow',
@@ -710,6 +718,13 @@ export class WidgetManager extends Abject {
       if (!surfaceId) return false;
       return this.request(request(this.id, this.windowManagerId,
         'raiseWindow', { surfaceId }));
+    });
+
+    this.on('openUrl', async (msg: AbjectMessage) => {
+      const { url } = msg.payload as { url: string };
+      if (!this.uiServerId) return false;
+      this.send(event(this.id, this.uiServerId, 'openUrl', { url }));
+      return true;
     });
 
     this.on('setObjectWorkspace', async (msg: AbjectMessage) => {
