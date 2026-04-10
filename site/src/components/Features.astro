@@ -15,14 +15,26 @@ const features = [
   {
     icon: '{=}',
     title: 'Shared Goals, Many Minds',
-    hook: 'One goal, many agents, many peers. All working. None coordinating.',
-    desc: 'Goals decompose into tasks that land in a shared pool synced across peers. Agents on any machine watch and claim work autonomously. If one peer crashes, stale claims expire and others pick up where it left off.',
+    hook: 'Post a goal. Abjects explain how they can help. The best approach wins.',
+    desc: 'Goals fracture into tasks in a shared TupleSpace synced across peers. Abjects that can help self-assess via the ask protocol. Work distributes across machines. If one peer drops, stale claims expire and others pick up where it left off.',
   },
   {
     icon: '{!}',
     title: 'Scars That Teach',
     hook: 'Every failure is fed back into the wound. The proxy that grows back is smarter.',
     desc: 'When error rates cross 10%, the system collects recent failures and generates a new proxy with the error history as context. The replacement accounts for exactly the mistakes that killed its predecessor.',
+  },
+  {
+    icon: '{~}',
+    title: 'Skills From the Wild',
+    hook: 'Drop a SKILL.md into the folder. Claude Code or OpenClaw format. Both work.',
+    desc: 'Abjects learn new abilities from portable skill files without integration code. The skill registry scans, parses, and injects instructions at runtime. The system grows by adoption, not by programming.',
+  },
+  {
+    icon: '{*}',
+    title: 'Memory That Persists',
+    hook: 'What one abject learns, all abjects know.',
+    desc: 'Facts, insights, and references persist in a searchable knowledge base synced across peers via CRDT. Abjects recall what was learned in previous sessions, on other machines, by other abjects.',
   },
 ];
 ---
@@ -46,11 +58,17 @@ const features = [
 <style>
   .feature-grid {
     display: grid;
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: repeat(3, 1fr);
     gap: 1.25rem;
   }
 
-  @media (max-width: 768px) {
+  @media (max-width: 900px) {
+    .feature-grid {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
+
+  @media (max-width: 520px) {
     .feature-grid {
       grid-template-columns: 1fr;
     }

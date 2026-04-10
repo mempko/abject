@@ -37,10 +37,10 @@ const manifestStructure = `AbjectManifest {
       params:      [{ name, type, description }]
       returns:     { type, description }
     }]
-    events:  [{ name, description, dataSchema }]
+    events:  [{ name, description, payload }]
   }
   requiredCapabilities: CapabilityRequest[]
-  providedCapabilities: CapabilityId[]
+  providedCapabilities: CapabilityId[]?
   tags:                 string[]
 }`;
 ---
@@ -82,7 +82,7 @@ const manifestStructure = `AbjectManifest {
 
         <p>
           Every Abject has a built-in <code>ask</code> handler. Send it a natural-language question,
-          and it answers using its own manifest and source code as context, via an LLM.
+          and it answers from its own self-knowledge, via an LLM.
           If no LLM is available, it falls back to a plain manifest description.
         </p>
 
@@ -169,7 +169,7 @@ const manifestStructure = `AbjectManifest {
 
             <!-- Step 2: Target -> LLM (with context) -->
             <line x1="420" y1="55" x2="575" y2="55" stroke="#5a5a70" stroke-width="1.5" marker-end="url(#sa-d)"/>
-            <text x="498" y="47" text-anchor="middle" fill="#8a8a9e" font-size="10" font-family="monospace">manifest + source</text>
+            <text x="498" y="47" text-anchor="middle" fill="#8a8a9e" font-size="10" font-family="monospace">self-knowledge</text>
 
             <!-- Step 3: LLM -> Target (answer) -->
             <line x1="575" y1="75" x2="425" y2="75" stroke="#5a5a70" stroke-width="1.5" marker-end="url(#sa-d)"/>
@@ -193,7 +193,7 @@ const manifestStructure = `AbjectManifest {
 
         <ol class="flow-steps">
           <li>The <strong>caller</strong> sends an <code>ask</code> request to the target with a natural-language question.</li>
-          <li>The <strong>target</strong> discovers the LLM service via the Registry and assembles context from its own manifest and source code.</li>
+          <li>The <strong>target</strong> discovers the LLM service and assembles context from its own self-knowledge.</li>
           <li>The <strong>LLM</strong> answers the question using that context.</li>
           <li>The <strong>target</strong> returns the answer to the caller.</li>
           <li>If no LLM is available, the target falls back to a plain manifest description.</li>
@@ -224,22 +224,21 @@ const manifestStructure = `AbjectManifest {
           natural-language English, which becomes the LLM's system context when answering questions.
         </p>
 
-        <h3>Static and Dynamic Context</h3>
+        <h3>Why Objects Can Answer</h3>
 
         <div class="spec-grid">
           <div class="spec-card">
-            <h4>Manifest (static)</h4>
+            <h4>They know what they are</h4>
             <p>
-              Every object has a manifest. It is defined at construction time and does not change.
-              It provides the structural foundation: names, types, capability requirements.
+              Every object carries a manifest declaring its name, capabilities, methods, and events.
+              This self-description is always available.
             </p>
           </div>
           <div class="spec-card">
-            <h4>Source Code (dynamic)</h4>
+            <h4>They know what they do</h4>
             <p>
-              ScriptableAbjects (objects whose code is generated or modified at runtime) override
-              <code>getSourceForAsk()</code> to include their live source code in the LLM context.
-              As the code changes, the answers change with it.
+              Objects that have source code include it. As the code changes, the answers change.
+              There is no external documentation to fall out of sync.
             </p>
           </div>
         </div>
@@ -250,7 +249,7 @@ const manifestStructure = `AbjectManifest {
         </p>
         <ul>
           <li><code>describe</code> returns the manifest and a formatted English description.</li>
-          <li><code>ask</code> accepts a natural-language question and returns an LLM-powered answer using the manifest and source as context.</li>
+          <li><code>ask</code> accepts a natural-language question and returns an LLM-powered answer using the object's self-knowledge as context.</li>
         </ul>
         <p>
           These methods are not opt-in. Every object in the system has them. This means any object can
@@ -258,8 +257,7 @@ const manifestStructure = `AbjectManifest {
         </p>
 
         <div class="spec-callout">
-          <strong>Key insight:</strong> Descriptions are dynamic. They change as the code changes.
-          There is no separate documentation to keep in sync. The schema is the object.
+          <strong>Key insight:</strong> The object is its own documentation. Ask it what it does. It knows.
         </div>
       </section>
 
@@ -322,6 +320,32 @@ const manifestStructure = `AbjectManifest {
             There is no separate user manual. The object is the manual.
           </p>
         </div>
+
+        <div class="use-case">
+          <h3>Task Routing: Approach-Based Dispatch</h3>
+          <p>
+            When a task appears in TupleSpace, the system asks every registered abject:
+            "How would you accomplish this?" Each abject self-assesses using its own manifest
+            and capabilities via the Ask Protocol. Abjects respond with a concrete approach
+            or PASS. An evaluator selects the best candidate.
+          </p>
+          <p>
+            The Ask Protocol is the dispatch mechanism.
+            Abjects are not assigned work; they volunteer by explaining their fitness.
+          </p>
+        </div>
+
+        <div class="use-case">
+          <h3>Knowledge Integration: Cross-Abject Memory</h3>
+          <p>
+            Abjects store learned facts, insights, and references in the KnowledgeBase.
+            Other abjects search and retrieve relevant knowledge via full-text search.
+            Knowledge syncs across peers via SharedState CRDT.
+          </p>
+          <p>
+            What one abject learns on one machine, every abject on every peer can recall.
+          </p>
+        </div>
       </section>
 
       <!-- Section 5: Comparison -->
@@ -348,7 +372,7 @@ const manifestStructure = `AbjectManifest {
             <div class="comparison-cell">OpenAPI specs. Static. External to the service.</div>
             <div class="comparison-cell">Schema introspection. Structural, not behavioral.</div>
             <div class="comparison-cell">Proto reflection. Method listing, not explanation.</div>
-            <div class="comparison-cell highlight-cell">LLM-powered answers from manifest and live source. Dynamic.</div>
+            <div class="comparison-cell highlight-cell">The object answers from its own self-knowledge. Dynamic.</div>
           </div>
 
           <div class="comparison-row">
@@ -422,7 +446,7 @@ const manifestStructure = `AbjectManifest {
             <div class="comparison-cell">Servers declare tools, resources, prompts at connect time. Static JSON schemas.</div>
             <div class="comparison-cell">Agent Cards: signed JSON with identity, skills, security schemes.</div>
             <div class="comparison-cell">Developer provides JSON schemas with descriptions per function.</div>
-            <div class="comparison-cell highlight-cell">LLM answers from manifest + live source code. Descriptions change as the code changes.</div>
+            <div class="comparison-cell highlight-cell">The object answers from its own self-knowledge. As the object changes, the answers change.</div>
           </div>
 
           <div class="comparison-row">

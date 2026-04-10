@@ -1,0 +1,117 @@
+---
+const capabilities = [
+  { icon: '{W}', name: 'Web Browsing', desc: 'Headless Playwright automation' },
+  { icon: '{S}', name: 'Web Search', desc: 'Search and fetch with parsing' },
+  { icon: '{$}', name: 'Shell Execution', desc: 'Run commands on the host' },
+  { icon: '{/}', name: 'Host Filesystem', desc: 'Read and write real files' },
+  { icon: '{#}', name: 'Screenshots', desc: 'Capture canvas, widgets, pages' },
+  { icon: '{C}', name: 'Scheduled Tasks', desc: 'Cron-like per-workspace jobs' },
+  { icon: '{K}', name: 'Knowledge Base', desc: 'Persistent memory, CRDT-synced' },
+  { icon: '{.}', name: 'Portable Skills', desc: 'Claude Code & OpenClaw formats' },
+  { icon: '{P}', name: 'File Transfer', desc: 'Peer-to-peer, encrypted' },
+  { icon: '{M}', name: 'Media Streaming', desc: 'Audio and video capture' },
+  { icon: '{&}', name: 'Shared State', desc: 'LWW-CRDT across peers' },
+  { icon: '{!}', name: 'Permission Gates', desc: 'Capability-gated trust model' },
+];
+---
+
+<section id="capabilities">
+  <div class="container">
+    <h2 class="section-title">What the Abjects Can Touch</h2>
+    <p class="cap-intro">
+      Every capability is an abject. Every abject can ask any other what it does.
+      The system's reach grows by spawning new abjects, not by adding framework plugins.
+    </p>
+    <div class="cap-grid">
+      {capabilities.map((c) => (
+        <div class="cap-pill">
+          <span class="cap-icon">{c.icon}</span>
+          <div class="cap-text">
+            <span class="cap-name">{c.name}</span>
+            <span class="cap-desc">{c.desc}</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  </div>
+</section>
+
+<style>
+  #capabilities {
+    padding: var(--section-gap) 0;
+  }
+
+  .cap-intro {
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 1.05rem;
+    max-width: 640px;
+    margin: 0 auto 2.5rem;
+    line-height: 1.6;
+  }
+
+  .cap-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.75rem;
+    max-width: 900px;
+    margin: 0 auto;
+  }
+
+  .cap-pill {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.7rem 0.9rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .cap-pill:hover {
+    border-color: var(--border-accent);
+    box-shadow: 0 0 12px var(--eldritch-glow);
+  }
+
+  .cap-icon {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--eldritch);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .cap-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .cap-name {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    line-height: 1.3;
+  }
+
+  .cap-desc {
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    line-height: 1.3;
+  }
+
+  @media (max-width: 768px) {
+    .cap-grid {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+
+  @media (max-width: 520px) {
+    .cap-grid {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
+</style>
