@@ -446,8 +446,8 @@ export class FileTransfer extends Abject {
     super.checkInvariants();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## FileTransfer Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## FileTransfer Usage Guide
 
 ### Send a file
 

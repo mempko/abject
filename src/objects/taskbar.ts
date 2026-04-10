@@ -30,6 +30,8 @@ export class Taskbar extends Abject {
   private webBrowserViewerId?: AbjectId;
   private goalBrowserId?: AbjectId;
   private knowledgeBrowserId?: AbjectId;
+  private agentBrowserId?: AbjectId;
+  private schedulerBrowserId?: AbjectId;
   private registryId?: AbjectId;
   private windowManagerId?: AbjectId;
 
@@ -93,8 +95,8 @@ export class Taskbar extends Abject {
     this.setupHandlers();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## Taskbar Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## Taskbar Usage Guide
 
 ### Overview
 Persistent vertical toolbar pinned to the left edge of the screen. Displays
@@ -127,6 +129,8 @@ windows" section so the user can restore windows from the taskbar.
     this.webBrowserViewerId = await this.discoverDep('WebBrowserViewer') ?? undefined;
     this.goalBrowserId = await this.discoverDep('GoalBrowser') ?? undefined;
     this.knowledgeBrowserId = await this.discoverDep('KnowledgeBrowser') ?? undefined;
+    this.agentBrowserId = await this.discoverDep('AgentBrowser') ?? undefined;
+    this.schedulerBrowserId = await this.discoverDep('SchedulerBrowser') ?? undefined;
     this.registryId = await this.requireDep('Registry');
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
 
@@ -317,7 +321,15 @@ windows" section so the user can restore windows from the taskbar.
     if (this.knowledgeBrowserId) {
       specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83E\uDDE0 Knowledge' });
     }
-    // [6?] Web (optional)
+    // [6?] Agents (optional)
+    if (this.agentBrowserId) {
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83E\uDD16 Agents' });
+    }
+    // [7?] Schedules (optional)
+    if (this.schedulerBrowserId) {
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\u23F0 Schedules' });
+    }
+    // [8?] Web (optional)
     if (this.webBrowserViewerId) {
       specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Web' });
     }
@@ -353,6 +365,8 @@ windows" section so the user can restore windows from the taskbar.
     if (this.goalBrowserId) this.systemButtons.set(widgetIds[idx++], this.goalBrowserId);
     this.systemButtons.set(widgetIds[idx++], this.jobBrowserId!);
     if (this.knowledgeBrowserId) this.systemButtons.set(widgetIds[idx++], this.knowledgeBrowserId);
+    if (this.agentBrowserId) this.systemButtons.set(widgetIds[idx++], this.agentBrowserId);
+    if (this.schedulerBrowserId) this.systemButtons.set(widgetIds[idx++], this.schedulerBrowserId);
     if (this.webBrowserViewerId) this.systemButtons.set(widgetIds[idx++], this.webBrowserViewerId);
 
     for (let i = 0; i < showableObjects.length; i++) {
@@ -414,6 +428,8 @@ windows" section so the user can restore windows from the taskbar.
     if (this.webBrowserViewerId) depIds.push(this.webBrowserViewerId);
     if (this.goalBrowserId) depIds.push(this.goalBrowserId);
     if (this.knowledgeBrowserId) depIds.push(this.knowledgeBrowserId);
+    if (this.agentBrowserId) depIds.push(this.agentBrowserId);
+    if (this.schedulerBrowserId) depIds.push(this.schedulerBrowserId);
     for (const depId of depIds) {
       this.send(request(this.id, depId, 'addDependent', {}));
     }
@@ -453,7 +469,7 @@ windows" section so the user can restore windows from the taskbar.
   }
 
   private computeHeight(userObjectCount: number): number {
-    const systemBtnCount = 2 + (this.webBrowserViewerId ? 1 : 0) + (this.goalBrowserId ? 1 : 0) + (this.knowledgeBrowserId ? 1 : 0);
+    const systemBtnCount = 2 + (this.webBrowserViewerId ? 1 : 0) + (this.goalBrowserId ? 1 : 0) + (this.knowledgeBrowserId ? 1 : 0) + (this.agentBrowserId ? 1 : 0) + (this.schedulerBrowserId ? 1 : 0);
     const minimizedCount = this.minimizedWindows.size;
     const totalBtnCount = systemBtnCount + userObjectCount + minimizedCount;
     const extraHeight = (LABEL_H + SPACING)

@@ -27,19 +27,6 @@ const log = new Log('AgentAbject');
 
 export type AgentPhase = 'idle' | 'observing' | 'thinking' | 'acting' | 'done' | 'error';
 
-export interface AgentPlan {
-  summary: string;
-  steps: AgentPlanStep[];
-  revision: number;        // 0 = initial, increments on replan
-}
-
-export interface AgentPlanStep {
-  id: string;              // "step-1", "step-2", ...
-  description: string;
-  taskId?: string;         // Set after TupleSpace task is created
-  data?: unknown;          // Optional task-specific payload
-}
-
 export interface AgentAction {
   action: string;
   reasoning?: string;
@@ -65,7 +52,6 @@ export interface AgentTaskState {
   error?: string;
   llmMessages: { role: string; content: string | ContentPart[] }[];
   timeout: number;
-  plan?: AgentPlan;
 }
 
 export interface AgentTaskOptions {
@@ -113,6 +99,8 @@ interface RegisteredAgent {
   agentId: AbjectId;
   name: string;
   description: string;
+  /** Richer description used during ask-protocol confidence scoring. If set, included in the dispatch ask question so agents can better self-assess task fitness. */
+  askDescription?: string;
   systemPrompt?: string;
   config: ResolvedAgentConfig;
   /** Whether this agent can execute tasks from TupleSpace. Agents that only create tasks (like Chat) set this to false. */
@@ -434,8 +422,8 @@ export class AgentAbject extends Abject {
     this.setupHandlers();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## AgentAbject Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## AgentAbject Usage Guide
 
 ### Register an Agent
 
@@ -544,10 +532,58 @@ Inside job code, goal helpers are available automatically:
 
 ### Task Dispatch & Semantic Matching
 
-Tasks are dispatched to agents via TupleSpace. Each agent is asked "can you handle
-this task?" via the ask protocol and rates its confidence 0-10. The most confident
-agent claims the task. Write clear, descriptive agent descriptions to improve
-semantic matching accuracy.
+Tasks are dispatched to agents via TupleSpace. Each agent is asked "how would you
+accomplish this task?" and describes its approach. An evaluator picks the most
+efficient approach. Write clear, descriptive agent descriptions to improve matching.
+
+### Creating a User Agent (ScriptableAbject as Agent)
+
+Any ScriptableAbject can register as an agent. In the startup/show handler, call registerAgent.
+AgentAbject will then send executeTask, agentObserve, and agentAct messages to the object
+when tasks are dispatched to it via the ask protocol.
+
+  // Register as agent (in startup or show handler):
+  await call(await dep('AgentAbject'), 'registerAgent', {
+    name: 'MyAgent',
+    description: 'Short description of what this agent handles',
+    askDescription: 'Detailed expertise description used for confidence scoring during task dispatch',
+    systemPrompt: 'You are an agent that specializes in...',
+    config: {
+      maxSteps: 15,
+      timeout: 180000,
+      terminalActions: {
+        done: { type: 'success', resultFields: ['result'] },
+        fail: { type: 'error', resultFields: ['reason'] },
+      },
+      intermediateActions: ['reply'],
+    },
+    canExecute: true,
+  });
+  // Returns: { agentId }
+
+  // Unregister (in hide handler):
+  await call(await dep('AgentAbject'), 'unregisterAgent', {});
+
+The registered object must implement these handlers to participate in the agent loop:
+
+  executeTask(msg) — Called when a task is dispatched to this agent from TupleSpace.
+    msg.payload: { goalId, description, data }
+    The handler should call startTask on AgentAbject to begin the observe-think-act loop.
+
+  agentObserve(msg) — Called during the observe phase.
+    msg.payload: { taskId }
+    Return: { observation: string } describing the current state/context.
+
+  agentAct(msg) — Called during the act phase with the LLM's chosen action.
+    msg.payload: { taskId, action: { action, reasoning, ...params } }
+    Return: { success: boolean, data?: any, error?: string }
+
+  taskResult(msg) — Receives the final result when a task completes.
+    msg.payload: { ticketId, success, result?, error?, steps }
+
+The askDescription field is used during task dispatch: when AgentAbject asks agents
+"Can you handle this task?", agents with askDescription get their expertise included
+in the question, leading to more accurate confidence ratings.
 
 ### IMPORTANT
 - startTask returns { ticketId } immediately — it does NOT block until completion.
@@ -557,6 +593,22 @@ semantic matching accuracy.
 - Agents must be registered before tasks can be sent to them.
 - listTasks includes goalId on each task entry for cross-referencing with GoalManager.
 - getAgentState returns an agent's active tasks with their goalIds — use it to see what an agent is working on.`;
+  }
+
+  protected override async handleAsk(question: string): Promise<string> {
+    let prompt = this.askPrompt(question);
+
+    // Dynamically include the list of currently registered agents
+    if (this.registeredAgents.size > 0) {
+      prompt += '\n\n### Currently Registered Agents\n';
+      for (const agent of this.registeredAgents.values()) {
+        const activeTasks = this.countActiveTasks(agent.agentId);
+        const status = activeTasks > 0 ? `busy (${activeTasks} tasks)` : 'idle';
+        prompt += `- **${agent.name}** [${status}]: ${agent.description}\n`;
+      }
+    }
+
+    return this.askLlm(prompt, question, 'balanced');
   }
 
   protected override async onInit(): Promise<void> {
@@ -608,8 +660,8 @@ semantic matching accuracy.
   private setupHandlers(): void {
     // ── Registration ──
     this.on('registerAgent', async (msg: AbjectMessage) => {
-      const { name, description, systemPrompt, config, canExecute } =
-        msg.payload as { name: string; description: string; systemPrompt?: string; config?: AgentConfig; canExecute?: boolean };
+      const { name, description, askDescription, systemPrompt, config, canExecute } =
+        msg.payload as { name: string; description: string; askDescription?: string; systemPrompt?: string; config?: AgentConfig; canExecute?: boolean };
       const agentId = msg.routing.from;
       const resolved = resolveConfig(config);
 
@@ -617,6 +669,7 @@ semantic matching accuracy.
         agentId,
         name,
         description,
+        askDescription,
         systemPrompt,
         config: resolved,
         canExecute: canExecute ?? true,
@@ -642,6 +695,7 @@ semantic matching accuracy.
           agentId: agent.agentId,
           name: agent.name,
           description: agent.description,
+          askDescription: agent.askDescription,
           status: activeTasks > 0 ? 'busy' : 'idle',
           activeTasks,
         };
@@ -854,6 +908,16 @@ semantic matching accuracy.
         return;
       }
 
+      // A task completed and dependent tasks may now be unblocked — re-scan
+      if (aspect === 'taskUnblocked') {
+        const { goalId } = value as { goalId?: string };
+        if (goalId) {
+          log.info(`UNBLOCK goalId=${goalId.slice(0, 8)} — re-scanning for unblocked tasks`);
+          this.scanNamespace(goalId);
+        }
+        return;
+      }
+
       // Watch both tuplePut (new tasks) and tupleUpdated (retried tasks released back to pending)
       if (aspect !== 'tuplePut' && aspect !== 'tupleUpdated') return;
 
@@ -934,6 +998,24 @@ semantic matching accuracy.
 
     log.info(`DISPATCH-INNER ${tupleId} goalId=${taskGoalId?.slice(0, 8) ?? '?'} failureHistory=${failureHistory.length}`);
 
+    // 0. Check dependencies — skip if any are unsatisfied
+    const dependsOn = (tuple.fields.dependsOn as string[]) ?? [];
+    if (dependsOn.length > 0 && taskGoalId && this.tupleSpaceId) {
+      try {
+        const allTuples = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
+          request(this.id, this.tupleSpaceId, 'scan', {
+            namespace: taskGoalId,
+            pattern: {},
+          }),
+        );
+        const doneIds = new Set(allTuples.filter(t => t.fields.status === 'done').map(t => t.id));
+        if (!dependsOn.every(depId => doneIds.has(depId))) {
+          log.info(`DISPATCH-INNER ${tupleId} — blocked: dependencies not yet satisfied`);
+          return;
+        }
+      } catch { /* best effort — proceed without check */ }
+    }
+
     // 1. Find all eligible agents (can execute, not failed, not busy)
     const failedAgentIds = new Set(failureHistory.map(f => f.agentId));
     const eligible = [...this.registeredAgents.values()]
@@ -946,46 +1028,81 @@ semantic matching accuracy.
       return;
     }
 
-    // 2. Ask each agent via the ask protocol if it can handle this task (in parallel)
-    let askQuestion = `Can you handle this task? Rate your confidence 0-10.\nTask: "${description.slice(0, 300)}"`;
+    // 2. Ask each agent how they would accomplish the task (in parallel)
+    let askQuestion = `How would you accomplish this task? Describe your approach briefly (1-3 sentences), or say CANNOT if this is outside your expertise.\nTask: "${description.slice(0, 300)}"`;
     if (failureHistory.length > 0) {
       const failSummary = failureHistory.map(f => `- ${f.agent}: ${f.error}`).join('\n');
       askQuestion += `\nPrevious attempts failed:\n${failSummary}`;
     }
 
-    const bids = await Promise.all(
+    const approaches = await Promise.all(
       eligible.map(async (agent) => {
         try {
           const answer = await this.request<string>(
-            request(this.id, agent.agentId, 'ask', {
-              question: askQuestion,
-            }),
-            15000,
+            request(this.id, agent.agentId, 'ask', { question: askQuestion }),
+            30000,
           );
           const text = typeof answer === 'string' ? answer : String(answer);
-          // Extract a number from the response
-          const match = text.match(/\b(10|[0-9])\b/);
-          const confidence = match ? parseInt(match[1], 10) : 0;
-          return { agent, confidence };
+          return { agent, approach: text };
         } catch {
-          return { agent, confidence: 0 };
+          return { agent, approach: 'CANNOT' };
         }
       })
     );
 
-    const MIN_CONFIDENCE = 3;
-    const willing = bids
-      .filter(b => b.confidence >= MIN_CONFIDENCE)
-      .sort((a, b) => b.confidence - a.confidence);
+    // Filter out agents that said CANNOT
+    const viable = approaches.filter(a =>
+      !a.approach.toUpperCase().startsWith('CANNOT')
+      && !a.approach.toUpperCase().startsWith('I CANNOT')
+      && a.approach.trim().length > 0
+    );
 
-    if (willing.length === 0) {
-      const bestBid = bids.sort((a, b) => b.confidence - a.confidence)[0];
-      log.info(`DISPATCH-INNER ${tupleId} — no agent confident enough (best: ${bestBid?.agent.name} at ${bestBid?.confidence}/10) for: ${description.slice(0, 60)}`);
+    if (viable.length === 0) {
+      log.info(`DISPATCH-INNER ${tupleId} — no agent can handle: ${description.slice(0, 60)}`);
       return;
     }
 
-    const chosen = willing[0].agent;
-    log.info(`DISPATCH-INNER ${tupleId} — ${chosen.name} (confidence ${willing[0].confidence}/10) from ${willing.length} willing agents`);
+    // If only one viable agent, pick it directly (no evaluator needed)
+    let chosen: RegisteredAgent;
+    let chosenApproach = '';
+    if (viable.length === 1) {
+      chosen = viable[0].agent;
+      chosenApproach = viable[0].approach;
+      log.info(`DISPATCH-INNER ${tupleId} — ${chosen.name} (sole viable agent)`);
+    } else {
+      // 3. Evaluator LLM call: pick the most efficient approach
+      const approachList = viable.map(a =>
+        `- ${a.agent.name} (${a.agent.description.slice(0, 150)}): ${a.approach.slice(0, 300)}`
+      ).join('\n');
+
+      const evalPrompt = `Given this task: "${description.slice(0, 300)}"
+
+These agents proposed approaches (each includes their role description):
+${approachList}
+
+Which agent's approach is most appropriate given their role? Reply with ONLY the agent name, nothing else.`;
+
+      let chosenName = viable[0].agent.name; // fallback to first viable
+      try {
+        const evalResult = await this.askLlm(
+          'You are a task dispatcher. Pick the best agent for the task.',
+          evalPrompt,
+          'fast',
+        );
+        const trimmed = evalResult.trim();
+        const match = viable.find(a =>
+          trimmed.toLowerCase().includes(a.agent.name.toLowerCase())
+        );
+        if (match) chosenName = match.agent.name;
+      } catch {
+        // fallback to first viable
+      }
+
+      const chosenEntry = viable.find(a => a.agent.name === chosenName) ?? viable[0];
+      chosen = chosenEntry.agent;
+      chosenApproach = chosenEntry.approach;
+      log.info(`DISPATCH-INNER ${tupleId} — ${chosen.name} (selected from ${viable.length} viable agents)`);
+    }
 
     // 3a. Mark agent busy BEFORE the async claim to prevent concurrent
     // dispatches from claiming tasks for the same agent (JS is single-threaded,
@@ -1047,6 +1164,7 @@ semantic matching accuracy.
       description,
       data,
       callerId: this.id,
+      approach: chosenApproach || undefined,
     };
     const jobCode = `return await call(${JSON.stringify(chosen.agentId)}, 'executeTask', ${JSON.stringify(executePayload)});`;
     const jobMgrId = await this.resolveDep('JobManager', this.jobManagerId);
@@ -1149,8 +1267,7 @@ semantic matching accuracy.
       const goals = await this.request<Array<{ id: string; parentId?: string }>>(
         request(this.id, this.goalManagerId, 'listGoals', { status: 'active' })
       );
-      const topLevel = goals.filter(g => !g.parentId);
-      for (const goal of topLevel) {
+      for (const goal of goals) {
         await this.scanNamespace(goal.id);
       }
     } catch (err) {
@@ -1168,6 +1285,11 @@ semantic matching accuracy.
         })
       );
 
+      // Build a set of completed task IDs for dependency checking
+      const doneIds = new Set(
+        tuples.filter(t => t.fields.status === 'done').map(t => t.id),
+      );
+
       let dispatched = 0;
       for (const tuple of tuples) {
         if (tuple.claimedBy) continue;
@@ -1175,6 +1297,12 @@ semantic matching accuracy.
         const maxAttempts = (tuple.fields.maxAttempts as number) ?? 3;
         if (attempts >= maxAttempts) continue;
         if (this.dispatchingTuples.has(tuple.id)) continue;
+
+        // Skip tasks whose dependencies haven't completed yet
+        const dependsOn = (tuple.fields.dependsOn as string[]) ?? [];
+        if (dependsOn.length > 0 && !dependsOn.every(depId => doneIds.has(depId))) {
+          continue;
+        }
 
         log.info(`SCAN ${tuple.id.slice(0, 8)} attempts=${attempts}/${maxAttempts} — DISPATCHING`);
         this.dispatchToAgent(tuple);
@@ -1528,7 +1656,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
                   const permFailed = tasks.filter(t => t.fields.status === 'permanently_failed');
 
                   // Agent decides: all tasks done → complete the child goal
-                  if (pending.length === 0 && inProgress.length === 0 && doneT.length > 0) {
+                  if (pending.length === 0 && inProgress.length === 0 && doneT.length > 0 && permFailed.length === 0) {
                     const results = doneT.map(t => ({
                       type: t.fields.type, description: t.fields.description, result: t.fields.result,
                     }));
@@ -1542,6 +1670,23 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
                       goalId: cgId, error: `All ${permFailed.length} tasks permanently failed`,
                     }));
                     statusLines.push(`[Child Goal "${goal.title}"] FAILED: all tasks permanently failed`);
+                  } else if (pending.length === 0 && inProgress.length === 0 && permFailed.length > 0 && doneT.length > 0) {
+                    // Partial failure: some tasks done, some permanently failed — trigger reflection
+                    const failedDescs = permFailed.map(t =>
+                      `  \u2717 ${(t.fields.description as string ?? '').slice(0, 120)}: ${String(t.fields.error ?? 'unknown').slice(0, 100)}`
+                    );
+                    const doneDescs = doneT.map(t =>
+                      `  \u2713 ${(t.fields.description as string ?? '').slice(0, 120)}`
+                    );
+                    statusLines.push(
+                      `[Child Goal "${goal.title}"] PARTIAL FAILURE: ${doneT.length} succeeded, ${permFailed.length} failed` +
+                      `\nSucceeded:\n${doneDescs.join('\n')}` +
+                      `\nFailed:\n${failedDescs.join('\n')}` +
+                      `\n[Reflection] Consider whether to:` +
+                      `\n- Use "replan" to create revised tasks addressing the failures` +
+                      `\n- Use "done" if partial results are sufficient` +
+                      `\n- Use "fail" if the goal is unachievable`,
+                    );
                   } else {
                     // Still in progress — keep tracking
                     stillActive.push(cgId);
@@ -1623,15 +1768,33 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
               break;
             }
 
-            // ── Replan: clear state, re-observe ──
+            // ── Replan: inject failure context and return to thinking ──
             if (task.action.action === 'replan') {
-              task.plan = undefined;
+              const reason = (task.action.reason as string) ?? 'Agent requested replan';
+              log.info(`[${agentName}] Replan requested: ${reason.slice(0, 80)}`);
+
+              // Build reflection context from child goal task results
+              let reflection = `[Replan] Reason: ${reason}\n`;
+              if (entry.childGoalIds && entry.childGoalIds.length > 0 && this.goalManagerId) {
+                for (const cgId of entry.childGoalIds) {
+                  try {
+                    reflection += await this.buildGoalProgressContext(cgId);
+                  } catch { /* best effort */ }
+                }
+              } else if (entry.goalId && this.goalManagerId) {
+                try {
+                  reflection += await this.buildGoalProgressContext(entry.goalId);
+                } catch { /* best effort */ }
+              }
+              reflection += '\nGenerate a revised approach using the "decompose" action, addressing what went wrong.';
+
+              task.llmMessages.push({ role: 'user', content: reflection });
               task.step++;
               if (task.step >= task.maxSteps) {
                 await this.handleMaxStepsReached(entry, agentName, setPhase);
                 break;
               }
-              setPhase('observing');
+              setPhase('thinking');
               break;
             }
 
@@ -2056,7 +2219,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
    */
   private async createChildGoalWithTasks(
     entry: TaskEntry,
-    subtasks: Array<{ description: string; data?: unknown }>,
+    subtasks: Array<{ description: string; data?: unknown; dependsOn?: number[] }>,
     agentName: string,
   ): Promise<string> {
     const goalMgrId = this.goalManagerId!;
@@ -2073,29 +2236,76 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
 
     const taskIds: string[] = [];
     for (const sub of subtasks) {
+      // Map index-based dependsOn to actual taskIds
+      const depIds = (sub.dependsOn ?? [])
+        .filter(idx => idx >= 0 && idx < taskIds.length)
+        .map(idx => taskIds[idx]);
+
       const { taskId } = await this.request<{ taskId: string }>(
         request(this.id, goalMgrId, 'addTask', {
           goalId: childGoalId,
-          description: sub.description, data: sub.data,
+          description: sub.description,
+          data: sub.data,
+          dependsOn: depIds.length > 0 ? depIds : undefined,
         }),
       );
       taskIds.push(taskId);
     }
 
-    // Store plan on child goal for visibility
-    this.send(event(this.id, goalMgrId, 'updatePlan', {
-      goalId: childGoalId,
-      plan: {
-        summary,
-        steps: subtasks.map((s, i) => ({
-          id: `step-${i + 1}`, description: s.description,
-          taskId: taskIds[i], data: s.data,
-        })),
-        revision: 0,
-      },
-    }));
-
     return childGoalId;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Goal Context
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Build a text summary of goal + task progress for injection into the LLM context.
+   * Returns empty string if no goal or no tasks.
+   */
+  private async buildGoalProgressContext(goalId: string): Promise<string> {
+    if (!this.goalManagerId) return '';
+    try {
+      const goal = await this.request<{
+        title?: string; status?: string;
+        scratchpad?: Record<string, unknown>;
+      } | null>(
+        request(this.id, this.goalManagerId, 'getGoal', { goalId }),
+        5000,
+      );
+
+      const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
+        request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId }),
+        5000,
+      );
+      if (!tasks || tasks.length === 0) return '';
+
+      const lines: string[] = [];
+      for (const t of tasks) {
+        const status = t.fields.status as string ?? 'unknown';
+        const desc = (t.fields.description as string ?? '').slice(0, 200);
+        const icon = status === 'done' ? '\u2713' : status === 'permanently_failed' ? '\u2717' : '\u25CB';
+        let line = `  ${icon} [${status}] ${desc}`;
+        if (status === 'done' && t.fields.result) {
+          line += ` -- Result: ${JSON.stringify(t.fields.result).slice(0, 150)}`;
+        }
+        if (status === 'permanently_failed' && t.fields.error) {
+          line += ` -- Error: ${String(t.fields.error).slice(0, 150)}`;
+        }
+        lines.push(line);
+      }
+
+      let ctx = `\n\n## Goal Progress\nGoal: "${goal?.title ?? goalId}"\nTasks:\n${lines.join('\n')}`;
+      ctx += `\n\nUse this progress to guide your actions. If tasks have failed, consider whether to retry with a different approach (replan) or work with partial results.`;
+
+      if (goal?.scratchpad && Object.keys(goal.scratchpad).length > 0) {
+        ctx += `\n\n## Shared Goal Data (scratchpad)\nOther agents working on this goal have shared the following data. Use writeGoalData(key, value) to add your own findings.\n\`\`\`json\n${JSON.stringify(goal.scratchpad, null, 2)}\n\`\`\``;
+      }
+
+      return ctx;
+    } catch {
+      return '';
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -2113,17 +2323,9 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       prompt += `\n\n## Response Schema\nWhen you complete the task, the "result" field of your terminal action MUST be a JSON object (not a string) conforming to this schema:\n\`\`\`json\n${JSON.stringify(entry.responseSchema, null, 2)}\n\`\`\`\nIMPORTANT: The "result" value must be a structured JSON object, NOT a string. Include all required fields. Use exact property names from the schema.`;
     }
 
-    // Inject goal scratchpad data into context
+    // Inject goal + task progress and scratchpad into context
     if (entry.goalId && this.goalManagerId) {
-      try {
-        const goal = await this.request<{ scratchpad?: Record<string, unknown> } | null>(
-          request(this.id, this.goalManagerId, 'getGoal', { goalId: entry.goalId }),
-          5000,
-        );
-        if (goal?.scratchpad && Object.keys(goal.scratchpad).length > 0) {
-          prompt += `\n\n## Shared Goal Data (scratchpad)\nOther agents working on this goal have shared the following data. Use writeGoalData(key, value) to add your own findings.\n\`\`\`json\n${JSON.stringify(goal.scratchpad, null, 2)}\n\`\`\``;
-        }
-      } catch { /* best effort */ }
+      prompt += await this.buildGoalProgressContext(entry.goalId);
     }
 
     // Inject relevant knowledge from KnowledgeBase

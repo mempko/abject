@@ -39,6 +39,10 @@ import { GoalManager } from '../src/objects/goal-manager.js';
 import { GoalBrowser } from '../src/objects/goal-browser.js';
 import { KnowledgeBase } from '../src/objects/knowledge-base.js';
 import { KnowledgeBrowser } from '../src/objects/knowledge-browser.js';
+import { AgentBrowser } from '../src/objects/agent-browser.js';
+import { AgentCreator } from '../src/objects/agent-creator.js';
+import { Scheduler } from '../src/objects/scheduler.js';
+import { SchedulerBrowser } from '../src/objects/scheduler-browser.js';
 import { Chat } from '../src/objects/chat.js';
 import { AgentAbject } from '../src/objects/agent-abject.js';
 import { GoalObserver } from '../src/objects/goal-observer.js';
@@ -376,6 +380,10 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('GoalBrowser', () => new GoalBrowser());
   runtime.objectFactory.registerConstructor('KnowledgeBase', () => new KnowledgeBase());
   runtime.objectFactory.registerConstructor('KnowledgeBrowser', () => new KnowledgeBrowser());
+  runtime.objectFactory.registerConstructor('AgentBrowser', () => new AgentBrowser());
+  runtime.objectFactory.registerConstructor('AgentCreator', () => new AgentCreator());
+  runtime.objectFactory.registerConstructor('Scheduler', () => new Scheduler());
+  runtime.objectFactory.registerConstructor('SchedulerBrowser', () => new SchedulerBrowser());
   runtime.objectFactory.registerConstructor('Chat', () => new Chat());
   runtime.objectFactory.registerConstructor('AgentAbject', () => new AgentAbject());
   runtime.objectFactory.registerConstructor('GoalObserver', () => new GoalObserver());
@@ -430,6 +438,7 @@ async function main(): Promise<void> {
       'TupleSpace',
       'GoalManager', 'GoalBrowser',
       'JobManager', 'JobBrowser',
+      'AgentBrowser', 'SchedulerBrowser',
       'AgentAbject', 'ObjectCreator',
       'Chat', 'AbjectEditor', 'Taskbar',
     ];

@@ -182,9 +182,7 @@ export class Registry extends Abject {
     this.setupHandlers();
   }
 
-  protected override getAskTier(): string { return 'balanced'; }
-
-  protected override getSourceForAsk(): string | undefined {
+  protected override askPrompt(_question: string): string {
     // Meta-protocol methods filtered from object summaries
     const metaMethods = new Set([
       'describe', 'ask', 'getRegistry', 'ping',
@@ -228,7 +226,11 @@ The following objects are currently registered in this registry. Use this catalo
       source += '\n';
     }
 
-    return source;
+    return super.askPrompt(_question) + '\n\n' + source;
+  }
+
+  protected override async handleAsk(question: string): Promise<string> {
+    return this.askLlm(this.askPrompt(question), question, 'fast');
   }
 
   private setupHandlers(): void {

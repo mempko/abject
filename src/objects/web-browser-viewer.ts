@@ -458,8 +458,8 @@ export class WebBrowserViewer extends Abject {
     } catch { /* canvas gone */ }
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## WebBrowserViewer Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## WebBrowserViewer Usage Guide
 
 ### Methods
 - \`show()\` — Open the browser viewer window. Shows tabs for each open browser page with live screenshots.

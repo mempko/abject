@@ -488,8 +488,8 @@ export class IdentityObject extends Abject {
     }
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## IdentityObject Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## IdentityObject Usage Guide
 
 ### Get this peer's identity
 

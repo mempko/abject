@@ -641,8 +641,8 @@ export class WorkspaceShareRegistry extends Abject {
     super.checkInvariants();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## WorkspaceShareRegistry Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## WorkspaceShareRegistry Usage Guide
 
 ### Get locally shared workspaces
 

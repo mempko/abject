@@ -112,8 +112,8 @@ export class PeerDiscoveryObject extends Abject {
     this.setupHandlers();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## PeerDiscovery Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## PeerDiscovery Usage Guide
 
 PeerDiscovery enables gossip-based peer discovery across the mesh network.
 Peers exchange their peer lists periodically and can find specific peers

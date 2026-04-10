@@ -64,6 +64,7 @@ export class LLMMonitor extends Abject {
   private killButtons: Map<AbjectId, string> = new Map();
   private viewButtons: Map<AbjectId, string> = new Map();
   private refreshTimer?: ReturnType<typeof setInterval>;
+  private refreshing = false;
 
   // Row tracking for in-place updates
   private activeRows: RowWidgets[] = [];
@@ -258,6 +259,7 @@ export class LLMMonitor extends Abject {
     this.historyRows = [];
     this.lastActiveIds = [];
     this.lastHistoryIds = [];
+    this.refreshing = false;
   }
 
   // -- Main View --
@@ -390,6 +392,12 @@ export class LLMMonitor extends Abject {
    */
   private async refreshView(): Promise<void> {
     if (!this.activeTabListId || !this.historyTabListId || !this.rootLayoutId || !this.windowId) return;
+    if (this.refreshing) return;
+    this.refreshing = true;
+    try { await this.refreshViewInner(); } finally { this.refreshing = false; }
+  }
+
+  private async refreshViewInner(): Promise<void> {
 
     // Fetch snapshot
     let snapshot: StatsSnapshot | null = null;
@@ -897,8 +905,8 @@ export class LLMMonitor extends Abject {
     }
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## LLMMonitor Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## LLMMonitor Usage Guide
 
 ### Methods
 - \`show()\` -- Open the LLM monitor window. Shows active requests, history, and stats.

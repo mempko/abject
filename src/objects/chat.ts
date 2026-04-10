@@ -123,6 +123,15 @@ export class Chat extends Abject {
                 }},
               },
               {
+                name: 'addNotification',
+                description: 'Display a message in the chat window without triggering the agent loop. Use this for notifications, status updates, or results from other agents.',
+                parameters: [
+                  { name: 'sender', type: { kind: 'primitive', primitive: 'string' }, description: 'Display name of the sender (e.g. agent name)' },
+                  { name: 'message', type: { kind: 'primitive', primitive: 'string' }, description: 'The notification text (supports markdown)' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
                 name: 'clearHistory',
                 description: 'Reset conversation history',
                 parameters: [],
@@ -190,6 +199,15 @@ export class Chat extends Abject {
       if (!message?.trim()) return false;
       log.info(`[Chat] sendMessage: "${message.trim().slice(0, 80)}"`);
       this.triggerSend(message.trim());
+      return true;
+    });
+
+    this.on('addNotification', async (msg: AbjectMessage) => {
+      const { sender, message } = msg.payload as { sender: string; message: string };
+      if (!message?.trim()) return false;
+      log.info(`[Chat] addNotification from "${sender}": "${message.trim().slice(0, 80)}"`);
+      await this.appendMessageLabel(sender || 'System', message.trim(), this.theme.statusNeutral, true);
+      this.conversationHistory.push({ role: 'assistant', content: `[${sender}]: ${message.trim()}` });
       return true;
     });
 
@@ -534,7 +552,7 @@ export class Chat extends Abject {
     // Handle goal action: create goal + tasks, wait for completion
     if (action.action === 'goal') {
       const title = (action.title as string) ?? 'Untitled goal';
-      const tasks = (action.tasks as Array<{ description: string; data?: Record<string, unknown> }>) ?? [];
+      const tasks = (action.tasks as Array<{ description: string; data?: Record<string, unknown>; dependsOn?: number[] }>) ?? [];
       if (tasks.length === 0) {
         return { success: false, error: 'Goal has no tasks' };
       }
@@ -549,14 +567,19 @@ export class Chat extends Abject {
       }
 
       try {
-        // Add all tasks to the goal
+        // Add all tasks to the goal, mapping index-based dependsOn to taskIds
         const taskIds: string[] = [];
         for (const task of tasks) {
+          const depIds = (task.dependsOn ?? [])
+            .filter(idx => idx >= 0 && idx < taskIds.length)
+            .map(idx => taskIds[idx]);
+
           const { taskId } = await this.request<{ taskId: string }>(
             request(this.id, this.goalManagerId, 'addTask', {
               goalId,
               description: task.description,
               data: task.data,
+              dependsOn: depIds.length > 0 ? depIds : undefined,
             })
           );
           taskIds.push(taskId);
@@ -621,6 +644,12 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
     { "description": "Fetch current weather data for Miami, FL using an HTTP API" },
     { "description": "Create a new dashboard widget that displays temperature and humidity" }
   ] }\`
+  Sequential tasks (task 1 depends on task 0):
+  \`{ "action": "goal", "title": "Fetch and summarize", "tasks": [
+    { "description": "Fetch the latest news headlines" },
+    { "description": "Summarize the fetched headlines into a brief report", "dependsOn": [0] }
+  ] }\`
+  Use dependsOn with 0-based task indices when a task needs a previous task to finish first. Tasks without dependsOn run in parallel.
   Include the object name in the task description when relevant. Be specific about the desired outcome.
 
 ### Memory
@@ -644,11 +673,13 @@ The chat window renders markdown. Use **bold**, *italic*, \`inline code\`, headi
 
 ## Writing Good Task Descriptions
 
-Task descriptions are how agents decide whether they can handle a task. Be specific:
+Task descriptions are how agents decide whether they can handle a task. Focus on the desired **outcome**, not the implementation mechanism. Let agents decide how to accomplish the task.
 - Include the object name when the task involves an existing object (e.g., "Modify the HackerNews object to..." not just "Fix the UI")
 - Describe the desired outcome, not just the problem (e.g., "Add a reset button to the Counter that sets the count back to zero")
 - For web tasks, mention that it involves a real website (e.g., "Browse https://example.com and extract the article text")
-- For new objects, describe what the object should do (e.g., "Create a todo list widget with add, remove, and mark-complete functionality")
+- For new functionality, describe what it should do without dictating how (e.g., "Display a todo list with add, remove, and mark-complete functionality")
+- When the user says "agent", preserve that word in the task description. An agent is an autonomous entity that registers with the system and can handle tasks on its own. Say "Create an agent that..." not "Create an object that..."
+- NEVER write "Create an Abjects object called..." in task descriptions. Describe the desired behavior and let the system decide the implementation.
 
 ## Assumption Checking
 
@@ -672,7 +703,8 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
 5. Keep reasoning brief (1-2 sentences before the JSON block).
 6. If a goal's tasks fail, you can retry by creating a new goal with a simpler task description. If it fails repeatedly, use "done" to tell the user what happened.
 7. P2P: Resolve remote objects by qualified name: this.find('peer.workspace.ObjectName'). Always use find() for dynamic ID resolution.
-8. When the user reveals personal facts (where they live, their name, preferences, job, etc.), save them using **remember** so you can recall them in future conversations.`;
+8. When the user reveals personal facts (where they live, their name, preferences, job, etc.), save them using **remember** so you can recall them in future conversations.
+9. NEVER write shell commands (curl, wget, etc.) in task descriptions. Describe the desired outcome (e.g., "Fetch the weather data from wttr.in for Silverdale, WA") and let agents decide how to accomplish it.`;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1060,8 +1092,8 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
     this.messageLabelIds = [];
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## Chat Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## Chat Usage Guide
 
 ### Send a message programmatically
 
@@ -1077,6 +1109,15 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
 
   const state = await call(await dep('Chat'), 'getState', {});
   // state: { phase, messageCount, visible, currentGoalId }
+
+### Display a notification (no agent loop)
+
+  await call(await dep('Chat'), 'addNotification', {
+    sender: 'WeatherScheduler',
+    message: 'Daily briefing: 62F, partly cloudy in Silverdale WA.'
+  });
+  // Displays the message in the chat window without triggering the agent loop.
+  // Supports markdown. Use this for status updates, results, or alerts from other objects.
 
 ### Clear conversation history
 

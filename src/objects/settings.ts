@@ -139,8 +139,8 @@ export class Settings extends Abject {
     this.peerRegistryId = await this.discoverDep('PeerRegistry') ?? undefined;
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## Settings Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## Settings Usage Guide
 
 Settings provides a per-workspace configuration UI with General and Access tabs.
 

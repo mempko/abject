@@ -546,7 +546,7 @@ export class HostFileSystem extends Abject {
     }
   }
 
-  protected override getSourceForAsk(): string | undefined {
+  protected override askPrompt(_question: string): string {
     const lines = [
       `## HostFileSystem Usage Guide`,
       ``,
@@ -581,7 +581,7 @@ export class HostFileSystem extends Abject {
       lines.push(`No directories are allowed. All access will be denied.`);
     }
 
-    return lines.join('\n');
+    return super.askPrompt(_question) + '\n\n' + lines.join('\n');
   }
 }
 

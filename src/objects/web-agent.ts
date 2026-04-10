@@ -193,28 +193,29 @@ export class WebAgent extends Abject {
     this.setupHandlers();
   }
 
-  protected override getAskTier(): string { return 'balanced'; }
-
-  protected override getSourceForAsk(): string | undefined {
-    return `## WebAgent — Autonomous Web Browsing Agent
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## WebAgent — Autonomous Web Browsing Agent
 
 ### What I Handle
-I am the agent for any task that requires visiting websites or interacting with web pages.
+I am the agent for tasks that require a REAL WEB BROWSER with interactive navigation.
 I open a headless browser, navigate to URLs, and use an LLM-driven loop to complete web tasks.
 
 Examples of tasks I handle well:
-- Visiting a URL and reading its content
-- Searching the web and extracting results
 - Filling out forms, clicking buttons, navigating multi-page workflows
-- Taking screenshots of web pages
 - Logging into websites (social media, email, web apps)
-- Scraping data from JavaScript-rendered pages
-- Any task that requires a real web browser
+- Scraping data from JavaScript-rendered pages that require JS execution
+- Taking screenshots of web pages
+- Searching the web via a search engine
+- Any task that requires interactive browser navigation (clicks, scrolls, form fills)
 
 ### What I Do NOT Handle
+- Simple HTTP data fetches (use HttpClient instead, not a browser)
+- Fetching weather, API data, or RSS feeds (these are simple GET requests, not browser tasks)
 - Calling internal system APIs or objects directly
 - Creating new objects from scratch
-- Tasks that don't involve web pages
+- Tasks that don't involve interactive web pages
+
+When asked about a task, describe your browsing approach if it genuinely needs an interactive browser. Say CANNOT for simple data fetching (weather APIs, RSS feeds, JSON endpoints) since those are better handled by HttpClient.
 
 ### Run a Full Web Task (free-text result)
 
@@ -325,6 +326,10 @@ Set keepPageOpen: false to explicitly close the page when done.
 - Kept-open pages auto-close after 5 minutes of inactivity.
 - Internally, WebAgent uses a ticket pattern with AgentAbject — startTask returns a ticketId and results arrive via taskResult events.
 - WebAgent can receive tasks via LLM semantic fallback even for task types it doesn't explicitly declare.`;
+  }
+
+  protected override async handleAsk(question: string): Promise<string> {
+    return this.askLlm(this.askPrompt(question), question, 'fast');
   }
 
   protected override async onInit(): Promise<void> {

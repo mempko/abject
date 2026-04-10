@@ -728,8 +728,8 @@ export class BackendUI extends Abject {
     } catch { /* logging should never break the caller */ }
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## UIServer Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## UIServer Usage Guide
 
 ### Creating and Using Surfaces
 

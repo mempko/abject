@@ -100,8 +100,8 @@ export class WorkspaceBrowser extends Abject {
     this.setupHandlers();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## WorkspaceBrowser Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## WorkspaceBrowser Usage Guide
 
 ### Overview
 Three-pane browser for discovering and browsing remote workspaces shared by

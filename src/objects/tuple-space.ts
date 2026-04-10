@@ -201,8 +201,8 @@ export class TupleSpace extends Abject {
     }
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## TupleSpace Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## TupleSpace Usage Guide
 
 All methods require a \`namespace\` parameter (the top-level goal ID).
 

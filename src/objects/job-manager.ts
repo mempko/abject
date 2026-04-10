@@ -438,8 +438,8 @@ export class JobManager extends Abject {
     contractRequire(this.jobCounter >= 0, 'jobCounter must be non-negative');
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## JobManager Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## JobManager Usage Guide
 
 ### Submit a job for execution
 

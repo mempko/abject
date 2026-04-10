@@ -681,8 +681,8 @@ export class AbjectEditor extends Abject {
     }
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## AbjectEditor Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## AbjectEditor Usage Guide
 
 ### Open the editor for a ScriptableAbject
 

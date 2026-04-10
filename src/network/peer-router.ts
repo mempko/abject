@@ -1887,8 +1887,8 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     super.checkInvariants();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## PeerRouter Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## PeerRouter Usage Guide
 
 ### Register a route to a remote object
 

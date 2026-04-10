@@ -67,8 +67,8 @@ export class WebSearch extends Abject {
     this.setupHandlers();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## WebSearch Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## WebSearch Usage Guide
 
 Interface: abjects:web-search
 

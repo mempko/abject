@@ -152,7 +152,7 @@ export class ObjectCatalog extends Abject {
 
   // ── Ask protocol ─────────────────────────────────────────────────
 
-  protected override getSourceForAsk(): string | undefined {
+  protected override askPrompt(_question: string): string {
     const metaMethods = new Set([
       'describe', 'ask', 'getRegistry', 'ping',
       'addDependent', 'removeDependent',
@@ -203,7 +203,7 @@ local registries every ${LOCAL_REFRESH_MS / 1000}s, remote registries every ${RE
       source += '\n';
     }
 
-    return source;
+    return super.askPrompt(_question) + '\n\n' + source;
   }
 
   // ── Handlers ─────────────────────────────────────────────────────

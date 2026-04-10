@@ -273,8 +273,8 @@ export class Console extends Abject {
     return this.logs.length;
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## Console Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## Console Usage Guide
 
 ### Log at Different Levels
 

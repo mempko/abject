@@ -103,8 +103,8 @@ export class WorkspaceSwitcher extends Abject {
     this.setupHandlers();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## WorkspaceSwitcher Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## WorkspaceSwitcher Usage Guide
 
 ### Overview
 Global chromeless bar for switching between workspaces. Shows one button per

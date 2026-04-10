@@ -343,8 +343,8 @@ export class WindowManager extends Abject {
 
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## WindowManager Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## WindowManager Usage Guide
 
 ### Overview
 

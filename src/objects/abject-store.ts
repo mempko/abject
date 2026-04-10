@@ -396,6 +396,22 @@ export class AbjectStore extends Abject {
 
           result.restored++;
           log.info(`Restored '${snap.manifest.name}' as ${spawnResult.objectId}`);
+
+          // Auto-start objects tagged 'autostart' or 'agent' so they can
+          // re-register with their dependencies (e.g. AgentAbject) without
+          // requiring the user to manually open them.
+          const tags = snap.manifest.tags ?? [];
+          if (tags.includes('autostart') || tags.includes('agent')) {
+            try {
+              await this.request(
+                request(this.id, spawnResult.objectId, 'startup', {}),
+                10000,
+              );
+              log.info(`Auto-started '${snap.manifest.name}'`);
+            } catch {
+              // Best effort — handler may not exist yet
+            }
+          }
         }
       } catch (err) {
         result.failed++;
@@ -420,8 +436,8 @@ export class AbjectStore extends Abject {
     invariant(this.snapshots.size >= 0, 'snapshot count must be non-negative');
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## AbjectStore Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## AbjectStore Usage Guide
 
 ### Save an object snapshot
 

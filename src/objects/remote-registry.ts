@@ -300,8 +300,8 @@ export class RemoteRegistry extends Abject {
     super.checkInvariants();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## RemoteRegistry Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## RemoteRegistry Usage Guide
 
 ### Discover remote objects by name or interface
 

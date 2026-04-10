@@ -120,8 +120,8 @@ export class Screenshot extends Abject {
     this.uiServerId = await this.discoverDep('UIServer') ?? undefined;
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## Screenshot Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## Screenshot Usage Guide
 
 ### Capture a Window
 

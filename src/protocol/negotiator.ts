@@ -135,8 +135,8 @@ export class Negotiator extends Abject {
     this.setupHandlers();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## Negotiator Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## Negotiator Usage Guide
 
 ### Connect two objects
 

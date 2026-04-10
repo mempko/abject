@@ -995,8 +995,8 @@ export class WidgetManager extends Abject {
     } catch { /* logging should never break the caller */ }
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## WidgetManager Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## WidgetManager Usage Guide
 
 ### Quick Reference
 

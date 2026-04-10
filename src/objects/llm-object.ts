@@ -944,8 +944,8 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     return content.trim();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## LLM Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## LLM Usage Guide
 
 ### Basic Completion (chat-style)
 

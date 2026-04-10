@@ -102,8 +102,8 @@ export class SignalingRelayObject extends Abject implements SignalingRelay {
     this.setupHandlers();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## SignalingRelay Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## SignalingRelay Usage Guide
 
 SignalingRelay relays SDP/ICE signaling between peers over DataChannel,
 enabling new peer connections even when the central signaling server is down.

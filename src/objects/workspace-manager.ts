@@ -48,12 +48,12 @@ const wsLog = new Log('WORKSPACE-MANAGER');
 const INFRA_OBJECTS = [
   'AbjectStore', 'SharedState', 'TupleSpace', 'FileTransfer', 'MediaStream', 'Theme',
   'GoalManager', 'JobManager', 'AgentAbject', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
-  'KnowledgeBase',
+  'AgentCreator', 'Scheduler', 'KnowledgeBase',
 ] as const;
 
 /** UI objects — deferred for inactive workspaces, spawned on first switch. */
 const UI_OBJECTS = [
-  'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser', 'KnowledgeBrowser',
+  'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser', 'KnowledgeBrowser', 'AgentBrowser', 'SchedulerBrowser',
   'WebBrowserViewer', 'Chat', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
 ] as const;
 
@@ -1463,8 +1463,8 @@ export class WorkspaceManager extends Abject {
     }
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## WorkspaceManager Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## WorkspaceManager Usage Guide
 
 ### Methods
 - \`createWorkspace({ name })\` — Create a new workspace. Returns { workspaceId }.

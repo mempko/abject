@@ -13,8 +13,6 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { require as precondition, requireNonEmpty } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
-import type { AgentPlan } from './agent-abject.js';
-
 const log = new Log('GoalManager');
 
 const GOAL_MANAGER_INTERFACE: InterfaceId = 'abjects:goal-manager';
@@ -49,7 +47,6 @@ export interface Goal {
   childIds: GoalId[];
   result?: unknown;
   error?: string;
-  plan?: AgentPlan;
   createdAt: number;
   updatedAt: number;
   scratchpad: Record<string, unknown>;
@@ -171,6 +168,7 @@ export class GoalManager extends Abject {
                 { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
                 { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'Task description' },
                 { name: 'data', type: { kind: 'object', properties: {} }, description: 'Task-specific payload', optional: true },
+                { name: 'dependsOn', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Task IDs that must complete before this task can start', optional: true },
               ],
               returns: { kind: 'object', properties: { taskId: { kind: 'primitive', primitive: 'string' } } },
             },
@@ -241,15 +239,6 @@ export class GoalManager extends Abject {
                 { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
               ],
               returns: { kind: 'object', properties: { cancelled: { kind: 'primitive', primitive: 'number' } } },
-            },
-            {
-              name: 'updatePlan',
-              description: 'Store or update a structured plan on a goal',
-              parameters: [
-                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
-                { name: 'plan', type: { kind: 'object', properties: {} }, description: 'Agent plan with summary and steps' },
-              ],
-              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
             },
             {
               name: 'cancelPendingTasks',
@@ -381,8 +370,8 @@ export class GoalManager extends Abject {
     } catch { /* best effort */ }
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## GoalManager Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## GoalManager Usage Guide
 
 ### Create a Goal
 
@@ -480,6 +469,25 @@ if it can handle the task, and the most confident agent claims it.
 - Tasks are backed by TupleSpace (CRDT-synced) — they persist across restarts and sync across peers.
 - Goals metadata syncs to SharedState for cross-peer visibility.
 - Task types are flexible — AgentAbject uses LLM semantic fallback when no agent declares the exact type.`;
+  }
+
+  protected override async handleAsk(question: string): Promise<string> {
+    let prompt = this.askPrompt(question);
+
+    // Include current goal status summary
+    const active = [...this.goals.values()].filter(g => g.status === 'active');
+    const completed = [...this.goals.values()].filter(g => g.status === 'completed');
+    const failed = [...this.goals.values()].filter(g => g.status === 'failed');
+    prompt += `\n\n### Current State\n`;
+    prompt += `${active.length} active, ${completed.length} completed, ${failed.length} failed goals.\n`;
+    if (active.length > 0) {
+      prompt += '\nActive goals:\n';
+      for (const g of active.slice(0, 5)) {
+        prompt += `- ${g.title}\n`;
+      }
+    }
+
+    return this.askLlm(prompt, question, 'balanced');
   }
 
   private async sweepGoals(): Promise<void> {
@@ -585,7 +593,6 @@ if it can handle the task, and the most confident agent claims it.
           childIds: goal.childIds,
           result: goal.result,
           error: goal.error,
-          plan: goal.plan,
           createdAt: goal.createdAt,
           updatedAt: goal.updatedAt,
           scratchpad: goal.scratchpad,
@@ -787,8 +794,8 @@ if it can handle the task, and the most confident agent claims it.
     // ── Task convenience methods (delegate to TupleSpace) ──
 
     this.on('addTask', async (msg: AbjectMessage) => {
-      const { goalId, description, data } = msg.payload as {
-        goalId: string; description: string; data?: unknown;
+      const { goalId, description, data, dependsOn } = msg.payload as {
+        goalId: string; description: string; data?: unknown; dependsOn?: string[];
       };
       requireNonEmpty(goalId, 'goalId');
       requireNonEmpty(description, 'description');
@@ -802,10 +809,14 @@ if it can handle the task, and the most confident agent claims it.
       const result = await this.request<{ tupleId: string }>(
         request(this.id, this.tupleSpaceId, 'put', {
           namespace: ns,
-          fields: { goalId, status: 'pending', description, data, attempts: 0, maxAttempts: 3, failureHistory: [] },
+          fields: {
+            goalId, status: 'pending', description, data,
+            attempts: 0, maxAttempts: 3, failureHistory: [],
+            dependsOn: dependsOn ?? [],
+          },
         })
       );
-      log.info(`Task added for goal ${goalId}: "${description.slice(0, 60)}"`);
+      log.info(`Task added for goal ${goalId}: "${description.slice(0, 60)}"${dependsOn?.length ? ` (depends on ${dependsOn.length} task(s))` : ''}`);
       return { taskId: result.tupleId };
     });
 
@@ -853,6 +864,12 @@ if it can handle the task, and the most confident agent claims it.
       log.info(`completeTask ${taskId.slice(0, 8)} — emitting taskCompleted`);
       this.emittedTerminalTasks.add(taskId);
       this.changed('taskCompleted', { taskId, goalId, result });
+
+      // Signal that dependent tasks may now be unblocked
+      if (goalId) {
+        this.changed('taskUnblocked', { goalId, completedTaskId: taskId });
+      }
+
       return updateResult;
     });
 
@@ -1008,17 +1025,6 @@ if it can handle the task, and the most confident agent claims it.
       this.goalOrder.push(goalId as GoalId);
       this.saveGoalIndex();
       return null;
-    });
-
-    this.on('updatePlan', async (msg: AbjectMessage) => {
-      const { goalId, plan } = msg.payload as { goalId: GoalId; plan: AgentPlan };
-      const goal = this.goals.get(goalId);
-      if (!goal) return { success: false };
-      goal.plan = plan;
-      goal.updatedAt = Date.now();
-      this.changed('goalUpdated', { goalId, plan });
-      this.syncGoalToSharedState(goal);
-      return { success: true };
     });
 
     this.on('writeGoalData', async (msg: AbjectMessage) => {

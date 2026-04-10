@@ -1140,8 +1140,8 @@ export class AppExplorer extends Abject {
     }
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## AppExplorer Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## AppExplorer Usage Guide
 
 ### Methods
 - \`show()\` — Open the app explorer window.

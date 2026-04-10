@@ -190,8 +190,8 @@ export class KnowledgeBase extends Abject {
     log.info(`KnowledgeBase initialized with ${this.entries.size} entries`);
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## KnowledgeBase Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## KnowledgeBase Usage Guide
 
 ### Remember something (create or update knowledge)
 
@@ -240,6 +240,29 @@ Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (age
 - Before starting a task, check if relevant knowledge exists
 - When uncertain about user preferences or project conventions
 - When a task is similar to a previous one`;
+  }
+
+  protected override async handleAsk(question: string): Promise<string> {
+    let prompt = this.askPrompt(question);
+
+    // Include knowledge store summary
+    const entries = [...this.entries.values()];
+    const byType: Record<string, number> = {};
+    for (const e of entries) {
+      byType[e.type] = (byType[e.type] ?? 0) + 1;
+    }
+    const typeSummary = Object.entries(byType).map(([t, c]) => `${c} ${t}`).join(', ');
+    prompt += `\n\n### Current Knowledge Store\n`;
+    prompt += `${entries.length} entries${typeSummary ? ` (${typeSummary})` : ''}.\n`;
+    if (entries.length > 0) {
+      const recent = entries.slice(-5);
+      prompt += '\nRecent entries:\n';
+      for (const e of recent) {
+        prompt += `- [${e.type}] ${e.title}\n`;
+      }
+    }
+
+    return this.askLlm(prompt, question, 'balanced');
   }
 
   // ═══════════════════════════════════════════════════════════════════

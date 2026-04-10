@@ -93,8 +93,8 @@ export class SkillBrowser extends Abject {
     }
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## SkillBrowser Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## SkillBrowser Usage Guide
 
 SkillBrowser provides a two-pane UI for browsing and managing installed skills.
 The left pane lists all skills with their enable/disable state, and the right

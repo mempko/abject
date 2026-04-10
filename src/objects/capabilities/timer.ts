@@ -361,8 +361,8 @@ export class Timer extends Abject {
     this.timers.clear();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## Timer Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## Timer Usage Guide
 
 ### Setting Up an Animation Timer (setInterval)
 

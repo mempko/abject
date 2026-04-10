@@ -339,8 +339,8 @@ export class WindowAbject extends Abject {
     });
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## WindowAbject Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## WindowAbject Usage Guide
 
 ### Overview
 

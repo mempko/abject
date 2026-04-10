@@ -67,8 +67,8 @@ export class WebFetch extends Abject {
     this.setupHandlers();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## WebFetch Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## WebFetch Usage Guide
 
 Interface: abjects:web-fetch
 

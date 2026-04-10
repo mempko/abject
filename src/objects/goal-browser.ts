@@ -131,8 +131,8 @@ export class GoalBrowser extends Abject {
     });
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## GoalBrowser Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## GoalBrowser Usage Guide
 
 ### Methods
 - \`show()\` -- Open the goal browser window. If already open, raises it to front.

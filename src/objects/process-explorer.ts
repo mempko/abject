@@ -720,8 +720,8 @@ export class ProcessExplorer extends Abject {
     }
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## ProcessExplorer Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## ProcessExplorer Usage Guide
 
 ### Methods
 - \`show()\` — Open the process explorer window. Shows all running objects.

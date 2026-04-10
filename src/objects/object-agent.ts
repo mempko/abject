@@ -78,22 +78,19 @@ export class ObjectAgent extends Abject {
     log.info('Registered with AgentAbject');
   }
 
-  protected override getAskTier(): string { return 'balanced'; }
-
-  protected override getSourceForAsk(): string | undefined {
-    return `## ObjectAgent — General-Purpose Object Interaction Agent
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## ObjectAgent — General-Purpose Object Interaction Agent
 
 ### What I Handle
-I am the go-to agent for any task that involves interacting with existing objects in the system.
-I discover objects via the Registry, learn their API via the ask protocol, and call their methods.
+I interact with existing objects by discovering them and sending them messages.
 
 Examples of tasks I handle well:
 - Fetching data from APIs (weather, stocks, etc.)
 - Running shell commands
 - Reading/writing files
 - Drawing on canvas apps, controlling UI objects, setting timers
-- Any task that can be accomplished by calling methods on existing objects
-- Multi-step workflows chaining calls across multiple objects
+- Any task that can be accomplished by sending messages to existing objects
+- Multi-step workflows chaining messages across multiple objects
 
 ### What I Do NOT Handle
 - Creating brand-new objects from scratch
@@ -102,17 +99,47 @@ Examples of tasks I handle well:
 
 ### How I Work
 1. Ask the Registry which objects can help
-2. Ask those objects how to use their API
-3. Call the right methods with the right parameters
-4. Chain results across multiple calls if needed`;
+2. Send ask messages to those objects to learn their capabilities
+3. Send the right messages with the right parameters
+4. Chain results across multiple objects if needed
+
+When asked about a task, describe which objects you would message and what you would ask them to do.
+Say CANNOT if the task involves creating, building, or making something new (apps, widgets, simulations, games, tools, agents). I can only interact with objects that already exist, not generate new code or spawn new objects.`;
+  }
+
+  protected override async handleAsk(question: string): Promise<string> {
+    // Extract task description from the confidence question
+    const taskMatch = question.match(/Task:\s*"?(.+?)"?\s*$/m);
+    const taskDesc = taskMatch?.[1] ?? question;
+
+    // Ask Registry which objects can help with this task
+    let registryContext = '';
+    const regId = this.getRegistryId();
+    if (regId) {
+      try {
+        registryContext = await this.request<string>(
+          request(this.id, regId, 'ask', {
+            question: `Which registered objects could help accomplish this task by sending them messages: "${taskDesc}"? List the most relevant objects with a brief description of how they help.`,
+          }),
+          15000,
+        );
+      } catch { /* Registry unavailable */ }
+    }
+
+    let prompt = this.askPrompt(question);
+    if (registryContext) {
+      prompt += '\n\n### Objects available to accomplish this task:\n' + registryContext;
+    }
+
+    return this.askLlm(prompt, question, 'fast');
   }
 
   private setupHandlers(): void {
     // ── TupleSpace dispatch handler ──
     this.on('executeTask', async (msg: AbjectMessage) => {
-      const { goalId, description, data } = msg.payload as {
+      const { goalId, description, data, approach } = msg.payload as {
         tupleId: string; goalId?: string; description: string;
-        data?: Record<string, unknown>; type: string;
+        data?: Record<string, unknown>; type: string; approach?: string;
       };
 
       const taskId = `obj-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -120,12 +147,23 @@ Examples of tasks I handle well:
 
       try {
         const systemPrompt = this.buildSystemPrompt(data);
+
+        // If the dispatch included the agent's proposed approach, seed it as
+        // an initial message so the agent skips re-discovery and acts on its plan.
+        const initialMessages = approach
+          ? [
+              { role: 'user' as const, content: `Task: ${description}` },
+              { role: 'assistant' as const, content: `I will accomplish this as follows: ${approach}` },
+            ]
+          : undefined;
+
         const { ticketId } = await this.request<{ ticketId: string }>(
           request(this.id, this.agentAbjectId!, 'startTask', {
             taskId,
             task: description,
             systemPrompt,
             goalId,
+            initialMessages,
             config: {
               maxSteps: 15,
               timeout: 300000,
@@ -209,9 +247,9 @@ Examples of tasks I handle well:
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'ObjectAgent',
       description:
-        'Interacts with existing objects by calling their methods, inspecting their state, and reading their data. ' +
-        'Discovers objects via Registry, learns their API via the ask protocol, and calls their methods. ' +
-        'Handles API calls, data retrieval, object queries, and controlling existing objects.',
+        'Interacts with existing objects by discovering them and sending messages. ' +
+        'Discovers objects via Registry, learns their capabilities via ask messages, then sends messages to accomplish tasks. ' +
+        'Handles data fetching, object queries, and orchestrating existing objects.',
       config: {
         terminalActions: {
           done: { type: 'success' as const, resultFields: ['result'] },

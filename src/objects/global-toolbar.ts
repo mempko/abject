@@ -88,8 +88,8 @@ export class GlobalToolbar extends Abject {
     this.setupHandlers();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## GlobalToolbar Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## GlobalToolbar Usage Guide
 
 ### Overview
 Persistent chromeless toolbar positioned above the workspace area. Provides

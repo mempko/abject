@@ -291,7 +291,7 @@ export class CompositeAbject extends Abject {
 
   // ── Ask support ─────────────────────────────────────────────────
 
-  protected override getSourceForAsk(): string | undefined {
+  protected override askPrompt(_question: string): string {
     const roles = this.spec.children
       .map((c) => `  - ${c.role}: ${c.manifest.name} — ${c.manifest.description}`)
       .join('\n');
@@ -303,7 +303,7 @@ export class CompositeAbject extends Abject {
       })
       .join('\n');
 
-    return `Composite: ${this.spec.name}\nDescription: ${this.spec.description}\n\nRoles:\n${roles}\n\nRoutes:\n${routes}`;
+    return super.askPrompt(_question) + `\n\nComposite: ${this.spec.name}\nDescription: ${this.spec.description}\n\nRoles:\n${roles}\n\nRoutes:\n${routes}`;
   }
 
   // ── Invariants ──────────────────────────────────────────────────

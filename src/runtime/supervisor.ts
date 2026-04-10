@@ -388,8 +388,8 @@ export class Supervisor extends Abject {
     invariant(this.children.size >= 0, 'child count must be non-negative');
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## Supervisor Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## Supervisor Usage Guide
 
 ### Add a supervised child
 

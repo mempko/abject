@@ -104,8 +104,8 @@ export class JobBrowser extends Abject {
     });
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## JobBrowser Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## JobBrowser Usage Guide
 
 ### Methods
 - \`show()\` -- Open the job browser window. If already open, raises it to front.

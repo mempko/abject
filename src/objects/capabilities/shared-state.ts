@@ -903,8 +903,8 @@ export class SharedState extends Abject {
     super.checkInvariants();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## SharedState Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## SharedState Usage Guide
 
 ### Create a shared state instance
 

@@ -1433,8 +1433,8 @@ export class WebBrowser extends Abject {
     }
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## WebBrowser Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## WebBrowser Usage Guide
 
 Use WebBrowser for JavaScript-rendered pages (React SPAs, Instagram, Twitter, etc.).
 For static HTML pages, prefer HttpClient.get() + WebParser instead.

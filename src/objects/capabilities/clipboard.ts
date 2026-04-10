@@ -154,8 +154,8 @@ export class Clipboard extends Abject {
     }
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## Clipboard Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## Clipboard Usage Guide
 
 ### Write Text to Clipboard
 

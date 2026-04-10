@@ -155,8 +155,10 @@ export class ScriptableAbject extends Abject {
     return this._owner;
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return this._source;
+  protected override askPrompt(question: string): string {
+    let prompt = super.askPrompt(question);
+    if (this._source) prompt += '\n\nSource code:\n' + this._source;
+    return prompt;
   }
 
   /**

@@ -395,7 +395,7 @@ export class ShellExecutor extends Abject {
     throw new Error(`Directory "${cwd}" is not allowed. Configure permissions in Settings > Permissions.`);
   }
 
-  protected override getSourceForAsk(): string | undefined {
+  protected override askPrompt(_question: string): string {
     const p = platformInfo;
     const lines = [
       `## ShellExecutor Usage Guide`,
@@ -432,7 +432,7 @@ export class ShellExecutor extends Abject {
       }
     }
 
-    return lines.join('\n');
+    return super.askPrompt(_question) + '\n\n' + lines.join('\n');
   }
 }
 

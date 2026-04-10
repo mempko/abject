@@ -1842,8 +1842,8 @@ export class PeerRegistry extends Abject {
     super.checkInvariants();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## PeerRegistry Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## PeerRegistry Usage Guide
 
 ### Add a contact
 

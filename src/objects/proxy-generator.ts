@@ -461,8 +461,8 @@ RULES:
     this.proxyMeta.clear();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## ProxyGenerator Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## ProxyGenerator Usage Guide
 
 ### Generate a proxy between two objects
 

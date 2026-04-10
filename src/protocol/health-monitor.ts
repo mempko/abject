@@ -736,8 +736,8 @@ export class HealthMonitor extends Abject {
     this.health.clear();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## HealthMonitor Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## HealthMonitor Usage Guide
 
 ### Monitor an object's liveness
 

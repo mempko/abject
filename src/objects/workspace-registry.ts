@@ -39,12 +39,11 @@ export class WorkspaceRegistry extends Registry {
    * Override ask catalog: include both workspace and global registry objects
    * so the LLM-based ask handler can see system capabilities like ShellExecutor.
    */
-  protected override getSourceForAsk(): string | undefined {
-    const local = super.getSourceForAsk() ?? '';
+  protected override askPrompt(_question: string): string {
+    const local = super.askPrompt(_question);
     if (!this.fallbackRegistryId) return local;
 
     // Append a note that global objects are discoverable via the fallback.
-    // The actual catalog is fetched asynchronously in getSourceForAskAsync().
     return local + (this._globalCatalogCache
       ? `\n## System Capabilities (global registry)\n\n${this._globalCatalogCache}`
       : '');

@@ -62,8 +62,8 @@ export class ModalDialog extends Abject {
     this.setupHandlers();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## ModalDialog Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## ModalDialog Usage Guide
 
 ModalDialog is an ephemeral confirmation dialog with a backdrop overlay.
 It is spawned on demand, shows a modal prompt, and returns the user's choice.

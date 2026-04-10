@@ -100,8 +100,8 @@ export class PeerNetwork extends Abject {
     this.setupHandlers();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## PeerNetwork Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## PeerNetwork Usage Guide
 
 PeerNetwork is the peer network management UI. It provides a modal window
 for managing your identity, signaling servers, and contacts.

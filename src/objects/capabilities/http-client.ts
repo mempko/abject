@@ -517,8 +517,8 @@ export class HttpClient extends Abject {
     this.deniedDomains.add(domain);
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## HttpClient Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## HttpClient Usage Guide
 
 ### GET Request
 

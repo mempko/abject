@@ -130,8 +130,8 @@ export class ThemeAbject extends Abject {
     }
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## Theme Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## Theme Usage Guide
 
 ### Getting the Current Theme
 

@@ -166,8 +166,8 @@ export class SkillRegistry extends Abject {
     log.info(`Initialized with ${this.skills.size} skills in ${this.skillsDir}`);
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## SkillRegistry Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## SkillRegistry Usage Guide
 
 SkillRegistry manages the lifecycle of skills (SKILL.md files). It scans the
 skills directory, handles enable/disable state, configuration (env vars), and

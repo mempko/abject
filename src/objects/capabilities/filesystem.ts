@@ -442,8 +442,8 @@ export class FileSystem extends Abject {
     return this.getEntry(path) !== undefined;
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## FileSystem Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## FileSystem Usage Guide
 
 ### Write a File
 

@@ -462,7 +462,15 @@ export class ObjectCreator extends Abject {
           return await this.modifyObject(objectId as AbjectId, description, callerId);
         }
         log.info(`executeTask create`);
-        return await this.createObject(description, undefined, callerId);
+        // If the task data includes a role hint (from AgentCreator decomposition),
+        // pass it as context so Phase 1 picks the right pattern.
+        const roleContextMap: Record<string, string> = {
+          agent: 'This object MUST follow the Agent Object pattern: register with AgentAbject, implement executeTask/agentObserve/agentAct handlers, use tags ["agent", "autostart"].',
+          scheduler: 'This object MUST follow the Scheduler Object pattern: use Timer for periodic ticking, submit Jobs via JobManager.submitJob when triggers fire (NEVER call GoalManager directly), use tags ["scheduler", "autostart"].',
+          watcher: 'This object MUST follow the Event Watcher Object pattern: observe other objects via addDependent, submit Jobs via JobManager.submitJob when events match (NEVER call GoalManager directly), use tags ["watcher", "autostart"].',
+        };
+        const roleContext = data?.role ? roleContextMap[data.role as string] : undefined;
+        return await this.createObject(description, roleContext, callerId);
       } finally {
         this._currentGoalId = undefined;
       }
@@ -568,10 +576,8 @@ Available actions (output ONE JSON object per turn):
 Always begin by executing create_object. After it completes, report done or fail.`;
   }
 
-  protected override getAskTier(): string { return 'balanced'; }
-
-  protected override getSourceForAsk(): string | undefined {
-    return `## ObjectCreator — Object Creation and Modification Agent
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## ObjectCreator — Object Creation and Modification Agent
 
 ### What I Handle
 I create brand-new objects and modify existing ones from natural language descriptions.
@@ -625,6 +631,10 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
 - The returned objectId is ready to use immediately. Do NOT look it up in the registry or call init().
 - The returned objectId can be called directly — interface IDs are resolved automatically.
 - Pass goalId to link creation progress to an existing Goal (from GoalManager). If omitted, a goal is auto-created by AgentAbject.`;
+  }
+
+  protected override async handleAsk(question: string): Promise<string> {
+    return this.askLlm(this.askPrompt(question), question, 'fast');
   }
 
   /**
@@ -954,6 +964,10 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
       '1. HttpClient (+ WebParser for HTML) -- DEFAULT for fetching web content: news sites, RSS feeds, APIs, HTML scraping.\n' +
       '2. WebBrowser -- for pages that require JavaScript rendering or interactive control.\n' +
       '3. WebAgent -- for autonomous multi-step browsing with AI planning (very heavy).\n\n' +
+      'AUTONOMOUS PATTERN HIERARCHY:\n' +
+      '- If the request mentions scheduling, recurring, periodic, daily, hourly, "every N minutes/hours", "at X time", cron, or timer-based behavior: include Timer, GoalManager, TupleSpace\n' +
+      '- If the request mentions "agent", autonomous task execution, or participating in task dispatch: include AgentAbject, GoalManager\n' +
+      '- If the request mentions watching, monitoring, reacting to events from other objects: include GoalManager, TupleSpace\n\n' +
       'Which registered objects should it depend on? Return just the object names, one per line. If no dependencies are needed, return "None".';
 
     try {
@@ -1450,6 +1464,22 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
               objectId: spawnResult.objectId, manifest, source: code, owner: this.id as string,
             })
           ).catch(err => log.warn('Failed to persist:', err));
+        }
+
+        // Auto-start objects tagged 'autostart' or 'agent' so they register
+        // with their dependencies (e.g. AgentAbject) immediately after creation,
+        // not just on restore.
+        const tags = manifest.tags ?? [];
+        if (spawnResult.objectId && (tags.includes('autostart') || tags.includes('agent'))) {
+          try {
+            await this.request(
+              request(this.id, spawnResult.objectId, 'startup', {}),
+              10000,
+            );
+            log.info(`Auto-started '${manifest.name}' after creation`);
+          } catch {
+            // Best effort — handler may not exist
+          }
         }
 
         this._currentCallerId = undefined;
@@ -2355,7 +2385,16 @@ Used objects: None
 
 ## Common Patterns
 
-There are TWO UI patterns. Choose the right one based on the user's request.
+Choose the pattern that best matches the user's request. Check autonomous patterns first.
+
+PATTERN SELECTION GUIDE:
+- User mentions "agent", "autonomous", "task executor" -> Agent Object
+- User mentions "schedule", "every N minutes/hours", "daily", "at X time", "recurring", "cron" -> Scheduler Object
+- User mentions "watch", "monitor", "when X changes", "trigger on event" -> Event Watcher Object
+- User wants custom graphics, games, animations -> Canvas Surface Object
+- User wants standard UI (forms, buttons, lists) -> Widget Object
+- User wants to fetch web content -> Web Data Object
+- User wants interactive web automation -> Web Automation Object
 
 ### Canvas Surface Objects (custom drawing, games, animations, visualizations)
 Use when the object draws graphics directly (games, charts, custom visuals).
@@ -2397,6 +2436,53 @@ WebBrowser provides a stateful page API: openPage → navigateTo → fill/click/
 
 ### Both patterns
 The system Taskbar automatically discovers objects with show + hide and adds launch buttons for them.
+
+### Agent Objects (autonomous task executors that participate in goal dispatch)
+Use when the user wants to create an agent that can claim and execute tasks from the TupleSpace.
+Agents register with AgentAbject and participate in the ask protocol for semantic task routing.
+Dependencies needed: AgentAbject (required), GoalManager (optional for goal tracking)
+Manifest tags MUST include: ['agent', 'autostart']
+Manifest MUST include these methods:
+- startup: registers the agent with AgentAbject (called automatically on restore)
+- executeTask: handles dispatched tasks from TupleSpace (receives goalId, description, data)
+- agentObserve: returns domain-specific observation for the observe-think-act loop
+- agentAct: executes an action chosen by the LLM during the act phase
+- taskResult: receives completed task results (ticketId, success, result/error)
+- agentPhaseChanged: receives phase transition notifications
+- agentIntermediateAction: handles intermediate actions (e.g. reply, decompose)
+- agentActionResult: handles action execution results
+- getState: returns current agent state
+Optional: show/hide for a status/config UI window
+
+### Scheduler Objects (periodic task creation via Timer)
+Use when the user wants tasks to run on a schedule (every N minutes/hours, or cron-like patterns).
+The scheduler uses Timer's setInterval to tick and creates goals + TupleSpace tasks on schedule.
+Dependencies needed: Timer (required), GoalManager (required), TupleSpace (required)
+Manifest tags MUST include: ['scheduler', 'autostart']
+Manifest MUST include these methods:
+- startup: starts the scheduling timer (called automatically on restore)
+- addSchedule: adds a new periodic schedule entry
+- removeSchedule: removes a schedule by ID
+- enableSchedule: enables a disabled schedule
+- disableSchedule: disables a schedule without removing it
+- timerFired: handles timer callbacks, checks which schedules are due, creates tasks
+- getState: returns current schedules with last run times
+Optional: show/hide for a schedule management UI window
+
+### Event Watcher Objects (event-triggered task creation)
+Use when the user wants tasks to run when specific events occur on other objects.
+The watcher observes other objects via addDependent and creates tasks when matching events fire.
+Dependencies needed: GoalManager (required), TupleSpace (required)
+Manifest tags MUST include: ['watcher', 'autostart']
+Manifest MUST include these methods:
+- startup: sets up observations on target objects (called automatically on restore)
+- addWatch: observe a named object for specific events (aspect filter)
+- removeWatch: stop watching by watch ID
+- enableWatch: enables a disabled watch
+- disableWatch: disables a watch without removing it
+- changed: receives events from observed objects, creates tasks when criteria match
+- getState: returns current watches with target names and filters
+Optional: show/hide for a watch management UI window
 
 ### Non-UI Objects
 Objects that only perform background work do NOT need show/hide.
@@ -2854,6 +2940,336 @@ Every object in the system supports the introspect protocol (abjects:introspect)
     { question: 'How do I subscribe to your events?' });
 
 Use this for dynamic composition — objects can learn about each other at runtime.
+
+## Complete Example: Agent Object (autonomous task executor)
+
+\`\`\`javascript
+({
+  _agentAbjectId: null,
+  _pendingTickets: null,
+  _registered: false,
+
+  async _registerAgent() {
+    if (this._registered) return;
+    this._pendingTickets = new Map();
+    this._agentAbjectId = await this.dep('AgentAbject');
+    await this.call(this._agentAbjectId, 'registerAgent', {
+      name: 'MyDomainAgent',
+      description: 'Handles tasks involving domain-specific work',
+      askDescription: 'I specialize in processing and summarizing data from external sources. I use HttpClient and WebParser to fetch and parse data, then format results for display.',
+      config: {
+        maxSteps: 15,
+        timeout: 180000,
+        terminalActions: {
+          done: { type: 'success', resultFields: ['result'] },
+          fail: { type: 'error', resultFields: ['reason'] },
+        },
+        intermediateActions: ['reply'],
+      },
+      canExecute: true,
+    });
+    this._registered = true;
+  },
+
+  async startup(msg) {
+    await this._registerAgent();
+  },
+
+  async show(msg) {
+    await this._registerAgent();
+    // Optional: create a status window here
+    return true;
+  },
+
+  async hide(msg) {
+    if (this._agentAbjectId) {
+      await this.call(this._agentAbjectId, 'unregisterAgent', {});
+      this._registered = false;
+    }
+    return true;
+  },
+
+  async executeTask(msg) {
+    const { goalId, description, data } = msg.payload;
+    const { ticketId } = await this.call(this._agentAbjectId, 'startTask', {
+      task: description,
+      systemPrompt: 'You are a specialist agent. Available actions: done(result), fail(reason), reply(message). Use done when the task is complete.',
+      goalId,
+      config: { maxSteps: 15, timeout: 180000 },
+    });
+    // Wait for result via ticket pattern
+    const result = await this._waitForTicket(ticketId, 190000);
+    return result;
+  },
+
+  async agentObserve(msg) {
+    const { taskId } = msg.payload;
+    // Return domain-specific observation for the LLM
+    return { observation: 'Ready to process. Describe the task and I will execute it.' };
+  },
+
+  async agentAct(msg) {
+    const { taskId, action } = msg.payload;
+    // Execute the LLM-chosen action
+    try {
+      if (action.action === 'done') {
+        return { success: true, data: action.result };
+      }
+      if (action.action === 'fail') {
+        return { success: false, error: action.reason || 'Task failed' };
+      }
+      // Handle custom intermediate actions here
+      return { success: true, data: { message: 'Action processed' } };
+    } catch (err) {
+      return { success: false, error: String(err) };
+    }
+  },
+
+  async taskResult(msg) {
+    const { ticketId, success, result, error } = msg.payload;
+    const pending = this._pendingTickets?.get(ticketId);
+    if (pending) {
+      this._pendingTickets.delete(ticketId);
+      pending.resolve({ success, result, error });
+    }
+  },
+
+  async agentPhaseChanged(msg) { },
+  async agentIntermediateAction(msg) { },
+  async agentActionResult(msg) { },
+
+  async _waitForTicket(ticketId, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._pendingTickets?.delete(ticketId);
+        reject(new Error('Ticket timeout'));
+      }, timeoutMs);
+      this._pendingTickets.set(ticketId, {
+        resolve: (val) => { clearTimeout(timer); resolve(val); },
+        reject: (err) => { clearTimeout(timer); reject(err); },
+      });
+    });
+  },
+
+  async getState(msg) {
+    return {
+      registered: this._registered,
+      pendingTickets: this._pendingTickets?.size ?? 0,
+    };
+  },
+})
+\`\`\`
+
+## Complete Example: Scheduler Object (periodic task creation)
+
+\`\`\`javascript
+({
+  _schedules: [],
+  _tickTimerId: null,
+  _tickIntervalMs: 60000,
+
+  async _startTicking() {
+    if (this._tickTimerId) return;
+    this._tickTimerId = await this.call(
+      this.dep('Timer'), 'setInterval',
+      { intervalMs: this._tickIntervalMs, data: { type: 'scheduleTick' } });
+  },
+
+  async _stopTicking() {
+    if (this._tickTimerId) {
+      await this.call(this.dep('Timer'), 'clearTimer', { timerId: this._tickTimerId });
+      this._tickTimerId = null;
+    }
+  },
+
+  async startup(msg) {
+    await this._startTicking();
+  },
+
+  async show(msg) {
+    await this._startTicking();
+    // Optional: create a schedule management window here
+    return true;
+  },
+
+  async hide(msg) {
+    await this._stopTicking();
+    return true;
+  },
+
+  async addSchedule(msg) {
+    const { description, intervalMs, taskDescription } = msg.payload;
+    const id = 'sched-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+    this._schedules.push({
+      id, description, intervalMs, taskDescription,
+      enabled: true, lastRun: 0, createdAt: Date.now(),
+    });
+    this.changed('schedulesUpdated', { schedules: this._schedules });
+    return { id };
+  },
+
+  async removeSchedule(msg) {
+    const { scheduleId } = msg.payload;
+    this._schedules = this._schedules.filter(s => s.id !== scheduleId);
+    this.changed('schedulesUpdated', { schedules: this._schedules });
+    return { success: true };
+  },
+
+  async enableSchedule(msg) {
+    const { scheduleId } = msg.payload;
+    const sched = this._schedules.find(s => s.id === scheduleId);
+    if (sched) sched.enabled = true;
+    this.changed('schedulesUpdated', { schedules: this._schedules });
+    return { success: !!sched };
+  },
+
+  async disableSchedule(msg) {
+    const { scheduleId } = msg.payload;
+    const sched = this._schedules.find(s => s.id === scheduleId);
+    if (sched) sched.enabled = false;
+    this.changed('schedulesUpdated', { schedules: this._schedules });
+    return { success: !!sched };
+  },
+
+  async timerFired(msg) {
+    const { data } = msg.payload;
+    if (!data || data.type !== 'scheduleTick') return;
+    const now = Date.now();
+    for (const sched of this._schedules) {
+      if (!sched.enabled) continue;
+      if (now - sched.lastRun < sched.intervalMs) continue;
+      // Submit a job that creates the goal and task
+      const taskDesc = JSON.stringify(sched.taskDescription);
+      const schedId = JSON.stringify(sched.id);
+      await this.call(this.dep('JobManager'), 'submitJob', {
+        description: 'Schedule: ' + sched.taskDescription,
+        code: 'const gm = await dep("GoalManager");'
+          + ' const ts = await dep("TupleSpace");'
+          + ' const { goalId } = await call(gm, "createGoal", { title: ' + taskDesc + ' });'
+          + ' await call(ts, "put", { namespace: goalId, fields: {'
+          + ' type: "task", status: "pending", goalId,'
+          + ' description: ' + taskDesc + ','
+          + ' data: { triggeredBy: "schedule", scheduleId: ' + schedId + ' },'
+          + ' } });'
+          + ' return { goalId };',
+      });
+      sched.lastRun = now;
+      this.changed('scheduleRan', { scheduleId: sched.id });
+    }
+  },
+
+  async getState(msg) {
+    return { schedules: this._schedules, ticking: !!this._tickTimerId };
+  },
+})
+\`\`\`
+
+## Complete Example: Event Watcher Object (event-triggered task creation)
+
+\`\`\`javascript
+({
+  _watches: [],
+
+  async _setupWatches() {
+    for (const watch of this._watches) {
+      if (!watch.enabled || watch.observing) continue;
+      try {
+        const targetId = await this.find(watch.targetName);
+        if (targetId) {
+          await this.call(targetId, 'addDependent', {});
+          watch.targetId = targetId;
+          watch.observing = true;
+        }
+      } catch { /* target may not exist yet */ }
+    }
+  },
+
+  async startup(msg) {
+    await this._setupWatches();
+  },
+
+  async show(msg) {
+    await this._setupWatches();
+    // Optional: create a watch management window here
+    return true;
+  },
+
+  async hide(msg) {
+    return true;
+  },
+
+  async addWatch(msg) {
+    const { targetName, aspectFilter, taskDescription } = msg.payload;
+    const id = 'watch-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+    const watch = {
+      id, targetName, targetId: null, aspectFilter, taskDescription,
+      enabled: true, observing: false, triggerCount: 0,
+    };
+    this._watches.push(watch);
+    // Try to start observing immediately
+    try {
+      const targetId = await this.find(targetName);
+      if (targetId) {
+        await this.call(targetId, 'addDependent', {});
+        watch.targetId = targetId;
+        watch.observing = true;
+      }
+    } catch { /* target may not exist yet */ }
+    this.changed('watchesUpdated', { watches: this._watches });
+    return { id, observing: watch.observing };
+  },
+
+  async removeWatch(msg) {
+    const { watchId } = msg.payload;
+    this._watches = this._watches.filter(w => w.id !== watchId);
+    this.changed('watchesUpdated', { watches: this._watches });
+    return { success: true };
+  },
+
+  async enableWatch(msg) {
+    const { watchId } = msg.payload;
+    const watch = this._watches.find(w => w.id === watchId);
+    if (watch) { watch.enabled = true; await this._setupWatches(); }
+    this.changed('watchesUpdated', { watches: this._watches });
+    return { success: !!watch };
+  },
+
+  async disableWatch(msg) {
+    const { watchId } = msg.payload;
+    const watch = this._watches.find(w => w.id === watchId);
+    if (watch) watch.enabled = false;
+    this.changed('watchesUpdated', { watches: this._watches });
+    return { success: !!watch };
+  },
+
+  async changed(msg) {
+    const { aspect, value } = msg.payload;
+    const senderId = msg.routing.from;
+    for (const watch of this._watches) {
+      if (!watch.enabled) continue;
+      if (watch.targetId !== senderId) continue;
+      if (watch.aspectFilter && watch.aspectFilter !== aspect) continue;
+      // Create a goal and task in TupleSpace
+      const { goalId } = await this.call(
+        this.dep('GoalManager'), 'createGoal',
+        { title: watch.taskDescription });
+      await this.call(
+        this.dep('TupleSpace'), 'put',
+        { namespace: goalId, fields: {
+          type: 'task', status: 'pending', goalId,
+          description: watch.taskDescription,
+          data: { triggeredBy: 'event', aspect, value, source: watch.targetName },
+        } });
+      watch.triggerCount++;
+      this.changed('watchTriggered', { watchId: watch.id, aspect, goalId });
+    }
+  },
+
+  async getState(msg) {
+    return { watches: this._watches };
+  },
+})
+\`\`\`
 
 ## Visual Inspection
 

@@ -341,28 +341,24 @@ export abstract class Abject {
   }
 
   /**
-   * Return source code for the ask handler. Override in ScriptableAbject.
+   * Build the system prompt for an ask question. Override to customize the
+   * context the LLM sees when answering questions about this object.
+   * Default: manifest description.
    */
-  protected getSourceForAsk(): string | undefined {
-    return undefined;
+  protected askPrompt(_question: string): string {
+    return `## System Model
+This is a message-passing object system called Abjects. Every object (Abject) has a mailbox, a manifest declaring its capabilities, and an ask handler for answering questions about itself. Objects communicate exclusively by sending messages to each other. The Registry knows about all objects in the system. Objects discover each other by asking the Registry, learn what other objects can do by sending them ask messages, then send messages to accomplish tasks. Every object is autonomous and processes messages from its mailbox sequentially.
+
+## About This Object
+${formatManifestAsDescription(this.manifest)}`;
   }
 
   /**
-   * Return the LLM tier for the ask handler. Override in subclasses that
-   * need better reasoning (e.g., agents that participate in task dispatch).
+   * Send a prompt + question to the LLM and return the response.
+   * Discovers LLM via Registry. Falls back to manifest description if unavailable.
+   * Reusable helper for any override that builds its own prompts.
    */
-  protected getAskTier(): string {
-    return 'fast';
-  }
-
-  /**
-   * Handle an 'ask' request: use LLM if available, else fall back to manifest description.
-   */
-  private async handleAsk(question: string): Promise<string> {
-    const manifestDesc = formatManifestAsDescription(this.manifest);
-    const source = this.getSourceForAsk();
-
-    // Try to discover LLM via Registry
+  protected async askLlm(systemPrompt: string, question: string, tier = 'fast'): Promise<string> {
     try {
       let regId = this.getRegistryId();
       if (!regId && this._parentId) {
@@ -374,45 +370,42 @@ export abstract class Abject {
             regId = id as AbjectId;
             this._registryId = regId;
           }
-        } catch {
-          // No registry available
-        }
+        } catch { /* No registry available */ }
       }
 
       if (regId) {
-        // Discover LLM via Registry
         const results = await this.request<Array<{ id: AbjectId }>>(
           request(this.id, regId, 'discover', { name: 'LLM' })
         );
 
         if (results && results.length > 0) {
           const llmId = results[0].id;
-
-          // Build context for LLM
-          let context = `Object manifest:\n${manifestDesc}`;
-          if (source) {
-            context += `\n\nObject source code:\n${source}`;
-          }
-
           const llmResult = await this.request<{ content: string }>(
             request(this.id, llmId, 'complete', {
               messages: [
-                { role: 'system', content: `You are "${this.manifest.name}": ${this.manifest.description}\nAnswer questions from your perspective as this object. Use the provided manifest and source code to give accurate, concise answers.\n\n${context}` },
+                { role: 'system', content: `You are "${this.manifest.name}": ${this.manifest.description}\n${systemPrompt}` },
                 { role: 'user', content: question },
               ],
-              options: { tier: this.getAskTier() },
+              options: { tier },
             }),
-            60000
+            60000,
           );
-
           return llmResult.content;
         }
       }
-    } catch {
-      // LLM not available or failed — fall back
-    }
+    } catch { /* LLM not available */ }
 
-    return `[No LLM available] ${manifestDesc}`;
+    return `[No LLM available] ${formatManifestAsDescription(this.manifest)}`;
+  }
+
+  /**
+   * Handle an 'ask' request. Override for custom behavior (e.g., querying
+   * Registry to discover which objects can help before answering).
+   * Default: build prompt via askPrompt(), send to LLM via askLlm().
+   */
+  protected async handleAsk(question: string): Promise<string> {
+    const prompt = this.askPrompt(question);
+    return this.askLlm(prompt, question);
   }
 
   /**

@@ -306,8 +306,8 @@ export class WebParser extends Abject {
     };
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## WebParser Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## WebParser Usage Guide
 
 ### Query HTML with CSS Selector
 

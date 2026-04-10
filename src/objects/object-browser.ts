@@ -180,8 +180,8 @@ export class ObjectBrowser extends Abject {
     this.systemRegistryId = await this.discoverDep('Registry') ?? undefined;
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## ObjectBrowser Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## ObjectBrowser Usage Guide
 
 ObjectBrowser is a Smalltalk-inspired four-pane Abject explorer for inspecting
 and interacting with all objects in the system.

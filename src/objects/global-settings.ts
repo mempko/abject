@@ -207,8 +207,8 @@ export class GlobalSettings extends Abject {
     this.setupHandlers();
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## GlobalSettings Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## GlobalSettings Usage Guide
 
 Interface: abjects:global-settings
 

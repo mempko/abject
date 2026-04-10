@@ -192,8 +192,8 @@ export class Factory extends Abject {
     });
   }
 
-  protected override getSourceForAsk(): string | undefined {
-    return `## Factory Usage Guide
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## Factory Usage Guide
 
 ### Methods
 - \`spawn({ manifest, source?, code?, owner?, parentId? })\` — Spawn a new object. If a constructor is registered for the manifest name, uses that. If source is provided and manifest.tags includes 'composite', creates a CompositeAbject from a JSON CompositeSpec. If source is provided without the composite tag, creates a ScriptableAbject. Returns { objectId, status }.

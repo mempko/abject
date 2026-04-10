@@ -98,10 +98,8 @@ export class SkillAgent extends Abject {
     log.info('Registered with AgentAbject');
   }
 
-  protected override getAskTier(): string { return 'balanced'; }
-
-  protected override getSourceForAsk(): string | undefined {
-    return `## SkillAgent — Installed Skill Execution Agent
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## SkillAgent — Installed Skill Execution Agent
 
 ### What I Handle
 I execute tasks that match an installed and enabled skill. Each skill has a specific domain
@@ -116,7 +114,11 @@ ${this.getInstalledSkillsSummary()}
 - Creating new objects from scratch
 - Any task outside the domains of installed skills
 
-If no installed skill matches the task, my confidence is 0.`;
+When asked about a task, describe which skill you would use and how. Say CANNOT if no installed skill matches the task.`;
+  }
+
+  protected override async handleAsk(question: string): Promise<string> {
+    return this.askLlm(this.askPrompt(question), question, 'fast');
   }
 
   private getInstalledSkillsSummary(): string {
