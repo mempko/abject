@@ -678,8 +678,8 @@ Task descriptions are how agents decide whether they can handle a task. Focus on
 - Describe the desired outcome, not just the problem (e.g., "Add a reset button to the Counter that sets the count back to zero")
 - For web tasks, mention that it involves a real website (e.g., "Browse https://example.com and extract the article text")
 - For new functionality, describe what it should do without dictating how (e.g., "Display a todo list with add, remove, and mark-complete functionality")
-- When the user says "agent", preserve that word in the task description. An agent is an autonomous entity that registers with the system and can handle tasks on its own. Say "Create an agent that..." not "Create an object that..."
-- NEVER write "Create an Abjects object called..." in task descriptions. Describe the desired behavior and let the system decide the implementation.
+- When the user says "agent", preserve that word in the task description. An agent is an autonomous entity that registers with the system and can handle tasks on its own. Prefer "Create an agent that..." over "Create an object that..."
+- Describe the desired behavior and let the system decide the implementation. Prefer "Display a morning briefing in chat every day at 10am" over "Create an Abjects object called MorningBriefing that uses setInterval..."
 
 ## Assumption Checking
 
@@ -704,7 +704,7 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
 6. If a goal's tasks fail, you can retry by creating a new goal with a simpler task description. If it fails repeatedly, use "done" to tell the user what happened.
 7. P2P: Resolve remote objects by qualified name: this.find('peer.workspace.ObjectName'). Always use find() for dynamic ID resolution.
 8. When the user reveals personal facts (where they live, their name, preferences, job, etc.), save them using **remember** so you can recall them in future conversations.
-9. NEVER write shell commands (curl, wget, etc.) in task descriptions. Describe the desired outcome (e.g., "Fetch the weather data from wttr.in for Silverdale, WA") and let agents decide how to accomplish it.`;
+9. Task descriptions should describe the desired outcome and timing, letting agents decide implementation. Example: "Post a weather briefing to chat every day at 10:30 AM" is better than "Use setInterval to check the time every minute".`;
   }
 
   // ═══════════════════════════════════════════════════════════════════

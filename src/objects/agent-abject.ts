@@ -1029,7 +1029,7 @@ in the question, leading to more accurate confidence ratings.
     }
 
     // 2. Ask each agent how they would accomplish the task (in parallel)
-    let askQuestion = `How would you accomplish this task? Describe your approach briefly (1-3 sentences), or say CANNOT if this is outside your expertise.\nTask: "${description.slice(0, 300)}"`;
+    let askQuestion = `How would you accomplish this task? Describe your approach briefly (1-3 sentences), or say PASS if this is outside your scope.\nTask: "${description.slice(0, 300)}"`;
     if (failureHistory.length > 0) {
       const failSummary = failureHistory.map(f => `- ${f.agent}: ${f.error}`).join('\n');
       askQuestion += `\nPrevious attempts failed:\n${failSummary}`;
@@ -1045,17 +1045,20 @@ in the question, leading to more accurate confidence ratings.
           const text = typeof answer === 'string' ? answer : String(answer);
           return { agent, approach: text };
         } catch {
-          return { agent, approach: 'CANNOT' };
+          return { agent, approach: 'PASS' };
         }
       })
     );
 
-    // Filter out agents that said CANNOT
-    const viable = approaches.filter(a =>
-      !a.approach.toUpperCase().startsWith('CANNOT')
-      && !a.approach.toUpperCase().startsWith('I CANNOT')
-      && a.approach.trim().length > 0
-    );
+    // Filter out agents that passed on the task
+    const viable = approaches.filter(a => {
+      const upper = a.approach.toUpperCase().trim();
+      return upper.length > 0
+        && !upper.startsWith('PASS')
+        && !upper.startsWith('I PASS')
+        && !upper.startsWith('CANNOT')
+        && !upper.startsWith('I CANNOT');
+    });
 
     if (viable.length === 0) {
       log.info(`DISPATCH-INNER ${tupleId} — no agent can handle: ${description.slice(0, 60)}`);

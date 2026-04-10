@@ -2446,11 +2446,12 @@ Manifest MUST include these methods:
 - startup: registers the agent with AgentAbject (called automatically on restore)
 - executeTask: handles dispatched tasks from TupleSpace (receives goalId, description, data)
 - agentObserve: returns domain-specific observation for the observe-think-act loop
-- agentAct: executes an action chosen by the LLM during the act phase
+- agentAct: executes an action chosen by the LLM during the act phase. ALL domain actions (fetching data, posting messages, etc.) MUST be handled here. Return { success, data } or { success: false, error }.
 - taskResult: receives completed task results (ticketId, success, result/error)
 - agentPhaseChanged: receives phase transition notifications
 - agentIntermediateAction: handles intermediate actions (e.g. reply, decompose)
 - agentActionResult: handles action execution results
+IMPORTANT: intermediateActions in the config must ONLY contain 'reply'. Domain-specific actions (fetch, post, process, etc.) are executed via agentAct, not as intermediate actions. Intermediate actions skip execution entirely.
 - getState: returns current agent state
 Optional: show/hide for a status/config UI window
 
@@ -2943,28 +2944,37 @@ Use this for dynamic composition — objects can learn about each other at runti
 
 ## Complete Example: Agent Object (autonomous task executor)
 
+An agent registers with AgentAbject, receives tasks via executeTask, and uses the
+observe-think-act loop to accomplish work. The LLM chooses actions, and agentAct
+executes them by sending messages to other objects.
+
+CRITICAL: intermediateActions MUST only contain 'reply'. ALL domain actions (fetching
+data, posting messages, processing, etc.) are executed through agentAct. If you put
+domain actions in intermediateActions, they will be SKIPPED entirely.
+
 \`\`\`javascript
 ({
   _agentAbjectId: null,
   _pendingTickets: null,
   _registered: false,
+  _lastResult: null,
 
   async _registerAgent() {
     if (this._registered) return;
     this._pendingTickets = new Map();
     this._agentAbjectId = await this.dep('AgentAbject');
     await this.call(this._agentAbjectId, 'registerAgent', {
-      name: 'MyDomainAgent',
-      description: 'Handles tasks involving domain-specific work',
-      askDescription: 'I specialize in processing and summarizing data from external sources. I use HttpClient and WebParser to fetch and parse data, then format results for display.',
+      name: 'WeatherAgent',
+      description: 'Fetches weather data and posts reports to chat',
+      askDescription: 'I fetch weather data for any location and post formatted reports. I send messages to HttpClient for API requests and Chat for posting results.',
       config: {
-        maxSteps: 15,
-        timeout: 180000,
+        maxSteps: 10,
+        timeout: 120000,
         terminalActions: {
           done: { type: 'success', resultFields: ['result'] },
           fail: { type: 'error', resultFields: ['reason'] },
         },
-        intermediateActions: ['reply'],
+        intermediateActions: ['reply'],  // ONLY 'reply' here. Never add domain actions.
       },
       canExecute: true,
     });
@@ -2975,52 +2985,81 @@ Use this for dynamic composition — objects can learn about each other at runti
     await this._registerAgent();
   },
 
-  async show(msg) {
-    await this._registerAgent();
-    // Optional: create a status window here
-    return true;
-  },
-
-  async hide(msg) {
-    if (this._agentAbjectId) {
-      await this.call(this._agentAbjectId, 'unregisterAgent', {});
-      this._registered = false;
-    }
-    return true;
-  },
-
   async executeTask(msg) {
-    const { goalId, description, data } = msg.payload;
+    const { goalId, description, data, approach } = msg.payload;
     const { ticketId } = await this.call(this._agentAbjectId, 'startTask', {
       task: description,
-      systemPrompt: 'You are a specialist agent. Available actions: done(result), fail(reason), reply(message). Use done when the task is complete.',
+      systemPrompt: \`You are a weather agent. Execute actions to fetch weather and post results.
+
+Available actions (executed via agentAct):
+- fetchWeather(location): Fetch current weather for a location
+- postToChat(message): Post a formatted message to the chat
+- done(result): Task complete, include the final summary
+- fail(reason): Task failed
+
+Steps: fetchWeather -> postToChat -> done. Keep it concise.\`,
       goalId,
-      config: { maxSteps: 15, timeout: 180000 },
+      initialMessages: approach
+        ? [{ role: 'user', content: 'Task: ' + description },
+           { role: 'assistant', content: 'I will: ' + approach }]
+        : undefined,
+      config: { maxSteps: 10, timeout: 120000 },
     });
-    // Wait for result via ticket pattern
-    const result = await this._waitForTicket(ticketId, 190000);
+    const result = await this._waitForTicket(ticketId, 130000);
     return result;
   },
 
   async agentObserve(msg) {
-    const { taskId } = msg.payload;
-    // Return domain-specific observation for the LLM
-    return { observation: 'Ready to process. Describe the task and I will execute it.' };
+    // Return current state so the LLM knows what has been done
+    return {
+      observation: this._lastResult
+        ? 'Last action result: ' + JSON.stringify(this._lastResult)
+        : 'Ready. Use fetchWeather to get data, then postToChat to deliver it.',
+    };
   },
 
   async agentAct(msg) {
-    const { taskId, action } = msg.payload;
-    // Execute the LLM-chosen action
+    const { action } = msg.payload;
+    // agentAct is where ALL domain work happens.
+    // The LLM picks an action, and this handler executes it
+    // by sending messages to other objects.
     try {
+      if (action.action === 'fetchWeather') {
+        const location = action.location || 'Silverdale,WA';
+        const resp = await this.call(
+          this.dep('HttpClient'), 'get',
+          { url: 'https://wttr.in/' + encodeURIComponent(location) + '?format=j1' }
+        );
+        const data = JSON.parse(resp.body);
+        const current = data.current_condition?.[0];
+        this._lastResult = {
+          tempF: current?.temp_F, condition: current?.weatherDesc?.[0]?.value,
+          humidity: current?.humidity, windMph: current?.windspeedMiles,
+        };
+        return { success: true, data: this._lastResult };
+      }
+
+      if (action.action === 'postToChat') {
+        const chatId = await this.find('Chat');
+        if (chatId) {
+          await this.call(chatId, 'addNotification', {
+            sender: 'WeatherAgent',
+            message: action.message || JSON.stringify(this._lastResult),
+          });
+        }
+        return { success: true, data: { posted: true } };
+      }
+
       if (action.action === 'done') {
         return { success: true, data: action.result };
       }
       if (action.action === 'fail') {
         return { success: false, error: action.reason || 'Task failed' };
       }
-      // Handle custom intermediate actions here
-      return { success: true, data: { message: 'Action processed' } };
+
+      return { success: false, error: 'Unknown action: ' + action.action };
     } catch (err) {
+      this._lastResult = { error: String(err) };
       return { success: false, error: String(err) };
     }
   },
@@ -3052,221 +3091,100 @@ Use this for dynamic composition — objects can learn about each other at runti
   },
 
   async getState(msg) {
-    return {
-      registered: this._registered,
-      pendingTickets: this._pendingTickets?.size ?? 0,
-    };
+    return { registered: this._registered };
   },
 })
 \`\`\`
 
 ## Complete Example: Scheduler Object (periodic task creation)
 
+Uses the built-in Scheduler object to register schedules. The Scheduler handles
+persistence, enable/disable, and fires jobs via JobManager. On startup, register
+the schedule with Scheduler.addSchedule or Scheduler.addScheduleAt.
+
 \`\`\`javascript
 ({
-  _schedules: [],
-  _tickTimerId: null,
-  _tickIntervalMs: 60000,
-
-  async _startTicking() {
-    if (this._tickTimerId) return;
-    this._tickTimerId = await this.call(
-      this.dep('Timer'), 'setInterval',
-      { intervalMs: this._tickIntervalMs, data: { type: 'scheduleTick' } });
-  },
-
-  async _stopTicking() {
-    if (this._tickTimerId) {
-      await this.call(this.dep('Timer'), 'clearTimer', { timerId: this._tickTimerId });
-      this._tickTimerId = null;
-    }
-  },
+  _scheduleId: null,
 
   async startup(msg) {
-    await this._startTicking();
-  },
-
-  async show(msg) {
-    await this._startTicking();
-    // Optional: create a schedule management window here
+    if (this._scheduleId) return true;
+    // Register a daily schedule at 6:00 AM Pacific Time
+    const { scheduleId } = await this.call(
+      this.dep('Scheduler'), 'addScheduleAt', {
+        description: 'Daily news digest at 6:00 AM PT',
+        hour: 6,
+        minute: 0,
+        timezone: 'America/Los_Angeles',
+        // jobCode runs in JobManager sandbox with access to call, dep, find
+        jobCode: [
+          'const gm = await dep("GoalManager");',
+          'const { goalId } = await call(gm, "createGoal", { title: "Daily news digest" });',
+          'await call(gm, "addTask", { goalId, description: "Fetch top news headlines and post a summary to chat" });',
+          'return { goalId };',
+        ].join(' '),
+      }
+    );
+    this._scheduleId = scheduleId;
     return true;
-  },
-
-  async hide(msg) {
-    await this._stopTicking();
-    return true;
-  },
-
-  async addSchedule(msg) {
-    const { description, intervalMs, taskDescription } = msg.payload;
-    const id = 'sched-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
-    this._schedules.push({
-      id, description, intervalMs, taskDescription,
-      enabled: true, lastRun: 0, createdAt: Date.now(),
-    });
-    this.changed('schedulesUpdated', { schedules: this._schedules });
-    return { id };
-  },
-
-  async removeSchedule(msg) {
-    const { scheduleId } = msg.payload;
-    this._schedules = this._schedules.filter(s => s.id !== scheduleId);
-    this.changed('schedulesUpdated', { schedules: this._schedules });
-    return { success: true };
-  },
-
-  async enableSchedule(msg) {
-    const { scheduleId } = msg.payload;
-    const sched = this._schedules.find(s => s.id === scheduleId);
-    if (sched) sched.enabled = true;
-    this.changed('schedulesUpdated', { schedules: this._schedules });
-    return { success: !!sched };
-  },
-
-  async disableSchedule(msg) {
-    const { scheduleId } = msg.payload;
-    const sched = this._schedules.find(s => s.id === scheduleId);
-    if (sched) sched.enabled = false;
-    this.changed('schedulesUpdated', { schedules: this._schedules });
-    return { success: !!sched };
-  },
-
-  async timerFired(msg) {
-    const { data } = msg.payload;
-    if (!data || data.type !== 'scheduleTick') return;
-    const now = Date.now();
-    for (const sched of this._schedules) {
-      if (!sched.enabled) continue;
-      if (now - sched.lastRun < sched.intervalMs) continue;
-      // Submit a job that creates the goal and task
-      const taskDesc = JSON.stringify(sched.taskDescription);
-      const schedId = JSON.stringify(sched.id);
-      await this.call(this.dep('JobManager'), 'submitJob', {
-        description: 'Schedule: ' + sched.taskDescription,
-        code: 'const gm = await dep("GoalManager");'
-          + ' const ts = await dep("TupleSpace");'
-          + ' const { goalId } = await call(gm, "createGoal", { title: ' + taskDesc + ' });'
-          + ' await call(ts, "put", { namespace: goalId, fields: {'
-          + ' type: "task", status: "pending", goalId,'
-          + ' description: ' + taskDesc + ','
-          + ' data: { triggeredBy: "schedule", scheduleId: ' + schedId + ' },'
-          + ' } });'
-          + ' return { goalId };',
-      });
-      sched.lastRun = now;
-      this.changed('scheduleRan', { scheduleId: sched.id });
-    }
   },
 
   async getState(msg) {
-    return { schedules: this._schedules, ticking: !!this._tickTimerId };
+    return { scheduleId: this._scheduleId };
   },
 })
 \`\`\`
 
 ## Complete Example: Event Watcher Object (event-triggered task creation)
 
+Watches other objects for events and creates goals when events match.
+Uses addDependent to subscribe to target objects and receives changed messages.
+NOTE: The handler for receiving events from observed objects must be named
+'changed' -- this is the standard observer pattern message name.
+
 \`\`\`javascript
 ({
-  _watches: [],
-
-  async _setupWatches() {
-    for (const watch of this._watches) {
-      if (!watch.enabled || watch.observing) continue;
-      try {
-        const targetId = await this.find(watch.targetName);
-        if (targetId) {
-          await this.call(targetId, 'addDependent', {});
-          watch.targetId = targetId;
-          watch.observing = true;
-        }
-      } catch { /* target may not exist yet */ }
-    }
-  },
+  _targetId: null,
+  _targetName: 'KnowledgeBase',
+  _aspectFilter: 'entryAdded',
+  _triggerCount: 0,
 
   async startup(msg) {
-    await this._setupWatches();
+    await this._observe();
   },
 
-  async show(msg) {
-    await this._setupWatches();
-    // Optional: create a watch management window here
-    return true;
-  },
-
-  async hide(msg) {
-    return true;
-  },
-
-  async addWatch(msg) {
-    const { targetName, aspectFilter, taskDescription } = msg.payload;
-    const id = 'watch-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
-    const watch = {
-      id, targetName, targetId: null, aspectFilter, taskDescription,
-      enabled: true, observing: false, triggerCount: 0,
-    };
-    this._watches.push(watch);
-    // Try to start observing immediately
+  async _observe() {
+    if (this._targetId) return;
     try {
-      const targetId = await this.find(targetName);
+      const targetId = await this.find(this._targetName);
       if (targetId) {
         await this.call(targetId, 'addDependent', {});
-        watch.targetId = targetId;
-        watch.observing = true;
+        this._targetId = targetId;
       }
     } catch { /* target may not exist yet */ }
-    this.changed('watchesUpdated', { watches: this._watches });
-    return { id, observing: watch.observing };
   },
 
-  async removeWatch(msg) {
-    const { watchId } = msg.payload;
-    this._watches = this._watches.filter(w => w.id !== watchId);
-    this.changed('watchesUpdated', { watches: this._watches });
-    return { success: true };
-  },
-
-  async enableWatch(msg) {
-    const { watchId } = msg.payload;
-    const watch = this._watches.find(w => w.id === watchId);
-    if (watch) { watch.enabled = true; await this._setupWatches(); }
-    this.changed('watchesUpdated', { watches: this._watches });
-    return { success: !!watch };
-  },
-
-  async disableWatch(msg) {
-    const { watchId } = msg.payload;
-    const watch = this._watches.find(w => w.id === watchId);
-    if (watch) watch.enabled = false;
-    this.changed('watchesUpdated', { watches: this._watches });
-    return { success: !!watch };
-  },
-
+  // Receives events from observed objects (standard observer pattern)
   async changed(msg) {
     const { aspect, value } = msg.payload;
     const senderId = msg.routing.from;
-    for (const watch of this._watches) {
-      if (!watch.enabled) continue;
-      if (watch.targetId !== senderId) continue;
-      if (watch.aspectFilter && watch.aspectFilter !== aspect) continue;
-      // Create a goal and task in TupleSpace
-      const { goalId } = await this.call(
-        this.dep('GoalManager'), 'createGoal',
-        { title: watch.taskDescription });
-      await this.call(
-        this.dep('TupleSpace'), 'put',
-        { namespace: goalId, fields: {
-          type: 'task', status: 'pending', goalId,
-          description: watch.taskDescription,
-          data: { triggeredBy: 'event', aspect, value, source: watch.targetName },
-        } });
-      watch.triggerCount++;
-      this.changed('watchTriggered', { watchId: watch.id, aspect, goalId });
-    }
+    if (senderId !== this._targetId) return;
+    if (this._aspectFilter && this._aspectFilter !== aspect) return;
+
+    // Create a goal with a task for agents to handle
+    const gm = this.dep('GoalManager');
+    const { goalId } = await this.call(gm, 'createGoal', {
+      title: 'Respond to ' + this._targetName + ' ' + aspect,
+    });
+    await this.call(gm, 'addTask', {
+      goalId,
+      description: 'Process ' + aspect + ' event from ' + this._targetName,
+      data: { triggeredBy: 'event', aspect, value, source: this._targetName },
+    });
+    this._triggerCount++;
   },
 
   async getState(msg) {
-    return { watches: this._watches };
+    return { targetName: this._targetName, observing: !!this._targetId, triggerCount: this._triggerCount };
   },
 })
 \`\`\`

@@ -92,10 +92,8 @@ Examples of tasks I handle well:
 - Any task that can be accomplished by sending messages to existing objects
 - Multi-step workflows chaining messages across multiple objects
 
-### What I Do NOT Handle
-- Creating brand-new objects from scratch
-- Browsing websites or navigating web pages
-- Tasks specific to an installed skill's domain
+### My Scope
+I work exclusively with objects that already exist in the system. I discover them, learn their capabilities, and orchestrate them via messages. Tasks that require generating new code, browsing websites, or installed skill domains belong to other agents.
 
 ### How I Work
 1. Ask the Registry which objects can help
@@ -104,7 +102,7 @@ Examples of tasks I handle well:
 4. Chain results across multiple objects if needed
 
 When asked about a task, describe which objects you would message and what you would ask them to do.
-Say CANNOT if the task involves creating, building, or making something new (apps, widgets, simulations, games, tools, agents). I can only interact with objects that already exist, not generate new code or spawn new objects.`;
+Say PASS if the task involves creating, building, or making something new (apps, widgets, simulations, games, tools, agents) since those require generating new code.`;
   }
 
   protected override async handleAsk(question: string): Promise<string> {

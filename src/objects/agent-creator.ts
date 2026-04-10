@@ -98,19 +98,15 @@ Examples of tasks I handle well:
 - "Create an agent that monitors weather and alerts on storms"
 - Any task containing the word "agent" that involves creating new autonomous behavior
 
-### What I Do NOT Handle
-- Creating regular GUI widgets or apps (no agent behavior)
-- Modifying existing objects
-- Browsing websites
-- One-time data fetches or API calls
-- Simple greetings or conversations
+### My Scope
+I create autonomous agents, scheduled agents, and event watchers. Tasks about modifying existing objects, regular widget/app creation, or one-time data fetches belong to other agents.
 
 ### How I Work
 1. Decompose the request into sub-tasks via the goal system
 2. Each sub-task creates a new object (agent, scheduler, or watcher)
 3. Monitor child goal progress, report done when all complete
 
-When asked about a task, describe how you would decompose it into agent/scheduler/watcher sub-tasks. Say CANNOT if the task is about modifying existing objects, regular widget creation, or calling existing objects.`;
+When asked about a task, describe how you would decompose it into agent/scheduler/watcher sub-tasks. Say PASS if the task is about modifying existing objects, regular widget creation, or calling existing objects.`;
   }
 
   protected override async handleAsk(question: string): Promise<string> {
@@ -309,6 +305,8 @@ Tasks without dependsOn run in parallel. Tasks with dependsOn wait until all lis
 - Each sub-task creates exactly one object
 - Schedulers and watchers MUST use JobManager.submitJob in their trigger handlers, never call GoalManager directly
 - When one sub-task depends on another (e.g. scheduler needs agent to exist), use dependsOn
+- Agents do work, schedulers trigger work. Always decompose timed tasks into separate agent + scheduler sub-tasks. The system has a built-in Scheduler object for all timed triggers.
+- When the request involves a specific time or recurring schedule, create at least two sub-tasks: one for the agent (role=agent) and one for the scheduler (role=scheduler, dependsOn the agent)
 
 ## Output Format
 

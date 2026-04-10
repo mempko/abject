@@ -108,13 +108,10 @@ I execute tasks that match an installed and enabled skill. Each skill has a spec
 Currently installed skills and their domains:
 ${this.getInstalledSkillsSummary()}
 
-### What I Do NOT Handle
-- General object interaction or API calls
-- Web browsing or navigating websites
-- Creating new objects from scratch
-- Any task outside the domains of installed skills
+### My Scope
+I handle tasks that match an installed and enabled skill's domain. General object interaction, web browsing, and object creation belong to other agents.
 
-When asked about a task, describe which skill you would use and how. Say CANNOT if no installed skill matches the task.`;
+When asked about a task, describe which skill you would use and how. Say PASS if no installed skill matches the task.`;
   }
 
   protected override async handleAsk(question: string): Promise<string> {
