@@ -60,6 +60,10 @@ import { SkillRegistry } from '../src/objects/skill-registry.js';
 import { SkillBrowser } from '../src/objects/skill-browser.js';
 import { SkillAgent } from '../src/objects/skill-agent.js';
 import { ObjectAgent } from '../src/objects/object-agent.js';
+import { HttpServer } from '../src/objects/http-server.js';
+import { SharedState } from '../src/objects/capabilities/shared-state.js';
+import { WebAgent } from '../src/objects/web-agent.js';
+import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 
 if (!parentPort) {
   throw new Error('abject-worker-node.ts must be run inside a worker_threads Worker');
@@ -128,6 +132,10 @@ constructors.set('SkillRegistry', () => {
 constructors.set('SkillBrowser', () => new SkillBrowser());
 constructors.set('SkillAgent', () => new SkillAgent());
 constructors.set('ObjectAgent', () => new ObjectAgent());
+constructors.set('HttpServer', () => new HttpServer());
+constructors.set('SharedState', () => new SharedState());
+constructors.set('WebAgent', () => new WebAgent());
+constructors.set('WorkspaceBrowser', () => new WorkspaceBrowser());
 constructors.set('ScriptableAbject', (args?: unknown) => {
   const opts = args as { manifest: AbjectManifest; source: string; owner: string };
   return new ScriptableAbject(opts.manifest, opts.source, opts.owner as AbjectId);

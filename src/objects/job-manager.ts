@@ -5,53 +5,19 @@
  * order. The manager broadcasts events for observability (JobBrowser, Chat).
  */
 
-import * as vm from 'vm';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { require as contractRequire, requireNonEmpty } from '../core/contracts.js';
+import { validateCode, runSandboxed, SANDBOX_BUILTIN_NAMES } from '../core/sandbox.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('JobManager');
 
 const JOBMANAGER_INTERFACE: InterfaceId = 'abjects:job-manager';
 
-/**
- * Patterns that must never appear in job code. Jobs should only use the
- * provided `call`, `dep`, `find`, and `progress` helpers — never raw
- * Node.js APIs. This is defence-in-depth; the `new Function` call also
- * shadows these globals at runtime.
- */
-/**
- * Single source of truth for the safe built-ins exposed inside the job sandbox.
- * Used both to build the vm.createContext() and to generate the ask-protocol guide.
- */
-const SANDBOX_BUILTINS: Record<string, unknown> = {
-  Math, JSON, Date, Array, Object, String, Number, Boolean, RegExp,
-  Map, Set, Promise, Error, TypeError, RangeError,
-  parseInt, parseFloat, isNaN, isFinite,
-  encodeURIComponent, decodeURIComponent, encodeURI, decodeURI,
-  console: { log() {}, warn() {}, error() {} },
-};
-
-const SANDBOX_BUILTIN_NAMES = Object.keys(SANDBOX_BUILTINS).filter(k => k !== 'console');
-
-const BLOCKED_CODE_PATTERNS: { pattern: RegExp; label: string }[] = [
-  { pattern: /\brequire\s*\(/, label: 'require()' },
-  { pattern: /\bchild_process\b/, label: 'child_process' },
-  { pattern: /\bexecSync\b/, label: 'execSync' },
-  { pattern: /\bexecFile\b/, label: 'execFile' },
-  { pattern: /\bspawnSync\b/, label: 'spawnSync' },
-  { pattern: /\bprocess\s*\.\s*(exit|kill|env|execPath|binding)/, label: 'process.*' },
-  { pattern: /\bglobalThis\b/, label: 'globalThis' },
-  { pattern: /\bglobal\b/, label: 'global' },
-  { pattern: /\beval\s*\(/, label: 'eval()' },
-  { pattern: /\bnew\s+Function\s*\(/, label: 'new Function()' },
-  { pattern: /\bimport\s*\(/, label: 'dynamic import()' },
-  { pattern: /\bfetch\s*\(/, label: 'fetch()' },
-  { pattern: /\bXMLHttpRequest\b/, label: 'XMLHttpRequest' },
-  { pattern: /\bWebSocket\b/, label: 'WebSocket' },
-];
+// Sandbox builtins, blocked patterns, and execution are provided by core/sandbox.ts.
+// JobManager only supplies its own application-level context (call, dep, find, progress).
 
 export interface Job {
   id: string;
@@ -205,14 +171,13 @@ export class JobManager extends Abject {
       requireNonEmpty(code, 'code');
 
       // Defence-in-depth: reject code that tries to use raw Node.js APIs.
-      for (const { pattern, label } of BLOCKED_CODE_PATTERNS) {
-        if (pattern.test(code)) {
-          log.info(`BLOCKED job from ${msg.routing.from}: code contains '${label}'`);
-          throw new Error(
-            `Job code rejected: '${label}' is not allowed. ` +
-            `Use call(), dep(), and find() to discover and invoke system capabilities.`,
-          );
-        }
+      const validation = validateCode(code);
+      if (!validation.valid) {
+        log.info(`BLOCKED job from ${msg.routing.from}: code contains '${validation.blocked}'`);
+        throw new Error(
+          `Job code rejected: '${validation.blocked}' is not allowed. ` +
+          `Use call(), dep(), and find() to discover and invoke system capabilities.`,
+        );
       }
 
       const callerId = msg.routing.from;
@@ -409,24 +374,18 @@ export class JobManager extends Abject {
     const depFn = async (name: string) => this.requireDep(name);
     const findFn = async (name: string) => this.discoverDep(name);
 
-    // Airtight sandbox: only the 5 allowed helpers exist in the context.
-    // No require, fetch, process, globalThis, or any other Node.js globals.
-    const sandbox = vm.createContext({
+    const context = {
       call: callFn,
       dep: depFn,
       find: findFn,
       id: this.id,
       progress: progressFn,
-      ...SANDBOX_BUILTINS,
-    });
-
-    const script = new vm.Script(
-      `(async () => { ${code} })()`,
-      { filename: `job-${this.jobCounter}.js` },
-    );
+    };
 
     try {
-      return await script.runInContext(sandbox);
+      return await runSandboxed(code, context, {
+        filename: `job-${this.jobCounter}.js`,
+      });
     } finally {
       q.currentJobCallerId = undefined;
       q.currentCallMsgId = undefined;

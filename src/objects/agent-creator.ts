@@ -279,7 +279,7 @@ Tasks without dependsOn run in parallel. Tasks with dependsOn wait until all lis
 "Create an agent that tells me the weather every day at 6:30PM":
 \`\`\`json
 { "action": "decompose", "subtasks": [
-  { "description": "Create an agent that fetches current weather and top news, registers with AgentAbject with askDescription for weather/news tasks, and posts results to Chat via addNotification when it executes a task", "data": { "role": "agent", "additionalDeps": ["HttpClient", "WebParser"] } },
+  { "description": "Create an agent that fetches current weather and top news, registers with AgentAbject for weather/news tasks, and posts results to Chat via addNotification when it executes a task", "data": { "role": "agent", "additionalDeps": ["HttpClient", "WebParser"] } },
   { "description": "Create a scheduler that fires every day at 6:30PM PT and submits a Job via JobManager that creates a goal with a weather briefing task for agent dispatch", "data": { "role": "scheduler" }, "dependsOn": [0] }
 ], "reasoning": "Scheduler depends on agent existing first" }
 \`\`\`

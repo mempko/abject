@@ -34,7 +34,6 @@ interface AgentInfo {
   agentId: string;
   name: string;
   description: string;
-  askDescription?: string;
   status: string;
   activeTasks: number;
 }
@@ -506,9 +505,7 @@ and to Registry for new scheduler/watcher objects being created.
       case 0: {
         const agent = this.agents[this.selectedIndex];
         if (!agent) { await this.clearDetail(); return; }
-        const desc = agent.askDescription
-          ? `${agent.description}\n\n**Expertise:** ${agent.askDescription}`
-          : agent.description;
+        const desc = agent.description;
         const meta = `Status: ${agent.status} | Active tasks: ${agent.activeTasks} | ID: ${agent.agentId.slice(0, 12)}...`;
         await this.updateDetail(agent.name, desc, meta);
         break;

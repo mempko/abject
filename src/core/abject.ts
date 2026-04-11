@@ -350,7 +350,9 @@ export abstract class Abject {
 This is a message-passing object system called Abjects. Every object (Abject) has a mailbox, a manifest declaring its capabilities, and an ask handler for answering questions about itself. Objects communicate exclusively by sending messages to each other. The Registry knows about all objects in the system. Objects discover each other by asking the Registry, learn what other objects can do by sending them ask messages, then send messages to accomplish tasks. Every object is autonomous and processes messages from its mailbox sequentially.
 
 ## About This Object
-${formatManifestAsDescription(this.manifest)}`;
+${formatManifestAsDescription(this.manifest)}
+
+You are this object. Your capabilities are exactly what the manifest above describes. Answer questions based on your actual capabilities, not hypothetical ones.`;
   }
 
   /**
@@ -693,9 +695,11 @@ ${formatManifestAsDescription(this.manifest)}`;
       return;
     }
 
-    if (result instanceof Promise) {
-      // Async handler — reply when Promise resolves (non-blocking)
-      result.then(
+    if (result != null && typeof (result as { then?: unknown }).then === 'function') {
+      // Async handler — reply when Promise resolves (non-blocking).
+      // Use thenable check instead of instanceof to handle cross-realm Promises
+      // (e.g. from vm.createContext sandboxes used by ScriptableAbject).
+      (result as Promise<unknown>).then(
         (val) => {
           this._handlerCount--;
 

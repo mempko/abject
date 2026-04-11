@@ -9,9 +9,9 @@
  *     }
  *   })
  *
- * Handler functions are bound to the ScriptableAbject instance, giving them
- * access to this.call() for inter-object communication and this.dep() for
- * dependency lookup.
+ * Handler functions run in a sandboxed vm context. A `this`-proxy shim
+ * provides this.call(), this.dep(), this.find(), this.changed(), this.emit(),
+ * and this.observe() without exposing the real Abject instance or Node.js APIs.
  */
 
 import {
@@ -26,6 +26,7 @@ import { Abject, MessageHandlerFn } from '../core/abject.js';
 import { require as contractRequire } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { INTROSPECT_METHODS, INTROSPECT_EVENTS } from '../core/introspect.js';
+import { validateCode, compileSandboxed } from '../core/sandbox.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('ScriptableAbject');
@@ -158,6 +159,7 @@ export class ScriptableAbject extends Abject {
   protected override askPrompt(question: string): string {
     let prompt = super.askPrompt(question);
     if (this._source) prompt += '\n\nSource code:\n' + this._source;
+    prompt += '\n\nYou are this object. Your capabilities are exactly what the manifest and source code above describe. Answer questions based on your actual capabilities, not hypothetical ones.';
     return prompt;
   }
 
@@ -241,8 +243,9 @@ export class ScriptableAbject extends Abject {
 
     this.on('probe', async () => {
       // Extract dep('...') and find('...') references from source
-      const depPattern = /this\.dep\(\s*['"]([^'"]+)['"]\s*\)/g;
-      const findPattern = /this\.find\(\s*['"]([^'"]+)['"]\s*\)/g;
+      // Match both this.dep() and bare dep() forms
+      const depPattern = /(?:this\.)?dep\(\s*['"]([^'"]+)['"]\s*\)/g;
+      const findPattern = /(?:this\.)?find\(\s*['"]([^'"]+)['"]\s*\)/g;
       const depNames = new Set<string>();
       let match: RegExpExecArray | null;
       while ((match = depPattern.exec(this._source)) !== null) depNames.add(match[1]);
@@ -399,10 +402,7 @@ export class ScriptableAbject extends Abject {
    */
   static tryCompile(source: string): string | undefined {
     try {
-      const handlerMap = new Function('return ' + source)();
-      if (typeof handlerMap !== 'object' || handlerMap === null) {
-        return 'Source must evaluate to a non-null object';
-      }
+      compileSandboxed(source, {});
       return undefined;
     } catch (err) {
       return err instanceof Error ? err.message : String(err);
@@ -426,31 +426,106 @@ export class ScriptableAbject extends Abject {
     'ping', 'addDependent', 'removeDependent',
   ]);
 
+  /** Keys on the this-proxy that must not be overwritten by user handler code. */
+  private static readonly PROXY_BUILTINS = new Set([
+    'call', 'dep', 'find', 'changed', 'emit', 'observe', 'id',
+  ]);
+
+  /**
+   * Build the `this`-proxy object that handler code sees as `this`.
+   * Contains only safe helpers; no access to the real Abject or Node.js APIs.
+   */
+  private buildHandlerProxy(): Record<string, unknown> {
+    const self = this;
+
+    const callFn = async <T>(
+      to: AbjectId | string | Promise<AbjectId>,
+      method: string,
+      payload?: unknown,
+      options?: { timeout?: number } | unknown,
+    ): Promise<T> => {
+      // Backward compat: 4-arg call(to, interfaceId, method, payload)
+      if (options !== undefined && typeof method === 'string' && typeof payload === 'string') {
+        const actualMethod = payload as unknown as string;
+        const actualPayload = options;
+        const resolvedTo = await to;
+        return self.request<T>(
+          request(self.id, resolvedTo as AbjectId, actualMethod, actualPayload)
+        );
+      }
+      const resolvedTo = await to;
+      const timeoutMs = (options && typeof options === 'object' && 'timeout' in options)
+        ? (options as { timeout?: number }).timeout
+        : undefined;
+      return self.request<T>(
+        request(self.id, resolvedTo as AbjectId, method, payload ?? {}),
+        timeoutMs,
+      );
+    };
+
+    const depFn = async (name: string): Promise<AbjectId> => self.dep(name);
+    const findFn = async (name: string): Promise<AbjectId | null> => self.find(name);
+    const changedFn = (aspect: string, value?: unknown): void => self.changed(aspect, value);
+    const emitFn = async (to: AbjectId | string | Promise<AbjectId>, eventName: string, payload?: unknown): Promise<void> => {
+      const resolvedTo = await to;
+      self.send(event(self.id, resolvedTo as AbjectId, eventName, payload ?? {}));
+    };
+    const observeFn = async (target: AbjectId | string | Promise<AbjectId>): Promise<void> => {
+      const resolvedTarget = await target;
+      await self.request(request(self.id, resolvedTarget as AbjectId, 'addDependent', {}));
+    };
+
+    return {
+      call: callFn,
+      dep: depFn,
+      find: findFn,
+      changed: changedFn,
+      emit: emitFn,
+      observe: observeFn,
+      id: self.id,
+    };
+  }
+
   private compileAndInstall(source: string): void {
-    const handlerMap = new Function('return ' + source)() as Record<string, MessageHandlerFn>;
-    contractRequire(
-      typeof handlerMap === 'object' && handlerMap !== null,
-      'Handler source must evaluate to a non-null object'
-    );
+    // Build the this-proxy with safe helpers
+    const handlerThis = this.buildHandlerProxy();
+
+    // Compile in sandboxed vm context. No access to require, process, fs, etc.
+    // Security comes from both the vm sandbox (isolates Node.js globals) and the
+    // this-proxy (restricts what handlers can access via `this`).
+    // Performance: ScriptableAbject is worker-eligible, so cross-realm overhead
+    // is contained within worker threads and does not block the main thread.
+    const handlerMap = compileSandboxed(source, handlerThis, {
+      filename: `scriptable-${this.manifest.name}.js`,
+    }) as Record<string, MessageHandlerFn>;
 
     const baseProps = new Set(Object.keys(this));
     const proto = Object.getPrototypeOf(this);
     for (const [key, value] of Object.entries(handlerMap)) {
       if (typeof value === 'function') {
-        const bound = value.bind(this);
+        const bound = value.bind(handlerThis);
         // Don't overwrite base class methods or properties
         if (!(key in proto) && !baseProps.has(key)) {
           (this as Record<string, unknown>)[key] = bound;
         }
+        // Store on proxy so handlers can call each other via this.method(),
+        // but never overwrite proxy builtins (call, dep, find, changed, etc.)
+        if (!ScriptableAbject.PROXY_BUILTINS.has(key)) {
+          handlerThis[key] = bound;
+        }
         if (!key.startsWith('_') && !ScriptableAbject.PROTECTED_HANDLERS.has(key)) {
-          // Message handler — also registered on bus
+          // Message handler -- also registered on bus
           this.on(key, bound);
           this._userMethods.add(key);
         }
       } else {
-        // State property — skip if it collides with a base class field
+        // State property -- store on proxy so handler code sees this._state
+        if (!ScriptableAbject.PROXY_BUILTINS.has(key)) {
+          handlerThis[key] = value;
+        }
+        // Skip if it collides with a base class field
         if (baseProps.has(key)) {
-          log.warn(`Skipping user property '${key}' — collides with base class`);
+          log.warn(`Skipping user property '${key}' -- collides with base class`);
           continue;
         }
         (this as Record<string, unknown>)[key] = value;
@@ -466,33 +541,26 @@ export class ScriptableAbject extends Abject {
    * On failure, old handlers remain — the object never enters a broken state.
    */
   applySource(source: string): { success: boolean; error?: string; errorLine?: number } {
-    // Compile first — if this fails, nothing changes
+    // Build a fresh this-proxy and compile in sandbox
+    const handlerThis = this.buildHandlerProxy();
     let handlerMap: Record<string, MessageHandlerFn>;
     try {
-      handlerMap = new Function('return ' + source)() as Record<string, MessageHandlerFn>;
+      handlerMap = compileSandboxed(source, handlerThis, {
+        filename: `scriptable-${this.manifest.name}.js`,
+      }) as Record<string, MessageHandlerFn>;
     } catch (err) {
-      // Try to extract the error line number using vm.Script for better diagnostics
+      // Extract error line number from vm.Script stack trace
       let errorLine: number | undefined;
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const { Script } = require('vm');
-        new Script('(function(){\nreturn ' + source + '\n})()');
-      } catch (vmErr: unknown) {
-        const stack = (vmErr as Error).stack ?? '';
-        const match = stack.match(/evalmachine\.<anonymous>:(\d+)/);
-        if (match) {
-          errorLine = parseInt(match[1], 10) - 1; // subtract 1 for the function wrapper line
-        }
+      const stack = (err as Error).stack ?? '';
+      const match = stack.match(/evalmachine\.<anonymous>:(\d+)/);
+      if (match) {
+        errorLine = parseInt(match[1], 10) - 1; // subtract 1 for the function wrapper line
       }
       return {
         success: false,
         error: err instanceof Error ? err.message : String(err),
         errorLine,
       };
-    }
-
-    if (typeof handlerMap !== 'object' || handlerMap === null) {
-      return { success: false, error: 'Source must evaluate to a non-null object' };
     }
 
     // Remove old user handlers and properties
@@ -505,25 +573,34 @@ export class ScriptableAbject extends Abject {
     this._userMethods.clear();
     this._userProps.clear();
 
-    // Install new handlers and properties bound to this instance
+    // Install new handlers and properties bound to the proxy
     const baseProps = new Set(Object.keys(this));
     const proto = Object.getPrototypeOf(this);
     for (const [key, value] of Object.entries(handlerMap)) {
       if (typeof value === 'function') {
-        const bound = value.bind(this);
+        const bound = value.bind(handlerThis);
         // Don't overwrite base class methods or properties
         if (!(key in proto) && !baseProps.has(key)) {
           (this as Record<string, unknown>)[key] = bound;
         }
+        // Store on proxy so handlers can call each other via this.method(),
+        // but never overwrite proxy builtins (call, dep, find, changed, etc.)
+        if (!ScriptableAbject.PROXY_BUILTINS.has(key)) {
+          handlerThis[key] = bound;
+        }
         if (!key.startsWith('_') && !ScriptableAbject.PROTECTED_HANDLERS.has(key)) {
-          // Message handler — also registered on bus
+          // Message handler -- also registered on bus
           this.on(key, bound);
           this._userMethods.add(key);
         }
       } else {
-        // State property — skip if it collides with a base class field
+        // State property -- store on proxy so handler code sees this._state
+        if (!ScriptableAbject.PROXY_BUILTINS.has(key)) {
+          handlerThis[key] = value;
+        }
+        // Skip if it collides with a base class field
         if (baseProps.has(key)) {
-          log.warn(`Skipping user property '${key}' — collides with base class`);
+          log.warn(`Skipping user property '${key}' -- collides with base class`);
           continue;
         }
         (this as Record<string, unknown>)[key] = value;

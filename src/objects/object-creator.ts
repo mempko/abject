@@ -2966,7 +2966,6 @@ domain actions in intermediateActions, they will be SKIPPED entirely.
     await this.call(this._agentAbjectId, 'registerAgent', {
       name: 'WeatherAgent',
       description: 'Fetches weather data and posts reports to chat',
-      askDescription: 'I fetch weather data for any location and post formatted reports. I send messages to HttpClient for API requests and Chat for posting results.',
       config: {
         maxSteps: 10,
         timeout: 120000,

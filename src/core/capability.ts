@@ -75,6 +75,9 @@ export const Capabilities = {
 
   // Skill management
   SKILL_MANAGE: 'abjects:skill:manage' as CapabilityId,
+
+  // HTTP server
+  HTTP_SERVER_LISTEN: 'abjects:http-server:listen' as CapabilityId,
 } as const;
 
 // =============================================================================

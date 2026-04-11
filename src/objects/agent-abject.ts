@@ -99,8 +99,6 @@ interface RegisteredAgent {
   agentId: AbjectId;
   name: string;
   description: string;
-  /** Richer description used during ask-protocol confidence scoring. If set, included in the dispatch ask question so agents can better self-assess task fitness. */
-  askDescription?: string;
   systemPrompt?: string;
   config: ResolvedAgentConfig;
   /** Whether this agent can execute tasks from TupleSpace. Agents that only create tasks (like Chat) set this to false. */
@@ -546,7 +544,6 @@ when tasks are dispatched to it via the ask protocol.
   await call(await dep('AgentAbject'), 'registerAgent', {
     name: 'MyAgent',
     description: 'Short description of what this agent handles',
-    askDescription: 'Detailed expertise description used for confidence scoring during task dispatch',
     systemPrompt: 'You are an agent that specializes in...',
     config: {
       maxSteps: 15,
@@ -580,10 +577,6 @@ The registered object must implement these handlers to participate in the agent 
 
   taskResult(msg) — Receives the final result when a task completes.
     msg.payload: { ticketId, success, result?, error?, steps }
-
-The askDescription field is used during task dispatch: when AgentAbject asks agents
-"Can you handle this task?", agents with askDescription get their expertise included
-in the question, leading to more accurate confidence ratings.
 
 ### IMPORTANT
 - startTask returns { ticketId } immediately — it does NOT block until completion.
@@ -660,8 +653,8 @@ in the question, leading to more accurate confidence ratings.
   private setupHandlers(): void {
     // ── Registration ──
     this.on('registerAgent', async (msg: AbjectMessage) => {
-      const { name, description, askDescription, systemPrompt, config, canExecute } =
-        msg.payload as { name: string; description: string; askDescription?: string; systemPrompt?: string; config?: AgentConfig; canExecute?: boolean };
+      const { name, description, systemPrompt, config, canExecute } =
+        msg.payload as { name: string; description: string; systemPrompt?: string; config?: AgentConfig; canExecute?: boolean };
       const agentId = msg.routing.from;
       const resolved = resolveConfig(config);
 
@@ -669,7 +662,6 @@ in the question, leading to more accurate confidence ratings.
         agentId,
         name,
         description,
-        askDescription,
         systemPrompt,
         config: resolved,
         canExecute: canExecute ?? true,
@@ -695,7 +687,6 @@ in the question, leading to more accurate confidence ratings.
           agentId: agent.agentId,
           name: agent.name,
           description: agent.description,
-          askDescription: agent.askDescription,
           status: activeTasks > 0 ? 'busy' : 'idle',
           activeTasks,
         };

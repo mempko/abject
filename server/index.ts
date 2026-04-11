@@ -78,6 +78,7 @@ import { SkillBrowser } from '../src/objects/skill-browser.js';
 import { SkillAgent } from '../src/objects/skill-agent.js';
 import { ObjectAgent } from '../src/objects/object-agent.js';
 import { MCPBridge } from '../src/objects/mcp-bridge.js';
+import { HttpServer } from '../src/objects/http-server.js';
 import type { MCPBridgeConfig } from '../src/objects/mcp-bridge.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
@@ -429,6 +430,7 @@ async function main(): Promise<void> {
     const config = args as MCPBridgeConfig;
     return new MCPBridge(config);
   });
+  runtime.objectFactory.registerConstructor('HttpServer', () => new HttpServer());
 
   // Mark worker-eligible constructors (only used when workerEnabled).
   // Per-workspace objects use registryHint to discover workspace dependencies.
@@ -437,16 +439,27 @@ async function main(): Promise<void> {
       // Global capabilities
       'LLMObject', 'HttpClient', 'Timer',
       'Clipboard', 'Console', 'FileSystem',
+      'ShellExecutor', 'HostFileSystem',
+      'WebSearch', 'WebFetch', 'Screenshot',
+      'Storage', 'HttpServer',
       // Global services
-      'GlobalSettings', 'PeerNetwork', 'ObjectCatalog', 'ObjectBrowser', 'ProcessExplorer', 'LLMMonitor', 'ProxyGenerator', 'Negotiator', 'HealthMonitor',
-      // Per-workspace objects (use workspace registry via registryHint)
+      'GlobalSettings', 'PeerNetwork',
+      'ObjectCatalog', 'ObjectBrowser', 'ProcessExplorer', 'LLMMonitor',
+      'ProxyGenerator', 'Negotiator', 'HealthMonitor',
+      'SkillRegistry', 'SkillBrowser',
+      // Per-workspace objects
       'AbjectStore', 'Theme', 'Settings', 'AppExplorer',
-      'TupleSpace',
-      'GoalManager', 'GoalBrowser',
+      'TupleSpace', 'SharedState',
+      'GoalManager', 'GoalBrowser', 'GoalObserver',
       'JobManager', 'JobBrowser',
-      'AgentBrowser', 'SchedulerBrowser',
-      'AgentAbject', 'ObjectCreator',
-      'Chat', 'AbjectEditor', 'Taskbar',
+      'KnowledgeBase', 'KnowledgeBrowser',
+      'AgentAbject', 'AgentBrowser', 'AgentCreator',
+      'ObjectAgent', 'SkillAgent', 'WebAgent',
+      'Scheduler', 'SchedulerBrowser',
+      'ObjectCreator', 'Chat', 'AbjectEditor', 'Taskbar',
+      'ScriptableAbject',
+      // Per-workspace UI
+      'WorkspaceBrowser',
     ];
     for (const name of workerEligible) {
       runtime.objectFactory.markWorkerEligible(name);
@@ -493,6 +506,7 @@ async function main(): Promise<void> {
   const webSearchId = await supervisedSpawn('WebSearch');
   const webFetchId = await supervisedSpawn('WebFetch');
   const screenshotId = await supervisedSpawn('Screenshot');
+  const httpServerId = await supervisedSpawn('HttpServer');
   const windowManagerId = await supervisedSpawn('WindowManager');
   const widgetManagerId = await supervisedSpawn('WidgetManager');
 
