@@ -6,6 +6,7 @@
  */
 
 import { parse as parseYaml } from 'yaml';
+import type { MCPServerMeta } from './skill-types.js';
 
 /** Result of parsing a SKILL.md file. */
 export interface ParsedSkill {
@@ -18,7 +19,7 @@ export interface ParsedSkill {
   /** Markdown body after the second `---`. */
   instructions: string;
   /** Detected source ecosystem. */
-  source: 'claude-code' | 'openclaw' | 'unknown';
+  source: 'claude-code' | 'openclaw' | 'mcp' | 'unknown';
   /** Parsed from Claude Code's `allowed-tools` field. */
   allowedTools?: string[];
   /** Parsed from OpenClaw's `metadata.openclaw.requires.bins`. */
@@ -27,6 +28,8 @@ export interface ParsedSkill {
   requiredEnv?: string[];
   /** Version string if present. */
   version?: string;
+  /** Present when the skill is an MCP server (type: mcp / mcp-command in frontmatter). */
+  mcpServer?: MCPServerMeta;
 }
 
 /**
@@ -94,13 +97,30 @@ export function parseSkillMd(content: string, dirName: string): ParsedSkill {
     }
   }
 
+  // Detect MCP server type
+  const mcpCommand = frontmatter['mcp-command'];
+  if (typeof mcpCommand === 'string' && mcpCommand.length > 0) {
+    const mcpArgs = Array.isArray(frontmatter['mcp-args'])
+      ? (frontmatter['mcp-args'] as unknown[]).filter((a): a is string => typeof a === 'string')
+      : undefined;
+
+    result.mcpServer = {
+      command: mcpCommand,
+      args: mcpArgs,
+      requiredEnv: result.requiredEnv,
+    };
+  }
+
   return result;
 }
 
 /**
  * Detect which ecosystem a skill comes from based on frontmatter fields.
  */
-function detectSource(fm: Record<string, unknown>): 'claude-code' | 'openclaw' | 'unknown' {
+function detectSource(fm: Record<string, unknown>): 'claude-code' | 'openclaw' | 'mcp' | 'unknown' {
+  // MCP server: has mcp-command or type: mcp
+  if ('mcp-command' in fm || fm.type === 'mcp') return 'mcp';
+
   // OpenClaw: has metadata.openclaw
   if (fm.metadata && typeof fm.metadata === 'object') {
     const m = fm.metadata as Record<string, unknown>;

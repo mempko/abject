@@ -173,8 +173,13 @@ pane shows details, configuration, and actions for the selected skill.
         return;
       }
 
-      // Scan button
+      // Scan button -- re-scan the directory, then refresh the UI
       if (fromId === this.scanButtonId && aspect === 'click') {
+        if (this.skillRegistryId) {
+          try {
+            await this.request(request(this.id, this.skillRegistryId, 'scanSkills', {}));
+          } catch { /* best effort */ }
+        }
         await this.refreshSkillList();
         return;
       }

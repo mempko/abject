@@ -77,6 +77,8 @@ import { SkillRegistry } from '../src/objects/skill-registry.js';
 import { SkillBrowser } from '../src/objects/skill-browser.js';
 import { SkillAgent } from '../src/objects/skill-agent.js';
 import { ObjectAgent } from '../src/objects/object-agent.js';
+import { MCPBridge } from '../src/objects/mcp-bridge.js';
+import type { MCPBridgeConfig } from '../src/objects/mcp-bridge.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
 import { NodeWorkerAdapter } from './node-worker-adapter.js';
@@ -423,6 +425,10 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('SkillBrowser', () => new SkillBrowser());
   runtime.objectFactory.registerConstructor('SkillAgent', () => new SkillAgent());
   runtime.objectFactory.registerConstructor('ObjectAgent', () => new ObjectAgent());
+  runtime.objectFactory.registerConstructor('MCPBridge', (args?: unknown) => {
+    const config = args as MCPBridgeConfig;
+    return new MCPBridge(config);
+  });
 
   // Mark worker-eligible constructors (only used when workerEnabled).
   // Per-workspace objects use registryHint to discover workspace dependencies.

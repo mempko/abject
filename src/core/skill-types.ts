@@ -10,7 +10,7 @@ export interface SkillInfo {
   name: string;
   description: string;
   version?: string;
-  source: 'claude-code' | 'openclaw' | 'unknown';
+  source: 'claude-code' | 'openclaw' | 'mcp' | 'unknown';
   enabled: boolean;
   error?: string;
   /** Claude Code allowed-tools field (e.g. ["Read", "Grep", "Bash"]). */
@@ -21,6 +21,19 @@ export interface SkillInfo {
   requiredEnv?: string[];
   /** User-configured environment variable values (keys only, values masked). */
   configuredEnvKeys?: string[];
+  /** True if this skill is an MCP server (type: mcp). */
+  isMcpServer?: boolean;
+  /** MCP server command (e.g. "npx @anthropic-ai/mcp-server-gmail"). */
+  mcpCommand?: string;
+  /** MCP server runtime status. */
+  mcpStatus?: 'idle' | 'running' | 'error';
+}
+
+/** MCP server metadata parsed from SKILL.md frontmatter. */
+export interface MCPServerMeta {
+  command: string;
+  args?: string[];
+  requiredEnv?: string[];
 }
 
 /** Per-skill configuration stored by SkillRegistry. */

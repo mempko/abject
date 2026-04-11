@@ -369,6 +369,28 @@ When asked about a task, describe which skill you would use and how. Say PASS if
           break;
         }
 
+        case 'mcp_tool_call': {
+          const server = action.server as string;
+          const tool = action.tool as string;
+          const input = (action.input as Record<string, unknown>) ?? {};
+          if (!server || !tool) return { success: false, error: 'mcp_tool_call requires "server" and "tool" fields' };
+
+          // Discover the MCPBridge for this server
+          const bridgeId = await this.discoverDep(`MCPBridge-${server}`);
+          if (!bridgeId) return { success: false, error: `MCP server "${server}" not running. Is it enabled?` };
+
+          const toolResult = await this.request<{ content: string; isError: boolean }>(
+            request(this.id, bridgeId, 'callTool', { toolName: tool, input }),
+          );
+
+          if (toolResult.isError) {
+            result = `MCP tool error: ${toolResult.content}`;
+          } else {
+            result = toolResult.content;
+          }
+          break;
+        }
+
         default:
           return { success: false, error: `Unknown action: ${action.action}` };
       }
@@ -415,6 +437,7 @@ I'll fetch the accounts list first.
 | write_file | path, content | Write a file |
 | search | query | Search the web |
 | fetch | url | Fetch a URL as cleaned text |
+| mcp_tool_call | server, tool, input | Call a tool on a connected MCP server |
 | decompose | subtasks | Break a complex task into parallel sub-tasks dispatched to other agents. Each subtask has type (call, browse, create, modify, skill), description, and optional data. |
 | done | result | Task complete. Include the answer in result. |
 | fail | reason | Task cannot be completed |
@@ -456,6 +479,33 @@ When using curl, use -s (silent) and pipe JSON through jq.
           }
         }
       } catch { /* SkillRegistry not available */ }
+    }
+
+    // Append connected MCP servers and their tools
+    if (this.skillRegistryId) {
+      try {
+        const servers = await this.request<Array<{
+          name: string;
+          description: string;
+          tools: Array<{ name: string; description: string }>;
+        }>>(
+          request(this.id, this.skillRegistryId, 'getEnabledMCPServers', {}),
+        );
+
+        if (servers.length > 0) {
+          prompt += '\n## Connected MCP Servers\n\n';
+          for (const server of servers) {
+            prompt += `### ${server.name}\n${server.description}\n\n`;
+            if (server.tools.length > 0) {
+              prompt += 'Available tools:\n';
+              for (const tool of server.tools) {
+                prompt += `- \`${tool.name}\`: ${tool.description}\n`;
+              }
+            }
+            prompt += `\nUse \`mcp_tool_call\` action with \`server: "${server.name}"\` and \`tool: "<tool_name>"\`.\n\n`;
+          }
+        }
+      } catch { /* MCP not available */ }
     }
 
     this.cachedSystemPrompt = prompt;

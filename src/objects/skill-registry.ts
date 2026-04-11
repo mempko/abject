@@ -36,6 +36,9 @@ export class SkillRegistry extends Abject {
   private skillsDir: string;
   private storageId?: AbjectId;
   private shellExecutorId?: AbjectId;
+  private factoryId?: AbjectId;
+  /** AbjectId of each running MCPBridge, keyed by skill name. */
+  private mcpBridges = new Map<string, AbjectId>();
 
   constructor(skillsDir?: string) {
     super({
@@ -126,6 +129,12 @@ export class SkillRegistry extends Abject {
               ],
               returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
             },
+            {
+              name: 'getEnabledMCPServers',
+              description: 'Get enabled MCP servers with their tool definitions',
+              parameters: [],
+              returns: { kind: 'array', elementType: { kind: 'reference', reference: 'MCPServerSummary' } },
+            },
           ],
           events: [
             {
@@ -161,7 +170,11 @@ export class SkillRegistry extends Abject {
     await this.loadConfigs();
 
     this.shellExecutorId = await this.discoverDep('ShellExecutor') ?? undefined;
+    this.factoryId = await this.discoverDep('Factory') ?? undefined;
     await this.pushEnvToShell();
+
+    // Auto-start any MCP servers that were previously enabled
+    await this.startEnabledMCPBridges();
 
     log.info(`Initialized with ${this.skills.size} skills in ${this.skillsDir}`);
   }
@@ -235,6 +248,12 @@ whenever the skill set changes.
       entry.enabled = true;
       await this.persistStates();
       await this.pushEnvToShell();
+
+      // If this is an MCP server, spawn a bridge
+      if (entry.parsed.mcpServer) {
+        await this.spawnMCPBridge(name, entry);
+      }
+
       this.changed('skillsChanged', { reason: 'enabled' });
       log.info(`Enabled skill: ${name}`);
       return { success: true };
@@ -248,6 +267,12 @@ whenever the skill set changes.
       entry.enabled = false;
       await this.persistStates();
       await this.pushEnvToShell();
+
+      // If this is an MCP server, stop its bridge
+      if (entry.parsed.mcpServer) {
+        await this.stopMCPBridge(name);
+      }
+
       this.changed('skillsChanged', { reason: 'disabled' });
       log.info(`Disabled skill: ${name}`);
       return { success: true };
@@ -310,6 +335,10 @@ whenever the skill set changes.
       this.changed('skillsChanged', { reason: 'configured' });
       log.info(`Saved config for skill: ${name}`);
       return { success: true };
+    });
+
+    this.on('getEnabledMCPServers', async () => {
+      return await this.getEnabledMCPServerSummaries();
     });
   }
 
@@ -457,7 +486,7 @@ whenever the skill set changes.
 
   private entryToInfo(entry: SkillEntry): SkillInfo {
     const config = this.skillConfigs.get(entry.parsed.name);
-    return {
+    const info: SkillInfo = {
       name: entry.parsed.name,
       description: entry.parsed.description,
       version: entry.parsed.version,
@@ -469,12 +498,22 @@ whenever the skill set changes.
       requiredEnv: entry.parsed.requiredEnv,
       configuredEnvKeys: config?.env ? Object.keys(config.env).filter(k => config.env[k]) : undefined,
     };
+
+    if (entry.parsed.mcpServer) {
+      info.isMcpServer = true;
+      info.mcpCommand = entry.parsed.mcpServer.command;
+      info.mcpStatus = this.mcpBridges.has(entry.parsed.name) ? 'running' : 'idle';
+    }
+
+    return info;
   }
 
   private getEnabledSummaries(): EnabledSkillSummary[] {
     const summaries: EnabledSkillSummary[] = [];
     for (const [name, entry] of this.skills) {
       if (!entry.enabled || entry.error) continue;
+      // Skip MCP servers from regular skill summaries (they get their own section)
+      if (entry.parsed.mcpServer) continue;
       const config = this.skillConfigs.get(name);
       summaries.push({
         name: entry.parsed.name,
@@ -484,6 +523,115 @@ whenever the skill set changes.
         env: config?.env,
       });
     }
+    return summaries;
+  }
+
+  // ─── MCP Bridge Lifecycle ──────────────────────────────────────
+
+  private async spawnMCPBridge(name: string, entry: SkillEntry): Promise<void> {
+    if (!this.factoryId || !entry.parsed.mcpServer) return;
+
+    // Don't double-spawn
+    if (this.mcpBridges.has(name)) {
+      log.info(`MCPBridge for "${name}" already running`);
+      return;
+    }
+
+    const config = this.skillConfigs.get(name);
+    const env = config?.env ?? {};
+
+    try {
+      const result = await this.request<{ objectId: AbjectId }>(
+        request(this.id, this.factoryId, 'spawn', {
+          manifest: {
+            name: 'MCPBridge',
+            description: `MCP bridge for "${name}"`,
+            version: '1.0.0',
+            interface: { id: 'abjects:mcp-bridge', name: 'MCPBridge', description: 'MCP bridge', methods: [] },
+            requiredCapabilities: [],
+            tags: ['system', 'mcp'],
+          },
+          constructorArgs: {
+            serverName: name,
+            command: entry.parsed.mcpServer.command,
+            args: entry.parsed.mcpServer.args,
+            env,
+          },
+        }),
+      );
+      this.mcpBridges.set(name, result.objectId);
+      log.info(`Spawned MCPBridge for "${name}": ${result.objectId}`);
+    } catch (err) {
+      log.error(`Failed to spawn MCPBridge for "${name}":`, err instanceof Error ? err.message : String(err));
+      entry.error = `MCP spawn failed: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  private async stopMCPBridge(name: string): Promise<void> {
+    const bridgeId = this.mcpBridges.get(name);
+    if (!bridgeId) return;
+
+    this.mcpBridges.delete(name);
+
+    try {
+      // Ask Factory to kill the bridge (Factory handles cleanup via Registry)
+      if (this.factoryId) {
+        await this.request(
+          request(this.id, this.factoryId, 'kill', { objectId: bridgeId }),
+        );
+      }
+      log.info(`Stopped MCPBridge for "${name}"`);
+    } catch (err) {
+      log.error(`Failed to stop MCPBridge for "${name}":`, err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  private async startEnabledMCPBridges(): Promise<void> {
+    for (const [name, entry] of this.skills) {
+      if (entry.enabled && entry.parsed.mcpServer && !this.mcpBridges.has(name)) {
+        await this.spawnMCPBridge(name, entry);
+      }
+    }
+  }
+
+  private async getEnabledMCPServerSummaries(): Promise<Array<{
+    name: string;
+    description: string;
+    tools: Array<{ name: string; description: string }>;
+    bridgeId: string;
+  }>> {
+    const summaries: Array<{
+      name: string;
+      description: string;
+      tools: Array<{ name: string; description: string }>;
+      bridgeId: string;
+    }> = [];
+
+    for (const [name, bridgeId] of this.mcpBridges) {
+      const entry = this.skills.get(name);
+      if (!entry) continue;
+
+      try {
+        const tools = await this.request<Array<{ name: string; description?: string; inputSchema?: unknown }>>(
+          request(this.id, bridgeId, 'listTools', {}),
+        );
+        summaries.push({
+          name,
+          description: entry.parsed.description,
+          tools: tools.map(t => ({ name: t.name, description: t.description ?? '' })),
+          bridgeId,
+        });
+      } catch (err) {
+        log.error(`Failed to list tools from MCPBridge "${name}":`, err instanceof Error ? err.message : String(err));
+        summaries.push({
+          name,
+          description: entry.parsed.description,
+          tools: [],
+          bridgeId,
+        });
+      }
+    }
+
     return summaries;
   }
 }

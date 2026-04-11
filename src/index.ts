@@ -144,7 +144,16 @@ export { ObjectAgent, OBJECT_AGENT_ID } from './objects/object-agent.js';
 export { SkillBrowser, SKILL_BROWSER_ID } from './objects/skill-browser.js';
 export { parseSkillMd } from './core/skill-parser.js';
 export type { ParsedSkill } from './core/skill-parser.js';
-export type { SkillInfo, SkillConfig, EnabledSkillSummary } from './core/skill-types.js';
+export type { SkillInfo, SkillConfig, EnabledSkillSummary, MCPServerMeta } from './core/skill-types.js';
+export { MCPBridge, MCP_BRIDGE_ID } from './objects/mcp-bridge.js';
+export type { MCPBridgeConfig, MCPBridgeStatus } from './objects/mcp-bridge.js';
+export { MCPTransport } from './network/mcp-transport.js';
+export type { MCPTransportState, MCPTransportEvents } from './network/mcp-transport.js';
+export type {
+  MCPToolDefinition, MCPToolCallResult, MCPContentItem,
+  MCPResourceDefinition, MCPInitResult, MCPServerCapabilities,
+  JsonRpcRequest, JsonRpcResponse, JsonRpcError,
+} from './core/mcp-types.js';
 // WebParser, WebBrowser, and WebAgent are server-only — import directly from their files:
 // import { WebParser } from './objects/capabilities/web-parser.js';
 // import { WebBrowser } from './objects/capabilities/web-browser.js';
