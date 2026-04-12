@@ -620,12 +620,12 @@ The registered object must implement these handlers to participate in the agent 
       this.send(request(this.id, this.goalManagerId, 'addDependent', {}));
     }
 
-    // Periodic scan for missed/pre-existing tasks (every 30s)
+    // Periodic scan for missed/pre-existing tasks (every 10s)
     this.scanTimer = setInterval(() => {
       this.periodicScan().catch(err => {
         log.warn('Periodic scan failed:', err instanceof Error ? err.message : String(err));
       });
-    }, 30_000);
+    }, 10_000);
 
     // Initial scan after 5s delay (give agents time to register)
     setTimeout(() => {
@@ -852,6 +852,22 @@ The registered object must implement these handlers to participate in the agent 
       return { success: true };
     });
 
+    this.on('cancelTasksByGoal', async (msg: AbjectMessage) => {
+      const { goalId } = msg.payload as { goalId: string };
+      let cancelled = 0;
+      for (const [taskId, entry] of this.taskEntries) {
+        if ((entry.goalId === goalId || entry.incomingGoalId === goalId)
+            && entry.state.phase !== 'done' && entry.state.phase !== 'error') {
+          entry.state.phase = 'error';
+          entry.state.error = 'Cancelled';
+          this.busyAgents.delete(entry.agentId);
+          cancelled++;
+          log.info(`cancelTasksByGoal: cancelled task ${taskId} for goal ${goalId}`);
+        }
+      }
+      return { cancelled };
+    });
+
     // ── Internal step handler (called by job code) ──
     // Only _think needs to go through AgentAbject (it accesses conversation
     // state + LLM).  Observe and act job code call agents directly to avoid
@@ -971,12 +987,12 @@ The registered object must implement these handlers to participate in the agent 
     } catch (err) {
       log.info(`DISPATCH ${tupleId} — threw: ${(err as Error).message?.slice(0, 120)}`);
     } finally {
-      // Keep guard for 5 seconds to prevent rapid re-dispatch from CRDT sync duplicates
-      log.info(`DISPATCH ${tupleId} — cooldown 5s before removing from dispatchingTuples`);
+      // Brief guard to prevent rapid re-dispatch from CRDT sync duplicates
+      log.info(`DISPATCH ${tupleId} — cooldown 1s before removing from dispatchingTuples`);
       setTimeout(() => {
         this.dispatchingTuples.delete(tuple.id);
         log.info(`DISPATCH ${tupleId} — cooldown expired, removed from dispatchingTuples`);
-      }, 5000);
+      }, 1000);
     }
   }
 
@@ -1019,8 +1035,21 @@ The registered object must implement these handlers to participate in the agent 
       return;
     }
 
-    // 2. Ask each agent how they would accomplish the task (in parallel)
-    let askQuestion = `How would you accomplish this task? Describe your approach briefly (1-3 sentences), or say PASS if this is outside your scope.\nTask: "${description.slice(0, 300)}"`;
+    // 2. Fetch goal title for richer context
+    let goalTitle = '';
+    if (taskGoalId && this.goalManagerId) {
+      try {
+        const goal = await this.request<{ title?: string }>(
+          request(this.id, this.goalManagerId, 'getGoal', { goalId: taskGoalId }),
+        );
+        goalTitle = goal?.title ?? '';
+      } catch { /* best effort */ }
+    }
+
+    // 3. Ask each agent if they can handle this task and what steps they would take
+    let askQuestion = `Here is the goal I'm trying to accomplish and the task I want you to do. Let me know if this is a task you can do. If you can, tell me the steps you would take to accomplish the task.`;
+    if (goalTitle) askQuestion += `\nGoal: "${goalTitle}"`;
+    askQuestion += `\nTask: "${description.slice(0, 400)}"`;
     if (failureHistory.length > 0) {
       const failSummary = failureHistory.map(f => `- ${f.agent}: ${f.error}`).join('\n');
       askQuestion += `\nPrevious attempts failed:\n${failSummary}`;
@@ -1041,62 +1070,56 @@ The registered object must implement these handlers to participate in the agent 
       })
     );
 
-    // Filter out agents that passed on the task
-    const viable = approaches.filter(a => {
-      const upper = a.approach.toUpperCase().trim();
-      return upper.length > 0
-        && !upper.startsWith('PASS')
-        && !upper.startsWith('I PASS')
-        && !upper.startsWith('CANNOT')
-        && !upper.startsWith('I CANNOT');
-    });
+    // 4. Evaluate: pick the agent with the most efficient, likely-to-succeed plan
+    for (const a of approaches) {
+      log.info(`DISPATCH-INNER ${tupleId} — ${a.agent.name} says: ${a.approach.slice(0, 150)}`);
+    }
+    const approachList = approaches.map(a =>
+      `- ${a.agent.name} (${a.agent.description.slice(0, 150)}): ${a.approach.slice(0, 500)}`
+    ).join('\n');
 
-    if (viable.length === 0) {
+    const evalPrompt = `Goal: "${goalTitle || 'N/A'}"
+Task: "${description.slice(0, 400)}"
+
+These agents were asked if they can handle this task. Each includes their role description and their proposed plan:
+
+${approachList}
+
+Evaluate each agent's plan on:
+1. Efficiency: How many steps? Does the plan go directly to the result?
+2. Likelihood of success: Does the agent have the right tools and capabilities for what it described? Is the plan realistic given its role?
+
+Pick the agent with the best combination of efficiency and likelihood of success. Exclude agents that declined. Reply with ONLY the agent name, or NONE if every agent declined.`;
+
+    let chosen: RegisteredAgent | undefined;
+    let chosenApproach = '';
+    try {
+      const evalResult = await this.askLlm(
+        'You are a task dispatcher. Evaluate each agent plan on efficiency and likelihood of success. Pick the best one, or say NONE.',
+        evalPrompt,
+        'balanced',
+      );
+      const trimmed = evalResult.trim();
+      log.info(`DISPATCH-INNER ${tupleId} — evaluator says: "${trimmed}"`);
+      if (!/\bNONE\b/i.test(trimmed)) {
+        const match = approaches.find(a =>
+          trimmed.toLowerCase().includes(a.agent.name.toLowerCase())
+        );
+        if (match) {
+          chosen = match.agent;
+          chosenApproach = match.approach;
+        }
+      }
+    } catch {
+      // LLM failed -- no dispatch
+    }
+
+    if (!chosen) {
       log.info(`DISPATCH-INNER ${tupleId} — no agent can handle: ${description.slice(0, 60)}`);
       return;
     }
 
-    // If only one viable agent, pick it directly (no evaluator needed)
-    let chosen: RegisteredAgent;
-    let chosenApproach = '';
-    if (viable.length === 1) {
-      chosen = viable[0].agent;
-      chosenApproach = viable[0].approach;
-      log.info(`DISPATCH-INNER ${tupleId} — ${chosen.name} (sole viable agent)`);
-    } else {
-      // 3. Evaluator LLM call: pick the most efficient approach
-      const approachList = viable.map(a =>
-        `- ${a.agent.name} (${a.agent.description.slice(0, 150)}): ${a.approach.slice(0, 300)}`
-      ).join('\n');
-
-      const evalPrompt = `Given this task: "${description.slice(0, 300)}"
-
-These agents proposed approaches (each includes their role description):
-${approachList}
-
-Which agent's approach is most appropriate given their role? Reply with ONLY the agent name, nothing else.`;
-
-      let chosenName = viable[0].agent.name; // fallback to first viable
-      try {
-        const evalResult = await this.askLlm(
-          'You are a task dispatcher. Pick the best agent for the task.',
-          evalPrompt,
-          'fast',
-        );
-        const trimmed = evalResult.trim();
-        const match = viable.find(a =>
-          trimmed.toLowerCase().includes(a.agent.name.toLowerCase())
-        );
-        if (match) chosenName = match.agent.name;
-      } catch {
-        // fallback to first viable
-      }
-
-      const chosenEntry = viable.find(a => a.agent.name === chosenName) ?? viable[0];
-      chosen = chosenEntry.agent;
-      chosenApproach = chosenEntry.approach;
-      log.info(`DISPATCH-INNER ${tupleId} — ${chosen.name} (selected from ${viable.length} viable agents)`);
-    }
+    log.info(`DISPATCH-INNER ${tupleId} — ${chosen.name} (selected from ${approaches.length} agents)`);
 
     // 3a. Mark agent busy BEFORE the async claim to prevent concurrent
     // dispatches from claiming tasks for the same agent (JS is single-threaded,
@@ -1930,7 +1953,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       const llmResult = await this.request<{ content: string }>(
         request(this.id, this.llmId, 'complete', {
           messages: task.llmMessages,
-          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 2048 },
+          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 4096 },
         }),
         60000,
       );
@@ -2117,7 +2140,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       llmResult = await this.request<{ content: string }>(
         request(this.id, this.llmId, 'stream', {
           messages: task.llmMessages,
-          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 2048 },
+          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 4096 },
         }),
         120000,
       );

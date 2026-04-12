@@ -169,6 +169,15 @@ export class SkillRegistry extends Abject {
     await this.loadStates();
     await this.loadConfigs();
 
+    // Seed config from SKILL.md default env values for skills with no config or empty env
+    for (const [name, entry] of this.skills) {
+      if (!entry.parsed.defaultEnv) continue;
+      const existing = this.skillConfigs.get(name);
+      if (!existing || !existing.env || Object.values(existing.env).every(v => !v)) {
+        this.skillConfigs.set(name, { env: { ...entry.parsed.defaultEnv } });
+      }
+    }
+
     this.shellExecutorId = await this.discoverDep('ShellExecutor') ?? undefined;
     this.factoryId = await this.discoverDep('Factory') ?? undefined;
     await this.pushEnvToShell();

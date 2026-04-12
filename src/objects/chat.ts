@@ -673,7 +673,7 @@ The chat window renders markdown. Use **bold**, *italic*, \`inline code\`, headi
 
 ## Writing Good Task Descriptions
 
-Task descriptions are how agents decide whether they can handle a task. Focus on the desired **outcome**, not the implementation mechanism. Let agents decide how to accomplish the task.
+Task descriptions are how agents decide whether they can handle a task. Describe WHAT needs to happen, not HOW to do it. Agents already know their own tools, APIs, credentials, and connection details. Including implementation details (ports, protocols, libraries, connection strings) in task descriptions confuses agent routing.
 - Include the object name when the task involves an existing object (e.g., "Modify the HackerNews object to..." not just "Fix the UI")
 - Describe the desired outcome, not just the problem (e.g., "Add a reset button to the Counter that sets the count back to zero")
 - For web tasks, mention that it involves a real website (e.g., "Browse https://example.com and extract the article text")

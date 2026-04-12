@@ -26,6 +26,8 @@ export interface ParsedSkill {
   requiredBins?: string[];
   /** Parsed from OpenClaw's `metadata.openclaw.requires.env`. */
   requiredEnv?: string[];
+  /** Default env var values from frontmatter (used to seed config on first scan). */
+  defaultEnv?: Record<string, string>;
   /** Version string if present. */
   version?: string;
   /** Present when the skill is an MCP server (type: mcp / mcp-command in frontmatter). */
@@ -85,14 +87,26 @@ export function parseSkillMd(content: string, dirName: string): ParsedSkill {
     }
 
     // Direct: metadata.env (object with env var names as keys)
-    // e.g. metadata.env.THETAEDGE_API_KEY: { required: true, description: "..." }
+    // e.g. env.GMAIL_EMAIL: "user@gmail.com" or env.THETAEDGE_API_KEY: { required: true }
     const envObj = m.env;
     if (envObj && typeof envObj === 'object' && !Array.isArray(envObj)) {
-      const envNames = Object.keys(envObj as Record<string, unknown>);
+      const envRecord = envObj as Record<string, unknown>;
+      const envNames = Object.keys(envRecord);
       if (envNames.length > 0) {
         const existing = new Set(result.requiredEnv ?? []);
-        for (const name of envNames) existing.add(name);
+        const defaults: Record<string, string> = {};
+        for (const name of envNames) {
+          existing.add(name);
+          // Extract default values (string values in the env block)
+          const val = envRecord[name];
+          if (typeof val === 'string' && val.length > 0) {
+            defaults[name] = val;
+          }
+        }
         result.requiredEnv = [...existing];
+        if (Object.keys(defaults).length > 0) {
+          result.defaultEnv = defaults;
+        }
       }
     }
   }

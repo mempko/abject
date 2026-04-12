@@ -42,7 +42,7 @@ export const BLOCKED_CODE_PATTERNS: ReadonlyArray<{ pattern: RegExp; label: stri
   { pattern: /\bspawnSync\b/, label: 'spawnSync' },
   { pattern: /\bprocess\s*\.\s*(exit|kill|env|execPath|binding)/, label: 'process.*' },
   { pattern: /\bglobalThis\b/, label: 'globalThis' },
-  { pattern: /\bglobal\b/, label: 'global' },
+  { pattern: /\bglobal\s*[.\[]/, label: 'global' },
   { pattern: /\beval\s*\(/, label: 'eval()' },
   { pattern: /\bnew\s+Function\s*\(/, label: 'new Function()' },
   { pattern: /\bimport\s*\(/, label: 'dynamic import()' },

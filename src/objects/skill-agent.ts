@@ -44,8 +44,8 @@ export class SkillAgent extends Abject {
       manifest: {
         name: 'SkillAgent',
         description:
-          'Agent that executes tasks only when they match an installed skill. ' +
-          'Routes tasks to skill-specific workflows for API integrations, data lookups, and other skill domains.',
+          'Agent that installs, manages, and executes skills and MCP servers. ' +
+          'Handles skill installation, enable/disable, and routes tasks to skill-specific workflows for API integrations, data lookups, and other skill domains.',
         version: '1.0.0',
         interface: {
           id: SKILL_AGENT_INTERFACE,
@@ -102,20 +102,55 @@ export class SkillAgent extends Abject {
     return super.askPrompt(_question) + `\n\n## SkillAgent — Installed Skill Execution Agent
 
 ### What I Handle
-I execute tasks that match an installed and enabled skill. Each skill has a specific domain
-(e.g., finance, analytics, data processing) and I only handle tasks within those domains.
+I manage and execute skills. I handle:
+- Installing new MCP servers and skills (e.g., "install @shinzolabs/gmail-mcp")
+- Enabling, disabling, and listing installed skills
+- Executing tasks that match an installed and enabled skill's domain
 
 Currently installed skills and their domains:
 ${this.getInstalledSkillsSummary()}
 
 ### My Scope
-I handle tasks that match an installed and enabled skill's domain. General object interaction, web browsing, and object creation belong to other agents.
+I handle skill installation, management, and tasks that match an installed skill's domain. General object interaction, web browsing, and object creation belong to other agents.
 
-When asked about a task, describe which skill you would use and how. Say PASS if no installed skill matches the task.`;
+When asked about a task, describe which skill you would use and how. Say PASS if no installed skill matches the task and the task is not about installing or managing skills.`;
   }
 
   protected override async handleAsk(question: string): Promise<string> {
-    return this.askLlm(this.askPrompt(question), question, 'fast');
+    let prompt = this.askPrompt(question);
+
+    if (this.skillRegistryId) {
+      // Include all installed skills (enabled and disabled) so the LLM knows
+      // what's available. Disabled skills can be enabled as part of the task.
+      try {
+        const allSkills = await this.request<Array<{ name: string; description: string; enabled: boolean; isMcpServer?: boolean }>>(
+          request(this.id, this.skillRegistryId, 'listSkills', {}),
+        );
+        if (allSkills.length > 0) {
+          prompt += '\n\nAll installed skills:\n';
+          for (const s of allSkills) {
+            prompt += `- ${s.name} [${s.enabled ? 'enabled' : 'disabled'}]: ${s.description.slice(0, 120)}\n`;
+          }
+        }
+      } catch { /* best effort */ }
+
+      // Include connected MCP server tools so the LLM knows specific capabilities
+      try {
+        const servers = await this.request<Array<{
+          name: string; tools: Array<{ name: string; description: string }>;
+        }>>(
+          request(this.id, this.skillRegistryId, 'getEnabledMCPServers', {}),
+        );
+        if (servers.length > 0) {
+          prompt += '\nConnected MCP servers and tools:\n';
+          for (const s of servers) {
+            prompt += `- ${s.name}: ${s.tools.map(t => t.name).join(', ')}\n`;
+          }
+        }
+      } catch { /* best effort */ }
+    }
+
+    return this.askLlm(prompt, question, 'fast');
   }
 
   private getInstalledSkillsSummary(): string {
@@ -272,7 +307,36 @@ When asked about a task, describe which skill you would use and how. Say PASS if
   private async handleObserve(taskId: string): Promise<{ observation: string }> {
     const extra = this.taskExtras.get(taskId);
     const lastResult = extra?.lastResult ?? 'No previous action result.';
-    return { observation: lastResult };
+
+    // Include current skill state so the LLM knows what's already done
+    let skillState = '';
+    if (this.skillRegistryId) {
+      try {
+        const skills = await this.request<Array<{ name: string; description: string; enabled: boolean; error?: string }>>(
+          request(this.id, this.skillRegistryId, 'listSkills', {}),
+        );
+        if (skills.length > 0) {
+          skillState = '\n\nInstalled skills:\n' + skills.map(s =>
+            `- ${s.name} [${s.enabled ? 'enabled' : 'disabled'}]${s.error ? ` (error: ${s.error})` : ''}: ${s.description.slice(0, 100)}`
+          ).join('\n');
+        }
+      } catch { /* best effort */ }
+
+      try {
+        const servers = await this.request<Array<{
+          name: string; tools: Array<{ name: string }>;
+        }>>(
+          request(this.id, this.skillRegistryId, 'getEnabledMCPServers', {}),
+        );
+        if (servers.length > 0) {
+          skillState += '\n\nConnected MCP servers:\n' + servers.map(s =>
+            `- ${s.name}: ${s.tools.length} tools available`
+          ).join('\n');
+        }
+      } catch { /* best effort */ }
+    }
+
+    return { observation: lastResult + skillState };
   }
 
   private async handleAct(taskId: string, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string }> {
@@ -369,6 +433,55 @@ When asked about a task, describe which skill you would use and how. Say PASS if
           break;
         }
 
+        case 'install_skill': {
+          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+          const name = action.name as string;
+          const content = action.content as string;
+          if (!name || !content) return { success: false, error: 'install_skill requires "name" and "content" fields' };
+
+          await this.request(
+            request(this.id, this.skillRegistryId, 'installSkill', { name, content }),
+          );
+          result = `Installed skill "${name}"`;
+          break;
+        }
+
+        case 'enable_skill': {
+          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+          const name = action.name as string;
+          if (!name) return { success: false, error: 'enable_skill requires "name" field' };
+
+          await this.request(
+            request(this.id, this.skillRegistryId, 'enableSkill', { name }),
+          );
+          result = `Enabled skill "${name}"`;
+          break;
+        }
+
+        case 'disable_skill': {
+          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+          const name = action.name as string;
+          if (!name) return { success: false, error: 'disable_skill requires "name" field' };
+
+          await this.request(
+            request(this.id, this.skillRegistryId, 'disableSkill', { name }),
+          );
+          result = `Disabled skill "${name}"`;
+          break;
+        }
+
+        case 'list_skills': {
+          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+
+          const skills = await this.request<Array<{ name: string; description: string; enabled: boolean; error?: string }>>(
+            request(this.id, this.skillRegistryId, 'listSkills', {}),
+          );
+          result = skills.length > 0
+            ? skills.map(s => `${s.enabled ? '[enabled]' : '[disabled]'} ${s.name}: ${s.description}${s.error ? ` (error: ${s.error})` : ''}`).join('\n')
+            : 'No skills installed.';
+          break;
+        }
+
         case 'mcp_tool_call': {
           const server = action.server as string;
           const tool = action.tool as string;
@@ -438,12 +551,46 @@ I'll fetch the accounts list first.
 | search | query | Search the web |
 | fetch | url | Fetch a URL as cleaned text |
 | mcp_tool_call | server, tool, input | Call a tool on a connected MCP server |
+| install_skill | name, content | Install a skill by writing a SKILL.md file |
+| enable_skill | name | Enable an installed skill (starts its MCP bridge if applicable) |
+| disable_skill | name | Disable a skill |
+| list_skills | | List all installed skills and their status |
 | decompose | subtasks | Break a complex task into parallel sub-tasks dispatched to other agents. Each subtask has type (call, browse, create, modify, skill), description, and optional data. |
 | done | result | Task complete. Include the answer in result. |
 | fail | reason | Task cannot be completed |
 | reply | message | Send a progress update to the user |
 
 Every action can include a "reasoning" field explaining your thinking.
+
+## Installing MCP Server Skills
+
+When a user asks to install an MCP server (e.g., "install @shinzolabs/gmail-mcp"):
+1. Use install_skill directly with a SKILL.md (exact format below). npx handles package installation automatically.
+2. Use enable_skill to start the MCP bridge.
+3. Check the observation to confirm the bridge connected and tools were discovered.
+4. Report done.
+
+SKILL.md format (frontmatter keys are always hyphenated):
+
+\`\`\`
+---
+name: <short-name>
+description: "<what the server provides>"
+mcp-command: npx
+mcp-args: ["-y", "<npm-package-name>"]
+env:
+  <ENV_VAR_NAME>: "<value>"
+---
+
+<Brief description of the MCP server.>
+\`\`\`
+
+Frontmatter rules:
+- All keys are hyphenated: \`mcp-command\`, \`mcp-args\`
+- \`mcp-command\` is always \`npx\` for npm packages
+- \`mcp-args\` always starts with \`"-y"\` followed by the package name
+- Include \`env\` with any required environment variables and their values
+- When the user provides credentials, include them in the env block. Otherwise leave values empty and tell the user what is needed before enabling.
 
 ## Environment
 

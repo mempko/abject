@@ -60,6 +60,7 @@ export class GoalManager extends Abject {
   private tupleSpaceId?: AbjectId;
   private sharedStateId?: AbjectId;
   private storageId?: AbjectId;
+  private agentAbjectId?: AbjectId;
   private localPeerId = '';
   /** Track taskIds for which we already emitted terminal events (idempotency guard). */
   private emittedTerminalTasks: Set<string> = new Set();
@@ -293,6 +294,7 @@ export class GoalManager extends Abject {
     this.tupleSpaceId = await this.discoverDep('TupleSpace') ?? undefined;
     this.sharedStateId = await this.discoverDep('SharedState') ?? undefined;
     this.storageId = await this.discoverDep('Storage') ?? undefined;
+    this.agentAbjectId = await this.discoverDep('AgentAbject') ?? undefined;
 
     // Subscribe to TupleSpace events so we detect remote permanently_failed/done transitions
     if (this.tupleSpaceId) {
@@ -1102,6 +1104,13 @@ if it can handle the task, and the most confident agent claims it.
           this.emittedTerminalTasks.delete(task.id);
           cancelled++;
         } catch { /* best effort -- tuple may already be gone */ }
+      }
+
+      // Cancel running agent tasks for this goal
+      if (this.agentAbjectId) {
+        try {
+          await this.request(request(this.id, this.agentAbjectId, 'cancelTasksByGoal', { goalId }));
+        } catch { /* best effort */ }
       }
 
       // Clean up per-goal SharedState namespace
