@@ -82,6 +82,13 @@ export abstract class Abject {
     timeoutMsg: string;
   }> = new Map();
 
+  /**
+   * Tracks senders of requests currently being handled (sync or async). Used to
+   * bubble progress events back to the originators so any progress anywhere in
+   * the call tree resets every ancestor's stall timer.
+   */
+  private _handlingRequestSenders: Set<import('./types.js').AbjectId> = new Set();
+
   constructor(options: AbjectOptions) {
     require(options.manifest !== undefined, 'manifest is required');
     requireNonEmpty(options.manifest.name, 'manifest.name');
@@ -232,6 +239,30 @@ export abstract class Abject {
       );
 
       return DEFERRED_REPLY;
+    });
+
+    // Default progress handler: reset all pending request timers, then bubble
+    // progress upstream to whoever called us. This makes any progress event
+    // anywhere in the call tree reset every ancestor's stall timer.
+    this.on('progress', (msg: AbjectMessage) => {
+      const pendingCount = this.pendingReplies.size;
+      const upstreamCount = this._handlingRequestSenders.size;
+      if (pendingCount > 0 || upstreamCount > 0) {
+        log.info(`[${this.manifest.name}:${this.id.slice(0, 8)}] PROGRESS from=${msg.routing.from.slice(0, 8)} resetting=${pendingCount} bubble_to=${upstreamCount}`);
+      }
+      // Reset stall timers for every outbound request we're awaiting
+      for (const id of this.pendingReplies.keys()) {
+        this.resetRequestTimeout(id);
+      }
+      // Bubble: forward a progress event to every upstream request sender,
+      // skipping the sender of this progress event to avoid ping-pong loops.
+      const from = msg.routing.from;
+      for (const upstream of this._handlingRequestSenders) {
+        if (upstream === from) continue;
+        try {
+          this.send(event(this.id, upstream, 'progress', msg.payload ?? {}));
+        } catch { /* bus gone */ }
+      }
     });
 
     this._status = 'ready';
@@ -556,6 +587,7 @@ You are this object. Your capabilities are exactly what the manifest above descr
 
       const timeout = setTimeout(() => {
         this.pendingReplies.delete(message.header.messageId);
+        log.warn(`[${this.manifest.name}:${this.id.slice(0, 8)}] TIMEOUT (no progress for ${timeoutMs}ms) → ${target.slice(0, 8)} ${method}`);
         reject(new Error(timeoutMsg));
       }, timeoutMs);
 
@@ -585,6 +617,7 @@ You are this object. Your capabilities are exactly what the manifest above descr
     clearTimeout(entry.timeout);
     entry.timeout = setTimeout(() => {
       this.pendingReplies.delete(messageId);
+      log.warn(`[${this.manifest.name}:${this.id.slice(0, 8)}] TIMEOUT (no progress for ${entry.timeoutMs}ms) ${entry.timeoutMsg}`);
       entry.reject(new Error(entry.timeoutMsg));
     }, entry.timeoutMs);
     return true;
@@ -662,12 +695,22 @@ You are this object. Your capabilities are exactly what the manifest above descr
     this._status = 'busy';
     this._handlerCount++;
 
+    // Track request handling so progress events received during the handler
+    // can be bubbled back to the originator.
+    const isReq = isRequest(message);
+    if (isReq) this._handlingRequestSenders.add(message.routing.from);
+
+    const cleanupHandling = () => {
+      if (isReq) this._handlingRequestSenders.delete(message.routing.from);
+    };
+
     let result: unknown;
     try {
       result = handler(message); // Call handler — don't await
     } catch (err) {
       // Sync handler threw — send error reply immediately
       this._handlerCount--;
+      cleanupHandling();
       this.errorCount++;
       this.lastError = {
         code: 'HANDLER_ERROR',
@@ -702,6 +745,7 @@ You are this object. Your capabilities are exactly what the manifest above descr
       (result as Promise<unknown>).then(
         (val) => {
           this._handlerCount--;
+          cleanupHandling();
 
           if (this._stoppedDuringHandler) {
             this._stoppedDuringHandler = false;
@@ -726,6 +770,7 @@ You are this object. Your capabilities are exactly what the manifest above descr
         },
         (err) => {
           this._handlerCount--;
+          cleanupHandling();
           this.errorCount++;
           this.lastError = {
             code: 'HANDLER_ERROR',
@@ -755,6 +800,11 @@ You are this object. Your capabilities are exactly what the manifest above descr
     } else {
       // Sync handler — reply immediately
       this._handlerCount--;
+      // Note: for DEFERRED_REPLY the work is async via sendDeferredReply,
+      // but we still clear here since the handler invocation itself returned.
+      // Progress events from the deferred work won't bubble through this Abject,
+      // which is acceptable -- the work runs independently.
+      cleanupHandling();
 
       if (this._stoppedDuringHandler) {
         this._stoppedDuringHandler = false;

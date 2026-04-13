@@ -203,13 +203,7 @@ export class AgentAbject extends Abject {
   /** Periodic scan timer for catching missed/pre-existing tasks. */
   private scanTimer?: ReturnType<typeof setInterval>;
 
-  /** Job submission heartbeat message ID for resetting request timeouts. */
-  private _currentJobMsgId?: string;
-
-  /** Active executeTask dispatch message ID for resetting request timeouts on progress. */
-  private _currentDispatchMsgId?: string;
-
-  /** Active task entry during LLM streaming — links llmChunk events to the right ticket. */
+  /** Active task entry during LLM streaming -- links llmChunk events to the right ticket. */
   private activeStreamEntry?: TaskEntry;
 
   /** Resolvers for event-driven child goal observation. */
@@ -894,15 +888,8 @@ The registered object must implement these handlers to participate in the agent 
       }));
     });
 
-    this.on('progress', (msg: AbjectMessage) => {
-      if (this._currentJobMsgId) this.resetRequestTimeout(this._currentJobMsgId);
-      if (this._currentDispatchMsgId) this.resetRequestTimeout(this._currentDispatchMsgId);
-      // Forward progress to JobManager so its internal callFn timeouts get reset,
-      // but ONLY if this event did not originate from JobManager (avoid ping-pong loop).
-      if (this.jobManagerId && msg.routing.from !== this.jobManagerId) {
-        this.send(event(this.id, this.jobManagerId, 'progress', msg.payload ?? {}));
-      }
-    });
+    // Note: progress events are handled by Abject base class which auto-bubbles
+    // them upstream and resets all pending request timeouts.
 
     // ── TupleSpace + GoalManager watcher ──
     this.on('changed', async (msg: AbjectMessage) => {
@@ -1006,18 +993,33 @@ The registered object must implement these handlers to participate in the agent 
     log.info(`DISPATCH-INNER ${tupleId} goalId=${taskGoalId?.slice(0, 8) ?? '?'} failureHistory=${failureHistory.length}`);
 
     // 0. Check dependencies — skip if any are unsatisfied
+    // The tuple's namespace (in TupleSpace) is the topmost goal's id; child goals
+    // share their root's namespace. Look it up from the tuple itself or by walking
+    // the goal chain. We can find the namespace by scanning the tuple's actual
+    // namespace from the goal manager.
     const dependsOn = (tuple.fields.dependsOn as string[]) ?? [];
-    if (dependsOn.length > 0 && taskGoalId && this.tupleSpaceId) {
+    if (dependsOn.length > 0 && taskGoalId && this.tupleSpaceId && this.goalManagerId) {
       try {
+        // Walk up to find the root goal id (which is the namespace)
+        let rootGoalId = taskGoalId;
+        let depth = 0;
+        while (depth < 10) {
+          const g = await this.request<{ id?: string; parentId?: string } | null>(
+            request(this.id, this.goalManagerId, 'getGoal', { goalId: rootGoalId }),
+          );
+          if (!g?.parentId) break;
+          rootGoalId = g.parentId;
+          depth++;
+        }
         const allTuples = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
           request(this.id, this.tupleSpaceId, 'scan', {
-            namespace: taskGoalId,
+            namespace: rootGoalId,
             pattern: {},
           }),
         );
         const doneIds = new Set(allTuples.filter(t => t.fields.status === 'done').map(t => t.id));
         if (!dependsOn.every(depId => doneIds.has(depId))) {
-          log.info(`DISPATCH-INNER ${tupleId} — blocked: dependencies not yet satisfied`);
+          log.info(`DISPATCH-INNER ${tupleId} — blocked: dependencies not yet satisfied (ns=${rootGoalId.slice(0, 8)}, deps=${dependsOn.map(d => d.slice(0, 8)).join(',')}, done=${[...doneIds].map(d => d.slice(0, 8)).join(',')})`);
           return;
         }
       } catch { /* best effort — proceed without check */ }
@@ -1190,20 +1192,8 @@ Pick the agent with the best combination of efficiency and likelihood of success
       code: jobCode,
       queue: chosen.name,
     });
-    this._currentDispatchMsgId = submitMsg.header.messageId;
-
-    // Heartbeat: send periodic progress while the job is queued/running so that
-    // upstream waitForTaskCompletion timeouts in Chat get reset.
-    const heartbeat = setInterval(() => {
-      if (taskGoalId && this.goalManagerId) {
-        this.send(event(this.id, this.goalManagerId, 'updateProgress', {
-          goalId: taskGoalId,
-          message: `${chosen.name} working...`,
-          phase: 'dispatch',
-          agentName: 'AgentAbject',
-        }));
-      }
-    }, 30000);
+    // No explicit heartbeat: progress events from the running job bubble up
+    // through Abject base class and reset this request's stall timer.
 
     try {
       const jobResult = await this.request<JobResult>(submitMsg, 400000);
@@ -1264,8 +1254,6 @@ Pick the agent with the best combination of efficiency and likelihood of success
         log.info(`DISPATCH-INNER ${tupleId} — failTask also failed: ${(err2 as Error).message?.slice(0, 80)}`);
       }
     } finally {
-      clearInterval(heartbeat);
-      this._currentDispatchMsgId = undefined;
       this.busyAgents.delete(chosen.agentId);
       // Immediate re-scan: pick up next pending task for this now-free agent
       this.periodicScan().catch(() => {});
@@ -1284,7 +1272,9 @@ Pick the agent with the best combination of efficiency and likelihood of success
       const goals = await this.request<Array<{ id: string; parentId?: string }>>(
         request(this.id, this.goalManagerId, 'listGoals', { status: 'active' })
       );
+      // Only scan top-level goals; child goals share their root's tuple namespace.
       for (const goal of goals) {
+        if (goal.parentId) continue;
         await this.scanNamespace(goal.id);
       }
     } catch (err) {
@@ -1295,17 +1285,19 @@ Pick the agent with the best combination of efficiency and likelihood of success
   private async scanNamespace(namespace: string): Promise<void> {
     if (!this.tupleSpaceId) return;
     try {
-      const tuples = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(
+      // Scan all tuples (any status) so we can build the doneIds set for
+      // dependency checking, then dispatch pending ones whose deps are met.
+      const allTuples = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(
         request(this.id, this.tupleSpaceId, 'scan', {
           namespace,
-          pattern: { status: 'pending' },
+          pattern: {},
         })
       );
 
-      // Build a set of completed task IDs for dependency checking
       const doneIds = new Set(
-        tuples.filter(t => t.fields.status === 'done').map(t => t.id),
+        allTuples.filter(t => t.fields.status === 'done').map(t => t.id),
       );
+      const tuples = allTuples.filter(t => t.fields.status === 'pending');
 
       let dispatched = 0;
       for (const tuple of tuples) {
@@ -1453,6 +1445,15 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       maxSteps: entry.state.maxSteps,
       phase: newPhase,
       action: entry.state.action?.action,
+    }));
+
+    // Also emit a 'progress' event to ourselves so the base-class progress handler
+    // resets all our pending request timers (most importantly the submitJob to
+    // JobManager) and bubbles upstream to whoever called us.
+    this.send(event(this.id, this.id, 'progress', {
+      ticketId: entry.state.id,
+      step: entry.state.step,
+      phase: newPhase,
     }));
 
     // Update goal progress via GoalManager
@@ -2084,13 +2085,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
         code: fullCode,
         ...(entry.config.queueName ? { queue: entry.config.queueName } : {}),
       });
-      this._currentJobMsgId = submitMsg.header.messageId;
-      let jobResult: JobResult;
-      try {
-        jobResult = await this.request<JobResult>(submitMsg, entry.state.timeout);
-      } finally {
-        this._currentJobMsgId = undefined;
-      }
+      const jobResult = await this.request<JobResult>(submitMsg, entry.state.timeout);
       if (jobResult.status === 'completed') {
         // If the agent's callback returned an AgentActionResult-shaped object
         // (with its own success/error), unwrap it so the caller sees the real
