@@ -60,6 +60,7 @@ export class KnowledgeBase extends Abject {
   private sharedStateId?: AbjectId;
   private entries: Map<string, KnowledgeEntry> = new Map();
   private index: MiniSearch<IndexedEntry>;
+  private distillTimer?: ReturnType<typeof setInterval>;
 
   constructor() {
     super({
@@ -188,6 +189,17 @@ export class KnowledgeBase extends Abject {
     }
 
     log.info(`KnowledgeBase initialized with ${this.entries.size} entries`);
+
+    // Run initial distillation, then periodically every 30 minutes
+    this.distill();
+    this.distillTimer = setInterval(() => this.distill(), 30 * 60 * 1000);
+  }
+
+  protected override async onStop(): Promise<void> {
+    if (this.distillTimer) {
+      clearInterval(this.distillTimer);
+      this.distillTimer = undefined;
+    }
   }
 
   protected override askPrompt(_question: string): string {
@@ -229,12 +241,12 @@ Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (age
 
   const all = await call(await dep('KnowledgeBase'), 'list', { type: 'learned', limit: 20 });
 
-### When to remember
-- Lessons from failed tasks (what went wrong and how to avoid it)
+### When to remember (durable knowledge only)
 - User preferences discovered during interaction
 - Facts about the workspace or project structure
-- Useful patterns or shortcuts found while working
+- Stable patterns or capabilities that help future unrelated tasks
 - References to external resources or object capabilities
+Ephemeral problems (runtime errors, connection failures, debugging context) belong in the goal scratchpad, not the knowledge base.
 
 ### When to recall
 - Before starting a task, check if relevant knowledge exists
@@ -453,6 +465,76 @@ Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (age
       if (entry.type === type && entry.title.toLowerCase() === lower) return entry;
     }
     return undefined;
+  }
+
+  // ─── Distillation ──────────────────────────────────────────────
+
+  private static readonly MAX_ENTRIES = 1000;
+  private static readonly STALE_NEVER_ACCESSED_DAYS = 7;
+  private static readonly STALE_INACTIVE_DAYS = 30;
+
+  /**
+   * Periodic cleanup: evict stale, low-value, and ephemeral entries.
+   * User facts (tagged 'user' or 'person') are always protected.
+   */
+  private distill(): void {
+    const now = Date.now();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const evicted: string[] = [];
+
+    for (const [id, entry] of this.entries) {
+      // Protect user facts
+      if (entry.type === 'fact' && entry.tags.some(t => t === 'user' || t === 'person')) continue;
+
+      const ageDays = (now - entry.createdAt) / dayMs;
+      const lastAccessDays = entry.lastAccessedAt
+        ? (now - entry.lastAccessedAt) / dayMs
+        : ageDays;
+
+      // Evict 'learned' entries never accessed after 7 days
+      if (entry.type === 'learned' && entry.accessCount === 0 && ageDays > KnowledgeBase.STALE_NEVER_ACCESSED_DAYS) {
+        evicted.push(id);
+        continue;
+      }
+
+      // Evict 'learned' or 'reference' entries inactive for 30 days
+      if ((entry.type === 'learned' || entry.type === 'reference') && lastAccessDays > KnowledgeBase.STALE_INACTIVE_DAYS) {
+        evicted.push(id);
+        continue;
+      }
+    }
+
+    // Evict collected entries
+    for (const id of evicted) {
+      const entry = this.entries.get(id);
+      if (entry) {
+        log.info(`Distill: evicting "${entry.title}" (type=${entry.type}, accessCount=${entry.accessCount})`);
+        this.index.discard(id);
+        this.entries.delete(id);
+      }
+    }
+
+    // Cap total entries by evicting lowest-accessCount non-user entries
+    if (this.entries.size > KnowledgeBase.MAX_ENTRIES) {
+      const sorted = [...this.entries.values()]
+        .filter(e => !(e.type === 'fact' && e.tags.some(t => t === 'user' || t === 'person')))
+        .sort((a, b) => a.accessCount - b.accessCount);
+
+      while (this.entries.size > KnowledgeBase.MAX_ENTRIES && sorted.length > 0) {
+        const entry = sorted.shift()!;
+        log.info(`Distill: cap evict "${entry.title}" (accessCount=${entry.accessCount})`);
+        this.index.discard(entry.id);
+        this.entries.delete(entry.id);
+      }
+    }
+
+    if (evicted.length > 0 || this.entries.size <= KnowledgeBase.MAX_ENTRIES) {
+      if (evicted.length > 0) {
+        this.persist();
+        this.syncToSharedState();
+        log.info(`Distill: evicted ${evicted.length} entries, ${this.entries.size} remaining`);
+      }
+    }
   }
 
   private rebuildIndex(): void {

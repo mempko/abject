@@ -666,14 +666,15 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   ] }\`
 - **reply**: Send intermediate text to the user (continue working after).
   \`{ "action": "reply", "text": "Working on it, I've created the goal..." }\`
-- **done**: Task complete, send final reply. The user can only see what you put in the done text, so include the complete results from previous actions. Present all data fully, do not summarize or truncate.
+- **done**: Task complete, send final reply. The user can only see what you put in the done text.
   \`{ "action": "done", "text": "Here are the results: ..." }\`
+  When the goal returned a result, present it to the user in full. You have plenty of output tokens (16K+) to include everything. Format the result for readability: markdown tables, lists, headers as appropriate. Rephrase or translate raw data (JSON, logs) into natural language when it helps the user. Include every item and every requested field. If the user asked for 5 items, show all 5. If the user asked for full content, show full content. Trust your output capacity -- the result fits.
 
 The chat window renders markdown. Use **bold**, *italic*, \`inline code\`, headings, bullet lists, code blocks, and [links](url) in your reply and done text for readable formatting.
 
 ## Writing Good Task Descriptions
 
-Task descriptions are how agents decide whether they can handle a task. Describe WHAT needs to happen, not HOW to do it. Agents already know their own tools, APIs, credentials, and connection details. Including implementation details (ports, protocols, libraries, connection strings) in task descriptions confuses agent routing.
+Task descriptions are how agents decide whether they can handle a task. Describe WHAT needs to happen, not HOW to do it. Agents already know their own tools, APIs, credentials, and connection details. Including implementation details (ports, protocols, libraries, connection strings) or notes about past failures in task descriptions confuses agent routing. Each attempt starts fresh; agents handle their own error recovery.
 - Include the object name when the task involves an existing object (e.g., "Modify the HackerNews object to..." not just "Fix the UI")
 - Describe the desired outcome, not just the problem (e.g., "Add a reset button to the Counter that sets the count back to zero")
 - For web tasks, mention that it involves a real website (e.g., "Browse https://example.com and extract the article text")

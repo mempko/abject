@@ -9,6 +9,7 @@
 import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import { AbjectId, AbjectMessage, InterfaceId } from '../../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../../core/abject.js';
 import { error as errorMsg, request } from '../../core/message.js';
@@ -299,7 +300,7 @@ export class HostFileSystem extends Abject {
   private async handleReadFile(filePath: string, offset?: number, limit?: number): Promise<{ content: string; lines: number }> {
     contractRequire(typeof filePath === 'string' && filePath.length > 0, 'path must be a non-empty string');
     log.info(`readFile: ${filePath}`);
-    await this.validatePath(filePath);
+    filePath = await this.validateAndResolve(filePath);
 
     const content = await fs.readFile(filePath, 'utf-8');
     const allLines = content.split('\n');
@@ -318,7 +319,7 @@ export class HostFileSystem extends Abject {
     contractRequire(typeof filePath === 'string' && filePath.length > 0, 'path must be a non-empty string');
     log.info(`writeFile: ${filePath} (${content.length} chars)`);
     this.requireWrite();
-    await this.validatePath(filePath);
+    filePath = await this.validateAndResolve(filePath);
 
     const dir = path.dirname(filePath);
     await fs.mkdir(dir, { recursive: true });
@@ -331,7 +332,7 @@ export class HostFileSystem extends Abject {
     log.info(`editFile: ${filePath}`);
     contractRequire(typeof oldText === 'string' && oldText.length > 0, 'oldText must be a non-empty string');
     this.requireWrite();
-    await this.validatePath(filePath);
+    filePath = await this.validateAndResolve(filePath);
 
     const content = await fs.readFile(filePath, 'utf-8');
     let replacements = 0;
@@ -352,10 +353,10 @@ export class HostFileSystem extends Abject {
     contractRequire(typeof pattern === 'string' && pattern.length > 0, 'pattern must be a non-empty string');
     log.info(`glob: ${pattern} (cwd=${cwd ?? 'default'})`);
     const baseDir = cwd ?? process.cwd();
-    await this.validatePath(baseDir);
+    const resolvedBase = await this.validateAndResolve(baseDir);
 
     // Simple recursive glob implementation using fs
-    const files = await this.walkGlob(baseDir, pattern);
+    const files = await this.walkGlob(resolvedBase, pattern);
     return { files };
   }
 
@@ -369,19 +370,19 @@ export class HostFileSystem extends Abject {
     log.info(`grep: ${pattern} (path=${searchPath ?? 'cwd'}, glob=${globFilter ?? 'none'})`);
 
     const baseDir = searchPath ?? process.cwd();
-    await this.validatePath(baseDir);
+    const resolvedBase = await this.validateAndResolve(baseDir);
 
     const regex = new RegExp(pattern);
     const max = maxResults ?? 100;
     const matches: Array<{ file: string; line: number; content: string }> = [];
 
-    const stat = await fs.stat(baseDir);
+    const stat = await fs.stat(resolvedBase);
     if (stat.isFile()) {
-      await this.grepFile(baseDir, regex, matches, max);
+      await this.grepFile(resolvedBase, regex, matches, max);
     } else {
       const files = globFilter
-        ? await this.walkGlob(baseDir, globFilter)
-        : await this.walkDir(baseDir);
+        ? await this.walkGlob(resolvedBase, globFilter)
+        : await this.walkDir(resolvedBase);
 
       for (const file of files) {
         if (matches.length >= max) break;
@@ -394,7 +395,7 @@ export class HostFileSystem extends Abject {
 
   private async handleStat(filePath: string): Promise<FileInfo> {
     contractRequire(typeof filePath === 'string' && filePath.length > 0, 'path must be a non-empty string');
-    await this.validatePath(filePath);
+    filePath = await this.validateAndResolve(filePath);
 
     const stat = await fs.stat(filePath);
     return {
@@ -409,7 +410,7 @@ export class HostFileSystem extends Abject {
   private async handleMkdir(dirPath: string): Promise<{ success: boolean }> {
     contractRequire(typeof dirPath === 'string' && dirPath.length > 0, 'path must be a non-empty string');
     this.requireWrite();
-    await this.validatePath(dirPath);
+    dirPath = await this.validateAndResolve(dirPath);
 
     await fs.mkdir(dirPath, { recursive: true });
     return { success: true };
@@ -417,7 +418,7 @@ export class HostFileSystem extends Abject {
 
   private async handleReaddir(dirPath: string): Promise<{ entries: Array<{ name: string; isDirectory: boolean }> }> {
     contractRequire(typeof dirPath === 'string' && dirPath.length > 0, 'path must be a non-empty string');
-    await this.validatePath(dirPath);
+    dirPath = await this.validateAndResolve(dirPath);
 
     const entries = await fs.readdir(dirPath, { withFileTypes: true });
     return {
@@ -427,7 +428,7 @@ export class HostFileSystem extends Abject {
 
   private async handleExists(filePath: string): Promise<{ exists: boolean }> {
     contractRequire(typeof filePath === 'string' && filePath.length > 0, 'path must be a non-empty string');
-    await this.validatePath(filePath);
+    filePath = await this.validateAndResolve(filePath);
 
     try {
       await fs.access(filePath);
@@ -440,7 +441,7 @@ export class HostFileSystem extends Abject {
   private async handleDeleteFile(filePath: string): Promise<{ success: boolean }> {
     contractRequire(typeof filePath === 'string' && filePath.length > 0, 'path must be a non-empty string');
     this.requireWrite();
-    await this.validatePath(filePath);
+    filePath = await this.validateAndResolve(filePath);
 
     await fs.unlink(filePath);
     return { success: true };
@@ -448,9 +449,18 @@ export class HostFileSystem extends Abject {
 
   // ─── Helpers ────────────────────────────────────────────────────
 
-  private async validatePath(p: string): Promise<void> {
-    const resolved = path.resolve(p);
-    if (this.allowedPaths?.some(ap => resolved.startsWith(path.resolve(ap)))) return;
+  /** Expand ~ and resolve to an absolute path. */
+  private resolvePath(p: string): string {
+    if (p.startsWith('~/') || p === '~') {
+      return path.resolve(path.join(os.homedir(), p.slice(1)));
+    }
+    return path.resolve(p);
+  }
+
+  /** Validate a path and return the resolved absolute path (with ~ expanded). */
+  private async validateAndResolve(p: string): Promise<string> {
+    const resolved = this.resolvePath(p);
+    if (this.allowedPaths?.some(ap => resolved.startsWith(path.resolve(ap)))) return resolved;
 
     // Path not in allow list -- ask the permissions authority
     if (this.permissionsAuthorityId) {
@@ -467,9 +477,9 @@ export class HostFileSystem extends Abject {
         case 'accept_always':
           if (!this.allowedPaths) this.allowedPaths = [];
           this.allowedPaths.push(resolved);
-          return;
+          return resolved;
         case 'accept_once':
-          return;
+          return resolved;
         case 'deny_always':
         case 'deny':
         default:

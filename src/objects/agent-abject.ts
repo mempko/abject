@@ -1658,7 +1658,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
 
                   if (goal.status === 'completed' || goal.status === 'failed') {
                     statusLines.push(goal.status === 'completed'
-                      ? `[Child Goal "${goal.title}"] COMPLETED: ${JSON.stringify(goal.result)?.slice(0, 300)}`
+                      ? `[Child Goal "${goal.title}"] COMPLETED: ${JSON.stringify(goal.result)?.slice(0, 20000)}`
                       : `[Child Goal "${goal.title}"] FAILED: ${goal.error ?? 'unknown'}`);
                     continue;
                   }
@@ -1680,7 +1680,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
                     await this.request(request(this.id, this.goalManagerId, 'completeGoal', {
                       goalId: cgId, result: results,
                     }));
-                    statusLines.push(`[Child Goal "${goal.title}"] COMPLETED (${doneT.length} tasks): ${JSON.stringify(results)?.slice(0, 300)}`);
+                    statusLines.push(`[Child Goal "${goal.title}"] COMPLETED (${doneT.length} tasks): ${JSON.stringify(results)?.slice(0, 20000)}`);
                   } else if (pending.length === 0 && inProgress.length === 0 && permFailed.length > 0 && doneT.length === 0) {
                     // All tasks permanently failed → fail the child goal
                     await this.request(request(this.id, this.goalManagerId, 'failGoal', {
@@ -1953,7 +1953,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       const llmResult = await this.request<{ content: string }>(
         request(this.id, this.llmId, 'complete', {
           messages: task.llmMessages,
-          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 4096 },
+          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 16384 },
         }),
         60000,
       );
@@ -2140,7 +2140,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       llmResult = await this.request<{ content: string }>(
         request(this.id, this.llmId, 'stream', {
           messages: task.llmMessages,
-          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 4096 },
+          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 16384 },
         }),
         120000,
       );
@@ -2304,10 +2304,10 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
         const icon = status === 'done' ? '\u2713' : status === 'permanently_failed' ? '\u2717' : '\u25CB';
         let line = `  ${icon} [${status}] ${desc}`;
         if (status === 'done' && t.fields.result) {
-          line += ` -- Result: ${JSON.stringify(t.fields.result).slice(0, 150)}`;
+          line += ` -- Result: ${JSON.stringify(t.fields.result).slice(0, 20000)}`;
         }
         if (status === 'permanently_failed' && t.fields.error) {
-          line += ` -- Error: ${String(t.fields.error).slice(0, 150)}`;
+          line += ` -- Error: ${String(t.fields.error).slice(0, 2000)}`;
         }
         lines.push(line);
       }
@@ -2359,7 +2359,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
         if (entries && entries.length > 0) {
           let kb = '\n\n## Relevant Knowledge\nPrevious agents have learned the following. Use remember(title, content, type, tags) to save new insights.\n';
           for (const e of entries) {
-            kb += `- **${e.title}** (${e.type}): ${e.content.slice(0, 200)}\n`;
+            kb += `- **${e.title}** (${e.type}): ${e.content.slice(0, 2000)}\n`;
           }
           prompt += kb;
         }
@@ -2375,10 +2375,11 @@ You can emit a remember action to save knowledge for future tasks:
 { "action": "remember", "title": "short summary", "content": "detailed knowledge", "type": "fact", "tags": ["tag1", "tag2"] }
 \`\`\`
 Types: 'learned' (lessons from outcomes), 'fact' (discovered facts), 'insight' (analysis), 'reference' (pointers)
-When to remember:
+When to remember (durable knowledge for future unrelated tasks):
 - User preferences or personal facts they share (location, name, job, etc.)
-- Lessons from task failures that would help future attempts
-- Useful patterns, shortcuts, or API details discovered while working
+- Stable system architecture insights or validated patterns
+- Useful API details or capabilities that are unlikely to change
+Ephemeral problems (runtime errors, connection failures, config issues, workarounds being tried) belong in the goal scratchpad, not the knowledge base. They are relevant to the current goal only.
 After remembering, you will be prompted to continue with the task.`;
 
     if (entry.goalId) {
@@ -2387,7 +2388,8 @@ After remembering, you will be prompted to continue with the task.`;
 **Goal Scratchpad** (shared with agents working on this same goal):
 - \`writeGoalData(key, value)\` -- save intermediate findings for other agents in this goal
 - \`readGoalData(key)\` -- read data another agent saved to this goal
-- Use for: partial results, specs, data one agent discovers that another needs`;
+- Use for: partial results, specs, errors encountered, debugging context, data one agent discovers that another needs
+- Prefer scratchpad over remember for anything tied to the current task`;
     }
 
     if (prompt) {
@@ -2447,7 +2449,7 @@ After remembering, you will be prompted to continue with the task.`;
 
     const action = task.action;
     const resultStr = task.lastResult.success
-      ? `Action "${action?.action}" succeeded: ${JSON.stringify(task.lastResult.data)?.slice(0, 500) ?? 'ok'}`
+      ? `Action "${action?.action}" succeeded: ${JSON.stringify(task.lastResult.data)?.slice(0, 30000) ?? 'ok'}`
       : `Action "${action?.action}" failed: ${task.lastResult.error}`;
 
     task.llmMessages.push({ role: 'user', content: `[Action Result]\n${resultStr}` });

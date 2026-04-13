@@ -329,7 +329,7 @@ pane shows details, configuration, and actions for the selected skill.
     if (!this.listWidgetId) return;
 
     const items = this.allSkills.map(s => ({
-      label: `${s.enabled ? '[on]' : '[off]'} ${s.name}`,
+      label: `${s.enabled ? (s.mcpStatus === 'error' ? '[err]' : '[on]') : '[off]'} ${s.name}`,
       value: s.name,
     }));
 
@@ -467,8 +467,13 @@ pane shows details, configuration, and actions for the selected skill.
     await this.addDetailLabel(skill.description || '(no description)', true);
     if (skill.allowedTools?.length) await this.addDetailLabel(`Tools: ${skill.allowedTools.join(', ')}`, true);
     if (skill.requiredBins?.length) await this.addDetailLabel(`Requires: ${skill.requiredBins.join(', ')}`, true);
-    await this.addDetailLabel(`Status: ${skill.enabled ? 'Enabled' : 'Disabled'}`, true);
+    if (skill.mcpStatus === 'error') {
+      await this.addDetailLabel(`Status: Error`, true, { color: '#ff6666' });
+    } else {
+      await this.addDetailLabel(`Status: ${skill.enabled ? 'Enabled' : 'Disabled'}`, true);
+    }
     if (skill.error) await this.addDetailLabel(`Error: ${skill.error}`, true, { color: '#ff6666' });
+    if (skill.configFile) await this.addDetailLabel(`Config file: ${skill.configFile}`, true);
 
     // ── Configuration section (always shown) ──
     await this.addDetailLabel('');

@@ -120,34 +120,32 @@ When asked about a task, describe which skill you would use and how. Say PASS if
     let prompt = this.askPrompt(question);
 
     if (this.skillRegistryId) {
-      // Include all installed skills (enabled and disabled) so the LLM knows
-      // what's available. Disabled skills can be enabled as part of the task.
-      try {
-        const allSkills = await this.request<Array<{ name: string; description: string; enabled: boolean; isMcpServer?: boolean }>>(
+      // Fetch skills and MCP servers in parallel
+      const [allSkills, servers] = await Promise.all([
+        this.request<Array<{ name: string; description: string; enabled: boolean; isMcpServer?: boolean; mcpStatus?: string; error?: string; configFile?: string }>>(
           request(this.id, this.skillRegistryId, 'listSkills', {}),
-        );
-        if (allSkills.length > 0) {
-          prompt += '\n\nAll installed skills:\n';
-          for (const s of allSkills) {
-            prompt += `- ${s.name} [${s.enabled ? 'enabled' : 'disabled'}]: ${s.description.slice(0, 120)}\n`;
-          }
-        }
-      } catch { /* best effort */ }
-
-      // Include connected MCP server tools so the LLM knows specific capabilities
-      try {
-        const servers = await this.request<Array<{
-          name: string; tools: Array<{ name: string; description: string }>;
-        }>>(
+        ).catch(() => []),
+        this.request<Array<{ name: string; tools: Array<{ name: string; description: string }> }>>(
           request(this.id, this.skillRegistryId, 'getEnabledMCPServers', {}),
-        );
-        if (servers.length > 0) {
-          prompt += '\nConnected MCP servers and tools:\n';
-          for (const s of servers) {
-            prompt += `- ${s.name}: ${s.tools.map(t => t.name).join(', ')}\n`;
-          }
+        ).catch(() => []),
+      ]);
+
+      if (allSkills.length > 0) {
+        prompt += '\n\nAll installed skills:\n';
+        for (const s of allSkills) {
+          const status = s.mcpStatus === 'error' ? 'error' : s.enabled ? 'enabled' : 'disabled';
+          let line = `- ${s.name} [${status}]${s.error ? ` (${s.error})` : ''}: ${s.description.slice(0, 120)}`;
+          if (s.configFile) line += ` [config: ${s.configFile}]`;
+          prompt += line + '\n';
         }
-      } catch { /* best effort */ }
+      }
+
+      if (servers.length > 0) {
+        prompt += '\nConnected MCP servers and tools:\n';
+        for (const s of servers) {
+          prompt += `- ${s.name}: ${s.tools.map(t => t.name).join(', ')}\n`;
+        }
+      }
     }
 
     return this.askLlm(prompt, question, 'fast');
@@ -312,13 +310,16 @@ When asked about a task, describe which skill you would use and how. Say PASS if
     let skillState = '';
     if (this.skillRegistryId) {
       try {
-        const skills = await this.request<Array<{ name: string; description: string; enabled: boolean; error?: string }>>(
+        const skills = await this.request<Array<{ name: string; description: string; enabled: boolean; mcpStatus?: string; error?: string; configFile?: string }>>(
           request(this.id, this.skillRegistryId, 'listSkills', {}),
         );
         if (skills.length > 0) {
-          skillState = '\n\nInstalled skills:\n' + skills.map(s =>
-            `- ${s.name} [${s.enabled ? 'enabled' : 'disabled'}]${s.error ? ` (error: ${s.error})` : ''}: ${s.description.slice(0, 100)}`
-          ).join('\n');
+          skillState = '\n\nInstalled skills:\n' + skills.map(s => {
+            const status = s.mcpStatus === 'error' ? 'error' : s.enabled ? 'enabled' : 'disabled';
+            let line = `- ${s.name} [${status}]${s.error ? ` (${s.error})` : ''}: ${s.description.slice(0, 100)}`;
+            if (s.configFile) line += ` [config: ${s.configFile}]`;
+            return line;
+          }).join('\n');
         }
       } catch { /* best effort */ }
 
@@ -380,7 +381,7 @@ When asked about a task, describe which skill you would use and how. Say PASS if
               body: action.body as string | undefined,
             }),
           );
-          result = `HTTP ${httpResult.status}\n${httpResult.body?.slice(0, 5000) ?? ''}`;
+          result = `HTTP ${httpResult.status}\n${httpResult.body?.slice(0, 30000) ?? ''}`;
           break;
         }
 
@@ -392,7 +393,7 @@ When asked about a task, describe which skill you would use and how. Say PASS if
           const fileResult = await this.request<{ content: string; lines: number }>(
             request(this.id, this.hostFileSystemId, 'readFile', { path }),
           );
-          result = fileResult.content.slice(0, 5000);
+          result = fileResult.content.slice(0, 30000);
           break;
         }
 
@@ -427,7 +428,7 @@ When asked about a task, describe which skill you would use and how. Say PASS if
           if (!url) return { success: false, error: 'fetch action requires "url" field' };
 
           const fetchResult = await this.request<{ content: string; title: string }>(
-            request(this.id, this.webFetchId, 'fetch', { url, maxLength: 5000 }),
+            request(this.id, this.webFetchId, 'fetch', { url, maxLength: 30000 }),
           );
           result = fetchResult.content;
           break;
@@ -591,6 +592,11 @@ Frontmatter rules:
 - \`mcp-args\` always starts with \`"-y"\` followed by the package name
 - Include \`env\` with any required environment variables and their values
 - When the user provides credentials, include them in the env block. Otherwise leave values empty and tell the user what is needed before enabling.
+- Include \`config-file\` if the MCP server uses an external config file (e.g. \`config-file: ~/.config/email-mcp/config.toml\`)
+
+## MCP Server Config Files
+
+Some MCP servers use external config files (TOML, JSON, YAML) in addition to or instead of env vars. Skills with a config file show \`[config: <path>]\` in the skill list. Use \`read_file\` to inspect and \`write_file\` to update these config files. After editing a config file, disable then re-enable the skill to restart the bridge with the new configuration.
 
 ## Environment
 

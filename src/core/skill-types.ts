@@ -27,6 +27,8 @@ export interface SkillInfo {
   mcpCommand?: string;
   /** MCP server runtime status. */
   mcpStatus?: 'idle' | 'running' | 'error';
+  /** Path to the MCP server's config file (e.g. ~/.config/email-mcp/config.toml). */
+  configFile?: string;
 }
 
 /** MCP server metadata parsed from SKILL.md frontmatter. */

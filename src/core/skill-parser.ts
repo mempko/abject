@@ -32,6 +32,8 @@ export interface ParsedSkill {
   version?: string;
   /** Present when the skill is an MCP server (type: mcp / mcp-command in frontmatter). */
   mcpServer?: MCPServerMeta;
+  /** Path to the MCP server's config file (from frontmatter 'config-file'). */
+  configFile?: string;
 }
 
 /**
@@ -123,6 +125,12 @@ export function parseSkillMd(content: string, dirName: string): ParsedSkill {
       args: mcpArgs,
       requiredEnv: result.requiredEnv,
     };
+  }
+
+  // Config file path (for MCP servers that use external config files)
+  const configFile = frontmatter['config-file'];
+  if (typeof configFile === 'string' && configFile.length > 0) {
+    result.configFile = configFile;
   }
 
   return result;

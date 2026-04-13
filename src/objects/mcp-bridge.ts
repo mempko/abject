@@ -37,6 +37,7 @@ export interface MCPBridgeConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
+  configFile?: string;
 }
 
 export class MCPBridge extends Abject {
@@ -44,6 +45,7 @@ export class MCPBridge extends Abject {
   private command: string;
   private commandArgs: string[];
   private env: Record<string, string>;
+  private configFile?: string;
   private transport: MCPTransport | null = null;
   private bridgeStatus: MCPBridgeStatus = 'idle';
   private bridgeStatusError?: string;
@@ -110,8 +112,32 @@ export class MCPBridge extends Abject {
     this.command = config.command;
     this.commandArgs = config.args ?? [];
     this.env = config.env ?? {};
+    this.configFile = config.configFile;
 
     this.setupHandlers();
+  }
+
+  protected override askPrompt(_question: string): string {
+    let prompt = super.askPrompt(_question);
+    prompt += `\n\nMCP Server: "${this.serverName}"`;
+    prompt += `\nCommand: ${this.command} ${this.commandArgs.join(' ')}`;
+    prompt += `\nStatus: ${this.bridgeStatus}`;
+    if (this.bridgeStatusError) {
+      prompt += `\nError: ${this.bridgeStatusError}`;
+    }
+    if (this.cachedTools.length > 0) {
+      prompt += `\nTools (${this.cachedTools.length}): ${this.cachedTools.map(t => t.name).join(', ')}`;
+    } else {
+      prompt += `\nTools: none discovered (server may have failed to start)`;
+    }
+    const envKeys = Object.keys(this.env).filter(k => this.env[k]);
+    if (envKeys.length > 0) {
+      prompt += `\nConfigured env vars: ${envKeys.join(', ')}`;
+    }
+    if (this.configFile) {
+      prompt += `\nConfig file: ${this.configFile}`;
+    }
+    return prompt;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -155,6 +181,7 @@ export class MCPBridge extends Abject {
         serverName: this.serverName,
         toolCount: this.cachedTools.length,
         error: this.bridgeStatusError,
+        configFile: this.configFile,
       };
     });
   }

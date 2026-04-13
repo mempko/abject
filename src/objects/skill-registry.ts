@@ -39,6 +39,8 @@ export class SkillRegistry extends Abject {
   private factoryId?: AbjectId;
   /** AbjectId of each running MCPBridge, keyed by skill name. */
   private mcpBridges = new Map<string, AbjectId>();
+  /** Cached bridge health state, keyed by skill name. */
+  private mcpBridgeStates = new Map<string, { status: string; error?: string; toolCount: number }>();
 
   constructor(skillsDir?: string) {
     super({
@@ -384,6 +386,14 @@ whenever the skill set changes.
           parsed,
           enabled: previousEnabled.get(parsed.name) ?? false,
         });
+
+        // Seed config from defaultEnv if no config exists or env is empty
+        if (parsed.defaultEnv) {
+          const existing = this.skillConfigs.get(parsed.name);
+          if (!existing || !existing.env || Object.values(existing.env).every(v => !v)) {
+            this.skillConfigs.set(parsed.name, { env: { ...parsed.defaultEnv } });
+          }
+        }
       } catch (err) {
         // If SKILL.md doesn't exist or can't be parsed, skip this directory
         if (err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -495,13 +505,14 @@ whenever the skill set changes.
 
   private entryToInfo(entry: SkillEntry): SkillInfo {
     const config = this.skillConfigs.get(entry.parsed.name);
+    const bridgeState = this.mcpBridgeStates.get(entry.parsed.name);
     const info: SkillInfo = {
       name: entry.parsed.name,
       description: entry.parsed.description,
       version: entry.parsed.version,
       source: entry.parsed.source,
       enabled: entry.enabled,
-      error: entry.error,
+      error: entry.error ?? bridgeState?.error,
       allowedTools: entry.parsed.allowedTools,
       requiredBins: entry.parsed.requiredBins,
       requiredEnv: entry.parsed.requiredEnv,
@@ -511,7 +522,17 @@ whenever the skill set changes.
     if (entry.parsed.mcpServer) {
       info.isMcpServer = true;
       info.mcpCommand = entry.parsed.mcpServer.command;
-      info.mcpStatus = this.mcpBridges.has(entry.parsed.name) ? 'running' : 'idle';
+      if (!this.mcpBridges.has(entry.parsed.name)) {
+        info.mcpStatus = 'idle';
+      } else if (bridgeState?.status === 'error') {
+        info.mcpStatus = 'error';
+      } else {
+        info.mcpStatus = 'running';
+      }
+    }
+
+    if (entry.parsed.configFile) {
+      info.configFile = entry.parsed.configFile;
     }
 
     return info;
@@ -565,14 +586,41 @@ whenever the skill set changes.
             command: entry.parsed.mcpServer.command,
             args: entry.parsed.mcpServer.args,
             env,
+            configFile: entry.parsed.configFile,
           },
         }),
       );
       this.mcpBridges.set(name, result.objectId);
       log.info(`Spawned MCPBridge for "${name}": ${result.objectId}`);
+
+      // Query bridge health after a short delay (give it time to connect)
+      setTimeout(() => this.refreshBridgeState(name).catch(() => {}), 3000);
     } catch (err) {
       log.error(`Failed to spawn MCPBridge for "${name}":`, err instanceof Error ? err.message : String(err));
       entry.error = `MCP spawn failed: ${err instanceof Error ? err.message : String(err)}`;
+      this.mcpBridgeStates.set(name, { status: 'error', error: entry.error, toolCount: 0 });
+    }
+  }
+
+  /** Query a bridge's getStatus and cache the result. */
+  private async refreshBridgeState(name: string): Promise<void> {
+    const bridgeId = this.mcpBridges.get(name);
+    if (!bridgeId) return;
+    try {
+      const status = await this.request<{ status: string; toolCount: number; error?: string }>(
+        request(this.id, bridgeId, 'getStatus', {}),
+        5000,
+      );
+      this.mcpBridgeStates.set(name, {
+        status: status.status,
+        error: status.error,
+        toolCount: status.toolCount,
+      });
+      if (status.status === 'error') {
+        log.info(`MCPBridge "${name}" in error state: ${status.error}`);
+      }
+    } catch {
+      this.mcpBridgeStates.set(name, { status: 'error', error: 'Bridge unreachable', toolCount: 0 });
     }
   }
 
@@ -581,6 +629,7 @@ whenever the skill set changes.
     if (!bridgeId) return;
 
     this.mcpBridges.delete(name);
+    this.mcpBridgeStates.delete(name);
 
     try {
       // Ask Factory to kill the bridge (Factory handles cleanup via Registry)
