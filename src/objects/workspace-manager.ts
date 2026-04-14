@@ -16,7 +16,7 @@ import {
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require as precondition, invariant } from '../core/contracts.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 
 const WORKSPACE_MANAGER_INTERFACE = 'abjects:workspace-manager' as InterfaceId;
@@ -790,6 +790,16 @@ export class WorkspaceManager extends Abject {
     await this.syncExposedToRegistry(ws);
     await this.persistWorkspaceList();
 
+    // Notify SharedState of the new access mode
+    try {
+      const results = await this.request<Array<{ id: AbjectId }>>(
+        request(this.id, ws.registryId, 'discover', { name: 'SharedState' })
+      );
+      if (results.length > 0) {
+        this.send(event(this.id, results[0].id, 'setAccessMode', { accessMode }));
+      }
+    } catch { /* SharedState not available yet */ }
+
     // Emit access change event for PeerRouter cache invalidation
     this.changed('workspaceAccessChanged', {
       workspaceId, accessMode, whitelist: ws.whitelist,
@@ -1304,6 +1314,17 @@ export class WorkspaceManager extends Abject {
     info.exposedObjectIds = resolvedIds;
 
     this.workspaces.set(workspaceId, info);
+
+    // Notify SharedState of the workspace access mode so it knows whether to sync P2P
+    try {
+      const results = await this.request<Array<{ id: AbjectId }>>(
+        request(this.id, info.registryId, 'discover', { name: 'SharedState' })
+      );
+      if (results.length > 0) {
+        this.send(event(this.id, results[0].id, 'setAccessMode', { accessMode }));
+      }
+    } catch { /* SharedState not spawned yet */ }
+
     if (info.accessMode !== 'local') {
       await this.ensureSharedStateExposed(info);
       await this.syncExposedToRegistry(info);

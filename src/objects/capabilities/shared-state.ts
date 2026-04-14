@@ -107,6 +107,9 @@ export class SharedState extends Abject {
   private storageId?: AbjectId;
   private localPeerId = '';
 
+  /** Workspace access mode. Local workspaces never sync over P2P. */
+  private _accessMode: 'local' | 'private' | 'public' = 'local';
+
   // Named state maps — each subscriber group gets its own CRDT map
   private stateMaps: Map<string, LWWMap> = new Map();
   // Track subscribers per state name
@@ -393,22 +396,23 @@ export class SharedState extends Abject {
     });
 
     this.on('_requestSync', async (msg: AbjectMessage) => {
+      // Local workspaces never respond to sync requests
+      if (this._accessMode === 'local') return;
+
       const { names } = msg.payload as { names: string[] };
       const fromId = msg.routing.from;
-      log.info(`[${this.id.slice(0, 8)}] _requestSync from=${fromId.slice(0, 8)} names=${JSON.stringify(names)}`);
+      log.info(`[${this.id.slice(0, 8)}] _requestSync from=${fromId.slice(0, 8)} names=${names.length} items`);
 
       // Add the requester as a known remote peer (bidirectional link)
       if (fromId !== this.id && !this.remotePeers.has(fromId)) {
         this.remotePeers.set(fromId, fromId as AbjectId);
-        log.info(`[${this.id.slice(0, 8)}] added remote peer ${fromId.slice(0, 8)} from _requestSync`);
       }
 
-      // Send full state back to the requesting SharedState for each name
+      // Send full state back only for namespaces we actually have
       for (const name of names) {
         const map = this.stateMaps.get(name);
         if (!map) {
-          log.info(`[${this.id.slice(0, 8)}] _requestSync: no map for '${name}'`);
-          this.bridgedNames.add(name);
+          // Unknown namespace -- drop silently. Bridging should be explicit.
           continue;
         }
         const entries = map.exportEntries();
@@ -442,6 +446,21 @@ export class SharedState extends Abject {
         this.pruneOnNextDiscovery = true;
         this.scheduleDiscovery();
         return;
+      }
+    });
+
+    this.on('setAccessMode', async (msg: AbjectMessage) => {
+      const { accessMode } = msg.payload as { accessMode: 'local' | 'private' | 'public' };
+      const prev = this._accessMode;
+      this._accessMode = accessMode;
+      log.info(`[${this.id.slice(0, 8)}] accessMode changed: ${prev} → ${accessMode}`);
+      if (accessMode === 'local' && prev !== 'local') {
+        // Went local: clear all remote peers, stop syncing
+        this.remotePeers.clear();
+        log.info(`[${this.id.slice(0, 8)}] cleared remote peers (workspace is now local)`);
+      } else if (accessMode !== 'local' && prev === 'local') {
+        // Went shared: trigger discovery
+        this.scheduleDiscovery();
       }
     });
   }
@@ -530,7 +549,12 @@ export class SharedState extends Abject {
   }
 
   private async discoverRemoteSharedStates(): Promise<void> {
-    log.info(`[${this.id.slice(0, 8)}] discoverRemoteSharedStates starting`);
+    // Local workspaces never sync over P2P
+    if (this._accessMode === 'local') {
+      log.info(`[${this.id.slice(0, 8)}] skipping discovery — workspace is local`);
+      return;
+    }
+    log.info(`[${this.id.slice(0, 8)}] discoverRemoteSharedStates starting (accessMode=${this._accessMode})`);
 
     // Get all subscribed state names (only sync what we care about)
     const subscribedNames = this.getSubscribedStateNames();
@@ -759,6 +783,7 @@ export class SharedState extends Abject {
   }
 
   private broadcastEntry(name: string, key: string, entry: LWWEntry): void {
+    if (this._accessMode === 'local') return;
     if (this.remotePeers.size === 0) return;
 
     const propagationId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -854,6 +879,7 @@ export class SharedState extends Abject {
   // ==========================================================================
 
   private async antiEntropyExchange(): Promise<void> {
+    if (this._accessMode === 'local') return;
     if (this.remotePeers.size === 0) return;
 
     // Clean up expired propagation IDs

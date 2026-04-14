@@ -78,13 +78,14 @@ const constructors = new Map<string, ObjectFactory>();
 constructors.set('LLMObject', () => new LLMObject());
 constructors.set('HttpClient', () => new HttpClient());
 constructors.set('Storage', (args?: unknown) => {
+  const dataDir = process.env.ABJECTS_DATA_DIR ?? '.abjects';
   const opts = args as { dbName?: string } | undefined;
   if (opts?.dbName) {
     const wsId = opts.dbName.replace('abjects-storage-', '');
-    const storagePath = path.join(process.cwd(), '.abjects', `ws-${wsId}`, 'storage.json');
+    const storagePath = path.join(process.cwd(), dataDir, `ws-${wsId}`, 'storage.json');
     return new NodeStorage(storagePath);
   }
-  return new NodeStorage();
+  return new NodeStorage(path.join(process.cwd(), dataDir, 'storage.json'));
 });
 constructors.set('Timer', () => new Timer());
 constructors.set('Clipboard', () => new Clipboard());

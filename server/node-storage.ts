@@ -10,7 +10,7 @@ import * as path from 'node:path';
 import { Storage, StorageEntry } from '../src/objects/capabilities/storage.js';
 import { Log } from '../src/core/timed-log.js';
 
-const STORAGE_DIR = '.abjects';
+const STORAGE_DIR = process.env.ABJECTS_DATA_DIR ?? '.abjects';
 const STORAGE_FILE = 'storage.json';
 const log = new Log('NODE-STORAGE');
 
