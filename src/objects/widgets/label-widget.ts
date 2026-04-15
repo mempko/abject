@@ -91,7 +91,11 @@ export class LabelWidget extends WidgetAbject {
       const fontSize = this.style.fontSize ?? 14;
       const lineHeight = fontSize + 4;
       const lines = await this.getWrappedLines(surfaceId, font, this.text, this.rect.width, fontSize);
-      const lineIndex = Math.max(0, Math.min(Math.floor((clickY - oy) / lineHeight), lines.length - 1));
+      // Mirror the vertical-centering offset applied in buildDrawCommands so
+      // clicks land on the right line.
+      const totalTextHeight = lines.length * lineHeight;
+      const yShift = Math.max(0, Math.floor((this.rect.height - totalTextHeight) / 2));
+      const lineIndex = Math.max(0, Math.min(Math.floor((clickY - oy - yShift) / lineHeight), lines.length - 1));
 
       // Find character offset within this line
       const localX = clickX - ox - textPadding;
@@ -121,10 +125,14 @@ export class LabelWidget extends WidgetAbject {
     const layout = this.cachedRichLayout!;
     const textPadding = 4;
 
+    // Mirror the vertical-centering offset applied in buildMarkdownDrawCommands.
+    const yShift = Math.max(0, Math.floor((this.rect.height - layout.totalHeight) / 2));
+    const localY = clickY - oy - yShift;
+
     // Find the clicked line
     let targetLine = layout.lines[layout.lines.length - 1]; // default to last
     for (const line of layout.lines) {
-      if (clickY - oy < line.y + line.height) {
+      if (localY < line.y + line.height) {
         targetLine = line;
         break;
       }
@@ -295,8 +303,12 @@ export class LabelWidget extends WidgetAbject {
     commands.push({ type: 'save', surfaceId, params: {} });
     commands.push({ type: 'clip', surfaceId, params: { x: ox, y: oy, width: w, height: h } });
 
+    // Vertically center the text block within the label rect when the rect
+    // has extra height (e.g., bubble-style labels with surrounding padding).
+    const yShift = Math.max(0, Math.floor((h - layout.totalHeight) / 2));
+
     for (const line of layout.lines) {
-      const lineTop = oy + line.y;
+      const lineTop = oy + yShift + line.y;
       const textY = lineTop + line.height * 0.7;
       if (lineTop > oy + h) break; // past bottom edge
 
@@ -467,8 +479,13 @@ export class LabelWidget extends WidgetAbject {
         selEnd = this.textPosToWrapped(lines, sel.end);
       }
 
+      // Vertically center the text block when the label rect has extra height
+      // (so bubble-style labels with surrounding padding look balanced).
+      const totalTextHeight = lines.length * lineHeight;
+      const yShift = Math.max(0, Math.floor((h - totalTextHeight) / 2));
+
       for (let i = 0; i < lines.length; i++) {
-        const lineY = oy + i * lineHeight;
+        const lineY = oy + yShift + i * lineHeight;
         const textY = lineY + lineHeight * 0.7;
         if (textY - lineHeight > oy + h) break; // past bottom edge
 
@@ -622,8 +639,12 @@ export class LabelWidget extends WidgetAbject {
     if (!layout) return null;
     const textPadding = 4;
 
+    // Account for the vertical-centering offset applied in buildMarkdownDrawCommands.
+    const yShift = Math.max(0, Math.floor((this.rect.height - layout.totalHeight) / 2));
+    const localY = clickY - yShift;
+
     for (const line of layout.lines) {
-      if (clickY < line.y || clickY >= line.y + line.height) continue;
+      if (localY < line.y || localY >= line.y + line.height) continue;
       let runX = textPadding + line.indent;
       for (const run of line.runs) {
         if (run.text.length === 0) continue;

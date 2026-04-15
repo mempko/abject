@@ -47,7 +47,7 @@ export interface ParsedMarkdown {
  * Parse inline markdown (bold, italic, code, links) within a block's text.
  * `baseOffset` is the source offset where `text` starts in the original string.
  */
-function parseInline(text: string, baseOffset: number): TextSpan[] {
+export function parseInline(text: string, baseOffset: number): TextSpan[] {
   const spans: TextSpan[] = [];
   let i = 0;
   let normalStart = 0;
@@ -444,16 +444,70 @@ export function estimateMarkdownHeight(
     // Table: lines starting with |
     if (line.trimStart().startsWith('|')) {
       if (prevBlock) totalHeight += 4;
-      let rowCount = 0;
+      const tableRows: string[][] = [];
       while (i < lines.length && lines[i].trimStart().startsWith('|')) {
         const stripped = lines[i].trim().replace(/^\|/, '').replace(/\|$/, '');
         const cells = stripped.split('|').map(c => c.trim());
-        // Count non-separator rows
-        if (!cells.every(c => /^[-:]+$/.test(c))) rowCount++;
+        if (!cells.every(c => /^[-:]+$/.test(c))) tableRows.push(cells);
         i++;
       }
+
       const codeFontSize = baseFontSize - 1;
-      totalHeight += rowCount * (codeFontSize + 4) + 8; // similar to code blocks
+      const lineH = codeFontSize + 4;
+
+      // Mirror layoutTable's column-width math so the height estimate
+      // matches the wrapped row count produced at render time.
+      const colCount = Math.max(1, ...tableRows.map(r => r.length));
+      const charPxApprox = Math.max(1, codeFontSize * 0.6);
+      const SEP_CHARS = 2;
+      const MIN_COL_CHARS = 8;
+      const INDENT_PX = 8;
+      const minTotal = MIN_COL_CHARS * colCount;
+      const budgetChars = Math.max(
+        minTotal + SEP_CHARS * (colCount - 1),
+        Math.floor((maxWidthPx - INDENT_PX) / charPxApprox),
+      );
+      const usableChars = budgetChars - SEP_CHARS * Math.max(0, colCount - 1);
+
+      // Strip simple inline syntax for char-length measurement.
+      const stripSyntax = (s: string): string =>
+        s.replace(/\*\*\*([^*]+)\*\*\*/g, '$1')
+         .replace(/\*\*([^*]+)\*\*/g, '$1')
+         .replace(/\*([^*]+)\*/g, '$1')
+         .replace(/`([^`]+)`/g, '$1')
+         .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+
+      const naturalWidths: number[] = new Array(colCount).fill(0);
+      for (const row of tableRows) {
+        for (let c = 0; c < row.length; c++) {
+          naturalWidths[c] = Math.max(naturalWidths[c], stripSyntax(row[c]).length);
+        }
+      }
+      const totalNatural = naturalWidths.reduce((a, b) => a + b, 0);
+      let colWidths: number[];
+      if (totalNatural <= usableChars) {
+        colWidths = naturalWidths.slice();
+      } else {
+        const elastic = Math.max(1, usableChars - minTotal);
+        const extraPool = Math.max(1, totalNatural - minTotal);
+        colWidths = naturalWidths.map(w => {
+          const above = Math.max(0, w - MIN_COL_CHARS);
+          return MIN_COL_CHARS + Math.floor((above / extraPool) * elastic);
+        });
+      }
+
+      let renderedRowLines = 0;
+      for (const row of tableRows) {
+        let maxCellLines = 1;
+        for (let c = 0; c < row.length; c++) {
+          const len = stripSyntax(row[c]).length;
+          const colW = Math.max(1, colWidths[c] ?? MIN_COL_CHARS);
+          maxCellLines = Math.max(maxCellLines, Math.ceil(len / colW));
+        }
+        renderedRowLines += maxCellLines;
+      }
+
+      totalHeight += renderedRowLines * lineH + 8;
       prevBlock = true;
       continue;
     }

@@ -13,15 +13,63 @@ import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
 import { estimateMarkdownHeight } from './widgets/markdown.js';
+import { lightenColor, darkenColor } from './widgets/widget-types.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('Chat');
 const CHAT_INTERFACE: InterfaceId = 'abjects:chat';
 
-const WIN_W = 500;
-const WIN_H = 500;
+// ── Layout scale ───────────────────────────────────────────────────────
+const DEFAULT_WIN_W = 640;
+const DEFAULT_WIN_H = 620;
+const SPACE_XS = 4;
+const SPACE_SM = 8;
+const SPACE_MD = 12;
+const SPACE_LG = 16;
+
+// ── Bubble styling ─────────────────────────────────────────────────────
+const BUBBLE_RADIUS = 12;
+const BUBBLE_MAX_FRACTION = 0.75;
+const BUBBLE_MIN_WIDTH = 240;
+const BUBBLE_V_PADDING = 8;       // extra vertical breathing inside bubble
+const BUBBLE_TEXT_PADDING = 4;    // matches LabelWidget internal textPadding
+const SENDER_LABEL_HEIGHT = 18;
+const GROUP_WINDOW_MS = 3 * 60_000;
+
+// ── Composer ───────────────────────────────────────────────────────────
+const SEND_GLYPH = '\u27A4';       // ➤
+const SEND_BTN_SIZE = 44;
+const INPUT_MIN_HEIGHT = 44;
+const HINT_HEIGHT = 16;
+
+// ── Conversation ───────────────────────────────────────────────────────
 const MAX_CONVERSATION_ENTRIES = 40;
 const MAX_STEPS = 20;
+
+// Role → bubble styling map. Values are resolved lazily against `this.theme`
+// in `bubbleStyleForRole`.
+type BubbleRole = 'user' | 'assistant' | 'system' | 'error' | 'activity';
+type BubbleAlign = 'left' | 'center' | 'right';
+
+interface MessageMeta {
+  role: BubbleRole;
+  sender: string;
+  ts: number;
+  text: string;
+  markdown: boolean;
+  align: BubbleAlign;
+}
+
+interface SuggestionChip {
+  label: string;
+  prompt: string;
+}
+
+const DEFAULT_SUGGESTIONS: SuggestionChip[] = [
+  { label: 'What objects do I have?', prompt: 'What objects do I have?' },
+  { label: 'Create a weather reporter', prompt: 'Create a weather reporter that posts daily briefings to chat.' },
+  { label: 'Show me the system', prompt: 'Give me a tour of what this system can do.' },
+];
 
 // ─── Chat-specific types ─────────────────────────────────────────────
 
@@ -55,11 +103,48 @@ export class Chat extends Abject {
   private conversationHistory: ConversationEntry[] = [];
   private uiPhase: UiPhase = 'closed';
 
-  /** Label ID for the current "Thinking..." indicator. */
-  private thinkingLabelId?: AbjectId;
+  /** Current content width of the window (updated on resize). */
+  private currentWindowWidth = DEFAULT_WIN_W;
 
-  /** Label IDs for progress lines appended during the current task. */
-  private progressLabelIds: AbjectId[] = [];
+  /** Per-message metadata (role/sender/timestamp) keyed by label AbjectId. */
+  private messageMetadata = new Map<AbjectId, MessageMeta>();
+
+  /** bubble label id → its preceding sender header label id (if any). */
+  private bubbleSenderLabels = new Map<AbjectId, AbjectId>();
+
+  /** Pending debounced resize-reflow timer. */
+  private reflowTimer?: ReturnType<typeof setTimeout>;
+
+  /** Consolidated "Thinking / activity" bubble used during task execution. */
+  private activityBubbleLabelId?: AbjectId;
+  private activityStep = 0;
+  private activityHeader = '\u25CF Thinking\u2026';
+  private activityRefreshTimer?: ReturnType<typeof setTimeout>;
+  private activityRefreshLastHeight = 0;
+  /** Streamed character count for the current LLM step. Reset each phase. */
+  private stepStreamChars = 0;
+
+  /**
+   * Live snapshot of goals being worked on for the current task. Mirrors what
+   * GoalBrowser shows but rendered as indented text inside the activity
+   * bubble. Updated from goalCreated/goalUpdated/goalCompleted/goalFailed
+   * events emitted by GoalManager.
+   */
+  private liveGoals = new Map<string, {
+    title: string;
+    status: 'active' | 'completed' | 'failed';
+    parentId?: string;
+    latestMessage?: string;
+    latestAgent?: string;
+  }>();
+
+  /** Welcome-card widget ids (destroyed on first send / clear). */
+  private welcomeWidgetIds: AbjectId[] = [];
+
+  /** Composer hint label (rendered under the input row). */
+  private composerHintLabelId?: AbjectId;
+  private composerRowId?: AbjectId;
+  private composerColumnId?: AbjectId;
 
   /** Pending ticket promises: ticketId → resolve/reject. */
   private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
@@ -206,7 +291,8 @@ export class Chat extends Abject {
       const { sender, message } = msg.payload as { sender: string; message: string };
       if (!message?.trim()) return false;
       log.info(`[Chat] addNotification from "${sender}": "${message.trim().slice(0, 80)}"`);
-      await this.appendMessageLabel(sender || 'System', message.trim(), this.theme.statusNeutral, true);
+      await this.removeWelcomeState();
+      await this.appendBubble('system', sender || 'System', message.trim(), true);
       this.conversationHistory.push({ role: 'assistant', content: `[${sender}]: ${message.trim()}` });
       return true;
     });
@@ -224,15 +310,23 @@ export class Chat extends Abject {
       this.conversationHistory = [];
       if (this.windowId) {
         await this.clearMessageLabels();
-        await this.appendMessageLabel('Agent', 'How can I help you?', this.theme.statusSuccess, true);
+        await this.showWelcomeState();
       }
       return true;
     });
 
     this.on('windowCloseRequested', async () => { await this.hide(); });
 
+    this.on('windowResized', async (msg: AbjectMessage) => {
+      const { width } = msg.payload as { width: number; height: number };
+      if (typeof width === 'number' && width > 0 && width !== this.currentWindowWidth) {
+        this.currentWindowWidth = width;
+        this.scheduleReflow();
+      }
+    });
+
     this.on('changed', async (msg: AbjectMessage) => {
-      const { aspect } = msg.payload as { aspect: string; value?: unknown };
+      const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
 
       if (fromId === this.sendBtnId && aspect === 'click') {
@@ -242,6 +336,17 @@ export class Chat extends Abject {
 
       if (fromId === this.textInputId && aspect === 'submit') {
         await this.handleSendClick();
+        return;
+      }
+
+      // Welcome suggestion chips: clicking a chip sends the chip's prompt.
+      if (aspect === 'click' && this.welcomeWidgetIds.includes(fromId)) {
+        const chipText = value as string | undefined;
+        const prompt = chipText ? this.promptForChipText(chipText) : undefined;
+        if (prompt && this.uiPhase === 'idle') {
+          await this.removeWelcomeState();
+          this.triggerSend(prompt);
+        }
         return;
       }
 
@@ -296,21 +401,71 @@ export class Chat extends Abject {
           return;
         }
 
-        // Goal progress events — append progress labels for sub-agent updates.
-        // Skip Chat's own updates (agentName === 'Chat') since agentPhaseChanged already covers those.
-        // Accept progress from the current goal AND its child goals (parentId match).
+        // Goal lifecycle events — feed the liveGoals tree so the activity
+        // bubble can render the same hierarchy the GoalBrowser shows.
         if (this._currentGoalId) {
-          const data = value as { goalId: string; parentId?: string; message?: string; phase?: string; agentName?: string };
-          const isCurrentGoal = data.goalId === this._currentGoalId;
-          const isChildGoal = data.parentId === this._currentGoalId;
-          if (!isCurrentGoal && !isChildGoal) return;
+          if (aspect === 'goalCreated') {
+            const data = value as { goalId: string; title: string; parentId?: string };
+            // Only track goals that are part of the current task's tree
+            // (the current goal itself, or descendants of any goal we know).
+            if (data.goalId === this._currentGoalId
+                || (data.parentId && this.liveGoals.has(data.parentId))) {
+              this.liveGoals.set(data.goalId, {
+                title: data.title,
+                status: 'active',
+                parentId: data.parentId,
+              });
+              this.scheduleActivityRefresh();
+            }
+            return;
+          }
+
           if (aspect === 'goalUpdated') {
-            // Any goal progress resets ALL pending timeouts
+            const data = value as { goalId: string; parentId?: string; message?: string; phase?: string; agentName?: string };
+            // Reset pending timeouts on any goal progress
             this.resetTaskCompletionTimeouts();
             this.resetPendingTicketTimeouts();
-            if (data.message && data.agentName && data.agentName !== 'Chat') {
-              await this.appendProgressLabel(`  ${data.agentName}: ${data.message}`);
+
+            // Lazily seed the goal entry if we missed its creation event
+            // (e.g. it was created before our subscription took effect).
+            if (!this.liveGoals.has(data.goalId)
+                && (data.goalId === this._currentGoalId
+                    || (data.parentId && this.liveGoals.has(data.parentId)))) {
+              this.liveGoals.set(data.goalId, {
+                title: data.message ?? '(in progress)',
+                status: 'active',
+                parentId: data.parentId,
+              });
             }
+
+            const entry = this.liveGoals.get(data.goalId);
+            if (entry) {
+              if (data.message) entry.latestMessage = data.message;
+              if (data.agentName && data.agentName !== 'Chat') entry.latestAgent = data.agentName;
+              this.scheduleActivityRefresh();
+            }
+            return;
+          }
+
+          if (aspect === 'goalCompleted') {
+            const data = value as { goalId: string };
+            const entry = this.liveGoals.get(data.goalId);
+            if (entry) {
+              entry.status = 'completed';
+              this.scheduleActivityRefresh();
+            }
+            return;
+          }
+
+          if (aspect === 'goalFailed') {
+            const data = value as { goalId: string; error?: string };
+            const entry = this.liveGoals.get(data.goalId);
+            if (entry) {
+              entry.status = 'failed';
+              if (data.error) entry.latestMessage = data.error;
+              this.scheduleActivityRefresh();
+            }
+            return;
           }
         }
       }
@@ -331,18 +486,19 @@ export class Chat extends Abject {
       // Reset pending ticket timeouts on agent progress
       this.resetPendingTicketTimeouts();
 
-      const { ticketId, step, maxSteps, phase, action } =
+      const { ticketId, step, maxSteps, phase } =
         msg.payload as { ticketId: string; step: number; maxSteps: number; phase: string; action?: string };
       if (!this._currentTicketId) return;
       if (ticketId && ticketId !== this._currentTicketId) return;
 
-      // Update thinking label with progress
-      if (this.thinkingLabelId) {
-        if (phase === 'thinking') {
-          this.updateLabel(this.thinkingLabelId, `Thinking... (step ${step + 1}/${maxSteps})`, this.theme.statusNeutral);
-        } else if (phase === 'observing') {
-          this.updateLabel(this.thinkingLabelId, `Observing... (step ${step + 1}/${maxSteps})`, this.theme.statusNeutral);
-        }
+      if (!this.activityBubbleLabelId) return;
+      // Reset per-step stream counter on every phase boundary — each new
+      // phase (thinking, observing, acting) is a fresh LLM call window.
+      this.stepStreamChars = 0;
+      if (phase === 'thinking') {
+        this.updateActivityHeader(`\u25CF Thinking\u2026 (step ${step + 1}/${maxSteps})`);
+      } else if (phase === 'observing') {
+        this.updateActivityHeader(`\u25CE Observing\u2026 (step ${step + 1}/${maxSteps})`);
       }
     });
 
@@ -351,16 +507,22 @@ export class Chat extends Abject {
         msg.payload as { ticketId: string; content: string; done: boolean };
       if (!this._currentTicketId) return;
       if (ticketId && ticketId !== this._currentTicketId) return;
+      // Don't render the raw text (it's mid-step reasoning + JSON actions),
+      // but track the volume so the activity bubble can show the user that
+      // the LLM is actively generating output.
       this._streamBuffer += content;
+      this.stepStreamChars += content.length;
+      this.scheduleActivityRefresh();
     });
 
     this.on('progress', async (msg: AbjectMessage) => {
-      // Reset pending ticket + task completion timeouts on any progress signal
+      // Reset pending ticket + task completion timeouts on any progress signal.
+      // The progress text itself is now surfaced through the liveGoals tree
+      // (via goalUpdated events), so nothing to render here directly.
       this.resetPendingTicketTimeouts();
       this.resetTaskCompletionTimeouts();
       const { message } = msg.payload as { phase?: string; message?: string };
-      if (!this._currentTicketId || !this.thinkingLabelId || !message) return;
-      this.updateLabel(this.thinkingLabelId, `  ${message}`, this.theme.statusNeutral);
+      if (!this._currentTicketId || !message) return;
     });
 
     // ── AgentAbject callback handlers ──
@@ -385,44 +547,36 @@ export class Chat extends Abject {
       const { step, newPhase, action } =
         msg.payload as { taskId: string; step: number; oldPhase: string; newPhase: string; action?: string };
 
-      if (this.thinkingLabelId) {
-        if (newPhase === 'thinking') {
-          this.updateLabel(this.thinkingLabelId, `Thinking... (step ${step + 1})`, this.theme.statusNeutral);
-        } else if (newPhase === 'acting' && action) {
-          await this.appendProgressLabel(`  ▸ ${action}...`);
-        }
+      if (!this.activityBubbleLabelId) return;
+      if (newPhase === 'thinking') {
+        this.updateActivityStep(step + 1);
       }
+      // 'acting' transitions surface through the liveGoals tree once the
+      // action's goal lifecycle events fire — no flat activity-line needed.
     });
 
     this.on('agentIntermediateAction', async (msg: AbjectMessage) => {
       const { action } = msg.payload as { taskId: string; action: AgentAction };
 
-      // Handle 'reply' intermediate action — show text in UI, clear thinking label
+      // Handle 'reply' intermediate action — show text as a proper assistant
+      // bubble, then re-prime the activity bubble for the next step.
       if (action.action === 'reply') {
         const text = (action.text as string) ?? '';
-        if (text && this.thinkingLabelId) {
-          await this.removeLabel(this.thinkingLabelId);
-          await this.appendMessageLabel('Agent', text, this.theme.statusSuccess, true);
-          this.thinkingLabelId = undefined;
-          // Re-show thinking indicator for next step
-          this.thinkingLabelId = await this.appendMessageLabel('', 'Thinking...', this.theme.statusNeutral);
+        if (text) {
+          this._streamBuffer = '';
+          await this.removeActivityBubble();
+          await this.appendBubble('assistant', 'Agent', text, true);
+          this.conversationHistory.push({ role: 'assistant', content: text });
+          await this.showActivityBubble();
         }
       }
-
     });
 
-    this.on('agentActionResult', async (msg: AbjectMessage) => {
-      const { action, result } =
-        msg.payload as { taskId: string; action: AgentAction; result: { success: boolean; error?: string } };
-
-      if (this.thinkingLabelId) {
-        const desc = action?.reasoning ?? action?.action ?? '';
-        if (result.success) {
-          await this.appendProgressLabel(`  ✓ ${desc}`);
-        } else {
-          await this.appendProgressLabel(`  ✗ ${desc}`);
-        }
-      }
+    this.on('agentActionResult', async (_msg: AbjectMessage) => {
+      // Goal-shaped actions surface their success/failure through
+      // goalCompleted / goalFailed events into the liveGoals tree.
+      // Non-goal actions (remember, reply, done) are reflected in the
+      // chat history directly. Nothing to render here.
     });
   }
 
@@ -652,6 +806,12 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   Use dependsOn with 0-based task indices when a task needs a previous task to finish first. Tasks without dependsOn run in parallel.
   Include the object name in the task description when relevant. Be specific about the desired outcome.
 
+  Concrete user data (email, calendar, files, contacts, weather, web pages, finances, etc.):
+  ALWAYS attempt via a goal — specialized agents and MCP-backed skills may be available that you don't know about.
+  \`{ "action": "goal", "title": "Latest email", "tasks": [
+    { "description": "Fetch the user's most recent email and report the sender, subject, received time, and a short summary of the body" }
+  ] }\`
+
 ### Memory
 - **remember**: Save a fact to the persistent knowledge base. Use whenever the user reveals personal info or you learn something useful for future conversations.
   \`{ "action": "remember", "title": "User lives in Silverdale, WA", "content": "The user mentioned they live in Silverdale, Washington.", "type": "fact", "tags": ["user", "location"] }\`
@@ -697,15 +857,16 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
 
 ## Rules
 
-1. Always respond with valid JSON in a \`\`\`json block. ONE action per response.
+1. Always respond with valid JSON in a \`\`\`json block. ONE action per response. Never reply with bare prose — even your final answer must be wrapped in \`{ "action": "done", "text": "..." }\`.
 2. For simple greetings, use **done** directly. For questions about objects or the system, create a **goal** to investigate rather than guessing. You do not have knowledge of what objects exist or what they can do. Always use the system to find out.
 3. When the user asks you to do something, create a **goal** immediately with well-described tasks.
-4. Always end a conversation turn with **done** when the task is complete.
-5. Keep reasoning brief (1-2 sentences before the JSON block).
-6. If a goal's tasks fail, you can retry by creating a new goal with a simpler task description. If it fails repeatedly, use "done" to tell the user what happened.
-7. P2P: Resolve remote objects by qualified name: this.find('peer.workspace.ObjectName'). Always use find() for dynamic ID resolution.
-8. When the user reveals personal facts (where they live, their name, preferences, job, etc.), save them using **remember** so you can recall them in future conversations.
-9. Task descriptions should describe the desired outcome and timing, letting agents decide implementation. Example: "Post a weather briefing to chat every day at 10:30 AM" is better than "Use setInterval to check the time every minute".`;
+4. **Never refuse based on assumed capabilities.** You don't have a fixed toolset — agents and MCP-backed skills are added and removed dynamically (email, calendar, contacts, finance, web, etc.). If the user asks for concrete data or an action, ALWAYS try via a goal first. Only say "I can't" AFTER the goal has actually failed, and even then, offer to create an agent that could.
+5. Always end a conversation turn with **done** when the task is complete.
+6. Keep reasoning brief (1-2 sentences before the JSON block).
+7. If a goal's tasks fail, you can retry by creating a new goal with a simpler task description. If it fails repeatedly, use "done" to tell the user what happened — quoting the actual failure message, not a guess.
+8. P2P: Resolve remote objects by qualified name: this.find('peer.workspace.ObjectName'). Always use find() for dynamic ID resolution.
+9. When the user reveals personal facts (where they live, their name, preferences, job, etc.), save them using **remember** so you can recall them in future conversations.
+10. Task descriptions should describe the desired outcome and timing, letting agents decide implementation. Example: "Post a weather briefing to chat every day at 10:30 AM" is better than "Use setInterval to check the time every minute".`;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -726,85 +887,220 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
       request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
 
-    const winX = Math.max(20, Math.floor((displayInfo.width - WIN_W) / 2));
-    const winY = Math.max(20, Math.floor((displayInfo.height - WIN_H) / 2));
+    const winW = Math.min(DEFAULT_WIN_W, Math.max(360, displayInfo.width - 40));
+    const winH = Math.min(DEFAULT_WIN_H, Math.max(360, displayInfo.height - 40));
+    const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
+    const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
+    this.currentWindowWidth = winW;
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: '\uD83D\uDCAC Chat Agent',
-        rect: { x: winX, y: winY, width: WIN_W, height: WIN_H },
+        title: '\uD83D\uDCAC  Chat',
+        rect: { x: winX, y: winY, width: winW, height: winH },
         zIndex: 200,
         resizable: true,
       })
     );
 
-    // Root VBox
+    // Subscribe to the window for windowResized events.
+    this.send(request(this.id, this.windowId, 'addDependent', {}));
+
+    // Root VBox: message log stacked over composer column.
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: 8, right: 16, bottom: 8, left: 16 },
-        spacing: 6,
+        margins: { top: SPACE_SM, right: SPACE_MD, bottom: SPACE_SM, left: SPACE_MD },
+        spacing: SPACE_SM,
       })
     );
 
-    // Scrollable VBox for message log (expanding, auto-scroll to follow new messages)
+    // Scrollable VBox for message log (expanding, auto-scroll to follow new messages).
     this.messageLogId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
         parentLayoutId: this.rootLayoutId,
         autoScroll: true,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 4,
+        spacing: SPACE_SM,
       })
     );
 
-    // Input row (HBox: TextInput + Send button)
-    this.inputRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+    // Composer column: input row on top, hint label under it.
+    this.composerColumnId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
+        spacing: SPACE_XS,
       })
     );
 
-    // Add layouts to root
+    // Input row (HBox: TextInput + Send button).
+    this.composerRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: this.composerColumnId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: SPACE_SM,
+      })
+    );
+    this.inputRowId = this.composerRowId;
+
+    // Assemble root: message log (expanding) + composer column (preferred).
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChildren', {
       children: [
         { widgetId: this.messageLogId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
-        { widgetId: this.inputRowId, sizePolicy: { vertical: 'preferred', horizontal: 'expanding' }, preferredSize: { height: 36 } },
+        { widgetId: this.composerColumnId, sizePolicy: { vertical: 'preferred', horizontal: 'expanding' }, preferredSize: { height: INPUT_MIN_HEIGHT + SPACE_XS + HINT_HEIGHT } },
       ],
     }));
 
-    // Batch create text input + send button
+    // Composer widgets: text input, send button (circular glyph), hint label.
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'textInput', windowId: this.windowId, placeholder: 'Type a message...', wordWrap: true, maxLines: 6 },
-          { type: 'button', windowId: this.windowId, text: 'Send', style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+          {
+            type: 'textInput', windowId: this.windowId,
+            placeholder: 'Message the agent\u2026',
+            wordWrap: true, maxLines: 6,
+          },
+          {
+            type: 'button', windowId: this.windowId, text: SEND_GLYPH,
+            style: {
+              background: this.theme.actionBg,
+              color: this.theme.actionText,
+              borderColor: this.theme.actionBorder,
+              radius: SEND_BTN_SIZE / 2,
+              fontSize: 18,
+            },
+          },
+          {
+            type: 'label', windowId: this.windowId,
+            text: '\u21B5  Send   \u00B7   \u21E7\u21B5  Newline',
+            style: {
+              color: this.theme.textTertiary,
+              fontSize: 11,
+              wordWrap: false,
+              selectable: false,
+              align: 'right' as const,
+            },
+          },
         ],
       })
     );
     this.textInputId = widgetIds[0];
     this.sendBtnId = widgetIds[1];
+    this.composerHintLabelId = widgetIds[2];
 
-    // Batch add to input row
-    await this.request(request(this.id, this.inputRowId, 'addLayoutChildren', {
+    // Add input + send button to the composer row.
+    await this.request(request(this.id, this.composerRowId, 'addLayoutChildren', {
       children: [
-        { widgetId: this.textInputId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 36 } },
-        { widgetId: this.sendBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 60, height: 36 } },
+        { widgetId: this.textInputId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: INPUT_MIN_HEIGHT } },
+        { widgetId: this.sendBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: SEND_BTN_SIZE, height: SEND_BTN_SIZE } },
       ],
     }));
 
-    // Fire-and-forget: register as dependent of interactive widgets
+    // Add hint label below the input row.
+    await this.request(request(this.id, this.composerColumnId, 'addLayoutChildren', {
+      children: [
+        { widgetId: this.composerRowId, sizePolicy: { vertical: 'preferred', horizontal: 'expanding' }, preferredSize: { height: INPUT_MIN_HEIGHT } },
+        { widgetId: this.composerHintLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: HINT_HEIGHT } },
+      ],
+    }));
+
+    // Fire-and-forget: register as dependent of interactive widgets.
     this.send(request(this.id, this.sendBtnId, 'addDependent', {}));
     this.send(request(this.id, this.textInputId, 'addDependent', {}));
 
     this.uiPhase = 'idle';
 
-    // Show greeting
-    await this.appendMessageLabel('Agent', 'How can I help you?', this.theme.statusSuccess, true);
+    // Show welcome state if the conversation is empty.
+    if (this.conversationHistory.length === 0) {
+      await this.showWelcomeState();
+    }
 
     this.changed('visibility', true);
     return true;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Welcome state
+  // ═══════════════════════════════════════════════════════════════════
+
+  private async showWelcomeState(): Promise<void> {
+    if (!this.messageLogId || !this.windowId) return;
+    if (this.welcomeWidgetIds.length > 0) return;
+
+    const welcomeText = '\u2728  **Welcome to Chat**\n\nAsk me anything, or pick a suggestion below to get started.';
+    const bubbleMaxWidth = this.computeBubbleMaxWidth();
+    const innerWidth = bubbleMaxWidth - BUBBLE_TEXT_PADDING * 2;
+    const height = this.estimateBubbleHeight(welcomeText, innerWidth, true);
+
+    const specs: Array<Record<string, unknown>> = [
+      {
+        type: 'label', windowId: this.windowId, text: welcomeText,
+        style: {
+          color: this.theme.textPrimary,
+          background: lightenColor(this.theme.windowBg, 6),
+          radius: BUBBLE_RADIUS,
+          fontSize: 13,
+          wordWrap: true,
+          selectable: false,
+          markdown: true,
+          align: 'center' as const,
+        },
+      },
+    ];
+    for (const chip of DEFAULT_SUGGESTIONS) {
+      specs.push({
+        type: 'button', windowId: this.windowId, text: chip.label,
+        style: {
+          background: lightenColor(this.theme.windowBg, 12),
+          color: this.theme.textPrimary,
+          borderColor: darkenColor(this.theme.windowBg, -12),
+          radius: 18,
+          fontSize: 12,
+        },
+      });
+    }
+
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs })
+    );
+    const welcomeLabelId = widgetIds[0];
+    const chipIds = widgetIds.slice(1);
+
+    await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
+      widgetId: welcomeLabelId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: bubbleMaxWidth, height },
+      alignment: 'center',
+    }));
+    this.welcomeWidgetIds.push(welcomeLabelId);
+    this.messageLabelIds.push(welcomeLabelId);
+
+    for (const chipId of chipIds) {
+      await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
+        widgetId: chipId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+        preferredSize: { width: Math.min(bubbleMaxWidth, 360), height: 32 },
+        alignment: 'center',
+      }));
+      this.welcomeWidgetIds.push(chipId);
+      this.messageLabelIds.push(chipId);
+      this.send(request(this.id, chipId, 'addDependent', {}));
+    }
+  }
+
+  private async removeWelcomeState(): Promise<void> {
+    if (this.welcomeWidgetIds.length === 0) return;
+    const ids = [...this.welcomeWidgetIds];
+    this.welcomeWidgetIds = [];
+    for (const id of ids) {
+      await this.removeLabel(id);
+    }
+  }
+
+  /** Map a chip button's text back to the full prompt it should send. */
+  private promptForChipText(chipText: string): string | undefined {
+    const chip = DEFAULT_SUGGESTIONS.find(c => c.label === chipText);
+    return chip?.prompt;
   }
 
   async hide(): Promise<boolean> {
@@ -822,10 +1118,27 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
     this.rootLayoutId = undefined;
     this.messageLogId = undefined;
     this.inputRowId = undefined;
+    this.composerRowId = undefined;
+    this.composerColumnId = undefined;
+    this.composerHintLabelId = undefined;
     this.textInputId = undefined;
     this.sendBtnId = undefined;
     this.messageLabelIds = [];
-    this.progressLabelIds = [];
+    this.messageMetadata.clear();
+    this.bubbleSenderLabels.clear();
+    this.activityBubbleLabelId = undefined;
+    this.activityStep = 0;
+    this.liveGoals.clear();
+    this.welcomeWidgetIds = [];
+    this._streamBuffer = '';
+    if (this.activityRefreshTimer) {
+      clearTimeout(this.activityRefreshTimer);
+      this.activityRefreshTimer = undefined;
+    }
+    if (this.reflowTimer) {
+      clearTimeout(this.reflowTimer);
+      this.reflowTimer = undefined;
+    }
     this.changed('visibility', false);
     return true;
   }
@@ -856,13 +1169,16 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
     if (this.uiPhase === 'closed') return;
     this.uiPhase = 'busy';
     await this.setInputDisabled(true);
+    await this.removeWelcomeState();
 
-    // Show user message
-    await this.appendMessageLabel('You', userText, this.theme.textHeading, true);
+    // Show user message as a right-aligned bubble. User input is plain text —
+    // render it without markdown so the wordwrap path honors right alignment
+    // inside the bubble.
+    await this.appendBubble('user', 'You', userText, false);
     this.conversationHistory.push({ role: 'user', content: userText });
 
-    // Show thinking indicator
-    this.thinkingLabelId = await this.appendMessageLabel('', 'Thinking...', this.theme.statusNeutral);
+    // Show consolidated activity bubble for the run.
+    await this.showActivityBubble();
 
     try {
       // Build initial messages: system prompt + conversation history + new user message
@@ -896,35 +1212,26 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
       this._currentTicketId = undefined;
       this._currentGoalId = undefined;
 
-      // Post-task UI cleanup
-      if (this.thinkingLabelId) {
-        if (result.success) {
-          await this.removeLabel(this.thinkingLabelId);
-          const text = (result.result as string) ?? '';
-          if (text) {
-            await this.appendMessageLabel('Agent', text, this.theme.statusSuccess, true);
-            this.conversationHistory.push({ role: 'assistant', content: text });
-          }
-        } else {
-          await this.removeLabel(this.thinkingLabelId);
-          const errorText = (result.error ?? 'Unknown error').slice(0, 100);
-          const note = result.maxStepsReached ? ' (step limit reached)' : '';
-          await this.appendMessageLabel('Error', errorText + note, this.theme.statusError);
+      // Post-task UI cleanup.
+      await this.removeActivityBubble();
+
+      if (result.success) {
+        const text = (result.result as string) ?? '';
+        if (text) {
+          await this.appendBubble('assistant', 'Agent', text, true);
+          this.conversationHistory.push({ role: 'assistant', content: text });
         }
-        this.thinkingLabelId = undefined;
+      } else {
+        const errorText = (result.error ?? 'Unknown error').slice(0, 200);
+        const note = result.maxStepsReached ? ' (step limit reached)' : '';
+        await this.appendBubble('error', 'Error', errorText + note, false);
       }
-      this.progressLabelIds = [];
     } catch (err) {
       this._currentTicketId = undefined;
       this._currentGoalId = undefined;
-      // Remove thinking indicator if still there
-      if (this.thinkingLabelId) {
-        await this.removeLabel(this.thinkingLabelId);
-        this.thinkingLabelId = undefined;
-      }
-      this.progressLabelIds = [];
+      await this.removeActivityBubble();
       const errMsg = err instanceof Error ? err.message : String(err);
-      await this.appendMessageLabel('Error', errMsg.slice(0, 100), this.theme.statusError);
+      await this.appendBubble('error', 'Error', errMsg.slice(0, 200), false);
     }
 
     this.uiPhase = this.windowId ? 'idle' : 'closed';
@@ -974,82 +1281,380 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
     }
   }
 
-  private async appendMessageLabel(prefix: string, text: string, color: string, markdown = false): Promise<AbjectId> {
-    if (!this.messageLogId || !this.windowId) return '' as AbjectId;
+  // ── Bubble styling ───────────────────────────────────────────────────
 
+  private bubbleStyleForRole(role: BubbleRole): { background: string; color: string; align: BubbleAlign; borderColor?: string } {
+    switch (role) {
+      case 'user':
+        return {
+          background: lightenColor(this.theme.windowBg, 18),
+          color: this.theme.textPrimary,
+          align: 'right',
+          borderColor: darkenColor(this.theme.accentSecondary, 30),
+        };
+      case 'assistant':
+        return {
+          background: lightenColor(this.theme.windowBg, 8),
+          color: this.theme.textPrimary,
+          align: 'left',
+        };
+      case 'system':
+        return {
+          background: darkenColor(this.theme.windowBg, 4),
+          color: this.theme.textSecondary,
+          align: 'center',
+        };
+      case 'error':
+        return {
+          background: darkenColor(this.theme.statusError, 60),
+          color: this.theme.statusError,
+          align: 'left',
+        };
+      case 'activity':
+        return {
+          background: lightenColor(this.theme.windowBg, 6),
+          color: this.theme.statusNeutral,
+          align: 'left',
+        };
+    }
+  }
+
+  private computeAvailableWidth(): number {
+    // Window content area = window width - side margins - scrollbar.
+    return Math.max(BUBBLE_MIN_WIDTH, this.currentWindowWidth - SPACE_MD * 2 - 8);
+  }
+
+  private computeBubbleMaxWidth(): number {
+    const available = this.computeAvailableWidth();
+    return Math.min(available, Math.max(BUBBLE_MIN_WIDTH, Math.floor(available * BUBBLE_MAX_FRACTION)));
+  }
+
+  private formatTimestamp(ts: number): string {
+    const delta = Date.now() - ts;
+    if (delta < 60_000) return 'now';
+    try {
+      return new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    } catch {
+      return '';
+    }
+  }
+
+  private shouldGroupWithPrevious(role: BubbleRole, sender: string): boolean {
+    const last = this.lastContentMeta();
+    if (!last) return false;
+    return last.role === role && last.sender === sender && (Date.now() - last.ts) < GROUP_WINDOW_MS;
+  }
+
+  /** Returns the metadata for the most recent content label (skipping sender labels). */
+  private lastContentMeta(): MessageMeta | undefined {
+    for (let i = this.messageLabelIds.length - 1; i >= 0; i--) {
+      const meta = this.messageMetadata.get(this.messageLabelIds[i]);
+      if (meta) return meta;
+    }
+    return undefined;
+  }
+
+  private estimateBubbleHeight(text: string, innerWidth: number, markdown: boolean): number {
     const fontSize = 13;
     const lineHeight = fontSize + 4;
-    const availableWidth = WIN_W - 32 - 8; // margins + scrollbar
+    const raw = markdown
+      ? estimateMarkdownHeight(text, innerWidth, fontSize)
+      : Math.max(lineHeight, estimateWrappedLineCount(text, innerWidth, fontSize) * lineHeight);
+    return raw + BUBBLE_V_PADDING;
+  }
 
-    // For markdown labels, emit the prefix as a separate bold label so the
-    // markdown body parses correctly (headings, bullets, etc. need to start at
-    // column 0). For plain labels, combine prefix and text as before.
-    if (markdown && prefix) {
-      const prefixText = `${prefix}:`;
-      const prefixHeight = Math.max(20, lineHeight + 4);
-      const { widgetIds: [prefixLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+  /**
+   * Append a styled "chat bubble" message to the log.
+   * Optionally precedes the bubble with a small sender/timestamp label unless
+   * grouping with the previous message (same role+sender within GROUP_WINDOW_MS).
+   */
+  private async appendBubble(
+    role: BubbleRole,
+    sender: string,
+    text: string,
+    markdown = false,
+  ): Promise<AbjectId> {
+    if (!this.messageLogId || !this.windowId) return '' as AbjectId;
+
+    const { background, color, align, borderColor } = this.bubbleStyleForRole(role);
+    const bubbleMaxWidth = this.computeBubbleMaxWidth();
+    const innerWidth = bubbleMaxWidth - BUBBLE_TEXT_PADDING * 2;
+    const bubbleHeight = this.estimateBubbleHeight(text, innerWidth, markdown);
+
+    // Sender/timestamp mini-label (skipped when grouping).
+    const shouldEmitSender = !!sender && !this.shouldGroupWithPrevious(role, sender);
+    let senderLabelId: AbjectId | undefined;
+    if (shouldEmitSender) {
+      const headerText = `${sender}  \u00B7  ${this.formatTimestamp(Date.now())}`;
+      const { widgetIds: [headerId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', {
           specs: [
-            { type: 'label', windowId: this.windowId, text: prefixText, style: { color, fontSize, fontWeight: 'bold' as const, wordWrap: false, selectable: false } },
+            {
+              type: 'label', windowId: this.windowId, text: headerText,
+              style: {
+                color: this.theme.textTertiary,
+                fontSize: 11,
+                wordWrap: false,
+                selectable: false,
+                align,
+              },
+            },
           ],
         })
       );
       await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
-        widgetId: prefixLabelId,
-        sizePolicy: { vertical: 'fixed' },
-        preferredSize: { height: prefixHeight },
+        widgetId: headerId,
+        sizePolicy: { vertical: 'fixed', horizontal: align === 'center' ? 'expanding' : 'fixed' },
+        preferredSize: { height: SENDER_LABEL_HEIGHT, width: align === 'center' ? undefined : bubbleMaxWidth },
+        alignment: align,
       }));
-      this.messageLabelIds.push(prefixLabelId);
+      this.messageLabelIds.push(headerId);
+      senderLabelId = headerId;
+      // Sender labels have no metadata entry — they are chrome, not content.
     }
-
-    const displayText = (!markdown && prefix) ? `${prefix}: ${text}` : text;
-    const estimatedHeight = markdown
-      ? estimateMarkdownHeight(displayText, availableWidth, fontSize)
-      : Math.max(20, estimateWrappedLineCount(displayText, availableWidth, fontSize) * lineHeight + 4);
 
     const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'label', windowId: this.windowId, text: displayText, style: { color, fontSize, wordWrap: true, selectable: true, markdown } },
+          {
+            type: 'label', windowId: this.windowId, text,
+            style: {
+              color,
+              fontSize: 13,
+              wordWrap: true,
+              selectable: true,
+              markdown,
+              background,
+              radius: BUBBLE_RADIUS,
+              borderColor,
+              align,
+            },
+          },
         ],
       })
     );
     await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
       widgetId: labelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: estimatedHeight },
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: bubbleMaxWidth, height: bubbleHeight },
+      alignment: align,
     }));
     this.messageLabelIds.push(labelId);
+    this.messageMetadata.set(labelId, { role, sender, ts: Date.now(), text, markdown, align });
+    if (senderLabelId) {
+      this.bubbleSenderLabels.set(labelId, senderLabelId);
+    }
     return labelId;
   }
 
-  private async appendProgressLabel(text: string): Promise<void> {
-    if (!this.messageLogId || !this.windowId) return;
+  // ── Activity bubble (consolidated thinking + progress) ───────────────
 
-    // Move thinking label to the bottom so progress lines appear above it.
-    // Remove → append progress → re-add thinking label at end.
-    if (this.thinkingLabelId) {
-      try {
-        await this.request(request(this.id, this.messageLogId, 'removeLayoutChild', {
-          widgetId: this.thinkingLabelId,
-        }));
-      } catch { /* may already be gone */ }
-    }
+  private async showActivityBubble(): Promise<void> {
+    if (this.activityBubbleLabelId) return;
+    this.activityStep = 0;
+    this.activityHeader = '\u25CF Thinking\u2026';
+    this.activityRefreshLastHeight = 0;
+    this.stepStreamChars = 0;
+    this.liveGoals.clear();
+    this.activityBubbleLabelId = await this.appendBubble('activity', 'Agent', this.activityHeader, false);
+  }
 
-    const labelId = await this.appendMessageLabel('', text, this.theme.statusNeutral);
-    this.progressLabelIds.push(labelId);
+  private composeActivityText(): string {
+    const baseHeader = this.activityStep > 0
+      ? `\u25CF Thinking\u2026 (step ${this.activityStep}/${MAX_STEPS})`
+      : this.activityHeader;
+    // Append a streaming hint so the user sees the LLM is actively producing
+    // output even when no other progress signal has fired yet. Approximate
+    // tokens at ~4 chars/token.
+    const header = this.stepStreamChars > 0
+      ? `${baseHeader}  \u00B7  ~${Math.max(1, Math.round(this.stepStreamChars / 4))} tok streamed`
+      : baseHeader;
+    const tree = this.composeProgressTree();
+    if (!tree) return header;
+    return header + '\n' + tree;
+  }
 
-    // Re-add thinking label at the bottom
-    if (this.thinkingLabelId) {
-      try {
-        await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
-          widgetId: this.thinkingLabelId,
-          sizePolicy: { vertical: 'fixed' },
-          preferredSize: { height: 24 },
-        }));
-      } catch { /* may already be gone */ }
+  /**
+   * Render a Goals-viewer-style indented tree of the goals being worked on
+   * for the current task. Walks from `_currentGoalId` down through any
+   * descendant goals captured in `liveGoals`.
+   */
+  private composeProgressTree(): string {
+    if (!this._currentGoalId || this.liveGoals.size === 0) return '';
+
+    const lines: string[] = [];
+    const visited = new Set<string>();
+
+    const visit = (goalId: string, depth: number): void => {
+      if (visited.has(goalId)) return;
+      visited.add(goalId);
+      const goal = this.liveGoals.get(goalId);
+      if (!goal) return;
+
+      const indent = '  '.repeat(depth);
+      const icon = goal.status === 'completed' ? '\u2713'   // ✓
+                 : goal.status === 'failed'    ? '\u2717'   // ✗
+                 : '\u25B8';                                // ▸
+      lines.push(`${indent}${icon} ${goal.title}`);
+
+      if (goal.status === 'active' && goal.latestMessage) {
+        const agent = goal.latestAgent ? `[${goal.latestAgent}] ` : '';
+        const msg = goal.latestMessage.length > 80
+          ? goal.latestMessage.slice(0, 80) + '\u2026'
+          : goal.latestMessage;
+        lines.push(`${indent}   \u2026 ${agent}${msg}`);
+      }
+
+      // Recurse into child goals.
+      for (const [childId, child] of this.liveGoals) {
+        if (child.parentId === goalId) visit(childId, depth + 1);
+      }
+    };
+
+    visit(this._currentGoalId, 0);
+    return lines.join('\n');
+  }
+
+  private updateActivityHeader(header: string): void {
+    this.activityHeader = header;
+    this.scheduleActivityRefresh();
+  }
+
+  private updateActivityStep(step: number): void {
+    this.activityStep = step;
+    this.scheduleActivityRefresh();
+  }
+
+  /**
+   * Trailing-debounced refresh — coalesces rapid-fire progress events into
+   * a single label update / layout reflow cycle. Without this, a busy agent
+   * run can fire 40+ updateLabel+updateLayoutChild round-trips per second
+   * and starve the compositor, making the UI feel frozen.
+   */
+  private scheduleActivityRefresh(): void {
+    if (this.activityRefreshTimer) return;
+    this.activityRefreshTimer = setTimeout(() => {
+      this.activityRefreshTimer = undefined;
+      this.refreshActivityBubble().catch(() => { /* widget gone */ });
+    }, 120);
+  }
+
+  private async refreshActivityBubble(): Promise<void> {
+    if (!this.activityBubbleLabelId) return;
+    const text = this.composeActivityText();
+    const innerWidth = this.computeBubbleMaxWidth() - BUBBLE_TEXT_PADDING * 2;
+    const height = this.estimateBubbleHeight(text, innerWidth, false);
+    // Keep the cached bubble text in sync so resize reflow uses the latest.
+    const meta = this.messageMetadata.get(this.activityBubbleLabelId);
+    if (meta) meta.text = text;
+    await this.updateLabel(this.activityBubbleLabelId, text, this.theme.statusNeutral);
+    // Only reflow layout when the height actually changed by at least one
+    // line; avoids a pointless updateLayoutChild round-trip on text-only
+    // updates.
+    if (Math.abs(height - this.activityRefreshLastHeight) >= 17) {
+      this.activityRefreshLastHeight = height;
+      await this.setLabelHeight(this.activityBubbleLabelId, height);
     }
   }
+
+  private async removeActivityBubble(): Promise<void> {
+    if (this.activityRefreshTimer) {
+      clearTimeout(this.activityRefreshTimer);
+      this.activityRefreshTimer = undefined;
+    }
+    if (!this.activityBubbleLabelId) return;
+    const id = this.activityBubbleLabelId;
+    this.activityBubbleLabelId = undefined;
+    this.activityStep = 0;
+    this.activityRefreshLastHeight = 0;
+    this.stepStreamChars = 0;
+    this.liveGoals.clear();
+    await this.removeLabel(id);
+  }
+
+  private async setLabelHeight(labelId: AbjectId, height: number): Promise<void> {
+    if (!this.messageLogId) return;
+    try {
+      await this.request(request(this.id, this.messageLogId, 'updateLayoutChild', {
+        widgetId: labelId,
+        preferredSize: { height },
+      }));
+    } catch { /* layout may be gone */ }
+  }
+
+  // ── Resize reflow ────────────────────────────────────────────────────
+
+  /** Debounce resize-driven reflow so rapid drag events collapse into one pass. */
+  private scheduleReflow(): void {
+    if (this.reflowTimer) return;
+    this.reflowTimer = setTimeout(() => {
+      this.reflowTimer = undefined;
+      this.reflowAllBubbles().catch(() => { /* window may be gone */ });
+    }, 140);
+  }
+
+  /**
+   * Recompute width+height for every bubble and paired sender header against
+   * the current window width. Also re-render the welcome state so its card
+   * and chips fit the new size. All updates are issued concurrently.
+   */
+  private async reflowAllBubbles(): Promise<void> {
+    if (!this.messageLogId || !this.windowId) return;
+
+    const bubbleMaxWidth = this.computeBubbleMaxWidth();
+    const innerWidth = bubbleMaxWidth - BUBBLE_TEXT_PADDING * 2;
+    const updates: Promise<unknown>[] = [];
+
+    for (const labelId of this.messageLabelIds) {
+      const meta = this.messageMetadata.get(labelId);
+      if (!meta) continue;
+
+      const height = this.estimateBubbleHeight(meta.text, innerWidth, meta.markdown);
+      updates.push(
+        this.request(request(this.id, this.messageLogId, 'updateLayoutChild', {
+          widgetId: labelId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+          preferredSize: { width: bubbleMaxWidth, height },
+          alignment: meta.align,
+        })).catch(() => { /* widget gone */ })
+      );
+
+      // If this bubble has a paired sender header, update its width too.
+      const senderId = this.bubbleSenderLabels.get(labelId);
+      if (senderId) {
+        updates.push(
+          this.request(request(this.id, this.messageLogId, 'updateLayoutChild', {
+            widgetId: senderId,
+            sizePolicy: { vertical: 'fixed', horizontal: meta.align === 'center' ? 'expanding' : 'fixed' },
+            preferredSize: {
+              height: SENDER_LABEL_HEIGHT,
+              width: meta.align === 'center' ? undefined : bubbleMaxWidth,
+            },
+            alignment: meta.align,
+          })).catch(() => { /* widget gone */ })
+        );
+      }
+    }
+
+    await Promise.all(updates);
+
+    // The welcome state is rendered with hand-built widths outside the
+    // bubble path; re-render it from scratch so it fits the new window size.
+    if (this.welcomeWidgetIds.length > 0) {
+      await this.removeWelcomeState();
+      await this.showWelcomeState();
+    }
+
+    // Keep activity bubble's cached height estimate aligned to avoid a
+    // spurious extra layout write on the next progress tick.
+    if (this.activityBubbleLabelId) {
+      const meta = this.messageMetadata.get(this.activityBubbleLabelId);
+      if (meta) {
+        this.activityRefreshLastHeight = this.estimateBubbleHeight(meta.text, innerWidth, false);
+      }
+    }
+  }
+
 
   private async updateLabel(labelId: AbjectId, text: string, color: string): Promise<void> {
     if (!labelId) return;
@@ -1065,6 +1670,21 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
 
   private async removeLabel(labelId: AbjectId): Promise<void> {
     if (!labelId || !this.messageLogId) return;
+
+    // If this bubble has a paired sender header, remove it too so we don't
+    // leave orphaned "Agent · now" lines floating in the log.
+    const pairedSenderId = this.bubbleSenderLabels.get(labelId);
+    if (pairedSenderId) {
+      this.bubbleSenderLabels.delete(labelId);
+      await this.detachLabel(pairedSenderId);
+    }
+
+    await this.detachLabel(labelId);
+  }
+
+  /** Low-level: remove a single label id from layout + destroy + tracking. */
+  private async detachLabel(labelId: AbjectId): Promise<void> {
+    if (!labelId || !this.messageLogId) return;
     try {
       await this.request(request(this.id, this.messageLogId, 'removeLayoutChild', {
         widgetId: labelId,
@@ -1076,6 +1696,7 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
 
     const idx = this.messageLabelIds.indexOf(labelId);
     if (idx >= 0) this.messageLabelIds.splice(idx, 1);
+    this.messageMetadata.delete(labelId);
   }
 
   private async clearMessageLabels(): Promise<void> {
@@ -1091,6 +1712,14 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
       this.send(request(this.id, labelId, 'destroy', {}));
     }
     this.messageLabelIds = [];
+    this.messageMetadata.clear();
+    this.bubbleSenderLabels.clear();
+    this.activityBubbleLabelId = undefined;
+    this.activityStep = 0;
+    this.liveGoals.clear();
+    // Welcome widgets (chips + card) live inside the message log and were
+    // just cleared above; drop our tracked ids.
+    this.welcomeWidgetIds = [];
   }
 
   protected override askPrompt(_question: string): string {

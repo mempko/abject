@@ -6,6 +6,7 @@
  */
 
 import type { ParsedMarkdown, MarkdownBlock, TextSpan, SpanStyle, BlockType } from './markdown.js';
+import { parseInline } from './markdown.js';
 import type { ThemeData } from './widget-types.js';
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -248,11 +249,58 @@ async function layoutCodeBlock(
   }
 }
 
+function tableFontForSpan(style: SpanStyle, size: number, isHeader: boolean): string {
+  const italic = (style === 'italic' || style === 'bold-italic') ? 'italic ' : '';
+  const weight = (isHeader || style === 'bold' || style === 'bold-italic') ? 'bold' : 'normal';
+  // Use monospace for the whole table so fixed-width column padding still aligns.
+  return `${italic}${weight} ${size}px "JetBrains Mono", "Fira Code", monospace`;
+}
+
+/** Word-wrap plain text into monospace lines of at most `maxChars`. */
+function wrapCellByChars(text: string, maxChars: number): string[] {
+  if (maxChars <= 0 || text.length <= maxChars) return [text];
+  const out: string[] = [];
+  let current = '';
+  const parts = text.split(/(\s+)/);
+
+  for (const part of parts) {
+    if (part === '') continue;
+
+    if ((current + part).length <= maxChars) {
+      current += part;
+      continue;
+    }
+
+    // Flush whatever we had before this too-long part.
+    if (current.length > 0) {
+      out.push(current);
+      current = '';
+    }
+
+    if (part.length <= maxChars) {
+      current = part.trimStart();
+    } else {
+      // Part alone is wider than the column — break at char boundaries.
+      for (let i = 0; i < part.length; i += maxChars) {
+        const chunk = part.slice(i, i + maxChars);
+        if (i + maxChars >= part.length) {
+          current = chunk;
+        } else {
+          out.push(chunk);
+        }
+      }
+    }
+  }
+
+  if (current.length > 0) out.push(current);
+  return out.length > 0 ? out : [''];
+}
+
 async function layoutTable(
   block: MarkdownBlock,
   lines: LayoutLine[],
   startY: number,
-  _maxWidth: number,
+  maxWidth: number,
   baseFontSize: number,
   theme: ThemeData,
   measureFn: MeasureFn,
@@ -262,46 +310,181 @@ async function layoutTable(
 
   const codeFontSize = baseFontSize - 1;
   const lineHeight = codeFontSize + 4;
-  const font = `${codeFontSize}px "JetBrains Mono", "Fira Code", monospace`;
-  const headerFont = `bold ${codeFontSize}px "JetBrains Mono", "Fira Code", monospace`;
-  const fill = theme.textPrimary;
+  const defaultFill = theme.textPrimary;
   const headerFill = theme.accent;
+  const COL_SEPARATOR = '  ';
+  const SEPARATOR_CHARS = COL_SEPARATOR.length;
+  const INDENT_PX = 8;
+  const MIN_COL_CHARS = 8;
 
-  // Compute max column count and widths (in characters)
-  const colCount = Math.max(...rows.map(r => r.length));
-  const colWidths: number[] = new Array(colCount).fill(0);
-  for (const row of rows) {
-    for (let c = 0; c < row.length; c++) {
-      colWidths[c] = Math.max(colWidths[c], row[c].length);
+  // Parse each cell's inline markdown so **text** becomes a bold span etc.
+  const rowsSpans: TextSpan[][][] = rows.map(row =>
+    row.map(cell => parseInline(cell, 0)),
+  );
+  const plainCellText = (cellSpans: TextSpan[]): string =>
+    cellSpans.map(s => s.text).join('');
+
+  const colCount = Math.max(...rowsSpans.map(r => r.length));
+
+  // Measure a single monospace char so we can budget the available width
+  // in character columns.
+  const probeFont = tableFontForSpan('normal', codeFontSize, false);
+  const charPixelWidth = Math.max(1, await measureFn('M', probeFont));
+  const budgetChars = Math.max(
+    MIN_COL_CHARS * colCount + SEPARATOR_CHARS * (colCount - 1),
+    Math.floor((maxWidth - INDENT_PX) / charPixelWidth),
+  );
+
+  // Natural (widest) column widths in chars.
+  const naturalWidths: number[] = new Array(colCount).fill(0);
+  for (const rowSpans of rowsSpans) {
+    for (let c = 0; c < rowSpans.length; c++) {
+      naturalWidths[c] = Math.max(naturalWidths[c], plainCellText(rowSpans[c]).length);
     }
   }
 
-  // Format each row as a padded string and create layout lines
-  let y = startY;
-  for (let ri = 0; ri < rows.length; ri++) {
-    const row = rows[ri];
-    const isHeader = ri === 0;
-    const padded = row.map((cell, c) => cell.padEnd(colWidths[c] ?? cell.length)).join('  ');
-    const rowFont = isHeader ? headerFont : font;
-    const rowFill = isHeader ? headerFill : fill;
-    const width = padded.length > 0 ? await measureFn(padded, rowFont) : 0;
-
-    lines.push({
-      runs: [{
-        text: padded,
-        font: rowFont,
-        fill: rowFill,
-        width,
-        sourceStart: block.sourceStart,
-        sourceEnd: block.sourceEnd,
-      }],
-      y,
-      height: lineHeight,
-      indent: 8,
-      blockType: 'table',
-      blockStart: ri === 0,
+  // Shrink columns proportionally to fit the character budget. Keep a
+  // minimum width per column so no column collapses.
+  const usableChars = budgetChars - SEPARATOR_CHARS * Math.max(0, colCount - 1);
+  const totalNatural = naturalWidths.reduce((a, b) => a + b, 0);
+  let colWidths: number[];
+  if (totalNatural <= usableChars) {
+    colWidths = naturalWidths.slice();
+  } else {
+    const minTotal = MIN_COL_CHARS * colCount;
+    const elastic = Math.max(1, usableChars - minTotal);
+    const extraPool = Math.max(1, totalNatural - minTotal);
+    colWidths = naturalWidths.map(w => {
+      const above = Math.max(0, w - MIN_COL_CHARS);
+      return MIN_COL_CHARS + Math.floor((above / extraPool) * elastic);
     });
-    y += lineHeight;
+    // Re-absorb rounding drift into the widest column.
+    const drift = usableChars - colWidths.reduce((a, b) => a + b, 0);
+    if (drift !== 0) {
+      let widestIdx = 0;
+      for (let c = 1; c < colWidths.length; c++) {
+        if (colWidths[c] > colWidths[widestIdx]) widestIdx = c;
+      }
+      colWidths[widestIdx] = Math.max(MIN_COL_CHARS, colWidths[widestIdx] + drift);
+    }
+  }
+
+  // Fast lookup: which cells fit on one line and can use per-span styling.
+  const fitsOnOneLine = (cellSpans: TextSpan[], cIdx: number): boolean =>
+    plainCellText(cellSpans).length <= (colWidths[cIdx] ?? 0);
+
+  let y = startY;
+  for (let ri = 0; ri < rowsSpans.length; ri++) {
+    const rowSpans = rowsSpans[ri];
+    const isHeader = ri === 0;
+    const baseFill = isHeader ? headerFill : defaultFill;
+
+    // Pre-wrap each cell to its column's char width. One-line cells
+    // retain styled runs; multi-line cells fall back to plain wrapped text.
+    const cellWraps: { kind: 'styled'; runs: StyledRun[]; plainLen: number }[]
+      | { kind: 'plain'; lines: string[] }[] = [] as never;
+    type WrapResult = { styled: StyledRun[]; plainLen: number } | { plain: string[] };
+    const wraps: WrapResult[] = [];
+
+    for (let c = 0; c < rowSpans.length; c++) {
+      const cellSpans = rowSpans[c];
+      const colW = colWidths[c] ?? 0;
+
+      if (fitsOnOneLine(cellSpans, c)) {
+        const runs: StyledRun[] = [];
+        for (const span of cellSpans) {
+          if (span.text.length === 0) continue;
+          const font = tableFontForSpan(span.style, codeFontSize, isHeader);
+          const fill = span.style === 'link'
+            ? theme.linkColor
+            : span.style === 'code'
+              ? theme.accent
+              : baseFill;
+          const width = await measureFn(span.text, font);
+          runs.push({
+            text: span.text,
+            font,
+            fill,
+            href: span.href,
+            width,
+            sourceStart: block.sourceStart,
+            sourceEnd: block.sourceEnd,
+          });
+        }
+        wraps.push({ styled: runs, plainLen: plainCellText(cellSpans).length });
+      } else {
+        wraps.push({ plain: wrapCellByChars(plainCellText(cellSpans), colW) });
+      }
+    }
+
+    // Row height = tallest wrapped cell.
+    const rowLineCount = Math.max(
+      1,
+      ...wraps.map(w => 'plain' in w ? w.plain.length : 1),
+    );
+
+    for (let li = 0; li < rowLineCount; li++) {
+      const lineRuns: StyledRun[] = [];
+
+      for (let c = 0; c < wraps.length; c++) {
+        const wrap = wraps[c];
+        const colW = colWidths[c] ?? 0;
+        const isLastCol = c === wraps.length - 1;
+
+        let visibleLen = 0;
+
+        if ('styled' in wrap) {
+          // One-line styled cell: emit runs only on the first line;
+          // subsequent wrap lines (from other cells) just see padding.
+          if (li === 0) {
+            for (const run of wrap.styled) lineRuns.push(run);
+            visibleLen = wrap.plainLen;
+          }
+        } else {
+          // Multi-line plain cell: pick the wrapped line for this index.
+          const lineText = wrap.plain[li] ?? '';
+          if (lineText.length > 0) {
+            const font = tableFontForSpan('normal', codeFontSize, isHeader);
+            const width = await measureFn(lineText, font);
+            lineRuns.push({
+              text: lineText,
+              font,
+              fill: baseFill,
+              width,
+              sourceStart: block.sourceStart,
+              sourceEnd: block.sourceEnd,
+            });
+          }
+          visibleLen = lineText.length;
+        }
+
+        // Pad to column width and append the separator (unless last column).
+        const padChars = Math.max(0, colW - visibleLen);
+        const trailing = ' '.repeat(padChars) + (isLastCol ? '' : COL_SEPARATOR);
+        if (trailing.length > 0) {
+          const font = tableFontForSpan('normal', codeFontSize, isHeader);
+          const width = await measureFn(trailing, font);
+          lineRuns.push({
+            text: trailing,
+            font,
+            fill: baseFill,
+            width,
+            sourceStart: block.sourceStart,
+            sourceEnd: block.sourceEnd,
+          });
+        }
+      }
+
+      lines.push({
+        runs: lineRuns,
+        y,
+        height: lineHeight,
+        indent: INDENT_PX,
+        blockType: 'table',
+        blockStart: li === 0 && ri === 0,
+      });
+      y += lineHeight;
+    }
   }
 }
 

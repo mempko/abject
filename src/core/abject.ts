@@ -789,8 +789,24 @@ You are this object. Your capabilities are exactly what the manifest above descr
           }
 
           if (isRequest(message)) {
-            try { this.send(errorFromException(message, err)); } catch (sendErr) {
-              log.error(`[${this.id}] Failed to send error reply:`, sendErr);
+            // If the object is already stopped, this.send()'s status
+            // precondition rejects. Route the error reply through the bus
+            // directly so the caller's request() doesn't hang 30s waiting
+            // for a reply. This can happen when stop() is called from a
+            // sibling handler and then a concurrent handler errors out
+            // AFTER _stoppedDuringHandler has been cleared by the first
+            // handler's completion.
+            const sendError = errorFromException(message, err);
+            try {
+              if ((this._status as string) === 'stopped' && this._bus) {
+                this._bus.send(sendError);
+              } else {
+                this.send(sendError);
+              }
+            } catch (sendErr) {
+              // Last-chance fallback: try the bus directly before giving up.
+              try { this._bus?.send(sendError); }
+              catch { log.error(`[${this.id}] Failed to send error reply:`, sendErr); }
             }
           }
           if (prevStatus !== 'busy') this._status = 'error';
