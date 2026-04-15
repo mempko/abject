@@ -23,6 +23,39 @@ interface TaskExtra {
   lastResult?: string;
 }
 
+/**
+ * Render an MCP tool's JSON Schema (the `inputSchema` field) as a compact,
+ * human-readable parameter list for the LLM system prompt. The LLM needs
+ * to know the exact parameter names (case-sensitive) to call tools correctly.
+ *
+ * Returns null if no schema or no properties — caller should omit the line.
+ */
+function formatMCPInputSchema(schema: Record<string, unknown> | undefined): string | null {
+  if (!schema || typeof schema !== 'object') return null;
+  const props = (schema as { properties?: Record<string, unknown> }).properties;
+  if (!props || typeof props !== 'object') return null;
+
+  const required = new Set<string>(
+    Array.isArray((schema as { required?: unknown[] }).required)
+      ? ((schema as { required: unknown[] }).required as string[])
+      : [],
+  );
+
+  const entries = Object.entries(props);
+  if (entries.length === 0) return null;
+
+  return entries.map(([name, rawDef]) => {
+    const def = (rawDef ?? {}) as { type?: string | string[]; enum?: unknown[]; description?: string };
+    const type = Array.isArray(def.type) ? def.type.join('|') : (def.type ?? 'any');
+    const enumPart = Array.isArray(def.enum) && def.enum.length > 0
+      ? ` = ${def.enum.map(v => JSON.stringify(v)).join('|')}`
+      : '';
+    const req = required.has(name) ? '' : '?';
+    const desc = def.description ? ` — ${def.description}` : '';
+    return `${name}${req}: ${type}${enumPart}${desc}`;
+  }).join('; ');
+}
+
 export class SkillAgent extends Abject {
   private agentAbjectId?: AbjectId;
   private shellExecutorId?: AbjectId;
@@ -640,7 +673,7 @@ When using curl, use -s (silent) and pipe JSON through jq.
         const servers = await this.request<Array<{
           name: string;
           description: string;
-          tools: Array<{ name: string; description: string }>;
+          tools: Array<{ name: string; description: string; inputSchema?: Record<string, unknown> }>;
         }>>(
           request(this.id, this.skillRegistryId, 'getEnabledMCPServers', {}),
         );
@@ -653,9 +686,13 @@ When using curl, use -s (silent) and pipe JSON through jq.
               prompt += 'Available tools:\n';
               for (const tool of server.tools) {
                 prompt += `- \`${tool.name}\`: ${tool.description}\n`;
+                const params = formatMCPInputSchema(tool.inputSchema);
+                if (params) {
+                  prompt += `  Parameters: ${params}\n`;
+                }
               }
             }
-            prompt += `\nUse \`mcp_tool_call\` action with \`server: "${server.name}"\` and \`tool: "<tool_name>"\`.\n\n`;
+            prompt += `\nUse \`mcp_tool_call\` action with \`server: "${server.name}"\`, \`tool: "<tool_name>"\`, and \`input: { ...parameters }\`. Use the EXACT parameter names shown above (case-sensitive).\n\n`;
           }
         }
       } catch { /* MCP not available */ }

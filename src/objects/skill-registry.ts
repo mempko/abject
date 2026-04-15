@@ -655,13 +655,13 @@ whenever the skill set changes.
   private async getEnabledMCPServerSummaries(): Promise<Array<{
     name: string;
     description: string;
-    tools: Array<{ name: string; description: string }>;
+    tools: Array<{ name: string; description: string; inputSchema?: Record<string, unknown> }>;
     bridgeId: string;
   }>> {
     const summaries: Array<{
       name: string;
       description: string;
-      tools: Array<{ name: string; description: string }>;
+      tools: Array<{ name: string; description: string; inputSchema?: Record<string, unknown> }>;
       bridgeId: string;
     }> = [];
 
@@ -670,13 +670,17 @@ whenever the skill set changes.
       if (!entry) continue;
 
       try {
-        const tools = await this.request<Array<{ name: string; description?: string; inputSchema?: unknown }>>(
+        const tools = await this.request<Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }>>(
           request(this.id, bridgeId, 'listTools', {}),
         );
         summaries.push({
           name,
           description: entry.parsed.description,
-          tools: tools.map(t => ({ name: t.name, description: t.description ?? '' })),
+          tools: tools.map(t => ({
+            name: t.name,
+            description: t.description ?? '',
+            inputSchema: t.inputSchema,
+          })),
           bridgeId,
         });
       } catch (err) {

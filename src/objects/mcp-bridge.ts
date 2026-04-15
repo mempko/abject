@@ -22,6 +22,7 @@ import type {
   MCPContentItem,
 } from '../core/mcp-types.js';
 import { Log } from '../core/timed-log.js';
+import { validateMCPToolInput, MCPInputValidationError } from './mcp-input-validation.js';
 
 const log = new Log('MCPBridge');
 
@@ -266,6 +267,18 @@ export class MCPBridge extends Abject {
     const tool = this.cachedTools.find(t => t.name === toolName);
     if (!tool) {
       throw new Error(`Tool "${toolName}" not found on MCP server "${this.serverName}". Available: ${this.cachedTools.map(t => t.name).join(', ')}`);
+    }
+
+    // Validate input against the tool's JSON schema before dispatching.
+    // This turns opaque server-side errors (e.g. "Email undefined not found")
+    // into deterministic, parameter-level feedback the agent can act on.
+    try {
+      validateMCPToolInput(toolName, tool.inputSchema, input);
+    } catch (err) {
+      if (err instanceof MCPInputValidationError) {
+        log.info(`[${this.serverName}] rejecting ${toolName}: ${err.message}`);
+      }
+      throw err;
     }
 
     const result = await this.transport!.sendRequest('tools/call', {
