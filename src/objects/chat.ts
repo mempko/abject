@@ -742,7 +742,7 @@ export class Chat extends Abject {
         // Wait for all tasks to complete
         const results: unknown[] = [];
         for (const taskId of taskIds) {
-          const completion = await this.waitForTaskCompletion(taskId, 310000);
+          const completion = await this.waitForTaskCompletion(taskId, 120000);
           const result = completion.result as Record<string, unknown> | undefined;
 
           // Auto-show created objects
@@ -1027,7 +1027,7 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
     if (!this.messageLogId || !this.windowId) return;
     if (this.welcomeWidgetIds.length > 0) return;
 
-    const welcomeText = '\u2728  **Welcome to Chat**\n\nAsk me anything, or pick a suggestion below to get started.';
+    const welcomeText = '\u2728  **Welcome to Chat**\n\nAbjects is a distributed object system where everything is an Abject -- autonomous objects that communicate via messages, discover each other through a Registry, and coordinate work through goals and agents. Ask me to explore what objects exist, create new ones, fetch your email, or anything else. Specialized agents will pick up the work automatically.';
     const bubbleMaxWidth = this.computeBubbleMaxWidth();
     const innerWidth = bubbleMaxWidth - BUBBLE_TEXT_PADDING * 2;
     const height = this.estimateBubbleHeight(welcomeText, innerWidth, true);
@@ -1208,7 +1208,7 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
       this._currentTicketId = ticketId;
 
       // Wait for taskResult event
-      const result = await this.waitForTaskResult(ticketId, 310000);
+      const result = await this.waitForTaskResult(ticketId, 180000);
       this._currentTicketId = undefined;
       this._currentGoalId = undefined;
 

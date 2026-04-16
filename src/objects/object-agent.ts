@@ -169,7 +169,7 @@ Say PASS if the task involves creating, building, or making something new (apps,
             },
           }),
         );
-        const result = await this.waitForTaskResult(ticketId, 310000);
+        const result = await this.waitForTaskResult(ticketId, 180000);
         return { success: result.success, result: result.result, error: result.error };
       } finally {
         this.taskExtras.delete(taskId);
@@ -196,7 +196,7 @@ Say PASS if the task involves creating, building, or making something new (apps,
             },
           }),
         );
-        const result = await this.waitForTaskResult(ticketId, 310000);
+        const result = await this.waitForTaskResult(ticketId, 180000);
         return { success: result.success, result: result.result };
       } finally {
         this.taskExtras.delete(taskId);

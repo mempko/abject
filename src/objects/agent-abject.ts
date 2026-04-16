@@ -205,6 +205,8 @@ export class AgentAbject extends Abject {
 
   /** Active task entry during LLM streaming -- links llmChunk events to the right ticket. */
   private activeStreamEntry?: TaskEntry;
+  /** Throttle timestamp for streaming progress events (1/sec max). */
+  private lastStreamProgressTs = 0;
 
   /** Resolvers for event-driven child goal observation. */
   private childGoalEventResolvers = new Map<string, {
@@ -886,10 +888,41 @@ The registered object must implement these handlers to participate in the agent 
         content,
         done,
       }));
+
+      // Streaming chunks prove the LLM is alive. Emit a self-directed
+      // progress event so the base-class handler resets ALL pending request
+      // timers (including the 120s stream request timer) and bubbles the
+      // signal upstream through the call tree. Throttled to 1/sec so we
+      // don't flood the bus on fast streams.
+      const now = Date.now();
+      if (now - this.lastStreamProgressTs > 1000) {
+        this.lastStreamProgressTs = now;
+        this.send(event(this.id, this.id, 'progress', {
+          phase: 'streaming',
+          message: `streaming (${content.length} chars)`,
+        }));
+      }
     });
 
     // Note: progress events are handled by Abject base class which auto-bubbles
     // them upstream and resets all pending request timeouts.
+
+    // ── JobManager failure notification ──
+    // When a job we submitted fails, JobManager sends us a direct jobFailed
+    // event. Immediately reject any pending request to JobManager so the
+    // dispatch / step execution unblocks instead of waiting for its stall
+    // timer to expire.
+    this.on('jobFailed', async (msg: AbjectMessage) => {
+      const { jobId, error } = msg.payload as { jobId: string; error?: string };
+      const jobMgrId = msg.routing.from;
+      const rejected = this.rejectPendingRequestsTo(
+        jobMgrId,
+        new Error(error ?? `Job ${jobId} failed`),
+      );
+      if (rejected > 0) {
+        log.info(`[${this.manifest.name}] jobFailed ${jobId} — rejected ${rejected} pending request(s)`);
+      }
+    });
 
     // ── TupleSpace + GoalManager watcher ──
     this.on('changed', async (msg: AbjectMessage) => {
@@ -1196,7 +1229,7 @@ Pick the agent with the best combination of efficiency and likelihood of success
     // through Abject base class and reset this request's stall timer.
 
     try {
-      const jobResult = await this.request<JobResult>(submitMsg, 400000);
+      const jobResult = await this.request<JobResult>(submitMsg, 200000);
       if (jobResult.status === 'failed') throw new Error(jobResult.error ?? 'Job failed');
       const result = jobResult.result;
 

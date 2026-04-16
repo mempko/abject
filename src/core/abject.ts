@@ -80,6 +80,7 @@ export abstract class Abject {
     timeout: ReturnType<typeof setTimeout>;
     timeoutMs: number;
     timeoutMsg: string;
+    targetId: AbjectId;
   }> = new Map();
 
   /**
@@ -597,6 +598,7 @@ You are this object. Your capabilities are exactly what the manifest above descr
         timeout,
         timeoutMs,
         timeoutMsg,
+        targetId: target,
       });
 
       try {
@@ -621,6 +623,25 @@ You are this object. Your capabilities are exactly what the manifest above descr
       entry.reject(new Error(entry.timeoutMsg));
     }, entry.timeoutMs);
     return true;
+  }
+
+  /**
+   * Reject all pending request replies whose target matches `targetId`.
+   * Useful when an external signal indicates the target can no longer
+   * deliver a reply, so the caller should not wait for its stall timer
+   * to expire.
+   */
+  protected rejectPendingRequestsTo(targetId: AbjectId, error: Error): number {
+    let count = 0;
+    for (const [msgId, entry] of this.pendingReplies) {
+      if (entry.targetId === targetId) {
+        clearTimeout(entry.timeout);
+        this.pendingReplies.delete(msgId);
+        entry.reject(error);
+        count++;
+      }
+    }
+    return count;
   }
 
   /**

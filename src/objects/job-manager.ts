@@ -314,6 +314,19 @@ export class JobManager extends Abject {
           job.error = err instanceof Error ? err.message : String(err);
           this.changed('jobFailed', { jobId, description: job.description, queue: job.queue, error: job.error });
           await this.log('error', `Job failed: ${job.description}`, { jobId, queue: job.queue, error: job.error });
+
+          // Notify the caller directly so it can recover immediately
+          // instead of waiting for its own request timeout to fire.
+          if (job.callerId) {
+            try {
+              this.send(event(this.id, job.callerId, 'jobFailed', {
+                jobId,
+                description: job.description,
+                queue: job.queue,
+                error: job.error,
+              }));
+            } catch { /* caller may be gone */ }
+          }
         }
 
         job.completedAt = Date.now();

@@ -42,6 +42,9 @@ const features = [
 <section id="features">
   <div class="container">
     <h2 class="section-title">What Lurks Inside</h2>
+    <p class="features-intro">
+      Every capability below is an Abject itself -- a living object with a manifest, a mailbox, and the ability to explain itself to any other object that asks.
+    </p>
     <div class="feature-grid">
       {features.map((f) => (
         <div class="card feature-card">
@@ -56,6 +59,15 @@ const features = [
 </section>
 
 <style>
+  .features-intro {
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 1rem;
+    max-width: 640px;
+    margin: -1.5rem auto 2.5rem;
+    line-height: 1.7;
+  }
+
   .feature-grid {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
