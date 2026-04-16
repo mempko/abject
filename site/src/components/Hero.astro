@@ -13,41 +13,42 @@
       find each other, and get to work.
       No cloud. No hierarchy. Just messages.
     </p>
+    <p class="hero-ask">
+      What if those objects could explain themselves?
+      <a href="/ask-protocol" class="thesis-link">Read the Ask Protocol &rarr;</a>
+    </p>
     <div class="hero-actions">
       <a href="#downloads" class="btn btn-primary">Download</a>
       <a href="#summon" class="btn btn-outline">Build from Source</a>
     </div>
-    <div class="hero-glyphs">
-      <div class="hero-glyph">
-        <span class="glyph-icon">{?}</span>
-        <span class="glyph-text">Objects that explain themselves</span>
-      </div>
-      <div class="hero-glyph">
-        <span class="glyph-icon">{!}</span>
-        <span class="glyph-text">Networks that heal their own wounds</span>
-      </div>
-      <div class="hero-glyph">
-        <span class="glyph-icon">{*}</span>
-        <span class="glyph-text">Software that grows by adoption</span>
-      </div>
-    </div>
-    <p class="hero-thesis">
-      Agent frameworks are hierarchical. MCP is a band-aid. A2A is a band-aid.
-      The largest, most complex system humanity ever built is the internet:
-      30 billion devices communicating by message passing.
-      Cells in your body work the same way.
-      Objects talking to objects is a 55-year-old idea that runs the world.
-      What if those objects could explain themselves?
-      <a href="/ask-protocol" class="thesis-link">Read the Ask Protocol &rarr;</a>
-    </p>
-    <p class="hero-tagline">
-      abject <span class="dim">(n.)</span> AI Object. Also: cosmic dread. Both apply.
-    </p>
     <div class="hero-demo">
       <video autoplay loop muted playsinline>
         <source src="/abject_demo2_1080.webm" type="video/webm" />
       </video>
     </div>
+    <div class="hero-glyphs">
+      <div class="hero-glyph">
+        <span class="glyph-icon">{'{'}?{'}'}</span>
+        <span class="glyph-text">Objects that explain themselves</span>
+      </div>
+      <div class="hero-glyph">
+        <span class="glyph-icon">{'{'}!{'}'}</span>
+        <span class="glyph-text">Networks that heal their own wounds</span>
+      </div>
+      <div class="hero-glyph">
+        <span class="glyph-icon">{'{'}*{'}'}</span>
+        <span class="glyph-text">Software that grows by adoption</span>
+      </div>
+    </div>
+    <p class="hero-thesis">
+      Agent frameworks are hierarchical. MCP is a band-aid. A2A is a band-aid.
+      The internet is 30 billion devices communicating by message passing.
+      Cells in your body work the same way.
+      Objects talking to objects is a 55-year-old idea that runs the world.
+    </p>
+    <p class="hero-tagline">
+      abject <span class="dim">(n.)</span> AI Object. Also: cosmic dread. Both apply.
+    </p>
   </div>
 </section>
 
@@ -111,9 +112,10 @@
     margin: 0 auto 1.5rem;
     color: var(--text-dim);
     font-size: 0.95rem;
-    line-height: 1.8;
+    line-height: 1.7;
     text-align: center;
   }
+
 
   .hero-tagline {
     font-family: var(--font-mono);
@@ -125,6 +127,17 @@
 
   .hero-tagline .dim {
     opacity: 0.6;
+  }
+
+  .hero-ask {
+    color: var(--text-secondary);
+    font-style: italic;
+    font-size: 1.05rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .hero-ask .thesis-link {
+    margin-left: 0.25rem;
   }
 
   .hero-actions {
@@ -139,6 +152,7 @@
     gap: 2rem;
     justify-content: center;
     margin-bottom: 2.5rem;
+    padding: 0.5rem 0;
     flex-wrap: wrap;
   }
 
@@ -184,16 +198,18 @@
 
   .thesis-link {
     display: inline-block;
-    margin-top: 0.5rem;
+    margin-top: 0.25rem;
     color: var(--eldritch-dim);
-    font-size: 0.85rem;
+    font-size: 0.9rem;
     text-decoration: none;
-    border-bottom: 1px solid transparent;
-    transition: border-color 0.2s;
+    border-bottom: 1px solid rgba(43, 204, 110, 0.3);
+    padding-bottom: 1px;
+    transition: color 0.2s, border-color 0.2s;
   }
 
   .thesis-link:hover {
-    border-bottom-color: var(--eldritch-dim);
+    color: var(--eldritch);
+    border-bottom-color: var(--eldritch);
   }
 
   .hero-demo {
