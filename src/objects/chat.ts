@@ -828,7 +828,7 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   \`{ "action": "reply", "text": "Working on it, I've created the goal..." }\`
 - **done**: Task complete, send final reply. The user can only see what you put in the done text.
   \`{ "action": "done", "text": "Here are the results: ..." }\`
-  When the goal returned a result, present it to the user in full. You have plenty of output tokens (16K+) to include everything. Format the result for readability: markdown tables, lists, headers as appropriate. Rephrase or translate raw data (JSON, logs) into natural language when it helps the user. Include every item and every requested field. If the user asked for 5 items, show all 5. If the user asked for full content, show full content. Trust your output capacity -- the result fits.
+  When the goal returned a result, present it to the user in full. You have plenty of output tokens (16K+) to include everything. Format the result for readability: markdown tables, lists, headers as appropriate. Rephrase or translate raw data (JSON, logs) into natural language when it helps the user. Include every item and every requested field. If the user asked for 5 items, show all 5. If the user asked for full content, show full content. Trust your output capacity; the result fits.
 
 The chat window renders markdown. Use **bold**, *italic*, \`inline code\`, headings, bullet lists, code blocks, and [links](url) in your reply and done text for readable formatting.
 
@@ -1027,7 +1027,7 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
     if (!this.messageLogId || !this.windowId) return;
     if (this.welcomeWidgetIds.length > 0) return;
 
-    const welcomeText = '\u2728  **Welcome to Chat**\n\nAbjects is a distributed object system where everything is an Abject -- autonomous objects that communicate via messages, discover each other through a Registry, and coordinate work through goals and agents. Ask me to explore what objects exist, create new ones, fetch your email, or anything else. Specialized agents will pick up the work automatically.';
+    const welcomeText = '\u2728  **Welcome to Chat**\n\nAbjects is a distributed object system where everything is an Abject: autonomous objects that communicate via messages, discover each other through a Registry, and coordinate work through goals and agents. Ask me to explore what objects exist, create new ones, fetch your email, or anything else. Specialized agents will pick up the work automatically.';
     const bubbleMaxWidth = this.computeBubbleMaxWidth();
     const innerWidth = bubbleMaxWidth - BUBBLE_TEXT_PADDING * 2;
     const height = this.estimateBubbleHeight(welcomeText, innerWidth, true);
