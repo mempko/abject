@@ -13,6 +13,24 @@
       find each other, and get to work.
       No cloud. No hierarchy. Just messages.
     </p>
+    <div class="hero-actions">
+      <a href="#downloads" class="btn btn-primary">Download</a>
+      <a href="#summon" class="btn btn-outline">Build from Source</a>
+    </div>
+    <div class="hero-glyphs">
+      <div class="hero-glyph">
+        <span class="glyph-icon">{?}</span>
+        <span class="glyph-text">Objects that explain themselves</span>
+      </div>
+      <div class="hero-glyph">
+        <span class="glyph-icon">{!}</span>
+        <span class="glyph-text">Networks that heal their own wounds</span>
+      </div>
+      <div class="hero-glyph">
+        <span class="glyph-icon">{*}</span>
+        <span class="glyph-text">Software that grows by adoption</span>
+      </div>
+    </div>
     <p class="hero-thesis">
       Agent frameworks are hierarchical. MCP is a band-aid. A2A is a band-aid.
       The largest, most complex system humanity ever built is the internet:
@@ -20,14 +38,11 @@
       Cells in your body work the same way.
       Objects talking to objects is a 55-year-old idea that runs the world.
       What if those objects could explain themselves?
+      <a href="/ask-protocol" class="thesis-link">Read the Ask Protocol &rarr;</a>
     </p>
     <p class="hero-tagline">
       abject <span class="dim">(n.)</span> AI Object. Also: cosmic dread. Both apply.
     </p>
-    <div class="hero-actions">
-      <a href="#downloads" class="btn btn-primary">Download</a>
-      <a href="#summon" class="btn btn-outline">Build from Source</a>
-    </div>
     <div class="hero-demo">
       <video autoplay loop muted playsinline>
         <source src="/abject_demo2_1080.webm" type="video/webm" />
@@ -116,7 +131,69 @@
     display: flex;
     gap: 1rem;
     justify-content: center;
-    margin-bottom: 3rem;
+    margin-bottom: 2.5rem;
+  }
+
+  .hero-glyphs {
+    display: flex;
+    gap: 2rem;
+    justify-content: center;
+    margin-bottom: 2.5rem;
+    flex-wrap: wrap;
+  }
+
+  .hero-glyph {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+
+  .glyph-icon {
+    font-family: var(--font-mono);
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: var(--eldritch);
+    background: var(--eldritch-glow);
+    border: 1px solid var(--border-accent);
+    padding: 0.25rem 0.45rem;
+    border-radius: 5px;
+    animation: breathe 4s ease-in-out infinite;
+  }
+
+  .hero-glyph:nth-child(2) .glyph-icon {
+    color: var(--void-purple);
+    background: var(--void-purple-glow);
+    border-color: rgba(155, 89, 255, 0.2);
+    animation-delay: 1.3s;
+  }
+
+  .hero-glyph:nth-child(3) .glyph-icon {
+    animation-delay: 2.6s;
+  }
+
+  .glyph-text {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    letter-spacing: 0.01em;
+  }
+
+  @keyframes breathe {
+    0%, 100% { box-shadow: 0 0 6px rgba(57, 255, 142, 0.1); }
+    50% { box-shadow: 0 0 14px rgba(57, 255, 142, 0.25); }
+  }
+
+  .thesis-link {
+    display: inline-block;
+    margin-top: 0.5rem;
+    color: var(--eldritch-dim);
+    font-size: 0.85rem;
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+    transition: border-color 0.2s;
+  }
+
+  .thesis-link:hover {
+    border-bottom-color: var(--eldritch-dim);
   }
 
   .hero-demo {
@@ -137,6 +214,11 @@
     .hero-actions {
       flex-direction: column;
       align-items: center;
+    }
+    .hero-glyphs {
+      flex-direction: column;
+      align-items: center;
+      gap: 1rem;
     }
   }
 </style>
