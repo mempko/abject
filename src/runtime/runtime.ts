@@ -145,6 +145,9 @@ export class Runtime {
     await this.registry.stop();
     await this.factory.stop();
 
+    // Tear down bus state (interceptors, subscriptions, routing tables).
+    this.bus.stop();
+
     this.state = 'stopped';
 
     log.info('Abjects runtime stopped');

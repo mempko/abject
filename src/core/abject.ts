@@ -124,12 +124,20 @@ export abstract class Abject {
    * Get current status.
    */
   get status(): AbjectStatus {
+    // Connections we know about: declared dependents (via addDependent) plus
+    // structural links (parent, registry). Message-flow connections would
+    // require per-send bookkeeping; this is the accurate subset available
+    // without adding overhead on every send.
+    const connections = new Set<AbjectId>(this.dependents);
+    if (this._parentId) connections.add(this._parentId);
+    if (this._registryId) connections.add(this._registryId);
+
     return {
       id: this.id,
       typeId: this._typeId,
       state: this._status,
       manifest: this.manifest,
-      connections: [], // TODO: track connections
+      connections: Array.from(connections),
       errorCount: this.errorCount,
       lastError: this.lastError,
       startedAt: this.startedAt,
@@ -179,11 +187,16 @@ export abstract class Abject {
 
   /**
    * Initialize the object. Called after registration with the bus.
-   * Starts the per-object processing loop.
+   * Starts the per-object processing loop. Accepts an optional registryHint
+   * so callers don't have to call setRegistryHint separately before init.
    */
-  async init(bus: MessageBusLike, parentId?: AbjectId): Promise<void> {
+  async init(bus: MessageBusLike, parentId?: AbjectId, registryHint?: AbjectId): Promise<void> {
     require(this._status === 'initializing', 'Object must be initializing');
     require(this._bus === undefined, 'Object already initialized');
+
+    if (registryHint) {
+      this._registryId = registryHint;
+    }
 
     this._bus = bus;
     this._parentId = parentId;

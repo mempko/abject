@@ -10,6 +10,7 @@
 import { AbjectMessage, AbjectId } from '../core/types.js';
 import { Mailbox } from './mailbox.js';
 import type { MessageBusLike } from './message-bus.js';
+import { resetSequence } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('WorkerBus');
@@ -57,6 +58,7 @@ export class WorkerBus implements MessageBusLike {
       mailbox.close();
     }
     this.mailboxes.delete(objectId);
+    resetSequence(objectId);
   }
 
   /**

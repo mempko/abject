@@ -8,7 +8,7 @@
 
 import { AbjectMessage, AbjectId, AbjectError } from '../core/types.js';
 import { require, ensure, invariant, requireNonEmpty } from '../core/contracts.js';
-import { request as createRequest, error as createError } from '../core/message.js';
+import { request as createRequest, error as createError, resetSequence } from '../core/message.js';
 import { Mailbox } from './mailbox.js';
 import type { WorkerPool } from './worker-pool.js';
 import type { WorkerBridge } from './worker-bridge.js';
@@ -86,6 +86,8 @@ export class MessageBus implements MessageBusLike {
     this.subscriptions = this.subscriptions.filter(
       (sub) => sub.objectId !== objectId
     );
+
+    resetSequence(objectId);
 
     this.checkInvariants();
   }
@@ -206,6 +208,25 @@ export class MessageBus implements MessageBusLike {
     if (idx >= 0) {
       this.interceptors.splice(idx, 1);
     }
+  }
+
+  /**
+   * Tear down bus state. Closes every mailbox and drops all interceptors,
+   * subscriptions, worker-routing entries, and the undeliverable handler so
+   * a fresh Runtime instance cannot inherit stale references.
+   */
+  stop(): void {
+    for (const mailbox of this.mailboxes.values()) {
+      mailbox.close();
+    }
+    this.mailboxes.clear();
+    this.subscriptions = [];
+    this.interceptors = [];
+    this.workerObjects.clear();
+    this.dedicatedBridges.clear();
+    this._undeliverableHandler = undefined;
+    this._workerPool = undefined;
+    this._running = false;
   }
 
   /**
@@ -435,22 +456,23 @@ export class HealthInterceptor implements MessageInterceptor {
     const agreementId = this.trackedPairs.get(pairKey);
 
     if (agreementId) {
+      // Self-report: sender is the HealthMonitor itself, since this is its
+      // own observation of the bus. Avoids a forged 'health-interceptor' id
+      // that isn't registered anywhere.
       if (message.header.type === 'error') {
-        // Report error to HealthMonitor (fire-and-forget)
         const errorPayload = message.payload as AbjectError;
         this.bus.send(
           createRequest(
-            'health-interceptor' as AbjectId,
+            this.healthMonitorId,
             this.healthMonitorId,
             'recordError',
             { agreementId, error: errorPayload }
           )
         );
       } else if (message.header.type === 'reply') {
-        // Report success to HealthMonitor (fire-and-forget)
         this.bus.send(
           createRequest(
-            'health-interceptor' as AbjectId,
+            this.healthMonitorId,
             this.healthMonitorId,
             'recordSuccess',
             { agreementId }
@@ -459,7 +481,6 @@ export class HealthInterceptor implements MessageInterceptor {
       }
     }
 
-    // Always pass — we're just observing
     return 'pass';
   }
 }

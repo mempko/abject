@@ -4,6 +4,9 @@
 
 import { AbjectMessage } from '../core/types.js';
 import { require, ensure, invariant, requirePositive } from '../core/contracts.js';
+import { Log } from '../core/timed-log.js';
+
+const log = new Log('Mailbox');
 
 /**
  * A bounded async message queue.
@@ -12,6 +15,8 @@ export class Mailbox {
   private queue: AbjectMessage[] = [];
   private waiters: { resolve: (msg: AbjectMessage) => void; reject: (err: Error) => void }[] = [];
   private closed = false;
+  private _droppedClosed = 0;
+  private _droppedFull = 0;
 
   constructor(private readonly maxSize: number = 1000) {
     requirePositive(maxSize, 'maxSize');
@@ -19,17 +24,47 @@ export class Mailbox {
 
   /**
    * Add a message to the queue.
-   * Silently drops if closed or full.
+   * Drops if closed or full; drops are counted and logged (throttled).
    */
   send(message: AbjectMessage): void {
-    if (this.closed) return;
-    if (this.queue.length >= this.maxSize) return;
+    if (this.closed) {
+      this._droppedClosed++;
+      if (this._droppedClosed === 1 || this._droppedClosed % 100 === 0) {
+        log.warn(
+          `drop: closed mailbox (to=${message.routing.to}, method=${message.routing.method ?? ''}, type=${message.header.type}, total=${this._droppedClosed})`
+        );
+      }
+      return;
+    }
+    if (this.queue.length >= this.maxSize) {
+      this._droppedFull++;
+      if (this._droppedFull === 1 || this._droppedFull % 100 === 0) {
+        log.warn(
+          `drop: full mailbox (to=${message.routing.to}, method=${message.routing.method ?? ''}, type=${message.header.type}, size=${this.queue.length}/${this.maxSize}, total=${this._droppedFull})`
+        );
+      }
+      return;
+    }
     const waiter = this.waiters.shift();
     if (waiter) {
       waiter.resolve(message);
     } else {
       this.queue.push(message);
     }
+  }
+
+  /**
+   * Count of messages dropped because the mailbox was closed.
+   */
+  get droppedClosed(): number {
+    return this._droppedClosed;
+  }
+
+  /**
+   * Count of messages dropped because the mailbox was full.
+   */
+  get droppedFull(): number {
+    return this._droppedFull;
   }
 
   /**
@@ -192,10 +227,16 @@ export class Mailbox {
 
 /**
  * Priority mailbox that processes messages by priority.
+ *
+ * Event-driven: receive() parks a waiter until send() arrives. No polling.
+ * Inner per-priority mailboxes are used as pure FIFO queues (we never call
+ * their receive()), so their waiter lists stay empty and send() always
+ * enqueues through the queue path.
  */
 export class PriorityMailbox {
   private queues: Map<number, Mailbox> = new Map();
   private priorities: number[] = [];
+  private waiters: ((msg: AbjectMessage) => void)[] = [];
 
   constructor(
     private readonly _maxSizePerPriority: number = 100,
@@ -219,24 +260,29 @@ export class PriorityMailbox {
       require(queue !== undefined, 'Default priority queue must exist');
     }
     queue.send(message);
+
+    // Wake one waiter, handing it the highest-priority pending message
+    // (which may not be the message we just sent).
+    if (this.waiters.length > 0) {
+      const msg = this.tryReceive();
+      if (msg) {
+        const waiter = this.waiters.shift()!;
+        waiter(msg);
+      }
+    }
   }
 
   /**
-   * Receive the highest priority message.
+   * Receive the highest priority message. Resolves as soon as a message is
+   * available; parks until send() delivers one otherwise.
    */
   async receive(): Promise<AbjectMessage> {
-    // Poll all queues in priority order
-    while (true) {
-      for (const p of this.priorities) {
-        const queue = this.queues.get(p)!;
-        const msg = queue.tryReceive();
-        if (msg) {
-          return msg;
-        }
-      }
-      // Wait a bit before retrying
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
+    const msg = this.tryReceive();
+    if (msg) return msg;
+
+    return new Promise<AbjectMessage>((resolve) => {
+      this.waiters.push(resolve);
+    });
   }
 
   /**

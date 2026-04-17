@@ -47,7 +47,8 @@ function getNextSequence(senderId: AbjectId): number {
 }
 
 /**
- * Reset sequence number for a sender (used in testing).
+ * Reset sequence number for a sender. Called by the bus on unregister
+ * so terminated objects do not leak entries in the module-level map.
  */
 export function resetSequence(senderId: AbjectId): void {
   sequenceNumbers.delete(senderId);
