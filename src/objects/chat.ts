@@ -743,12 +743,22 @@ export class Chat extends Abject {
       }
 
       try {
-        // Add all tasks to the goal, mapping index-based dependsOn to taskIds
+        // Add all tasks to the goal. Default is SEQUENTIAL: each task auto-depends
+        // on the previous one unless dependsOn is explicitly specified (including
+        // dependsOn: [] for explicit parallel execution).
         const taskIds: string[] = [];
-        for (const task of tasks) {
-          const depIds = (task.dependsOn ?? [])
-            .filter(idx => idx >= 0 && idx < taskIds.length)
-            .map(idx => taskIds[idx]);
+        for (let i = 0; i < tasks.length; i++) {
+          const task = tasks[i];
+          let depIds: string[];
+          if (task.dependsOn === undefined) {
+            // Default: auto-chain to previous task for sequential execution
+            depIds = i > 0 ? [taskIds[i - 1]] : [];
+          } else {
+            // Explicit: map index-based dependsOn to task IDs (empty array allowed)
+            depIds = task.dependsOn
+              .filter(idx => idx >= 0 && idx < taskIds.length)
+              .map(idx => taskIds[idx]);
+          }
 
           const { taskId } = await this.request<{ taskId: string }>(
             request(this.id, this.goalManagerId, 'addTask', {
@@ -815,17 +825,24 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   \`{ "action": "goal", "title": "Fix the HackerNews UI", "tasks": [
     { "description": "Fix the UI of the HackerNews object: improve layout spacing, make the story list scrollable, fix text overflow" }
   ] }\`
-  Complex request (multiple parallel tasks):
-  \`{ "action": "goal", "title": "Weather dashboard", "tasks": [
-    { "description": "Fetch current weather data for Miami, FL using an HTTP API" },
-    { "description": "Create a new dashboard widget that displays temperature and humidity" }
-  ] }\`
-  Sequential tasks (task 1 depends on task 0):
+  **Tasks run SEQUENTIALLY by default** — each task waits for the previous one to finish. Most multi-step work has natural ordering (fetch then summarize, discover then modify), so sequential is safest.
+  Sequential (default):
   \`{ "action": "goal", "title": "Fetch and summarize", "tasks": [
     { "description": "Fetch the latest news headlines" },
-    { "description": "Summarize the fetched headlines into a brief report", "dependsOn": [0] }
+    { "description": "Summarize the fetched headlines into a brief report" }
   ] }\`
-  Use dependsOn with 0-based task indices when a task needs a previous task to finish first. Tasks without dependsOn run in parallel.
+  Explicit dependency (task 2 depends on task 0 but not task 1):
+  \`{ "action": "goal", "title": "Research and report", "tasks": [
+    { "description": "Research topic A" },
+    { "description": "Research topic B" },
+    { "description": "Combine findings", "dependsOn": [0, 1] }
+  ] }\`
+  Opt-in parallel (use \`dependsOn: []\` when you KNOW tasks are independent):
+  \`{ "action": "goal", "title": "Independent lookups", "tasks": [
+    { "description": "Fetch weather for Miami", "dependsOn": [] },
+    { "description": "Fetch weather for NYC", "dependsOn": [] }
+  ] }\`
+  Use \`dependsOn: []\` ONLY when tasks truly have no dependencies and can safely run at the same time. When in doubt, leave dependsOn unspecified (sequential).
   Include the object name in the task description when relevant. Be specific about the desired outcome.
 
   Concrete user data (email, calendar, files, contacts, weather, web pages, finances, etc.):

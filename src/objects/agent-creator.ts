@@ -292,8 +292,11 @@ Include data.additionalDeps for extra dependencies beyond the pattern base (e.g.
 
 ## Task Dependencies
 
-Use \`dependsOn\` with task indices (0-based) when a task needs a previous task to complete first.
-Tasks without dependsOn run in parallel. Tasks with dependsOn wait until all listed tasks are done.
+**Tasks run SEQUENTIALLY by default** — each task waits for the previous one to finish. This is safest when one task's output feeds another, or when tasks share resources.
+
+- Leave \`dependsOn\` unspecified (or omit it) for the default sequential chain.
+- Set \`dependsOn: [0, 2]\` with 0-based indices for a specific dependency.
+- Set \`dependsOn: []\` (empty array) to explicitly opt into parallel execution — ONLY when you know the tasks are fully independent.
 
 ## Examples
 

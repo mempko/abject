@@ -2313,11 +2313,18 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
     log.info(`[${agentName}] Child goal ${childGoalId.slice(0, 8)} with ${subtasks.length} tasks`);
 
     const taskIds: string[] = [];
-    for (const sub of subtasks) {
-      // Map index-based dependsOn to actual taskIds
-      const depIds = (sub.dependsOn ?? [])
-        .filter(idx => idx >= 0 && idx < taskIds.length)
-        .map(idx => taskIds[idx]);
+    for (let i = 0; i < subtasks.length; i++) {
+      const sub = subtasks[i];
+      let depIds: string[];
+      if (sub.dependsOn === undefined) {
+        // Default: SEQUENTIAL — auto-chain to previous task
+        depIds = i > 0 ? [taskIds[i - 1]] : [];
+      } else {
+        // Explicit: map index-based dependsOn to taskIds (empty array allowed)
+        depIds = sub.dependsOn
+          .filter(idx => idx >= 0 && idx < taskIds.length)
+          .map(idx => taskIds[idx]);
+      }
 
       const { taskId } = await this.request<{ taskId: string }>(
         request(this.id, goalMgrId, 'addTask', {
