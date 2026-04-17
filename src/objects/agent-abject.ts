@@ -1091,16 +1091,37 @@ The registered object must implement these handlers to participate in the agent 
       } catch { /* best effort */ }
     }
 
-    // 3. Ask each agent if they can handle this task and what steps they would take
-    let askQuestion = `Here is the goal I'm trying to accomplish and the task I want you to do. Let me know if this is a task you can do. If you can, tell me the steps you would take to accomplish the task.`;
-    if (goalTitle) askQuestion += `\nGoal: "${goalTitle}"`;
+    // 3. Ask each agent if they can handle this task and what steps they would take.
+    //    Require a structured verdict on the first line so we can filter
+    //    out agents that pass or are only partially capable.
+    let askQuestion = `Here is the goal I'm trying to accomplish and the task I want you to do.
+
+**Your response MUST start with one of these verdicts on the first line, followed by a colon:**
+- \`YES:\` — I can fully accomplish this task with my current capabilities.
+- \`PARTIAL:\` — I can do part of this task but not all of it.
+- \`NO:\` — This task is outside my capabilities.
+
+After the verdict, briefly (2-4 sentences) describe the specific steps you would take (if YES/PARTIAL) or why you cannot do it (if NO).`;
+    if (goalTitle) askQuestion += `\n\nGoal: "${goalTitle}"`;
     askQuestion += `\nTask: "${description.slice(0, 400)}"`;
     if (failureHistory.length > 0) {
       const failSummary = failureHistory.map(f => `- ${f.agent}: ${f.error}`).join('\n');
-      askQuestion += `\nPrevious attempts failed:\n${failSummary}`;
+      askQuestion += `\n\nPrevious attempts failed:\n${failSummary}`;
     }
 
-    const approaches = await Promise.all(
+    type AgentApproach = { agent: RegisteredAgent; approach: string; verdict: 'YES' | 'PARTIAL' | 'NO' };
+    const parseVerdict = (text: string): 'YES' | 'PARTIAL' | 'NO' => {
+      const firstLine = text.trim().split('\n')[0].toUpperCase();
+      if (/^YES\b/.test(firstLine)) return 'YES';
+      if (/^PARTIAL\b/.test(firstLine)) return 'PARTIAL';
+      if (/^NO\b/.test(firstLine)) return 'NO';
+      // Fallback: look for PASS keyword or "cannot" in first 200 chars
+      const head = text.slice(0, 200).toUpperCase();
+      if (/\bPASS\b|\bCANNOT\b|\bOUT OF SCOPE\b/.test(head)) return 'NO';
+      return 'PARTIAL';
+    };
+
+    const allApproaches: AgentApproach[] = await Promise.all(
       eligible.map(async (agent) => {
         try {
           const answer = await this.request<string>(
@@ -1108,45 +1129,82 @@ The registered object must implement these handlers to participate in the agent 
             30000,
           );
           const text = typeof answer === 'string' ? answer : String(answer);
-          return { agent, approach: text };
+          return { agent, approach: text, verdict: parseVerdict(text) };
         } catch {
-          return { agent, approach: 'PASS' };
+          return { agent, approach: 'NO: ask failed', verdict: 'NO' as const };
         }
       })
     );
 
-    // 4. Evaluate: pick the agent with the most efficient, likely-to-succeed plan
-    for (const a of approaches) {
-      log.info(`DISPATCH-INNER ${tupleId} — ${a.agent.name} says: ${a.approach.slice(0, 150)}`);
+    for (const a of allApproaches) {
+      log.info(`DISPATCH-INNER ${tupleId} — ${a.agent.name} [${a.verdict}]: ${a.approach.slice(0, 150)}`);
     }
+
+    // Prefer YES agents. Only fall back to PARTIAL if no YES exists.
+    // Never dispatch to NO agents.
+    const yesAgents = allApproaches.filter(a => a.verdict === 'YES');
+    const partialAgents = allApproaches.filter(a => a.verdict === 'PARTIAL');
+    const approaches = yesAgents.length > 0 ? yesAgents : partialAgents;
+
+    if (approaches.length === 0) {
+      log.info(`DISPATCH-INNER ${tupleId} — no agent can handle: all declined`);
+      if (taskGoalId && this.goalManagerId) {
+        this.send(event(this.id, this.goalManagerId, 'updateProgress', {
+          goalId: taskGoalId,
+          message: 'All agents declined this task',
+          phase: 'dispatch',
+          agentName: 'AgentAbject',
+        }));
+      }
+      // Schedule a retry with backoff (same policy as evaluator NONE below)
+      const dispatchRetries = (tuple.fields._dispatchRetries as number) ?? 0;
+      if (dispatchRetries < 6) {
+        tuple.fields._dispatchRetries = dispatchRetries + 1;
+        const delay = Math.min(5000 * (dispatchRetries + 1), 30000);
+        log.info(`DISPATCH-INNER ${tupleId} — scheduling retry ${dispatchRetries + 1}/6 in ${delay}ms`);
+        setTimeout(() => {
+          this.dispatchToAgent(tuple).catch(err => {
+            log.warn(`DISPATCH-INNER ${tupleId} — retry failed:`, err instanceof Error ? err.message : String(err));
+          });
+        }, delay);
+      }
+      return;
+    }
+
     const approachList = approaches.map(a =>
-      `- ${a.agent.name} (${a.agent.description.slice(0, 150)}): ${a.approach.slice(0, 500)}`
+      `- ${a.agent.name} (${a.agent.description.slice(0, 150)}) [${a.verdict}]: ${a.approach.slice(0, 500)}`
     ).join('\n');
 
     const evalPrompt = `Goal: "${goalTitle || 'N/A'}"
 Task: "${description.slice(0, 400)}"
 
-These agents were asked if they can handle this task. Each includes their role description and their proposed plan:
+These agents said they can handle this task (YES = fully, PARTIAL = partially). Each includes their role description and their proposed plan:
 
 ${approachList}
 
 Evaluate each agent's plan on:
-1. Efficiency: How many steps? Does the plan go directly to the result?
-2. Likelihood of success: Does the agent have the right tools and capabilities for what it described? Is the plan realistic given its role?
+1. Verdict: Prefer YES over PARTIAL. A PARTIAL agent is a fallback only.
+2. Efficiency: How many steps? Does the plan go directly to the result?
+3. Likelihood of success: Does the agent have the right tools and capabilities for what it described? Is the plan realistic given its role?
 
-Pick the agent with the best combination of efficiency and likelihood of success. Exclude agents that declined. Reply with ONLY the agent name, or NONE if every agent declined.`;
+Pick the agent with the best combination. Reply with ONLY the agent name.`;
 
     let chosen: RegisteredAgent | undefined;
     let chosenApproach = '';
-    try {
-      const evalResult = await this.askLlm(
-        'You are a task dispatcher. Evaluate each agent plan on efficiency and likelihood of success. Pick the best one, or say NONE.',
-        evalPrompt,
-        'balanced',
-      );
-      const trimmed = evalResult.trim();
-      log.info(`DISPATCH-INNER ${tupleId} — evaluator says: "${trimmed}"`);
-      if (!/\bNONE\b/i.test(trimmed)) {
+    if (approaches.length === 1) {
+      // Only one candidate — skip the evaluator
+      chosen = approaches[0].agent;
+      chosenApproach = approaches[0].approach;
+      log.info(`DISPATCH-INNER ${tupleId} — single candidate: ${chosen.name} [${approaches[0].verdict}]`);
+    } else {
+      try {
+        const evalResult = await this.askLlm(
+          'You are a task dispatcher. Evaluate each agent plan on efficiency and likelihood of success. Pick the best one.',
+          evalPrompt,
+          'balanced',
+        );
+        const trimmed = evalResult.trim();
+        log.info(`DISPATCH-INNER ${tupleId} — evaluator says: "${trimmed}"`);
         const match = approaches.find(a =>
           trimmed.toLowerCase().includes(a.agent.name.toLowerCase())
         );
@@ -1154,9 +1212,11 @@ Pick the agent with the best combination of efficiency and likelihood of success
           chosen = match.agent;
           chosenApproach = match.approach;
         }
+      } catch {
+        // LLM failed — fall back to first YES/PARTIAL candidate
+        chosen = approaches[0].agent;
+        chosenApproach = approaches[0].approach;
       }
-    } catch {
-      // LLM failed -- no dispatch
     }
 
     if (!chosen) {
