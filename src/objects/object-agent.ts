@@ -138,9 +138,10 @@ Say PASS if the task involves creating, building, or making something new (apps,
   private setupHandlers(): void {
     // ── TupleSpace dispatch handler ──
     this.on('executeTask', async (msg: AbjectMessage) => {
-      const { goalId, description, data, approach } = msg.payload as {
+      const { goalId, description, data, approach, failureHistory } = msg.payload as {
         tupleId: string; goalId?: string; description: string;
         data?: Record<string, unknown>; type: string; approach?: string;
+        failureHistory?: Array<{ agent: string; error: string }>;
       };
 
       const taskId = `obj-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -150,14 +151,25 @@ Say PASS if the task involves creating, building, or making something new (apps,
       try {
         const systemPrompt = this.buildSystemPrompt(data);
 
-        // If the dispatch included the agent's proposed approach, seed it as
-        // an initial message so the agent skips re-discovery and acts on its plan.
-        const initialMessages = approach
-          ? [
-              { role: 'user' as const, content: `Task: ${description}` },
-              { role: 'assistant' as const, content: `I will accomplish this as follows: ${approach}` },
-            ]
-          : undefined;
+        // Seed conversation with approach and failure context from previous attempts.
+        const initialMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+        if (failureHistory && failureHistory.length > 0) {
+          const failSummary = failureHistory
+            .map(f => `- ${f.agent}: ${f.error}`)
+            .join('\n');
+          initialMessages.push(
+            { role: 'user', content: `Task: ${description}\n\nPrevious attempts at this task failed:\n${failSummary}\n\nLearn from these failures and take a different approach.` },
+          );
+        } else if (approach) {
+          initialMessages.push(
+            { role: 'user', content: `Task: ${description}` },
+          );
+        }
+        if (approach) {
+          initialMessages.push(
+            { role: 'assistant', content: `I will accomplish this as follows: ${approach}` },
+          );
+        }
 
         const { ticketId } = await this.request<{ ticketId: string }>(
           request(this.id, this.agentAbjectId!, 'startTask', {
@@ -165,7 +177,7 @@ Say PASS if the task involves creating, building, or making something new (apps,
             task: description,
             systemPrompt,
             goalId,
-            initialMessages,
+            initialMessages: initialMessages.length > 0 ? initialMessages : undefined,
             config: {
               maxSteps: 15,
               timeout: 300000,

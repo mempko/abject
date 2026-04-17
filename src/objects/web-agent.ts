@@ -450,9 +450,10 @@ Set keepPageOpen: false to explicitly close the page when done.
     });
 
     this.on('executeTask', async (msg: AbjectMessage) => {
-      const { goalId, description, data } = msg.payload as {
+      const { goalId, description, data, approach, failureHistory } = msg.payload as {
         tupleId: string; goalId?: string; description: string;
-        data?: Record<string, unknown>; type: string;
+        data?: Record<string, unknown>; type: string; approach?: string;
+        failureHistory?: Array<{ agent: string; error: string }>;
       };
 
       const taskId = `web-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -476,6 +477,20 @@ Set keepPageOpen: false to explicitly close the page when done.
       }
 
       try {
+        // Seed conversation with failure context from previous attempts
+        const initialMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+        if (failureHistory && failureHistory.length > 0) {
+          const failSummary = failureHistory.map(f => `- ${f.agent}: ${f.error}`).join('\n');
+          initialMessages.push(
+            { role: 'user', content: `Task: ${description}\n\nPrevious attempts at this task failed:\n${failSummary}\n\nLearn from these failures and take a different approach.` },
+          );
+        }
+        if (approach) {
+          initialMessages.push(
+            { role: 'assistant', content: `I will accomplish this as follows: ${approach}` },
+          );
+        }
+
         // Run task via AgentAbject
         const { ticketId } = await this.request<{ ticketId: string }>(
           request(this.id, this.agentAbjectId!, 'startTask', {
@@ -483,6 +498,7 @@ Set keepPageOpen: false to explicitly close the page when done.
             task: description,
             systemPrompt: this.buildSystemPrompt(description),
             goalId,
+            initialMessages: initialMessages.length > 0 ? initialMessages : undefined,
             config: {
               maxSteps: 15,
               timeout: 300000,

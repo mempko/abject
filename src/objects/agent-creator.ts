@@ -124,21 +124,36 @@ When asked about a task, describe how you would decompose it into agent/schedule
 
   private setupHandlers(): void {
     this.on('executeTask', async (msg: AbjectMessage) => {
-      const { goalId, description } = msg.payload as {
+      const { goalId, description, approach, failureHistory } = msg.payload as {
         tupleId: string; goalId?: string; description: string;
-        data?: Record<string, unknown>; type: string;
+        data?: Record<string, unknown>; type: string; approach?: string;
+        failureHistory?: Array<{ agent: string; error: string }>;
       };
 
       const taskId = `ac-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       this.taskExtras.set(taskId, { description, goalId });
 
       try {
+        const initialMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+        if (failureHistory && failureHistory.length > 0) {
+          const failSummary = failureHistory.map(f => `- ${f.agent}: ${f.error}`).join('\n');
+          initialMessages.push(
+            { role: 'user', content: `Task: ${description}\n\nPrevious attempts at this task failed:\n${failSummary}\n\nLearn from these failures and take a different approach.` },
+          );
+        }
+        if (approach) {
+          initialMessages.push(
+            { role: 'assistant', content: `I will accomplish this as follows: ${approach}` },
+          );
+        }
+
         const { ticketId } = await this.request<{ ticketId: string }>(
           request(this.id, this.agentAbjectId!, 'startTask', {
             taskId,
             task: description,
             systemPrompt: this.buildSystemPrompt(),
             goalId,
+            initialMessages: initialMessages.length > 0 ? initialMessages : undefined,
             config: {
               maxSteps: 15,
               timeout: 600000,

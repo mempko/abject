@@ -1227,6 +1227,7 @@ Pick the agent with the best combination of efficiency and likelihood of success
       data,
       callerId: this.id,
       approach: chosenApproach || undefined,
+      failureHistory: failureHistory.length > 0 ? failureHistory : undefined,
     };
     const jobCode = `return await call(${JSON.stringify(chosen.agentId)}, 'executeTask', ${JSON.stringify(executePayload)});`;
     const jobMgrId = await this.resolveDep('JobManager', this.jobManagerId);
