@@ -47,9 +47,37 @@ const DEFAULT_PORT = 7720;
 const STALE_TIMEOUT = 5 * 60 * 1000; // 5 minutes
 const log = new Log('Signaling');
 
+/**
+ * Parse and shape-validate an incoming signaling frame.
+ * Returns undefined if the payload is not a well-formed SignalingMessage.
+ */
+function parseSignalingMessage(raw: string): SignalingMessage | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== 'object') return undefined;
+  const candidate = parsed as Record<string, unknown>;
+  if (typeof candidate.type !== 'string' || candidate.type.length === 0) {
+    return undefined;
+  }
+  // Reject oversized optional string fields up front; these are identifiers,
+  // not content payloads.
+  for (const field of ['peerId', 'targetPeerId', 'name'] as const) {
+    const val = candidate[field];
+    if (val !== undefined && (typeof val !== 'string' || val.length > 1024)) {
+      return undefined;
+    }
+  }
+  return candidate as unknown as SignalingMessage;
+}
+
 export class SignalingServer {
   private wss: WsServer;
   private peers: Map<string, PeerRecord> = new Map();
+  private wsToPeerId: Map<WebSocket, string> = new Map();
   private cleanupTimer: ReturnType<typeof setInterval>;
   private siblings: Map<string, FederationPeer> = new Map();
   private federationEnabled = false;
@@ -59,12 +87,12 @@ export class SignalingServer {
 
     this.wss.on('connection', (ws) => {
       ws.on('message', (data) => {
-        try {
-          const msg = JSON.parse(data.toString()) as SignalingMessage;
-          this.handleMessage(ws, msg);
-        } catch (err) {
-          log.error('Failed to parse message:', err);
+        const msg = parseSignalingMessage(data.toString());
+        if (!msg) {
+          log.warn('Dropping malformed signaling message');
+          return;
         }
+        this.handleMessage(ws, msg);
       });
 
       ws.on('close', () => {
@@ -82,6 +110,7 @@ export class SignalingServer {
       for (const [peerId, record] of this.peers) {
         if (now - record.lastSeen > STALE_TIMEOUT) {
           this.peers.delete(peerId);
+          this.wsToPeerId.delete(record.ws);
           log.info(`Removed stale peer: ${peerId.slice(0, 16)}`);
         }
       }
@@ -96,7 +125,7 @@ export class SignalingServer {
         this.handleRegister(ws, msg);
         break;
       case 'unregister':
-        this.handleUnregister(msg);
+        this.handleUnregister(ws, msg);
         break;
       case 'find':
         this.handleFind(ws, msg);
@@ -129,6 +158,13 @@ export class SignalingServer {
       return;
     }
 
+    // One peerId per socket. If this socket was already bound to a different
+    // peerId, drop the prior binding so identity is not laundered silently.
+    const previousPeerId = this.wsToPeerId.get(ws);
+    if (previousPeerId && previousPeerId !== msg.peerId) {
+      this.peers.delete(previousPeerId);
+    }
+
     this.peers.set(msg.peerId, {
       peerId: msg.peerId,
       publicSigningKey: msg.publicSigningKey,
@@ -137,6 +173,7 @@ export class SignalingServer {
       ws,
       lastSeen: Date.now(),
     });
+    this.wsToPeerId.set(ws, msg.peerId);
 
     log.info(`Registered peer: ${msg.peerId.slice(0, 16)} (${msg.name ?? 'unnamed'})`);
     this.sendMessage(ws, { type: 'registered', peerId: msg.peerId });
@@ -146,11 +183,16 @@ export class SignalingServer {
     this.broadcastPeerList(msg.peerId);
   }
 
-  private handleUnregister(msg: SignalingMessage): void {
-    if (msg.peerId) {
-      this.peers.delete(msg.peerId);
-      log.info(`Unregistered peer: ${msg.peerId.slice(0, 16)}`);
+  private handleUnregister(ws: WebSocket, msg: SignalingMessage): void {
+    if (!msg.peerId) return;
+    const boundPeerId = this.wsToPeerId.get(ws);
+    if (boundPeerId !== msg.peerId) {
+      this.sendMessage(ws, { type: 'error', error: 'peerId does not match this connection' });
+      return;
     }
+    this.peers.delete(msg.peerId);
+    this.wsToPeerId.delete(ws);
+    log.info(`Unregistered peer: ${msg.peerId.slice(0, 16)}`);
   }
 
   private handleFind(ws: WebSocket, msg: SignalingMessage): void {
@@ -183,10 +225,23 @@ export class SignalingServer {
 
   /**
    * Relay signaling messages (SDP offers/answers, ICE candidates) to the target peer.
+   * The claimed sender (msg.peerId) must match the peerId bound to this socket
+   * at register time; otherwise we reject to prevent identity spoofing.
    */
   private handleRelay(ws: WebSocket, msg: SignalingMessage): void {
     if (!msg.targetPeerId) {
       this.sendMessage(ws, { type: 'error', error: 'Missing targetPeerId for relay' });
+      return;
+    }
+
+    const boundPeerId = this.wsToPeerId.get(ws);
+    if (!boundPeerId) {
+      this.sendMessage(ws, { type: 'error', error: 'Register before relaying' });
+      return;
+    }
+    if (msg.peerId && msg.peerId !== boundPeerId) {
+      log.warn(`Relay rejected: claimed sender ${msg.peerId.slice(0, 16)} but socket bound to ${boundPeerId.slice(0, 16)}`);
+      this.sendMessage(ws, { type: 'error', error: 'peerId does not match this connection' });
       return;
     }
 
@@ -196,14 +251,12 @@ export class SignalingServer {
       return;
     }
 
-    // Update sender's lastSeen
-    if (msg.peerId) {
-      const sender = this.peers.get(msg.peerId);
-      if (sender) sender.lastSeen = Date.now();
-    }
+    // Sender is authoritative here, not whatever msg.peerId said.
+    const sender = this.peers.get(boundPeerId);
+    if (sender) sender.lastSeen = Date.now();
 
-    // Forward the message to the target peer
-    this.sendMessage(target.ws, msg);
+    // Stamp the authenticated sender so targets can trust msg.peerId.
+    this.sendMessage(target.ws, { ...msg, peerId: boundPeerId });
   }
 
   private handleListPeers(ws: WebSocket, msg: SignalingMessage): void {
@@ -220,12 +273,10 @@ export class SignalingServer {
   }
 
   private handlePing(ws: WebSocket): void {
-    // Update lastSeen for the peer associated with this WebSocket
-    for (const record of this.peers.values()) {
-      if (record.ws === ws) {
-        record.lastSeen = Date.now();
-        break;
-      }
+    const peerId = this.wsToPeerId.get(ws);
+    if (peerId) {
+      const record = this.peers.get(peerId);
+      if (record) record.lastSeen = Date.now();
     }
     this.sendMessage(ws, { type: 'pong' });
   }
@@ -250,12 +301,11 @@ export class SignalingServer {
   }
 
   private removePeerBySocket(ws: WebSocket): void {
-    for (const [peerId, record] of this.peers) {
-      if (record.ws === ws) {
-        this.peers.delete(peerId);
-        log.info(`Peer disconnected: ${peerId.slice(0, 16)}`);
-        break;
-      }
+    const peerId = this.wsToPeerId.get(ws);
+    if (peerId) {
+      this.peers.delete(peerId);
+      this.wsToPeerId.delete(ws);
+      log.info(`Peer disconnected: ${peerId.slice(0, 16)}`);
     }
   }
 
@@ -304,10 +354,8 @@ export class SignalingServer {
       });
 
       ws.on('message', (data: Buffer | string) => {
-        try {
-          const msg = JSON.parse(data.toString()) as SignalingMessage;
-          this.handleFederationMessage(url, msg);
-        } catch { /* ignore parse errors */ }
+        const msg = parseSignalingMessage(data.toString());
+        if (msg) this.handleFederationMessage(url, msg);
       });
 
       ws.on('close', () => {
@@ -392,6 +440,7 @@ export class SignalingServer {
         record.ws.close(1000, 'Server shutting down');
       }
       this.peers.clear();
+      this.wsToPeerId.clear();
       this.wss.close((err) => {
         if (err) reject(err);
         else resolve();

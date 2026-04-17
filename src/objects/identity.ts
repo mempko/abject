@@ -43,8 +43,29 @@ export class IdentityObject extends Abject {
   private peerName = '';
   private storageId?: AbjectId;
 
-  // Cache of imported contact public keys
+  // LRU cache of imported contact public keys. Map iteration order is
+  // insertion order, so we refresh entries on access and evict from the
+  // front when we exceed the cap.
+  private static readonly MAX_CONTACT_KEYS = 1024;
   private contactKeys: Map<PeerId, { signing: CryptoKey; exchange: CryptoKey }> = new Map();
+
+  private touchContact(peerId: PeerId): { signing: CryptoKey; exchange: CryptoKey } | undefined {
+    const entry = this.contactKeys.get(peerId);
+    if (!entry) return undefined;
+    this.contactKeys.delete(peerId);
+    this.contactKeys.set(peerId, entry);
+    return entry;
+  }
+
+  private setContact(peerId: PeerId, entry: { signing: CryptoKey; exchange: CryptoKey }): void {
+    if (this.contactKeys.has(peerId)) {
+      this.contactKeys.delete(peerId);
+    } else if (this.contactKeys.size >= IdentityObject.MAX_CONTACT_KEYS) {
+      const oldest = this.contactKeys.keys().next().value;
+      if (oldest !== undefined) this.contactKeys.delete(oldest);
+    }
+    this.contactKeys.set(peerId, entry);
+  }
 
   constructor() {
     super({
@@ -402,7 +423,7 @@ export class IdentityObject extends Abject {
     data: string,
     signature: string,
   ): Promise<boolean> {
-    const contact = this.contactKeys.get(peerId);
+    const contact = this.touchContact(peerId);
     precondition(contact !== undefined, `Unknown contact: ${peerId.slice(0, 16)}`);
 
     const encoder = new TextEncoder();
@@ -419,7 +440,7 @@ export class IdentityObject extends Abject {
 
   private async encryptFor(peerId: string, data: string): Promise<{ iv: string; ciphertext: string }> {
     precondition(this.exchangeKeyPair !== undefined, 'Exchange key not initialized');
-    const contact = this.contactKeys.get(peerId);
+    const contact = this.touchContact(peerId);
     precondition(contact !== undefined, `Unknown contact: ${peerId.slice(0, 16)}`);
 
     const sessionKey = await deriveSessionKey(
@@ -432,7 +453,7 @@ export class IdentityObject extends Abject {
 
   private async decryptFrom(peerId: string, iv: string, ciphertext: string): Promise<string> {
     precondition(this.exchangeKeyPair !== undefined, 'Exchange key not initialized');
-    const contact = this.contactKeys.get(peerId);
+    const contact = this.touchContact(peerId);
     precondition(contact !== undefined, `Unknown contact: ${peerId.slice(0, 16)}`);
 
     const sessionKey = await deriveSessionKey(
@@ -459,13 +480,13 @@ export class IdentityObject extends Abject {
     const signingKey = await importSigningPublicKey(publicSigningKeyJwk);
     const exchangeKey = await importExchangePublicKey(publicExchangeKeyJwk);
 
-    this.contactKeys.set(peerId, { signing: signingKey, exchange: exchangeKey });
+    this.setContact(peerId, { signing: signingKey, exchange: exchangeKey });
     return true;
   }
 
   private async deriveSessionKeyForPeer(peerId: string): Promise<string> {
     precondition(this.exchangeKeyPair !== undefined, 'Exchange key not initialized');
-    const contact = this.contactKeys.get(peerId);
+    const contact = this.touchContact(peerId);
     precondition(contact !== undefined, `Unknown contact: ${peerId.slice(0, 16)}`);
 
     const sessionKey = await deriveSessionKey(

@@ -30,6 +30,7 @@ const log = new Log('PeerTransport');
 const PONG_MISS_LIMIT = 3;
 const MAX_CHUNK_SIZE = 200_000; // 200KB per chunk (safe under 256KB SCTP limit)
 const CHUNK_REASSEMBLY_TIMEOUT = 30_000; // 30s to receive all chunks
+const CHUNK_REASSEMBLY_WARN_AT = 8_000;  // warn after 8s if still waiting
 const CONNECTION_TIMEOUT = 20_000; // 20s max to establish DataChannel
 
 export interface PeerTransportConfig extends TransportConfig {
@@ -66,7 +67,7 @@ export class PeerTransport extends Transport {
   private pingInterval?: ReturnType<typeof setInterval>;
   private lastPongReceived: number = 0;
   private chunkCounter = 0;
-  private pendingChunks: Map<string, { total: number; parts: Map<number, string>; timer: ReturnType<typeof setTimeout> }> = new Map();
+  private pendingChunks: Map<string, { total: number; parts: Map<number, string>; timer: ReturnType<typeof setTimeout>; warnTimer: ReturnType<typeof setTimeout> }> = new Map();
   private connectionTimer?: ReturnType<typeof setTimeout>;
 
   constructor(config: PeerTransportConfig) {
@@ -516,7 +517,14 @@ export class PeerTransport extends Transport {
         log.warn(`chunk reassembly timeout for id=${parsed.id}, discarding`);
         this.pendingChunks.delete(parsed.id);
       }, CHUNK_REASSEMBLY_TIMEOUT);
-      entry = { total: parsed.total, parts: new Map(), timer };
+      const warnTimer = setTimeout(() => {
+        const current = this.pendingChunks.get(parsed.id);
+        if (!current) return;
+        log.warn(
+          `chunk reassembly slow for id=${parsed.id}: ${current.parts.size}/${current.total} after ${CHUNK_REASSEMBLY_WARN_AT}ms from ${this.remotePeerId.slice(0, 16)}`
+        );
+      }, CHUNK_REASSEMBLY_WARN_AT);
+      entry = { total: parsed.total, parts: new Map(), timer, warnTimer };
       this.pendingChunks.set(parsed.id, entry);
     }
 
@@ -526,6 +534,7 @@ export class PeerTransport extends Transport {
 
     // All chunks received — reassemble
     clearTimeout(entry.timer);
+    clearTimeout(entry.warnTimer);
     this.pendingChunks.delete(parsed.id);
 
     const pieces: string[] = [];
@@ -609,6 +618,7 @@ export class PeerTransport extends Transport {
     this.stopPing();
     for (const [, entry] of this.pendingChunks) {
       clearTimeout(entry.timer);
+      clearTimeout(entry.warnTimer);
     }
     this.pendingChunks.clear();
     super.handleDisconnect(reason);

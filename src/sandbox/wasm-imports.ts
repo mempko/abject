@@ -8,6 +8,11 @@ import { require } from '../core/contracts.js';
 
 /**
  * Context for WASM imports - provides access to system capabilities.
+ *
+ * `isTargetAllowed` gates outbound messages at the routing.to level:
+ * a WASM object with SEND_MESSAGE can still only address peers the
+ * runtime vouches for (e.g. within the same workspace). If omitted,
+ * no target-level filtering is applied.
  */
 export interface WasmImportContext {
   objectId: AbjectId;
@@ -15,6 +20,23 @@ export interface WasmImportContext {
   memory: () => WebAssembly.Memory;
   onSend: (message: AbjectMessage) => void;
   onLog: (level: number, message: string) => void;
+  isTargetAllowed?: (target: AbjectId) => boolean;
+}
+
+/**
+ * Minimal structural check for an AbjectMessage decoded from WASM memory.
+ * We only verify the routing fields we rely on here; the full shape is
+ * enforced by the main-thread bus and downstream handlers.
+ */
+function looksLikeAbjectMessage(value: unknown): value is AbjectMessage {
+  if (!value || typeof value !== 'object') return false;
+  const msg = value as { header?: unknown; routing?: unknown; payload?: unknown };
+  if (!msg.header || typeof msg.header !== 'object') return false;
+  if (!msg.routing || typeof msg.routing !== 'object') return false;
+  const routing = msg.routing as { from?: unknown; to?: unknown };
+  if (typeof routing.to !== 'string' || routing.to.length === 0) return false;
+  // `from` is overwritten by the host; presence not required.
+  return true;
 }
 
 /**
@@ -35,7 +57,7 @@ function readString(
 export function createWasmImports(
   context: WasmImportContext
 ): WebAssembly.Imports {
-  const { objectId, capabilities, memory, onSend, onLog } = context;
+  const { objectId, capabilities, memory, onSend, onLog, isTargetAllowed } = context;
 
   return {
     abjects: {
@@ -50,10 +72,26 @@ export function createWasmImports(
         );
 
         const msgJson = readString(memory(), msgPtr, msgLen);
-        const message = JSON.parse(msgJson) as AbjectMessage;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(msgJson);
+        } catch {
+          onLog(3, `WASM send: invalid JSON (len=${msgLen})`);
+          return;
+        }
+        if (!looksLikeAbjectMessage(parsed)) {
+          onLog(3, 'WASM send: malformed AbjectMessage');
+          return;
+        }
 
+        const message = parsed;
         // Ensure sender is this object
         message.routing.from = objectId;
+
+        if (isTargetAllowed && !isTargetAllowed(message.routing.to)) {
+          onLog(2, `WASM send blocked: target ${message.routing.to} not allowed for ${objectId}`);
+          return;
+        }
 
         onSend(message);
       },
