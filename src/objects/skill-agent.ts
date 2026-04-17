@@ -65,6 +65,8 @@ export class SkillAgent extends Abject {
   private webFetchId?: AbjectId;
   private skillRegistryId?: AbjectId;
   private jobManagerId?: AbjectId;
+  private goalManagerId?: AbjectId;
+  private _currentGoalId?: string;
 
   private taskExtras = new Map<string, TaskExtra>();
   private installedSkillDescriptions = '(none)';
@@ -119,6 +121,7 @@ export class SkillAgent extends Abject {
     this.webFetchId = await this.discoverDep('WebFetch') ?? undefined;
     this.skillRegistryId = await this.discoverDep('SkillRegistry') ?? undefined;
     this.jobManagerId = await this.discoverDep('JobManager') ?? undefined;
+    this.goalManagerId = await this.discoverDep('GoalManager') ?? undefined;
 
     // Subscribe to SkillRegistry changes to rebuild prompt
     if (this.skillRegistryId) {
@@ -198,6 +201,7 @@ When asked about a task, describe which skill you would use and how. Say PASS if
 
       const taskId = `skill-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       this.taskExtras.set(taskId, {});
+      this._currentGoalId = goalId;
 
       try {
         const systemPrompt = await this.buildSystemPrompt();
@@ -218,6 +222,7 @@ When asked about a task, describe which skill you would use and how. Say PASS if
         return { success: result.success, result: result.result, error: result.error };
       } finally {
         this.taskExtras.delete(taskId);
+        this._currentGoalId = undefined;
       }
     });
 
@@ -253,31 +258,48 @@ When asked about a task, describe which skill you would use and how. Say PASS if
       const payload = msg.payload as { ticketId: string };
       const pending = this.pendingTickets.get(payload.ticketId);
       if (pending) {
-        this.pendingTickets.delete(payload.ticketId);
         pending.resolve(payload);
       }
     });
 
+    // Forward progress to GoalManager so Chat's timeout resets during long operations.
+    this.on('progress', (msg: AbjectMessage) => {
+      this.resetPendingTicketTimeouts();
+      if (this._currentGoalId && this.goalManagerId) {
+        const payload = msg.payload as { phase?: string; message?: string } | undefined;
+        this.send(event(this.id, this.goalManagerId, 'updateProgress', {
+          goalId: this._currentGoalId,
+          message: payload?.message ?? 'working...',
+          phase: payload?.phase ?? 'acting',
+          agentName: 'SkillAgent',
+        }));
+      }
+    });
+
     // ── AgentAbject callback handlers ──
+    // Each callback proves the agent is still working, so reset the inactivity timeout.
     this.on('agentObserve', async (msg: AbjectMessage) => {
+      this.resetPendingTicketTimeouts();
       const { taskId } = msg.payload as { taskId: string; step: number };
       return this.handleObserve(taskId);
     });
 
     this.on('agentAct', async (msg: AbjectMessage) => {
+      this.resetPendingTicketTimeouts();
       const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
       return this.handleAct(taskId, action);
     });
 
     this.on('agentPhaseChanged', async (msg: AbjectMessage) => {
+      this.resetPendingTicketTimeouts();
       const { newPhase } = msg.payload as { taskId: string; step: number; oldPhase: string; newPhase: string };
       if (this.jobManagerId) {
         this.send(event(this.id, this.jobManagerId, 'progress', { phase: newPhase }));
       }
     });
 
-    this.on('agentIntermediateAction', async () => { /* handled by AgentAbject */ });
-    this.on('agentActionResult', async () => { /* handled by AgentAbject */ });
+    this.on('agentIntermediateAction', async () => { this.resetPendingTicketTimeouts(); });
+    this.on('agentActionResult', async () => { this.resetPendingTicketTimeouts(); });
 
     // ── SkillRegistry change handler ──
     this.on('changed', async (msg: AbjectMessage) => {
@@ -706,18 +728,42 @@ When using curl, use -s (silent) and pipe JSON through jq.
   // Ticket waiting (same pattern as WebAgent)
   // ═══════════════════════════════════════════════════════════════════
 
-  private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  private pendingTickets = new Map<string, {
+    resolve: (v: unknown) => void;
+    reject: (e: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+    timeoutMs: number;
+  }>();
+
+  private resetPendingTicketTimeouts(): void {
+    for (const [ticketId, entry] of this.pendingTickets) {
+      clearTimeout(entry.timer);
+      entry.timer = setTimeout(() => {
+        this.pendingTickets.delete(ticketId);
+        if (this.agentAbjectId) {
+          this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
+        }
+        entry.reject(new Error(`Task ${ticketId} timed out after ${entry.timeoutMs}ms of inactivity`));
+      }, entry.timeoutMs);
+    }
+  }
 
   private waitForTaskResult(ticketId: string, timeout: number): Promise<{ success: boolean; result?: unknown; error?: string }> {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const makeTimer = () => setTimeout(() => {
         this.pendingTickets.delete(ticketId);
-        reject(new Error(`Task ${ticketId} timed out after ${timeout}ms`));
+        if (this.agentAbjectId) {
+          this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
+        }
+        reject(new Error(`Task ${ticketId} timed out after ${timeout}ms of inactivity`));
       }, timeout);
 
-      this.pendingTickets.set(ticketId, {
+      const entry = {
+        timer: makeTimer(),
+        timeoutMs: timeout,
         resolve: (payload: unknown) => {
-          clearTimeout(timer);
+          clearTimeout(entry.timer);
+          this.pendingTickets.delete(ticketId);
           const p = payload as { success?: boolean; result?: unknown; error?: string; state?: { result?: unknown; error?: string } };
           const success = p.success !== false && !p.error;
           resolve({
@@ -727,10 +773,12 @@ When using curl, use -s (silent) and pipe JSON through jq.
           });
         },
         reject: (err: Error) => {
-          clearTimeout(timer);
+          clearTimeout(entry.timer);
+          this.pendingTickets.delete(ticketId);
           reject(err);
         },
-      });
+      };
+      this.pendingTickets.set(ticketId, entry);
     });
   }
 }

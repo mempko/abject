@@ -33,7 +33,12 @@ export class AgentCreator extends Abject {
   private jobManagerId?: AbjectId;
 
   private taskExtras = new Map<string, TaskExtra>();
-  private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  private pendingTickets = new Map<string, {
+    resolve: (v: unknown) => void;
+    reject: (e: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+    timeoutMs: number;
+  }>();
 
   constructor() {
     super({
@@ -177,12 +182,13 @@ When asked about a task, describe how you would decompose it into agent/schedule
       const payload = msg.payload as { ticketId: string };
       const pending = this.pendingTickets.get(payload.ticketId);
       if (pending) {
-        this.pendingTickets.delete(payload.ticketId);
         pending.resolve(payload);
       }
     });
 
+    // Each callback proves the agent is still working, so reset the inactivity timeout.
     this.on('agentObserve', async (msg: AbjectMessage) => {
+      this.resetPendingTicketTimeouts();
       const { taskId } = msg.payload as { taskId: string; step: number };
       const extra = this.taskExtras.get(taskId);
       if (extra?.lastResult) {
@@ -192,24 +198,24 @@ When asked about a task, describe how you would decompose it into agent/schedule
     });
 
     this.on('agentAct', async (msg: AbjectMessage) => {
+      this.resetPendingTicketTimeouts();
       const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
       const extra = this.taskExtras.get(taskId) ?? {};
       this.taskExtras.set(taskId, extra);
-      // decompose, done, fail, reply are all handled by AgentAbject natively.
-      // If we get here it's an unknown action.
       extra.lastResult = `Unknown action: ${action.action}`;
       return { success: false, error: `Unknown action: ${action.action}` };
     });
 
     this.on('agentPhaseChanged', async (msg: AbjectMessage) => {
+      this.resetPendingTicketTimeouts();
       const { newPhase } = msg.payload as { taskId: string; step: number; oldPhase: string; newPhase: string };
       if (this.jobManagerId) {
         this.send(event(this.id, this.jobManagerId, 'progress', { phase: newPhase }));
       }
     });
 
-    this.on('agentIntermediateAction', async () => {});
-    this.on('agentActionResult', async () => {});
+    this.on('agentIntermediateAction', async () => { this.resetPendingTicketTimeouts(); });
+    this.on('agentActionResult', async () => { this.resetPendingTicketTimeouts(); });
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -317,16 +323,35 @@ Respond with ONE JSON object inside \`\`\`json fenced code markers.`;
   // Ticket waiting
   // ═══════════════════════════════════════════════════════════════════
 
+  private resetPendingTicketTimeouts(): void {
+    for (const [ticketId, entry] of this.pendingTickets) {
+      clearTimeout(entry.timer);
+      entry.timer = setTimeout(() => {
+        this.pendingTickets.delete(ticketId);
+        if (this.agentAbjectId) {
+          this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
+        }
+        entry.reject(new Error(`Task ${ticketId} timed out after ${entry.timeoutMs}ms of inactivity`));
+      }, entry.timeoutMs);
+    }
+  }
+
   private waitForTaskResult(ticketId: string, timeout: number): Promise<{ success: boolean; result?: unknown; error?: string }> {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const makeTimer = () => setTimeout(() => {
         this.pendingTickets.delete(ticketId);
-        reject(new Error(`Task ${ticketId} timed out after ${timeout}ms`));
+        if (this.agentAbjectId) {
+          this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
+        }
+        reject(new Error(`Task ${ticketId} timed out after ${timeout}ms of inactivity`));
       }, timeout);
 
-      this.pendingTickets.set(ticketId, {
+      const entry = {
+        timer: makeTimer(),
+        timeoutMs: timeout,
         resolve: (payload: unknown) => {
-          clearTimeout(timer);
+          clearTimeout(entry.timer);
+          this.pendingTickets.delete(ticketId);
           const p = payload as { success?: boolean; result?: unknown; error?: string; state?: { result?: unknown; error?: string } };
           const success = p.success !== false && !p.error;
           resolve({
@@ -336,10 +361,12 @@ Respond with ONE JSON object inside \`\`\`json fenced code markers.`;
           });
         },
         reject: (err: Error) => {
-          clearTimeout(timer);
+          clearTimeout(entry.timer);
+          this.pendingTickets.delete(ticketId);
           reject(err);
         },
-      });
+      };
+      this.pendingTickets.set(ticketId, entry);
     });
   }
 }

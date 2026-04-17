@@ -138,6 +138,17 @@ export class Chat extends Abject {
     latestAgent?: string;
   }>();
 
+  /** Task info per goal, fetched from GoalManager. */
+  private liveTasks = new Map<string, Array<{
+    id: string;
+    description: string;
+    status: string;
+    agentName?: string;
+    claimedBy?: string;
+    attempts: number;
+    maxAttempts: number;
+  }>>();
+
   /** Welcome-card widget ids (destroyed on first send / clear). */
   private welcomeWidgetIds: AbjectId[] = [];
 
@@ -381,6 +392,8 @@ export class Chat extends Abject {
             this.pendingTaskCompletions.delete(data.taskId);
             pending.resolve({ taskId: data.taskId, result: data.result });
           }
+          // Refresh task cache for the goal
+          if (data.goalId) this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
           return;
         }
         if (aspect === 'taskPermanentlyFailed') {
@@ -392,12 +405,14 @@ export class Chat extends Abject {
             this.pendingTaskCompletions.delete(data.taskId);
             pending.reject(new Error(data.error ?? 'Task permanently failed'));
           }
+          if (data.goalId) this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
           return;
         }
         // taskRetrying — task will be re-dispatched, don't reject the promise
         if (aspect === 'taskRetrying') {
-          const data = value as { taskId: string; attempts?: number; maxAttempts?: number; error?: string };
+          const data = value as { taskId: string; goalId?: string; attempts?: number; maxAttempts?: number; error?: string };
           log.info(`[Chat] GoalManager taskRetrying ${data.taskId.slice(0, 8)} attempts=${data.attempts ?? '?'}/${data.maxAttempts ?? '?'} — NOT rejecting promise`);
+          if (data.goalId) this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
           return;
         }
 
@@ -415,6 +430,8 @@ export class Chat extends Abject {
                 status: 'active',
                 parentId: data.parentId,
               });
+              // Fetch tasks for this goal so we can render them
+              this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
               this.scheduleActivityRefresh();
             }
             return;
@@ -432,16 +449,21 @@ export class Chat extends Abject {
                 && (data.goalId === this._currentGoalId
                     || (data.parentId && this.liveGoals.has(data.parentId)))) {
               this.liveGoals.set(data.goalId, {
-                title: data.message ?? '(in progress)',
+                title: '(in progress)',
                 status: 'active',
                 parentId: data.parentId,
               });
+              // Fetch the real title from GoalManager
+              this.fetchGoalTitle(data.goalId);
+              this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
             }
 
             const entry = this.liveGoals.get(data.goalId);
             if (entry) {
               if (data.message) entry.latestMessage = data.message;
               if (data.agentName && data.agentName !== 'Chat') entry.latestAgent = data.agentName;
+              // Refetch tasks on any progress so we always show current state
+              this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
               this.scheduleActivityRefresh();
             }
             return;
@@ -1129,6 +1151,7 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
     this.activityBubbleLabelId = undefined;
     this.activityStep = 0;
     this.liveGoals.clear();
+    this.liveTasks.clear();
     this.welcomeWidgetIds = [];
     this._streamBuffer = '';
     if (this.activityRefreshTimer) {
@@ -1456,7 +1479,48 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
     this.activityRefreshLastHeight = 0;
     this.stepStreamChars = 0;
     this.liveGoals.clear();
+    this.liveTasks.clear();
     this.activityBubbleLabelId = await this.appendBubble('activity', 'Agent', this.activityHeader, false);
+  }
+
+  /** Fetch goal title from GoalManager when we lazily seed a goal entry. */
+  private async fetchGoalTitle(goalId: string): Promise<void> {
+    if (!this.goalManagerId) return;
+    try {
+      const goal = await this.request<{ id: string; title: string; parentId?: string; status: string } | null>(
+        request(this.id, this.goalManagerId, 'getGoal', { goalId })
+      );
+      if (goal) {
+        const entry = this.liveGoals.get(goalId);
+        if (entry) {
+          entry.title = goal.title;
+          entry.parentId = goal.parentId;
+          this.scheduleActivityRefresh();
+        }
+      }
+    } catch { /* GoalManager may not be ready */ }
+  }
+
+  /** Fetch tasks for a goal from GoalManager and cache them. */
+  private async fetchGoalTasks(goalId: string): Promise<void> {
+    if (!this.goalManagerId) return;
+    try {
+      const tuples = await this.request<Array<{
+        id: string; fields: Record<string, unknown>; claimedBy?: string;
+      }>>(
+        request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId })
+      );
+      const tasks = (tuples ?? []).map(t => ({
+        id: t.id,
+        description: (t.fields?.description as string) ?? '',
+        status: (t.fields?.status as string) ?? 'pending',
+        agentName: (t.fields?.agentName as string) ?? undefined,
+        claimedBy: t.claimedBy,
+        attempts: (t.fields?.attempts as number) ?? 0,
+        maxAttempts: (t.fields?.maxAttempts as number) ?? 3,
+      }));
+      this.liveTasks.set(goalId, tasks);
+    } catch { /* GoalManager may not be ready */ }
   }
 
   private composeActivityText(): string {
@@ -1491,18 +1555,43 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
       const goal = this.liveGoals.get(goalId);
       if (!goal) return;
 
+      // Goal title with status icon (matches GoalBrowser)
       const indent = '  '.repeat(depth);
-      const icon = goal.status === 'completed' ? '\u2713'   // ✓
-                 : goal.status === 'failed'    ? '\u2717'   // ✗
-                 : '\u25B8';                                // ▸
-      lines.push(`${indent}${icon} ${goal.title}`);
+      const goalIcon = goal.status === 'completed' ? '\u2713'   // ✓
+                     : goal.status === 'failed'    ? '\u2717'   // ✗
+                     : '\u25B8';                                // ▸
+      lines.push(`${indent}${goalIcon} ${goal.title}`);
 
+      // Render tasks under this goal
+      const tasks = this.liveTasks.get(goalId);
+      if (tasks && tasks.length > 0) {
+        const taskIndent = '  '.repeat(depth + 1);
+        for (const task of tasks) {
+          // Pending + claimedBy → effectively "claimed"
+          const effectiveStatus = task.status === 'pending' && task.claimedBy
+            ? 'claimed' : task.status;
+
+          const tIcon = effectiveStatus === 'done' ? '\u2713'                         // ✓
+                      : effectiveStatus === 'permanently_failed' ? '\u2717'           // ✗
+                      : effectiveStatus === 'claimed' || effectiveStatus === 'in_progress' ? '\u25D1'  // ◑
+                      : '\u25CB';                                                     // ○
+
+          const agent = task.agentName ? `[${task.agentName}] ` : '';
+          const attempts = task.attempts > 0 ? ` (${task.attempts}/${task.maxAttempts})` : '';
+          const desc = task.description.length > 50
+            ? task.description.slice(0, 50) + '\u2026'
+            : task.description;
+          lines.push(`${taskIndent}${tIcon} ${agent}${desc}${attempts}`);
+        }
+      }
+
+      // Latest progress message for active goals (like GoalBrowser's "… ask..." line)
       if (goal.status === 'active' && goal.latestMessage) {
-        const agent = goal.latestAgent ? `[${goal.latestAgent}] ` : '';
-        const msg = goal.latestMessage.length > 80
-          ? goal.latestMessage.slice(0, 80) + '\u2026'
+        const msgIndent = '  '.repeat(depth + 1);
+        const msg = goal.latestMessage.length > 60
+          ? goal.latestMessage.slice(0, 60) + '\u2026'
           : goal.latestMessage;
-        lines.push(`${indent}   \u2026 ${agent}${msg}`);
+        lines.push(`${msgIndent}\u2026 ${msg}`);
       }
 
       // Recurse into child goals.
@@ -1569,6 +1658,7 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
     this.activityRefreshLastHeight = 0;
     this.stepStreamChars = 0;
     this.liveGoals.clear();
+    this.liveTasks.clear();
     await this.removeLabel(id);
   }
 
@@ -1717,6 +1807,7 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
     this.activityBubbleLabelId = undefined;
     this.activityStep = 0;
     this.liveGoals.clear();
+    this.liveTasks.clear();
     // Welcome widgets (chips + card) live inside the message log and were
     // just cleared above; drop our tracked ids.
     this.welcomeWidgetIds = [];

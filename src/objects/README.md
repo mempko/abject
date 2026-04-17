@@ -41,7 +41,7 @@ Objects that create and adapt other objects using the LLM.
 | `object-creator.ts` | `ObjectCreator` | `OBJECT_CREATOR_ID` | Natural language → Abject. Multi-phase LLM pipeline with dependency discovery |
 | `proxy-generator.ts` | `ProxyGenerator` | `PROXY_GENERATOR_ID` | LLM-generated protocol translation proxies (JavaScript handler maps) |
 | `scriptable-abject.ts` | `ScriptableAbject` | `SCRIPTABLE_ABJECT_ID` | Runtime-editable Abject with JavaScript handler source. Emits `sourceUpdated` event |
-| `composite-abject.ts` | `CompositeAbject` | `COMPOSITE_ABJECT_ID` | Symbogenesis: encapsulates multiple child Abjects behind a single ID with routing table |
+| `organism.ts` | `Organism` | `ORGANISM_INTERFACE` | Symbiogenesis: composite Abject with internal registry, organelles discover each other like a biological cell |
 
 ## Agent System
 

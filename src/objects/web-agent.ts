@@ -48,6 +48,7 @@ export class WebAgent extends Abject {
   private agentAbjectId?: AbjectId;
   private jobManagerId?: AbjectId;
   private goalManagerId?: AbjectId;
+  private _currentGoalId?: string;
 
   /** Per-task extra state (page IDs, startUrl, etc.). */
   private taskExtras = new Map<string, WebTaskExtra>();
@@ -57,7 +58,12 @@ export class WebAgent extends Abject {
   private static readonly PAGE_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
   /** Pending ticket promises: ticketId → resolve/reject. */
-  private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  private pendingTickets = new Map<string, {
+    resolve: (v: unknown) => void;
+    reject: (e: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+    timeoutMs: number;
+  }>();
 
   constructor() {
     super({
@@ -355,7 +361,6 @@ Set keepPageOpen: false to explicitly close the page when done.
       const payload = msg.payload as { ticketId: string };
       const pending = this.pendingTickets.get(payload.ticketId);
       if (pending) {
-        this.pendingTickets.delete(payload.ticketId);
         pending.resolve(payload);
       }
     });
@@ -452,6 +457,7 @@ Set keepPageOpen: false to explicitly close the page when done.
 
       const taskId = `web-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const startUrl = data?.startUrl as string | undefined;
+      this._currentGoalId = goalId;
 
       const extra: WebTaskExtra = { startUrl };
       this.taskExtras.set(taskId, extra);
@@ -503,22 +509,42 @@ Set keepPageOpen: false to explicitly close the page when done.
           this.trackKeptOpenPage(extra.pageId);
         }
         throw err; // Re-throw so AgentAbject's dispatchToAgent records the failure
+      } finally {
+        this._currentGoalId = undefined;
+      }
+    });
+
+    // Forward progress to GoalManager so Chat's timeout resets during long operations.
+    this.on('progress', (msg: AbjectMessage) => {
+      this.resetPendingTicketTimeouts();
+      if (this._currentGoalId && this.goalManagerId) {
+        const payload = msg.payload as { phase?: string; message?: string } | undefined;
+        this.send(event(this.id, this.goalManagerId, 'updateProgress', {
+          goalId: this._currentGoalId,
+          message: payload?.message ?? 'working...',
+          phase: payload?.phase ?? 'acting',
+          agentName: 'WebAgent',
+        }));
       }
     });
 
     // ── AgentAbject callback handlers ──
 
+    // Each callback proves the agent is still working, so reset the inactivity timeout.
     this.on('agentObserve', async (msg: AbjectMessage) => {
+      this.resetPendingTicketTimeouts();
       const { taskId } = msg.payload as { taskId: string; step: number };
       return this.handleObserve(taskId);
     });
 
     this.on('agentAct', async (msg: AbjectMessage) => {
+      this.resetPendingTicketTimeouts();
       const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
       return this.handleAct(taskId, action);
     });
 
     this.on('agentPhaseChanged', async (msg: AbjectMessage) => {
+      this.resetPendingTicketTimeouts();
       const { taskId, step, newPhase, action } =
         msg.payload as { taskId: string; step: number; oldPhase: string; newPhase: string; action?: string };
 
@@ -531,8 +557,8 @@ Set keepPageOpen: false to explicitly close the page when done.
       }
     });
 
-    this.on('agentIntermediateAction', async () => { /* no-op for WebAgent */ });
-    this.on('agentActionResult', async () => { /* no-op for WebAgent */ });
+    this.on('agentIntermediateAction', async () => { this.resetPendingTicketTimeouts(); });
+    this.on('agentActionResult', async () => { this.resetPendingTicketTimeouts(); });
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -573,6 +599,19 @@ Set keepPageOpen: false to explicitly close the page when done.
     this.pendingTickets.clear();
   }
 
+  private resetPendingTicketTimeouts(): void {
+    for (const [ticketId, entry] of this.pendingTickets) {
+      clearTimeout(entry.timer);
+      entry.timer = setTimeout(() => {
+        this.pendingTickets.delete(ticketId);
+        if (this.agentAbjectId) {
+          this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
+        }
+        entry.reject(new Error(`Task ${ticketId} timed out after ${entry.timeoutMs}ms of inactivity`));
+      }, entry.timeoutMs);
+    }
+  }
+
   private waitForTaskResult(ticketId: string, timeoutMs: number): Promise<{
     ticketId: string; success: boolean; result?: unknown; error?: string;
     steps: number; maxStepsReached?: boolean; validationErrors?: string[];
@@ -580,14 +619,21 @@ Set keepPageOpen: false to explicitly close the page when done.
   }> {
     type TaskResult = { ticketId: string; success: boolean; result?: unknown; error?: string; steps: number; maxStepsReached?: boolean; validationErrors?: string[]; lastAction?: Record<string, unknown> };
     return new Promise<TaskResult>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const makeTimer = () => setTimeout(() => {
         this.pendingTickets.delete(ticketId);
-        reject(new Error(`Task ${ticketId} timed out after ${timeoutMs}ms`));
+        if (this.agentAbjectId) {
+          this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
+        }
+        reject(new Error(`Task ${ticketId} timed out after ${timeoutMs}ms of inactivity`));
       }, timeoutMs);
-      this.pendingTickets.set(ticketId, {
-        resolve: (v) => { clearTimeout(timer); resolve(v as TaskResult); },
-        reject: (e) => { clearTimeout(timer); reject(e); },
-      });
+
+      const entry = {
+        timer: makeTimer(),
+        timeoutMs,
+        resolve: (v: unknown) => { clearTimeout(entry.timer); this.pendingTickets.delete(ticketId); resolve(v as TaskResult); },
+        reject: (e: Error) => { clearTimeout(entry.timer); this.pendingTickets.delete(ticketId); reject(e); },
+      };
+      this.pendingTickets.set(ticketId, entry);
     });
   }
 

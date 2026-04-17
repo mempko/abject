@@ -28,6 +28,8 @@ interface TaskExtra {
 export class ObjectAgent extends Abject {
   private agentAbjectId?: AbjectId;
   private jobManagerId?: AbjectId;
+  private goalManagerId?: AbjectId;
+  private _currentGoalId?: string;
 
   private taskExtras = new Map<string, TaskExtra>();
 
@@ -73,6 +75,7 @@ export class ObjectAgent extends Abject {
   protected override async onInit(): Promise<void> {
     this.agentAbjectId = await this.requireDep('AgentAbject');
     this.jobManagerId = await this.discoverDep('JobManager') ?? undefined;
+    this.goalManagerId = await this.discoverDep('GoalManager') ?? undefined;
 
     await this.registerWithAgentAbject();
     log.info('Registered with AgentAbject');
@@ -142,6 +145,7 @@ Say PASS if the task involves creating, building, or making something new (apps,
 
       const taskId = `obj-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       this.taskExtras.set(taskId, { taskData: data });
+      this._currentGoalId = goalId;
 
       try {
         const systemPrompt = this.buildSystemPrompt(data);
@@ -173,6 +177,7 @@ Say PASS if the task involves creating, building, or making something new (apps,
         return { success: result.success, result: result.result, error: result.error };
       } finally {
         this.taskExtras.delete(taskId);
+        this._currentGoalId = undefined;
       }
     });
 
@@ -208,31 +213,51 @@ Say PASS if the task involves creating, building, or making something new (apps,
       const payload = msg.payload as { ticketId: string };
       const pending = this.pendingTickets.get(payload.ticketId);
       if (pending) {
-        this.pendingTickets.delete(payload.ticketId);
         pending.resolve(payload);
       }
     });
 
+    // Override progress handler: reset ticket timeouts and forward to GoalManager
+    // so Chat's timeout resets during long operations (e.g. ObjectCreator.modify).
+    // The base Abject handler only bubbles to _handlingRequestSenders which dies
+    // at JobManager (no upstream during job execution).
+    this.on('progress', (msg: AbjectMessage) => {
+      this.resetPendingTicketTimeouts();
+      if (this._currentGoalId && this.goalManagerId) {
+        const payload = msg.payload as { phase?: string; message?: string } | undefined;
+        this.send(event(this.id, this.goalManagerId, 'updateProgress', {
+          goalId: this._currentGoalId,
+          message: payload?.message ?? 'working...',
+          phase: payload?.phase ?? 'acting',
+          agentName: 'ObjectAgent',
+        }));
+      }
+    });
+
     // ── AgentAbject callback handlers ──
+    // Each callback proves the agent is still working, so reset the inactivity timeout.
     this.on('agentObserve', async (msg: AbjectMessage) => {
+      this.resetPendingTicketTimeouts();
       const { taskId } = msg.payload as { taskId: string; step: number };
       return this.handleObserve(taskId);
     });
 
     this.on('agentAct', async (msg: AbjectMessage) => {
+      this.resetPendingTicketTimeouts();
       const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
       return this.handleAct(taskId, action);
     });
 
     this.on('agentPhaseChanged', async (msg: AbjectMessage) => {
+      this.resetPendingTicketTimeouts();
       const { newPhase } = msg.payload as { taskId: string; step: number; oldPhase: string; newPhase: string };
       if (this.jobManagerId) {
         this.send(event(this.id, this.jobManagerId, 'progress', { phase: newPhase }));
       }
     });
 
-    this.on('agentIntermediateAction', async () => { /* handled by AgentAbject */ });
-    this.on('agentActionResult', async () => { /* handled by AgentAbject */ });
+    this.on('agentIntermediateAction', async () => { this.resetPendingTicketTimeouts(); });
+    this.on('agentActionResult', async () => { this.resetPendingTicketTimeouts(); });
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -476,18 +501,47 @@ Respond with ONE JSON object inside \`\`\`json fenced code markers. Include brie
   // Ticket waiting (same pattern as SkillAgent/WebAgent)
   // ═══════════════════════════════════════════════════════════════════
 
-  private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  private pendingTickets = new Map<string, {
+    resolve: (v: unknown) => void;
+    reject: (e: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+    timeoutMs: number;
+  }>();
+
+  /** Reset all pending ticket timeouts on progress (agent is still working). */
+  private resetPendingTicketTimeouts(): void {
+    for (const [ticketId, entry] of this.pendingTickets) {
+      clearTimeout(entry.timer);
+      entry.timer = setTimeout(() => {
+        this.pendingTickets.delete(ticketId);
+        if (this.agentAbjectId) {
+          this.send(
+            request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId })
+          );
+        }
+        entry.reject(new Error(`Task ${ticketId} timed out after ${entry.timeoutMs}ms of inactivity`));
+      }, entry.timeoutMs);
+    }
+  }
 
   private waitForTaskResult(ticketId: string, timeout: number): Promise<{ success: boolean; result?: unknown; error?: string }> {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const makeTimer = () => setTimeout(() => {
         this.pendingTickets.delete(ticketId);
-        reject(new Error(`Task ${ticketId} timed out after ${timeout}ms`));
+        if (this.agentAbjectId) {
+          this.send(
+            request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId })
+          );
+        }
+        reject(new Error(`Task ${ticketId} timed out after ${timeout}ms of inactivity`));
       }, timeout);
 
-      this.pendingTickets.set(ticketId, {
+      const entry = {
+        timer: makeTimer(),
+        timeoutMs: timeout,
         resolve: (payload: unknown) => {
-          clearTimeout(timer);
+          clearTimeout(entry.timer);
+          this.pendingTickets.delete(ticketId);
           const p = payload as { success?: boolean; result?: unknown; error?: string; state?: { result?: unknown; error?: string } };
           const success = p.success !== false && !p.error;
           resolve({
@@ -497,10 +551,12 @@ Respond with ONE JSON object inside \`\`\`json fenced code markers. Include brie
           });
         },
         reject: (err: Error) => {
-          clearTimeout(timer);
+          clearTimeout(entry.timer);
+          this.pendingTickets.delete(ticketId);
           reject(err);
         },
-      });
+      };
+      this.pendingTickets.set(ticketId, entry);
     });
   }
 }

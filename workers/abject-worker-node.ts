@@ -64,6 +64,8 @@ import { HttpServer } from '../src/objects/http-server.js';
 import { SharedState } from '../src/objects/capabilities/shared-state.js';
 import { WebAgent } from '../src/objects/web-agent.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
+import { Organism } from '../src/objects/organism.js';
+import type { OrganismSpec } from '../src/objects/organism.js';
 
 if (!parentPort) {
   throw new Error('abject-worker-node.ts must be run inside a worker_threads Worker');
@@ -140,6 +142,10 @@ constructors.set('WorkspaceBrowser', () => new WorkspaceBrowser());
 constructors.set('ScriptableAbject', (args?: unknown) => {
   const opts = args as { manifest: AbjectManifest; source: string; owner: string };
   return new ScriptableAbject(opts.manifest, opts.source, opts.owner as AbjectId);
+});
+constructors.set('Organism', (args?: unknown) => {
+  const spec = args as OrganismSpec;
+  return new Organism(spec);
 });
 
 // Global error handlers — report to main thread before the worker dies

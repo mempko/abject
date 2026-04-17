@@ -23,8 +23,8 @@ import { request } from '../core/message.js';
 import type { MessageBusLike } from '../runtime/message-bus.js';
 import { type WorkerPool, workerIndexForId } from '../runtime/worker-pool.js';
 import { ScriptableAbject, mergeScriptableManifest } from './scriptable-abject.js';
-import { CompositeAbject } from './composite-abject.js';
-import type { CompositeSpec } from './composite-abject.js';
+import { Organism, buildOrganismManifest } from './organism.js';
+import type { OrganismSpec } from './organism.js';
 
 const FACTORY_INTERFACE = 'abjects:factory';
 
@@ -196,14 +196,14 @@ export class Factory extends Abject {
     return super.askPrompt(_question) + `\n\n## Factory Usage Guide
 
 ### Methods
-- \`spawn({ manifest, source?, code?, owner?, parentId? })\` — Spawn a new object. If a constructor is registered for the manifest name, uses that. If source is provided and manifest.tags includes 'composite', creates a CompositeAbject from a JSON CompositeSpec. If source is provided without the composite tag, creates a ScriptableAbject. Returns { objectId, status }.
+- \`spawn({ manifest, source?, code?, owner?, parentId? })\` — Spawn a new object. If a constructor is registered for the manifest name, uses that. If source is provided and manifest.tags includes 'organism', creates an Organism from a JSON OrganismSpec. If source is provided without the organism tag, creates a ScriptableAbject. Returns { objectId, status }.
 - \`kill({ objectId })\` — Stop and destroy an object. Unregisters from Registry, removes from Supervisor, and stops the object. Returns boolean.
-- \`clone({ objectId, registryHint? })\` — Clone an existing object (new instance with same manifest/source but new ID). Returns { objectId, status }. Works for CompositeAbjects — the clone gets fresh children with new IDs. Searches local registry first, then remote workspace registries. Pass \`registryHint\` (a registry AbjectId) to register the clone in a specific registry (e.g. workspace registry) instead of the global one.
+- \`clone({ objectId, registryHint? })\` — Clone an existing object (new instance with same manifest/source but new ID). Returns { objectId, status }. Works for Organisms -- the clone gets a fresh internal registry, organelles, and interface with new IDs. Searches local registry first, then remote workspace registries. Pass \`registryHint\` (a registry AbjectId) to register the clone in a specific registry (e.g. workspace registry) instead of the global one.
 - \`respawn({ objectId, constructorName, parentId? })\` — Kill and re-create an object with the same ID. Used by Supervisor for restart.
 - \`registerConstructor(name, factory)\` — Register a constructor function for a named object type.
 
-### CompositeAbject
-A CompositeAbject groups multiple child ScriptableAbjects behind a single ID with unified interfaces. To spawn one, pass \`source\` as a JSON-serialized CompositeSpec and include \`'composite'\` in \`manifest.tags\`. The spec defines children (role + source + manifest), interfaces, and a routing table mapping "interfaceId::method" to strategies: delegate (single child), fanout (multiple children), or orchestrate (custom handler). Children are managed internally — they are not visible in the Registry unless exposeChildren is set.
+### Organism
+An Organism is a composite Abject with its own internal registry. Like a biological cell, it has organelles (internal ScriptableAbjects) hidden behind an interface (the membrane). To spawn one, pass \`source\` as a JSON-serialized OrganismSpec and include \`'organism'\` in \`manifest.tags\`. The spec defines an interface organelle (the externally visible face) and internal organelles that discover each other through the organism's internal registry. Organelles are not visible in the workspace Registry -- only the organism itself is.
 
 ### Object Inspection
 - \`getObjectInfo({ objectId })\` — Returns \`{ isWorkerHosted, constructorName, workerIndex }\` or undefined if not found.
@@ -460,8 +460,8 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         status: obj.status,
       };
       if (preservedTypeId) payload.typeId = preservedTypeId;
-      if (obj instanceof CompositeAbject) {
-        payload.source = obj.compositeSource;
+      if (obj instanceof Organism) {
+        payload.source = obj.organismSource;
       } else if (obj instanceof ScriptableAbject) {
         payload.owner = obj.owner;
         payload.source = obj.source;
@@ -496,8 +496,13 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
     }
 
     // Worker path for ScriptableAbjects (user-created objects with source code)
-    if (!factory && req.source && !req.manifest.tags?.includes('composite') && this._workerPool) {
+    if (!factory && req.source && !req.manifest.tags?.includes('organism') && this._workerPool) {
       return this.spawnScriptableInWorker(req);
+    }
+
+    // Worker path for Organisms (entire organism runs in one worker)
+    if (!factory && req.source && req.manifest.tags?.includes('organism') && this._workerPool) {
+      return this.spawnOrganismInWorker(req);
     }
 
     let obj: Abject;
@@ -505,10 +510,10 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
     if (factory) {
       // Use registered factory function
       obj = factory(req.constructorArgs);
-    } else if (req.source && req.manifest.tags?.includes('composite')) {
-      // Spawn a CompositeAbject from a JSON spec
-      const spec = JSON.parse(req.source) as CompositeSpec;
-      obj = new CompositeAbject(spec);
+    } else if (req.source && req.manifest.tags?.includes('organism')) {
+      // Spawn an Organism from a JSON OrganismSpec (no worker pool)
+      const spec = JSON.parse(req.source) as OrganismSpec;
+      obj = new Organism(spec);
     } else if (req.source) {
       // Spawn a ScriptableAbject from handler source
       obj = new ScriptableAbject(
@@ -554,8 +559,8 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         status: obj.status,
       };
       if (req.typeId) payload.typeId = req.typeId;
-      if (obj instanceof CompositeAbject) {
-        payload.source = obj.compositeSource;
+      if (obj instanceof Organism) {
+        payload.source = obj.organismSource;
       } else if (obj instanceof ScriptableAbject) {
         payload.owner = obj.owner;
         payload.source = obj.source;
@@ -599,8 +604,8 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         status: obj.status,
       };
       if (obj.typeId) payload.typeId = obj.typeId;
-      if (obj instanceof CompositeAbject) {
-        payload.source = obj.compositeSource;
+      if (obj instanceof Organism) {
+        payload.source = obj.organismSource;
       } else if (obj instanceof ScriptableAbject) {
         payload.owner = obj.owner;
         payload.source = obj.source;
@@ -727,6 +732,70 @@ A CompositeAbject groups multiple child ScriptableAbjects behind a single ID wit
         objectId,
         manifest: realManifest,
         owner: req.owner,
+        source: req.source,
+        status: {
+          id: objectId,
+          typeId: req.typeId,
+          state: 'ready',
+          manifest: realManifest,
+          connections: [] as AbjectId[],
+          errorCount: 0,
+          startedAt: now,
+          lastActivity: now,
+        },
+      };
+      if (req.typeId) regPayload.typeId = req.typeId;
+      await this.request(
+        request(this.id, targetRegistry, 'register', regPayload)
+      );
+    }
+
+    const now = Date.now();
+    return {
+      objectId,
+      typeId: req.typeId,
+      status: {
+        id: objectId,
+        typeId: req.typeId,
+        state: 'ready',
+        manifest: realManifest,
+        connections: [] as AbjectId[],
+        errorCount: 0,
+        startedAt: now,
+        lastActivity: now,
+      },
+    };
+  }
+
+  /**
+   * Spawn an Organism in a Web Worker.
+   * The entire organism (internal registry + organelles + interface) runs in one worker.
+   */
+  private async spawnOrganismInWorker(req: SpawnRequest): Promise<SpawnResult> {
+    require(this._workerPool !== undefined, 'WorkerPool must be set');
+    require(req.source !== undefined, 'source is required for Organism');
+
+    const spec = JSON.parse(req.source!) as OrganismSpec;
+    const objectId = uuidv4() as AbjectId;
+
+    await this._workerPool!.spawnInWorker(objectId, 'Organism', {
+      constructorArgs: spec,
+      registryId: req.registryHint ?? this._factoryRegistryId,
+      parentId: req.parentId ?? this.id,
+    });
+
+    this.workerSpawned.set(objectId, 'Organism');
+
+    // Build the merged manifest for registry registration
+    const realManifest = buildOrganismManifest(spec);
+
+    const targetRegistry = req.registryHint ?? (req.skipGlobalRegistry ? undefined : this._factoryRegistryId);
+    if (targetRegistry) this.workerRegistries.set(objectId, targetRegistry);
+    if (targetRegistry) {
+      const now = Date.now();
+      const regPayload: Record<string, unknown> = {
+        objectId,
+        manifest: realManifest,
         source: req.source,
         status: {
           id: objectId,
