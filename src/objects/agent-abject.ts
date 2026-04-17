@@ -901,6 +901,16 @@ The registered object must implement these handlers to participate in the agent 
           phase: 'streaming',
           message: `streaming (${content.length} chars)`,
         }));
+        // Also notify the registered agent (callerId) so its inactivity
+        // timer resets during long LLM calls. The self-directed progress
+        // above only bubbles via _handlingRequestSenders (JobManager), which
+        // doesn't reach the agent that started the task.
+        if (entry.callerId !== this.id) {
+          this.send(event(this.id, entry.callerId, 'progress', {
+            phase: 'streaming',
+            message: 'LLM thinking...',
+          }));
+        }
       }
     });
 
