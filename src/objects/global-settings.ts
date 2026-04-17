@@ -59,7 +59,7 @@ const TIER_NAMES: ModelTierName[] = ['smart', 'balanced', 'fast'];
 
 // Default tier models per provider (for migration from old single-provider setting)
 const DEFAULT_TIER_MODELS: Record<LLMProviderName, Record<ModelTierName, string>> = {
-  anthropic: { smart: 'claude-opus-4-6', balanced: 'claude-sonnet-4-6', fast: 'claude-haiku-4-5-20251001' },
+  anthropic: { smart: 'claude-opus-4-7', balanced: 'claude-sonnet-4-6', fast: 'claude-haiku-4-5-20251001' },
   openai: { smart: 'gpt-5.4', balanced: 'gpt-5.4-mini', fast: 'gpt-5.4-nano' },
   ollama: { smart: '', balanced: '', fast: '' },
 };
@@ -1424,7 +1424,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private async fetchAllProviderModels(ollamaUrl?: string | null): Promise<void> {
     // Anthropic and OpenAI have static model lists; Ollama is dynamic
     this.providerModelCache.anthropic = [
-      { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
+      { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
       { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
       { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
     ];

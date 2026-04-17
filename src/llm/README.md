@@ -21,8 +21,8 @@ Abstract interface and shared utilities.
 Anthropic Claude API integration.
 
 - Separates system message from conversation (Claude API format)
-- Default model: `claude-sonnet-4-5-20250929`
-- **Tier mapping**: `smart` → `claude-opus-4-6`, `balanced` → `claude-sonnet-4-6`, `fast` → `claude-haiku-4-5-20251001`
+- Default model: `claude-sonnet-4-6`
+- **Tier mapping**: `smart` → `claude-opus-4-7`, `balanced` → `claude-sonnet-4-6`, `fast` → `claude-haiku-4-5-20251001`
 - SSE streaming via `ReadableStream`
 - Authentication: `x-api-key` header + `anthropic-version`
 - Factory: `createAnthropicProvider()` reads from `globalThis.ANTHROPIC_API_KEY`

@@ -26,12 +26,22 @@ export interface AnthropicConfig {
   fetchFn?: FetchDelegate;
 }
 
+type CacheControl = { type: 'ephemeral' };
+
 type AnthropicContentBlock = {
   type: 'text';
   text: string;
+  cache_control?: CacheControl;
 } | {
   type: 'image';
   source: { type: 'base64'; media_type: string; data: string };
+  cache_control?: CacheControl;
+};
+
+type AnthropicSystemBlock = {
+  type: 'text';
+  text: string;
+  cache_control?: CacheControl;
 };
 
 interface AnthropicMessage {
@@ -43,7 +53,7 @@ interface AnthropicRequest {
   model: string;
   max_tokens: number;
   messages: AnthropicMessage[];
-  system?: string;
+  system?: string | AnthropicSystemBlock[];
   temperature?: number;
   stop_sequences?: string[];
   stream?: boolean;
@@ -59,6 +69,8 @@ interface AnthropicResponse {
   usage: {
     input_tokens: number;
     output_tokens: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
   };
 }
 
@@ -70,7 +82,7 @@ export class AnthropicProvider extends BaseLLMProvider {
   private model: string;
 
   private static readonly TIER_MODELS: Record<ModelTier, string> = {
-    smart: 'claude-opus-4-6',
+    smart: 'claude-opus-4-7',
     balanced: 'claude-sonnet-4-6',
     fast: 'claude-haiku-4-5-20251001',
   };
@@ -82,7 +94,7 @@ export class AnthropicProvider extends BaseLLMProvider {
 
   async listModels(): Promise<ModelInfo[]> {
     return [
-      { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
+      { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
       { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
       { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
     ];
@@ -98,7 +110,43 @@ export class AnthropicProvider extends BaseLLMProvider {
       baseUrl: config.baseUrl ?? defaultBase,
       fetchFn: config.fetchFn,
     });
-    this.model = config.model ?? 'claude-sonnet-4-5-20250929';
+    this.model = config.model ?? 'claude-sonnet-4-6';
+  }
+
+  private buildSystem(systemMsg: LLMMessage | undefined): AnthropicSystemBlock[] | undefined {
+    if (!systemMsg) return undefined;
+    const text = getTextContent(systemMsg);
+    if (!text) return undefined;
+    return [{ type: 'text', text, cache_control: { type: 'ephemeral' } }];
+  }
+
+  /**
+   * Place a cache breakpoint on the final content block of the last message.
+   *
+   * Claude caches everything up to and including each breakpoint. Marking the
+   * tail means turn N+1 of an ongoing conversation reuses turn N's cached
+   * prefix: system + all prior messages get served from cache instead of
+   * re-tokenized. Combined with the system-prompt breakpoint, agent loops
+   * (AgentAbject's think/act iterations, Chat's rolling history, ObjectCreator
+   * retries) all benefit automatically.
+   *
+   * Breakpoints below Anthropic's cache threshold are ignored by the API at
+   * no extra cost, so we always apply this; callers do not need to opt in.
+   * We use at most 2 of the 4 breakpoints Anthropic allows per request.
+   */
+  private applyCacheBreakpoint(messages: AnthropicMessage[]): void {
+    if (messages.length === 0) return;
+    const last = messages[messages.length - 1];
+
+    if (typeof last.content === 'string') {
+      if (!last.content) return;
+      last.content = [{ type: 'text', text: last.content, cache_control: { type: 'ephemeral' } }];
+      return;
+    }
+
+    const blocks = last.content;
+    if (blocks.length === 0) return;
+    blocks[blocks.length - 1].cache_control = { type: 'ephemeral' };
   }
 
   async isAvailable(): Promise<boolean> {
@@ -122,6 +170,7 @@ export class AnthropicProvider extends BaseLLMProvider {
         content: this.mapContent(m.content),
       })
     );
+    this.applyCacheBreakpoint(anthropicMessages);
 
     const request: AnthropicRequest = {
       model: this.resolveModel(options),
@@ -131,8 +180,9 @@ export class AnthropicProvider extends BaseLLMProvider {
       stop_sequences: options.stopSequences,
     };
 
-    if (systemMsg) {
-      request.system = getTextContent(systemMsg);
+    const systemBlocks = this.buildSystem(systemMsg);
+    if (systemBlocks) {
+      request.system = systemBlocks;
     }
 
     const response = await this.fetch(`${this.baseUrl}/v1/messages`, {
@@ -160,6 +210,8 @@ export class AnthropicProvider extends BaseLLMProvider {
       usage: {
         inputTokens: data.usage.input_tokens,
         outputTokens: data.usage.output_tokens,
+        cacheReadTokens: data.usage.cache_read_input_tokens,
+        cacheWriteTokens: data.usage.cache_creation_input_tokens,
       },
     };
   }
@@ -179,6 +231,7 @@ export class AnthropicProvider extends BaseLLMProvider {
         content: this.mapContent(m.content),
       })
     );
+    this.applyCacheBreakpoint(anthropicMessages);
 
     const request: AnthropicRequest = {
       model: this.resolveModel(options),
@@ -189,8 +242,9 @@ export class AnthropicProvider extends BaseLLMProvider {
       stream: true,
     };
 
-    if (systemMsg) {
-      request.system = getTextContent(systemMsg);
+    const systemBlocks = this.buildSystem(systemMsg);
+    if (systemBlocks) {
+      request.system = systemBlocks;
     }
 
     const response = await fetch(`${this.baseUrl}/v1/messages`, {

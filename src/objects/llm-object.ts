@@ -990,7 +990,7 @@ This is configured via the Settings UI or the \`setTierRouting\` method:
 
   await this.call(this.dep('LLM'), 'setTierRouting', {
     tierRouting: {
-      smart: { provider: 'anthropic', model: 'claude-opus-4-6' },
+      smart: { provider: 'anthropic', model: 'claude-opus-4-7' },
       balanced: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
       fast: { provider: 'ollama', model: 'llama3:latest' },
     }
@@ -1002,11 +1002,11 @@ This is configured via the Settings UI or the \`setTierRouting\` method:
   // providers: ['anthropic', 'openai', 'ollama']
 
   const models = await this.call(this.dep('LLM'), 'listProviderModels', { provider: 'anthropic' });
-  // models: [{ id: 'claude-opus-4-6', name: 'Claude Opus 4.6' }, ...]
+  // models: [{ id: 'claude-opus-4-7', name: 'Claude Opus 4.7' }, ...]
 
   await this.call(this.dep('LLM'), 'configure', {
     anthropicApiKey: '...', openaiApiKey: '...', ollamaUrl: 'http://localhost:11434',
-    tierRouting: { smart: { provider: 'anthropic', model: 'claude-opus-4-6' } }
+    tierRouting: { smart: { provider: 'anthropic', model: 'claude-opus-4-7' } }
   });
   // Configure all providers and tier routing (all fields optional)
 

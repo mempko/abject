@@ -39,6 +39,12 @@ interface OpenAIRequest {
   temperature?: number;
   stop?: string[];
   stream?: boolean;
+  /**
+   * Pins this request's prefix hash to a routing bucket so the same long
+   * prefix (e.g. a chat system prompt + history) lands on the same server
+   * instance across calls, lifting cache hit rate. OpenAI-only.
+   */
+  prompt_cache_key?: string;
 }
 
 interface OpenAIResponse {
@@ -58,6 +64,9 @@ interface OpenAIResponse {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
+    prompt_tokens_details?: {
+      cached_tokens?: number;
+    };
   };
 }
 
@@ -116,6 +125,9 @@ export class OpenAIProvider extends BaseLLMProvider {
       temperature: options.temperature,
       stop: options.stopSequences,
     };
+    if (options.cacheKey) {
+      request.prompt_cache_key = options.cacheKey;
+    }
 
     const response = await this.fetch(`${this.baseUrl}/v1/chat/completions`, {
       method: 'POST',
@@ -136,6 +148,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       usage: {
         inputTokens: data.usage.prompt_tokens,
         outputTokens: data.usage.completion_tokens,
+        cacheReadTokens: data.usage.prompt_tokens_details?.cached_tokens,
       },
     };
   }
@@ -157,6 +170,9 @@ export class OpenAIProvider extends BaseLLMProvider {
       stop: options.stopSequences,
       stream: true,
     };
+    if (options.cacheKey) {
+      request.prompt_cache_key = options.cacheKey;
+    }
 
     const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
       method: 'POST',

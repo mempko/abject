@@ -22,6 +22,13 @@ export interface LLMCompletionOptions {
   stream?: boolean;
   tier?: ModelTier;
   model?: string;
+  /**
+   * Stable identifier that providers may use to improve prompt-cache routing
+   * (e.g. OpenAI's `prompt_cache_key`). Set to a per-conversation or per-task
+   * string so repeated calls hash to the same server instance. Providers that
+   * don't support routed caching (Anthropic, Ollama) ignore this.
+   */
+  cacheKey?: string;
 }
 
 export interface ModelInfo {
@@ -35,6 +42,8 @@ export interface LLMCompletionResult {
   usage?: {
     inputTokens: number;
     outputTokens: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
   };
 }
 
