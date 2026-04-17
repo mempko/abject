@@ -178,6 +178,14 @@ export class Scheduler extends Abject {
       precondition(intervalMs > 0, 'intervalMs must be positive');
       requireNonEmpty(jobCode, 'jobCode');
 
+      // Deduplicate: if an identical schedule already exists (same jobCode
+      // and same interval), return its id instead of creating a duplicate.
+      const existing = this.findDuplicate({ intervalMs, jobCode });
+      if (existing) {
+        log.info(`Schedule already exists for this jobCode (${existing.id}) — returning existing id`);
+        return { scheduleId: existing.id };
+      }
+
       const id = `sched-${++this.entryCounter}`;
       const now = Date.now();
       const entry: ScheduleEntry = {
@@ -201,6 +209,14 @@ export class Scheduler extends Abject {
       precondition(hour >= 0 && hour <= 23, 'hour must be 0-23');
       precondition(minute >= 0 && minute <= 59, 'minute must be 0-59');
       requireNonEmpty(jobCode, 'jobCode');
+
+      // Deduplicate: if an identical daily schedule already exists (same time,
+      // timezone, and jobCode), return its id instead of creating a duplicate.
+      const existing = this.findDuplicate({ hour, minute, timezone, jobCode });
+      if (existing) {
+        log.info(`Schedule already exists for this time + jobCode (${existing.id}) — returning existing id`);
+        return { scheduleId: existing.id };
+      }
 
       const id = `sched-${++this.entryCounter}`;
       const now = Date.now();
@@ -322,6 +338,40 @@ export class Scheduler extends Abject {
   }
 
   // ═══════════════════════════════════════════════════════════════════
+  // Deduplication
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Find an existing schedule that matches the given key fields. Returns
+   * undefined if no duplicate exists. Used to prevent accumulating duplicate
+   * schedules across sessions (e.g. the LLM creating the same "daily 6AM
+   * briefing" scheduler every time it runs).
+   */
+  private findDuplicate(criteria: {
+    intervalMs?: number;
+    hour?: number;
+    minute?: number;
+    timezone?: string;
+    jobCode: string;
+  }): ScheduleEntry | undefined {
+    for (const entry of this.entries.values()) {
+      if (entry.jobCode !== criteria.jobCode) continue;
+      if (criteria.intervalMs !== undefined) {
+        if (entry.intervalMs === criteria.intervalMs) return entry;
+        continue;
+      }
+      if (criteria.hour !== undefined && criteria.minute !== undefined) {
+        if (entry.hour === criteria.hour
+            && entry.minute === criteria.minute
+            && (entry.timezone ?? undefined) === (criteria.timezone ?? undefined)) {
+          return entry;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
   // Time computation
   // ═══════════════════════════════════════════════════════════════════
 
@@ -396,6 +446,28 @@ export class Scheduler extends Abject {
           this.entries.set(entry.id, entry);
         }
         log.info(`Loaded ${this.entries.size} schedule entries from storage`);
+
+        // Clean up duplicates accumulated from previous sessions.
+        // Keys by jobCode + schedule identity (intervalMs OR hour/minute/timezone).
+        // Keeps the oldest entry, drops the rest.
+        const seen = new Map<string, ScheduleEntry>();
+        const toRemove: string[] = [];
+        const sorted = [...this.entries.values()].sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+        for (const entry of sorted) {
+          const key = entry.intervalMs !== undefined
+            ? `interval:${entry.intervalMs}:${entry.jobCode}`
+            : `daily:${entry.hour}:${entry.minute}:${entry.timezone ?? ''}:${entry.jobCode}`;
+          if (seen.has(key)) {
+            toRemove.push(entry.id);
+          } else {
+            seen.set(key, entry);
+          }
+        }
+        if (toRemove.length > 0) {
+          for (const id of toRemove) this.entries.delete(id);
+          log.info(`Dedup: removed ${toRemove.length} duplicate schedule(s) on load`);
+          await this.persistToStorage();
+        }
       }
     } catch (err) {
       log.warn('Failed to load schedules:', err instanceof Error ? err.message : String(err));
