@@ -128,6 +128,9 @@ export class MCPBridge extends Abject {
     }
     if (this.cachedTools.length > 0) {
       prompt += `\nTools (${this.cachedTools.length}): ${this.cachedTools.map(t => t.name).join(', ')}`;
+      prompt += `\n\nTo invoke a tool, call the \`callTool\` method with payload \`{ toolName, input }\`:`;
+      prompt += `\n  call(mcpBridgeId, 'callTool', { toolName: '<tool>', input: { <args> } })`;
+      prompt += `\nThe payload also accepts the MCP-standard names \`tool\` / \`name\` for the tool, and \`arguments\` / \`args\` for the input.`;
     } else {
       prompt += `\nTools: none discovered (server may have failed to start)`;
     }
@@ -159,10 +162,17 @@ export class MCPBridge extends Abject {
 
   private setupHandlers(): void {
     this.on('callTool', async (msg: AbjectMessage) => {
-      const { toolName, input } = msg.payload as { toolName: string; input?: Record<string, unknown> };
-      contractRequire(typeof toolName === 'string' && toolName.length > 0, 'toolName must be non-empty');
+      // Accept multiple naming conventions (MCP standard uses name/arguments,
+      // our manifest documents toolName/input). Both should work.
+      const payload = msg.payload as {
+        toolName?: string; tool?: string; name?: string;
+        input?: Record<string, unknown>; arguments?: Record<string, unknown>; args?: Record<string, unknown>;
+      };
+      const toolName = payload.toolName ?? payload.tool ?? payload.name;
+      const input = payload.input ?? payload.arguments ?? payload.args ?? {};
+      contractRequire(typeof toolName === 'string' && toolName.length > 0, 'toolName must be non-empty (accepts toolName, tool, or name)');
 
-      return await this.callTool(toolName, input ?? {});
+      return await this.callTool(toolName, input);
     });
 
     this.on('listTools', async (_msg: AbjectMessage) => {
