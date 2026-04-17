@@ -1161,6 +1161,28 @@ Pick the agent with the best combination of efficiency and likelihood of success
 
     if (!chosen) {
       log.info(`DISPATCH-INNER ${tupleId} — no agent can handle: ${description.slice(0, 60)}`);
+      // Notify GoalManager so progress events keep flowing (prevents Chat timeout)
+      if (taskGoalId && this.goalManagerId) {
+        this.send(event(this.id, this.goalManagerId, 'updateProgress', {
+          goalId: taskGoalId,
+          message: 'Looking for an available agent...',
+          phase: 'dispatch',
+          agentName: 'AgentAbject',
+        }));
+      }
+      // Schedule a retry after a short delay instead of waiting for the 10s periodic scan.
+      // The periodic scan will also pick it up, so this is just faster recovery.
+      const dispatchRetries = (tuple.fields._dispatchRetries as number) ?? 0;
+      if (dispatchRetries < 6) {
+        tuple.fields._dispatchRetries = dispatchRetries + 1;
+        const delay = Math.min(5000 * (dispatchRetries + 1), 30000);
+        log.info(`DISPATCH-INNER ${tupleId} — scheduling retry ${dispatchRetries + 1}/6 in ${delay}ms`);
+        setTimeout(() => {
+          this.dispatchToAgent(tuple).catch(err => {
+            log.warn(`DISPATCH-INNER ${tupleId} — retry failed:`, err instanceof Error ? err.message : String(err));
+          });
+        }, delay);
+      }
       return;
     }
 
