@@ -1101,7 +1101,9 @@ The registered object must implement these handlers to participate in the agent 
 - \`PARTIAL:\` — I can do part of this task but not all of it.
 - \`NO:\` — This task is outside my capabilities.
 
-After the verdict, briefly (2-4 sentences) describe the specific steps you would take (if YES/PARTIAL) or why you cannot do it (if NO).`;
+Be honest. Do not claim YES if your plan depends on things you don't actually have (credentials, tools not configured, objects that don't exist, data you don't have access to). If your plan requires the user to log in, grant permissions, or install something first, that is a PARTIAL at best, not YES.
+
+After the verdict, in 2-4 sentences: name the SPECIFIC tool, skill, MCP server, or capability you would use (by name if you have it configured), and outline the concrete steps. Direct/configured tools are preferred over general-purpose automation. If you must use a general-purpose tool (like a web browser) for something a specialized tool could do, say so honestly.`;
     if (goalTitle) askQuestion += `\n\nGoal: "${goalTitle}"`;
     askQuestion += `\nTask: "${description.slice(0, 400)}"`;
     if (failureHistory.length > 0) {
@@ -1182,10 +1184,13 @@ These agents said they can handle this task (YES = fully, PARTIAL = partially). 
 
 ${approachList}
 
-Evaluate each agent's plan on:
-1. Verdict: Prefer YES over PARTIAL. A PARTIAL agent is a fallback only.
-2. Efficiency: How many steps? Does the plan go directly to the result?
-3. Likelihood of success: Does the agent have the right tools and capabilities for what it described? Is the plan realistic given its role?
+Evaluate each agent's plan on (in this priority order):
+1. **Verdict**: YES strongly preferred over PARTIAL. PARTIAL is a fallback only.
+2. **Tool specificity**: An agent with a SPECIFIC, ALREADY-CONFIGURED tool for this exact task (e.g. an enabled MCP server for email when the task is about email, a native API client for a service) is STRONGLY preferred over an agent proposing general-purpose automation (web browsing, shell scripting, etc). Even if the general-purpose plan sounds more detailed, prefer the specific tool — it's faster, more reliable, and doesn't require credentials/login the user hasn't provided.
+3. **Realism**: Is the plan feasible with what the agent actually has? Plans that rely on logging in, granting permissions, or data the agent doesn't have access to are unrealistic.
+4. **Efficiency**: Fewer steps to result is better.
+
+Be careful: verbose, confident-sounding prose about general automation is NOT the same as having the right tool. A short "I'll use the configured X skill" beats a long "I'll navigate a browser and click around".
 
 Pick the agent with the best combination. Reply with ONLY the agent name.`;
 
