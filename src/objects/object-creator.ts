@@ -487,7 +487,7 @@ export class ObjectCreator extends Abject {
     this.llmId = await this.requireDep('LLM');
     this.registryId = await this.requireDep('Registry');
     this.factoryId = await this.requireDep('Factory');
-    this.negotiatorId = await this.requireDep('Negotiator');
+    this.negotiatorId = (await this.discoverDep('Negotiator')) ?? undefined;
     this.abjectStoreId = await this.discoverDep('AbjectStore') ?? undefined;
     this.systemRegistryId = await this.discoverDep('SystemRegistry') ?? undefined;
     this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
@@ -1419,24 +1419,6 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
           }
         }
 
-        // Phase 6: Connect to dependencies via Negotiator (fire-and-forget)
-        if (callerId && deps.length > 0) {
-          const connectNames = deps.map((d) => d.name).join(', ');
-          await this.reportProgress(callerId, '6', `Connecting to ${connectNames}...`);
-        }
-        // TODO: Re-enable Negotiator connect when implementation is improved
-        // if (this.negotiatorId && spawnResult.objectId) {
-        //   for (const dep of deps) {
-        //     this.request(request(
-        //       this.id, this.negotiatorId,
-        //       'connect',
-        //       { sourceId: spawnResult.objectId, targetId: dep.id }
-        //     )).catch((err) => {
-        //       console.warn(`[OBJECT-CREATOR] Connect to ${dep.name} failed:`, err);
-        //     });
-        //   }
-        // }
-
         // Tag the new object with ObjectCreator's own workspace so its windows
         // are scoped to the workspace where it was created
         if (this.widgetManagerId && spawnResult.objectId) {
@@ -1993,24 +1975,6 @@ Rules:
         }
       }
 
-      // Phase 6: Connect to any new dependencies via Negotiator
-      if (callerId && deps.length > 0) {
-        const connectNames = deps.map((d) => d.name).join(', ');
-        await this.reportProgress(callerId, '6', `Connecting to ${connectNames}...`);
-      }
-      // TODO: Re-enable Negotiator connect when implementation is improved
-      // if (this.negotiatorId) {
-      //   for (const dep of deps) {
-      //     this.request(request(
-      //       this.id, this.negotiatorId,
-      //       'connect',
-      //       { sourceId: objectId, targetId: dep.id }
-      //     )).catch((err) => {
-      //       console.warn(`[OBJECT-CREATOR modify] Connect to ${dep.name} failed:`, err);
-      //     });
-      //   }
-      // }
-
       this._currentCallerId = undefined;
       return {
         success: true,
@@ -2404,7 +2368,7 @@ Manifest MUST include these methods:
 - hide: destroys the window via WidgetManager
 - input: receives mouse/keyboard events. Coordinates are canvas-local (0,0 = top-left of canvas).
 - timerFired: receives timer callbacks if using animation
-DO NOT use UIServer.createSurface for canvas objects. Use WidgetManager.createCanvas instead.
+Use WidgetManager.createCanvas for canvas objects (it is the supported entry point for surface creation).
 
 ### Widget Objects (standard UI: forms, buttons, text inputs, lists)
 Use when the object needs standard UI controls.
@@ -2543,24 +2507,21 @@ The WebBrowser, HttpClient, and other capabilities are user-authorized tools in 
 Output ONLY the handler map in a \`\`\`javascript code block. Nothing else.
 
 CRITICAL RULES:
-- RESERVED NAMES: Do NOT use these property names for state — they collide with the base class and will be silently skipped:
+- RESERVED NAMES: the following property names collide with base-class fields and are silently skipped. Choose other names:
   _status, _bus, _mailbox, _parentId, _registryId, _source, _owner, id, manifest, state,
   handlers, dependents, pendingReplies, capabilities, errorCount, lastError, startedAt, lastActivity
-  Use descriptive alternatives: _gameState instead of _status, _inputKeys instead of _keys, etc.
-- You MUST implement a handler for EVERY method listed in the manifest, EXCEPT these framework-provided methods which are auto-registered and must NOT appear in your handler map:
+  Prefer descriptive alternatives like _gameState (instead of _status) or _inputKeys (instead of _keys).
+- Implement a handler for every method listed in the manifest. The following framework-provided methods are auto-registered; omit them from your handler map:
   ${[...FRAMEWORK_PROVIDED_METHODS].join(', ')}
 - FUNCTION NAME PREFIX RULE:
-  - Functions WITHOUT '_' prefix become MESSAGE HANDLERS only — NOT callable as this.foo().
-    Calling this.foo() where foo has no '_' prefix will throw "this.foo is not a function".
-  - Functions WITH '_' prefix become direct properties — callable as this._foo().
-  - THEREFORE: helper functions (drawing, physics, etc.) MUST be prefixed with '_'.
-    Example: _draw(), _update(), _createBall(), _renderFrame()
-  - Only manifest methods should be unprefixed (show, hide, input, timerFired, getState, etc.)
-- COMMON BUG — DO NOT DO THIS:
-    await this.spawnBall({ payload: { x, y } });  // WRONG — throws "this.spawnBall is not a function"
-  The fix: rename spawnBall to _spawnBall (add '_' prefix):
+  - Functions with an underscore prefix become direct properties, callable as this._foo().
+  - Functions without the prefix are message handlers; they are routed via the bus and are not callable as this.foo().
+  - Helper functions (drawing, physics, etc.) use the underscore prefix: _draw(), _update(), _createBall(), _renderFrame().
+  - Manifest methods stay unprefixed (show, hide, input, timerFired, getState, etc.).
+- COMMON MISTAKE: await this.spawnBall({ payload: { x, y } }) throws "this.spawnBall is not a function" because handlers without the underscore prefix are not callable.
+  Fix: rename to _spawnBall and call it as this._spawnBall(x, y):
     async _spawnBall(x, y) { ... }
-    await this._spawnBall(x, y);  // CORRECT — '_' prefix makes it callable
+    await this._spawnBall(x, y);
 - COMMON BUG — CANVAS WITH WIDGETS:
     When combining canvas with widgets (toolbar, sidebar, etc.), the canvas MUST be added
     to the layout via addLayoutChildren. Without this, the canvas gets 0x0 size and is invisible.

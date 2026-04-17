@@ -2085,7 +2085,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       const llmResult = await this.request<{ content: string }>(
         request(this.id, this.llmId, 'complete', {
           messages: task.llmMessages,
-          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 16384 },
+          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 16384, cacheKey: entry.state.id },
         }),
         60000,
       );
@@ -2266,7 +2266,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       llmResult = await this.request<{ content: string }>(
         request(this.id, this.llmId, 'stream', {
           messages: task.llmMessages,
-          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 16384 },
+          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 16384, cacheKey: entry.state.id },
         }),
         120000,
       );
