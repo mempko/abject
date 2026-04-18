@@ -37,6 +37,7 @@ export class SkillRegistry extends Abject {
   private storageId?: AbjectId;
   private shellExecutorId?: AbjectId;
   private factoryId?: AbjectId;
+  private secretsVaultId?: AbjectId;
   /** AbjectId of each running MCPBridge, keyed by skill name. */
   private mcpBridges = new Map<string, AbjectId>();
   /** Cached bridge health state, keyed by skill name. */
@@ -101,6 +102,18 @@ export class SkillRegistry extends Abject {
               returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
             },
             {
+              name: 'installSkillBundle',
+              description: 'Install a multi-file skill by writing an entire tree under <skillsDir>/<name>/. Each value may be {text: string} or {base64: string} for binary files.',
+              parameters: [
+                { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Skill directory name' },
+                { name: 'entries', type: { kind: 'object', properties: {} }, description: 'path → {text | base64}' },
+              ],
+              returns: { kind: 'object', properties: {
+                success: { kind: 'primitive', primitive: 'boolean' },
+                files: { kind: 'primitive', primitive: 'number' },
+              }},
+            },
+            {
               name: 'uninstallSkill',
               description: 'Remove a skill from disk',
               parameters: [
@@ -136,6 +149,14 @@ export class SkillRegistry extends Abject {
               description: 'Get enabled MCP servers with their tool definitions',
               parameters: [],
               returns: { kind: 'array', elementType: { kind: 'reference', reference: 'MCPServerSummary' } },
+            },
+            {
+              name: 'getSkillsDir',
+              description: 'Return the absolute filesystem path where SKILL.md directories live. Agents should use SkillRegistry methods (getSkillConfig, setSkillConfig, listSkills) rather than poking the filesystem, but some skills reference ancillary files under this path.',
+              parameters: [],
+              returns: { kind: 'object', properties: {
+                path: { kind: 'primitive', primitive: 'string' },
+              }},
             },
           ],
           events: [
@@ -182,6 +203,7 @@ export class SkillRegistry extends Abject {
 
     this.shellExecutorId = await this.discoverDep('ShellExecutor') ?? undefined;
     this.factoryId = await this.discoverDep('Factory') ?? undefined;
+    this.secretsVaultId = await this.discoverDep('SecretsVault') ?? undefined;
     await this.pushEnvToShell();
 
     // Auto-start any MCP servers that were previously enabled
@@ -224,8 +246,27 @@ provides enabled skill summaries for agent prompt injection.
 
 ### Configure environment variables for a skill
 
+Env vars for a skill (including BOT_TOKEN / API_KEY values for its MCP server) live inside SkillRegistry and are injected into the MCP subprocess at spawn time. Read and write them through SkillRegistry:
+
   await call(await dep('SkillRegistry'), 'setSkillConfig', { name: 'my-skill', env: { API_KEY: 'xxx' } });
   const config = await call(await dep('SkillRegistry'), 'getSkillConfig', { name: 'my-skill' });
+
+### Where users set these values
+
+When an agent needs to tell the user how to configure a skill, point them at one of these paths (in order of typical preference):
+
+1. **Installed Skills window** (Settings → AI → "Installed Skills" button): each skill has a form with a row per declared env var. Paste the value, click "Save Config", and the skill re-spawns with the new environment.
+2. **Chat**: the user can say something like "set TELEGRAM_BOT_TOKEN to <value> for the io.github.daedalus-mcp-telegram-bot skill" and an agent will call setSkillConfig for them.
+3. **Programmatic** (from inside an agent's job code): the setSkillConfig call above.
+
+All three paths update the same storage inside SkillRegistry; the new env is picked up on the next MCPBridge spawn.
+
+### Locating skill files on disk
+
+Each installed skill is a directory under the skills root. To read ancillary files from a skill (scripts, references, templates), ask for the absolute root and resolve paths yourself:
+
+  const { path } = await call(await dep('SkillRegistry'), 'getSkillsDir', {});
+  // Files for a skill named "my-skill" live under \`\${path}/my-skill/\`.
 
 ### Events
 
@@ -235,7 +276,8 @@ whenever the skill set changes.
 ### IMPORTANT
 - The interface ID is '${SKILL_REGISTRY_INTERFACE}'.
 - Skills are SKILL.md files in subdirectories of the skills/ folder.
-- Compatible with Claude Code and OpenClaw SKILL.md formats.`;
+- Compatible with Claude Code and OpenClaw SKILL.md formats.
+- The skills directory is under the app's data directory (default \`./.abjects/skills/\`, override via the \`ABJECTS_DATA_DIR\` env var). Use \`getSkillsDir\` to resolve it at runtime.`;
   }
 
   private setupHandlers(): void {
@@ -295,6 +337,44 @@ whenever the skill set changes.
       return { found: this.skills.size };
     });
 
+    this.on('installSkillBundle', async (msg: AbjectMessage) => {
+      const { name, entries } = msg.payload as {
+        name: string;
+        entries: Record<string, { text?: string; base64?: string }>;
+      };
+      contractRequire(typeof name === 'string' && name.length > 0, 'name must be non-empty');
+      contractRequire(entries !== null && typeof entries === 'object', 'entries must be an object');
+
+      const skillDir = path.join(this.skillsDir, name);
+      await fsPromises.mkdir(skillDir, { recursive: true });
+
+      let files = 0;
+      for (const [relPath, entry] of Object.entries(entries)) {
+        // Refuse absolute paths or anything that tries to escape the skill dir.
+        const normalised = path.posix.normalize(relPath);
+        if (path.isAbsolute(normalised) || normalised.startsWith('..') || normalised.includes('/../')) {
+          log.warn(`Skipping unsafe path in bundle: ${relPath}`);
+          continue;
+        }
+        const absPath = path.join(skillDir, normalised);
+        await fsPromises.mkdir(path.dirname(absPath), { recursive: true });
+        if (typeof entry.text === 'string') {
+          await fsPromises.writeFile(absPath, entry.text, 'utf-8');
+        } else if (typeof entry.base64 === 'string') {
+          await fsPromises.writeFile(absPath, Buffer.from(entry.base64, 'base64'));
+        } else {
+          continue;
+        }
+        files++;
+      }
+
+      // Re-scan so the new skill appears in listSkills and getEnabledSkills.
+      await this.doScan();
+      this.changed('skillsChanged', { reason: 'installed' });
+      log.info(`Installed skill bundle: ${name} (${files} files)`);
+      return { success: true, files };
+    });
+
     this.on('installSkill', async (msg: AbjectMessage) => {
       const { name, content } = msg.payload as { name: string; content: string };
       contractRequire(typeof name === 'string' && name.length > 0, 'name must be non-empty');
@@ -350,6 +430,10 @@ whenever the skill set changes.
 
     this.on('getEnabledMCPServers', async () => {
       return await this.getEnabledMCPServerSummaries();
+    });
+
+    this.on('getSkillsDir', async () => {
+      return { path: path.resolve(this.skillsDir) };
     });
   }
 
@@ -568,7 +652,25 @@ whenever the skill set changes.
     }
 
     const config = this.skillConfigs.get(name);
-    const env = config?.env ?? {};
+    const env: Record<string, string> = { ...(config?.env ?? {}) };
+
+    // Resolve required-secret frontmatter via SecretsVault before spawn so the
+    // subprocess gets real values in its env without them transiting prompts.
+    const secretMapping = extractRequiredSecretMapping(entry.parsed.frontmatter);
+    if (secretMapping && this.secretsVaultId) {
+      try {
+        const bound = await this.request<{ env: Record<string, string>; missing: string[] }>(
+          request(this.id, this.secretsVaultId, 'bindEnv', { owner: name, mapping: secretMapping }),
+          5000,
+        );
+        Object.assign(env, bound.env);
+        if (bound.missing.length > 0) {
+          log.warn(`Skill "${name}" missing secrets: ${bound.missing.join(', ')}`);
+        }
+      } catch (err) {
+        log.warn(`Failed to bind secrets for "${name}": ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
 
     try {
       const result = await this.request<{ objectId: AbjectId }>(
@@ -696,6 +798,37 @@ whenever the skill set changes.
 
     return summaries;
   }
+}
+
+/**
+ * Pull `required-secret` out of SKILL.md frontmatter. We accept two shapes:
+ *
+ *   required-secret:
+ *     GMAIL_TOKEN: gmail_oauth_access_token
+ *
+ *   required-secret: gmail_oauth_access_token  (env var name == secret name)
+ *
+ * Returns a map of envVarName → secretName, or undefined if no secrets declared.
+ */
+function extractRequiredSecretMapping(frontmatter: Record<string, unknown>): Record<string, string> | undefined {
+  const raw = frontmatter['required-secret'];
+  if (raw === undefined || raw === null) return undefined;
+
+  if (typeof raw === 'string' && raw.length > 0) {
+    return { [raw]: raw };
+  }
+
+  if (typeof raw === 'object' && !Array.isArray(raw)) {
+    const out: Record<string, string> = {};
+    for (const [env, secret] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof secret === 'string' && secret.length > 0) {
+        out[env] = secret;
+      }
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
+  return undefined;
 }
 
 export const SKILL_REGISTRY_ID = 'abjects:skill-registry' as AbjectId;

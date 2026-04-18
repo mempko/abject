@@ -13,6 +13,9 @@ import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
 import type { EnabledSkillSummary } from '../core/skill-types.js';
+import type { MCPServerSummary, MCPServerDetail } from './mcp-registry-client.js';
+import type { ClawHubSkillSummary, SkillBundle } from './clawhub-client.js';
+import { buildMcpSkillMd, packageToMcpCommand, sanitiseSkillName } from '../core/skill-synth.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('SkillAgent');
@@ -66,6 +69,8 @@ export class SkillAgent extends Abject {
   private skillRegistryId?: AbjectId;
   private jobManagerId?: AbjectId;
   private goalManagerId?: AbjectId;
+  private mcpRegistryClientId?: AbjectId;
+  private clawHubClientId?: AbjectId;
   private _currentGoalId?: string;
 
   private taskExtras = new Map<string, TaskExtra>();
@@ -122,6 +127,8 @@ export class SkillAgent extends Abject {
     this.skillRegistryId = await this.discoverDep('SkillRegistry') ?? undefined;
     this.jobManagerId = await this.discoverDep('JobManager') ?? undefined;
     this.goalManagerId = await this.discoverDep('GoalManager') ?? undefined;
+    this.mcpRegistryClientId = await this.discoverDep('MCPRegistryClient') ?? undefined;
+    this.clawHubClientId = await this.discoverDep('ClawHubClient') ?? undefined;
 
     // Subscribe to SkillRegistry changes to rebuild prompt
     if (this.skillRegistryId) {
@@ -518,6 +525,41 @@ When asked about a task, describe which skill you would use and how. Say PASS if
           break;
         }
 
+        case 'search_catalog': {
+          const query = (action.query as string)?.trim() ?? '';
+          const limit = typeof action.limit === 'number' && action.limit > 0 ? action.limit : 10;
+          if (!query) return { success: false, error: 'search_catalog requires "query" field' };
+          const hits = await this.searchCatalog(query, limit);
+          if (hits.length === 0) {
+            result = `No matches for "${query}" in the MCP registry or ClawHub.`;
+          } else {
+            const lines = hits.map(h => h.kind === 'mcp'
+              ? `- [mcp] ${h.name}${h.version ? ' (' + h.version + ')' : ''}: ${h.description ?? ''}`
+              : `- [skill] ${h.slug}${h.version ? ' (' + h.version + ')' : ''}: ${h.description ?? ''}`,
+            );
+            result = `Found ${hits.length} candidates:\n${lines.join('\n')}`;
+          }
+          break;
+        }
+
+        case 'install_mcp_server': {
+          if (!this.mcpRegistryClientId) return { success: false, error: 'MCPRegistryClient not available' };
+          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+          const name = action.name as string;
+          if (!name) return { success: false, error: 'install_mcp_server requires "name" field' };
+          result = await this.installMcpServer(name);
+          break;
+        }
+
+        case 'install_clawhub_skill': {
+          if (!this.clawHubClientId) return { success: false, error: 'ClawHubClient not available' };
+          if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
+          const slug = action.slug as string;
+          if (!slug) return { success: false, error: 'install_clawhub_skill requires "slug" field' };
+          result = await this.installClawHubSkill(slug);
+          break;
+        }
+
         case 'enable_skill': {
           if (!this.skillRegistryId) return { success: false, error: 'SkillRegistry not available' };
           const name = action.name as string;
@@ -625,6 +667,9 @@ I'll fetch the accounts list first.
 | mcp_tool_call | server, tool, input | Call a tool on a connected MCP server |
 | install_skill | name, content | Install a skill by writing a SKILL.md file |
 | enable_skill | name | Enable an installed skill (starts its MCP bridge if applicable) |
+| search_catalog | query, limit? | Search the official MCP registry and the ClawHub skills registry (vendor-neutral, ~13k+ community skills). Use this first when the user asks to install something generic like "a PDF reader" — you can present matches before committing. |
+| install_mcp_server | name | Install an MCP server by its registry name (e.g. the result of search_catalog). Fetches the package details, synthesises a SKILL.md, installs, and enables. |
+| install_clawhub_skill | slug | Install a skill from ClawHub by slug (result of search_catalog). Downloads the ZIP bundle and writes it under the local skills directory. Does NOT auto-enable — the user reviews first. |
 | disable_skill | name | Disable a skill |
 | list_skills | | List all installed skills and their status |
 | decompose | subtasks | Break a complex task into parallel sub-tasks dispatched to other agents. Each subtask has type (call, browse, create, modify, skill), description, and optional data. |
@@ -636,11 +681,19 @@ Every action can include a "reasoning" field explaining your thinking.
 
 ## Installing MCP Server Skills
 
-When a user asks to install an MCP server (e.g., "install @shinzolabs/gmail-mcp"):
+Two paths, depending on whether the user named a specific package:
+
+**By specific package name** (e.g., "install @shinzolabs/gmail-mcp"):
 1. Use install_skill directly with a SKILL.md (exact format below). npx handles package installation automatically.
 2. Use enable_skill to start the MCP bridge.
 3. Check the observation to confirm the bridge connected and tools were discovered.
 4. Report done.
+
+**By capability** (e.g., "install a PDF reader", "install something that lets me search GitHub"):
+1. Use search_catalog with a focused query to see what's in the MCP registry and ClawHub.
+2. If there's a clear best match, call install_mcp_server (for MCP entries) or install_clawhub_skill (for ClawHub entries) with the picked identifier.
+3. If several plausible options exist and you're not confident, use reply to list the top 3 and ask the user to pick.
+4. Report done once installed. MCP servers are auto-enabled; ClawHub skills are not (the user reviews first), so note that in your reply.
 
 SKILL.md format (frontmatter keys are always hyphenated):
 
@@ -796,6 +849,94 @@ When using curl, use -s (silent) and pipe JSON through jq.
       };
       this.pendingTickets.set(ticketId, entry);
     });
+  }
+
+  // ─── Catalog search + install ───────────────────────────────────
+
+  private async searchCatalog(query: string, limit: number): Promise<Array<
+    | { kind: 'mcp'; name: string; description?: string; version?: string }
+    | { kind: 'skill'; slug: string; description?: string; version?: string }
+  >> {
+    const hits: Array<
+      | { kind: 'mcp'; name: string; description?: string; version?: string }
+      | { kind: 'skill'; slug: string; description?: string; version?: string }
+    > = [];
+
+    if (this.mcpRegistryClientId) {
+      try {
+        const servers = await this.request<MCPServerSummary[]>(
+          request(this.id, this.mcpRegistryClientId, 'search', { query, limit }),
+          30000,
+        );
+        for (const s of servers) {
+          hits.push({ kind: 'mcp', name: s.name, description: s.description, version: s.version });
+        }
+      } catch (err) {
+        log.warn(`MCP registry search failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    if (this.clawHubClientId) {
+      try {
+        const clawHits = await this.request<ClawHubSkillSummary[]>(
+          request(this.id, this.clawHubClientId, 'search', { query, limit }),
+          30000,
+        );
+        for (const s of clawHits) {
+          hits.push({
+            kind: 'skill',
+            slug: s.slug,
+            description: s.summary,
+            version: s.latestVersion,
+          });
+        }
+      } catch (err) {
+        log.warn(`ClawHub search failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    return hits.slice(0, limit);
+  }
+
+  private async installMcpServer(name: string): Promise<string> {
+    const detail = await this.request<MCPServerDetail>(
+      request(this.id, this.mcpRegistryClientId!, 'getServer', { name }),
+      30000,
+    );
+    const pkg = detail.packages?.find(p => !!p && !!(p.identifier ?? p.name));
+    const { command, args } = packageToMcpCommand(pkg);
+    if (!command) return `Cannot install "${name}": no supported package registry for this server.`;
+
+    const skillName = sanitiseSkillName(detail.name);
+    const content = buildMcpSkillMd({
+      name: skillName,
+      description: detail.description ?? `MCP server: ${detail.name}`,
+      mcpCommand: command,
+      mcpArgs: args,
+    });
+
+    await this.request(
+      request(this.id, this.skillRegistryId!, 'installSkill', { name: skillName, content }),
+    );
+    await this.request(
+      request(this.id, this.skillRegistryId!, 'enableSkill', { name: skillName }),
+    );
+    return `Installed and enabled MCP server "${detail.name}" as skill "${skillName}".`;
+  }
+
+  private async installClawHubSkill(slug: string): Promise<string> {
+    const bundle = await this.request<SkillBundle>(
+      request(this.id, this.clawHubClientId!, 'downloadSkill', { slug }),
+      60000,
+    );
+    const skillName = sanitiseSkillName(slug);
+    await this.request(
+      request(this.id, this.skillRegistryId!, 'installSkillBundle', {
+        name: skillName,
+        entries: bundle.entries,
+      }),
+    );
+    return `Installed skill "${skillName}" from ClawHub. Review the SKILL.md and use enable_skill once you're ready to run it.`;
   }
 }
 

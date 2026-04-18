@@ -78,6 +78,11 @@ import { SkillBrowser } from '../src/objects/skill-browser.js';
 import { SkillAgent } from '../src/objects/skill-agent.js';
 import { ObjectAgent } from '../src/objects/object-agent.js';
 import { MCPBridge } from '../src/objects/mcp-bridge.js';
+import { MCPRegistryClient } from '../src/objects/mcp-registry-client.js';
+import { ClawHubClient } from '../src/objects/clawhub-client.js';
+import { CatalogBrowser } from '../src/objects/catalog-browser.js';
+import { SecretsVault } from '../src/objects/secrets-vault.js';
+import { OAuthHelper } from '../src/objects/oauth-helper.js';
 import { HttpServer } from '../src/objects/http-server.js';
 import type { MCPBridgeConfig } from '../src/objects/mcp-bridge.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
@@ -426,6 +431,11 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('SkillBrowser', () => new SkillBrowser());
   runtime.objectFactory.registerConstructor('SkillAgent', () => new SkillAgent());
   runtime.objectFactory.registerConstructor('ObjectAgent', () => new ObjectAgent());
+  runtime.objectFactory.registerConstructor('MCPRegistryClient', () => new MCPRegistryClient());
+  runtime.objectFactory.registerConstructor('ClawHubClient', () => new ClawHubClient());
+  runtime.objectFactory.registerConstructor('CatalogBrowser', () => new CatalogBrowser());
+  runtime.objectFactory.registerConstructor('SecretsVault', () => new SecretsVault());
+  runtime.objectFactory.registerConstructor('OAuthHelper', () => new OAuthHelper());
   runtime.objectFactory.registerConstructor('MCPBridge', (args?: unknown) => {
     const config = args as MCPBridgeConfig;
     return new MCPBridge(config);
@@ -447,6 +457,8 @@ async function main(): Promise<void> {
       'ObjectCatalog', 'ObjectBrowser', 'ProcessExplorer', 'LLMMonitor',
       'ProxyGenerator', 'Negotiator', 'HealthMonitor',
       'SkillRegistry', 'SkillBrowser',
+      'MCPRegistryClient', 'ClawHubClient', 'CatalogBrowser',
+      'SecretsVault', 'OAuthHelper',
       // Per-workspace objects
       'AbjectStore', 'Theme', 'Settings', 'AppExplorer',
       'TupleSpace', 'SharedState',
@@ -682,6 +694,11 @@ async function main(): Promise<void> {
   const llmMonitorId = await supervisedSpawn('LLMMonitor', 'permanent', systemTypeId('LLMMonitor'));
   const skillRegistryId = await supervisedSpawn('SkillRegistry', 'permanent', systemTypeId('SkillRegistry'));
   const skillBrowserId = await supervisedSpawn('SkillBrowser', 'permanent', systemTypeId('SkillBrowser'));
+  const mcpRegistryClientId = await supervisedSpawn('MCPRegistryClient', 'permanent', systemTypeId('MCPRegistryClient'));
+  const clawHubClientId = await supervisedSpawn('ClawHubClient', 'permanent', systemTypeId('ClawHubClient'));
+  const catalogBrowserId = await supervisedSpawn('CatalogBrowser', 'permanent', systemTypeId('CatalogBrowser'));
+  const secretsVaultId = await supervisedSpawn('SecretsVault', 'permanent', systemTypeId('SecretsVault'));
+  const oauthHelperId = await supervisedSpawn('OAuthHelper', 'permanent', systemTypeId('OAuthHelper'));
 
   const proxyGenId = await supervisedSpawn('ProxyGenerator', 'permanent', systemTypeId('ProxyGenerator'));
   const negotiatorId = await supervisedSpawn('Negotiator', 'permanent', systemTypeId('Negotiator'));
@@ -723,6 +740,8 @@ async function main(): Promise<void> {
     signalingRelayId, peerDiscoveryId,
     workspaceShareRegistryId, workspaceBrowserId, objectCatalogId,
     globalSettingsId, peerNetworkId, globalToolbarId, objectBrowserId, processExplorerId, skillRegistryId, skillBrowserId,
+    mcpRegistryClientId, clawHubClientId, catalogBrowserId,
+    secretsVaultId, oauthHelperId,
     proxyGenId, negotiatorId,
     workspaceSwitcherId, workspaceManagerId,
   ];

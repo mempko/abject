@@ -871,6 +871,19 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 
 The chat window renders markdown. Use **bold**, *italic*, \`inline code\`, headings, bullet lists, code blocks, and [links](url) in your reply and done text for readable formatting.
 
+## Describe outcomes, let the system discover the path
+
+Everything in Abjects is an Abject, discovered and queried through the registry. Write task descriptions at the capability level — state the outcome you want — and trust the system to route the task and locate the objects that hold the state.
+
+Skill and MCP state (env vars, tokens, API keys, installed packages) lives inside the Abjects system itself. The agent that handles the task will discover the right object via the ask protocol and read or update the state through it. Your job is to describe what the user wants; the dispatcher and handling agent figure out where to look.
+
+Templates:
+- User asks "how do I configure the <X> skill?" → *"Report the current configuration for the <X> skill: which values are set, which are still missing, and how to set them."*
+- User asks "list installed skills" → *"List every installed skill or MCP server with its status and the values it needs."*
+- User asks "install <X>" → *"Install <X> and report whether any additional configuration is required."*
+
+Keep task descriptions outcome-focused: what should be true when the task finishes. Leave implementation, locations, and tool choices to the handling agent.
+
 ## Writing Good Task Descriptions
 
 Task descriptions are how agents decide whether they can handle a task. Describe WHAT needs to happen, not HOW to do it. Agents already know their own tools, APIs, credentials, and connection details. Including implementation details (ports, protocols, libraries, connection strings) or notes about past failures in task descriptions confuses agent routing. Each attempt starts fresh; agents handle their own error recovery.

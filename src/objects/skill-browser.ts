@@ -236,7 +236,7 @@ pane shows details, configuration, and actions for the selected skill.
     if (this.windowId) return;
 
     this.windowId = await this.wm('createWindowAbject', {
-      title: 'Skill Browser',
+      title: 'Installed Skills',
       rect: { x: 180, y: 100, width: WIN_W, height: WIN_H },
       resizable: true,
     }) as AbjectId;

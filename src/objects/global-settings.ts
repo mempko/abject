@@ -104,6 +104,7 @@ export class GlobalSettings extends Abject {
   private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
   private skillBrowserBtnId?: AbjectId;
+  private catalogBrowserBtnId?: AbjectId;
 
   // Tab state
   private tabBarId?: AbjectId;
@@ -506,6 +507,15 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const skillBrowserId = await this.discoverDep('SkillBrowser');
         if (skillBrowserId) {
           await this.request(request(this.id, skillBrowserId, 'show', {}));
+        }
+        return;
+      }
+
+      // Open Catalog (MCP registry + skill marketplaces)
+      if (fromId === this.catalogBrowserBtnId && aspect === 'click') {
+        const catalogBrowserId = await this.discoverDep('CatalogBrowser');
+        if (catalogBrowserId) {
+          await this.request(request(this.id, catalogBrowserId, 'show', {}));
         }
         return;
       }
@@ -1109,18 +1119,27 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }));
     await this.request(request(this.id, skillRowId, 'addLayoutSpacer', {}));
 
-    const { widgetIds: [skillBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'button', windowId: this.windowId, text: 'Open Skill Browser',
+        { type: 'button', windowId: this.windowId, text: 'Installed Skills',
+          style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+        { type: 'button', windowId: this.windowId, text: 'Browse Skills & MCP',
           style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
       ]})
     );
-    this.skillBrowserBtnId = skillBtnId;
+    this.skillBrowserBtnId = widgetIds[0];
+    this.catalogBrowserBtnId = widgetIds[1];
     await this.request(request(this.id, this.skillBrowserBtnId, 'addDependent', {}));
+    await this.request(request(this.id, this.catalogBrowserBtnId, 'addDependent', {}));
     await this.request(request(this.id, skillRowId, 'addLayoutChild', {
       widgetId: this.skillBrowserBtnId,
       sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 160, height: 36 },
+      preferredSize: { width: 150, height: 36 },
+    }));
+    await this.request(request(this.id, skillRowId, 'addLayoutChild', {
+      widgetId: this.catalogBrowserBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 180, height: 36 },
     }));
   }
 
@@ -1322,6 +1341,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.authPassToggleId = undefined;
     this.authSaveBtnId = undefined;
     this.skillBrowserBtnId = undefined;
+    this.catalogBrowserBtnId = undefined;
     this.tabBarId = undefined;
     this.aiContainerId = undefined;
     this.authContainerId = undefined;
