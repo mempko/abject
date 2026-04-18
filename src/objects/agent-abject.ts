@@ -1305,7 +1305,11 @@ Pick the agent with the best combination. Reply with ONLY the agent name.`;
       }));
     }
 
-    // 6. Route executeTask through JobManager so it appears in the Jobs panel
+    // 6. Route executeTask through JobManager so it appears in the Jobs panel.
+    // Pass the payload via the sandbox context (bound variable) rather than
+    // inlining it into jobCode — free-form text in `description` / `approach`
+    // could otherwise contain substrings like "fetch(" that trip the sandbox
+    // code validator even though they're inside JSON string literals.
     const dispatchStart = Date.now();
     const executePayload = {
       tupleId: claimed.tuple.id,
@@ -1316,11 +1320,12 @@ Pick the agent with the best combination. Reply with ONLY the agent name.`;
       approach: chosenApproach || undefined,
       failureHistory: failureHistory.length > 0 ? failureHistory : undefined,
     };
-    const jobCode = `return await call(${JSON.stringify(chosen.agentId)}, 'executeTask', ${JSON.stringify(executePayload)});`;
+    const jobCode = `return await call(${JSON.stringify(chosen.agentId)}, 'executeTask', __payload);`;
     const jobMgrId = await this.resolveDep('JobManager', this.jobManagerId);
     const submitMsg = request(this.id, jobMgrId, 'submitJob', {
       description: `[${chosen.name}] ${description.slice(0, 80)}`,
       code: jobCode,
+      context: { __payload: executePayload },
       queue: chosen.name,
     });
     // No explicit heartbeat: progress events from the running job bubble up

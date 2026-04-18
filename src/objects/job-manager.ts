@@ -25,6 +25,8 @@ export interface Job {
   description: string;
   code: string;
   callerId: AbjectId;
+  /** Extra values bound into the sandbox context alongside call/dep/find. */
+  context?: Record<string, unknown>;
   status: 'queued' | 'running' | 'completed' | 'failed';
   result?: unknown;
   error?: string;
@@ -48,6 +50,14 @@ export interface JobResult {
   result?: unknown;
   error?: string;
 }
+
+/**
+ * Names the job sandbox reserves for its built-ins. Caller-supplied context
+ * entries with these keys are silently dropped on submit.
+ */
+const RESERVED_CONTEXT_KEYS = new Set<string>([
+  'call', 'dep', 'find', 'id', 'progress', 'console',
+]);
 
 export class JobManager extends Abject {
   private jobs: Map<string, Job> = new Map();
@@ -164,8 +174,9 @@ export class JobManager extends Abject {
     });
 
     this.on('submitJob', async (msg: AbjectMessage) => {
-      const { description, code, queue: queueName } = msg.payload as {
+      const { description, code, queue: queueName, context: userContext } = msg.payload as {
         description: string; code: string; queue?: string;
+        context?: Record<string, unknown>;
       };
       requireNonEmpty(description, 'description');
       requireNonEmpty(code, 'code');
@@ -180,6 +191,16 @@ export class JobManager extends Abject {
         );
       }
 
+      // User-supplied context values cannot shadow built-in names.
+      let sanitisedContext: Record<string, unknown> | undefined;
+      if (userContext && typeof userContext === 'object') {
+        sanitisedContext = {};
+        for (const [k, v] of Object.entries(userContext)) {
+          if (RESERVED_CONTEXT_KEYS.has(k)) continue;
+          sanitisedContext[k] = v;
+        }
+      }
+
       const callerId = msg.routing.from;
       const jobId = `job-${++this.jobCounter}`;
       const resolvedQueue = queueName ?? JobManager.DEFAULT_QUEUE;
@@ -190,6 +211,7 @@ export class JobManager extends Abject {
         description,
         code,
         callerId,
+        context: sanitisedContext,
         status: 'queued',
         queuedAt: Date.now(),
       };
@@ -304,7 +326,7 @@ export class JobManager extends Abject {
         await this.log('info', `Job started: ${job.description}`, { jobId, queue: job.queue });
 
         try {
-          const result = await this.executeCode(job.code, job.callerId, q);
+          const result = await this.executeCode(job.code, job.callerId, q, job.context);
           job.status = 'completed';
           job.result = result;
           this.changed('jobCompleted', { jobId, description: job.description, queue: job.queue, result });
@@ -348,7 +370,12 @@ export class JobManager extends Abject {
     }
   }
 
-  private async executeCode(code: string, callerId: AbjectId | undefined, q: QueueState): Promise<unknown> {
+  private async executeCode(
+    code: string,
+    callerId: AbjectId | undefined,
+    q: QueueState,
+    userContext?: Record<string, unknown>,
+  ): Promise<unknown> {
     q.currentJobCallerId = callerId;
     log.info(`Executing job code (queue: ${q.name}):\n${code}`);
 
@@ -387,7 +414,9 @@ export class JobManager extends Abject {
     const depFn = async (name: string) => this.requireDep(name);
     const findFn = async (name: string) => this.discoverDep(name);
 
-    const context = {
+    // Caller-bound values first; built-ins second so they cannot be shadowed.
+    const context: Record<string, unknown> = {
+      ...(userContext ?? {}),
       call: callFn,
       dep: depFn,
       find: findFn,
