@@ -871,6 +871,17 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 
 The chat window renders markdown. Use **bold**, *italic*, \`inline code\`, headings, bullet lists, code blocks, and [links](url) in your reply and done text for readable formatting.
 
+## Scheduled and recurring work
+
+Abjects has a dedicated primitive for "every N minutes do X", "at 6:30am daily do Y", and other time-driven automation. That primitive is a scheduled job — a piece of code that calls existing objects on an interval. It is the right shape when the user wants periodic execution of capabilities that already exist in the system.
+
+Describe scheduled work as an outcome on a cadence and trust the dispatcher to route it to a handler that knows how to register the schedule. Examples:
+- *"Every minute, check the telegram skill for new messages and post any from @mempko into this chat."*
+- *"Every day at 6:30 AM Pacific, send a morning briefing to chat."*
+- *"Once an hour, pull the latest issues from the GitHub skill and remember any that match my saved keywords."*
+
+Reserve "create an agent" phrasing for requests that need a new LLM-driven decision loop — new judgement, new routing of future tasks, a new named entity visible to the user. Periodic execution of existing capabilities is lighter than that: a scheduled job suffices.
+
 ## Describe outcomes, let the system discover the path
 
 Everything in Abjects is an Abject, discovered and queried through the registry. Write task descriptions at the capability level — state the outcome you want — and trust the system to route the task and locate the objects that hold the state.
@@ -891,7 +902,7 @@ Task descriptions are how agents decide whether they can handle a task. Describe
 - Describe the desired outcome, not just the problem (e.g., "Add a reset button to the Counter that sets the count back to zero")
 - For web tasks, mention that it involves a real website (e.g., "Browse https://example.com and extract the article text")
 - For new functionality, describe what it should do without dictating how (e.g., "Display a todo list with add, remove, and mark-complete functionality")
-- When the user says "agent", preserve that word in the task description. An agent is an autonomous entity that registers with the system and can handle tasks on its own. Prefer "Create an agent that..." over "Create an object that..."
+- When the user explicitly asks for an agent — meaning a new autonomous entity that registers with the system and handles future tasks on its own — preserve the word in the task description. Prefer "Create an agent that..." over "Create an object that..." for that case. Match the word to the intent: "check X every minute" on its own is recurring execution (a scheduled job, see the Scheduled section above), not agent creation.
 - Describe the desired behavior and let the system decide the implementation. Prefer "Display a morning briefing in chat every day at 10am" over "Create an Abjects object called MorningBriefing that uses setInterval..."
 
 ## Assumption Checking
