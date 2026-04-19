@@ -450,14 +450,28 @@ export class JobManager extends Abject {
   // result: { jobId, status: 'completed'|'failed'|'cancelled', result?, error? }
 
 Jobs run in a sandboxed environment. Only these helpers and built-ins are available:
-- \`call(target, method, payload)\` — call other objects
-- \`dep(name)\` — resolve a dependency by name
-- \`find(query)\` — find objects in the registry
+- \`call(target, method, payload)\` — invoke a method on another object. Returns the method's reply.
+- \`dep(name)\` — resolve a dependency by name. Returns a Promise<AbjectId> (a string).
+- \`find(query)\` — find objects in the registry. Returns a Promise<AbjectId | undefined>.
 - \`id\` — this object's AbjectId
 - \`progress(pct)\` — report progress (0-100)
 - Built-ins: ${SANDBOX_BUILTIN_NAMES.join(', ')}
 
 No other globals exist. require, fetch, process, Buffer, setTimeout, and all Node.js/browser APIs are unavailable. Use \`dep(name)\` or \`find(query)\` to discover available system capabilities at runtime.
+
+### Calling objects — the canonical pattern
+
+\`dep(name)\` and \`find(query)\` return an AbjectId (a plain string). Every interaction happens through \`call(id, method, payload)\`; methods live on the receiver, not on a local proxy:
+
+  // Always: await the id, then pass it to call() with the method name.
+  const storageId = await dep('Storage');
+  const existing = await call(storageId, 'get', { key: 'my-key' });
+  await call(storageId, 'set', { key: 'my-key', value: { hits: 1 } });
+
+  const chatId = await dep('Chat');
+  await call(chatId, 'addNotification', { sender: 'Scheduler', message: 'hi' });
+
+Every method has a payload object; pass the exact parameter names the target method declares (see its manifest via the ask protocol). The pattern is always: \`const id = await dep('Name'); await call(id, 'method', { ...params });\`
 
 ### Inspect jobs
 

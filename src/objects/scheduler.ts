@@ -524,12 +524,20 @@ Use the Scheduler for ALL recurring/periodic/timed tasks. Do NOT create new obje
 ### Job Code
 
 The jobCode runs in JobManager's sandbox with access to:
-- call(target, method, payload) -- call other objects
-- dep(name) -- resolve a dependency
-- find(query) -- find objects in registry
-- id -- the Scheduler's AbjectId
+- \`call(target, method, payload)\` — invoke a method on another object.
+- \`dep(name)\` — resolve a dependency by name. Returns a Promise<AbjectId> (a plain string).
+- \`find(query)\` — find an object in the registry. Returns a Promise<AbjectId | undefined>.
+- \`id\` — the Scheduler's AbjectId.
 
-Typical pattern: create a GoalManager goal + TupleSpace task so agents pick up the work.
+\`dep\` and \`find\` resolve to AbjectIds. Every method lives on the receiver, so invocations look like \`const id = await dep('Name'); await call(id, 'method', { ...params })\`. The id on its own has no methods attached. A minimal example:
+
+  const storageId = await dep('Storage');
+  const prev = await call(storageId, 'get', { key: 'my-counter' });
+  await call(storageId, 'set', { key: 'my-counter', value: (prev ?? 0) + 1 });
+
+Ask the objects you plan to call via the ask protocol when you need their specific method signatures — each one's ask response includes its full API.
+
+For longer work, dispatch through GoalManager + TupleSpace so an agent picks it up.
 
 ### IMPORTANT
 - Schedules persist across restarts (saved to Storage)
