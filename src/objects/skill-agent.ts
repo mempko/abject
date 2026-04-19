@@ -16,6 +16,7 @@ import type { EnabledSkillSummary } from '../core/skill-types.js';
 import type { MCPServerSummary, MCPServerDetail } from './mcp-registry-client.js';
 import type { ClawHubSkillSummary, SkillBundle } from './clawhub-client.js';
 import { buildMcpSkillMd, packageToMcpCommand, sanitiseSkillName } from '../core/skill-synth.js';
+import { formatMCPToolList } from '../core/mcp-format.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('SkillAgent');
@@ -24,39 +25,6 @@ const SKILL_AGENT_INTERFACE: InterfaceId = 'abjects:skill-agent';
 
 interface TaskExtra {
   lastResult?: string;
-}
-
-/**
- * Render an MCP tool's JSON Schema (the `inputSchema` field) as a compact,
- * human-readable parameter list for the LLM system prompt. The LLM needs
- * to know the exact parameter names (case-sensitive) to call tools correctly.
- *
- * Returns null if no schema or no properties — caller should omit the line.
- */
-function formatMCPInputSchema(schema: Record<string, unknown> | undefined): string | null {
-  if (!schema || typeof schema !== 'object') return null;
-  const props = (schema as { properties?: Record<string, unknown> }).properties;
-  if (!props || typeof props !== 'object') return null;
-
-  const required = new Set<string>(
-    Array.isArray((schema as { required?: unknown[] }).required)
-      ? ((schema as { required: unknown[] }).required as string[])
-      : [],
-  );
-
-  const entries = Object.entries(props);
-  if (entries.length === 0) return null;
-
-  return entries.map(([name, rawDef]) => {
-    const def = (rawDef ?? {}) as { type?: string | string[]; enum?: unknown[]; description?: string };
-    const type = Array.isArray(def.type) ? def.type.join('|') : (def.type ?? 'any');
-    const enumPart = Array.isArray(def.enum) && def.enum.length > 0
-      ? ` = ${def.enum.map(v => JSON.stringify(v)).join('|')}`
-      : '';
-    const req = required.has(name) ? '' : '?';
-    const desc = def.description ? ` — ${def.description}` : '';
-    return `${name}${req}: ${type}${enumPart}${desc}`;
-  }).join('; ');
 }
 
 export class SkillAgent extends Abject {
@@ -765,25 +733,22 @@ When using curl, use -s (silent) and pipe JSON through jq.
           name: string;
           description: string;
           tools: Array<{ name: string; description: string; inputSchema?: Record<string, unknown> }>;
+          bridgeId?: string;
         }>>(
           request(this.id, this.skillRegistryId, 'getEnabledMCPServers', {}),
         );
 
         if (servers.length > 0) {
-          prompt += '\n## Connected MCP Servers\n\n';
+          prompt += `\n## Connected MCP Servers\n\n`;
+          prompt += `These servers are running locally. To call one of their tools from inside this task, use the \`mcp_tool_call\` action — the LLM decides which tool fits the request. For scheduled or deterministic flows (e.g. polling every minute), prefer calling the MCPBridge directly from job code (\`call(bridgeId, 'callTool', { toolName, input })\`) so the loop runs without an LLM in it; ask the bridge via \`ask\` for a full per-tool schema at that point.\n\n`;
           for (const server of servers) {
             prompt += `### ${server.name}\n${server.description}\n\n`;
             if (server.tools.length > 0) {
               prompt += 'Available tools:\n';
-              for (const tool of server.tools) {
-                prompt += `- \`${tool.name}\`: ${tool.description}\n`;
-                const params = formatMCPInputSchema(tool.inputSchema);
-                if (params) {
-                  prompt += `  Parameters: ${params}\n`;
-                }
-              }
+              prompt += formatMCPToolList(server.tools);
+              prompt += '\n';
             }
-            prompt += `\nUse \`mcp_tool_call\` action with \`server: "${server.name}"\`, \`tool: "<tool_name>"\`, and \`input: { ...parameters }\`. Use the EXACT parameter names shown above (case-sensitive).\n\n`;
+            prompt += `\nUse \`mcp_tool_call\` with \`server: "${server.name}"\`, \`tool: "<tool_name>"\`, and \`input: { ...parameters }\`. Pass parameter names exactly as listed (case-sensitive).\n\n`;
           }
         }
       } catch { /* MCP not available */ }

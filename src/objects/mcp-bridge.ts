@@ -23,6 +23,7 @@ import type {
 } from '../core/mcp-types.js';
 import { Log } from '../core/timed-log.js';
 import { validateMCPToolInput, MCPInputValidationError } from './mcp-input-validation.js';
+import { formatMCPToolList } from '../core/mcp-format.js';
 
 const log = new Log('MCPBridge');
 
@@ -120,27 +121,47 @@ export class MCPBridge extends Abject {
 
   protected override askPrompt(_question: string): string {
     let prompt = super.askPrompt(_question);
-    prompt += `\n\nMCP Server: "${this.serverName}"`;
-    prompt += `\nCommand: ${this.command} ${this.commandArgs.join(' ')}`;
-    prompt += `\nStatus: ${this.bridgeStatus}`;
+    prompt += `\n\n## MCPBridge: ${this.serverName}\n\n`;
+    prompt += `Owns a single running MCP server subprocess and exposes its tools and resources via message passing. Use this bridge for deterministic, LLM-free tool calls — it is the canonical low-level interface to the server.\n\n`;
+
+    prompt += `### Status\n`;
+    prompt += `- Subprocess: \`${this.command} ${this.commandArgs.join(' ')}\`\n`;
+    prompt += `- Bridge state: ${this.bridgeStatus}\n`;
     if (this.bridgeStatusError) {
-      prompt += `\nError: ${this.bridgeStatusError}`;
-    }
-    if (this.cachedTools.length > 0) {
-      prompt += `\nTools (${this.cachedTools.length}): ${this.cachedTools.map(t => t.name).join(', ')}`;
-      prompt += `\n\nTo invoke a tool, call the \`callTool\` method with payload \`{ toolName, input }\`:`;
-      prompt += `\n  call(mcpBridgeId, 'callTool', { toolName: '<tool>', input: { <args> } })`;
-      prompt += `\nThe payload also accepts the MCP-standard names \`tool\` / \`name\` for the tool, and \`arguments\` / \`args\` for the input.`;
-    } else {
-      prompt += `\nTools: none discovered (server may have failed to start)`;
+      prompt += `- Last error: ${this.bridgeStatusError}\n`;
     }
     const envKeys = Object.keys(this.env).filter(k => this.env[k]);
     if (envKeys.length > 0) {
-      prompt += `\nConfigured env vars: ${envKeys.join(', ')}`;
+      prompt += `- Configured env vars: ${envKeys.join(', ')}\n`;
     }
     if (this.configFile) {
-      prompt += `\nConfig file: ${this.configFile}`;
+      prompt += `- Config file: ${this.configFile}\n`;
     }
+    prompt += '\n';
+
+    if (this.cachedTools.length > 0) {
+      prompt += `### Tools (${this.cachedTools.length})\n\n`;
+      prompt += formatMCPToolList(this.cachedTools);
+      prompt += `\n\n### Invoking a tool\n\n`;
+      prompt += 'From inside job code (recommended for scheduled/deterministic flows):\n';
+      prompt += '```js\n';
+      prompt += `const result = await call(bridgeId, 'callTool', { toolName: '<tool>', input: { /* params */ } });\n`;
+      prompt += `// result: { content: string, isError: boolean }\n`;
+      prompt += '```\n\n';
+      prompt += 'Parameter-name aliases are accepted for MCP-standard compatibility: `tool` or `name` for the tool, `arguments` or `args` for the input. Tool names and parameter keys are case-sensitive.\n\n';
+      prompt += `### Other methods\n\n`;
+      prompt += `- \`listTools\`: returns \`MCPToolDefinition[]\` (the raw list behind the block above).\n`;
+      prompt += `- \`readResource({ uri })\`: returns \`{ content, mimeType? }\`.\n`;
+      prompt += `- \`getStatus\`: returns \`{ status, serverName, toolCount, error? }\`.\n\n`;
+    } else {
+      prompt += `### Tools\n\nNone yet (subprocess may still be starting or in an error state). Call \`getStatus\` to check, or \`listTools\` once the bridge reaches 'connected'.\n\n`;
+    }
+
+    prompt += `### Choosing between this bridge and SkillAgent\n\n`;
+    prompt += `- **Scheduled polling, event-driven pipelines, deterministic tool wiring**: call this bridge directly from job code. Each call is one JSON-RPC round trip with zero LLM tokens, so loops that run every minute stay cheap. A polling job should short-circuit on empty results and only dispatch to SkillAgent when there is actually a batch worth reasoning about.\n`;
+    prompt += `- **User-phrased natural-language requests** ("send a message on Telegram to Alice saying hi"): dispatch through SkillAgent. Its LLM picks the right tool and fills in arguments from the user's phrasing, then calls this bridge under the hood.\n`;
+    prompt += `- **Code that already knows the tool + arguments**: this bridge is the right call. The schema block above names every parameter so job code can paste names verbatim.\n`;
+
     return prompt;
   }
 
