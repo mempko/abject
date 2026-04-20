@@ -687,6 +687,29 @@ I'll fetch the accounts list first.
 
 Every action can include a "reasoning" field explaining your thinking.
 
+## Handling Large Tool Results
+
+Tool calls can return far more data than fits the context window. Email bodies with embedded base64 images, full file contents, rendered web pages, and large list queries all blow up fast. A single oversized observation poisons every subsequent think call in this task, so the whole task dies with an API error. Budget every call BEFORE you run it.
+
+**Pagination first.** When a tool has a limit/offset parameter (emails, messages, records, files), start with a small batch like \`limit: 5\`. Summarise what you saw into scratchpad, then page with \`offset\` only if you need more. Thirty emails with full bodies can exceed a million tokens; five at a time, distilled along the way, stay under a few KB.
+
+**Distil immediately.** After any call that returns full content (a message body, a file, a web page), your very next action should write a short summary (who, what, when, why, in roughly 500 chars or less) to scratchpad under a stable key like \`email-<id>-summary\`. Do NOT fetch another full-content item before distilling the previous one. If you return to the raw content later, \`read_scratchpad\` with a summary key instead of re-fetching.
+
+**Watch the size.** If a result comes back larger than roughly 10 KB, your next action must either (a) write a summary to scratchpad so the raw data stops mattering, or (b) \`fail\` the task with a short reason so a creation agent can build a dedicated preprocessor object. Do not stack large results.
+
+**Preprocess in the shell.** Whenever you reach data through the \`shell\` action, pipe it through \`jq\`, \`grep\`, \`sed\`, \`head\`, \`awk\`, or redirect to a temp file and read back only the slice you need. For HTML, strip \`data:image/*;base64,...\` URIs before the payload lands in your observation. It is always cheaper to trim before the LLM sees the bytes than to reason about them after.
+
+**Scratchpad is your memory, history is not.** Conversation history gets trimmed and re-sent on every step; scratchpad persists and is read on demand. Summaries, indices, cursors, partial results, anything you need across steps belongs in scratchpad. Your final \`done\` should assemble its answer from scratchpad rather than assuming earlier observations are still in context.
+
+**Decompose when the work is inherently big.** For tasks that legitimately need lots of data (example: "summarise my 30 most recent emails"), emit a \`decompose\` action with one subtask per chunk. Each subtask gets a fresh conversation, fetches its slice, distils to scratchpad, and returns a short digest. A final task reads the digests and composes the answer. This is how you break a single multi-megabyte pipeline into many small ones.
+
+Worked example. Task: "what are the most important emails I should look at today?"
+1. \`mcp_tool_call\` get_emails with \`limit: 10, offset: 0\` to pull metadata only (sender, subject, date, unread flag).
+2. \`write_scratchpad\` key \`inbox-index\` with a compact one-line-per-message listing.
+3. Rank the index in your head, pick the top 3 candidates that are unread or time-sensitive.
+4. For each candidate: \`mcp_tool_call\` get_email_by_id, then immediately \`write_scratchpad\` key \`email-<id>-summary\` with sender, subject, one-sentence gist, action required. Never carry the full body forward.
+5. \`done\` with a short ranked list composed from the summary keys. Never include raw bodies in the final answer.
+
 ## Installing MCP Server Skills
 
 Two paths, depending on whether the user named a specific package:
