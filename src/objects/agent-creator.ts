@@ -89,29 +89,30 @@ export class AgentCreator extends Abject {
   }
 
   protected override askPrompt(_question: string): string {
-    return super.askPrompt(_question) + `\n\n## AgentCreator -- Autonomous Agent, Scheduler, and Watcher Creation Specialist
+    return super.askPrompt(_question) + `\n\n## AgentCreator: Autonomous Agent, Scheduler, and Watcher Creation Specialist
 
 ### What I Handle
-I create NEW autonomous agents, scheduled agents, and event watchers. I am the right
-choice whenever the user asks to "create an agent" or wants autonomous behavior that
-runs on a schedule or responds to events.
+I create NEW autonomous behavior that requires MULTIPLE cooperating objects: an agent that claims tasks with an LLM decision loop, a scheduler that fires on a recurring trigger, and a watcher that reacts to events. I decompose the request into separate sub-tasks so each component Abject gets built. My specialty is the composition pattern of agent plus scheduler plus watcher.
 
 Examples of tasks I handle well:
-- "Create an agent that delivers a morning briefing every day at 6 AM"
-- "Create an agent that analyzes news and writes summaries"
-- "Build an agent that reviews code changes and provides feedback"
-- "Create an agent that monitors weather and alerts on storms"
-- Any task containing the word "agent" that involves creating new autonomous behavior
+- "Create an agent that delivers a morning briefing every day at 6 AM" (agent + scheduler)
+- "Create an agent that analyzes news and writes summaries" (agent + scheduler)
+- "Build an agent that reviews code changes and provides feedback" (agent + watcher on a code source)
+- "Create an agent that monitors weather and alerts on storms" (agent + scheduler)
+- "Set up a recurring check every 10 minutes that posts to chat when something changes" (scheduler + watcher)
 
 ### My Scope
-I create autonomous agents, scheduled agents, and event watchers. Tasks about modifying existing objects, regular widget/app creation, or one-time data fetches belong to other agents.
+I create new autonomous agents, scheduled agents, and event watchers, decomposed into the set of cooperating objects needed. The signal that a request belongs here is that the work needs a new LLM decision loop or multiple cooperating objects (agent plus scheduler plus watcher).
+
+### Single-Object Forwarders Fit Elsewhere
+Bridges, proxies, relays, adapters, and integrations are single forwarding objects, not agents: they move traffic between endpoints and wrap a service. Even when they poll internally, they fit in ONE object and belong with a creation agent that builds single objects. Say PASS for any "create a X proxy", "create a X bridge", "create a X relay", "create a X adapter", or "create a X integration" request unless the user explicitly describes a multi-object system with an LLM decision loop.
 
 ### How I Work
 1. Decompose the request into sub-tasks via the goal system
 2. Each sub-task creates a new object (agent, scheduler, or watcher)
 3. Monitor child goal progress, report done when all complete
 
-When asked about a task, describe how you would decompose it into agent/scheduler/watcher sub-tasks. Say PASS if the task is about modifying existing objects, regular widget creation, or calling existing objects.`;
+When asked about a task, describe how you would decompose it into agent/scheduler/watcher sub-tasks. Say PASS so routing can hand the task onward when the request is to run an existing agent, modify an existing agent's source code, build a regular widget or app without an autonomous loop, perform a one-time data fetch, or create a single-object bridge/proxy/relay/adapter/integration.`;
   }
 
   protected override async handleAsk(question: string): Promise<string> {
@@ -124,7 +125,7 @@ When asked about a task, describe how you would decompose it into agent/schedule
 
   private setupHandlers(): void {
     this.on('executeTask', async (msg: AbjectMessage) => {
-      const { goalId, description, approach, failureHistory } = msg.payload as {
+      const { tupleId, goalId, description, approach, failureHistory } = msg.payload as {
         tupleId: string; goalId?: string; description: string;
         data?: Record<string, unknown>; type: string; approach?: string;
         failureHistory?: Array<{ agent: string; error: string }>;
@@ -153,6 +154,7 @@ When asked about a task, describe how you would decompose it into agent/schedule
             task: description,
             systemPrompt: this.buildSystemPrompt(),
             goalId,
+            dispatchTupleId: tupleId,
             initialMessages: initialMessages.length > 0 ? initialMessages : undefined,
             config: {
               maxSteps: 15,
@@ -243,9 +245,10 @@ When asked about a task, describe how you would decompose it into agent/schedule
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'AgentCreator',
       description:
-        'Creates autonomous agents, scheduled agents, and event watchers. ' +
-        'Any task containing "agent" that involves creating new autonomous behavior belongs here. ' +
-        'Decomposes requests into sub-tasks dispatched via the goal system.',
+        'Creates new autonomous behavior that requires MULTIPLE cooperating objects: an LLM-driven agent, a recurring scheduler, and/or an event watcher, composed together. ' +
+        'Decomposes the request into sub-tasks that spawn each component Abject (agent plus scheduler plus watcher as needed) through the goal system. ' +
+        'Best when the work needs a new LLM decision loop plus infrastructure to trigger or observe it. ' +
+        'Single forwarding objects (bridges, proxies, relays, adapters, integrations that move traffic between endpoints) fit a single-object pattern and go to a creation agent that builds single objects, even when the forwarder polls internally. Running an existing agent on a one-off task goes to a runtime interaction agent; source changes to an existing agent go to a creation-and-modification agent; regular widgets or apps without an autonomous loop go to a creation agent; one-shot data fetches go to a runtime interaction agent.',
       config: {
         maxSteps: 15,
         timeout: 600000,
@@ -292,11 +295,37 @@ Include data.additionalDeps for extra dependencies beyond the pattern base (e.g.
 
 ## Task Dependencies
 
-**Tasks run SEQUENTIALLY by default** — each task waits for the previous one to finish. This is safest when one task's output feeds another, or when tasks share resources.
+**Tasks run SEQUENTIALLY by default.** Each task waits for the previous one to finish. This is safest when one task's output feeds another, or when tasks share resources.
 
 - Leave \`dependsOn\` unspecified (or omit it) for the default sequential chain.
 - Set \`dependsOn: [0, 2]\` with 0-based indices for a specific dependency.
-- Set \`dependsOn: []\` (empty array) to explicitly opt into parallel execution — ONLY when you know the tasks are fully independent.
+- Set \`dependsOn: []\` (empty array) to explicitly opt into parallel execution, ONLY when you know the tasks are fully independent.
+
+## Scratchpad Contracts for Data Handoff
+
+When a downstream sub-task needs structured data from an upstream one, declare the contract so the data flows reliably even when results are large:
+
+- Add \`produces\` to the upstream subtask: an array of \`{ key, description }\` entries naming the scratchpad keys it will write and describing the value shape.
+- Add \`consumes\` to the downstream subtask: an array of key strings it expects to read.
+
+The downstream agent automatically sees the full values for its consumed keys; the upstream agent is told to write each produced key with \`writeGoalData\` before reporting done. Use contracts when a scheduler needs to know an agent's id, or when task 1 needs structured output from task 0.
+
+Example:
+\`\`\`json
+{ "action": "decompose", "subtasks": [
+  {
+    "description": "Create a BriefingAgent that fetches weather and posts to chat when dispatched a weather task",
+    "data": { "role": "agent" },
+    "produces": [{ "key": "briefing_agent_id", "description": "AbjectId string of the newly created BriefingAgent" }]
+  },
+  {
+    "description": "Create a scheduler that fires every day at 6:30PM PT and submits a Job that dispatches a weather task to the agent at scratchpad key briefing_agent_id",
+    "data": { "role": "scheduler" },
+    "consumes": ["briefing_agent_id"],
+    "dependsOn": [0]
+  }
+], "reasoning": "Scheduler needs the agent's id; passing it via scratchpad contract." }
+\`\`\`
 
 ## Examples
 

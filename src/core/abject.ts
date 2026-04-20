@@ -277,6 +277,14 @@ export abstract class Abject {
           this.send(event(this.id, upstream, 'progress', msg.payload ?? {}));
         } catch { /* bus gone */ }
       }
+      // Subclass hook: run after the base bubble so overrides see the same
+      // signal the bus just processed. Default is no-op; AgentAbject uses
+      // this to notify GoalManager so Chat's per-task stall timer (which
+      // watches goalUpdated, not raw PROGRESS) stays alive during long
+      // downstream calls.
+      try {
+        this.onProgressBubble(msg);
+      } catch { /* never let a hook crash the base handler */ }
     });
 
     this._status = 'ready';
@@ -304,6 +312,18 @@ export abstract class Abject {
    * Override this to perform custom initialization.
    */
   protected async onInit(): Promise<void> {
+    // Default: no-op
+  }
+
+  /**
+   * Subclass hook fired by the default `progress` handler after it has
+   * reset pending request timers and bubbled the signal upstream. The
+   * base implementation is a no-op. AgentAbject overrides this to emit
+   * GoalManager.updateProgress for each in-flight TaskEntry so goal-level
+   * stall timers (Chat's waitForTaskCompletion in particular) stay alive
+   * during long downstream calls.
+   */
+  protected onProgressBubble(_msg: AbjectMessage): void {
     // Default: no-op
   }
 
@@ -562,7 +582,19 @@ You are this object. Your capabilities are exactly what the manifest above descr
 
   /**
    * Notify all dependents of a change (Smalltalk changed: protocol).
-   * Sends a 'changed' event message to each dependent via the bus.
+   * Sends two events to each dependent per change:
+   *   1. A generic `changed` event with payload `{aspect, value}` for
+   *      subscribers that register a single `on('changed', ...)` handler
+   *      and dispatch by aspect internally.
+   *   2. A per-aspect event whose method equals the aspect name with the
+   *      `value` as the payload, so subscribers can register handlers
+   *      directly named after the aspect (e.g. `messageAdded(msg)`,
+   *      `goalCompleted(msg)`). This matches the natural pattern used by
+   *      generated ScriptableAbject source.
+   *
+   * Subscribers can choose either style; the value is identical in both
+   * shapes. Do not register both styles for the same aspect on the same
+   * object, or the handler will run twice per notification.
    */
   protected changed(aspect: string, value?: unknown): void {
     for (const depId of this.dependents) {
@@ -570,6 +602,7 @@ You are this object. Your capabilities are exactly what the manifest above descr
         aspect,
         value,
       }));
+      this.send(event(this.id, depId, aspect, value ?? {}));
     }
   }
 

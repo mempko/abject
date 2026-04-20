@@ -170,6 +170,8 @@ export class GoalManager extends Abject {
                 { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'Task description' },
                 { name: 'data', type: { kind: 'object', properties: {} }, description: 'Task-specific payload', optional: true },
                 { name: 'dependsOn', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Task IDs that must complete before this task can start', optional: true },
+                { name: 'produces', type: { kind: 'array', elementType: { kind: 'object', properties: {} } }, description: 'Scratchpad keys this task is expected to write. Each entry is { key: string, description: string } describing the value shape for downstream consumers.', optional: true },
+                { name: 'consumes', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Scratchpad keys this task expects to read. The agent claiming this task will see the full values for these keys in its system prompt.', optional: true },
               ],
               returns: { kind: 'object', properties: { taskId: { kind: 'primitive', primitive: 'string' } } },
             },
@@ -796,8 +798,10 @@ if it can handle the task, and the most confident agent claims it.
     // ── Task convenience methods (delegate to TupleSpace) ──
 
     this.on('addTask', async (msg: AbjectMessage) => {
-      const { goalId, description, data, dependsOn } = msg.payload as {
+      const { goalId, description, data, dependsOn, produces, consumes } = msg.payload as {
         goalId: string; description: string; data?: unknown; dependsOn?: string[];
+        produces?: Array<{ key: string; description: string }>;
+        consumes?: string[];
       };
       requireNonEmpty(goalId, 'goalId');
       requireNonEmpty(description, 'description');
@@ -815,10 +819,16 @@ if it can handle the task, and the most confident agent claims it.
             goalId, status: 'pending', description, data,
             attempts: 0, maxAttempts: 3, failureHistory: [],
             dependsOn: dependsOn ?? [],
+            produces: produces ?? [],
+            consumes: consumes ?? [],
           },
         })
       );
-      log.info(`Task added for goal ${goalId}: "${description.slice(0, 60)}"${dependsOn?.length ? ` (depends on ${dependsOn.length} task(s))` : ''}`);
+      const contractParts: string[] = [];
+      if (produces?.length) contractParts.push(`produces=[${produces.map(p => p.key).join(',')}]`);
+      if (consumes?.length) contractParts.push(`consumes=[${consumes.join(',')}]`);
+      const contractSuffix = contractParts.length ? ` (${contractParts.join(' ')})` : '';
+      log.info(`Task added for goal ${goalId}: "${description.slice(0, 60)}"${dependsOn?.length ? ` (depends on ${dependsOn.length} task(s))` : ''}${contractSuffix}`);
       return { taskId: result.tupleId };
     });
 
@@ -862,6 +872,37 @@ if it can handle the task, and the most confident agent claims it.
           ...(ns ? { namespace: ns } : {}),
         })
       );
+
+      // Auto-mirror the result into the goal's scratchpad under a well-known path
+      // so downstream tasks have an untruncated, addressable copy. Also check the
+      // task's declared `produces` keys and warn if any are missing from the
+      // scratchpad (advisory only, never blocks completion).
+      if (goalId) {
+        const goal = this.goals.get(goalId as GoalId);
+        if (goal) {
+          if (!goal.scratchpad) goal.scratchpad = {};
+          goal.scratchpad[`tasks/${taskId}/result`] = result;
+          goal.updatedAt = Date.now();
+
+          try {
+            const tuples = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
+              request(this.id, this.tupleSpaceId, 'scan', {
+                namespace: this.getTupleNamespace(goalId as GoalId),
+                pattern: { goalId },
+              }),
+            );
+            const tuple = tuples?.find(t => t.id === taskId);
+            const produces = (tuple?.fields.produces as Array<{ key: string; description: string }> | undefined) ?? [];
+            const missing = produces.filter(p => !(p.key in goal.scratchpad));
+            if (missing.length > 0) {
+              log.info(`completeTask ${taskId.slice(0, 8)} — warning: declared produces missing from scratchpad: ${missing.map(m => m.key).join(', ')}. Auto-mirror at tasks/${taskId}/result still available.`);
+            }
+          } catch { /* best effort */ }
+
+          this.changed('goalUpdated', { goalId, message: `scratchpad.tasks/${taskId.slice(0, 8)}/result written` });
+          this.syncGoalToSharedState(goal);
+        }
+      }
 
       log.info(`completeTask ${taskId.slice(0, 8)} — emitting taskCompleted`);
       this.emittedTerminalTasks.add(taskId);

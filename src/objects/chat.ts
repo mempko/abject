@@ -234,6 +234,19 @@ export class Chat extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
             ],
+            events: [
+              {
+                name: 'messageAdded',
+                description: 'Fires every time a bubble is appended to the chat log (user input, assistant reply, system notification, or error). Subscribe via addDependent to forward, mirror, or log messages from bridges, proxies, relays, and integrations. The "activity" role represents in-progress agent state and is filtered out; subscribers see only durable bubbles.',
+                payload: { kind: 'object', properties: {
+                  role: { kind: 'primitive', primitive: 'string' },
+                  sender: { kind: 'primitive', primitive: 'string' },
+                  text: { kind: 'primitive', primitive: 'string' },
+                  markdown: { kind: 'primitive', primitive: 'boolean' },
+                  at: { kind: 'primitive', primitive: 'number' },
+                }},
+              },
+            ],
           },
         requiredCapabilities: [
           { capability: Capabilities.UI_SURFACE, reason: 'Display chat window', required: true },
@@ -728,7 +741,13 @@ export class Chat extends Abject {
     // Handle goal action: create goal + tasks, wait for completion
     if (action.action === 'goal') {
       const title = (action.title as string) ?? 'Untitled goal';
-      const tasks = (action.tasks as Array<{ description: string; data?: Record<string, unknown>; dependsOn?: number[] }>) ?? [];
+      const tasks = (action.tasks as Array<{
+        description: string;
+        data?: Record<string, unknown>;
+        dependsOn?: number[];
+        produces?: Array<{ key: string; description: string }>;
+        consumes?: string[];
+      }>) ?? [];
       if (tasks.length === 0) {
         return { success: false, error: 'Goal has no tasks' };
       }
@@ -766,6 +785,8 @@ export class Chat extends Abject {
               description: task.description,
               data: task.data,
               dependsOn: depIds.length > 0 ? depIds : undefined,
+              produces: task.produces,
+              consumes: task.consumes,
             })
           );
           taskIds.push(taskId);
@@ -845,6 +866,44 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
   Use \`dependsOn: []\` ONLY when tasks truly have no dependencies and can safely run at the same time. When in doubt, leave dependsOn unspecified (sequential).
   Include the object name in the task description when relevant. Be specific about the desired outcome.
 
+  **Scratchpad contracts for data handoff (investigate-then-fix, fetch-then-summarize, and similar chains)**
+
+  When a downstream task needs structured data from an upstream task, declare the contract so the data flows reliably even when results are large. Add \`produces\` to the upstream task (each entry is \`{ key, description }\` describing the value shape) and \`consumes\` to the downstream task (the keys to read). The downstream agent sees the full values in its system prompt; the upstream agent is told to write them with \`writeGoalData\` before reporting done.
+
+  Investigate-then-fix:
+  \`{ "action": "goal", "title": "Diagnose and fix auth bug", "tasks": [
+    {
+      "description": "Investigate the auth failure. Find file, line, and root cause.",
+      "produces": [{
+        "key": "bug_analysis",
+        "description": "{ file: string, line: number, rootCause: string, suggestedFix: string }"
+      }]
+    },
+    {
+      "description": "Apply the fix documented at scratchpad key bug_analysis.",
+      "consumes": ["bug_analysis"],
+      "dependsOn": [0]
+    }
+  ] }\`
+
+  Fetch-then-summarize:
+  \`{ "action": "goal", "title": "Summarize today's headlines", "tasks": [
+    {
+      "description": "Fetch the current top 20 news headlines with URL, title, and source.",
+      "produces": [{
+        "key": "headlines",
+        "description": "Array of { title: string, url: string, source: string }"
+      }]
+    },
+    {
+      "description": "Write a one-paragraph summary of the day's top stories using the headlines at scratchpad key headlines.",
+      "consumes": ["headlines"],
+      "dependsOn": [0]
+    }
+  ] }\`
+
+  Use contracts when task 1 depends on structured output from task 0. For simple chains where a short string result is enough, omit \`produces\`/\`consumes\` and the existing Goal Progress block carries the result verbatim.
+
   Concrete user data (email, calendar, files, contacts, weather, web pages, finances, etc.):
   ALWAYS attempt via a goal — specialized agents and MCP-backed skills may be available that you don't know about.
   \`{ "action": "goal", "title": "Latest email", "tasks": [
@@ -873,14 +932,25 @@ The chat window renders markdown. Use **bold**, *italic*, \`inline code\`, headi
 
 ## Scheduled and recurring work
 
-Abjects has a dedicated primitive for "every N minutes do X", "at 6:30am daily do Y", and other time-driven automation. That primitive is a scheduled job — a piece of code that calls existing objects on an interval. It is the right shape when the user wants periodic execution of capabilities that already exist in the system.
+Abjects has a dedicated primitive for "every N minutes do X", "at 6:30am daily do Y", and other time-driven automation. That primitive is a scheduled job: a piece of code that calls existing objects on an interval. It is the right shape when the user wants periodic execution of capabilities that already exist in the system.
 
 Describe scheduled work as an outcome on a cadence and trust the dispatcher to route it to a handler that knows how to register the schedule. Examples:
 - *"Every minute, check the telegram skill for new messages and post any from @mempko into this chat."*
 - *"Every day at 6:30 AM Pacific, send a morning briefing to chat."*
 - *"Once an hour, pull the latest issues from the GitHub skill and remember any that match my saved keywords."*
 
-Reserve "create an agent" phrasing for requests that need a new LLM-driven decision loop — new judgement, new routing of future tasks, a new named entity visible to the user. Periodic execution of existing capabilities is lighter than that: a scheduled job suffices.
+Reserve "create an agent" phrasing for requests that need a new LLM-driven decision loop: new judgement, new routing of future tasks, a new named entity visible to the user. Periodic execution of existing capabilities is lighter than that: a scheduled job suffices.
+
+## Bridges, proxies, relays, adapters, integrations
+
+When the user asks for a bridge, proxy, relay, adapter, or integration between two endpoints (chat and a messaging service, a skill and another system, two APIs), that is a single forwarding object. Describe it with the user's word ("proxy", "bridge", "relay", "adapter", "integration") and keep the task wording as an OBJECT, not an agent. A forwarding object has no LLM decision loop of its own; it moves traffic between endpoints and wraps a service.
+
+Examples (preserve the user's terminology):
+- User says "create a telegram proxy" → *"Create a Telegram proxy object that forwards chat messages to Telegram and relays incoming Telegram messages back into the chat as user input."*
+- User says "build a calendar bridge" → *"Create a calendar bridge object that syncs events between Google Calendar and the local calendar object."*
+- User says "make a slack relay" → *"Create a Slack relay object that forwards notifications from the workspace to the configured Slack channel."*
+
+Use "Create a X proxy object" or "Create a X bridge object" in the task description so the dispatcher routes it to a creation agent that builds single forwarding objects. Keep the word the user chose rather than promoting it to "agent".
 
 ## Describe outcomes, let the system discover the path
 
@@ -902,7 +972,7 @@ Task descriptions are how agents decide whether they can handle a task. Describe
 - Describe the desired outcome, not just the problem (e.g., "Add a reset button to the Counter that sets the count back to zero")
 - For web tasks, mention that it involves a real website (e.g., "Browse https://example.com and extract the article text")
 - For new functionality, describe what it should do without dictating how (e.g., "Display a todo list with add, remove, and mark-complete functionality")
-- When the user explicitly asks for an agent — meaning a new autonomous entity that registers with the system and handles future tasks on its own — preserve the word in the task description. Prefer "Create an agent that..." over "Create an object that..." for that case. Match the word to the intent: "check X every minute" on its own is recurring execution (a scheduled job, see the Scheduled section above), not agent creation.
+- Match the word the user chose to the intent, and preserve it in the task description. "Create an agent that..." fits when the user asks for a new LLM-driven decision loop that registers with the system and handles future tasks on its own. "Check X every minute" on its own is recurring execution (a scheduled job, see the Scheduled section above). "Create a proxy / bridge / relay / adapter / integration" is a single forwarding object (see the Bridges section above). Preserve the user's word choice instead of promoting a proxy or scheduled job to "agent".
 - Describe the desired behavior and let the system decide the implementation. Prefer "Display a morning briefing in chat every day at 10am" over "Create an Abjects object called MorningBriefing that uses setInterval..."
 
 ## Assumption Checking
@@ -1440,6 +1510,20 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
   ): Promise<AbjectId> {
     if (!this.messageLogId || !this.windowId) return '' as AbjectId;
 
+    // Notify subscribers (bridges, proxies, relays, integrations) that a new
+    // durable message landed in the chat log. Skip the transient 'activity'
+    // role since those bubbles represent in-progress agent status that mutates
+    // continuously and is not part of the user-visible conversation record.
+    if (role !== 'activity') {
+      this.changed('messageAdded', {
+        role,
+        sender,
+        text,
+        markdown,
+        at: Date.now(),
+      });
+    }
+
     const { background, color, align, borderColor } = this.bubbleStyleForRole(role);
     const bubbleMaxWidth = this.computeBubbleMaxWidth();
     const innerWidth = bubbleMaxWidth - BUBBLE_TEXT_PADDING * 2;
@@ -1857,10 +1941,26 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## Chat Usage Guide
 
-### Send a message programmatically
+### Choosing between sendMessage and addNotification
+
+Two ways to place text into the chat, with very different behavior:
+
+- \`sendMessage\` behaves exactly as though the user typed the text in the input box and pressed Enter. Use it for any human-authored input, including messages bridged in from an external channel (bridges, proxies, relays, integrations). Pass the text through verbatim so the agent sees the user's exact words.
+- \`addNotification\` displays a labeled bubble and stops there: no agent loop runs. Use it for machine-authored status, alerts, briefings, scheduler output, or results from other objects.
+
+The fast rule: if the text is a person speaking to the chat, use \`sendMessage\`; if the text is an object reporting a result, use \`addNotification\`.
+
+### Send a message programmatically (equivalent to typing and pressing Enter)
 
   await call(await dep('Chat'), 'sendMessage', { message: 'Hello, what can you do?' });
-  // The Chat agent processes the message through its observe-think-act loop
+  // Chat treats the text as user input and runs the full observe-think-act loop.
+
+Relaying a user's message from another channel (bridge / proxy pattern):
+
+  // A user message arrived on another channel (SMS, email, another messaging service).
+  // Forward it verbatim so the agent reacts the same as if they had typed it locally.
+  await call(await dep('Chat'), 'sendMessage', { message: incomingText });
+  // The chat log renders this as user input; the agent processes the exact words received.
 
 ### Show / hide the Chat window
 
@@ -1872,18 +1972,44 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
   const state = await call(await dep('Chat'), 'getState', {});
   // state: { phase, messageCount, visible, currentGoalId }
 
-### Display a notification (no agent loop)
+### Display a notification (for machine-authored output; no agent loop runs)
 
   await call(await dep('Chat'), 'addNotification', {
     sender: 'WeatherScheduler',
     message: 'Daily briefing: 62F, partly cloudy in Silverdale WA.'
   });
-  // Displays the message in the chat window without triggering the agent loop.
-  // Supports markdown. Use this for status updates, results, or alerts from other objects.
+  // Renders a labeled bubble from the given sender. Supports markdown.
+  // Use this when an object, scheduler, watcher, or agent produces a result and you want
+  // to surface it in the chat log. For a user's message arriving from another channel,
+  // use sendMessage instead so the agent actually processes the input.
 
 ### Clear conversation history
 
   await call(await dep('Chat'), 'clearHistory', {});
+
+### Observe messages as they land (bridge / proxy / relay pattern)
+
+Chat emits a \`messageAdded\` event every time a durable bubble is appended to the log. This is the hook for forwarding Chat traffic to an external channel (Telegram, SMS, email, another messaging service). Subscribe via \`addDependent\` and you receive every user message, every assistant reply, every system notification, and every error.
+
+  // In your bridge / proxy / relay object's startup handler:
+  await call(await dep('Chat'), 'addDependent', {});
+
+  // Then implement the changed-event handler:
+  async messageAdded(msg) {
+    const { role, sender, text, markdown, at } = msg.payload;
+    // role is one of: 'user' | 'assistant' | 'system' | 'error'
+    // The transient 'activity' role (in-progress agent status) is already filtered out.
+    // Forward to your external channel here.
+    await this._sendToExternalChannel(text);
+  }
+
+Role meanings:
+- **user**: something the local user typed, or was injected via \`sendMessage\` from a bridge.
+- **assistant**: the agent's reply rendered via \`done\`.
+- **system**: a labeled notification added via \`addNotification\` (machine-authored output).
+- **error**: an error bubble surfaced in the log.
+
+A full bidirectional bridge combines two sides: subscribe to \`messageAdded\` for outbound forwarding, and call \`Chat.sendMessage\` to inject inbound messages as user input. Use the \`role\` field to avoid echo loops: when relaying an inbound external message via \`sendMessage\`, the resulting \`messageAdded\` event carries \`role: 'user'\` on the next turn; tag your own forwards (e.g. with a per-source Set of recent text hashes) to skip re-forwarding.
 
 ### Goal Tracking
 
@@ -1900,8 +2026,9 @@ Subscribe to GoalManager's changed events (goalUpdated, goalCompleted, goalFaile
 
 ### IMPORTANT
 - The interface ID is 'abjects:chat'.
-- Chat is an agent — it uses AgentAbject's observe-think-act loop to process messages.
-- sendMessage triggers the full agent cycle: the LLM decides what actions to take.
+- Chat is an agent: it uses AgentAbject's observe-think-act loop to process messages.
+- sendMessage is the programmatic equivalent of typing into the input box and pressing Enter. It triggers the full agent cycle: the LLM decides what actions to take. Pass user text through verbatim.
+- addNotification places a bubble in the chat log and stops; it is for machine-authored output, and the agent does not react to it.
 - Actions can include creating objects, calling other services, or replying with text.
 - getState returns currentGoalId when Chat is actively processing a message (null otherwise).
 - Chat can receive tasks via LLM semantic fallback even for task types it doesn't explicitly declare.`;

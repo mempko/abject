@@ -500,7 +500,7 @@ export class ObjectCreator extends Abject {
       try {
         await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
           name: 'ObjectCreator',
-          description: 'Creates new objects and modifies existing objects from natural language. Users may refer to objects as "apps". Handles object creation, fixing object UIs, changing object behavior, adding features to objects, and redesigning objects. Any task about fixing, changing, updating, modifying, redesigning, or improving an existing object belongs to this agent.',
+          description: 'Creates new objects and modifies existing objects from natural language. Users may refer to objects as "apps". Handles object creation, fixing object UIs, changing object behavior, adding features to objects, and redesigning objects. Also creates bridges, proxies, relays, wrappers, adapters, and integrations (including objects that wrap an installed skill or MCP server into a reusable Abject). Any task about building, authoring, creating, fixing, changing, updating, modifying, redesigning, or improving an object belongs to this agent, even when that object talks to a skill or external service.',
           config: {
             maxSteps: 10,
             skipFirstObservation: true,
@@ -577,22 +577,24 @@ Always begin by executing create_object. After it completes, report done or fail
   }
 
   protected override askPrompt(_question: string): string {
-    return super.askPrompt(_question) + `\n\n## ObjectCreator — Object Creation and Modification Agent
+    return super.askPrompt(_question) + `\n\n## ObjectCreator: Object Creation and Modification Agent
 
 ### What I Handle
 I create brand-new objects and modify existing ones from natural language descriptions.
 I generate the code, manifest, and handlers for new Abjects.
 
 Examples of tasks I handle well:
-- "Create a todo list app" — I build a new widget from scratch
-- "Make a countdown timer" — I create a new object with UI
-- "Add a reset button to the Counter" — I modify existing object code
-- Any task that requires building or changing an object's implementation
+- "Create a todo list app". I build a new widget from scratch.
+- "Make a countdown timer". I create a new object with UI.
+- "Add a reset button to the Counter". I modify existing object code.
+- "Create a messaging bridge", "build a service proxy", "wrap this MCP server in an object", "make a relay between X and Y". I generate bridge, proxy, relay, wrapper, adapter, and integration objects, including ones that poll or forward between an installed skill/MCP server and another Abject.
+- Any task that requires building or changing an object's implementation.
 
-### What I Do NOT Handle
-- Interacting with existing objects (calling methods, fetching data)
-- Browsing websites or navigating web pages
-- Drawing on canvases or controlling existing apps at runtime — I create/modify their source code
+### Stays with Other Agents
+- Pure runtime interaction with existing objects (calling their methods, fetching data from them) when the source stays as-is.
+- Browsing websites or navigating web pages.
+- Driving a running app (drawing on its canvas, clicking its buttons) while the source stays as-is.
+- Installing, enabling, or configuring skills and MCP servers. Wrapping one in a new object belongs here; the install and credential setup stay with skill management.
 
 ### Create a New Object
 
@@ -602,14 +604,13 @@ Examples of tasks I handle well:
   // result: { success: boolean, objectId?: string, manifest?: AbjectManifest,
   //           code?: string, error?: string, usedObjects?: string[] }
 
-The created object is ALREADY initialized and registered in the system — do NOT call init() on it.
-To display it, call show() on the returned objectId:
+The created object is ALREADY initialized and registered in the system. Call show() directly on the returned objectId to display it; skip init():
 
   if (result.success && result.objectId) {
     await call(result.objectId, 'show', {});
   }
 
-Always create and show in ONE step. Do NOT generate extra steps to "find", "init", or "discover" the created object — the returned objectId and manifest have everything needed.
+Always create and show in ONE step. The returned objectId and manifest already carry everything needed, so skip any extra lookup, init, or discovery steps.
 
 ### Modify an Existing Object
 
@@ -626,10 +627,10 @@ Always create and show in ONE step. Do NOT generate extra steps to "find", "init
   // Returns string[] of suggested object ideas
 
 ### IMPORTANT
-- The interface ID is 'abjects:object-creator' (NOT 'abjects:objectcreator').
+- The interface ID is 'abjects:object-creator' (with the hyphen).
 - create is a long-running operation (may take 30-60 seconds). ObjectCreator emits 'progress' events during creation.
-- The returned objectId is ready to use immediately. Do NOT look it up in the registry or call init().
-- The returned objectId can be called directly — interface IDs are resolved automatically.
+- The returned objectId is ready to use immediately. Call it directly; registry lookup and init() are already handled.
+- The returned objectId can be called directly. Interface IDs are resolved automatically.
 - Pass goalId to link creation progress to an existing Goal (from GoalManager). If omitted, a goal is auto-created by AgentAbject.`;
   }
 
@@ -2450,7 +2451,7 @@ Manifest MUST include these methods:
 Optional: show/hide for a watch management UI window
 
 ### Non-UI Objects
-Objects that only perform background work do NOT need show/hide.
+Background-only objects omit show/hide; only objects with a window or widget surface declare them.
 
 ### Using Dependency Information
 Study the dependency descriptions and their "Usage Guide" sections carefully. They contain working examples of how to call each dependency's methods and handle its events.
@@ -3193,7 +3194,7 @@ You are modifying an EXISTING object. You will receive:
 Output ONLY the updated manifest JSON in a \`\`\`json code block, followed by a "Used objects:" line listing which available objects the modified implementation will need.
 
 CRITICAL RULES:
-- PRESERVE the existing object name and interface IDs — do NOT rename the object.
+- PRESERVE the existing object name and interface IDs (keep the original identity intact).
 - PRESERVE all existing methods unless the modification explicitly removes them.
 - ADD new methods for new functionality requested by the modification.
 - Update method descriptions if behavior changes.

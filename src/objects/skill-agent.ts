@@ -110,7 +110,7 @@ export class SkillAgent extends Abject {
   }
 
   protected override askPrompt(_question: string): string {
-    return super.askPrompt(_question) + `\n\n## SkillAgent — Installed Skill Execution Agent
+    return super.askPrompt(_question) + `\n\n## SkillAgent: Installed Skill Execution Agent
 
 ### What I Handle
 I manage and execute skills. I handle:
@@ -122,9 +122,12 @@ Currently installed skills and their domains:
 ${this.getInstalledSkillsSummary()}
 
 ### My Scope
-I handle skill installation, management, and tasks that match an installed skill's domain. General object interaction, web browsing, and object creation belong to other agents.
+I handle skill installation, management, and tasks that match an installed skill's domain. Runtime interaction with existing objects, web browsing, and authoring new object source code are each handled by a dedicated agent.
 
-When asked about a task, describe which skill you would use and how. Say PASS if no installed skill matches the task and the task is not about installing or managing skills.`;
+### Where Creation Tasks Go
+When a task asks to create, build, design, or wrap services as a new object (widget, app, agent, bridge, proxy, relay, integration), say PASS so routing reaches a creation agent. Wrapping a skill in a proxy object is object authoring, so PASS fits there too, even when the new object would use a skill or MCP server I manage.
+
+When asked about a task, describe which skill you would use and how. Say PASS when no installed skill matches the task and the task is outside skill installation or management. Say PASS for any task whose goal is to create or modify an object's implementation.`;
   }
 
   protected override async handleAsk(question: string): Promise<string> {
@@ -169,7 +172,7 @@ When asked about a task, describe which skill you would use and how. Say PASS if
   private setupHandlers(): void {
     // ── TupleSpace dispatch handler ──
     this.on('executeTask', async (msg: AbjectMessage) => {
-      const { goalId, description, approach, failureHistory } = msg.payload as {
+      const { tupleId, goalId, description, approach, failureHistory } = msg.payload as {
         tupleId: string; goalId?: string; description: string;
         data?: Record<string, unknown>; type: string; approach?: string;
         failureHistory?: Array<{ agent: string; error: string }>;
@@ -201,6 +204,7 @@ When asked about a task, describe which skill you would use and how. Say PASS if
             task: description,
             systemPrompt,
             goalId,
+            dispatchTupleId: tupleId,
             initialMessages: initialMessages.length > 0 ? initialMessages : undefined,
             config: {
               maxSteps: 15,
@@ -311,7 +315,10 @@ When asked about a task, describe which skill you would use and how. Say PASS if
 
     // Build description from enabled skills only -- no generic capability language
     // so semantic matching only routes skill-specific tasks here.
-    let description = 'Executes tasks only when they match an installed skill.';
+    // Always append the authoring-exclusion so dispatch never mistakes "wrap
+    // a skill in a new object" for a skill-execution task.
+    const AUTHORING_EXCLUSION = 'Best for exercising an installed skill or MCP tool to complete the task. Object authoring (widgets, apps, agents, bridges, proxies, relays, skill wrappers) belongs with a creation agent, including when the new object would wrap a skill or MCP server handled here.';
+    let description = `Executes tasks only when they match an installed skill. ${AUTHORING_EXCLUSION}`;
     const skillNames: string[] = [];
 
     if (this.skillRegistryId) {
@@ -321,10 +328,10 @@ When asked about a task, describe which skill you would use and how. Say PASS if
         );
         if (skills.length > 0) {
           skillNames.push(...skills.map(s => s.name));
-          description = `Executes tasks for these installed skills only: ${skills.map(s => `${s.name} (${s.description.slice(0, 80)})`).join('; ')}.`;
+          description = `Executes tasks for these installed skills only: ${skills.map(s => `${s.name} (${s.description.slice(0, 80)})`).join('; ')}. ${AUTHORING_EXCLUSION}`;
           this.installedSkillDescriptions = skills.map(s => `- ${s.name}: ${s.description}`).join('\n');
         } else {
-          description = 'Skill execution agent (no skills currently enabled).';
+          description = `Skill execution agent (no skills currently enabled). ${AUTHORING_EXCLUSION}`;
           this.installedSkillDescriptions = '(none currently enabled)';
         }
       } catch { /* use default */ }
@@ -586,6 +593,33 @@ When asked about a task, describe which skill you would use and how. Say PASS if
           break;
         }
 
+        case 'write_scratchpad': {
+          if (!this._currentGoalId) return { success: false, error: 'write_scratchpad requires an active goal context' };
+          if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
+          const key = action.key as string;
+          if (!key) return { success: false, error: 'write_scratchpad requires "key"' };
+          await this.request(
+            request(this.id, this.goalManagerId, 'writeGoalData', {
+              goalId: this._currentGoalId, key, value: action.value,
+            }),
+          );
+          result = `Wrote scratchpad key "${key}"`;
+          break;
+        }
+
+        case 'read_scratchpad': {
+          if (!this._currentGoalId) return { success: false, error: 'read_scratchpad requires an active goal context' };
+          if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
+          const key = action.key as string | undefined;
+          const value = await this.request(
+            request(this.id, this.goalManagerId, 'readGoalData', {
+              goalId: this._currentGoalId, ...(key ? { key } : {}),
+            }),
+          );
+          result = typeof value === 'string' ? value : JSON.stringify(value);
+          break;
+        }
+
         default:
           return { success: false, error: `Unknown action: ${action.action}` };
       }
@@ -606,7 +640,11 @@ When asked about a task, describe which skill you would use and how. Say PASS if
   private async buildSystemPrompt(): Promise<string> {
     if (this.cachedSystemPrompt) return this.cachedSystemPrompt;
 
-    let prompt = `You are a skill execution agent. You complete tasks by running shell commands, making HTTP requests, reading/writing files, and searching the web.
+    let prompt = `You are a skill execution agent. You complete tasks by exercising installed skills: running shell commands, making HTTP requests, reading/writing configuration and data files, calling MCP server tools, and searching the web.
+
+## Task Scope
+
+Stay within skill execution: run shell commands, call MCP tools, make HTTP requests, edit skill configuration, and search the web so an enabled skill gets the task done. When a task asks you to create, build, design, wrap, or modify an object, widget, app, agent, bridge, proxy, relay, or integration, respond right away with the \`fail\` action and a short reason so routing reaches a creation agent. Use \`write_file\` for skill configuration (SKILL.md frontmatter, TOML/JSON/YAML bridge configs). For Abject source code authoring, fail the task so a creation agent picks it up.
 
 ## Output Format
 
@@ -640,6 +678,8 @@ I'll fetch the accounts list first.
 | install_clawhub_skill | slug | Install a skill from ClawHub by slug (result of search_catalog). Downloads the ZIP bundle and writes it under the local skills directory. Does NOT auto-enable — the user reviews first. |
 | disable_skill | name | Disable a skill |
 | list_skills | | List all installed skills and their status |
+| write_scratchpad | key, value | Write a value to the goal's shared scratchpad under the given key. Use this to fulfil a contract's produces keys (see "Your Task's Contract" in the injected context) so downstream tasks can read structured findings. |
+| read_scratchpad | key? | Read a value from the goal's scratchpad. Omit key to read the full scratchpad. Consumed keys are already shown in the injected context; use this action only when you need to fetch something extra. |
 | decompose | subtasks | Break a complex task into parallel sub-tasks dispatched to other agents. Each subtask has type (call, browse, create, modify, skill), description, and optional data. |
 | done | result | Task complete. Include the answer in result. |
 | fail | reason | Task cannot be completed |

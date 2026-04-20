@@ -323,7 +323,7 @@ Set keepPageOpen: false to explicitly close the page when done.
 - The method is **runTask** (not "run" or "navigate").
 - Options: startUrl, maxSteps, timeout, pageOptions, responseSchema, pageId, keepPageOpen.
 - Pages stay open by default after task completion (5-minute idle timeout). Pass keepPageOpen: false to close immediately.
-- WebAgent manages browser pages — do NOT call WebBrowser directly.
+- WebAgent manages browser pages; route all page operations through WebAgent.
 - **runTask is long-running** — always pass \`{ timeout: 300000 }\` as the 4th argument to \`call()\` (the default 30s timeout is too short).
 - Kept-open pages auto-close after 5 minutes of inactivity.
 - Internally, WebAgent uses a ticket pattern with AgentAbject — startTask returns a ticketId and results arrive via taskResult events.
@@ -344,7 +344,7 @@ Set keepPageOpen: false to explicitly close the page when done.
     // Register with AgentAbject
     await this.request(request(this.id, this.agentAbjectId, 'registerAgent', {
       name: 'WebAgent',
-      description: 'Browses real websites using a headless browser. Handles web scraping, visiting URLs, navigating websites, reading page content, filling forms, taking screenshots, extracting data, and researching topics on the web. Only use for tasks involving real external websites.',
+      description: 'Browses real websites using a headless browser. Handles web scraping, visiting URLs, navigating websites, reading page content, filling forms, taking screenshots, extracting data, and researching topics on the web. Best for interactive browser navigation on real external sites. Object source authoring goes to a creation agent; plain HTTP data fetches (JSON APIs, RSS feeds) run faster via HttpClient directly; installed skill flows go to a skill-execution agent.',
       config: {
         terminalActions: {
           done: { type: 'success', resultFields: ['result'] },
@@ -450,7 +450,7 @@ Set keepPageOpen: false to explicitly close the page when done.
     });
 
     this.on('executeTask', async (msg: AbjectMessage) => {
-      const { goalId, description, data, approach, failureHistory } = msg.payload as {
+      const { tupleId, goalId, description, data, approach, failureHistory } = msg.payload as {
         tupleId: string; goalId?: string; description: string;
         data?: Record<string, unknown>; type: string; approach?: string;
         failureHistory?: Array<{ agent: string; error: string }>;
@@ -498,6 +498,7 @@ Set keepPageOpen: false to explicitly close the page when done.
             task: description,
             systemPrompt: this.buildSystemPrompt(description),
             goalId,
+            dispatchTupleId: tupleId,
             initialMessages: initialMessages.length > 0 ? initialMessages : undefined,
             config: {
               maxSteps: 15,
@@ -939,6 +940,31 @@ Set keepPageOpen: false to explicitly close the page when done.
           return { success: true, data: result.result };
         }
 
+        case 'write_scratchpad': {
+          if (!this._currentGoalId) return { success: false, error: 'write_scratchpad requires an active goal context' };
+          if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
+          const key = action.key as string;
+          if (!key) return { success: false, error: 'write_scratchpad requires "key"' };
+          await this.request(
+            request(this.id, this.goalManagerId, 'writeGoalData', {
+              goalId: this._currentGoalId, key, value: action.value,
+            }),
+          );
+          return { success: true, data: `Wrote scratchpad key "${key}"` };
+        }
+
+        case 'read_scratchpad': {
+          if (!this._currentGoalId) return { success: false, error: 'read_scratchpad requires an active goal context' };
+          if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
+          const key = action.key as string | undefined;
+          const value = await this.request(
+            request(this.id, this.goalManagerId, 'readGoalData', {
+              goalId: this._currentGoalId, ...(key ? { key } : {}),
+            }),
+          );
+          return { success: true, data: value };
+        }
+
         default:
           return { success: false, error: `Unknown action: ${action.action}` };
       }
@@ -1018,6 +1044,12 @@ Respond with ONE action as a JSON object in a \`\`\`json code block:
     { "type": "call", "description": "Fetch API endpoint Y" }
   ] }
   Use when the task requires multiple independent steps that could run in parallel.
+
+### Scratchpad (data handoff to downstream tasks)
+- write_scratchpad: Write a value to the goal's shared scratchpad under a named key. Use this to fulfil a contract's produces keys (see "Your Task's Contract" in the injected context) so downstream tasks can read structured findings.
+  { "action": "write_scratchpad", "key": "headlines", "value": [ ... ] }
+- read_scratchpad: Read a value from the goal's scratchpad. Omit key to read the full scratchpad. Consumed keys are already shown in the injected context; use this action only when you need to fetch something extra.
+  { "action": "read_scratchpad", "key": "bug_analysis" }
 
 ### Terminal
 - done: Task complete. { "action": "done", "result": "extracted data or summary" }

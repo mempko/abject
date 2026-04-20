@@ -128,6 +128,8 @@ interface TaskEntry {
   childGoalIds?: string[];
   /** Cached skill instructions appended to system prompt. */
   skillPromptSuffix?: string;
+  /** TupleSpace tuple id of the goal task this entry is executing (when dispatched). Enables scratchpad contract injection for the current task. */
+  dispatchTupleId?: string;
 }
 
 // ─── AgentAbject ─────────────────────────────────────────────────────
@@ -193,6 +195,10 @@ export class AgentAbject extends Abject {
   private registeredAgents = new Map<AbjectId, RegisteredAgent>();
   private taskEntries = new Map<string, TaskEntry>();
   private taskOrder: string[] = [];
+
+  /** Last time we forwarded a low-level progress signal as GoalManager.updateProgress per goal. */
+  private lastGoalProgressTs = new Map<string, number>();
+  private static readonly GOAL_PROGRESS_THROTTLE_MS = 1000;
 
   /** Guard: tuple IDs currently being dispatched — prevents concurrent dispatch loops. */
   private dispatchingTuples = new Set<string>();
@@ -700,6 +706,7 @@ The registered object must implement these handlers to participate in the agent 
         config: taskConfig,
         responseSchema,
         goalId: incomingGoalId,
+        dispatchTupleId,
       } = msg.payload as {
         agentId?: AbjectId;
         taskId?: string;
@@ -709,6 +716,7 @@ The registered object must implement these handlers to participate in the agent 
         config?: Partial<AgentConfig>;
         responseSchema?: Record<string, unknown>;
         goalId?: string;
+        dispatchTupleId?: string;
       };
 
       const callerId = msg.routing.from;
@@ -739,6 +747,7 @@ The registered object must implement these handlers to participate in the agent 
         initialMessages,
         responseSchema,
         goalId,
+        dispatchTupleId,
       };
 
       // Pre-fetch enabled skill instructions for prompt injection
@@ -1096,12 +1105,14 @@ The registered object must implement these handlers to participate in the agent 
     //    out agents that pass or are only partially capable.
     let askQuestion = `Here is the goal I'm trying to accomplish and the task I want you to do.
 
-**Your response MUST start with one of these verdicts on the first line, followed by a colon:**
-- \`YES:\` — I can fully accomplish this task with my current capabilities.
-- \`PARTIAL:\` — I can do part of this task but not all of it.
-- \`NO:\` — This task is outside my capabilities.
+**Your response MUST start with one of these verdicts on the first line, followed by a colon.** Use the plain word, no backticks, no quotes, no markdown:
+- YES: I can fully accomplish this task with my current capabilities.
+- PARTIAL: I can do part of this task but not all of it.
+- NO: This task is outside my capabilities.
 
-Be honest. Do not claim YES if your plan depends on things you don't actually have (credentials, tools not configured, objects that don't exist, data you don't have access to). If your plan requires the user to log in, grant permissions, or install something first, that is a PARTIAL at best, not YES.
+Be honest. Answer YES when your plan uses only what you already have: configured credentials, installed tools, existing objects, and data you can actually access. Answer PARTIAL when the plan requires the user to log in first, grant permissions, or install something before it can run.
+
+Creation-task rule: when the task is to CREATE, BUILD, AUTHOR, or WRAP a new object (including bridges, proxies, relays, adapters, and integrations that talk to external services), answer YES whenever you can write the code and manifest yourself. The new object's runtime dependencies (credentials, live services it will contact) are wired up after creation and stay outside this verdict. A creator's YES is about authoring, not about every downstream service the object will eventually use.
 
 After the verdict, in 2-4 sentences: name the SPECIFIC tool, skill, MCP server, or capability you would use (by name if you have it configured), and outline the concrete steps. Direct/configured tools are preferred over general-purpose automation. If you must use a general-purpose tool (like a web browser) for something a specialized tool could do, say so honestly.`;
     if (goalTitle) askQuestion += `\n\nGoal: "${goalTitle}"`;
@@ -1113,13 +1124,18 @@ After the verdict, in 2-4 sentences: name the SPECIFIC tool, skill, MCP server, 
 
     type AgentApproach = { agent: RegisteredAgent; approach: string; verdict: 'YES' | 'PARTIAL' | 'NO' };
     const parseVerdict = (text: string): 'YES' | 'PARTIAL' | 'NO' => {
-      const firstLine = text.trim().split('\n')[0].toUpperCase();
+      // Strip common wrappers (backticks, quotes, asterisks, underscores, whitespace)
+      // so verdicts rendered as `YES:`, **NO:**, "PARTIAL:" etc. still parse correctly.
+      const firstLineRaw = text.trim().split('\n')[0];
+      const firstLine = firstLineRaw.replace(/^[`"'*_~\s>]+/, '').toUpperCase();
       if (/^YES\b/.test(firstLine)) return 'YES';
       if (/^PARTIAL\b/.test(firstLine)) return 'PARTIAL';
       if (/^NO\b/.test(firstLine)) return 'NO';
-      // Fallback: look for PASS keyword or "cannot" in first 200 chars
+      // Fallback: look for refusal phrases in first 200 chars. Avoid matching bare
+      // "cannot" since PARTIAL responses often include it as a qualifier
+      // (e.g. "I can create X, but I cannot handle Y" is legitimately PARTIAL).
       const head = text.slice(0, 200).toUpperCase();
-      if (/\bPASS\b|\bCANNOT\b|\bOUT OF SCOPE\b/.test(head)) return 'NO';
+      if (/\bPASS\b|\bOUT OF SCOPE\b|\bOUTSIDE (MY|THE AGENT'?S?) CAPABILITIES\b|\bCANNOT HELP\b|\bI DECLINE\b/.test(head)) return 'NO';
       return 'PARTIAL';
     };
 
@@ -1884,7 +1900,11 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
             // ── Decompose: create child goal + tasks, return to observing ──
             if (task.action.action === 'decompose') {
               const subtasks = task.action.subtasks as Array<{
-                description: string; data?: unknown;
+                description: string;
+                data?: unknown;
+                dependsOn?: number[];
+                produces?: Array<{ key: string; description: string }>;
+                consumes?: string[];
               }>;
               if (!subtasks?.length) {
                 task.llmMessages.push({
@@ -2367,7 +2387,13 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
    */
   private async createChildGoalWithTasks(
     entry: TaskEntry,
-    subtasks: Array<{ description: string; data?: unknown; dependsOn?: number[] }>,
+    subtasks: Array<{
+      description: string;
+      data?: unknown;
+      dependsOn?: number[];
+      produces?: Array<{ key: string; description: string }>;
+      consumes?: string[];
+    }>,
     agentName: string,
   ): Promise<string> {
     const goalMgrId = this.goalManagerId!;
@@ -2402,6 +2428,8 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
           description: sub.description,
           data: sub.data,
           dependsOn: depIds.length > 0 ? depIds : undefined,
+          produces: sub.produces,
+          consumes: sub.consumes,
         }),
       );
       taskIds.push(taskId);
@@ -2418,7 +2446,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
    * Build a text summary of goal + task progress for injection into the LLM context.
    * Returns empty string if no goal or no tasks.
    */
-  private async buildGoalProgressContext(goalId: string): Promise<string> {
+  private async buildGoalProgressContext(goalId: string, dispatchTupleId?: string): Promise<string> {
     if (!this.goalManagerId) return '';
     try {
       const goal = await this.request<{
@@ -2435,14 +2463,28 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       );
       if (!tasks || tasks.length === 0) return '';
 
+      // Identify the current task (the one this agent is working on) and its contract,
+      // if the caller passed a dispatchTupleId. The contract lets us focus the rendered
+      // scratchpad on just the keys this task will consume, and tells the agent which
+      // keys it is expected to produce.
+      const currentTask = dispatchTupleId ? tasks.find(t => t.id === dispatchTupleId) : undefined;
+      const currentProduces = (currentTask?.fields.produces as Array<{ key: string; description: string }> | undefined) ?? [];
+      const currentConsumes = (currentTask?.fields.consumes as string[] | undefined) ?? [];
+
       const lines: string[] = [];
       for (const t of tasks) {
         const status = t.fields.status as string ?? 'unknown';
         const desc = (t.fields.description as string ?? '').slice(0, 200);
         const icon = status === 'done' ? '\u2713' : status === 'permanently_failed' ? '\u2717' : '\u25CB';
         let line = `  ${icon} [${status}] ${desc}`;
-        if (status === 'done' && t.fields.result) {
+        // Skip the inline result dump for prior tasks that declared produces: those
+        // findings live in the scratchpad and are surfaced there (either via the
+        // consumed-keys block or via the auto-mirror path tasks/<id>/result).
+        const taskProduces = (t.fields.produces as Array<{ key: string; description: string }> | undefined) ?? [];
+        if (status === 'done' && t.fields.result && taskProduces.length === 0) {
           line += ` -- Result: ${JSON.stringify(t.fields.result).slice(0, 20000)}`;
+        } else if (status === 'done' && taskProduces.length > 0) {
+          line += ` -- Wrote scratchpad keys: ${taskProduces.map(p => p.key).join(', ')}`;
         }
         if (status === 'permanently_failed' && t.fields.error) {
           line += ` -- Error: ${String(t.fields.error).slice(0, 2000)}`;
@@ -2453,8 +2495,43 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       let ctx = `\n\n## Goal Progress\nGoal: "${goal?.title ?? goalId}"\nTasks:\n${lines.join('\n')}`;
       ctx += `\n\nUse this progress to guide your actions. If tasks have failed, consider whether to retry with a different approach (replan) or work with partial results.`;
 
-      if (goal?.scratchpad && Object.keys(goal.scratchpad).length > 0) {
-        ctx += `\n\n## Shared Goal Data (scratchpad)\nOther agents working on this goal have shared the following data. Use writeGoalData(key, value) to add your own findings.\n\`\`\`json\n${JSON.stringify(goal.scratchpad, null, 2)}\n\`\`\``;
+      // Current task's contract: what it must write, what it will read.
+      if (currentProduces.length > 0 || currentConsumes.length > 0) {
+        ctx += `\n\n## Your Task's Contract`;
+        if (currentProduces.length > 0) {
+          ctx += `\n\nThis task is expected to write the following scratchpad keys before reporting done. Use writeGoalData(goalId, key, value) for each one. Keep the \`done\` result as a short human-readable summary; downstream tasks will read the structured data from the scratchpad.`;
+          for (const p of currentProduces) {
+            ctx += `\n- **${p.key}**: ${p.description}`;
+          }
+        }
+        if (currentConsumes.length > 0) {
+          ctx += `\n\nThis task consumes the following scratchpad keys written by earlier tasks. Their current values are shown in the Shared Goal Data block below.`;
+          for (const k of currentConsumes) {
+            ctx += `\n- **${k}**`;
+          }
+        }
+      }
+
+      // Scratchpad rendering: when the current task declared consumes, show only
+      // those keys (full values). Otherwise fall back to the full scratchpad dump
+      // for backward compatibility with tasks that have no contract.
+      const scratchpad = goal?.scratchpad;
+      if (scratchpad && Object.keys(scratchpad).length > 0) {
+        if (currentConsumes.length > 0) {
+          const consumed: Record<string, unknown> = {};
+          for (const k of currentConsumes) {
+            if (k in scratchpad) consumed[k] = scratchpad[k];
+          }
+          const missing = currentConsumes.filter(k => !(k in scratchpad));
+          if (Object.keys(consumed).length > 0) {
+            ctx += `\n\n## Shared Goal Data (consumed keys)\nValues at the scratchpad keys this task consumes.\n\`\`\`json\n${JSON.stringify(consumed, null, 2)}\n\`\`\``;
+          }
+          if (missing.length > 0) {
+            ctx += `\n\nConsumed keys not yet written: ${missing.join(', ')}. Earlier tasks should have produced these; if they are missing, the auto-mirror at tasks/<taskId>/result may hold the raw completion output as a fallback.`;
+          }
+        } else {
+          ctx += `\n\n## Shared Goal Data (scratchpad)\nOther agents working on this goal have shared the following data. Use writeGoalData(key, value) to add your own findings.\n\`\`\`json\n${JSON.stringify(scratchpad, null, 2)}\n\`\`\``;
+        }
       }
 
       return ctx;
@@ -2480,7 +2557,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
 
     // Inject goal + task progress and scratchpad into context
     if (entry.goalId && this.goalManagerId) {
-      prompt += await this.buildGoalProgressContext(entry.goalId);
+      prompt += await this.buildGoalProgressContext(entry.goalId, entry.dispatchTupleId);
     }
 
     // Inject relevant knowledge from KnowledgeBase
@@ -2668,5 +2745,32 @@ After remembering, you will be prompted to continue with the task.`;
       }
     }
     return null;
+  }
+
+  /**
+   * Propagate low-level PROGRESS bubbles up to GoalManager as
+   * `updateProgress` events so higher layers that watch `goalUpdated`
+   * (notably Chat's `waitForTaskCompletion`) stay alive during long
+   * downstream calls. Throttled per-goal so streaming LLM chunks don't
+   * flood the bus.
+   */
+  protected override onProgressBubble(_msg: AbjectMessage): void {
+    if (!this.goalManagerId) return;
+    const now = Date.now();
+    for (const entry of this.taskEntries.values()) {
+      const goalId = entry.goalId ?? entry.incomingGoalId;
+      if (!goalId) continue;
+      const last = this.lastGoalProgressTs.get(goalId) ?? 0;
+      if (now - last < AgentAbject.GOAL_PROGRESS_THROTTLE_MS) continue;
+      this.lastGoalProgressTs.set(goalId, now);
+      try {
+        this.send(event(this.id, this.goalManagerId, 'updateProgress', {
+          goalId,
+          message: 'working',
+          phase: entry.state.phase ?? 'acting',
+          agentName: this.registeredAgents.get(entry.agentId)?.name ?? 'agent',
+        }));
+      } catch { /* bus may be gone */ }
+    }
   }
 }

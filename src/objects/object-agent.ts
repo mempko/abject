@@ -138,7 +138,7 @@ Say PASS if the task involves creating, building, or making something new (apps,
   private setupHandlers(): void {
     // ── TupleSpace dispatch handler ──
     this.on('executeTask', async (msg: AbjectMessage) => {
-      const { goalId, description, data, approach, failureHistory } = msg.payload as {
+      const { tupleId, goalId, description, data, approach, failureHistory } = msg.payload as {
         tupleId: string; goalId?: string; description: string;
         data?: Record<string, unknown>; type: string; approach?: string;
         failureHistory?: Array<{ agent: string; error: string }>;
@@ -177,6 +177,7 @@ Say PASS if the task involves creating, building, or making something new (apps,
             task: description,
             systemPrompt,
             goalId,
+            dispatchTupleId: tupleId,
             initialMessages: initialMessages.length > 0 ? initialMessages : undefined,
             config: {
               maxSteps: 15,
@@ -284,7 +285,8 @@ Say PASS if the task involves creating, building, or making something new (apps,
       description:
         'Interacts with existing objects by discovering them and sending messages. ' +
         'Discovers objects via Registry, learns their capabilities via ask messages, then sends messages to accomplish tasks. ' +
-        'Handles data fetching, object queries, and orchestrating existing objects.',
+        'Handles data fetching, object queries, and orchestrating existing objects at runtime. ' +
+        'Best for runtime message passing over the bus. Object source authoring goes to a creation agent; interactive web browsing goes to a web-browsing agent; installed skill flows go to a skill-execution agent.',
       config: {
         terminalActions: {
           done: { type: 'success' as const, resultFields: ['result'] },
@@ -407,6 +409,33 @@ Say PASS if the task involves creating, building, or making something new (apps,
           break;
         }
 
+        case 'write_scratchpad': {
+          if (!this._currentGoalId) return { success: false, error: 'write_scratchpad requires an active goal context' };
+          if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
+          const key = action.key as string;
+          if (!key) return { success: false, error: 'write_scratchpad requires "key"' };
+          await this.request(
+            request(this.id, this.goalManagerId, 'writeGoalData', {
+              goalId: this._currentGoalId, key, value: action.value,
+            }),
+          );
+          result = `Wrote scratchpad key "${key}"`;
+          break;
+        }
+
+        case 'read_scratchpad': {
+          if (!this._currentGoalId) return { success: false, error: 'read_scratchpad requires an active goal context' };
+          if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
+          const key = action.key as string | undefined;
+          const value = await this.request(
+            request(this.id, this.goalManagerId, 'readGoalData', {
+              goalId: this._currentGoalId, ...(key ? { key } : {}),
+            }),
+          );
+          result = typeof value === 'string' ? value : JSON.stringify(value);
+          break;
+        }
+
         default:
           return { success: false, error: `Unknown action: ${action.action}` };
       }
@@ -507,6 +536,8 @@ Respond with ONE JSON object inside \`\`\`json fenced code markers. Include brie
 | ask | object, question | Ask an object a question via the ask protocol. |
 | introspect | object | Get an object's manifest and method descriptions. |
 | call | object, method, payload?, timeout? | Call a method on an object. |
+| write_scratchpad | key, value | Write a value to the goal's shared scratchpad under the given key. Use this to fulfil a contract's produces keys (see "Your Task's Contract" in the injected context) so downstream tasks can read structured findings. |
+| read_scratchpad | key? | Read a value from the goal's scratchpad. Omit key to read the full scratchpad. Values for keys in your task's consumes list are already shown in the injected context; use this action only when you need to fetch something extra. |
 | decompose | subtasks | Break the task into sub-tasks for other agents. Each subtask has a description and optional data. |
 | done | result | Task complete. Include the full answer. |
 | fail | reason | Task cannot be completed. |
