@@ -99,6 +99,45 @@ export function startAbyssBg(canvas: HTMLCanvasElement): AbyssBgControl {
   let frame = 0;
   let descending = true;
   let descentSpeed = 1.0;  // 1.0 = full descent, 0.0 = ambient
+  let paused = false;
+  let lastRenderTs = 0;
+
+  // Cache of pre-rendered particle-glow sprites keyed by color+radius bucket.
+  // Creating a radialGradient every frame for 40 particles lights Firefox on
+  // fire; blitting a pre-rendered sprite is ~40× cheaper.
+  const glowCache = new Map<string, HTMLCanvasElement>();
+
+  function getGlowSprite(color: typeof ELDRITCH, radius: number): HTMLCanvasElement {
+    // Bucket radius to 0.5px steps so we reuse ~5 sprites across all particles.
+    const rBucket = Math.round(radius * 2) / 2;
+    const key = `${color.r},${color.g},${color.b}:${rBucket}`;
+    const cached = glowCache.get(key);
+    if (cached) return cached;
+
+    const spriteR = rBucket * 6;
+    const size = Math.ceil(spriteR * 2) + 2;
+    const off = document.createElement('canvas');
+    off.width = size;
+    off.height = size;
+    const octx = off.getContext('2d')!;
+    const cx = size / 2;
+    const cy = size / 2;
+    const { r, g, b } = color;
+    const grad = octx.createRadialGradient(cx, cy, 0, cx, cy, spriteR);
+    grad.addColorStop(0, `rgba(${r},${g},${b},1)`);
+    grad.addColorStop(0.3, `rgba(${r},${g},${b},0.3)`);
+    grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+    octx.fillStyle = grad;
+    octx.beginPath();
+    octx.arc(cx, cy, spriteR, 0, Math.PI * 2);
+    octx.fill();
+    octx.fillStyle = `rgba(${r},${g},${b},1)`;
+    octx.beginPath();
+    octx.arc(cx, cy, rBucket, 0, Math.PI * 2);
+    octx.fill();
+    glowCache.set(key, off);
+    return off;
+  }
 
   function resize(): void {
     const dpr = window.devicePixelRatio || 1;
@@ -152,24 +191,12 @@ export function startAbyssBg(canvas: HTMLCanvasElement): AbyssBgControl {
   function drawParticle(p: Particle): void {
     const breathe = 0.5 + 0.5 * Math.sin(p.pulse);
     const a = p.alpha * (0.4 + 0.6 * breathe);
-    const { r, g, b } = p.color;
 
-    // Soft glow
-    const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.radius * 6);
-    grad.addColorStop(0, `rgba(${r},${g},${b},${a})`);
-    grad.addColorStop(0.3, `rgba(${r},${g},${b},${a * 0.3})`);
-    grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
-
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, p.radius * 6, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Bright core
-    ctx.fillStyle = `rgba(${r},${g},${b},${a * 1.5})`;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
-    ctx.fill();
+    const sprite = getGlowSprite(p.color, p.radius);
+    const half = sprite.width / 2;
+    ctx.globalAlpha = a;
+    ctx.drawImage(sprite, p.x - half, p.y - half);
+    ctx.globalAlpha = 1;
   }
 
   function drawTendril(t: Tendril): void {
@@ -197,23 +224,33 @@ export function startAbyssBg(canvas: HTMLCanvasElement): AbyssBgControl {
     ctx.stroke();
   }
 
-  function render(): void {
+  function render(ts: number): void {
+    if (paused) return;
+
+    // Throttle to 60fps while descending (needs to feel snappy) and to 20fps
+    // in the ambient idle state. The drifting particles move so slowly that
+    // 20fps is indistinguishable visually, and it cuts the render cost to 1/3.
+    const idle = descentSpeed === 0;
+    const minFrameMs = idle ? 50 : 16;
+    if (ts - lastRenderTs < minFrameMs) {
+      animId = requestAnimationFrame(render);
+      return;
+    }
+    lastRenderTs = ts;
+
     frame++;
 
-    // Smoothly decelerate when no longer descending
     if (!descending && descentSpeed > 0) {
       descentSpeed = Math.max(0, descentSpeed - 0.008);
     }
 
     ctx.clearRect(0, 0, w, h);
 
-    // Draw tendrils behind particles
     for (const t of tendrils) {
       updateTendril(t);
       drawTendril(t);
     }
 
-    // Draw particles
     for (const p of particles) {
       updateParticle(p);
       drawParticle(p);
@@ -222,14 +259,28 @@ export function startAbyssBg(canvas: HTMLCanvasElement): AbyssBgControl {
     animId = requestAnimationFrame(render);
   }
 
+  function onVisibilityChange(): void {
+    if (document.hidden) {
+      paused = true;
+      cancelAnimationFrame(animId);
+    } else if (paused) {
+      paused = false;
+      lastRenderTs = 0;
+      animId = requestAnimationFrame(render);
+    }
+  }
+
   init();
   window.addEventListener('resize', resize);
+  document.addEventListener('visibilitychange', onVisibilityChange);
   animId = requestAnimationFrame(render);
 
   return {
     stop: () => {
+      paused = true;
       cancelAnimationFrame(animId);
       window.removeEventListener('resize', resize);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     },
     setDescending: (d: boolean) => {
       descending = d;
