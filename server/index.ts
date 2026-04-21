@@ -44,6 +44,8 @@ import { AgentCreator } from '../src/objects/agent-creator.js';
 import { Scheduler } from '../src/objects/scheduler.js';
 import { SchedulerBrowser } from '../src/objects/scheduler-browser.js';
 import { Chat } from '../src/objects/chat.js';
+import { ChatManager } from '../src/objects/chat-manager.js';
+import { ChatBrowser } from '../src/objects/chat-browser.js';
 import { AgentAbject } from '../src/objects/agent-abject.js';
 import { GoalObserver } from '../src/objects/goal-observer.js';
 import { AbjectStore } from '../src/objects/abject-store.js';
@@ -392,7 +394,9 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('AgentCreator', () => new AgentCreator());
   runtime.objectFactory.registerConstructor('Scheduler', () => new Scheduler());
   runtime.objectFactory.registerConstructor('SchedulerBrowser', () => new SchedulerBrowser());
-  runtime.objectFactory.registerConstructor('Chat', () => new Chat());
+  runtime.objectFactory.registerConstructor('Chat', (args?: unknown) => new Chat(args as { conversationId?: string; title?: string; rect?: { x: number; y: number; width: number; height: number } } | undefined));
+  runtime.objectFactory.registerConstructor('ChatManager', () => new ChatManager());
+  runtime.objectFactory.registerConstructor('ChatBrowser', () => new ChatBrowser());
   runtime.objectFactory.registerConstructor('AgentAbject', () => new AgentAbject());
   runtime.objectFactory.registerConstructor('GoalObserver', () => new GoalObserver());
   runtime.objectFactory.registerConstructor('AbjectStore', () => new AbjectStore());
@@ -468,7 +472,7 @@ async function main(): Promise<void> {
       'AgentAbject', 'AgentBrowser', 'AgentCreator',
       'ObjectAgent', 'SkillAgent', 'WebAgent',
       'Scheduler', 'SchedulerBrowser',
-      'ObjectCreator', 'Chat', 'AbjectEditor', 'Taskbar',
+      'ObjectCreator', 'Chat', 'ChatManager', 'ChatBrowser', 'AbjectEditor', 'Taskbar',
       'ScriptableAbject',
       // Per-workspace UI
       'WorkspaceBrowser',

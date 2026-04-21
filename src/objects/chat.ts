@@ -86,10 +86,27 @@ interface ObjectSummary {
 
 type UiPhase = 'closed' | 'idle' | 'busy';
 
+interface ChatConstructorArgs {
+  conversationId?: string;
+  title?: string;
+  rect?: { x: number; y: number; width: number; height: number };
+}
+
 export class Chat extends Abject {
   private widgetManagerId?: AbjectId;
   private registryId?: AbjectId;
   private agentAbjectId?: AbjectId;
+  private storageId?: AbjectId;
+  private chatManagerId?: AbjectId;
+
+  // Conversation identity (passed via constructor args; unset for legacy callers)
+  private conversationId?: string;
+  private conversationTitle?: string;
+  private initialRect?: { x: number; y: number; width: number; height: number };
+  private currentRect?: { x: number; y: number; width: number; height: number };
+  private rectPersistTimer?: ReturnType<typeof setTimeout>;
+  private persistTimer?: ReturnType<typeof setTimeout>;
+  private historyLoaded = false;
 
   // Window/widget IDs
   private windowId?: AbjectId;
@@ -175,7 +192,7 @@ export class Chat extends Abject {
   /** Pending task completion promises: taskId → resolve/reject. */
   private pendingTaskCompletions = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
 
-  constructor() {
+  constructor(args?: ChatConstructorArgs) {
     super({
       manifest: {
         name: 'Chat',
@@ -233,17 +250,47 @@ export class Chat extends Abject {
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
+              {
+                name: 'setTitle',
+                description: 'Update the conversation title (reflected in the window title bar).',
+                parameters: [
+                  { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'New conversation title' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
             ],
             events: [
               {
                 name: 'messageAdded',
-                description: 'Fires every time a bubble is appended to the chat log (user input, assistant reply, system notification, or error). Subscribe via addDependent to forward, mirror, or log messages from bridges, proxies, relays, and integrations. The "activity" role represents in-progress agent state and is filtered out; subscribers see only durable bubbles.',
+                description: 'Fires every time a bubble is appended to the chat log (user input, assistant reply, system notification, or error). Subscribe via addDependent to forward, mirror, or log messages from bridges, proxies, relays, and integrations. The "activity" role represents in-progress agent state and is filtered out; subscribers see only durable bubbles. Includes conversationId for multi-chat subscribers.',
                 payload: { kind: 'object', properties: {
+                  conversationId: { kind: 'primitive', primitive: 'string' },
                   role: { kind: 'primitive', primitive: 'string' },
                   sender: { kind: 'primitive', primitive: 'string' },
                   text: { kind: 'primitive', primitive: 'string' },
                   markdown: { kind: 'primitive', primitive: 'boolean' },
                   at: { kind: 'primitive', primitive: 'number' },
+                }},
+              },
+              {
+                name: 'titleChanged',
+                description: 'Fires when the conversation title changes (either via setTitle or auto-derived from the first user message).',
+                payload: { kind: 'object', properties: {
+                  conversationId: { kind: 'primitive', primitive: 'string' },
+                  title: { kind: 'primitive', primitive: 'string' },
+                }},
+              },
+              {
+                name: 'rectChanged',
+                description: 'Fires when the chat window is moved or resized; ChatManager uses this to persist per-conversation window geometry.',
+                payload: { kind: 'object', properties: {
+                  conversationId: { kind: 'primitive', primitive: 'string' },
+                  rect: { kind: 'object', properties: {
+                    x: { kind: 'primitive', primitive: 'number' },
+                    y: { kind: 'primitive', primitive: 'number' },
+                    width: { kind: 'primitive', primitive: 'number' },
+                    height: { kind: 'primitive', primitive: 'number' },
+                  } },
                 }},
               },
             ],
@@ -257,6 +304,12 @@ export class Chat extends Abject {
       },
     });
 
+    if (args) {
+      this.conversationId = args.conversationId;
+      this.conversationTitle = args.title;
+      this.initialRect = args.rect;
+    }
+
     this.setupHandlers();
   }
 
@@ -266,10 +319,36 @@ export class Chat extends Abject {
     this.registryId = await this.requireDep('Registry');
     this.agentAbjectId = await this.requireDep('AgentAbject');
     this.goalManagerId = await this.discoverDep('GoalManager') ?? undefined;
+    this.storageId = await this.discoverDep('Storage') ?? undefined;
+    this.chatManagerId = await this.discoverDep('ChatManager') ?? undefined;
 
     // Subscribe to GoalManager for real-time goal updates
     if (this.goalManagerId) {
       this.send(request(this.id, this.goalManagerId, 'addDependent', {}));
+    }
+
+    // Load persisted conversation history (if any) for this conversation.
+    if (this.conversationId && !this.historyLoaded) {
+      if (!this.storageId) {
+        log.warn(`[Chat ${this.conversationId.slice(0, 8)}] Storage not found — history will not be loaded`);
+      } else {
+        try {
+          const hist = await this.request<ConversationEntry[] | null>(
+            request(this.id, this.storageId, 'get', { key: `chats:history:${this.conversationId}` })
+          );
+          if (Array.isArray(hist)) {
+            this.conversationHistory = hist;
+            log.info(`[Chat ${this.conversationId.slice(0, 8)}] Loaded ${hist.length} entries from history`);
+          } else {
+            log.info(`[Chat ${this.conversationId.slice(0, 8)}] No persisted history (key miss)`);
+          }
+        } catch (err) {
+          log.warn(`[Chat ${this.conversationId.slice(0, 8)}] Failed to load history: ${String(err)}`);
+        }
+      }
+      this.historyLoaded = true;
+    } else if (!this.conversationId) {
+      log.info(`[Chat ${this.id.slice(0, 8)}] No conversationId set — running in legacy single-chat mode`);
     }
 
     // Register with AgentAbject (fire-and-forget: handler is idempotent)
@@ -318,6 +397,7 @@ export class Chat extends Abject {
       await this.removeWelcomeState();
       await this.appendBubble('system', sender || 'System', message.trim(), true);
       this.conversationHistory.push({ role: 'assistant', content: `[${sender}]: ${message.trim()}` });
+      this.schedulePersist();
       return true;
     });
 
@@ -332,6 +412,15 @@ export class Chat extends Abject {
 
     this.on('clearHistory', async () => {
       this.conversationHistory = [];
+      // Drop persisted history too; the roster entry survives so the
+      // conversation itself isn't deleted (ChatManager owns that).
+      if (this.conversationId && this.storageId) {
+        try {
+          await this.request(request(this.id, this.storageId, 'delete', {
+            key: `chats:history:${this.conversationId}`,
+          }));
+        } catch { /* best effort */ }
+      }
       if (this.windowId) {
         await this.clearMessageLabels();
         await this.showWelcomeState();
@@ -339,13 +428,51 @@ export class Chat extends Abject {
       return true;
     });
 
+    this.on('setTitle', async (msg: AbjectMessage) => {
+      const { title } = msg.payload as { title: string };
+      const next = (title ?? '').trim().slice(0, 80);
+      if (!next || next === this.conversationTitle) return false;
+      this.conversationTitle = next;
+      // Reflect in the open window's title bar, if any
+      if (this.windowId) {
+        try {
+          await this.request(request(this.id, this.windowId, 'setTitle', {
+            title: this.formatWindowTitle(next),
+          }));
+        } catch { /* best effort */ }
+      }
+      // Notify ChatManager for roster updates
+      if (this.chatManagerId && this.conversationId) {
+        this.send(event(this.id, this.chatManagerId, 'titleChanged', {
+          conversationId: this.conversationId,
+          title: next,
+        }));
+      }
+      this.changed('titleChanged', { conversationId: this.conversationId ?? '', title: next });
+      return true;
+    });
+
     this.on('windowCloseRequested', async () => { await this.hide(); });
 
     this.on('windowResized', async (msg: AbjectMessage) => {
-      const { width } = msg.payload as { width: number; height: number };
+      const { width, height } = msg.payload as { width: number; height: number };
       if (typeof width === 'number' && width > 0 && width !== this.currentWindowWidth) {
         this.currentWindowWidth = width;
         this.scheduleReflow();
+      }
+      if (this.currentRect) {
+        if (typeof width === 'number' && width > 0) this.currentRect.width = width;
+        if (typeof height === 'number' && height > 0) this.currentRect.height = height;
+        this.notifyRectChanged();
+      }
+    });
+
+    this.on('windowMoved', async (msg: AbjectMessage) => {
+      const { x, y } = msg.payload as { x: number; y: number };
+      if (this.currentRect) {
+        if (typeof x === 'number') this.currentRect.x = x;
+        if (typeof y === 'number') this.currentRect.y = y;
+        this.notifyRectChanged();
       }
     });
 
@@ -602,6 +729,7 @@ export class Chat extends Abject {
           await this.removeActivityBubble();
           await this.appendBubble('assistant', 'Agent', text, true);
           this.conversationHistory.push({ role: 'assistant', content: text });
+          this.schedulePersist();
           await this.showActivityBubble();
         }
       }
@@ -997,6 +1125,19 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
 5. Always end a conversation turn with **done** when the task is complete.
 6. Keep reasoning brief (1-2 sentences before the JSON block).
 7. If a goal's tasks fail, you can retry by creating a new goal with a simpler task description. If it fails repeatedly, use "done" to tell the user what happened — quoting the actual failure message, not a guess.
+
+## Stop when the work is done
+
+When the user asked for an object, app, widget, bridge, tool, schedule, or agent and the goal finishes successfully, the work is done. The object is registered; the user can discover and open it from the taskbar, AppExplorer, or by asking. On the very next turn, call **done** with:
+- the object's name exactly as registered,
+- a one-line summary of what it does,
+- how to open it (taskbar, AppExplorer, or "ask me to open it").
+
+Treat the user's silence as confirmation. Wait for the user to report a specific issue before revisiting the object — their feedback is the signal to retry or refine.
+
+Save method-call follow-ups (show, hide, refresh, update) for turns when the user explicitly asks. If the user says "open it" or "show me X" or "run X", then create a goal whose task description names the target object and the method, e.g. *"Call show() on the FooWidget object to open its window"*.
+
+A single successful creation goal is a complete turn. End it with **done**.
 8. P2P: Resolve remote objects by qualified name: this.find('peer.workspace.ObjectName'). Always use find() for dynamic ID resolution.
 9. When the user reveals personal facts (where they live, their name, preferences, job, etc.), save them using **remember** so you can recall them in future conversations.
 10. Task descriptions should describe the desired outcome and timing, letting agents decide implementation. Example: "Post a weather briefing to chat every day at 10:30 AM" is better than "Use setInterval to check the time every minute".`;
@@ -1020,15 +1161,27 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
       request(this.id, this.widgetManagerId!, 'getDisplayInfo', {})
     );
 
-    const winW = Math.min(DEFAULT_WIN_W, Math.max(360, displayInfo.width - 40));
-    const winH = Math.min(DEFAULT_WIN_H, Math.max(360, displayInfo.height - 40));
-    const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
-    const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
+    let winW: number;
+    let winH: number;
+    let winX: number;
+    let winY: number;
+    if (this.initialRect) {
+      winW = Math.min(this.initialRect.width, displayInfo.width - 20);
+      winH = Math.min(this.initialRect.height, displayInfo.height - 20);
+      winX = Math.max(10, Math.min(this.initialRect.x, displayInfo.width - winW - 10));
+      winY = Math.max(10, Math.min(this.initialRect.y, displayInfo.height - winH - 10));
+    } else {
+      winW = Math.min(DEFAULT_WIN_W, Math.max(360, displayInfo.width - 40));
+      winH = Math.min(DEFAULT_WIN_H, Math.max(360, displayInfo.height - 40));
+      winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
+      winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
+    }
     this.currentWindowWidth = winW;
+    this.currentRect = { x: winX, y: winY, width: winW, height: winH };
 
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: '\uD83D\uDCAC  Chat',
+        title: this.formatWindowTitle(this.conversationTitle),
         rect: { x: winX, y: winY, width: winW, height: winH },
         zIndex: 200,
         resizable: true,
@@ -1143,13 +1296,36 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
 
     this.uiPhase = 'idle';
 
-    // Show welcome state if the conversation is empty.
+    log.info(`[Chat ${(this.conversationId ?? this.id).slice(0, 8)}] show() historyLen=${this.conversationHistory.length} title="${this.conversationTitle ?? ''}"`);
     if (this.conversationHistory.length === 0) {
+      // Fresh conversation — show the welcome card + suggestion chips.
       await this.showWelcomeState();
+    } else {
+      // Restored from persistence — re-render each past message as a bubble.
+      await this.renderHistoryBubbles();
     }
 
     this.changed('visibility', true);
     return true;
+  }
+
+  /**
+   * Re-render `conversationHistory` as bubbles. Called on show() when the
+   * conversation already has persisted messages (rehydrated from Storage).
+   * Bubbles are emitted silently so downstream subscribers do not treat
+   * historical messages as new arrivals.
+   */
+  private async renderHistoryBubbles(): Promise<void> {
+    for (const entry of this.conversationHistory) {
+      const role: BubbleRole =
+        entry.role === 'user' ? 'user' :
+        entry.role === 'assistant' ? 'assistant' : 'system';
+      const sender =
+        entry.role === 'user' ? 'You' :
+        entry.role === 'assistant' ? 'Agent' : 'System';
+      const markdown = entry.role !== 'user';
+      await this.appendBubble(role, sender, entry.content, markdown, /* silent */ true);
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1241,6 +1417,13 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
 
     this.uiPhase = 'closed';
 
+    // Flush any pending history persist before the window goes away
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = undefined;
+      void this.persistHistory();
+    }
+
     await this.request(
       request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
         windowId: this.windowId,
@@ -1277,6 +1460,72 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
     return true;
   }
 
+  // ─── Conversation identity helpers ──────────────────────────────────
+
+  private formatWindowTitle(title?: string): string {
+    const t = (title ?? this.conversationTitle ?? 'Chat').trim();
+    return `\uD83D\uDCAC  ${t || 'Chat'}`;
+  }
+
+  private notifyRectChanged(): void {
+    if (!this.currentRect || !this.chatManagerId || !this.conversationId) return;
+    if (this.rectPersistTimer) return;
+    this.rectPersistTimer = setTimeout(() => {
+      this.rectPersistTimer = undefined;
+      if (!this.currentRect || !this.chatManagerId || !this.conversationId) return;
+      this.send(event(this.id, this.chatManagerId, 'rectChanged', {
+        conversationId: this.conversationId,
+        rect: { ...this.currentRect },
+      }));
+    }, 250);
+  }
+
+  private schedulePersist(): void {
+    if (!this.conversationId || !this.storageId) return;
+    if (this.persistTimer) return;
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = undefined;
+      void this.persistHistory();
+    }, 200);
+  }
+
+  private async persistHistory(): Promise<void> {
+    if (!this.conversationId || !this.storageId) return;
+    try {
+      await this.request(request(this.id, this.storageId, 'set', {
+        key: `chats:history:${this.conversationId}`,
+        value: this.conversationHistory,
+      }));
+    } catch { /* best effort */ }
+  }
+
+  /**
+   * Auto-derive a title from the first user message. No-op if the user or a
+   * caller has already given the conversation a non-default title.
+   */
+  private maybeAutoTitle(userText: string): void {
+    if (!this.conversationId) return;
+    const current = (this.conversationTitle ?? '').trim();
+    if (current && current !== 'New chat') return;
+    const cleaned = userText.replace(/\s+/g, ' ').trim();
+    if (!cleaned) return;
+    const derived = cleaned.length > 40 ? cleaned.slice(0, 40).trimEnd() + '\u2026' : cleaned;
+    this.conversationTitle = derived;
+    if (this.windowId) {
+      try {
+        this.send(request(this.id, this.windowId, 'setTitle', {
+          title: this.formatWindowTitle(derived),
+        }));
+      } catch { /* best effort */ }
+    }
+    if (this.chatManagerId) {
+      this.send(event(this.id, this.chatManagerId, 'titleChanged', {
+        conversationId: this.conversationId,
+        title: derived,
+      }));
+    }
+  }
+
   private async handleSendClick(): Promise<void> {
     if (this.uiPhase !== 'idle' || !this.textInputId) return;
 
@@ -1310,6 +1559,8 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
     // inside the bubble.
     await this.appendBubble('user', 'You', userText, false);
     this.conversationHistory.push({ role: 'user', content: userText });
+    this.schedulePersist();
+    this.maybeAutoTitle(userText);
 
     // Show consolidated activity bubble for the run.
     await this.showActivityBubble();
@@ -1354,6 +1605,7 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
         if (text) {
           await this.appendBubble('assistant', 'Agent', text, true);
           this.conversationHistory.push({ role: 'assistant', content: text });
+          this.schedulePersist();
         }
       } else {
         const errorText = (result.error ?? 'Unknown error').slice(0, 200);
@@ -1507,6 +1759,7 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
     sender: string,
     text: string,
     markdown = false,
+    silent = false,
   ): Promise<AbjectId> {
     if (!this.messageLogId || !this.windowId) return '' as AbjectId;
 
@@ -1514,8 +1767,11 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
     // durable message landed in the chat log. Skip the transient 'activity'
     // role since those bubbles represent in-progress agent status that mutates
     // continuously and is not part of the user-visible conversation record.
-    if (role !== 'activity') {
+    // `silent` suppresses the event during history rehydration — those bubbles
+    // are re-renders of past messages, not new arrivals.
+    if (role !== 'activity' && !silent) {
       this.changed('messageAdded', {
+        conversationId: this.conversationId ?? '',
         role,
         sender,
         text,

@@ -25,7 +25,8 @@ const SPACING = 6;
 export class Taskbar extends Abject {
   private widgetManagerId?: AbjectId;
   private appExplorerId?: AbjectId;
-  private chatId?: AbjectId;
+  private chatBrowserId?: AbjectId;
+  private chatManagerId?: AbjectId;
   private jobBrowserId?: AbjectId;
   private webBrowserViewerId?: AbjectId;
   private goalBrowserId?: AbjectId;
@@ -43,6 +44,8 @@ export class Taskbar extends Abject {
   private systemButtons: Map<AbjectId, AbjectId> = new Map();
   private userObjButtons: Map<AbjectId, AbjectId> = new Map();
   private restoreButtons: Map<AbjectId, string> = new Map();
+  // Buttons that dispatch a method other than `show` (e.g. "+ New chat")
+  private actionButtons: Map<AbjectId, { target: AbjectId; method: string }> = new Map();
 
   // Minimized window state (survives rebuilds)
   private minimizedWindows: Map<string, { windowId: AbjectId; title: string }> = new Map();
@@ -124,7 +127,8 @@ windows" section so the user can restore windows from the taskbar.
     await this.fetchTheme();
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.appExplorerId = await this.requireDep('AppExplorer');
-    this.chatId = await this.requireDep('Chat');
+    this.chatBrowserId = await this.requireDep('ChatBrowser');
+    this.chatManagerId = await this.requireDep('ChatManager');
     this.jobBrowserId = await this.requireDep('JobBrowser');
     this.webBrowserViewerId = await this.discoverDep('WebBrowserViewer') ?? undefined;
     this.goalBrowserId = await this.discoverDep('GoalBrowser') ?? undefined;
@@ -165,6 +169,13 @@ windows" section so the user can restore windows from the taskbar.
       if (aspect !== 'click') return;
 
       const fromId = msg.routing.from;
+
+      // Action button clicked (non-show dispatch, e.g. "+ New chat")
+      const action = this.actionButtons.get(fromId);
+      if (action) {
+        this.send(event(this.id, action.target, action.method, {}));
+        return;
+      }
 
       // Launch button clicked
       const targetId = this.systemButtons.get(fromId) ?? this.userObjButtons.get(fromId);
@@ -225,6 +236,7 @@ windows" section so the user can restore windows from the taskbar.
     this.systemButtons.clear();
     this.userObjButtons.clear();
     this.restoreButtons.clear();
+    this.actionButtons.clear();
     this.changed('visibility', false);
     return true;
   }
@@ -248,6 +260,7 @@ windows" section so the user can restore windows from the taskbar.
     this.systemButtons.clear();
     this.userObjButtons.clear();
     this.restoreButtons.clear();
+    this.actionButtons.clear();
 
     await this.populateContent();
     await this.resizeWindow();
@@ -309,9 +322,14 @@ windows" section so the user can restore windows from the taskbar.
     // [1] Gear button (AppExplorer)
     specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699',
       style: { fontSize: 13 } });
-    // [2] Chat
+    // [2] Chat (opens ChatBrowser overview)
     specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCAC Chat' });
-    // [3?] Goals (optional)
+    // [3] + New chat → ChatManager.newConversation
+    specs.push({
+      type: 'button', windowId: this.windowId!, text: '+ New chat',
+      style: { fontSize: 11 },
+    });
+    // [4?] Goals (optional)
     if (this.goalBrowserId) {
       specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDFAF Goals' });
     }
@@ -361,7 +379,9 @@ windows" section so the user can restore windows from the taskbar.
     this.systemButtons.set(gearBtnId, this.appExplorerId!);
 
     let idx = 2;
-    this.systemButtons.set(widgetIds[idx++], this.chatId!);
+    this.systemButtons.set(widgetIds[idx++], this.chatBrowserId!);
+    // "+ New chat" — dispatches newConversation instead of show
+    this.actionButtons.set(widgetIds[idx++], { target: this.chatManagerId!, method: 'newConversation' });
     if (this.goalBrowserId) this.systemButtons.set(widgetIds[idx++], this.goalBrowserId);
     this.systemButtons.set(widgetIds[idx++], this.jobBrowserId!);
     if (this.knowledgeBrowserId) this.systemButtons.set(widgetIds[idx++], this.knowledgeBrowserId);
@@ -384,9 +404,13 @@ windows" section so the user can restore windows from the taskbar.
     // ---- Add root layout children ----
     const rootChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize: Record<string, number> }> = [];
 
-    // System buttons (skip gear, it's in the header row)
-    for (const [btnId] of this.systemButtons) {
-      if (btnId === gearBtnId) continue;
+    // Keep the order specs were declared: systemButtons + actionButtons mix
+    // is driven by the btnIds, not by map iteration. Emit based on widgetIds
+    // range so "+ New chat" lands just under "Chat".
+    const trackedIds = new Set<AbjectId>([...this.systemButtons.keys(), ...this.actionButtons.keys()]);
+    for (let i = 2; i < userObjStartIdx; i++) {
+      const btnId = widgetIds[i];
+      if (!trackedIds.has(btnId)) continue;
       rootChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: BTN_H } });
     }
 
@@ -416,6 +440,9 @@ windows" section so the user can restore windows from the taskbar.
     for (const [btnId] of this.systemButtons) {
       this.send(request(this.id, btnId, 'addDependent', {}));
     }
+    for (const [btnId] of this.actionButtons) {
+      this.send(request(this.id, btnId, 'addDependent', {}));
+    }
     for (let i = 0; i < showableObjects.length; i++) {
       this.send(request(this.id, widgetIds[userObjStartIdx + i], 'addDependent', {}));
     }
@@ -424,7 +451,7 @@ windows" section so the user can restore windows from the taskbar.
     }
 
     // Subscribe as dependent of system objects for visibility change events
-    const depIds = [this.appExplorerId!, this.chatId!, this.jobBrowserId!];
+    const depIds = [this.appExplorerId!, this.chatBrowserId!, this.jobBrowserId!];
     if (this.webBrowserViewerId) depIds.push(this.webBrowserViewerId);
     if (this.goalBrowserId) depIds.push(this.goalBrowserId);
     if (this.knowledgeBrowserId) depIds.push(this.knowledgeBrowserId);
@@ -469,7 +496,9 @@ windows" section so the user can restore windows from the taskbar.
   }
 
   private computeHeight(userObjectCount: number): number {
-    const systemBtnCount = 2 + (this.webBrowserViewerId ? 1 : 0) + (this.goalBrowserId ? 1 : 0) + (this.knowledgeBrowserId ? 1 : 0) + (this.agentBrowserId ? 1 : 0) + (this.schedulerBrowserId ? 1 : 0);
+    // Base: gear + Chat + "+ New chat" + Jobs = 4 always-present buttons (though
+    // only 3 row-level; the gear sits in the header row and is not counted).
+    const systemBtnCount = 3 + (this.webBrowserViewerId ? 1 : 0) + (this.goalBrowserId ? 1 : 0) + (this.knowledgeBrowserId ? 1 : 0) + (this.agentBrowserId ? 1 : 0) + (this.schedulerBrowserId ? 1 : 0);
     const minimizedCount = this.minimizedWindows.size;
     const totalBtnCount = systemBtnCount + userObjectCount + minimizedCount;
     const extraHeight = (LABEL_H + SPACING)

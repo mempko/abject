@@ -33,6 +33,7 @@ const WINDOW_MANAGER_INTERFACE = 'abjects:window-manager' as InterfaceId;
 
 const SETTINGS_INTERFACE = 'abjects:settings' as InterfaceId;
 const CHAT_INTERFACE = 'abjects:chat' as InterfaceId;
+const CHAT_BROWSER_INTERFACE = 'abjects:chat-browser' as InterfaceId;
 const APP_EXPLORER_INTERFACE = 'abjects:app-explorer' as InterfaceId;
 const JOB_BROWSER_INTERFACE = 'abjects:job-browser' as InterfaceId;
 const GOAL_BROWSER_INTERFACE = 'abjects:goal-browser' as InterfaceId;
@@ -48,13 +49,13 @@ const wsLog = new Log('WORKSPACE-MANAGER');
 const INFRA_OBJECTS = [
   'AbjectStore', 'SharedState', 'TupleSpace', 'FileTransfer', 'MediaStream', 'Theme',
   'GoalManager', 'JobManager', 'AgentAbject', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
-  'AgentCreator', 'Scheduler', 'KnowledgeBase',
+  'AgentCreator', 'Scheduler', 'KnowledgeBase', 'ChatManager',
 ] as const;
 
 /** UI objects — deferred for inactive workspaces, spawned on first switch. */
 const UI_OBJECTS = [
   'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser', 'KnowledgeBrowser', 'AgentBrowser', 'SchedulerBrowser',
-  'WebBrowserViewer', 'Chat', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
+  'WebBrowserViewer', 'ChatBrowser', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
 ] as const;
 
 /** All per-workspace objects in dependency order. */
@@ -1008,7 +1009,7 @@ export class WorkspaceManager extends Abject {
       AppExplorer: APP_EXPLORER_INTERFACE,
       GoalBrowser: GOAL_BROWSER_INTERFACE,
       JobBrowser: JOB_BROWSER_INTERFACE,
-      Chat: CHAT_INTERFACE,
+      ChatBrowser: CHAT_BROWSER_INTERFACE,
     };
 
     for (const objName of UI_OBJECTS) {
@@ -1171,7 +1172,7 @@ export class WorkspaceManager extends Abject {
       AppExplorer: APP_EXPLORER_INTERFACE,
       GoalBrowser: GOAL_BROWSER_INTERFACE,
       JobBrowser: JOB_BROWSER_INTERFACE,
-      Chat: CHAT_INTERFACE,
+      ChatBrowser: CHAT_BROWSER_INTERFACE,
     };
 
     for (const objName of objectsToSpawn) {
