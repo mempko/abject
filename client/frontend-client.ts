@@ -30,6 +30,10 @@ const MEASURED_FONTS = [
   '14px system-ui',                         // legacy WIDGET_FONT
 ];
 
+/** ASCII printable range pre-measured for every new font we see. */
+const ASCII_MIN = 32;
+const ASCII_MAX = 126;
+
 export class FrontendClient {
   private compositor: Compositor;
   private canvas: HTMLCanvasElement;
@@ -41,6 +45,8 @@ export class FrontendClient {
   private loginFormHandler: ((e: Event) => void) | null = null;
   private pendingMouseMove: FrontendToBackendMsg | null = null;
   private mouseMoveRafId = 0;
+  /** Fonts for which we've already shipped a full ASCII metrics table. */
+  private measuredFonts: Set<string> = new Set();
   private reconnectAttempt = 0;
   private mobileMode = false;
   private mobileTabTouchStartX?: number;  // track start X for tap vs scroll detection
@@ -444,15 +450,33 @@ export class FrontendClient {
     for (const font of MEASURED_FONTS) {
       ctx.font = font;
       const charWidths: Record<string, number> = {};
-      // Measure printable ASCII (32-126)
-      for (let code = 32; code <= 126; code++) {
+      for (let code = ASCII_MIN; code <= ASCII_MAX; code++) {
         const ch = String.fromCharCode(code);
         charWidths[ch] = ctx.measureText(ch).width;
       }
       metrics[font] = charWidths;
+      this.measuredFonts.add(font);
     }
 
     this.sendRaw({ type: 'fontMetrics', metrics });
+  }
+
+  /**
+   * Measure ASCII char widths for a font and ship them to the backend so its
+   * local cache handles all future measureText calls without a round-trip.
+   */
+  private shipFontMetrics(font: string): void {
+    if (this.measuredFonts.has(font)) return;
+    this.measuredFonts.add(font);
+    const measureCanvas = document.createElement('canvas');
+    const ctx = measureCanvas.getContext('2d')!;
+    ctx.font = font;
+    const charWidths: Record<string, number> = {};
+    for (let code = ASCII_MIN; code <= ASCII_MAX; code++) {
+      const ch = String.fromCharCode(code);
+      charWidths[ch] = ctx.measureText(ch).width;
+    }
+    this.sendRaw({ type: 'fontMetrics', metrics: { [font]: charWidths } });
   }
 
   /**
@@ -700,6 +724,11 @@ export class FrontendClient {
     text: string,
     font: string
   ): void {
+    // First time we see this font: ship full ASCII metrics so the server's
+    // local cache handles every subsequent measureText call without a
+    // round-trip. One round-trip per unique font, not per widget render.
+    this.shipFontMetrics(font);
+
     let width = 0;
     const surface = this.compositor.getSurface(surfaceId);
     if (surface && text) {
