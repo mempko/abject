@@ -27,6 +27,13 @@ const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 const STORAGE_KEY_ANTHROPIC = 'global-settings:anthropicApiKey';
 const STORAGE_KEY_OPENAI = 'global-settings:openaiApiKey';
 const STORAGE_KEY_OLLAMA_URL = 'global-settings:ollamaUrl';
+const STORAGE_KEY_OPENROUTER = 'global-settings:openrouterApiKey';
+const STORAGE_KEY_DEEPSEEK = 'global-settings:deepseekApiKey';
+const STORAGE_KEY_GROK = 'global-settings:grokApiKey';
+const STORAGE_KEY_GEMINI = 'global-settings:geminiApiKey';
+const STORAGE_KEY_KIMI = 'global-settings:kimiApiKey';
+const STORAGE_KEY_MINIMAX = 'global-settings:minimaxApiKey';
+const STORAGE_KEY_AI_ACTIVE_PROVIDER = 'global-settings:aiActiveProvider';
 const STORAGE_KEY_AUTH_ENABLED = 'global-settings:authEnabled';
 const STORAGE_KEY_AUTH_USER = 'global-settings:authUser';
 const STORAGE_KEY_AUTH_PASS = 'global-settings:authPass';
@@ -49,9 +56,9 @@ const STORAGE_KEY_TIER_BALANCED_MODEL = 'global-settings:tierBalancedModel';
 const STORAGE_KEY_TIER_FAST_PROVIDER = 'global-settings:tierFastProvider';
 const STORAGE_KEY_TIER_FAST_MODEL = 'global-settings:tierFastModel';
 
-type LLMProviderName = 'anthropic' | 'openai' | 'ollama';
-const PROVIDER_LABELS: string[] = ['Anthropic', 'OpenAI', 'Ollama'];
-const PROVIDER_NAMES: LLMProviderName[] = ['anthropic', 'openai', 'ollama'];
+type LLMProviderName = 'anthropic' | 'openai' | 'ollama' | 'openrouter' | 'deepseek' | 'grok' | 'gemini' | 'kimi' | 'minimax';
+const PROVIDER_LABELS: string[] = ['Anthropic', 'OpenAI', 'Ollama', 'OpenRouter', 'DeepSeek', 'Grok', 'Gemini', 'Kimi', 'MiniMax'];
+const PROVIDER_NAMES: LLMProviderName[] = ['anthropic', 'openai', 'ollama', 'openrouter', 'deepseek', 'grok', 'gemini', 'kimi', 'minimax'];
 
 type ModelTierName = 'smart' | 'balanced' | 'fast';
 const TIER_LABELS: string[] = ['Smart', 'Balanced', 'Fast'];
@@ -62,6 +69,31 @@ const DEFAULT_TIER_MODELS: Record<LLMProviderName, Record<ModelTierName, string>
   anthropic: { smart: 'claude-opus-4-7', balanced: 'claude-sonnet-4-6', fast: 'claude-haiku-4-5-20251001' },
   openai: { smart: 'gpt-5.4', balanced: 'gpt-5.4-mini', fast: 'gpt-5.4-nano' },
   ollama: { smart: '', balanced: '', fast: '' },
+  openrouter: { smart: 'anthropic/claude-opus-4-6', balanced: 'openai/gpt-5.4-mini', fast: 'meta-llama/llama-3.3-70b-instruct' },
+  deepseek: { smart: 'deepseek-reasoner', balanced: 'deepseek-chat', fast: 'deepseek-chat' },
+  grok: { smart: 'grok-4', balanced: 'grok-4-mini', fast: 'grok-4-fast' },
+  gemini: { smart: 'gemini-3.1-pro', balanced: 'gemini-3.1-flash', fast: 'gemini-3.1-flash-lite' },
+  kimi: { smart: 'kimi-k2-0905-preview', balanced: 'moonshot-v1-32k', fast: 'moonshot-v1-8k' },
+  minimax: { smart: 'MiniMax-M2', balanced: 'MiniMax-M1', fast: 'abab6.5s-chat' },
+};
+
+// Per-provider placeholder and label metadata for the single-panel AI tab
+interface ProviderMeta {
+  credentialLabel: string;
+  placeholder: string;
+  isUrl: boolean;
+}
+
+const PROVIDER_META: Record<LLMProviderName, ProviderMeta> = {
+  anthropic: { credentialLabel: 'Anthropic API Key', placeholder: 'sk-ant-...', isUrl: false },
+  openai: { credentialLabel: 'OpenAI API Key', placeholder: 'sk-...', isUrl: false },
+  ollama: { credentialLabel: 'Ollama URL', placeholder: 'http://localhost:11434', isUrl: true },
+  openrouter: { credentialLabel: 'OpenRouter API Key', placeholder: 'sk-or-...', isUrl: false },
+  deepseek: { credentialLabel: 'DeepSeek API Key', placeholder: 'sk-...', isUrl: false },
+  grok: { credentialLabel: 'xAI Grok API Key', placeholder: 'xai-...', isUrl: false },
+  gemini: { credentialLabel: 'Google Gemini API Key', placeholder: 'AIza...', isUrl: false },
+  kimi: { credentialLabel: 'Kimi (Moonshot) API Key', placeholder: 'sk-...', isUrl: false },
+  minimax: { credentialLabel: 'MiniMax API Key', placeholder: 'sk-...', isUrl: false },
 };
 
 // Legacy keys for migration
@@ -90,12 +122,16 @@ export class GlobalSettings extends Abject {
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
 
-  // Credential widgets (always visible)
-  private anthropicKeyId?: AbjectId;
-  private anthropicToggleId?: AbjectId;
-  private openaiKeyId?: AbjectId;
-  private openaiToggleId?: AbjectId;
-  private ollamaUrlId?: AbjectId;
+  // Provider dropdown + single credential panel
+  private providerSelectorId?: AbjectId;
+  private credentialLabelId?: AbjectId;
+  private credentialInputId?: AbjectId;
+  private credentialToggleId?: AbjectId;
+  private providerModelsLabelId?: AbjectId;
+  private activeAiProvider: LLMProviderName = 'anthropic';
+  // In-memory cache of unsaved credential values (keyed by provider). Survives
+  // provider-switches within the panel; flushed to Storage on Save.
+  private credentialValues: Partial<Record<LLMProviderName, string>> = {};
 
   // Per-tier provider + model select widgets
   private tierProviderSelectIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined };
@@ -167,6 +203,12 @@ export class GlobalSettings extends Abject {
     anthropic: [],
     openai: [],
     ollama: [],
+    openrouter: [],
+    deepseek: [],
+    grok: [],
+    gemini: [],
+    kimi: [],
+    minimax: [],
   };
 
   constructor() {
@@ -247,9 +289,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.uiServerId = await this.requireDep('UIServer');
 
-    let anthropicKey: string | null = null;
-    let openaiKey: string | null = null;
-    let ollamaUrl: string | null = null;
+    const credentials: Partial<Record<LLMProviderName, string>> = {};
     const tierRouting: Record<ModelTierName, { provider: string | null; model: string | null }> = {
       smart: { provider: null, model: null },
       balanced: { provider: null, model: null },
@@ -257,15 +297,29 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     };
 
     if (this.storageId) {
-      anthropicKey = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_ANTHROPIC })
+      const storageKeys: Array<[LLMProviderName, string]> = [
+        ['anthropic', STORAGE_KEY_ANTHROPIC],
+        ['openai', STORAGE_KEY_OPENAI],
+        ['ollama', STORAGE_KEY_OLLAMA_URL],
+        ['openrouter', STORAGE_KEY_OPENROUTER],
+        ['deepseek', STORAGE_KEY_DEEPSEEK],
+        ['grok', STORAGE_KEY_GROK],
+        ['gemini', STORAGE_KEY_GEMINI],
+        ['kimi', STORAGE_KEY_KIMI],
+        ['minimax', STORAGE_KEY_MINIMAX],
+      ];
+      for (const [name, key] of storageKeys) {
+        const value = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key })
+        );
+        if (value) credentials[name] = value;
+      }
+      const savedActive = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AI_ACTIVE_PROVIDER })
       );
-      openaiKey = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OPENAI })
-      );
-      ollamaUrl = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_URL })
-      );
+      if (savedActive && PROVIDER_NAMES.includes(savedActive as LLMProviderName)) {
+        this.activeAiProvider = savedActive as LLMProviderName;
+      }
 
       // Load per-tier routing
       tierRouting.smart.provider = await this.request<string | null>(
@@ -288,7 +342,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       );
 
       // Legacy migration from per-workspace keys
-      if (!anthropicKey && !openaiKey) {
+      if (!credentials.anthropic && !credentials.openai) {
         const legacyAnthropic = await this.request<string | null>(
           request(this.id, this.storageId, 'get', { key: LEGACY_KEY_ANTHROPIC })
         );
@@ -296,16 +350,16 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
           request(this.id, this.storageId, 'get', { key: LEGACY_KEY_OPENAI })
         );
         if (legacyAnthropic || legacyOpenai) {
-          anthropicKey = legacyAnthropic;
-          openaiKey = legacyOpenai;
-          if (anthropicKey) {
+          if (legacyAnthropic) {
+            credentials.anthropic = legacyAnthropic;
             await this.request(
-              request(this.id, this.storageId, 'set', { key: STORAGE_KEY_ANTHROPIC, value: anthropicKey })
+              request(this.id, this.storageId, 'set', { key: STORAGE_KEY_ANTHROPIC, value: legacyAnthropic })
             );
           }
-          if (openaiKey) {
+          if (legacyOpenai) {
+            credentials.openai = legacyOpenai;
             await this.request(
-              request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OPENAI, value: openaiKey })
+              request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OPENAI, value: legacyOpenai })
             );
           }
           log.info('Migrated API keys from legacy storage');
@@ -356,11 +410,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       await this.applySavedPermissions();
     }
 
+    // Seed in-memory credential cache so the settings panel opens prefilled.
+    this.credentialValues = { ...credentials };
+
     // Configure all providers and tier routing
-    const hasAnyConfig = anthropicKey || openaiKey || ollamaUrl;
+    const hasAnyConfig = Object.keys(credentials).length > 0;
     const hasTierConfig = tierRouting.smart.provider || tierRouting.balanced.provider || tierRouting.fast.provider;
     if ((hasAnyConfig || hasTierConfig) && this.llmId) {
-      await this.configureProviders(anthropicKey, openaiKey, ollamaUrl, tierRouting);
+      await this.configureProviders(credentials, tierRouting);
       log.info('Loaded saved provider configuration');
     } else {
       await this.show();
@@ -387,9 +444,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   }
 
   private async configureProviders(
-    anthropicKey: string | null,
-    openaiKey: string | null,
-    ollamaUrl: string | null,
+    credentials: Partial<Record<LLMProviderName, string>>,
     tierRouting: Record<ModelTierName, { provider: string | null; model: string | null }>,
   ): Promise<void> {
     if (!this.llmId) return;
@@ -404,9 +459,15 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }
 
     const config: Record<string, unknown> = {
-      anthropicApiKey: anthropicKey ?? undefined,
-      openaiApiKey: openaiKey ?? undefined,
-      ollamaUrl: ollamaUrl || undefined,
+      anthropicApiKey: credentials.anthropic,
+      openaiApiKey: credentials.openai,
+      ollamaUrl: credentials.ollama || undefined,
+      openrouterApiKey: credentials.openrouter,
+      deepseekApiKey: credentials.deepseek,
+      grokApiKey: credentials.grok,
+      geminiApiKey: credentials.gemini,
+      kimiApiKey: credentials.kimi,
+      minimaxApiKey: credentials.minimax,
       tierRouting: Object.keys(routing).length > 0 ? routing : undefined,
     };
 
@@ -468,13 +529,15 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         return;
       }
 
-      if (fromId === this.anthropicToggleId && aspect === 'click') {
-        await this.toggleMask(this.anthropicKeyId!, this.anthropicToggleId!);
+      if (fromId === this.credentialToggleId && aspect === 'click') {
+        if (this.credentialInputId) {
+          await this.toggleMask(this.credentialInputId, this.credentialToggleId);
+        }
         return;
       }
 
-      if (fromId === this.openaiToggleId && aspect === 'click') {
-        await this.toggleMask(this.openaiKeyId!, this.openaiToggleId!);
+      if (fromId === this.providerSelectorId && aspect === 'change') {
+        await this.onProviderSelectorChanged();
         return;
       }
 
@@ -482,6 +545,15 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       for (const tier of TIER_NAMES) {
         if (fromId === this.tierProviderSelectIds[tier] && aspect === 'change') {
           await this.refreshTierModelOptions(tier);
+          // Also kick off a background live fetch for the newly-selected provider
+          const providerSelectId = this.tierProviderSelectIds[tier];
+          if (providerSelectId) {
+            const label = await this.request<string>(
+              request(this.id, providerSelectId, 'getValue', {})
+            );
+            const idx = PROVIDER_LABELS.indexOf(label);
+            if (idx >= 0) void this.refreshProviderModels(PROVIDER_NAMES[idx]);
+          }
           return;
         }
       }
@@ -768,25 +840,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private async buildAiTab(): Promise<void> {
     const cId = this.aiContainerId!;
 
-    // Load saved values to populate inputs
-    let savedAnthropicKey: string | null = null;
-    let savedOpenaiKey: string | null = null;
-    let savedOllamaUrl: string | null = null;
+    // Load tier routing (credentials already loaded into this.credentialValues in onInit)
     const savedTierRouting: Record<ModelTierName, { provider: string | null; model: string | null }> = {
       smart: { provider: null, model: null },
       balanced: { provider: null, model: null },
       fast: { provider: null, model: null },
     };
     if (this.storageId) {
-      savedAnthropicKey = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_ANTHROPIC })
-      );
-      savedOpenaiKey = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OPENAI })
-      );
-      savedOllamaUrl = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_OLLAMA_URL })
-      );
       savedTierRouting.smart.provider = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_SMART_PROVIDER })
       );
@@ -807,15 +867,18 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       );
     }
 
-    // Fetch model lists for all providers
-    await this.fetchAllProviderModels(savedOllamaUrl);
+    // Populate cache with defaults synchronously so the UI can render now.
+    // Live per-provider fetches run lazily (when the user looks at a provider
+    // or hits Save) to avoid blocking the window paint.
+    this.populateDefaultModelCache();
 
     // ── Credentials section ──
     const { widgetIds: [credHeaderId, credDescId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId, text: 'Credentials',
           style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
-        { type: 'label', windowId: this.windowId, text: 'Enter API keys for cloud providers. Ollama runs locally.',
+        { type: 'label', windowId: this.windowId,
+          text: 'Pick a provider to enter or update its API key. Configured keys persist across restarts.',
           style: { color: this.theme.textDescription, fontSize: 12 } },
       ]})
     );
@@ -830,20 +893,60 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       preferredSize: { height: 18 },
     }));
 
-    // Anthropic API Key row
-    const { widgetIds: [anthropicLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    // Provider selector row
+    const providerSelectRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: cId,
+        margins: { top: 4, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: providerSelectRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    const { widgetIds: [providerPickerLabelId, providerSelectorId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Anthropic API Key',
+        { type: 'label', windowId: this.windowId, text: 'Provider',
+          style: { color: this.theme.textHeading, fontSize: 13 } },
+        { type: 'select', windowId: this.windowId,
+          options: PROVIDER_LABELS,
+          selectedIndex: Math.max(0, PROVIDER_NAMES.indexOf(this.activeAiProvider)) },
+      ]})
+    );
+    this.providerSelectorId = providerSelectorId;
+    await this.request(request(this.id, providerPickerLabelId, 'update', {}));
+    await this.request(request(this.id, providerSelectRowId, 'addLayoutChild', {
+      widgetId: providerPickerLabelId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 65, height: 32 },
+    }));
+    await this.request(request(this.id, this.providerSelectorId, 'addDependent', {}));
+    await this.request(request(this.id, providerSelectRowId, 'addLayoutChild', {
+      widgetId: this.providerSelectorId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    // Credential label (shows "Anthropic API Key" etc.)
+    const meta = PROVIDER_META[this.activeAiProvider];
+    const { widgetIds: [credentialLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: meta.credentialLabel,
           style: { color: this.theme.textHeading, fontSize: 13 } },
       ]})
     );
+    this.credentialLabelId = credentialLabelId;
     await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: anthropicLabelId,
+      widgetId: this.credentialLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
     }));
 
-    const anthropicRowId = await this.request<AbjectId>(
+    // Credential input row (input + Show/Hide toggle)
+    const credentialRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: cId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
@@ -851,106 +954,51 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       })
     );
     await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: anthropicRowId,
+      widgetId: credentialRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
 
-    const { widgetIds: [anthropicKeyId, anthropicToggleId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    const initialValue = this.credentialValues[this.activeAiProvider]
+      ?? (this.activeAiProvider === 'ollama' ? 'http://localhost:11434' : '');
+    const { widgetIds: [credentialInputId, credentialToggleId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'textInput', windowId: this.windowId, placeholder: 'sk-ant-...', masked: true,
-          text: savedAnthropicKey ?? undefined },
-        { type: 'button', windowId: this.windowId, text: 'Show' },
+        { type: 'textInput', windowId: this.windowId,
+          placeholder: meta.placeholder,
+          masked: !meta.isUrl,
+          text: initialValue },
+        { type: 'button', windowId: this.windowId, text: 'Show',
+          style: meta.isUrl ? { disabled: true } : undefined },
       ]})
     );
-    this.anthropicKeyId = anthropicKeyId;
-    this.anthropicToggleId = anthropicToggleId;
-    await this.request(request(this.id, this.anthropicKeyId, 'addDependent', {}));
-    await this.request(request(this.id, anthropicRowId, 'addLayoutChild', {
-      widgetId: this.anthropicKeyId,
+    this.credentialInputId = credentialInputId;
+    this.credentialToggleId = credentialToggleId;
+    await this.request(request(this.id, this.credentialInputId, 'addDependent', {}));
+    await this.request(request(this.id, credentialRowId, 'addLayoutChild', {
+      widgetId: this.credentialInputId,
       sizePolicy: { horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
-    await this.request(request(this.id, this.anthropicToggleId, 'addDependent', {}));
-    await this.request(request(this.id, anthropicRowId, 'addLayoutChild', {
-      widgetId: this.anthropicToggleId,
+    await this.request(request(this.id, this.credentialToggleId, 'addDependent', {}));
+    await this.request(request(this.id, credentialRowId, 'addLayoutChild', {
+      widgetId: this.credentialToggleId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 56, height: 32 },
     }));
 
-    // OpenAI API Key row
-    const { widgetIds: [openaiLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    // Models list label (read-only, shows discovered models for the active provider)
+    const { widgetIds: [providerModelsLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'OpenAI API Key',
-          style: { color: this.theme.textHeading, fontSize: 13 } },
+        { type: 'label', windowId: this.windowId,
+          text: this.formatModelListLine(this.activeAiProvider),
+          style: { color: this.theme.textDescription, fontSize: 12 } },
       ]})
     );
+    this.providerModelsLabelId = providerModelsLabelId;
     await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: openaiLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-
-    const openaiRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: cId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: openaiRowId,
+      widgetId: this.providerModelsLabelId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-
-    const { widgetIds: [openaiKeyId, openaiToggleId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'textInput', windowId: this.windowId, placeholder: 'sk-...', masked: true,
-          text: savedOpenaiKey ?? undefined },
-        { type: 'button', windowId: this.windowId, text: 'Show' },
-      ]})
-    );
-    this.openaiKeyId = openaiKeyId;
-    this.openaiToggleId = openaiToggleId;
-    await this.request(request(this.id, this.openaiKeyId, 'addDependent', {}));
-    await this.request(request(this.id, openaiRowId, 'addLayoutChild', {
-      widgetId: this.openaiKeyId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-    await this.request(request(this.id, this.openaiToggleId, 'addDependent', {}));
-    await this.request(request(this.id, openaiRowId, 'addLayoutChild', {
-      widgetId: this.openaiToggleId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 56, height: 32 },
-    }));
-
-    // Ollama URL row
-    const { widgetIds: [ollamaLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Ollama URL',
-          style: { color: this.theme.textHeading, fontSize: 13 } },
-      ]})
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: ollamaLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-
-    const { widgetIds: [ollamaUrlId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'textInput', windowId: this.windowId, placeholder: 'http://localhost:11434',
-          text: savedOllamaUrl || 'http://localhost:11434' },
-      ]})
-    );
-    this.ollamaUrlId = ollamaUrlId;
-    await this.request(request(this.id, this.ollamaUrlId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: this.ollamaUrlId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
+      preferredSize: { height: 18 },
     }));
 
     // ── Model Tiers section ──
@@ -1142,6 +1190,18 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 180, height: 36 },
     }));
+
+    // Kick off background live fetches for providers the user is currently
+    // looking at or that a tier is pointed at. Fire-and-forget so the window
+    // paints immediately. Each fetch updates its dropdown/label when it lands.
+    const toPrefetch = new Set<LLMProviderName>([this.activeAiProvider]);
+    for (const tier of TIER_NAMES) {
+      const p = savedTierRouting[tier].provider as LLMProviderName | null;
+      if (p && PROVIDER_NAMES.includes(p)) toPrefetch.add(p);
+    }
+    for (const p of toPrefetch) {
+      void this.refreshProviderModels(p);
+    }
   }
 
   /** Build Auth tab content into authContainerId. */
@@ -1327,11 +1387,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
     this.windowId = undefined;
     this.rootLayoutId = undefined;
-    this.anthropicKeyId = undefined;
-    this.anthropicToggleId = undefined;
-    this.openaiKeyId = undefined;
-    this.openaiToggleId = undefined;
-    this.ollamaUrlId = undefined;
+    this.providerSelectorId = undefined;
+    this.credentialLabelId = undefined;
+    this.credentialInputId = undefined;
+    this.credentialToggleId = undefined;
+    this.providerModelsLabelId = undefined;
     this.tierProviderSelectIds = { smart: undefined, balanced: undefined, fast: undefined };
     this.tierModelSelectIds = { smart: undefined, balanced: undefined, fast: undefined };
     this.saveBtnId = undefined;
@@ -1426,7 +1486,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private async setSaveControlsDisabled(disabled: boolean): Promise<void> {
     const style = { disabled };
     const ids: (AbjectId | undefined)[] = [
-      this.saveBtnId, this.anthropicKeyId, this.openaiKeyId, this.ollamaUrlId,
+      this.saveBtnId, this.providerSelectorId, this.credentialInputId, this.credentialToggleId,
       ...Object.values(this.tierProviderSelectIds),
       ...Object.values(this.tierModelSelectIds),
     ];
@@ -1439,11 +1499,16 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
   // ========== TIER MODEL REFRESH ==========
 
+  /** Tracks providers whose live models have been fetched this session. */
+  private fetchedLiveModels: Set<LLMProviderName> = new Set();
+  /** Tracks in-flight fetches so we don't kick off duplicates. */
+  private modelFetchInFlight: Set<LLMProviderName> = new Set();
+
   /**
-   * Fetch model lists for all providers and cache them.
+   * Synchronously populate the cache with hardcoded defaults so the UI can
+   * render immediately. Live fetches happen lazily via refreshProviderModels.
    */
-  private async fetchAllProviderModels(ollamaUrl?: string | null): Promise<void> {
-    // Anthropic and OpenAI have static model lists; Ollama is dynamic
+  private populateDefaultModelCache(): void {
     this.providerModelCache.anthropic = [
       { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
       { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
@@ -1454,22 +1519,160 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
       { id: 'gpt-5.4-nano', name: 'GPT-5.4 Nano' },
     ];
+    this.providerModelCache.openrouter = [
+      { id: 'anthropic/claude-opus-4-6', name: 'anthropic/claude-opus-4-6' },
+      { id: 'openai/gpt-5.4-mini', name: 'openai/gpt-5.4-mini' },
+      { id: 'meta-llama/llama-3.3-70b-instruct', name: 'meta-llama/llama-3.3-70b-instruct' },
+    ];
+    this.providerModelCache.deepseek = [
+      { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
+      { id: 'deepseek-chat', name: 'DeepSeek Chat' },
+    ];
+    this.providerModelCache.grok = [
+      { id: 'grok-4', name: 'Grok 4' },
+      { id: 'grok-4-mini', name: 'Grok 4 Mini' },
+      { id: 'grok-4-fast', name: 'Grok 4 Fast' },
+    ];
+    this.providerModelCache.gemini = [
+      { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro' },
+      { id: 'gemini-3.1-flash', name: 'Gemini 3.1 Flash' },
+      { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
+    ];
+    this.providerModelCache.kimi = [
+      { id: 'kimi-k2-0905-preview', name: 'Kimi K2 (preview)' },
+      { id: 'moonshot-v1-128k', name: 'Moonshot v1 128k' },
+      { id: 'moonshot-v1-32k', name: 'Moonshot v1 32k' },
+      { id: 'moonshot-v1-8k', name: 'Moonshot v1 8k' },
+    ];
+    this.providerModelCache.minimax = [
+      { id: 'MiniMax-M2', name: 'MiniMax M2' },
+      { id: 'MiniMax-M1', name: 'MiniMax M1' },
+      { id: 'abab6.5-chat', name: 'abab6.5 Chat' },
+      { id: 'abab6.5s-chat', name: 'abab6.5s Chat' },
+    ];
     this.providerModelCache.ollama = [];
-    if (this.llmId) {
-      try {
-        const models = await this.request<ModelInfo[]>(
-          request(this.id, this.llmId, 'listProviderModels', {
-            provider: 'ollama',
-            ollamaUrl: ollamaUrl || 'http://localhost:11434',
-          })
-        );
-        this.providerModelCache.ollama = models;
-      } catch { /* Ollama not running */ }
-    }
   }
 
   /**
-   * Refresh the model dropdown for a specific tier after its provider changed.
+   * Lazily refresh one provider's model list from its API. Non-blocking when
+   * awaitResult is false — call-sites can fire-and-forget to avoid freezing
+   * the UI. Updates visible widgets (provider-panel label and any matching
+   * tier dropdown) when the fetch completes.
+   */
+  private async refreshProviderModels(
+    name: LLMProviderName,
+    opts: { force?: boolean } = {},
+  ): Promise<void> {
+    if (!this.llmId) return;
+    if (this.modelFetchInFlight.has(name)) return;
+    if (!opts.force && this.fetchedLiveModels.has(name)) return;
+    // Skip unreachable providers without credentials (except Ollama which is local)
+    if (name !== 'ollama' && !this.credentialValues[name]) return;
+
+    this.modelFetchInFlight.add(name);
+    try {
+      const payload: Record<string, unknown> = { provider: name };
+      if (name === 'ollama') {
+        payload.ollamaUrl = this.credentialValues.ollama || 'http://localhost:11434';
+      }
+      const models = await this.request<ModelInfo[]>(
+        request(this.id, this.llmId, 'listProviderModels', payload)
+      );
+      if (models.length > 0) {
+        this.providerModelCache[name] = models;
+        this.fetchedLiveModels.add(name);
+        await this.onProviderModelsUpdated(name);
+      }
+    } catch {
+      // Network error or provider not registered; keep defaults.
+    } finally {
+      this.modelFetchInFlight.delete(name);
+    }
+  }
+
+  /** Update any visible widgets that depend on the given provider's model list. */
+  private async onProviderModelsUpdated(name: LLMProviderName): Promise<void> {
+    if (!this.windowId) return;
+    if (name === this.activeAiProvider && this.providerModelsLabelId) {
+      await this.request(request(this.id, this.providerModelsLabelId, 'update', {
+        text: this.formatModelListLine(name),
+      }));
+    }
+    // Update any tier dropdown currently pointed at this provider
+    for (const tier of TIER_NAMES) {
+      const providerSelectId = this.tierProviderSelectIds[tier];
+      if (!providerSelectId) continue;
+      try {
+        const label = await this.request<string>(
+          request(this.id, providerSelectId, 'getValue', {})
+        );
+        const idx = PROVIDER_LABELS.indexOf(label);
+        const tierProvider = idx >= 0 ? PROVIDER_NAMES[idx] : null;
+        if (tierProvider === name) {
+          await this.refreshTierModelOptions(tier);
+        }
+      } catch { /* widget gone */ }
+    }
+  }
+
+  /** Format the models-list label for a provider ("3 models: Claude Opus 4.7, …"). */
+  private formatModelListLine(provider: LLMProviderName): string {
+    const models = this.providerModelCache[provider];
+    if (!models || models.length === 0) {
+      return provider === 'ollama' ? 'No local models found. Start Ollama and save.' : 'Save credentials to discover models.';
+    }
+    const names = models.slice(0, 6).map(m => m.name);
+    const more = models.length > names.length ? `, …(+${models.length - names.length})` : '';
+    return `${models.length} models: ${names.join(', ')}${more}`;
+  }
+
+  /** Handle provider-dropdown change: snapshot the current input, then swap panel. */
+  private async onProviderSelectorChanged(): Promise<void> {
+    if (!this.providerSelectorId || !this.credentialInputId || !this.credentialLabelId || !this.credentialToggleId) return;
+
+    // Snapshot the current input into credentialValues for the old provider
+    const oldValue = await this.request<string>(request(this.id, this.credentialInputId, 'getValue', {}));
+    this.credentialValues[this.activeAiProvider] = oldValue ?? '';
+
+    // Figure out the new provider
+    const newLabel = await this.request<string>(request(this.id, this.providerSelectorId, 'getValue', {}));
+    const newIdx = PROVIDER_LABELS.indexOf(newLabel);
+    const newProvider = newIdx >= 0 ? PROVIDER_NAMES[newIdx] : PROVIDER_NAMES[0];
+    this.activeAiProvider = newProvider;
+
+    const meta = PROVIDER_META[newProvider];
+    const newValue = this.credentialValues[newProvider]
+      ?? (newProvider === 'ollama' ? 'http://localhost:11434' : '');
+
+    // Reset masking state for the input
+    this.unmasked.delete(this.credentialInputId);
+
+    await this.request(request(this.id, this.credentialLabelId, 'update', {
+      text: meta.credentialLabel,
+    }));
+    await this.request(request(this.id, this.credentialInputId, 'update', {
+      text: newValue,
+      placeholder: meta.placeholder,
+      masked: !meta.isUrl,
+    }));
+    await this.request(request(this.id, this.credentialToggleId, 'update', {
+      text: 'Show',
+      style: meta.isUrl ? { disabled: true } : { disabled: false },
+    }));
+    if (this.providerModelsLabelId) {
+      await this.request(request(this.id, this.providerModelsLabelId, 'update', {
+        text: this.formatModelListLine(newProvider),
+      }));
+    }
+
+    // Background refresh for the newly-active provider (idempotent + deduped)
+    void this.refreshProviderModels(newProvider);
+  }
+
+  /**
+   * Refresh the model dropdown for a specific tier after its provider changed
+   * or the model cache was updated. Preserves the current selection when
+   * still present in the new list.
    */
   private async refreshTierModelOptions(tier: ModelTierName): Promise<void> {
     const providerSelectId = this.tierProviderSelectIds[tier];
@@ -1482,13 +1685,20 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const providerIdx = PROVIDER_LABELS.indexOf(providerLabel);
     const providerName = providerIdx >= 0 ? PROVIDER_NAMES[providerIdx] : PROVIDER_NAMES[0];
 
+    const currentLabel = await this.request<string>(
+      request(this.id, modelSelectId, 'getValue', {})
+    );
+
     const modelList = this.providerModelCache[providerName];
     const options = modelList.length > 0
       ? modelList.map(m => m.name)
       : ['(no models)'];
 
+    const keepIdx = options.indexOf(currentLabel);
+    const selectedIndex = keepIdx >= 0 ? keepIdx : 0;
+
     await this.request(
-      request(this.id, modelSelectId, 'update', { options, selectedIndex: 0 })
+      request(this.id, modelSelectId, 'update', { options, selectedIndex })
     );
   }
 
@@ -2628,17 +2838,18 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
     await this.setSaveControlsDisabled(true);
 
-    // Read all credential values
-    const anthropicKey = this.anthropicKeyId
-      ? await this.request<string>(request(this.id, this.anthropicKeyId, 'getValue', {}))
-      : '';
-    const openaiKey = this.openaiKeyId
-      ? await this.request<string>(request(this.id, this.openaiKeyId, 'getValue', {}))
-      : '';
-    let ollamaUrl = this.ollamaUrlId
-      ? await this.request<string>(request(this.id, this.ollamaUrlId, 'getValue', {}))
-      : '';
-    if (!ollamaUrl) ollamaUrl = 'http://localhost:11434';
+    // Snapshot the currently visible credential into the cache so it persists.
+    if (this.credentialInputId) {
+      const currentValue = await this.request<string>(
+        request(this.id, this.credentialInputId, 'getValue', {})
+      );
+      this.credentialValues[this.activeAiProvider] = currentValue ?? '';
+    }
+
+    // Default Ollama URL if empty
+    if (!this.credentialValues.ollama) {
+      this.credentialValues.ollama = 'http://localhost:11434';
+    }
 
     // Read per-tier provider + model selections
     const tierRouting: Record<ModelTierName, { provider: string | null; model: string | null }> = {
@@ -2663,7 +2874,6 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       );
 
       if (providerName && modelName && modelName !== '(no models)') {
-        // Resolve display name back to model id
         const modelList = this.providerModelCache[providerName];
         const modelInfo = modelList.find(m => m.name === modelName);
         tierRouting[tier] = {
@@ -2681,17 +2891,18 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       return;
     }
 
-    // Validate: each configured tier's provider must have credentials
+    // Validate: each tier's provider must have credentials (Ollama always has a URL)
     for (const tier of TIER_NAMES) {
       const { provider } = tierRouting[tier];
-      if (!provider) continue;
-      if (provider === 'anthropic' && !anthropicKey) {
-        await this.setStatus(`${TIER_LABELS[TIER_NAMES.indexOf(tier)]} tier uses Anthropic but no API key provided.`, this.theme.statusErrorBright);
-        await this.setSaveControlsDisabled(false);
-        return;
-      }
-      if (provider === 'openai' && !openaiKey) {
-        await this.setStatus(`${TIER_LABELS[TIER_NAMES.indexOf(tier)]} tier uses OpenAI but no API key provided.`, this.theme.statusErrorBright);
+      if (!provider || provider === 'ollama') continue;
+      const providerName = provider as LLMProviderName;
+      if (!this.credentialValues[providerName]) {
+        const tierLabel = TIER_LABELS[TIER_NAMES.indexOf(tier)];
+        const providerLabel = PROVIDER_LABELS[PROVIDER_NAMES.indexOf(providerName)] ?? providerName;
+        await this.setStatus(
+          `${tierLabel} tier uses ${providerLabel} but no API key provided.`,
+          this.theme.statusErrorBright,
+        );
         await this.setSaveControlsDisabled(false);
         return;
       }
@@ -2699,18 +2910,30 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
     // Persist credentials to storage
     if (this.storageId) {
-      if (anthropicKey) {
-        await this.request(
-          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_ANTHROPIC, value: anthropicKey })
-        );
-      }
-      if (openaiKey) {
-        await this.request(
-          request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OPENAI, value: openaiKey })
-        );
+      const storageKeys: Array<[LLMProviderName, string]> = [
+        ['anthropic', STORAGE_KEY_ANTHROPIC],
+        ['openai', STORAGE_KEY_OPENAI],
+        ['ollama', STORAGE_KEY_OLLAMA_URL],
+        ['openrouter', STORAGE_KEY_OPENROUTER],
+        ['deepseek', STORAGE_KEY_DEEPSEEK],
+        ['grok', STORAGE_KEY_GROK],
+        ['gemini', STORAGE_KEY_GEMINI],
+        ['kimi', STORAGE_KEY_KIMI],
+        ['minimax', STORAGE_KEY_MINIMAX],
+      ];
+      for (const [name, key] of storageKeys) {
+        const value = this.credentialValues[name];
+        if (value) {
+          await this.request(
+            request(this.id, this.storageId, 'set', { key, value })
+          );
+        }
       }
       await this.request(
-        request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OLLAMA_URL, value: ollamaUrl })
+        request(this.id, this.storageId, 'set', {
+          key: STORAGE_KEY_AI_ACTIVE_PROVIDER,
+          value: this.activeAiProvider,
+        })
       );
 
       // Persist tier routing
@@ -2718,16 +2941,24 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }
 
     // Configure all providers and tier routing
-    await this.configureProviders(
-      anthropicKey || null,
-      openaiKey || null,
-      ollamaUrl || null,
-      tierRouting,
-    );
+    await this.configureProviders(this.credentialValues, tierRouting);
 
     log.info('Saved provider settings with per-tier routing');
     await this.setStatus('Settings saved!');
     await this.setSaveControlsDisabled(false);
+
+    // Kick off background live model refreshes now that providers are
+    // registered. Each completing fetch re-renders only the widgets bound to
+    // that provider, so the UI never blocks on a slow API.
+    this.fetchedLiveModels.clear();
+    const prefetch = new Set<LLMProviderName>([this.activeAiProvider]);
+    for (const tier of TIER_NAMES) {
+      const p = tierRouting[tier].provider as LLMProviderName | null;
+      if (p && PROVIDER_NAMES.includes(p)) prefetch.add(p);
+    }
+    for (const p of prefetch) {
+      void this.refreshProviderModels(p, { force: true });
+    }
   }
 }
 

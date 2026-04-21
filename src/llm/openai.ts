@@ -23,6 +23,16 @@ export interface OpenAIConfig {
   model?: string;
   baseUrl?: string;
   fetchFn?: FetchDelegate;
+  /**
+   * Optional per-tier model override. Subclasses (OpenRouter, DeepSeek, Grok)
+   * pass their own tier mapping while reusing OpenAI's chat-completions logic.
+   */
+  tierModels?: Record<ModelTier, string>;
+  /**
+   * Optional extra headers merged into every request (e.g. OpenRouter's
+   * HTTP-Referer and X-Title attribution headers).
+   */
+  extraHeaders?: Record<string, string>;
 }
 
 type OpenAIContentPart = { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } };
@@ -74,21 +84,52 @@ interface OpenAIResponse {
  * OpenAI provider.
  */
 export class OpenAIProvider extends BaseLLMProvider {
-  readonly name = 'openai';
-  private model: string;
+  name: string = 'openai';
+  protected model: string;
+  protected tierModels: Record<ModelTier, string>;
+  protected extraHeaders: Record<string, string>;
 
-  private static readonly TIER_MODELS: Record<ModelTier, string> = {
+  private static readonly DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
     smart: 'gpt-5.4',
     balanced: 'gpt-5.4-mini',
     fast: 'gpt-5.4-nano',
   };
 
-  private resolveModel(options?: LLMCompletionOptions): string {
+  protected resolveModel(options?: LLMCompletionOptions): string {
     if (options?.model) return options.model;
-    return options?.tier ? OpenAIProvider.TIER_MODELS[options.tier] : this.model;
+    return options?.tier ? this.tierModels[options.tier] : this.model;
   }
 
   async listModels(): Promise<ModelInfo[]> {
+    if (!this.apiKey) {
+      return this.fallbackModels();
+    }
+    try {
+      const response = await this.fetch(`${this.baseUrl}/v1/models`, {
+        method: 'GET',
+        headers: this.buildHeaders(),
+      });
+      const parsed = JSON.parse(response.body) as {
+        data?: Array<{ id: string; owned_by?: string }>;
+      };
+      const rows = parsed.data ?? [];
+      if (rows.length === 0) return this.fallbackModels();
+      // Keep chat-capable text models; drop embeddings/audio/image/moderation/realtime.
+      const excluded = /(embedding|whisper|tts|dall-e|moderation|audio|realtime|transcribe|davinci|babbage|ada|curie)/i;
+      const filtered = rows
+        .map(r => r.id)
+        .filter(id => !excluded.test(id))
+        .sort();
+      const models = (filtered.length > 0 ? filtered : rows.map(r => r.id))
+        .map(id => ({ id, name: id }));
+      return models;
+    } catch (err) {
+      log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
+      return this.fallbackModels();
+    }
+  }
+
+  protected fallbackModels(): ModelInfo[] {
     return [
       { id: 'gpt-5.4', name: 'GPT-5.4' },
       { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
@@ -102,7 +143,9 @@ export class OpenAIProvider extends BaseLLMProvider {
       baseUrl: config.baseUrl ?? 'https://api.openai.com',
       fetchFn: config.fetchFn,
     });
-    this.model = config.model ?? 'gpt-5.4-mini';
+    this.tierModels = config.tierModels ?? OpenAIProvider.DEFAULT_TIER_MODELS;
+    this.model = config.model ?? this.tierModels.balanced;
+    this.extraHeaders = config.extraHeaders ?? {};
   }
 
   async isAvailable(): Promise<boolean> {
@@ -236,7 +279,7 @@ export class OpenAIProvider extends BaseLLMProvider {
    * Map LLMMessage content to OpenAI API format.
    * String content passes through; ContentPart[] maps to OpenAI content parts.
    */
-  private mapContent(content: string | ContentPart[]): string | OpenAIContentPart[] {
+  protected mapContent(content: string | ContentPart[]): string | OpenAIContentPart[] {
     if (typeof content === 'string') return content;
     return content.map((part): OpenAIContentPart => {
       if (part.type === 'text') return { type: 'text', text: part.text };
@@ -248,6 +291,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     return {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${this.apiKey}`,
+      ...this.extraHeaders,
     };
   }
 }

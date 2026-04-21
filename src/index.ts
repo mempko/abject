@@ -187,6 +187,12 @@ export { getTextContent, userMessageWithImages } from './llm/provider.js';
 export { AnthropicProvider } from './llm/anthropic.js';
 export { OpenAIProvider } from './llm/openai.js';
 export { OllamaProvider } from './llm/ollama.js';
+export { OpenRouterProvider } from './llm/openrouter.js';
+export { DeepSeekProvider } from './llm/deepseek.js';
+export { GrokProvider } from './llm/grok.js';
+export { GeminiProvider } from './llm/google-gemini.js';
+export { KimiProvider } from './llm/kimi.js';
+export { MiniMaxProvider } from './llm/minimax.js';
 
 // Export network
 export { Transport } from './network/transport.js';

@@ -93,6 +93,32 @@ export class AnthropicProvider extends BaseLLMProvider {
   }
 
   async listModels(): Promise<ModelInfo[]> {
+    if (!this.apiKey) {
+      return this.fallbackModels();
+    }
+    try {
+      const response = await this.fetch(`${this.baseUrl}/v1/models?limit=1000`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': this.apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+      });
+      const parsed = JSON.parse(response.body) as {
+        data?: Array<{ id: string; display_name?: string }>;
+      };
+      const rows = parsed.data ?? [];
+      if (rows.length === 0) return this.fallbackModels();
+      return rows.map(r => ({ id: r.id, name: r.display_name ?? r.id }));
+    } catch (err) {
+      log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
+      return this.fallbackModels();
+    }
+  }
+
+  private fallbackModels(): ModelInfo[] {
     return [
       { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
       { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },

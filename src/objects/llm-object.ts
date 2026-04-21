@@ -32,6 +32,12 @@ export type TierRouting = Partial<Record<ModelTier, TierConfig>>;
 import { AnthropicProvider } from '../llm/anthropic.js';
 import { OpenAIProvider } from '../llm/openai.js';
 import { OllamaProvider } from '../llm/ollama.js';
+import { OpenRouterProvider } from '../llm/openrouter.js';
+import { DeepSeekProvider } from '../llm/deepseek.js';
+import { GrokProvider } from '../llm/grok.js';
+import { GeminiProvider } from '../llm/google-gemini.js';
+import { KimiProvider } from '../llm/kimi.js';
+import { MiniMaxProvider } from '../llm/minimax.js';
 import type { HttpRequest, HttpResponse } from './capabilities/http-client.js';
 
 const log = new Log('LLM');
@@ -424,6 +430,12 @@ export class LLMObject extends Abject {
         anthropicApiKey?: string;
         openaiApiKey?: string;
         ollamaUrl?: string;
+        openrouterApiKey?: string;
+        deepseekApiKey?: string;
+        grokApiKey?: string;
+        geminiApiKey?: string;
+        kimiApiKey?: string;
+        minimaxApiKey?: string;
         tierRouting?: TierRouting;
       };
       await this.configure(config);
@@ -579,6 +591,12 @@ export class LLMObject extends Abject {
     anthropicApiKey?: string;
     openaiApiKey?: string;
     ollamaUrl?: string;
+    openrouterApiKey?: string;
+    deepseekApiKey?: string;
+    grokApiKey?: string;
+    geminiApiKey?: string;
+    kimiApiKey?: string;
+    minimaxApiKey?: string;
     tierRouting?: TierRouting;
   }): Promise<void> {
     const fetchFn = this.httpClientId ? this.createFetchDelegate() : undefined;
@@ -592,6 +610,42 @@ export class LLMObject extends Abject {
     if (config.openaiApiKey) {
       this.registerProvider(
         new OpenAIProvider({ apiKey: config.openaiApiKey, fetchFn })
+      );
+    }
+
+    if (config.openrouterApiKey) {
+      this.registerProvider(
+        new OpenRouterProvider({ apiKey: config.openrouterApiKey, fetchFn })
+      );
+    }
+
+    if (config.deepseekApiKey) {
+      this.registerProvider(
+        new DeepSeekProvider({ apiKey: config.deepseekApiKey, fetchFn })
+      );
+    }
+
+    if (config.grokApiKey) {
+      this.registerProvider(
+        new GrokProvider({ apiKey: config.grokApiKey, fetchFn })
+      );
+    }
+
+    if (config.geminiApiKey) {
+      this.registerProvider(
+        new GeminiProvider({ apiKey: config.geminiApiKey, fetchFn })
+      );
+    }
+
+    if (config.kimiApiKey) {
+      this.registerProvider(
+        new KimiProvider({ apiKey: config.kimiApiKey, fetchFn })
+      );
+    }
+
+    if (config.minimaxApiKey) {
+      this.registerProvider(
+        new MiniMaxProvider({ apiKey: config.minimaxApiKey, fetchFn })
       );
     }
 
@@ -999,13 +1053,14 @@ This is configured via the Settings UI or the \`setTierRouting\` method:
 ### Provider Management
 
   const providers = await this.call(this.dep('LLM'), 'listProviders', {});
-  // providers: ['anthropic', 'openai', 'ollama']
+  // providers: ['anthropic', 'openai', 'ollama', 'openrouter', 'deepseek', 'grok', 'gemini']
 
   const models = await this.call(this.dep('LLM'), 'listProviderModels', { provider: 'anthropic' });
   // models: [{ id: 'claude-opus-4-7', name: 'Claude Opus 4.7' }, ...]
 
   await this.call(this.dep('LLM'), 'configure', {
     anthropicApiKey: '...', openaiApiKey: '...', ollamaUrl: 'http://localhost:11434',
+    openrouterApiKey: '...', deepseekApiKey: '...', grokApiKey: '...', geminiApiKey: '...',
     tierRouting: { smart: { provider: 'anthropic', model: 'claude-opus-4-7' } }
   });
   // Configure all providers and tier routing (all fields optional)
