@@ -47,6 +47,10 @@ export class FrontendClient {
   private mouseMoveRafId = 0;
   /** Fonts for which we've already shipped a full ASCII metrics table. */
   private measuredFonts: Set<string> = new Set();
+  /** Middle-click-drag pan in progress. */
+  private panningViewport = false;
+  /** Scrollbar thumb drag in progress. */
+  private draggingScrollbar = false;
   private reconnectAttempt = 0;
   private mobileMode = false;
   private mobileTabTouchStartX?: number;  // track start X for tap vs scroll detection
@@ -709,8 +713,9 @@ export class FrontendClient {
   private updateCursor(canvasX: number, canvasY: number): void {
     const surface = this.compositor.surfaceAt(canvasX, canvasY);
     if (surface && this.resizableSurfaces.has(surface.id)) {
-      const localX = canvasX - surface.rect.x;
-      const localY = canvasY - surface.rect.y;
+      const { x: wx, y: wy } = this.compositor.viewportToWorkspace(canvasX, canvasY);
+      const localX = wx - surface.rect.x;
+      const localY = wy - surface.rect.y;
       const edge = this.detectResizeEdge(surface.rect, localX, localY);
       this.canvas.style.cursor = edge ? FrontendClient.edgeToCursor(edge) : 'default';
     } else {
@@ -782,11 +787,24 @@ export class FrontendClient {
 
     this.canvas.addEventListener('mousedown', (e) => {
       this.canvas.focus();
+      if (this.handleScrollOrPanMouseDown(e)) return;
       this.handleMouseEvent(e, 'mousedown');
     });
-    this.canvas.addEventListener('mouseup', (e) => this.handleMouseUp(e));
-    this.canvas.addEventListener('mousemove', (e) => this.handleMouseMoveThrottled(e));
+    this.canvas.addEventListener('mouseup', (e) => {
+      if (this.handleScrollOrPanMouseUp()) return;
+      this.handleMouseUp(e);
+    });
+    this.canvas.addEventListener('mousemove', (e) => {
+      if (this.handleScrollOrPanMouseMove(e)) return;
+      this.handleMouseMoveThrottled(e);
+    });
     this.canvas.addEventListener('wheel', (e) => this.handleWheelEvent(e));
+    this.canvas.addEventListener('auxclick', (e) => { if (e.button === 1) e.preventDefault(); });
+    this.canvas.addEventListener('contextmenu', (e) => {
+      // Don't block browser context menu normally, but if a middle-pan is
+      // happening we don't want it to intercept.
+      if (this.panningViewport) e.preventDefault();
+    });
 
     document.addEventListener('keydown', (e) => this.handleKeyEvent(e, 'keydown'));
     document.addEventListener('keyup', (e) => this.handleKeyEvent(e, 'keyup'));
@@ -950,6 +968,70 @@ export class FrontendClient {
     }
   }
 
+  /**
+   * Intercept mousedown for scrollbar thumb or middle-click pan. Returns true
+   * if the event was consumed and the normal input path should be skipped.
+   */
+  private handleScrollOrPanMouseDown(e: MouseEvent): boolean {
+    if (this.mobileMode) return false;
+    const canvasRect = this.canvas.getBoundingClientRect();
+    const vx = e.clientX - canvasRect.left;
+    const vy = e.clientY - canvasRect.top;
+
+    // Scrollbar thumb? (left button only)
+    if (e.button === 0) {
+      const axis = this.compositor.scrollbarAt(vx, vy);
+      if (axis) {
+        this.compositor.beginScrollbarDrag(axis, axis === 'x' ? vx : vy);
+        this.draggingScrollbar = true;
+        e.preventDefault();
+        return true;
+      }
+    }
+
+    // Middle-click pans anywhere.
+    if (e.button === 1) {
+      this.compositor.beginPanDrag(vx, vy);
+      this.panningViewport = true;
+      this.canvas.style.cursor = 'grabbing';
+      e.preventDefault();
+      return true;
+    }
+
+    return false;
+  }
+
+  private handleScrollOrPanMouseMove(e: MouseEvent): boolean {
+    if (!this.panningViewport && !this.draggingScrollbar) return false;
+    const canvasRect = this.canvas.getBoundingClientRect();
+    const vx = e.clientX - canvasRect.left;
+    const vy = e.clientY - canvasRect.top;
+    if (this.draggingScrollbar) {
+      this.compositor.updateScrollbarDrag(vx, vy);
+      return true;
+    }
+    if (this.panningViewport) {
+      this.compositor.updatePanDrag(vx, vy);
+      return true;
+    }
+    return false;
+  }
+
+  private handleScrollOrPanMouseUp(): boolean {
+    if (this.draggingScrollbar) {
+      this.compositor.endScrollbarDrag();
+      this.draggingScrollbar = false;
+      return true;
+    }
+    if (this.panningViewport) {
+      this.compositor.endPanDrag();
+      this.panningViewport = false;
+      this.canvas.style.cursor = 'default';
+      return true;
+    }
+    return false;
+  }
+
   private handleMouseEvent(
     e: MouseEvent,
     type: 'mousedown' | 'mouseup' | 'mousemove'
@@ -962,6 +1044,9 @@ export class FrontendClient {
     this.lastCanvasX = x;
     this.lastCanvasY = y;
 
+    // Workspace coords (surface.rect is in workspace space, mouse is in viewport)
+    const { x: wx, y: wy } = this.compositor.viewportToWorkspace(x, y);
+
     // Hit test locally — compositor is local
     const hitSurface = this.compositor.surfaceAt(x, y);
     const grabbed = this.grabbedSurface
@@ -969,8 +1054,8 @@ export class FrontendClient {
       : undefined;
     const surface = grabbed ?? hitSurface;
 
-    const localX = surface ? x - surface.rect.x : x;
-    const localY = surface ? y - surface.rect.y : y;
+    const localX = surface ? wx - surface.rect.x : wx;
+    const localY = surface ? wy - surface.rect.y : wy;
 
     // For resize drags (grabbedSurface set, no local drag), include globalX/globalY
     // to avoid stale local→global reconstruction on the server
@@ -990,8 +1075,8 @@ export class FrontendClient {
     };
 
     if (this.grabbedSurface && !this.localDragState) {
-      inputMsg.globalX = x;
-      inputMsg.globalY = y;
+      inputMsg.globalX = wx;
+      inputMsg.globalY = wy;
     }
 
     this.sendToBackend(inputMsg as unknown as FrontendToBackendMsg);
@@ -1041,11 +1126,12 @@ export class FrontendClient {
     // Update resize cursor on hover (instant, no server round-trip)
     this.updateCursor(x, y);
 
+    const { x: wx, y: wy } = this.compositor.viewportToWorkspace(x, y);
     const hitSurface = this.compositor.surfaceAt(x, y);
     const surface = hitSurface;
 
-    const localX = surface ? x - surface.rect.x : x;
-    const localY = surface ? y - surface.rect.y : y;
+    const localX = surface ? wx - surface.rect.x : wx;
+    const localY = surface ? wy - surface.rect.y : wy;
 
     this.pendingMouseMove = {
       type: 'input',
@@ -1079,14 +1165,26 @@ export class FrontendClient {
     const y = e.clientY - rect.top;
 
     const surface = this.compositor.surfaceAt(x, y);
-    if (!surface) return;
 
+    // Wheel over empty desktop pans the viewport. Shift+wheel scrolls
+    // horizontally (standard mousewheel convention).
+    if (!surface) {
+      e.preventDefault();
+      if (e.shiftKey) {
+        this.compositor.scrollBy(e.deltaY !== 0 ? e.deltaY : e.deltaX, 0);
+      } else {
+        this.compositor.scrollBy(e.deltaX, e.deltaY);
+      }
+      return;
+    }
+
+    const { x: wx, y: wy } = this.compositor.viewportToWorkspace(x, y);
     this.sendToBackend({
       type: 'input',
       inputType: 'wheel',
       surfaceId: surface.id,
-      x: x - surface.rect.x,
-      y: y - surface.rect.y,
+      x: wx - surface.rect.x,
+      y: wy - surface.rect.y,
       deltaX: e.deltaX,
       deltaY: e.deltaY,
       modifiers: {

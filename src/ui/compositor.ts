@@ -214,6 +214,25 @@ export class Compositor {
   private static IMAGE_CACHE_MAX = 100;
   private liveDataImages: Map<string, { img: HTMLImageElement; width: number; height: number }> = new Map();
 
+  // ── Desktop scroll state ──
+  /**
+   * Viewport scroll offset in workspace coords. Workspace content is drawn
+   * translated by (-scrollX, -scrollY); mouse events are translated the
+   * opposite way before hit-testing. Workspace size = max(viewport, bbox of
+   * all surfaces). Users pan via wheel (over empty area), middle-click drag,
+   * or the scrollbar thumbs.
+   */
+  private scrollX = 0;
+  private scrollY = 0;
+  private static readonly SCROLLBAR_SIZE = 10;
+  private static readonly SCROLLBAR_MARGIN = 2;
+  private scrollbarDrag?: {
+    axis: 'x' | 'y';
+    startMouse: number;
+    startScroll: number;
+  };
+  private panDrag?: { startX: number; startY: number; startScrollX: number; startScrollY: number };
+
   // ── Mobile mode state ──
   private mobileMode = false;
   private mobileFocusedSurfaceId?: string;
@@ -982,6 +1001,10 @@ export class Compositor {
   }
 
   private renderDesktop(): void {
+    this.clampScroll();
+
+    this.ctx.save();
+    this.ctx.translate(-this.scrollX, -this.scrollY);
     for (const surface of this.sortedSurfaces) {
       if (!surface.visible || !surface.drawn) continue;
       if (this.isWorkspaceFiltered(surface)) continue;
@@ -994,6 +1017,181 @@ export class Compositor {
         surface.rect.height
       );
     }
+    this.ctx.restore();
+
+    this.renderScrollbars();
+  }
+
+  /**
+   * Workspace size is the union of the viewport and the bounding box of all
+   * visible surfaces, so users can always scroll to any window even if it
+   * gets dragged off-screen.
+   */
+  private getWorkspaceSize(): { width: number; height: number } {
+    let maxX = this.width;
+    let maxY = this.height;
+    for (const s of this.sortedSurfaces) {
+      if (!s.visible) continue;
+      if (this.isWorkspaceFiltered(s)) continue;
+      const rx = s.rect.x + s.rect.width;
+      const ry = s.rect.y + s.rect.height;
+      if (rx > maxX) maxX = rx;
+      if (ry > maxY) maxY = ry;
+    }
+    return { width: maxX, height: maxY };
+  }
+
+  private clampScroll(): void {
+    const ws = this.getWorkspaceSize();
+    const maxX = Math.max(0, ws.width - this.width);
+    const maxY = Math.max(0, ws.height - this.height);
+    if (this.scrollX < 0) this.scrollX = 0;
+    if (this.scrollY < 0) this.scrollY = 0;
+    if (this.scrollX > maxX) this.scrollX = maxX;
+    if (this.scrollY > maxY) this.scrollY = maxY;
+  }
+
+  /**
+   * Scroll the viewport within the workspace. Coordinates are in workspace
+   * pixels. Values are clamped to the workspace bounds on next render.
+   */
+  scrollTo(x: number, y: number): void {
+    if (x === this.scrollX && y === this.scrollY) return;
+    this.scrollX = x;
+    this.scrollY = y;
+    this.needsRender = true;
+  }
+
+  scrollBy(dx: number, dy: number): void {
+    this.scrollTo(this.scrollX + dx, this.scrollY + dy);
+  }
+
+  getScroll(): { x: number; y: number } {
+    return { x: this.scrollX, y: this.scrollY };
+  }
+
+  private renderScrollbars(): void {
+    const ws = this.getWorkspaceSize();
+    const needH = ws.width > this.width;
+    const needV = ws.height > this.height;
+    if (!needH && !needV) return;
+
+    const SZ = Compositor.SCROLLBAR_SIZE;
+    const M = Compositor.SCROLLBAR_MARGIN;
+    this.ctx.save();
+
+    if (needV) {
+      // Track
+      this.ctx.fillStyle = 'rgba(0,0,0,0.25)';
+      this.ctx.fillRect(this.width - SZ - M, M, SZ, this.height - 2 * M - (needH ? SZ + M : 0));
+      // Thumb
+      const trackH = this.height - 2 * M - (needH ? SZ + M : 0);
+      const thumbH = Math.max(24, (this.height / ws.height) * trackH);
+      const thumbY = M + (this.scrollY / (ws.height - this.height)) * (trackH - thumbH);
+      this.ctx.fillStyle = 'rgba(180,180,200,0.6)';
+      this.scrollbarThumbPath(this.width - SZ - M, thumbY, SZ, thumbH, 4);
+      this.ctx.fill();
+    }
+    if (needH) {
+      this.ctx.fillStyle = 'rgba(0,0,0,0.25)';
+      this.ctx.fillRect(M, this.height - SZ - M, this.width - 2 * M - (needV ? SZ + M : 0), SZ);
+      const trackW = this.width - 2 * M - (needV ? SZ + M : 0);
+      const thumbW = Math.max(24, (this.width / ws.width) * trackW);
+      const thumbX = M + (this.scrollX / (ws.width - this.width)) * (trackW - thumbW);
+      this.ctx.fillStyle = 'rgba(180,180,200,0.6)';
+      this.scrollbarThumbPath(thumbX, this.height - SZ - M, thumbW, SZ, 4);
+      this.ctx.fill();
+    }
+
+    this.ctx.restore();
+  }
+
+  private scrollbarThumbPath(x: number, y: number, w: number, h: number, r: number): void {
+    const ctx = this.ctx;
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  /**
+   * Return the scrollbar hit (for starting a thumb drag) at viewport coords.
+   */
+  scrollbarAt(vx: number, vy: number): 'x' | 'y' | undefined {
+    const ws = this.getWorkspaceSize();
+    const needH = ws.width > this.width;
+    const needV = ws.height > this.height;
+    const SZ = Compositor.SCROLLBAR_SIZE;
+    const M = Compositor.SCROLLBAR_MARGIN;
+    if (needV && vx >= this.width - SZ - M && vx <= this.width - M) return 'y';
+    if (needH && vy >= this.height - SZ - M && vy <= this.height - M) return 'x';
+    return undefined;
+  }
+
+  beginScrollbarDrag(axis: 'x' | 'y', mouseViewportPos: number): void {
+    this.scrollbarDrag = {
+      axis,
+      startMouse: mouseViewportPos,
+      startScroll: axis === 'x' ? this.scrollX : this.scrollY,
+    };
+  }
+
+  /**
+   * Update scroll based on ongoing scrollbar thumb drag. Returns true if a
+   * drag is in progress and the event should be consumed.
+   */
+  updateScrollbarDrag(mouseViewportX: number, mouseViewportY: number): boolean {
+    if (!this.scrollbarDrag) return false;
+    const ws = this.getWorkspaceSize();
+    if (this.scrollbarDrag.axis === 'y') {
+      const trackH = this.height - 2 * Compositor.SCROLLBAR_MARGIN;
+      const thumbH = Math.max(24, (this.height / ws.height) * trackH);
+      const travel = trackH - thumbH;
+      const delta = mouseViewportY - this.scrollbarDrag.startMouse;
+      const scrollRange = ws.height - this.height;
+      if (travel > 0 && scrollRange > 0) {
+        this.scrollTo(this.scrollX, this.scrollbarDrag.startScroll + (delta / travel) * scrollRange);
+      }
+    } else {
+      const trackW = this.width - 2 * Compositor.SCROLLBAR_MARGIN;
+      const thumbW = Math.max(24, (this.width / ws.width) * trackW);
+      const travel = trackW - thumbW;
+      const delta = mouseViewportX - this.scrollbarDrag.startMouse;
+      const scrollRange = ws.width - this.width;
+      if (travel > 0 && scrollRange > 0) {
+        this.scrollTo(this.scrollbarDrag.startScroll + (delta / travel) * scrollRange, this.scrollY);
+      }
+    }
+    return true;
+  }
+
+  endScrollbarDrag(): void {
+    this.scrollbarDrag = undefined;
+  }
+
+  /** Middle-click pan drag support. */
+  beginPanDrag(viewportX: number, viewportY: number): void {
+    this.panDrag = {
+      startX: viewportX,
+      startY: viewportY,
+      startScrollX: this.scrollX,
+      startScrollY: this.scrollY,
+    };
+  }
+
+  updatePanDrag(viewportX: number, viewportY: number): boolean {
+    if (!this.panDrag) return false;
+    const dx = viewportX - this.panDrag.startX;
+    const dy = viewportY - this.panDrag.startY;
+    this.scrollTo(this.panDrag.startScrollX - dx, this.panDrag.startScrollY - dy);
+    return true;
+  }
+
+  endPanDrag(): void {
+    this.panDrag = undefined;
   }
 
   private renderMobile(): void {
@@ -1108,7 +1306,16 @@ export class Compositor {
     if (this.mobileMode) {
       return this.mobileHitTest(x, y);
     }
-    return this.desktopHitTest(x, y);
+    // Translate viewport coords → workspace coords
+    return this.desktopHitTest(x + this.scrollX, y + this.scrollY);
+  }
+
+  /**
+   * Convert a viewport (x,y) point to workspace coords. Needed by callers
+   * that do their own rect math (e.g., drag-resize hit tests).
+   */
+  viewportToWorkspace(x: number, y: number): { x: number; y: number } {
+    return { x: x + this.scrollX, y: y + this.scrollY };
   }
 
   private desktopHitTest(x: number, y: number): Surface | undefined {
