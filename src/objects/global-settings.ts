@@ -658,7 +658,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     );
 
     const winW = 520;
-    const winH = 580;
+    const winH = Math.min(720, Math.max(480, displayInfo.height - 40));
     const winX = Math.max(20, Math.floor((displayInfo.width - winW) / 2));
     const winY = Math.max(20, Math.floor((displayInfo.height - winH) / 2));
 
@@ -668,6 +668,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         title: 'Settings',
         rect: { x: winX, y: winY, width: winW, height: winH },
         zIndex: 200,
+        resizable: true,
       })
     );
 
