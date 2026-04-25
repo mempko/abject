@@ -617,6 +617,116 @@ You are this object. Your capabilities are exactly what the manifest above descr
     this._bus!.send(message);
   }
 
+  // ── Logging helpers ──────────────────────────────────────────────────
+  //
+  // Any Abject can voluntarily log to its own per-object buffer on the
+  // workspace's Console. Console is resolved lazily via typeId
+  // ({peerId}/{workspaceId}/Console), or by name as a fallback for system
+  // objects whose typeIds are not always assigned. Calls never throw — a
+  // log failure must not break the caller.
+
+  private _consoleIdCache?: AbjectId;
+  private _consoleIdPromise?: Promise<AbjectId | undefined>;
+
+  protected logDebug(message: string, data?: unknown): void { this.#pushLog('debug', message, data); }
+  protected logInfo (message: string, data?: unknown): void { this.#pushLog('info',  message, data); }
+  protected logWarn (message: string, data?: unknown): void { this.#pushLog('warn',  message, data); }
+  protected logError(message: string, data?: unknown): void { this.#pushLog('error', message, data); }
+
+  #pushLog(level: 'debug' | 'info' | 'warn' | 'error', message: string, data?: unknown): void {
+    if (!this._bus) return;
+    if (this.manifest.name === 'Console') return; // don't recurse into self
+    const objectId = this.id;
+    this.#resolveConsole().then(
+      (consoleId) => {
+        if (!consoleId || !this._bus) return;
+        if (consoleId === this.id) return;
+        try {
+          this._bus.send(
+            request(objectId, consoleId, 'logFor', { level, objectId, message, data })
+          );
+        } catch { /* bus gone */ }
+      },
+      () => { /* resolution failure — drop silently */ },
+    );
+  }
+
+  #resolveConsole(): Promise<AbjectId | undefined> {
+    if (this._consoleIdCache) return Promise.resolve(this._consoleIdCache);
+    if (this._consoleIdPromise) return this._consoleIdPromise;
+
+    const registryId = this.getRegistryId();
+    if (!registryId || !this._bus) {
+      // Don't cache a failure — try again on the next log call when the
+      // registry hint may have been populated.
+      return Promise.resolve(undefined);
+    }
+
+    this._consoleIdPromise = (async (): Promise<AbjectId | undefined> => {
+
+      let consoleId: AbjectId | undefined;
+
+      // Fast path: resolve by scoped typeId
+      if (this._typeId) {
+        const parts = this._typeId.split('/');
+        if (parts.length >= 3) {
+          const peerId = parts[0];
+          const workspaceId = parts[1];
+          if (peerId) {
+            const consoleTypeId = `${peerId}/${workspaceId}/Console` as TypeId;
+            const resolved = await this.#busRequest<AbjectId | null>(
+              registryId, 'resolveType', { typeId: consoleTypeId },
+            ).catch(() => null);
+            if (resolved) consoleId = resolved as AbjectId;
+          }
+        }
+      }
+
+      // Fallback: discover by name (system objects without typeId land here).
+      if (!consoleId) {
+        const results = await this.#busRequest<Array<{ id: AbjectId }>>(
+          registryId, 'discover', { name: 'Console' },
+        ).catch(() => [] as Array<{ id: AbjectId }>);
+        if (results && results.length > 0) consoleId = results[0].id;
+      }
+
+      if (consoleId) this._consoleIdCache = consoleId;
+      return consoleId;
+    })();
+
+    return this._consoleIdPromise;
+  }
+
+  /**
+   * Like `this.request` but bypasses the status precondition on `send`. Used
+   * by the log helpers so errors can be logged when the object is already in
+   * the 'error' state. Replies still flow through the mailbox and resolve
+   * pending promises in processMessages() as normal.
+   */
+  #busRequest<T>(target: AbjectId, method: string, payload: unknown, timeoutMs = 10000): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const msg = request(this.id, target, method, payload);
+      const timeout = setTimeout(() => {
+        this.pendingReplies.delete(msg.header.messageId);
+        reject(new Error(`logger: ${method} request timeout`));
+      }, timeoutMs);
+      this.pendingReplies.set(msg.header.messageId, {
+        resolve: resolve as (value: unknown) => void,
+        reject, timeout, timeoutMs,
+        timeoutMsg: `logger: ${method} request timeout`,
+        targetId: target,
+      });
+      try {
+        if (!this._bus) throw new Error('bus not initialized');
+        this._bus.send(msg);
+      } catch (err) {
+        clearTimeout(timeout);
+        this.pendingReplies.delete(msg.header.messageId);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  }
+
   /**
    * Send a request and wait for reply.
    */
@@ -802,6 +912,10 @@ You are this object. Your capabilities are exactly what the manifest above descr
       }
       if (prevStatus !== 'busy') this._status = 'error';
       log.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
+      this.logError(
+        `Handler '${message.routing.method ?? '?'}' threw: ${err instanceof Error ? err.message : String(err)}`,
+        { method: message.routing.method, stack: err instanceof Error ? err.stack : undefined },
+      );
       return;
     }
 
@@ -878,6 +992,10 @@ You are this object. Your capabilities are exactly what the manifest above descr
           }
           if (prevStatus !== 'busy') this._status = 'error';
           log.error(`[${this.manifest.name}:${this.id}] Error handling message (method=${message.routing.method}):`, err);
+          this.logError(
+            `Handler '${message.routing.method ?? '?'}' threw: ${err instanceof Error ? err.message : String(err)}`,
+            { method: message.routing.method, stack: err instanceof Error ? err.stack : undefined },
+          );
         },
       );
     } else {

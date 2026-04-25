@@ -50,6 +50,7 @@ const INFRA_OBJECTS = [
   'AbjectStore', 'SharedState', 'TupleSpace', 'FileTransfer', 'MediaStream', 'Theme',
   'GoalManager', 'JobManager', 'AgentAbject', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
   'AgentCreator', 'Scheduler', 'KnowledgeBase', 'ChatManager',
+  'Console',
 ] as const;
 
 /** UI objects — deferred for inactive workspaces, spawned on first switch. */

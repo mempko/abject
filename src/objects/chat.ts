@@ -920,25 +920,62 @@ export class Chat extends Abject {
           taskIds.push(taskId);
         }
 
-        // Wait for all tasks to complete
+        // Wait for all tasks to complete. Track whether any task failed so
+        // we can still surface the diagnostic results from the ones that
+        // succeeded — critical for the "diagnose then fix" pattern where
+        // a diagnosis completes but the fix stalls.
         const results: unknown[] = [];
+        let taskWaitError: Error | undefined;
         for (const taskId of taskIds) {
-          const completion = await this.waitForTaskCompletion(taskId, 120000);
-          const result = completion.result as Record<string, unknown> | undefined;
+          try {
+            const completion = await this.waitForTaskCompletion(taskId, 120000);
+            const result = completion.result as Record<string, unknown> | undefined;
 
-          // Auto-show created objects
-          if (result?.objectId) {
-            this.send(event(this.id, result.objectId as AbjectId, 'show', {}));
+            // Auto-show created objects
+            if (result?.objectId) {
+              this.send(event(this.id, result.objectId as AbjectId, 'show', {}));
+            }
+            results.push(result);
+          } catch (err) {
+            taskWaitError = err instanceof Error ? err : new Error(String(err));
+            results.push({ success: false, error: taskWaitError.message });
+            // Don't wait for remaining tasks — a timeout usually means the
+            // whole dispatch chain is stuck. Pull the scratchpad and return.
+            break;
           }
-          results.push(result);
         }
+
+        // Always pull the goal scratchpad. GoalManager auto-mirrors every
+        // completed task's result into `tasks/{id}/result`, so this gives
+        // Chat's next think-step access to successful diagnostics even when
+        // a later fix task timed out. Without this, the LLM synthesising
+        // the user-facing reply loses the correct findings and hallucinates
+        // generic "the system is timing out" messages.
+        let scratchpad: Record<string, unknown> | undefined;
+        try {
+          const goal = await this.request<{ scratchpad?: Record<string, unknown> } | null>(
+            request(this.id, this.goalManagerId, 'getGoal', { goalId }),
+            5000,
+          );
+          scratchpad = goal?.scratchpad;
+        } catch { /* best effort — scratchpad is a nice-to-have */ }
 
         const failures = results.filter(r => r && (r as Record<string, unknown>).success === false);
-        if (failures.length > 0) {
+        if (failures.length > 0 || taskWaitError) {
           const errors = failures.map(f => (f as Record<string, unknown>).error ?? 'Unknown error');
-          return { success: false, error: errors.join('; '), data: results };
+          if (taskWaitError) errors.push(taskWaitError.message);
+          return {
+            success: false,
+            error: errors.join('; '),
+            data: { results, scratchpad, partial: true },
+          };
         }
-        return { success: true, data: results.length === 1 ? results[0] : results };
+        return {
+          success: true,
+          data: results.length === 1
+            ? { result: results[0], scratchpad }
+            : { results, scratchpad },
+        };
       } catch (err) {
         return { success: false, error: err instanceof Error ? err.message : String(err) };
       }

@@ -296,6 +296,16 @@ export class AnthropicProvider extends BaseLLMProvider {
     const decoder = new TextDecoder();
     let buffer = '';
 
+    // Diagnostics: when the stream ends with no text content, emitting a
+    // single warning line listing what events DID arrive turns "0 chars"
+    // mysteries (refusals, unhandled delta types, content moderation hits)
+    // into actionable debugging data.
+    let emittedTextChars = 0;
+    const eventTypeCounts = new Map<string, number>();
+    const blockTypes: string[] = [];
+    const deltaTypes: string[] = [];
+    let stopReason: string | undefined;
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -311,19 +321,32 @@ export class AnthropicProvider extends BaseLLMProvider {
 
         const data = line.slice(6);
         if (data === '[DONE]') {
+          if (emittedTextChars === 0) this.warnEmptyStream(eventTypeCounts, blockTypes, deltaTypes, stopReason);
           yield { content: '', done: true };
           return;
         }
 
         try {
           const event = JSON.parse(data);
+          if (typeof event?.type === 'string') {
+            eventTypeCounts.set(event.type, (eventTypeCounts.get(event.type) ?? 0) + 1);
+          }
 
-          if (event.type === 'content_block_delta') {
+          if (event.type === 'content_block_start' && event.content_block?.type) {
+            blockTypes.push(String(event.content_block.type));
+          } else if (event.type === 'content_block_delta') {
+            const deltaType = event.delta?.type;
+            if (deltaType) deltaTypes.push(String(deltaType));
+            const text = event.delta?.text ?? '';
+            if (text) emittedTextChars += text.length;
             yield {
-              content: event.delta?.text ?? '',
+              content: text,
               done: false,
             };
+          } else if (event.type === 'message_delta' && event.delta?.stop_reason) {
+            stopReason = String(event.delta.stop_reason);
           } else if (event.type === 'message_stop') {
+            if (emittedTextChars === 0) this.warnEmptyStream(eventTypeCounts, blockTypes, deltaTypes, stopReason);
             yield { content: '', done: true };
             return;
           }
@@ -333,7 +356,33 @@ export class AnthropicProvider extends BaseLLMProvider {
       }
     }
 
+    if (emittedTextChars === 0) this.warnEmptyStream(eventTypeCounts, blockTypes, deltaTypes, stopReason);
     yield { content: '', done: true };
+  }
+
+  /**
+   * Emit a structured warning when a stream completed with no text content.
+   * Captures stop_reason, content block types, and delta types so the next
+   * incident has actionable debugging data without re-running the request.
+   */
+  private warnEmptyStream(
+    eventTypeCounts: Map<string, number>,
+    blockTypes: string[],
+    deltaTypes: string[],
+    stopReason: string | undefined,
+  ): void {
+    const eventSummary = [...eventTypeCounts.entries()]
+      .map(([k, v]) => `${k}=${v}`)
+      .join(', ');
+    const blockSummary = blockTypes.length > 0 ? blockTypes.join(', ') : '(none)';
+    const deltaSummary = deltaTypes.length > 0 ? [...new Set(deltaTypes)].join(', ') : '(none)';
+    log.warn(
+      `Anthropic stream produced 0 text chars. ` +
+        `stop_reason=${stopReason ?? 'unknown'} ` +
+        `block_types=[${blockSummary}] ` +
+        `delta_types=[${deltaSummary}] ` +
+        `events=[${eventSummary || '(none)'}]`,
+    );
   }
 
   /**

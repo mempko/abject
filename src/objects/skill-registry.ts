@@ -151,6 +151,21 @@ export class SkillRegistry extends Abject {
               returns: { kind: 'array', elementType: { kind: 'reference', reference: 'MCPServerSummary' } },
             },
             {
+              name: 'getMCPBridgeInfo',
+              description: 'Diagnostic lookup for a single MCP bridge by skill name. Returns rich state so callers can tell the difference between "never installed", "installed but disabled", "enabled but spawn failed", and "enabled and connected". Caller should use name-matching that tolerates case differences (the match is case-insensitive).',
+              parameters: [
+                { name: 'serverName', type: { kind: 'primitive', primitive: 'string' }, description: 'Skill / MCP server name (e.g. "telegram"). Case-insensitive.' },
+              ],
+              returns: { kind: 'object', properties: {
+                found: { kind: 'primitive', primitive: 'boolean' },
+                status: { kind: 'primitive', primitive: 'string' },
+                bridgeId: { kind: 'primitive', primitive: 'string' },
+                error: { kind: 'primitive', primitive: 'string' },
+                toolCount: { kind: 'primitive', primitive: 'number' },
+                hint: { kind: 'primitive', primitive: 'string' },
+              }},
+            },
+            {
               name: 'getSkillsDir',
               description: 'Return the absolute filesystem path where SKILL.md directories live. Agents should use SkillRegistry methods (getSkillConfig, setSkillConfig, listSkills) rather than poking the filesystem, but some skills reference ancillary files under this path.',
               parameters: [],
@@ -243,6 +258,20 @@ provides enabled skill summaries for agent prompt injection.
 
   const summaries = await call(await dep('SkillRegistry'), 'getEnabledSkills', {});
   // Returns EnabledSkillSummary[]: { name, description, instructions, allowedTools, env }
+
+### Look up a single MCP bridge with diagnostic detail
+
+When an Abject bridges a specific MCP server (Telegram, Slack, GitHub, etc.), call \`getMCPBridgeInfo\` to resolve its bridgeId AND get a clear failure reason if the bridge is unavailable. Case-insensitive matching — "telegram", "Telegram", "TELEGRAM" all work.
+
+  const info = await call(await dep('SkillRegistry'), 'getMCPBridgeInfo', { serverName: 'telegram' });
+  // info.found === true  → use info.bridgeId to call the MCPBridge directly.
+  // info.found === false → info.status explains why:
+  //   'not_installed' — skill with that name is not on disk
+  //   'not_mcp'       — installed but no mcpServer block in SKILL.md
+  //   'disabled'      — installed but not enabled; info.hint tells the user/agent to enable it
+  //   'error'         — enabled but spawn or runtime error; info.error has details, info.hint points at credentials
+  // Always prefer this over catch-all "bridge not found" errors — surface info.hint so the caller
+  // can point the user at the right setting (Installed Skills window, missing env var, etc.).
 
 ### Configure environment variables for a skill
 
@@ -432,9 +461,94 @@ whenever the skill set changes.
       return await this.getEnabledMCPServerSummaries();
     });
 
+    this.on('getMCPBridgeInfo', async (msg: AbjectMessage) => {
+      const { serverName } = msg.payload as { serverName: string };
+      contractRequire(typeof serverName === 'string' && serverName.length > 0, 'serverName must be non-empty');
+      return this.getMCPBridgeInfo(serverName);
+    });
+
     this.on('getSkillsDir', async () => {
       return { path: path.resolve(this.skillsDir) };
     });
+  }
+
+  /**
+   * Case-insensitive lookup for a skill entry. Lets callers pass "telegram",
+   * "Telegram", or "TELEGRAM" interchangeably — the stored key is whatever
+   * name the SKILL.md declared.
+   */
+  private findSkillEntry(serverName: string): { key: string; entry: SkillEntry } | null {
+    const needle = serverName.toLowerCase();
+    for (const [key, entry] of this.skills) {
+      if (key.toLowerCase() === needle) return { key, entry };
+    }
+    return null;
+  }
+
+  /**
+   * Diagnostic bridge-info lookup. Callers (typically user-generated
+   * objects like TelegramBridge) use this to find their MCP bridge AND
+   * get a clear failure reason when the bridge is unavailable, so the
+   * caller's error log points at the real problem instead of blaming
+   * unrelated logic.
+   */
+  private getMCPBridgeInfo(serverName: string): {
+    found: boolean;
+    status: 'connected' | 'connecting' | 'error' | 'disabled' | 'not_installed' | 'not_mcp';
+    bridgeId?: string;
+    error?: string;
+    toolCount?: number;
+    hint?: string;
+  } {
+    const match = this.findSkillEntry(serverName);
+    if (!match) {
+      return {
+        found: false,
+        status: 'not_installed',
+        hint: `No skill named "${serverName}" is installed. Call SkillRegistry.installSkill to add it, or scanSkills to re-check disk. Installed skills: ${[...this.skills.keys()].join(', ') || '(none)'}`,
+      };
+    }
+    const { key, entry } = match;
+    if (!entry.parsed.mcpServer) {
+      return {
+        found: false,
+        status: 'not_mcp',
+        hint: `Skill "${key}" is installed but does not declare an mcpServer block in SKILL.md — it is not bridgeable via MCPBridge.`,
+      };
+    }
+    if (!entry.enabled) {
+      return {
+        found: false,
+        status: 'disabled',
+        hint: `Skill "${key}" is installed but disabled. Call SkillRegistry.enableSkill({ name: "${key}" }) to start its MCP bridge.`,
+      };
+    }
+    const bridgeId = this.mcpBridges.get(key);
+    const state = this.mcpBridgeStates.get(key);
+    if (!bridgeId) {
+      return {
+        found: false,
+        status: 'error',
+        error: entry.error ?? 'Skill is enabled but bridge was never spawned.',
+        hint: `Enable/disable the skill again, or inspect SkillRegistry state. Last error: ${entry.error ?? 'none recorded'}`,
+      };
+    }
+    if (state?.status === 'error') {
+      return {
+        found: false,
+        status: 'error',
+        bridgeId,
+        error: state.error,
+        toolCount: state.toolCount,
+        hint: `MCPBridge spawned but is in error state: ${state.error ?? 'unknown'}. Check credentials (SkillRegistry.getSkillConfig/setSkillConfig) or the bridge's getStatus handler directly.`,
+      };
+    }
+    return {
+      found: true,
+      status: (state?.status as 'connected' | 'connecting') ?? 'connecting',
+      bridgeId,
+      toolCount: state?.toolCount ?? 0,
+    };
   }
 
   // ─── Scanning ───────────────────────────────────────────────────

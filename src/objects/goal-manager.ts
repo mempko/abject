@@ -809,6 +809,23 @@ if it can handle the task, and the most confident agent claims it.
       const goal = this.goals.get(goalId as GoalId);
       if (!goal) return { error: 'Goal not found' };
 
+      // Re-activate a goal that was prematurely completed. This happens when
+      // an earlier task on the goal signalled completion via completeGoal and
+      // a caller (e.g. Chat's sequential addTask/wait loop) then appends a
+      // follow-up task. If we don't re-activate, updateProgress events for
+      // the new task are silently dropped and any caller waiting on its
+      // completion stalls until its hard timeout fires.
+      if (goal.status !== 'active') {
+        log.info(`addTask: re-activating goal ${goalId.slice(0, 8)} (was ${goal.status}) to accept new task`);
+        goal.status = 'active';
+        goal.updatedAt = Date.now();
+        this.changed('goalUpdated', {
+          goalId, parentId: goal.parentId,
+          message: 'Goal re-activated for additional task',
+          phase: 'active',
+        });
+      }
+
       if (!this.tupleSpaceId) return { error: 'TupleSpace not available' };
 
       const ns = this.getTupleNamespace(goalId as GoalId);

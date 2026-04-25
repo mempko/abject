@@ -8,12 +8,14 @@ import {
   AbjectManifest,
   AbjectMessage,
   ObjectRegistration,
+  ObjectSummary,
   DiscoveryQuery,
   AbjectStatus,
   InterfaceId,
   CapabilityId,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
+import type { MessageBusLike } from '../runtime/message-bus.js';
 import { require, invariant } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
@@ -132,11 +134,20 @@ export class Registry extends Abject {
               },
               {
                 name: 'list',
-                description: 'List all registered Abjects',
+                description: 'List all registered Abjects with full manifests. For LLM agents: prefer `ask` (answers questions directly) or `listSummaries` (lightweight). Use `list` only from UI/catalog tooling that actually needs full schemas.',
                 parameters: [],
                 returns: {
                   kind: 'array',
                   elementType: { kind: 'reference', reference: 'ObjectRegistration' },
+                },
+              },
+              {
+                name: 'listSummaries',
+                description: 'List all registered Abjects as lightweight summaries (id, name, description, method names, tags). Use this for discovery from LLM-driven agents — the full manifest is available via lookup(objectId) when needed.',
+                parameters: [],
+                returns: {
+                  kind: 'array',
+                  elementType: { kind: 'reference', reference: 'ObjectSummary' },
                 },
               },
               {
@@ -182,46 +193,72 @@ export class Registry extends Abject {
     this.setupHandlers();
   }
 
+  /**
+   * Convert a full registration to the lightweight LLM-friendly summary.
+   * Filters meta-protocol methods (describe/ask/ping/etc.) that every Abject
+   * has but that aren't useful for task-level discovery.
+   */
+  private toSummary(reg: ObjectRegistration): ObjectSummary {
+    const m = reg.manifest;
+    const methods = m.interface.methods
+      .filter((method) => !Registry.META_METHODS.has(method.name))
+      .map((method) => method.name);
+    return {
+      id: reg.id,
+      typeId: reg.typeId,
+      name: reg.name ?? m.name,
+      description: m.description,
+      methods,
+      tags: m.tags,
+    };
+  }
+
+  /**
+   * Meta-protocol method names filtered from LLM-facing summaries and the
+   * ask catalog. These exist on every Abject so listing them is noise.
+   */
+  private static readonly META_METHODS = new Set([
+    'describe', 'ask', 'getRegistry', 'ping',
+    'addDependent', 'removeDependent',
+    'getSource', 'updateSource', 'probe',
+  ]);
+
   protected override askPrompt(_question: string): string {
-    // Meta-protocol methods filtered from object summaries
-    const metaMethods = new Set([
-      'describe', 'ask', 'getRegistry', 'ping',
-      'addDependent', 'removeDependent',
-      'getSource', 'updateSource', 'probe',
-    ]);
+    let source = `## Registry — How to query me
 
-    let source = `## Registry Usage Guide
+### You are asking the Registry directly
+If a caller is asking you ("what is the AbjectId for X?", "which object can do Y?", "does Z exist?"), **answer the question directly from the catalog below**. The catalog gives you every registered object's id, name, description, and method names. Only suggest a method call if the answer truly requires fetching something not in the catalog (e.g. a method's full parameter schema, or an object's persisted source).
 
-### Methods
-- \`list()\` — Returns an array of all ObjectRegistration entries. Each has: id, name, manifest, status, registeredAt, owner?, source?.
-- \`discover({ name?, interface?, capability?, tags? })\` — Find objects matching a query. Returns ObjectRegistration[]. Use \`{ name: 'Chat' }\` to find by registration name (falls back to manifest name).
-- \`lookup({ objectId })\` — Look up a single object by its AbjectId. Returns ObjectRegistration or null.
-- \`subscribe()\` — Subscribe to registration events. The caller will receive \`objectRegistered\` events when new objects are registered.
-- \`unsubscribe()\` — Unsubscribe from registration events.
-- \`register({ objectId, manifest, status?, owner?, source?, name? })\` — Register an object (normally called by Factory). Optional name overrides manifest.name; auto-suffixed on collision.
-- \`unregister({ objectId })\` — Remove an object (normally called by Factory).
-- \`updateManifest({ objectId, manifest })\` — Update an object's manifest and re-index it.
-- \`rename({ objectId, name })\` — Rename an object's registered name. Returns \`{ name }\` with the actual assigned name (may be suffixed on collision).
+### Discovery methods (ordered by preference for LLM-driven callers)
+1. \`ask({ question })\` — **preferred.** Ask me a question in natural language. I answer directly using the catalog.
+2. \`listSummaries()\` — Lightweight list of \`{ id, name, typeId?, description, methods[], tags? }\` for every registered object. Cheap and LLM-friendly.
+3. \`discover({ name?, interface?, capability?, tags? })\` — Structured query, returns full \`ObjectRegistration[]\`. Heavy — each entry includes every method's parameter and return schema. Use only when a caller truly needs the full manifest shape.
+4. \`lookup({ objectId })\` — Full \`ObjectRegistration\` for one object. Use when you already have an AbjectId and need the full manifest.
+5. \`list()\` — Full \`ObjectRegistration[]\` of every object. Heavy. Intended for UI/catalog tooling (AppExplorer, ProcessExplorer), NOT for LLM-driven discovery. Do not suggest this to agents — recommend \`ask\` or \`listSummaries\` instead.
+
+### Subscription & mutation
+- \`subscribe()\` / \`unsubscribe()\` — Receive \`objectRegistered\` / \`objectUnregistered\` events.
+- \`register\`, \`unregister\`, \`updateManifest\`, \`rename\` — Mutation methods normally called by Factory, not by agents.
 
 ### Events
-- \`objectRegistered\` — Sent to subscribers when a new object is registered. Payload is the ObjectRegistration.
-- \`objectUnregistered\` — Sent to subscribers when an object is removed. Payload is the objectId string.
+- \`objectRegistered\` — Emitted when a new object is registered. Payload is the full ObjectRegistration.
+- \`objectUnregistered\` — Emitted when an object is removed. Payload is the objectId string.
 
 ### Interface ID
 \`abjects:registry\`
 
-## Registered Objects
+## Registered Objects (catalog)
 
-The following objects are currently registered in this registry. Use this catalog to answer questions about which objects to talk to for a given task.
+Each line shows one registered object: id, name, description, and non-meta method names. Use this catalog to answer the caller's question directly whenever possible.
 
 `;
     for (const [, reg] of this.objects) {
       const m = reg.manifest;
       const methods = m.interface.methods
-        .filter(method => !metaMethods.has(method.name))
-        .map(method => method.name)
+        .filter((method) => !Registry.META_METHODS.has(method.name))
+        .map((method) => method.name)
         .join(', ');
-      source += `- **${reg.name ?? m.name}**: ${m.description}`;
+      source += `- \`${reg.id}\` **${reg.name ?? m.name}**: ${m.description}`;
       if (methods) source += ` Methods: ${methods}`;
       source += '\n';
     }
@@ -253,11 +290,13 @@ The following objects are currently registered in this registry. Use this catalo
     });
 
     this.on('lookup', async (msg: AbjectMessage) => {
+      this.reconcileDeadEntries();
       const { objectId } = msg.payload as { objectId: AbjectId };
       return this.lookupObject(objectId);
     });
 
     this.on('discover', async (msg: AbjectMessage) => {
+      this.reconcileDeadEntries();
       const query = msg.payload as DiscoveryQuery;
       const results = await this.handleDiscover(query);
       return this.filterForCaller(results, msg.routing.from);
@@ -274,7 +313,14 @@ The following objects are currently registered in this registry. Use this catalo
     });
 
     this.on('list', async (msg: AbjectMessage) => {
+      this.reconcileDeadEntries();
       return this.filterForCaller(this.listObjects(), msg.routing.from);
+    });
+
+    this.on('listSummaries', async (msg: AbjectMessage) => {
+      this.reconcileDeadEntries();
+      return this.filterForCaller(this.listObjects(), msg.routing.from)
+        .map((reg) => this.toSummary(reg));
     });
 
     this.on('setExposedObjectIds', async (msg: AbjectMessage) => {
@@ -334,6 +380,7 @@ The following objects are currently registered in this registry. Use this catalo
     });
 
     this.on('resolveType', async (msg: AbjectMessage) => {
+      this.reconcileDeadEntries();
       const { typeId } = msg.payload as { typeId: TypeId };
       return this.byTypeId.get(typeId) ?? null;
     });
@@ -433,6 +480,35 @@ The following objects are currently registered in this registry. Use this catalo
 
     this.checkInvariants();
     return true;
+  }
+
+  /**
+   * Lazy-evict registrations whose mailboxes are gone. Called from every
+   * query handler (list/listSummaries/discover/lookup/resolveType) so stale
+   * catalog entries never leak into an LLM's context. An object is "dead"
+   * if its mailbox has been dropped from the bus — the bus already replies
+   * RECIPIENT_NOT_FOUND when someone sends to a dead id, but without this
+   * reconciliation Registry would keep handing the id back to callers.
+   *
+   * System objects we ourselves register (global/system-scoped) stay even
+   * when the bus reports them unregistered; they may live in a dedicated
+   * worker whose mailbox isn't visible to the main bus.
+   */
+  private reconcileDeadEntries(): void {
+    let bus: MessageBusLike;
+    try { bus = this.bus; } catch { return; }
+    const deadIds: AbjectId[] = [];
+    for (const [id, reg] of this.objects) {
+      // Skip self and core system objects (see note above).
+      if (id === this.id) continue;
+      if (reg.manifest.tags?.includes('core')) continue;
+      if (!bus.isRegistered(id)) deadIds.push(id);
+    }
+    for (const id of deadIds) {
+      const reg = this.objects.get(id);
+      log.info(`reconcile: unregistering dead entry ${id.slice(0, 8)} (${reg?.name ?? reg?.manifest.name})`);
+      this.unregisterObject(id);
+    }
   }
 
   /**

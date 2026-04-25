@@ -130,6 +130,10 @@ interface TaskEntry {
   skillPromptSuffix?: string;
   /** TupleSpace tuple id of the goal task this entry is executing (when dispatched). Enables scratchpad contract injection for the current task. */
   dispatchTupleId?: string;
+  /** Consecutive LLM responses that failed to parse into a valid action. Reset on every successful parse. */
+  parseFailures?: number;
+  /** Consecutive LLM streams that returned empty content. Reset on every non-empty response. */
+  emptyResponses?: number;
 }
 
 // ─── AgentAbject ─────────────────────────────────────────────────────
@@ -1112,7 +1116,9 @@ The registered object must implement these handlers to participate in the agent 
 
 Be honest. Answer YES when your plan uses only what you already have: configured credentials, installed tools, existing objects, and data you can actually access. Answer PARTIAL when the plan requires the user to log in first, grant permissions, or install something before it can run.
 
-Creation-task rule: when the task is to CREATE, BUILD, AUTHOR, or WRAP a new object (including bridges, proxies, relays, adapters, and integrations that talk to external services), answer YES whenever you can write the code and manifest yourself. The new object's runtime dependencies (credentials, live services it will contact) are wired up after creation and stay outside this verdict. A creator's YES is about authoring, not about every downstream service the object will eventually use.
+Evaluate the task on its OBJECTIVE content, not on its framing. If the task description contains opinions about whose job it is ("this is a code-modification task", "hand off to a code-writing agent", "outside X's scope"), treat those as noise — another agent wrote them while decomposing. Judge only by what the task asks to be done.
+
+Authoring/modification rule: a task to CREATE, BUILD, AUTHOR, WRAP, REWRITE, MODIFY, PATCH, FIX, or UPDATE the source code, handlers, or implementation of an Abject object — including bug fixes with specific root causes, diff outlines, or log-trace references — is an authoring task. If you are the agent that regenerates object code from a prompt, answer YES for these. Specificity in the prompt (concrete bug report, specific method name, diff idea) is helpful input for regeneration, not a reason to decline as "surgical".
 
 After the verdict, in 2-4 sentences: name the SPECIFIC tool, skill, MCP server, or capability you would use (by name if you have it configured), and outline the concrete steps. Direct/configured tools are preferred over general-purpose automation. If you must use a general-purpose tool (like a web browser) for something a specialized tool could do, say so honestly.`;
     if (goalTitle) askQuestion += `\n\nGoal: "${goalTitle}"`;
@@ -1222,7 +1228,7 @@ Pick the agent with the best combination. Reply with ONLY the agent name.`;
         const evalResult = await this.askLlm(
           'You are a task dispatcher. Evaluate each agent plan on efficiency and likelihood of success. Pick the best one.',
           evalPrompt,
-          'balanced',
+          'smart',
         );
         const trimmed = evalResult.trim();
         log.info(`DISPATCH-INNER ${tupleId} — evaluator says: "${trimmed}"`);
@@ -1710,8 +1716,19 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       }
     }
 
-    // Complete or fail the goal via GoalManager
-    if (entry.goalId && this.goalManagerId) {
+    // Complete or fail the underlying work item via GoalManager.
+    //
+    // When this task came from a TupleSpace dispatch, the dispatcher
+    // (dispatchToAgentInner) is responsible for calling completeTask on the
+    // specific tuple. We must NOT call completeGoal here because a goal may
+    // contain multiple tasks (e.g. Chat's "diagnose then fix" pattern) —
+    // force-completing the parent goal would cause GoalManager to drop all
+    // subsequent progress events for tasks added later, which in turn stalls
+    // Chat's waitForTaskCompletion timers.
+    //
+    // When this task is a solo agent run (no dispatchTupleId), the agent owns
+    // the whole goal and completing/failing it here is correct.
+    if (entry.goalId && this.goalManagerId && !entry.dispatchTupleId) {
       if (success) {
         this.send(event(this.id, this.goalManagerId, 'completeGoal', {
           goalId: entry.goalId,
@@ -1896,6 +1913,23 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
               break;
             }
             task.action = thinkResult.data as AgentAction;
+
+            // ── Reparse sentinels from parseAction ──
+            // _reparse: unparseable LLM output, correction message already pushed — loop back into thinking.
+            // _reparse_abort: retries exhausted and no error terminal configured — fail hard.
+            if (task.action.action === '_reparse') {
+              task.step++;
+              if (task.step >= task.maxSteps) {
+                await this.handleMaxStepsReached(entry, agentName, setPhase);
+                break;
+              }
+              setPhase('thinking');
+              break;
+            }
+            if (task.action.action === '_reparse_abort') {
+              setPhase('error');
+              break;
+            }
 
             // ── Decompose: create child goal + tasks, return to observing ──
             if (task.action.action === 'decompose') {
@@ -2104,13 +2138,16 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
         content: `[BUDGET EXHAUSTED — Final Step]\nYou have used all ${task.maxSteps} steps. You MUST respond with a "done" or "fail" action NOW.\nIf you have extracted ANY useful data during this task, respond with:\n\`\`\`json\n{"action": "done", "result": <your best result so far>}\n\`\`\`\nOtherwise respond with:\n\`\`\`json\n{"action": "fail", "reason": "Could not complete task in ${task.maxSteps} steps"}\n\`\`\``,
       });
 
-      this.trimConversation(entry);
+      await this.trimConversation(entry);
 
       this.llmId = await this.resolveDep('LLM', this.llmId);
       const llmResult = await this.request<{ content: string }>(
         request(this.id, this.llmId, 'complete', {
           messages: task.llmMessages,
-          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 16384, cacheKey: entry.state.id },
+          // Thinking / action decisions run on 'smart' regardless of the observe
+          // hint. Fast-tier models drop the JSON action envelope under load,
+          // producing prose that the parser can't accept.
+          options: { tier: 'smart', maxTokens: 16384, cacheKey: entry.state.id },
         }),
         60000,
       );
@@ -2280,8 +2317,8 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
     // Add last action result
     this.addActionResultToConversation(entry);
 
-    // Trim conversation
-    this.trimConversation(entry);
+    // Trim conversation (may do an LLM-compressor pass when over byte budget)
+    await this.trimConversation(entry);
 
     this.llmId = await this.resolveDep('LLM', this.llmId);
     // Use streaming — llmChunk events are forwarded to the ticket caller
@@ -2291,7 +2328,10 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       llmResult = await this.request<{ content: string }>(
         request(this.id, this.llmId, 'stream', {
           messages: task.llmMessages,
-          options: { tier: entry.observeTier ?? 'balanced', maxTokens: 16384, cacheKey: entry.state.id },
+          // Thinking is the JSON-action-decision step. Pin it to 'smart' so the
+          // model reliably emits the envelope instead of prose. The observe
+          // tier hint only applies to observation LLM calls, not thinking.
+          options: { tier: 'smart', maxTokens: 16384, cacheKey: entry.state.id },
         }),
         120000,
       );
@@ -2299,10 +2339,37 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       this.activeStreamEntry = undefined;
     }
 
+    const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
+
+    // Empty / whitespace-only LLM responses are NOT a parse failure — the
+    // service returned nothing to parse. Treat as a transient issue: do not
+    // pollute llmMessages with an empty assistant turn (Anthropic dislikes
+    // it), and retry with the same prompt (no correction injected, since
+    // there's nothing for the LLM to correct).
+    const trimmedContent = (llmResult.content ?? '').trim();
+    if (trimmedContent.length === 0) {
+      entry.emptyResponses = (entry.emptyResponses ?? 0) + 1;
+      log.warn(
+        `[${agentName}] Step ${task.step + 1} — LLM returned empty content ` +
+          `(attempt ${entry.emptyResponses}/${AgentAbject.MAX_EMPTY_RESPONSES}). ` +
+          `Likely a transient provider issue or an unhandled content-block type.`,
+      );
+      if (entry.emptyResponses <= AgentAbject.MAX_EMPTY_RESPONSES) {
+        return { action: '_reparse', reasoning: `LLM returned empty content (attempt ${entry.emptyResponses}/${AgentAbject.MAX_EMPTY_RESPONSES}); retrying without correction` };
+      }
+      const errorTerminal = Object.entries(entry.config.terminalActions).find(([, v]) => v.type === 'error')?.[0];
+      const reason = `LLM returned empty content ${entry.emptyResponses} times in a row; aborting. This is usually a provider-side issue (rate limit, content moderation, or an unhandled streaming block type) — check the LLM provider logs.`;
+      if (errorTerminal) return { action: errorTerminal, reason, error: reason };
+      entry.state.error = reason;
+      return { action: '_reparse_abort', reasoning: reason };
+    }
+
+    // Reset empty-response counter on a non-empty turn.
+    entry.emptyResponses = 0;
+
     // Add assistant response
     task.llmMessages.push({ role: 'assistant', content: llmResult.content });
 
-    const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
     const parsed = this.parseAction(entry, llmResult.content);
     log.info(`[${agentName}] Step ${task.step + 1} — LLM action: ${parsed.action}${parsed.reasoning ? ' (' + parsed.reasoning.slice(0, 60) + ')' : ''}`);
     return parsed;
@@ -2663,58 +2730,205 @@ After remembering, you will be prompted to continue with the task.`;
     if (!task.lastResult) return;
 
     const action = task.action;
-    const resultStr = task.lastResult.success
-      ? `Action "${action?.action}" succeeded: ${JSON.stringify(task.lastResult.data)?.slice(0, 30000) ?? 'ok'}`
-      : `Action "${action?.action}" failed: ${task.lastResult.error}`;
+    let resultStr: string;
+    if (task.lastResult.success) {
+      resultStr = `Action "${action?.action}" succeeded: ${JSON.stringify(task.lastResult.data)?.slice(0, 30000) ?? 'ok'}`;
+    } else {
+      // On failure, include any partial `data` alongside the error. Callers
+      // like Chat's `goal` action attach scratchpad/successful sub-task
+      // results to the failure payload so the next think-step can still
+      // use what was learned before the stall. Dropping data here causes
+      // the LLM to synthesise generic "everything timed out" replies
+      // instead of using the real findings.
+      const errStr = String(task.lastResult.error ?? 'unknown error');
+      const dataStr = task.lastResult.data !== undefined
+        ? `\nPartial data (from sub-tasks that succeeded):\n${JSON.stringify(task.lastResult.data)?.slice(0, 30000) ?? ''}`
+        : '';
+      resultStr = `Action "${action?.action}" failed: ${errStr}${dataStr}`;
+    }
 
     task.llmMessages.push({ role: 'user', content: `[Action Result]\n${resultStr}` });
   }
 
-  private trimConversation(entry: TaskEntry): void {
-    const task = entry.state;
-    const max = entry.config.maxConversationMessages;
-    if (task.llmMessages.length <= max) return;
+  /** Whole-conversation byte budget. Above this, the middle block is
+   *  distilled by a fast-tier LLM pass and replaced with a single synthetic
+   *  summary message. 180k chars ≈ 45k tokens — well under every provider's
+   *  context window, leaves headroom for the current observation + response. */
+  private static readonly MAX_CONVERSATION_CHARS = 180000;
+  /** How many recent messages to keep verbatim after compression. Covers the
+   *  current observation, the current action, and the prior action cycle. */
+  private static readonly KEEP_RECENT_MESSAGES = 4;
 
-    const pinned = task.llmMessages.slice(0, entry.config.pinnedMessageCount);
-    const recent = task.llmMessages.slice(-(max - entry.config.pinnedMessageCount));
-    task.llmMessages = [...pinned, ...recent];
+  private conversationChars(msgs: { content: string | ContentPart[] }[]): number {
+    let total = 0;
+    for (const m of msgs) {
+      if (typeof m.content === 'string') {
+        total += m.content.length;
+      } else {
+        for (const part of m.content) {
+          if ('text' in part && typeof part.text === 'string') total += part.text.length;
+        }
+      }
+    }
+    return total;
+  }
+
+  private async trimConversation(entry: TaskEntry): Promise<void> {
+    const task = entry.state;
+    const maxMsgs = entry.config.maxConversationMessages;
+    const pinnedCount = entry.config.pinnedMessageCount;
+
+    // 1. Count cap — cheap, always apply first.
+    if (task.llmMessages.length > maxMsgs) {
+      const pinned = task.llmMessages.slice(0, pinnedCount);
+      const recent = task.llmMessages.slice(-(maxMsgs - pinnedCount));
+      task.llmMessages = [...pinned, ...recent];
+    }
+
+    // 2. Byte cap — only kick in if a single fat observation (e.g. an
+    //    accidental Registry.list dump) blew past the budget. Compress the
+    //    middle block with a fast LLM pass and replace it with a summary.
+    if (this.conversationChars(task.llmMessages) <= AgentAbject.MAX_CONVERSATION_CHARS) {
+      return;
+    }
+
+    const keepRecent = AgentAbject.KEEP_RECENT_MESSAGES;
+    const middleEnd = Math.max(pinnedCount, task.llmMessages.length - keepRecent);
+    if (middleEnd <= pinnedCount) {
+      // Nothing compressible (pinned + recent already fill the budget). Fall
+      // back to hard-truncating the oldest non-pinned message to fit.
+      if (task.llmMessages.length > pinnedCount) {
+        const victim = task.llmMessages[pinnedCount];
+        if (typeof victim.content === 'string') {
+          victim.content = `[Earlier message truncated to fit context budget] ${victim.content.slice(0, 4000)}`;
+        }
+      }
+      return;
+    }
+
+    const pinned = task.llmMessages.slice(0, pinnedCount);
+    const middle = task.llmMessages.slice(pinnedCount, middleEnd);
+    const recent = task.llmMessages.slice(middleEnd);
+
+    try {
+      const summary = await this.compressMiddle(middle, entry.state.task);
+      task.llmMessages = [
+        ...pinned,
+        { role: 'user', content: `[Earlier context — distilled by fast-tier compressor]\n${summary}` },
+        ...recent,
+      ];
+    } catch (err) {
+      // Compressor failed — fall back to dropping the middle entirely so we
+      // at least stay under the API limit. Losing raw history beats a 400.
+      log.warn(`trimConversation: compression failed (${err instanceof Error ? err.message : String(err)}) — dropping middle block`);
+      task.llmMessages = [
+        ...pinned,
+        { role: 'user', content: `[Earlier context dropped: ${middle.length} messages elided to fit context budget]` },
+        ...recent,
+      ];
+    }
+  }
+
+  /**
+   * Fast-tier LLM pass that distills an arbitrary middle block of the
+   * agent's conversation into a compact summary. The summary is injected
+   * back as a single synthetic user message so the agent can keep working
+   * with the key findings, errors, and partial results intact.
+   */
+  private async compressMiddle(
+    middle: { role: string; content: string | ContentPart[] }[],
+    taskDescription: string,
+  ): Promise<string> {
+    const serialized = middle.map((m, i) => {
+      const text = typeof m.content === 'string'
+        ? m.content
+        : m.content.map((p) => ('text' in p && typeof p.text === 'string' ? p.text : '[non-text part]')).join('\n');
+      return `---- message ${i + 1} (${m.role}) ----\n${text}`;
+    }).join('\n\n');
+
+    const systemPrompt = `You are compressing the middle of an agent's working conversation so the agent can keep going without losing its progress. Distil the messages below into a tight, factual summary (target: under 2000 chars). Include every one of:
+- findings and discovered facts (IDs, names, states, values)
+- actions attempted and their outcomes (what succeeded, what failed, error messages)
+- partial results that later steps will need
+- decisions made and rejected options
+- blockers and what is still unknown
+Omit: duplicated schema dumps, long method catalogs, step numbers, decorative headers. Write in neutral prose with bullet points — this is context, not a narrative.`;
+
+    const userPrompt = `Agent task: "${taskDescription.slice(0, 400)}"\n\nMessages to distil (${middle.length} total):\n\n${serialized}`;
+
+    this.llmId = await this.resolveDep('LLM', this.llmId);
+    const result = await this.request<{ content: string }>(
+      request(this.id, this.llmId, 'complete', {
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        options: { tier: 'fast', maxTokens: 2048 },
+      }),
+      30000,
+    );
+    const summary = result.content?.trim();
+    if (!summary) throw new Error('empty summary');
+    return summary;
   }
 
   // ═══════════════════════════════════════════════════════════════════
   // Action Parsing
   // ═══════════════════════════════════════════════════════════════════
 
+  /** Maximum consecutive unparseable LLM responses before we force a terminal fail. */
+  private static readonly MAX_PARSE_FAILURES = 2;
+  /** Maximum consecutive empty LLM responses before we force a terminal fail. */
+  private static readonly MAX_EMPTY_RESPONSES = 3;
+
   private parseAction(entry: TaskEntry, content: string): AgentAction {
     // Try ```json block
     const jsonMatch = content.match(/```json\s*([\s\S]*?)```/);
     if (jsonMatch) {
       const parsed = this.tryParseActionJson(jsonMatch[1].trim());
-      if (parsed) return parsed;
+      if (parsed) { entry.parseFailures = 0; return parsed; }
     }
 
     // Fallback: unclosed ```json block
     const unclosedMatch = content.match(/```json\s*([\s\S]*)/);
     if (unclosedMatch && !jsonMatch) {
       const parsed = this.tryParseActionJson(unclosedMatch[1].trim());
-      if (parsed) return parsed;
+      if (parsed) { entry.parseFailures = 0; return parsed; }
     }
 
     // Try whole content as JSON
     const parsed = this.tryParseActionJson(content);
-    if (parsed) return parsed;
+    if (parsed) { entry.parseFailures = 0; return parsed; }
 
-    // Detect hallucinated tool calls -- strip them and inject a correction
+    // No structured action found — this is a parse failure. Track it and
+    // either retry (by emitting a _reparse sentinel the main loop handles)
+    // or fail the task explicitly. Never silently promote raw prose into a
+    // terminal "done" — that makes the LLM's hallucinated summary look like
+    // real work.
+    entry.parseFailures = (entry.parseFailures ?? 0) + 1;
+
     const hallucinationPatterns = ['<function_calls>', '<tool_call>', '<invoke name='];
-    if (hallucinationPatterns.some(p => content.includes(p))) {
-      entry.state.llmMessages.push({
-        role: 'user',
-        content: '[Error] You produced XML tool calls, but this system uses JSON actions in ```json code blocks. Please respond with a valid JSON action.',
-      });
-      return { action: entry.config.fallbackActionName, result: undefined, reasoning: 'Retrying after hallucinated tool calls' };
+    const hallucinatedTools = hallucinationPatterns.some(p => content.includes(p));
+
+    if (entry.parseFailures <= AgentAbject.MAX_PARSE_FAILURES) {
+      const correction = hallucinatedTools
+        ? '[Error] You produced XML tool calls, but this system uses JSON actions in ```json code blocks. Respond with a valid JSON action, for example:\n```json\n{"action": "done", "result": "..."}\n```'
+        : '[Error] Your previous response was not a valid action. You must respond with a single ```json code block containing an action object. Example:\n```json\n{"action": "done", "result": "your final answer"}\n```\nor, to abort:\n```json\n{"action": "fail", "reason": "why you cannot continue"}\n```';
+      entry.state.llmMessages.push({ role: 'user', content: correction });
+      return { action: '_reparse', reasoning: `Retrying after unparseable response (attempt ${entry.parseFailures}/${AgentAbject.MAX_PARSE_FAILURES})` };
     }
 
-    // Config-driven fallback
-    return { action: entry.config.fallbackActionName, result: content, reasoning: 'Could not parse action, returning raw response' };
+    // Retries exhausted — force a terminal failure using whichever error
+    // terminal this agent has configured (typically "fail").
+    const errorTerminal = Object.entries(entry.config.terminalActions).find(([, v]) => v.type === 'error')?.[0];
+    const preview = content.trim().slice(0, 200).replace(/\s+/g, ' ');
+    const reason = `LLM produced unparseable output ${entry.parseFailures} times in a row; aborting. Last response began: "${preview}${content.length > 200 ? '…' : ''}"`;
+    if (errorTerminal) {
+      return { action: errorTerminal, reason, error: reason };
+    }
+    // No error terminal configured — synthesize a generic failed state.
+    entry.state.error = reason;
+    return { action: '_reparse_abort', reasoning: reason };
   }
 
   private tryParseActionJson(raw: string): AgentAction | null {

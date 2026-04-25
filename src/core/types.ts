@@ -196,6 +196,20 @@ export interface ObjectRegistration {
   source?: string;
 }
 
+/**
+ * Lightweight registration summary. Exists so LLM-driven agents can browse
+ * the registry without pulling every method's parameter/return schema —
+ * those full manifests are recovered on demand via lookup(id).
+ */
+export interface ObjectSummary {
+  id: AbjectId;
+  typeId?: TypeId;
+  name: string;
+  description: string;
+  methods: string[];
+  tags?: string[];
+}
+
 export interface DiscoveryQuery {
   name?: string;
   interface?: InterfaceId;

@@ -190,7 +190,14 @@ export class MCPBridge extends Abject {
         input?: Record<string, unknown>; arguments?: Record<string, unknown>; args?: Record<string, unknown>;
       };
       const toolName = payload.toolName ?? payload.tool ?? payload.name;
-      const input = payload.input ?? payload.arguments ?? payload.args ?? {};
+      const rawInput = payload.input ?? payload.arguments ?? payload.args ?? {};
+      // Strip envelope-level keys that callers sometimes co-mingle with tool args.
+      // `timeout` is a transport-level concern (per-call deadline), NOT an MCP
+      // tool parameter — leaving it in `input` causes JSON-Schema validation to
+      // reject the call with "unknown parameter timeout" for any tool whose
+      // schema does not declare it (which is essentially all of them).
+      const { timeout: _envelopeTimeout, ...input } = rawInput as Record<string, unknown>;
+      void _envelopeTimeout;  // currently unused; could be wired into sendRequest deadline later
       contractRequire(typeof toolName === 'string' && toolName.length > 0, 'toolName must be non-empty (accepts toolName, tool, or name)');
 
       return await this.callTool(toolName, input);
