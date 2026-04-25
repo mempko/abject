@@ -26,6 +26,7 @@ import { ScriptableAbject } from './scriptable-abject.js';
 import { systemMessage, userMessage, LLMMessage } from '../llm/provider.js';
 import type { AgentAction } from './agent-abject.js';
 import { Log } from '../core/timed-log.js';
+import { applyDiff, parseSearchReplaceBlocks } from './source-diff.js';
 
 const log = new Log('OBJECT-CREATOR');
 
@@ -341,6 +342,62 @@ export class ObjectCreator extends Abject {
   }
 
   /**
+   * Apply SEARCH/REPLACE blocks to the current source. Bases off
+   * `state.draftSource` if present (so multiple diff calls stack), otherwise
+   * `state.targetSource` (the existing object's source for a modify loop).
+   * Result is staged as the new draftSource.
+   *
+   * On any block failure, draftSource is left untouched and the failure
+   * details are returned so the LLM can correct course on the next turn.
+   * Common failure causes: SEARCH text doesn't match (whitespace mismatch
+   * or wrong snippet), or SEARCH matches multiple locations (need more
+   * surrounding context).
+   */
+  private async opDraftDiff(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
+    const blocksText = action.blocks as string | undefined;
+    if (typeof blocksText !== 'string' || blocksText.length === 0) {
+      return { ok: false, summary: 'draft_diff: missing blocks', error: 'blocks must be a non-empty string of SEARCH/REPLACE blocks' };
+    }
+    const base = state.draftSource ?? state.targetSource;
+    if (!base) {
+      return {
+        ok: false,
+        summary: 'draft_diff: no base source',
+        error: 'draft_diff requires an existing source to edit. For modify loops the target source is loaded automatically; for create flows use draft_source instead.',
+      };
+    }
+
+    const parsed = parseSearchReplaceBlocks(blocksText);
+    if (parsed.blocks.length === 0) {
+      const detail = parsed.parseErrors.length > 0 ? parsed.parseErrors.join('; ') : 'no blocks recognized';
+      return {
+        ok: false,
+        summary: `draft_diff: parse failed (${detail.slice(0, 80)})`,
+        error: `Could not parse any SEARCH/REPLACE blocks. ${detail}. Format: each block is\n<<<<<<< SEARCH\n...\n=======\n...\n>>>>>>> REPLACE`,
+      };
+    }
+
+    const result = applyDiff(base, parsed.blocks);
+    if (!result.ok) {
+      const errorLines = result.errors.map((e) => `  - ${e.message}`).join('\n');
+      const parseNote = parsed.parseErrors.length > 0 ? `\nParse warnings: ${parsed.parseErrors.join('; ')}` : '';
+      return {
+        ok: false,
+        summary: `draft_diff: ${result.applied}/${parsed.blocks.length} applied, ${result.errors.length} failed`,
+        error: `Some SEARCH/REPLACE blocks could not be applied:\n${errorLines}${parseNote}\n\nFix the failing blocks and call draft_diff again with a fresh blocks payload.`,
+      };
+    }
+
+    state.draftSource = result.source;
+    const stackedNote = state.draftSource && base !== state.targetSource ? ' (stacked on prior draft)' : '';
+    const parseNote = parsed.parseErrors.length > 0 ? ` [parse warnings: ${parsed.parseErrors.length}]` : '';
+    return {
+      ok: true,
+      summary: `draft_diff: ${parsed.blocks.length} block${parsed.blocks.length === 1 ? '' : 's'} applied${stackedNote}, source now ${result.source!.split('\n').length} lines${parseNote}`,
+    };
+  }
+
+  /**
    * Ask an LLM to write the requested draft using the loop state as context.
    * Smart tier, 16k tokens. The instructions field gives the writer model
    * specific guidance (e.g. "make it idempotent", "preserve the existing
@@ -403,7 +460,7 @@ export class ObjectCreator extends Abject {
   /** Run ScriptableAbject.tryCompile against the staged source. */
   private opCompile(state: LoopState): { ok: boolean; summary: string; error?: string } {
     if (!state.draftSource) {
-      return { ok: false, summary: 'compile: no source drafted', error: 'call draft_source or draft_via_llm first' };
+      return { ok: false, summary: 'compile: no source drafted', error: 'call draft_source, draft_diff, or draft_via_llm first' };
     }
     const err = ScriptableAbject.tryCompile(state.draftSource);
     state.lastValidation = { ...(state.lastValidation ?? {}), compile: err ?? '' };
@@ -424,7 +481,7 @@ export class ObjectCreator extends Abject {
    */
   private opValidateCalls(state: LoopState): { ok: boolean; summary: string; error?: string; issues?: CallValidationError[] } {
     if (!state.draftSource) {
-      return { ok: false, summary: 'validate_calls: no source drafted', error: 'call draft_source or draft_via_llm first' };
+      return { ok: false, summary: 'validate_calls: no source drafted', error: 'call draft_source, draft_diff, or draft_via_llm first' };
     }
 
     const errors: CallValidationError[] = [];
@@ -505,7 +562,7 @@ export class ObjectCreator extends Abject {
    */
   private async opReviewSemantics(state: LoopState): Promise<{ ok: boolean; summary: string; error?: string; result?: SemanticReviewResult }> {
     if (!state.draftSource) {
-      return { ok: false, summary: 'review_semantics: no source drafted', error: 'call draft_source or draft_via_llm first' };
+      return { ok: false, summary: 'review_semantics: no source drafted', error: 'call draft_source, draft_diff, or draft_via_llm first' };
     }
     if (!this.llmId) return { ok: false, summary: 'review_semantics: LLM unavailable', error: 'LLM not resolved' };
 
@@ -562,7 +619,7 @@ export class ObjectCreator extends Abject {
   private async opDeploySpawn(state: LoopState): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
     if (!this.factoryId) return { ok: false, summary: 'deploy_spawn: Factory unavailable', error: 'Factory not resolved' };
     if (!state.draftManifest) return { ok: false, summary: 'deploy_spawn: no manifest drafted', error: 'call draft_manifest or draft_via_llm({kind: "manifest"}) first' };
-    if (!state.draftSource) return { ok: false, summary: 'deploy_spawn: no source drafted', error: 'call draft_source or draft_via_llm({kind: "source"}) first' };
+    if (!state.draftSource) return { ok: false, summary: 'deploy_spawn: no source drafted', error: 'call draft_source, draft_diff, or draft_via_llm({kind: "source"}) first' };
 
     const spawnReq: SpawnRequest = {
       manifest: state.draftManifest,
@@ -627,7 +684,7 @@ export class ObjectCreator extends Abject {
    */
   private async opDeployUpdate(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
     if (!this.registryId) return { ok: false, summary: 'deploy_update: Registry unavailable', error: 'Registry not resolved' };
-    if (!state.draftSource) return { ok: false, summary: 'deploy_update: no source drafted', error: 'call draft_source or draft_via_llm({kind: "source"}) first' };
+    if (!state.draftSource) return { ok: false, summary: 'deploy_update: no source drafted', error: 'call draft_source, draft_diff, or draft_via_llm({kind: "source"}) first' };
 
     // Resolve target: explicit objectId / targetName from action wins, else
     // fall back to the kind:modify state target.
@@ -1235,11 +1292,28 @@ export class ObjectCreator extends Abject {
       }
     }
 
+    // Preload existing source for modify loops so the agent can author
+    // draft_diff blocks without burning a turn on Registry.getSource. Best
+    // effort — if this fails (object not yet registered, no source on file),
+    // the agent falls back to fetching it explicitly.
+    let targetSource: string | undefined;
+    if (args.kind === 'modify' && targetObjectId && this.registryId) {
+      try {
+        const src = await this.sendRequest<string | null>(
+          this.registryId, 'getSource', { objectId: targetObjectId }, 5000,
+        );
+        if (typeof src === 'string' && src.length > 0) targetSource = src;
+      } catch {
+        /* preload is opportunistic */
+      }
+    }
+
     const state: LoopState = {
       kind: args.kind,
       goal: args.prompt,
       targetObjectId,
       targetName,
+      targetSource,
       deps: new Map(),
       usedObjects: [],
       turn: 0,
@@ -1323,6 +1397,9 @@ export class ObjectCreator extends Abject {
           break;
         case 'draft_source':
           res = await this.opDraftSource(state, action);
+          break;
+        case 'draft_diff':
+          res = await this.opDraftDiff(state, action);
           break;
         case 'draft_via_llm':
           res = await this.opDraftViaLlm(state, action);
@@ -1422,6 +1499,14 @@ export class ObjectCreator extends Abject {
       }
     }
     lines.push('');
+
+    if (state.targetSource) {
+      lines.push(`TARGET SOURCE (${state.targetSource.split('\n').length} lines — current code of ${state.targetName ?? state.targetObjectId?.slice(0, 8) ?? 'target'}; use draft_diff to edit)`);
+      lines.push('```javascript');
+      lines.push(state.targetSource);
+      lines.push('```');
+      lines.push('');
+    }
 
     lines.push('DRAFTS');
     lines.push(`  manifest: ${state.draftManifest ? state.draftManifest.name : '(not drafted)'}`);
@@ -1526,8 +1611,19 @@ Emit EXACTLY ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothi
 ## Local operations (no message target)
 
 - \`draft_manifest({manifest, usedObjects?})\` — stage a manifest you've authored. Used before \`deploy_spawn\`.
-- \`draft_source({source})\` — stage handler-map source you've authored. The format is a single parenthesized object literal: \`({ method(msg) { ... } })\`.
-- \`draft_via_llm({kind: "manifest" | "source", instructions})\` — ask an LLM to draft for you. It sees current loop state. Use when the work is large.
+- \`draft_source({source})\` — stage handler-map source you've authored. The format is a single parenthesized object literal: \`({ method(msg) { ... } })\`. Use this for new objects (create flow).
+- \`draft_diff({blocks})\` — apply SEARCH/REPLACE blocks to the existing source. **Strongly prefer this for any modification of an existing object** — it lets you edit a few lines without re-emitting the whole file. Each block:
+
+  \`\`\`
+  <<<<<<< SEARCH
+  exact lines from the current source, including indentation
+  =======
+  the replacement lines
+  >>>>>>> REPLACE
+  \`\`\`
+
+  Multiple blocks may appear in one \`blocks\` payload and are applied in order. SEARCH must match a UNIQUE location in the current source — include 2–3 lines of surrounding context if a snippet would otherwise match in more than one place. Whitespace is forgiven (line-trimmed match), but matching the indentation exactly is safer. Successive \`draft_diff\` calls stack on the prior result, so you can layer fixes. To insert new code, use a SEARCH that matches a nearby anchor and include both the anchor and your insertion in REPLACE.
+- \`draft_via_llm({kind: "manifest" | "source", instructions})\` — ask an LLM to draft for you. It sees current loop state. Use when authoring a brand-new manifest or source from scratch is too large for one think-step. Do NOT use this for modifications of existing objects — use \`draft_diff\` instead, since the LLM consistently truncates "preserve everything else" rewrites.
 - \`compile()\` — run a syntax check on the staged source. Fails fast on parse errors.
 - \`validate_calls()\` — static check: every \`this.call(x, "method", …)\` site is checked against the live manifest of the target dep. Run AFTER compile.
 - \`review_semantics()\` — LLM reviewer reads the drafts plus all known dependency manifests + usage guides and flags semantic issues (wrong payload shape, enum-like values not in the guide, missing await, etc.). May emit follow-up \`questions\` for specific deps.
@@ -1554,7 +1650,7 @@ Investigation:
 
 Deployment (use the local actions — they read your staged drafts and run the proper multi-message sequence):
 - Spawn a new object: \`{ "action": "deploy_spawn" }\` after both \`draft_manifest\` (or \`draft_via_llm({kind: "manifest"})\`) and \`draft_source\` (or \`draft_via_llm({kind: "source"})\`).
-- Update an existing object: \`{ "action": "deploy_update" }\` after \`draft_source\`. If the loop started as a modify, the target is set automatically. If the loop started as create but you discovered the user actually wanted to modify an existing object (e.g. "fix the Pong game" → you found Pong already exists), pass the target explicitly: \`{ "action": "deploy_update", "objectId": "<id>" }\` or \`{ "action": "deploy_update", "targetName": "Pong" }\`.
+- Update an existing object: \`{ "action": "deploy_update" }\` after \`draft_diff\` (preferred for surgical edits) or after \`draft_source\` (only when wholesale rewrite is intended). If the loop started as a modify, the target source is preloaded into \`state.targetSource\` and the deploy target is set automatically. If the loop started as create but you discovered the user actually wanted to modify an existing object (e.g. "fix the Pong game" → you found Pong already exists), pass the target explicitly: \`{ "action": "deploy_update", "objectId": "<id>" }\` or \`{ "action": "deploy_update", "targetName": "Pong" }\`.
 - Probe: \`call("<Name>", "probe", {})\` — verifies dep references resolve in the deployed object.
 
 ANTI-PATTERNS — do not do these:
@@ -1573,7 +1669,7 @@ Persistence:
 
 1. **Ask before guessing.** When you don't know whether an object exists, what its API is, what its state means, or what method to call — \`ask\`. The Registry, the target object, or any candidate dep will answer.
 2. **Investigate before drafting.** For modifications: \`describe\` the target, \`ask\` it any open questions, \`getSource\` to see its current code, \`getState\` if relevant. For creations: \`ask\` the Registry for what's available, \`describe\` likely deps, \`ask\` each chosen dep for usage examples. Only draft when the call surface is known.
-3. **Validate before deploying.** After any \`draft_source\` (whether you wrote it or used \`draft_via_llm\`): always \`compile\`; then \`validate_calls\`; for non-trivial logic also \`review_semantics\`. Deploy only when compile is clean and validators agree.
+3. **Validate before deploying.** After any \`draft_source\`, \`draft_diff\`, or \`draft_via_llm\`: always \`compile\`; then \`validate_calls\`; for non-trivial logic also \`review_semantics\`. Deploy only when compile is clean and validators agree.
 4. **Verify behavior after deploying — really test what the user asked for.** After deploy, you must exercise the specific behavior the user requested, not just check that the object exists. \`call show\` and reading \`getState\` are not enough by themselves.
 
    For each behavior the user mentioned, send a \`call\` that drives it and check the result via \`getState\` or the response. Examples:
@@ -1594,6 +1690,7 @@ Persistence:
 
 The TASK section gives the kind, target (if any), and goal.
 The KNOWN OBJECTS section is everything you have learned via \`describe\` / \`ask\` so far. Method names listed there are the only valid names — copy them verbatim.
+The TARGET SOURCE section (modify loops only) shows the current code of the object being edited, preloaded from the Registry. Author SEARCH/REPLACE blocks against the exact text shown here.
 The DRAFTS section shows what manifest / source you have staged.
 The LAST VALIDATION section shows the most recent compile / validate_calls / review_semantics result.
 The RECENT TURNS section is your action log so you remember what you have already done.

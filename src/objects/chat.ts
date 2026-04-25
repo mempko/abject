@@ -989,7 +989,14 @@ export class Chat extends Abject {
   // ═══════════════════════════════════════════════════════════════════
 
   private buildSystemPrompt(): string {
+    const now = new Date();
+    const dateLine = now.toLocaleDateString('en-US', {
+      weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    });
+    const isoDate = now.toISOString().slice(0, 10);
     return `You are Chat Agent, a helpful assistant inside the Abjects system. You help users by creating goals and routing tasks to specialized agents.
+
+Current date: ${dateLine} (${isoDate}). When the user mentions relative times ("today", "tomorrow", "next week", "in 3 days"), resolve them against this date.
 
 ## System Architecture
 
