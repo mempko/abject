@@ -228,10 +228,10 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'createCanvas',
-                description: 'Create a canvas drawing widget inside a window. Returns the canvas widget AbjectId. Draw to it via this.call(canvasId, "abjects:canvas", "draw", { commands: [...] }). Get size via this.call(canvasId, "abjects:canvas", "getCanvasSize", {}).',
+                description: 'Create a canvas drawing widget inside a window. Returns the canvas widget AbjectId. Draw to it via this.call(canvasId, "draw", { commands: [...] }). Get size via this.call(canvasId, "getCanvasSize", {}). The canvas forwards mouse/keyboard input from the compositor to inputTargetId via an `input` event whose fields land on msg.payload — same shape as a synthetic call(canvasId, "input", payload).',
                 parameters: [
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
-                  { name: 'inputTargetId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId that receives input events (defaults to caller)', optional: true },
+                  { name: 'inputTargetId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId that receives `input` events for this canvas. Defaults to msg.routing.from (the object that sent createCanvas). Always pass `inputTargetId: this.id` explicitly from a ScriptableAbject — the default works in simple cases but breaks any time createCanvas is called by a helper or proxy on the user object\'s behalf.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -1005,11 +1005,13 @@ All operations use this.call(). There are no shorthand methods.
 Window:   this.call(this.dep('WidgetManager'), 'createWindowAbject', { title, rect, resizable })
 Layout:   this.call(this.dep('WidgetManager'), 'createVBox', { windowId, margins, spacing })
 Widgets:  this.call(this.dep('WidgetManager'), 'create', { specs: [{ type, windowId, ... }] })
-Canvas:   this.call(this.dep('WidgetManager'), 'createCanvas', { windowId })
+Canvas:   this.call(this.dep('WidgetManager'), 'createCanvas', { windowId, inputTargetId: this.id })
 Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', params }] })
 Size:     this.call(canvasId, 'getCanvasSize', {})
-Input:    this.call(canvasId, 'addDependent', {})   // then implement input(msg) handler
-Events:   this.call(widgetId, 'addDependent', {})   // then implement changed(msg) handler
+Input:    Pass inputTargetId on createCanvas, then implement input(msg) — read msg.payload.{type,x,y,button,code,key}.
+          Real compositor events and synthetic call(canvasId, 'input', payload) BOTH put fields on msg.payload.
+          DO NOT rely on a top-level fallback; there is no top-level event shape.
+Events:   this.call(widgetId, 'addDependent', {})   // then implement changed(msg) handler — for clicks, slider/textInput changes
 Update:   this.call(widgetId, 'update', { text, style, ... })
 Destroy:  this.call(this.dep('WidgetManager'), 'destroyWindowAbject', { windowId })
 
@@ -1344,9 +1346,11 @@ async _draw() {
 Rules for canvas apps:
 - show() must be idempotent: start with "if (this._windowId) return true;"
 - createWindowAbject and createCanvas are called only inside show(), never elsewhere
+- ALWAYS pass inputTargetId: this.id to createCanvas. The default (msg.routing.from) is fragile when show() is invoked through proxies or helpers.
 - _draw() must always start with a clear command covering the full canvas
-- input(), timerFired(), and changed() handlers update state and call _draw(), nothing more
+- input(), timerFired(), and changed() handlers read fields from msg.payload, update state, and call _draw(), nothing more
 - Use this._canvasW and this._canvasH for layout calculations, not hardcoded pixel values
+- After a deploy_update that changes show()/createCanvas wiring, the existing window+canvas widgets are NOT recreated automatically — call hide() then show() (or have the user close and re-open the window) to apply the new wiring
 
 ### Updating Layout Children
 

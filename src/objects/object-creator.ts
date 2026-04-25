@@ -1650,7 +1650,7 @@ Investigation:
 
 Deployment (use the local actions — they read your staged drafts and run the proper multi-message sequence):
 - Spawn a new object: \`{ "action": "deploy_spawn" }\` after both \`draft_manifest\` (or \`draft_via_llm({kind: "manifest"})\`) and \`draft_source\` (or \`draft_via_llm({kind: "source"})\`).
-- Update an existing object: \`{ "action": "deploy_update" }\` after \`draft_diff\` (preferred for surgical edits) or after \`draft_source\` (only when wholesale rewrite is intended). If the loop started as a modify, the target source is preloaded into \`state.targetSource\` and the deploy target is set automatically. If the loop started as create but you discovered the user actually wanted to modify an existing object (e.g. "fix the Pong game" → you found Pong already exists), pass the target explicitly: \`{ "action": "deploy_update", "objectId": "<id>" }\` or \`{ "action": "deploy_update", "targetName": "Pong" }\`.
+- Update an existing object: \`{ "action": "deploy_update" }\` after \`draft_diff\` (preferred for surgical edits) or after \`draft_source\` (only when wholesale rewrite is intended). If the loop started as a modify, the target source is preloaded into \`state.targetSource\` and the deploy target is set automatically. If the loop started as create but you discovered the user actually wanted to modify an existing object (e.g. "fix the Pong game" → you found Pong already exists), pass the target explicitly: \`{ "action": "deploy_update", "objectId": "<id>" }\` or \`{ "action": "deploy_update", "targetName": "Pong" }\`. **deploy_update hot-swaps source ONLY** — it does not rerun \`show()\` or recreate widgets the object already spawned. If the change touches \`show()\`, \`createCanvas\`, or any other widget wiring, also call \`hide()\` then \`show()\` on the target after deploy_update so the new wiring takes effect, OR tell the user to close and re-open the window. An idempotent \`show()\` will silently keep the OLD widgets otherwise, and your fix won't be observable.
 - Probe: \`call("<Name>", "probe", {})\` — verifies dep references resolve in the deployed object.
 
 ANTI-PATTERNS — do not do these:
@@ -1679,6 +1679,10 @@ Persistence:
    - User said "responds to peer messages" → send the message yourself via \`call\` and check the response.
 
    If the requested behavior is keyboard input, mouse input, or any input event, the canvas widget id is in your draft source — find it from \`state.draftSource\` (look for the \`createCanvas\` call), or read the running object's state for the canvas id, then \`call(<canvasId>, "input", { type, code | x | y, ... })\`.
+
+   **Synthetic input is a partial test, not full verification.** A passing \`call(<canvasId>, "input", payload)\` only proves the input-target's handler logic works. It does NOT exercise the real compositor → window → layout → canvas → inputTargetId chain (the synthetic call dispatches straight to the handler). Before declaring input wired correctly, ALSO check that:
+   1. The drafted source passes \`inputTargetId: this.id\` explicitly to \`createCanvas\` — never rely on the \`msg.routing.from\` default for canvas apps.
+   2. The handler reads fields from \`msg.payload\` (the real shape and the synthetic shape are identical — both wrap fields under \`msg.payload\`). Do NOT add a "top-level fallback" — there is no top-level event shape.
 
    "I called \`getState\` and the numbers look fine" is NOT verification. \`done\` only after at least one synthetic exercise of each user-requested behavior produced the expected change.
 5. **Diagnostic prompts terminate with a report.** If the user asked HOW something works, WHY it's failing, or to EXPLAIN behavior — answer with \`done({result: "<written report>"})\` after enough read-only calls (\`describe\`, \`ask\`, \`getState\`, \`getObjectLogs\`). Do not draft, do not deploy.

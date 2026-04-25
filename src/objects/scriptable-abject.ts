@@ -475,15 +475,25 @@ export class ScriptableAbject extends Abject {
       await self.request(request(self.id, resolvedTarget as AbjectId, 'addDependent', {}));
     };
 
-    return {
+    const proxy: Record<string, unknown> = {
       call: callFn,
       dep: depFn,
       find: findFn,
       changed: changedFn,
       emit: emitFn,
       observe: observeFn,
-      id: self.id,
     };
+    // `id` must read live from the Abject so handler code that captures
+    // `this.id` (e.g. `inputTargetId: this.id` on createCanvas) sees the
+    // post-setId value. Worker spawn and snapshot restore both call
+    // setId AFTER the constructor finishes, so a value-captured id would
+    // be the stale constructor-time uuid and route messages to a dead id.
+    Object.defineProperty(proxy, 'id', {
+      enumerable: true,
+      configurable: false,
+      get: () => self.id,
+    });
+    return proxy;
   }
 
   private compileAndInstall(source: string): void {
