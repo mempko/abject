@@ -224,11 +224,13 @@ Answer PASS for simple data fetches (weather APIs, RSS, JSON endpoints) since Ht
 
 Route to another agent — by answering NO — whenever the task targets a named object that lives inside this system rather than on the open web. Those are message-bus calls on Abjects, and ObjectAgent (or another in-process agent) has the right access. Concrete shapes to route away:
 
+- **Authoring or creating a new Abject** — any task whose verbs include create, build, author, write, generate, scaffold, wrap, or implement, applied to an Abject (UI window, client object, bridge, viewer, helper). Even when the new Abject will eventually talk to a website (e.g. "build a TiddlyWikiExplorer that browses my wiki"), the work itself is writing handler-map source code, not opening a browser. Answer NO — ObjectCreator handles authoring. Mention of HTTPS URLs, "wiki", "client", or web-shaped vocabulary in the spec is NOT enough to claim it.
+- **Modifying or fixing an existing Abject's source** — same logic. Answer NO; defer to ObjectCreator.
 - Calling a method on a named local object (e.g. "Call show() on FooWidget", "Invoke refresh on DashboardApp", "Display the MyApp window") — the target is an Abject id, reachable via \`find(name)\` on the message bus.
 - Opening, displaying, or rendering an Abject-owned UI window on the local compositor — surfaces in this system are objects, not web pages, even when the wording is "display" or "visualization".
 - Inspecting, patching, or debugging a local Abject's source or runtime state — that flows through Registry/Factory/Storage, which ObjectAgent can reach directly.
 
-Rule of thumb: if the task names a specific object from this system, answer NO so the dispatcher routes it to an agent with message-bus access. If the task names a URL or public web content, answer YES and describe your browsing approach.
+Rule of thumb: I answer YES only when the work itself is operating a browser on a public URL. If the task asks me to *write code* that talks to a URL, that's authoring — answer NO and let ObjectCreator do it. If the task names a specific Abject from this system, answer NO. If the task names a URL or public web content AND the verb is browse/fetch/scrape/click/login, answer YES and describe my browsing approach.
 
 ### Run a Full Web Task (free-text result)
 
@@ -568,7 +570,15 @@ Set keepPageOpen: false to explicitly close the page when done.
     this.on('agentAct', async (msg: AbjectMessage) => {
       this.resetPendingTicketTimeouts();
       const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
-      return this.handleAct(taskId, action);
+      // Heartbeat: a single browse step (large page navigate, screenshot,
+      // structured extraction) can run minutes; keep the parent's inactivity
+      // timer reset while we're awaiting it.
+      const heartbeat = setInterval(() => this.resetPendingTicketTimeouts(), 60000);
+      try {
+        return await this.handleAct(taskId, action);
+      } finally {
+        clearInterval(heartbeat);
+      }
     });
 
     this.on('agentPhaseChanged', async (msg: AbjectMessage) => {

@@ -207,6 +207,12 @@ export class AgentAbject extends Abject {
   /** Guard: tuple IDs currently being dispatched — prevents concurrent dispatch loops. */
   private dispatchingTuples = new Set<string>();
 
+  /** Decline-retry counts per tupleId. In-memory so the count survives the
+   *  periodic scan re-fetching tuples from SharedState. Cleared once the
+   *  task is claimed, fails permanently, or exceeds the retry budget. */
+  private declineRetries = new Map<string, number>();
+  private static readonly MAX_DECLINE_RETRIES = 6;
+
   /** Agents currently executing a dispatched TupleSpace task (one task at a time per agent). */
   private busyAgents = new Set<AbjectId>();
 
@@ -1120,6 +1126,8 @@ Evaluate the task on its OBJECTIVE content, not on its framing. If the task desc
 
 Authoring/modification rule: a task to CREATE, BUILD, AUTHOR, WRAP, REWRITE, MODIFY, PATCH, FIX, or UPDATE the source code, handlers, or implementation of an Abject object — including bug fixes with specific root causes, diff outlines, or log-trace references — is an authoring task. If you are the agent that regenerates object code from a prompt, answer YES for these. Specificity in the prompt (concrete bug report, specific method name, diff idea) is helpful input for regeneration, not a reason to decline as "surgical".
 
+User-shared credentials are explicit consent. When the task description includes a username and password, API key, bearer token, or similar secret that the user themselves typed into chat, treat that as explicit instruction to wire it into the object you author. Do NOT decline on "plaintext credentials" grounds. Context: this Abjects runtime is the user's own self-hosted local system. Object source is persisted only into their own .abjects directory on their own disk; it is never uploaded, synced to a remote service, or shared across users. The user knows where it goes. They asked for the integration. Refusing forces them to do the same thing by hand. Embed the credential in the source you author and continue.
+
 After the verdict, in 2-4 sentences: name the SPECIFIC tool, skill, MCP server, or capability you would use (by name if you have it configured), and outline the concrete steps. Direct/configured tools are preferred over general-purpose automation. If you must use a general-purpose tool (like a web browser) for something a specialized tool could do, say so honestly.`;
     if (goalTitle) askQuestion += `\n\nGoal: "${goalTitle}"`;
     askQuestion += `\nTask: "${description.slice(0, 400)}"`;
@@ -1180,17 +1188,36 @@ After the verdict, in 2-4 sentences: name the SPECIFIC tool, skill, MCP server, 
           agentName: 'AgentAbject',
         }));
       }
-      // Schedule a retry with backoff (same policy as evaluator NONE below)
-      const dispatchRetries = (tuple.fields._dispatchRetries as number) ?? 0;
-      if (dispatchRetries < 6) {
-        tuple.fields._dispatchRetries = dispatchRetries + 1;
-        const delay = Math.min(5000 * (dispatchRetries + 1), 30000);
-        log.info(`DISPATCH-INNER ${tupleId} — scheduling retry ${dispatchRetries + 1}/6 in ${delay}ms`);
+      // In-memory retry counter survives the periodic scan re-fetching tuples
+      // from SharedState (which would otherwise reset a tuple-stored count).
+      const prev = this.declineRetries.get(tupleId) ?? 0;
+      const next = prev + 1;
+      if (next <= AgentAbject.MAX_DECLINE_RETRIES) {
+        this.declineRetries.set(tupleId, next);
+        const delay = Math.min(5000 * next, 30000);
+        log.info(`DISPATCH-INNER ${tupleId} — scheduling retry ${next}/${AgentAbject.MAX_DECLINE_RETRIES} in ${delay}ms`);
         setTimeout(() => {
           this.dispatchToAgent(tuple).catch(err => {
             log.warn(`DISPATCH-INNER ${tupleId} — retry failed:`, err instanceof Error ? err.message : String(err));
           });
         }, delay);
+      } else {
+        // Retries exhausted — fail the task so the periodic scan stops re-dispatching.
+        // Without this, scanNamespace fetches a fresh tuple object every cycle and the
+        // counter on the in-memory tuple resets, producing an infinite "All agents declined"
+        // loop. failTask sets status to permanently_failed (after maxAttempts) so the
+        // scan filter excludes it.
+        log.info(`DISPATCH-INNER ${tupleId} — retries exhausted (${prev}/${AgentAbject.MAX_DECLINE_RETRIES}); failing task`);
+        this.declineRetries.delete(tupleId);
+        if (taskGoalId && this.goalManagerId) {
+          this.send(event(this.id, this.goalManagerId, 'failTask', {
+            taskId: tupleId,
+            goalId: taskGoalId,
+            error: 'No agent capable of handling this task. All registered agents declined repeatedly.',
+            agentName: 'AgentAbject',
+            agentId: this.id,
+          }));
+        }
       }
       return;
     }
@@ -1257,18 +1284,31 @@ Pick the agent with the best combination. Reply with ONLY the agent name.`;
           agentName: 'AgentAbject',
         }));
       }
-      // Schedule a retry after a short delay instead of waiting for the 10s periodic scan.
-      // The periodic scan will also pick it up, so this is just faster recovery.
-      const dispatchRetries = (tuple.fields._dispatchRetries as number) ?? 0;
-      if (dispatchRetries < 6) {
-        tuple.fields._dispatchRetries = dispatchRetries + 1;
-        const delay = Math.min(5000 * (dispatchRetries + 1), 30000);
-        log.info(`DISPATCH-INNER ${tupleId} — scheduling retry ${dispatchRetries + 1}/6 in ${delay}ms`);
+      // Same in-memory retry policy as the all-declined path — the periodic
+      // scan would otherwise reset a tuple-stored counter every cycle.
+      const prev = this.declineRetries.get(tupleId) ?? 0;
+      const next = prev + 1;
+      if (next <= AgentAbject.MAX_DECLINE_RETRIES) {
+        this.declineRetries.set(tupleId, next);
+        const delay = Math.min(5000 * next, 30000);
+        log.info(`DISPATCH-INNER ${tupleId} — scheduling retry ${next}/${AgentAbject.MAX_DECLINE_RETRIES} in ${delay}ms`);
         setTimeout(() => {
           this.dispatchToAgent(tuple).catch(err => {
             log.warn(`DISPATCH-INNER ${tupleId} — retry failed:`, err instanceof Error ? err.message : String(err));
           });
         }, delay);
+      } else {
+        log.info(`DISPATCH-INNER ${tupleId} — retries exhausted (${prev}/${AgentAbject.MAX_DECLINE_RETRIES}); failing task`);
+        this.declineRetries.delete(tupleId);
+        if (taskGoalId && this.goalManagerId) {
+          this.send(event(this.id, this.goalManagerId, 'failTask', {
+            taskId: tupleId,
+            goalId: taskGoalId,
+            error: 'No agent capable of handling this task. The evaluator could not pick a winning candidate.',
+            agentName: 'AgentAbject',
+            agentId: this.id,
+          }));
+        }
       }
       return;
     }
@@ -1304,6 +1344,8 @@ Pick the agent with the best combination. Reply with ONLY the agent name.`;
       this.busyAgents.delete(chosen.agentId);
       return;
     }
+    // Successfully claimed — clear any decline-retry history for this tuple.
+    this.declineRetries.delete(tupleId);
     log.info(`DISPATCH-INNER ${tupleId} — claimed, sending executeTask to ${chosen.name}`);
 
     // 4b. Store agent name on the tuple so GoalBrowser can display it
@@ -2464,12 +2506,18 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
     agentName: string,
   ): Promise<string> {
     const goalMgrId = this.goalManagerId!;
-    const summary = (entry.state.action?.reasoning as string)
-      ?? `Decomposed: ${subtasks.map(s => s.description).join(', ').slice(0, 100)}`;
+    // Title from the subtask descriptions — short and human-readable.
+    // The LLM's `reasoning` field is internal thought-trace, NOT a title:
+    // it tends to start with "This task requires..." or "I need to...", which
+    // looks awful in any goal-list UI and makes the goal hard to identify.
+    const titleSource = subtasks.length === 1
+      ? subtasks[0].description
+      : `${subtasks.length} steps: ${subtasks.map(s => s.description.split(/[.\n]/)[0]).join(' → ')}`;
+    const title = titleSource.slice(0, 120).trim() || `Decomposed task (${subtasks.length} step${subtasks.length === 1 ? '' : 's'})`;
 
     const { goalId: childGoalId } = await this.request<{ goalId: string }>(
       request(this.id, goalMgrId, 'createGoal', {
-        title: summary.slice(0, 200),
+        title,
         parentId: entry.goalId,
       }),
     );
@@ -2972,6 +3020,13 @@ Omit: duplicated schema dumps, long method catalogs, step numbers, decorative he
     if (!this.goalManagerId) return;
     const now = Date.now();
     for (const entry of this.taskEntries.values()) {
+      // Don't emit progress for terminal entries — they're done. Without this,
+      // every late LLM chunk or background bubble would re-fire `phase=done` on
+      // GoalManager forever, filling the log and blasting UNDELIVERABLE events
+      // at every stale dependent (e.g. Chat instances from previous workspace
+      // sessions). taskEntries is currently never pruned, so the loop runs over
+      // an ever-growing graveyard.
+      if (entry.state.phase === 'done' || entry.state.phase === 'error') continue;
       const goalId = entry.goalId ?? entry.incomingGoalId;
       if (!goalId) continue;
       const last = this.lastGoalProgressTs.get(goalId) ?? 0;

@@ -274,7 +274,17 @@ When asked about a task, describe which objects you would message and what you w
     this.on('agentAct', async (msg: AbjectMessage) => {
       this.resetPendingTicketTimeouts();
       const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
-      return this.handleAct(taskId, action);
+      // Action handlers can await sub-calls that run for minutes (e.g. an
+      // ObjectCreator.create authoring loop). While we're awaiting, no other
+      // agentObserve / agentAct event fires, so the inactivity timer would
+      // reject our pending tickets even though work is genuinely happening.
+      // Heartbeat the timeouts every 60s while the action is in flight.
+      const heartbeat = setInterval(() => this.resetPendingTicketTimeouts(), 60000);
+      try {
+        return await this.handleAct(taskId, action);
+      } finally {
+        clearInterval(heartbeat);
+      }
     });
 
     this.on('agentPhaseChanged', async (msg: AbjectMessage) => {

@@ -282,7 +282,14 @@ When asked about a task, describe which skill you would use and how. Say PASS wh
     this.on('agentAct', async (msg: AbjectMessage) => {
       this.resetPendingTicketTimeouts();
       const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
-      return this.handleAct(taskId, action);
+      // Heartbeat: long sub-calls (e.g. MCP tool that takes minutes) shouldn't
+      // let the parent's inactivity timer fire while we're genuinely working.
+      const heartbeat = setInterval(() => this.resetPendingTicketTimeouts(), 60000);
+      try {
+        return await this.handleAct(taskId, action);
+      } finally {
+        clearInterval(heartbeat);
+      }
     });
 
     this.on('agentPhaseChanged', async (msg: AbjectMessage) => {
