@@ -2929,24 +2929,84 @@ Omit: duplicated schema dumps, long method catalogs, step numbers, decorative he
   /** Maximum consecutive empty LLM responses before we force a terminal fail. */
   private static readonly MAX_EMPTY_RESPONSES = 3;
 
+  /**
+   * Returns null if the parsed action has acceptable content, or a `_reparse`
+   * sentinel (or terminal error) if the agent should be asked to try again.
+   *
+   * Currently checks: terminal actions whose configured `resultFields` are all
+   * missing or empty. Example: `clarify` is registered with `resultFields:
+   * ['question']`; an LLM that emits `{"action": "clarify"}` with no question
+   * would succeed silently and the user would see nothing. We reject such
+   * empty terminals and ask the LLM to fill in at least one field.
+   */
+  private validateActionContent(entry: TaskEntry, parsed: AgentAction): AgentAction | null {
+    const terminal = entry.config.terminalActions[parsed.action];
+    if (!terminal) return null;
+    const fields = terminal.resultFields ?? [];
+    if (fields.length === 0) return null;
+
+    const hasContent = fields.some(field => {
+      const val = parsed[field];
+      if (val === undefined || val === null) return false;
+      if (typeof val === 'string') return val.trim().length > 0;
+      // Object / array / number / boolean — present but maybe empty:
+      if (typeof val === 'object') {
+        if (Array.isArray(val)) return val.length > 0;
+        return Object.keys(val as object).length > 0;
+      }
+      return true;
+    });
+    if (hasContent) return null;
+
+    entry.parseFailures = (entry.parseFailures ?? 0) + 1;
+    if (entry.parseFailures <= AgentAbject.MAX_PARSE_FAILURES) {
+      const fieldList = fields.map(f => `"${f}"`).join(', ');
+      const example: AgentAction = { action: parsed.action };
+      example[fields[0]] = `<your ${fields[0]} here>`;
+      const correction = `[Error] Your "${parsed.action}" action arrived with no content in any of the required fields (${fieldList}). At least one must be a non-empty string (or non-empty object/array). Without it the user sees nothing. Re-emit the action with the field populated, e.g.:\n\`\`\`json\n${JSON.stringify(example)}\n\`\`\``;
+      entry.state.llmMessages.push({ role: 'user', content: correction });
+      return { action: '_reparse', reasoning: `Retrying empty "${parsed.action}" terminal (attempt ${entry.parseFailures}/${AgentAbject.MAX_PARSE_FAILURES})` };
+    }
+
+    // Retries exhausted — fall back to the agent's error terminal so the
+    // caller hears about the failure instead of getting silent success.
+    const errorTerminal = Object.entries(entry.config.terminalActions).find(([, v]) => v.type === 'error')?.[0];
+    const reason = `LLM emitted "${parsed.action}" with empty content in all required fields (${fields.join(', ')}) ${entry.parseFailures} times in a row; aborting.`;
+    if (errorTerminal) {
+      return { action: errorTerminal, reason, error: reason };
+    }
+    entry.state.error = reason;
+    return { action: '_reparse_abort', reasoning: reason };
+  }
+
   private parseAction(entry: TaskEntry, content: string): AgentAction {
-    // Try ```json block
+    // Extract a parsed action from the content (try several wrapper shapes).
+    let parsed: AgentAction | null = null;
     const jsonMatch = content.match(/```json\s*([\s\S]*?)```/);
     if (jsonMatch) {
-      const parsed = this.tryParseActionJson(jsonMatch[1].trim());
-      if (parsed) { entry.parseFailures = 0; return parsed; }
+      parsed = this.tryParseActionJson(jsonMatch[1].trim());
+    }
+    if (!parsed) {
+      const unclosedMatch = content.match(/```json\s*([\s\S]*)/);
+      if (unclosedMatch && !jsonMatch) {
+        parsed = this.tryParseActionJson(unclosedMatch[1].trim());
+      }
+    }
+    if (!parsed) {
+      parsed = this.tryParseActionJson(content);
     }
 
-    // Fallback: unclosed ```json block
-    const unclosedMatch = content.match(/```json\s*([\s\S]*)/);
-    if (unclosedMatch && !jsonMatch) {
-      const parsed = this.tryParseActionJson(unclosedMatch[1].trim());
-      if (parsed) { entry.parseFailures = 0; return parsed; }
+    if (parsed) {
+      // Reject terminal actions that arrive with all required fields missing
+      // or empty. Without this, the framework happily promotes e.g.
+      // `{"action": "clarify"}` to a success terminal, but downstream renders
+      // an empty bubble and the user sees nothing. Treat empty-terminal as a
+      // parse failure so the LLM is asked to retry with the missing content.
+      const reparse = this.validateActionContent(entry, parsed);
+      if (reparse) return reparse;
+      entry.parseFailures = 0;
+      return parsed;
     }
-
-    // Try whole content as JSON
-    const parsed = this.tryParseActionJson(content);
-    if (parsed) { entry.parseFailures = 0; return parsed; }
 
     // No structured action found — this is a parse failure. Track it and
     // either retry (by emitting a _reparse sentinel the main loop handles)
