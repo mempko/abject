@@ -11,5 +11,18 @@ test-results/
 .abjects2/
 .abjects3/
 *.log
+*.log.*
 *.har
 playwright-browsers/
+
+# Local tooling / scratch
+.claude/
+.codex
+home/
+ollama.sh
+
+# Astro build cache
+site/.astro/
+
+# Local demo assets
+site/abject_demo.webm
