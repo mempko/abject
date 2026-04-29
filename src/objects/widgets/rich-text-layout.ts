@@ -37,6 +37,15 @@ export interface LayoutLine {
   codeBackground?: boolean;
   /** True for blockquote lines that need a left border. */
   quoteBorder?: boolean;
+  /** Image data for image lines (drawn instead of `runs`). */
+  image?: {
+    url: string;
+    alt: string;
+    width: number;
+    height: number;
+    sourceStart: number;
+    sourceEnd: number;
+  };
 }
 
 export interface RichTextLayout {
@@ -45,6 +54,13 @@ export interface RichTextLayout {
 }
 
 export type MeasureFn = (text: string, font: string) => Promise<number>;
+
+/**
+ * Resolve the natural pixel dimensions of an image URL, or null if unknown
+ * (e.g., still loading). Implementations typically cache results and trigger
+ * a relayout when a probe completes.
+ */
+export type ImageResolver = (url: string) => { width: number; height: number } | null;
 
 // ── Font / Color Mapping ───────────────────────────────────────────────
 
@@ -134,6 +150,7 @@ export async function layoutRichText(
   theme: ThemeData,
   baseFontSize: number,
   baseFill: string,
+  imageResolver?: ImageResolver,
 ): Promise<RichTextLayout> {
   const lines: LayoutLine[] = [];
   let y = 0;
@@ -163,6 +180,29 @@ export async function layoutRichText(
       await layoutTable(block, lines, y, maxWidth, baseFontSize, theme, measureFn);
       y = lines.length > 0 ? lines[lines.length - 1].y + lines[lines.length - 1].height : y;
       y += 4; // bottom padding
+      continue;
+    }
+
+    if (block.type === 'image' && block.imageUrl) {
+      y += 4; // top padding
+      const dims = computeImageDims(block, maxWidth, imageResolver);
+      lines.push({
+        runs: [],
+        y,
+        height: dims.height,
+        indent: 0,
+        blockType: 'image',
+        blockStart: true,
+        image: {
+          url: block.imageUrl,
+          alt: block.imageAlt ?? '',
+          width: dims.width,
+          height: dims.height,
+          sourceStart: block.sourceStart,
+          sourceEnd: block.sourceEnd,
+        },
+      });
+      y += dims.height + 4; // include bottom padding
       continue;
     }
 
@@ -207,6 +247,32 @@ export async function layoutRichText(
   }
 
   return { lines, totalHeight: y };
+}
+
+function computeImageDims(
+  block: MarkdownBlock,
+  maxWidth: number,
+  imageResolver: ImageResolver | undefined,
+): { width: number; height: number } {
+  // Explicit `|WxH` hint wins; fit to maxWidth if larger.
+  if (block.imageWidth && block.imageHeight) {
+    if (block.imageWidth > maxWidth) {
+      const scale = maxWidth / block.imageWidth;
+      return { width: maxWidth, height: Math.round(block.imageHeight * scale) };
+    }
+    return { width: block.imageWidth, height: block.imageHeight };
+  }
+  // Probed natural dimensions (resolver returns null while loading).
+  if (imageResolver && block.imageUrl) {
+    const probed = imageResolver(block.imageUrl);
+    if (probed && probed.width > 0 && probed.height > 0) {
+      const w = Math.min(probed.width, maxWidth);
+      const h = Math.round(probed.height * (w / probed.width));
+      return { width: w, height: h };
+    }
+  }
+  // Placeholder: full width at 16:9 until natural dims are known.
+  return { width: maxWidth, height: Math.round(maxWidth * 9 / 16) };
 }
 
 async function layoutCodeBlock(

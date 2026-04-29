@@ -625,8 +625,21 @@ export class Compositor {
         const sid = command.surfaceId;
 
         if (p.url.startsWith('data:')) {
-          // Data URI path: show previous screenshot synchronously while loading new one.
-          // This prevents the blank flash between surface clear and async decode.
+          // Fast path: stable data URIs (e.g. chat messages) hit the cache
+          // on every frame after the first decode.
+          const cachedData = this.imageCache.get(p.url);
+          if (cachedData && cachedData.loaded) {
+            if (p.width && p.height) {
+              ctx.drawImage(cachedData.img, p.x, p.y, p.width, p.height);
+            } else {
+              ctx.drawImage(cachedData.img, p.x, p.y);
+            }
+            break;
+          }
+
+          // Live-screenshot fallback: show the previous data URI synchronously
+          // while the new one decodes. Prevents blank flash on surfaces that
+          // continually swap data URIs (remote views, etc.).
           const live = this.liveDataImages.get(sid);
           if (live) {
             if (p.width && p.height) {
@@ -636,11 +649,19 @@ export class Compositor {
             }
           }
 
-          // Async load of the new data URI
+          // Async load: populate both the live (per-surface) cache and the
+          // shared imageCache so subsequent renders skip the decode.
           const img = new Image();
           const savedTransform = ctx.getTransform();
           img.onload = () => {
             this.liveDataImages.set(sid, { img, width: img.naturalWidth, height: img.naturalHeight });
+
+            if (this.imageCache.size >= Compositor.IMAGE_CACHE_MAX) {
+              const firstKey = this.imageCache.keys().next().value!;
+              this.imageCache.delete(firstKey);
+            }
+            this.imageCache.set(p.url, { img, loaded: true });
+
             const surf = this.surfaces.get(sid);
             if (surf) {
               surf.ctx.save();

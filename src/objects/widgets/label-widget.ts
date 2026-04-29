@@ -17,7 +17,7 @@ import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
 import { wrapText } from './word-wrap.js';
 import { event } from '../../core/message.js';
 import { parseMarkdown } from './markdown.js';
-import { layoutRichText, type RichTextLayout, type StyledRun } from './rich-text-layout.js';
+import { layoutRichText, type RichTextLayout, type StyledRun, type ImageResolver } from './rich-text-layout.js';
 
 export class LabelWidget extends WidgetAbject {
   // Word-wrap cache
@@ -31,6 +31,11 @@ export class LabelWidget extends WidgetAbject {
   private cachedRichText: string = '';
   private cachedRichWidth: number = 0;
   private cachedRichFontSize: number | undefined = undefined;
+
+  // Natural dimensions of images referenced in markdown, populated by
+  // probe loads. URLs map to dims when known, or 'pending'/'error' to
+  // dedupe in-flight loads. Layout uses placeholder dims when unknown.
+  private imageDims: Map<string, { width: number; height: number } | 'pending' | 'error'> = new Map();
 
   // Selection state (only used when style.selectable is true)
   private cursorPos = 0;
@@ -136,6 +141,11 @@ export class LabelWidget extends WidgetAbject {
         targetLine = line;
         break;
       }
+    }
+
+    // Image line: return the source offset of the image block (no text inside)
+    if (targetLine.image) {
+      return targetLine.image.sourceStart;
     }
 
     // Walk runs to find the clicked run and character offset within it
@@ -276,12 +286,40 @@ export class LabelWidget extends WidgetAbject {
     ) {
       const parsed = parseMarkdown(text);
       const measureFn = (t: string, font: string) => this.measureText(surfaceId, t, font);
-      this.cachedRichLayout = await layoutRichText(parsed, maxWidth, measureFn, this.theme, fontSize, fill);
+      const imageResolver: ImageResolver = (url) => this.resolveImageDims(url);
+      this.cachedRichLayout = await layoutRichText(
+        parsed, maxWidth, measureFn, this.theme, fontSize, fill, imageResolver,
+      );
       this.cachedRichText = text;
       this.cachedRichWidth = maxWidth;
       this.cachedRichFontSize = fontSize;
     }
     return this.cachedRichLayout;
+  }
+
+  /**
+   * Look up cached natural dimensions; on miss, kick off a probe load that
+   * invalidates the layout cache and triggers a redraw when complete.
+   */
+  private resolveImageDims(url: string): { width: number; height: number } | null {
+    const cached = this.imageDims.get(url);
+    if (cached && cached !== 'pending' && cached !== 'error') return cached;
+    if (cached) return null; // pending / error
+    this.imageDims.set(url, 'pending');
+    const img = new Image();
+    img.onload = () => {
+      this.imageDims.set(url, { width: img.naturalWidth, height: img.naturalHeight });
+      this.cachedRichLayout = null;
+      void this.requestRedraw();
+    };
+    img.onerror = () => {
+      this.imageDims.set(url, 'error');
+    };
+    if (!url.startsWith('data:')) {
+      img.crossOrigin = 'anonymous';
+    }
+    img.src = url;
+    return null;
   }
 
   /**
@@ -311,6 +349,22 @@ export class LabelWidget extends WidgetAbject {
       const lineTop = oy + yShift + line.y;
       const textY = lineTop + line.height * 0.7;
       if (lineTop > oy + h) break; // past bottom edge
+
+      // Image line: emit imageUrl draw command and continue.
+      // The compositor handles loading & caching for both http and data: URIs.
+      if (line.image) {
+        commands.push({
+          type: 'imageUrl', surfaceId,
+          params: {
+            x: ox + textPadding + line.indent,
+            y: lineTop,
+            width: line.image.width,
+            height: line.image.height,
+            url: line.image.url,
+          },
+        });
+        continue;
+      }
 
       // Code block background
       if (line.codeBackground) {

@@ -245,6 +245,15 @@ export class Chat extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
+                name: 'attachMedia',
+                description: 'Append an assistant bubble containing markdown media (typically an image data URI from a screenshot or render). Bypasses conversationHistory so large data URIs never enter the LLM context — the LLM sees the agent\'s text summary instead. Use this from sub-task agents that captured user-facing media.',
+                parameters: [
+                  { name: 'markdown', type: { kind: 'primitive', primitive: 'string' }, description: 'Markdown content to render (e.g. ![alt|WxH](data:image/png;base64,...))' },
+                  { name: 'sender', type: { kind: 'primitive', primitive: 'string' }, description: 'Optional display name; defaults to "Agent"' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
                 name: 'clearHistory',
                 description: 'Reset conversation history',
                 parameters: [],
@@ -387,6 +396,18 @@ export class Chat extends Abject {
       if (!message?.trim()) return false;
       log.info(`[Chat] sendMessage: "${message.trim().slice(0, 80)}"`);
       this.triggerSend(message.trim());
+      return true;
+    });
+
+    this.on('attachMedia', async (msg: AbjectMessage) => {
+      const { markdown, sender } = msg.payload as { markdown: string; sender?: string };
+      if (!markdown?.trim()) return false;
+      // Deliberately do NOT push to conversationHistory: the markdown carries
+      // a data URI that would balloon every subsequent LLM call. The LLM
+      // gets the originating agent's text summary instead.
+      await this.removeWelcomeState();
+      await this.appendBubble('assistant', sender || 'Agent', markdown.trim(), true);
+      this.schedulePersist();
       return true;
     });
 

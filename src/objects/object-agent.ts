@@ -426,6 +426,17 @@ When asked about a task, describe which objects you would message and what you w
                 mediaType: 'image/png',
                 data: img.imageBase64,
               }];
+
+              // Deliver the image to the dispatching chat (the goal's creator)
+              // as a markdown bubble. Routes data URI bytes around the LLM —
+              // attachMedia skips conversationHistory so neither this agent's
+              // LLM nor the chat's LLM ever sees the raw base64.
+              if (this._currentGoalId && this.goalManagerId) {
+                this.deliverScreenshotToChat(this._currentGoalId, img).catch(() => {
+                  // Best-effort: chat may have closed, or creator may not be a Chat.
+                });
+              }
+
               result = `Screenshot captured (${img.width}x${img.height}). The image is attached for your analysis.`;
               break;
             }
@@ -473,6 +484,31 @@ When asked about a task, describe which objects you would message and what you w
       extra.lastResult = `Error: ${errMsg}`;
       return { success: false, error: errMsg };
     }
+  }
+
+  /**
+   * Look up the goal's creator (typically the dispatching Chat) and send it
+   * an `attachMedia` message containing the screenshot as a markdown image
+   * data URI. Bypasses every LLM context — the chat renders the bubble
+   * directly. Targets that don't implement `attachMedia` ignore it.
+   */
+  private async deliverScreenshotToChat(
+    goalId: string,
+    img: { imageBase64: string; width: number; height: number },
+  ): Promise<void> {
+    const goal = await this.request<{ createdBy?: AbjectId } | null>(
+      request(this.id, this.goalManagerId!, 'getGoal', { goalId }),
+      5000,
+    );
+    if (!goal?.createdBy) return;
+
+    const dataUri = `data:image/png;base64,${img.imageBase64}`;
+    const markdown = `![screenshot|${img.width}x${img.height}](${dataUri})`;
+
+    this.send(request(this.id, goal.createdBy, 'attachMedia', {
+      markdown,
+      sender: 'Screenshot',
+    }));
   }
 
   // ═══════════════════════════════════════════════════════════════════

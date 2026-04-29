@@ -21,7 +21,7 @@ export interface TextSpan {
   sourceEnd: number;
 }
 
-export type BlockType = 'paragraph' | 'heading' | 'bullet' | 'code-block' | 'blockquote' | 'table';
+export type BlockType = 'paragraph' | 'heading' | 'bullet' | 'code-block' | 'blockquote' | 'table' | 'image';
 
 export interface MarkdownBlock {
   type: BlockType;
@@ -32,6 +32,14 @@ export interface MarkdownBlock {
   language?: string;
   /** Table cells: rows of cell strings (for type 'table'). */
   cells?: string[][];
+  /** Image source URL (http(s) or data: URI) for type 'image'. */
+  imageUrl?: string;
+  /** Alt text for type 'image'. */
+  imageAlt?: string;
+  /** Optional explicit display width in CSS pixels (from `|WxH` hint). */
+  imageWidth?: number;
+  /** Optional explicit display height in CSS pixels (from `|WxH` hint). */
+  imageHeight?: number;
   sourceStart: number;
   sourceEnd: number;
 }
@@ -78,6 +86,29 @@ export function parseInline(text: string, baseOffset: number): TextSpan[] {
         i = closeIdx + 1;
         normalStart = i;
         continue;
+      }
+    }
+
+    // Inline image: ![alt](url) — block-level images are handled by the
+    // block parser; inline images degrade to alt text so the syntax doesn't
+    // get mis-matched as a link below.
+    if (text[i] === '!' && text[i + 1] === '[') {
+      const closeBracket = text.indexOf(']', i + 2);
+      if (closeBracket !== -1 && text[closeBracket + 1] === '(') {
+        const closeParen = text.indexOf(')', closeBracket + 2);
+        if (closeParen !== -1) {
+          flush(i);
+          const altText = text.slice(i + 2, closeBracket);
+          spans.push({
+            text: altText,
+            style: 'normal',
+            sourceStart: baseOffset + i,
+            sourceEnd: baseOffset + closeParen + 1,
+          });
+          i = closeParen + 1;
+          normalStart = i;
+          continue;
+        }
       }
     }
 
@@ -275,6 +306,32 @@ export function parseMarkdown(text: string): ParsedMarkdown {
       continue;
     }
 
+    // Image block: ![alt](url) or ![alt|WxH](url) on its own line.
+    // The `|WxH` hint lets height estimation stay synchronous; without it
+    // the layout uses placeholder dims until the widget probes the image.
+    const imageMatch = line.match(/^\s*!\[([^\]]*)\]\(([^)]+)\)\s*$/);
+    if (imageMatch) {
+      const altPart = imageMatch[1];
+      const url = imageMatch[2];
+      const sizeMatch = altPart.match(/^(.*?)\|(\d+)x(\d+)$/);
+      const alt = sizeMatch ? sizeMatch[1] : altPart;
+      const width = sizeMatch ? Number(sizeMatch[2]) : undefined;
+      const height = sizeMatch ? Number(sizeMatch[3]) : undefined;
+      blocks.push({
+        type: 'image',
+        spans: [],
+        imageUrl: url,
+        imageAlt: alt,
+        imageWidth: width,
+        imageHeight: height,
+        sourceStart: lineStart,
+        sourceEnd: lineEnd,
+      });
+      offset = lineEnd + 1;
+      i++;
+      continue;
+    }
+
     // Blockquote: > text
     if (line.startsWith('> ')) {
       const contentText = line.slice(2);
@@ -341,7 +398,8 @@ export function parseMarkdown(text: string): ParsedMarkdown {
         nextLine.match(/^\s*[-*]\s+/) ||
         nextLine.startsWith('> ') ||
         nextLine.trimStart().startsWith('```') ||
-        nextLine.trimStart().startsWith('|')
+        nextLine.trimStart().startsWith('|') ||
+        nextLine.match(/^\s*!\[[^\]]*\]\([^)]+\)\s*$/)
       ) {
         break;
       }
@@ -436,6 +494,29 @@ export function estimateMarkdownHeight(
       const quoteText = line.slice(2);
       const availWidth = maxWidthPx - 12; // indent
       totalHeight += estimateTextHeight(quoteText, availWidth, baseFontSize);
+      prevBlock = true;
+      i++;
+      continue;
+    }
+
+    // Image block: explicit dims if provided, otherwise 16:9 at full width.
+    const estImageMatch = line.match(/^\s*!\[([^\]]*)\]\([^)]+\)\s*$/);
+    if (estImageMatch) {
+      const altPart = estImageMatch[1];
+      const sizeMatch = altPart.match(/\|(\d+)x(\d+)$/);
+      let h: number;
+      if (sizeMatch) {
+        const w = Number(sizeMatch[1]);
+        const hh = Number(sizeMatch[2]);
+        if (w > maxWidthPx) {
+          h = Math.round(hh * (maxWidthPx / w));
+        } else {
+          h = hh;
+        }
+      } else {
+        h = Math.round(maxWidthPx * 9 / 16);
+      }
+      totalHeight += h + 8;
       prevBlock = true;
       i++;
       continue;
