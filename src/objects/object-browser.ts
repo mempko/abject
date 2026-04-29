@@ -1956,6 +1956,20 @@ Pane 4: Detail view with signature, status, source, send-message form,
       return;
     }
 
+    // Internal data clones with the source — deep-copy via JSON so the
+    // clone's data is independent of the original's. ScriptableAbjects use
+    // this to persist intrinsic state (drawings, notes, counters) that is
+    // meant to travel with the object.
+    const sourceData = (obj as unknown as { data?: Record<string, unknown> }).data;
+    let cloneData: Record<string, unknown> | undefined;
+    if (sourceData !== undefined) {
+      try {
+        cloneData = JSON.parse(JSON.stringify(sourceData));
+      } catch {
+        cloneData = undefined;
+      }
+    }
+
     // Lazy-discover Factory
     if (!this.factoryId) {
       this.factoryId = await this.discoverDep('Factory') ?? undefined;
@@ -1973,24 +1987,28 @@ Pane 4: Detail view with signature, status, source, send-message form,
     }
 
     try {
+      const spawnPayload: Record<string, unknown> = {
+        manifest: obj.manifest,
+        source,
+        registryHint: targetRegistryId,
+      };
+      if (cloneData !== undefined) spawnPayload.data = cloneData;
+
       const result = await this.request<SpawnResult>(request(this.id, this.factoryId,
-        'spawn', {
-          manifest: obj.manifest,
-          source,
-          registryHint: targetRegistryId,
-        }));
+        'spawn', spawnPayload));
 
       // Persist to AbjectStore so it survives restart
       const abjectStoreId = await this.findAbjectStoreForClone(targetRegistryId);
       if (abjectStoreId) {
         try {
-          await this.request(request(this.id, abjectStoreId,
-            'save', {
-              objectId: result.objectId,
-              manifest: obj.manifest,
-              source,
-              owner: this.id,
-            }));
+          const savePayload: Record<string, unknown> = {
+            objectId: result.objectId,
+            manifest: obj.manifest,
+            source,
+            owner: this.id,
+          };
+          if (cloneData !== undefined) savePayload.data = cloneData;
+          await this.request(request(this.id, abjectStoreId, 'save', savePayload));
         } catch { /* best-effort persist */ }
       }
 

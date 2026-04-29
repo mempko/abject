@@ -285,11 +285,22 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
 
     require(reg !== null, `Object '${objectId}' not found in any registry`);
 
-    // Delegate to spawn with the same manifest and source
+    // Delegate to spawn with the same manifest and source.
+    // Internal data clones with the source — that is the point of having data
+    // live inside the object.
     const spawnReq: SpawnRequest = { manifest: reg!.manifest };
     if (reg!.source) {
       spawnReq.source = reg!.source;
       spawnReq.owner = reg!.owner;
+    }
+    if (reg!.data !== undefined) {
+      // Deep-copy via JSON so the clone's data is independent of the original's.
+      try {
+        spawnReq.data = JSON.parse(JSON.stringify(reg!.data));
+      } catch {
+        // Original had non-serializable data; clone starts empty rather than failing.
+        spawnReq.data = {};
+      }
     }
     if (registryHint) {
       spawnReq.registryHint = registryHint;
@@ -377,6 +388,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
             manifest: existingReg.manifest,
             source: existingReg.source,
             owner: existingReg.owner ?? '',
+            data: existingReg.data,
           },
           registryId: effectiveRegistryId,
           parentId: parentId ?? this.id,
@@ -406,6 +418,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         if (isScriptable && existingReg) {
           regPayload.source = existingReg.source;
           regPayload.owner = existingReg.owner;
+          if (existingReg.data !== undefined) regPayload.data = existingReg.data;
         }
         await this.request(
           request(this.id, effectiveRegistryId, 'register', regPayload)
@@ -465,6 +478,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       } else if (obj instanceof ScriptableAbject) {
         payload.owner = obj.owner;
         payload.source = obj.source;
+        payload.data = obj.dataSnapshot;
       }
       await this.request(
         request(this.id, effectiveRegistryId, 'register', payload)
@@ -519,7 +533,8 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       obj = new ScriptableAbject(
         req.manifest,
         req.source,
-        req.owner ?? ('' as AbjectId)
+        req.owner ?? ('' as AbjectId),
+        req.data,
       );
     } else if (req.code) {
       // TODO: Load WASM object
@@ -564,6 +579,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       } else if (obj instanceof ScriptableAbject) {
         payload.owner = obj.owner;
         payload.source = obj.source;
+        payload.data = obj.dataSnapshot;
       }
       await this.request(
         request(this.id, targetRegistry, 'register', payload)
@@ -713,6 +729,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         manifest: req.manifest,
         source: req.source,
         owner: req.owner ?? '',
+        data: req.data,
       },
       registryId: req.registryHint ?? this._factoryRegistryId,
       parentId: req.parentId ?? this.id,
@@ -745,6 +762,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         },
       };
       if (req.typeId) regPayload.typeId = req.typeId;
+      if (req.data !== undefined) regPayload.data = req.data;
       await this.request(
         request(this.id, targetRegistry, 'register', regPayload)
       );

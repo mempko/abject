@@ -26,6 +26,21 @@ const log = new Log('AppExplorer');
 
 const APP_EXPLORER_INTERFACE: InterfaceId = 'abjects:app-explorer';
 
+/**
+ * Deep-copy the internal data carried by a registration, so the clone's data
+ * is independent of the original's. Returns undefined if the registration has
+ * no data or if it isn't JSON-serializable.
+ */
+function cloneSourceData(obj: ObjectRegistration): Record<string, unknown> | undefined {
+  const data = (obj as unknown as { data?: Record<string, unknown> }).data;
+  if (data === undefined) return undefined;
+  try {
+    return JSON.parse(JSON.stringify(data));
+  } catch {
+    return undefined;
+  }
+}
+
 const WIN_W = 820;
 const WIN_H = 500;
 
@@ -874,6 +889,8 @@ export class AppExplorer extends Abject {
     const source = (obj as unknown as { source?: string }).source;
     if (!source) return;
 
+    const cloneData = cloneSourceData(obj);
+
     if (!this.factoryId) {
       this.factoryId = await this.discoverDep('Factory') ?? undefined;
     }
@@ -887,24 +904,28 @@ export class AppExplorer extends Abject {
     }
 
     try {
+      const spawnPayload: Record<string, unknown> = {
+        manifest: obj.manifest,
+        source,
+        registryHint: targetRegistryId,
+      };
+      if (cloneData !== undefined) spawnPayload.data = cloneData;
+
       const result = await this.request<SpawnResult>(request(this.id, this.factoryId,
-        'spawn', {
-          manifest: obj.manifest,
-          source,
-          registryHint: targetRegistryId,
-        }));
+        'spawn', spawnPayload));
 
       // Persist to AbjectStore so it survives restart
       const abjectStoreId = await this.findAbjectStore(targetRegistryId);
       if (abjectStoreId) {
         try {
-          await this.request(request(this.id, abjectStoreId,
-            'save', {
-              objectId: result.objectId,
-              manifest: obj.manifest,
-              source,
-              owner: this.id,
-            }));
+          const savePayload: Record<string, unknown> = {
+            objectId: result.objectId,
+            manifest: obj.manifest,
+            source,
+            owner: this.id,
+          };
+          if (cloneData !== undefined) savePayload.data = cloneData;
+          await this.request(request(this.id, abjectStoreId, 'save', savePayload));
         } catch { /* best-effort persist */ }
       }
 
@@ -937,6 +958,8 @@ export class AppExplorer extends Abject {
     const source = (obj as unknown as { source?: string }).source;
     if (!source) return;
 
+    const cloneData = cloneSourceData(obj);
+
     // Get all workspaces with registryIds
     const allWorkspaces = await this.request<Array<{
       workspaceId: string; name: string; registryId: AbjectId;
@@ -952,24 +975,28 @@ export class AppExplorer extends Abject {
     const targetRegistryId = allWorkspaces[selectedIdx].registryId;
 
     try {
+      const spawnPayload: Record<string, unknown> = {
+        manifest: obj.manifest,
+        source,
+        registryHint: targetRegistryId,
+      };
+      if (cloneData !== undefined) spawnPayload.data = cloneData;
+
       const result = await this.request<SpawnResult>(request(this.id, this.factoryId,
-        'spawn', {
-          manifest: obj.manifest,
-          source,
-          registryHint: targetRegistryId,
-        }));
+        'spawn', spawnPayload));
 
       // Persist to AbjectStore so it survives restart
       const abjectStoreId = await this.findAbjectStore(targetRegistryId);
       if (abjectStoreId) {
         try {
-          await this.request(request(this.id, abjectStoreId,
-            'save', {
-              objectId: result.objectId,
-              manifest: obj.manifest,
-              source,
-              owner: this.id,
-            }));
+          const savePayload: Record<string, unknown> = {
+            objectId: result.objectId,
+            manifest: obj.manifest,
+            source,
+            owner: this.id,
+          };
+          if (cloneData !== undefined) savePayload.data = cloneData;
+          await this.request(request(this.id, abjectStoreId, 'save', savePayload));
         } catch { /* best-effort persist */ }
       }
 

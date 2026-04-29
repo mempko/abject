@@ -194,6 +194,7 @@ export interface ObjectRegistration {
   registeredAt: number;
   owner?: AbjectId;
   source?: string;
+  data?: Record<string, unknown>;
 }
 
 /**
@@ -233,6 +234,7 @@ export interface SpawnRequest {
   constructorArgs?: unknown;
   registryHint?: AbjectId;
   typeId?: TypeId;
+  data?: Record<string, unknown>;
 }
 
 export interface SpawnResult {

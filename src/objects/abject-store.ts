@@ -29,6 +29,7 @@ export interface AbjectSnapshot {
   source: string;
   owner: string;
   savedAt: number;
+  data?: Record<string, unknown>;
 }
 
 export interface RestoreResult {
@@ -85,6 +86,11 @@ export class AbjectStore extends Abject {
                     type: { kind: 'primitive', primitive: 'string' },
                     description: 'Owner object ID',
                   },
+                  {
+                    name: 'data',
+                    type: { kind: 'object', properties: {} },
+                    description: 'Optional internal data record (this.data) to persist with the snapshot',
+                  },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -128,13 +134,14 @@ export class AbjectStore extends Abject {
 
   private setupHandlers(): void {
     this.on('save', async (msg: AbjectMessage) => {
-      const { objectId, manifest, source, owner } = msg.payload as {
+      const { objectId, manifest, source, owner, data } = msg.payload as {
         objectId: string;
         manifest: AbjectManifest;
         source: string;
         owner: string;
+        data?: Record<string, unknown>;
       };
-      return this.saveSnapshot(objectId, manifest, source, owner);
+      return this.saveSnapshot(objectId, manifest, source, owner, data);
     });
 
     this.on('remove', async (msg: AbjectMessage) => {
@@ -237,7 +244,8 @@ export class AbjectStore extends Abject {
     objectId: string,
     manifest: AbjectManifest,
     source: string,
-    owner: string
+    owner: string,
+    data?: Record<string, unknown>,
   ): Promise<boolean> {
     precondition(objectId !== '', 'objectId must not be empty');
     precondition(source !== '', 'source must not be empty');
@@ -257,6 +265,11 @@ export class AbjectStore extends Abject {
 
     const typeId = this.computeTypeId(manifest.name) ?? objectId;
 
+    // Preserve existing data if the caller didn't supply one (e.g. an
+    // ObjectCreator-driven save after a source edit shouldn't wipe data).
+    const existing = this.snapshots.get(typeId);
+    const finalData = data !== undefined ? data : existing?.data;
+
     const snapshot: AbjectSnapshot = {
       typeId,
       objectId,
@@ -264,6 +277,7 @@ export class AbjectStore extends Abject {
       source,
       owner,
       savedAt: Date.now(),
+      ...(finalData !== undefined ? { data: finalData } : {}),
     };
 
     // Key by typeId for durable identity (survives restart with new objectId)
@@ -276,6 +290,7 @@ export class AbjectStore extends Abject {
         await this.request(request(this.id, this.registryId,
           'register', {
             objectId, manifest, owner, source, typeId: typeId as TypeId,
+            ...(finalData !== undefined ? { data: finalData } : {}),
           }));
       } catch { /* best effort — registry may not be ready */ }
     }
@@ -368,6 +383,7 @@ export class AbjectStore extends Abject {
             parentId: this.id,
             registryHint: this.registryId,
             typeId: typeId as TypeId,
+            ...(snap.data !== undefined ? { data: snap.data } : {}),
           })
         );
 

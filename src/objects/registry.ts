@@ -272,7 +272,7 @@ Each line shows one registered object: id, name, description, and non-meta metho
 
   private setupHandlers(): void {
     this.on('register', async (msg: AbjectMessage) => {
-      const { objectId, manifest, status, owner, source, name, typeId } = msg.payload as {
+      const { objectId, manifest, status, owner, source, name, typeId, data } = msg.payload as {
         objectId: AbjectId;
         manifest: AbjectManifest;
         status?: AbjectStatus;
@@ -280,8 +280,9 @@ Each line shows one registered object: id, name, description, and non-meta metho
         source?: string;
         name?: string;
         typeId?: TypeId;
+        data?: Record<string, unknown>;
       };
-      return this.registerObject(objectId, manifest, status, owner, source, name, typeId);
+      return this.registerObject(objectId, manifest, status, owner, source, name, typeId, data);
     });
 
     this.on('unregister', async (msg: AbjectMessage) => {
@@ -410,6 +411,7 @@ Each line shows one registered object: id, name, description, and non-meta metho
     source?: string,
     name?: string,
     typeId?: TypeId,
+    data?: Record<string, unknown>,
   ): boolean {
     require(objectId !== '', 'objectId must not be empty');
     require(manifest !== undefined, 'manifest is required');
@@ -426,6 +428,11 @@ Each line shows one registered object: id, name, description, and non-meta metho
     // Auto-generate unique name
     const baseName = name ?? manifest.name;
     const uniqueName = this.makeUniqueName(baseName);
+
+    // Preserve existing data if caller didn't pass any (re-registration after
+    // a Status update shouldn't wipe internal data carried by ScriptableAbjects).
+    const existing = this.objects.get(objectId);
+    const finalData = data !== undefined ? data : existing?.data;
 
     const registration: ObjectRegistration = {
       id: objectId,
@@ -445,6 +452,7 @@ Each line shows one registered object: id, name, description, and non-meta metho
       registeredAt: Date.now(),
       owner,
       source,
+      ...(finalData !== undefined ? { data: finalData } : {}),
     };
 
     this.objects.set(objectId, registration);

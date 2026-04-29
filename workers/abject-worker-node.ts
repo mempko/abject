@@ -154,8 +154,13 @@ constructors.set('SharedState', () => new SharedState());
 constructors.set('WebAgent', () => new WebAgent());
 constructors.set('WorkspaceBrowser', () => new WorkspaceBrowser());
 constructors.set('ScriptableAbject', (args?: unknown) => {
-  const opts = args as { manifest: AbjectManifest; source: string; owner: string };
-  return new ScriptableAbject(opts.manifest, opts.source, opts.owner as AbjectId);
+  const opts = args as {
+    manifest: AbjectManifest;
+    source: string;
+    owner: string;
+    data?: Record<string, unknown>;
+  };
+  return new ScriptableAbject(opts.manifest, opts.source, opts.owner as AbjectId, opts.data);
 });
 constructors.set('Organism', (args?: unknown) => {
   const spec = args as OrganismSpec;

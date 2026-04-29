@@ -40,6 +40,12 @@ const EDITABLE_METHODS: MethodDeclaration[] = [
     returns: { kind: 'primitive' as const, primitive: 'string' as const },
   },
   {
+    name: 'getData',
+    description: 'Get a deep copy of this object\'s internal data (the same record source code mutates as this.data).',
+    parameters: [],
+    returns: { kind: 'object' as const, properties: {} },
+  },
+  {
     name: 'updateSource',
     description: 'Replace handler source code at runtime',
     parameters: [
@@ -117,11 +123,17 @@ export function mergeScriptableManifest(manifest: AbjectManifest): AbjectManifes
 export class ScriptableAbject extends Abject {
   private _source: string;
   private _owner: AbjectId;
+  private _data: Record<string, unknown>;
   private _userMethods: Set<string> = new Set();
   private _userProps: Set<string> = new Set();
   private _depCache: Record<string, AbjectId> = {};
 
-  constructor(manifest: AbjectManifest, source: string, owner: AbjectId) {
+  constructor(
+    manifest: AbjectManifest,
+    source: string,
+    owner: AbjectId,
+    data?: Record<string, unknown>,
+  ) {
     const tags = [...(manifest.tags ?? [])];
     if (!tags.includes('scriptable')) {
       tags.push('scriptable');
@@ -143,6 +155,10 @@ export class ScriptableAbject extends Abject {
 
     this._source = source;
     this._owner = owner;
+    // Internal data clones with the object via Factory.clone, snapshot restore,
+    // and respawn. Source code mutates it as `this.data`; persistence is
+    // explicit via `await this.saveData()`.
+    this._data = data ?? {};
 
     this.compileAndInstall(source);
     this.setupEditableHandlers();
@@ -156,9 +172,30 @@ export class ScriptableAbject extends Abject {
     return this._owner;
   }
 
+  /**
+   * Live reference to the internal data record. Used by Factory/AbjectStore to
+   * read what should be persisted or carried with a clone. Callers MUST treat
+   * the returned object as read-only — handler code mutates `this.data`
+   * directly through the proxy.
+   */
+  get dataSnapshot(): Record<string, unknown> {
+    return this._data;
+  }
+
   protected override askPrompt(question: string): string {
     let prompt = super.askPrompt(question);
     if (this._source) prompt += '\n\nSource code:\n' + this._source;
+    if (this._data && Object.keys(this._data).length > 0) {
+      let dataJson: string;
+      try {
+        dataJson = JSON.stringify(this._data, null, 2);
+      } catch {
+        dataJson = '(non-serializable)';
+      }
+      // Cap at ~2 KB so a large data record doesn't drown the prompt.
+      if (dataJson.length > 2048) dataJson = dataJson.slice(0, 2048) + '\n…(truncated)';
+      prompt += '\n\nInternal data (this.data):\n' + dataJson;
+    }
     prompt += '\n\nYou are this object. Your capabilities are exactly what the manifest and source code above describe. Answer questions based on your actual capabilities, not hypothetical ones.';
     return prompt;
   }
@@ -239,6 +276,15 @@ export class ScriptableAbject extends Abject {
   private setupEditableHandlers(): void {
     this.on('getSource', () => {
       return this._source;
+    });
+
+    this.on('getData', () => {
+      // Deep-copy via JSON round-trip so callers can't mutate the live record.
+      try {
+        return JSON.parse(JSON.stringify(this._data));
+      } catch {
+        return {};
+      }
     });
 
     this.on('probe', async () => {
@@ -421,7 +467,7 @@ export class ScriptableAbject extends Abject {
    * ObjectCreator imports this set to exclude them from verification and LLM prompts.
    */
   static readonly PROTECTED_HANDLERS = new Set([
-    'getSource', 'updateSource', 'probe', 'windowCloseRequested',
+    'getSource', 'getData', 'updateSource', 'probe', 'windowCloseRequested',
     'describe', 'ask', 'getRegistry',
     'ping', 'addDependent', 'removeDependent',
   ]);
@@ -429,6 +475,7 @@ export class ScriptableAbject extends Abject {
   /** Keys on the this-proxy that must not be overwritten by user handler code. */
   private static readonly PROXY_BUILTINS = new Set([
     'call', 'dep', 'find', 'changed', 'emit', 'observe', 'id',
+    'data', 'saveData',
   ]);
 
   /**
@@ -475,6 +522,8 @@ export class ScriptableAbject extends Abject {
       await self.request(request(self.id, resolvedTarget as AbjectId, 'addDependent', {}));
     };
 
+    const saveDataFn = async (): Promise<void> => self.saveData();
+
     const proxy: Record<string, unknown> = {
       call: callFn,
       dep: depFn,
@@ -482,6 +531,7 @@ export class ScriptableAbject extends Abject {
       changed: changedFn,
       emit: emitFn,
       observe: observeFn,
+      saveData: saveDataFn,
     };
     // `id` must read live from the Abject so handler code that captures
     // `this.id` (e.g. `inputTargetId: this.id` on createCanvas) sees the
@@ -493,7 +543,58 @@ export class ScriptableAbject extends Abject {
       configurable: false,
       get: () => self.id,
     });
+    // `data` reads live from the Abject — same record across handler calls
+    // and across applySource hot-reloads. Mutations are persisted only when
+    // user code calls `await this.saveData()`.
+    Object.defineProperty(proxy, 'data', {
+      enumerable: true,
+      configurable: false,
+      get: () => self._data,
+    });
     return proxy;
+  }
+
+  /**
+   * Persist the current internal data through AbjectStore so it survives
+   * restart and is included in clones / snapshots / remote shares.
+   * Throws ContractViolation if `data` contains values JSON cannot serialize.
+   */
+  async saveData(): Promise<void> {
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(this._data);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `saveData failed: this.data is not JSON-serializable (${reason}). ` +
+        `Remove functions, cycles, or class instances and retry.`
+      );
+    }
+    if (serialized === undefined) {
+      throw new Error(
+        'saveData failed: JSON.stringify returned undefined. ' +
+        'Top-level this.data must be a plain object, not a function or undefined.'
+      );
+    }
+    try {
+      const storeId = await this.discoverDep('AbjectStore');
+      if (!storeId) {
+        log.warn(`saveData: AbjectStore not available for '${this.manifest.name}' (${this.id}); data not persisted`);
+        return;
+      }
+      await this.request(
+        request(this.id, storeId, 'save', {
+          objectId: this.id,
+          manifest: this.manifest,
+          source: this._source,
+          owner: this._owner,
+          data: this._data,
+        })
+      );
+    } catch (err) {
+      log.warn(`saveData: failed to persist for '${this.manifest.name}':`, err);
+      throw err;
+    }
   }
 
   private compileAndInstall(source: string): void {
