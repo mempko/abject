@@ -961,6 +961,31 @@ Set keepPageOpen: false to explicitly close the page when done.
           return { success: true, data: result.result };
         }
 
+        case 'attach_screenshot': {
+          // Fresh shot so what the user sees matches the page state right
+          // now. Delivers to the dispatching chat by looking up the goal's
+          // creator; bytes never enter any LLM context.
+          const shot = await this.request<{ dataUri: string; width: number; height: number }>(
+            request(this.id, webId, 'screenshotPage', { pageId })
+          );
+          if (this._currentGoalId && this.goalManagerId) {
+            try {
+              const goal = await this.request<{ createdBy?: AbjectId } | null>(
+                request(this.id, this.goalManagerId, 'getGoal', { goalId: this._currentGoalId }),
+                5000,
+              );
+              if (goal?.createdBy) {
+                const markdown = `![screenshot|${shot.width}x${shot.height}](${shot.dataUri})`;
+                this.send(request(this.id, goal.createdBy, 'attachMedia', {
+                  markdown,
+                  sender: 'WebAgent',
+                }));
+              }
+            } catch { /* best effort */ }
+          }
+          return { success: true, data: `Screenshot attached (${shot.width}x${shot.height})` };
+        }
+
         case 'write_scratchpad': {
           if (!this._currentGoalId) return { success: false, error: 'write_scratchpad requires an active goal context' };
           if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
@@ -1050,6 +1075,10 @@ Respond with ONE action as a JSON object in a \`\`\`json code block:
 - hover: Hover over an element. { "action": "hover", "ref": "e5" }
 - check: Check a checkbox. { "action": "check", "ref": "e10" }
 - uncheck: Uncheck a checkbox. { "action": "uncheck", "ref": "e10" }
+
+### Showing the page to the user
+- attach_screenshot: Display the current page to the user as an image bubble in the chat. Use this whenever the task asks you to show, display, or render a page (or a portion of one) to the user. Do this BEFORE calling done. The image goes directly to the chat — you do not need to also describe what's in it.
+  { "action": "attach_screenshot", "reasoning": "User asked to see the homepage" }
 
 ### Extraction (escape hatch for complex JavaScript)
 - extract: Run JavaScript in the page context. The script is evaluated as an expression.
