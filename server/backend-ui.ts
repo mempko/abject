@@ -717,6 +717,103 @@ export class BackendUI extends Abject {
           'subscribe', {}));
       } catch { /* best effort */ }
     }
+
+    this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
+  }
+
+  // CommandPalette and WindowSwitcher are per-workspace, so we resolve the
+  // target instance lazily via the active workspace's registry on every
+  // shortcut press. Caching by workspace id avoids repeated discovery.
+  private workspaceManagerId?: AbjectId;
+  private paletteByWorkspace: Map<string, AbjectId> = new Map();
+  private switcherByWorkspace: Map<string, AbjectId> = new Map();
+
+  // Cursor-hint state. lastCursor is what the frontend currently shows; we
+  // suppress redundant setCursor messages when the hint hasn't changed.
+  private lastCursor = 'default';
+  private lastCursorRequestAt = 0;
+  private cursorRequestInFlight = false;
+  private static readonly CURSOR_THROTTLE_MS = 33;
+
+  private maybeUpdateCursor(surfaceId: string | undefined, localX: number, localY: number): void {
+    if (!this.windowManagerId) return;
+    if (this.cursorRequestInFlight) return;
+    const now = Date.now();
+    if (now - this.lastCursorRequestAt < BackendUI.CURSOR_THROTTLE_MS) return;
+    this.lastCursorRequestAt = now;
+
+    if (!surfaceId) {
+      // Mouse is over the desktop backdrop — clear any sticky hint.
+      this.applyCursor('default');
+      return;
+    }
+
+    this.cursorRequestInFlight = true;
+    this.request<string>(
+      request(this.id, this.windowManagerId, 'getCursorAt', { surfaceId, localX, localY }),
+    )
+      .then((cursor) => { this.applyCursor(cursor || 'default'); })
+      .catch(() => { /* swallow — bad cursor hint is not worth a log */ })
+      .finally(() => { this.cursorRequestInFlight = false; });
+  }
+
+  private applyCursor(cursor: string): void {
+    if (cursor === this.lastCursor) return;
+    this.lastCursor = cursor;
+    this.sendToFrontend({ type: 'setCursor', cursor });
+  }
+
+  private async dispatchGlobalShortcut(combo: string): Promise<void> {
+    const targetName =
+      combo === 'commandPalette' ? 'CommandPalette' :
+      combo === 'windowSwitcher' ? 'WindowSwitcher' :
+      undefined;
+    if (!targetName) return;
+
+    const target = await this.resolveActiveWorkspaceObject(targetName, combo);
+    if (target) {
+      this.send(event(this.id, target, 'toggle', {}));
+    }
+  }
+
+  /**
+   * Resolve a per-workspace Abject by name in the *active* workspace.
+   *
+   * 1. Ask WorkspaceManager for the active workspace and its registry.
+   * 2. Discover the target by name in that registry — WorkspaceRegistry
+   *    serves local hits first, so we get the workspace's own instance.
+   * 3. Cache by workspace id so a held-down shortcut doesn't refetch.
+   */
+  private async resolveActiveWorkspaceObject(name: string, combo: string): Promise<AbjectId | undefined> {
+    if (!this.workspaceManagerId) {
+      this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
+      if (!this.workspaceManagerId) return undefined;
+    }
+
+    let active: { id?: string; registryId?: AbjectId } | null = null;
+    try {
+      active = await this.request<{ id?: string; registryId?: AbjectId } | null>(
+        request(this.id, this.workspaceManagerId, 'getActiveWorkspace', {}),
+      );
+    } catch { return undefined; }
+    if (!active?.id || !active?.registryId) return undefined;
+
+    const cache = combo === 'commandPalette' ? this.paletteByWorkspace : this.switcherByWorkspace;
+    const cached = cache.get(active.id);
+    if (cached) return cached;
+
+    try {
+      const found = await this.request<Array<{ id: AbjectId }>>(
+        request(this.id, active.registryId, 'discover', { name }),
+      );
+      const targetId = found?.[0]?.id;
+      if (targetId) {
+        cache.set(active.id, targetId);
+        return targetId;
+      }
+    } catch { /* fall through */ }
+
+    return undefined;
   }
 
   private async log(level: string, message: string, data?: unknown): Promise<void> {
@@ -1372,6 +1469,12 @@ IMPORTANT:
         this.handleFrontendInput(msg as InputMsg, clientId);
         break;
 
+      case 'globalShortcut': {
+        const m = msg as { combo: string };
+        this.dispatchGlobalShortcut(m.combo).catch(() => {});
+        break;
+      }
+
       case 'measureTextReply': {
         const pending = this.pendingRequests.get(msg.requestId!);
         if (pending) {
@@ -1461,6 +1564,14 @@ IMPORTANT:
       this.lastMouseX = (msg.x ?? 0) + (surfState?.rect.x ?? 0);
       this.lastMouseY = (msg.y ?? 0) + (surfState?.rect.y ?? 0);
       this.lastInputClientId = clientId;
+    }
+
+    // ── Cursor hint: ask WindowManager which CSS cursor fits the current
+    // (surface, x, y). Throttled to 30 Hz; only forwarded to the frontend
+    // when the cursor *changes*, so a still or steady-zone mouse costs
+    // nothing.
+    if (msg.inputType === 'mousemove' && !this.mouseGrabAbject) {
+      this.maybeUpdateCursor(msg.surfaceId, msg.x ?? 0, msg.y ?? 0);
     }
 
     // ── Input monitors: broadcast mouse/wheel events to all monitor surfaces ──

@@ -21,7 +21,7 @@ import {
   TypeDeclaration,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 
@@ -2152,8 +2152,11 @@ Pane 4: Detail view with signature, status, source, send-message form,
       }
     }
 
-    // Disable send button during request
+    // Disable send button + paint long-op halo during the RPC.
     await this.setWidgetDisabled(this.msgSendBtnId, true);
+    if (this.msgSendBtnId) {
+      this.send(event(this.id, this.msgSendBtnId, 'update', { busy: true }));
+    }
     await this.showFeedback('Sending...');
 
     try {
@@ -2162,12 +2165,17 @@ Pane 4: Detail view with signature, status, source, send-message form,
       );
       const resultStr = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
       await this.showFeedback(`Response: ${resultStr}`);
+      await this.notify(`${methodName} returned ${resultStr.length > 60 ? resultStr.slice(0, 57) + '...' : resultStr}`, 'success');
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
       await this.showFeedback(`Error: ${errMsg}`);
+      await this.notify(`${methodName} failed: ${errMsg.slice(0, 80)}`, 'error');
+    } finally {
+      if (this.msgSendBtnId) {
+        this.send(event(this.id, this.msgSendBtnId, 'update', { busy: false }));
+      }
+      await this.setWidgetDisabled(this.msgSendBtnId, false);
     }
-
-    await this.setWidgetDisabled(this.msgSendBtnId, false);
   }
 
   // ── Type parsing / formatting ────────────────────────────────────

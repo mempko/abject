@@ -9,11 +9,12 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { KnowledgeEntry, KnowledgeType } from './knowledge-base.js';
 import type { ListItem } from './widgets/list-widget.js';
+import type { IconName } from '../ui/icons.js';
 
 const log = new Log('KnowledgeBrowser');
 
@@ -22,11 +23,15 @@ const KNOWLEDGE_BROWSER_INTERFACE: InterfaceId = 'abjects:knowledge-browser';
 const WIN_W = 720;
 const WIN_H = 480;
 
-const TYPE_ICONS: Record<KnowledgeType, string> = {
-  learned:   '\u2731',  // ✱
-  fact:      '\u25C6',  // ◆
-  insight:   '\u2605',  // ★
-  reference: '\u2192',  // →
+/**
+ * Vector icon names for knowledge types. ListWidget renders these at the
+ * row leading edge (via ListItem.iconName); colors come from the theme.
+ */
+const TYPE_ICON_NAMES: Record<KnowledgeType, IconName> = {
+  learned:   'check',
+  fact:      'dot',
+  insight:   'plus',
+  reference: 'chevronRight',
 };
 
 const TAB_LABELS = ['All', 'Learned', 'Facts', 'Insights', 'References'];
@@ -290,6 +295,18 @@ export class KnowledgeBrowser extends Abject {
     // Load initial data
     await this.loadEntries();
 
+    // Autofocus the search input so the user can start typing immediately
+    // (Paradox of the Active User — surface the primary action without an
+    // extra click).
+    if (this.windowId && this.searchInputId && this.rootLayoutId) {
+      try {
+        await this.request(request(this.id, this.windowId, 'focusChild', {
+          widgetId: this.searchInputId,
+          parentChildId: this.rootLayoutId,
+        }));
+      } catch { /* window gone */ }
+    }
+
     this.changed('visibility', true);
     return true;
   }
@@ -375,12 +392,12 @@ export class KnowledgeBrowser extends Abject {
     if (!this.listWidgetId) return;
 
     const items: ListItem[] = this.filteredEntries.map(entry => {
-      const icon = TYPE_ICONS[entry.type] ?? '';
       const tagStr = entry.tags.length > 0 ? entry.tags.slice(0, 3).join(', ') : '';
       return {
-        label: `${icon} ${entry.title}`,
+        label: entry.title,
         value: entry.id,
         secondary: tagStr,
+        iconName: TYPE_ICON_NAMES[entry.type],
       };
     });
 
@@ -410,7 +427,6 @@ export class KnowledgeBrowser extends Abject {
     await this.showEmptyState(false);
 
     const typeColor = this.typeColor(entry.type);
-    const icon = TYPE_ICONS[entry.type] ?? '';
     const created = new Date(entry.createdAt).toLocaleDateString();
     const updated = new Date(entry.updatedAt).toLocaleDateString();
     const tagsStr = entry.tags.length > 0 ? entry.tags.join(', ') : 'none';
@@ -418,7 +434,7 @@ export class KnowledgeBrowser extends Abject {
     await Promise.all([
       this.request(request(this.id, this.titleLabelId!, 'update', { text: entry.title })),
       this.request(request(this.id, this.typeLabelId!, 'update', {
-        text: `${icon} ${entry.type}`,
+        text: entry.type,
         style: { color: typeColor, visible: true },
       })),
       this.request(request(this.id, this.tagsLabelId!, 'update', {
@@ -496,12 +512,21 @@ export class KnowledgeBrowser extends Abject {
       });
       if (!confirmed) return;
 
-      await this.request(
-        request(this.id, this.knowledgeBaseId, 'forget', { id: this.selectedId })
-      );
-      this.selectedId = undefined;
-      await this.showEmptyState(true);
-      await this.loadEntries();
+      this.send(event(this.id, this.deleteBtnId, 'update', { busy: true }));
+      try {
+        await this.request(
+          request(this.id, this.knowledgeBaseId, 'forget', { id: this.selectedId })
+        );
+        await this.notify(entry ? `Forgot "${entry.title}"` : 'Entry forgotten', 'success');
+        this.selectedId = undefined;
+        await this.showEmptyState(true);
+        await this.loadEntries();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await this.notify(`Forget failed: ${msg.slice(0, 80)}`, 'error');
+      } finally {
+        this.send(event(this.id, this.deleteBtnId, 'update', { busy: false }));
+      }
       return;
     }
 

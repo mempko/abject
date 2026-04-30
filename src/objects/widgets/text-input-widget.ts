@@ -17,6 +17,13 @@ import { event } from '../../core/message.js';
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
 import { WidgetStyle, Rect, WIDGET_FONT, CODE_FONT, DEFAULT_LINE_HEIGHT } from './widget-types.js';
 import { wrapText, estimateWrappedLineCount } from './word-wrap.js';
+import { wordBoundaryLeft, wordBoundaryRight, EditHistory, type EditKind } from './text-edit-helpers.js';
+
+interface InputSnapshot {
+  text: string;
+  cursorPos: number;
+  selAnchor: number | null;
+}
 
 export interface TextInputWidgetConfig extends WidgetConfig {
   placeholder?: string;
@@ -34,7 +41,11 @@ export class TextInputWidget extends WidgetAbject {
   private dragging = false;
   private lastClickTime = 0;
   private lastClickPos = 0;
+  private lastClickCount = 0; // 1=single, 2=double, 3=triple
   private lastSurfaceId = '';
+
+  /** Undo/redo stack. Snapshots the entire visible state pre-edit. */
+  private history = new EditHistory<InputSnapshot>();
 
   // Word-wrap fields
   private wordWrap: boolean;
@@ -59,6 +70,24 @@ export class TextInputWidget extends WidgetAbject {
 
   protected override acceptsInputWhenDisabled(): boolean {
     return true;
+  }
+
+  /** Capture current state for the undo stack. */
+  private snapshot(): InputSnapshot {
+    return { text: this.text, cursorPos: this.cursorPos, selAnchor: this.selAnchor };
+  }
+
+  /** Apply a stored snapshot (undo/redo path). */
+  private restoreSnapshot(s: InputSnapshot): void {
+    this.text = s.text;
+    this.cursorPos = s.cursorPos;
+    this.selAnchor = s.selAnchor;
+    this.invalidateWrapCache();
+  }
+
+  /** Push a pre-edit snapshot before mutating. Coalesces by `kind` (500 ms burst). */
+  private recordEdit(kind: EditKind): void {
+    this.history.push(this.snapshot(), kind);
   }
 
   protected override wantsMobileKeyboard(): boolean {
@@ -624,12 +653,25 @@ export class TextInputWidget extends WidgetAbject {
 
     const clickPos = await this.posFromClick(clickX, clickY, surfaceId);
 
+    // Multi-click tracking: same spot within 400 ms increments the count;
+    // any other click resets to 1. Triple-click selects all (a single-line
+    // input has no concept of "current line").
     const now = Date.now();
-    const isDoubleClick = (now - this.lastClickTime) < 400 && Math.abs(clickPos - this.lastClickPos) <= 1;
+    const sameSpot = Math.abs(clickPos - this.lastClickPos) <= 1;
+    if (sameSpot && (now - this.lastClickTime) < 400) {
+      this.lastClickCount = Math.min(this.lastClickCount + 1, 3);
+    } else {
+      this.lastClickCount = 1;
+    }
     this.lastClickTime = now;
     this.lastClickPos = clickPos;
 
-    if (isDoubleClick) {
+    if (this.lastClickCount === 3) {
+      this.selAnchor = 0;
+      this.cursorPos = this.text.length;
+      this.dragging = false;
+      await this.notifySelectionChanged();
+    } else if (this.lastClickCount === 2) {
       const { start, end } = this.wordBoundaries(clickPos);
       this.selAnchor = start;
       this.cursorPos = end;
@@ -700,6 +742,30 @@ export class TextInputWidget extends WidgetAbject {
       return { consumed: true };
     }
 
+    // Ctrl/Meta+Z = undo; Ctrl/Meta+Shift+Z or Ctrl+Y = redo. Both work
+    // even when the widget is disabled because read-only widgets shouldn't
+    // generally have anything in their history anyway.
+    if ((ctrl || meta) && (key === 'z' || key === 'Z') && !shift) {
+      const prev = this.history.undo(this.snapshot());
+      if (prev) {
+        this.restoreSnapshot(prev);
+        this.changed('change', this.text);
+        await this.notifySelectionChanged();
+        await this.requestRedraw();
+      }
+      return { consumed: true };
+    }
+    if ((ctrl || meta) && ((key === 'z' || key === 'Z') && shift || key === 'y' || key === 'Y')) {
+      const next = this.history.redo(this.snapshot());
+      if (next) {
+        this.restoreSnapshot(next);
+        this.changed('change', this.text);
+        await this.notifySelectionChanged();
+        await this.requestRedraw();
+      }
+      return { consumed: true };
+    }
+
     // When disabled, block all editing keys but allow navigation/selection above
     if (this.disabled) {
       // Allow navigation keys (arrows, Home, End) to fall through for selection
@@ -714,6 +780,7 @@ export class TextInputWidget extends WidgetAbject {
     // Ctrl+X / Meta+X: cut
     if (key === 'x' && (ctrl || meta)) {
       if (this.getSelection()) {
+        this.recordEdit('edit');
         this.deleteSelection();
         this.changed('change', this.text);
         await this.notifySelectionChanged();
@@ -724,13 +791,18 @@ export class TextInputWidget extends WidgetAbject {
 
     if (key === 'Backspace') {
       if (this.getSelection()) {
+        this.recordEdit('edit');
         this.deleteSelection();
         this.changed('change', this.text);
         await this.notifySelectionChanged();
         await this.requestRedraw();
       } else if (pos > 0) {
-        this.text = this.text.substring(0, pos - 1) + this.text.substring(pos);
-        this.cursorPos = pos - 1;
+        // Ctrl+Backspace (Alt+Backspace on macOS) deletes a word.
+        const wordMod = ctrl || (modifiers?.alt ?? false);
+        const target = wordMod ? wordBoundaryLeft(this.text, pos) : pos - 1;
+        this.recordEdit('delete');
+        this.text = this.text.substring(0, target) + this.text.substring(pos);
+        this.cursorPos = target;
         this.invalidateWrapCache();
         this.changed('change', this.text);
         await this.requestRedraw();
@@ -740,12 +812,17 @@ export class TextInputWidget extends WidgetAbject {
 
     if (key === 'Delete') {
       if (this.getSelection()) {
+        this.recordEdit('edit');
         this.deleteSelection();
         this.changed('change', this.text);
         await this.notifySelectionChanged();
         await this.requestRedraw();
       } else if (pos < this.text.length) {
-        this.text = this.text.substring(0, pos) + this.text.substring(pos + 1);
+        // Ctrl+Delete (Alt+Delete on macOS) deletes the next word.
+        const wordMod = ctrl || (modifiers?.alt ?? false);
+        const target = wordMod ? wordBoundaryRight(this.text, pos) : pos + 1;
+        this.recordEdit('delete');
+        this.text = this.text.substring(0, pos) + this.text.substring(target);
         this.invalidateWrapCache();
         this.changed('change', this.text);
         await this.requestRedraw();
@@ -754,32 +831,45 @@ export class TextInputWidget extends WidgetAbject {
     }
 
     if (key === 'ArrowLeft') {
+      // Ctrl/Alt+Left jumps a word; otherwise a single char.
+      const wordMod = ctrl || (modifiers?.alt ?? false);
+      const target = wordMod ? wordBoundaryLeft(this.text, pos) : Math.max(0, pos - 1);
       if (shift) {
         if (this.selAnchor === null) this.selAnchor = pos;
-        if (this.cursorPos > 0) this.cursorPos--;
+        this.cursorPos = target;
         await this.notifySelectionChanged();
-      } else if (this.getSelection()) {
+      } else if (this.getSelection() && !wordMod) {
         this.cursorPos = this.getSelection()!.start;
         this.clearSelection();
         await this.notifySelectionChanged();
-      } else if (pos > 0) {
-        this.cursorPos = pos - 1;
+      } else {
+        this.cursorPos = target;
+        if (this.selAnchor !== null) {
+          this.clearSelection();
+          await this.notifySelectionChanged();
+        }
       }
       await this.requestRedraw();
       return { consumed: true };
     }
 
     if (key === 'ArrowRight') {
+      const wordMod = ctrl || (modifiers?.alt ?? false);
+      const target = wordMod ? wordBoundaryRight(this.text, pos) : Math.min(this.text.length, pos + 1);
       if (shift) {
         if (this.selAnchor === null) this.selAnchor = pos;
-        if (this.cursorPos < this.text.length) this.cursorPos++;
+        this.cursorPos = target;
         await this.notifySelectionChanged();
-      } else if (this.getSelection()) {
+      } else if (this.getSelection() && !wordMod) {
         this.cursorPos = this.getSelection()!.end;
         this.clearSelection();
         await this.notifySelectionChanged();
-      } else if (pos < this.text.length) {
-        this.cursorPos = pos + 1;
+      } else {
+        this.cursorPos = target;
+        if (this.selAnchor !== null) {
+          this.clearSelection();
+          await this.notifySelectionChanged();
+        }
       }
       await this.requestRedraw();
       return { consumed: true };
@@ -896,6 +986,7 @@ export class TextInputWidget extends WidgetAbject {
 
     // Printable character
     if (key.length === 1 && !ctrl && !meta) {
+      this.recordEdit('typing');
       if (this.getSelection()) {
         this.replaceSelection(key);
       } else {
@@ -910,6 +1001,12 @@ export class TextInputWidget extends WidgetAbject {
       return { consumed: true };
     }
 
+    // Escape: let it bubble so the parent Window (e.g. command palette,
+    // notification card) can handle it as "dismiss".
+    if (key === 'Escape') {
+      return { consumed: false };
+    }
+
     return { consumed: true };
   }
 
@@ -918,6 +1015,7 @@ export class TextInputWidget extends WidgetAbject {
     const pasteText = (input.pasteText as string) ?? '';
     if (!pasteText) return { consumed: true };
 
+    this.recordEdit('paste');
     if (this.getSelection()) {
       this.replaceSelection(pasteText);
     } else {
@@ -951,6 +1049,10 @@ export class TextInputWidget extends WidgetAbject {
     return { consumed: true };
   }
 
+  protected override suppressGenericFocusRing(): boolean {
+    return true; // input paints its own focus glow + animated cursor
+  }
+
   protected getWidgetValue(): string {
     return this.text;
   }
@@ -964,12 +1066,15 @@ export class TextInputWidget extends WidgetAbject {
     }
     if (updates.minLines !== undefined) this.minLines = updates.minLines as number;
     if (updates.maxLines !== undefined) this.maxLines = updates.maxLines as number | undefined;
-    // When text is set externally, reset cursor to end and clear selection
+    // When text is set externally, reset cursor to end and clear selection.
+    // Also drop the undo history — its snapshots reference the previous text
+    // and would surprise the user if they undid into someone else's content.
     if (updates.text !== undefined) {
       this.cursorPos = this.text.length;
       this.selAnchor = null;
       this.invalidateWrapCache();
       this.scrollOffset = 0;
+      this.history.clear();
     }
   }
 }

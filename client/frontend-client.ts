@@ -594,6 +594,10 @@ export class FrontendClient {
         }
         break;
 
+      case 'setCursor':
+        this.canvas.style.cursor = msg.cursor || 'default';
+        break;
+
       case 'captureSurfaceRequest':
         this.handleCaptureSurfaceRequest(msg.requestId!, msg.surfaceId);
         break;
@@ -1197,6 +1201,26 @@ export class FrontendClient {
   }
 
   private handleKeyEvent(e: KeyboardEvent, type: 'keydown' | 'keyup'): void {
+    // Global shortcuts: pulled out of the regular keydown stream so they
+    // always work regardless of which surface holds focus.
+    //   ⌘K / Ctrl-K → CommandPalette (launch any Abject)
+    //   ⌘` / Ctrl-` → WindowSwitcher (jump to an open window)
+    if (
+      type === 'keydown' &&
+      (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey
+    ) {
+      if (e.key === 'k' || e.key === 'K') {
+        e.preventDefault();
+        this.sendToBackend({ type: 'globalShortcut', combo: 'commandPalette' });
+        return;
+      }
+      if (e.key === '`') {
+        e.preventDefault();
+        this.sendToBackend({ type: 'globalShortcut', combo: 'windowSwitcher' });
+        return;
+      }
+    }
+
     if (!this.focusedSurface) return;
 
     // On mobile, the hidden proxy input handles keyboard events -- skip

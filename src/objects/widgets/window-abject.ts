@@ -21,6 +21,8 @@ import {
   TITLE_FONT,
   lightenColor,
 } from './widget-types.js';
+import { iconCommands } from '../../ui/icons.js';
+import { Tween, shimmer as motionShimmer } from '../../ui/motion.js';
 
 export interface WindowConfig {
   title: string;
@@ -64,6 +66,12 @@ export class WindowAbject extends Abject {
   private rendering = false;
   private renderScheduled = false;
   private frameTimer?: ReturnType<typeof setTimeout>;
+
+  // Animation state — shimmerPos cycles 0 → 1 along the accent line while
+  // focused. Sampled each render and wrapped in save/restore so it never
+  // bleeds into child draw commands.
+  private shimmerTween?: Tween;
+  private shimmerPos = 0;
 
   constructor(config: WindowConfig) {
     super({
@@ -111,6 +119,16 @@ export class WindowAbject extends Abject {
                 name: 'destroy',
                 description: 'Destroy this window and all children',
                 parameters: [],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'focusChild',
+                description: 'Programmatically focus a child widget. Unfocuses any current child first. via=keyboard surfaces the focus ring; via=mouse (default) does not.',
+                parameters: [
+                  { name: 'widgetId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId of the widget to focus' },
+                  { name: 'parentChildId', type: { kind: 'primitive', primitive: 'string' }, description: 'The window\'s direct child (e.g. layout) that contains widgetId. Defaults to widgetId.', optional: true },
+                  { name: 'via', type: { kind: 'primitive', primitive: 'string' }, description: '"keyboard" | "mouse"', optional: true },
+                ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
             ],
@@ -224,6 +242,16 @@ export class WindowAbject extends Abject {
       return true;
     });
 
+    this.on('focusChild', async (msg: AbjectMessage) => {
+      const { widgetId, parentChildId, via } = msg.payload as {
+        widgetId: AbjectId;
+        parentChildId?: AbjectId;
+        via?: 'keyboard' | 'mouse';
+      };
+      await this.focusChildWidget(widgetId, parentChildId ?? widgetId, via);
+      return true;
+    });
+
     // Input events forwarded from UIServer
     this.on('input', async (msg: AbjectMessage) => {
       const inputEvent = msg.payload as {
@@ -264,6 +292,12 @@ export class WindowAbject extends Abject {
     this.on('focus', async (msg: AbjectMessage) => {
       const { focused } = msg.payload as { surfaceId: string; focused: boolean };
       this.windowFocused = focused;
+
+      if (focused) {
+        this.startShimmer();
+      } else {
+        this.stopShimmer();
+      }
 
       // When window loses focus, send mouseleave to hovered child so it
       // clears hover highlight (the mouse may never
@@ -401,6 +435,23 @@ method calls on 'abjects:widgets' interface:
     await this.renderWindow();
   }
 
+  private startShimmer(): void {
+    this.shimmerTween?.cancel();
+    this.shimmerTween = motionShimmer(
+      this.theme.tokens.motion.shimmer,
+      (pos) => {
+        if (this.destroying) return;
+        this.shimmerPos = pos;
+        this.scheduleFrame();
+      },
+    ).start();
+  }
+
+  private stopShimmer(): void {
+    this.shimmerTween?.cancel();
+    this.shimmerTween = undefined;
+  }
+
   // ── Rendering (Morphic drawOn:) ──────────────────────────────────────
 
   /**
@@ -442,18 +493,29 @@ method calls on 'abjects:widgets' interface:
     const sid = this.surfaceId!;
     const w = this.rect.width;
     const h = this.rect.height;
+    const tbh = this.theme.titleBarHeight;
+    const focused = this.windowFocused;
+    const tokens = this.theme.tokens;
     const commands: unknown[] = [];
 
     // Clear
     commands.push({ type: 'clear', surfaceId: sid, params: {} });
 
+    // Unfocused windows are drawn at 0.88 alpha so the focused one visually
+    // pops (Selective Attention). The wrapping save/restore guarantees the
+    // alpha never leaks into surrounding chrome.
+    const focusAlpha = focused ? 1.0 : 0.88;
+    commands.push({ type: 'save', surfaceId: sid, params: {} });
+    commands.push({ type: 'globalAlpha', surfaceId: sid, params: { alpha: focusAlpha } });
+
     if (!this.transparent) {
-      // Window shadow
+      // Window shadow — deeper when focused (Selective Attention / Von Restorff)
+      const shadow = focused ? tokens.elevation.level3 : tokens.elevation.level2;
       commands.push({ type: 'save', surfaceId: sid, params: {} });
       commands.push({
         type: 'shadow',
         surfaceId: sid,
-        params: { color: this.theme.shadowColor, blur: 20, offsetY: 6 },
+        params: { color: shadow.color, blur: shadow.blur, offsetY: shadow.offsetY },
       });
       commands.push({
         type: 'rect',
@@ -469,9 +531,10 @@ method calls on 'abjects:widgets' interface:
         params: { x: 0, y: 0, width: w, height: h, fill: this.theme.windowBg, stroke: this.theme.windowBorder, radius: this.theme.windowRadius },
       });
 
-      // Faint accent overlay — barely-perceptible green tint matching website card glow
+      // Faint accent wash across the whole window — very subtle, gives the surface
+      // a tint of "alive" without competing with the accent line.
       commands.push({ type: 'save', surfaceId: sid, params: {} });
-      commands.push({ type: 'globalAlpha', surfaceId: sid, params: { alpha: 0.03 } });
+      commands.push({ type: 'globalAlpha', surfaceId: sid, params: { alpha: focused ? 0.04 : 0.02 } });
       commands.push({
         type: 'rect',
         surfaceId: sid,
@@ -479,135 +542,163 @@ method calls on 'abjects:widgets' interface:
       });
       commands.push({ type: 'restore', surfaceId: sid, params: {} });
 
-      // Accent border glow — brighter when focused
-      const borderGlowAlpha = this.windowFocused ? 0.2 : 0.08;
-      if (this.windowFocused) {
+      // Accent border — fades when not focused (de-saturation = unfocused signal)
+      const borderAlpha = focused ? 0.22 : 0.06;
+      commands.push({
+        type: 'rect',
+        surfaceId: sid,
+        params: { x: 0, y: 0, width: w, height: h, stroke: `rgba(57, 255, 142, ${borderAlpha})`, radius: this.theme.windowRadius },
+      });
+    }
+
+    if (!this.chromeless) {
+      // Title bar — flat fill (the accent line below carries the visual weight,
+      // so the bar itself stays quiet to avoid competing).
+      commands.push({
+        type: 'rect',
+        surfaceId: sid,
+        params: { x: 0, y: 0, width: w, height: tbh, fill: this.theme.titleBarBg, radius: this.theme.windowRadius },
+      });
+      commands.push({
+        type: 'rect',
+        surfaceId: sid,
+        params: { x: 0, y: tbh - 6, width: w, height: 6, fill: this.theme.titleBarBg },
+      });
+
+      // Title text — accent glow when focused, desaturated when not (Von Restorff)
+      const titleColor = focused ? this.theme.textPrimary : this.theme.textSecondary;
+      if (focused) {
         commands.push({ type: 'save', surfaceId: sid, params: {} });
         commands.push({
           type: 'shadow',
           surfaceId: sid,
-          params: { color: 'rgba(57, 255, 142, 0.07)', blur: 16 },
+          params: { color: tokens.glow.accent.color, blur: tokens.glow.accent.blur },
         });
         commands.push({
-          type: 'rect',
+          type: 'text',
           surfaceId: sid,
-          params: { x: 0, y: 0, width: w, height: h, stroke: `rgba(57, 255, 142, ${borderGlowAlpha})`, radius: this.theme.windowRadius },
+          params: {
+            x: 14, y: tbh / 2,
+            text: this.title, font: TITLE_FONT, fill: titleColor, baseline: 'middle',
+          },
         });
         commands.push({ type: 'restore', surfaceId: sid, params: {} });
       } else {
         commands.push({
-          type: 'rect',
+          type: 'text',
           surfaceId: sid,
-          params: { x: 0, y: 0, width: w, height: h, stroke: `rgba(57, 255, 142, ${borderGlowAlpha})`, radius: this.theme.windowRadius },
+          params: {
+            x: 14, y: tbh / 2,
+            text: this.title, font: TITLE_FONT, fill: titleColor, baseline: 'middle',
+          },
         });
       }
-    }
 
-    if (!this.chromeless) {
-      // Title bar with gradient
-      commands.push({ type: 'save', surfaceId: sid, params: {} });
-      commands.push({
-        type: 'linearGradient',
-        surfaceId: sid,
-        params: { x0: 0, y0: 0, x1: 0, y1: TITLE_BAR_HEIGHT, stops: [
-          { offset: 0, color: this.theme.titleBarBg },
-          { offset: 1, color: lightenColor(this.theme.titleBarBg, 8) },
-        ] },
-      });
-      commands.push({
-        type: 'rect',
-        surfaceId: sid,
-        params: { x: 0, y: 0, width: w, height: TITLE_BAR_HEIGHT, fill: this.theme.titleBarBg, radius: this.theme.windowRadius },
-      });
-      commands.push({ type: 'restore', surfaceId: sid, params: {} });
-      commands.push({
-        type: 'rect',
-        surfaceId: sid,
-        params: { x: 0, y: TITLE_BAR_HEIGHT - 6, width: w, height: 6, fill: this.theme.titleBarBg },
-      });
-      // Title text with subtle glow shadow
-      commands.push({ type: 'save', surfaceId: sid, params: {} });
-      commands.push({
-        type: 'shadow',
-        surfaceId: sid,
-        params: { color: 'rgba(57, 255, 142, 0.15)', blur: 8 },
-      });
-      commands.push({
-        type: 'text',
-        surfaceId: sid,
-        params: {
-          x: 12, y: TITLE_BAR_HEIGHT / 2,
-          text: this.title, font: TITLE_FONT, fill: this.theme.textPrimary, baseline: 'middle',
-        },
-      });
-      commands.push({ type: 'restore', surfaceId: sid, params: {} });
-
-      // Close and minimize buttons (right side of title bar)
+      // Close and minimize buttons — vector icons in 24×24 hit boxes (Fitts).
+      // Hovered button gets a faint accent-colored backplate.
       const btnSize = this.theme.titleButtonSize;
       const btnMargin = this.theme.titleButtonMargin;
       const iconSize = this.theme.titleButtonIconSize;
 
-      // Close button (rightmost)
       const closeCx = w - btnMargin - btnSize / 2;
-      const closeCy = TITLE_BAR_HEIGHT / 2;
-      // X icon — two crossing lines
-      const halfIcon = iconSize / 2;
-      commands.push({
-        type: 'line', surfaceId: sid,
-        params: {
-          x1: closeCx - halfIcon, y1: closeCy - halfIcon,
-          x2: closeCx + halfIcon, y2: closeCy + halfIcon,
-          stroke: this.theme.textSecondary, lineWidth: 1.5,
-        },
-      });
-      commands.push({
-        type: 'line', surfaceId: sid,
-        params: {
-          x1: closeCx + halfIcon, y1: closeCy - halfIcon,
-          x2: closeCx - halfIcon, y2: closeCy + halfIcon,
-          stroke: this.theme.textSecondary, lineWidth: 1.5,
-        },
-      });
-
-      // Minimize button (left of close)
       const minCx = closeCx - btnSize - btnMargin;
-      const minCy = TITLE_BAR_HEIGHT / 2;
-      // Dash icon — horizontal line
-      commands.push({
-        type: 'line', surfaceId: sid,
-        params: {
-          x1: minCx - halfIcon, y1: minCy,
-          x2: minCx + halfIcon, y2: minCy,
-          stroke: this.theme.textSecondary, lineWidth: 1.5,
-        },
-      });
+      const cy = tbh / 2;
 
-      // Signature accent line under title bar with soft glow
-      commands.push({ type: 'save', surfaceId: sid, params: {} });
-      commands.push({
-        type: 'shadow',
-        surfaceId: sid,
-        params: { color: 'rgba(57, 255, 142, 0.3)', blur: 6 },
-      });
-      commands.push({
-        type: 'line',
-        surfaceId: sid,
-        params: { x1: 0, y1: TITLE_BAR_HEIGHT, x2: w, y2: TITLE_BAR_HEIGHT, stroke: this.theme.accent },
-      });
-      commands.push({ type: 'restore', surfaceId: sid, params: {} });
+      const iconColor = focused ? this.theme.textSecondary : this.theme.textTertiary;
+      const drawButton = (cx: number, kind: 'close' | 'minimize') => {
+        commands.push(...iconCommands(kind, {
+          surfaceId: sid,
+          x: cx - iconSize / 2,
+          y: cy - iconSize / 2,
+          size: iconSize,
+          color: iconColor,
+        }));
+      };
+
+      drawButton(minCx, 'minimize');
+      drawButton(closeCx, 'close');
+
+      // Signature accent line — *the* iconic element of every window.
+      // Focused: full-width gradient (accent → soft → accent) plus a moving
+      //   shimmer highlight that traces left → right. The shimmer is what makes
+      //   the focused window feel "alive" without distracting motion elsewhere.
+      // Unfocused: a single hairline at divider color, no glow.
+      const lineY = tbh;
+      if (focused) {
+        commands.push({ type: 'save', surfaceId: sid, params: {} });
+        commands.push({
+          type: 'shadow',
+          surfaceId: sid,
+          params: { color: tokens.glow.focus.color, blur: tokens.glow.focus.blur, offsetY: 0 },
+        });
+        commands.push({
+          type: 'linearGradient',
+          surfaceId: sid,
+          params: {
+            x0: 0, y0: lineY, x1: w, y1: lineY,
+            stops: [
+              { offset: 0,    color: 'rgba(57, 255, 142, 0.10)' },
+              { offset: 0.5,  color: 'rgba(57, 255, 142, 0.95)' },
+              { offset: 1,    color: 'rgba(57, 255, 142, 0.10)' },
+            ],
+          },
+        });
+        commands.push({
+          type: 'rect',
+          surfaceId: sid,
+          params: { x: 0, y: lineY - 1, width: w, height: 2 },
+        });
+        commands.push({ type: 'restore', surfaceId: sid, params: {} });
+
+        // Shimmer highlight: a small bright spot travelling along the line.
+        // Width is 18% of the window; centered on shimmerPos × w.
+        const shimmerW = Math.max(80, w * 0.18);
+        const shimmerCx = this.shimmerPos * (w + shimmerW) - shimmerW / 2;
+        commands.push({ type: 'save', surfaceId: sid, params: {} });
+        commands.push({
+          type: 'linearGradient',
+          surfaceId: sid,
+          params: {
+            x0: shimmerCx - shimmerW / 2, y0: lineY,
+            x1: shimmerCx + shimmerW / 2, y1: lineY,
+            stops: [
+              { offset: 0,   color: 'rgba(255, 255, 255, 0)' },
+              { offset: 0.5, color: 'rgba(255, 255, 255, 0.8)' },
+              { offset: 1,   color: 'rgba(255, 255, 255, 0)' },
+            ],
+          },
+        });
+        commands.push({
+          type: 'rect',
+          surfaceId: sid,
+          params: { x: shimmerCx - shimmerW / 2, y: lineY - 1, width: shimmerW, height: 2 },
+        });
+        commands.push({ type: 'restore', surfaceId: sid, params: {} });
+      } else {
+        commands.push({
+          type: 'line',
+          surfaceId: sid,
+          params: { x1: 0, y1: lineY, x2: w, y2: lineY, stroke: this.theme.divider, lineWidth: 1 },
+        });
+      }
     }
 
-    // Resize grip
+    // Resize grip — vector icon in the bottom-right corner
     if (this.resizable) {
-      commands.push({
-        type: 'line', surfaceId: sid,
-        params: { x1: w - 3, y1: h - 8, x2: w - 8, y2: h - 3, stroke: this.theme.resizeGrip },
-      });
-      commands.push({
-        type: 'line', surfaceId: sid,
-        params: { x1: w - 3, y1: h - 4, x2: w - 4, y2: h - 3, stroke: this.theme.resizeGrip },
-      });
+      const gripSize = 14;
+      commands.push(...iconCommands('resize', {
+        surfaceId: sid,
+        x: w - gripSize - 2,
+        y: h - gripSize - 2,
+        size: gripSize,
+        color: focused ? this.theme.resizeGrip : this.theme.divider,
+        lineWidth: 1.25,
+      }));
     }
+
+    // Suppress unused-import warning for legacy lightenColor (kept for callers
+    // that still import it via this module).
+    void lightenColor;
 
     // Render children in parallel — request draw commands from each child widget (Morphic drawOn:)
     const childResults = await Promise.all(
@@ -628,6 +719,9 @@ method calls on 'abjects:widgets' interface:
     for (const childCmds of childResults) {
       if (Array.isArray(childCmds)) commands.push(...childCmds);
     }
+
+    // Close the open-fade wrapper opened at the top of this render.
+    commands.push({ type: 'restore', surfaceId: sid, params: {} });
 
     // Window may have been destroyed mid-render (e.g., destroy arrived
     // re-entrantly during a child render await).
@@ -912,6 +1006,11 @@ method calls on 'abjects:widgets' interface:
       if (!result.consumed) {
         if (e.key === 'Tab') {
           await this.focusNextWidget();
+        } else if (e.key === 'Escape' && this.chromeless) {
+          // Chromeless windows are used for modals/popups (palette, switcher,
+          // toasts). Esc dismisses them by reusing the existing close path,
+          // which WidgetManager forwards to the window's owner.
+          this.changed('windowCloseRequested', {});
         }
       }
     } catch {
@@ -964,6 +1063,31 @@ method calls on 'abjects:widgets' interface:
 
   // ── Focus Management ──────────────────────────────────────────────────
 
+  /**
+   * Move focus to a specific child widget. Caller-supplied parentChildId
+   * identifies the window's direct child (typically a layout) that contains
+   * the target — needed because we don't track nesting from the outside.
+   * Used by chromeless modal Abjects (CommandPalette, WindowSwitcher) that
+   * want to autofocus their search input on open.
+   */
+  private async focusChildWidget(widgetId: AbjectId, parentChildId: AbjectId, via?: 'keyboard' | 'mouse'): Promise<void> {
+    if (this.focusedChildId && this.focusedChildId !== widgetId) {
+      try {
+        await this.request(
+          request(this.id, this.focusedChildId, 'setFocused', { focused: false }),
+        );
+      } catch { /* widget gone */ }
+    }
+    this.focusedChildId = widgetId;
+    this.focusedParentChildId = parentChildId;
+    try {
+      await this.request(
+        request(this.id, widgetId, 'setFocused', { focused: true, via: via ?? 'mouse' }),
+      );
+    } catch { /* widget gone */ }
+    this.scheduleFrame();
+  }
+
   private async focusNextWidget(): Promise<void> {
     if (!this.focusedChildId) return;
 
@@ -988,11 +1112,11 @@ method calls on 'abjects:widgets' interface:
         // Widget gone
       }
 
-      // Focus next
+      // Focus next — Tab is keyboard-driven, so opt in to focus-visible.
       this.focusedChildId = nextId;
       try {
         await this.request(
-          request(this.id, nextId, 'setFocused', { focused: true })
+          request(this.id, nextId, 'setFocused', { focused: true, via: 'keyboard' })
         );
       } catch {
         // Widget gone
@@ -1061,6 +1185,8 @@ method calls on 'abjects:widgets' interface:
 
   private async destroyWindow(): Promise<void> {
     this.destroying = true;
+    this.shimmerTween?.cancel();
+    this.shimmerTween = undefined;
     if (this.frameTimer) {
       clearTimeout(this.frameTimer);
       this.frameTimer = undefined;

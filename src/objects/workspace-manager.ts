@@ -57,6 +57,7 @@ const INFRA_OBJECTS = [
 const UI_OBJECTS = [
   'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser', 'KnowledgeBrowser', 'AgentBrowser', 'SchedulerBrowser',
   'WebBrowserViewer', 'ChatBrowser', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
+  'CommandPalette', 'NotificationCenter', 'WindowSwitcher',
 ] as const;
 
 /** All per-workspace objects in dependency order. */

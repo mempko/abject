@@ -19,20 +19,12 @@ import { Log } from '../core/timed-log.js';
 const log = new Log('Chat');
 const CHAT_INTERFACE: InterfaceId = 'abjects:chat';
 
-// ── Layout scale ───────────────────────────────────────────────────────
 const DEFAULT_WIN_W = 640;
 const DEFAULT_WIN_H = 620;
-const SPACE_XS = 4;
-const SPACE_SM = 8;
-const SPACE_MD = 12;
-const SPACE_LG = 16;
 
 // ── Bubble styling ─────────────────────────────────────────────────────
-const BUBBLE_RADIUS = 12;
 const BUBBLE_MAX_FRACTION = 0.75;
 const BUBBLE_MIN_WIDTH = 240;
-const BUBBLE_V_PADDING = 8;       // extra vertical breathing inside bubble
-const BUBBLE_TEXT_PADDING = 4;    // matches LabelWidget internal textPadding
 const SENDER_LABEL_HEIGHT = 18;
 const GROUP_WINDOW_MS = 3 * 60_000;
 
@@ -40,7 +32,6 @@ const GROUP_WINDOW_MS = 3 * 60_000;
 const SEND_GLYPH = '\u27A4';       // ➤
 const SEND_BTN_SIZE = 44;
 const INPUT_MIN_HEIGHT = 44;
-const HINT_HEIGHT = 16;
 
 // ── Conversation ───────────────────────────────────────────────────────
 const MAX_CONVERSATION_ENTRIES = 40;
@@ -1260,8 +1251,8 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: SPACE_SM, right: SPACE_MD, bottom: SPACE_SM, left: SPACE_MD },
-        spacing: SPACE_SM,
+        margins: { top: this.theme.tokens.space.md, right: this.theme.tokens.space.lg, bottom: this.theme.tokens.space.md, left: this.theme.tokens.space.lg },
+        spacing: this.theme.tokens.space.md,
       })
     );
 
@@ -1271,7 +1262,7 @@ A single successful creation goal is a complete turn. End it with **done**.
         parentLayoutId: this.rootLayoutId,
         autoScroll: true,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: SPACE_SM,
+        spacing: this.theme.tokens.space.md,
       })
     );
 
@@ -1280,7 +1271,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       request(this.id, this.widgetManagerId!, 'createNestedVBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: SPACE_XS,
+        spacing: this.theme.tokens.space.xs,
       })
     );
 
@@ -1289,7 +1280,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.composerColumnId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: SPACE_SM,
+        spacing: this.theme.tokens.space.md,
       })
     );
     this.inputRowId = this.composerRowId;
@@ -1298,7 +1289,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     await this.request(request(this.id, this.rootLayoutId, 'addLayoutChildren', {
       children: [
         { widgetId: this.messageLogId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
-        { widgetId: this.composerColumnId, sizePolicy: { vertical: 'preferred', horizontal: 'expanding' }, preferredSize: { height: INPUT_MIN_HEIGHT + SPACE_XS + HINT_HEIGHT } },
+        { widgetId: this.composerColumnId, sizePolicy: { vertical: 'preferred', horizontal: 'expanding' }, preferredSize: { height: INPUT_MIN_HEIGHT + this.theme.tokens.space.xs + this.theme.tokens.space.xl } },
       ],
     }));
 
@@ -1351,7 +1342,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     await this.request(request(this.id, this.composerColumnId, 'addLayoutChildren', {
       children: [
         { widgetId: this.composerRowId, sizePolicy: { vertical: 'preferred', horizontal: 'expanding' }, preferredSize: { height: INPUT_MIN_HEIGHT } },
-        { widgetId: this.composerHintLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: HINT_HEIGHT } },
+        { widgetId: this.composerHintLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: this.theme.tokens.space.xl } },
       ],
     }));
 
@@ -1403,7 +1394,7 @@ A single successful creation goal is a complete turn. End it with **done**.
 
     const welcomeText = '\u2728  **Welcome to Chat**\n\nAbjects is a distributed object system where everything is an Abject: autonomous objects that communicate via messages, discover each other through a Registry, and coordinate work through goals and agents. Ask me to explore what objects exist, create new ones, fetch your email, or anything else. Specialized agents will pick up the work automatically.';
     const bubbleMaxWidth = this.computeBubbleMaxWidth();
-    const innerWidth = bubbleMaxWidth - BUBBLE_TEXT_PADDING * 2;
+    const innerWidth = bubbleMaxWidth - this.theme.tokens.space.xs * 2;
     const height = this.estimateBubbleHeight(welcomeText, innerWidth, true);
 
     const specs: Array<Record<string, unknown>> = [
@@ -1412,7 +1403,7 @@ A single successful creation goal is a complete turn. End it with **done**.
         style: {
           color: this.theme.textPrimary,
           background: lightenColor(this.theme.windowBg, 6),
-          radius: BUBBLE_RADIUS,
+          radius: this.theme.tokens.radius.lg,
           fontSize: 13,
           wordWrap: true,
           selectable: false,
@@ -1617,6 +1608,11 @@ A single successful creation goal is a complete turn. End it with **done**.
     if (this.uiPhase === 'closed') return;
     this.uiPhase = 'busy';
     await this.setInputDisabled(true);
+    // Long-op accent halo on the send button so the user sees the agent is
+    // working even when the activity bubble scrolls off-screen (Doherty).
+    if (this.sendBtnId) {
+      try { this.send(event(this.id, this.sendBtnId, 'update', { busy: true })); } catch { /* widget gone */ }
+    }
     await this.removeWelcomeState();
 
     // Show user message as a right-aligned bubble. User input is plain text —
@@ -1676,6 +1672,10 @@ A single successful creation goal is a complete turn. End it with **done**.
         const errorText = (result.error ?? 'Unknown error').slice(0, 200);
         const note = result.maxStepsReached ? ' (step limit reached)' : '';
         await this.appendBubble('error', 'Error', errorText + note, false);
+        await this.notify(
+          result.maxStepsReached ? 'Agent stopped: step limit reached' : 'Agent error',
+          'error',
+        );
       }
     } catch (err) {
       this._currentTicketId = undefined;
@@ -1683,6 +1683,11 @@ A single successful creation goal is a complete turn. End it with **done**.
       await this.removeActivityBubble();
       const errMsg = err instanceof Error ? err.message : String(err);
       await this.appendBubble('error', 'Error', errMsg.slice(0, 200), false);
+      await this.notify(`Chat error: ${errMsg.slice(0, 80)}`, 'error');
+    } finally {
+      if (this.sendBtnId) {
+        try { this.send(event(this.id, this.sendBtnId, 'update', { busy: false })); } catch { /* widget gone */ }
+      }
     }
 
     this.uiPhase = this.windowId ? 'idle' : 'closed';
@@ -1772,7 +1777,7 @@ A single successful creation goal is a complete turn. End it with **done**.
 
   private computeAvailableWidth(): number {
     // Window content area = window width - side margins - scrollbar.
-    return Math.max(BUBBLE_MIN_WIDTH, this.currentWindowWidth - SPACE_MD * 2 - 8);
+    return Math.max(BUBBLE_MIN_WIDTH, this.currentWindowWidth - this.theme.tokens.space.lg * 2 - 8);
   }
 
   private computeBubbleMaxWidth(): number {
@@ -1811,7 +1816,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     const raw = markdown
       ? estimateMarkdownHeight(text, innerWidth, fontSize)
       : Math.max(lineHeight, estimateWrappedLineCount(text, innerWidth, fontSize) * lineHeight);
-    return raw + BUBBLE_V_PADDING;
+    return raw + this.theme.tokens.space.md;
   }
 
   /**
@@ -1847,7 +1852,7 @@ A single successful creation goal is a complete turn. End it with **done**.
 
     const { background, color, align, borderColor } = this.bubbleStyleForRole(role);
     const bubbleMaxWidth = this.computeBubbleMaxWidth();
-    const innerWidth = bubbleMaxWidth - BUBBLE_TEXT_PADDING * 2;
+    const innerWidth = bubbleMaxWidth - this.theme.tokens.space.xs * 2;
     const bubbleHeight = this.estimateBubbleHeight(text, innerWidth, markdown);
 
     // Sender/timestamp mini-label (skipped when grouping).
@@ -1894,7 +1899,7 @@ A single successful creation goal is a complete turn. End it with **done**.
               selectable: true,
               markdown,
               background,
-              radius: BUBBLE_RADIUS,
+              radius: this.theme.tokens.radius.lg,
               borderColor,
               align,
             },
@@ -2077,7 +2082,7 @@ A single successful creation goal is a complete turn. End it with **done**.
   private async refreshActivityBubble(): Promise<void> {
     if (!this.activityBubbleLabelId) return;
     const text = this.composeActivityText();
-    const innerWidth = this.computeBubbleMaxWidth() - BUBBLE_TEXT_PADDING * 2;
+    const innerWidth = this.computeBubbleMaxWidth() - this.theme.tokens.space.xs * 2;
     const height = this.estimateBubbleHeight(text, innerWidth, false);
     // Keep the cached bubble text in sync so resize reflow uses the latest.
     const meta = this.messageMetadata.get(this.activityBubbleLabelId);
@@ -2138,7 +2143,7 @@ A single successful creation goal is a complete turn. End it with **done**.
     if (!this.messageLogId || !this.windowId) return;
 
     const bubbleMaxWidth = this.computeBubbleMaxWidth();
-    const innerWidth = bubbleMaxWidth - BUBBLE_TEXT_PADDING * 2;
+    const innerWidth = bubbleMaxWidth - this.theme.tokens.space.xs * 2;
     const updates: Promise<unknown>[] = [];
 
     for (const labelId of this.messageLabelIds) {

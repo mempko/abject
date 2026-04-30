@@ -6,6 +6,93 @@
  * backward compatibility.
  */
 
+// ── Design Tokens ──────────────────────────────────────────────────────────
+
+export interface SpaceTokens {
+  none: number;
+  xxs: number;
+  xs: number;
+  sm: number;
+  md: number;
+  lg: number;
+  xl: number;
+  xxl: number;
+  xxxl: number;
+}
+
+export interface TypeToken {
+  font: string;
+  size: number;
+  weight: string;
+  lineHeight: number;
+}
+
+export interface TypeTokens {
+  caption: TypeToken;
+  body: TypeToken;
+  bodyStrong: TypeToken;
+  title: TypeToken;
+  display: TypeToken;
+  code: TypeToken;
+}
+
+export interface RadiusTokens {
+  sm: number;
+  md: number;
+  lg: number;
+  pill: number;
+}
+
+export interface MotionTokens {
+  fast: number;
+  base: number;
+  slow: number;
+  shimmer: number;
+}
+
+export type EasingCurve = readonly [number, number, number, number];
+
+export interface EasingTokens {
+  standard: EasingCurve;
+  accelerate: EasingCurve;
+  decelerate: EasingCurve;
+  emphasize: EasingCurve;
+}
+
+export interface ElevationToken {
+  blur: number;
+  offsetY: number;
+  color: string;
+}
+
+export interface ElevationTokens {
+  level0: ElevationToken;
+  level1: ElevationToken;
+  level2: ElevationToken;
+  level3: ElevationToken;
+}
+
+export interface GlowToken {
+  blur: number;
+  color: string;
+}
+
+export interface GlowTokens {
+  focus: GlowToken;
+  accent: GlowToken;
+  danger: GlowToken;
+}
+
+export interface DesignTokens {
+  space: SpaceTokens;
+  type: TypeTokens;
+  radius: RadiusTokens;
+  motion: MotionTokens;
+  easing: EasingTokens;
+  elevation: ElevationTokens;
+  glow: GlowTokens;
+}
+
 // ── Theme ──────────────────────────────────────────────────────────────────
 
 export interface ThemeData {
@@ -90,6 +177,11 @@ export interface ThemeData {
 
   // ── Links ──
   linkColor: string;
+
+  // ── Design Tokens ──
+  // Centralized scales for spacing, typography, radius, motion, elevation, glow.
+  // New widgets should read from tokens; legacy fields above remain for compatibility.
+  tokens: DesignTokens;
 }
 
 export const MIDNIGHT_BLOOM: ThemeData = {
@@ -128,10 +220,10 @@ export const MIDNIGHT_BLOOM: ThemeData = {
   sliderThumbBorder: '#2a2a3a',
   windowRadius: 8,
   widgetRadius: 6,
-  titleBarHeight: 34,
-  titleButtonSize: 20,
-  titleButtonMargin: 7,
-  titleButtonIconSize: 10,
+  titleBarHeight: 36,
+  titleButtonSize: 24,
+  titleButtonMargin: 6,
+  titleButtonIconSize: 14,
   titleButtonHoverBg: '#2a2a3a',
   titleCloseHoverBg: '#ff4d6a',
 
@@ -174,4 +266,56 @@ export const MIDNIGHT_BLOOM: ThemeData = {
 
   // ── Links ──
   linkColor: '#6ea8fe',
+
+  // ── Design Tokens ──
+  tokens: {
+    space: {
+      none: 0,
+      xxs: 2,
+      xs: 4,
+      sm: 6,
+      md: 8,
+      lg: 12,
+      xl: 16,
+      xxl: 24,
+      xxxl: 32,
+    },
+    type: {
+      caption:    { font: '"Inter", system-ui, sans-serif',          size: 11, weight: '400', lineHeight: 14 },
+      body:       { font: '"Inter", system-ui, sans-serif',          size: 14, weight: '400', lineHeight: 20 },
+      bodyStrong: { font: '"Inter", system-ui, sans-serif',          size: 14, weight: '600', lineHeight: 20 },
+      title:      { font: '"Inter", system-ui, sans-serif',          size: 13, weight: '600', lineHeight: 18 },
+      display:    { font: '"Inter", system-ui, sans-serif',          size: 18, weight: '700', lineHeight: 24 },
+      code:       { font: '"JetBrains Mono", "Fira Code", monospace', size: 13, weight: '400', lineHeight: 18 },
+    },
+    radius: {
+      sm: 4,
+      md: 8,
+      lg: 12,
+      pill: 999,
+    },
+    motion: {
+      fast: 120,
+      base: 200,
+      slow: 320,
+      shimmer: 3000,
+    },
+    easing: {
+      standard:   [0.4, 0.0, 0.2, 1.0],
+      accelerate: [0.4, 0.0, 1.0, 1.0],
+      decelerate: [0.0, 0.0, 0.2, 1.0],
+      emphasize:  [0.2, 0.0, 0.0, 1.0],
+    },
+    elevation: {
+      level0: { blur: 0,  offsetY: 0, color: 'rgba(0,0,0,0)' },
+      level1: { blur: 8,  offsetY: 2, color: 'rgba(0,0,0,0.35)' },
+      level2: { blur: 18, offsetY: 6, color: 'rgba(0,0,0,0.5)' },
+      level3: { blur: 32, offsetY: 12, color: 'rgba(0,0,0,0.65)' },
+    },
+    glow: {
+      focus:  { blur: 18, color: 'rgba(57, 255, 142, 0.55)' },
+      accent: { blur: 10, color: 'rgba(57, 255, 142, 0.35)' },
+      danger: { blur: 14, color: 'rgba(255, 77, 106, 0.5)' },
+    },
+  },
 };

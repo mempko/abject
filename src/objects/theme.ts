@@ -13,6 +13,29 @@ import { request } from '../core/message.js';
 import { require as contractRequire } from '../core/contracts.js';
 import { ThemeData, MIDNIGHT_BLOOM } from './widgets/widget-types.js';
 
+/**
+ * Deep-merge a partial theme update over the current theme.
+ *
+ * Why: ThemeData carries a nested `tokens` sub-object. A naive shallow spread
+ * would let `setTheme({ tokens: { space: {...} } })` wipe sibling token groups.
+ */
+function mergeTheme(current: ThemeData, partial: Partial<ThemeData>): ThemeData {
+  const next: ThemeData = { ...current, ...partial };
+  if (partial.tokens) {
+    const t = partial.tokens;
+    next.tokens = {
+      space:     { ...current.tokens.space,     ...(t.space     ?? {}) },
+      type:      { ...current.tokens.type,      ...(t.type      ?? {}) },
+      radius:    { ...current.tokens.radius,    ...(t.radius    ?? {}) },
+      motion:    { ...current.tokens.motion,    ...(t.motion    ?? {}) },
+      easing:    { ...current.tokens.easing,    ...(t.easing    ?? {}) },
+      elevation: { ...current.tokens.elevation, ...(t.elevation ?? {}) },
+      glow:      { ...current.tokens.glow,      ...(t.glow      ?? {}) },
+    };
+  }
+  return next;
+}
+
 const THEME_INTERFACE: InterfaceId = 'abjects:theme' as InterfaceId;
 const STORAGE_KEY = 'theme:active';
 
@@ -71,7 +94,7 @@ export class ThemeAbject extends Abject {
 
     this.on('setTheme', async (msg: AbjectMessage) => {
       const partial = msg.payload as Partial<ThemeData>;
-      this.currentTheme = { ...this.currentTheme, ...partial };
+      this.currentTheme = mergeTheme(this.currentTheme, partial);
       this.applyBodyBackground();
       await this.persistTheme();
       this.changed('themeChanged', { ...this.currentTheme });
@@ -96,7 +119,7 @@ export class ThemeAbject extends Abject {
           request(this.id, this.storageId, 'get', { key: STORAGE_KEY })
         );
         if (saved && typeof saved === 'object' && 'canvasBg' in saved) {
-          this.currentTheme = { ...MIDNIGHT_BLOOM, ...saved };
+          this.currentTheme = mergeTheme(MIDNIGHT_BLOOM, saved);
         }
       } catch {
         // Storage not available or key not found — use default
@@ -108,11 +131,18 @@ export class ThemeAbject extends Abject {
 
   private applyBodyBackground(): void {
     if (typeof document !== 'undefined') {
-      document.body.style.background = [
+      // Layered backdrop:
+      //   1. Faint dot grid — gives the abyss a sense of space without
+      //      attracting the eye. 24-px pitch with a 1-px dot at <4% alpha.
+      //   2. Two soft accent ellipses for depth.
+      //   3. The flat canvas color underneath.
+      document.body.style.backgroundImage = [
+        'radial-gradient(circle at 1px 1px, rgba(57,255,142,0.06) 1px, transparent 1.6px)',
         'radial-gradient(ellipse 60% 50% at 50% 30%, rgba(57,255,142,0.04) 0%, transparent 60%)',
         'radial-gradient(ellipse 40% 40% at 70% 20%, rgba(155,89,255,0.03) 0%, transparent 50%)',
-        this.currentTheme.canvasBg,
       ].join(', ');
+      document.body.style.backgroundSize = '24px 24px, auto, auto';
+      document.body.style.backgroundColor = this.currentTheme.canvasBg;
     }
   }
 

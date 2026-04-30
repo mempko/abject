@@ -9,7 +9,7 @@
 
 import { AbjectId, AbjectMessage, InterfaceId, SpawnResult } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { DiscoveredWorkspace } from './workspace-share-registry.js';
@@ -329,13 +329,19 @@ discovered, the browser rebuilds automatically if it is visible.
       this.shareRegistryId = await this.discoverDep('WorkspaceShareRegistry') ?? undefined;
     }
 
+    if (this.refreshBtnId) {
+      this.send(event(this.id, this.refreshBtnId, 'update', { busy: true }));
+    }
+    let ok = true;
     // Trigger discovery
     if (this.shareRegistryId) {
       try {
         await this.request(
           request(this.id, this.shareRegistryId, 'discoverWorkspaces', { hops: 1 })
         );
-      } catch { /* best-effort */ }
+      } catch {
+        ok = false;
+      }
     }
 
     log.info('discovery done, rebuilding UI');
@@ -343,6 +349,12 @@ discovered, the browser rebuilds automatically if it is visible.
       await this.fetchAndRebuild();
     } else {
       await this.show();
+    }
+    if (this.refreshBtnId) {
+      this.send(event(this.id, this.refreshBtnId, 'update', { busy: false }));
+    }
+    if (!ok) {
+      await this.notify('Workspace discovery failed', 'error');
     }
     return true;
   }

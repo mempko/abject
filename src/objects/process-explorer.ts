@@ -13,7 +13,7 @@ import {
   ObjectRegistration,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 
@@ -338,6 +338,15 @@ export class ProcessExplorer extends Abject {
     );
 
     await this.populateView();
+    // Autofocus the filter input so the user can start typing immediately.
+    if (this.windowId && this.searchInputId && this.rootLayoutId) {
+      try {
+        await this.request(request(this.id, this.windowId, 'focusChild', {
+          widgetId: this.searchInputId,
+          parentChildId: this.rootLayoutId,
+        }));
+      } catch { /* window gone */ }
+    }
     this.changed('visibility', true);
     return true;
   }
@@ -693,10 +702,17 @@ export class ProcessExplorer extends Abject {
           destructive: true,
         });
         if (!confirmed) return;
+        this.send(event(this.id, fromId, 'update', { busy: true }));
         try {
           await this.request(request(this.id, this.factoryId,
             'kill', { objectId: row.id }));
-        } catch { /* object may already be gone */ }
+          await this.notify(`Stopped "${row.name}"`, 'success');
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await this.notify(`Stop failed: ${msg.slice(0, 80)}`, 'error');
+        } finally {
+          this.send(event(this.id, fromId, 'update', { busy: false }));
+        }
         await this.rebuildList();
       }
       return;
@@ -708,11 +724,17 @@ export class ProcessExplorer extends Abject {
       const row = this.currentRows[restartIdx];
       if (row && this.factoryId) {
         const constructorName = row.constructorName ?? row.name;
+        this.send(event(this.id, fromId, 'update', { busy: true }));
         try {
           await this.request(request(this.id, this.factoryId,
             'respawn', { objectId: row.id, constructorName, registryId: this.registryId }));
+          await this.notify(`Restarted "${row.name}"`, 'success');
         } catch (err) {
           log.warn(`Failed to restart ${row.name}:`, err);
+          const msg = err instanceof Error ? err.message : String(err);
+          await this.notify(`Restart failed: ${msg.slice(0, 80)}`, 'error');
+        } finally {
+          this.send(event(this.id, fromId, 'update', { busy: false }));
         }
         await this.rebuildList();
       }

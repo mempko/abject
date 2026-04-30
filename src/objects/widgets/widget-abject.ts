@@ -22,6 +22,7 @@ import {
   WIDGET_INTERFACE,
   WIDGET_FONT,
 } from './widget-types.js';
+import { Tween, pulse as motionPulse } from '../../ui/motion.js';
 
 
 
@@ -113,8 +114,26 @@ export abstract class WidgetAbject extends Abject {
   protected uiServerId: AbjectId;
   protected href: string = '';
   protected focused = false;
+  /**
+   * Mirrors CSS `:focus-visible` semantics: true only when the widget gained
+   * focus or interacted via the keyboard. Mouse-driven focus stays false so
+   * a click doesn't paint an accent ring around the clicked target.
+   *
+   * Subclasses with their own focus indicator (button, text input) override
+   * `suppressGenericFocusRing` so we don't double-paint.
+   */
+  protected focusVisible = false;
   protected disabled = false;
   protected visible = true;
+
+  /**
+   * Long-op affordance (Doherty Threshold). Set via `update({ busy: true })`.
+   * While true, an accent halo pulses around the widget so the user knows
+   * something is happening for ops > ~200 ms with unknown duration.
+   */
+  protected busy = false;
+  private busyTween?: Tween;
+  private busyPulseValue = 0;
   protected widgetType: WidgetType;
   protected override theme: ThemeData;
 
@@ -159,7 +178,25 @@ export abstract class WidgetAbject extends Abject {
       this._renderRect = { ...this.rect };
       this._renderStyle = { ...this.style };
       const { surfaceId, ox, oy } = msg.payload as { surfaceId: string; ox: number; oy: number };
-      return this.buildDrawCommands(surfaceId, ox, oy);
+      const commands = await this.buildDrawCommands(surfaceId, ox, oy);
+
+      // Generic keyboard-focus ring. Drawn AFTER the widget so it always
+      // appears on top of the widget's own chrome. Widgets with bespoke
+      // focus styles (button, text input) opt out via suppressGenericFocusRing.
+      if (
+        this.focused &&
+        this.focusVisible &&
+        !this.disabled &&
+        !this.suppressGenericFocusRing()
+      ) {
+        commands.push(...this.buildFocusRing(surfaceId, ox, oy));
+      }
+
+      if (this.busy) {
+        commands.push(...this.buildBusyPulse(surfaceId, ox, oy));
+      }
+
+      return commands;
     });
 
     this.on('getValue', async () => {
@@ -179,8 +216,11 @@ export abstract class WidgetAbject extends Abject {
     });
 
     this.on('setFocused', async (msg: AbjectMessage) => {
-      const { focused } = msg.payload as { focused: boolean };
+      const { focused, via } = msg.payload as { focused: boolean; via?: 'keyboard' | 'mouse' };
       this.focused = focused;
+      // Reset focus-visible on every transition. Default trigger is mouse;
+      // an explicit `via: 'keyboard'` opts in to the visible ring.
+      this.focusVisible = focused && via === 'keyboard';
       // Tell mobile clients to show/hide the virtual keyboard
       if (this.wantsMobileKeyboard()) {
         this.send(request(this.id, this.uiServerId, 'showMobileKeyboard', { show: focused }));
@@ -193,6 +233,23 @@ export abstract class WidgetAbject extends Abject {
       if (!this.visible) return { consumed: false };
       if (this.disabled && !this.acceptsInputWhenDisabled()) return { consumed: false };
       const input = msg.payload as Record<string, unknown>;
+
+      // Track input modality for the focus-visible heuristic. Keyboard
+      // interaction surfaces the ring; mouse interaction hides it.
+      if (this.focused) {
+        const t = input.type;
+        if (t === 'keydown') {
+          if (!this.focusVisible) {
+            this.focusVisible = true;
+            await this.requestRedraw();
+          }
+        } else if (t === 'mousedown' || t === 'mousemove') {
+          if (this.focusVisible) {
+            this.focusVisible = false;
+            await this.requestRedraw();
+          }
+        }
+      }
 
       // Open URL in browser when any widget with href is clicked
       if (input.type === 'mousedown' && this.href) {
@@ -231,6 +288,79 @@ export abstract class WidgetAbject extends Abject {
   }
 
   /**
+   * Override to return true when the widget paints its own focus indicator
+   * (button, text input). The base class then skips the generic keyboard
+   * focus ring so the two don't double up.
+   */
+  protected suppressGenericFocusRing(): boolean {
+    return false;
+  }
+
+  /**
+   * Build the long-op pulse halo drawn around a busy widget.
+   * Pulses between 0.25 and 0.65 alpha so it's visible without screaming.
+   */
+  protected buildBusyPulse(surfaceId: string, ox: number, oy: number): unknown[] {
+    const r = this.style.radius ?? this.theme.widgetRadius;
+    const alpha = 0.25 + this.busyPulseValue * 0.4;
+    const blur = 8 + this.busyPulseValue * 6;
+    return [
+      { type: 'save', surfaceId, params: {} },
+      {
+        type: 'shadow',
+        surfaceId,
+        params: { color: this.theme.tokens.glow.accent.color, blur, offsetY: 0 },
+      },
+      {
+        type: 'rect',
+        surfaceId,
+        params: {
+          x: ox,
+          y: oy,
+          width: this.rect.width,
+          height: this.rect.height,
+          stroke: `rgba(57, 255, 142, ${alpha.toFixed(3)})`,
+          lineWidth: 1.5,
+          radius: r,
+        },
+      },
+      { type: 'restore', surfaceId, params: {} },
+    ];
+  }
+
+  /**
+   * Build the generic keyboard-focus ring drawn around the widget rect.
+   * Subclasses can override for custom shapes; the default is a 2-px
+   * inset rect at the widget's radius.
+   */
+  protected buildFocusRing(surfaceId: string, ox: number, oy: number): unknown[] {
+    const r = this.style.radius ?? this.theme.widgetRadius;
+    const inset = 1; // pull the ring 1 px inside the widget bounds
+    return [
+      { type: 'save', surfaceId, params: {} },
+      {
+        type: 'shadow',
+        surfaceId,
+        params: { color: this.theme.tokens.glow.accent.color, blur: this.theme.tokens.glow.accent.blur, offsetY: 0 },
+      },
+      {
+        type: 'rect',
+        surfaceId,
+        params: {
+          x: ox + inset,
+          y: oy + inset,
+          width: this.rect.width - inset * 2,
+          height: this.rect.height - inset * 2,
+          stroke: this.theme.accent,
+          lineWidth: 2,
+          radius: Math.max(0, r - 1),
+        },
+      },
+      { type: 'restore', surfaceId, params: {} },
+    ];
+  }
+
+  /**
    * Apply common updates shared by all widgets.
    */
   private applyCommonUpdates(updates: Record<string, unknown>): void {
@@ -241,7 +371,29 @@ export abstract class WidgetAbject extends Abject {
     // Support top-level visible/disabled as shorthand for style.visible/style.disabled
     if (updates.visible !== undefined) this.style = { ...this.style, visible: updates.visible as boolean };
     if (updates.disabled !== undefined) this.style = { ...this.style, disabled: updates.disabled as boolean };
+    if (updates.busy !== undefined) this.setBusy(updates.busy as boolean);
     this.syncDisabledVisible();
+  }
+
+  protected override async onStop(): Promise<void> {
+    this.busyTween?.cancel();
+    this.busyTween = undefined;
+  }
+
+  private setBusy(busy: boolean): void {
+    if (this.busy === busy) return;
+    this.busy = busy;
+    if (busy) {
+      this.busyTween?.cancel();
+      this.busyTween = motionPulse(1100, (v) => {
+        this.busyPulseValue = v;
+        this.requestRedraw().catch(() => {});
+      }).start();
+    } else {
+      this.busyTween?.cancel();
+      this.busyTween = undefined;
+      this.busyPulseValue = 0;
+    }
   }
 
   /**

@@ -8,11 +8,12 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { Goal, GoalId } from './goal-manager.js';
 import type { TreeItem } from './widgets/tree-widget.js';
+import type { IconName } from '../ui/icons.js';
 
 const log = new Log('GoalBrowser');
 
@@ -33,18 +34,18 @@ interface TaskInfo {
   agentName?: string;
 }
 
-const GOAL_STATUS_ICONS: Record<string, { icon: string; color: string }> = {
-  active:    { icon: '\u25B8', color: '' },  // ▸ (color set from theme)
-  completed: { icon: '\u2713', color: '' },  // ✓
-  failed:    { icon: '\u2717', color: '' },  // ✗
+const GOAL_STATUS_ICON_NAMES: Record<string, IconName> = {
+  active:    'chevronRight',
+  completed: 'check',
+  failed:    'close',
 };
 
-const TASK_STATUS_ICONS: Record<string, string> = {
-  pending:            '\u25CB',  // ○
-  claimed:            '\u25D1',  // ◑
-  in_progress:        '\u25D1',  // ◑
-  done:               '\u2713',  // ✓
-  permanently_failed: '\u2717',  // ✗
+const TASK_STATUS_ICON_NAMES: Record<string, IconName> = {
+  pending:            'dot',
+  claimed:            'chevronRight',
+  in_progress:        'chevronRight',
+  done:               'check',
+  permanently_failed: 'close',
 };
 
 export class GoalBrowser extends Abject {
@@ -351,8 +352,6 @@ Click the arrow to expand/collapse a goal.
       const hasChildren = tasks.length > 0 || children.length > 0
         || (goal.status === 'active' && !!latestProgress);
 
-      const statusInfo = GOAL_STATUS_ICONS[goal.status];
-      const icon = statusInfo?.icon ?? '?';
       let iconColor: string;
       switch (goal.status) {
         case 'active': iconColor = this.theme.statusWarning; break;
@@ -368,7 +367,7 @@ Click the arrow to expand/collapse a goal.
       items.push({
         id: `goal:${goal.id}`,
         label: goal.title + errorSuffix,
-        icon,
+        iconName: GOAL_STATUS_ICON_NAMES[goal.status],
         iconColor,
         depth,
         expanded: isExpanded,
@@ -380,14 +379,13 @@ Click the arrow to expand/collapse a goal.
       // Task children
       for (const task of tasks) {
         const effectiveStatus = task.status === 'pending' && task.claimedBy ? 'claimed' : task.status;
-        const taskIcon = TASK_STATUS_ICONS[effectiveStatus] ?? '\u2022';
         const attempts = task.attempts > 0 ? ` (${task.attempts}/${task.maxAttempts})` : '';
         const desc = task.description.slice(0, 50);
 
         items.push({
           id: `task:${task.id}`,
           label: task.agentName ? `[${task.agentName}] ${desc}${attempts}` : `${desc}${attempts}`,
-          icon: taskIcon,
+          iconName: TASK_STATUS_ICON_NAMES[effectiveStatus] ?? 'dot',
           iconColor: effectiveStatus === 'done' ? this.theme.statusSuccess
             : effectiveStatus === 'permanently_failed' ? this.theme.statusError
             : this.theme.textSecondary,
@@ -400,12 +398,12 @@ Click the arrow to expand/collapse a goal.
         renderGoal(child, depth + 1);
       }
 
-      // Progress line at the bottom
+      // Progress line at the bottom \u2014 uses a soft dot to flag "in progress".
       if (goal.status === 'active' && latestProgress) {
         items.push({
           id: `progress:${goal.id}`,
           label: latestProgress,
-          icon: '\u2026',
+          iconName: 'dot',
           iconColor: this.theme.textTertiary,
           depth: depth + 1,
         });
@@ -460,11 +458,17 @@ Click the arrow to expand/collapse a goal.
         destructive: true,
       });
       if (!confirmed) return;
-      this.send(request(this.id, this.goalObserverId!, 'failAllGoals', {}));
-      this.goals = [];
-      this.tasksByGoal.clear();
-      this.expandedGoals.clear();
-      await this.rebuildTree();
+      this.send(event(this.id, this.stopAllBtnId, 'update', { busy: true }));
+      try {
+        this.send(request(this.id, this.goalObserverId!, 'failAllGoals', {}));
+        this.goals = [];
+        this.tasksByGoal.clear();
+        this.expandedGoals.clear();
+        await this.rebuildTree();
+        await this.notify('All active goals stopped', 'success');
+      } finally {
+        this.send(event(this.id, this.stopAllBtnId, 'update', { busy: false }));
+      }
       return;
     }
 
@@ -518,6 +522,13 @@ Click the arrow to expand/collapse a goal.
                 this.goals[idx] = goal;
               }
               this.tasksByGoal.set(goalId, tasks);
+              // Surface goal-level outcomes as toasts (Goal-Gradient + Zeigarnik).
+              // Skip the noisier task-level events.
+              if (aspect === 'goalCompleted' && goal) {
+                await this.notify(`Goal completed: ${goal.title}`, 'success');
+              } else if (aspect === 'goalFailed' && goal) {
+                await this.notify(`Goal failed: ${goal.title}`, 'error');
+              }
             } catch { /* goal may be gone */ }
           }
           await this.rebuildTree();

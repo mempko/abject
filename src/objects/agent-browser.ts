@@ -11,7 +11,7 @@
 
 import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { ListItem } from './widgets/list-widget.js';
@@ -621,6 +621,7 @@ and to Registry for new scheduler/watcher objects being created.
         const watch = this.watches[this.selectedIndex];
         if (!watch) return;
         const method = watch.enabled ? 'disableWatch' : 'enableWatch';
+        if (this.toggleBtnId) this.send(event(this.id, this.toggleBtnId, 'update', { busy: true }));
         try {
           await this.request(
             request(this.id, watch.watcherId as AbjectId, method, { watchId: watch.id }),
@@ -629,8 +630,12 @@ and to Registry for new scheduler/watcher objects being created.
           watch.enabled = !watch.enabled;
           await this.rebuildList();
           await this.showDetailForSelection();
+          await this.notify(`Watch ${watch.enabled ? 'enabled' : 'disabled'}`, 'success');
         } catch (err) {
           log.warn('Failed to toggle watch:', err);
+          await this.notify('Toggle failed', 'error');
+        } finally {
+          if (this.toggleBtnId) this.send(event(this.id, this.toggleBtnId, 'update', { busy: false }));
         }
         break;
       }
@@ -697,8 +702,11 @@ and to Registry for new scheduler/watcher objects being created.
       await this.loadAgents();
       await this.rebuildList();
       await this.updateDetail('Select an item', '', '');
+      await this.notify(`Agent "${agent.name}" deleted`, 'success');
     } catch (err) {
       log.warn('Failed to delete agent:', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      await this.notify(`Delete failed: ${msg.slice(0, 80)}`, 'error');
     }
   }
 

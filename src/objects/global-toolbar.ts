@@ -35,6 +35,11 @@ export class GlobalToolbar extends Abject {
   private explorerBtnId?: AbjectId;
   private processesBtnId?: AbjectId;
   private llmMonitorBtnId?: AbjectId;
+  private notificationsBtnId?: AbjectId;
+
+  // Cached lookup for the active workspace's NotificationCenter. Refreshed
+  // on every click in case the workspace switched.
+  private workspaceManagerId?: AbjectId;
 
   /** Current window height (queried by WorkspaceManager for Taskbar positioning) */
   private currentHeight = 0;
@@ -192,7 +197,45 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
         }
         return;
       }
+
+      // Notifications bell — opens the active workspace's NotificationCenter.
+      // NotificationCenter is per-workspace, so we resolve through
+      // WorkspaceManager every click (cheap; lets workspace switching work).
+      if (fromId === this.notificationsBtnId) {
+        const ncId = await this.resolveActiveNotificationCenter();
+        if (ncId) {
+          this.send(request(this.id, ncId, 'toggle', {}));
+        }
+        return;
+      }
     });
+  }
+
+  /**
+   * Resolve the NotificationCenter belonging to the currently active
+   * workspace via WorkspaceManager. Returns undefined if no workspace is
+   * active or the registry can't be reached.
+   */
+  private async resolveActiveNotificationCenter(): Promise<AbjectId | undefined> {
+    if (!this.workspaceManagerId) {
+      this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
+      if (!this.workspaceManagerId) return undefined;
+    }
+    let active: { registryId?: AbjectId } | null = null;
+    try {
+      active = await this.request<{ registryId?: AbjectId } | null>(
+        request(this.id, this.workspaceManagerId, 'getActiveWorkspace', {}),
+      );
+    } catch { return undefined; }
+    if (!active?.registryId) return undefined;
+    try {
+      const found = await this.request<Array<{ id: AbjectId }>>(
+        request(this.id, active.registryId, 'discover', { name: 'NotificationCenter' }),
+      );
+      return found?.[0]?.id;
+    } catch {
+      return undefined;
+    }
   }
 
   async show(yOffset = 8): Promise<boolean> {
@@ -212,6 +255,7 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
     this.explorerBtnId = undefined;
     this.processesBtnId = undefined;
     this.llmMonitorBtnId = undefined;
+    this.notificationsBtnId = undefined;
     this.rootLayoutId = undefined;
 
     const btnW = 120;
@@ -220,8 +264,8 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
     const padding = 16;
     const spacing = 6;
 
-    // Height: padding + label row + 4 buttons + padding
-    const barHeight = padding + labelH + (spacing + btnH) * 4 + padding;
+    // Height: padding + label row + 5 buttons + padding
+    const barHeight = padding + labelH + (spacing + btnH) * 5 + padding;
     const barWidth = btnW + padding * 2;
 
     this.currentHeight = barHeight;
@@ -259,7 +303,7 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
       preferredSize: { height: labelH },
     }));
 
-    // Batch create all widgets: header label, gear button, 3 action buttons
+    // Batch create all widgets: header label, gear button, action buttons
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
@@ -269,6 +313,7 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
           { type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0D Explorer' },
           { type: 'button', windowId: this.windowId!, text: '\u2699\uFE0F Procs' },
           { type: 'button', windowId: this.windowId!, text: '\uD83D\uDC41 The Eye' },
+          { type: 'button', windowId: this.windowId!, text: '\uD83D\uDD14 Notifications' },
         ],
       })
     );
@@ -279,6 +324,7 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
     this.explorerBtnId = widgetIds[3];
     this.processesBtnId = widgetIds[4];
     this.llmMonitorBtnId = widgetIds[5];
+    this.notificationsBtnId = widgetIds[6];
 
     // Add header row children: label + gear button
     await this.request(request(this.id, headerRowId, 'addLayoutChildren', {
@@ -295,6 +341,7 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
         { widgetId: this.explorerBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
         { widgetId: this.processesBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
         { widgetId: this.llmMonitorBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
+        { widgetId: this.notificationsBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
       ],
     }));
 
@@ -304,6 +351,7 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
     this.send(request(this.id, this.explorerBtnId, 'addDependent', {}));
     this.send(request(this.id, this.processesBtnId, 'addDependent', {}));
     this.send(request(this.id, this.llmMonitorBtnId, 'addDependent', {}));
+    this.send(request(this.id, this.notificationsBtnId, 'addDependent', {}));
 
     return true;
   }
@@ -324,6 +372,7 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
     this.explorerBtnId = undefined;
     this.processesBtnId = undefined;
     this.llmMonitorBtnId = undefined;
+    this.notificationsBtnId = undefined;
     return true;
   }
 }

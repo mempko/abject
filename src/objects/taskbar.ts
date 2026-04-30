@@ -19,8 +19,6 @@ const TASKBAR_INTERFACE: InterfaceId = 'abjects:taskbar';
 const BTN_W = 120;
 const BTN_H = 30;
 const LABEL_H = 20;
-const PADDING = 16;
-const SPACING = 6;
 
 export class Taskbar extends Abject {
   private widgetManagerId?: AbjectId;
@@ -262,7 +260,7 @@ windows" section so the user can restore windows from the taskbar.
     this.windowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createWindowAbject', {
         title: '\u25A0 Abjects',
-        rect: { x: 8, y: this.yOffset, width: BTN_W + PADDING * 2, height: barHeight },
+        rect: { x: 8, y: this.yOffset, width: BTN_W + this.theme.tokens.space.xl * 2, height: barHeight },
         zIndex: 999,
         chromeless: true,
         draggable: true,
@@ -272,8 +270,8 @@ windows" section so the user can restore windows from the taskbar.
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: PADDING, right: PADDING, bottom: PADDING, left: PADDING },
-        spacing: SPACING,
+        margins: { top: this.theme.tokens.space.xl, right: this.theme.tokens.space.xl, bottom: this.theme.tokens.space.xl, left: this.theme.tokens.space.xl },
+        spacing: this.theme.tokens.space.sm,
       })
     );
 
@@ -472,9 +470,9 @@ windows" section so the user can restore windows from the taskbar.
     const systemBtnCount = 2 + (this.webBrowserViewerId ? 1 : 0) + (this.goalBrowserId ? 1 : 0) + (this.knowledgeBrowserId ? 1 : 0) + (this.agentBrowserId ? 1 : 0) + (this.schedulerBrowserId ? 1 : 0);
     const minimizedCount = this.minimizedWindows.size;
     const totalBtnCount = systemBtnCount + userObjectCount + minimizedCount;
-    const extraHeight = (LABEL_H + SPACING)
-      + (minimizedCount > 0 ? (LABEL_H + SPACING) : 0);
-    return PADDING + extraHeight + totalBtnCount * (BTN_H + SPACING) - SPACING + PADDING;
+    const extraHeight = (LABEL_H + this.theme.tokens.space.sm)
+      + (minimizedCount > 0 ? (LABEL_H + this.theme.tokens.space.sm) : 0);
+    return this.theme.tokens.space.xl + extraHeight + totalBtnCount * (BTN_H + this.theme.tokens.space.sm) - this.theme.tokens.space.sm + this.theme.tokens.space.xl;
   }
 
   private async resizeWindow(): Promise<void> {
@@ -482,7 +480,7 @@ windows" section so the user can restore windows from the taskbar.
     const showableObjects = await this.discoverShowableObjects();
     const barHeight = this.computeHeight(showableObjects.length);
     await this.request(request(this.id, this.windowId, 'windowRect', {
-      x: 8, y: this.yOffset, width: BTN_W + PADDING * 2, height: barHeight,
+      x: 8, y: this.yOffset, width: BTN_W + this.theme.tokens.space.xl * 2, height: barHeight,
     }));
   }
 

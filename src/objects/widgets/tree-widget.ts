@@ -13,11 +13,19 @@
 
 import { WidgetAbject, WidgetConfig } from './widget-abject.js';
 import { lightenColor } from './widget-types.js';
+import { iconCommands, IconName } from '../../ui/icons.js';
 
 export interface TreeItem {
   id: string;
   label: string;
+  /** Legacy text glyph rendered as a single character. Prefer `iconName`. */
   icon?: string;
+  /**
+   * Vector icon drawn at the item's leading edge. Takes precedence over
+   * `icon` when both are present so a row that opted in to vector glyphs
+   * can drop the legacy field at its leisure.
+   */
+  iconName?: IconName;
   iconColor?: string;
   secondary?: string;
   depth: number;
@@ -169,15 +177,26 @@ export class TreeWidget extends WidgetAbject {
       }
       textX += ARROW_WIDTH;
 
-      // Icon
-      if (item.icon) {
+      // Icon — vector iconName takes precedence; falls back to text glyph
+      // when only the legacy `icon` field is set.
+      const iconColor = item.iconColor ?? (isSelected ? this.theme.accent : this.theme.textSecondary);
+      if (item.iconName) {
+        const iconSize = Math.min(14, this.itemHeight - 6);
+        commands.push(...iconCommands(item.iconName, {
+          surfaceId,
+          x: textX,
+          y: itemY + (this.itemHeight - iconSize) / 2,
+          size: iconSize,
+          color: iconColor,
+        }));
+      } else if (item.icon) {
         commands.push({
           type: 'text', surfaceId,
           params: {
             x: textX, y: itemY + this.itemHeight / 2,
             text: item.icon,
             font: '12px "Inter", system-ui, sans-serif',
-            fill: item.iconColor ?? this.theme.textSecondary,
+            fill: iconColor,
             baseline: 'middle',
           },
         });

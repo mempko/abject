@@ -48,7 +48,7 @@ export const WIDGET_FONT = '14px "Inter", system-ui, sans-serif';
 export const TITLE_FONT = '600 13px "Inter", system-ui, sans-serif';
 export const CODE_FONT = '13px "JetBrains Mono", "Fira Code", monospace';
 export const DEFAULT_LINE_HEIGHT = 18;
-export const TITLE_BAR_HEIGHT = 34;
+export const TITLE_BAR_HEIGHT = 36;
 export const EDGE_SIZE = 10;
 
 // ── Layout Types ──────────────────────────────────────────────────────────

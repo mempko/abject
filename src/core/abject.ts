@@ -378,6 +378,40 @@ export abstract class Abject {
   }
 
   /**
+   * Cached NotificationCenter id; populated on first `notify` call. Not part
+   * of construction so headless tests / pre-workspace contexts don't pay
+   * the discovery cost up-front.
+   */
+  private _notificationCenterId?: AbjectId;
+
+  /**
+   * Show a transient toast in the UI.
+   *
+   * Convenience wrapper around the standard discover-then-send pattern, in
+   * the same shape as `discoverDep`. NotificationCenter remains an ordinary
+   * Abject — this helper just removes the boilerplate every caller would
+   * otherwise duplicate.
+   *
+   * No-op when NotificationCenter isn't reachable (e.g. before any workspace
+   * is active, or in headless contexts), so callers don't have to guard.
+   */
+  protected async notify(
+    message: string,
+    level: 'info' | 'success' | 'warning' | 'error' = 'info',
+    durationMs?: number,
+  ): Promise<void> {
+    if (!this._notificationCenterId) {
+      this._notificationCenterId = await this.discoverDep('NotificationCenter') ?? undefined;
+    }
+    if (!this._notificationCenterId) return;
+    this.send(event(this.id, this._notificationCenterId, 'notify', {
+      message,
+      level,
+      ...(durationMs !== undefined ? { durationMs } : {}),
+    }));
+  }
+
+  /**
    * Get the current theme. Returns cached theme or MIDNIGHT_BLOOM default.
    * WidgetAbject overrides this field directly (set from config).
    */

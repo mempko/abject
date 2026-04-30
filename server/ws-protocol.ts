@@ -138,6 +138,16 @@ export interface ShowMobileKeyboardMsg extends WsEnvelope {
   show: boolean;
 }
 
+/**
+ * Update the canvas cursor. Sent only when the cursor hint actually
+ * changes — the backend throttles redundant updates so we don't burn
+ * messages while the mouse is moving freely.
+ */
+export interface SetCursorMsg extends WsEnvelope {
+  type: 'setCursor';
+  cursor: string;
+}
+
 export interface CaptureSurfaceRequestMsg extends WsEnvelope {
   type: 'captureSurfaceRequest';
   requestId: string;
@@ -188,6 +198,7 @@ export type BackendToFrontendMsg =
   | StartWindowDragMsg
   | SetSurfaceResizableMsg
   | ShowMobileKeyboardMsg
+  | SetCursorMsg
   | CaptureSurfaceRequestMsg
   | CaptureDesktopRequestMsg
   | AuthRequiredMsg
@@ -286,6 +297,17 @@ export interface FontMetricsMsg extends WsEnvelope {
   metrics: Record<string, Record<string, number>>;
 }
 
+/**
+ * Global keyboard shortcut intercept. The frontend pulls a small set of
+ * known combos (currently ⌘K / Ctrl-K) out of the regular keydown stream
+ * and sends them here so they aren't swallowed by whichever widget happens
+ * to hold focus.
+ */
+export interface GlobalShortcutMsg extends WsEnvelope {
+  type: 'globalShortcut';
+  combo: 'commandPalette' | 'windowSwitcher';
+}
+
 export type FrontendToBackendMsg =
   | InputMsg
   | EndWindowDragMsg
@@ -296,6 +318,7 @@ export type FrontendToBackendMsg =
   | SurfaceCreatedMsg
   | ReadyMsg
   | FontMetricsMsg
+  | GlobalShortcutMsg
   | AuthLoginMsg
   | AuthTokenMsg;
 

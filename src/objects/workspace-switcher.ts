@@ -202,8 +202,11 @@ the WorkspaceBrowser for discovering remote workspaces.
             // Tell WM to refresh the taskbar position (switcher height may have changed)
             this.send(request(this.id, this.workspaceManagerId,
               'refreshTaskbar', {}));
+            await this.notify(`Workspace "${name}" created`, 'success');
           } catch (err) {
             log.warn('Failed to create workspace:', err);
+            const msg = err instanceof Error ? err.message : String(err);
+            await this.notify(`Workspace creation failed: ${msg.slice(0, 80)}`, 'error');
           }
         }
         return;

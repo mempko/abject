@@ -7,11 +7,12 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { Job } from './job-manager.js';
 import type { ListItem } from './widgets/list-widget.js';
+import type { IconName } from '../ui/icons.js';
 
 const log = new Log('JobBrowser');
 
@@ -20,11 +21,12 @@ const JOB_BROWSER_INTERFACE: InterfaceId = 'abjects:job-browser';
 const WIN_W = 500;
 const WIN_H = 350;
 
-const STATUS_ICONS: Record<string, string> = {
-  queued:    '\u25CB',  // ○
-  running:   '\u25B8',  // ▸
-  completed: '\u2713',  // ✓
-  failed:    '\u2717',  // ✗
+/** Vector icon names for job statuses; ListWidget renders via ListItem.iconName. */
+const STATUS_ICON_NAMES: Record<string, IconName> = {
+  queued:    'dot',
+  running:   'chevronRight',
+  completed: 'check',
+  failed:    'close',
 };
 
 export class JobBrowser extends Abject {
@@ -250,7 +252,6 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
   }
 
   private formatJobItem(job: Job): ListItem {
-    const icon = STATUS_ICONS[job.status] ?? '?';
     const num = job.id.replace('job-', '');
     const queueTag = job.queue && job.queue !== 'default' ? `[${job.queue}] ` : '';
     const elapsed = job.completedAt && job.startedAt
@@ -261,9 +262,10 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
       : '';
 
     return {
-      label: `${icon} #${num} ${queueTag}${job.description}${errorSuffix}`,
+      label: `#${num} ${queueTag}${job.description}${errorSuffix}`,
       value: job.id,
       secondary: elapsed,
+      iconName: STATUS_ICON_NAMES[job.status],
     };
   }
 
@@ -287,11 +289,17 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
         destructive: true,
       });
       if (!confirmed) return;
-      if (this.jobManagerId) {
-        this.send(request(this.id, this.jobManagerId, 'clearHistory', {}));
+      this.send(event(this.id, this.clearBtnId, 'update', { busy: true }));
+      try {
+        if (this.jobManagerId) {
+          this.send(request(this.id, this.jobManagerId, 'clearHistory', {}));
+        }
+        this.jobs = [];
+        await this.rebuildList();
+        await this.notify('Job history cleared', 'success');
+      } finally {
+        this.send(event(this.id, this.clearBtnId, 'update', { busy: false }));
       }
-      this.jobs = [];
-      await this.rebuildList();
       return;
     }
 
@@ -333,6 +341,7 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
             job.status = 'failed';
             job.error = (data.error as string) ?? undefined;
             job.completedAt = Date.now();
+            await this.notify(`Job failed: ${job.description.slice(0, 60)}`, 'error');
           }
           await this.rebuildList();
           break;

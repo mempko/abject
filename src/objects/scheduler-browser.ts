@@ -8,7 +8,7 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { ScheduleEntry } from './scheduler.js';
@@ -424,6 +424,7 @@ Use Toggle to enable/disable, Delete to remove.
       const entry = this.entries[this.selectedIndex];
       if (!entry || !this.schedulerId) return;
       const method = entry.enabled ? 'disableSchedule' : 'enableSchedule';
+      if (this.toggleBtnId) this.send(event(this.id, this.toggleBtnId, 'update', { busy: true }));
       try {
         await this.request(
           request(this.id, this.schedulerId, method, { scheduleId: entry.id }),
@@ -432,8 +433,12 @@ Use Toggle to enable/disable, Delete to remove.
         entry.enabled = !entry.enabled;
         await this.rebuildList();
         await this.showDetail();
+        await this.notify(`Schedule ${entry.enabled ? 'enabled' : 'disabled'}`, 'success');
       } catch (err) {
         log.warn('Failed to toggle schedule:', err);
+        await this.notify('Toggle failed', 'error');
+      } finally {
+        if (this.toggleBtnId) this.send(event(this.id, this.toggleBtnId, 'update', { busy: false }));
       }
       return;
     }
@@ -449,6 +454,7 @@ Use Toggle to enable/disable, Delete to remove.
         destructive: true,
       });
       if (!confirmed) return;
+      if (this.deleteBtnId) this.send(event(this.id, this.deleteBtnId, 'update', { busy: true }));
       try {
         await this.request(
           request(this.id, this.schedulerId, 'removeSchedule', { scheduleId: entry.id }),
@@ -457,8 +463,12 @@ Use Toggle to enable/disable, Delete to remove.
         this.selectedIndex = -1;
         await this.loadEntries();
         await this.updateDetail('Select a schedule', '', '');
+        await this.notify('Schedule deleted', 'success');
       } catch (err) {
         log.warn('Failed to delete schedule:', err);
+        await this.notify('Delete failed', 'error');
+      } finally {
+        if (this.deleteBtnId) this.send(event(this.id, this.deleteBtnId, 'update', { busy: false }));
       }
       return;
     }

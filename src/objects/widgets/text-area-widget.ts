@@ -13,6 +13,16 @@ import { event } from '../../core/message.js';
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
 import { WidgetStyle, Rect, WIDGET_FONT, CODE_FONT, DEFAULT_LINE_HEIGHT } from './widget-types.js';
 import { tokenizeLine, type Token, type TokenType } from './handler-parser.js';
+import { wordBoundaryLeft, wordBoundaryRight, EditHistory, type EditKind } from './text-edit-helpers.js';
+
+interface AreaSnapshot {
+  text: string;
+  cursorLine: number;
+  cursorCol: number;
+  selAnchorLine: number | null;
+  selAnchorCol: number | null;
+  scrollTop: number;
+}
 
 export interface TextAreaWidgetConfig extends WidgetConfig {
   monospace?: boolean;
@@ -30,8 +40,14 @@ export class TextAreaWidget extends WidgetAbject {
   private lastClickTime = 0;
   private lastClickLine = 0;
   private lastClickCol = 0;
+  private lastClickCount = 0; // 1=single, 2=double, 3=triple
+  /** Last position 'Home' jumped to, for the smart-home toggle. */
+  private lastHomeCol = -1;
   private lastSurfaceId = '';
   private errorLine = -1; // line index to highlight as error (-1 = none)
+
+  /** Undo/redo stack. Snapshots full editor state pre-edit. */
+  private history = new EditHistory<AreaSnapshot>();
 
   constructor(config: TextAreaWidgetConfig) {
     super(config);
@@ -45,6 +61,33 @@ export class TextAreaWidget extends WidgetAbject {
 
   protected override wantsMobileKeyboard(): boolean {
     return true;
+  }
+
+  /** Capture current state for the undo stack. */
+  private snapshot(): AreaSnapshot {
+    return {
+      text: this.text,
+      cursorLine: this.cursorLine,
+      cursorCol: this.cursorCol,
+      selAnchorLine: this.selAnchorLine,
+      selAnchorCol: this.selAnchorCol,
+      scrollTop: this.scrollTop,
+    };
+  }
+
+  /** Apply a stored snapshot (undo/redo path). */
+  private restoreSnapshot(s: AreaSnapshot): void {
+    this.text = s.text;
+    this.cursorLine = s.cursorLine;
+    this.cursorCol = s.cursorCol;
+    this.selAnchorLine = s.selAnchorLine;
+    this.selAnchorCol = s.selAnchorCol;
+    this.scrollTop = s.scrollTop;
+  }
+
+  /** Push a pre-edit snapshot before mutating. Coalesces by `kind` (500 ms burst). */
+  private recordEdit(kind: EditKind): void {
+    this.history.push(this.snapshot(), kind);
   }
 
   // ── Selection helpers ──────────────────────────────────────────────
@@ -415,15 +458,29 @@ export class TextAreaWidget extends WidgetAbject {
 
     const { line: targetLine, col: targetCol } = await this.posFromClick(clickX, clickY, surfaceId);
 
+    // Multi-click tracking: same line within 400 ms increments the count.
+    // 1 = single, 2 = word select, 3 = line select.
     const now = Date.now();
-    const isDoubleClick = (now - this.lastClickTime) < 400
-      && targetLine === this.lastClickLine
-      && Math.abs(targetCol - this.lastClickCol) <= 1;
+    const sameSpot = targetLine === this.lastClickLine && Math.abs(targetCol - this.lastClickCol) <= 1;
+    if (sameSpot && (now - this.lastClickTime) < 400) {
+      this.lastClickCount = Math.min(this.lastClickCount + 1, 3);
+    } else {
+      this.lastClickCount = 1;
+    }
     this.lastClickTime = now;
     this.lastClickLine = targetLine;
     this.lastClickCol = targetCol;
 
-    if (isDoubleClick) {
+    if (this.lastClickCount === 3) {
+      // Triple-click: select the entire line (excluding the trailing newline).
+      const lines = this.text.split('\n');
+      this.selAnchorLine = targetLine;
+      this.selAnchorCol = 0;
+      this.cursorLine = targetLine;
+      this.cursorCol = (lines[targetLine] ?? '').length;
+      this.dragging = false;
+      await this.notifySelectionChanged();
+    } else if (this.lastClickCount === 2) {
       const lines = this.text.split('\n');
       const lineText = lines[targetLine] ?? '';
       const { start, end } = this.wordBoundaries(lineText, targetCol);
@@ -517,6 +574,28 @@ export class TextAreaWidget extends WidgetAbject {
       return { consumed: true };
     }
 
+    // Ctrl/Meta+Z = undo; Ctrl/Meta+Shift+Z or Ctrl+Y = redo.
+    if ((ctrl || meta) && (key === 'z' || key === 'Z') && !shift) {
+      const prev = this.history.undo(this.snapshot());
+      if (prev) {
+        this.restoreSnapshot(prev);
+        this.changed('change', this.text);
+        await this.notifySelectionChanged();
+        await this.requestRedraw();
+      }
+      return { consumed: true };
+    }
+    if ((ctrl || meta) && (((key === 'z' || key === 'Z') && shift) || key === 'y' || key === 'Y')) {
+      const next = this.history.redo(this.snapshot());
+      if (next) {
+        this.restoreSnapshot(next);
+        this.changed('change', this.text);
+        await this.notifySelectionChanged();
+        await this.requestRedraw();
+      }
+      return { consumed: true };
+    }
+
     // When disabled, block all editing keys but allow navigation/selection above
     if (this.disabled) {
       if (key === 'ArrowLeft' || key === 'ArrowRight' || key === 'ArrowUp' || key === 'ArrowDown'
@@ -530,6 +609,7 @@ export class TextAreaWidget extends WidgetAbject {
     // Ctrl+X / Meta+X: cut
     if (key === 'x' && (ctrl || meta)) {
       if (this.getSelection()) {
+        this.recordEdit('edit');
         this.deleteSelection();
         line = this.cursorLine;
         col = this.cursorCol;
@@ -542,17 +622,25 @@ export class TextAreaWidget extends WidgetAbject {
     }
 
     if (key === 'Backspace') {
+      const wordMod = ctrl || (modifiers?.alt ?? false);
       if (this.getSelection()) {
+        this.recordEdit('edit');
         this.deleteSelection();
         line = this.cursorLine;
         col = this.cursorCol;
       } else if (col > 0) {
-        lines[line] = lines[line].substring(0, col - 1) + lines[line].substring(col);
-        col--;
+        // Ctrl/Alt+Backspace deletes a word; otherwise one char.
+        const target = wordMod ? wordBoundaryLeft(lines[line], col) : col - 1;
+        this.recordEdit('delete');
+        lines[line] = lines[line].substring(0, target) + lines[line].substring(col);
+        col = target;
         this.text = lines.join('\n');
         this.cursorLine = line;
         this.cursorCol = col;
       } else if (line > 0) {
+        // At column 0: merge with previous line (ignores word modifier;
+        // joining lines is a single-step operation by convention).
+        this.recordEdit('delete');
         col = lines[line - 1].length;
         lines[line - 1] += lines[line];
         lines.splice(line, 1);
@@ -569,16 +657,21 @@ export class TextAreaWidget extends WidgetAbject {
     }
 
     if (key === 'Delete') {
+      const wordMod = ctrl || (modifiers?.alt ?? false);
       if (this.getSelection()) {
+        this.recordEdit('edit');
         this.deleteSelection();
         line = this.cursorLine;
         col = this.cursorCol;
       } else if (col < lines[line].length) {
-        lines[line] = lines[line].substring(0, col) + lines[line].substring(col + 1);
+        const target = wordMod ? wordBoundaryRight(lines[line], col) : col + 1;
+        this.recordEdit('delete');
+        lines[line] = lines[line].substring(0, col) + lines[line].substring(target);
         this.text = lines.join('\n');
         this.cursorLine = line;
         this.cursorCol = col;
       } else if (line < lines.length - 1) {
+        this.recordEdit('delete');
         lines[line] += lines[line + 1];
         lines.splice(line + 1, 1);
         this.text = lines.join('\n');
@@ -592,26 +685,33 @@ export class TextAreaWidget extends WidgetAbject {
     }
 
     if (key === 'Enter') {
+      this.recordEdit('edit');
       if (this.getSelection()) {
         this.deleteSelection();
         // Re-split after deletion
         const newLines = this.text.split('\n');
         line = this.cursorLine;
         col = this.cursorCol;
+        // Carry over the leading whitespace of the line we're splitting so
+        // continued blocks stay aligned (auto-indent).
+        const indentMatch = newLines[line].match(/^[ \t]*/);
+        const indent = indentMatch ? indentMatch[0] : '';
         const before = newLines[line].substring(0, col);
         const after = newLines[line].substring(col);
         newLines[line] = before;
-        newLines.splice(line + 1, 0, after);
+        newLines.splice(line + 1, 0, indent + after);
         line++;
-        col = 0;
+        col = indent.length;
         this.text = newLines.join('\n');
       } else {
+        const indentMatch = lines[line].match(/^[ \t]*/);
+        const indent = indentMatch ? indentMatch[0] : '';
         const before = lines[line].substring(0, col);
         const after = lines[line].substring(col);
         lines[line] = before;
-        lines.splice(line + 1, 0, after);
+        lines.splice(line + 1, 0, indent + after);
         line++;
-        col = 0;
+        col = indent.length;
         this.text = lines.join('\n');
       }
       this.cursorLine = line;
@@ -624,14 +724,60 @@ export class TextAreaWidget extends WidgetAbject {
     }
 
     if (key === 'Tab') {
-      if (this.getSelection()) {
-        this.replaceSelection('  ');
-      } else {
+      // Multi-line selection: indent (or outdent with Shift) every line in
+      // the selection. Otherwise: insert (or remove a leading) 2-space indent
+      // at the cursor.
+      const sel = this.getSelection();
+      if (sel && sel.startLine !== sel.endLine) {
+        this.recordEdit('edit');
         const indent = '  ';
-        lines[line] = lines[line].substring(0, col) + indent + lines[line].substring(col);
-        col += indent.length;
+        for (let i = sel.startLine; i <= sel.endLine; i++) {
+          if (shift) {
+            // Outdent: strip up to 2 leading spaces (or one tab) from each line.
+            if (lines[i].startsWith(indent)) lines[i] = lines[i].substring(indent.length);
+            else if (lines[i].startsWith('\t')) lines[i] = lines[i].substring(1);
+            else if (lines[i].startsWith(' '))  lines[i] = lines[i].substring(1);
+          } else {
+            lines[i] = indent + lines[i];
+          }
+        }
+        this.text = lines.join('\n');
+        // Adjust the selection bounds and cursor so the same lines remain selected.
+        const delta = shift ? -indent.length : indent.length;
+        if (this.selAnchorLine === sel.startLine) {
+          this.selAnchorCol = Math.max(0, (this.selAnchorCol ?? 0) + delta);
+        } else if (this.selAnchorLine === sel.endLine) {
+          this.selAnchorCol = Math.max(0, (this.selAnchorCol ?? 0) + delta);
+        }
+        this.cursorCol = Math.max(0, this.cursorCol + delta);
+        await this.notifySelectionChanged();
+      } else if (shift) {
+        // Shift+Tab without a multi-line selection: outdent the current line.
+        this.recordEdit('edit');
+        const indent = '  ';
+        if (lines[line].startsWith(indent)) {
+          lines[line] = lines[line].substring(indent.length);
+          col = Math.max(0, col - indent.length);
+        } else if (lines[line].startsWith('\t')) {
+          lines[line] = lines[line].substring(1);
+          col = Math.max(0, col - 1);
+        } else if (lines[line].startsWith(' ')) {
+          lines[line] = lines[line].substring(1);
+          col = Math.max(0, col - 1);
+        }
         this.text = lines.join('\n');
         this.cursorCol = col;
+      } else {
+        this.recordEdit('edit');
+        if (sel) {
+          this.replaceSelection('  ');
+        } else {
+          const indent = '  ';
+          lines[line] = lines[line].substring(0, col) + indent + lines[line].substring(col);
+          col += indent.length;
+          this.text = lines.join('\n');
+          this.cursorCol = col;
+        }
       }
       this.changed('change', this.text);
       await this.notifySelectionChanged();
@@ -640,22 +786,30 @@ export class TextAreaWidget extends WidgetAbject {
     }
 
     if (key === 'ArrowLeft') {
+      const wordMod = ctrl || (modifiers?.alt ?? false);
+      // Compute target (line, col) — word-jump operates within a single line;
+      // crossing lines still happens at column 0 (mirror of single-char move).
+      const computeLeftTarget = (): { line: number; col: number } => {
+        if (wordMod && col > 0) {
+          return { line, col: wordBoundaryLeft(lines[line], col) };
+        }
+        if (col > 0) return { line, col: col - 1 };
+        if (line > 0) return { line: line - 1, col: lines[line - 1].length };
+        return { line, col };
+      };
       if (shift) {
         if (this.selAnchorLine === null) {
           this.selAnchorLine = line;
           this.selAnchorCol = col;
         }
-        if (col > 0) {
-          col--;
-        } else if (line > 0) {
-          line--;
-          col = lines[line].length;
-        }
+        const t = computeLeftTarget();
+        line = t.line;
+        col = t.col;
         this.cursorLine = line;
         this.cursorCol = col;
         autoScroll();
         await this.notifySelectionChanged();
-      } else if (this.getSelection()) {
+      } else if (this.getSelection() && !wordMod) {
         const sel = this.getSelection()!;
         line = sel.startLine;
         col = sel.startCol;
@@ -665,7 +819,13 @@ export class TextAreaWidget extends WidgetAbject {
         autoScroll();
         await this.notifySelectionChanged();
       } else {
-        if (col > 0) {
+        if (this.selAnchorLine !== null) {
+          this.clearSelection();
+          await this.notifySelectionChanged();
+        }
+        if (wordMod && col > 0) {
+          col = wordBoundaryLeft(lines[line], col);
+        } else if (col > 0) {
           col--;
         } else if (line > 0) {
           line--;
@@ -680,22 +840,28 @@ export class TextAreaWidget extends WidgetAbject {
     }
 
     if (key === 'ArrowRight') {
+      const wordMod = ctrl || (modifiers?.alt ?? false);
+      const computeRightTarget = (): { line: number; col: number } => {
+        if (wordMod && col < lines[line].length) {
+          return { line, col: wordBoundaryRight(lines[line], col) };
+        }
+        if (col < lines[line].length) return { line, col: col + 1 };
+        if (line < lines.length - 1) return { line: line + 1, col: 0 };
+        return { line, col };
+      };
       if (shift) {
         if (this.selAnchorLine === null) {
           this.selAnchorLine = line;
           this.selAnchorCol = col;
         }
-        if (col < lines[line].length) {
-          col++;
-        } else if (line < lines.length - 1) {
-          line++;
-          col = 0;
-        }
+        const t = computeRightTarget();
+        line = t.line;
+        col = t.col;
         this.cursorLine = line;
         this.cursorCol = col;
         autoScroll();
         await this.notifySelectionChanged();
-      } else if (this.getSelection()) {
+      } else if (this.getSelection() && !wordMod) {
         const sel = this.getSelection()!;
         line = sel.endLine;
         col = sel.endCol;
@@ -705,7 +871,13 @@ export class TextAreaWidget extends WidgetAbject {
         autoScroll();
         await this.notifySelectionChanged();
       } else {
-        if (col < lines[line].length) {
+        if (this.selAnchorLine !== null) {
+          this.clearSelection();
+          await this.notifySelectionChanged();
+        }
+        if (wordMod && col < lines[line].length) {
+          col = wordBoundaryRight(lines[line], col);
+        } else if (col < lines[line].length) {
           col++;
         } else if (line < lines.length - 1) {
           line++;
@@ -792,16 +964,39 @@ export class TextAreaWidget extends WidgetAbject {
     }
 
     if (key === 'Home') {
-      if (shift) {
-        if (this.selAnchorLine === null) {
-          this.selAnchorLine = line;
-          this.selAnchorCol = col;
+      // Ctrl+Home jumps to document start. Otherwise: smart-home — first
+      // press goes to first non-whitespace char on the line, second press
+      // (cursor already there) goes to column 0.
+      if (ctrl || meta) {
+        if (shift) {
+          if (this.selAnchorLine === null) {
+            this.selAnchorLine = line;
+            this.selAnchorCol = col;
+          }
+        } else {
+          this.clearSelection();
         }
+        this.cursorLine = 0;
         this.cursorCol = 0;
+        this.scrollTop = 0;
         await this.notifySelectionChanged();
       } else {
-        this.clearSelection();
-        this.cursorCol = 0;
+        const lineText = lines[line];
+        const indentMatch = lineText.match(/^[ \t]*/);
+        const indentEnd = indentMatch ? indentMatch[0].length : 0;
+        // Smart-home target: indent edge unless cursor is already there,
+        // in which case go to column 0.
+        const target = (col === indentEnd && this.lastHomeCol === indentEnd) ? 0 : indentEnd;
+        this.lastHomeCol = target;
+        if (shift) {
+          if (this.selAnchorLine === null) {
+            this.selAnchorLine = line;
+            this.selAnchorCol = col;
+          }
+        } else {
+          this.clearSelection();
+        }
+        this.cursorCol = target;
         await this.notifySelectionChanged();
       }
       await this.requestRedraw();
@@ -809,24 +1004,42 @@ export class TextAreaWidget extends WidgetAbject {
     }
 
     if (key === 'End') {
-      if (shift) {
-        if (this.selAnchorLine === null) {
-          this.selAnchorLine = line;
-          this.selAnchorCol = col;
+      // Ctrl+End jumps to document end.
+      if (ctrl || meta) {
+        if (shift) {
+          if (this.selAnchorLine === null) {
+            this.selAnchorLine = line;
+            this.selAnchorCol = col;
+          }
+        } else {
+          this.clearSelection();
         }
-        this.cursorCol = lines[line].length;
+        this.cursorLine = lines.length - 1;
+        this.cursorCol = lines[lines.length - 1].length;
+        this.scrollTop = Math.max(0, lines.length - visibleLines);
         await this.notifySelectionChanged();
       } else {
-        this.clearSelection();
-        this.cursorCol = lines[line].length;
-        await this.notifySelectionChanged();
+        if (shift) {
+          if (this.selAnchorLine === null) {
+            this.selAnchorLine = line;
+            this.selAnchorCol = col;
+          }
+          this.cursorCol = lines[line].length;
+          await this.notifySelectionChanged();
+        } else {
+          this.clearSelection();
+          this.cursorCol = lines[line].length;
+          await this.notifySelectionChanged();
+        }
       }
+      this.lastHomeCol = -1;
       await this.requestRedraw();
       return { consumed: true };
     }
 
     // Printable character
     if (key.length === 1 && !ctrl && !meta) {
+      this.recordEdit('typing');
       if (this.getSelection()) {
         this.replaceSelection(key);
         line = this.cursorLine;
@@ -868,6 +1081,8 @@ export class TextAreaWidget extends WidgetAbject {
     if (this.disabled) return { consumed: true };
     const pasteText = (input.pasteText as string) ?? '';
     if (!pasteText) return { consumed: true };
+
+    this.recordEdit('paste');
 
     const lineHeight = this.lineHeight;
     const visibleLines = Math.floor(this.rect.height / lineHeight);
@@ -919,13 +1134,16 @@ export class TextAreaWidget extends WidgetAbject {
   protected applyUpdate(updates: Record<string, unknown>): void {
     if (updates.monospace !== undefined) this.monospace = updates.monospace as boolean;
     if (updates.errorLine !== undefined) this.errorLine = updates.errorLine as number;
-    // When text is set externally, reset cursor to start and clear selection
+    // When text is set externally, reset cursor to start and clear selection.
+    // Also drop the undo history — its snapshots reference the previous text
+    // and would surprise the user if they undid into someone else's content.
     if (updates.text !== undefined) {
       this.cursorLine = 0;
       this.cursorCol = 0;
       this.selAnchorLine = null;
       this.selAnchorCol = null;
       this.errorLine = -1; // clear error on new text
+      this.history.clear();
     }
   }
 }

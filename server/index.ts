@@ -25,6 +25,9 @@ import { WebBrowser } from '../src/objects/capabilities/web-browser.js';
 import { WebAgent } from '../src/objects/web-agent.js';
 import { WebBrowserViewer } from '../src/objects/web-browser-viewer.js';
 import { Settings } from '../src/objects/settings.js';
+import { CommandPaletteAbject } from '../src/objects/command-palette.js';
+import { NotificationCenter } from '../src/objects/notification-center.js';
+import { WindowSwitcherAbject } from '../src/objects/window-switcher.js';
 import { Taskbar } from '../src/objects/taskbar.js';
 import { AppExplorer } from '../src/objects/app-explorer.js';
 import { ObjectBrowser } from '../src/objects/object-browser.js';
@@ -381,6 +384,9 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('ObjectCreator', () => new ObjectCreator());
   runtime.objectFactory.registerConstructor('AbjectEditor', () => new AbjectEditor());
   runtime.objectFactory.registerConstructor('Settings', () => new Settings());
+  runtime.objectFactory.registerConstructor('CommandPalette', () => new CommandPaletteAbject());
+  runtime.objectFactory.registerConstructor('NotificationCenter', () => new NotificationCenter());
+  runtime.objectFactory.registerConstructor('WindowSwitcher', () => new WindowSwitcherAbject());
   runtime.objectFactory.registerConstructor('AppExplorer', () => new AppExplorer());
   runtime.objectFactory.registerConstructor('ObjectBrowser', () => new ObjectBrowser());
   runtime.objectFactory.registerConstructor('ObjectCatalog', () => new ObjectCatalog());
@@ -475,7 +481,7 @@ async function main(): Promise<void> {
       'ObjectCreator', 'Chat', 'ChatManager', 'ChatBrowser', 'AbjectEditor', 'Taskbar',
       'ScriptableAbject',
       // Per-workspace UI
-      'WorkspaceBrowser',
+      'WorkspaceBrowser', 'CommandPalette', 'NotificationCenter', 'WindowSwitcher',
     ];
     for (const name of workerEligible) {
       runtime.objectFactory.markWorkerEligible(name);
@@ -525,6 +531,9 @@ async function main(): Promise<void> {
   const httpServerId = await supervisedSpawn('HttpServer');
   const windowManagerId = await supervisedSpawn('WindowManager');
   const widgetManagerId = await supervisedSpawn('WidgetManager');
+  // CommandPalette / NotificationCenter / WindowSwitcher are per-workspace —
+  // spawned by WorkspaceManager so each instance sees its workspace's
+  // registry. See INFRA_OBJECTS / UI_OBJECTS in workspace-manager.ts.
 
   log.timed('core capabilities spawned');
 

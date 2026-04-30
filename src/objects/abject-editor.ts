@@ -21,14 +21,17 @@ import {
   type HandlerEntry,
   type EntryType,
 } from './widgets/handler-parser.js';
+import type { ListItem } from './widgets/list-widget.js';
+import type { IconName } from '../ui/icons.js';
 
 const ABJECT_EDITOR_INTERFACE: InterfaceId = 'abjects:abject-editor' as InterfaceId;
 
-// Icons for entry types in the handler list
-const ICON: Record<EntryType, string> = {
-  property: '\u25B8',  // small right triangle
-  handler:  '\u25CF',  // filled circle
-  helper:   '\u25C6',  // filled diamond
+// Vector icons for entry types in the handler list. ListWidget renders
+// these via ListItem.iconName so they re-tint with the active theme.
+const ICON_NAMES: Record<EntryType, IconName> = {
+  property: 'chevronRight',
+  handler:  'dot',
+  helper:   'plus',
 };
 
 export class AbjectEditor extends Abject {
@@ -361,11 +364,12 @@ export class AbjectEditor extends Abject {
 
   // ── List Items ───────────────────────────────────────────────────────
 
-  private buildListItems(): Array<{ label: string; value: string; secondary?: string }> {
+  private buildListItems(): ListItem[] {
     return this.entries.map((entry, i) => ({
-      label: `${ICON[entry.type]} ${entry.name}`,
+      label: entry.name,
       value: String(i),
       secondary: entry.type === 'property' ? 'prop' : entry.type === 'helper' ? 'fn' : 'msg',
+      iconName: ICON_NAMES[entry.type],
     }));
   }
 
@@ -532,16 +536,21 @@ export class AbjectEditor extends Abject {
             }
           } catch { /* persist not critical for apply */ }
           await this.updateStatus('Saved and persisted', this.theme.statusSuccess);
+          await this.notify('Source saved and persisted', 'success');
         } else {
-          await this.updateStatus(persist ? 'Applied (store unavailable)' : 'Applied (not persisted)', this.theme.statusSuccess);
+          const msg = persist ? 'Applied (store unavailable)' : 'Applied (not persisted)';
+          await this.updateStatus(msg, this.theme.statusSuccess);
+          await this.notify(msg, persist ? 'warning' : 'success');
         }
       } else {
         await this.updateStatus(`**Error:** ${result.error ?? 'Unknown'}`, this.theme.statusError);
         await this.highlightErrorLine(source, result.errorLine, result.error);
+        await this.notify(`Compile error: ${(result.error ?? 'Unknown').slice(0, 80)}`, 'error');
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await this.updateStatus(`**Error:** ${msg}`, this.theme.statusError);
+      await this.notify(`Save failed: ${msg.slice(0, 80)}`, 'error');
     }
     await this.setControlsDisabled(false);
   }

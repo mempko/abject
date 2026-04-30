@@ -335,7 +335,9 @@ export class LabelWidget extends WidgetAbject {
     const textPadding = 4;
 
     const layout = await this.getRichLayout(surfaceId, text, w, fontSize, fill);
-    const sel = this.style.selectable && this.focused ? this.getSelection() : null;
+    // Show the selection regardless of focus; otherwise the highlight blinks
+    // away the moment the user moves focus to copy or click elsewhere.
+    const sel = this.style.selectable ? this.getSelection() : null;
 
     // Clip to prevent overflow
     commands.push({ type: 'save', surfaceId, params: {} });
@@ -525,10 +527,16 @@ export class LabelWidget extends WidgetAbject {
         params: { x: ox, y: oy, width: w, height: h },
       });
 
-      // Compute selection line/col positions for highlight
+      // Compute selection line/col positions for highlight.
+      // We intentionally don't gate on `this.focused` — once the user has
+      // selected text they expect the highlight to remain visible while
+      // they move the mouse over to a Copy button, switch focus to a
+      // sibling, etc. A future "dim selection while unfocused" tweak can
+      // multiply the fill alpha; right now keeping the selection visible
+      // is the more important fix.
       let selStart: { line: number; col: number } | null = null;
       let selEnd: { line: number; col: number } | null = null;
-      if (sel && this.focused) {
+      if (sel) {
         selStart = this.textPosToWrapped(lines, sel.start);
         selEnd = this.textPosToWrapped(lines, sel.end);
       }
@@ -620,8 +628,9 @@ export class LabelWidget extends WidgetAbject {
     } else {
       // Single-line rendering
 
-      // Selection highlight (single-line)
-      if (sel && this.focused) {
+      // Selection highlight (single-line). Same focus-gate removal as
+      // the wrapped path above.
+      if (sel) {
         const beforeStart = this.text.substring(0, sel.start);
         const beforeEnd = this.text.substring(0, sel.end);
         const startX = ox + (beforeStart.length > 0

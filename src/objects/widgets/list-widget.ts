@@ -9,11 +9,19 @@
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
 import { WIDGET_FONT, lightenColor } from './widget-types.js';
+import { iconCommands, IconName } from '../../ui/icons.js';
 
 export interface ListItem {
   label: string;
   value: string;
   secondary?: string;
+  /**
+   * Optional vector icon drawn at the row's leading edge — used by
+   * status-style lists (jobs, agents, schedules) to replace ASCII glyphs.
+   */
+  iconName?: IconName;
+  /** Override icon color; defaults to theme.textSecondary. */
+  iconColor?: string;
 }
 
 export interface ListWidgetConfig extends WidgetConfig {
@@ -237,9 +245,25 @@ export class ListWidget extends WidgetAbject {
         });
       }
 
+      // Optional leading icon (status indicator). Drawn before the label so
+      // we can shift the text origin right by iconSize+pad.
+      const iconSize = item.iconName ? Math.min(14, this.itemHeight - 8) : 0;
+      const iconPad = item.iconName ? 8 : 0;
+      const textX = ox + 10 + iconSize + iconPad;
+      if (item.iconName) {
+        const iconColor = item.iconColor ?? (isSelected ? this.theme.accent : this.theme.textSecondary);
+        commands.push(...iconCommands(item.iconName, {
+          surfaceId,
+          x: ox + 10,
+          y: itemY + (this.itemHeight - iconSize) / 2,
+          size: iconSize,
+          color: iconColor,
+        }));
+      }
+
       // Label + secondary as a single truncated line
       const labelColor = isSelected ? this.theme.accent : this.theme.textPrimary;
-      const maxTextWidth = w - 24;
+      const maxTextWidth = w - (textX - ox) - 14;
       const secondary = item.secondary ?? '';
       const fullText = secondary ? `${item.label}  ${secondary}` : item.label;
       const displayText = await this.truncateWithEllipsis(surfaceId, fullText, maxTextWidth, font);
@@ -254,7 +278,7 @@ export class ListWidget extends WidgetAbject {
           type: 'text',
           surfaceId,
           params: {
-            x: ox + 10, y: itemY + this.itemHeight / 2,
+            x: textX, y: itemY + this.itemHeight / 2,
             text: labelPrefix + separator,
             font,
             fill: labelColor,
@@ -267,7 +291,7 @@ export class ListWidget extends WidgetAbject {
           type: 'text',
           surfaceId,
           params: {
-            x: ox + 10 + labelPartWidth, y: itemY + this.itemHeight / 2,
+            x: textX + labelPartWidth, y: itemY + this.itemHeight / 2,
             text: secondaryPart,
             font: secondaryFont,
             fill: this.theme.textTertiary,
@@ -280,7 +304,7 @@ export class ListWidget extends WidgetAbject {
           type: 'text',
           surfaceId,
           params: {
-            x: ox + 10, y: itemY + this.itemHeight / 2,
+            x: textX, y: itemY + this.itemHeight / 2,
             text: displayText,
             font,
             fill: labelColor,
@@ -368,6 +392,7 @@ export class ListWidget extends WidgetAbject {
             index: this.selectedIndex,
             value: item.value,
             label: item.label,
+            via: 'click',
           }));
         }
       }

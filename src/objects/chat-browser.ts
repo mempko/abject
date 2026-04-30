@@ -24,8 +24,6 @@ const ONBOARDING_KEY = 'chat-browser:seen-onboarding';
 
 const OVERVIEW_W = 440;
 const OVERVIEW_H = 520;
-const OVERVIEW_PADDING = 16;
-const OVERVIEW_SPACING = 8;
 const ROW_H = 44;
 const HEADER_BTN_H = 40;
 
@@ -166,7 +164,11 @@ export class ChatBrowser extends Abject {
     if (!this.chatManagerId) return;
     try {
       await this.request(request(this.id, this.chatManagerId, 'deleteConversation', { conversationId }), 5000);
-    } catch (err) { log.warn(`deleteConversation failed: ${String(err)}`); }
+      await this.notify('Conversation deleted', 'success');
+    } catch (err) {
+      log.warn(`deleteConversation failed: ${String(err)}`);
+      await this.notify('Delete failed', 'error');
+    }
   }
 
   private async fetchRoster(): Promise<PersistedConversation[]> {
@@ -239,8 +241,8 @@ export class ChatBrowser extends Abject {
     this.rootLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createVBox', {
         windowId: this.windowId,
-        margins: { top: OVERVIEW_PADDING, right: OVERVIEW_PADDING, bottom: OVERVIEW_PADDING, left: OVERVIEW_PADDING },
-        spacing: OVERVIEW_SPACING,
+        margins: { top: this.theme.tokens.space.xl, right: this.theme.tokens.space.xl, bottom: this.theme.tokens.space.xl, left: this.theme.tokens.space.xl },
+        spacing: this.theme.tokens.space.md,
       })
     );
 
@@ -291,7 +293,7 @@ export class ChatBrowser extends Abject {
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: OVERVIEW_SPACING,
+        spacing: this.theme.tokens.space.md,
       })
     );
 

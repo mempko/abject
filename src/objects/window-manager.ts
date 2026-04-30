@@ -147,6 +147,28 @@ export class WindowManager extends Abject {
                 ],
                 returns: { kind: 'object', properties: { grab: { kind: 'primitive', primitive: 'boolean' } } },
               },
+              {
+                name: 'listOpenWindows',
+                description: 'List currently visible (non-minimized, non-chromeless) windows for switcher UI.',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'object', properties: {
+                  surfaceId: { kind: 'primitive', primitive: 'string' },
+                  windowId: { kind: 'primitive', primitive: 'string' },
+                  title: { kind: 'primitive', primitive: 'string' },
+                  workspaceId: { kind: 'primitive', primitive: 'string' },
+                  zIndex: { kind: 'primitive', primitive: 'number' },
+                } } },
+              },
+              {
+                name: 'getCursorAt',
+                description: 'Compute the CSS cursor hint for the given surface-local point. Returns "default" when the point is outside any registered window or in non-interactive content.',
+                parameters: [
+                  { name: 'surfaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Surface ID' },
+                  { name: 'localX', type: { kind: 'primitive', primitive: 'number' }, description: 'Mouse X in surface-local coords' },
+                  { name: 'localY', type: { kind: 'primitive', primitive: 'number' }, description: 'Mouse Y in surface-local coords' },
+                ],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
             ],
           },
         requiredCapabilities: [],
@@ -341,6 +363,63 @@ export class WindowManager extends Abject {
       return true;
     });
 
+    this.on('listOpenWindows', async (msg: AbjectMessage) => {
+      const { workspaceId: filter } = (msg.payload ?? {}) as { workspaceId?: string };
+      const out: Array<{ surfaceId: string; windowId: AbjectId; title: string; workspaceId?: string; zIndex: number }> = [];
+      for (const [surfaceId, info] of this.windows) {
+        if (info.minimized) continue;
+        if (info.chromeless) continue;
+        // If the caller passed a workspace filter, only include windows in
+        // that workspace (plus system-scoped windows that have no workspaceId).
+        if (filter && info.workspaceId && info.workspaceId !== filter) continue;
+        out.push({
+          surfaceId,
+          windowId: info.windowId,
+          title: info.title || 'Untitled',
+          workspaceId: info.workspaceId,
+          zIndex: info.zIndex,
+        });
+      }
+      // Sort top-most first so the user sees recently-active windows at the top.
+      out.sort((a, b) => b.zIndex - a.zIndex);
+      return out;
+    });
+
+    this.on('getCursorAt', async (msg: AbjectMessage) => {
+      const { surfaceId, localX, localY } = msg.payload as {
+        surfaceId: string; localX: number; localY: number;
+      };
+      return this.computeCursorAt(surfaceId, localX, localY);
+    });
+
+  }
+
+  /**
+   * Map a surface-local point to a CSS cursor string. Resize edges win
+   * over title-bar zones (the user is more likely to want to grab a
+   * corner than to start a drag at the very edge of the title bar).
+   */
+  private computeCursorAt(surfaceId: string, localX: number, localY: number): string {
+    const info = this.windows.get(surfaceId);
+    if (!info) return 'default';
+
+    const edge = this.detectResizeEdge(info, localX, localY);
+    if (edge) {
+      switch (edge) {
+        case 'n': case 's': return 'ns-resize';
+        case 'e': case 'w': return 'ew-resize';
+        case 'ne': case 'sw': return 'nesw-resize';
+        case 'nw': case 'se': return 'nwse-resize';
+      }
+    }
+
+    if (!info.chromeless && localY < info.titleBarHeight) {
+      // Over a title-bar button → pointer; over the bar itself → move
+      const btn = this.detectTitleButton(info, localX, localY);
+      return btn ? 'pointer' : 'move';
+    }
+
+    return 'default';
   }
 
   protected override askPrompt(_question: string): string {

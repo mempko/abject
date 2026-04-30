@@ -7,7 +7,7 @@
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 
@@ -1085,6 +1085,7 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
           })
         );
       }
+      await this.notify('Workspace name cannot be empty', 'warning');
       await this.setControlsDisabled(false, [this.saveBtnId, this.workspaceNameInputId]);
       return;
     }
@@ -1163,6 +1164,7 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
       );
       await new Promise((resolve) => setTimeout(resolve, 800));
     }
+    await this.notify('Workspace settings saved', 'success');
     await this.hide();
   }
 
@@ -1342,19 +1344,23 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     });
     if (!confirmed) return;
 
+    if (this.deleteWorkspaceBtnId) {
+      this.send(event(this.id, this.deleteWorkspaceBtnId, 'update', { busy: true }));
+    }
     try {
       await this.request(
         request(this.id, this.workspaceManagerId, 'deleteWorkspace', { workspaceId: this.workspaceId })
       );
+      await this.notify(`Workspace "${workspaceName}" deleted`, 'success');
       await this.hide();
     } catch (err) {
       // Guard: if Settings was killed mid-handler (e.g. workspace deletion destroyed us),
       // don't attempt requests on a stopped object.
       if (this._status === 'stopped') return;
+      const msg = err instanceof Error ? err.message : String(err);
       // Last workspace can't be deleted
       if (this.statusLabelId) {
         try {
-          const msg = err instanceof Error ? err.message : String(err);
           await this.request(
             request(this.id, this.statusLabelId, 'update', {
               text: msg.slice(0, 60),
@@ -1362,6 +1368,10 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
             })
           );
         } catch { /* widget may be gone */ }
+      }
+      await this.notify(`Delete failed: ${msg.slice(0, 80)}`, 'error');
+      if (this.deleteWorkspaceBtnId) {
+        this.send(event(this.id, this.deleteWorkspaceBtnId, 'update', { busy: false }));
       }
     }
   }

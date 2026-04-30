@@ -837,10 +837,14 @@ export class AppExplorer extends Abject {
   private async deleteObject(objectId: AbjectId): Promise<void> {
     if (!this.factoryId) return;
 
+    let ok = true;
     try {
       await this.request(request(this.id, this.factoryId,
         'kill', { objectId }));
-    } catch { /* object may already be gone */ }
+    } catch {
+      ok = false; /* object may already be gone */
+    }
+    await this.notify(ok ? 'Object deleted' : 'Delete failed', ok ? 'success' : 'error');
 
     this.cachedObjects = await this.registryList();
 
