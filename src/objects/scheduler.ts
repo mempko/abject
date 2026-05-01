@@ -32,6 +32,12 @@ export interface ScheduleEntry {
   minute?: number;
   /** IANA timezone (e.g. "America/Los_Angeles"). Defaults to local. */
   timezone?: string;
+  /**
+   * Absolute unix-ms timestamp for one-shot schedules. When set (and
+   * `intervalMs`/`hour` are not), the entry fires once at this time and
+   * is deleted from the registry. Use `addScheduleOnce` to create.
+   */
+  runAt?: number;
   /** JavaScript code to run in JobManager sandbox when the schedule fires. */
   jobCode: string;
   /** JobManager queue name. */
@@ -58,9 +64,11 @@ export class Scheduler extends Abject {
         name: 'Scheduler',
         description:
           'The system scheduler for all recurring and timed tasks. Use this to run code every N minutes/hours, ' +
-          'at a specific time daily, or on any repeating schedule. Handles "every minute do X", "every day at 6:30PM do Y", ' +
+          'at a specific time daily, once at a specific date+time, or on any repeating schedule. Handles ' +
+          '"every minute do X", "every day at 6:30PM do Y", "next Tuesday at 9am do Z once", ' +
           'and all periodic/recurring/scheduled/timed automation. When a schedule fires, the code runs as a Job. ' +
-          'Use cases: say hello every minute, daily briefings, periodic data checks, recurring automation, timed reminders.',
+          'Use cases: say hello every minute, daily briefings, periodic data checks, recurring automation, ' +
+          'timed reminders, one-off appointments.',
         version: '1.0.0',
         interface: {
           id: SCHEDULER_INTERFACE,
@@ -86,6 +94,17 @@ export class Scheduler extends Abject {
                 { name: 'hour', type: { kind: 'primitive', primitive: 'number' }, description: 'Hour (0-23)' },
                 { name: 'minute', type: { kind: 'primitive', primitive: 'number' }, description: 'Minute (0-59)' },
                 { name: 'timezone', type: { kind: 'primitive', primitive: 'string' }, description: 'IANA timezone (e.g. "America/Los_Angeles"). Defaults to local.', optional: true },
+                { name: 'jobCode', type: { kind: 'primitive', primitive: 'string' }, description: 'JavaScript code to run in JobManager sandbox' },
+                { name: 'queue', type: { kind: 'primitive', primitive: 'string' }, description: 'JobManager queue name', optional: true },
+              ],
+              returns: { kind: 'object', properties: { scheduleId: { kind: 'primitive', primitive: 'string' } } },
+            },
+            {
+              name: 'addScheduleOnce',
+              description: 'Register a one-shot schedule that fires once at a specific date+time, then auto-deletes',
+              parameters: [
+                { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'Human-readable description' },
+                { name: 'runAt', type: { kind: 'primitive', primitive: 'number' }, description: 'Absolute unix-ms timestamp to fire at (e.g. Date.parse("2026-05-15T14:30:00-07:00"))' },
                 { name: 'jobCode', type: { kind: 'primitive', primitive: 'string' }, description: 'JavaScript code to run in JobManager sandbox' },
                 { name: 'queue', type: { kind: 'primitive', primitive: 'string' }, description: 'JobManager queue name', optional: true },
               ],
@@ -233,6 +252,37 @@ export class Scheduler extends Abject {
       return { scheduleId: id };
     });
 
+    this.on('addScheduleOnce', async (msg: AbjectMessage) => {
+      const { description, runAt, jobCode, queue } = msg.payload as {
+        description: string; runAt: number; jobCode: string; queue?: string;
+      };
+      requireNonEmpty(description, 'description');
+      precondition(typeof runAt === 'number' && isFinite(runAt), 'runAt must be a number (unix ms)');
+      requireNonEmpty(jobCode, 'jobCode');
+
+      // Deduplicate: if the same one-shot (runAt + jobCode) already
+      // exists, return its id. Tolerates a 1-minute jitter window since
+      // tick precision is 60s anyway.
+      const existing = this.findDuplicate({ runAt, jobCode });
+      if (existing) {
+        log.info(`One-shot schedule already exists for this runAt + jobCode (${existing.id}) — returning existing id`);
+        return { scheduleId: existing.id };
+      }
+
+      const id = `sched-${++this.entryCounter}`;
+      const now = Date.now();
+      const entry: ScheduleEntry = {
+        id, description, runAt, jobCode, queue,
+        enabled: true, lastRun: 0, nextRun: runAt,
+        createdAt: now, owner: msg.routing.from as string,
+      };
+      this.entries.set(id, entry);
+      await this.persistToStorage();
+      this.changed('scheduleAdded', { scheduleId: id, description });
+      log.info(`Added one-shot schedule "${description}" at ${new Date(runAt).toISOString()} -> ${id}`);
+      return { scheduleId: id };
+    });
+
     this.on('removeSchedule', async (msg: AbjectMessage) => {
       const { scheduleId } = msg.payload as { scheduleId: string };
       const deleted = this.entries.delete(scheduleId);
@@ -299,6 +349,7 @@ export class Scheduler extends Abject {
   private async tick(): Promise<void> {
     const now = Date.now();
     let dirty = false;
+    const toDelete: string[] = [];
 
     for (const entry of this.entries.values()) {
       if (!entry.enabled) continue;
@@ -326,10 +377,19 @@ export class Scheduler extends Abject {
         entry.nextRun = now + entry.intervalMs;
       } else if (entry.hour !== undefined && entry.minute !== undefined) {
         entry.nextRun = this.computeNextDailyRun(entry.hour, entry.minute, entry.timezone);
+      } else if (entry.runAt !== undefined) {
+        // One-shot: fire-once-and-delete. The job-submit above ran
+        // whether or not it succeeded; either way we don't fire again.
+        toDelete.push(entry.id);
       }
 
       dirty = true;
       this.changed('scheduleFired', { scheduleId: entry.id, description: entry.description });
+    }
+
+    for (const id of toDelete) {
+      this.entries.delete(id);
+      this.changed('scheduleRemoved', { scheduleId: id });
     }
 
     if (dirty) {
@@ -352,8 +412,10 @@ export class Scheduler extends Abject {
     hour?: number;
     minute?: number;
     timezone?: string;
+    runAt?: number;
     jobCode: string;
   }): ScheduleEntry | undefined {
+    const RUN_AT_TOLERANCE_MS = 60_000;
     for (const entry of this.entries.values()) {
       if (entry.jobCode !== criteria.jobCode) continue;
       if (criteria.intervalMs !== undefined) {
@@ -364,6 +426,13 @@ export class Scheduler extends Abject {
         if (entry.hour === criteria.hour
             && entry.minute === criteria.minute
             && (entry.timezone ?? undefined) === (criteria.timezone ?? undefined)) {
+          return entry;
+        }
+        continue;
+      }
+      if (criteria.runAt !== undefined) {
+        if (entry.runAt !== undefined
+            && Math.abs(entry.runAt - criteria.runAt) <= RUN_AT_TOLERANCE_MS) {
           return entry;
         }
       }
@@ -448,24 +517,39 @@ export class Scheduler extends Abject {
         log.info(`Loaded ${this.entries.size} schedule entries from storage`);
 
         // Clean up duplicates accumulated from previous sessions.
-        // Keys by jobCode + schedule identity (intervalMs OR hour/minute/timezone).
+        // Keys by jobCode + schedule identity (interval / daily / one-shot).
         // Keeps the oldest entry, drops the rest.
         const seen = new Map<string, ScheduleEntry>();
         const toRemove: string[] = [];
         const sorted = [...this.entries.values()].sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
         for (const entry of sorted) {
-          const key = entry.intervalMs !== undefined
-            ? `interval:${entry.intervalMs}:${entry.jobCode}`
-            : `daily:${entry.hour}:${entry.minute}:${entry.timezone ?? ''}:${entry.jobCode}`;
+          let key: string;
+          if (entry.intervalMs !== undefined) {
+            key = `interval:${entry.intervalMs}:${entry.jobCode}`;
+          } else if (entry.runAt !== undefined) {
+            key = `once:${entry.runAt}:${entry.jobCode}`;
+          } else {
+            key = `daily:${entry.hour}:${entry.minute}:${entry.timezone ?? ''}:${entry.jobCode}`;
+          }
           if (seen.has(key)) {
             toRemove.push(entry.id);
           } else {
             seen.set(key, entry);
           }
         }
+
+        // Drop one-shot entries that have already fired and somehow
+        // survived (e.g. the process died between fire and persist).
+        // `lastRun > 0` means it ran at least once.
+        for (const entry of this.entries.values()) {
+          if (entry.runAt !== undefined && entry.lastRun > 0 && !toRemove.includes(entry.id)) {
+            toRemove.push(entry.id);
+          }
+        }
+
         if (toRemove.length > 0) {
           for (const id of toRemove) this.entries.delete(id);
-          log.info(`Dedup: removed ${toRemove.length} duplicate schedule(s) on load`);
+          log.info(`Dedup: removed ${toRemove.length} duplicate / spent schedule(s) on load`);
           await this.persistToStorage();
         }
       }
@@ -482,7 +566,11 @@ export class Scheduler extends Abject {
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## Scheduler Usage Guide
 
-Use the Scheduler for ALL recurring/periodic/timed tasks. Do NOT create new objects for scheduling. Call Scheduler.addSchedule or Scheduler.addScheduleAt to register job code that runs on a timer.
+Use the Scheduler for ALL recurring/periodic/timed tasks AND one-shot future tasks. Do NOT create new objects for scheduling. Pick the method by the schedule shape:
+
+- \`addSchedule\`     — repeats every N ms forever
+- \`addScheduleAt\`   — repeats daily at HH:MM (optional timezone)
+- \`addScheduleOnce\` — fires once at an absolute date+time, then auto-deletes
 
 ### Simple example: post to chat every minute
 
@@ -510,6 +598,17 @@ Use the Scheduler for ALL recurring/periodic/timed tasks. Do NOT create new obje
     jobCode: 'const gm = await dep("GoalManager"); const ts = await dep("TupleSpace"); const r = await call(gm, "createGoal", { title: "Daily weather briefing" }); await call(ts, "put", { namespace: r.goalId, fields: { type: "task", status: "pending", goalId: r.goalId, description: "Fetch weather and news for daily briefing" } }); return r;',
   });
 
+### Add a one-shot schedule (fires once at a specific date+time, then auto-deletes)
+
+  const runAt = Date.parse('2026-05-15T14:30:00-07:00'); // unix-ms timestamp
+  const { scheduleId } = await call(await dep('Scheduler'), 'addScheduleOnce', {
+    description: 'Remind me about the dentist appointment',
+    runAt,
+    jobCode: 'const chat = await find("Chat"); await call(chat, "addNotification", { sender: "Scheduler", message: "Dentist appointment in 30 minutes" });',
+  });
+  // Pass any absolute timestamp: Date.parse(...), Date.UTC(...), Date.now() + delayMs, etc.
+  // The entry persists across restarts. After firing it is removed from listSchedules automatically.
+
 ### Manage schedules
 
   await call(await dep('Scheduler'), 'disableSchedule', { scheduleId: 'sched-1' });
@@ -519,7 +618,7 @@ Use the Scheduler for ALL recurring/periodic/timed tasks. Do NOT create new obje
 ### List all schedules
 
   const schedules = await call(await dep('Scheduler'), 'listSchedules', {});
-  // schedules: [{ id, description, intervalMs?, hour?, minute?, timezone?, enabled, lastRun, nextRun }]
+  // schedules: [{ id, description, intervalMs?, hour?, minute?, timezone?, runAt?, enabled, lastRun, nextRun }]
 
 ### Job Code
 
@@ -543,7 +642,8 @@ For longer work, dispatch through GoalManager + TupleSpace so an agent picks it 
 - Schedules persist across restarts (saved to Storage)
 - Job code runs in a sandboxed environment -- no require, fetch, setTimeout
 - The Scheduler ticks every 60 seconds -- schedules have ~1 minute precision
-- For daily schedules, timezone defaults to local if not specified`;
+- For daily schedules, timezone defaults to local if not specified
+- One-shot schedules (\`addScheduleOnce\`) auto-delete after firing; if a runAt is in the past, it fires on the next tick and then deletes`;
   }
 
   protected override async handleAsk(question: string): Promise<string> {
@@ -556,9 +656,14 @@ For longer work, dispatch through GoalManager + TupleSpace so an agent picks it 
     prompt += `${entries.length} total, ${enabled.length} enabled.\n`;
     if (entries.length > 0) {
       for (const e of entries) {
-        const timing = e.intervalMs
-          ? `every ${e.intervalMs < 60000 ? Math.round(e.intervalMs / 1000) + 's' : e.intervalMs < 3600000 ? Math.round(e.intervalMs / 60000) + 'm' : (e.intervalMs / 3600000).toFixed(1) + 'h'}`
-          : `daily at ${String(e.hour ?? 0).padStart(2, '0')}:${String(e.minute ?? 0).padStart(2, '0')} ${e.timezone ?? 'local'}`;
+        let timing: string;
+        if (e.intervalMs) {
+          timing = `every ${e.intervalMs < 60000 ? Math.round(e.intervalMs / 1000) + 's' : e.intervalMs < 3600000 ? Math.round(e.intervalMs / 60000) + 'm' : (e.intervalMs / 3600000).toFixed(1) + 'h'}`;
+        } else if (e.runAt !== undefined) {
+          timing = `once at ${new Date(e.runAt).toISOString()}`;
+        } else {
+          timing = `daily at ${String(e.hour ?? 0).padStart(2, '0')}:${String(e.minute ?? 0).padStart(2, '0')} ${e.timezone ?? 'local'}`;
+        }
         const status = e.enabled ? 'enabled' : 'disabled';
         prompt += `- ${e.description} (${timing}, ${status})\n`;
       }

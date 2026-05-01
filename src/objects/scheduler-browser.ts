@@ -349,9 +349,14 @@ Use Toggle to enable/disable, Delete to remove.
 
   private formatListItem(entry: ScheduleEntry): ListItem {
     const icon = STATUS_ICONS[entry.enabled ? 'enabled' : 'disabled'];
-    const timing = entry.intervalMs
-      ? this.formatInterval(entry.intervalMs)
-      : `${String(entry.hour ?? 0).padStart(2, '0')}:${String(entry.minute ?? 0).padStart(2, '0')} ${entry.timezone ?? 'local'}`;
+    let timing: string;
+    if (entry.intervalMs) {
+      timing = this.formatInterval(entry.intervalMs);
+    } else if (entry.runAt !== undefined) {
+      timing = `once @ ${new Date(entry.runAt).toLocaleString()}`;
+    } else {
+      timing = `${String(entry.hour ?? 0).padStart(2, '0')}:${String(entry.minute ?? 0).padStart(2, '0')} ${entry.timezone ?? 'local'}`;
+    }
     return {
       label: `${icon} ${entry.description}`,
       value: entry.id,
@@ -380,9 +385,14 @@ Use Toggle to enable/disable, Delete to remove.
       return;
     }
 
-    const timing = entry.intervalMs
-      ? `**Interval:** ${this.formatInterval(entry.intervalMs)}`
-      : `**Daily at:** ${String(entry.hour ?? 0).padStart(2, '0')}:${String(entry.minute ?? 0).padStart(2, '0')} ${entry.timezone ?? 'local'}`;
+    let timing: string;
+    if (entry.intervalMs) {
+      timing = `**Interval:** ${this.formatInterval(entry.intervalMs)}`;
+    } else if (entry.runAt !== undefined) {
+      timing = `**Once at:** ${new Date(entry.runAt).toLocaleString()} (auto-deletes after firing)`;
+    } else {
+      timing = `**Daily at:** ${String(entry.hour ?? 0).padStart(2, '0')}:${String(entry.minute ?? 0).padStart(2, '0')} ${entry.timezone ?? 'local'}`;
+    }
 
     const lastRun = entry.lastRun > 0 ? new Date(entry.lastRun).toLocaleString() : 'Never';
     const nextRun = entry.nextRun > 0 ? new Date(entry.nextRun).toLocaleString() : 'Unknown';
