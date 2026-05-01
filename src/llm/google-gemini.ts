@@ -13,6 +13,7 @@ import {
   LLMMessage,
   LLMCompletionOptions,
   LLMCompletionResult,
+  LLMProviderDescription,
   LLMStreamChunk,
   ModelTier,
   ModelInfo,
@@ -127,6 +128,23 @@ export class GeminiProvider extends BaseLLMProvider {
         { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
       ];
     }
+  }
+
+  override describe(): LLMProviderDescription {
+    return {
+      id: 'gemini',
+      label: 'Gemini',
+      storageSuffix: 'geminiApiKey',
+      credentialMode: 'apiKey',
+      credentialLabel: 'Google Gemini API Key',
+      credentialPlaceholder: 'AIza...',
+      models: [
+        { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro' },
+        { id: 'gemini-3.1-flash', name: 'Gemini 3.1 Flash' },
+        { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
+      ],
+      defaultTierModels: GeminiProvider.TIER_MODELS,
+    };
   }
 
   async complete(

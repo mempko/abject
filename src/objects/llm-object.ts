@@ -11,6 +11,7 @@ import * as msg from '../core/message.js';
 import { event } from '../core/message.js';
 import {
   LLMProvider,
+  LLMProviderDescription,
   FetchDelegate,
   FetchResult,
   LLMMessage,
@@ -31,6 +32,8 @@ export interface TierConfig {
 export type TierRouting = Partial<Record<ModelTier, TierConfig>>;
 import { AnthropicProvider } from '../llm/anthropic.js';
 import { OpenAIProvider } from '../llm/openai.js';
+import { ClaudeCliProvider } from '../llm/claude-cli.js';
+import { CodexCliProvider } from '../llm/codex-cli.js';
 import { OllamaProvider } from '../llm/ollama.js';
 import { OpenRouterProvider } from '../llm/openrouter.js';
 import { DeepSeekProvider } from '../llm/deepseek.js';
@@ -232,6 +235,15 @@ export class LLMObject extends Abject {
                 },
               },
               {
+                name: 'listProviderDescriptions',
+                description: 'List self-describing UI metadata for every known provider type (id, label, credential mode, default models, …). Returns descriptions for all known providers regardless of credential state, so settings UIs can render the full provider list before configure().',
+                parameters: [],
+                returns: {
+                  kind: 'array',
+                  elementType: { kind: 'reference', reference: 'LLMProviderDescription' },
+                },
+              },
+              {
                 name: 'setProvider',
                 description: 'Set the default provider',
                 parameters: [
@@ -420,6 +432,10 @@ export class LLMObject extends Abject {
       return this.listProviders();
     });
 
+    this.on('listProviderDescriptions', async () => {
+      return this.listProviderDescriptions();
+    });
+
     this.on('setProvider', async (msg: AbjectMessage) => {
       const { name } = msg.payload as { name: string };
       return this.setDefaultProvider(name);
@@ -427,15 +443,7 @@ export class LLMObject extends Abject {
 
     this.on('configure', async (msg: AbjectMessage) => {
       const config = msg.payload as {
-        anthropicApiKey?: string;
-        openaiApiKey?: string;
-        ollamaUrl?: string;
-        openrouterApiKey?: string;
-        deepseekApiKey?: string;
-        grokApiKey?: string;
-        geminiApiKey?: string;
-        kimiApiKey?: string;
-        minimaxApiKey?: string;
+        credentials?: Record<string, string>;
         tierRouting?: TierRouting;
       };
       await this.configure(config);
@@ -588,75 +596,44 @@ export class LLMObject extends Abject {
    * All providers with valid credentials are registered simultaneously.
    */
   async configure(config: {
-    anthropicApiKey?: string;
-    openaiApiKey?: string;
-    ollamaUrl?: string;
-    openrouterApiKey?: string;
-    deepseekApiKey?: string;
-    grokApiKey?: string;
-    geminiApiKey?: string;
-    kimiApiKey?: string;
-    minimaxApiKey?: string;
+    credentials?: Record<string, string>;
     tierRouting?: TierRouting;
   }): Promise<void> {
     const fetchFn = this.httpClientId ? this.createFetchDelegate() : undefined;
+    const credentials = config.credentials ?? {};
 
-    if (config.anthropicApiKey) {
-      this.registerProvider(
-        new AnthropicProvider({ apiKey: config.anthropicApiKey, fetchFn })
-      );
+    // CLI providers — top-level entries in the registry alongside the API
+    // ones. Always registered; their own `isAvailable()` reports whether
+    // the binary is on PATH. Routing to an unreachable CLI surfaces a
+    // clear error toast at call time.
+    this.registerProvider(new ClaudeCliProvider());
+    this.registerProvider(new CodexCliProvider());
+
+    // API-key-credentialed providers, registered when a key is present.
+    const apiKeyFactories: Array<[string, (apiKey: string) => LLMProvider]> = [
+      ['anthropic',  (apiKey) => new AnthropicProvider({ apiKey, fetchFn })],
+      ['openai',     (apiKey) => new OpenAIProvider({ apiKey, fetchFn })],
+      ['openrouter', (apiKey) => new OpenRouterProvider({ apiKey, fetchFn })],
+      ['deepseek',   (apiKey) => new DeepSeekProvider({ apiKey, fetchFn })],
+      ['grok',       (apiKey) => new GrokProvider({ apiKey, fetchFn })],
+      ['gemini',     (apiKey) => new GeminiProvider({ apiKey, fetchFn })],
+      ['kimi',       (apiKey) => new KimiProvider({ apiKey, fetchFn })],
+      ['minimax',    (apiKey) => new MiniMaxProvider({ apiKey, fetchFn })],
+    ];
+    for (const [id, make] of apiKeyFactories) {
+      const cred = credentials[id];
+      if (cred) this.registerProvider(make(cred));
     }
 
-    if (config.openaiApiKey) {
-      this.registerProvider(
-        new OpenAIProvider({ apiKey: config.openaiApiKey, fetchFn })
-      );
-    }
-
-    if (config.openrouterApiKey) {
-      this.registerProvider(
-        new OpenRouterProvider({ apiKey: config.openrouterApiKey, fetchFn })
-      );
-    }
-
-    if (config.deepseekApiKey) {
-      this.registerProvider(
-        new DeepSeekProvider({ apiKey: config.deepseekApiKey, fetchFn })
-      );
-    }
-
-    if (config.grokApiKey) {
-      this.registerProvider(
-        new GrokProvider({ apiKey: config.grokApiKey, fetchFn })
-      );
-    }
-
-    if (config.geminiApiKey) {
-      this.registerProvider(
-        new GeminiProvider({ apiKey: config.geminiApiKey, fetchFn })
-      );
-    }
-
-    if (config.kimiApiKey) {
-      this.registerProvider(
-        new KimiProvider({ apiKey: config.kimiApiKey, fetchFn })
-      );
-    }
-
-    if (config.minimaxApiKey) {
-      this.registerProvider(
-        new MiniMaxProvider({ apiKey: config.minimaxApiKey, fetchFn })
-      );
-    }
-
-    // Always register Ollama if URL provided (defaults to localhost)
-    const ollamaUrl = config.ollamaUrl || 'http://localhost:11434';
+    // URL-credentialed providers (Ollama). Always register if configured;
+    // also register if reachable at the default URL even without explicit
+    // configuration.
+    const ollamaUrl = credentials.ollama || 'http://localhost:11434';
     const ollamaProvider = new OllamaProvider({ baseUrl: ollamaUrl });
     if (await ollamaProvider.isAvailable()) {
       await ollamaProvider.autoDetectModel();
       this.registerProvider(ollamaProvider);
-    } else if (config.ollamaUrl) {
-      // Explicitly configured URL -- register even if not reachable yet
+    } else if (credentials.ollama) {
       this.registerProvider(ollamaProvider);
     }
 
@@ -775,6 +752,53 @@ Only output the code, no explanations. Use proper formatting and comments.`;
   listProviders(): string[] {
     return Array.from(this.providers.keys());
   }
+
+  /**
+   * Self-describing UI metadata for every known provider type. Used by
+   * GlobalSettings to render the AI tab — credential rows, default tier
+   * models, static model-list seeds — without per-provider hardcoding.
+   *
+   * Returns descriptions for all known providers regardless of whether
+   * they are registered with credentials yet, so the dropdown can show
+   * the full set on first run. Already-registered providers' live
+   * `describe()` is preferred over the stub instance.
+   */
+  listProviderDescriptions(): LLMProviderDescription[] {
+    const descriptions: LLMProviderDescription[] = [];
+    for (const factory of LLMObject.PROVIDER_DESCRIPTORS) {
+      const registered = this.providers.get(factory.id);
+      if (registered) {
+        descriptions.push(registered.describe());
+      } else {
+        descriptions.push(factory.describe());
+      }
+    }
+    return descriptions;
+  }
+
+  /**
+   * Static list of provider factories. Each entry is a stub instance
+   * (constructed with no credentials) used purely to harvest its
+   * `describe()` for the AI tab. Keep this list aligned with the set of
+   * providers `configure()` knows how to register — the order here is
+   * the order the dropdown shows.
+   */
+  private static readonly PROVIDER_DESCRIPTORS: ReadonlyArray<{
+    id: string;
+    describe(): LLMProviderDescription;
+  }> = [
+    new AnthropicProvider({ apiKey: '' }),
+    new OpenAIProvider({ apiKey: '' }),
+    new ClaudeCliProvider(),
+    new CodexCliProvider(),
+    new OllamaProvider(),
+    new OpenRouterProvider({ apiKey: '' }),
+    new DeepSeekProvider({ apiKey: '' }),
+    new GrokProvider({ apiKey: '' }),
+    new GeminiProvider({ apiKey: '' }),
+    new KimiProvider({ apiKey: '' }),
+    new MiniMaxProvider({ apiKey: '' }),
+  ].map(p => ({ id: p.describe().id, describe: () => p.describe() }));
 
   /**
    * Set the default provider.
@@ -1059,8 +1083,10 @@ This is configured via the Settings UI or the \`setTierRouting\` method:
   // models: [{ id: 'claude-opus-4-7', name: 'Claude Opus 4.7' }, ...]
 
   await this.call(this.dep('LLM'), 'configure', {
-    anthropicApiKey: '...', openaiApiKey: '...', ollamaUrl: 'http://localhost:11434',
-    openrouterApiKey: '...', deepseekApiKey: '...', grokApiKey: '...', geminiApiKey: '...',
+    credentials: {
+      anthropic: '...', openai: '...', ollama: 'http://localhost:11434',
+      openrouter: '...', deepseek: '...', grok: '...', gemini: '...',
+    },
     tierRouting: { smart: { provider: 'anthropic', model: 'claude-opus-4-7' } }
   });
   // Configure all providers and tier routing (all fields optional)

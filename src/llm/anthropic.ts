@@ -8,6 +8,7 @@ import {
   LLMMessage,
   LLMCompletionOptions,
   LLMCompletionResult,
+  LLMProviderDescription,
   LLMStreamChunk,
   ModelTier,
   ModelInfo,
@@ -124,6 +125,19 @@ export class AnthropicProvider extends BaseLLMProvider {
       { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
       { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
     ];
+  }
+
+  override describe(): LLMProviderDescription {
+    return {
+      id: 'anthropic',
+      label: 'Anthropic',
+      storageSuffix: 'anthropicApiKey',
+      credentialMode: 'apiKey',
+      credentialLabel: 'Anthropic API Key',
+      credentialPlaceholder: 'sk-ant-...',
+      models: this.fallbackModels(),
+      defaultTierModels: AnthropicProvider.TIER_MODELS,
+    };
   }
 
   constructor(config: AnthropicConfig) {

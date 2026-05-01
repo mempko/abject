@@ -9,6 +9,7 @@ import {
   LLMMessage,
   LLMCompletionOptions,
   LLMCompletionResult,
+  LLMProviderDescription,
   LLMStreamChunk,
   ModelTier,
   ModelInfo,
@@ -315,6 +316,21 @@ export class OllamaProvider extends BaseLLMProvider {
     } catch {
       return [];
     }
+  }
+
+  override describe(): LLMProviderDescription {
+    return {
+      id: 'ollama',
+      label: 'Ollama',
+      storageSuffix: 'ollamaUrl',
+      credentialMode: 'url',
+      credentialLabel: 'Ollama URL',
+      credentialPlaceholder: 'http://localhost:11434',
+      // Ollama models are entirely user-installed and discovered live
+      // via /api/tags. No useful static seed.
+      models: [],
+      defaultTierModels: { smart: '', balanced: '', fast: '' },
+    };
   }
 
   /**

@@ -8,6 +8,7 @@ import {
   LLMMessage,
   LLMCompletionOptions,
   LLMCompletionResult,
+  LLMProviderDescription,
   LLMStreamChunk,
   ModelTier,
   ModelInfo,
@@ -135,6 +136,24 @@ export class OpenAIProvider extends BaseLLMProvider {
       { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
       { id: 'gpt-5.4-nano', name: 'GPT-5.4 Nano' },
     ];
+  }
+
+  /**
+   * Self-description for the AI tab. OpenAI-compatible subclasses
+   * (OpenRouter, DeepSeek, Grok, Kimi, MiniMax) override this with
+   * their own id/label/defaults but reuse the shared OpenAI HTTP path.
+   */
+  override describe(): LLMProviderDescription {
+    return {
+      id: 'openai',
+      label: 'OpenAI',
+      storageSuffix: 'openaiApiKey',
+      credentialMode: 'apiKey',
+      credentialLabel: 'OpenAI API Key',
+      credentialPlaceholder: 'sk-...',
+      models: this.fallbackModels(),
+      defaultTierModels: this.tierModels,
+    };
   }
 
   constructor(config: OpenAIConfig) {

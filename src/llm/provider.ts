@@ -36,6 +36,65 @@ export interface ModelInfo {
   name: string;
 }
 
+/**
+ * How a provider authenticates: HTTP API key, base URL (Ollama), an
+ * external CLI binary that manages its own auth (claude/codex), or
+ * nothing at all. Drives the GlobalSettings AI tab — `apiKey` and
+ * `url` render a credential input; `cli` renders a binary-detection
+ * status row; `none` renders nothing.
+ */
+export type CredentialMode = 'apiKey' | 'url' | 'cli' | 'none';
+
+/**
+ * Self-describing UI metadata for a provider. GlobalSettings reads this
+ * via `LLMObject.listProviderDescriptions` and uses it to build the
+ * provider dropdown, credential field, default tier models, and the
+ * cached model list seed — without hardcoding per-provider knowledge.
+ *
+ * Each provider returns one of these from `describe()`. The base
+ * implementation supplies sane defaults; subclasses override only the
+ * fields where they differ.
+ */
+export interface LLMProviderDescription {
+  /** Stable id used in tier routing and storage (e.g. 'anthropic'). */
+  id: string;
+  /** Human label for the provider dropdown (e.g. 'Anthropic'). */
+  label: string;
+  /** Storage key suffix (e.g. 'anthropicApiKey' → 'global-settings:anthropicApiKey'). */
+  storageSuffix: string;
+  /** How the user authenticates with this provider. */
+  credentialMode: CredentialMode;
+  /** Label for the credential input row when credentialMode is apiKey/url. */
+  credentialLabel?: string;
+  /** Placeholder for the credential input. */
+  credentialPlaceholder?: string;
+  /**
+   * For `cli` providers: the binary name to detect on PATH and the
+   * one-line install hint shown when it isn't found.
+   */
+  cli?: { binary: string; installHint: string };
+  /**
+   * Static fallback model list shown in tier dropdowns before any live
+   * fetch completes. Live `listModels()` results override this.
+   */
+  models: ModelInfo[];
+  /**
+   * Default model id per tier — used when migrating a legacy
+   * single-provider config to the new per-tier router, and when no
+   * other selection exists. Use empty strings when the provider has no
+   * stable defaults (Ollama).
+   */
+  defaultTierModels: { smart: string; balanced: string; fast: string };
+  /**
+   * Declarative migration map for saved tier-routing model ids — `{ from
+   * → to }`. Applied once at GlobalSettings init. Useful when an upstream
+   * API drops a model name (e.g. codex's `gpt-5` → `auto` under ChatGPT
+   * login). A function would be cleaner but descriptions cross worker
+   * boundaries via structured clone, which can't transport closures.
+   */
+  modelMigrations?: Record<string, string>;
+}
+
 export interface LLMCompletionResult {
   content: string;
   finishReason: 'stop' | 'length' | 'error';
@@ -100,6 +159,13 @@ export interface LLMProvider {
    * List available models for this provider.
    */
   listModels(): Promise<ModelInfo[]>;
+
+  /**
+   * Self-describing UI metadata: credential mode, default tier models,
+   * static model list seed, etc. GlobalSettings consumes this to build
+   * the AI tab without per-provider hardcoding.
+   */
+  describe(): LLMProviderDescription;
 }
 
 /**
@@ -125,6 +191,24 @@ export abstract class BaseLLMProvider implements LLMProvider {
 
   async listModels(): Promise<ModelInfo[]> {
     return [];
+  }
+
+  /**
+   * Default self-description. Subclasses override to supply real
+   * defaults; the base form returns minimum-viable metadata so any
+   * unconfigured provider still renders a usable row in the AI tab.
+   */
+  describe(): LLMProviderDescription {
+    return {
+      id: this.name,
+      label: this.name,
+      storageSuffix: `${this.name}ApiKey`,
+      credentialMode: 'apiKey',
+      credentialLabel: `${this.name} API Key`,
+      credentialPlaceholder: '',
+      models: [],
+      defaultTierModels: { smart: '', balanced: '', fast: '' },
+    };
   }
 
   /**

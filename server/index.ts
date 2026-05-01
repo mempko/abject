@@ -507,13 +507,16 @@ async function main(): Promise<void> {
   const httpClientId = await supervisedSpawn('HttpClient');
   const llmId = await supervisedSpawn('LLMObject');
 
-  // Configure LLM with API keys
-  if (anthropicKey || openaiKey) {
-    await bootstrapRequest(llmId, 'configure', {
-      anthropicApiKey: anthropicKey,
-      openaiApiKey: openaiKey,
-    });
-  }
+  // Configure LLM. We always call configure() so the CLI providers
+  // (claude-cli, codex-cli) get registered alongside the API ones,
+  // independent of whether the user has API keys set. The CLI providers'
+  // own `isAvailable()` reports detection on first use.
+  const bootCreds: Record<string, string> = {};
+  if (anthropicKey) bootCreds.anthropic = anthropicKey;
+  if (openaiKey)    bootCreds.openai    = openaiKey;
+  await bootstrapRequest(llmId, 'configure', {
+    credentials: bootCreds,
+  });
 
   const storageId = await supervisedSpawn('Storage');
   const timerId = await supervisedSpawn('Timer');

@@ -5,7 +5,7 @@
  * we subclass OpenAIProvider with different base URL and tier models.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription } from './provider.js';
 import { OpenAIProvider } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
@@ -56,6 +56,23 @@ export class GrokProvider extends OpenAIProvider {
         { id: 'grok-4-fast', name: 'Grok 4 Fast' },
       ];
     }
+  }
+
+  override describe(): LLMProviderDescription {
+    return {
+      id: 'grok',
+      label: 'Grok',
+      storageSuffix: 'grokApiKey',
+      credentialMode: 'apiKey',
+      credentialLabel: 'xAI Grok API Key',
+      credentialPlaceholder: 'xai-...',
+      models: [
+        { id: 'grok-4', name: 'Grok 4' },
+        { id: 'grok-4-mini', name: 'Grok 4 Mini' },
+        { id: 'grok-4-fast', name: 'Grok 4 Fast' },
+      ],
+      defaultTierModels: DEFAULT_TIER_MODELS,
+    };
   }
 }
 

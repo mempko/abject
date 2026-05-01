@@ -5,7 +5,7 @@
  * subclass OpenAIProvider with different base URL and tier models.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription } from './provider.js';
 import { OpenAIProvider } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
@@ -55,6 +55,22 @@ export class DeepSeekProvider extends OpenAIProvider {
         { id: 'deepseek-chat', name: 'DeepSeek Chat' },
       ];
     }
+  }
+
+  override describe(): LLMProviderDescription {
+    return {
+      id: 'deepseek',
+      label: 'DeepSeek',
+      storageSuffix: 'deepseekApiKey',
+      credentialMode: 'apiKey',
+      credentialLabel: 'DeepSeek API Key',
+      credentialPlaceholder: 'sk-...',
+      models: [
+        { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
+        { id: 'deepseek-chat', name: 'DeepSeek Chat' },
+      ],
+      defaultTierModels: DEFAULT_TIER_MODELS,
+    };
   }
 }
 

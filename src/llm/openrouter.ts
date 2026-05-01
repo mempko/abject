@@ -8,7 +8,7 @@
  * headers.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription } from './provider.js';
 import { OpenAIProvider } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
@@ -61,6 +61,19 @@ export class OpenRouterProvider extends OpenAIProvider {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
       return Object.values(DEFAULT_TIER_MODELS).map(id => ({ id, name: id }));
     }
+  }
+
+  override describe(): LLMProviderDescription {
+    return {
+      id: 'openrouter',
+      label: 'OpenRouter',
+      storageSuffix: 'openrouterApiKey',
+      credentialMode: 'apiKey',
+      credentialLabel: 'OpenRouter API Key',
+      credentialPlaceholder: 'sk-or-...',
+      models: Object.values(DEFAULT_TIER_MODELS).map(id => ({ id, name: id })),
+      defaultTierModels: DEFAULT_TIER_MODELS,
+    };
   }
 }
 

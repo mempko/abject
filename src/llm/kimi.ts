@@ -6,7 +6,7 @@
  * tier models. Kimi is known for very long context windows.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription } from './provider.js';
 import { OpenAIProvider } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
@@ -58,6 +58,24 @@ export class KimiProvider extends OpenAIProvider {
         { id: 'moonshot-v1-8k', name: 'Moonshot v1 8k' },
       ];
     }
+  }
+
+  override describe(): LLMProviderDescription {
+    return {
+      id: 'kimi',
+      label: 'Kimi',
+      storageSuffix: 'kimiApiKey',
+      credentialMode: 'apiKey',
+      credentialLabel: 'Kimi (Moonshot) API Key',
+      credentialPlaceholder: 'sk-...',
+      models: [
+        { id: 'kimi-k2-0905-preview', name: 'Kimi K2 (preview)' },
+        { id: 'moonshot-v1-128k', name: 'Moonshot v1 128k' },
+        { id: 'moonshot-v1-32k', name: 'Moonshot v1 32k' },
+        { id: 'moonshot-v1-8k', name: 'Moonshot v1 8k' },
+      ],
+      defaultTierModels: DEFAULT_TIER_MODELS,
+    };
   }
 }
 

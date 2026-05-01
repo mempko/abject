@@ -11,6 +11,7 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+import { LLMProviderDescription } from '../llm/provider.js';
 
 const log = new Log('GlobalSettings');
 
@@ -24,16 +25,10 @@ const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 const WIDGET_INTERFACE: InterfaceId = 'abjects:widget';
 const LAYOUT_INTERFACE: InterfaceId = 'abjects:layout';
 
-const STORAGE_KEY_ANTHROPIC = 'global-settings:anthropicApiKey';
-const STORAGE_KEY_OPENAI = 'global-settings:openaiApiKey';
-const STORAGE_KEY_OLLAMA_URL = 'global-settings:ollamaUrl';
-const STORAGE_KEY_OPENROUTER = 'global-settings:openrouterApiKey';
-const STORAGE_KEY_DEEPSEEK = 'global-settings:deepseekApiKey';
-const STORAGE_KEY_GROK = 'global-settings:grokApiKey';
-const STORAGE_KEY_GEMINI = 'global-settings:geminiApiKey';
-const STORAGE_KEY_KIMI = 'global-settings:kimiApiKey';
-const STORAGE_KEY_MINIMAX = 'global-settings:minimaxApiKey';
-const STORAGE_KEY_AI_ACTIVE_PROVIDER = 'global-settings:aiActiveProvider';
+const STORAGE_PREFIX = 'global-settings:';
+const STORAGE_KEY_AI_ACTIVE_PROVIDER = `${STORAGE_PREFIX}aiActiveProvider`;
+/** Build a per-provider credential storage key from a description's `storageSuffix`. */
+function storageKeyFor(suffix: string): string { return `${STORAGE_PREFIX}${suffix}`; }
 const STORAGE_KEY_AUTH_ENABLED = 'global-settings:authEnabled';
 const STORAGE_KEY_AUTH_USER = 'global-settings:authUser';
 const STORAGE_KEY_AUTH_PASS = 'global-settings:authPass';
@@ -56,45 +51,18 @@ const STORAGE_KEY_TIER_BALANCED_MODEL = 'global-settings:tierBalancedModel';
 const STORAGE_KEY_TIER_FAST_PROVIDER = 'global-settings:tierFastProvider';
 const STORAGE_KEY_TIER_FAST_MODEL = 'global-settings:tierFastModel';
 
-type LLMProviderName = 'anthropic' | 'openai' | 'ollama' | 'openrouter' | 'deepseek' | 'grok' | 'gemini' | 'kimi' | 'minimax';
-const PROVIDER_LABELS: string[] = ['Anthropic', 'OpenAI', 'Ollama', 'OpenRouter', 'DeepSeek', 'Grok', 'Gemini', 'Kimi', 'MiniMax'];
-const PROVIDER_NAMES: LLMProviderName[] = ['anthropic', 'openai', 'ollama', 'openrouter', 'deepseek', 'grok', 'gemini', 'kimi', 'minimax'];
+/**
+ * Provider list, labels, default tier models, credential metadata, and
+ * CLI binary detection are all derived from per-provider `describe()`
+ * via `LLMObject.listProviderDescriptions`. Each provider self-describes
+ * (see `src/llm/provider.ts` — `LLMProviderDescription`); GlobalSettings
+ * has no per-provider knowledge.
+ */
+type LLMProviderName = string;
 
 type ModelTierName = 'smart' | 'balanced' | 'fast';
 const TIER_LABELS: string[] = ['Smart', 'Balanced', 'Fast'];
 const TIER_NAMES: ModelTierName[] = ['smart', 'balanced', 'fast'];
-
-// Default tier models per provider (for migration from old single-provider setting)
-const DEFAULT_TIER_MODELS: Record<LLMProviderName, Record<ModelTierName, string>> = {
-  anthropic: { smart: 'claude-opus-4-7', balanced: 'claude-sonnet-4-6', fast: 'claude-haiku-4-5-20251001' },
-  openai: { smart: 'gpt-5.4', balanced: 'gpt-5.4-mini', fast: 'gpt-5.4-nano' },
-  ollama: { smart: '', balanced: '', fast: '' },
-  openrouter: { smart: 'anthropic/claude-opus-4-6', balanced: 'openai/gpt-5.4-mini', fast: 'meta-llama/llama-3.3-70b-instruct' },
-  deepseek: { smart: 'deepseek-reasoner', balanced: 'deepseek-chat', fast: 'deepseek-chat' },
-  grok: { smart: 'grok-4', balanced: 'grok-4-mini', fast: 'grok-4-fast' },
-  gemini: { smart: 'gemini-3.1-pro', balanced: 'gemini-3.1-flash', fast: 'gemini-3.1-flash-lite' },
-  kimi: { smart: 'kimi-k2-0905-preview', balanced: 'moonshot-v1-32k', fast: 'moonshot-v1-8k' },
-  minimax: { smart: 'MiniMax-M2', balanced: 'MiniMax-M1', fast: 'abab6.5s-chat' },
-};
-
-// Per-provider placeholder and label metadata for the single-panel AI tab
-interface ProviderMeta {
-  credentialLabel: string;
-  placeholder: string;
-  isUrl: boolean;
-}
-
-const PROVIDER_META: Record<LLMProviderName, ProviderMeta> = {
-  anthropic: { credentialLabel: 'Anthropic API Key', placeholder: 'sk-ant-...', isUrl: false },
-  openai: { credentialLabel: 'OpenAI API Key', placeholder: 'sk-...', isUrl: false },
-  ollama: { credentialLabel: 'Ollama URL', placeholder: 'http://localhost:11434', isUrl: true },
-  openrouter: { credentialLabel: 'OpenRouter API Key', placeholder: 'sk-or-...', isUrl: false },
-  deepseek: { credentialLabel: 'DeepSeek API Key', placeholder: 'sk-...', isUrl: false },
-  grok: { credentialLabel: 'xAI Grok API Key', placeholder: 'xai-...', isUrl: false },
-  gemini: { credentialLabel: 'Google Gemini API Key', placeholder: 'AIza...', isUrl: false },
-  kimi: { credentialLabel: 'Kimi (Moonshot) API Key', placeholder: 'sk-...', isUrl: false },
-  minimax: { credentialLabel: 'MiniMax API Key', placeholder: 'sk-...', isUrl: false },
-};
 
 // Legacy keys for migration
 const LEGACY_KEY_ANTHROPIC = 'settings:anthropicApiKey';
@@ -132,6 +100,18 @@ export class GlobalSettings extends Abject {
   // In-memory cache of unsaved credential values (keyed by provider). Survives
   // provider-switches within the panel; flushed to Storage on Save.
   private credentialValues: Partial<Record<LLMProviderName, string>> = {};
+
+  /**
+   * Cached binary-detection state for CLI providers. `undefined` means the
+   * detection probe hasn't completed yet; `null` means probed and not found;
+   * a string is the resolved binary path (or just the binary name).
+   */
+  private cliDetected: Partial<Record<LLMProviderName, string | null>> = {};
+
+  /** Detection-status label widget for the AI tab (visible only for CLI providers). */
+  private cliStatusLabelId?: AbjectId;
+  /** Refresh button next to the detection label. */
+  private cliRefreshBtnId?: AbjectId;
 
   // Per-tier provider + model select widgets
   private tierProviderSelectIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined };
@@ -198,18 +178,20 @@ export class GlobalSettings extends Abject {
 
   private unmasked: Set<AbjectId> = new Set();
 
-  // Cached model lists per provider (refreshed when credentials change)
-  private providerModelCache: Record<LLMProviderName, ModelInfo[]> = {
-    anthropic: [],
-    openai: [],
-    ollama: [],
-    openrouter: [],
-    deepseek: [],
-    grok: [],
-    gemini: [],
-    kimi: [],
-    minimax: [],
-  };
+  /**
+   * Provider descriptions fetched from LLMObject at init. Used to render
+   * the AI tab dropdown, default tier models, credential metadata, and
+   * CLI detection — everything that used to be hardcoded per-provider.
+   */
+  private providerDescriptions: LLMProviderDescription[] = [];
+  private providerDescById: Map<string, LLMProviderDescription> = new Map();
+
+  /**
+   * Cached model lists per provider, keyed by provider id. Seeded from
+   * each description's static `models` list so tier dropdowns render
+   * immediately; live `listProviderModels` results override.
+   */
+  private providerModelCache: Map<string, ModelInfo[]> = new Map();
 
   constructor() {
     super({
@@ -289,6 +271,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.widgetManagerId = await this.requireDep('WidgetManager');
     this.uiServerId = await this.requireDep('UIServer');
 
+    // Fetch provider descriptions before reading storage so we can derive
+    // the per-provider credential keys, default tier models, and dropdown
+    // entries from them — no per-provider hardcoding lives here.
+    await this.loadProviderDescriptions();
+
     const credentials: Partial<Record<LLMProviderName, string>> = {};
     const tierRouting: Record<ModelTierName, { provider: string | null; model: string | null }> = {
       smart: { provider: null, model: null },
@@ -297,28 +284,21 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     };
 
     if (this.storageId) {
-      const storageKeys: Array<[LLMProviderName, string]> = [
-        ['anthropic', STORAGE_KEY_ANTHROPIC],
-        ['openai', STORAGE_KEY_OPENAI],
-        ['ollama', STORAGE_KEY_OLLAMA_URL],
-        ['openrouter', STORAGE_KEY_OPENROUTER],
-        ['deepseek', STORAGE_KEY_DEEPSEEK],
-        ['grok', STORAGE_KEY_GROK],
-        ['gemini', STORAGE_KEY_GEMINI],
-        ['kimi', STORAGE_KEY_KIMI],
-        ['minimax', STORAGE_KEY_MINIMAX],
-      ];
-      for (const [name, key] of storageKeys) {
+      // Per-provider credential keys derived from each description's
+      // storageSuffix — CLI providers contribute nothing (their auth
+      // lives in the binary).
+      for (const desc of this.providerDescriptions) {
+        if (desc.credentialMode === 'cli' || desc.credentialMode === 'none') continue;
         const value = await this.request<string | null>(
-          request(this.id, this.storageId, 'get', { key })
+          request(this.id, this.storageId, 'get', { key: storageKeyFor(desc.storageSuffix) })
         );
-        if (value) credentials[name] = value;
+        if (value) credentials[desc.id] = value;
       }
       const savedActive = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_AI_ACTIVE_PROVIDER })
       );
-      if (savedActive && PROVIDER_NAMES.includes(savedActive as LLMProviderName)) {
-        this.activeAiProvider = savedActive as LLMProviderName;
+      if (savedActive && this.providerDescById.has(savedActive)) {
+        this.activeAiProvider = savedActive;
       }
 
       // Load per-tier routing
@@ -341,8 +321,38 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_FAST_MODEL })
       );
 
-      // Legacy migration from per-workspace keys
-      if (!credentials.anthropic && !credentials.openai) {
+      // Apply each provider's optional `modelMigrations` map to saved
+      // tier-routing model ids. Used when an upstream API drops a model
+      // name (e.g. codex no longer accepts `gpt-5` under ChatGPT login —
+      // migrates to `auto`). Self-described per provider, no special
+      // casing here.
+      const tierModelKeys: Record<ModelTierName, string> = {
+        smart:    STORAGE_KEY_TIER_SMART_MODEL,
+        balanced: STORAGE_KEY_TIER_BALANCED_MODEL,
+        fast:     STORAGE_KEY_TIER_FAST_MODEL,
+      };
+      for (const tier of TIER_NAMES) {
+        const providerId = tierRouting[tier].provider;
+        if (!providerId) continue;
+        const migrations = this.descById(providerId)?.modelMigrations;
+        if (!migrations) continue;
+        const saved = tierRouting[tier].model;
+        if (!saved) continue;
+        const migrated = migrations[saved];
+        if (migrated && migrated !== saved) {
+          tierRouting[tier].model = migrated;
+          try {
+            await this.request(request(this.id, this.storageId, 'set', { key: tierModelKeys[tier], value: migrated }));
+          } catch { /* best-effort migration */ }
+          log.info(`Migrated ${providerId} ${tier} tier model "${saved}" → "${migrated}"`);
+        }
+      }
+
+      // Legacy migration from per-workspace keys (anthropic/openai only —
+      // those were the only two providers when the legacy keys existed).
+      const anthropicSuffix = this.descById('anthropic')?.storageSuffix;
+      const openaiSuffix = this.descById('openai')?.storageSuffix;
+      if (!credentials.anthropic && !credentials.openai && anthropicSuffix && openaiSuffix) {
         const legacyAnthropic = await this.request<string | null>(
           request(this.id, this.storageId, 'get', { key: LEGACY_KEY_ANTHROPIC })
         );
@@ -353,13 +363,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
           if (legacyAnthropic) {
             credentials.anthropic = legacyAnthropic;
             await this.request(
-              request(this.id, this.storageId, 'set', { key: STORAGE_KEY_ANTHROPIC, value: legacyAnthropic })
+              request(this.id, this.storageId, 'set', { key: storageKeyFor(anthropicSuffix), value: legacyAnthropic })
             );
           }
           if (legacyOpenai) {
             credentials.openai = legacyOpenai;
             await this.request(
-              request(this.id, this.storageId, 'set', { key: STORAGE_KEY_OPENAI, value: legacyOpenai })
+              request(this.id, this.storageId, 'set', { key: storageKeyFor(openaiSuffix), value: legacyOpenai })
             );
           }
           log.info('Migrated API keys from legacy storage');
@@ -372,12 +382,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const oldProvider = await this.request<string | null>(
           request(this.id, this.storageId, 'get', { key: LEGACY_KEY_PROVIDER })
         );
-        if (oldProvider && PROVIDER_NAMES.includes(oldProvider as LLMProviderName)) {
-          const providerName = oldProvider as LLMProviderName;
-          const defaults = DEFAULT_TIER_MODELS[providerName];
+        const oldDesc = oldProvider ? this.descById(oldProvider) : undefined;
+        if (oldProvider && oldDesc) {
+          const providerName = oldProvider;
+          const defaults = oldDesc.defaultTierModels;
 
-          // For Ollama, check old per-tier model keys
-          if (providerName === 'ollama') {
+          // For URL-credential providers (Ollama), preserve the old
+          // per-tier model keys if present.
+          if (oldDesc.credentialMode === 'url') {
             const oldSmart = await this.request<string | null>(
               request(this.id, this.storageId, 'get', { key: LEGACY_KEY_OLLAMA_MODEL_SMART })
             );
@@ -387,7 +399,6 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
             const oldFast = await this.request<string | null>(
               request(this.id, this.storageId, 'get', { key: LEGACY_KEY_OLLAMA_MODEL_FAST })
             );
-            // Check legacy single model key
             const legacyModel = await this.request<string | null>(
               request(this.id, this.storageId, 'get', { key: LEGACY_KEY_OLLAMA_MODEL })
             );
@@ -458,20 +469,17 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }
     }
 
-    const config: Record<string, unknown> = {
-      anthropicApiKey: credentials.anthropic,
-      openaiApiKey: credentials.openai,
-      ollamaUrl: credentials.ollama || undefined,
-      openrouterApiKey: credentials.openrouter,
-      deepseekApiKey: credentials.deepseek,
-      grokApiKey: credentials.grok,
-      geminiApiKey: credentials.gemini,
-      kimiApiKey: credentials.kimi,
-      minimaxApiKey: credentials.minimax,
-      tierRouting: Object.keys(routing).length > 0 ? routing : undefined,
-    };
+    // Generic per-provider credentials map keyed by provider id, derived
+    // from descriptions so adding a new provider doesn't touch this code.
+    const credMap: Record<string, string> = {};
+    for (const [id, value] of Object.entries(credentials)) {
+      if (value) credMap[id] = value;
+    }
 
-    await this.request(request(this.id, this.llmId, 'configure', config));
+    await this.request(request(this.id, this.llmId, 'configure', {
+      credentials: credMap,
+      tierRouting: Object.keys(routing).length > 0 ? routing : undefined,
+    }));
   }
 
   private setupHandlers(): void {
@@ -541,6 +549,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         return;
       }
 
+      // CLI detection refresh button — re-probe the binary and update the
+      // status label without saving anything.
+      if (fromId === this.cliRefreshBtnId && aspect === 'click') {
+        await this.refreshCliDetection(this.activeAiProvider);
+        return;
+      }
+
       // Tier provider dropdown changed -- refresh model list for that tier
       for (const tier of TIER_NAMES) {
         if (fromId === this.tierProviderSelectIds[tier] && aspect === 'change') {
@@ -551,8 +566,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
             const label = await this.request<string>(
               request(this.id, providerSelectId, 'getValue', {})
             );
-            const idx = PROVIDER_LABELS.indexOf(label);
-            if (idx >= 0) void this.refreshProviderModels(PROVIDER_NAMES[idx]);
+            const id = this.idForLabel(label);
+            if (id) void this.refreshProviderModels(id);
           }
           return;
         }
@@ -912,8 +927,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         { type: 'label', windowId: this.windowId, text: 'Provider',
           style: { color: this.theme.textHeading, fontSize: 13 } },
         { type: 'select', windowId: this.windowId,
-          options: PROVIDER_LABELS,
-          selectedIndex: Math.max(0, PROVIDER_NAMES.indexOf(this.activeAiProvider)) },
+          options: this.providerLabels(),
+          selectedIndex: Math.max(0, this.providerIds().indexOf(this.activeAiProvider)) },
       ]})
     );
     this.providerSelectorId = providerSelectorId;
@@ -931,10 +946,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }));
 
     // Credential label (shows "Anthropic API Key" etc.)
-    const meta = PROVIDER_META[this.activeAiProvider];
+    const activeDesc = this.descById(this.activeAiProvider);
+    const credentialLabel = activeDesc?.credentialLabel ?? activeDesc?.label ?? this.activeAiProvider;
+    const credentialPlaceholder = activeDesc?.credentialPlaceholder ?? '';
+    const isUrl = activeDesc?.credentialMode === 'url';
     const { widgetIds: [credentialLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: meta.credentialLabel,
+        { type: 'label', windowId: this.windowId, text: credentialLabel,
           style: { color: this.theme.textHeading, fontSize: 13 } },
       ]})
     );
@@ -960,15 +978,15 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }));
 
     const initialValue = this.credentialValues[this.activeAiProvider]
-      ?? (this.activeAiProvider === 'ollama' ? 'http://localhost:11434' : '');
+      ?? (isUrl ? credentialPlaceholder : '');
     const { widgetIds: [credentialInputId, credentialToggleId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'textInput', windowId: this.windowId,
-          placeholder: meta.placeholder,
-          masked: !meta.isUrl,
+          placeholder: credentialPlaceholder,
+          masked: !isUrl,
           text: initialValue },
         { type: 'button', windowId: this.windowId, text: 'Show',
-          style: meta.isUrl ? { disabled: true } : undefined },
+          style: isUrl ? { disabled: true } : undefined },
       ]})
     );
     this.credentialInputId = credentialInputId;
@@ -985,6 +1003,64 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 56, height: 32 },
     }));
+
+    // CLI detection-status row — visible only when the active provider is
+    // a CLI provider (claude-cli / codex-cli). Replaces the credential
+    // value with a "Detected at /path" or "not detected" line plus a
+    // Refresh button. For non-CLI providers the row stays present but
+    // collapsed (height 0) so the layout slot is stable across switches.
+    const isCli = this.isCliProvider(this.activeAiProvider);
+    const cliRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: cId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: cliRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: isCli ? 28 : 0 },
+    }));
+    const { widgetIds: [cliStatusLabelId, cliRefreshBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId,
+          text: this.formatCliStatus(this.activeAiProvider),
+          style: { color: this.cliStatusColor(this.activeAiProvider), fontSize: 12, visible: isCli } },
+        { type: 'button', windowId: this.windowId, text: 'Refresh',
+          style: { visible: isCli, fontSize: 12 } },
+      ]})
+    );
+    this.cliStatusLabelId = cliStatusLabelId;
+    this.cliRefreshBtnId = cliRefreshBtnId;
+    await this.request(request(this.id, this.cliRefreshBtnId, 'addDependent', {}));
+    await this.request(request(this.id, cliRowId, 'addLayoutChild', {
+      widgetId: this.cliStatusLabelId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: isCli ? 28 : 0 },
+    }));
+    await this.request(request(this.id, cliRowId, 'addLayoutChild', {
+      widgetId: this.cliRefreshBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 80, height: isCli ? 28 : 0 },
+    }));
+
+    // Disable / hide the credential input for CLI providers so the user
+    // doesn't enter an irrelevant API key.
+    if (isCli) {
+      await this.request(request(this.id, this.credentialInputId, 'update', {
+        style: { visible: false },
+      }));
+      await this.request(request(this.id, this.credentialToggleId, 'update', {
+        style: { visible: false },
+      }));
+      await this.request(request(this.id, this.credentialLabelId, 'update', {
+        style: { visible: false },
+      }));
+    }
+
+    // Kick off detection in the background — first show or after switch.
+    if (isCli) void this.refreshCliDetection(this.activeAiProvider);
 
     // Models list label (read-only, shows discovered models for the active provider)
     const { widgetIds: [providerModelsLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
@@ -1056,11 +1132,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }));
 
       // Provider dropdown
-      const providerIdx = savedProvider ? PROVIDER_NAMES.indexOf(savedProvider) : 0;
+      const providerIds = this.providerIds();
+      const providerIdx = savedProvider ? providerIds.indexOf(savedProvider) : 0;
       const { widgetIds: [providerSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs: [
           { type: 'select', windowId: this.windowId,
-            options: PROVIDER_LABELS,
+            options: this.providerLabels(),
             selectedIndex: providerIdx >= 0 ? providerIdx : 0 },
         ]})
       );
@@ -1073,8 +1150,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }));
 
       // Model dropdown (populated from provider's model list)
-      const activeProvider = savedProvider && PROVIDER_NAMES.includes(savedProvider) ? savedProvider : PROVIDER_NAMES[0];
-      const modelList = this.providerModelCache[activeProvider];
+      const activeProvider = savedProvider && providerIds.includes(savedProvider) ? savedProvider : providerIds[0];
+      const modelList = this.providerModelCache.get(activeProvider) ?? [];
       const modelOptions = modelList.length > 0
         ? modelList.map(m => m.name)
         : ['(no models)'];
@@ -1196,8 +1273,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // paints immediately. Each fetch updates its dropdown/label when it lands.
     const toPrefetch = new Set<LLMProviderName>([this.activeAiProvider]);
     for (const tier of TIER_NAMES) {
-      const p = savedTierRouting[tier].provider as LLMProviderName | null;
-      if (p && PROVIDER_NAMES.includes(p)) toPrefetch.add(p);
+      const p = savedTierRouting[tier].provider;
+      if (p && this.providerDescById.has(p)) toPrefetch.add(p);
     }
     for (const p of toPrefetch) {
       void this.refreshProviderModels(p);
@@ -1505,52 +1582,72 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private modelFetchInFlight: Set<LLMProviderName> = new Set();
 
   /**
-   * Synchronously populate the cache with hardcoded defaults so the UI can
+   * Seed the model cache from each provider's description so the UI can
    * render immediately. Live fetches happen lazily via refreshProviderModels.
    */
   private populateDefaultModelCache(): void {
-    this.providerModelCache.anthropic = [
-      { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
-      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
-      { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
-    ];
-    this.providerModelCache.openai = [
-      { id: 'gpt-5.4', name: 'GPT-5.4' },
-      { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
-      { id: 'gpt-5.4-nano', name: 'GPT-5.4 Nano' },
-    ];
-    this.providerModelCache.openrouter = [
-      { id: 'anthropic/claude-opus-4-6', name: 'anthropic/claude-opus-4-6' },
-      { id: 'openai/gpt-5.4-mini', name: 'openai/gpt-5.4-mini' },
-      { id: 'meta-llama/llama-3.3-70b-instruct', name: 'meta-llama/llama-3.3-70b-instruct' },
-    ];
-    this.providerModelCache.deepseek = [
-      { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
-      { id: 'deepseek-chat', name: 'DeepSeek Chat' },
-    ];
-    this.providerModelCache.grok = [
-      { id: 'grok-4', name: 'Grok 4' },
-      { id: 'grok-4-mini', name: 'Grok 4 Mini' },
-      { id: 'grok-4-fast', name: 'Grok 4 Fast' },
-    ];
-    this.providerModelCache.gemini = [
-      { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro' },
-      { id: 'gemini-3.1-flash', name: 'Gemini 3.1 Flash' },
-      { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
-    ];
-    this.providerModelCache.kimi = [
-      { id: 'kimi-k2-0905-preview', name: 'Kimi K2 (preview)' },
-      { id: 'moonshot-v1-128k', name: 'Moonshot v1 128k' },
-      { id: 'moonshot-v1-32k', name: 'Moonshot v1 32k' },
-      { id: 'moonshot-v1-8k', name: 'Moonshot v1 8k' },
-    ];
-    this.providerModelCache.minimax = [
-      { id: 'MiniMax-M2', name: 'MiniMax M2' },
-      { id: 'MiniMax-M1', name: 'MiniMax M1' },
-      { id: 'abab6.5-chat', name: 'abab6.5 Chat' },
-      { id: 'abab6.5s-chat', name: 'abab6.5s Chat' },
-    ];
-    this.providerModelCache.ollama = [];
+    for (const desc of this.providerDescriptions) {
+      this.providerModelCache.set(desc.id, [...desc.models]);
+    }
+  }
+
+  /**
+   * Fetch provider descriptions from LLMObject and index them by id. Run
+   * once at init, before any storage reads — every per-provider thing
+   * (credential keys, dropdown labels, default tier models, CLI binary
+   * detection) flows from this list.
+   */
+  private async loadProviderDescriptions(): Promise<void> {
+    if (!this.llmId) return;
+    try {
+      this.providerDescriptions = await this.request<LLMProviderDescription[]>(
+        request(this.id, this.llmId, 'listProviderDescriptions', {})
+      );
+    } catch (err) {
+      log.warn(`Failed to load provider descriptions: ${err instanceof Error ? err.message : String(err)}`);
+      this.providerDescriptions = [];
+    }
+    this.providerDescById = new Map(this.providerDescriptions.map(d => [d.id, d]));
+    if (!this.providerDescById.has(this.activeAiProvider) && this.providerDescriptions.length > 0) {
+      this.activeAiProvider = this.providerDescriptions[0].id;
+    }
+  }
+
+  // ── Provider description helpers ─────────────────────────────────────
+
+  /** Provider id → description (or undefined if unknown). */
+  private descById(id: string): LLMProviderDescription | undefined {
+    return this.providerDescById.get(id);
+  }
+
+  /** All provider ids in dropdown order. */
+  private providerIds(): string[] {
+    return this.providerDescriptions.map(d => d.id);
+  }
+
+  /** All provider labels in dropdown order. */
+  private providerLabels(): string[] {
+    return this.providerDescriptions.map(d => d.label);
+  }
+
+  /** Resolve a dropdown label back to its provider id. */
+  private idForLabel(label: string): string | undefined {
+    return this.providerDescriptions.find(d => d.label === label)?.id;
+  }
+
+  /** Resolve a provider id to its display label. */
+  private labelForId(id: string): string | undefined {
+    return this.providerDescById.get(id)?.label;
+  }
+
+  /** True when a provider authenticates via an external CLI binary. */
+  private isCliProvider(id: string): boolean {
+    return this.providerDescById.get(id)?.credentialMode === 'cli';
+  }
+
+  /** Default URL for a `url` provider (Ollama). */
+  private defaultUrlPlaceholder(id: string): string {
+    return this.providerDescById.get(id)?.credentialPlaceholder ?? '';
   }
 
   /**
@@ -1566,20 +1663,24 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     if (!this.llmId) return;
     if (this.modelFetchInFlight.has(name)) return;
     if (!opts.force && this.fetchedLiveModels.has(name)) return;
-    // Skip unreachable providers without credentials (except Ollama which is local)
-    if (name !== 'ollama' && !this.credentialValues[name]) return;
+    // Skip providers that have no way to reach their models. URL-keyed
+    // (Ollama) and CLI-driven providers don't need credentials — they
+    // fetch via the binary or local URL.
+    const desc = this.descById(name);
+    const noCredentialNeeded = !!desc && (desc.credentialMode === 'url' || desc.credentialMode === 'cli');
+    if (!noCredentialNeeded && !this.credentialValues[name]) return;
 
     this.modelFetchInFlight.add(name);
     try {
       const payload: Record<string, unknown> = { provider: name };
-      if (name === 'ollama') {
-        payload.ollamaUrl = this.credentialValues.ollama || 'http://localhost:11434';
+      if (desc?.credentialMode === 'url') {
+        payload.ollamaUrl = this.credentialValues[name] || desc.credentialPlaceholder || '';
       }
       const models = await this.request<ModelInfo[]>(
         request(this.id, this.llmId, 'listProviderModels', payload)
       );
       if (models.length > 0) {
-        this.providerModelCache[name] = models;
+        this.providerModelCache.set(name, models);
         this.fetchedLiveModels.add(name);
         await this.onProviderModelsUpdated(name);
       }
@@ -1606,8 +1707,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const label = await this.request<string>(
           request(this.id, providerSelectId, 'getValue', {})
         );
-        const idx = PROVIDER_LABELS.indexOf(label);
-        const tierProvider = idx >= 0 ? PROVIDER_NAMES[idx] : null;
+        const tierProvider = this.idForLabel(label);
         if (tierProvider === name) {
           await this.refreshTierModelOptions(tier);
         }
@@ -1617,9 +1717,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
   /** Format the models-list label for a provider ("3 models: Claude Opus 4.7, …"). */
   private formatModelListLine(provider: LLMProviderName): string {
-    const models = this.providerModelCache[provider];
-    if (!models || models.length === 0) {
-      return provider === 'ollama' ? 'No local models found. Start Ollama and save.' : 'Save credentials to discover models.';
+    const desc = this.descById(provider);
+    const models = this.providerModelCache.get(provider) ?? [];
+    if (models.length === 0) {
+      return desc?.credentialMode === 'url'
+        ? 'No local models found. Start the service and save.'
+        : 'Save credentials to discover models.';
     }
     const names = models.slice(0, 6).map(m => m.name);
     const more = models.length > names.length ? `, …(+${models.length - names.length})` : '';
@@ -1636,29 +1739,47 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
     // Figure out the new provider
     const newLabel = await this.request<string>(request(this.id, this.providerSelectorId, 'getValue', {}));
-    const newIdx = PROVIDER_LABELS.indexOf(newLabel);
-    const newProvider = newIdx >= 0 ? PROVIDER_NAMES[newIdx] : PROVIDER_NAMES[0];
+    const newProvider = this.idForLabel(newLabel) ?? this.providerIds()[0];
     this.activeAiProvider = newProvider;
 
-    const meta = PROVIDER_META[newProvider];
+    const desc = this.descById(newProvider);
+    if (!desc) return;
+    const isCli = desc.credentialMode === 'cli';
+    const isUrl = desc.credentialMode === 'url';
     const newValue = this.credentialValues[newProvider]
-      ?? (newProvider === 'ollama' ? 'http://localhost:11434' : '');
+      ?? (isUrl ? (desc.credentialPlaceholder ?? '') : '');
 
     // Reset masking state for the input
     this.unmasked.delete(this.credentialInputId);
 
+    // Toggle credential input vs CLI detection row based on provider type.
     await this.request(request(this.id, this.credentialLabelId, 'update', {
-      text: meta.credentialLabel,
+      text: desc.credentialLabel ?? desc.label,
+      style: { visible: !isCli, color: this.theme.textHeading, fontSize: 13 },
     }));
     await this.request(request(this.id, this.credentialInputId, 'update', {
       text: newValue,
-      placeholder: meta.placeholder,
-      masked: !meta.isUrl,
+      placeholder: desc.credentialPlaceholder ?? '',
+      masked: !isUrl,
+      style: { visible: !isCli },
     }));
     await this.request(request(this.id, this.credentialToggleId, 'update', {
       text: 'Show',
-      style: meta.isUrl ? { disabled: true } : { disabled: false },
+      style: isUrl
+        ? { disabled: true, visible: !isCli }
+        : { disabled: false, visible: !isCli },
     }));
+    if (this.cliStatusLabelId) {
+      await this.request(request(this.id, this.cliStatusLabelId, 'update', {
+        text: this.formatCliStatus(newProvider),
+        style: { color: this.cliStatusColor(newProvider), fontSize: 12, visible: isCli },
+      }));
+    }
+    if (this.cliRefreshBtnId) {
+      await this.request(request(this.id, this.cliRefreshBtnId, 'update', {
+        style: { visible: isCli, fontSize: 12 },
+      }));
+    }
     if (this.providerModelsLabelId) {
       await this.request(request(this.id, this.providerModelsLabelId, 'update', {
         text: this.formatModelListLine(newProvider),
@@ -1666,7 +1787,86 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }
 
     // Background refresh for the newly-active provider (idempotent + deduped)
-    void this.refreshProviderModels(newProvider);
+    if (isCli) void this.refreshCliDetection(newProvider);
+    else void this.refreshProviderModels(newProvider);
+  }
+
+  // ── CLI detection helpers ─────────────────────────────────────────
+
+  /** Re-probe whether the CLI binary for `provider` is on PATH and update the status label. */
+  private async refreshCliDetection(provider: LLMProviderName): Promise<void> {
+    const desc = this.descById(provider);
+    if (!desc?.cli) return;
+    const bin = desc.cli.binary;
+    let path: string | null = null;
+    try {
+      // Spawn the CLI's --version flag through ShellExecutor if available,
+      // otherwise via a direct child_process spawn. Either approach is
+      // fine for a one-shot detection probe.
+      path = await this.probeCliPath(bin);
+    } catch { path = null; }
+    this.cliDetected[provider] = path;
+
+    // Update label only if we're still on this provider in the panel.
+    if (this.activeAiProvider === provider && this.cliStatusLabelId) {
+      await this.request(request(this.id, this.cliStatusLabelId, 'update', {
+        text: this.formatCliStatus(provider),
+        style: { color: this.cliStatusColor(provider), fontSize: 12, visible: true },
+      }));
+    }
+  }
+
+  /** Run `<bin> --version` and return the binary name on success, or null. */
+  private async probeCliPath(bin: string): Promise<string | null> {
+    return new Promise((resolve) => {
+      try {
+        // Lazily require `node:child_process` so the browser bundle never
+        // pulls it (this Abject runs server-side, but be defensive).
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { spawn } = require('node:child_process') as typeof import('node:child_process');
+        const proc = spawn(bin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let resolved = false;
+        const timer = setTimeout(() => {
+          if (resolved) return;
+          resolved = true;
+          proc.kill('SIGTERM');
+          resolve(null);
+        }, 5_000);
+        proc.on('error', () => {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(timer);
+          resolve(null);
+        });
+        proc.on('close', (code) => {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(timer);
+          resolve(code === 0 ? bin : null);
+        });
+      } catch {
+        resolve(null);
+      }
+    });
+  }
+
+  private formatCliStatus(provider: LLMProviderName): string {
+    const cli = this.descById(provider)?.cli;
+    const bin = cli?.binary ?? '';
+    const detected = this.cliDetected[provider];
+    if (detected === undefined) return `Detecting \`${bin}\` …`;
+    if (detected === null) {
+      const hint = cli?.installHint ?? '';
+      return `\`${bin}\` not found on PATH. ${hint}`;
+    }
+    return `Detected \`${bin}\` on PATH. The CLI manages its own auth — run \`${bin} login\` if you haven't already.`;
+  }
+
+  private cliStatusColor(provider: LLMProviderName): string {
+    const detected = this.cliDetected[provider];
+    if (detected === undefined) return this.theme.textTertiary;
+    if (detected === null)      return this.theme.statusErrorBright;
+    return this.theme.statusSuccess;
   }
 
   /**
@@ -1682,14 +1882,13 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const providerLabel = await this.request<string>(
       request(this.id, providerSelectId, 'getValue', {})
     );
-    const providerIdx = PROVIDER_LABELS.indexOf(providerLabel);
-    const providerName = providerIdx >= 0 ? PROVIDER_NAMES[providerIdx] : PROVIDER_NAMES[0];
+    const providerName = this.idForLabel(providerLabel) ?? this.providerIds()[0];
 
     const currentLabel = await this.request<string>(
       request(this.id, modelSelectId, 'getValue', {})
     );
 
-    const modelList = this.providerModelCache[providerName];
+    const modelList = this.providerModelCache.get(providerName) ?? [];
     const options = modelList.length > 0
       ? modelList.map(m => m.name)
       : ['(no models)'];
@@ -2866,15 +3065,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       const providerLabel = await this.request<string>(
         request(this.id, providerSelectId, 'getValue', {})
       );
-      const providerIdx = PROVIDER_LABELS.indexOf(providerLabel);
-      const providerName = providerIdx >= 0 ? PROVIDER_NAMES[providerIdx] : null;
+      const providerName = this.idForLabel(providerLabel) ?? null;
 
       const modelName = await this.request<string>(
         request(this.id, modelSelectId, 'getValue', {})
       );
 
       if (providerName && modelName && modelName !== '(no models)') {
-        const modelList = this.providerModelCache[providerName];
+        const modelList = this.providerModelCache.get(providerName) ?? [];
         const modelInfo = modelList.find(m => m.name === modelName);
         tierRouting[tier] = {
           provider: providerName,
@@ -2891,16 +3089,19 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       return;
     }
 
-    // Validate: each tier's provider must have credentials (Ollama always has a URL)
+    // Validate: each tier's provider must have credentials. URL-only
+    // (e.g. Ollama) and CLI providers manage their own auth — neither
+    // needs an API key.
     for (const tier of TIER_NAMES) {
       const { provider } = tierRouting[tier];
-      if (!provider || provider === 'ollama') continue;
-      const providerName = provider as LLMProviderName;
-      if (!this.credentialValues[providerName]) {
+      if (!provider) continue;
+      const desc = this.descById(provider);
+      if (!desc) continue;
+      if (desc.credentialMode === 'cli' || desc.credentialMode === 'url' || desc.credentialMode === 'none') continue;
+      if (!this.credentialValues[provider]) {
         const tierLabel = TIER_LABELS[TIER_NAMES.indexOf(tier)];
-        const providerLabel = PROVIDER_LABELS[PROVIDER_NAMES.indexOf(providerName)] ?? providerName;
         await this.setStatus(
-          `${tierLabel} tier uses ${providerLabel} but no API key provided.`,
+          `${tierLabel} tier uses ${desc.label} but no API key provided.`,
           this.theme.statusErrorBright,
         );
         await this.setSaveControlsDisabled(false);
@@ -2908,24 +3109,16 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }
     }
 
-    // Persist credentials to storage
+    // Persist credentials to storage. Per-provider keys derived from
+    // each description's storageSuffix; CLI providers contribute nothing
+    // (their auth lives in the binary).
     if (this.storageId) {
-      const storageKeys: Array<[LLMProviderName, string]> = [
-        ['anthropic', STORAGE_KEY_ANTHROPIC],
-        ['openai', STORAGE_KEY_OPENAI],
-        ['ollama', STORAGE_KEY_OLLAMA_URL],
-        ['openrouter', STORAGE_KEY_OPENROUTER],
-        ['deepseek', STORAGE_KEY_DEEPSEEK],
-        ['grok', STORAGE_KEY_GROK],
-        ['gemini', STORAGE_KEY_GEMINI],
-        ['kimi', STORAGE_KEY_KIMI],
-        ['minimax', STORAGE_KEY_MINIMAX],
-      ];
-      for (const [name, key] of storageKeys) {
-        const value = this.credentialValues[name];
+      for (const desc of this.providerDescriptions) {
+        if (desc.credentialMode === 'cli' || desc.credentialMode === 'none') continue;
+        const value = this.credentialValues[desc.id];
         if (value) {
           await this.request(
-            request(this.id, this.storageId, 'set', { key, value })
+            request(this.id, this.storageId, 'set', { key: storageKeyFor(desc.storageSuffix), value })
           );
         }
       }
@@ -2953,8 +3146,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.fetchedLiveModels.clear();
     const prefetch = new Set<LLMProviderName>([this.activeAiProvider]);
     for (const tier of TIER_NAMES) {
-      const p = tierRouting[tier].provider as LLMProviderName | null;
-      if (p && PROVIDER_NAMES.includes(p)) prefetch.add(p);
+      const p = tierRouting[tier].provider;
+      if (p && this.providerDescById.has(p)) prefetch.add(p);
     }
     for (const p of prefetch) {
       void this.refreshProviderModels(p, { force: true });

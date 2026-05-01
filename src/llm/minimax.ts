@@ -6,7 +6,7 @@
  * tier models.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo } from './provider.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription } from './provider.js';
 import { OpenAIProvider } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
@@ -46,6 +46,24 @@ export class MiniMaxProvider extends OpenAIProvider {
       { id: 'abab6.5-chat', name: 'abab6.5 Chat' },
       { id: 'abab6.5s-chat', name: 'abab6.5s Chat' },
     ];
+  }
+
+  override describe(): LLMProviderDescription {
+    return {
+      id: 'minimax',
+      label: 'MiniMax',
+      storageSuffix: 'minimaxApiKey',
+      credentialMode: 'apiKey',
+      credentialLabel: 'MiniMax API Key',
+      credentialPlaceholder: 'sk-...',
+      models: [
+        { id: 'MiniMax-M2', name: 'MiniMax M2' },
+        { id: 'MiniMax-M1', name: 'MiniMax M1' },
+        { id: 'abab6.5-chat', name: 'abab6.5 Chat' },
+        { id: 'abab6.5s-chat', name: 'abab6.5s Chat' },
+      ],
+      defaultTierModels: DEFAULT_TIER_MODELS,
+    };
   }
 }
 
