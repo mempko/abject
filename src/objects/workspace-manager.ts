@@ -679,6 +679,14 @@ export class WorkspaceManager extends Abject {
       await this.request(request(this.id, this.uiServerId, 'setActiveWorkspace', { workspaceId }));
     }
 
+    // Tell WidgetManager so it can re-skin system-level UI (workspace switcher,
+    // global toolbar, taskbar) with the new workspace's theme.
+    if (this.widgetManagerId) {
+      try {
+        await this.request(request(this.id, this.widgetManagerId, 'setActiveWorkspace', { workspaceId }));
+      } catch { /* WidgetManager may not be ready */ }
+    }
+
     await this.persistActiveWorkspaceId();
 
     // Reposition all panels (GlobalToolbar → WorkspaceSwitcher → Taskbar)

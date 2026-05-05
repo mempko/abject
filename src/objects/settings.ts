@@ -10,6 +10,10 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+import {
+  ThemePreset,
+  DEFAULT_THEME_ID,
+} from '../core/theme-data.js';
 
 const log = new Log('SETTINGS');
 
@@ -41,8 +45,16 @@ export class Settings extends Abject {
   private rootLayoutId?: AbjectId;
 
   // Tab state
-  private activeTab: 'general' | 'access' = 'general';
+  private activeTab: 'general' | 'access' | 'appearance' = 'general';
   private tabBarId?: AbjectId;
+
+  // Appearance tab state
+  private themeAbjectId?: AbjectId;
+  private themeSwatches: Map<AbjectId, string> = new Map();  // swatchId → themeId
+  private activeThemeNameLabelId?: AbjectId;
+  private resetThemeBtnId?: AbjectId;
+  private selectedThemeId: string = DEFAULT_THEME_ID;
+  private appearancePresets: ThemePreset[] = [];
 
   // Widget AbjectIds (General tab)
   private workspaceNameInputId?: AbjectId;
@@ -238,6 +250,11 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     this.exposedWidgetIds = [];
     this.accessSearchInputId = undefined;
     this.accessSearchText = '';
+
+    // Appearance tab refs
+    this.themeSwatches.clear();
+    this.activeThemeNameLabelId = undefined;
+    this.resetThemeBtnId = undefined;
   }
 
   private setupHandlers(): void {
@@ -263,14 +280,36 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
       // Tab bar change — clear and rebuild tab content without destroying window
       if (fromId === this.tabBarId && aspect === 'change') {
         const idx = value as number;
-        this.activeTab = idx === 0 ? 'general' : 'access';
+        this.activeTab = idx === 0 ? 'general' : idx === 1 ? 'access' : 'appearance';
         await this.clearTabContent();
         const r0 = { x: 0, y: 0, width: 0, height: 0 };
         if (this.activeTab === 'general') {
           await this.buildGeneralTab(r0);
-        } else {
+        } else if (this.activeTab === 'access') {
           await this.buildAccessTab(r0);
+        } else {
+          await this.buildAppearanceTab();
         }
+        return;
+      }
+
+      // Appearance tab — theme swatch click
+      if (this.themeSwatches.has(fromId) && aspect === 'click') {
+        const newId = this.themeSwatches.get(fromId)!;
+        await this.applySelectedTheme(newId);
+        return;
+      }
+
+      // Appearance tab — reset button
+      if (fromId === this.resetThemeBtnId && aspect === 'click') {
+        await this.applySelectedTheme(DEFAULT_THEME_ID);
+        return;
+      }
+
+      // Appearance tab — preset list updated (user theme registered/removed)
+      if (fromId === this.themeAbjectId && aspect === 'presetsChanged' && this.activeTab === 'appearance') {
+        await this.clearTabContent();
+        await this.buildAppearanceTab();
         return;
       }
 
@@ -376,8 +415,8 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     const { widgetIds: [tabBarId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [{
         type: 'tabBar', windowId: this.windowId,
-        tabs: ['General', 'Access'],
-        selectedIndex: this.activeTab === 'general' ? 0 : 1,
+        tabs: ['General', 'Access', 'Appearance'],
+        selectedIndex: this.activeTab === 'general' ? 0 : this.activeTab === 'access' ? 1 : 2,
       }] })
     );
     this.tabBarId = tabBarId;
@@ -404,8 +443,10 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     // Build tab content
     if (this.activeTab === 'general') {
       await this.buildGeneralTab(r0);
-    } else {
+    } else if (this.activeTab === 'access') {
       await this.buildAccessTab(r0);
+    } else {
+      await this.buildAppearanceTab();
     }
 
     this.changed('visibility', true);
@@ -1406,8 +1447,211 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     const r0 = { x: 0, y: 0, width: 0, height: 0 };
     if (this.activeTab === 'general') {
       await this.buildGeneralTab(r0);
-    } else {
+    } else if (this.activeTab === 'access') {
       await this.buildAccessTab(r0);
+    } else {
+      await this.buildAppearanceTab();
+    }
+  }
+
+  /**
+   * Build the Appearance tab: header, current-theme label, swatch grid, reset button.
+   */
+  private async buildAppearanceTab(): Promise<void> {
+    const cId = this.tabContentContainerId!;
+
+    // Discover (and remember) the Theme abject so we can subscribe to its events.
+    if (!this.themeAbjectId) {
+      this.themeAbjectId = await this.discoverDep('Theme') ?? undefined;
+      if (this.themeAbjectId) {
+        try {
+          await this.request(request(this.id, this.themeAbjectId, 'addDependent', {}));
+        } catch { /* best effort */ }
+      }
+    }
+
+    // Pull preset list and active id from Theme.
+    let presets: ThemePreset[] = [];
+    let activeId: string = DEFAULT_THEME_ID;
+    if (this.themeAbjectId) {
+      try {
+        presets = await this.request<ThemePreset[]>(
+          request(this.id, this.themeAbjectId, 'listPresets', {})
+        );
+      } catch { /* fall through with empty list */ }
+      try {
+        activeId = await this.request<string>(
+          request(this.id, this.themeAbjectId, 'getActiveThemeId', {})
+        );
+      } catch { /* keep default */ }
+    }
+    this.appearancePresets = presets;
+    this.selectedThemeId = activeId;
+
+    const activeName = presets.find((p) => p.id === activeId)?.name ?? 'Custom';
+
+    // Section header + description + active-theme label.
+    const { widgetIds: [headerId, descId, activeLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Theme',
+          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
+        { type: 'label', windowId: this.windowId,
+          text: 'Choose how this workspace looks. Changes apply immediately.',
+          style: { color: this.theme.textDescription, fontSize: 12 } },
+        { type: 'label', windowId: this.windowId, text: `Active: ${activeName}`,
+          style: { color: this.theme.textMeta, fontSize: 12 } },
+      ] })
+    );
+    this.trackTabWidget(headerId);
+    this.trackTabWidget(descId);
+    this.activeThemeNameLabelId = this.trackTabWidget(activeLabelId);
+
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: headerId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 24 },
+    }));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: descId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.activeThemeNameLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
+
+    // Render swatches: built-ins first, then a divider, then user presets.
+    const builtins = presets.filter((p) => p.builtin);
+    const userThemes = presets.filter((p) => !p.builtin);
+
+    await this.renderSwatchGrid(cId, builtins);
+
+    if (userThemes.length > 0) {
+      const { widgetIds: [divId, userHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'divider', windowId: this.windowId },
+          { type: 'label', windowId: this.windowId, text: 'Your themes',
+            style: { color: this.theme.sectionLabel, fontSize: 12, fontWeight: 'bold' } },
+        ] })
+      );
+      this.trackTabWidget(divId);
+      this.trackTabWidget(userHeaderId);
+      await this.request(request(this.id, cId, 'addLayoutChild', {
+        widgetId: divId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 1 },
+      }));
+      await this.request(request(this.id, cId, 'addLayoutChild', {
+        widgetId: userHeaderId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 18 },
+      }));
+      await this.renderSwatchGrid(cId, userThemes);
+    }
+
+    // Reset to default button.
+    const { widgetIds: [resetBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Reset to default',
+          style: { background: this.theme.buttonBg, color: this.theme.buttonText } },
+      ] })
+    );
+    this.resetThemeBtnId = this.trackTabWidget(resetBtnId);
+    await this.request(request(this.id, this.resetThemeBtnId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.resetThemeBtnId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+  }
+
+  /**
+   * Render a 2-column row-of-rows grid of theme swatches inside the given parent layout.
+   */
+  private async renderSwatchGrid(parentId: AbjectId, presets: ThemePreset[]): Promise<void> {
+    const COLS = 2;
+    const SWATCH_H = 110;
+
+    for (let i = 0; i < presets.length; i += COLS) {
+      const rowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+          parentLayoutId: parentId,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 10,
+        })
+      );
+      this.trackTabWidget(rowId);
+      await this.request(request(this.id, parentId, 'addLayoutChild', {
+        widgetId: rowId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: SWATCH_H },
+      }));
+
+      for (let c = 0; c < COLS; c++) {
+        const preset = presets[i + c];
+        if (!preset) break;
+        const { widgetIds: [swatchId] } = await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs: [{
+            type: 'themeSwatch', windowId: this.windowId,
+            themeId: preset.id,
+            themeName: preset.name,
+            previewTheme: preset.theme,
+            selected: preset.id === this.selectedThemeId,
+          }] })
+        );
+        this.themeSwatches.set(swatchId, preset.id);
+        this.trackTabWidget(swatchId);
+        await this.request(request(this.id, swatchId, 'addDependent', {}));
+        await this.request(request(this.id, rowId, 'addLayoutChild', {
+          widgetId: swatchId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+          preferredSize: { height: SWATCH_H },
+        }));
+      }
+    }
+  }
+
+  /**
+   * Apply the selected theme by id and refresh visual selection state without
+   * tearing down the tab — the swatches keep showing their preset colours,
+   * only their selection ring (which uses the *active* theme accent) flips.
+   */
+  private async applySelectedTheme(newId: string): Promise<void> {
+    if (!this.themeAbjectId) {
+      this.themeAbjectId = await this.discoverDep('Theme') ?? undefined;
+    }
+    if (!this.themeAbjectId) return;
+
+    try {
+      await this.request(
+        request(this.id, this.themeAbjectId, 'setThemeById', { id: newId })
+      );
+    } catch (err) {
+      log.warn('setThemeById failed:', err);
+      return;
+    }
+
+    this.selectedThemeId = newId;
+
+    // Update the "Active: …" label.
+    const newName = this.appearancePresets.find((p) => p.id === newId)?.name ?? newId;
+    if (this.activeThemeNameLabelId) {
+      try {
+        await this.request(request(this.id, this.activeThemeNameLabelId, 'update', {
+          text: `Active: ${newName}`,
+        }));
+      } catch { /* widget may have been disposed */ }
+    }
+
+    // Move the selection ring to the right swatch.
+    for (const [swatchId, themeId] of this.themeSwatches.entries()) {
+      try {
+        await this.request(request(this.id, swatchId, 'update', {
+          selected: themeId === newId,
+        }));
+      } catch { /* gone */ }
     }
   }
 }

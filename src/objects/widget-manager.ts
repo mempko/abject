@@ -40,6 +40,7 @@ import { CanvasWidget, CanvasWidgetConfig } from './widgets/canvas-widget.js';
 import { TabBarWidget, TabBarConfig } from './widgets/tabbar-widget.js';
 import { SliderWidget, SliderWidgetConfig } from './widgets/slider-widget.js';
 import { ImageWidget, ImageWidgetConfig } from './widgets/image-widget.js';
+import { ThemeSwatchWidget, ThemeSwatchWidgetConfig } from './widgets/theme-swatch-widget.js';
 import { ListWidget, ListWidgetConfig, ListItem } from './widgets/list-widget.js';
 import { TreeWidget, TreeWidgetConfig, TreeItem } from './widgets/tree-widget.js';
 import { SplitPaneWidget, SplitPaneConfig } from './widgets/split-pane-widget.js';
@@ -68,6 +69,12 @@ export class WidgetManager extends Abject {
   private consoleId?: AbjectId;
   private defaultTheme: ThemeData = MIDNIGHT_BLOOM;
   private workspaceThemes: Map<string, { themeId: AbjectId; theme: ThemeData }> = new Map();
+  /**
+   * The currently active workspace. System-level widgets (workspace switcher,
+   * global toolbar, etc. — anything not tagged to a workspace) use this
+   * workspace's theme so the whole UI re-skins together.
+   */
+  private activeWorkspaceId?: string;
   private windowManagerId?: AbjectId;
 
   // Tracking spawned Abjects (Set<AbjectId>, NOT references — network transparent)
@@ -763,6 +770,28 @@ export class WidgetManager extends Abject {
       } catch { /* may not support dependents */ }
 
       this.workspaceThemes.set(workspaceId, { themeId, theme });
+
+      // If this is the active workspace, immediately push its theme to
+      // system-level UI so it re-skins on first registration too.
+      if (this.activeWorkspaceId === workspaceId) {
+        this.broadcastThemeToSystemWidgets(theme);
+      }
+      return true;
+    });
+
+    /**
+     * Notify WidgetManager that the active workspace changed. Called by
+     * WorkspaceManager.switchWorkspace. We broadcast the new workspace's
+     * theme to system-level widgets/windows (workspace switcher, global
+     * toolbar, etc.) so the entire UI flips colour together.
+     */
+    this.on('setActiveWorkspace', async (msg: AbjectMessage) => {
+      const { workspaceId } = msg.payload as { workspaceId: string };
+      this.activeWorkspaceId = workspaceId;
+      const entry = this.workspaceThemes.get(workspaceId);
+      if (entry) {
+        this.broadcastThemeToSystemWidgets(entry.theme);
+      }
       return true;
     });
 
@@ -814,7 +843,7 @@ export class WidgetManager extends Abject {
         }
         if (changedWorkspaceId) {
           const newTheme = value as ThemeData;
-          // Propagate only to widgets/windows in this workspace
+          // Propagate to widgets/windows in this workspace
           for (const id of this.spawnedWidgets) {
             if (this.getWorkspaceForWidgetOrWindow(id) === changedWorkspaceId) {
               try { this.send(event(this.id, id, 'updateTheme', newTheme)); } catch { /* gone */ }
@@ -824,6 +853,12 @@ export class WidgetManager extends Abject {
             if (this.getWorkspaceForWidgetOrWindow(id) === changedWorkspaceId) {
               try { this.send(event(this.id, id, 'updateTheme', newTheme)); } catch { /* gone */ }
             }
+          }
+          // If this is the active workspace's theme, also re-skin system-level
+          // UI (workspace switcher, global toolbar — anything untagged) so
+          // the whole frame flips colour together.
+          if (changedWorkspaceId === this.activeWorkspaceId) {
+            this.broadcastThemeToSystemWidgets(newTheme);
           }
           return;
         }
@@ -967,6 +1002,25 @@ export class WidgetManager extends Abject {
       if (entry) return entry.theme;
     }
     return this.defaultTheme;
+  }
+
+  /**
+   * Send `updateTheme` to every widget and window that is NOT tagged to a
+   * workspace (workspace switcher, global toolbar, modal dialogs, taskbar,
+   * etc.). Used when the active workspace changes or its theme is updated,
+   * so system chrome flips colour with the workspace content.
+   */
+  private broadcastThemeToSystemWidgets(theme: ThemeData): void {
+    for (const id of this.spawnedWidgets) {
+      if (this.getWorkspaceForWidgetOrWindow(id) === undefined) {
+        try { this.send(event(this.id, id, 'updateTheme', theme)); } catch { /* gone */ }
+      }
+    }
+    for (const id of this.spawnedWindows) {
+      if (this.getWorkspaceForWidgetOrWindow(id) === undefined) {
+        try { this.send(event(this.id, id, 'updateTheme', theme)); } catch { /* gone */ }
+      }
+    }
   }
 
   /** Get workspace ID for a widget/window by tracing through windowOwners → objectWorkspaces. */
@@ -1838,6 +1892,10 @@ await this.call(timerId, 'addDependent', {});
     orientation?: 'horizontal' | 'vertical';
     dividerPosition?: number;
     minSize?: number;
+    themeId?: string;
+    themeName?: string;
+    previewTheme?: ThemeData;
+    selected?: boolean;
   }): Promise<AbjectId> {
     const rect = spec.rect ?? { x: 0, y: 0, width: 0, height: 0 };
     const theme = this.getThemeForWindow(spec.windowId);
@@ -1898,6 +1956,21 @@ await this.call(timerId, 'addDependent', {});
           type: 'image', rect, style: spec.style,
           url: spec.url, fit: spec.fit, alt: spec.alt, ...base,
         }), rect);
+      case 'themeSwatch':
+        require(typeof spec.themeId === 'string' && spec.themeId.length > 0,
+          'themeSwatch spec requires themeId');
+        require(typeof spec.themeName === 'string' && spec.themeName.length > 0,
+          'themeSwatch spec requires themeName');
+        require(spec.previewTheme !== undefined,
+          'themeSwatch spec requires previewTheme');
+        return this.createTypedWidget(spec.windowId, new ThemeSwatchWidget({
+          type: 'themeSwatch', rect, style: spec.style,
+          themeId: spec.themeId!,
+          themeName: spec.themeName!,
+          previewTheme: spec.previewTheme!,
+          selected: spec.selected,
+          ...base,
+        } as ThemeSwatchWidgetConfig), rect);
       case 'list':
         return this.createTypedWidget(spec.windowId, new ListWidget({
           type: 'label' as WidgetType, rect, style: spec.style,

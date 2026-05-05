@@ -33,7 +33,7 @@ export interface WidgetStyle {
   syntaxHighlight?: boolean;  // textArea only: colorize JavaScript tokens
 }
 
-export type WidgetType = 'label' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image';
+export type WidgetType = 'label' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image' | 'themeSwatch';
 
 export interface Rect {
   x: number;
