@@ -195,6 +195,156 @@
         75%  { content: '...'; }
         100% { content: ''; }
       }
+
+      /* Pair prompt overlay (shown for p2p-default builds with no pairing) */
+      #pair-prompt-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 10001;
+        background: #030308;
+        align-items: center;
+        justify-content: center;
+        padding: 1.5rem;
+      }
+      #pair-prompt-overlay.visible { display: flex; }
+      .pair-card {
+        background: #0f1018;
+        border: 1px solid #1f2030;
+        border-radius: 14px;
+        padding: 2rem 1.75rem;
+        max-width: 420px;
+        width: 100%;
+        box-shadow: 0 12px 48px rgba(0,0,0,0.55);
+        font-family: "Inter", system-ui, sans-serif;
+      }
+      .pair-card .pair-logo {
+        font-family: "JetBrains Mono", "Fira Code", monospace;
+        font-size: 1.4rem;
+        font-weight: 700;
+        color: #e0e0ea;
+        text-align: center;
+        margin-bottom: 0.4rem;
+      }
+      .pair-card .pair-logo .accent { color: #39ff8e; }
+      .pair-card h2 {
+        color: #e2e4f0;
+        font-size: 1.1rem;
+        font-weight: 600;
+        text-align: center;
+        margin: 0.6rem 0 0.4rem;
+      }
+      .pair-card .pair-message {
+        color: #f87171;
+        font-size: 0.85rem;
+        text-align: center;
+        margin: 0 0 0.75rem;
+        min-height: 1.2em;
+      }
+      .pair-card ol {
+        color: #b0b2c8;
+        font-size: 0.9rem;
+        line-height: 1.55;
+        padding-left: 1.25rem;
+        margin: 0.75rem 0 1rem;
+      }
+      .pair-card ol li { margin-bottom: 0.4rem; }
+      .pair-card .pair-hint {
+        color: #6a6c84;
+        font-size: 0.75rem;
+        text-align: center;
+        margin-top: 1rem;
+        line-height: 1.5;
+      }
+      .pair-card .pair-hint code {
+        background: #1a1b2e;
+        padding: 0.1rem 0.35rem;
+        border-radius: 3px;
+        font-size: 0.72rem;
+        color: #b0b2c8;
+      }
+      .pair-card .pair-actions {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+        margin: 0.75rem 0 0.25rem;
+      }
+      .pair-card .pair-btn {
+        width: 100%;
+        padding: 0.75rem;
+        background: #39ff8e;
+        border: none;
+        border-radius: 8px;
+        color: #06120a;
+        font-size: 0.95rem;
+        font-weight: 600;
+        font-family: inherit;
+        cursor: pointer;
+        transition: filter 0.15s, transform 0.05s;
+      }
+      .pair-card .pair-btn:hover { filter: brightness(0.95); }
+      .pair-card .pair-btn:active { transform: scale(0.98); }
+      .pair-card .pair-btn.secondary {
+        background: transparent;
+        color: #b0b2c8;
+        border: 1px solid #2a2c42;
+      }
+
+      /* QR scanner overlay (fullscreen video) */
+      #qr-scanner-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 10002;
+        background: #000;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+      }
+      #qr-scanner-overlay.visible { display: flex; }
+      #qr-scanner-video {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+      .qr-scanner-frame {
+        position: absolute;
+        inset: 50% 50% 50% 50%;
+        width: min(70vw, 280px);
+        height: min(70vw, 280px);
+        transform: translate(-50%, -50%);
+        border: 2px solid #39ff8e;
+        border-radius: 12px;
+        box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55);
+        pointer-events: none;
+      }
+      .qr-scanner-hint {
+        position: absolute;
+        top: max(1.5rem, env(safe-area-inset-top));
+        left: 50%;
+        transform: translateX(-50%);
+        color: #e2e4f0;
+        font-family: "Inter", system-ui, sans-serif;
+        font-size: 0.9rem;
+        text-align: center;
+        background: rgba(0, 0, 0, 0.5);
+        padding: 0.5rem 0.9rem;
+        border-radius: 999px;
+      }
+      .qr-scanner-cancel {
+        position: absolute;
+        bottom: max(1.5rem, env(safe-area-inset-bottom));
+        left: 50%;
+        transform: translateX(-50%);
+        background: #1a1b2e;
+        color: #e2e4f0;
+        border: 1px solid #2a2c42;
+        border-radius: 999px;
+        padding: 0.6rem 1.5rem;
+        font-family: inherit;
+        font-size: 0.9rem;
+        cursor: pointer;
+      }
     </style>
   </head>
   <body>
@@ -214,6 +364,30 @@
     <div id="connecting-overlay">
       <div class="connecting-logo"><span class="accent">{abject}</span></div>
       <div class="connecting-status">Descending into the depths<span class="connecting-dots"></span></div>
+    </div>
+    <div id="pair-prompt-overlay">
+      <div class="pair-card">
+        <div class="pair-logo"><span class="accent">{abject}</span></div>
+        <h2>Pair this device</h2>
+        <div id="pair-prompt-message" class="pair-message"></div>
+        <ol>
+          <li>Open Abject on your desktop.</li>
+          <li>Go to <b>Settings → Auth → Remote Access</b> and click <b>Generate Pairing QR</b>.</li>
+          <li>Scan the QR below.</li>
+        </ol>
+        <div class="pair-actions">
+          <button id="pair-scan-btn" class="pair-btn" type="button">Scan QR with camera</button>
+        </div>
+        <div class="pair-hint">
+          Or scan with your phone's camera app — the link <code>?pair=…</code> opens this browser and pairs once.
+        </div>
+      </div>
+    </div>
+    <div id="qr-scanner-overlay">
+      <video id="qr-scanner-video" autoplay playsinline muted></video>
+      <div class="qr-scanner-frame"></div>
+      <div class="qr-scanner-hint">Point at the QR shown on your desktop</div>
+      <button id="qr-scanner-cancel" class="qr-scanner-cancel" type="button">Cancel</button>
     </div>
     <canvas id="abyss-bg"></canvas>
     <div id="app"></div>

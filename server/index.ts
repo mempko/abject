@@ -88,6 +88,8 @@ import { ClawHubClient } from '../src/objects/clawhub-client.js';
 import { CatalogBrowser } from '../src/objects/catalog-browser.js';
 import { SecretsVault } from '../src/objects/secrets-vault.js';
 import { OAuthHelper } from '../src/objects/oauth-helper.js';
+import { RemoteUIAccess } from '../src/objects/remote-ui-access.js';
+import type { UITransportLike } from '../src/network/webrtc-ui-transport.js';
 import { HttpServer } from '../src/objects/http-server.js';
 import type { MCPBridgeConfig } from '../src/objects/mcp-bridge.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
@@ -328,6 +330,39 @@ async function main(): Promise<void> {
     }
   }
 
+  /**
+   * Attach a paired remote UI client (encrypted WebRTC DataChannel) to
+   * BackendUI. Same dual-mode pattern as connectFrontend: in worker mode we
+   * relay strings between the WebRTCUITransport (main thread) and a
+   * MessagePort that we hand to the UI worker, where BackendUI lives.
+   */
+  function attachRemoteUIClient(peerId: string, transport: UITransportLike): void {
+    if (DEDICATED_WORKERS && uiBridge) {
+      const { port1, port2 } = new MessageChannel();
+
+      transport.onMessage((data: string) => {
+        port1.postMessage(data);
+      });
+      port1.on('message', (data: unknown) => {
+        if (transport.ready) transport.send(String(data));
+      });
+
+      transport.onClose(() => port1.close());
+      port1.on('close', () => {
+        if (transport.ready) transport.close();
+      });
+
+      uiBridge.transferPort('webrtc-relay', port2);
+      alog.info(`Remote UI client ${peerId.slice(0, 16)} relayed to UI worker`);
+    } else if (backendUI) {
+      backendUI.addTransport(transport);
+      alog.info(`Remote UI client ${peerId.slice(0, 16)} attached to BackendUI`);
+    } else {
+      alog.warn(`No BackendUI available to attach remote UI client ${peerId.slice(0, 16)}`);
+      transport.close();
+    }
+  }
+
   const wsServer = new NodeWebSocketServer({
     port: WS_PORT,
     host: '127.0.0.1',
@@ -446,6 +481,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('CatalogBrowser', () => new CatalogBrowser());
   runtime.objectFactory.registerConstructor('SecretsVault', () => new SecretsVault());
   runtime.objectFactory.registerConstructor('OAuthHelper', () => new OAuthHelper());
+  runtime.objectFactory.registerConstructor('RemoteUIAccess', () => new RemoteUIAccess());
   runtime.objectFactory.registerConstructor('MCPBridge', (args?: unknown) => {
     const config = args as MCPBridgeConfig;
     return new MCPBridge(config);
@@ -701,6 +737,16 @@ async function main(): Promise<void> {
   }
 
   log.timed('P2P layer ready');
+
+  // RemoteUIAccess must spawn before GlobalSettings so the auth tab's
+  // discoverDep('RemoteUIAccess') in onInit succeeds.
+  const remoteUIAccessId = await supervisedSpawn('RemoteUIAccess', 'permanent', systemTypeId('RemoteUIAccess'));
+  const remoteUIAccessObj = runtime.objectFactory.getObject(remoteUIAccessId) as RemoteUIAccess | undefined;
+  if (remoteUIAccessObj) {
+    remoteUIAccessObj.setAttachHandler((peerId: string, transport: UITransportLike) => {
+      attachRemoteUIClient(peerId, transport);
+    });
+  }
 
   const globalSettingsId = await supervisedSpawn('GlobalSettings', 'permanent', systemTypeId('GlobalSettings'));
   const peerNetworkId = await supervisedSpawn('PeerNetwork', 'permanent', systemTypeId('PeerNetwork'));

@@ -12,6 +12,7 @@
     "conjure": "pnpm install",
     "awaken": "tsx --watch server/index.ts",
     "scry": "vite --config vite.client.config.ts",
+    "divine": "VITE_DEFAULT_MODE=p2p VITE_CLIENT_PORT=5180 vite --config vite.client.config.ts",
     "whisper": "tsx server/signaling-server.ts",
     "awaken2": "ABJECTS_DATA_DIR=.abjects2 WS_PORT=7721 tsx --watch server/index.ts",
     "scry2": "VITE_WS_PORT=7721 VITE_CLIENT_PORT=5175 vite --config vite.client.config.ts",
@@ -30,10 +31,13 @@
   },
   "dependencies": {
     "ajv": "^8.12.0",
+    "fflate": "^0.8.2",
+    "jsqr": "^1.4.0",
     "linkedom": "^0.18.0",
     "minisearch": "^7.2.0",
     "node-datachannel": "^0.32.1",
     "playwright": "^1.40.0",
+    "qrcode": "^1.5.4",
     "uuid": "^9.0.0",
     "ws": "^8.18.0",
     "yaml": "^2.8.3"
@@ -46,6 +50,7 @@
     ]
   },
   "devDependencies": {
+    "@types/qrcode": "^1.5.6",
     "@types/uuid": "^9.0.0",
     "@types/ws": "^8.5.0",
     "assemblyscript": "^0.27.0",

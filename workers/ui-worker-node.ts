@@ -61,12 +61,12 @@ port.on('message', async (data: { type: string; [key: string]: unknown }) => {
       const portName = data.portName as string;
       const wsPort = data.port as MessagePort;
 
-      if (portName === 'ws-relay' && backendUI) {
+      if ((portName === 'ws-relay' || portName === 'webrtc-relay') && backendUI) {
         const transport = new MessagePortUITransport(wsPort);
         backendUI.addTransport(transport);
-        log.info('WebSocket relay port connected to BackendUI');
-      } else if (portName === 'ws-relay') {
-        log.warn('Received ws-relay port but BackendUI not yet initialized');
+        log.info(`${portName} port connected to BackendUI`);
+      } else if (portName === 'ws-relay' || portName === 'webrtc-relay') {
+        log.warn(`Received ${portName} port but BackendUI not yet initialized`);
       }
       break;
     }
