@@ -45,19 +45,32 @@ function shouldOmitModelFlag(model: string | undefined): boolean {
   return !model || model === AUTO_MODEL;
 }
 
+/**
+ * Default idle timeout: how long the subprocess can be silent before we
+ * kill it. Resets on every chunk of output, so a long-but-progressing
+ * generation keeps running. Codex emits NDJSON event-by-event, so token
+ * deltas naturally keep the timer alive.
+ *
+ * 180s is generous enough for big context turns and tight enough to
+ * notice a truly hung subprocess (auth prompt, network stall).
+ */
+const DEFAULT_IDLE_TIMEOUT_MS = 180_000;
+
 export class CodexCliProvider extends BaseLLMProvider {
   readonly name = 'codex-cli';
 
   private readonly bin: string;
+  private readonly idleTimeoutMs: number;
 
-  constructor(config: { bin?: string } = {}) {
+  constructor(config: { bin?: string; idleTimeoutMs?: number } = {}) {
     super({});
     this.bin = config.bin ?? 'codex';
+    this.idleTimeoutMs = config.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
   }
 
   async isAvailable(): Promise<boolean> {
     try {
-      const { code } = await runCli(this.bin, ['--version'], '', 5_000);
+      const { code } = await runCliIdle(this.bin, ['--version'], '', { idleTimeoutMs: 5_000 });
       return code === 0;
     } catch {
       return false;
@@ -66,7 +79,7 @@ export class CodexCliProvider extends BaseLLMProvider {
 
   async complete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
     const { argv, stdin } = this.buildArgs(messages, options);
-    const { code, stdout, stderr } = await runCli(this.bin, argv, stdin, 180_000);
+    const { code, stdout, stderr } = await runCliIdle(this.bin, argv, stdin, { idleTimeoutMs: this.idleTimeoutMs });
     if (code !== 0) {
       throw new Error(formatCliError('codex', code, stderr, stdout, argv));
     }
@@ -87,30 +100,50 @@ export class CodexCliProvider extends BaseLLMProvider {
     const proc = spawn(this.bin, argv, { stdio: ['pipe', 'pipe', 'pipe'] });
     proc.stdin.end(stdin);
 
+    // Idle timer — resets per chunk so a long generation keeps running.
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    let timeoutFired = false;
+    const armIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        timeoutFired = true;
+        try { proc.kill('SIGTERM'); } catch { /* already gone */ }
+      }, this.idleTimeoutMs);
+    };
+    armIdle();
+
     let buffer = '';
     let allStdout = '';
     let stderr = '';
     let cliErrorMessage: string | undefined;
-    proc.stderr.on('data', (b) => { stderr += b.toString(); });
+    proc.stderr.on('data', (b) => { stderr += b.toString(); armIdle(); });
 
-    for await (const chunk of proc.stdout) {
-      const s = String(chunk);
-      allStdout += s;
-      buffer += s;
-      let nl = buffer.indexOf('\n');
-      while (nl >= 0) {
-        const line = buffer.slice(0, nl).trim();
-        buffer = buffer.slice(nl + 1);
-        nl = buffer.indexOf('\n');
-        if (!line) continue;
-        const errMsg = extractCodexStreamError(line);
-        if (errMsg) cliErrorMessage = errMsg;
-        const delta = extractCodexStreamDelta(line);
-        if (delta) yield { content: delta, done: false };
+    try {
+      for await (const chunk of proc.stdout) {
+        armIdle();
+        const s = String(chunk);
+        allStdout += s;
+        buffer += s;
+        let nl = buffer.indexOf('\n');
+        while (nl >= 0) {
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          nl = buffer.indexOf('\n');
+          if (!line) continue;
+          const errMsg = extractCodexStreamError(line);
+          if (errMsg) cliErrorMessage = errMsg;
+          const delta = extractCodexStreamDelta(line);
+          if (delta) yield { content: delta, done: false };
+        }
       }
+    } finally {
+      if (idleTimer) clearTimeout(idleTimer);
     }
 
     const code = await new Promise<number>((resolve) => proc.on('close', (c) => resolve(c ?? 0)));
+    if (timeoutFired) {
+      throw new Error(`codex idle for ${this.idleTimeoutMs}ms — no output, subprocess killed`);
+    }
     if (code !== 0) {
       throw new Error(formatCliError('codex', code, stderr, allStdout, argv, cliErrorMessage));
     }
@@ -197,26 +230,44 @@ export class CodexCliProvider extends BaseLLMProvider {
 
 interface CliResult { code: number; stdout: string; stderr: string; }
 
-function runCli(bin: string, argv: string[], stdin: string, timeoutMs: number): Promise<CliResult> {
+/**
+ * Spawn a CLI, return its full stdout/stderr/exit when it closes.
+ *
+ * Uses an *idle* timeout: the timer resets on every chunk of stdout or
+ * stderr, so a long-but-progressing subprocess keeps running. Only true
+ * hangs (no output for `idleTimeoutMs`) trigger SIGTERM. This replaces
+ * the old wall-clock total-call timeout, which killed long generations
+ * even though codex was still working.
+ */
+function runCliIdle(
+  bin: string, argv: string[], stdin: string,
+  opts: { idleTimeoutMs: number },
+): Promise<CliResult> {
   return new Promise((resolve, reject) => {
     const proc = spawn(bin, argv, { stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     let killed = false;
-    const timer = setTimeout(() => {
-      killed = true;
-      proc.kill('SIGTERM');
-      reject(new Error(`${bin} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
 
-    proc.stdout.on('data', (b) => { stdout += b.toString(); });
-    proc.stderr.on('data', (b) => { stderr += b.toString(); });
+    let idleTimer: ReturnType<typeof setTimeout>;
+    const armIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        killed = true;
+        try { proc.kill('SIGTERM'); } catch { /* already gone */ }
+        reject(new Error(`${bin} idle for ${opts.idleTimeoutMs}ms — no output, subprocess killed`));
+      }, opts.idleTimeoutMs);
+    };
+    armIdle();
+
+    proc.stdout.on('data', (b) => { stdout += b.toString(); armIdle(); });
+    proc.stderr.on('data', (b) => { stderr += b.toString(); armIdle(); });
     proc.on('error', (err) => {
-      clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
       if (!killed) reject(err);
     });
     proc.on('close', (code) => {
-      clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
       if (!killed) resolve({ code: code ?? 0, stdout, stderr });
     });
 

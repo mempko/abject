@@ -41,20 +41,16 @@ function shouldOmitModelFlag(model: string | undefined): boolean {
   return !model || model === AUTO_MODEL;
 }
 
-/** What `claude -p --output-format json` writes to stdout. */
-interface ClaudeCliJson {
-  result?: string;
-  session_id?: string;
-  model?: string;
-  usage?: {
-    input_tokens?: number;
-    output_tokens?: number;
-    cache_read_tokens?: number;
-    cache_creation_tokens?: number;
-  };
-  /** Older builds emit `error` on a top-level key. */
-  error?: string;
-}
+/**
+ * Default idle timeout: how long the subprocess can be silent (no stdout
+ * AND no stderr) before we kill it. Resets on every chunk of output, so
+ * a long-but-progressing generation keeps running. Only true hangs
+ * (auth prompt, network stall, broken binary) hit the limit.
+ *
+ * Why 180s: large coding prompts that produce thousands of output tokens
+ * can have multi-second silences between bursts even on healthy runs.
+ */
+const DEFAULT_IDLE_TIMEOUT_MS = 180_000;
 
 export class ClaudeCliProvider extends BaseLLMProvider {
   /** Top-level provider name; lives alongside `anthropic` etc. */
@@ -63,44 +59,66 @@ export class ClaudeCliProvider extends BaseLLMProvider {
   /** Path to the binary; default 'claude' resolved via PATH. */
   private readonly bin: string;
 
-  constructor(config: { bin?: string } = {}) {
+  /** Idle timeout in ms — resets on every stdout/stderr chunk. */
+  private readonly idleTimeoutMs: number;
+
+  constructor(config: { bin?: string; idleTimeoutMs?: number } = {}) {
     super({});
     this.bin = config.bin ?? 'claude';
+    this.idleTimeoutMs = config.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
   }
 
   async isAvailable(): Promise<boolean> {
     try {
-      const { code } = await runCli(this.bin, ['--version'], '', 5_000);
+      const { code } = await runCliIdle(this.bin, ['--version'], '', { idleTimeoutMs: 5_000 });
       return code === 0;
     } catch {
       return false;
     }
   }
 
+  /**
+   * Read a complete response. Internally drives `--output-format stream-json`
+   * so token deltas reset the idle timer mid-call — long generations no
+   * longer get SIGTERM'd. Returns the same shape `complete()` always has;
+   * usage comes from the terminal `result` event.
+   */
   async complete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
-    const args = this.buildArgs(messages, options, 'json');
-    const { code, stdout, stderr } = await runCli(this.bin, args.argv, args.stdin, 120_000);
+    const args = this.buildArgs(messages, options, 'stream-json');
+
+    let textSoFar = '';
+    let resultText: string | undefined;
+    let usage: LLMCompletionResult['usage'];
+    let cliErrorMessage: string | undefined;
+
+    const { code, stdout, stderr } = await runCliIdleStreaming(
+      this.bin, args.argv, args.stdin,
+      { idleTimeoutMs: this.idleTimeoutMs },
+      (line) => {
+        const errMsg = extractStreamError(line);
+        if (errMsg) cliErrorMessage = errMsg;
+        const delta = extractStreamDelta(line);
+        if (delta) textSoFar += delta;
+        const finalText = extractStreamResultText(line);
+        if (finalText) resultText = finalText;
+        const u = extractStreamUsage(line);
+        if (u) usage = u;
+      },
+    );
+
     if (code !== 0) {
-      throw new Error(formatCliError('claude', code, stderr, stdout, args.argv));
+      throw new Error(formatCliError('claude', code, stderr, stdout, args.argv, cliErrorMessage));
     }
 
-    const parsed = parseClaudeJson(stdout);
-    if (parsed.error) {
-      throw new Error(`claude CLI error: ${parsed.error}`);
-    }
-    if (!parsed.result) {
+    const content = textSoFar || resultText;
+    if (!content) {
       throw new Error(`claude CLI returned no result. raw=${stdout.slice(0, 200)}`);
     }
 
     return {
-      content: parsed.result,
+      content,
       finishReason: 'stop',
-      usage: parsed.usage ? {
-        inputTokens:       parsed.usage.input_tokens ?? 0,
-        outputTokens:      parsed.usage.output_tokens ?? 0,
-        cacheReadTokens:   parsed.usage.cache_read_tokens,
-        cacheWriteTokens:  parsed.usage.cache_creation_tokens,
-      } : undefined,
+      usage,
     };
   }
 
@@ -109,36 +127,57 @@ export class ClaudeCliProvider extends BaseLLMProvider {
     const proc = spawn(this.bin, args.argv, { stdio: ['pipe', 'pipe', 'pipe'] });
     proc.stdin.end(args.stdin);
 
+    // Idle timer: reset on every chunk of stdout/stderr. Without this a
+    // hung subprocess (auth prompt, network stall) would block forever.
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    let timeoutFired = false;
+    const armIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        timeoutFired = true;
+        try { proc.kill('SIGTERM'); } catch { /* already gone */ }
+      }, this.idleTimeoutMs);
+    };
+    armIdle();
+
     let textSoFar = '';
     let buffer = '';
     let allStdout = '';
     let stderr = '';
     let cliErrorMessage: string | undefined;
-    proc.stderr.on('data', (b) => { stderr += b.toString(); });
+    proc.stderr.on('data', (b) => { stderr += b.toString(); armIdle(); });
 
-    for await (const chunk of proc.stdout) {
-      const s = String(chunk);
-      allStdout += s;
-      buffer += s;
-      let nl = buffer.indexOf('\n');
-      while (nl >= 0) {
-        const line = buffer.slice(0, nl).trim();
-        buffer = buffer.slice(nl + 1);
-        nl = buffer.indexOf('\n');
-        if (!line) continue;
-        // Some failures arrive as a single error event on stdout —
-        // capture it so we can surface a useful message.
-        const errMsg = extractStreamError(line);
-        if (errMsg) cliErrorMessage = errMsg;
-        const delta = extractStreamDelta(line);
-        if (delta) {
-          textSoFar += delta;
-          yield { content: delta, done: false };
+    try {
+      for await (const chunk of proc.stdout) {
+        armIdle();
+        const s = String(chunk);
+        allStdout += s;
+        buffer += s;
+        let nl = buffer.indexOf('\n');
+        while (nl >= 0) {
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          nl = buffer.indexOf('\n');
+          if (!line) continue;
+          // Some failures arrive as a single error event on stdout —
+          // capture it so we can surface a useful message.
+          const errMsg = extractStreamError(line);
+          if (errMsg) cliErrorMessage = errMsg;
+          const delta = extractStreamDelta(line);
+          if (delta) {
+            textSoFar += delta;
+            yield { content: delta, done: false };
+          }
         }
       }
+    } finally {
+      if (idleTimer) clearTimeout(idleTimer);
     }
 
     const code = await new Promise<number>((resolve) => proc.on('close', (c) => resolve(c ?? 0)));
+    if (timeoutFired) {
+      throw new Error(`claude idle for ${this.idleTimeoutMs}ms — no output, subprocess killed`);
+    }
     if (code !== 0) {
       throw new Error(formatCliError('claude', code, stderr, allStdout, args.argv, cliErrorMessage));
     }
@@ -206,18 +245,23 @@ export class ClaudeCliProvider extends BaseLLMProvider {
     const prompt = transcript.join('\n\n');
     const system = systemParts.join('\n\n');
 
-    // Conservative arg set. Claude Code requires `--verbose` together
-    // with `--output-format stream-json` (the CLI rejects the call with
-    // exit 1 otherwise), so we add it on the streaming path only. Other
-    // flags from earlier drafts (`--bare`, `--include-partial-messages`)
-    // turned out to be unsupported on stable builds — keeping the
-    // surface minimal means a working `claude` install just works.
+    // Claude Code requires `--verbose` together with `--output-format
+    // stream-json` (CLI rejects the call with exit 1 otherwise).
+    //
+    // `--include-partial-messages` makes the binary emit incremental
+    // `content_block_delta` events as tokens generate. Without it, the
+    // assistant message lands as a single event at the end — fine for
+    // correctness, terrible for the idle timeout: a long generation is
+    // silent for the whole turn, and we'd kill it. Recent stable builds
+    // (2.1.x) accept the flag; older releases that reject it will exit
+    // 1 with a clear `unknown option` error.
     const argv: string[] = [
       '-p',
       '--output-format', outputFormat,
     ];
     if (outputFormat === 'stream-json') {
       argv.push('--verbose');
+      argv.push('--include-partial-messages');
     }
     const model = options?.model;
     // 'auto' / undefined → omit `--model` so the CLI picks its current
@@ -237,26 +281,44 @@ export class ClaudeCliProvider extends BaseLLMProvider {
 
 interface CliResult { code: number; stdout: string; stderr: string; }
 
-function runCli(bin: string, argv: string[], stdin: string, timeoutMs: number): Promise<CliResult> {
+/**
+ * Spawn a CLI, return its full stdout/stderr/exit when it closes.
+ *
+ * Uses an *idle* timeout: the timer resets on every chunk of stdout or
+ * stderr, so a long-but-progressing subprocess keeps running. Only true
+ * hangs (no output for `idleTimeoutMs`) trigger SIGTERM. This replaces
+ * the old wall-clock total-call timeout, which killed long generations
+ * even though claude was still working.
+ */
+function runCliIdle(
+  bin: string, argv: string[], stdin: string,
+  opts: { idleTimeoutMs: number },
+): Promise<CliResult> {
   return new Promise((resolve, reject) => {
     const proc = spawn(bin, argv, { stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     let killed = false;
-    const timer = setTimeout(() => {
-      killed = true;
-      proc.kill('SIGTERM');
-      reject(new Error(`${bin} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
 
-    proc.stdout.on('data', (b) => { stdout += b.toString(); });
-    proc.stderr.on('data', (b) => { stderr += b.toString(); });
+    let idleTimer: ReturnType<typeof setTimeout>;
+    const armIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        killed = true;
+        try { proc.kill('SIGTERM'); } catch { /* already gone */ }
+        reject(new Error(`${bin} idle for ${opts.idleTimeoutMs}ms — no output, subprocess killed`));
+      }, opts.idleTimeoutMs);
+    };
+    armIdle();
+
+    proc.stdout.on('data', (b) => { stdout += b.toString(); armIdle(); });
+    proc.stderr.on('data', (b) => { stderr += b.toString(); armIdle(); });
     proc.on('error', (err) => {
-      clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
       if (!killed) reject(err);
     });
     proc.on('close', (code) => {
-      clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
       if (!killed) resolve({ code: code ?? 0, stdout, stderr });
     });
 
@@ -265,17 +327,115 @@ function runCli(bin: string, argv: string[], stdin: string, timeoutMs: number): 
   });
 }
 
-function parseClaudeJson(raw: string): ClaudeCliJson {
-  // Some claude builds wrap the JSON with leading log lines. Find the
-  // first '{' and parse from there; fall back to raw text on any error.
-  const trimmed = raw.trimStart();
-  const i = trimmed.indexOf('{');
-  if (i < 0) return { error: `unexpected output: ${raw.slice(0, 200)}` };
+/**
+ * Same as `runCliIdle`, but feeds each line of stdout to `onLine` as it
+ * arrives. Used by `complete()` to walk a `--output-format stream-json`
+ * stream so token deltas reset the idle timer in real time. The full
+ * stdout/stderr buffers are still returned for error reporting.
+ */
+function runCliIdleStreaming(
+  bin: string, argv: string[], stdin: string,
+  opts: { idleTimeoutMs: number },
+  onLine: (line: string) => void,
+): Promise<CliResult> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(bin, argv, { stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    let buffer = '';
+    let killed = false;
+
+    let idleTimer: ReturnType<typeof setTimeout>;
+    const armIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        killed = true;
+        try { proc.kill('SIGTERM'); } catch { /* already gone */ }
+        reject(new Error(`${bin} idle for ${opts.idleTimeoutMs}ms — no output, subprocess killed`));
+      }, opts.idleTimeoutMs);
+    };
+    armIdle();
+
+    proc.stdout.on('data', (b) => {
+      const s = b.toString();
+      stdout += s;
+      buffer += s;
+      armIdle();
+      let nl = buffer.indexOf('\n');
+      while (nl >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        nl = buffer.indexOf('\n');
+        if (line) {
+          try { onLine(line); } catch { /* never let a callback crash the runner */ }
+        }
+      }
+    });
+    proc.stderr.on('data', (b) => { stderr += b.toString(); armIdle(); });
+    proc.on('error', (err) => {
+      if (idleTimer) clearTimeout(idleTimer);
+      if (!killed) reject(err);
+    });
+    proc.on('close', (code) => {
+      if (idleTimer) clearTimeout(idleTimer);
+      if (!killed) {
+        // Flush any trailing line without a newline.
+        const tail = buffer.trim();
+        if (tail) {
+          try { onLine(tail); } catch { /* swallow */ }
+        }
+        resolve({ code: code ?? 0, stdout, stderr });
+      }
+    });
+
+    if (stdin.length > 0) proc.stdin.end(stdin);
+    else proc.stdin.end();
+  });
+}
+
+/**
+ * Some `claude --output-format stream-json` builds emit a final
+ * `{type:"result", result:"…", usage:{…}}` line that mirrors what `json`
+ * mode would have returned. We capture it as a fallback in case no
+ * incremental deltas were observed (older builds, or pure tool-only
+ * turns). When deltas *are* present they are authoritative and we
+ * prefer them over `result.result`.
+ */
+function extractStreamResultText(line: string): string | undefined {
   try {
-    return JSON.parse(trimmed.slice(i)) as ClaudeCliJson;
-  } catch (err) {
-    return { error: `JSON parse failed: ${(err as Error).message}; raw=${raw.slice(0, 200)}` };
-  }
+    const obj = JSON.parse(line) as Record<string, unknown>;
+    if (obj.type === 'result') {
+      const r = (obj as { result?: unknown }).result;
+      if (typeof r === 'string' && r.length > 0) return r;
+    }
+  } catch { /* not json */ }
+  return undefined;
+}
+
+/**
+ * Pull `usage` (token accounting) out of any stream line that carries it.
+ * Claude Code emits this on the terminal `result` event in stream-json
+ * mode; the same field shape as the old `--output-format json` payload.
+ */
+function extractStreamUsage(line: string): LLMCompletionResult['usage'] | undefined {
+  try {
+    const obj = JSON.parse(line) as Record<string, unknown>;
+    const u = (obj as { usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_read_tokens?: number;
+      cache_creation_tokens?: number;
+    } }).usage;
+    if (u && typeof u === 'object') {
+      return {
+        inputTokens:      u.input_tokens ?? 0,
+        outputTokens:     u.output_tokens ?? 0,
+        cacheReadTokens:  u.cache_read_tokens,
+        cacheWriteTokens: u.cache_creation_tokens,
+      };
+    }
+  } catch { /* not json */ }
+  return undefined;
 }
 
 /**
@@ -327,24 +487,35 @@ function formatCliError(
   return parts.join(' | ');
 }
 
+/**
+ * Pull the visible-text delta out of a stream-json line.
+ *
+ * Returns ONLY incremental token deltas — never the terminal assistant
+ * event's full text. If we returned both, `complete()` (which accumulates
+ * deltas into a single string) would double-count: every token once via
+ * the delta + once again via the terminal `assistant` event that carries
+ * the same content. The terminal full text is captured separately via
+ * `extractStreamResultText` and used only when no deltas arrived (e.g.
+ * tool-only turn or an unsupported claude build).
+ *
+ * Recognises both wrappings:
+ *   { type: 'stream_event', event: { type: 'content_block_delta', delta: { text: '…' } } }   ← 2.1.x with --include-partial-messages
+ *   { type: 'content_block_delta', delta: { text: '…' } }                                     ← older top-level form
+ */
 function extractStreamDelta(line: string): string | undefined {
   try {
     const obj = JSON.parse(line) as Record<string, unknown>;
-    // Common shapes seen across Claude Code releases:
-    //   { type: 'content_block_delta', delta: { type: 'text_delta', text: '...' } }
-    //   { type: 'partial_message', message: { content: [{ type: 'text', text: '...' }] } }
-    //   { type: 'assistant', message: { content: [...] } }
-    if (typeof obj.type === 'string') {
-      const t = obj.type as string;
-      if (t === 'content_block_delta') {
-        const delta = (obj as { delta?: { text?: string } }).delta;
-        if (delta && typeof delta.text === 'string') return delta.text;
+    const t = obj.type;
+    if (t === 'stream_event') {
+      const ev = (obj as { event?: { type?: string; delta?: { text?: string } } }).event;
+      if (ev?.type === 'content_block_delta' && typeof ev.delta?.text === 'string') {
+        return ev.delta.text;
       }
-      if (t === 'partial_message' || t === 'assistant') {
-        const message = (obj as { message?: { content?: Array<{ type?: string; text?: string }> } }).message;
-        const text = message?.content?.find((b) => b.type === 'text')?.text;
-        if (text) return text;
-      }
+      return undefined;
+    }
+    if (t === 'content_block_delta') {
+      const delta = (obj as { delta?: { text?: string } }).delta;
+      if (delta && typeof delta.text === 'string') return delta.text;
     }
   } catch {
     /* malformed line — skip */
