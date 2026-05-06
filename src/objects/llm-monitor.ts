@@ -72,6 +72,19 @@ export class LLMMonitor extends Abject {
   private lastActiveIds: string[] = [];
   private lastHistoryIds: string[] = [];
 
+  /**
+   * Every widget created inside a tab's ScrollableVBox, tracked per-tab so we
+   * can explicitly destroy each one before tearing down the container on
+   * rebuild. Without this the tab container alone was getting destroyed and
+   * its widget tree was orphaned in WidgetManager — every refresh leaked all
+   * the rows worth of widgets, OOMing after a few hours of LLM activity.
+   *
+   * LayoutAbject also cascades destroy on stop now, so this is belt-and-
+   * suspenders, but it also documents intent and keeps llm-monitor consistent
+   * with the explicit-tracking pattern Settings.clearTabContent uses.
+   */
+  private tabWidgetIds: AbjectId[][] = [[], []];
+
   // Detail window
   private detailWindowId?: AbjectId;
 
@@ -259,6 +272,7 @@ export class LLMMonitor extends Abject {
     this.historyRows = [];
     this.lastActiveIds = [];
     this.lastHistoryIds = [];
+    this.tabWidgetIds = [[], []];
     this.refreshing = false;
   }
 
@@ -500,14 +514,15 @@ export class LLMMonitor extends Abject {
 
     // Rebuild Active Requests tab
     await this.rebuildTabContent(0, async (targetId) => {
-      await this.addHeaderRow(targetId);
+      await this.addHeaderRow(targetId, 0);
       if (activeRequests.length === 0) {
-        await this.addEmptyLabel(targetId, 'No active requests');
+        await this.addEmptyLabel(targetId, 0, 'No active requests');
       } else {
         for (const req of activeRequests) {
           const elapsedSec = Math.round((now - req.startTime) / 1000);
           const row = await this.addRequestRow(
             targetId,
+            0,
             req.callerName ?? req.callerId.slice(0, 8),
             req.method,
             req.provider,
@@ -526,13 +541,14 @@ export class LLMMonitor extends Abject {
     // Rebuild Recent History tab
     await this.rebuildTabContent(1, async (targetId) => {
       if (history.length > 0) {
-        await this.addHeaderRow(targetId);
+        await this.addHeaderRow(targetId, 1);
         for (let i = history.length - 1; i >= 0; i--) {
           const entry = history[i];
           const timeSec = (entry.elapsedMs / 1000).toFixed(1);
           const nameColor = entry.error ? this.theme.statusError : this.theme.textHeading;
           const row = await this.addRequestRow(
             targetId,
+            1,
             entry.callerName ?? entry.callerId.slice(0, 8),
             entry.method,
             entry.provider,
@@ -546,7 +562,7 @@ export class LLMMonitor extends Abject {
           this.historyRows.push(row);
         }
       } else {
-        await this.addEmptyLabel(targetId, 'No history yet');
+        await this.addEmptyLabel(targetId, 1, 'No history yet');
       }
     });
   }
@@ -559,6 +575,19 @@ export class LLMMonitor extends Abject {
     populate: (targetLayoutId: AbjectId) => Promise<void>,
   ): Promise<void> {
     const oldId = this.tabContents[tabIndex];
+
+    // Destroy every widget we created inside the previous instance of this
+    // tab container. We must do this BEFORE destroying the container so that
+    // the WidgetManager and Theme dependent registrations are cleaned up
+    // cleanly. LayoutAbject's onStop also cascades, but tracking explicitly
+    // makes intent clear and survives any future refactor of cascade order.
+    const prev = this.tabWidgetIds[tabIndex];
+    for (const widgetId of prev) {
+      try {
+        await this.request(request(this.id, widgetId, 'destroy', {}));
+      } catch { /* widget already gone */ }
+    }
+    this.tabWidgetIds[tabIndex] = [];
 
     // Remove old from layout
     try {
@@ -614,18 +643,24 @@ export class LLMMonitor extends Abject {
     }));
   }
 
-  private async addHeaderRow(targetLayoutId: AbjectId): Promise<void> {
+  /** Track a widget id for cleanup when the given tab is rebuilt or destroyed. */
+  private trackTab(tabIndex: number, widgetId: AbjectId): AbjectId {
+    this.tabWidgetIds[tabIndex].push(widgetId);
+    return widgetId;
+  }
+
+  private async addHeaderRow(targetLayoutId: AbjectId, tabIndex: number): Promise<void> {
     const headerStyle = { color: this.theme.sectionLabel, fontSize: 10, fontWeight: 'bold' };
     const headerTexts = ['Requester', 'Method', 'Provider', 'Time', 'Output', ''];
     const headerWidths: Array<number | undefined> = [undefined, 70, 80, 50, 60, 50];
 
-    const headerRowId = await this.request<AbjectId>(
+    const headerRowId = this.trackTab(tabIndex, await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: targetLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
-    );
+    ));
     await this.request(request(this.id, targetLayoutId, 'addLayoutChild', {
       widgetId: headerRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
@@ -639,6 +674,7 @@ export class LLMMonitor extends Abject {
         })),
       })
     );
+    for (const id of headerLabelIds) this.trackTab(tabIndex, id);
 
     for (let h = 0; h < headerLabelIds.length; h++) {
       const width = headerWidths[h];
@@ -650,7 +686,7 @@ export class LLMMonitor extends Abject {
     }
   }
 
-  private async addEmptyLabel(targetLayoutId: AbjectId, text: string): Promise<void> {
+  private async addEmptyLabel(targetLayoutId: AbjectId, tabIndex: number, text: string): Promise<void> {
     const { widgetIds: [emptyId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
@@ -658,6 +694,7 @@ export class LLMMonitor extends Abject {
         ],
       })
     );
+    this.trackTab(tabIndex, emptyId);
     await this.request(request(this.id, targetLayoutId, 'addLayoutChild', {
       widgetId: emptyId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
@@ -667,6 +704,7 @@ export class LLMMonitor extends Abject {
 
   private async addRequestRow(
     targetLayoutId: AbjectId,
+    tabIndex: number,
     requesterName: string,
     method: string,
     provider: string,
@@ -678,13 +716,13 @@ export class LLMMonitor extends Abject {
     isKill: boolean,
   ): Promise<RowWidgets> {
     const rowH = 26;
-    const rowLayoutId = await this.request<AbjectId>(
+    const rowLayoutId = this.trackTab(tabIndex, await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: targetLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
-    );
+    ));
     await this.request(request(this.id, targetLayoutId, 'addLayoutChild', {
       widgetId: rowLayoutId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
@@ -703,6 +741,7 @@ export class LLMMonitor extends Abject {
           ],
         })
       );
+    for (const id of [nameId, methodId, providerId, timeId, outputId]) this.trackTab(tabIndex, id);
 
     await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
       widgetId: nameId,
@@ -729,6 +768,7 @@ export class LLMMonitor extends Abject {
         ],
       })
     );
+    this.trackTab(tabIndex, btnId);
     await this.addDep(btnId);
     if (isKill) {
       this.killButtons.set(btnId, requestId);
