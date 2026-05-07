@@ -656,6 +656,38 @@ export class Chat extends Abject {
       }
     });
 
+    // GoalManager fires this once per goal when every task has reached terminal
+    // state and the goal is still active. Chat is the creator of top-level
+    // goals, so it owns the "is this goal complete?" decision. Minimal default:
+    // mark goals with no failures as completed; leave goals with failures
+    // active so the user (or a follow-up turn) can decide what to do.
+    this.on('goalReadyForCompletion', async (msg: AbjectMessage) => {
+      const { goalId, doneTaskIds, failedTaskIds } = msg.payload as {
+        goalId: string;
+        creatorAgentId: string;
+        doneTaskIds: string[];
+        failedTaskIds: string[];
+      };
+      if (!this.goalManagerId) return;
+      log.info(`[Chat] goalReadyForCompletion ${goalId.slice(0, 8)} done=${doneTaskIds.length} failed=${failedTaskIds.length}`);
+      if (failedTaskIds.length === 0) {
+        try {
+          await this.request(
+            request(this.id, this.goalManagerId, 'completeGoal', {
+              goalId,
+              result: { doneTaskIds },
+            }),
+          );
+        } catch (err) {
+          log.warn(`[Chat] completeGoal ${goalId.slice(0, 8)} failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      // For now, goals with failures stay active. The follow-up turn (next
+      // user prompt) is the natural place to surface "X tasks failed, what
+      // do you want to do?" — wiring that into the LLM loop is left to a
+      // dedicated change.
+    });
+
     this.on('taskProgress', async (msg: AbjectMessage) => {
       // Reset pending ticket timeouts on agent progress
       this.resetPendingTicketTimeouts();

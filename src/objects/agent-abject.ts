@@ -25,7 +25,7 @@ const log = new Log('AgentAbject');
 
 // ─── Shared types ────────────────────────────────────────────────────
 
-export type AgentPhase = 'idle' | 'observing' | 'thinking' | 'acting' | 'done' | 'error';
+export type AgentPhase = 'idle' | 'observing' | 'thinking' | 'acting' | 'done' | 'error' | 'suspended';
 
 export interface AgentAction {
   action: string;
@@ -134,6 +134,11 @@ interface TaskEntry {
   parseFailures?: number;
   /** Consecutive LLM streams that returned empty content. Reset on every non-empty response. */
   emptyResponses?: number;
+  /** Set when this entry's state machine yielded on decompose/observing-with-children.
+   *  AgentAbject (not the dispatcher) owns tuple completion in this case, since the
+   *  dispatcher's executeTask call already returned with `{ suspended: true }` and
+   *  the JobManager job has finished. */
+  ownsTupleCompletion?: boolean;
 }
 
 // ─── AgentAbject ─────────────────────────────────────────────────────
@@ -224,9 +229,14 @@ export class AgentAbject extends Abject {
   /** Throttle timestamp for streaming progress events (1/sec max). */
   private lastStreamProgressTs = 0;
 
-  /** Resolvers for event-driven child goal observation. */
-  private childGoalEventResolvers = new Map<string, {
-    resolve: (evt: { aspect: string; goalId: string; taskId?: string; result?: unknown; error?: string }) => void;
+  /** Suspended task entries waiting on child goal completion. Keyed by parent taskId.
+   *  Each entry persists across the gap between executeTask returning `{ suspended: true }`
+   *  to the dispatcher and the eventual resume when all childGoalIds are terminal.
+   *  childGoalIdSet is the set of goals we're waiting on; the timer enforces the parent's
+   *  timeout while suspended. Resume restores phase to 'observing' and re-runs the loop. */
+  private suspendedEntries = new Map<string, {
+    entry: TaskEntry;
+    childGoalIdSet: Set<string>;
     timer: ReturnType<typeof setTimeout>;
   }>();
 
@@ -652,6 +662,12 @@ The registered object must implement these handlers to participate in the agent 
       clearInterval(this.scanTimer);
       this.scanTimer = undefined;
     }
+    // Clear any suspended-entry timeout timers so they don't fire on a
+    // partially-torn-down instance.
+    for (const susp of this.suspendedEntries.values()) {
+      clearTimeout(susp.timer);
+    }
+    this.suspendedEntries.clear();
   }
 
   /** Resolve a required dependency lazily. */
@@ -1403,9 +1419,18 @@ Pick the agent with the best combination. Reply with ONLY the agent name.`;
       const elapsed = Date.now() - dispatchStart;
       log.info(`DISPATCH-INNER ${tupleId} — executeTask SUCCESS (${elapsed}ms), completing task`);
 
-      // 7. Check result — fail, watch child goal, or complete
+      // 7. Check result — suspended, fail, watch child goal, or complete
       const resultObj = result as Record<string, unknown> | undefined;
-      if (resultObj && resultObj.success === false) {
+      if (resultObj && resultObj.suspended === true) {
+        // Agent's state machine yielded waiting on child goals. AgentAbject
+        // (not the dispatcher) owns tuple completion now — it will call
+        // completeTask/failTask when the suspended entry resumes and finishes.
+        // We just clear busy (in finally) and walk away.
+        const childGoals = Array.isArray(resultObj.childGoalIds)
+          ? (resultObj.childGoalIds as string[]).map(g => g.slice(0, 8)).join(',')
+          : '?';
+        log.info(`DISPATCH-INNER ${tupleId} — task suspended, waiting on child goal(s) [${childGoals}]; tuple completion deferred to resume`);
+      } else if (resultObj && resultObj.success === false) {
         // Agent returned an explicit failure (e.g. "Object not found") — treat as failTask so it can retry
         const errorMsg = (resultObj.error as string) ?? 'Task returned success: false';
         log.info(`DISPATCH-INNER ${tupleId} — executeTask returned failure: ${errorMsg.slice(0, 120)}`);
@@ -1741,6 +1766,26 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       entry.state.error = err instanceof Error ? err.message : String(err);
     }
 
+    // ── Suspension shortcut ──
+    //
+    // The state machine yielded waiting on child goals. Send the caller a
+    // taskResult with `suspended: true, childGoalIds`. The caller (e.g. a
+    // ScriptableAbject's executeTask handler) forwards it to its deferredMsg
+    // so the JobManager job completes promptly and the agent's queue / busy
+    // slot are freed. Resume happens when handleChildGoalEvent observes that
+    // every watched child goal is terminal — runTaskAsync is then re-invoked
+    // and falls through this branch into normal completion.
+    if (entry.state.phase === 'suspended') {
+      this.send(event(this.id, entry.callerId, 'taskResult', {
+        ticketId: entry.state.id,
+        success: undefined,
+        suspended: true,
+        childGoalIds: entry.childGoalIds ?? [],
+        steps: entry.state.step,
+      }));
+      return;
+    }
+
     // Send deferred reply to startTask caller
     const success = entry.state.phase === 'done';
 
@@ -1760,16 +1805,16 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
 
     // Complete or fail the underlying work item via GoalManager.
     //
-    // When this task came from a TupleSpace dispatch, the dispatcher
-    // (dispatchToAgentInner) is responsible for calling completeTask on the
-    // specific tuple. We must NOT call completeGoal here because a goal may
-    // contain multiple tasks (e.g. Chat's "diagnose then fix" pattern) —
-    // force-completing the parent goal would cause GoalManager to drop all
-    // subsequent progress events for tasks added later, which in turn stalls
-    // Chat's waitForTaskCompletion timers.
-    //
-    // When this task is a solo agent run (no dispatchTupleId), the agent owns
-    // the whole goal and completing/failing it here is correct.
+    // Three regimes:
+    //  1. Solo agent run (no dispatchTupleId): the agent owns the goal end-to-end,
+    //     so completeGoal/failGoal is correct here.
+    //  2. Dispatched task that ran straight through (no suspension): the dispatcher
+    //     (dispatchToAgentInner) calls completeTask on the tuple after executeTask
+    //     returns; we must NOT compete with it.
+    //  3. Dispatched task that suspended and resumed (entry.ownsTupleCompletion
+    //     true): the dispatcher's executeTask call already returned with
+    //     `{ suspended: true }` and the dispatcher will not call completeTask. We
+    //     own the tuple now and must call completeTask/failTask ourselves.
     if (entry.goalId && this.goalManagerId && !entry.dispatchTupleId) {
       if (success) {
         this.send(event(this.id, this.goalManagerId, 'completeGoal', {
@@ -1782,6 +1827,32 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
           error: entry.state.error,
         }));
       }
+    }
+
+    if (entry.ownsTupleCompletion && entry.dispatchTupleId && this.goalManagerId) {
+      const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
+      try {
+        if (success) {
+          await this.request(request(this.id, this.goalManagerId, 'completeTask', {
+            taskId: entry.dispatchTupleId,
+            goalId: entry.incomingGoalId ?? entry.goalId,
+            result: entry.state.result,
+          }));
+          log.info(`[${agentName}] Resumed task ${entry.state.id.slice(0, 8)} completed; tuple ${entry.dispatchTupleId.slice(0, 8)} marked done`);
+        } else {
+          await this.request(request(this.id, this.goalManagerId, 'failTask', {
+            taskId: entry.dispatchTupleId,
+            goalId: entry.incomingGoalId ?? entry.goalId,
+            error: entry.state.error ?? 'Resumed task failed',
+            agentName,
+            agentId: entry.agentId,
+          }));
+          log.info(`[${agentName}] Resumed task ${entry.state.id.slice(0, 8)} failed; tuple ${entry.dispatchTupleId.slice(0, 8)} marked failed`);
+        }
+      } catch (err) {
+        log.warn(`Owning-side complete/fail for tuple ${entry.dispatchTupleId.slice(0, 8)} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      entry.ownsTupleCompletion = false;
     }
 
     // Send taskResult event to the ticket holder (caller)
@@ -1826,7 +1897,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
     };
 
     try {
-      while (phase !== 'done' && phase !== 'error') {
+      while (phase !== 'done' && phase !== 'error' && phase !== 'suspended') {
         switch (phase) {
           case 'observing': {
             // Skip observation on step 0 if configured
@@ -1926,15 +1997,21 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
 
               entry.childGoalIds = stillActive;
 
-              // If any child goals still active, wait for next event before thinking
-              if (stillActive.length > 0) {
-                log.info(`[${agentName}] Waiting for child goal event...`);
-                await this.waitForChildGoalEvent(stillActive, entry.state.timeout);
-                // Re-check status will happen on next observe cycle
-              }
-
-              // Inject child goal status into observation
+              // Inject child goal status into observation now (consumed either
+              // immediately when we proceed to thinking, or on resume after a
+              // suspend below).
               task.observation = (task.observation ?? '') + '\n\n' + statusLines.join('\n');
+
+              // If any child goals still active, suspend the loop and yield the
+              // agent's queue. Resume when a child-goal event fires (handled in
+              // handleChildGoalEvent). The agent is freed to participate in the
+              // dispatch ask poll for its own children while suspended.
+              if (stillActive.length > 0) {
+                log.info(`[${agentName}] Suspending — waiting for child goals: ${stillActive.map(g => g.slice(0, 8)).join(', ')}`);
+                this.suspendEntry(entry, agentName);
+                setPhase('suspended');
+                break;
+              }
             }
 
             setPhase('thinking');
@@ -1998,6 +2075,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
               }
 
               log.info(`[${agentName}] Decomposing into ${subtasks.length} sub-tasks`);
+              let decomposeFailed = false;
               try {
                 const childGoalId = await this.createChildGoalWithTasks(entry, subtasks, agentName);
                 if (!entry.childGoalIds) entry.childGoalIds = [];
@@ -2007,14 +2085,23 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
                   role: 'user',
                   content: `[Decomposition Error] ${err instanceof Error ? err.message : String(err)}`,
                 });
+                decomposeFailed = true;
               }
               task.step++;
               if (task.step >= task.maxSteps) {
                 await this.handleMaxStepsReached(entry, agentName, setPhase);
                 break;
               }
-              // Back to observing — the event-driven wait will kick in
-              setPhase('observing');
+              if (decomposeFailed) {
+                // Stay in the loop and re-think; no children to wait on.
+                setPhase('thinking');
+                break;
+              }
+              // Suspend until all child goals reach a terminal state. Frees the
+              // agent's busy slot and JobManager queue so it can participate in
+              // the dispatch ask poll for its own children if it chooses to.
+              this.suspendEntry(entry, agentName);
+              setPhase('suspended');
               break;
             }
 
@@ -2148,6 +2235,8 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
         log.info(`[${agentName}] Task done in ${task.step} steps`);
       } else if (task.phase === 'error') {
         log.info(`[${agentName}] Task error at step ${task.step}: ${task.error}`);
+      } else if (task.phase === 'suspended') {
+        log.info(`[${agentName}] Task suspended at step ${task.step}, waiting on ${entry.childGoalIds?.length ?? 0} child goal(s)`);
       }
     }
   }
@@ -2429,8 +2518,110 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
   }
 
   /**
+   * Suspend a task entry that's waiting on its child goals to terminate.
+   * Persists the entry, registers a per-entry timeout that fails the task if
+   * children stall too long, and seeds the watch set from entry.childGoalIds.
+   *
+   * This is the one place that creates a `suspendedEntries` record. Resume happens
+   * in `handleChildGoalEvent` once every watched child goal reaches a terminal state.
+   */
+  private suspendEntry(entry: TaskEntry, agentName: string): void {
+    const childGoalIds = entry.childGoalIds ?? [];
+    const childGoalIdSet = new Set(childGoalIds);
+    const taskId = entry.state.id;
+
+    // Replace any existing suspension for this task (e.g. nested wait round-trip).
+    const prev = this.suspendedEntries.get(taskId);
+    if (prev) clearTimeout(prev.timer);
+
+    const timer = setTimeout(() => {
+      const susp = this.suspendedEntries.get(taskId);
+      if (!susp) return;
+      this.suspendedEntries.delete(taskId);
+      const errMsg = `Suspended task timed out waiting on child goals: ${childGoalIds.map(g => g.slice(0, 8)).join(', ')}`;
+      log.info(`[${agentName}] Suspended task ${taskId.slice(0, 8)} timed out after ${entry.state.timeout}ms — failing`);
+      entry.state.phase = 'error';
+      entry.state.error = errMsg;
+      this.finalizeFailedSuspendedEntry(entry, errMsg).catch(err => {
+        log.warn(`finalizeFailedSuspendedEntry after timeout failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }, entry.state.timeout);
+
+    // Mark that AgentAbject (not the dispatcher) owns the eventual tuple completion
+    // for this entry. The dispatcher's executeTask call returns immediately with
+    // `{ suspended: true }` and the dispatcher does not call completeTask/failTask.
+    entry.ownsTupleCompletion = true;
+
+    this.suspendedEntries.set(taskId, { entry, childGoalIdSet, timer });
+  }
+
+  /**
+   * Resume a suspended task: drop its suspension record, set phase back to
+   * observing, and re-run the state machine. The state machine's observing branch
+   * picks up child results from GoalManager and proceeds to thinking.
+   *
+   * If the resumed run completes (done/error) and the entry owns tuple completion,
+   * AgentAbject calls completeTask / failTask on GoalManager directly.
+   */
+  private async resumeSuspendedEntry(taskId: string, reason: string): Promise<void> {
+    const susp = this.suspendedEntries.get(taskId);
+    if (!susp) return;
+    clearTimeout(susp.timer);
+    this.suspendedEntries.delete(taskId);
+
+    const entry = susp.entry;
+    const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
+    log.info(`[${agentName}] Resuming task ${taskId.slice(0, 8)} (${reason})`);
+    entry.state.phase = 'observing';
+    // Run the state machine again; runTaskAsync handles post-completion bookkeeping
+    // and (for entries that own tuple completion) the GoalManager.completeTask call.
+    this.runTaskAsync(entry).catch(err => {
+      log.warn(`Resumed runTaskAsync threw: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+
+  /**
+   * Suspend timer fired without children completing. Fail the dispatched tuple
+   * (so the goal can be retried by the dispatcher) and emit a taskResult event
+   * to the caller. Don't go through runTaskAsync — its first step is
+   * runStateMachine which would overwrite phase='error' back to 'observing'.
+   */
+  private async finalizeFailedSuspendedEntry(entry: TaskEntry, errMsg: string): Promise<void> {
+    const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
+    if (entry.ownsTupleCompletion && entry.dispatchTupleId && this.goalManagerId) {
+      try {
+        await this.request(request(this.id, this.goalManagerId, 'failTask', {
+          taskId: entry.dispatchTupleId,
+          goalId: entry.incomingGoalId ?? entry.goalId,
+          error: errMsg,
+          agentName,
+          agentId: entry.agentId,
+        }));
+        log.info(`[${agentName}] Suspended-task timeout: tuple ${entry.dispatchTupleId.slice(0, 8)} marked failed`);
+      } catch (err) {
+        log.warn(`Suspended-task failTask threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      entry.ownsTupleCompletion = false;
+    }
+    this.send(event(this.id, entry.callerId, 'taskResult', {
+      ticketId: entry.state.id,
+      success: false,
+      error: errMsg,
+      steps: entry.state.step,
+      maxStepsReached: false,
+    }));
+    this.changed('taskCompleted', {
+      taskId: entry.state.id,
+      agentId: entry.agentId,
+      success: false,
+      error: errMsg,
+    });
+  }
+
+  /**
    * Called from the `changed` handler when GoalManager emits goalCompleted/goalFailed/taskCompleted/taskPermanentlyFailed.
-   * Resolves event waiters (from observe phase) and handles dispatch-level child goal watching.
+   * Resolves event waiters (from observe phase), drives suspended-task resume, and
+   * handles dispatch-level child goal watching.
    */
   private handleChildGoalEvent(aspect: string, value: unknown): void {
     if (aspect !== 'goalCompleted' && aspect !== 'goalFailed'
@@ -2440,11 +2631,24 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       goalId: string; taskId?: string; result?: unknown; error?: string;
     };
 
-    // Resolve event waiters (from observe phase waiting on child goals)
-    const resolver = this.childGoalEventResolvers.get(goalId);
-    if (resolver) {
-      resolver.resolve({ aspect, goalId, taskId, result, error });
-      // resolve callback cleans up all resolvers in the wait group
+    // Suspended-entry resume: any task-or-goal terminal event for a watched
+    // child goal triggers a resume so the parent's observing branch can re-poll
+    // GoalManager fresh, decide whether to call completeGoal on the child, and
+    // either proceed to thinking with results in scope or suspend again if more
+    // children are still active.
+    //
+    // We don't try to gate on "all children fully done" here — the observing
+    // branch already does that per child goal at line 1888 (and re-suspends if
+    // there's still work). Resuming on partial progress just costs an extra
+    // poll cycle, which is cheap and self-corrects.
+    // Snapshot keys before resuming — resumeSuspendedEntry mutates the map.
+    const matching: string[] = [];
+    for (const [parentTaskId, susp] of this.suspendedEntries) {
+      if (susp.childGoalIdSet.has(goalId)) matching.push(parentTaskId);
+    }
+    for (const parentTaskId of matching) {
+      this.resumeSuspendedEntry(parentTaskId, `child goal ${goalId.slice(0, 8)} ${aspect}`)
+        .catch(err => log.warn(`resume failed: ${err instanceof Error ? err.message : String(err)}`));
     }
 
     // Existing dispatch-level child goal watching (unchanged)
@@ -2461,34 +2665,6 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
         taskId: watched.parentTaskId, error: error ?? 'Child goal failed', goalId: watched.parentGoalId,
       }));
     }
-  }
-
-  /**
-   * Wait for the next event related to any of the child goals.
-   * Resolved by handleChildGoalEvent when a matching event arrives.
-   */
-  private waitForChildGoalEvent(
-    childGoalIds: string[],
-    timeoutMs: number,
-  ): Promise<{ aspect: string; goalId: string; taskId?: string; result?: unknown; error?: string }> {
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        for (const id of childGoalIds) this.childGoalEventResolvers.delete(id);
-        resolve({ aspect: 'timeout', goalId: childGoalIds[0] ?? '' });
-      }, timeoutMs);
-
-      for (const id of childGoalIds) {
-        this.childGoalEventResolvers.set(id, {
-          resolve: (evt) => {
-            clearTimeout(timer);
-            // Clean up all resolvers for this wait group
-            for (const gid of childGoalIds) this.childGoalEventResolvers.delete(gid);
-            resolve(evt);
-          },
-          timer,
-        });
-      }
-    });
   }
 
   /**

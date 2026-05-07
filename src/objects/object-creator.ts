@@ -1238,15 +1238,39 @@ export class ObjectCreator extends Abject {
 
     // ── Receive task results from AgentAbject ──
     this.on('taskResult', async (msg: AbjectMessage) => {
-      const { ticketId, success, result, error } = msg.payload as {
-        ticketId: string; success: boolean; result?: unknown; error?: string; steps: number;
+      const { ticketId, success, suspended, childGoalIds, result, error } = msg.payload as {
+        ticketId: string;
+        success?: boolean;
+        suspended?: boolean;
+        childGoalIds?: string[];
+        result?: unknown;
+        error?: string;
+        steps: number;
       };
       const taskId = this.taskIdByTicket.get(ticketId);
       if (!taskId) return;
       const extra = this.tasks.get(taskId);
       if (!extra) return;
 
-      const finalResult = this.finalizeLoop(extra.state, success, result, error);
+      // Suspension: AgentAbject's state machine yielded waiting on child goals.
+      // Forward `{ suspended: true, childGoalIds }` to the deferred caller (the
+      // dispatcher) so the JobManager job completes and our queue is freed.
+      // AgentAbject re-runs the state machine when children terminate; keep
+      // TaskExtra alive so subsequent agentObserve / agentAct callbacks during
+      // resume still find their state. Drop the deferredMsg so a future taskResult
+      // doesn't double-reply (AgentAbject takes over tuple completion on resume).
+      if (suspended) {
+        if (extra.deferredMsg) {
+          this.sendDeferredReply(extra.deferredMsg, {
+            suspended: true,
+            childGoalIds: childGoalIds ?? [],
+          });
+          extra.deferredMsg = undefined;
+        }
+        return;
+      }
+
+      const finalResult = this.finalizeLoop(extra.state, success ?? false, result, error);
 
       // Emit lifecycle events
       if (finalResult.success) {

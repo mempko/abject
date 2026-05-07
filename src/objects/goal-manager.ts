@@ -64,6 +64,8 @@ export class GoalManager extends Abject {
   private localPeerId = '';
   /** Track taskIds for which we already emitted terminal events (idempotency guard). */
   private emittedTerminalTasks: Set<string> = new Set();
+  /** Goals for which `goalReadyForCompletion` has been emitted; cleared when a new task is added. */
+  private readyForCompletionEmitted: Set<GoalId> = new Set();
 
   /** Walk up the parent chain to find the top-level goal ID, which is the TupleSpace namespace. */
   private getTupleNamespace(goalId: GoalId): string {
@@ -281,6 +283,7 @@ export class GoalManager extends Abject {
             { name: 'taskCompleted', description: 'A task was completed', payload: { kind: 'object', properties: { taskId: { kind: 'primitive', primitive: 'string' }, goalId: { kind: 'primitive', primitive: 'string' }, result: { kind: 'primitive', primitive: 'string' } } } },
             { name: 'taskRetrying', description: 'A task failed but will be retried', payload: { kind: 'object', properties: { taskId: { kind: 'primitive', primitive: 'string' }, goalId: { kind: 'primitive', primitive: 'string' }, error: { kind: 'primitive', primitive: 'string' }, attempts: { kind: 'primitive', primitive: 'number' }, maxAttempts: { kind: 'primitive', primitive: 'number' } } } },
             { name: 'taskPermanentlyFailed', description: 'A task exhausted all retry attempts', payload: { kind: 'object', properties: { taskId: { kind: 'primitive', primitive: 'string' }, goalId: { kind: 'primitive', primitive: 'string' }, error: { kind: 'primitive', primitive: 'string' }, attempts: { kind: 'primitive', primitive: 'number' } } } },
+            { name: 'goalReadyForCompletion', description: 'All tasks of a goal reached terminal state. Sent once to the goal\'s creator so they can decide whether to completeGoal, replan, failGoal, or add follow-up tasks. Goal stays active until the creator acts on it.', payload: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' }, creatorAgentId: { kind: 'primitive', primitive: 'string' }, doneTaskIds: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, failedTaskIds: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } } } } },
           ],
         },
         requiredCapabilities: [],
@@ -578,6 +581,63 @@ if it can handle the task, and the most confident agent claims it.
   }
 
   /**
+   * After a task transition that may have completed the goal's task set,
+   * check if every task is terminal (done or permanently_failed). If so, fire
+   * `goalReadyForCompletion` exactly once per goal so the creator agent can
+   * decide whether to call `completeGoal`, `failGoal`, `replan`, or add follow-up
+   * tasks. The goal stays `active` until the creator acts.
+   *
+   * Idempotent: tracks emission via the in-memory `readyForCompletionEmitted`
+   * set so adding a new task after a temporary "all done" state correctly
+   * re-arms the check (set is cleared on addTask).
+   */
+  private async maybeEmitGoalReadyForCompletion(goalId: GoalId): Promise<void> {
+    const goal = this.goals.get(goalId);
+    if (!goal || goal.status !== 'active') return;
+    if (this.readyForCompletionEmitted.has(goalId)) return;
+    if (!this.tupleSpaceId) return;
+    let tasks: Array<{ id: string; fields: Record<string, unknown> }>;
+    try {
+      tasks = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
+        request(this.id, this.tupleSpaceId, 'scan', {
+          namespace: this.getTupleNamespace(goalId),
+          pattern: { goalId },
+        }),
+      );
+    } catch {
+      return;
+    }
+    if (tasks.length === 0) return;
+    const doneTaskIds: string[] = [];
+    const failedTaskIds: string[] = [];
+    for (const t of tasks) {
+      const status = t.fields.status as string | undefined;
+      if (status === 'done') doneTaskIds.push(t.id);
+      else if (status === 'permanently_failed') failedTaskIds.push(t.id);
+      else return; // at least one task is still pending / in-flight — not ready
+    }
+    this.readyForCompletionEmitted.add(goalId);
+    log.info(`Goal ${goalId.slice(0, 8)} ready for completion decision (creator=${goal.createdBy.slice(0, 8)}, ${doneTaskIds.length} done, ${failedTaskIds.length} failed)`);
+    this.changed('goalReadyForCompletion', {
+      goalId,
+      creatorAgentId: goal.createdBy,
+      doneTaskIds,
+      failedTaskIds,
+    });
+    // Direct event to the creator so they don't need to subscribe to changed
+    // events. Useful for top-level creators (e.g. Chat) that don't otherwise
+    // run an observing loop on goals they create.
+    try {
+      this.send(event(this.id, goal.createdBy, 'goalReadyForCompletion', {
+        goalId,
+        creatorAgentId: goal.createdBy,
+        doneTaskIds,
+        failedTaskIds,
+      }));
+    } catch { /* best effort — creator may be gone */ }
+  }
+
+  /**
    * Sync goal metadata to its per-goal SharedState namespace.
    * Each goal gets namespace `goal-{uuid}` for selective cross-peer sync.
    */
@@ -826,6 +886,10 @@ if it can handle the task, and the most confident agent claims it.
         });
       }
 
+      // Re-arm the goal-ready-for-completion check so the creator gets a fresh
+      // signal once the new task (and any siblings) reach terminal state.
+      this.readyForCompletionEmitted.delete(goalId as GoalId);
+
       if (!this.tupleSpaceId) return { error: 'TupleSpace not available' };
 
       const ns = this.getTupleNamespace(goalId as GoalId);
@@ -928,6 +992,7 @@ if it can handle the task, and the most confident agent claims it.
       // Signal that dependent tasks may now be unblocked
       if (goalId) {
         this.changed('taskUnblocked', { goalId, completedTaskId: taskId });
+        this.maybeEmitGoalReadyForCompletion(goalId as GoalId).catch(() => { /* best effort */ });
       }
 
       return updateResult;
@@ -986,6 +1051,9 @@ if it can handle the task, and the most confident agent claims it.
         } catch { /* best effort */ }
         this.emittedTerminalTasks.add(taskId);
         this.changed('taskPermanentlyFailed', { taskId, goalId, error, attempts });
+        if (goalId) {
+          this.maybeEmitGoalReadyForCompletion(goalId as GoalId).catch(() => { /* best effort */ });
+        }
         return updateResult;
       }
 
