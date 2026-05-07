@@ -91,6 +91,16 @@ export class AgentCreator extends Abject {
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## AgentCreator: Autonomous Agent, Scheduler, and Watcher Creation Specialist
 
+### Hard Refusals — answer NO immediately, do not analyze further
+Any task whose goal is to **modify, fix, patch, update, rewrite, or change** the source code, handlers, manifest, events, or implementation of an existing Abject — **answer NO**. Examples that MUST be NO:
+- "Modify the LinkedInBrowser object so it uses the new ticketing API" — NO (modifies an Abject's source)
+- "Fix bug in WeatherAgent's _checkForecast handler" — NO (modifies an Abject's source)
+- "Update the manifest events for WidgetY" — NO (modifies an Abject's manifest)
+- "Run the existing morning-briefing agent" — NO (running an existing object, not creating one)
+- "Create a TelegramBridge proxy" / "Wrap GitHub API as a new Abject" / "Build an SMS-to-chat relay" — NO (single-object forwarder, not a multi-object autonomous system)
+
+I create new agents/schedulers/watchers as a multi-object composition. The dispatcher's "authoring/modification rule" applies to ObjectCreator (single-object authoring) and to me (multi-object autonomous-system authoring) only when the request is genuinely a NEW multi-object autonomous system with an LLM decision loop. Single-object create/wrap requests go to ObjectCreator. Modify-existing-source requests go to ObjectCreator. I refuse both.
+
 ### What I Handle
 I create NEW autonomous behavior that requires MULTIPLE cooperating objects: an agent that claims tasks with an LLM decision loop, a scheduler that fires on a recurring trigger, and a watcher that reacts to events. I decompose the request into separate sub-tasks so each component Abject gets built. My specialty is the composition pattern of agent plus scheduler plus watcher.
 

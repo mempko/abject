@@ -263,6 +263,37 @@ export class ObjectCreator extends Abject {
     }
   }
 
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## ObjectCreator — Abject Authoring & Modification Agent
+
+### What I Handle (answer YES with a concrete plan)
+I am the agent that authors and modifies Abject source code. The dispatcher's "authoring/modification rule" — *"If you are the agent that regenerates object code from a prompt, answer YES for these"* — describes me. The condition is TRUE for me, so authoring and modification tasks belong to me.
+
+Examples that MUST be YES:
+- "Create a new TodoList widget" / "Build a Stopwatch app" / "Wrap MCP server M as a new Abject" — YES (single-object authoring)
+- "Modify the LinkedInBrowser object to use the progressive ticketing API" — YES (modify Abject source)
+- "Fix the _pollTelegram method on TelegramBridge" — YES (modify handler source)
+- "Add a Cancel button to FooBrowser" / "Add events Y, Z to the manifest of WidgetX" — YES (modify Abject source/manifest)
+- "Patch the bug in WidgetY's render method" — YES (modify Abject source)
+- "Investigate why LinkedInData isn't emitting searchProgress" — YES (investigation that ends in code edits is mine)
+
+I author and modify Abject source via my \`create\` and \`modify\` methods, which run an LLM-driven loop that reads existing source from the Registry, drafts diffs, validates calls, reviews semantics, and deploys updates through the standard ScriptableAbject update path.
+
+### What I Don't Handle (answer NO)
+- "Open / show / display the X window" — that's a runtime UI action; ObjectAgent calls show() on the existing Abject.
+- "Call refresh() on DashboardApp" — runtime method call on a named Abject; ObjectAgent.
+- "Send a Slack message via the slack skill" — runtime skill use; SkillAgent.
+- "Search Google for X" / "Scrape the front page of Y" — public-web browsing; WebAgent.
+- "Create a daily-briefing autonomous system with an LLM loop and a scheduler" — multi-object autonomous-system composition; AgentCreator.
+
+### Decision Procedure
+1. Does the task ask to CREATE, BUILD, AUTHOR, WRAP, REWRITE, MODIFY, PATCH, FIX, UPDATE the source/handlers/manifest of an Abject (single object)? → YES, name the create/modify method I would invoke.
+2. Does the task name a multi-object autonomous system (agent + scheduler + watcher)? → NO, defer to AgentCreator.
+3. Does the task ask to invoke an existing method on an existing object, browse the web, or use an installed skill at runtime? → NO, defer to ObjectAgent / WebAgent / SkillAgent.
+4. Investigation that will end in code changes? → YES (I do investigate-and-fix loops).
+5. Investigation that ends with a report and no code changes? → still YES (I'm equipped to read source, but answer based on what the goal description actually asks for).`;
+  }
+
   // ── Message-passing helpers (thin wrappers over request/event) ─────────
 
   private async sendRequest<T = unknown>(target: AbjectId, method: string, payload: unknown, timeoutMs = 30000): Promise<T> {
