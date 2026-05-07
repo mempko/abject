@@ -1192,7 +1192,7 @@ export class ObjectCreator extends Abject {
     });
 
     this.on('executeTask', (msg: AbjectMessage) => {
-      const { goalId, description, type, data, callerId: explicitCaller } = msg.payload as {
+      const { tupleId, goalId, description, type, data, callerId: explicitCaller } = msg.payload as {
         tupleId?: string;
         goalId?: string;
         description: string;
@@ -1215,6 +1215,7 @@ export class ObjectCreator extends Abject {
         prompt: description,
         targetIdOrName,
         goalId,
+        dispatchTupleId: tupleId,
         callerId,
         deferredMsg: msg,
       });
@@ -1297,6 +1298,16 @@ export class ObjectCreator extends Abject {
     context?: string;
     targetIdOrName?: string;
     goalId?: string;
+    /**
+     * TupleSpace tuple id when this task came from the dispatcher. Forwarded
+     * to AgentAbject.startTask so its TaskEntry has dispatchTupleId set; that's
+     * what tells runTaskAsync to leave goal-level completion to the dispatcher
+     * (or to the resume path for suspended tasks). Without it, the entry's
+     * runTaskAsync fires `completeGoal` for the parent goal as soon as this one
+     * task finishes, prematurely retiring the goal while sibling tasks are
+     * still pending.
+     */
+    dispatchTupleId?: string;
     callerId?: AbjectId;
     deferredMsg?: AbjectMessage;
   }): Promise<void> {
@@ -1367,6 +1378,7 @@ export class ObjectCreator extends Abject {
           task: args.prompt,
           systemPrompt: this.buildSystemPrompt(),
           goalId: args.goalId,
+          dispatchTupleId: args.dispatchTupleId,
           config: {
             maxSteps: 30,
             timeout: 600000,

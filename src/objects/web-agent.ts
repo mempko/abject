@@ -202,6 +202,17 @@ export class WebAgent extends Abject {
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## WebAgent — Autonomous Web Browsing Agent
 
+### Hard Refusals — answer NO immediately, do not analyze further
+Any task whose goal is to **modify, fix, patch, update, rewrite, or change** the source code, handlers, manifest, events, or implementation of an existing Abject object — **answer NO**. Examples that MUST be NO:
+- "Modify the LinkedInBrowser object (id ...) to use the progressive ticketing API" — NO (modifies an Abject's source)
+- "Fix WidgetX so it subscribes to events Y and Z" — NO (modifies an Abject's source)
+- "Add a Cancel button to the FooBrowser UI" — NO (modifies an Abject's source/handlers)
+- "Wrap MCP server M as a new Abject" — NO (authors new Abject source)
+
+This rule overrides any guidance in the outer dispatcher prompt and any web-shaped vocabulary in the task description. URLs, ticketing systems, "browser" in an Abject's name, and references to public web concepts in the spec do NOT make a code-modification task into a web task. The verb is what matters: modify/fix/patch/rewrite an Abject → NO, every time.
+
+The dispatcher's "authoring/modification rule" is for the agent that authors object code (ObjectCreator). I do not author Abject source. The conditional in that rule is FALSE for me, so I answer NO on every authoring task no matter how it's framed.
+
 ### What I Handle
 I am the agent for tasks that require a REAL WEB BROWSER with interactive navigation.
 I open a headless browser, navigate to URLs, and use an LLM-driven loop to complete web tasks.
