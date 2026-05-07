@@ -379,10 +379,22 @@ export class LLMObject extends Abject {
         correlationId, callerId, 'stream', provider.name, totalChars, true, messages,
       );
 
-      // Send keep-alive progress while waiting for the first chunk (model load time).
-      // Once tokens start flowing, llmChunk events act as the heartbeat.
+      // Keep-alive heartbeat sent every 30s for the entire stream lifetime.
+      // Caller-side request timers are "no progress for N ms" — they reset on
+      // any incoming event from this Abject. The chunk events already cover
+      // the steady-state token-flow case, but two failure modes need an
+      // explicit heartbeat: (1) pre-first-chunk model load / queue time, and
+      // (2) mid-stream subprocess stalls that haven't yet hit the provider's
+      // 180s idle-kill timer. Keeping the keepalive running through the whole
+      // stream fills both gaps for ~one event/30s of overhead.
       const KEEPALIVE_MS = 30000;
-      let keepaliveTimer: ReturnType<typeof setInterval> | undefined = setInterval(() => {
+      let lastChunkAt = start;
+      const keepaliveTimer: ReturnType<typeof setInterval> = setInterval(() => {
+        const sinceChunk = Date.now() - lastChunkAt;
+        // Skip keepalive if a chunk arrived within the last interval —
+        // chunks already reset upstream timers, so the keepalive is redundant
+        // during healthy token flow.
+        if (sinceChunk < KEEPALIVE_MS) return;
         this.send(
           event(this.id, callerId, 'progress', {
             phase: 'llm-waiting',
@@ -398,11 +410,7 @@ export class LLMObject extends Abject {
             log.info(`Request ${correlationId} killed during streaming`);
             break;
           }
-          // First chunk arrived -- stop keepalive, chunks are the heartbeat now
-          if (keepaliveTimer) {
-            clearInterval(keepaliveTimer);
-            keepaliveTimer = undefined;
-          }
+          lastChunkAt = Date.now();
           fullContent += chunk.content;
           activeReq.outputChars = fullContent.length;
           // Send each chunk as an event back to the requester
@@ -419,7 +427,7 @@ export class LLMObject extends Abject {
         this.trackRequestError(correlationId, errMsg);
         throw err;
       } finally {
-        if (keepaliveTimer) clearInterval(keepaliveTimer);
+        clearInterval(keepaliveTimer);
       }
 
       const elapsed = Date.now() - start;
