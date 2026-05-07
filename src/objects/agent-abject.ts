@@ -2075,6 +2075,17 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
               }
 
               log.info(`[${agentName}] Decomposing into ${subtasks.length} sub-tasks`);
+              // Free the busy slot BEFORE creating child tuples. The await below
+              // yields the event loop, and the TupleSpace put events fire watcher
+              // dispatch immediately. If we leave the agent in busyAgents, the
+              // watcher's eligibility filter excludes the very agent that just
+              // decomposed — so the ask poll runs without it and a less capable
+              // agent (e.g. SkillAgent answering YES on a code-modification task)
+              // wins. Clearing here makes the parent eligible to bid on its own
+              // children when the watcher fires; the executeTask handler is
+              // already idempotent re: busy state (the dispatcher's finally clause
+              // does a redundant delete that we tolerate).
+              this.busyAgents.delete(entry.agentId);
               let decomposeFailed = false;
               try {
                 const childGoalId = await this.createChildGoalWithTasks(entry, subtasks, agentName);
