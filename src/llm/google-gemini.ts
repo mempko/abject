@@ -18,6 +18,7 @@ import {
   ModelTier,
   ModelInfo,
   ContentPart,
+  defaultIsRetryable,
   getTextContent,
 } from './provider.js';
 import { require } from '../core/contracts.js';
@@ -156,35 +157,37 @@ export class GeminiProvider extends BaseLLMProvider {
     const model = this.resolveModel(options);
     const request = this.buildRequest(messages, options);
 
-    const response = await this.fetch(
-      `${this.baseUrl}/v1beta/models/${model}:generateContent?key=${this.apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(request),
-      },
-      { timeout: 300000 },
-    );
+    return this.withRetries(async () => {
+      const response = await this.fetch(
+        `${this.baseUrl}/v1beta/models/${model}:generateContent?key=${this.apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        },
+        { timeout: 300000 },
+      );
 
-    const data = JSON.parse(response.body) as GeminiResponse;
-    const candidate = data.candidates?.[0];
-    if (!candidate) {
-      throw new Error('No completion returned');
-    }
+      const data = JSON.parse(response.body) as GeminiResponse;
+      const candidate = data.candidates?.[0];
+      if (!candidate) {
+        throw new Error('No completion returned');
+      }
 
-    const text = (candidate.content?.parts ?? [])
-      .map(p => p.text ?? '')
-      .join('');
+      const text = (candidate.content?.parts ?? [])
+        .map(p => p.text ?? '')
+        .join('');
 
-    return {
-      content: text,
-      finishReason: this.mapFinishReason(candidate.finishReason),
-      usage: {
-        inputTokens: data.usageMetadata?.promptTokenCount ?? 0,
-        outputTokens: data.usageMetadata?.candidatesTokenCount ?? 0,
-        cacheReadTokens: data.usageMetadata?.cachedContentTokenCount,
-      },
-    };
+      return {
+        content: text,
+        finishReason: this.mapFinishReason(candidate.finishReason),
+        usage: {
+          inputTokens: data.usageMetadata?.promptTokenCount ?? 0,
+          outputTokens: data.usageMetadata?.candidatesTokenCount ?? 0,
+          cacheReadTokens: data.usageMetadata?.cachedContentTokenCount,
+        },
+      };
+    }, { label: 'gemini.complete' });
   }
 
   async *stream(
@@ -196,6 +199,36 @@ export class GeminiProvider extends BaseLLMProvider {
     const model = this.resolveModel(options);
     const request = this.buildRequest(messages, options);
 
+    const maxAttempts = 3;
+    const initialDelayMs = 1000;
+    const backoffFactor = 2;
+    const maxDelayMs = 10000;
+    let yielded = false;
+    let lastErr: unknown;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        for await (const chunk of this.streamOnce(model, request)) {
+          if (chunk.content.length > 0) yielded = true;
+          yield chunk;
+        }
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (yielded) throw err;
+        if (attempt >= maxAttempts) throw err;
+        if (!defaultIsRetryable(err)) throw err;
+        const delay = Math.min(initialDelayMs * Math.pow(backoffFactor, attempt - 1), maxDelayMs);
+        const msg = err instanceof Error ? err.message : String(err);
+        // eslint-disable-next-line no-console
+        console.warn(`[gemini.stream] attempt ${attempt}/${maxAttempts} failed: ${msg.slice(0, 200)} — retrying in ${delay}ms`);
+        await new Promise<void>(resolve => setTimeout(resolve, delay));
+      }
+    }
+    throw lastErr;
+  }
+
+  private async *streamOnce(model: string, request: GeminiRequest): AsyncIterable<LLMStreamChunk> {
     const response = await fetch(
       `${this.baseUrl}/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${this.apiKey}`,
       {

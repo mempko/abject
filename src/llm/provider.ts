@@ -125,6 +125,119 @@ export type FetchDelegate = (
   options?: { timeout?: number }
 ) => Promise<FetchResult>;
 
+// ─── Retry plumbing ──────────────────────────────────────────────────────
+
+export interface RetryOptions {
+  /** Total attempts including the first try. Defaults to 3. */
+  maxAttempts?: number;
+  /** Backoff before retry #2. Doubles up to maxDelayMs per attempt. */
+  initialDelayMs?: number;
+  /** Cap on backoff between attempts. */
+  maxDelayMs?: number;
+  /** Multiplier applied to delay after each failure. */
+  backoffFactor?: number;
+  /**
+   * Decide whether an error is worth retrying. Return false for permanent
+   * failures (auth, 4xx other than 408/429, malformed argv) so we don't
+   * hammer a known-broken endpoint. Default: see `defaultIsRetryable`.
+   */
+  isRetryable?: (err: unknown) => boolean;
+  /** Hook for logging — called once before each retry sleep. */
+  onRetry?: (err: unknown, attempt: number, delayMs: number) => void;
+  /** Diagnostic label used by onRetry's default formatter. */
+  label?: string;
+}
+
+const DEFAULT_RETRY_OPTS: Required<Omit<RetryOptions, 'isRetryable' | 'onRetry' | 'label'>> = {
+  maxAttempts: 3,
+  initialDelayMs: 1000,
+  maxDelayMs: 10000,
+  backoffFactor: 2,
+};
+
+/**
+ * Errors we don't retry: auth/permission, model-not-found, bad request,
+ * unknown CLI flags, missing binary. These will keep failing identically;
+ * retrying just delays the user-visible failure.
+ */
+const PERMANENT_PATTERNS: RegExp[] = [
+  /\b(401|403|404)\b/,                      // HTTP auth / forbidden / not found
+  /\bAPI[- ]?key\b/i,
+  /\bunauthor/i,
+  /\bauth(entication)?\s+(failed|required)/i,
+  /\binvalid_request/i,
+  /\bmodel\s+not\s+found/i,
+  /\bunsupported\s+model/i,
+  /\bunknown\s+option/i,                    // CLI version mismatch
+  /\bENOENT\b/,                             // binary missing
+  /\bcommand\s+not\s+found\b/i,
+];
+
+/** Default retryability check: assume transient unless the message matches a known permanent pattern. */
+export function defaultIsRetryable(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // 4xx other than 408 (timeout) and 429 (rate limit) are permanent. Match
+  // before the broad permanent patterns so 429 stays retryable.
+  if (/\b429\b/.test(msg)) return true;
+  if (/\b408\b/.test(msg)) return true;
+  if (/\b4\d\d\b/.test(msg) && !/\b(408|429)\b/.test(msg)) return false;
+  return !PERMANENT_PATTERNS.some(re => re.test(msg));
+}
+
+/**
+ * Run `fn` with bounded retries and exponential backoff. Returns whatever
+ * `fn` returns on the first success; throws the last error if every attempt
+ * fails or the error is classified permanent.
+ *
+ * The provided `isRetryable` predicate is called per attempt; a `false`
+ * result short-circuits and re-throws immediately.
+ */
+export async function withRetries<T>(fn: () => Promise<T>, opts: RetryOptions = {}): Promise<T> {
+  const cfg = { ...DEFAULT_RETRY_OPTS, ...opts };
+  const isRetryable = opts.isRetryable ?? defaultIsRetryable;
+  const label = opts.label ?? 'llm-call';
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= cfg.maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= cfg.maxAttempts || !isRetryable(err)) {
+        throw err;
+      }
+      const delay = Math.min(
+        cfg.initialDelayMs * Math.pow(cfg.backoffFactor, attempt - 1),
+        cfg.maxDelayMs,
+      );
+      if (opts.onRetry) {
+        try { opts.onRetry(err, attempt, delay); } catch { /* never let logging crash retry */ }
+      } else {
+        const msg = err instanceof Error ? err.message : String(err);
+        // eslint-disable-next-line no-console
+        console.warn(`[${label}] attempt ${attempt}/${cfg.maxAttempts} failed: ${msg.slice(0, 200)} — retrying in ${delay}ms`);
+      }
+      await new Promise<void>(resolve => setTimeout(resolve, delay));
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * Retry classifier for CLI-driven providers. Subprocess-specific transient
+ * failures (idle-timeout kills, broken pipes, signal-killed) get retried;
+ * authentication, missing binaries, and unknown-flag errors do not.
+ */
+export function cliIsRetryable(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // CLI-specific transient signals. Match these BEFORE delegating to the
+  // default classifier so we don't accidentally drop them under a 4xx test.
+  if (/idle for \d+ms/i.test(msg)) return true;
+  if (/subprocess killed/i.test(msg)) return true;
+  if (/\b(ECONNRESET|EPIPE|ETIMEDOUT|ECONNREFUSED)\b/.test(msg)) return true;
+  if (/SIGTERM|SIGKILL|signal\s+\d+/i.test(msg)) return true;
+  return defaultIsRetryable(err);
+}
+
 /**
  * Abstract LLM provider interface.
  */
@@ -249,6 +362,15 @@ export abstract class BaseLLMProvider implements LLMProvider {
       body,
       ok: response.ok,
     };
+  }
+
+  /**
+   * Wrap an async call in retry-with-backoff. Subclasses pick the right
+   * `isRetryable` (e.g. `cliIsRetryable` for subprocess providers); HTTP
+   * subclasses leave it default.
+   */
+  protected withRetries<T>(fn: () => Promise<T>, opts: RetryOptions = {}): Promise<T> {
+    return withRetries(fn, { label: this.name, ...opts });
   }
 
   /**

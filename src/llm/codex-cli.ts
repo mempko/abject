@@ -30,6 +30,7 @@ import {
   LLMProviderDescription,
   LLMStreamChunk,
   ModelInfo,
+  cliIsRetryable,
   getTextContent,
 } from './provider.js';
 
@@ -79,28 +80,60 @@ export class CodexCliProvider extends BaseLLMProvider {
 
   async complete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
     const { argv, stdin } = this.buildArgs(messages, options);
-    const { code, stdout, stderr } = await runCliIdle(this.bin, argv, stdin, { idleTimeoutMs: this.idleTimeoutMs });
-    if (code !== 0) {
-      throw new Error(formatCliError('codex', code, stderr, stdout, argv));
-    }
+    return this.withRetries(async () => {
+      const { code, stdout, stderr } = await runCliIdle(this.bin, argv, stdin, { idleTimeoutMs: this.idleTimeoutMs });
+      if (code !== 0) {
+        throw new Error(formatCliError('codex', code, stderr, stdout, argv));
+      }
 
-    const final = extractCodexFinalMessage(stdout);
-    if (!final) {
-      throw new Error(`codex CLI returned no message. raw=${stdout.slice(0, 300)}`);
-    }
-    return {
-      content: final.text,
-      finishReason: 'stop',
-      usage: final.usage,
-    };
+      const final = extractCodexFinalMessage(stdout);
+      if (!final) {
+        throw new Error(`codex CLI returned no message. raw=${stdout.slice(0, 300)}`);
+      }
+      return {
+        content: final.text,
+        finishReason: 'stop',
+        usage: final.usage,
+      };
+    }, { isRetryable: cliIsRetryable, label: 'codex-cli.complete' });
   }
 
   async *stream(messages: LLMMessage[], options?: LLMCompletionOptions): AsyncIterable<LLMStreamChunk> {
     const { argv, stdin } = this.buildArgs(messages, options);
+    const maxAttempts = 3;
+    const initialDelayMs = 1000;
+    const backoffFactor = 2;
+    const maxDelayMs = 10000;
+    let yielded = false;
+    let lastErr: unknown;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        for await (const chunk of this.streamOnce(argv, stdin)) {
+          if (chunk.content.length > 0) yielded = true;
+          yield chunk;
+        }
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (yielded) throw err;
+        if (attempt >= maxAttempts) throw err;
+        if (!cliIsRetryable(err)) throw err;
+        const delay = Math.min(initialDelayMs * Math.pow(backoffFactor, attempt - 1), maxDelayMs);
+        const msg = err instanceof Error ? err.message : String(err);
+        // eslint-disable-next-line no-console
+        console.warn(`[codex-cli.stream] attempt ${attempt}/${maxAttempts} failed: ${msg.slice(0, 200)} — retrying in ${delay}ms`);
+        await new Promise<void>(resolve => setTimeout(resolve, delay));
+      }
+    }
+    throw lastErr;
+  }
+
+  /** Single stream attempt — yields chunks; throws on subprocess failure. */
+  private async *streamOnce(argv: string[], stdin: string): AsyncIterable<LLMStreamChunk> {
     const proc = spawn(this.bin, argv, { stdio: ['pipe', 'pipe', 'pipe'] });
     proc.stdin.end(stdin);
 
-    // Idle timer — resets per chunk so a long generation keeps running.
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
     let timeoutFired = false;
     const armIdle = () => {

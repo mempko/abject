@@ -26,6 +26,7 @@ import {
   LLMProviderDescription,
   LLMStreamChunk,
   ModelInfo,
+  cliIsRetryable,
   getTextContent,
 } from './provider.js';
 
@@ -82,48 +83,96 @@ export class ClaudeCliProvider extends BaseLLMProvider {
    * so token deltas reset the idle timer mid-call — long generations no
    * longer get SIGTERM'd. Returns the same shape `complete()` always has;
    * usage comes from the terminal `result` event.
+   *
+   * Wrapped in {@link withRetries} so a transient subprocess death
+   * (idle-killed by an upstream stall, broken pipe, transient ECONNRESET on
+   * the binary's outbound API call) is re-attempted with backoff. Permanent
+   * failures (auth missing, unknown CLI flag, model rejected) are surfaced
+   * on the first try by `cliIsRetryable`.
    */
   async complete(messages: LLMMessage[], options?: LLMCompletionOptions): Promise<LLMCompletionResult> {
     const args = this.buildArgs(messages, options, 'stream-json');
+    return this.withRetries(async () => {
+      let textSoFar = '';
+      let resultText: string | undefined;
+      let usage: LLMCompletionResult['usage'];
+      let cliErrorMessage: string | undefined;
 
-    let textSoFar = '';
-    let resultText: string | undefined;
-    let usage: LLMCompletionResult['usage'];
-    let cliErrorMessage: string | undefined;
+      const { code, stdout, stderr } = await runCliIdleStreaming(
+        this.bin, args.argv, args.stdin,
+        { idleTimeoutMs: this.idleTimeoutMs },
+        (line) => {
+          const errMsg = extractStreamError(line);
+          if (errMsg) cliErrorMessage = errMsg;
+          const delta = extractStreamDelta(line);
+          if (delta) textSoFar += delta;
+          const finalText = extractStreamResultText(line);
+          if (finalText) resultText = finalText;
+          const u = extractStreamUsage(line);
+          if (u) usage = u;
+        },
+      );
 
-    const { code, stdout, stderr } = await runCliIdleStreaming(
-      this.bin, args.argv, args.stdin,
-      { idleTimeoutMs: this.idleTimeoutMs },
-      (line) => {
-        const errMsg = extractStreamError(line);
-        if (errMsg) cliErrorMessage = errMsg;
-        const delta = extractStreamDelta(line);
-        if (delta) textSoFar += delta;
-        const finalText = extractStreamResultText(line);
-        if (finalText) resultText = finalText;
-        const u = extractStreamUsage(line);
-        if (u) usage = u;
-      },
-    );
+      if (code !== 0) {
+        throw new Error(formatCliError('claude', code, stderr, stdout, args.argv, cliErrorMessage));
+      }
 
-    if (code !== 0) {
-      throw new Error(formatCliError('claude', code, stderr, stdout, args.argv, cliErrorMessage));
-    }
+      const content = textSoFar || resultText;
+      if (!content) {
+        throw new Error(`claude CLI returned no result. raw=${stdout.slice(0, 200)}`);
+      }
 
-    const content = textSoFar || resultText;
-    if (!content) {
-      throw new Error(`claude CLI returned no result. raw=${stdout.slice(0, 200)}`);
-    }
-
-    return {
-      content,
-      finishReason: 'stop',
-      usage,
-    };
+      return {
+        content,
+        finishReason: 'stop',
+        usage,
+      };
+    }, { isRetryable: cliIsRetryable, label: 'claude-cli.complete' });
   }
 
   async *stream(messages: LLMMessage[], options?: LLMCompletionOptions): AsyncIterable<LLMStreamChunk> {
     const args = this.buildArgs(messages, options, 'stream-json');
+
+    // Retry logic for streams: an attempt is retryable only if it fails
+    // BEFORE any delta has been yielded to the consumer. Once tokens have
+    // started flowing, a mid-stream failure can't be re-attempted without
+    // duplicating output, so we propagate. Permanent failures (auth /
+    // unknown flag / missing binary) skip retries on the first error.
+    const maxAttempts = 3;
+    const initialDelayMs = 1000;
+    const backoffFactor = 2;
+    const maxDelayMs = 10000;
+    let yielded = false;
+    let lastErr: unknown;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        // Iterate manually (rather than `yield*`) so we can track whether
+        // any chunk has crossed the generator boundary to the consumer —
+        // that's the gate for "safe to retry" vs "must propagate".
+        for await (const chunk of this.streamOnce(args)) {
+          if (chunk.content.length > 0) yielded = true;
+          yield chunk;
+        }
+        return; // success
+      } catch (err) {
+        lastErr = err;
+        if (yielded) throw err;
+        if (attempt >= maxAttempts) throw err;
+        if (!cliIsRetryable(err)) throw err;
+        const delay = Math.min(initialDelayMs * Math.pow(backoffFactor, attempt - 1), maxDelayMs);
+        const msg = err instanceof Error ? err.message : String(err);
+        // eslint-disable-next-line no-console
+        console.warn(`[claude-cli.stream] attempt ${attempt}/${maxAttempts} failed: ${msg.slice(0, 200)} — retrying in ${delay}ms`);
+        await new Promise<void>(resolve => setTimeout(resolve, delay));
+      }
+    }
+    // Defensive — the loop above either returns or throws.
+    throw lastErr;
+  }
+
+  /** Single stream attempt — yields chunks; throws on subprocess failure. */
+  private async *streamOnce(args: { argv: string[]; stdin: string }): AsyncIterable<LLMStreamChunk> {
     const proc = spawn(this.bin, args.argv, { stdio: ['pipe', 'pipe', 'pipe'] });
     proc.stdin.end(args.stdin);
 
@@ -182,7 +231,7 @@ export class ClaudeCliProvider extends BaseLLMProvider {
       throw new Error(formatCliError('claude', code, stderr, allStdout, args.argv, cliErrorMessage));
     }
     yield { content: '', done: true };
-    void textSoFar; // for future debug; stream consumers accumulate themselves
+    void textSoFar;
   }
 
   async listModels(): Promise<ModelInfo[]> {

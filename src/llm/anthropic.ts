@@ -13,6 +13,7 @@ import {
   ModelTier,
   ModelInfo,
   ContentPart,
+  defaultIsRetryable,
   getTextContent,
 } from './provider.js';
 import { require } from '../core/contracts.js';
@@ -225,35 +226,37 @@ export class AnthropicProvider extends BaseLLMProvider {
       request.system = systemBlocks;
     }
 
-    const response = await this.fetch(`${this.baseUrl}/v1/messages`, {
-      method: 'POST',
-      headers: {
-        ...this.buildHeaders(),
-        'x-api-key': this.apiKey!,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true',
-      },
-      body: JSON.stringify(request),
-    }, { timeout: 300000 });
+    return this.withRetries(async () => {
+      const response = await this.fetch(`${this.baseUrl}/v1/messages`, {
+        method: 'POST',
+        headers: {
+          ...this.buildHeaders(),
+          'x-api-key': this.apiKey!,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        body: JSON.stringify(request),
+      }, { timeout: 300000 });
 
-    const data = JSON.parse(response.body) as AnthropicResponse;
+      const data = JSON.parse(response.body) as AnthropicResponse;
 
-    // Extract text content
-    const content = data.content
-      .filter((c) => c.type === 'text')
-      .map((c) => c.text)
-      .join('');
+      // Extract text content
+      const content = data.content
+        .filter((c) => c.type === 'text')
+        .map((c) => c.text)
+        .join('');
 
-    return {
-      content,
-      finishReason: data.stop_reason === 'end_turn' ? 'stop' : 'length',
-      usage: {
-        inputTokens: data.usage.input_tokens,
-        outputTokens: data.usage.output_tokens,
-        cacheReadTokens: data.usage.cache_read_input_tokens,
-        cacheWriteTokens: data.usage.cache_creation_input_tokens,
-      },
-    };
+      return {
+        content,
+        finishReason: data.stop_reason === 'end_turn' ? 'stop' : 'length',
+        usage: {
+          inputTokens: data.usage.input_tokens,
+          outputTokens: data.usage.output_tokens,
+          cacheReadTokens: data.usage.cache_read_input_tokens,
+          cacheWriteTokens: data.usage.cache_creation_input_tokens,
+        },
+      };
+    }, { label: 'anthropic.complete' });
   }
 
   async *stream(
@@ -287,6 +290,36 @@ export class AnthropicProvider extends BaseLLMProvider {
       request.system = systemBlocks;
     }
 
+    const maxAttempts = 3;
+    const initialDelayMs = 1000;
+    const backoffFactor = 2;
+    const maxDelayMs = 10000;
+    let yielded = false;
+    let lastErr: unknown;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        for await (const chunk of this.streamOnce(request)) {
+          if (chunk.content.length > 0) yielded = true;
+          yield chunk;
+        }
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (yielded) throw err;
+        if (attempt >= maxAttempts) throw err;
+        if (!defaultIsRetryable(err)) throw err;
+        const delay = Math.min(initialDelayMs * Math.pow(backoffFactor, attempt - 1), maxDelayMs);
+        const msg = err instanceof Error ? err.message : String(err);
+        // eslint-disable-next-line no-console
+        console.warn(`[anthropic.stream] attempt ${attempt}/${maxAttempts} failed: ${msg.slice(0, 200)} — retrying in ${delay}ms`);
+        await new Promise<void>(resolve => setTimeout(resolve, delay));
+      }
+    }
+    throw lastErr;
+  }
+
+  private async *streamOnce(request: AnthropicRequest): AsyncIterable<LLMStreamChunk> {
     const response = await fetch(`${this.baseUrl}/v1/messages`, {
       method: 'POST',
       headers: {
