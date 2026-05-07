@@ -1103,15 +1103,26 @@ The registered object must implement these handlers to participate in the agent 
       } catch { /* best effort — proceed without check */ }
     }
 
-    // 1. Find all eligible agents (can execute, not failed, not busy)
+    // 1. Find all eligible agents. We deliberately INCLUDE busy agents in the
+    // ask poll: an agent's capability ("can I do this task?") is independent
+    // of its current load ("am I free right now?"). If we filter out busy
+    // agents here, sibling sub-tasks under a decomposing agent (e.g. two
+    // children that both need ObjectCreator) end up polling only the wrong
+    // agents — they all decline correctly, but the decline-retry path
+    // eventually misroutes via LLM variability (a weak PARTIAL bid wins).
+    //
+    // Instead: ask everyone. If a busy agent says YES and the claim step
+    // races with that agent becoming-free or staying-busy, line ~1337's
+    // "agent ${name} became busy, aborting before claim" guard short-circuits
+    // cleanly and periodicScan re-fires the tuple when the agent frees
+    // (the dispatcher's finally clause runs periodicScan after busyAgents.delete).
     const failedAgentIds = new Set(failureHistory.map(f => f.agentId));
     const eligible = [...this.registeredAgents.values()]
       .filter(a => a.canExecute)
-      .filter(a => !failedAgentIds.has(a.agentId))
-      .filter(a => !this.busyAgents.has(a.agentId));
+      .filter(a => !failedAgentIds.has(a.agentId));
 
     if (eligible.length === 0) {
-      log.info(`DISPATCH-INNER ${tupleId} — no agents available (all failed or busy)`);
+      log.info(`DISPATCH-INNER ${tupleId} — no eligible agents (all in failureHistory)`);
       return;
     }
 
@@ -1192,7 +1203,20 @@ After the verdict, in 2-4 sentences: name the SPECIFIC tool, skill, MCP server, 
     // Never dispatch to NO agents.
     const yesAgents = allApproaches.filter(a => a.verdict === 'YES');
     const partialAgents = allApproaches.filter(a => a.verdict === 'PARTIAL');
-    const approaches = yesAgents.length > 0 ? yesAgents : partialAgents;
+    let approaches = yesAgents.length > 0 ? yesAgents : partialAgents;
+
+    // Bias toward free agents inside the same verdict bucket. If there are
+    // both free and busy YES'ers, only consider the free ones — saves an
+    // LLM evaluator call AND avoids the claim-time abort that would otherwise
+    // bounce the tuple back through periodicScan. Same for the PARTIAL
+    // fallback bucket. If every bidder is busy, we keep them all in play and
+    // let the claim-abort path defer the work until one frees.
+    const freeOnly = approaches.filter(a => !this.busyAgents.has(a.agent.agentId));
+    if (freeOnly.length > 0 && freeOnly.length < approaches.length) {
+      const dropped = approaches.length - freeOnly.length;
+      log.info(`DISPATCH-INNER ${tupleId} — ${dropped} busy ${approaches[0].verdict} bidder(s) dropped; preferring ${freeOnly.length} free agent(s)`);
+      approaches = freeOnly;
+    }
 
     if (approaches.length === 0) {
       log.info(`DISPATCH-INNER ${tupleId} — no agent can handle: all declined`);
