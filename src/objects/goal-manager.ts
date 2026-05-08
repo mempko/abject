@@ -50,6 +50,19 @@ export interface Goal {
   createdAt: number;
   updatedAt: number;
   scratchpad: Record<string, unknown>;
+  /**
+   * Scrum-shaped orchestration: each round of ScrumMaster's Sprint Planning
+   * increments this. New tasks created in that round carry the same scrumNumber
+   * on their tuple, so Sprint Review only fires when every task at the
+   * current scrum number reaches terminal state. Starts at 0 (no scrum yet).
+   */
+  currentScrumNumber: number;
+  /**
+   * Optional explicit acceptance criteria for the goal. ScrumMaster's Sprint
+   * Review LLM call uses this to decide DONE. When unset, the LLM judges from
+   * the goal title/description and accumulated task results.
+   */
+  definitionOfDone?: string;
 }
 
 // ─── GoalManager ─────────────────────────────────────────────────────
@@ -64,8 +77,9 @@ export class GoalManager extends Abject {
   private localPeerId = '';
   /** Track taskIds for which we already emitted terminal events (idempotency guard). */
   private emittedTerminalTasks: Set<string> = new Set();
-  /** Goals for which `goalReadyForCompletion` has been emitted; cleared when a new task is added. */
-  private readyForCompletionEmitted: Set<GoalId> = new Set();
+  /** Scrums for which `goalReadyForCompletion` has been emitted. Key is `${goalId}#${scrumNumber}` so each scrum
+   *  gets one emission. Cleared per-key when a new task is added at that scrum number. */
+  private readyForCompletionEmitted: Set<string> = new Set();
 
   /** Walk up the parent chain to find the top-level goal ID, which is the TupleSpace namespace. */
   private getTupleNamespace(goalId: GoalId): string {
@@ -118,6 +132,14 @@ export class GoalManager extends Abject {
                 { name: 'result', type: { kind: 'primitive', primitive: 'string' }, description: 'Optional result data', optional: true },
               ],
               returns: { kind: 'primitive', primitive: 'undefined' },
+            },
+            {
+              name: 'startNextScrum',
+              description: 'Increment the goal\'s currentScrumNumber. Called by ScrumMaster after Sprint Planning so subsequent tasks land in the new scrum.',
+              parameters: [
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
+              ],
+              returns: { kind: 'object', properties: { scrumNumber: { kind: 'primitive', primitive: 'number' } } },
             },
             {
               name: 'failGoal',
@@ -351,7 +373,12 @@ export class GoalManager extends Abject {
           const meta = all?.meta;
           if (meta && typeof meta === 'object' && 'id' in (meta as object)) {
             const goalData = meta as Goal;
-            const goal: Goal = { ...goalData, progress: goalData.progress ?? [], scratchpad: goalData.scratchpad ?? {} };
+            const goal: Goal = {
+              ...goalData,
+              progress: goalData.progress ?? [],
+              scratchpad: goalData.scratchpad ?? {},
+              currentScrumNumber: goalData.currentScrumNumber ?? 0,
+            };
             this.goals.set(goal.id, goal);
             if (!this.goalOrder.includes(goal.id)) {
               this.goalOrder.push(goal.id);
@@ -581,20 +608,24 @@ if it can handle the task, and the most confident agent claims it.
   }
 
   /**
-   * After a task transition that may have completed the goal's task set,
-   * check if every task is terminal (done or permanently_failed). If so, fire
-   * `goalReadyForCompletion` exactly once per goal so the creator agent can
-   * decide whether to call `completeGoal`, `failGoal`, `replan`, or add follow-up
-   * tasks. The goal stays `active` until the creator acts.
+   * After a task transition, check whether every task at the goal's
+   * currentScrumNumber has reached terminal state. If so, fire
+   * `goalReadyForCompletion` so ScrumMaster (the goal's creator) can run
+   * Sprint Review and decide DONE or ANOTHER_SCRUM. The goal stays `active`
+   * until the creator acts.
    *
-   * Idempotent: tracks emission via the in-memory `readyForCompletionEmitted`
-   * set so adding a new task after a temporary "all done" state correctly
-   * re-arms the check (set is cleared on addTask).
+   * Scoped by scrum number: tasks from earlier scrums (already terminal) do
+   * not block emission for the current scrum, and tasks from a later scrum
+   * (added by Sprint Planning N+1) re-arm the check.
+   *
+   * Idempotent per (goalId, scrumNumber): each scrum gets one emission.
+   * `addTask` clears the matching key so the next scrum gets its own.
    */
   private async maybeEmitGoalReadyForCompletion(goalId: GoalId): Promise<void> {
     const goal = this.goals.get(goalId);
     if (!goal || goal.status !== 'active') return;
-    if (this.readyForCompletionEmitted.has(goalId)) return;
+    const scrumKey = `${goalId}#${goal.currentScrumNumber}`;
+    if (this.readyForCompletionEmitted.has(scrumKey)) return;
     if (!this.tupleSpaceId) return;
     let tasks: Array<{ id: string; fields: Record<string, unknown> }>;
     try {
@@ -608,18 +639,23 @@ if it can handle the task, and the most confident agent claims it.
       return;
     }
     if (tasks.length === 0) return;
+    // Filter to tasks at the goal's current scrum number — that's the
+    // sprint backlog whose terminality controls the review trigger.
+    const scrumTasks = tasks.filter(t => (t.fields.scrumNumber as number | undefined) === goal.currentScrumNumber);
+    if (scrumTasks.length === 0) return;
     const doneTaskIds: string[] = [];
     const failedTaskIds: string[] = [];
-    for (const t of tasks) {
+    for (const t of scrumTasks) {
       const status = t.fields.status as string | undefined;
       if (status === 'done') doneTaskIds.push(t.id);
       else if (status === 'permanently_failed') failedTaskIds.push(t.id);
-      else return; // at least one task is still pending / in-flight — not ready
+      else return; // at least one current-scrum task is still pending / in-flight — not ready
     }
-    this.readyForCompletionEmitted.add(goalId);
-    log.info(`Goal ${goalId.slice(0, 8)} ready for completion decision (creator=${goal.createdBy.slice(0, 8)}, ${doneTaskIds.length} done, ${failedTaskIds.length} failed)`);
+    this.readyForCompletionEmitted.add(scrumKey);
+    log.info(`Goal ${goalId.slice(0, 8)} scrum ${goal.currentScrumNumber} ready for review (creator=${goal.createdBy.slice(0, 8)}, ${doneTaskIds.length} done, ${failedTaskIds.length} failed)`);
     this.changed('goalReadyForCompletion', {
       goalId,
+      scrumNumber: goal.currentScrumNumber,
       creatorAgentId: goal.createdBy,
       doneTaskIds,
       failedTaskIds,
@@ -630,6 +666,7 @@ if it can handle the task, and the most confident agent claims it.
     try {
       this.send(event(this.id, goal.createdBy, 'goalReadyForCompletion', {
         goalId,
+        scrumNumber: goal.currentScrumNumber,
         creatorAgentId: goal.createdBy,
         doneTaskIds,
         failedTaskIds,
@@ -660,6 +697,8 @@ if it can handle the task, and the most confident agent claims it.
           createdAt: goal.createdAt,
           updatedAt: goal.updatedAt,
           scratchpad: goal.scratchpad,
+          currentScrumNumber: goal.currentScrumNumber,
+          definitionOfDone: goal.definitionOfDone,
         },
         persist: true,
       }));
@@ -669,7 +708,11 @@ if it can handle the task, and the most confident agent claims it.
   private setupHandlers(): void {
     this.on('createGoal', async (msg: AbjectMessage) => {
       await this.sweepGoals();
-      const { title, parentId } = msg.payload as { title: string; parentId?: GoalId };
+      const { title, parentId, definitionOfDone } = msg.payload as {
+        title: string;
+        parentId?: GoalId;
+        definitionOfDone?: string;
+      };
       requireNonEmpty(title, 'title');
 
       const goalId = uuidv4() as GoalId;
@@ -687,6 +730,8 @@ if it can handle the task, and the most confident agent claims it.
         createdAt: Date.now(),
         updatedAt: Date.now(),
         scratchpad: {},
+        currentScrumNumber: 0,
+        definitionOfDone,
       };
 
       this.goals.set(goalId, goal);
@@ -756,6 +801,29 @@ if it can handle the task, and the most confident agent claims it.
       log.info(`Goal completed: "${goal.title}" (${goalId})`);
       this.changed('goalCompleted', { goalId, result });
       this.syncGoalToSharedState(goal);
+    });
+
+    /**
+     * Increment Goal.currentScrumNumber. Called by ScrumMaster after each
+     * Sprint Planning round. New tasks added in that round carry the new
+     * scrumNumber so Sprint Review only fires when every task at the new
+     * scrum number is terminal.
+     */
+    this.on('startNextScrum', async (msg: AbjectMessage) => {
+      const { goalId } = msg.payload as { goalId: GoalId };
+      const goal = this.goals.get(goalId);
+      if (!goal) return { error: 'Goal not found' };
+      goal.currentScrumNumber += 1;
+      goal.updatedAt = Date.now();
+      log.info(`Goal ${goalId.slice(0, 8)} entering scrum ${goal.currentScrumNumber}`);
+      this.changed('goalUpdated', {
+        goalId,
+        parentId: goal.parentId,
+        message: `Scrum ${goal.currentScrumNumber} planned`,
+        phase: 'planning',
+      });
+      this.syncGoalToSharedState(goal);
+      return { scrumNumber: goal.currentScrumNumber };
     });
 
     this.on('failGoal', async (msg: AbjectMessage) => {
@@ -858,10 +926,14 @@ if it can handle the task, and the most confident agent claims it.
     // ── Task convenience methods (delegate to TupleSpace) ──
 
     this.on('addTask', async (msg: AbjectMessage) => {
-      const { goalId, description, data, dependsOn, produces, consumes } = msg.payload as {
+      const { goalId, description, data, dependsOn, produces, consumes, assignedAgentId, scrumNumber } = msg.payload as {
         goalId: string; description: string; data?: unknown; dependsOn?: string[];
         produces?: Array<{ key: string; description: string }>;
         consumes?: string[];
+        /** Direct assignment from ScrumMaster — the agent that will run this task. */
+        assignedAgentId?: string;
+        /** Scrum cycle this task belongs to. Sprint Review fires when every task at the goal's currentScrumNumber is terminal. */
+        scrumNumber?: number;
       };
       requireNonEmpty(goalId, 'goalId');
       requireNonEmpty(description, 'description');
@@ -886,9 +958,15 @@ if it can handle the task, and the most confident agent claims it.
         });
       }
 
-      // Re-arm the goal-ready-for-completion check so the creator gets a fresh
-      // signal once the new task (and any siblings) reach terminal state.
-      this.readyForCompletionEmitted.delete(goalId as GoalId);
+      // Resolve the task's effective scrum number. ScrumMaster passes one
+      // explicitly; legacy callers omit it, in which case we attribute to the
+      // goal's currentScrumNumber so existing flows continue to work.
+      const effectiveScrumNumber = scrumNumber ?? goal.currentScrumNumber;
+
+      // Re-arm the ready-for-completion check for THIS scrum so the creator
+      // gets a fresh signal once every task at the new task's scrum number
+      // reaches terminal state. Re-key by (goalId, scrumNumber).
+      this.readyForCompletionEmitted.delete(`${goalId}#${effectiveScrumNumber}`);
 
       if (!this.tupleSpaceId) return { error: 'TupleSpace not available' };
 
@@ -902,13 +980,17 @@ if it can handle the task, and the most confident agent claims it.
             dependsOn: dependsOn ?? [],
             produces: produces ?? [],
             consumes: consumes ?? [],
+            assignedAgentId,
+            scrumNumber: effectiveScrumNumber,
           },
         })
       );
       const contractParts: string[] = [];
       if (produces?.length) contractParts.push(`produces=[${produces.map(p => p.key).join(',')}]`);
       if (consumes?.length) contractParts.push(`consumes=[${consumes.join(',')}]`);
-      const contractSuffix = contractParts.length ? ` (${contractParts.join(' ')})` : '';
+      if (assignedAgentId) contractParts.push(`assigned=${assignedAgentId.slice(0, 8)}`);
+      contractParts.push(`scrum=${effectiveScrumNumber}`);
+      const contractSuffix = ` (${contractParts.join(' ')})`;
       log.info(`Task added for goal ${goalId}: "${description.slice(0, 60)}"${dependsOn?.length ? ` (depends on ${dependsOn.length} task(s))` : ''}${contractSuffix}`);
       return { taskId: result.tupleId };
     });

@@ -84,18 +84,8 @@ export class ObjectAgent extends Abject {
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## ObjectAgent — General-Purpose Object Interaction Agent
 
-### Hard Refusals — answer NO immediately, do not analyze further
-Any task whose goal is to **modify, fix, patch, update, rewrite, or change** the source code, handlers, manifest, events, or implementation of an existing Abject — **answer NO**. Examples that MUST be NO:
-- "Modify the LinkedInBrowser object to subscribe to events Y" — NO (modifies an Abject's source)
-- "Fix the _pollTelegram method on TelegramBridge" — NO (modifies handler source)
-- "Add a parse step to handleX" — NO (modifies handler source)
-- "Patch the bug in WidgetY's render method" — NO (modifies an Abject's source)
-- "Wrap MCP server M as a new Abject" — NO (authors new Abject source)
-
-I have no programmatic API to change source. The dispatcher's "authoring/modification rule" is for ObjectCreator, not me. The conditional in that rule is FALSE for me, so I answer NO on every authoring/modification task regardless of how it's framed. If a diagnosis task ends in "the fix is to change the code of object X", report the diagnosis and stop — don't try to do the fix yourself.
-
 ### What I Handle
-I interact with existing objects by discovering them and sending them messages.
+I interact with existing objects by discovering them and sending them messages. Authoring or modifying Abject source is outside my scope (no programmatic API to change source). When asked to investigate, I report findings and stop — I don't write code.
 
 Examples of tasks I handle well:
 - Fetching data from APIs (weather, stocks, etc.)
@@ -164,13 +154,14 @@ When asked about a task, describe which objects you would message and what you w
   private setupHandlers(): void {
     // ── TupleSpace dispatch handler ──
     this.on('executeTask', async (msg: AbjectMessage) => {
-      const { tupleId, goalId, description, data, approach, failureHistory } = msg.payload as {
-        tupleId: string; goalId?: string; description: string;
+      const { tupleId, taskId: explicitTaskId, goalId, description, data, approach, failureHistory } = msg.payload as {
+        tupleId: string; taskId?: string; goalId?: string; description: string;
         data?: Record<string, unknown>; type: string; approach?: string;
         failureHistory?: Array<{ agent: string; error: string }>;
       };
 
-      const taskId = `obj-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      // Use queue-runner-supplied taskId for inFlight match; fall back for legacy.
+      const taskId = explicitTaskId ?? tupleId ?? `obj-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       this.taskExtras.set(taskId, { taskData: data });
       this._currentGoalId = goalId;
 

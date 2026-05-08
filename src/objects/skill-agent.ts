@@ -112,33 +112,15 @@ export class SkillAgent extends Abject {
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## SkillAgent: Installed Skill Execution Agent
 
-### Hard Refusals — answer NO immediately, do not analyze further
-Any task whose goal is to **modify, fix, patch, update, rewrite, or change** the source code, handlers, manifest, events, or implementation of an existing Abject object — **answer NO**. Examples that MUST be NO:
-- "Modify LinkedInData to add cancelSearch" — NO (modifies an Abject's source)
-- "Fix the bug in WidgetX.handleClick" — NO (modifies an Abject's implementation)
-- "Add events to the Y manifest" — NO (modifies an Abject's manifest)
-- "Wrap MCP server Z as a new Abject" — NO (authors new Abject source)
-
-This rule overrides any guidance in the outer dispatcher prompt. The dispatcher's "authoring/modification rule" applies only to the agent that authors object code — that is NOT me. I install and use skills; I do not write or edit Abject source. The outer prompt's "if you are the agent that regenerates object code, answer YES" is a conditional — for me the condition is FALSE, so I answer NO on every authoring task regardless of how the task is framed.
-
-### What I Handle
-I manage and execute skills. I handle:
-- Installing new MCP servers and skills (e.g., "install @shinzolabs/gmail-mcp")
-- Enabling, disabling, and listing installed skills
-- Executing tasks that match an installed and enabled skill's domain at runtime (e.g. "send a Slack message", "list my Linear issues")
+I install, enable, disable, and list skills. I execute tasks that match an installed skill's domain at runtime — e.g. "send a Slack message", "list my Linear issues", "create a Gmail draft".
 
 Currently installed skills and their domains:
 ${this.getInstalledSkillsSummary()}
 
 ### My Scope
-I handle skill installation, management, and tasks that match an installed skill's domain. Runtime interaction with existing objects, web browsing, and authoring/modifying object source code are each handled by a dedicated agent — not me.
+Skill installation, management, and at-runtime execution of tasks that match an installed skill's domain. Authoring or modifying Abject source code is outside my scope; that's a different agent's job. Web browsing of arbitrary public URLs is also outside my scope.
 
-### Decision Procedure
-1. Is the task asking to modify, fix, patch, rewrite, or change the source/handlers/manifest of an Abject? → NO (per Hard Refusals above), even if the task description names a skill or MCP server.
-2. Is the task asking to create or wrap something as a new Abject (widget, app, bridge, proxy, agent)? → NO. Object authoring is outside my scope.
-3. Does the task name an installed skill or MCP server I have, AND ask me to *use* it (call a tool, fetch data, send a message)? → YES, name the skill and outline the steps.
-4. Is it asking me to install / enable / disable / list skills? → YES.
-5. Otherwise → NO.`;
+When invited to contribute to a Sprint Plan, describe the specific task I could run using one of my installed skills. If no installed skill matches the goal, reply PASS.`;
   }
 
   protected override async handleAsk(question: string): Promise<string> {
@@ -183,13 +165,16 @@ I handle skill installation, management, and tasks that match an installed skill
   private setupHandlers(): void {
     // ── TupleSpace dispatch handler ──
     this.on('executeTask', async (msg: AbjectMessage) => {
-      const { tupleId, goalId, description, approach, failureHistory } = msg.payload as {
-        tupleId: string; goalId?: string; description: string;
+      const { tupleId, taskId: explicitTaskId, goalId, description, approach, failureHistory } = msg.payload as {
+        tupleId: string; taskId?: string; goalId?: string; description: string;
         data?: Record<string, unknown>; type: string; approach?: string;
         failureHistory?: Array<{ agent: string; error: string }>;
       };
 
-      const taskId = `skill-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      // Use the queue-runner-supplied taskId so AgentAbject's TaskEntry,
+      // SkillAgent's TaskExtra, and AgentAbject's queue inFlight slot share
+      // one ID. Falls back to a fresh `skill-exec-${...}` for legacy callers.
+      const taskId = explicitTaskId ?? tupleId ?? `skill-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       this.taskExtras.set(taskId, {});
       this._currentGoalId = goalId;
 

@@ -266,32 +266,20 @@ export class ObjectCreator extends Abject {
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## ObjectCreator — Abject Authoring & Modification Agent
 
-### What I Handle (answer YES with a concrete plan)
-I am the agent that authors and modifies Abject source code. The dispatcher's "authoring/modification rule" — *"If you are the agent that regenerates object code from a prompt, answer YES for these"* — describes me. The condition is TRUE for me, so authoring and modification tasks belong to me.
+I author and modify Abject source code via an LLM-driven loop that reads existing source from the Registry, drafts diffs, validates calls, reviews semantics, and deploys updates through the standard ScriptableAbject update path.
 
-Examples that MUST be YES:
-- "Create a new TodoList widget" / "Build a Stopwatch app" / "Wrap MCP server M as a new Abject" — YES (single-object authoring)
-- "Modify the LinkedInBrowser object to use the progressive ticketing API" — YES (modify Abject source)
-- "Fix the _pollTelegram method on TelegramBridge" — YES (modify handler source)
-- "Add a Cancel button to FooBrowser" / "Add events Y, Z to the manifest of WidgetX" — YES (modify Abject source/manifest)
-- "Patch the bug in WidgetY's render method" — YES (modify Abject source)
-- "Investigate why LinkedInData isn't emitting searchProgress" — YES (investigation that ends in code edits is mine)
+What I handle:
+- Single-object authoring (new widgets, apps, bridges, proxies, MCP wrappers).
+- Modifying existing Abject source — adding methods, events, manifest entries; fixing handlers; refactoring an Abject's implementation.
+- Investigation that ends in code edits (read source, diagnose, fix).
 
-I author and modify Abject source via my \`create\` and \`modify\` methods, which run an LLM-driven loop that reads existing source from the Registry, drafts diffs, validates calls, reviews semantics, and deploys updates through the standard ScriptableAbject update path.
+What I don't handle:
+- Multi-object autonomous-system composition (agent + scheduler + watcher) — that's AgentCreator.
+- Runtime method calls on existing objects — that's ObjectAgent.
+- Public-web browsing — that's WebAgent.
+- Installed skill use at runtime — that's SkillAgent.
 
-### What I Don't Handle (answer NO)
-- "Open / show / display the X window" — that's a runtime UI action; ObjectAgent calls show() on the existing Abject.
-- "Call refresh() on DashboardApp" — runtime method call on a named Abject; ObjectAgent.
-- "Send a Slack message via the slack skill" — runtime skill use; SkillAgent.
-- "Search Google for X" / "Scrape the front page of Y" — public-web browsing; WebAgent.
-- "Create a daily-briefing autonomous system with an LLM loop and a scheduler" — multi-object autonomous-system composition; AgentCreator.
-
-### Decision Procedure
-1. Does the task ask to CREATE, BUILD, AUTHOR, WRAP, REWRITE, MODIFY, PATCH, FIX, UPDATE the source/handlers/manifest of an Abject (single object)? → YES, name the create/modify method I would invoke.
-2. Does the task name a multi-object autonomous system (agent + scheduler + watcher)? → NO, defer to AgentCreator.
-3. Does the task ask to invoke an existing method on an existing object, browse the web, or use an installed skill at runtime? → NO, defer to ObjectAgent / WebAgent / SkillAgent.
-4. Investigation that will end in code changes? → YES (I do investigate-and-fix loops).
-5. Investigation that ends with a report and no code changes? → still YES (I'm equipped to read source, but answer based on what the goal description actually asks for).`;
+When invited to a Sprint Plan, describe the concrete authoring or modification I'd perform, the target Abject (by name), and what would change. If the goal is purely runtime (open a window, call a method, send a Slack message), reply PASS.`;
   }
 
   // ── Message-passing helpers (thin wrappers over request/event) ─────────
@@ -1223,8 +1211,9 @@ I author and modify Abject source via my \`create\` and \`modify\` methods, whic
     });
 
     this.on('executeTask', (msg: AbjectMessage) => {
-      const { tupleId, goalId, description, type, data, callerId: explicitCaller } = msg.payload as {
+      const { tupleId, taskId: explicitTaskId, goalId, description, type, data, callerId: explicitCaller } = msg.payload as {
         tupleId?: string;
+        taskId?: string;
         goalId?: string;
         description: string;
         type?: string;
@@ -1232,7 +1221,6 @@ I author and modify Abject source via my \`create\` and \`modify\` methods, whic
         callerId?: string;
       };
       const callerId = (explicitCaller as AbjectId) ?? msg.routing.from;
-      // Pass any object hint from data through; the agent decides kind on turn 1.
       const targetIdOrName = (data?.objectId as string | undefined)
         ?? (data?.target as string | undefined)
         ?? (data?.objectName as string | undefined);
@@ -1241,14 +1229,18 @@ I author and modify Abject source via my \`create\` and \`modify\` methods, whic
           : type === 'modify' ? 'modify'
             : type === 'investigate' ? 'investigate'
               : (targetIdOrName ? 'modify' : 'create');
+      // Use the queue-runner-supplied taskId so AgentAbject's TaskEntry,
+      // ObjectCreator's TaskExtra, and the queue's inFlight slot all share
+      // one ID. Falls back to a fresh oc-${...} for legacy direct callers.
       this.startAgentTask({
         kind,
         prompt: description,
         targetIdOrName,
         goalId,
-        dispatchTupleId: tupleId,
+        dispatchTupleId: tupleId ?? explicitTaskId,
         callerId,
         deferredMsg: msg,
+        explicitTaskId: explicitTaskId ?? tupleId,
       });
       return DEFERRED_REPLY;
     });
@@ -1270,11 +1262,9 @@ I author and modify Abject source via my \`create\` and \`modify\` methods, whic
 
     // ── Receive task results from AgentAbject ──
     this.on('taskResult', async (msg: AbjectMessage) => {
-      const { ticketId, success, suspended, childGoalIds, result, error } = msg.payload as {
+      const { ticketId, success, result, error } = msg.payload as {
         ticketId: string;
-        success?: boolean;
-        suspended?: boolean;
-        childGoalIds?: string[];
+        success: boolean;
         result?: unknown;
         error?: string;
         steps: number;
@@ -1284,25 +1274,7 @@ I author and modify Abject source via my \`create\` and \`modify\` methods, whic
       const extra = this.tasks.get(taskId);
       if (!extra) return;
 
-      // Suspension: AgentAbject's state machine yielded waiting on child goals.
-      // Forward `{ suspended: true, childGoalIds }` to the deferred caller (the
-      // dispatcher) so the JobManager job completes and our queue is freed.
-      // AgentAbject re-runs the state machine when children terminate; keep
-      // TaskExtra alive so subsequent agentObserve / agentAct callbacks during
-      // resume still find their state. Drop the deferredMsg so a future taskResult
-      // doesn't double-reply (AgentAbject takes over tuple completion on resume).
-      if (suspended) {
-        if (extra.deferredMsg) {
-          this.sendDeferredReply(extra.deferredMsg, {
-            suspended: true,
-            childGoalIds: childGoalIds ?? [],
-          });
-          extra.deferredMsg = undefined;
-        }
-        return;
-      }
-
-      const finalResult = this.finalizeLoop(extra.state, success ?? false, result, error);
+      const finalResult = this.finalizeLoop(extra.state, success, result, error);
 
       // Emit lifecycle events
       if (finalResult.success) {
@@ -1330,15 +1302,22 @@ I author and modify Abject source via my \`create\` and \`modify\` methods, whic
     targetIdOrName?: string;
     goalId?: string;
     /**
-     * TupleSpace tuple id when this task came from the dispatcher. Forwarded
-     * to AgentAbject.startTask so its TaskEntry has dispatchTupleId set; that's
-     * what tells runTaskAsync to leave goal-level completion to the dispatcher
-     * (or to the resume path for suspended tasks). Without it, the entry's
-     * runTaskAsync fires `completeGoal` for the parent goal as soon as this one
-     * task finishes, prematurely retiring the goal while sibling tasks are
-     * still pending.
+     * TupleSpace tuple id (or queued task id) when this task came from
+     * AgentAbject's task queue. Forwarded to startTask so the TaskEntry's
+     * dispatchTupleId tells runTaskAsync to call completeTask/failTask on
+     * the originating tuple — which is how ScrumMaster's goalReadyForCompletion
+     * trigger fires.
      */
     dispatchTupleId?: string;
+    /**
+     * Explicit taskId to use for the AgentAbject startTask. When supplied
+     * (by the queue runner), AgentAbject's TaskEntry, ObjectCreator's
+     * TaskExtra, and AgentAbject's queue inFlight slot all share this ID
+     * so the queue runner can match `entry.state.id` and pop the next
+     * pending task on completion. When omitted (legacy direct callers),
+     * we generate a fresh `oc-${...}`.
+     */
+    explicitTaskId?: string;
     callerId?: AbjectId;
     deferredMsg?: AbjectMessage;
   }): Promise<void> {
@@ -1386,7 +1365,7 @@ I author and modify Abject source via my \`create\` and \`modify\` methods, whic
       turnLog: [],
     };
 
-    const taskId = `oc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const taskId = args.explicitTaskId ?? `oc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const taskExtra: TaskExtra = {
       taskId,
       prompt: args.prompt,

@@ -48,7 +48,7 @@ const wsLog = new Log('WORKSPACE-MANAGER');
 /** Infrastructure objects — always spawned for every workspace (no UI). */
 const INFRA_OBJECTS = [
   'AbjectStore', 'SharedState', 'TupleSpace', 'FileTransfer', 'MediaStream', 'Theme',
-  'GoalManager', 'JobManager', 'AgentAbject', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
+  'GoalManager', 'JobManager', 'AgentAbject', 'ScrumMaster', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
   'AgentCreator', 'Scheduler', 'KnowledgeBase', 'ChatManager',
   'Console',
 ] as const;

@@ -91,38 +91,19 @@ export class AgentCreator extends Abject {
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## AgentCreator: Autonomous Agent, Scheduler, and Watcher Creation Specialist
 
-### Hard Refusals — answer NO immediately, do not analyze further
-Any task whose goal is to **modify, fix, patch, update, rewrite, or change** the source code, handlers, manifest, events, or implementation of an existing Abject — **answer NO**. Examples that MUST be NO:
-- "Modify the LinkedInBrowser object so it uses the new ticketing API" — NO (modifies an Abject's source)
-- "Fix bug in WeatherAgent's _checkForecast handler" — NO (modifies an Abject's source)
-- "Update the manifest events for WidgetY" — NO (modifies an Abject's manifest)
-- "Run the existing morning-briefing agent" — NO (running an existing object, not creating one)
-- "Create a TelegramBridge proxy" / "Wrap GitHub API as a new Abject" / "Build an SMS-to-chat relay" — NO (single-object forwarder, not a multi-object autonomous system)
+I author NEW autonomous behavior that requires multiple cooperating objects: an agent with an LLM decision loop, a scheduler that fires on a recurring trigger, a watcher that reacts to events.
 
-I create new agents/schedulers/watchers as a multi-object composition. The dispatcher's "authoring/modification rule" applies to ObjectCreator (single-object authoring) and to me (multi-object autonomous-system authoring) only when the request is genuinely a NEW multi-object autonomous system with an LLM decision loop. Single-object create/wrap requests go to ObjectCreator. Modify-existing-source requests go to ObjectCreator. I refuse both.
-
-### What I Handle
-I create NEW autonomous behavior that requires MULTIPLE cooperating objects: an agent that claims tasks with an LLM decision loop, a scheduler that fires on a recurring trigger, and a watcher that reacts to events. I decompose the request into separate sub-tasks so each component Abject gets built. My specialty is the composition pattern of agent plus scheduler plus watcher.
-
-Examples of tasks I handle well:
+Examples I handle well:
 - "Create an agent that delivers a morning briefing every day at 6 AM" (agent + scheduler)
-- "Create an agent that analyzes news and writes summaries" (agent + scheduler)
 - "Build an agent that reviews code changes and provides feedback" (agent + watcher on a code source)
-- "Create an agent that monitors weather and alerts on storms" (agent + scheduler)
 - "Set up a recurring check every 10 minutes that posts to chat when something changes" (scheduler + watcher)
 
-### My Scope
-I create new autonomous agents, scheduled agents, and event watchers, decomposed into the set of cooperating objects needed. The signal that a request belongs here is that the work needs a new LLM decision loop or multiple cooperating objects (agent plus scheduler plus watcher).
+### What's outside my scope
+- Modifying existing Abject source — that's ObjectCreator's job.
+- Single-object create/wrap (bridges, proxies, relays, adapters, integrations) — also ObjectCreator unless the request is a multi-object autonomous system.
+- Running an existing agent — ObjectAgent invokes existing objects.
 
-### Single-Object Forwarders Fit Elsewhere
-Bridges, proxies, relays, adapters, and integrations are single forwarding objects, not agents: they move traffic between endpoints and wrap a service. Even when they poll internally, they fit in ONE object and belong with a creation agent that builds single objects. Say PASS for any "create a X proxy", "create a X bridge", "create a X relay", "create a X adapter", or "create a X integration" request unless the user explicitly describes a multi-object system with an LLM decision loop.
-
-### How I Work
-1. Decompose the request into sub-tasks via the goal system
-2. Each sub-task creates a new object (agent, scheduler, or watcher)
-3. Monitor child goal progress, report done when all complete
-
-When asked about a task, describe how you would decompose it into agent/scheduler/watcher sub-tasks. Say PASS so routing can hand the task onward when the request is to run an existing agent, modify an existing agent's source code, build a regular widget or app without an autonomous loop, perform a one-time data fetch, or create a single-object bridge/proxy/relay/adapter/integration.`;
+When invited to a Sprint Plan, describe what I'd build and how I'd compose it across multiple cooperating objects. If the goal needs only a single object or only modifications, reply PASS so the work routes to ObjectCreator.`;
   }
 
   protected override async handleAsk(question: string): Promise<string> {
@@ -135,13 +116,14 @@ When asked about a task, describe how you would decompose it into agent/schedule
 
   private setupHandlers(): void {
     this.on('executeTask', async (msg: AbjectMessage) => {
-      const { tupleId, goalId, description, approach, failureHistory } = msg.payload as {
-        tupleId: string; goalId?: string; description: string;
+      const { tupleId, taskId: explicitTaskId, goalId, description, approach, failureHistory } = msg.payload as {
+        tupleId: string; taskId?: string; goalId?: string; description: string;
         data?: Record<string, unknown>; type: string; approach?: string;
         failureHistory?: Array<{ agent: string; error: string }>;
       };
 
-      const taskId = `ac-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      // Use queue-runner-supplied taskId for inFlight match; fall back for legacy.
+      const taskId = explicitTaskId ?? tupleId ?? `ac-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       this.taskExtras.set(taskId, { description, goalId });
 
       try {

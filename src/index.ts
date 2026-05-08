@@ -134,6 +134,7 @@ export { FileTransfer, FILE_TRANSFER_ID } from './objects/capabilities/file-tran
 export { MediaStreamCapability, MEDIA_STREAM_ID } from './objects/capabilities/media-stream.js';
 export { AgentAbject, AGENT_ABJECT_ID } from './objects/agent-abject.js';
 export type { AgentPhase, AgentAction, AgentActionResult, AgentTaskState, AgentTaskOptions, AgentConfig, TerminalActionConfig } from './objects/agent-abject.js';
+export { ScrumMaster } from './objects/scrum-master.js';
 export { WebBrowserViewer, WEB_BROWSER_VIEWER_ID } from './objects/web-browser-viewer.js';
 export { ShellExecutor, SHELL_EXECUTOR_ID } from './objects/capabilities/shell-executor.js';
 export { HostFileSystem, HOST_FILESYSTEM_ID } from './objects/capabilities/host-filesystem.js';
