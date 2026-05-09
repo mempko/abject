@@ -39,7 +39,16 @@ export interface ProgressEntry {
 export interface Goal {
   id: GoalId;
   parentId?: GoalId;
+  /** Short, user-facing label for the goal (~200 chars). Used in lists / UI. */
   title: string;
+  /**
+   * Required. Free-form prose capturing the user's intent in detail. May
+   * include explicit ordering ("do A then B then C"), examples, constraints,
+   * and any other context. ScrumMaster's planning LLM reads this to decide
+   * the sprint backlog. The user's actual phrasing should land here verbatim
+   * where possible — title is the label, description is the substance.
+   */
+  description: string;
   status: 'active' | 'completed' | 'failed' | 'archived';
   createdBy: AbjectId;
   creatorName: string;
@@ -51,18 +60,12 @@ export interface Goal {
   updatedAt: number;
   scratchpad: Record<string, unknown>;
   /**
-   * Scrum-shaped orchestration: each round of ScrumMaster's Sprint Planning
+   * Scrum-shaped orchestration: each ScrumMaster scrum that plans more work
    * increments this. New tasks created in that round carry the same scrumNumber
-   * on their tuple, so Sprint Review only fires when every task at the
+   * on their tuple, so the next scrum only fires when every task at the
    * current scrum number reaches terminal state. Starts at 0 (no scrum yet).
    */
   currentScrumNumber: number;
-  /**
-   * Optional explicit acceptance criteria for the goal. ScrumMaster's Sprint
-   * Review LLM call uses this to decide DONE. When unset, the LLM judges from
-   * the goal title/description and accumulated task results.
-   */
-  definitionOfDone?: string;
 }
 
 // ─── GoalManager ─────────────────────────────────────────────────────
@@ -108,7 +111,8 @@ export class GoalManager extends Abject {
               name: 'createGoal',
               description: 'Create a new goal for tracking progress',
               parameters: [
-                { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal title' },
+                { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Short user-facing label (~200 chars)' },
+                { name: 'description', type: { kind: 'primitive', primitive: 'string' }, description: 'REQUIRED. Free-form prose capturing the user\'s intent in detail — including explicit ordering ("do A then B then C"), constraints, examples, and what counts as success. ScrumMaster reads this at every scrum.' },
                 { name: 'parentId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent goal ID for sub-goals', optional: true },
               ],
               returns: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' } } },
@@ -135,7 +139,7 @@ export class GoalManager extends Abject {
             },
             {
               name: 'startNextScrum',
-              description: 'Increment the goal\'s currentScrumNumber. Called by ScrumMaster after Sprint Planning so subsequent tasks land in the new scrum.',
+              description: 'Increment the goal\'s currentScrumNumber. Called by ScrumMaster after a scrum plans more tasks so they land at the new scrum number.',
               parameters: [
                 { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal ID' },
               ],
@@ -303,8 +307,7 @@ export class GoalManager extends Abject {
             { name: 'goalsCleared', description: 'Completed/failed goals were cleared', payload: { kind: 'primitive', primitive: 'undefined' } },
             { name: 'goalsSwept', description: 'Goals were archived or deleted by lifecycle sweep', payload: { kind: 'primitive', primitive: 'undefined' } },
             { name: 'taskCompleted', description: 'A task was completed', payload: { kind: 'object', properties: { taskId: { kind: 'primitive', primitive: 'string' }, goalId: { kind: 'primitive', primitive: 'string' }, result: { kind: 'primitive', primitive: 'string' } } } },
-            { name: 'taskRetrying', description: 'A task failed but will be retried', payload: { kind: 'object', properties: { taskId: { kind: 'primitive', primitive: 'string' }, goalId: { kind: 'primitive', primitive: 'string' }, error: { kind: 'primitive', primitive: 'string' }, attempts: { kind: 'primitive', primitive: 'number' }, maxAttempts: { kind: 'primitive', primitive: 'number' } } } },
-            { name: 'taskPermanentlyFailed', description: 'A task exhausted all retry attempts', payload: { kind: 'object', properties: { taskId: { kind: 'primitive', primitive: 'string' }, goalId: { kind: 'primitive', primitive: 'string' }, error: { kind: 'primitive', primitive: 'string' }, attempts: { kind: 'primitive', primitive: 'number' } } } },
+            { name: 'taskPermanentlyFailed', description: 'A task failed. The next scrum may schedule a corrective task or accept the failure.', payload: { kind: 'object', properties: { taskId: { kind: 'primitive', primitive: 'string' }, goalId: { kind: 'primitive', primitive: 'string' }, error: { kind: 'primitive', primitive: 'string' }, attempts: { kind: 'primitive', primitive: 'number' } } } },
             { name: 'goalReadyForCompletion', description: 'All tasks of a goal reached terminal state. Sent once to the goal\'s creator so they can decide whether to completeGoal, replan, failGoal, or add follow-up tasks. Goal stays active until the creator acts on it.', payload: { kind: 'object', properties: { goalId: { kind: 'primitive', primitive: 'string' }, creatorAgentId: { kind: 'primitive', primitive: 'string' }, doneTaskIds: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, failedTaskIds: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } } } } },
           ],
         },
@@ -378,6 +381,9 @@ export class GoalManager extends Abject {
               progress: goalData.progress ?? [],
               scratchpad: goalData.scratchpad ?? {},
               currentScrumNumber: goalData.currentScrumNumber ?? 0,
+              // Legacy goals from before description was required: backfill
+              // from title so the field invariant holds.
+              description: goalData.description ?? goalData.title,
             };
             this.goals.set(goal.id, goal);
             if (!this.goalOrder.includes(goal.id)) {
@@ -610,13 +616,13 @@ if it can handle the task, and the most confident agent claims it.
   /**
    * After a task transition, check whether every task at the goal's
    * currentScrumNumber has reached terminal state. If so, fire
-   * `goalReadyForCompletion` so ScrumMaster (the goal's creator) can run
-   * Sprint Review and decide DONE or ANOTHER_SCRUM. The goal stays `active`
-   * until the creator acts.
+   * `goalReadyForCompletion` so ScrumMaster can run the next scrum, which
+   * decides whether to declare the sprint done or plan more tasks. The goal
+   * stays `active` until ScrumMaster acts.
    *
-   * Scoped by scrum number: tasks from earlier scrums (already terminal) do
-   * not block emission for the current scrum, and tasks from a later scrum
-   * (added by Sprint Planning N+1) re-arm the check.
+   * Scoped by scrum number: tasks from earlier rounds (already terminal) do
+   * not block emission for the current round, and tasks from a later round
+   * (added when a scrum plans more work) re-arm the check.
    *
    * Idempotent per (goalId, scrumNumber): each scrum gets one emission.
    * `addTask` clears the matching key so the next scrum gets its own.
@@ -688,6 +694,7 @@ if it can handle the task, and the most confident agent claims it.
           id: goal.id,
           parentId: goal.parentId,
           title: goal.title,
+          description: goal.description,
           status: goal.status,
           createdBy: goal.createdBy,
           creatorName: goal.creatorName,
@@ -698,7 +705,6 @@ if it can handle the task, and the most confident agent claims it.
           updatedAt: goal.updatedAt,
           scratchpad: goal.scratchpad,
           currentScrumNumber: goal.currentScrumNumber,
-          definitionOfDone: goal.definitionOfDone,
         },
         persist: true,
       }));
@@ -708,12 +714,13 @@ if it can handle the task, and the most confident agent claims it.
   private setupHandlers(): void {
     this.on('createGoal', async (msg: AbjectMessage) => {
       await this.sweepGoals();
-      const { title, parentId, definitionOfDone } = msg.payload as {
+      const { title, parentId, description } = msg.payload as {
         title: string;
         parentId?: GoalId;
-        definitionOfDone?: string;
+        description: string;
       };
       requireNonEmpty(title, 'title');
+      requireNonEmpty(description, 'description');
 
       const goalId = uuidv4() as GoalId;
       const callerId = msg.routing.from;
@@ -722,6 +729,7 @@ if it can handle the task, and the most confident agent claims it.
         id: goalId,
         parentId,
         title: title.slice(0, 200),
+        description,
         status: 'active',
         createdBy: callerId,
         creatorName: '',
@@ -731,7 +739,6 @@ if it can handle the task, and the most confident agent claims it.
         updatedAt: Date.now(),
         scratchpad: {},
         currentScrumNumber: 0,
-        definitionOfDone,
       };
 
       this.goals.set(goalId, goal);
@@ -756,7 +763,7 @@ if it can handle the task, and the most confident agent claims it.
       }
 
       log.info(`Goal created: "${goal.title}" (${goalId})`);
-      this.changed('goalCreated', { goalId, title: goal.title, parentId });
+      this.changed('goalCreated', { goalId, title: goal.title, description: goal.description, parentId });
       this.syncGoalToSharedState(goal);
       this.saveGoalIndex();
 
@@ -804,10 +811,9 @@ if it can handle the task, and the most confident agent claims it.
     });
 
     /**
-     * Increment Goal.currentScrumNumber. Called by ScrumMaster after each
-     * Sprint Planning round. New tasks added in that round carry the new
-     * scrumNumber so Sprint Review only fires when every task at the new
-     * scrum number is terminal.
+     * Increment Goal.currentScrumNumber. Called by ScrumMaster when a scrum
+     * decides to plan more work. New tasks added at the incremented number
+     * gate the next round's `goalReadyForCompletion` emission.
      */
     this.on('startNextScrum', async (msg: AbjectMessage) => {
       const { goalId } = msg.payload as { goalId: GoalId };
@@ -932,7 +938,7 @@ if it can handle the task, and the most confident agent claims it.
         consumes?: string[];
         /** Direct assignment from ScrumMaster — the agent that will run this task. */
         assignedAgentId?: string;
-        /** Scrum cycle this task belongs to. Sprint Review fires when every task at the goal's currentScrumNumber is terminal. */
+        /** Scrum round this task belongs to. `goalReadyForCompletion` fires when every task at the goal's currentScrumNumber is terminal. */
         scrumNumber?: number;
       };
       requireNonEmpty(goalId, 'goalId');
@@ -941,21 +947,16 @@ if it can handle the task, and the most confident agent claims it.
       const goal = this.goals.get(goalId as GoalId);
       if (!goal) return { error: 'Goal not found' };
 
-      // Re-activate a goal that was prematurely completed. This happens when
-      // an earlier task on the goal signalled completion via completeGoal and
-      // a caller (e.g. Chat's sequential addTask/wait loop) then appends a
-      // follow-up task. If we don't re-activate, updateProgress events for
-      // the new task are silently dropped and any caller waiting on its
-      // completion stalls until its hard timeout fires.
+      // Refuse tasks for terminated goals. Under the Scrum model, ScrumMaster
+      // is the only party adding tasks, and a scrum's first action is a
+      // status check before planning. If we get here for a non-active goal
+      // it means something raced (e.g. GoalObserver's staleness backstop
+      // ran while a scrum was already mid-plan); silently re-activating
+      // hides the bug and lets work continue on a goal Chat already gave
+      // up on.
       if (goal.status !== 'active') {
-        log.info(`addTask: re-activating goal ${goalId.slice(0, 8)} (was ${goal.status}) to accept new task`);
-        goal.status = 'active';
-        goal.updatedAt = Date.now();
-        this.changed('goalUpdated', {
-          goalId, parentId: goal.parentId,
-          message: 'Goal re-activated for additional task',
-          phase: 'active',
-        });
+        log.warn(`addTask: refused — goal ${goalId.slice(0, 8)} is ${goal.status}, not active`);
+        return { error: `Goal is ${goal.status}, cannot add tasks` };
       }
 
       // Resolve the task's effective scrum number. ScrumMaster passes one
@@ -1105,9 +1106,6 @@ if it can handle the task, and the most confident agent claims it.
 
       const failureHistory = (currentFields.failureHistory as Array<{ agent: string; agentId: string; error: string; timestamp: number }>) ?? [];
       const attempts = ((currentFields.attempts as number) ?? 0) + 1;
-      const maxAttempts = (currentFields.maxAttempts as number) ?? 3;
-
-      log.info(`failTask ${taskId.slice(0, 8)} attempts=${attempts}/${maxAttempts}`);
 
       // Append failure record
       failureHistory.push({
@@ -1117,48 +1115,28 @@ if it can handle the task, and the most confident agent claims it.
         timestamp: Date.now(),
       });
 
-      if (attempts >= maxAttempts) {
-        log.info(`failTask ${taskId.slice(0, 8)} — PERMANENTLY FAILED (${attempts}/${maxAttempts})`);
-        // Permanently failed — no more retries.
-        // Update fields BEFORE release so tuplePut from release carries correct state.
-        const updateResult = await this.request(
-          request(this.id, this.tupleSpaceId, 'update', {
-            tupleId: taskId,
-            fields: { status: 'permanently_failed', error, attempts, failureHistory },
-            ...(ns ? { namespace: ns } : {}),
-          })
-        );
-        try {
-          await this.request(request(this.id, this.tupleSpaceId, 'release', { tupleId: taskId, ...(ns ? { namespace: ns } : {}) }));
-        } catch { /* best effort */ }
-        this.emittedTerminalTasks.add(taskId);
-        this.changed('taskPermanentlyFailed', { taskId, goalId, error, attempts });
-        if (goalId) {
-          this.maybeEmitGoalReadyForCompletion(goalId as GoalId).catch(() => { /* best effort */ });
-        }
-        return updateResult;
-      }
-
-      log.info(`failTask ${taskId.slice(0, 8)} — RETRYING (${attempts}/${maxAttempts}), updating tuple then releasing`);
-      // Update fields BEFORE release so that the tupleUpdated event triggered by
-      // release already carries the incremented attempts count.  Without this
-      // ordering, observers see status=pending + old attempts and immediately
-      // re-dispatch, creating a tight infinite loop.
+      // No per-task retry budget. In the Scrum design, a failed task ends the
+      // current scrum (for that task) and the failure context flows into
+      // the next scrum, which decides whether to schedule a corrective task in
+      // the next scrum. The retry budget that used to live here predates
+      // Scrum and would now silently swallow failures the planner needs to
+      // see.
+      log.info(`failTask ${taskId.slice(0, 8)} — PERMANENTLY FAILED (attempt ${attempts})`);
       const updateResult = await this.request(
         request(this.id, this.tupleSpaceId, 'update', {
           tupleId: taskId,
-          fields: { status: 'pending', error, attempts, failureHistory },
+          fields: { status: 'permanently_failed', error, attempts, failureHistory },
           ...(ns ? { namespace: ns } : {}),
         })
       );
-
-      // Release the claim so others can retry
       try {
         await this.request(request(this.id, this.tupleSpaceId, 'release', { tupleId: taskId, ...(ns ? { namespace: ns } : {}) }));
       } catch { /* best effort */ }
-
-      log.info(`failTask ${taskId.slice(0, 8)} — emitting taskRetrying`);
-      this.changed('taskRetrying', { taskId, goalId, error, attempts, maxAttempts });
+      this.emittedTerminalTasks.add(taskId);
+      this.changed('taskPermanentlyFailed', { taskId, goalId, error, attempts });
+      if (goalId) {
+        this.maybeEmitGoalReadyForCompletion(goalId as GoalId).catch(() => { /* best effort */ });
+      }
       return updateResult;
     });
 
@@ -1220,13 +1198,18 @@ if it can handle the task, and the most confident agent claims it.
         const meta = all?.meta;
         if (meta && typeof meta === 'object' && 'id' in (meta as object)) {
           const goalData = meta as Goal;
-          const goal: Goal = { ...goalData, progress: goalData.progress ?? [], scratchpad: goalData.scratchpad ?? {} };
+          const goal: Goal = {
+            ...goalData,
+            progress: goalData.progress ?? [],
+            scratchpad: goalData.scratchpad ?? {},
+            description: goalData.description ?? goalData.title,
+          };
           this.goals.set(goal.id, goal);
           if (!this.goalOrder.includes(goal.id)) {
             this.goalOrder.push(goal.id);
           }
           this.saveGoalIndex();
-          this.changed('goalCreated', { goalId: goal.id, title: goal.title, parentId: goal.parentId });
+          this.changed('goalCreated', { goalId: goal.id, title: goal.title, description: goal.description, parentId: goal.parentId });
           return goal;
         }
       } catch { /* Goal may not exist yet */ }
@@ -1417,7 +1400,7 @@ if it can handle the task, and the most confident agent claims it.
           this.goalOrder.push(goal.id);
         }
         this.saveGoalIndex();
-        this.changed('goalCreated', { goalId: goal.id, title: goal.title, parentId: goal.parentId });
+        this.changed('goalCreated', { goalId: goal.id, title: goal.title, description: goal.description, parentId: goal.parentId });
         return;
       }
 

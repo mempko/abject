@@ -653,11 +653,9 @@ Stay within skill execution: run shell commands, call MCP tools, make HTTP reque
 
 You MUST respond with EXACTLY ONE JSON object inside \`\`\`json fenced code markers.
 Do NOT use XML, function_calls tags, tool_call tags, or any other format.
-Do NOT include any text outside the JSON block except brief reasoning before it.
+Output ONLY the JSON block — no prose around it. Any one-sentence note belongs in the action's \`reasoning\` field; the parser only reads the JSON.
 
 Example response:
-
-I'll fetch the accounts list first.
 
 \`\`\`json
 { "action": "shell", "command": "curl -s -H \\"Authorization: Bearer $API_KEY\\" \\"https://api.example.com/accounts\\" | jq .", "reasoning": "Fetch accounts" }

@@ -355,7 +355,7 @@ Example:
 
 ## Output Format
 
-Respond with ONE JSON object inside \`\`\`json fenced code markers.`;
+Respond with ONE JSON object inside \`\`\`json fenced code markers. Output ONLY the JSON block — no prose around it. Any one-sentence note belongs in the action's \`reasoning\` field; the parser only reads the JSON.`;
   }
 
   // ═══════════════════════════════════════════════════════════════════

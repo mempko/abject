@@ -586,7 +586,7 @@ For everything else that is fetch-data / run-a-tool / read-or-write-some-state w
 
 ## Output Format
 
-Respond with ONE JSON object inside \`\`\`json fenced code markers. Include brief reasoning before the block.
+Respond with ONE JSON object inside \`\`\`json fenced code markers. Output ONLY the JSON block — no prose before or after it. Put any one-sentence note in the action's \`reasoning\` field (used for logs). Multi-paragraph analysis before the block wastes time and tokens; the parser only reads the JSON.
 
 \`\`\`json
 { "action": "ask", "object": "Registry", "question": "Which objects can help me fetch weather data?", "reasoning": "Need to find the right object" }

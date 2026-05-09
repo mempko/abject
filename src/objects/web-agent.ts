@@ -1055,7 +1055,7 @@ The observation contains an accessibility tree in YAML-like format. Example:
 Each element shows its role, name/label in quotes, attributes in brackets, and [ref=eN] for targeting.
 
 ## Action Format
-Respond with ONE action as a JSON object in a \`\`\`json code block:
+Respond with ONE action as a JSON object in a \`\`\`json code block. Output ONLY the JSON block — no prose before or after it. Put any one-sentence note in the action's \`reasoning\` field; the parser only reads the JSON.
 
 \`\`\`json
 { "action": "click", "ref": "e8", "reasoning": "Click the Submit button" }
@@ -1129,7 +1129,7 @@ When in doubt, close the page (omit "keepPageOpen"). Pages left open consume res
 5. As soon as you have useful data, call "done" immediately. Good enough is good enough.
 6. If stuck after several attempts, use "fail" with a clear reason.
 7. Do not retry the same action more than twice. If it fails twice, try a different approach or fail.
-8. Keep reasoning brief (1-2 sentences).
+8. Output ONLY the JSON block. Any one-sentence note belongs in the JSON's \`reasoning\` field.
 9. Pay attention to the step counter. When steps are running low, call "done" with whatever you have.`;
   }
 }

@@ -48,10 +48,14 @@ function shouldOmitModelFlag(model: string | undefined): boolean {
  * a long-but-progressing generation keeps running. Only true hangs
  * (auth prompt, network stall, broken binary) hit the limit.
  *
- * Why 180s: large coding prompts that produce thousands of output tokens
- * can have multi-second silences between bursts even on healthy runs.
+ * Calibrated for opus on synthesis-heavy tasks (full UI rewrites,
+ * multi-thousand-token code generation, large analysis): the model can
+ * take 3+ minutes of internal reasoning before emitting the first stream
+ * token, especially with very large prompts (40KB+) where it needs
+ * substantial planning. 180s killed legitimate work; 6 minutes catches
+ * genuine hangs while letting deep reasoning complete.
  */
-const DEFAULT_IDLE_TIMEOUT_MS = 180_000;
+const DEFAULT_IDLE_TIMEOUT_MS = 360_000;
 
 export class ClaudeCliProvider extends BaseLLMProvider {
   /** Top-level provider name; lives alongside `anthropic` etc. */
@@ -307,6 +311,27 @@ export class ClaudeCliProvider extends BaseLLMProvider {
     const argv: string[] = [
       '-p',
       '--output-format', outputFormat,
+      // Disable EVERY native capability the claude CLI offers: built-in
+      // tools (Bash/Read/Edit/Web*), user-configured MCP servers, and
+      // slash-command skills. In Abjects the LLM is a pure JSON-action
+      // generator — agents call other Abjects via the message bus, never
+      // through claude-cli's tool layer. Without these flags the model
+      // sees a catalog of tools (`mcp__claude_ai_Gmail__*`, Slack, Linear,
+      // Calendar...) and reflexively reaches for them on tasks that
+      // mention email/calendar/etc., producing tool calls that error
+      // ("permission not granted") instead of routing through our own
+      // configured Abjects (e.g. the protonmail-mcp MCPBridge).
+      //
+      // - `--tools ""`            disables every built-in tool
+      // - `--strict-mcp-config`   ignores user-/project-level MCP servers
+      //                           (paired with no `--mcp-config`, no MCP at all)
+      // - `--disable-slash-commands` disables skills
+      //
+      // All three remain compatible with subscription auth; only `--bare`
+      // forces ANTHROPIC_API_KEY.
+      '--tools', '',
+      '--strict-mcp-config',
+      '--disable-slash-commands',
     ];
     if (outputFormat === 'stream-json') {
       argv.push('--verbose');
@@ -316,7 +341,15 @@ export class ClaudeCliProvider extends BaseLLMProvider {
     // 'auto' / undefined → omit `--model` so the CLI picks its current
     // default. This is how "Auto (latest)" routes track binary upgrades.
     if (!shouldOmitModelFlag(model)) argv.push('--model', model!);
-    if (system) argv.push('--append-system-prompt', system);
+    // `--system-prompt` *replaces* the default Claude Code system prompt
+    // (vs `--append-system-prompt` which layers on top of it). Replace is
+    // preferred because the default prompt injects ~5k tokens of coding-
+    // assistant guidance Abjects doesn't need. We only pass the flag when
+    // we actually have system content — a whitespace placeholder makes the
+    // CLI exit 1 ("system prompt required"). Without the flag the CLI uses
+    // its default; that's fine for calls that have no system role anyway.
+    // Subscription auth still works (only `--bare` forces API key).
+    if (system) argv.push('--system-prompt', system);
 
     // Long prompts on the command line risk argv-length limits — pipe via
     // stdin instead. Tells claude to read the prompt from stdin with `-`.

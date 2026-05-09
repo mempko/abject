@@ -140,6 +140,7 @@ export class Chat extends Abject {
    */
   private liveGoals = new Map<string, {
     title: string;
+    description?: string;
     status: 'active' | 'completed' | 'failed';
     parentId?: string;
     latestMessage?: string;
@@ -182,6 +183,7 @@ export class Chat extends Abject {
 
   /** Pending task completion promises: taskId → resolve/reject. */
   private pendingTaskCompletions = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
+  private pendingGoalCompletions = new Map<string, { resolve: (v: { result?: unknown; error?: string; status: 'completed' | 'failed' }) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
 
   constructor(args?: ChatConstructorArgs) {
     super({
@@ -560,25 +562,18 @@ export class Chat extends Abject {
           if (data.goalId) this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
           return;
         }
-        // taskRetrying — task will be re-dispatched, don't reject the promise
-        if (aspect === 'taskRetrying') {
-          const data = value as { taskId: string; goalId?: string; attempts?: number; maxAttempts?: number; error?: string };
-          log.info(`[Chat] GoalManager taskRetrying ${data.taskId.slice(0, 8)} attempts=${data.attempts ?? '?'}/${data.maxAttempts ?? '?'} — NOT rejecting promise`);
-          if (data.goalId) this.fetchGoalTasks(data.goalId).then(() => this.scheduleActivityRefresh());
-          return;
-        }
-
         // Goal lifecycle events — feed the liveGoals tree so the activity
         // bubble can render the same hierarchy the GoalBrowser shows.
         if (this._currentGoalId) {
           if (aspect === 'goalCreated') {
-            const data = value as { goalId: string; title: string; parentId?: string };
+            const data = value as { goalId: string; title: string; description?: string; parentId?: string };
             // Only track goals that are part of the current task's tree
             // (the current goal itself, or descendants of any goal we know).
             if (data.goalId === this._currentGoalId
                 || (data.parentId && this.liveGoals.has(data.parentId))) {
               this.liveGoals.set(data.goalId, {
                 title: data.title,
+                description: data.description,
                 status: 'active',
                 parentId: data.parentId,
               });
@@ -622,11 +617,20 @@ export class Chat extends Abject {
           }
 
           if (aspect === 'goalCompleted') {
-            const data = value as { goalId: string };
+            const data = value as { goalId: string; result?: unknown };
             const entry = this.liveGoals.get(data.goalId);
             if (entry) {
               entry.status = 'completed';
               this.scheduleActivityRefresh();
+            }
+            // Resolve any waitForGoalCompletion promise for this goal — Chat's
+            // goal action waits on this to surface ScrumMaster's synthesized
+            // result to the user.
+            const pending = this.pendingGoalCompletions.get(data.goalId);
+            if (pending) {
+              this.pendingGoalCompletions.delete(data.goalId);
+              clearTimeout(pending.timer);
+              pending.resolve({ result: data.result, status: 'completed' });
             }
             return;
           }
@@ -638,6 +642,12 @@ export class Chat extends Abject {
               entry.status = 'failed';
               if (data.error) entry.latestMessage = data.error;
               this.scheduleActivityRefresh();
+            }
+            const pending = this.pendingGoalCompletions.get(data.goalId);
+            if (pending) {
+              this.pendingGoalCompletions.delete(data.goalId);
+              clearTimeout(pending.timer);
+              pending.resolve({ error: data.error, status: 'failed' });
             }
             return;
           }
@@ -656,9 +666,9 @@ export class Chat extends Abject {
       }
     });
 
-    // ScrumMaster owns goal-level completion under the Scrum model: it runs
-    // Sprint Review on goalReadyForCompletion and decides DONE (call
-    // completeGoal) or ANOTHER_SCRUM. Chat watches `goalCompleted` /
+    // ScrumMaster owns goal-level completion under the Scrum model: each
+    // scrum reviews the prior round and decides whether to call completeGoal,
+    // plan more tasks, or fail the goal. Chat watches `goalCompleted` /
     // `goalFailed` (broadcast via the changed handler) like any other observer
     // — no per-goal completion handler needed here.
 
@@ -836,29 +846,55 @@ export class Chat extends Abject {
         entry.reject(new Error(`Task ${taskId} timed out after ${entry.timeoutMs}ms`));
       }, entry.timeoutMs);
     }
+    for (const [goalId, entry] of this.pendingGoalCompletions) {
+      clearTimeout(entry.timer);
+      entry.timer = setTimeout(() => {
+        this.pendingGoalCompletions.delete(goalId);
+        log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} — TIMED OUT after ${entry.timeoutMs}ms`);
+        entry.reject(new Error(`Goal ${goalId} timed out after ${entry.timeoutMs}ms`));
+      }, entry.timeoutMs);
+    }
+  }
+
+  /**
+   * Wait for a goal to reach `goalCompleted` or `goalFailed`. ScrumMaster
+   * makes the completion decision under the Scrum model; Chat awaits it
+   * here and surfaces the synthesized result to the user.
+   *
+   * The timer resets on goal-level progress events (see
+   * resetTaskCompletionTimeouts), so a goal that is making progress through
+   * multiple scrums won't time out from inactivity.
+   */
+  private waitForGoalCompletion(goalId: string, timeoutMs: number): Promise<{ result?: unknown; error?: string; status: 'completed' | 'failed' }> {
+    log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} timeout=${timeoutMs}ms`);
+    return new Promise((resolve, reject) => {
+      const makeTimer = () => setTimeout(() => {
+        this.pendingGoalCompletions.delete(goalId);
+        log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} — TIMED OUT after ${timeoutMs}ms`);
+        reject(new Error(`Goal ${goalId} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      const entry = {
+        timer: makeTimer(),
+        timeoutMs,
+        resolve: (v: { result?: unknown; error?: string; status: 'completed' | 'failed' }) => {
+          clearTimeout(entry.timer);
+          log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} — RESOLVED (${v.status})`);
+          resolve(v);
+        },
+        reject: (e: Error) => {
+          clearTimeout(entry.timer);
+          log.info(`[Chat] waitForGoalCompletion ${goalId.slice(0, 8)} — REJECTED: ${e.message?.slice(0, 80)}`);
+          reject(e);
+        },
+      };
+      this.pendingGoalCompletions.set(goalId, entry);
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════════
   // Agent act handler
   // ═══════════════════════════════════════════════════════════════════
 
-  /**
-   * Lazily create a goal on first action, using the action's description
-   * as the title instead of the raw user query.
-   */
-  private async ensureGoal(description: string): Promise<string | undefined> {
-    if (this._currentGoalId) return this._currentGoalId;
-    if (!this.goalManagerId) return undefined;
-    try {
-      const { goalId } = await this.request<{ goalId: string }>(
-        request(this.id, this.goalManagerId, 'createGoal', {
-          title: description.slice(0, 100),
-        })
-      );
-      this._currentGoalId = goalId;
-      return goalId;
-    } catch { return undefined; }
-  }
 
   private async handleAgentAct(action: AgentAction): Promise<unknown> {
     log.info(`[Chat] handleAgentAct: action=${action.action}`);
@@ -884,91 +920,51 @@ export class Chat extends Abject {
       }
     }
 
-    // Handle goal action: create goal + tasks, wait for completion
+    // Handle goal action: create the goal and wait for ScrumMaster to run
+    // the sprint to completion. Under the Scrum model, Chat is the Product
+    // Owner — it expresses intent (title + description capturing the user's
+    // words). ScrumMaster runs scrums, agents execute the tasks each scrum
+    // plans, and one of those scrums eventually synthesizes a final result
+    // and calls completeGoal. We wait on the goalCompleted event and surface
+    // that synthesis to the user.
     if (action.action === 'goal') {
       const title = (action.title as string) ?? 'Untitled goal';
-      const tasks = (action.tasks as Array<{
-        description: string;
-        data?: Record<string, unknown>;
-        dependsOn?: number[];
-        produces?: Array<{ key: string; description: string }>;
-        consumes?: string[];
-      }>) ?? [];
-      if (tasks.length === 0) {
-        return { success: false, error: 'Goal has no tasks' };
-      }
+      const description = (action.description as string | undefined) ?? '';
 
       if (!this.goalManagerId) {
         return { success: false, error: 'GoalManager not available' };
       }
+      if (!description.trim()) {
+        return {
+          success: false,
+          error: 'Goal action requires a non-empty `description` field — restate the user\'s intent in detail (their words where possible, including any explicit ordering or constraints).',
+        };
+      }
 
-      const goalId = await this.ensureGoal(title);
-      if (!goalId) {
-        return { success: false, error: 'Failed to create goal' };
+      let goalId: string;
+      try {
+        const created = await this.request<{ goalId: string }>(
+          request(this.id, this.goalManagerId, 'createGoal', {
+            title: title.slice(0, 200),
+            description,
+          }),
+        );
+        goalId = created.goalId;
+        this._currentGoalId = goalId;
+      } catch (err) {
+        return { success: false, error: err instanceof Error ? err.message : String(err) };
       }
 
       try {
-        // Add all tasks to the goal. Default is SEQUENTIAL: each task auto-depends
-        // on the previous one unless dependsOn is explicitly specified (including
-        // dependsOn: [] for explicit parallel execution).
-        const taskIds: string[] = [];
-        for (let i = 0; i < tasks.length; i++) {
-          const task = tasks[i];
-          let depIds: string[];
-          if (task.dependsOn === undefined) {
-            // Default: auto-chain to previous task for sequential execution
-            depIds = i > 0 ? [taskIds[i - 1]] : [];
-          } else {
-            // Explicit: map index-based dependsOn to task IDs (empty array allowed)
-            depIds = task.dependsOn
-              .filter(idx => idx >= 0 && idx < taskIds.length)
-              .map(idx => taskIds[idx]);
-          }
+        // Wait for ScrumMaster's DONE decision. The timer resets on every
+        // goal-level progress event (scrumPlanned, goalUpdated, etc.) via
+        // resetTaskCompletionTimeouts, so multi-scrum goals don't time out
+        // from inactivity — only from actually being stuck.
+        const completion = await this.waitForGoalCompletion(goalId, 600000);
 
-          const { taskId } = await this.request<{ taskId: string }>(
-            request(this.id, this.goalManagerId, 'addTask', {
-              goalId,
-              description: task.description,
-              data: task.data,
-              dependsOn: depIds.length > 0 ? depIds : undefined,
-              produces: task.produces,
-              consumes: task.consumes,
-            })
-          );
-          taskIds.push(taskId);
-        }
-
-        // Wait for all tasks to complete. Track whether any task failed so
-        // we can still surface the diagnostic results from the ones that
-        // succeeded — critical for the "diagnose then fix" pattern where
-        // a diagnosis completes but the fix stalls.
-        const results: unknown[] = [];
-        let taskWaitError: Error | undefined;
-        for (const taskId of taskIds) {
-          try {
-            const completion = await this.waitForTaskCompletion(taskId, 120000);
-            const result = completion.result as Record<string, unknown> | undefined;
-
-            // Auto-show created objects
-            if (result?.objectId) {
-              this.send(event(this.id, result.objectId as AbjectId, 'show', {}));
-            }
-            results.push(result);
-          } catch (err) {
-            taskWaitError = err instanceof Error ? err : new Error(String(err));
-            results.push({ success: false, error: taskWaitError.message });
-            // Don't wait for remaining tasks — a timeout usually means the
-            // whole dispatch chain is stuck. Pull the scratchpad and return.
-            break;
-          }
-        }
-
-        // Always pull the goal scratchpad. GoalManager auto-mirrors every
-        // completed task's result into `tasks/{id}/result`, so this gives
-        // Chat's next think-step access to successful diagnostics even when
-        // a later fix task timed out. Without this, the LLM synthesising
-        // the user-facing reply loses the correct findings and hallucinates
-        // generic "the system is timing out" messages.
+        // Always pull the goal scratchpad alongside the result so Chat's
+        // next think-step has access to per-task outputs ScrumMaster
+        // synthesized from in the final scrum.
         let scratchpad: Record<string, unknown> | undefined;
         try {
           const goal = await this.request<{ scratchpad?: Record<string, unknown> } | null>(
@@ -976,26 +972,36 @@ export class Chat extends Abject {
             5000,
           );
           scratchpad = goal?.scratchpad;
-        } catch { /* best effort — scratchpad is a nice-to-have */ }
+        } catch { /* best effort */ }
 
-        const failures = results.filter(r => r && (r as Record<string, unknown>).success === false);
-        if (failures.length > 0 || taskWaitError) {
-          const errors = failures.map(f => (f as Record<string, unknown>).error ?? 'Unknown error');
-          if (taskWaitError) errors.push(taskWaitError.message);
+        if (completion.status === 'failed') {
           return {
             success: false,
-            error: errors.join('; '),
-            data: { results, scratchpad, partial: true },
+            error: completion.error ?? 'Goal failed',
+            data: { scratchpad, partial: true },
           };
         }
         return {
           success: true,
-          data: results.length === 1
-            ? { result: results[0], scratchpad }
-            : { results, scratchpad },
+          data: { result: completion.result, scratchpad },
         };
       } catch (err) {
-        return { success: false, error: err instanceof Error ? err.message : String(err) };
+        // Goal-wait timeout. The goal may still be running; surface a
+        // partial result with whatever scratchpad has so the LLM can
+        // build a useful reply.
+        let scratchpad: Record<string, unknown> | undefined;
+        try {
+          const goal = await this.request<{ scratchpad?: Record<string, unknown> } | null>(
+            request(this.id, this.goalManagerId, 'getGoal', { goalId }),
+            5000,
+          );
+          scratchpad = goal?.scratchpad;
+        } catch { /* best effort */ }
+        return {
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+          data: { scratchpad, partial: true },
+        };
       }
     }
 
@@ -1022,7 +1028,7 @@ Abjects is a distributed message-passing system. Each Abject is an autonomous ob
 
 ## Action Format
 
-Respond with ONE action as a JSON object in a \`\`\`json code block. Include brief reasoning before the block.
+Respond with ONE action as a JSON object in a \`\`\`json code block. Output ONLY the JSON block — no prose before or after it. Put a one-sentence note in the action's \`reasoning\` field if you want it logged; the prose around the block is unread.
 
 \`\`\`json
 { "action": "done", "text": "Hello! How can I help you?" }
@@ -1031,74 +1037,26 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 ## Available Actions
 
 ### Agent Work
-- **goal**: Create a goal with one or more tasks for specialized agents to handle. Describe each task clearly so the right agent self-selects based on what it can do.
-  Simple request (one task):
-  \`{ "action": "goal", "title": "Fix the HackerNews UI", "tasks": [
-    { "description": "Fix the UI of the HackerNews object: improve layout spacing, make the story list scrollable, fix text overflow" }
-  ] }\`
-  **Tasks run SEQUENTIALLY by default** — each task waits for the previous one to finish. Most multi-step work has natural ordering (fetch then summarize, discover then modify), so sequential is safest.
-  Sequential (default):
-  \`{ "action": "goal", "title": "Fetch and summarize", "tasks": [
-    { "description": "Fetch the latest news headlines" },
-    { "description": "Summarize the fetched headlines into a brief report" }
-  ] }\`
-  Explicit dependency (task 2 depends on task 0 but not task 1):
-  \`{ "action": "goal", "title": "Research and report", "tasks": [
-    { "description": "Research topic A" },
-    { "description": "Research topic B" },
-    { "description": "Combine findings", "dependsOn": [0, 1] }
-  ] }\`
-  Opt-in parallel (use \`dependsOn: []\` when you KNOW tasks are independent):
-  \`{ "action": "goal", "title": "Independent lookups", "tasks": [
-    { "description": "Fetch weather for Miami", "dependsOn": [] },
-    { "description": "Fetch weather for NYC", "dependsOn": [] }
-  ] }\`
-  Use \`dependsOn: []\` ONLY when tasks truly have no dependencies and can safely run at the same time. When in doubt, leave dependsOn unspecified (sequential).
-  Include the object name in the task description when relevant. Be specific about the desired outcome.
+- **goal**: Express the user's intent as a goal. You're the Product Owner — define WHAT needs to happen. ScrumMaster runs scrums to plan and execute the work, then synthesizes a final result.
 
-  **Scratchpad contracts for data handoff (investigate-then-fix, fetch-then-summarize, and similar chains)**
+  You provide:
+  - **title** (required): a short user-facing label (~200 chars). Used in lists / UI.
+  - **description** (required): the user's intent in detail, in their words where possible. Include any explicit ordering ("do A then B then C"), constraints, examples, and what success looks like. ScrumMaster's planning LLM reads this to decide the sprint backlog — the richer and more concrete the description, the better the plan. Never leave this empty.
 
-  When a downstream task needs structured data from an upstream task, declare the contract so the data flows reliably even when results are large. Add \`produces\` to the upstream task (each entry is \`{ key, description }\` describing the value shape) and \`consumes\` to the downstream task (the keys to read). The downstream agent sees the full values in its system prompt; the upstream agent is told to write them with \`writeGoalData\` before reporting done.
+  Do NOT pre-decide tasks. ScrumMaster owns task decomposition; the team's capabilities inform how the work splits, not your guess.
 
-  Investigate-then-fix:
-  \`{ "action": "goal", "title": "Diagnose and fix auth bug", "tasks": [
-    {
-      "description": "Investigate the auth failure. Find file, line, and root cause.",
-      "produces": [{
-        "key": "bug_analysis",
-        "description": "{ file: string, line: number, rootCause: string, suggestedFix: string }"
-      }]
-    },
-    {
-      "description": "Apply the fix documented at scratchpad key bug_analysis.",
-      "consumes": ["bug_analysis"],
-      "dependsOn": [0]
-    }
-  ] }\`
+  Simple request:
+  \`{ "action": "goal", "title": "Current weather", "description": "Tell me the current weather for my location (Silverdale, WA). Include temperature, conditions, and a brief outlook for today." }\`
 
-  Fetch-then-summarize:
-  \`{ "action": "goal", "title": "Summarize today's headlines", "tasks": [
-    {
-      "description": "Fetch the current top 20 news headlines with URL, title, and source.",
-      "produces": [{
-        "key": "headlines",
-        "description": "Array of { title: string, url: string, source: string }"
-      }]
-    },
-    {
-      "description": "Write a one-paragraph summary of the day's top stories using the headlines at scratchpad key headlines.",
-      "consumes": ["headlines"],
-      "dependsOn": [0]
-    }
-  ] }\`
+  Multi-step intent (express ordering as prose, ScrumMaster will plan accordingly):
+  \`{ "action": "goal", "title": "News digest", "description": "Fetch the latest top news headlines, then write a brief one-paragraph summary of the day's stories. The summary should be readable in under a minute." }\`
 
-  Use contracts when task 1 depends on structured output from task 0. For simple chains where a short string result is enough, omit \`produces\`/\`consumes\` and the existing Goal Progress block carries the result verbatim.
+  Diagnose-then-fix:
+  \`{ "action": "goal", "title": "Diagnose and fix auth bug", "description": "Investigate the auth failure: find the file, line number, and root cause. Then apply the fix and verify the change. Done means the auth flow works end-to-end." }\`
 
   Concrete user data (email, calendar, files, contacts, weather, web pages, finances, etc.):
   ALWAYS attempt via a goal — specialized agents and MCP-backed skills may be available that you don't know about.
-  \`{ "action": "goal", "title": "Latest email", "tasks": [
-    { "description": "Fetch the user's most recent email and report the sender, subject, received time, and a short summary of the body" }
-  ] }\`
+  \`{ "action": "goal", "title": "Latest email", "description": "Fetch my most recent email and report sender, subject, received time, and a short summary of the body." }\`
 
 ### Memory
 - **remember**: Save a fact to the persistent knowledge base. Use whenever the user reveals personal info or you learn something useful for future conversations.
@@ -1117,6 +1075,8 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Include bri
 - **done**: Task complete, send final reply. The user can only see what you put in the done text.
   \`{ "action": "done", "text": "Here are the results: ..." }\`
   When the goal returned a result, present it to the user in full. You have plenty of output tokens (16K+) to include everything. Format the result for readability: markdown tables, lists, headers as appropriate. Rephrase or translate raw data (JSON, logs) into natural language when it helps the user. Include every item and every requested field. If the user asked for 5 items, show all 5. If the user asked for full content, show full content. Trust your output capacity; the result fits.
+
+  **Self-contained text rule.** The done text is the user's ONLY view of the result. Do not reference internal artifacts the user can't see — no "see above", "see the prioritized list", "see scratchpad", "see goal X", "see the attached", "as shown earlier". The user has not seen anything earlier; they only see this reply. If the goal result or scratchpad contains a list, table, or detailed data the user asked for, INLINE it directly in the done text. Pull values out of the scratchpad and write them into your reply.
 
 The chat window renders markdown. Use **bold**, *italic*, \`inline code\`, headings, bullet lists, code blocks, and [links](url) in your reply and done text for readable formatting.
 
@@ -1185,7 +1145,7 @@ You do not need to clarify simple greetings, direct questions, or unambiguous re
 3. When the user asks you to do something, create a **goal** immediately with well-described tasks.
 4. **Never refuse based on assumed capabilities.** You don't have a fixed toolset — agents and MCP-backed skills are added and removed dynamically (email, calendar, contacts, finance, web, etc.). If the user asks for concrete data or an action, ALWAYS try via a goal first. Only say "I can't" AFTER the goal has actually failed, and even then, offer to create an agent that could.
 5. Always end a conversation turn with **done** when the task is complete.
-6. Keep reasoning brief (1-2 sentences before the JSON block).
+6. Output ONLY the JSON block. Any one-sentence note belongs in the JSON's \`reasoning\` field.
 7. If a goal's tasks fail, you can retry by creating a new goal with a simpler task description. If it fails repeatedly, use "done" to tell the user what happened — quoting the actual failure message, not a guess.
 
 ## Stop when the work is done
@@ -1640,8 +1600,9 @@ A single successful creation goal is a complete turn. End it with **done**.
         initialMessages.push({ role: entry.role, content: entry.content });
       }
 
-      // Goal is created lazily on first action via ensureGoal(),
-      // using the action's description instead of the raw user query.
+      // Goal is created on the first `goal` action — Chat creates it via
+      // GoalManager.createGoal, ScrumMaster runs the scrum cycle (plan,
+      // execute, plan again or declare done), and emits goalCompleted.
       this._currentGoalId = undefined;
       const goalId = undefined;
 
@@ -1940,17 +1901,18 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.activityBubbleLabelId = await this.appendBubble('activity', 'Agent', this.activityHeader, false);
   }
 
-  /** Fetch goal title from GoalManager when we lazily seed a goal entry. */
+  /** Fetch goal title and description from GoalManager when we lazily seed a goal entry. */
   private async fetchGoalTitle(goalId: string): Promise<void> {
     if (!this.goalManagerId) return;
     try {
-      const goal = await this.request<{ id: string; title: string; parentId?: string; status: string } | null>(
+      const goal = await this.request<{ id: string; title: string; description?: string; parentId?: string; status: string } | null>(
         request(this.id, this.goalManagerId, 'getGoal', { goalId })
       );
       if (goal) {
         const entry = this.liveGoals.get(goalId);
         if (entry) {
           entry.title = goal.title;
+          if (goal.description) entry.description = goal.description;
           entry.parentId = goal.parentId;
           this.scheduleActivityRefresh();
         }
@@ -2018,6 +1980,17 @@ A single successful creation goal is a complete turn. End it with **done**.
                      : goal.status === 'failed'    ? '\u2717'   // ✗
                      : '\u25B8';                                // ▸
       lines.push(`${indent}${goalIcon} ${goal.title}`);
+
+      // User's intent (description) — shown as the first sub-line so the
+      // reader can verify Chat captured the request faithfully. Truncated
+      // for the activity bubble; GoalBrowser shows the full text.
+      if (goal.description && goal.description.trim() && goal.description.trim() !== goal.title.trim()) {
+        const descIndent = '  '.repeat(depth + 1);
+        const descText = goal.description.length > 240
+          ? goal.description.slice(0, 240) + '…'
+          : goal.description;
+        lines.push(`${descIndent}ℹ ${descText}`);
+      }
 
       // Render tasks under this goal
       const tasks = this.liveTasks.get(goalId);

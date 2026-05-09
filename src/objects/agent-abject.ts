@@ -110,7 +110,7 @@ interface RegisteredAgent {
  * One task queued for execution on a specific agent. A QueuedTask carries
  * everything needed to call `startTask` when the agent's queue runner pops it
  * — meaning the queue is a simple buffer of fully-prepared task descriptions,
- * not a planning surface. ScrumMaster fills queues during Sprint Planning;
+ * not a planning surface. ScrumMaster fills queues from each scrum's plan;
  * AgentAbject pops from each queue one task at a time per agent.
  */
 interface QueuedTask {
@@ -235,8 +235,8 @@ export class AgentAbject extends Abject {
    * in-flight tasks set `entry.state.phase = 'error'` with `error: 'Cancelled'`
    * which the OTA loop checks at observe/think boundaries.
    *
-   * Filled by `enqueueTask` (called by ScrumMaster on Sprint Planning) and
-   * drained by `runTaskAsync`'s tail when each task terminates.
+   * Filled by `enqueueTask` (called by ScrumMaster after each scrum plans
+   * tasks) and drained by `runTaskAsync`'s tail when each task terminates.
    */
   private agentTaskQueues = new Map<AbjectId, {
     inFlight?: { taskId: string; goalId?: string };
@@ -1569,7 +1569,7 @@ The registered object must implement these handlers to participate in the agent 
             // ── Replan: inject reason and continue thinking ──
             // Replan tells the LLM to try a different approach for the SAME
             // task. Decomposition is no longer an agent-level concern under
-            // the Scrum model — ScrumMaster splits work via Sprint Planning.
+            // the Scrum model — ScrumMaster splits work across scrums.
             if (task.action.action === 'replan') {
               const reason = (task.action.reason as string) ?? 'Agent requested replan';
               log.info(`[${agentName}] Replan requested: ${reason.slice(0, 80)}`);
@@ -1974,7 +1974,7 @@ The registered object must implement these handlers to participate in the agent 
     if (!this.goalManagerId) return '';
     try {
       const goal = await this.request<{
-        title?: string; status?: string;
+        title?: string; description?: string; status?: string;
         scratchpad?: Record<string, unknown>;
       } | null>(
         request(this.id, this.goalManagerId, 'getGoal', { goalId }),
@@ -2016,7 +2016,17 @@ The registered object must implement these handlers to participate in the agent 
         lines.push(line);
       }
 
-      let ctx = `\n\n## Goal Progress\nGoal: "${goal?.title ?? goalId}"\nTasks:\n${lines.join('\n')}`;
+      let ctx = `\n\n## Goal Progress\nGoal: "${goal?.title ?? goalId}"`;
+      // The user's intent (goal description) — without this, the agent only
+      // sees the short title and its individual task description, missing the
+      // surrounding context of WHY the work is being done. Adding the
+      // description here lets the agent reason about its task in light of
+      // the larger goal (and reject scope creep, replan if its task is
+      // misaligned, etc.).
+      if (goal?.description && goal.description.trim() && goal.description.trim() !== (goal.title ?? '').trim()) {
+        ctx += `\nUser's intent:\n${goal.description}`;
+      }
+      ctx += `\nTasks:\n${lines.join('\n')}`;
       ctx += `\n\nUse this progress to guide your actions. If tasks have failed, consider whether to retry with a different approach (replan) or work with partial results.`;
 
       // Current task's contract: what it must write, what it will read.
