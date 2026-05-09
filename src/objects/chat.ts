@@ -67,6 +67,18 @@ const DEFAULT_SUGGESTIONS: SuggestionChip[] = [
 interface ConversationEntry {
   role: 'user' | 'assistant' | 'system';
   content: string;
+  /**
+   * Display-only entry. Persisted so close+reopen replays it as a bubble,
+   * but skipped when assembling the LLM context — the markdown typically
+   * carries a data URI (image, screenshot) whose raw bytes would balloon
+   * every subsequent LLM call with no benefit. Set true on `attachMedia`.
+   */
+  media?: boolean;
+  /**
+   * Optional display-name override. When set, `renderHistoryBubbles` uses
+   * this instead of the role-derived default ("You" / "Agent" / "System").
+   */
+  sender?: string;
 }
 
 interface ObjectSummary {
@@ -395,11 +407,20 @@ export class Chat extends Abject {
     this.on('attachMedia', async (msg: AbjectMessage) => {
       const { markdown, sender } = msg.payload as { markdown: string; sender?: string };
       if (!markdown?.trim()) return false;
-      // Deliberately do NOT push to conversationHistory: the markdown carries
-      // a data URI that would balloon every subsequent LLM call. The LLM
-      // gets the originating agent's text summary instead.
+      const trimmed = markdown.trim();
+      const displaySender = sender || 'Agent';
       await this.removeWelcomeState();
-      await this.appendBubble('assistant', sender || 'Agent', markdown.trim(), true);
+      await this.appendBubble('assistant', displaySender, trimmed, true);
+      // Persist as a media-flagged entry. The flag keeps the data URI out of
+      // every subsequent LLM call (see initialMessages assembly in handleAct
+      // → goal action) while still letting renderHistoryBubbles replay the
+      // image bubble after a close+reopen of the chat window.
+      this.conversationHistory.push({
+        role: 'assistant',
+        content: trimmed,
+        media: true,
+        sender: displaySender,
+      });
       this.schedulePersist();
       return true;
     });
@@ -1342,9 +1363,10 @@ A single successful creation goal is a complete turn. End it with **done**.
       const role: BubbleRole =
         entry.role === 'user' ? 'user' :
         entry.role === 'assistant' ? 'assistant' : 'system';
-      const sender =
+      const defaultSender =
         entry.role === 'user' ? 'You' :
         entry.role === 'assistant' ? 'Agent' : 'System';
+      const sender = entry.sender ?? defaultSender;
       const markdown = entry.role !== 'user';
       await this.appendBubble(role, sender, entry.content, markdown, /* silent */ true);
     }
@@ -1595,7 +1617,13 @@ A single successful creation goal is a complete turn. End it with **done**.
     try {
       // Build initial messages: system prompt + conversation history + new user message
       const initialMessages: { role: string; content: string }[] = [];
-      const recent = this.conversationHistory.slice(-MAX_CONVERSATION_ENTRIES);
+      // Filter media-only entries (images/screenshots persisted for re-render
+      // but not part of the LLM-visible conversation). Their data URIs would
+      // balloon every prompt with no semantic gain; the originating agent
+      // already pushed a text summary into conversationHistory separately.
+      const recent = this.conversationHistory
+        .filter(e => e.media !== true)
+        .slice(-MAX_CONVERSATION_ENTRIES);
       for (const entry of recent) {
         initialMessages.push({ role: entry.role, content: entry.content });
       }
