@@ -22,6 +22,7 @@
     "hack": "tsx hack/security-audit.ts",
     "bind": "node build-server.mjs",
     "etch": "vite build --config vite.client.config.ts",
+    "etch:p2p": "VITE_DEFAULT_MODE=p2p vite build --config vite.client.config.ts",
     "incarnate": "node build-electron.mjs && pnpm bind && pnpm etch",
     "incarnate:linux": "pnpm incarnate && node download-playwright-browser.mjs linux-x64 && electron-builder --linux",
     "incarnate:win": "pnpm incarnate && node download-playwright-browser.mjs win-x64 && electron-builder --win",

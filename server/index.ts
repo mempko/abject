@@ -337,7 +337,8 @@ async function main(): Promise<void> {
    * relay strings between the WebRTCUITransport (main thread) and a
    * MessagePort that we hand to the UI worker, where BackendUI lives.
    */
-  function attachRemoteUIClient(peerId: string, transport: UITransportLike): void {
+  function attachRemoteUIClient(peerId: string, transport: UITransportLike, meta?: { name?: string }): void {
+    const clientMeta = { kind: 'webrtc' as const, peerId, name: meta?.name };
     if (DEDICATED_WORKERS && uiBridge) {
       const { port1, port2 } = new MessageChannel();
 
@@ -353,10 +354,14 @@ async function main(): Promise<void> {
         if (transport.ready) transport.close();
       });
 
+      // Pre-announce metadata before transferring the port. Node's parent-port
+      // queue preserves order so the worker sees meta first and pairs it with
+      // the next webrtc-relay port-transfer.
+      uiBridge.sendCustom({ type: 'frontend-client-meta', portName: 'webrtc-relay', meta: clientMeta });
       uiBridge.transferPort('webrtc-relay', port2);
       alog.info(`Remote UI client ${peerId.slice(0, 16)} relayed to UI worker`);
     } else if (backendUI) {
-      backendUI.addTransport(transport);
+      backendUI.addTransport(transport, clientMeta);
       alog.info(`Remote UI client ${peerId.slice(0, 16)} attached to BackendUI`);
     } else {
       alog.warn(`No BackendUI available to attach remote UI client ${peerId.slice(0, 16)}`);
@@ -745,8 +750,8 @@ async function main(): Promise<void> {
   const remoteUIAccessId = await supervisedSpawn('RemoteUIAccess', 'permanent', systemTypeId('RemoteUIAccess'));
   const remoteUIAccessObj = runtime.objectFactory.getObject(remoteUIAccessId) as RemoteUIAccess | undefined;
   if (remoteUIAccessObj) {
-    remoteUIAccessObj.setAttachHandler((peerId: string, transport: UITransportLike) => {
-      attachRemoteUIClient(peerId, transport);
+    remoteUIAccessObj.setAttachHandler((peerId: string, transport: UITransportLike, meta?: { name?: string }) => {
+      attachRemoteUIClient(peerId, transport, meta);
     });
   }
 

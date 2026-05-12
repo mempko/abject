@@ -105,7 +105,7 @@ export class RemoteUIAccess extends Abject {
   private pendingAuth: Map<string, PendingAuth> = new Map();
 
   /** Set by server bootstrap so we can hand the encrypted channel to BackendUI. */
-  private attachHandler?: (peerId: string, transport: UITransportLike) => void;
+  private attachHandler?: (peerId: string, transport: UITransportLike, meta?: { name?: string }) => void;
 
   constructor() {
     super({
@@ -199,7 +199,7 @@ export class RemoteUIAccess extends Abject {
    * Wire the callback that BackendUI bootstrap uses to attach a paired
    * WebRTC channel to BackendUI.addTransport (directly or via worker port relay).
    */
-  setAttachHandler(handler: (peerId: string, transport: UITransportLike) => void): void {
+  setAttachHandler(handler: (peerId: string, transport: UITransportLike, meta?: { name?: string }) => void): void {
     this.attachHandler = handler;
   }
 
@@ -555,7 +555,8 @@ export class RemoteUIAccess extends Abject {
 
     if (this.attachHandler) {
       const ui = new WebRTCUITransport(transport);
-      this.attachHandler(peerId, ui);
+      const client = this.authorizedClients.get(peerId);
+      this.attachHandler(peerId, ui, { name: client?.name });
       log.info(`accepted ${mode} from ${peerId.slice(0, 16)} (${this.connectedTransports.size} active)`);
     } else {
       log.warn(`no attachHandler set; closing ${peerId.slice(0, 16)}`);

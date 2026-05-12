@@ -60,6 +60,12 @@ export class PeerNetwork extends Abject {
   // Signaling peers section widgets
   private signalingPeerAddButtons: Map<AbjectId, { peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string }> = new Map();
 
+  // Frontends section
+  private uiServerId?: AbjectId;
+  private remoteUIAccessId?: AbjectId;
+  private frontendDisconnectButtons: Map<AbjectId, string> = new Map();
+  private frontendRevokeButtons: Map<AbjectId, string> = new Map();
+
   // Discovery dep
   private peerDiscoveryId?: AbjectId;
 
@@ -137,10 +143,18 @@ Interface: abjects:peer-network`;
     this.clipboardId = await this.discoverDep('Clipboard') ?? undefined;
     this.peerRegistryId = await this.discoverDep('PeerRegistry') ?? undefined;
     this.peerDiscoveryId = await this.discoverDep('PeerDiscovery') ?? undefined;
+    this.uiServerId = await this.discoverDep('UIServer') ?? undefined;
+    this.remoteUIAccessId = await this.discoverDep('RemoteUIAccess') ?? undefined;
 
     // Subscribe to PeerRegistry events so the window auto-refreshes
     if (this.peerRegistryId) {
       await this.request(request(this.id, this.peerRegistryId, 'addDependent', {}));
+    }
+    if (this.uiServerId) {
+      try { await this.request(request(this.id, this.uiServerId, 'addDependent', {})); } catch { /* best effort */ }
+    }
+    if (this.remoteUIAccessId) {
+      try { await this.request(request(this.id, this.remoteUIAccessId, 'addDependent', {})); } catch { /* best effort */ }
     }
   }
 
@@ -261,6 +275,28 @@ Interface: abjects:peer-network`;
         return;
       }
 
+      // Frontends tab — disconnect a connected UI client
+      if (aspect === 'click' && this.frontendDisconnectButtons.has(fromId)) {
+        const clientId = this.frontendDisconnectButtons.get(fromId)!;
+        if (this.uiServerId) {
+          try {
+            await this.request(request(this.id, this.uiServerId, 'disconnectFrontendClient', { clientId }));
+          } catch { /* best effort */ }
+        }
+        return;
+      }
+
+      // Frontends tab — revoke a paired remote UI client (WebRTC only)
+      if (aspect === 'click' && this.frontendRevokeButtons.has(fromId)) {
+        const peerId = this.frontendRevokeButtons.get(fromId)!;
+        if (this.remoteUIAccessId) {
+          try {
+            await this.request(request(this.id, this.remoteUIAccessId, 'revokeClient', { peerId }));
+          } catch { /* best effort */ }
+        }
+        return;
+      }
+
       // PeerRegistry events — auto-refresh
       if (fromId === this.peerRegistryId && (
         aspect === 'contactConnected' || aspect === 'contactDisconnected' ||
@@ -270,6 +306,13 @@ Interface: abjects:peer-network`;
         aspect === 'signalingPeersUpdated' ||
         aspect === 'peerBlocked' || aspect === 'peerUnblocked'
       )) {
+        await this.refresh();
+        return;
+      }
+
+      // UIServer / RemoteUIAccess events — auto-refresh
+      if ((fromId === this.uiServerId && aspect === 'frontendClientsChanged') ||
+          (fromId === this.remoteUIAccessId && aspect === 'clientsChanged')) {
         await this.refresh();
         return;
       }
@@ -310,7 +353,7 @@ Interface: abjects:peer-network`;
     // Tab bar
     const { widgetIds: [_tabBarId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'tabBar', windowId: this.windowId, tabs: ['Identity', 'Contacts', 'Servers & Peers', 'Introductions'], selectedIndex: 0 },
+        { type: 'tabBar', windowId: this.windowId, tabs: ['Identity', 'Contacts', 'Servers & Peers', 'Introductions', 'Frontends'], selectedIndex: 0 },
       ] })
     );
     this.tabBarId = _tabBarId;
@@ -321,9 +364,9 @@ Interface: abjects:peer-network`;
       preferredSize: { height: 36 },
     }));
 
-    // Create 4 tab content ScrollableVBoxes
+    // Create 5 tab content ScrollableVBoxes
     this.tabContents = [];
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 5; i++) {
       const tabVBox = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, 'createScrollableVBox', {
           windowId: this.windowId,
@@ -371,6 +414,8 @@ Interface: abjects:peer-network`;
     this.blockButtons.clear();
     this.unblockButtons.clear();
     this.signalingPeerAddButtons.clear();
+    this.frontendDisconnectButtons.clear();
+    this.frontendRevokeButtons.clear();
 
     // Fetch identity info
     let peerId = '';
@@ -1166,6 +1211,129 @@ Interface: abjects:peer-network`;
       }
     }
 
+    // ========== TAB 4: FRONTENDS ==========
+    await this.populateFrontendsTab(this.tabContents[4]);
+  }
+
+  /** Populate the Frontends tab — currently connected UI clients (WS + WebRTC). */
+  private async populateFrontendsTab(tab4: AbjectId): Promise<void> {
+    // Header
+    const { widgetIds: [headerId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Connected Frontends', style: { color: this.theme.statusInfo, fontWeight: 'bold', fontSize: 13 } },
+      ] })
+    );
+    await this.request(request(this.id, tab4, 'addLayoutChild', {
+      widgetId: headerId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    // Lazy-discover in case the deps weren't ready in onInit.
+    if (!this.uiServerId) {
+      this.uiServerId = await this.discoverDep('UIServer') ?? undefined;
+      if (this.uiServerId) {
+        try { await this.request(request(this.id, this.uiServerId, 'addDependent', {})); } catch { /* best effort */ }
+      }
+    }
+    if (!this.remoteUIAccessId) {
+      this.remoteUIAccessId = await this.discoverDep('RemoteUIAccess') ?? undefined;
+      if (this.remoteUIAccessId) {
+        try { await this.request(request(this.id, this.remoteUIAccessId, 'addDependent', {})); } catch { /* best effort */ }
+      }
+    }
+
+    interface FrontendClient {
+      clientId: string;
+      kind: 'websocket' | 'webrtc' | string;
+      peerId: string;
+      name: string;
+      connectedAt: number;
+      ready: boolean;
+    }
+
+    let clients: FrontendClient[] = [];
+    if (this.uiServerId) {
+      try {
+        clients = await this.request<FrontendClient[]>(
+          request(this.id, this.uiServerId, 'listFrontendClients', {})
+        );
+      } catch { /* UIServer not reachable */ }
+    }
+
+    if (clients.length === 0) {
+      const { widgetIds: [emptyId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: 'No frontends connected.', style: { color: this.theme.textDescription, fontSize: 12 } },
+        ] })
+      );
+      await this.request(request(this.id, tab4, 'addLayoutChild', {
+        widgetId: emptyId,
+        sizePolicy: { vertical: 'fixed' },
+        preferredSize: { height: 18 },
+      }));
+      return;
+    }
+
+    for (const c of clients) {
+      const rowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+          parentLayoutId: tab4,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 8,
+        })
+      );
+      await this.request(request(this.id, tab4, 'addLayoutChild', {
+        widgetId: rowId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 32 },
+      }));
+
+      const isWebRTC = c.kind === 'webrtc';
+      const kindLabel = isWebRTC ? 'P2P' : 'WS';
+      const displayName = c.name?.trim()
+        || (c.peerId ? c.peerId.slice(0, 12) + '…' : '')
+        || c.clientId;
+      const relAgo = formatRelative(Date.now() - c.connectedAt);
+      const text = `[${kindLabel}] ${displayName} • ${relAgo}`;
+
+      const specs: Array<Record<string, unknown>> = [
+        { type: 'label', windowId: this.windowId, text, style: { color: this.theme.textHeading, fontSize: 12, selectable: true } },
+        { type: 'button', windowId: this.windowId, text: 'Disconnect', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
+      ];
+      if (isWebRTC) {
+        specs.push({ type: 'button', windowId: this.windowId, text: 'Revoke', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } });
+      }
+
+      const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs })
+      );
+      const [labelId, disconnectBtnId, revokeBtnId] = widgetIds;
+
+      await this.request(request(this.id, rowId, 'addLayoutChild', {
+        widgetId: labelId,
+        sizePolicy: { horizontal: 'expanding', vertical: 'fixed' },
+        preferredSize: { height: 30 },
+      }));
+
+      await this.request(request(this.id, disconnectBtnId, 'addDependent', {}));
+      await this.request(request(this.id, rowId, 'addLayoutChild', {
+        widgetId: disconnectBtnId,
+        sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+        preferredSize: { width: 90, height: 28 },
+      }));
+      this.frontendDisconnectButtons.set(disconnectBtnId, c.clientId);
+
+      if (isWebRTC && revokeBtnId) {
+        await this.request(request(this.id, revokeBtnId, 'addDependent', {}));
+        await this.request(request(this.id, rowId, 'addLayoutChild', {
+          widgetId: revokeBtnId,
+          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
+          preferredSize: { width: 70, height: 28 },
+        }));
+        this.frontendRevokeButtons.set(revokeBtnId, c.peerId);
+      }
+    }
   }
 
   async hide(): Promise<boolean> {
@@ -1200,6 +1368,8 @@ Interface: abjects:peer-network`;
     this.blockButtons.clear();
     this.unblockButtons.clear();
     this.signalingPeerAddButtons.clear();
+    this.frontendDisconnectButtons.clear();
+    this.frontendRevokeButtons.clear();
 
     this.changed('visibility', false);
     return true;
@@ -1593,3 +1763,15 @@ Interface: abjects:peer-network`;
 
 // Well-known peer network ID
 export const PEER_NETWORK_ID = 'abjects:peer-network' as AbjectId;
+
+function formatRelative(ms: number): string {
+  if (ms < 0) ms = 0;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  return `${d}d ago`;
+}

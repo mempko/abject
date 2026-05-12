@@ -75,6 +75,17 @@ interface ClientConnection {
   ready: boolean;
   sendQueue: BackendToFrontendMsg[];
   flushScheduled: boolean;
+  kind: 'websocket' | 'webrtc';
+  peerId?: string;
+  name?: string;
+  connectedAt: number;
+}
+
+/** Optional metadata supplied when registering a transport with addTransport. */
+export interface ClientMeta {
+  kind?: 'websocket' | 'webrtc';
+  peerId?: string;
+  name?: string;
 }
 
 export class BackendUI extends Abject {
@@ -406,6 +417,33 @@ export class BackendUI extends Abject {
                   elementType: { kind: 'reference', reference: 'WindowInfo' },
                 },
               },
+              {
+                name: 'listFrontendClients',
+                description: 'List all currently connected frontend UI clients (both WebSocket and WebRTC).',
+                parameters: [],
+                returns: {
+                  kind: 'array',
+                  elementType: {
+                    kind: 'object',
+                    properties: {
+                      clientId: { kind: 'primitive', primitive: 'string' },
+                      kind: { kind: 'primitive', primitive: 'string' },
+                      peerId: { kind: 'primitive', primitive: 'string' },
+                      name: { kind: 'primitive', primitive: 'string' },
+                      connectedAt: { kind: 'primitive', primitive: 'number' },
+                      ready: { kind: 'primitive', primitive: 'boolean' },
+                    },
+                  },
+                },
+              },
+              {
+                name: 'disconnectFrontendClient',
+                description: 'Forcefully close a connected frontend UI client by clientId.',
+                parameters: [
+                  { name: 'clientId', type: { kind: 'primitive', primitive: 'string' }, description: 'Client id from listFrontendClients' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
             ],
             events: [
               {
@@ -421,6 +459,16 @@ export class BackendUI extends Abject {
                   properties: {
                     surfaceId: { kind: 'primitive', primitive: 'string' },
                     focused: { kind: 'primitive', primitive: 'boolean' },
+                  },
+                },
+              },
+              {
+                name: 'frontendClientsChanged',
+                description: 'Emitted when a frontend UI client connects or disconnects',
+                payload: {
+                  kind: 'object',
+                  properties: {
+                    count: { kind: 'primitive', primitive: 'number' },
                   },
                 },
               },
@@ -705,6 +753,30 @@ export class BackendUI extends Abject {
     this.on('listWindows', async () => {
       return this.handleListWindows();
     });
+
+    this.on('listFrontendClients', async () => {
+      return Array.from(this.clients.values()).map((c) => ({
+        clientId: c.id,
+        kind: c.kind,
+        peerId: c.peerId ?? '',
+        name: c.name ?? '',
+        connectedAt: c.connectedAt,
+        ready: c.ready && c.transport.ready,
+      }));
+    });
+
+    this.on('disconnectFrontendClient', async (msg: AbjectMessage) => {
+      const { clientId } = msg.payload as { clientId: string };
+      const conn = this.clients.get(clientId);
+      if (!conn) return false;
+      try {
+        conn.transport.close(1000, 'disconnected by operator');
+      } catch (err) {
+        log.warn(`disconnectFrontendClient close threw: ${err}`);
+      }
+      // onClose handler will delete from this.clients and emit the event.
+      return true;
+    });
   }
 
   protected override async onInit(): Promise<void> {
@@ -974,14 +1046,14 @@ IMPORTANT:
    * Add a WebSocket connection as a new client (convenience wrapper).
    */
   addWebSocket(ws: WebSocket): string {
-    return this.addTransport(new WebSocketUITransport(ws));
+    return this.addTransport(new WebSocketUITransport(ws), { kind: 'websocket' });
   }
 
   /**
    * Add a transport as a new client. Multiple clients can be connected
    * simultaneously; all receive broadcasts.
    */
-  addTransport(newTransport: UITransport): string {
+  addTransport(newTransport: UITransport, meta?: ClientMeta): string {
     const clientId = this.nextClientId();
     const conn: ClientConnection = {
       id: clientId,
@@ -989,9 +1061,14 @@ IMPORTANT:
       ready: false,
       sendQueue: [],
       flushScheduled: false,
+      kind: meta?.kind ?? 'websocket',
+      peerId: meta?.peerId,
+      name: meta?.name,
+      connectedAt: Date.now(),
     };
     this.clients.set(clientId, conn);
     log.info(`Client ${clientId} connected (${this.clients.size} total)`);
+    this.emitFrontendClientsChanged();
 
     newTransport.onMessage((str: string) => {
       try {
@@ -1016,6 +1093,7 @@ IMPORTANT:
         }
         this.pendingRequests.clear();
       }
+      this.emitFrontendClientsChanged();
     });
 
     return clientId;
@@ -1029,8 +1107,12 @@ IMPORTANT:
     this.addWebSocket(ws);
   }
 
-  setTransport(newTransport: UITransport): void {
-    this.addTransport(newTransport);
+  setTransport(newTransport: UITransport, meta?: ClientMeta): void {
+    this.addTransport(newTransport, meta);
+  }
+
+  private emitFrontendClientsChanged(): void {
+    this.changed('frontendClientsChanged', { count: this.clients.size });
   }
 
   /**
