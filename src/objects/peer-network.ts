@@ -65,6 +65,12 @@ export class PeerNetwork extends Abject {
   private remoteUIAccessId?: AbjectId;
   private frontendDisconnectButtons: Map<AbjectId, string> = new Map();
   private frontendRevokeButtons: Map<AbjectId, string> = new Map();
+  // Pairing widgets (Frontends tab)
+  private remoteEnableCheckboxId?: AbjectId;
+  private remoteStatusLabelId?: AbjectId;
+  private remoteGenerateBtnId?: AbjectId;
+  private remoteQrImageId?: AbjectId;
+  private remoteQrUrlLabelId?: AbjectId;
 
   // Discovery dep
   private peerDiscoveryId?: AbjectId;
@@ -275,6 +281,34 @@ Interface: abjects:peer-network`;
         return;
       }
 
+      // Frontends tab — toggle remote UI access
+      if (fromId === this.remoteEnableCheckboxId && aspect === 'change') {
+        if (this.remoteUIAccessId) {
+          try {
+            await this.request(request(this.id, this.remoteUIAccessId, 'setEnabled', { enabled: !!value }));
+          } catch { /* best effort */ }
+        }
+        return;
+      }
+
+      // Frontends tab — Generate Pairing QR
+      if (fromId === this.remoteGenerateBtnId && aspect === 'click') {
+        if (this.remoteUIAccessId) {
+          try {
+            const result = await this.request<{ qrUrl: string; qrDataUrl: string }>(
+              request(this.id, this.remoteUIAccessId, 'generatePairingToken', {})
+            );
+            if (this.remoteQrImageId) {
+              await this.request(request(this.id, this.remoteQrImageId, 'update', { url: result.qrDataUrl, alt: '' }));
+            }
+            if (this.remoteQrUrlLabelId) {
+              await this.request(request(this.id, this.remoteQrUrlLabelId, 'update', { text: result.qrUrl }));
+            }
+          } catch { /* best effort */ }
+        }
+        return;
+      }
+
       // Frontends tab — disconnect a connected UI client
       if (aspect === 'click' && this.frontendDisconnectButtons.has(fromId)) {
         const clientId = this.frontendDisconnectButtons.get(fromId)!;
@@ -416,6 +450,11 @@ Interface: abjects:peer-network`;
     this.signalingPeerAddButtons.clear();
     this.frontendDisconnectButtons.clear();
     this.frontendRevokeButtons.clear();
+    this.remoteEnableCheckboxId = undefined;
+    this.remoteStatusLabelId = undefined;
+    this.remoteGenerateBtnId = undefined;
+    this.remoteQrImageId = undefined;
+    this.remoteQrUrlLabelId = undefined;
 
     // Fetch identity info
     let peerId = '';
@@ -1217,18 +1256,6 @@ Interface: abjects:peer-network`;
 
   /** Populate the Frontends tab — currently connected UI clients (WS + WebRTC). */
   private async populateFrontendsTab(tab4: AbjectId): Promise<void> {
-    // Header
-    const { widgetIds: [headerId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Connected Frontends', style: { color: this.theme.statusInfo, fontWeight: 'bold', fontSize: 13 } },
-      ] })
-    );
-    await this.request(request(this.id, tab4, 'addLayoutChild', {
-      widgetId: headerId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-
     // Lazy-discover in case the deps weren't ready in onInit.
     if (!this.uiServerId) {
       this.uiServerId = await this.discoverDep('UIServer') ?? undefined;
@@ -1242,6 +1269,21 @@ Interface: abjects:peer-network`;
         try { await this.request(request(this.id, this.remoteUIAccessId, 'addDependent', {})); } catch { /* best effort */ }
       }
     }
+
+    // ── Pair a new frontend (QR generation) ──
+    await this.buildPairingSection(tab4);
+
+    // ── Connected frontends header ──
+    const { widgetIds: [headerId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Connected Frontends', style: { color: this.theme.statusInfo, fontWeight: 'bold', fontSize: 13 } },
+      ] })
+    );
+    await this.request(request(this.id, tab4, 'addLayoutChild', {
+      widgetId: headerId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
 
     interface FrontendClient {
       clientId: string;
@@ -1336,6 +1378,136 @@ Interface: abjects:peer-network`;
     }
   }
 
+  /**
+   * Pair-a-new-frontend section: enable toggle, status, Generate QR button,
+   * QR image, and selectable pairing URL. Mirrors the UX that previously
+   * lived in GlobalSettings → Auth → Remote Access.
+   */
+  private async buildPairingSection(tab4: AbjectId): Promise<void> {
+    // Section header
+    const { widgetIds: [headerId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Pair a Frontend',
+          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
+      ] })
+    );
+    await this.request(request(this.id, tab4, 'addLayoutChild', {
+      widgetId: headerId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 24 },
+    }));
+
+    let status = { enabled: false, peerId: '', signalingUrl: '', deviceLabel: '', connectedCount: 0, authorizedCount: 0 };
+    if (this.remoteUIAccessId) {
+      try {
+        status = await this.request<typeof status>(
+          request(this.id, this.remoteUIAccessId, 'getStatus', {})
+        );
+      } catch { /* not ready */ }
+    }
+
+    // Enable checkbox
+    const enableRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: tab4,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, tab4, 'addLayoutChild', {
+      widgetId: enableRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 28 },
+    }));
+
+    const { widgetIds: [enableCheckboxId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'checkbox', windowId: this.windowId,
+          checked: status.enabled,
+          text: 'Enable remote UI (phone access via WebRTC)' },
+      ] })
+    );
+    this.remoteEnableCheckboxId = enableCheckboxId;
+    await this.request(request(this.id, this.remoteEnableCheckboxId, 'addDependent', {}));
+    await this.request(request(this.id, enableRowId, 'addLayoutChild', {
+      widgetId: this.remoteEnableCheckboxId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: 28 },
+    }));
+
+    // Status label
+    const { widgetIds: [statusLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId,
+          text: formatRemoteStatus(status),
+          style: { color: this.theme.textDescription, fontSize: 12 } },
+      ] })
+    );
+    this.remoteStatusLabelId = statusLabelId;
+    await this.request(request(this.id, tab4, 'addLayoutChild', {
+      widgetId: this.remoteStatusLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 18 },
+    }));
+
+    // Generate QR button
+    const generateRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: tab4,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, tab4, 'addLayoutChild', {
+      widgetId: generateRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 36 },
+    }));
+
+    const { widgetIds: [generateBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Generate Pairing QR',
+          style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+      ] })
+    );
+    this.remoteGenerateBtnId = generateBtnId;
+    await this.request(request(this.id, this.remoteGenerateBtnId, 'addDependent', {}));
+    await this.request(request(this.id, generateRowId, 'addLayoutChild', {
+      widgetId: this.remoteGenerateBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 200, height: 36 },
+    }));
+    await this.request(request(this.id, generateRowId, 'addLayoutSpacer', {}));
+
+    // QR image
+    const { widgetIds: [qrImageId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'image', windowId: this.windowId, alt: 'No QR generated yet',
+          style: { background: this.theme.windowBg, color: this.theme.textTertiary, fontSize: 12, radius: 4 } },
+      ] })
+    );
+    this.remoteQrImageId = qrImageId;
+    await this.request(request(this.id, tab4, 'addLayoutChild', {
+      widgetId: this.remoteQrImageId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: 280, height: 280 },
+    }));
+
+    // QR URL label
+    const { widgetIds: [qrUrlLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: '',
+          style: { color: this.theme.textTertiary, fontSize: 11, wordWrap: true, selectable: true } },
+      ] })
+    );
+    this.remoteQrUrlLabelId = qrUrlLabelId;
+    await this.request(request(this.id, tab4, 'addLayoutChild', {
+      widgetId: this.remoteQrUrlLabelId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+  }
+
   async hide(): Promise<boolean> {
     if (!this.windowId) return true;
 
@@ -1370,6 +1542,11 @@ Interface: abjects:peer-network`;
     this.signalingPeerAddButtons.clear();
     this.frontendDisconnectButtons.clear();
     this.frontendRevokeButtons.clear();
+    this.remoteEnableCheckboxId = undefined;
+    this.remoteStatusLabelId = undefined;
+    this.remoteGenerateBtnId = undefined;
+    this.remoteQrImageId = undefined;
+    this.remoteQrUrlLabelId = undefined;
 
     this.changed('visibility', false);
     return true;
@@ -1763,6 +1940,12 @@ Interface: abjects:peer-network`;
 
 // Well-known peer network ID
 export const PEER_NETWORK_ID = 'abjects:peer-network' as AbjectId;
+
+function formatRemoteStatus(status: { enabled: boolean; peerId: string; signalingUrl: string; connectedCount: number }): string {
+  if (!status.enabled) return 'Remote access is disabled.';
+  if (!status.peerId) return 'Remote access enabled (initializing…)';
+  return `Listening as ${status.peerId.slice(0, 16)}… via ${status.signalingUrl} (${status.connectedCount} connected)`;
+}
 
 function formatRelative(ms: number): string {
   if (ms < 0) ms = 0;
