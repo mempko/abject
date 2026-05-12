@@ -376,6 +376,18 @@ Click the arrow to expand/collapse a goal.
 
       if (!isExpanded) return;
 
+      // User's intent (goal description) — first child when expanded so the
+      // reader sees what the user actually asked for before the planned tasks.
+      if (goal.description && goal.description.trim() && goal.description.trim() !== goal.title.trim()) {
+        items.push({
+          id: `description:${goal.id}`,
+          label: goal.description,
+          iconName: 'info',
+          iconColor: this.theme.textSecondary,
+          depth: depth + 1,
+        });
+      }
+
       // Task children
       for (const task of tasks) {
         const effectiveStatus = task.status === 'pending' && task.claimedBy ? 'claimed' : task.status;

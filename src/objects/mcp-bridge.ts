@@ -55,6 +55,14 @@ export class MCPBridge extends Abject {
   private cachedTools: MCPToolDefinition[] = [];
   private cachedResources: MCPResourceDefinition[] = [];
 
+  /**
+   * The remote MCP server's self-identification from the initialize
+   * handshake. Captured for the dynamic manifest description so Registry's
+   * catalog reflects what's actually bridged (e.g. "ProtonMail email
+   * tools") instead of the static "MCP bridge" placeholder.
+   */
+  private serverInfo: { name?: string; version?: string } = {};
+
   constructor(config: MCPBridgeConfig) {
     const name = `MCPBridge-${config.serverName}`;
     super({
@@ -244,8 +252,10 @@ export class MCPBridge extends Abject {
       onNotification: (method, params) => {
         log.info(`[${this.serverName}] notification: ${method}`);
         if (method === 'notifications/tools/list_changed') {
-          this.refreshTools().catch((err) =>
-            log.error(`[${this.serverName}] failed to refresh tools:`, err));
+          this.refreshTools()
+            .then(() => this.publishEnrichedManifest())
+            .catch((err) =>
+              log.error(`[${this.serverName}] failed to refresh tools:`, err));
         }
       },
       onError: (err) => {
@@ -266,6 +276,10 @@ export class MCPBridge extends Abject {
       }) as MCPInitResult;
 
       log.info(`[${this.serverName}] initialized: ${initResult.serverInfo?.name ?? 'unknown'} v${initResult.serverInfo?.version ?? '?'}`);
+      this.serverInfo = {
+        name: initResult.serverInfo?.name,
+        version: initResult.serverInfo?.version,
+      };
 
       // Send initialized notification (required by MCP spec)
       this.transport.sendNotification('notifications/initialized');
@@ -276,6 +290,24 @@ export class MCPBridge extends Abject {
 
       this.bridgeStatus = 'connected';
       log.info(`[${this.serverName}] connected with ${this.cachedTools.length} tools, ${this.cachedResources.length} resources`);
+
+      // Publish a manifest that reflects what the server actually exposes.
+      // Registry's catalog reads `manifest.description` — without this
+      // update, it sees only the generic "MCP bridge for foo" line and
+      // never knows the bridge can do email/calendar/etc.
+      //
+      // FIRE-AND-FORGET. We must not block here: `connectToServer` runs
+      // inside onInit, and Factory.spawn registers us in Registry AFTER
+      // onInit returns. If we awaited the publish synchronously, the
+      // updateManifest call would race against a registration that's
+      // waiting for us to finish — a deadlock that exhausted the retry
+      // budget on every spawn. By detaching, onInit returns quickly,
+      // Factory registers us, and the deferred publish (still retrying
+      // in the background) finds Registry knows about us within the
+      // first one or two attempts.
+      this.publishEnrichedManifest().catch((err) => {
+        log.warn(`[${this.serverName}] manifest enrichment failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
     } catch (err) {
       this.bridgeStatus = 'error';
       this.bridgeStatusError = err instanceof Error ? err.message : String(err);
@@ -374,5 +406,117 @@ export class MCPBridge extends Abject {
       if (item.type === 'image' && item.data) return `[image: ${item.mimeType ?? 'unknown'}]`;
       return '';
     }).filter(Boolean).join('\n');
+  }
+
+  /**
+   * Push an updated manifest to Registry that reflects what this bridge
+   * actually exposes. Without this, the bridge's catalog entry says only
+   * "MCP bridge for foo" — agents asking Registry "which objects do
+   * email/calendar/chat?" cannot find it because the manifest gives no
+   * signal about the wrapped server's domain.
+   *
+   * The new description embeds:
+   *   - The MCP server's self-reported identity (name + version)
+   *   - The full list of tools (name + raw description from the server)
+   *
+   * No keyword inference, no inferred tags — the raw tool descriptions
+   * from the server are the truth. The Registry's ask-LLM classifies
+   * (e.g. "MCPBridge-protonmail-mcp exposes search_emails, send_email,
+   * read_inbox... → this is email-capable") at retrieval time. If the
+   * upstream server later evolves new tools, that signal flows through
+   * the next refreshTools cycle automatically (a tools/list_changed
+   * notification triggers a republish).
+   *
+   * Description is capped to keep the catalog manageable; if the tool
+   * list overflows, names are kept and descriptions are clipped.
+   */
+  private async publishEnrichedManifest(): Promise<void> {
+    const registryId = this.getRegistryId();
+    if (!registryId) return;
+
+    const newDescription = this.buildEnrichedDescription();
+    const newManifest = {
+      ...this.manifest,
+      description: newDescription,
+    };
+
+    // Race window: Factory.spawn() registers an object in Registry AFTER
+    // `onInit` returns. `connectToServer` (and thus this method) runs
+    // inside onInit, so on the first attempt the Registry doesn't know
+    // about us yet and `updateManifest` silently returns `false`. Retry
+    // with small backoff until the registration lands. The MCP subprocess
+    // startup typically takes seconds — by then registration has long
+    // since completed, so this usually succeeds on the first try; the
+    // retry is for the edge case where connect is fast or registration
+    // is slow.
+    const maxAttempts = 8;
+    let lastError: string | undefined;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const ok = await this.request<boolean>(
+          request(this.id, registryId, 'updateManifest', {
+            objectId: this.id,
+            manifest: newManifest,
+          }),
+          5000,
+        );
+        if (ok === true) {
+          log.info(`[${this.serverName}] published enriched manifest (${this.cachedTools.length} tool(s)) on attempt ${attempt}`);
+          return;
+        }
+        lastError = `Registry returned ${ok}`;
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+      }
+      // Backoff: 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 5000ms, 5000ms
+      const delay = Math.min(100 * Math.pow(2, attempt - 1), 5000);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+    log.warn(`[${this.serverName}] updateManifest never succeeded after ${maxAttempts} attempts (last: ${lastError ?? 'unknown'})`);
+  }
+
+  /**
+   * Build the manifest description text. Layout:
+   *
+   *   Bridges MCP server "<server.name>" v<version>. Exposes <N> tool(s)
+   *   via callTool({ toolName, input }):
+   *     - <tool>: <description>
+   *     - <tool>: <description>
+   *     ...
+   *
+   * Total length is bounded; once the budget is hit, remaining tools
+   * collapse to a name-only summary line ("plus N more: a, b, c, ...").
+   */
+  private buildEnrichedDescription(): string {
+    const MAX_LEN = 6000;
+    const PER_TOOL_DESC_LIMIT = 200;
+
+    const sn = this.serverInfo.name ?? this.serverName;
+    const sv = this.serverInfo.version ? ` v${this.serverInfo.version}` : '';
+    const head = this.cachedTools.length === 0
+      ? `MCP bridge wrapping the "${sn}"${sv} server. The subprocess is connected but currently exposes no tools (call \`getStatus\` for diagnostics).`
+      : `MCP bridge wrapping the "${sn}"${sv} server. Exposes ${this.cachedTools.length} tool(s) via \`callTool({ toolName, input })\`. Tools:\n`;
+
+    let body = '';
+    const remaining: string[] = [];
+    for (let i = 0; i < this.cachedTools.length; i++) {
+      const tool = this.cachedTools[i];
+      const desc = (tool.description ?? '').trim().replace(/\s+/g, ' ');
+      const clipped = desc.length > PER_TOOL_DESC_LIMIT
+        ? desc.slice(0, PER_TOOL_DESC_LIMIT) + '…'
+        : desc;
+      const line = clipped
+        ? `  - ${tool.name}: ${clipped}\n`
+        : `  - ${tool.name}\n`;
+      if (head.length + body.length + line.length > MAX_LEN) {
+        remaining.push(tool.name);
+      } else {
+        body += line;
+      }
+    }
+    if (remaining.length > 0) {
+      body += `  - plus ${remaining.length} more tool(s): ${remaining.join(', ')}\n`;
+    }
+    return head + body;
   }
 }

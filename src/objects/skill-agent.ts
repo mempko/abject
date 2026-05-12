@@ -112,22 +112,15 @@ export class SkillAgent extends Abject {
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## SkillAgent: Installed Skill Execution Agent
 
-### What I Handle
-I manage and execute skills. I handle:
-- Installing new MCP servers and skills (e.g., "install @shinzolabs/gmail-mcp")
-- Enabling, disabling, and listing installed skills
-- Executing tasks that match an installed and enabled skill's domain
+I install, enable, disable, and list skills. I execute tasks that match an installed skill's domain at runtime — e.g. "send a Slack message", "list my Linear issues", "create a Gmail draft".
 
 Currently installed skills and their domains:
 ${this.getInstalledSkillsSummary()}
 
 ### My Scope
-I handle skill installation, management, and tasks that match an installed skill's domain. Runtime interaction with existing objects, web browsing, and authoring new object source code are each handled by a dedicated agent.
+Skill installation, management, and at-runtime execution of tasks that match an installed skill's domain. Authoring or modifying Abject source code is outside my scope; that's a different agent's job. Web browsing of arbitrary public URLs is also outside my scope.
 
-### Where Creation Tasks Go
-When a task asks to create, build, design, or wrap services as a new object (widget, app, agent, bridge, proxy, relay, integration), say PASS so routing reaches a creation agent. Wrapping a skill in a proxy object is object authoring, so PASS fits there too, even when the new object would use a skill or MCP server I manage.
-
-When asked about a task, describe which skill you would use and how. Say PASS when no installed skill matches the task and the task is outside skill installation or management. Say PASS for any task whose goal is to create or modify an object's implementation.`;
+When invited to contribute to a Sprint Plan, describe the specific task I could run using one of my installed skills. If no installed skill matches the goal, reply PASS.`;
   }
 
   protected override async handleAsk(question: string): Promise<string> {
@@ -172,13 +165,16 @@ When asked about a task, describe which skill you would use and how. Say PASS wh
   private setupHandlers(): void {
     // ── TupleSpace dispatch handler ──
     this.on('executeTask', async (msg: AbjectMessage) => {
-      const { tupleId, goalId, description, approach, failureHistory } = msg.payload as {
-        tupleId: string; goalId?: string; description: string;
+      const { tupleId, taskId: explicitTaskId, goalId, description, approach, failureHistory } = msg.payload as {
+        tupleId: string; taskId?: string; goalId?: string; description: string;
         data?: Record<string, unknown>; type: string; approach?: string;
         failureHistory?: Array<{ agent: string; error: string }>;
       };
 
-      const taskId = `skill-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      // Use the queue-runner-supplied taskId so AgentAbject's TaskEntry,
+      // SkillAgent's TaskExtra, and AgentAbject's queue inFlight slot share
+      // one ID. Falls back to a fresh `skill-exec-${...}` for legacy callers.
+      const taskId = explicitTaskId ?? tupleId ?? `skill-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       this.taskExtras.set(taskId, {});
       this._currentGoalId = goalId;
 
@@ -657,11 +653,9 @@ Stay within skill execution: run shell commands, call MCP tools, make HTTP reque
 
 You MUST respond with EXACTLY ONE JSON object inside \`\`\`json fenced code markers.
 Do NOT use XML, function_calls tags, tool_call tags, or any other format.
-Do NOT include any text outside the JSON block except brief reasoning before it.
+Output ONLY the JSON block — no prose around it. Any one-sentence note belongs in the action's \`reasoning\` field; the parser only reads the JSON.
 
 Example response:
-
-I'll fetch the accounts list first.
 
 \`\`\`json
 { "action": "shell", "command": "curl -s -H \\"Authorization: Bearer $API_KEY\\" \\"https://api.example.com/accounts\\" | jq .", "reasoning": "Fetch accounts" }

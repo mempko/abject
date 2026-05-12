@@ -13,6 +13,7 @@ import {
   ModelTier,
   ModelInfo,
   ContentPart,
+  defaultIsRetryable,
 } from './provider.js';
 import { require } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
@@ -191,28 +192,30 @@ export class OpenAIProvider extends BaseLLMProvider {
       request.prompt_cache_key = options.cacheKey;
     }
 
-    const response = await this.fetch(`${this.baseUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers: this.buildHeaders(),
-      body: JSON.stringify(request),
-    }, { timeout: 300000 });
+    return this.withRetries(async () => {
+      const response = await this.fetch(`${this.baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: this.buildHeaders(),
+        body: JSON.stringify(request),
+      }, { timeout: 300000 });
 
-    const data = JSON.parse(response.body) as OpenAIResponse;
+      const data = JSON.parse(response.body) as OpenAIResponse;
 
-    const choice = data.choices[0];
-    if (!choice) {
-      throw new Error('No completion returned');
-    }
+      const choice = data.choices[0];
+      if (!choice) {
+        throw new Error('No completion returned');
+      }
 
-    return {
-      content: choice.message.content,
-      finishReason: choice.finish_reason === 'stop' ? 'stop' : 'length',
-      usage: {
-        inputTokens: data.usage.prompt_tokens,
-        outputTokens: data.usage.completion_tokens,
-        cacheReadTokens: data.usage.prompt_tokens_details?.cached_tokens,
-      },
-    };
+      return {
+        content: choice.message.content,
+        finishReason: choice.finish_reason === 'stop' ? 'stop' : 'length',
+        usage: {
+          inputTokens: data.usage.prompt_tokens,
+          outputTokens: data.usage.completion_tokens,
+          cacheReadTokens: data.usage.prompt_tokens_details?.cached_tokens,
+        },
+      };
+    }, { label: `${this.name}.complete` });
   }
 
   async *stream(
@@ -236,6 +239,36 @@ export class OpenAIProvider extends BaseLLMProvider {
       request.prompt_cache_key = options.cacheKey;
     }
 
+    const maxAttempts = 3;
+    const initialDelayMs = 1000;
+    const backoffFactor = 2;
+    const maxDelayMs = 10000;
+    let yielded = false;
+    let lastErr: unknown;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        for await (const chunk of this.streamOnce(request)) {
+          if (chunk.content.length > 0) yielded = true;
+          yield chunk;
+        }
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (yielded) throw err;
+        if (attempt >= maxAttempts) throw err;
+        if (!defaultIsRetryable(err)) throw err;
+        const delay = Math.min(initialDelayMs * Math.pow(backoffFactor, attempt - 1), maxDelayMs);
+        const msg = err instanceof Error ? err.message : String(err);
+        // eslint-disable-next-line no-console
+        console.warn(`[${this.name}.stream] attempt ${attempt}/${maxAttempts} failed: ${msg.slice(0, 200)} — retrying in ${delay}ms`);
+        await new Promise<void>(resolve => setTimeout(resolve, delay));
+      }
+    }
+    throw lastErr;
+  }
+
+  private async *streamOnce(request: OpenAIRequest): AsyncIterable<LLMStreamChunk> {
     const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: this.buildHeaders(),

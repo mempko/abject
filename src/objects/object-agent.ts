@@ -85,7 +85,7 @@ export class ObjectAgent extends Abject {
     return super.askPrompt(_question) + `\n\n## ObjectAgent — General-Purpose Object Interaction Agent
 
 ### What I Handle
-I interact with existing objects by discovering them and sending them messages.
+I interact with existing objects by discovering them and sending them messages. Authoring or modifying Abject source is outside my scope (no programmatic API to change source). When asked to investigate, I report findings and stop — I don't write code.
 
 Examples of tasks I handle well:
 - Fetching data from APIs (weather, stocks, etc.)
@@ -154,13 +154,14 @@ When asked about a task, describe which objects you would message and what you w
   private setupHandlers(): void {
     // ── TupleSpace dispatch handler ──
     this.on('executeTask', async (msg: AbjectMessage) => {
-      const { tupleId, goalId, description, data, approach, failureHistory } = msg.payload as {
-        tupleId: string; goalId?: string; description: string;
+      const { tupleId, taskId: explicitTaskId, goalId, description, data, approach, failureHistory } = msg.payload as {
+        tupleId: string; taskId?: string; goalId?: string; description: string;
         data?: Record<string, unknown>; type: string; approach?: string;
         failureHistory?: Array<{ agent: string; error: string }>;
       };
 
-      const taskId = `obj-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      // Use queue-runner-supplied taskId for inFlight match; fall back for legacy.
+      const taskId = explicitTaskId ?? tupleId ?? `obj-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       this.taskExtras.set(taskId, { taskData: data });
       this._currentGoalId = goalId;
 
@@ -585,7 +586,7 @@ For everything else that is fetch-data / run-a-tool / read-or-write-some-state w
 
 ## Output Format
 
-Respond with ONE JSON object inside \`\`\`json fenced code markers. Include brief reasoning before the block.
+Respond with ONE JSON object inside \`\`\`json fenced code markers. Output ONLY the JSON block — no prose before or after it. Put any one-sentence note in the action's \`reasoning\` field (used for logs). Multi-paragraph analysis before the block wastes time and tokens; the parser only reads the JSON.
 
 \`\`\`json
 { "action": "ask", "object": "Registry", "question": "Which objects can help me fetch weather data?", "reasoning": "Need to find the right object" }

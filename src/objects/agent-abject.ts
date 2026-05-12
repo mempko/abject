@@ -106,6 +106,26 @@ interface RegisteredAgent {
   registeredAt: number;
 }
 
+/**
+ * One task queued for execution on a specific agent. A QueuedTask carries
+ * everything needed to call `startTask` when the agent's queue runner pops it
+ * — meaning the queue is a simple buffer of fully-prepared task descriptions,
+ * not a planning surface. ScrumMaster fills queues from each scrum's plan;
+ * AgentAbject pops from each queue one task at a time per agent.
+ */
+interface QueuedTask {
+  taskId: string;
+  task: string;
+  systemPrompt?: string;
+  initialMessages?: { role: string; content: string | ContentPart[] }[];
+  config?: Partial<AgentConfig>;
+  responseSchema?: Record<string, unknown>;
+  goalId?: string;
+  dispatchTupleId?: string;
+  callerId: AbjectId;
+  enqueuedAt: number;
+}
+
 interface TaskEntry {
   state: AgentTaskState;
   agentId: AbjectId;
@@ -122,10 +142,6 @@ interface TaskEntry {
   goalId?: string;
   /** Set when task came from dispatch (the parent goal). */
   incomingGoalId?: string;
-  /** Set when planning creates a child goal for a dispatched task. */
-  childGoalId?: string;
-  /** Active child goal IDs created by decompose. */
-  childGoalIds?: string[];
   /** Cached skill instructions appended to system prompt. */
   skillPromptSuffix?: string;
   /** TupleSpace tuple id of the goal task this entry is executing (when dispatched). Enables scratchpad contract injection for the current task. */
@@ -204,30 +220,27 @@ export class AgentAbject extends Abject {
   private lastGoalProgressTs = new Map<string, number>();
   private static readonly GOAL_PROGRESS_THROTTLE_MS = 1000;
 
-  /** Guard: tuple IDs currently being dispatched — prevents concurrent dispatch loops. */
-  private dispatchingTuples = new Set<string>();
-
-  /** Decline-retry counts per tupleId. In-memory so the count survives the
-   *  periodic scan re-fetching tuples from SharedState. Cleared once the
-   *  task is claimed, fails permanently, or exceeds the retry budget. */
-  private declineRetries = new Map<string, number>();
-  private static readonly MAX_DECLINE_RETRIES = 6;
-
-  /** Agents currently executing a dispatched TupleSpace task (one task at a time per agent). */
-  private busyAgents = new Set<AbjectId>();
-
-  /** Periodic scan timer for catching missed/pre-existing tasks. */
-  private scanTimer?: ReturnType<typeof setInterval>;
-
   /** Active task entry during LLM streaming -- links llmChunk events to the right ticket. */
   private activeStreamEntry?: TaskEntry;
   /** Throttle timestamp for streaming progress events (1/sec max). */
   private lastStreamProgressTs = 0;
 
-  /** Resolvers for event-driven child goal observation. */
-  private childGoalEventResolvers = new Map<string, {
-    resolve: (evt: { aspect: string; goalId: string; taskId?: string; result?: unknown; error?: string }) => void;
-    timer: ReturnType<typeof setTimeout>;
+  /**
+   * Per-agent task queues. Each registered agent runs one task at a time
+   * through its OTA loop; additional tasks queue up here and the queue
+   * runner pops the next one when the current task finishes.
+   *
+   * The `inFlight` slot replaces the legacy `busyAgents` mutual-exclusion
+   * mechanism. Cancellation: pending tasks splice out of `pending`;
+   * in-flight tasks set `entry.state.phase = 'error'` with `error: 'Cancelled'`
+   * which the OTA loop checks at observe/think boundaries.
+   *
+   * Filled by `enqueueTask` (called by ScrumMaster after each scrum plans
+   * tasks) and drained by `runTaskAsync`'s tail when each task terminates.
+   */
+  private agentTaskQueues = new Map<AbjectId, {
+    inFlight?: { taskId: string; goalId?: string };
+    pending: QueuedTask[];
   }>();
 
   /** Lazy Ajv instance for response schema validation. */
@@ -361,11 +374,53 @@ export class AgentAbject extends Abject {
             },
             {
               name: 'cancelTask',
-              description: 'Cancel a running task',
+              description: 'Cancel a task. If in-flight, the OTA loop bails at the next observe/think boundary. If pending in some agent\'s queue, splice it out so it never starts.',
               parameters: [
                 { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Task ID' },
+                { name: 'agentId', type: { kind: 'primitive', primitive: 'string' }, description: 'Optional hint — only scan this agent\'s queue', optional: true },
               ],
-              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+              returns: { kind: 'object', properties: {
+                success: { kind: 'primitive', primitive: 'boolean' },
+                where: { kind: 'primitive', primitive: 'string' },
+              } },
+            },
+            {
+              name: 'enqueueTask',
+              description: 'Enqueue a task on a specific agent\'s task queue. The agent runs queued tasks one at a time through its OTA loop. Used by ScrumMaster to assign Sprint Backlog items.',
+              parameters: [
+                { name: 'agentId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target agent — required' },
+                { name: 'task', type: { kind: 'primitive', primitive: 'string' }, description: 'Task description' },
+                { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-provided task ID (e.g. tuple ID for goal tasks)', optional: true },
+                { name: 'systemPrompt', type: { kind: 'primitive', primitive: 'string' }, description: 'Override system prompt', optional: true },
+                { name: 'initialMessages', type: { kind: 'array', elementType: { kind: 'object', properties: {} } }, description: 'Initial conversation messages', optional: true },
+                { name: 'config', type: { kind: 'object', properties: {} }, description: 'Per-task config overrides', optional: true },
+                { name: 'responseSchema', type: { kind: 'object', properties: {} }, description: 'JSON Schema for structured result', optional: true },
+                { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal this task belongs to (for cancellation cascades and progress)', optional: true },
+                { name: 'dispatchTupleId', type: { kind: 'primitive', primitive: 'string' }, description: 'TupleSpace tuple ID — when set, AgentAbject calls completeTask/failTask on this tuple after the OTA loop terminates', optional: true },
+              ],
+              returns: { kind: 'object', properties: {
+                taskId: { kind: 'primitive', primitive: 'string' },
+                queuePosition: { kind: 'primitive', primitive: 'number' },
+              } },
+            },
+            {
+              name: 'listAgentQueue',
+              description: 'Inspect an agent\'s task queue: returns { inFlight, pending }.',
+              parameters: [
+                { name: 'agentId', type: { kind: 'primitive', primitive: 'string' }, description: 'Agent ID' },
+              ],
+              returns: { kind: 'object', properties: {
+                inFlight: { kind: 'object', properties: {} },
+                pending: { kind: 'array', elementType: { kind: 'object', properties: {} } },
+              } },
+            },
+            {
+              name: 'drainAgentQueue',
+              description: 'Drop all pending tasks from an agent\'s queue (without cancelling the in-flight task).',
+              parameters: [
+                { name: 'agentId', type: { kind: 'primitive', primitive: 'string' }, description: 'Agent ID' },
+              ],
+              returns: { kind: 'object', properties: { drained: { kind: 'primitive', primitive: 'number' } } },
             },
           ],
           events: [
@@ -621,37 +676,28 @@ The registered object must implement these handlers to participate in the agent 
     this.jobManagerId = await this.discoverDep('JobManager') ?? undefined;
     this.goalManagerId = await this.discoverDep('GoalManager') ?? undefined;
     this.tupleSpaceId = await this.discoverDep('TupleSpace') ?? undefined;
-
-    // Subscribe to TupleSpace for centralized task dispatch
-    if (this.tupleSpaceId) {
-      this.send(request(this.id, this.tupleSpaceId, 'addDependent', {}));
-    }
-
-    // Subscribe to GoalManager for child goal completion events
-    if (this.goalManagerId) {
-      this.send(request(this.id, this.goalManagerId, 'addDependent', {}));
-    }
-
-    // Periodic scan for missed/pre-existing tasks (every 10s)
-    this.scanTimer = setInterval(() => {
-      this.periodicScan().catch(err => {
-        log.warn('Periodic scan failed:', err instanceof Error ? err.message : String(err));
-      });
-    }, 10_000);
-
-    // Initial scan after 5s delay (give agents time to register)
-    setTimeout(() => {
-      this.periodicScan().catch(err => {
-        log.warn('Initial scan failed:', err instanceof Error ? err.message : String(err));
-      });
-    }, 5000);
+    // No TupleSpace watcher and no periodic scan: under the Scrum model,
+    // ScrumMaster places tasks via enqueueTask. AgentAbject runs the OTA
+    // loop for each queued task and pops the next one when the current
+    // task terminates. There is nothing to scan for.
   }
 
   protected override async onStop(): Promise<void> {
-    if (this.scanTimer) {
-      clearInterval(this.scanTimer);
-      this.scanTimer = undefined;
+    // Drain in-flight tasks to error so any awaiting callers get a clean
+    // signal rather than hanging. Pending queues drop on the floor — they
+    // weren't started so there's no partial work to surface.
+    for (const [agentId, q] of this.agentTaskQueues) {
+      if (q.inFlight) {
+        const entry = this.taskEntries.get(q.inFlight.taskId);
+        if (entry && entry.state.phase !== 'done' && entry.state.phase !== 'error') {
+          entry.state.phase = 'error';
+          entry.state.error = 'AgentAbject stopped';
+        }
+      }
+      q.pending.length = 0;
+      void agentId;
     }
+    this.agentTaskQueues.clear();
   }
 
   /** Resolve a required dependency lazily. */
@@ -688,6 +734,16 @@ The registered object must implement these handlers to participate in the agent 
     this.on('unregisterAgent', async (msg: AbjectMessage) => {
       const agentId = msg.routing.from;
       const deleted = this.registeredAgents.delete(agentId);
+      // Drop any queued tasks for this agent — they have nowhere to run now.
+      // In-flight tasks remain in taskEntries for their last bit of cleanup
+      // (the state machine will be torn down when its handlers stop responding).
+      const q = this.agentTaskQueues.get(agentId);
+      if (q) {
+        if (q.pending.length > 0) {
+          log.info(`Agent ${agentId} unregistered with ${q.pending.length} pending task(s); dropping`);
+        }
+        this.agentTaskQueues.delete(agentId);
+      }
       if (deleted) log.info(`Agent unregistered: ${agentId}`);
       return { success: deleted };
     });
@@ -785,6 +841,108 @@ The registered object must implement these handlers to participate in the agent 
       return { ticketId: taskId };
     });
 
+    /**
+     * Enqueue a task on an agent's task queue. Used by ScrumMaster (or any
+     * caller that wants explicit per-agent serialization) to hand work to a
+     * specific agent. The agent's OTA loop runs queued tasks one at a time;
+     * ScrumMaster receives a `taskResult` event when each task terminates.
+     *
+     * Returns `{ taskId, queuePosition }` where queuePosition is 0 if the
+     * task started immediately (queue was idle), or N if it queued behind
+     * N other pending tasks.
+     */
+    this.on('enqueueTask', async (msg: AbjectMessage) => {
+      const {
+        agentId: targetAgentId,
+        task,
+        taskId: callerTaskId,
+        systemPrompt,
+        initialMessages,
+        config: taskConfig,
+        responseSchema,
+        goalId,
+        dispatchTupleId,
+        callerId: explicitCaller,
+      } = msg.payload as {
+        agentId: AbjectId;
+        task: string;
+        taskId?: string;
+        systemPrompt?: string;
+        initialMessages?: { role: string; content: string | ContentPart[] }[];
+        config?: Partial<AgentConfig>;
+        responseSchema?: Record<string, unknown>;
+        goalId?: string;
+        dispatchTupleId?: string;
+        callerId?: AbjectId;
+      };
+      if (!targetAgentId) throw new Error('enqueueTask requires agentId');
+      const agent = this.registeredAgents.get(targetAgentId);
+      if (!agent) throw new Error(`Agent "${targetAgentId}" is not registered`);
+
+      const taskId = callerTaskId ?? `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const callerId = explicitCaller ?? msg.routing.from;
+
+      let q = this.agentTaskQueues.get(targetAgentId);
+      if (!q) {
+        q = { pending: [] };
+        this.agentTaskQueues.set(targetAgentId, q);
+      }
+      const queued: QueuedTask = {
+        taskId,
+        task,
+        systemPrompt,
+        initialMessages,
+        config: taskConfig,
+        responseSchema,
+        goalId,
+        dispatchTupleId,
+        callerId,
+        enqueuedAt: Date.now(),
+      };
+      q.pending.push(queued);
+      const queuePosition = q.pending.length - 1 + (q.inFlight ? 1 : 0);
+      log.info(`enqueueTask: agent=${agent.name} task="${task.slice(0, 60)}" position=${queuePosition} (inFlight=${q.inFlight ? 'yes' : 'no'})`);
+      // Kick the queue runner — no-op if inFlight is already set.
+      this.processNextInQueue(targetAgentId);
+      return { taskId, queuePosition };
+    });
+
+    /**
+     * Inspect an agent's queue. Returns `{ inFlight, pending }` where
+     * inFlight is the currently-running task (or undefined) and pending is
+     * the FIFO list of tasks waiting their turn.
+     */
+    this.on('listAgentQueue', async (msg: AbjectMessage) => {
+      const { agentId } = msg.payload as { agentId: AbjectId };
+      const q = this.agentTaskQueues.get(agentId);
+      if (!q) return { inFlight: null, pending: [] };
+      const summarise = (t: QueuedTask) => ({
+        taskId: t.taskId,
+        task: t.task.slice(0, 100),
+        goalId: t.goalId ?? null,
+        enqueuedAt: t.enqueuedAt,
+      });
+      return {
+        inFlight: q.inFlight ? { taskId: q.inFlight.taskId, goalId: q.inFlight.goalId ?? null } : null,
+        pending: q.pending.map(summarise),
+      };
+    });
+
+    /**
+     * Drain pending tasks from an agent's queue without cancelling the
+     * in-flight task. Used by ScrumMaster on cleanup paths where we want
+     * to abandon scheduled work but let the current task run to completion.
+     */
+    this.on('drainAgentQueue', async (msg: AbjectMessage) => {
+      const { agentId } = msg.payload as { agentId: AbjectId };
+      const q = this.agentTaskQueues.get(agentId);
+      if (!q) return { drained: 0 };
+      const drained = q.pending.length;
+      q.pending = [];
+      log.info(`drainAgentQueue: agent ${agentId.slice(0, 8)} drained ${drained} pending task(s)`);
+      return { drained };
+    });
+
     this.on('getTaskStatus', async (msg: AbjectMessage) => {
       const { taskId } = msg.payload as { taskId: string };
       const entry = this.taskEntries.get(taskId);
@@ -857,27 +1015,59 @@ The registered object must implement these handlers to participate in the agent 
       };
     });
 
+    /**
+     * Cancel a task. If it's currently in-flight (has a TaskEntry and isn't
+     * already terminal), set its phase to error so the OTA loop bails at the
+     * next observe/think boundary. If it's pending in some agent's queue,
+     * splice it out so it never starts. `agentId` is optional; when omitted
+     * we scan every queue's pending list for a match.
+     */
     this.on('cancelTask', async (msg: AbjectMessage) => {
-      const { taskId } = msg.payload as { taskId: string };
+      const { taskId, agentId: hintedAgent } = msg.payload as { taskId: string; agentId?: AbjectId };
+      // First check in-flight tasks
       const entry = this.taskEntries.get(taskId);
-      if (!entry) return { success: false };
-      if (entry.state.phase === 'done' || entry.state.phase === 'error') return { success: false };
-      entry.state.phase = 'error';
-      entry.state.error = 'Cancelled';
-      return { success: true };
+      if (entry && entry.state.phase !== 'done' && entry.state.phase !== 'error') {
+        entry.state.phase = 'error';
+        entry.state.error = 'Cancelled';
+        return { success: true, where: 'in-flight' };
+      }
+      // Then check queue pending lists
+      const queuesToScan = hintedAgent
+        ? [this.agentTaskQueues.get(hintedAgent)].filter((q): q is NonNullable<typeof q> => !!q)
+        : [...this.agentTaskQueues.values()];
+      for (const q of queuesToScan) {
+        const idx = q.pending.findIndex(t => t.taskId === taskId);
+        if (idx >= 0) {
+          q.pending.splice(idx, 1);
+          return { success: true, where: 'queue' };
+        }
+      }
+      return { success: false };
     });
 
     this.on('cancelTasksByGoal', async (msg: AbjectMessage) => {
       const { goalId } = msg.payload as { goalId: string };
       let cancelled = 0;
+      // Cancel in-flight tasks (set phase=error so the OTA loop bails at the
+      // next observe/think boundary; runTaskAsync's tail will pop the next
+      // queued task as usual).
       for (const [taskId, entry] of this.taskEntries) {
         if ((entry.goalId === goalId || entry.incomingGoalId === goalId)
             && entry.state.phase !== 'done' && entry.state.phase !== 'error') {
           entry.state.phase = 'error';
           entry.state.error = 'Cancelled';
-          this.busyAgents.delete(entry.agentId);
           cancelled++;
-          log.info(`cancelTasksByGoal: cancelled task ${taskId} for goal ${goalId}`);
+          log.info(`cancelTasksByGoal: cancelled in-flight task ${taskId} for goal ${goalId}`);
+        }
+      }
+      // Drain pending tasks for this goal from every agent's queue.
+      for (const [agentId, q] of this.agentTaskQueues) {
+        const before = q.pending.length;
+        q.pending = q.pending.filter(t => t.goalId !== goalId);
+        const dropped = before - q.pending.length;
+        if (dropped > 0) {
+          log.info(`cancelTasksByGoal: dropped ${dropped} pending task(s) from agent ${agentId.slice(0, 8)} for goal ${goalId}`);
+          cancelled += dropped;
         }
       }
       return { cancelled };
@@ -953,613 +1143,6 @@ The registered object must implement these handlers to participate in the agent 
       }
     });
 
-    // ── TupleSpace + GoalManager watcher ──
-    this.on('changed', async (msg: AbjectMessage) => {
-      const { aspect, value } = msg.payload as { aspect: string; value: unknown };
-
-      // Handle GoalManager child goal events (completion, failure, task updates)
-      if (aspect === 'goalCompleted' || aspect === 'goalFailed'
-          || aspect === 'taskCompleted' || aspect === 'taskPermanentlyFailed') {
-        this.handleChildGoalEvent(aspect, value);
-        return;
-      }
-
-      // A task completed and dependent tasks may now be unblocked — re-scan
-      if (aspect === 'taskUnblocked') {
-        const { goalId } = value as { goalId?: string };
-        if (goalId) {
-          log.info(`UNBLOCK goalId=${goalId.slice(0, 8)} — re-scanning for unblocked tasks`);
-          this.scanNamespace(goalId);
-        }
-        return;
-      }
-
-      // Watch both tuplePut (new tasks) and tupleUpdated (retried tasks released back to pending)
-      if (aspect !== 'tuplePut' && aspect !== 'tupleUpdated') return;
-
-      const tuple = value as { id: string; fields: Record<string, unknown>; claimedBy?: string };
-      if (!tuple?.fields) {
-        log.info(`WATCHER ${aspect} — no fields, skipping`);
-        return;
-      }
-
-      const tupleId = tuple.id?.slice(0, 8) ?? '?';
-      const status = tuple.fields.status as string ?? '?';
-      const attempts = (tuple.fields.attempts as number) ?? 0;
-      const maxAttempts = (tuple.fields.maxAttempts as number) ?? 3;
-
-      if (status !== 'pending') {
-        log.info(`WATCHER ${aspect} ${tupleId} — skip: status=${status}`);
-        return;
-      }
-      if (tuple.claimedBy) {
-        log.info(`WATCHER ${aspect} ${tupleId} — skip: claimedBy=${tuple.claimedBy.slice(0, 8)}`);
-        return;
-      }
-      if (attempts >= maxAttempts) {
-        log.info(`WATCHER ${aspect} ${tupleId} — skip: attempts=${attempts}>=${maxAttempts}`);
-        return;
-      }
-
-      // Prevent concurrent dispatches for the same tuple
-      if (this.dispatchingTuples.has(tuple.id)) {
-        log.info(`WATCHER ${aspect} ${tupleId} — skip: already dispatching`);
-        return;
-      }
-
-      log.info(`WATCHER ${aspect} ${tupleId} attempts=${attempts}/${maxAttempts} — DISPATCHING`);
-      // Dispatch asynchronously — don't block the changed handler
-      this.dispatchToAgent(tuple);
-    });
-  }
-
-  // ═══════════════════════════════════════════════════════════════════
-  // Centralized Task Dispatch
-  // ═══════════════════════════════════════════════════════════════════
-
-  /**
-   * Centralized claim + dispatch for TupleSpace tasks.
-   * Asks agents via the ask protocol, filters out agents in failureHistory, optionally
-   * uses LLM to pick the best agent, claims via GoalManager, sends executeTask
-   * to the chosen agent, and handles success/failure.
-   */
-  private async dispatchToAgent(tuple: { id: string; fields: Record<string, unknown> }): Promise<void> {
-    if (!this.goalManagerId) return;
-
-    const tupleId = tuple.id.slice(0, 8);
-    log.info(`DISPATCH ${tupleId} — start (dispatchingTuples size=${this.dispatchingTuples.size})`);
-    this.dispatchingTuples.add(tuple.id);
-
-    try {
-      await this.dispatchToAgentInner(tuple);
-      log.info(`DISPATCH ${tupleId} — completed normally`);
-    } catch (err) {
-      log.info(`DISPATCH ${tupleId} — threw: ${(err as Error).message?.slice(0, 120)}`);
-    } finally {
-      // Brief guard to prevent rapid re-dispatch from CRDT sync duplicates
-      log.info(`DISPATCH ${tupleId} — cooldown 1s before removing from dispatchingTuples`);
-      setTimeout(() => {
-        this.dispatchingTuples.delete(tuple.id);
-        log.info(`DISPATCH ${tupleId} — cooldown expired, removed from dispatchingTuples`);
-      }, 1000);
-    }
-  }
-
-  private async dispatchToAgentInner(tuple: { id: string; fields: Record<string, unknown> }): Promise<void> {
-    const tupleId = tuple.id.slice(0, 8);
-    const description = tuple.fields.description as string;
-    const data = tuple.fields.data as Record<string, unknown> | undefined;
-    const taskGoalId = tuple.fields.goalId as string | undefined;
-    const failureHistory = (tuple.fields.failureHistory as Array<{ agent: string; agentId: string; error: string; timestamp: number }>) ?? [];
-
-    log.info(`DISPATCH-INNER ${tupleId} goalId=${taskGoalId?.slice(0, 8) ?? '?'} failureHistory=${failureHistory.length}`);
-
-    // 0. Check dependencies — skip if any are unsatisfied
-    // The tuple's namespace (in TupleSpace) is the topmost goal's id; child goals
-    // share their root's namespace. Look it up from the tuple itself or by walking
-    // the goal chain. We can find the namespace by scanning the tuple's actual
-    // namespace from the goal manager.
-    const dependsOn = (tuple.fields.dependsOn as string[]) ?? [];
-    if (dependsOn.length > 0 && taskGoalId && this.tupleSpaceId && this.goalManagerId) {
-      try {
-        // Walk up to find the root goal id (which is the namespace)
-        let rootGoalId = taskGoalId;
-        let depth = 0;
-        while (depth < 10) {
-          const g = await this.request<{ id?: string; parentId?: string } | null>(
-            request(this.id, this.goalManagerId, 'getGoal', { goalId: rootGoalId }),
-          );
-          if (!g?.parentId) break;
-          rootGoalId = g.parentId;
-          depth++;
-        }
-        const allTuples = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
-          request(this.id, this.tupleSpaceId, 'scan', {
-            namespace: rootGoalId,
-            pattern: {},
-          }),
-        );
-        const doneIds = new Set(allTuples.filter(t => t.fields.status === 'done').map(t => t.id));
-        if (!dependsOn.every(depId => doneIds.has(depId))) {
-          log.info(`DISPATCH-INNER ${tupleId} — blocked: dependencies not yet satisfied (ns=${rootGoalId.slice(0, 8)}, deps=${dependsOn.map(d => d.slice(0, 8)).join(',')}, done=${[...doneIds].map(d => d.slice(0, 8)).join(',')})`);
-          return;
-        }
-      } catch { /* best effort — proceed without check */ }
-    }
-
-    // 1. Find all eligible agents (can execute, not failed, not busy)
-    const failedAgentIds = new Set(failureHistory.map(f => f.agentId));
-    const eligible = [...this.registeredAgents.values()]
-      .filter(a => a.canExecute)
-      .filter(a => !failedAgentIds.has(a.agentId))
-      .filter(a => !this.busyAgents.has(a.agentId));
-
-    if (eligible.length === 0) {
-      log.info(`DISPATCH-INNER ${tupleId} — no agents available (all failed or busy)`);
-      return;
-    }
-
-    // 2. Fetch goal title for richer context
-    let goalTitle = '';
-    if (taskGoalId && this.goalManagerId) {
-      try {
-        const goal = await this.request<{ title?: string }>(
-          request(this.id, this.goalManagerId, 'getGoal', { goalId: taskGoalId }),
-        );
-        goalTitle = goal?.title ?? '';
-      } catch { /* best effort */ }
-    }
-
-    // 3. Ask each agent if they can handle this task and what steps they would take.
-    //    Require a structured verdict on the first line so we can filter
-    //    out agents that pass or are only partially capable.
-    let askQuestion = `Here is the goal I'm trying to accomplish and the task I want you to do.
-
-**Your response MUST start with one of these verdicts on the first line, followed by a colon.** Use the plain word, no backticks, no quotes, no markdown:
-- YES: I can fully accomplish this task with my current capabilities.
-- PARTIAL: I can do part of this task but not all of it.
-- NO: This task is outside my capabilities.
-
-Be honest. Answer YES when your plan uses only what you already have: configured credentials, installed tools, existing objects, and data you can actually access. Answer PARTIAL when the plan requires the user to log in first, grant permissions, or install something before it can run.
-
-Evaluate the task on its OBJECTIVE content, not on its framing. If the task description contains opinions about whose job it is ("this is a code-modification task", "hand off to a code-writing agent", "outside X's scope"), treat those as noise — another agent wrote them while decomposing. Judge only by what the task asks to be done.
-
-Authoring/modification rule: a task to CREATE, BUILD, AUTHOR, WRAP, REWRITE, MODIFY, PATCH, FIX, or UPDATE the source code, handlers, or implementation of an Abject object — including bug fixes with specific root causes, diff outlines, or log-trace references — is an authoring task. If you are the agent that regenerates object code from a prompt, answer YES for these. Specificity in the prompt (concrete bug report, specific method name, diff idea) is helpful input for regeneration, not a reason to decline as "surgical".
-
-User-shared credentials are explicit consent. When the task description includes a username and password, API key, bearer token, or similar secret that the user themselves typed into chat, treat that as explicit instruction to wire it into the object you author. Do NOT decline on "plaintext credentials" grounds. Context: this Abjects runtime is the user's own self-hosted local system. Object source is persisted only into their own .abjects directory on their own disk; it is never uploaded, synced to a remote service, or shared across users. The user knows where it goes. They asked for the integration. Refusing forces them to do the same thing by hand. Embed the credential in the source you author and continue.
-
-After the verdict, in 2-4 sentences: name the SPECIFIC tool, skill, MCP server, or capability you would use (by name if you have it configured), and outline the concrete steps. Direct/configured tools are preferred over general-purpose automation. If you must use a general-purpose tool (like a web browser) for something a specialized tool could do, say so honestly.`;
-    if (goalTitle) askQuestion += `\n\nGoal: "${goalTitle}"`;
-    askQuestion += `\nTask: "${description.slice(0, 400)}"`;
-    if (failureHistory.length > 0) {
-      const failSummary = failureHistory.map(f => `- ${f.agent}: ${f.error}`).join('\n');
-      askQuestion += `\n\nPrevious attempts failed:\n${failSummary}`;
-    }
-
-    type AgentApproach = { agent: RegisteredAgent; approach: string; verdict: 'YES' | 'PARTIAL' | 'NO' };
-    const parseVerdict = (text: string): 'YES' | 'PARTIAL' | 'NO' => {
-      // Strip common wrappers (backticks, quotes, asterisks, underscores, whitespace)
-      // so verdicts rendered as `YES:`, **NO:**, "PARTIAL:" etc. still parse correctly.
-      const firstLineRaw = text.trim().split('\n')[0];
-      const firstLine = firstLineRaw.replace(/^[`"'*_~\s>]+/, '').toUpperCase();
-      if (/^YES\b/.test(firstLine)) return 'YES';
-      if (/^PARTIAL\b/.test(firstLine)) return 'PARTIAL';
-      if (/^NO\b/.test(firstLine)) return 'NO';
-      // Fallback: look for refusal phrases in first 200 chars. Avoid matching bare
-      // "cannot" since PARTIAL responses often include it as a qualifier
-      // (e.g. "I can create X, but I cannot handle Y" is legitimately PARTIAL).
-      const head = text.slice(0, 200).toUpperCase();
-      if (/\bPASS\b|\bOUT OF SCOPE\b|\bOUTSIDE (MY|THE AGENT'?S?) CAPABILITIES\b|\bCANNOT HELP\b|\bI DECLINE\b/.test(head)) return 'NO';
-      return 'PARTIAL';
-    };
-
-    const allApproaches: AgentApproach[] = await Promise.all(
-      eligible.map(async (agent) => {
-        try {
-          const answer = await this.request<string>(
-            request(this.id, agent.agentId, 'ask', { question: askQuestion }),
-            30000,
-          );
-          const text = typeof answer === 'string' ? answer : String(answer);
-          return { agent, approach: text, verdict: parseVerdict(text) };
-        } catch {
-          return { agent, approach: 'NO: ask failed', verdict: 'NO' as const };
-        }
-      })
-    );
-
-    for (const a of allApproaches) {
-      log.info(`DISPATCH-INNER ${tupleId} — ${a.agent.name} [${a.verdict}]: ${a.approach.slice(0, 150)}`);
-    }
-
-    // Prefer YES agents. Only fall back to PARTIAL if no YES exists.
-    // Never dispatch to NO agents.
-    const yesAgents = allApproaches.filter(a => a.verdict === 'YES');
-    const partialAgents = allApproaches.filter(a => a.verdict === 'PARTIAL');
-    const approaches = yesAgents.length > 0 ? yesAgents : partialAgents;
-
-    if (approaches.length === 0) {
-      log.info(`DISPATCH-INNER ${tupleId} — no agent can handle: all declined`);
-      if (taskGoalId && this.goalManagerId) {
-        this.send(event(this.id, this.goalManagerId, 'updateProgress', {
-          goalId: taskGoalId,
-          message: 'All agents declined this task',
-          phase: 'dispatch',
-          agentName: 'AgentAbject',
-        }));
-      }
-      // In-memory retry counter survives the periodic scan re-fetching tuples
-      // from SharedState (which would otherwise reset a tuple-stored count).
-      const prev = this.declineRetries.get(tupleId) ?? 0;
-      const next = prev + 1;
-      if (next <= AgentAbject.MAX_DECLINE_RETRIES) {
-        this.declineRetries.set(tupleId, next);
-        const delay = Math.min(5000 * next, 30000);
-        log.info(`DISPATCH-INNER ${tupleId} — scheduling retry ${next}/${AgentAbject.MAX_DECLINE_RETRIES} in ${delay}ms`);
-        setTimeout(() => {
-          this.dispatchToAgent(tuple).catch(err => {
-            log.warn(`DISPATCH-INNER ${tupleId} — retry failed:`, err instanceof Error ? err.message : String(err));
-          });
-        }, delay);
-      } else {
-        // Retries exhausted — fail the task so the periodic scan stops re-dispatching.
-        // Without this, scanNamespace fetches a fresh tuple object every cycle and the
-        // counter on the in-memory tuple resets, producing an infinite "All agents declined"
-        // loop. failTask sets status to permanently_failed (after maxAttempts) so the
-        // scan filter excludes it.
-        log.info(`DISPATCH-INNER ${tupleId} — retries exhausted (${prev}/${AgentAbject.MAX_DECLINE_RETRIES}); failing task`);
-        this.declineRetries.delete(tupleId);
-        if (taskGoalId && this.goalManagerId) {
-          this.send(event(this.id, this.goalManagerId, 'failTask', {
-            taskId: tupleId,
-            goalId: taskGoalId,
-            error: 'No agent capable of handling this task. All registered agents declined repeatedly.',
-            agentName: 'AgentAbject',
-            agentId: this.id,
-          }));
-        }
-      }
-      return;
-    }
-
-    const approachList = approaches.map(a =>
-      `- ${a.agent.name} (${a.agent.description.slice(0, 150)}) [${a.verdict}]: ${a.approach.slice(0, 500)}`
-    ).join('\n');
-
-    const evalPrompt = `Goal: "${goalTitle || 'N/A'}"
-Task: "${description.slice(0, 400)}"
-
-These agents said they can handle this task (YES = fully, PARTIAL = partially). Each includes their role description and their proposed plan:
-
-${approachList}
-
-Evaluate each agent's plan on (in this priority order):
-1. **Verdict**: YES strongly preferred over PARTIAL. PARTIAL is a fallback only.
-2. **Tool specificity**: An agent with a SPECIFIC, ALREADY-CONFIGURED tool for this exact task (e.g. an enabled MCP server for email when the task is about email, a native API client for a service) is STRONGLY preferred over an agent proposing general-purpose automation (web browsing, shell scripting, etc). Even if the general-purpose plan sounds more detailed, prefer the specific tool — it's faster, more reliable, and doesn't require credentials/login the user hasn't provided.
-3. **Realism**: Is the plan feasible with what the agent actually has? Plans that rely on logging in, granting permissions, or data the agent doesn't have access to are unrealistic.
-4. **Efficiency**: Fewer steps to result is better.
-
-Be careful: verbose, confident-sounding prose about general automation is NOT the same as having the right tool. A short "I'll use the configured X skill" beats a long "I'll navigate a browser and click around".
-
-Pick the agent with the best combination. Reply with ONLY the agent name.`;
-
-    let chosen: RegisteredAgent | undefined;
-    let chosenApproach = '';
-    if (approaches.length === 1) {
-      // Only one candidate — skip the evaluator
-      chosen = approaches[0].agent;
-      chosenApproach = approaches[0].approach;
-      log.info(`DISPATCH-INNER ${tupleId} — single candidate: ${chosen.name} [${approaches[0].verdict}]`);
-    } else {
-      try {
-        const evalResult = await this.askLlm(
-          'You are a task dispatcher. Evaluate each agent plan on efficiency and likelihood of success. Pick the best one.',
-          evalPrompt,
-          'smart',
-        );
-        const trimmed = evalResult.trim();
-        log.info(`DISPATCH-INNER ${tupleId} — evaluator says: "${trimmed}"`);
-        const match = approaches.find(a =>
-          trimmed.toLowerCase().includes(a.agent.name.toLowerCase())
-        );
-        if (match) {
-          chosen = match.agent;
-          chosenApproach = match.approach;
-        }
-      } catch {
-        // LLM failed — fall back to first YES/PARTIAL candidate
-        chosen = approaches[0].agent;
-        chosenApproach = approaches[0].approach;
-      }
-    }
-
-    if (!chosen) {
-      log.info(`DISPATCH-INNER ${tupleId} — no agent can handle: ${description.slice(0, 60)}`);
-      // Notify GoalManager so progress events keep flowing (prevents Chat timeout)
-      if (taskGoalId && this.goalManagerId) {
-        this.send(event(this.id, this.goalManagerId, 'updateProgress', {
-          goalId: taskGoalId,
-          message: 'Looking for an available agent...',
-          phase: 'dispatch',
-          agentName: 'AgentAbject',
-        }));
-      }
-      // Same in-memory retry policy as the all-declined path — the periodic
-      // scan would otherwise reset a tuple-stored counter every cycle.
-      const prev = this.declineRetries.get(tupleId) ?? 0;
-      const next = prev + 1;
-      if (next <= AgentAbject.MAX_DECLINE_RETRIES) {
-        this.declineRetries.set(tupleId, next);
-        const delay = Math.min(5000 * next, 30000);
-        log.info(`DISPATCH-INNER ${tupleId} — scheduling retry ${next}/${AgentAbject.MAX_DECLINE_RETRIES} in ${delay}ms`);
-        setTimeout(() => {
-          this.dispatchToAgent(tuple).catch(err => {
-            log.warn(`DISPATCH-INNER ${tupleId} — retry failed:`, err instanceof Error ? err.message : String(err));
-          });
-        }, delay);
-      } else {
-        log.info(`DISPATCH-INNER ${tupleId} — retries exhausted (${prev}/${AgentAbject.MAX_DECLINE_RETRIES}); failing task`);
-        this.declineRetries.delete(tupleId);
-        if (taskGoalId && this.goalManagerId) {
-          this.send(event(this.id, this.goalManagerId, 'failTask', {
-            taskId: tupleId,
-            goalId: taskGoalId,
-            error: 'No agent capable of handling this task. The evaluator could not pick a winning candidate.',
-            agentName: 'AgentAbject',
-            agentId: this.id,
-          }));
-        }
-      }
-      return;
-    }
-
-    log.info(`DISPATCH-INNER ${tupleId} — ${chosen.name} (selected from ${approaches.length} agents)`);
-
-    // 3a. Mark agent busy BEFORE the async claim to prevent concurrent
-    // dispatches from claiming tasks for the same agent (JS is single-threaded,
-    // so this is visible to any dispatch that runs between our await points).
-    if (this.busyAgents.has(chosen.agentId)) {
-      log.info(`DISPATCH-INNER ${tupleId} — agent ${chosen.name} became busy, aborting before claim`);
-      return;
-    }
-    this.busyAgents.add(chosen.agentId);
-
-    // 4. Claim via GoalManager
-    log.info(`DISPATCH-INNER ${tupleId} — claiming for ${chosen.name}`);
-    let claimed: { tuple: { id: string; fields: Record<string, unknown> }; claimed: boolean } | null;
-    try {
-      claimed = await this.request<{ tuple: { id: string; fields: Record<string, unknown> }; claimed: boolean } | null>(
-        request(this.id, this.goalManagerId!, 'claimTask', {
-          goalId: taskGoalId,
-        })
-      );
-    } catch (err) {
-      log.info(`DISPATCH-INNER ${tupleId} — claim failed: ${(err as Error).message}`);
-      this.busyAgents.delete(chosen.agentId);
-      return;
-    }
-
-    if (!claimed) {
-      log.info(`DISPATCH-INNER ${tupleId} — no claimable tuple found`);
-      this.busyAgents.delete(chosen.agentId);
-      return;
-    }
-    // Successfully claimed — clear any decline-retry history for this tuple.
-    this.declineRetries.delete(tupleId);
-    log.info(`DISPATCH-INNER ${tupleId} — claimed, sending executeTask to ${chosen.name}`);
-
-    // 4b. Store agent name on the tuple so GoalBrowser can display it
-    if (this.goalManagerId && taskGoalId) {
-      try {
-        await this.request(request(this.id, this.goalManagerId, 'updateTaskFields', {
-          goalId: taskGoalId,
-          taskId: claimed.tuple.id,
-          fields: { agentName: chosen.name },
-        }));
-      } catch { /* best effort */ }
-    }
-
-    // 5. Report progress (attempts are tracked by failTask, not here)
-    if (taskGoalId) {
-      this.send(event(this.id, this.goalManagerId!, 'updateProgress', {
-        goalId: taskGoalId,
-        message: `${chosen.name} claiming task: ${description.slice(0, 60)}`,
-        phase: 'dispatch',
-        agentName: 'AgentAbject',
-      }));
-    }
-
-    // 6. Route executeTask through JobManager so it appears in the Jobs panel.
-    // Pass the payload via the sandbox context (bound variable) rather than
-    // inlining it into jobCode — free-form text in `description` / `approach`
-    // could otherwise contain substrings like "fetch(" that trip the sandbox
-    // code validator even though they're inside JSON string literals.
-    const dispatchStart = Date.now();
-    const executePayload = {
-      tupleId: claimed.tuple.id,
-      goalId: taskGoalId,
-      description,
-      data,
-      callerId: this.id,
-      approach: chosenApproach || undefined,
-      failureHistory: failureHistory.length > 0 ? failureHistory : undefined,
-    };
-    const jobCode = `return await call(${JSON.stringify(chosen.agentId)}, 'executeTask', __payload);`;
-    const jobMgrId = await this.resolveDep('JobManager', this.jobManagerId);
-    const submitMsg = request(this.id, jobMgrId, 'submitJob', {
-      description: `[${chosen.name}] ${description.slice(0, 80)}`,
-      code: jobCode,
-      context: { __payload: executePayload },
-      queue: chosen.name,
-    });
-    // No explicit heartbeat: progress events from the running job bubble up
-    // through Abject base class and reset this request's stall timer.
-
-    try {
-      const jobResult = await this.request<JobResult>(submitMsg, 200000);
-      if (jobResult.status === 'failed') throw new Error(jobResult.error ?? 'Job failed');
-      const result = jobResult.result;
-
-      const elapsed = Date.now() - dispatchStart;
-      log.info(`DISPATCH-INNER ${tupleId} — executeTask SUCCESS (${elapsed}ms), completing task`);
-
-      // 7. Check result — fail, watch child goal, or complete
-      const resultObj = result as Record<string, unknown> | undefined;
-      if (resultObj && resultObj.success === false) {
-        // Agent returned an explicit failure (e.g. "Object not found") — treat as failTask so it can retry
-        const errorMsg = (resultObj.error as string) ?? 'Task returned success: false';
-        log.info(`DISPATCH-INNER ${tupleId} — executeTask returned failure: ${errorMsg.slice(0, 120)}`);
-        try {
-          await this.request(
-            request(this.id, this.goalManagerId!, 'failTask', {
-              taskId: claimed.tuple.id,
-              goalId: taskGoalId,
-              error: errorMsg,
-              agentName: chosen.name,
-              agentId: chosen.agentId,
-            })
-          );
-        } catch (err2) {
-          log.info(`DISPATCH-INNER ${tupleId} — failTask also failed: ${(err2 as Error).message?.slice(0, 80)}`);
-        }
-      } else if (resultObj && resultObj.childGoalId) {
-        log.info(`DISPATCH-INNER ${tupleId} — task spawned child goal ${(resultObj.childGoalId as string).slice(0, 8)}, watching`);
-        this.watchChildGoal(resultObj.childGoalId as string, claimed.tuple.id, taskGoalId!);
-      } else {
-        await this.request(
-          request(this.id, this.goalManagerId!, 'completeTask', {
-            taskId: claimed.tuple.id,
-            goalId: taskGoalId,
-            result,
-          })
-        );
-        log.info(`DISPATCH-INNER ${tupleId} — task completed`);
-      }
-    } catch (err) {
-      const elapsed = Date.now() - dispatchStart;
-      log.info(`DISPATCH-INNER ${tupleId} — executeTask FAILED (${elapsed}ms): ${(err as Error).message?.slice(0, 120)}`);
-      // 8. Fail task with agent identity for history tracking
-      try {
-        await this.request(
-          request(this.id, this.goalManagerId!, 'failTask', {
-            taskId: claimed.tuple.id,
-            goalId: taskGoalId,
-            error: (err as Error).message,
-            agentName: chosen.name,
-            agentId: chosen.agentId,
-          })
-        );
-        log.info(`DISPATCH-INNER ${tupleId} — failTask sent`);
-      } catch (err2) {
-        log.info(`DISPATCH-INNER ${tupleId} — failTask also failed: ${(err2 as Error).message?.slice(0, 80)}`);
-      }
-    } finally {
-      this.busyAgents.delete(chosen.agentId);
-      // Immediate re-scan: pick up next pending task for this now-free agent
-      this.periodicScan().catch(() => {});
-    }
-  }
-
-  /**
-   * Scan TupleSpace for pending/unclaimed tasks and dispatch eligible ones.
-   * Catches tasks missed during cooldown, pre-existing at boot, or lost events.
-   * Queries GoalManager for active top-level goals and scans each namespace.
-   */
-  private async periodicScan(): Promise<void> {
-    if (!this.tupleSpaceId || !this.goalManagerId) return;
-
-    try {
-      const goals = await this.request<Array<{ id: string; parentId?: string }>>(
-        request(this.id, this.goalManagerId, 'listGoals', { status: 'active' })
-      );
-      // Only scan top-level goals; child goals share their root's tuple namespace.
-      for (const goal of goals) {
-        if (goal.parentId) continue;
-        await this.scanNamespace(goal.id);
-      }
-    } catch (err) {
-      log.info(`SCAN failed: ${(err as Error).message?.slice(0, 120)}`);
-    }
-  }
-
-  private async scanNamespace(namespace: string): Promise<void> {
-    if (!this.tupleSpaceId) return;
-    try {
-      // Scan all tuples (any status) so we can build the doneIds set for
-      // dependency checking, then dispatch pending ones whose deps are met.
-      const allTuples = await this.request<Array<{ id: string; fields: Record<string, unknown>; claimedBy?: string }>>(
-        request(this.id, this.tupleSpaceId, 'scan', {
-          namespace,
-          pattern: {},
-        })
-      );
-
-      const doneIds = new Set(
-        allTuples.filter(t => t.fields.status === 'done').map(t => t.id),
-      );
-      const tuples = allTuples.filter(t => t.fields.status === 'pending');
-
-      let dispatched = 0;
-      for (const tuple of tuples) {
-        if (tuple.claimedBy) continue;
-        const attempts = (tuple.fields.attempts as number) ?? 0;
-        const maxAttempts = (tuple.fields.maxAttempts as number) ?? 3;
-        if (attempts >= maxAttempts) continue;
-        if (this.dispatchingTuples.has(tuple.id)) continue;
-
-        // Skip tasks whose dependencies haven't completed yet
-        const dependsOn = (tuple.fields.dependsOn as string[]) ?? [];
-        if (dependsOn.length > 0 && !dependsOn.every(depId => doneIds.has(depId))) {
-          continue;
-        }
-
-        log.info(`SCAN ${tuple.id.slice(0, 8)} attempts=${attempts}/${maxAttempts} — DISPATCHING`);
-        this.dispatchToAgent(tuple);
-        dispatched++;
-      }
-      if (dispatched > 0) {
-        log.info(`SCAN dispatched ${dispatched} pending task(s) from ns=${namespace.slice(0, 8)}`);
-      }
-    } catch (err) {
-      log.info(`SCAN ns=${namespace.slice(0, 8)} failed: ${(err as Error).message?.slice(0, 120)}`);
-    }
-  }
-
-  /**
-   * Use a short LLM call to classify which agent is best suited for a task.
-   * Falls back to the first candidate if LLM is unavailable or fails.
-   */
-  private async classifyBestAgent(candidates: RegisteredAgent[], description: string): Promise<RegisteredAgent> {
-    if (!this.llmId) return candidates[0];
-
-    const agentList = candidates.map((a, i) => `${i}: ${a.name} — ${a.description}`).join('\n');
-    const prompt = `Given this task: "${description.slice(0, 200)}"
-
-Which agent is best suited? Pick one by index number.
-
-Agents:
-${agentList}
-
-Reply with ONLY the index number (e.g. "0" or "1").`;
-
-    try {
-      const result = await this.request<{ content: string }>(
-        request(this.id, this.llmId, 'complete', {
-          messages: [{ role: 'user', content: prompt }],
-          options: { maxTokens: 20 },
-        }),
-        10000,
-      );
-      const content = result.content ?? '';
-      const idx = parseInt(content.trim(), 10);
-      if (!isNaN(idx) && idx >= 0 && idx < candidates.length) {
-        return candidates[idx];
-      }
-    } catch (err) {
-      log.warn(`classifyBestAgent LLM failed, using first candidate:`, err instanceof Error ? err.message : String(err));
-    }
-
-    return candidates[0];
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1758,18 +1341,10 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       }
     }
 
-    // Complete or fail the underlying work item via GoalManager.
-    //
-    // When this task came from a TupleSpace dispatch, the dispatcher
-    // (dispatchToAgentInner) is responsible for calling completeTask on the
-    // specific tuple. We must NOT call completeGoal here because a goal may
-    // contain multiple tasks (e.g. Chat's "diagnose then fix" pattern) —
-    // force-completing the parent goal would cause GoalManager to drop all
-    // subsequent progress events for tasks added later, which in turn stalls
-    // Chat's waitForTaskCompletion timers.
-    //
-    // When this task is a solo agent run (no dispatchTupleId), the agent owns
-    // the whole goal and completing/failing it here is correct.
+    // Solo agent run with goalId set but no dispatchTupleId: the caller owns
+    // the goal end-to-end, so completeGoal/failGoal is correct here. Tasks
+    // queued via enqueueTask carry dispatchTupleId; ScrumMaster owns goal
+    // lifecycle for those, so we don't compete with it.
     if (entry.goalId && this.goalManagerId && !entry.dispatchTupleId) {
       if (success) {
         this.send(event(this.id, this.goalManagerId, 'completeGoal', {
@@ -1781,6 +1356,35 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
           goalId: entry.goalId,
           error: entry.state.error,
         }));
+      }
+    }
+
+    // For tasks dispatched via enqueueTask (dispatchTupleId set), AgentAbject
+    // calls completeTask / failTask on the originating tuple so ScrumMaster's
+    // goalReadyForCompletion trigger fires. The taskResult event below also
+    // carries the same outcome to the caller (typically ScrumMaster).
+    if (entry.dispatchTupleId && this.goalManagerId) {
+      const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
+      try {
+        if (success) {
+          await this.request(request(this.id, this.goalManagerId, 'completeTask', {
+            taskId: entry.dispatchTupleId,
+            goalId: entry.incomingGoalId ?? entry.goalId,
+            result: entry.state.result,
+          }));
+          log.info(`[${agentName}] Task ${entry.state.id.slice(0, 8)} done; tuple ${entry.dispatchTupleId.slice(0, 8)} marked done`);
+        } else {
+          await this.request(request(this.id, this.goalManagerId, 'failTask', {
+            taskId: entry.dispatchTupleId,
+            goalId: entry.incomingGoalId ?? entry.goalId,
+            error: entry.state.error ?? 'Task failed',
+            agentName,
+            agentId: entry.agentId,
+          }));
+          log.info(`[${agentName}] Task ${entry.state.id.slice(0, 8)} failed; tuple ${entry.dispatchTupleId.slice(0, 8)} marked failed`);
+        }
+      } catch (err) {
+        log.warn(`completeTask/failTask for tuple ${entry.dispatchTupleId.slice(0, 8)} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 
@@ -1803,6 +1407,75 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
       result: success ? entry.state.result : undefined,
       error: success ? undefined : entry.state.error,
     });
+
+    // ── Queue runner ──
+    // Clear inFlight for this agent and pop the next pending task, if any.
+    // The queue's inFlight slot is the one-task-at-a-time guard that
+    // replaces the legacy `busyAgents` set.
+    const q = this.agentTaskQueues.get(entry.agentId);
+    if (q && q.inFlight?.taskId === entry.state.id) {
+      q.inFlight = undefined;
+      this.processNextInQueue(entry.agentId);
+    }
+  }
+
+  /**
+   * Pop the next pending task from an agent's queue and start it through
+   * the OTA loop. No-op if `inFlight` is set or `pending` is empty.
+   * Called from `enqueueTask` (initial kick-off) and from `runTaskAsync`'s
+   * tail (when a task terminates and the slot frees).
+   */
+  private processNextInQueue(agentId: AbjectId): void {
+    const q = this.agentTaskQueues.get(agentId);
+    if (!q || q.inFlight || q.pending.length === 0) return;
+    const next = q.pending.shift()!;
+    q.inFlight = { taskId: next.taskId, goalId: next.goalId };
+    this.startQueuedTask(agentId, next).catch(err => {
+      log.warn(`startQueuedTask for ${agentId.slice(0, 8)} threw: ${err instanceof Error ? err.message : String(err)}`);
+      // Free the slot so subsequent enqueues aren't stuck.
+      const q2 = this.agentTaskQueues.get(agentId);
+      if (q2) q2.inFlight = undefined;
+      this.processNextInQueue(agentId);
+    });
+  }
+
+  /**
+   * Send the queued task to the agent's `executeTask` handler so the agent
+   * can do its per-task setup (e.g. ObjectCreator's LoopState) and then call
+   * back into AgentAbject.startTask. The queued taskId flows through to the
+   * agent's startTask so AgentAbject's TaskEntry, the agent's per-task state,
+   * and the queue's `inFlight` slot all share one ID — runTaskAsync's tail
+   * matches `entry.state.id` against `q.inFlight.taskId` to clear the slot
+   * and pop the next pending task.
+   */
+  private async startQueuedTask(agentId: AbjectId, queued: QueuedTask): Promise<void> {
+    const agent = this.registeredAgents.get(agentId);
+    if (!agent) {
+      log.warn(`startQueuedTask: agent ${agentId.slice(0, 8)} no longer registered; dropping task ${queued.taskId.slice(0, 8)}`);
+      const q = this.agentTaskQueues.get(agentId);
+      if (q) {
+        q.inFlight = undefined;
+        this.processNextInQueue(agentId);
+      }
+      return;
+    }
+    log.info(`Queue runner: starting task ${queued.taskId.slice(0, 8)} on agent ${agent.name}`);
+    // Fire-and-forget. The agent's executeTask handler returns DEFERRED_REPLY;
+    // we don't await its response. AgentAbject's runTaskAsync runs the state
+    // machine synchronously (within the async event loop) and its tail clears
+    // the queue's inFlight slot.
+    this.send(request(this.id, agentId, 'executeTask', {
+      tupleId: queued.taskId,
+      taskId: queued.taskId,
+      goalId: queued.goalId,
+      description: queued.task,
+      callerId: queued.callerId,
+      systemPrompt: queued.systemPrompt,
+      initialMessages: queued.initialMessages,
+      config: queued.config,
+      responseSchema: queued.responseSchema,
+      dispatchTupleId: queued.dispatchTupleId ?? queued.taskId,
+    }));
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1856,86 +1529,6 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
             else entry.lastObservationLlmContent = undefined;
             if (obsData.tier) entry.observeTier = obsData.tier;
 
-            // If there are active child goals, wait for next event then check status
-            if (entry.childGoalIds && entry.childGoalIds.length > 0 && this.goalManagerId) {
-              const statusLines: string[] = [];
-              const stillActive: string[] = [];
-
-              for (const cgId of entry.childGoalIds) {
-                try {
-                  const goal = await this.request<{ id: string; status: string; title: string; result?: unknown; error?: string } | null>(
-                    request(this.id, this.goalManagerId, 'getGoal', { goalId: cgId }),
-                  );
-                  if (!goal) continue;
-
-                  if (goal.status === 'completed' || goal.status === 'failed') {
-                    statusLines.push(goal.status === 'completed'
-                      ? `[Child Goal "${goal.title}"] COMPLETED: ${JSON.stringify(goal.result)?.slice(0, 20000)}`
-                      : `[Child Goal "${goal.title}"] FAILED: ${goal.error ?? 'unknown'}`);
-                    continue;
-                  }
-
-                  // Active — check task progress
-                  const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
-                    request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId: cgId }),
-                  );
-                  const doneT = tasks.filter(t => t.fields.status === 'done');
-                  const pending = tasks.filter(t => t.fields.status === 'pending');
-                  const inProgress = tasks.filter(t => t.fields.claimedBy);
-                  const permFailed = tasks.filter(t => t.fields.status === 'permanently_failed');
-
-                  // Agent decides: all tasks done → complete the child goal
-                  if (pending.length === 0 && inProgress.length === 0 && doneT.length > 0 && permFailed.length === 0) {
-                    const results = doneT.map(t => ({
-                      type: t.fields.type, description: t.fields.description, result: t.fields.result,
-                    }));
-                    await this.request(request(this.id, this.goalManagerId, 'completeGoal', {
-                      goalId: cgId, result: results,
-                    }));
-                    statusLines.push(`[Child Goal "${goal.title}"] COMPLETED (${doneT.length} tasks): ${JSON.stringify(results)?.slice(0, 20000)}`);
-                  } else if (pending.length === 0 && inProgress.length === 0 && permFailed.length > 0 && doneT.length === 0) {
-                    // All tasks permanently failed → fail the child goal
-                    await this.request(request(this.id, this.goalManagerId, 'failGoal', {
-                      goalId: cgId, error: `All ${permFailed.length} tasks permanently failed`,
-                    }));
-                    statusLines.push(`[Child Goal "${goal.title}"] FAILED: all tasks permanently failed`);
-                  } else if (pending.length === 0 && inProgress.length === 0 && permFailed.length > 0 && doneT.length > 0) {
-                    // Partial failure: some tasks done, some permanently failed — trigger reflection
-                    const failedDescs = permFailed.map(t =>
-                      `  \u2717 ${(t.fields.description as string ?? '').slice(0, 120)}: ${String(t.fields.error ?? 'unknown').slice(0, 100)}`
-                    );
-                    const doneDescs = doneT.map(t =>
-                      `  \u2713 ${(t.fields.description as string ?? '').slice(0, 120)}`
-                    );
-                    statusLines.push(
-                      `[Child Goal "${goal.title}"] PARTIAL FAILURE: ${doneT.length} succeeded, ${permFailed.length} failed` +
-                      `\nSucceeded:\n${doneDescs.join('\n')}` +
-                      `\nFailed:\n${failedDescs.join('\n')}` +
-                      `\n[Reflection] Consider whether to:` +
-                      `\n- Use "replan" to create revised tasks addressing the failures` +
-                      `\n- Use "done" if partial results are sufficient` +
-                      `\n- Use "fail" if the goal is unachievable`,
-                    );
-                  } else {
-                    // Still in progress — keep tracking
-                    stillActive.push(cgId);
-                    statusLines.push(`[Child Goal "${goal.title}"] ${doneT.length}/${tasks.length} tasks done, ${pending.length} pending`);
-                  }
-                } catch { /* best effort */ }
-              }
-
-              entry.childGoalIds = stillActive;
-
-              // If any child goals still active, wait for next event before thinking
-              if (stillActive.length > 0) {
-                log.info(`[${agentName}] Waiting for child goal event...`);
-                await this.waitForChildGoalEvent(stillActive, entry.state.timeout);
-                // Re-check status will happen on next observe cycle
-              }
-
-              // Inject child goal status into observation
-              task.observation = (task.observation ?? '') + '\n\n' + statusLines.join('\n');
-            }
 
             setPhase('thinking');
             break;
@@ -1973,70 +1566,21 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
               break;
             }
 
-            // ── Decompose: create child goal + tasks, return to observing ──
-            if (task.action.action === 'decompose') {
-              const subtasks = task.action.subtasks as Array<{
-                description: string;
-                data?: unknown;
-                dependsOn?: number[];
-                produces?: Array<{ key: string; description: string }>;
-                consumes?: string[];
-              }>;
-              if (!subtasks?.length) {
-                task.llmMessages.push({
-                  role: 'user',
-                  content: '[Error] decompose requires a non-empty "subtasks" array.',
-                });
-                break; // re-enter thinking
-              }
-              if (!this.goalManagerId || !entry.goalId) {
-                task.llmMessages.push({
-                  role: 'user',
-                  content: '[Error] Cannot decompose — GoalManager not available.',
-                });
-                break;
-              }
-
-              log.info(`[${agentName}] Decomposing into ${subtasks.length} sub-tasks`);
-              try {
-                const childGoalId = await this.createChildGoalWithTasks(entry, subtasks, agentName);
-                if (!entry.childGoalIds) entry.childGoalIds = [];
-                entry.childGoalIds.push(childGoalId);
-              } catch (err) {
-                task.llmMessages.push({
-                  role: 'user',
-                  content: `[Decomposition Error] ${err instanceof Error ? err.message : String(err)}`,
-                });
-              }
-              task.step++;
-              if (task.step >= task.maxSteps) {
-                await this.handleMaxStepsReached(entry, agentName, setPhase);
-                break;
-              }
-              // Back to observing — the event-driven wait will kick in
-              setPhase('observing');
-              break;
-            }
-
-            // ── Replan: inject failure context and return to thinking ──
+            // ── Replan: inject reason and continue thinking ──
+            // Replan tells the LLM to try a different approach for the SAME
+            // task. Decomposition is no longer an agent-level concern under
+            // the Scrum model — ScrumMaster splits work across scrums.
             if (task.action.action === 'replan') {
               const reason = (task.action.reason as string) ?? 'Agent requested replan';
               log.info(`[${agentName}] Replan requested: ${reason.slice(0, 80)}`);
 
-              // Build reflection context from child goal task results
               let reflection = `[Replan] Reason: ${reason}\n`;
-              if (entry.childGoalIds && entry.childGoalIds.length > 0 && this.goalManagerId) {
-                for (const cgId of entry.childGoalIds) {
-                  try {
-                    reflection += await this.buildGoalProgressContext(cgId);
-                  } catch { /* best effort */ }
-                }
-              } else if (entry.goalId && this.goalManagerId) {
+              if (entry.goalId && this.goalManagerId) {
                 try {
                   reflection += await this.buildGoalProgressContext(entry.goalId);
                 } catch { /* best effort */ }
               }
-              reflection += '\nGenerate a revised approach using the "decompose" action, addressing what went wrong.';
+              reflection += '\nRe-evaluate and pick a different action that addresses what went wrong. If the task is genuinely outside your capability, emit a `fail` action with a clear reason.';
 
               task.llmMessages.push({ role: 'user', content: reflection });
               task.step++;
@@ -2417,141 +1961,6 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
     return parsed;
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // Child Goal Watching
-  // ═══════════════════════════════════════════════════════════════════
-
-  /** Maps child goal ID → { parentTaskId, parentGoalId } for completion tracking. */
-  private watchedChildGoals = new Map<string, { parentTaskId: string; parentGoalId: string }>();
-
-  private watchChildGoal(childGoalId: string, parentTaskId: string, parentGoalId: string): void {
-    this.watchedChildGoals.set(childGoalId, { parentTaskId, parentGoalId });
-  }
-
-  /**
-   * Called from the `changed` handler when GoalManager emits goalCompleted/goalFailed/taskCompleted/taskPermanentlyFailed.
-   * Resolves event waiters (from observe phase) and handles dispatch-level child goal watching.
-   */
-  private handleChildGoalEvent(aspect: string, value: unknown): void {
-    if (aspect !== 'goalCompleted' && aspect !== 'goalFailed'
-        && aspect !== 'taskCompleted' && aspect !== 'taskPermanentlyFailed') return;
-
-    const { goalId, taskId, result, error } = value as {
-      goalId: string; taskId?: string; result?: unknown; error?: string;
-    };
-
-    // Resolve event waiters (from observe phase waiting on child goals)
-    const resolver = this.childGoalEventResolvers.get(goalId);
-    if (resolver) {
-      resolver.resolve({ aspect, goalId, taskId, result, error });
-      // resolve callback cleans up all resolvers in the wait group
-    }
-
-    // Existing dispatch-level child goal watching (unchanged)
-    const watched = this.watchedChildGoals.get(goalId);
-    if (!watched) return;
-    this.watchedChildGoals.delete(goalId);
-
-    if (aspect === 'goalCompleted') {
-      this.request(request(this.id, this.goalManagerId!, 'completeTask', {
-        taskId: watched.parentTaskId, result, goalId: watched.parentGoalId,
-      }));
-    } else if (aspect === 'goalFailed') {
-      this.request(request(this.id, this.goalManagerId!, 'failTask', {
-        taskId: watched.parentTaskId, error: error ?? 'Child goal failed', goalId: watched.parentGoalId,
-      }));
-    }
-  }
-
-  /**
-   * Wait for the next event related to any of the child goals.
-   * Resolved by handleChildGoalEvent when a matching event arrives.
-   */
-  private waitForChildGoalEvent(
-    childGoalIds: string[],
-    timeoutMs: number,
-  ): Promise<{ aspect: string; goalId: string; taskId?: string; result?: unknown; error?: string }> {
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        for (const id of childGoalIds) this.childGoalEventResolvers.delete(id);
-        resolve({ aspect: 'timeout', goalId: childGoalIds[0] ?? '' });
-      }, timeoutMs);
-
-      for (const id of childGoalIds) {
-        this.childGoalEventResolvers.set(id, {
-          resolve: (evt) => {
-            clearTimeout(timer);
-            // Clean up all resolvers for this wait group
-            for (const gid of childGoalIds) this.childGoalEventResolvers.delete(gid);
-            resolve(evt);
-          },
-          timer,
-        });
-      }
-    });
-  }
-
-  /**
-   * Create a child goal with tasks for the decompose action.
-   */
-  private async createChildGoalWithTasks(
-    entry: TaskEntry,
-    subtasks: Array<{
-      description: string;
-      data?: unknown;
-      dependsOn?: number[];
-      produces?: Array<{ key: string; description: string }>;
-      consumes?: string[];
-    }>,
-    agentName: string,
-  ): Promise<string> {
-    const goalMgrId = this.goalManagerId!;
-    // Title from the subtask descriptions — short and human-readable.
-    // The LLM's `reasoning` field is internal thought-trace, NOT a title:
-    // it tends to start with "This task requires..." or "I need to...", which
-    // looks awful in any goal-list UI and makes the goal hard to identify.
-    const titleSource = subtasks.length === 1
-      ? subtasks[0].description
-      : `${subtasks.length} steps: ${subtasks.map(s => s.description.split(/[.\n]/)[0]).join(' → ')}`;
-    const title = titleSource.slice(0, 120).trim() || `Decomposed task (${subtasks.length} step${subtasks.length === 1 ? '' : 's'})`;
-
-    const { goalId: childGoalId } = await this.request<{ goalId: string }>(
-      request(this.id, goalMgrId, 'createGoal', {
-        title,
-        parentId: entry.goalId,
-      }),
-    );
-    log.info(`[${agentName}] Child goal ${childGoalId.slice(0, 8)} with ${subtasks.length} tasks`);
-
-    const taskIds: string[] = [];
-    for (let i = 0; i < subtasks.length; i++) {
-      const sub = subtasks[i];
-      let depIds: string[];
-      if (sub.dependsOn === undefined) {
-        // Default: SEQUENTIAL — auto-chain to previous task
-        depIds = i > 0 ? [taskIds[i - 1]] : [];
-      } else {
-        // Explicit: map index-based dependsOn to taskIds (empty array allowed)
-        depIds = sub.dependsOn
-          .filter(idx => idx >= 0 && idx < taskIds.length)
-          .map(idx => taskIds[idx]);
-      }
-
-      const { taskId } = await this.request<{ taskId: string }>(
-        request(this.id, goalMgrId, 'addTask', {
-          goalId: childGoalId,
-          description: sub.description,
-          data: sub.data,
-          dependsOn: depIds.length > 0 ? depIds : undefined,
-          produces: sub.produces,
-          consumes: sub.consumes,
-        }),
-      );
-      taskIds.push(taskId);
-    }
-
-    return childGoalId;
-  }
 
   // ═══════════════════════════════════════════════════════════════════
   // Goal Context
@@ -2565,7 +1974,7 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
     if (!this.goalManagerId) return '';
     try {
       const goal = await this.request<{
-        title?: string; status?: string;
+        title?: string; description?: string; status?: string;
         scratchpad?: Record<string, unknown>;
       } | null>(
         request(this.id, this.goalManagerId, 'getGoal', { goalId }),
@@ -2607,7 +2016,17 @@ Reply with ONLY the index number (e.g. "0" or "1").`;
         lines.push(line);
       }
 
-      let ctx = `\n\n## Goal Progress\nGoal: "${goal?.title ?? goalId}"\nTasks:\n${lines.join('\n')}`;
+      let ctx = `\n\n## Goal Progress\nGoal: "${goal?.title ?? goalId}"`;
+      // The user's intent (goal description) — without this, the agent only
+      // sees the short title and its individual task description, missing the
+      // surrounding context of WHY the work is being done. Adding the
+      // description here lets the agent reason about its task in light of
+      // the larger goal (and reject scope creep, replan if its task is
+      // misaligned, etc.).
+      if (goal?.description && goal.description.trim() && goal.description.trim() !== (goal.title ?? '').trim()) {
+        ctx += `\nUser's intent:\n${goal.description}`;
+      }
+      ctx += `\nTasks:\n${lines.join('\n')}`;
       ctx += `\n\nUse this progress to guide your actions. If tasks have failed, consider whether to retry with a different approach (replan) or work with partial results.`;
 
       // Current task's contract: what it must write, what it will read.

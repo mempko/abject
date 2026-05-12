@@ -15,6 +15,7 @@ import {
   ModelInfo,
   ContentPart,
   ImagePart,
+  defaultIsRetryable,
   getTextContent,
 } from './provider.js';
 import { Log } from '../core/timed-log.js';
@@ -131,7 +132,7 @@ export class OllamaProvider extends BaseLLMProvider {
     const url = new URL(`${this.baseUrl}/api/chat`);
     const body = JSON.stringify(req);
 
-    return new Promise<LLMCompletionResult>((resolve, reject) => {
+    return this.withRetries(() => new Promise<LLMCompletionResult>((resolve, reject) => {
       const httpReq = http.request(
         {
           hostname: url.hostname,
@@ -187,7 +188,7 @@ export class OllamaProvider extends BaseLLMProvider {
       httpReq.on('timeout', () => { httpReq.destroy(); reject(new Error('Ollama request timed out (30min)')); });
       httpReq.write(body);
       httpReq.end();
-    });
+    }), { label: 'ollama.complete' });
   }
 
   async *stream(
@@ -205,6 +206,36 @@ export class OllamaProvider extends BaseLLMProvider {
       },
     };
 
+    const maxAttempts = 3;
+    const initialDelayMs = 1000;
+    const backoffFactor = 2;
+    const maxDelayMs = 10000;
+    let yielded = false;
+    let lastErr: unknown;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        for await (const chunk of this.streamOnce(req)) {
+          if (chunk.content.length > 0) yielded = true;
+          yield chunk;
+        }
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (yielded) throw err;
+        if (attempt >= maxAttempts) throw err;
+        if (!defaultIsRetryable(err)) throw err;
+        const delay = Math.min(initialDelayMs * Math.pow(backoffFactor, attempt - 1), maxDelayMs);
+        const msg = err instanceof Error ? err.message : String(err);
+        // eslint-disable-next-line no-console
+        console.warn(`[ollama.stream] attempt ${attempt}/${maxAttempts} failed: ${msg.slice(0, 200)} — retrying in ${delay}ms`);
+        await new Promise<void>(resolve => setTimeout(resolve, delay));
+      }
+    }
+    throw lastErr;
+  }
+
+  private async *streamOnce(req: OllamaRequest): AsyncIterable<LLMStreamChunk> {
     const url = new URL(`${this.baseUrl}/api/chat`);
     const body = JSON.stringify(req);
 

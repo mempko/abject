@@ -1,8 +1,23 @@
 /**
  * GoalObserver — per-workspace watchdog that monitors goal health.
  *
- * Periodically sweeps active goals and auto-fails those that are stale,
- * have runaway task counts, or have exhausted all retry attempts.
+ * Under the Scrum model, ScrumMaster owns goal completion: each scrum's
+ * synthesis call decides done / plan-more / fail. GoalObserver MUST NOT
+ * race that decision. Its job is now passive: sweep active goals, log
+ * stats, emit warnings. The only auto-fail it performs is the staleness
+ * backstop (no progress for a long time) — that one survives because
+ * "totally stuck" is something only an outside observer can see.
+ *
+ * What this object used to do but no longer does (the old per-task
+ * retry budget is gone, and ScrumMaster is the planner):
+ *   - "All tasks permanently failed" → auto-fail. Now ScrumMaster runs
+ *     the next scrum on `goalReadyForCompletion` and decides what to do.
+ *   - Runaway task count cap. Multi-scrum sprints legitimately accumulate
+ *     tasks across rounds; a fixed per-goal cap has no useful meaning.
+ *   - Total-attempts cap. Was calibrated for the 3x retry budget that
+ *     no longer exists.
+ *   - `taskPermanentlyFailed` event listener. Removed because handling
+ *     that event is what created the race with ScrumMaster.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
@@ -18,9 +33,7 @@ const GOAL_OBSERVER_INTERFACE: InterfaceId = 'abjects:goal-observer';
 
 const SWEEP_INTERVAL_MS    = 60_000;          // 1 min
 const STALE_WARN_MS        = 20 * 60_000;     // 20 min no progress → warning
-const STALE_FAIL_MS        = 30 * 60_000;     // 30 min → auto-fail
-const MAX_TASKS_PER_GOAL   = 20;              // runaway decomposition
-const MAX_TOTAL_ATTEMPTS   = 50;              // resource waste across all tasks
+const STALE_FAIL_MS        = 30 * 60_000;     // 30 min → auto-fail backstop
 
 // ─── GoalObserver ───────────────────────────────────────────────────
 
@@ -35,7 +48,7 @@ export class GoalObserver extends Abject {
       manifest: {
         name: 'GoalObserver',
         description:
-          'Per-workspace watchdog that monitors goal health. Detects stale goals, runaway task counts, and exhausted retries, auto-failing goals that cannot be achieved.',
+          'Per-workspace watchdog that monitors goal health. Sweeps active goals, emits warnings on stale goals, and auto-fails goals that have made no progress for an extended period. ScrumMaster owns done/fail decisions for active goals; GoalObserver is the staleness backstop only.',
         version: '1.0.0',
         interface: {
           id: GOAL_OBSERVER_INTERFACE,
@@ -66,9 +79,7 @@ export class GoalObserver extends Abject {
               description: 'Adjust monitoring thresholds',
               parameters: [
                 { name: 'staleWarnMs', type: { kind: 'primitive', primitive: 'number' }, description: 'Stale warning threshold (ms)', optional: true },
-                { name: 'staleFailMs', type: { kind: 'primitive', primitive: 'number' }, description: 'Stale auto-fail threshold (ms)', optional: true },
-                { name: 'maxTasksPerGoal', type: { kind: 'primitive', primitive: 'number' }, description: 'Max tasks per goal', optional: true },
-                { name: 'maxTotalAttempts', type: { kind: 'primitive', primitive: 'number' }, description: 'Max total attempts across tasks', optional: true },
+                { name: 'staleFailMs', type: { kind: 'primitive', primitive: 'number' }, description: 'Stale auto-fail backstop threshold (ms)', optional: true },
               ],
               returns: { kind: 'primitive', primitive: 'undefined' },
             },
@@ -99,8 +110,10 @@ export class GoalObserver extends Abject {
 Interface: abjects:goal-observer
 
 GoalObserver is a per-workspace watchdog that monitors goal health.
-It periodically sweeps active goals and auto-fails those that are stale,
-have runaway task counts, or have exhausted all retry attempts.
+It periodically sweeps active goals, emits warnings for stale goals,
+and auto-fails goals only when they have made no progress for an
+extended period (the staleness backstop). All other done/fail
+decisions belong to ScrumMaster.
 
 ### Get Monitoring Health
 
@@ -119,36 +132,32 @@ have runaway task counts, or have exhausted all retry attempts.
 
   await this.call(
     this.dep('GoalObserver'), 'configure',
-    { staleWarnMs: 600000, staleFailMs: 1200000, maxTasksPerGoal: 30 });
+    { staleWarnMs: 600000, staleFailMs: 1200000 });
   // All parameters are optional; only provided values are updated.
 
 ### Events
-- goalWarning: emitted when a goal shows signs of trouble (stale, high usage)
+- goalWarning: emitted when a goal is stale (20+ min with no progress)
 - goalAutoFailed: emitted when a goal is auto-failed by the observer
 
 ### IMPORTANT
 - Default stale warning at 20 min, auto-fail at 30 min of no progress.
-- Default max 20 tasks per goal, 50 total attempts across all tasks.
+- Auto-fail only triggers on staleness; per-task failures are ScrumMaster's call.
 - failAllGoals cleans up TupleSpace and shared state entries.`;
   }
 
   // Configurable thresholds
   private staleWarnMs = STALE_WARN_MS;
   private staleFailMs = STALE_FAIL_MS;
-  private maxTasksPerGoal = MAX_TASKS_PER_GOAL;
-  private maxTotalAttempts = MAX_TOTAL_ATTEMPTS;
 
   private autoFailedCount = 0;
 
   protected override async onInit(): Promise<void> {
     this.goalManagerId = await this.discoverDep('GoalManager') ?? undefined;
 
-    // Subscribe as dependent of GoalManager for taskPermanentlyFailed events
-    if (this.goalManagerId) {
-      this.send(request(this.id, this.goalManagerId, 'addDependent', {}));
-    }
-
-    // Start periodic sweep
+    // Periodic sweep is the only signal source now. We deliberately do
+    // NOT subscribe to GoalManager events: reacting to taskPermanentlyFailed
+    // is what created the auto-fail race against ScrumMaster's next-scrum
+    // decision.
     this.sweepTimer = setInterval(() => this.sweep(), SWEEP_INTERVAL_MS);
   }
 
@@ -182,24 +191,11 @@ have runaway task counts, or have exhausted all retry attempts.
     });
 
     this.on('configure', async (msg: AbjectMessage) => {
-      const { staleWarnMs, staleFailMs, maxTasksPerGoal, maxTotalAttempts } = msg.payload as {
-        staleWarnMs?: number; staleFailMs?: number; maxTasksPerGoal?: number; maxTotalAttempts?: number;
+      const { staleWarnMs, staleFailMs } = msg.payload as {
+        staleWarnMs?: number; staleFailMs?: number;
       };
       if (staleWarnMs !== undefined) this.staleWarnMs = staleWarnMs;
       if (staleFailMs !== undefined) this.staleFailMs = staleFailMs;
-      if (maxTasksPerGoal !== undefined) this.maxTasksPerGoal = maxTasksPerGoal;
-      if (maxTotalAttempts !== undefined) this.maxTotalAttempts = maxTotalAttempts;
-    });
-
-    // Listen for taskPermanentlyFailed from GoalManager for immediate checks
-    this.on('changed', async (msg: AbjectMessage) => {
-      const { aspect, value } = msg.payload as { aspect: string; value: unknown };
-      if (aspect !== 'taskPermanentlyFailed') return;
-
-      const { goalId } = value as { goalId?: string };
-      if (goalId) {
-        await this.checkGoalTasks(goalId);
-      }
     });
   }
 
@@ -237,57 +233,8 @@ have runaway task counts, or have exhausted all retry attempts.
         continue;
       }
 
-      // Task-level checks
-      await this.checkGoalTasks(goal.id);
-    }
-  }
-
-  /**
-   * Check tasks for a specific goal — runaway count, all permanently failed, resource waste.
-   */
-  private async checkGoalTasks(goalId: string): Promise<void> {
-    if (!this.goalManagerId) return;
-
-    let tasks: Array<{ id: string; fields: Record<string, unknown> }>;
-    try {
-      tasks = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
-        request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId })
-      );
-    } catch { return; }
-
-    if (tasks.length === 0) return;
-
-    const pending = tasks.filter(t => t.fields.status === 'pending');
-    const inProgress = tasks.filter(t => t.fields.status === 'in_progress');
-    const permFailed = tasks.filter(t => t.fields.status === 'permanently_failed');
-    const done = tasks.filter(t => t.fields.status === 'done');
-
-    log.info(`checkGoalTasks ${goalId.slice(0, 8)}: ${tasks.length} tasks (pending=${pending.length} inProgress=${inProgress.length} done=${done.length} permFailed=${permFailed.length})`);
-
-    // Runaway task count
-    if (tasks.length > this.maxTasksPerGoal) {
-      log.info(`checkGoalTasks ${goalId.slice(0, 8)}: RUNAWAY ${tasks.length} > ${this.maxTasksPerGoal}`);
-      await this.autoFailGoal(goalId, `Runaway task count: ${tasks.length} tasks (max ${this.maxTasksPerGoal})`);
-      return;
-    }
-
-    // All tasks permanently failed or done with none pending
-    if (pending.length === 0 && inProgress.length === 0 && permFailed.length > 0) {
-      if (done.length === 0) {
-        log.info(`checkGoalTasks ${goalId.slice(0, 8)}: all ${permFailed.length} tasks permanently failed`);
-        await this.autoFailGoal(goalId, `All ${permFailed.length} tasks permanently failed`);
-        return;
-      }
-    }
-
-    // Resource waste — total attempts across all tasks
-    let totalAttempts = 0;
-    for (const task of tasks) {
-      totalAttempts += (task.fields.attempts as number) ?? 0;
-    }
-    if (totalAttempts > this.maxTotalAttempts) {
-      log.info(`checkGoalTasks ${goalId.slice(0, 8)}: RESOURCE WASTE ${totalAttempts} > ${this.maxTotalAttempts}`);
-      await this.autoFailGoal(goalId, `Excessive resource usage: ${totalAttempts} total attempts (max ${this.maxTotalAttempts})`);
+      // No task-level auto-fail under the Scrum model — ScrumMaster owns
+      // those decisions. Staleness above is the only auto-fail trigger.
     }
   }
 

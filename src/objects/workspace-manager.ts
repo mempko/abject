@@ -48,7 +48,7 @@ const wsLog = new Log('WORKSPACE-MANAGER');
 /** Infrastructure objects — always spawned for every workspace (no UI). */
 const INFRA_OBJECTS = [
   'AbjectStore', 'SharedState', 'TupleSpace', 'FileTransfer', 'MediaStream', 'Theme',
-  'GoalManager', 'JobManager', 'AgentAbject', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
+  'GoalManager', 'JobManager', 'AgentAbject', 'ScrumMaster', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
   'AgentCreator', 'Scheduler', 'KnowledgeBase', 'ChatManager',
   'Console',
 ] as const;
@@ -677,6 +677,14 @@ export class WorkspaceManager extends Abject {
     // Instant switch: change the compositor filter (no hide/show messages needed)
     if (this.uiServerId) {
       await this.request(request(this.id, this.uiServerId, 'setActiveWorkspace', { workspaceId }));
+    }
+
+    // Tell WidgetManager so it can re-skin system-level UI (workspace switcher,
+    // global toolbar, taskbar) with the new workspace's theme.
+    if (this.widgetManagerId) {
+      try {
+        await this.request(request(this.id, this.widgetManagerId, 'setActiveWorkspace', { workspaceId }));
+      } catch { /* WidgetManager may not be ready */ }
     }
 
     await this.persistActiveWorkspaceId();

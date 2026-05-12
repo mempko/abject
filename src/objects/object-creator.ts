@@ -263,6 +263,25 @@ export class ObjectCreator extends Abject {
     }
   }
 
+  protected override askPrompt(_question: string): string {
+    return super.askPrompt(_question) + `\n\n## ObjectCreator — Abject Authoring & Modification Agent
+
+I author and modify Abject source code via an LLM-driven loop that reads existing source from the Registry, drafts diffs, validates calls, reviews semantics, and deploys updates through the standard ScriptableAbject update path.
+
+What I handle:
+- Single-object authoring (new widgets, apps, bridges, proxies, MCP wrappers).
+- Modifying existing Abject source — adding methods, events, manifest entries; fixing handlers; refactoring an Abject's implementation.
+- Investigation that ends in code edits (read source, diagnose, fix).
+
+What I don't handle:
+- Multi-object autonomous-system composition (agent + scheduler + watcher) — that's AgentCreator.
+- Runtime method calls on existing objects — that's ObjectAgent.
+- Public-web browsing — that's WebAgent.
+- Installed skill use at runtime — that's SkillAgent.
+
+When invited to a Sprint Plan, describe the concrete authoring or modification I'd perform, the target Abject (by name), and what would change. If the goal is purely runtime (open a window, call a method, send a Slack message), reply PASS.`;
+  }
+
   // ── Message-passing helpers (thin wrappers over request/event) ─────────
 
   private async sendRequest<T = unknown>(target: AbjectId, method: string, payload: unknown, timeoutMs = 30000): Promise<T> {
@@ -1192,8 +1211,9 @@ export class ObjectCreator extends Abject {
     });
 
     this.on('executeTask', (msg: AbjectMessage) => {
-      const { goalId, description, type, data, callerId: explicitCaller } = msg.payload as {
+      const { tupleId, taskId: explicitTaskId, goalId, description, type, data, callerId: explicitCaller } = msg.payload as {
         tupleId?: string;
+        taskId?: string;
         goalId?: string;
         description: string;
         type?: string;
@@ -1201,7 +1221,6 @@ export class ObjectCreator extends Abject {
         callerId?: string;
       };
       const callerId = (explicitCaller as AbjectId) ?? msg.routing.from;
-      // Pass any object hint from data through; the agent decides kind on turn 1.
       const targetIdOrName = (data?.objectId as string | undefined)
         ?? (data?.target as string | undefined)
         ?? (data?.objectName as string | undefined);
@@ -1210,13 +1229,18 @@ export class ObjectCreator extends Abject {
           : type === 'modify' ? 'modify'
             : type === 'investigate' ? 'investigate'
               : (targetIdOrName ? 'modify' : 'create');
+      // Use the queue-runner-supplied taskId so AgentAbject's TaskEntry,
+      // ObjectCreator's TaskExtra, and the queue's inFlight slot all share
+      // one ID. Falls back to a fresh oc-${...} for legacy direct callers.
       this.startAgentTask({
         kind,
         prompt: description,
         targetIdOrName,
         goalId,
+        dispatchTupleId: tupleId ?? explicitTaskId,
         callerId,
         deferredMsg: msg,
+        explicitTaskId: explicitTaskId ?? tupleId,
       });
       return DEFERRED_REPLY;
     });
@@ -1239,7 +1263,11 @@ export class ObjectCreator extends Abject {
     // ── Receive task results from AgentAbject ──
     this.on('taskResult', async (msg: AbjectMessage) => {
       const { ticketId, success, result, error } = msg.payload as {
-        ticketId: string; success: boolean; result?: unknown; error?: string; steps: number;
+        ticketId: string;
+        success: boolean;
+        result?: unknown;
+        error?: string;
+        steps: number;
       };
       const taskId = this.taskIdByTicket.get(ticketId);
       if (!taskId) return;
@@ -1273,6 +1301,23 @@ export class ObjectCreator extends Abject {
     context?: string;
     targetIdOrName?: string;
     goalId?: string;
+    /**
+     * TupleSpace tuple id (or queued task id) when this task came from
+     * AgentAbject's task queue. Forwarded to startTask so the TaskEntry's
+     * dispatchTupleId tells runTaskAsync to call completeTask/failTask on
+     * the originating tuple — which is how ScrumMaster's goalReadyForCompletion
+     * trigger fires.
+     */
+    dispatchTupleId?: string;
+    /**
+     * Explicit taskId to use for the AgentAbject startTask. When supplied
+     * (by the queue runner), AgentAbject's TaskEntry, ObjectCreator's
+     * TaskExtra, and AgentAbject's queue inFlight slot all share this ID
+     * so the queue runner can match `entry.state.id` and pop the next
+     * pending task on completion. When omitted (legacy direct callers),
+     * we generate a fresh `oc-${...}`.
+     */
+    explicitTaskId?: string;
     callerId?: AbjectId;
     deferredMsg?: AbjectMessage;
   }): Promise<void> {
@@ -1320,7 +1365,7 @@ export class ObjectCreator extends Abject {
       turnLog: [],
     };
 
-    const taskId = `oc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const taskId = args.explicitTaskId ?? `oc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const taskExtra: TaskExtra = {
       taskId,
       prompt: args.prompt,
@@ -1343,6 +1388,7 @@ export class ObjectCreator extends Abject {
           task: args.prompt,
           systemPrompt: this.buildSystemPrompt(),
           goalId: args.goalId,
+          dispatchTupleId: args.dispatchTupleId,
           config: {
             maxSteps: 30,
             timeout: 600000,
@@ -1664,6 +1710,19 @@ Verification (after deploy):
 Persistence:
 - Goal scratchpad (per-goal handoff): \`call("GoalManager", "writeGoalData", {goalId, key, value})\` / \`readGoalData\`.
 - KnowledgeBase (cross-session facts): \`call("KnowledgeBase", "remember", {title, content, type, tags})\` / \`recall\`.
+
+# Event emission
+
+Use \`this.changed(aspect, value)\` to publish events to observing Abjects:
+
+\`\`\`js
+this.changed('progress', { processed, total });
+this.changed('completed', { resultCount });
+\`\`\`
+
+\`this.changed\` broadcasts to every Abject that subscribed via \`await this.observe(targetId)\` (a thin helper that sends the universal \`addDependent\` protocol message — both forms are equivalent and you'll see either in existing source). Subscribers implement either \`changed(msg)\` (dispatch by \`msg.payload.aspect\`) or a method named after each aspect (\`progress(msg)\`, \`completed(msg)\`). Both delivery shapes carry the same value.
+
+\`this.emit(toId, eventName, payload)\` is a separate primitive: it sends a single event to one specific recipient whose id you already hold — the first argument is the recipient, the second is the event name. Choose \`this.changed\` for broadcasting to observers (the typical case); choose \`this.emit\` only when targeting a known recipient.
 
 # Discipline
 

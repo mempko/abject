@@ -19,6 +19,104 @@ import { event } from '../../core/message.js';
 import { parseMarkdown } from './markdown.js';
 import { layoutRichText, type RichTextLayout, type StyledRun, type ImageResolver } from './rich-text-layout.js';
 
+/**
+ * Extract natural width/height from a data-URI-encoded image by parsing the
+ * format header bytes directly. No DOM required, so this works in the Node
+ * worker where the LabelWidget runs.
+ *
+ * Supports PNG, JPEG, and GIF — covers every common case for screenshots
+ * and agent-attached images. Returns null on unsupported formats, malformed
+ * data URIs, or decode errors.
+ *
+ * The fallback path in `rich-text-layout.computeImageDims` handles missing
+ * dims gracefully (alt-text `|WxH` hint, then 16:9 placeholder), so a null
+ * return is safe — just sub-optimal for layout precision.
+ */
+function decodeDataUriImageDims(url: string): { width: number; height: number } | null {
+  // Format: data:[<mediatype>][;base64],<data>
+  const comma = url.indexOf(',');
+  if (comma < 0) return null;
+  const meta = url.slice(5, comma); // strip "data:"
+  const isBase64 = /;base64/i.test(meta);
+  const data = url.slice(comma + 1);
+  if (!data) return null;
+
+  let bytes: Uint8Array;
+  try {
+    if (isBase64) {
+      // atob exists in modern Node (and browsers). Decode base64 → bytes.
+      const bin = (typeof atob === 'function') ? atob(data) : Buffer.from(data, 'base64').toString('binary');
+      bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    } else {
+      const decoded = decodeURIComponent(data);
+      bytes = new Uint8Array(decoded.length);
+      for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
+    }
+  } catch {
+    return null;
+  }
+
+  // PNG: 8-byte signature 89 50 4E 47 0D 0A 1A 0A, then IHDR chunk where
+  // width is bytes 16-19 (big-endian uint32), height is 20-23.
+  if (bytes.length >= 24 &&
+      bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47 &&
+      bytes[4] === 0x0D && bytes[5] === 0x0A && bytes[6] === 0x1A && bytes[7] === 0x0A) {
+    const w = (bytes[16] << 24) | (bytes[17] << 16) | (bytes[18] << 8) | bytes[19];
+    const h = (bytes[20] << 24) | (bytes[21] << 16) | (bytes[22] << 8) | bytes[23];
+    if (w > 0 && h > 0) return { width: w, height: h };
+    return null;
+  }
+
+  // GIF: "GIF87a" or "GIF89a", then width/height as little-endian uint16
+  // at bytes 6-9.
+  if (bytes.length >= 10 &&
+      bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 &&
+      bytes[3] === 0x38 && (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61) {
+    const w = bytes[6] | (bytes[7] << 8);
+    const h = bytes[8] | (bytes[9] << 8);
+    if (w > 0 && h > 0) return { width: w, height: h };
+    return null;
+  }
+
+  // JPEG: starts with FF D8. Scan markers until we hit a Start-Of-Frame
+  // (SOF0..SOF3, SOF5..SOF7, SOF9..SOF11, SOF13..SOF15) which carries
+  // height + width. Skip variable-length markers via their declared size.
+  if (bytes.length >= 4 && bytes[0] === 0xFF && bytes[1] === 0xD8) {
+    let i = 2;
+    while (i + 9 < bytes.length) {
+      if (bytes[i] !== 0xFF) return null;
+      let marker = bytes[i + 1];
+      // Skip fill bytes 0xFF 0xFF...
+      while (marker === 0xFF && i + 2 < bytes.length) {
+        i++;
+        marker = bytes[i + 1];
+      }
+      i += 2;
+      // Markers without payload
+      if (marker === 0xD8 || marker === 0xD9 || (marker >= 0xD0 && marker <= 0xD7)) continue;
+      if (i + 1 >= bytes.length) return null;
+      const segLen = (bytes[i] << 8) | bytes[i + 1];
+      // SOF markers
+      const isSOF =
+        (marker >= 0xC0 && marker <= 0xC3) ||
+        (marker >= 0xC5 && marker <= 0xC7) ||
+        (marker >= 0xC9 && marker <= 0xCB) ||
+        (marker >= 0xCD && marker <= 0xCF);
+      if (isSOF && i + 7 < bytes.length) {
+        const h = (bytes[i + 3] << 8) | bytes[i + 4];
+        const w = (bytes[i + 5] << 8) | bytes[i + 6];
+        if (w > 0 && h > 0) return { width: w, height: h };
+        return null;
+      }
+      i += segLen;
+    }
+    return null;
+  }
+
+  return null;
+}
+
 export class LabelWidget extends WidgetAbject {
   // Word-wrap cache
   private cachedWrappedLines: string[] | null = null;
@@ -32,10 +130,10 @@ export class LabelWidget extends WidgetAbject {
   private cachedRichWidth: number = 0;
   private cachedRichFontSize: number | undefined = undefined;
 
-  // Natural dimensions of images referenced in markdown, populated by
-  // probe loads. URLs map to dims when known, or 'pending'/'error' to
-  // dedupe in-flight loads. Layout uses placeholder dims when unknown.
-  private imageDims: Map<string, { width: number; height: number } | 'pending' | 'error'> = new Map();
+  // Natural dimensions of images referenced in markdown. Populated
+  // synchronously from data-URI header bytes; HTTP/etc. URLs cache 'error'
+  // (no probe path is reachable here — see resolveImageDims).
+  private imageDims: Map<string, { width: number; height: number } | 'error'> = new Map();
 
   // Selection state (only used when style.selectable is true)
   private cursorPos = 0;
@@ -298,27 +396,44 @@ export class LabelWidget extends WidgetAbject {
   }
 
   /**
-   * Look up cached natural dimensions; on miss, kick off a probe load that
-   * invalidates the layout cache and triggers a redraw when complete.
+   * Look up an image's natural dimensions for layout, synchronously.
+   *
+   * **Architecture context.** LabelWidget extends WidgetAbject extends Abject
+   * — every Abject runs in a workspace worker thread (Node). Image painting
+   * is the Compositor's job (`src/ui/compositor.ts`), which lives in the
+   * browser and has access to `Image` / `CanvasRenderingContext2D`. The
+   * widget never paints; it only emits draw commands. So at this layer,
+   * `Image` is always undefined — there is no probe path to take.
+   *
+   * Resolution sources, in order:
+   *   1. Cache hit on `imageDims` (set on a prior call).
+   *   2. Data URI → parse header bytes via `decodeDataUriImageDims`. Covers
+   *      the common case: agent-attached screenshots are PNG data URIs.
+   *   3. HTTP(S) / other URL → cache 'error' and return null. The layout
+   *      caller falls back to an alt-text `|WxH` hint if the markdown carries
+   *      one, otherwise a 16:9 placeholder. See `computeImageDims` in
+   *      `rich-text-layout.ts`.
    */
   private resolveImageDims(url: string): { width: number; height: number } | null {
     const cached = this.imageDims.get(url);
-    if (cached && cached !== 'pending' && cached !== 'error') return cached;
-    if (cached) return null; // pending / error
-    this.imageDims.set(url, 'pending');
-    const img = new Image();
-    img.onload = () => {
-      this.imageDims.set(url, { width: img.naturalWidth, height: img.naturalHeight });
-      this.cachedRichLayout = null;
-      void this.requestRedraw();
-    };
-    img.onerror = () => {
+    if (cached === 'error') return null;
+    if (cached) return cached;
+
+    if (url.startsWith('data:')) {
+      const dims = decodeDataUriImageDims(url);
+      if (dims) {
+        this.imageDims.set(url, dims);
+        return dims;
+      }
       this.imageDims.set(url, 'error');
-    };
-    if (!url.startsWith('data:')) {
-      img.crossOrigin = 'anonymous';
+      return null;
     }
-    img.src = url;
+
+    // Non-data URL: no synchronous resolution from a worker thread. Layout
+    // uses its fallback (alt-text hint or placeholder). A future change
+    // could plumb an `imageDimsResolved` event back from the Compositor
+    // once it paints the URL, then invalidate this cache and re-emit.
+    this.imageDims.set(url, 'error');
     return null;
   }
 

@@ -50,6 +50,7 @@ import { Chat } from '../src/objects/chat.js';
 import { ChatManager } from '../src/objects/chat-manager.js';
 import { ChatBrowser } from '../src/objects/chat-browser.js';
 import { AgentAbject } from '../src/objects/agent-abject.js';
+import { ScrumMaster } from '../src/objects/scrum-master.js';
 import { GoalObserver } from '../src/objects/goal-observer.js';
 import { AbjectStore } from '../src/objects/abject-store.js';
 import { Supervisor } from '../src/runtime/supervisor.js';
@@ -439,6 +440,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('ChatManager', () => new ChatManager());
   runtime.objectFactory.registerConstructor('ChatBrowser', () => new ChatBrowser());
   runtime.objectFactory.registerConstructor('AgentAbject', () => new AgentAbject());
+  runtime.objectFactory.registerConstructor('ScrumMaster', () => new ScrumMaster());
   runtime.objectFactory.registerConstructor('GoalObserver', () => new GoalObserver());
   runtime.objectFactory.registerConstructor('AbjectStore', () => new AbjectStore());
   runtime.objectFactory.registerConstructor('Supervisor', () => new Supervisor());
@@ -511,7 +513,7 @@ async function main(): Promise<void> {
       'GoalManager', 'GoalBrowser', 'GoalObserver',
       'JobManager', 'JobBrowser',
       'KnowledgeBase', 'KnowledgeBrowser',
-      'AgentAbject', 'AgentBrowser', 'AgentCreator',
+      'AgentAbject', 'ScrumMaster', 'AgentBrowser', 'AgentCreator',
       'ObjectAgent', 'SkillAgent', 'WebAgent',
       'Scheduler', 'SchedulerBrowser',
       'ObjectCreator', 'Chat', 'ChatManager', 'ChatBrowser', 'AbjectEditor', 'Taskbar',

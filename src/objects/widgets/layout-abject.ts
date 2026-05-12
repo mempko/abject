@@ -11,7 +11,7 @@ import {
   AbjectMessage,
   InterfaceDeclaration,
 } from '../../core/types.js';
-import { request } from '../../core/message.js';
+import { request, event } from '../../core/message.js';
 
 import { WidgetAbject, WidgetConfig } from './widget-abject.js';
 import {
@@ -167,6 +167,36 @@ export abstract class LayoutAbject extends WidgetAbject {
         this.requestRedraw().catch(() => {});
       }
     }, 0);
+  }
+
+  /**
+   * When a layout container is destroyed, cascade `destroy` to each of its
+   * current layout children. Without this, callers that destroy a container
+   * (e.g. tab-rebuild patterns) leak every widget the container held — the
+   * children stay alive in WidgetManager.spawnedWidgets with their mailboxes,
+   * dependents, and draw command buffers, growing the heap unboundedly.
+   *
+   * Fire-and-forget: we send `destroy` events rather than requesting replies
+   * because we are ourselves shutting down. WidgetAbject's destroy handler is
+   * idempotent on a stopped object, so callers that explicitly destroyed
+   * children before destroying the container are unaffected.
+   */
+  protected override async onStop(): Promise<void> {
+    if (this.relayoutTimer) {
+      clearTimeout(this.relayoutTimer);
+      this.relayoutTimer = undefined;
+    }
+
+    const children = this.layoutChildren;
+    this.layoutChildren = [];
+    for (const child of children) {
+      if (isSpacer(child)) continue;
+      try {
+        this.send(event(this.id, child.widgetId, 'destroy', {}));
+      } catch { /* child already gone */ }
+    }
+
+    await super.onStop();
   }
 
   private setupLayoutHandlers(): void {
