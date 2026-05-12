@@ -18,7 +18,7 @@ import type { MessagePort } from 'node:worker_threads';
 import { AbjectId } from '../src/core/types.js';
 import { WorkerBus } from '../src/runtime/worker-bus.js';
 import type { WorkerInboundMessage } from '../src/runtime/worker-bridge.js';
-import { BackendUI } from '../server/backend-ui.js';
+import { BackendUI, ClientMeta } from '../server/backend-ui.js';
 import { MessagePortUITransport } from '../server/ui-transport.js';
 import { Log } from '../src/core/timed-log.js';
 
@@ -33,6 +33,12 @@ const log = new Log('UIWorker');
 const workerBus = new WorkerBus((data) => port.postMessage(data));
 let backendUI: BackendUI | null = null;
 let backendUIId: AbjectId | null = null;
+/**
+ * Per-portName FIFO of metadata pre-announced by the main thread.
+ * Node IPC preserves order so a meta msg sent immediately before a
+ * port-transfer arrives first, but a queue lets us tolerate batching.
+ */
+const pendingMeta: Map<string, ClientMeta[]> = new Map();
 
 /**
  * Handle messages from the main thread.
@@ -61,12 +67,26 @@ port.on('message', async (data: { type: string; [key: string]: unknown }) => {
       const portName = data.portName as string;
       const wsPort = data.port as MessagePort;
 
-      if (portName === 'ws-relay' && backendUI) {
+      if ((portName === 'ws-relay' || portName === 'webrtc-relay') && backendUI) {
         const transport = new MessagePortUITransport(wsPort);
-        backendUI.addTransport(transport);
-        log.info('WebSocket relay port connected to BackendUI');
-      } else if (portName === 'ws-relay') {
-        log.warn('Received ws-relay port but BackendUI not yet initialized');
+        const queue = pendingMeta.get(portName);
+        const meta = queue?.shift() ?? { kind: portName === 'webrtc-relay' ? 'webrtc' : 'websocket' };
+        if (queue && queue.length === 0) pendingMeta.delete(portName);
+        backendUI.addTransport(transport, meta);
+        log.info(`${portName} port connected to BackendUI`);
+      } else if (portName === 'ws-relay' || portName === 'webrtc-relay') {
+        log.warn(`Received ${portName} port but BackendUI not yet initialized`);
+      }
+      break;
+    }
+
+    case 'frontend-client-meta': {
+      const portName = data.portName as string;
+      const meta = data.meta as ClientMeta;
+      if (portName) {
+        const queue = pendingMeta.get(portName) ?? [];
+        queue.push(meta);
+        pendingMeta.set(portName, queue);
       }
       break;
     }

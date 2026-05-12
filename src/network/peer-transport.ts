@@ -22,8 +22,32 @@ import {
   aesDecrypt,
 } from '../core/identity.js';
 import type { SignalingRelay } from './signaling.js';
-import { gzipSync, gunzipSync } from 'node:zlib';
+import { gzipSync, gunzipSync } from 'fflate';
 import { Log } from '../core/timed-log.js';
+
+// Isomorphic base64 helpers — no Buffer, no Node-only APIs.
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
+function base64ToBytes(b64: string): Uint8Array {
+  // Be lenient — Node's `Buffer.from(s, 'base64')` accepts URL-safe variants,
+  // missing padding, and whitespace. atob() rejects all of those, so normalise
+  // first to stay compatible with peers that produce non-canonical base64.
+  const cleaned = b64.replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
+  const padded = cleaned.length % 4 === 0
+    ? cleaned
+    : cleaned + '='.repeat(4 - (cleaned.length % 4));
+  const bin = atob(padded);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
 
 const log = new Log('PeerTransport');
 
@@ -278,29 +302,56 @@ export class PeerTransport extends Transport {
     const data = serialize(message);
 
     if (this.sessionKey) {
-      const encoder = new TextEncoder();
-      const encrypted = await aesEncrypt(this.sessionKey, encoder.encode(data));
-      const payload = JSON.stringify({ enc: true, ...encrypted });
-
-      // Compress and possibly chunk the encrypted payload
-      const compressed = gzipSync(Buffer.from(payload));
-      const b64 = compressed.toString('base64');
-
-      if (b64.length <= MAX_CHUNK_SIZE) {
-        // Single compressed message
-        this.dataChannel!.send(JSON.stringify({ gz: true, data: b64 }));
-      } else {
-        // Split into chunks
-        const chunkId = String(this.chunkCounter++);
-        const total = Math.ceil(b64.length / MAX_CHUNK_SIZE);
-        for (let i = 0; i < total; i++) {
-          const slice = b64.slice(i * MAX_CHUNK_SIZE, (i + 1) * MAX_CHUNK_SIZE);
-          this.dataChannel!.send(JSON.stringify({ chunk: true, id: chunkId, idx: i, total, data: slice }));
-        }
-        log.info(`sent ${total} chunks (${b64.length} bytes compressed) to ${this.remotePeerId.slice(0, 16)}`);
-      }
+      await this.sendEncryptedString(data);
     } else {
       this.dataChannel!.send(data);
+    }
+  }
+
+  /**
+   * Send a raw string (UI protocol JSON) over the encrypted DataChannel,
+   * bypassing AbjectMessage serialize/deserialize. Compression and chunking
+   * still apply. Used by WebRTCUITransport for browser ↔ server UI traffic.
+   */
+  async sendRaw(data: string): Promise<void> {
+    precondition(this.dataChannel !== undefined, 'DataChannel not open');
+    precondition(this.dataChannel!.readyState === 'open', 'DataChannel not open');
+    precondition(this.sessionKey !== undefined, 'Session key not established');
+    await this.sendEncryptedString(data, true);
+  }
+
+  /**
+   * Register a handler for raw string messages received post-handshake.
+   * These are messages sent via sendRaw — i.e. UI protocol JSON, not AbjectMessage.
+   */
+  onRawMessage(handler: (data: string) => void): void {
+    this.rawMessageHandler = handler;
+  }
+
+  private rawMessageHandler?: (data: string) => void;
+
+  /**
+   * Internal: encrypt + (optionally) compress + (optionally) chunk a string.
+   * raw=true signals the receiver to deliver via onRawMessage instead of onMessage.
+   */
+  private async sendEncryptedString(data: string, raw = false): Promise<void> {
+    const encoder = new TextEncoder();
+    const encrypted = await aesEncrypt(this.sessionKey!, encoder.encode(data));
+    const payload = JSON.stringify({ enc: true, raw: raw || undefined, ...encrypted });
+
+    const compressed = gzipSync(encoder.encode(payload));
+    const b64 = bytesToBase64(compressed);
+
+    if (b64.length <= MAX_CHUNK_SIZE) {
+      this.dataChannel!.send(JSON.stringify({ gz: true, data: b64 }));
+    } else {
+      const chunkId = String(this.chunkCounter++);
+      const total = Math.ceil(b64.length / MAX_CHUNK_SIZE);
+      for (let i = 0; i < total; i++) {
+        const slice = b64.slice(i * MAX_CHUNK_SIZE, (i + 1) * MAX_CHUNK_SIZE);
+        this.dataChannel!.send(JSON.stringify({ chunk: true, id: chunkId, idx: i, total, data: slice }));
+      }
+      log.info(`sent ${total} chunks (${b64.length} bytes compressed) to ${this.remotePeerId.slice(0, 16)}`);
     }
   }
 
@@ -467,14 +518,14 @@ export class PeerTransport extends Transport {
         const reassembled = this.handleChunk(parsed);
         if (!reassembled) return; // waiting for more chunks
         // Reassembled data is gz-compressed — decompress and re-parse
-        const decompressed = gunzipSync(Buffer.from(reassembled, 'base64')).toString();
+        const decompressed = new TextDecoder().decode(gunzipSync(base64ToBytes(reassembled)));
         await this.handleIncomingData(decompressed);
         return;
       }
 
       // Compressed (non-chunked) message — decompress and re-parse
       if (parsed.gz) {
-        const decompressed = gunzipSync(Buffer.from(parsed.data, 'base64')).toString();
+        const decompressed = new TextDecoder().decode(gunzipSync(base64ToBytes(parsed.data)));
         await this.handleIncomingData(decompressed);
         return;
       }
@@ -484,6 +535,11 @@ export class PeerTransport extends Transport {
         const plaintext = await aesDecrypt(this.sessionKey, parsed.iv, parsed.ciphertext);
         const decoder = new TextDecoder();
         const msgData = decoder.decode(plaintext);
+        if (parsed.raw) {
+          // Raw string payload (UI protocol) — deliver via onRawMessage
+          this.rawMessageHandler?.(msgData);
+          return;
+        }
         const message = deserialize(msgData);
         log.info(`recv encrypted from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
         this.events.onMessage?.(message);
