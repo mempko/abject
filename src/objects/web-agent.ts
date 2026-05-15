@@ -513,12 +513,27 @@ Set keepPageOpen: false to explicitly close the page when done.
       const startUrl = data?.startUrl as string | undefined;
       this._currentGoalId = goalId;
 
-      const extra: WebTaskExtra = { startUrl };
+      // Discover a persistent profile from either structured `data` (preferred,
+      // when the planner passes one along) or by parsing the description. The
+      // dispatch pipeline (ScrumMaster add_task → enqueueTask → executeTask)
+      // currently only carries the description string, so the regex fallback
+      // is what unlocks "profile=linkedin" / "the 'linkedin' profile" phrasings.
+      const profileFromData = (data?.profile as string | undefined)
+        ?? (data?.pageOptions as { profile?: string } | undefined)?.profile;
+      const profileFromDescription = extractProfileName(description);
+      const profile = profileFromData ?? profileFromDescription;
+      const pageOptions: WebTaskExtra['pageOptions'] = profile ? { profile } : undefined;
+
+      const extra: WebTaskExtra = { startUrl, pageOptions };
       this.taskExtras.set(taskId, extra);
+
+      if (profile) {
+        log.info(`executeTask using profile="${profile}" (${profileFromData ? 'data' : 'description'})`);
+      }
 
       // Open page
       const pageResult = await this.request<{ pageId: string }>(
-        request(this.id, this.webBrowserId!, 'openPage', {})
+        request(this.id, this.webBrowserId!, 'openPage', pageOptions ? { options: pageOptions } : {})
       );
       extra.pageId = pageResult.pageId;
       extra.pageOpenedByThisTask = true;
@@ -1188,3 +1203,37 @@ The page screenshot you produce with \`attach_screenshot\` (and on "done") is a 
 }
 
 export const WEB_AGENT_ID = 'abjects:web-agent' as AbjectId;
+
+/**
+ * Pull a persistent-profile name out of a free-text task description. The
+ * dispatcher (ScrumMaster's add_task) only carries description text, so the
+ * planner's phrasing — "use the 'linkedin' profile", "pageOptions.profile='linkedin'",
+ * "the persistent linkedin profile", etc. — is the only signal available.
+ * Returns the first plausible match or undefined.
+ */
+function extractProfileName(description: string): string | undefined {
+  if (!description) return undefined;
+
+  const patterns: RegExp[] = [
+    // pageOptions.profile = 'linkedin' / profile: "linkedin" / profile=linkedin
+    /\bprofile\s*[=:]\s*['"`]?([A-Za-z0-9][\w.-]{0,63})['"`]?/i,
+    // "the 'linkedin' profile" / "named 'linkedin' Playwright profile"
+    /['"`]([A-Za-z0-9][\w.-]{0,63})['"`]\s+(?:Playwright\s+)?profile\b/i,
+    // "(persistent|named|the) `linkedin` (Playwright )?profile"
+    /\b(?:persistent|named|the)\s+['"`]?([A-Za-z0-9][\w.-]{0,63})['"`]?\s+(?:Playwright\s+)?profile\b/i,
+    // "profile named 'linkedin'" / "profile 'linkedin'"
+    /\bprofile\s+(?:named\s+)?['"`]([A-Za-z0-9][\w.-]{0,63})['"`]/i,
+  ];
+
+  for (const re of patterns) {
+    const m = description.match(re);
+    if (m && m[1]) {
+      const name = m[1].trim();
+      // Skip generic words so we don't latch onto "the persistent BROWSER profile".
+      if (!/^(browser|playwright|persistent|named|the|a|this|that|new)$/i.test(name)) {
+        return name;
+      }
+    }
+  }
+  return undefined;
+}
