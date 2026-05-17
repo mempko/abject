@@ -106,13 +106,15 @@ Cryptographic identity and peer-to-peer networking.
 
 ## Coordination
 
-Cross-agent task coordination and progress tracking.
+Cross-agent task coordination and progress tracking. Goals run as Scrum-style sprints: ScrumMaster plans one round at a time, TupleSpace holds the dispatched tasks, GoalManager tracks the tree and emits round-completion events, GoalObserver is a staleness backstop.
 
 | File | Class | Well-known ID | Description |
 |------|-------|---------------|-------------|
-| `goal-manager.ts` | `GoalManager` | `GOAL_MANAGER_ID` | Shared coordination surface for cross-agent progress tracking. Persists goals to SharedState for peer visibility. Task convenience methods delegate to TupleSpace |
+| `scrum-master.ts` | `ScrumMaster` | `SCRUM_MASTER_INTERFACE` | Per-workspace planner. Runs each goal as a sprint of scrums via the standard observe-think-act loop. Actions: `review_scrum`, `poll_team`, `add_task` (stage), `dispatch_scrum` (commit round), `complete_goal`, `fail_goal`. Triggered by `goalCreated` and `goalReadyForCompletion` events |
+| `goal-manager.ts` | `GoalManager` | `GOAL_MANAGER_ID` | Owns the goal tree; tracks per-goal `currentScrumNumber`. Emits `goalReadyForCompletion` when every task at the current scrum reaches a terminal state. Persists goals to SharedState for peer visibility |
+| `tuple-space.ts` | `TupleSpace` | `TUPLE_SPACE_ID` | CRDT-backed coordination primitive for task distribution, namespaced per goal (`ts-{namespace}`). Workers claim optimistically (LWW); stale claims expire after 5 min and become reclaimable |
+| `goal-observer.ts` | `GoalObserver` | — | Passive watchdog. Sweeps active goals once a minute and auto-fails any that have made no progress for 30 minutes. Does NOT enforce per-task retry budgets or task-count caps; ScrumMaster owns failure decisions |
 | `goal-browser.ts` | `GoalBrowser` | `GOAL_BROWSER_ID` | UI for viewing cross-agent goal progress in real-time |
-| `tuple-space.ts` | `TupleSpace` | `TUPLE_SPACE_ID` | CRDT-backed coordination primitive for task distribution. Agents put tasks, claim them optimistically (LWW), and post results |
 
 ## Common Pattern
 

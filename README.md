@@ -43,14 +43,17 @@ a mind, silent otherwise.
 
 ## Emergence
 
-A Goal and nothing else. The Goal fractures into sub-goals and tasks. Tasks
-surface in the TupleSpace, a shared pool visible to every Abject on every
-connected peer. Agents watch. Programs watch. Anything can claim a task.
-Progress flows back up through the Goal tree.
+A Goal, and a planner that keeps re-planning. The **ScrumMaster** runs each
+goal as a sprint of recurring scrums: every round it reviews what the previous
+round produced, stages a batch of tasks, dispatches them into a shared
+**TupleSpace**, and waits for the round to complete before deciding what to
+plan next. Tasks are visible to every Abject on every connected peer. Anything
+that can do the work claims it — agents thinking with an LLM, abjects running
+deterministic code, abjects another agent spawned five minutes ago.
 
-- **Goal Decomposition**: A Goal decomposes recursively at runtime, shaped by what workers discover as they work. Agents can spawn purpose-built programs for repetitive tasks: no LLM calls, just code, running alongside the thinkers.
-- **Cross-Machine Coordination**: Goals are CRDTs that sync across peers through encrypted WebRTC channels with no central server. Kill a peer and the goal survives on every other peer that subscribed.
-- **Failure & Recovery**: Failed tasks release their claim and return to the TupleSpace. The system remembers who failed and routes to a different worker next time. Three strikes and the task dies; too many dead tasks and the GoalObserver kills the entire goal.
+- **Iterative Decomposition**: The plan is not decided up front. Each scrum reads the prior round's results (including failures) and rewrites what comes next. Sub-goals get their own scrum loops. The plan adapts as the system discovers what the work actually needs.
+- **Cross-Machine Coordination**: Goals and TupleSpace tuples are CRDTs that sync across peers through encrypted WebRTC channels with no central server. Kill a peer and the goal survives on every other peer that subscribed. Stale claims expire after 5 minutes and become reclaimable.
+- **Failure as Context**: There is no fixed retry budget. A failed task ends with its error attached to the goal's history; the next scrum reads that history and decides whether to schedule a corrective task, route the work to a different abject, or fail the goal. A separate **GoalObserver** watches from outside and auto-fails goals that go silent for too long.
 
 ## The Spreading
 
