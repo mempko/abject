@@ -2,39 +2,39 @@
 const features = [
   {
     icon: '{>}',
-    title: 'Spoken Into Being',
-    hook: 'Describe what you want. It appears. Alive. Watching.',
-    desc: 'Say "a todo list that syncs with my calendar" in plain English. The system writes a manifest, generates code via LLM, and spawns a running object with its own window. From words to living software in seconds.',
+    title: 'Speak it into existence.',
+    hook: '"A todo list that syncs my calendar." Type those words. A window appears.',
+    desc: 'Chat decomposes your sentence. The LLM writes a manifest. ObjectCreator spawns the abject. The result is a real running object with its own window, its own mailbox, and source code you can open and read.',
   },
   {
     icon: '{@}',
-    title: 'No Servers, No Masters',
-    hook: 'Your identity is your public key. Your network is your contacts. No cloud required.',
-    desc: "Every peer's true name is the SHA-256 hash of its signing key. Connect directly over encrypted WebRTC channels. Peers find each other through stateless signaling relays, then talk peer-to-peer. Networks grow by introduction, not registration.",
+    title: 'Your address is a public key.',
+    hook: 'No accounts. No signup. No cloud asking for your email.',
+    desc: "Every peer's true name is the SHA-256 hash of its ECDSA P-256 key. Connect over encrypted WebRTC with ECDH key exchange and AES-256-GCM. The signaling server only helps two peers find each other; it never sees a byte of the conversation.",
   },
   {
     icon: '{=}',
-    title: 'Shared Goals, Many Minds',
-    hook: 'Post a goal. Abjects explain how they can help. The best approach wins.',
-    desc: 'Goals fracture into tasks in a shared TupleSpace synced across peers. Abjects that can help self-assess via the ask protocol. Work distributes across machines. If one peer drops, stale claims expire and others pick up where it left off.',
+    title: 'Post a goal. Watch the swarm converge.',
+    hook: 'No dispatcher. No queue. No central state holder.',
+    desc: 'The goal lives in a TupleSpace synced across peers via CRDT. Abjects answer "what can you do?" through the Ask Protocol; the ScrumMaster picks the best fit each round. Work distributes itself across machines without ever talking to a server.',
   },
   {
     icon: '{!}',
-    title: 'Scars That Teach',
-    hook: 'Every failure is fed back into the wound. The proxy that grows back is smarter.',
-    desc: 'When error rates cross 10%, the system collects recent failures and generates a new proxy with the error history as context. The replacement accounts for exactly the mistakes that killed its predecessor.',
+    title: 'Break it. It always grows back.',
+    hook: 'Error rate crosses 10%. The replacement is already incoming.',
+    desc: 'When a proxy starts failing, Abject collects the crash data, hands it to the LLM, and generates a smarter proxy with the failures as training context. The hot-swap is invisible. The replacement accounts for exactly the mistakes that killed its predecessor.',
   },
   {
     icon: '{~}',
-    title: 'Skills From the Wild',
-    hook: 'Drop a SKILL.md into the folder. Claude Code or OpenClaw format. Both work.',
-    desc: 'Abjects learn new abilities from portable skill files without integration code. The skill registry scans, parses, and injects instructions at runtime. The system grows by adoption, not by programming.',
+    title: 'Drop a SKILL.md. The agents already know.',
+    hook: 'Claude Code or OpenClaw format. Both work, both at once.',
+    desc: 'Skills are markdown files. No build, no install, no registry to register with. The SkillRegistry watches the folder; the next time an abject needs a new ability, it reads what landed. The system grows by adoption, not by programming.',
   },
   {
     icon: '{*}',
-    title: 'Memory That Persists',
-    hook: 'What one abject learns, all abjects know.',
-    desc: 'Facts, insights, and references persist in a searchable knowledge base synced across peers via CRDT. Abjects recall what was learned in previous sessions, on other machines, by other abjects.',
+    title: 'What one abject learns, every abject knows.',
+    hook: 'A CRDT knowledge base that crosses machines and survives crashes.',
+    desc: 'Save a fact. Save a snippet. Save a reference. Every abject can ask. Every peer syncs. Lose a peer, the memory stays. Add a peer, it gets every fact from the past three weeks.',
   },
 ];
 
@@ -58,7 +58,7 @@ const capabilities = [
   <div class="container">
     <h2 class="section-title">What Lurks Inside</h2>
     <p class="features-intro">
-      Every capability below is an Abject itself: a living object with a manifest, a mailbox, and the ability to explain itself to any other object that asks.
+      Every one of these is an abject: a living object you can message, kill, restart, fork, or ask what it just did.
     </p>
     <div class="feature-grid">
       {features.map((f) => (
