@@ -1,0 +1,207 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+---
+
+<Layout
+  title="About - Abject"
+  description="Abject is an open-source, peer-to-peer desktop platform for local-first AI objects. Built by mempko, successor to Fire★. GPL-3.0. No company, no investors, no surveillance."
+>
+  <Header />
+  <main class="about">
+    <div class="about-container">
+
+      <header class="about-hero">
+        <p class="about-eyebrow">// ABOUT</p>
+        <h1>The Grass Still Grows. Now It Thinks.</h1>
+        <p class="about-thesis">
+          Abject is an open-source desktop platform for AI objects that live on your own machine,
+          find each other over peer-to-peer connections, and explain themselves in plain English.
+          It is licensed under GPL-3.0. It is not a company. It is not selling you a subscription.
+          It is a thing that exists because it should.
+        </p>
+      </header>
+
+      <section class="about-section">
+        <h2>Why This Exists</h2>
+        <p>
+          Every popular AI agent framework today puts a single planner on top and tools beneath.
+          That works for short demos and breaks on the things you actually want it to do for weeks
+          at a time. Hierarchies snap; meshes route around damage. The internet has known this
+          for fifty years.
+        </p>
+        <p>
+          Abject is what happens when you take the message-passing object pattern that already
+          runs the world (TCP/IP, Smalltalk, Erlang, the cells in your body) and add a small
+          new primitive: every object can explain itself to any other object in plain English.
+          The LLM is just a service one object asks when it needs to think. The architecture is
+          older than the LLM.
+        </p>
+        <p>
+          The result is a system you own. Your machine runs your agents. Your tokens come from
+          your account, or from a local model that costs nothing. Your goals live on your peers,
+          not on someone else's server. Anthropic can change its pricing at midnight and your
+          abjects will not notice.
+        </p>
+      </section>
+
+      <section class="about-section">
+        <h2>Who Built It</h2>
+        <p>
+          Abject is built by <strong>Maxim Khailo</strong> (<a href="https://github.com/mempko" target="_blank" rel="noopener">mempko</a> on GitHub),
+          a software engineer who has spent years building open-source distributed systems.
+        </p>
+        <p>
+          Before Abject came <a href="https://firestr.com" target="_blank" rel="noopener">Fire★</a>,
+          a peer-to-peer platform for creating and sharing distributed applications, written in C++ and Lua,
+          released under the GNU GPL. Fire★ called what it did <em>Grass Computing</em>:
+          software you can touch, shape, and share directly. No cloud. No landlords. It proved
+          the vision works. It also proved that the vision needs an LLM to negotiate between objects
+          built by people who never met. That gap is what Abject closes.
+        </p>
+      </section>
+
+      <section class="about-section">
+        <h2>What This Isn't</h2>
+        <ul class="about-list">
+          <li><strong>Not a startup.</strong> No investors. No board. No exit strategy. No roadmap to monetize you.</li>
+          <li><strong>Not a SaaS.</strong> Your data, your tokens, your machine. The signaling server is open source; run your own.</li>
+          <li><strong>Not telemetry-funded.</strong> The system makes no calls home. Add a <code>WS_PORT</code> and that's the only network it asks for.</li>
+          <li><strong>Not closed.</strong> GPL-3.0-or-later. Fork it. Modify it. Ship it. Just keep it free.</li>
+        </ul>
+      </section>
+
+      <section class="about-section">
+        <h2>How To Reach Me</h2>
+        <ul class="about-list">
+          <li><strong>Email:</strong> <a href="mailto:max@mempko.com">max@mempko.com</a></li>
+          <li><strong>GitHub:</strong> <a href="https://github.com/mempko/abjects" target="_blank" rel="noopener">mempko/abjects</a> (issues, PRs welcome)</li>
+          <li><strong>Reddit:</strong> <a href="https://www.reddit.com/r/AbjectWorld/" target="_blank" rel="noopener">r/AbjectWorld</a></li>
+          <li><strong>Discord:</strong> <a href="https://discord.gg/B75AeYUYcF" target="_blank" rel="noopener">join here</a></li>
+        </ul>
+      </section>
+
+      <p class="about-coda">
+        Abject is a long-term project. It will be slow. It will be weird. It will keep being free.
+      </p>
+
+    </div>
+  </main>
+  <Footer />
+</Layout>
+
+<style>
+  .about {
+    min-height: 100vh;
+    padding-top: 96px;
+    padding-bottom: 4rem;
+    position: relative;
+    z-index: 1;
+  }
+
+  .about-container {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 0 1.5rem;
+  }
+
+  .about-hero {
+    margin-bottom: 3.5rem;
+  }
+
+  .about-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--eldritch);
+    letter-spacing: 0.15em;
+    margin-bottom: 0.75rem;
+  }
+
+  .about-hero h1 {
+    font-size: clamp(1.8rem, 4vw, 2.6rem);
+    line-height: 1.2;
+    margin-bottom: 1.25rem;
+  }
+
+  .about-thesis {
+    color: var(--text-secondary);
+    font-size: 1.05rem;
+    line-height: 1.75;
+  }
+
+  .about-section {
+    margin-bottom: 3rem;
+  }
+
+  .about-section h2 {
+    font-size: 1.4rem;
+    color: var(--text-primary);
+    margin-bottom: 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .about-section p {
+    color: var(--text-secondary);
+    font-size: 1rem;
+    line-height: 1.8;
+    margin-bottom: 1rem;
+  }
+
+  .about-section p:last-child {
+    margin-bottom: 0;
+  }
+
+  .about-section a {
+    color: var(--eldritch-dim);
+    border-bottom: 1px solid rgba(43, 204, 110, 0.3);
+    padding-bottom: 1px;
+    transition: color 0.2s, border-color 0.2s;
+  }
+
+  .about-section a:hover {
+    color: var(--eldritch);
+    border-bottom-color: var(--eldritch);
+  }
+
+  .about-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+
+  .about-list li {
+    color: var(--text-secondary);
+    font-size: 1rem;
+    line-height: 1.7;
+    padding: 0.75rem 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .about-list li:last-child {
+    border-bottom: none;
+  }
+
+  .about-list strong {
+    color: var(--text-primary);
+  }
+
+  .about-list code {
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    color: var(--eldritch);
+    background: var(--eldritch-glow);
+    padding: 0.1rem 0.35rem;
+    border-radius: 3px;
+  }
+
+  .about-coda {
+    margin-top: 4rem;
+    text-align: center;
+    font-family: var(--font-mono);
+    font-style: italic;
+    color: var(--text-dim);
+    font-size: 0.95rem;
+  }
+</style>
