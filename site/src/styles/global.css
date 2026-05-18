@@ -28,10 +28,10 @@
   --accent-glow-strong: var(--eldritch-glow-strong);
   --accent-secondary: var(--void-purple);
 
-  --text-primary: #e0e0ea;
-  --text-secondary: #8a8a9e;
-  --text-dim: #5a5a70;
-  --text-code: #c0c0d4;
+  --text-primary: #ececf2;
+  --text-secondary: #c4c4d2;
+  --text-dim: #9a9aae;
+  --text-code: #d8d8e4;
 
   --border: #1a1a2a;
   --border-accent: rgba(57, 255, 142, 0.2);

@@ -15,7 +15,7 @@
 
     <!-- Zone B2: Goal Hierarchy Diagram -->
     <div class="goal-diagram">
-      <h3 class="diagram-label diagram-label-new">The Descent</h3>
+      <p class="diagram-label diagram-label-new">The Descent</p>
       <svg class="diagram-svg diagram-svg-new" viewBox="0 0 700 440" xmlns="http://www.w3.org/2000/svg">
         <defs>
           <filter id="em-gd-glow">
@@ -140,7 +140,7 @@
         <div class="step-label">II</div>
         <h3 class="step-title">The Reaching</h3>
         <p class="step-tagline">Abjects sense what they were made for.</p>
-        <p>The ScrumMaster polls registered workers through the ask protocol — "Can you do this? How?" Workers that can't help reply PASS; the planner assigns each task to the most fitting candidate. Tasks land in TupleSpace, which syncs across peers via CRDT over WebRTC. Optimistic claims with LWW, no locks. Not every hand that reaches needs a brain behind it.</p>
+        <p>The ScrumMaster polls registered workers through the ask protocol: "Can you do this? How?" Workers that can't help reply PASS; the planner assigns each task to the most fitting candidate. Tasks land in TupleSpace, which syncs across peers via CRDT over WebRTC. Optimistic claims with LWW, no locks. Not every hand that reaches needs a brain behind it.</p>
       </div>
 
       <div class="step-connector">
@@ -153,7 +153,7 @@
         <div class="step-label">III</div>
         <h3 class="step-title">The Convergence</h3>
         <p class="step-tagline">A round finishes; the planner returns.</p>
-        <p>Every task in the current scrum runs to a terminal state — done, failed, or skipped — somewhere on the mesh. When the round is complete, the GoalManager emits <code>goalReadyForCompletion</code>. ScrumMaster wakes for the next scrum, reviews what the round produced and what it didn't, and decides: declare the goal done, plan another round of tasks, or fail the goal. Multiple abjects on different machines converge on the same Goal without ever speaking to each other directly.</p>
+        <p>Every task in the current scrum runs to a terminal state (done, failed, or skipped) somewhere on the mesh. When the round is complete, the GoalManager emits <code>goalReadyForCompletion</code>. ScrumMaster wakes for the next scrum, reviews what the round produced and what it didn't, and decides: declare the goal done, plan another round of tasks, or fail the goal. Multiple abjects on different machines converge on the same Goal without ever speaking to each other directly.</p>
       </div>
 
       <div class="step-connector">
@@ -166,7 +166,7 @@
         <div class="step-label">IV</div>
         <h3 class="step-title">The Scar</h3>
         <p class="step-tagline">Failure is not the end. It is context for the next scrum.</p>
-        <p>Failed tasks attach their error and the worker that failed them to the goal's history. There is no per-task retry budget; the next scrum reads the failure and decides what to do about it — schedule a corrective task, route the work to a different abject, or fail the goal entirely. A GoalObserver watches from outside and auto-fails goals that go silent for too long. Nothing is patched into amnesia; every scar is a fact the next round can reason about.</p>
+        <p>Failed tasks attach their error and the worker that failed them to the goal's history. There is no per-task retry budget; the next scrum reads the failure and decides what to do about it: schedule a corrective task, route the work to a different abject, or fail the goal entirely. A GoalObserver watches from outside and auto-fails goals that go silent for too long. Nothing is patched into amnesia; every scar is a fact the next round can reason about.</p>
       </div>
 
     </div>
@@ -180,7 +180,7 @@
         <div class="compare-systems">AutoGen &middot; CrewAI &middot; LangGraph</div>
         <div class="compare-diagrams">
           <div class="diagram-old">
-            <h3 class="diagram-label">The Old Way</h3>
+            <p class="diagram-label">The Old Way</p>
             <svg class="diagram-svg diagram-svg-old" viewBox="0 0 620 170" xmlns="http://www.w3.org/2000/svg">
               <defs>
                 <marker id="em-arrow-dim" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
@@ -216,7 +216,7 @@
             </svg>
           </div>
           <div class="diagram-new">
-            <h3 class="diagram-label diagram-label-new">The Inversion</h3>
+            <p class="diagram-label diagram-label-new">The Inversion</p>
             <svg class="diagram-svg diagram-svg-new" viewBox="0 0 620 310" xmlns="http://www.w3.org/2000/svg">
               <defs>
                 <filter id="em-glow-green">
@@ -420,7 +420,7 @@
           </div>
           <div class="compare-side compare-abjects">
             <span class="compare-tag compare-tag-abjects">Abject</span>
-            <p>A failed task ends the current round with its error attached to the goal's history. The next scrum reads that history and decides what to do — schedule a corrective task, route the work to a different abject, or fail the goal. There is no fixed retry budget; the planner adapts each round. A separate GoalObserver auto-fails goals that go silent for too long.</p>
+            <p>A failed task ends the current round with its error attached to the goal's history. The next scrum reads that history and decides what to do: schedule a corrective task, route the work to a different abject, or fail the goal. There is no fixed retry budget; the planner adapts each round. A separate GoalObserver auto-fails goals that go silent for too long.</p>
           </div>
         </div>
       </div>

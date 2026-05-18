@@ -2,36 +2,42 @@
 const features = [
   {
     icon: '{>}',
+    abjects: 'ObjectCreator · Chat',
     title: 'Speak it into existence.',
     hook: '"A todo list that syncs my calendar." Type those words. A window appears.',
     desc: 'Chat decomposes your sentence. The LLM writes a manifest. ObjectCreator spawns the abject. The result is a real running object with its own window, its own mailbox, and source code you can open and read.',
   },
   {
     icon: '{@}',
+    abjects: 'IdentityObject · PeerRegistry',
     title: 'Your address is a public key.',
     hook: 'No accounts. No signup. No cloud asking for your email.',
     desc: "Every peer's true name is the SHA-256 hash of its ECDSA P-256 key. Connect over encrypted WebRTC with ECDH key exchange and AES-256-GCM. The signaling server only helps two peers find each other; it never sees a byte of the conversation.",
   },
   {
     icon: '{=}',
+    abjects: 'ScrumMaster · GoalManager · TupleSpace',
     title: 'Post a goal. Watch the swarm converge.',
     hook: 'No dispatcher. No queue. No central state holder.',
     desc: 'The goal lives in a TupleSpace synced across peers via CRDT. Abjects answer "what can you do?" through the Ask Protocol; the ScrumMaster picks the best fit each round. Work distributes itself across machines without ever talking to a server.',
   },
   {
     icon: '{!}',
-    title: 'Break it. It always grows back.',
-    hook: 'Error rate crosses 10%. The replacement is already incoming.',
-    desc: 'When a proxy starts failing, Abject collects the crash data, hands it to the LLM, and generates a smarter proxy with the failures as training context. The hot-swap is invisible. The replacement accounts for exactly the mistakes that killed its predecessor.',
+    abjects: 'Negotiator · ProxyGenerator · HealthMonitor',
+    title: 'Break it. It tries to grow back.',
+    hook: 'Error rate crosses 10%. The LLM drafts a replacement from the crash data.',
+    desc: 'When a proxy starts failing, Abject collects the recent errors and asks the LLM to generate a smarter proxy with those failures as context. The hot-swap is invisible when it works; when it doesn\'t, you find out in the logs instead of in production. The replacement accounts for exactly the mistakes that killed its predecessor.',
   },
   {
     icon: '{~}',
+    abjects: 'SkillRegistry',
     title: 'Drop a SKILL.md. The agents already know.',
     hook: 'Claude Code or OpenClaw format. Both work, both at once.',
     desc: 'Skills are markdown files. No build, no install, no registry to register with. The SkillRegistry watches the folder; the next time an abject needs a new ability, it reads what landed. The system grows by adoption, not by programming.',
   },
   {
     icon: '{*}',
+    abjects: 'KnowledgeBase',
     title: 'What one abject learns, every abject knows.',
     hook: 'A CRDT knowledge base that crosses machines and survives crashes.',
     desc: 'Save a fact. Save a snippet. Save a reference. Every abject can ask. Every peer syncs. Lose a peer, the memory stays. Add a peer, it gets every fact from the past three weeks.',
@@ -63,7 +69,10 @@ const capabilities = [
     <div class="feature-grid">
       {features.map((f) => (
         <div class="card feature-card">
-          <span class="card-icon">{f.icon}</span>
+          <div class="card-header">
+            <span class="card-icon">{f.icon}</span>
+            <span class="card-abjects">{f.abjects}</span>
+          </div>
           <h3>{f.title}</h3>
           <p class="hook">{f.hook}</p>
           <p>{f.desc}</p>
@@ -120,6 +129,14 @@ const capabilities = [
     }
   }
 
+  .card-header {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+  }
+
   .card-icon {
     display: inline-block;
     font-family: var(--font-mono);
@@ -130,7 +147,15 @@ const capabilities = [
     border: 1px solid var(--border-accent);
     padding: 0.4rem 0.6rem;
     border-radius: 6px;
-    margin-bottom: 0.75rem;
+  }
+
+  .card-abjects {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--text-dim);
+    letter-spacing: 0.01em;
+    line-height: 1.4;
   }
 
   .feature-card .hook {
