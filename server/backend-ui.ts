@@ -1597,14 +1597,21 @@ IMPORTANT:
       case 'fontMetrics': {
         const fmMsg = msg as FontMetricsMsg;
         const hadMetrics = this.fontMetrics.size > 0;
+        // Multi-client safety: a secondary client (e.g. a paired phone) reports
+        // its own font widths, but the layout is shared. Overwriting the
+        // first client's metrics with a different-font set would re-flow every
+        // window using mismatched widths. Keep first-arrival per (font, char).
         for (const [font, chars] of Object.entries(fmMsg.metrics)) {
-          const charMap = new Map<string, number>();
-          for (const [ch, w] of Object.entries(chars)) {
-            charMap.set(ch, w);
+          let charMap = this.fontMetrics.get(font);
+          if (!charMap) {
+            charMap = new Map<string, number>();
+            this.fontMetrics.set(font, charMap);
           }
-          this.fontMetrics.set(font, charMap);
+          for (const [ch, w] of Object.entries(chars)) {
+            if (!charMap.has(ch)) charMap.set(ch, w);
+          }
         }
-        log.info(`Received font metrics from ${clientId} for ${Object.keys(fmMsg.metrics).length} fonts`);
+        log.info(`Received font metrics from ${clientId} for ${Object.keys(fmMsg.metrics).length} fonts (additive)`);
         // Only fire fontMetricsChanged on first metrics arrival
         if (!hadMetrics) {
           this.lastDrawHash.clear();

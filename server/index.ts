@@ -103,7 +103,7 @@ import { Log } from '../src/core/timed-log.js';
 import * as path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { MessageChannel } from 'node:worker_threads';
+import { MessageChannel, type MessagePort } from 'node:worker_threads';
 import type { PeerId } from '../src/core/identity.js';
 
 const WS_PORT = parseInt(process.env.WS_PORT ?? '7719', 10);
@@ -339,6 +339,13 @@ async function main(): Promise<void> {
    */
   function attachRemoteUIClient(peerId: string, transport: UITransportLike, meta?: { name?: string }): void {
     const clientMeta = { kind: 'webrtc' as const, peerId, name: meta?.name };
+    // The pair-token handshake already authenticated this client, so signal
+    // the frontend that it's good to go — same message the WS path sends in
+    // the auth-disabled branch. Without this the client stays on the
+    // "Descending into the depths" overlay forever.
+    if (transport.ready) {
+      transport.send(JSON.stringify({ type: 'authNotRequired' }));
+    }
     if (DEDICATED_WORKERS && uiBridge) {
       const { port1, port2 } = new MessageChannel();
 
@@ -367,6 +374,41 @@ async function main(): Promise<void> {
       alog.warn(`No BackendUI available to attach remote UI client ${peerId.slice(0, 16)}`);
       transport.close();
     }
+  }
+
+  /**
+   * Wrap a Node MessagePort (received from the P2P worker after a successful
+   * remote-UI pairing) as a UITransportLike — the same interface that
+   * BackendUI expects from a direct WebRTCUITransport. The actual encrypted
+   * DataChannel lives in the P2P worker; only string payloads cross the port.
+   */
+  function portToUITransport(port: MessagePort): UITransportLike {
+    let msgHandler: ((data: string) => void) | undefined;
+    let closeHandler: (() => void) | undefined;
+    let closed = false;
+
+    port.on('message', (data) => {
+      msgHandler?.(String(data));
+    });
+    port.on('close', () => {
+      closed = true;
+      closeHandler?.();
+    });
+
+    return {
+      send(data: string): void {
+        if (closed) return;
+        port.postMessage(data);
+      },
+      onMessage(handler) { msgHandler = handler; },
+      onClose(handler) { closeHandler = handler; },
+      close(): void {
+        if (closed) return;
+        closed = true;
+        try { port.close(); } catch { /* ignore */ }
+      },
+      get ready() { return !closed; },
+    };
   }
 
   const wsServer = new NodeWebSocketServer({
@@ -591,6 +633,7 @@ async function main(): Promise<void> {
   let peerRouterId: AbjectId;
   let signalingRelayId: AbjectId;
   let peerDiscoveryId: AbjectId;
+  let remoteUIAccessId: AbjectId | undefined;
   let p2pBridge: DedicatedWorkerBridge | null = null;
 
   /** Compute a system-scoped TypeId: {peerId}/system/{name} */
@@ -615,13 +658,14 @@ async function main(): Promise<void> {
     remoteRegistryId = randomUUID() as AbjectId;
     signalingRelayId = randomUUID() as AbjectId;
     peerDiscoveryId = randomUUID() as AbjectId;
+    remoteUIAccessId = randomUUID() as AbjectId;
 
     const p2pWorkerScript = new URL('../workers/p2p-worker-node.ts', import.meta.url);
     const p2pWorker = new NodeWorkerAdapter(p2pWorkerScript);
     p2pBridge = new DedicatedWorkerBridge(p2pWorker, bus);
 
     // Register all P2P object IDs on the main bus before worker init
-    const p2pObjectIds = [identityId, peerRegistryId, remoteRegistryId, signalingRelayId, peerDiscoveryId];
+    const p2pObjectIds = [identityId, peerRegistryId, remoteRegistryId, signalingRelayId, peerDiscoveryId, remoteUIAccessId];
     for (const id of p2pObjectIds) {
       bus.registerDedicatedBridge(id, p2pBridge);
     }
@@ -635,6 +679,7 @@ async function main(): Promise<void> {
       { id: remoteRegistryId, name: 'RemoteRegistry', interfaceId: 'abjects:remote-registry' },
       { id: signalingRelayId, name: 'SignalingRelay', interfaceId: 'abjects:signaling-relay' },
       { id: peerDiscoveryId, name: 'PeerDiscovery', interfaceId: 'abjects:peer-discovery' },
+      { id: remoteUIAccessId, name: 'RemoteUIAccess', interfaceId: 'abjects:remote-ui-access' },
     ];
     for (const reg of p2pRegistrations) {
       await bootstrapRequest(registryId, 'register', {
@@ -680,6 +725,16 @@ async function main(): Promise<void> {
     // Wire PeerRouter → P2P bridge for transport sends
     peerRouterObj.setP2PBridge(p2pBridge);
 
+    // remote-ui-attach: a remote UI client successfully paired in the P2P
+    // worker. The transport bytes are relayed across via a MessagePort; on
+    // this side we wrap the port as a UITransportLike and hand it to
+    // attachRemoteUIClient (which routes it on to BackendUI).
+    p2pBridge.onCustom('remote-ui-attach', (data) => {
+      const d = data as unknown as { peerId: string; meta?: { name?: string }; transferPort: MessagePort };
+      const transport = portToUITransport(d.transferPort);
+      attachRemoteUIClient(d.peerId, transport, d.meta);
+    });
+
     // Wait for worker ready, then send config
     await p2pBridge.waitReady();
     p2pBridge.sendConfig({
@@ -688,6 +743,7 @@ async function main(): Promise<void> {
       remoteRegistryId: remoteRegistryId as string,
       signalingRelayId: signalingRelayId as string,
       peerDiscoveryId: peerDiscoveryId as string,
+      remoteUIAccessId: remoteUIAccessId as string,
       registryId: registryId as string,
     });
 
@@ -745,14 +801,19 @@ async function main(): Promise<void> {
 
   log.timed('P2P layer ready');
 
-  // RemoteUIAccess must spawn before GlobalSettings so the auth tab's
-  // discoverDep('RemoteUIAccess') in onInit succeeds.
-  const remoteUIAccessId = await supervisedSpawn('RemoteUIAccess', 'permanent', systemTypeId('RemoteUIAccess'));
-  const remoteUIAccessObj = runtime.objectFactory.getObject(remoteUIAccessId) as RemoteUIAccess | undefined;
-  if (remoteUIAccessObj) {
-    remoteUIAccessObj.setAttachHandler((peerId: string, transport: UITransportLike, meta?: { name?: string }) => {
-      attachRemoteUIClient(peerId, transport, meta);
-    });
+  // RemoteUIAccess must be reachable before GlobalSettings so the auth tab's
+  // discoverDep('RemoteUIAccess') in onInit succeeds. In DEDICATED_WORKERS
+  // mode it was already bootstrapped inside the P2P worker (which holds the
+  // WebRTC polyfill); the main-thread spawn here is only the non-worker
+  // fallback.
+  if (!DEDICATED_WORKERS) {
+    remoteUIAccessId = await supervisedSpawn('RemoteUIAccess', 'permanent', systemTypeId('RemoteUIAccess'));
+    const remoteUIAccessObj = runtime.objectFactory.getObject(remoteUIAccessId) as RemoteUIAccess | undefined;
+    if (remoteUIAccessObj) {
+      remoteUIAccessObj.setAttachHandler((peerId: string, transport: UITransportLike, meta?: { name?: string }) => {
+        attachRemoteUIClient(peerId, transport, meta);
+      });
+    }
   }
 
   const globalSettingsId = await supervisedSpawn('GlobalSettings', 'permanent', systemTypeId('GlobalSettings'));

@@ -47,6 +47,9 @@ import { PeerRegistry } from '../src/objects/peer-registry.js';
 import { RemoteRegistry } from '../src/objects/remote-registry.js';
 import { SignalingRelayObject } from '../src/objects/signaling-relay.js';
 import { PeerDiscoveryObject } from '../src/objects/peer-discovery.js';
+import { RemoteUIAccess } from '../src/objects/remote-ui-access.js';
+import { MessageChannel } from 'node:worker_threads';
+import type { UITransportLike } from '../src/network/webrtc-ui-transport.js';
 import type { PeerId } from '../src/core/identity.js';
 import { Log } from '../src/core/timed-log.js';
 
@@ -67,12 +70,14 @@ interface P2PConfig {
   remoteRegistryId: string;
   signalingRelayId: string;
   peerDiscoveryId: string;
+  remoteUIAccessId?: string;
   registryId: string;
   identityTypeId?: string;
   peerRegistryTypeId?: string;
   remoteRegistryTypeId?: string;
   signalingRelayTypeId?: string;
   peerDiscoveryTypeId?: string;
+  remoteUIAccessTypeId?: string;
 }
 
 /**
@@ -158,6 +163,39 @@ async function bootstrapP2P(config: P2PConfig): Promise<void> {
   peerRegistryObj.setSignalingRelay(signalingRelayObj);
 
   log.info('P2P objects wired');
+
+  // 6. RemoteUIAccess — also needs WebRTC, so it lives here alongside the
+  // rest of the P2P stack. When a remote UI client successfully pairs we
+  // relay its UI bytes back to the main thread via a MessagePort, so
+  // BackendUI (which lives outside this worker) can drive it.
+  if (config.remoteUIAccessId) {
+    const remoteUIAccessObj = new RemoteUIAccess();
+    remoteUIAccessObj.setId(config.remoteUIAccessId as AbjectId);
+    remoteUIAccessObj.setRegistryHint(mainRegistryId);
+    if (config.remoteUIAccessTypeId) {
+      remoteUIAccessObj.setTypeId(config.remoteUIAccessTypeId as TypeId);
+    }
+    remoteUIAccessObj.setAttachHandler((peerId: string, transport: UITransportLike, meta?: { name?: string }) => {
+      const { port1, port2 } = new MessageChannel();
+
+      transport.onMessage((data) => port1.postMessage(data));
+      port1.on('message', (data) => {
+        if (transport.ready) transport.send(String(data));
+      });
+
+      transport.onClose(() => port1.close());
+      port1.on('close', () => {
+        if (transport.ready) transport.close();
+      });
+
+      port.postMessage(
+        { type: 'remote-ui-attach', peerId, meta, transferPort: port2 },
+        [port2],
+      );
+    });
+    await remoteUIAccessObj.init(workerBus);
+    log.info('RemoteUIAccess initialized');
+  }
 
   // Wire PeerRegistry events to post messages to main thread
   peerRegistryObj.onRemoteMessage((msg: AbjectMessage, fromPeerId: PeerId) => {
