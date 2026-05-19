@@ -195,6 +195,29 @@
         75%  { content: '...'; }
         100% { content: ''; }
       }
+      .connecting-reset {
+        margin-top: 2.5rem;
+        padding: 0.55rem 1.1rem;
+        font-family: "JetBrains Mono", "Fira Code", monospace;
+        font-size: 0.78rem;
+        letter-spacing: 0.08em;
+        color: #cfcfdc;
+        background: transparent;
+        border: 1px solid rgba(207, 207, 220, 0.25);
+        border-radius: 4px;
+        cursor: pointer;
+        pointer-events: auto;
+        opacity: 0;
+        transition: opacity 0.4s ease-out, border-color 0.2s, color 0.2s;
+      }
+      .connecting-reset.visible {
+        opacity: 1;
+      }
+      .connecting-reset:hover, .connecting-reset:focus {
+        color: #39ff8e;
+        border-color: rgba(57, 255, 142, 0.5);
+        outline: none;
+      }
 
       /* Pair prompt overlay (shown for p2p-default builds with no pairing) */
       #pair-prompt-overlay {
@@ -364,6 +387,9 @@
     <div id="connecting-overlay">
       <div class="connecting-logo"><span class="accent">{abject}</span></div>
       <div class="connecting-status">Descending into the depths<span class="connecting-dots"></span></div>
+      <button id="connecting-reset-btn" type="button" class="connecting-reset" hidden>
+        Reset and re-pair
+      </button>
     </div>
     <div id="pair-prompt-overlay">
       <div class="pair-card">

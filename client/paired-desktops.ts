@@ -58,3 +58,7 @@ export function removePairedDesktop(peerId: string): void {
   const remaining = listPairedDesktops().filter((p) => p.peerId !== peerId);
   localStorage.setItem(LS_PAIRED, JSON.stringify(remaining));
 }
+
+export function clearAllPairedDesktops(): void {
+  localStorage.removeItem(LS_PAIRED);
+}

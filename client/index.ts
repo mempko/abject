@@ -15,7 +15,8 @@ import { startAbyssBg } from './abyss-bg.js';
 import { WebSocketClientTransport } from './ws-transport.js';
 import { WebRTCClientTransport } from './webrtc-transport.js';
 import { getPairingPayloadFromUrl, clearPairingParamFromUrl, type PairingPayload } from './pairing.js';
-import { getMostRecentPairedDesktop } from './paired-desktops.js';
+import { getMostRecentPairedDesktop, clearAllPairedDesktops } from './paired-desktops.js';
+import { clearBrowserIdentity } from './identity-store.js';
 import type { ClientTransport } from './transport.js';
 import { startQrScanner, type QrScannerHandle } from './qr-scanner.js';
 
@@ -206,12 +207,47 @@ function beginPairing(payload: PairingPayload): void {
   });
 }
 
+async function resetClientState(): Promise<void> {
+  clog('reset: clearing keys and paired desktops');
+  try {
+    await clearBrowserIdentity();
+  } catch (err) {
+    console.warn('[Frontend] clearBrowserIdentity failed:', err);
+  }
+  clearAllPairedDesktops();
+  try { localStorage.removeItem('abjects_auth_token'); } catch { /* ignore */ }
+  // Drop any ?pair=… so reload lands on the clean splash.
+  const url = new URL(window.location.href);
+  url.search = '';
+  window.location.replace(url.toString());
+}
+
+function wireResetButton(): void {
+  const btn = document.getElementById('connecting-reset-btn') as HTMLButtonElement | null;
+  if (!btn || btn.dataset.wired) return;
+  btn.dataset.wired = '1';
+  btn.addEventListener('click', () => { void resetClientState(); });
+
+  // Reveal the reset button after a few seconds of being on the connecting
+  // overlay — quick successful connects never see it. If the overlay is
+  // already hidden (we connected fast), do nothing.
+  setTimeout(() => {
+    const overlay = document.getElementById('connecting-overlay');
+    if (overlay && !overlay.classList.contains('hidden')) {
+      btn.hidden = false;
+      requestAnimationFrame(() => btn.classList.add('visible'));
+    }
+  }, 5000);
+}
+
 function start(): void {
   const container = document.querySelector('#app');
   if (!container) {
     console.error('[Frontend] #app container not found');
     return;
   }
+
+  wireResetButton();
 
   // Guard against double initialization (HMR or module re-execution)
   const existing = container.querySelector('canvas');

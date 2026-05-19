@@ -93,6 +93,27 @@ async function generateIdentity(): Promise<BrowserIdentity> {
   return { peerId, signingKeyPair, exchangeKeyPair, publicSigningKeyJwk, publicExchangeKeyJwk };
 }
 
+/**
+ * Wipe the browser's signing/exchange keypair (IndexedDB) and the localStorage
+ * mirrors. After this, the next getBrowserIdentity() call generates a fresh
+ * peerId. Use when the user explicitly resets — the desktop will see a
+ * different peer next time and the user must re-pair via QR.
+ */
+export async function clearBrowserIdentity(): Promise<void> {
+  cached = undefined;
+  localStorage.removeItem(LS_PEER_ID);
+  localStorage.removeItem(LS_SIGNING_PUB);
+  localStorage.removeItem(LS_EXCHANGE_PUB);
+  try {
+    const db = await openDb();
+    await idbDelete(db, KEY_SIGNING);
+    await idbDelete(db, KEY_EXCHANGE);
+    db.close();
+  } catch (err) {
+    console.warn('[identity-store] clearBrowserIdentity failed:', err);
+  }
+}
+
 async function persistIdentity(identity: BrowserIdentity): Promise<void> {
   const db = await openDb();
   await idbPut(db, KEY_SIGNING, identity.signingKeyPair);
@@ -134,6 +155,16 @@ function idbPut<T>(db: IDBDatabase, key: string, value: T): Promise<void> {
     const tx = db.transaction(STORE_KEYS, 'readwrite');
     const store = tx.objectStore(STORE_KEYS);
     const req = store.put(value, key);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function idbDelete(db: IDBDatabase, key: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_KEYS, 'readwrite');
+    const store = tx.objectStore(STORE_KEYS);
+    const req = store.delete(key);
     req.onsuccess = () => resolve();
     req.onerror = () => reject(req.error);
   });
