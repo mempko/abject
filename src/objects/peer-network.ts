@@ -71,6 +71,11 @@ export class PeerNetwork extends Abject {
   private remoteGenerateBtnId?: AbjectId;
   private remoteQrImageId?: AbjectId;
   private remoteQrUrlLabelId?: AbjectId;
+  private lastQrDataUrl?: string;
+  private lastQrUrl?: string;
+  private refreshing = false;
+  private refreshPending = false;
+  private frontendsListAreaId?: AbjectId;
 
   // Discovery dep
   private peerDiscoveryId?: AbjectId;
@@ -298,6 +303,8 @@ Interface: abjects:peer-network`;
             const result = await this.request<{ qrUrl: string; qrDataUrl: string }>(
               request(this.id, this.remoteUIAccessId, 'generatePairingToken', {})
             );
+            this.lastQrDataUrl = result.qrDataUrl;
+            this.lastQrUrl = result.qrUrl;
             if (this.remoteQrImageId) {
               await this.request(request(this.id, this.remoteQrImageId, 'update', { url: result.qrDataUrl, alt: '' }));
             }
@@ -448,13 +455,11 @@ Interface: abjects:peer-network`;
     this.blockButtons.clear();
     this.unblockButtons.clear();
     this.signalingPeerAddButtons.clear();
-    this.frontendDisconnectButtons.clear();
-    this.frontendRevokeButtons.clear();
-    this.remoteEnableCheckboxId = undefined;
-    this.remoteStatusLabelId = undefined;
-    this.remoteGenerateBtnId = undefined;
-    this.remoteQrImageId = undefined;
-    this.remoteQrUrlLabelId = undefined;
+    // NOTE: frontendDisconnectButtons / frontendRevokeButtons and the pairing
+    // widget refs (remoteEnableCheckboxId, remoteQrImageId, frontendsListAreaId,
+    // etc.) are NOT reset here. The Frontends tab is refreshed in place —
+    // refresh() skips clearing it, populateFrontendsTab() clears just its
+    // list area before rebuilding rows. Their refs are reset only in hide().
 
     // Fetch identity info
     let peerId = '';
@@ -1270,8 +1275,33 @@ Interface: abjects:peer-network`;
       }
     }
 
-    // ── Pair a new frontend (QR generation) ──
-    await this.buildPairingSection(tab4);
+    // ── Pair a new frontend (QR generation) ── built once; persists across refreshes
+    if (!this.remoteEnableCheckboxId) {
+      await this.buildPairingSection(tab4);
+    } else {
+      await this.refreshRemoteStatusLabel();
+    }
+
+    // ── Connected-frontends area: a nested layout we can clear/rebuild
+    //    without touching the pairing widgets above. ──
+    if (!this.frontendsListAreaId) {
+      this.frontendsListAreaId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createVBox', {
+          windowId: this.windowId,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 8,
+        })
+      );
+      await this.request(request(this.id, tab4, 'addLayoutChild', {
+        widgetId: this.frontendsListAreaId,
+        sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+      }));
+    } else {
+      await this.request(request(this.id, this.frontendsListAreaId, 'clearLayoutChildren', {}));
+      this.frontendDisconnectButtons.clear();
+      this.frontendRevokeButtons.clear();
+    }
+    const listArea = this.frontendsListAreaId;
 
     // ── Connected frontends header ──
     const { widgetIds: [headerId] } = await this.request<{ widgetIds: AbjectId[] }>(
@@ -1279,7 +1309,7 @@ Interface: abjects:peer-network`;
         { type: 'label', windowId: this.windowId, text: 'Connected Frontends', style: { color: this.theme.statusInfo, fontWeight: 'bold', fontSize: 13 } },
       ] })
     );
-    await this.request(request(this.id, tab4, 'addLayoutChild', {
+    await this.request(request(this.id, listArea, 'addLayoutChild', {
       widgetId: headerId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -1309,7 +1339,7 @@ Interface: abjects:peer-network`;
           { type: 'label', windowId: this.windowId, text: 'No frontends connected.', style: { color: this.theme.textDescription, fontSize: 12 } },
         ] })
       );
-      await this.request(request(this.id, tab4, 'addLayoutChild', {
+      await this.request(request(this.id, listArea, 'addLayoutChild', {
         widgetId: emptyId,
         sizePolicy: { vertical: 'fixed' },
         preferredSize: { height: 18 },
@@ -1320,12 +1350,12 @@ Interface: abjects:peer-network`;
     for (const c of clients) {
       const rowId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-          parentLayoutId: tab4,
+          parentLayoutId: listArea,
           margins: { top: 0, right: 0, bottom: 0, left: 0 },
           spacing: 8,
         })
       );
-      await this.request(request(this.id, tab4, 'addLayoutChild', {
+      await this.request(request(this.id, listArea, 'addLayoutChild', {
         widgetId: rowId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: 32 },
@@ -1480,23 +1510,26 @@ Interface: abjects:peer-network`;
     await this.request(request(this.id, generateRowId, 'addLayoutSpacer', {}));
 
     // QR image
+    const qrImageSpec: Record<string, unknown> = {
+      type: 'image', windowId: this.windowId,
+      alt: this.lastQrDataUrl ? '' : 'No QR generated yet',
+      style: { background: this.theme.windowBg, color: this.theme.textTertiary, fontSize: 12, radius: 4 },
+    };
+    if (this.lastQrDataUrl) qrImageSpec.url = this.lastQrDataUrl;
     const { widgetIds: [qrImageId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'image', windowId: this.windowId, alt: 'No QR generated yet',
-          style: { background: this.theme.windowBg, color: this.theme.textTertiary, fontSize: 12, radius: 4 } },
-      ] })
+      request(this.id, this.widgetManagerId!, 'create', { specs: [qrImageSpec] })
     );
     this.remoteQrImageId = qrImageId;
     await this.request(request(this.id, tab4, 'addLayoutChild', {
       widgetId: this.remoteQrImageId,
       sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-      preferredSize: { width: 280, height: 280 },
+      preferredSize: { width: 400, height: 400 },
     }));
 
     // QR URL label
     const { widgetIds: [qrUrlLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: '',
+        { type: 'label', windowId: this.windowId, text: this.lastQrUrl ?? '',
           style: { color: this.theme.textTertiary, fontSize: 11, wordWrap: true, selectable: true } },
       ] })
     );
@@ -1547,6 +1580,7 @@ Interface: abjects:peer-network`;
     this.remoteGenerateBtnId = undefined;
     this.remoteQrImageId = undefined;
     this.remoteQrUrlLabelId = undefined;
+    this.frontendsListAreaId = undefined;
 
     this.changed('visibility', false);
     return true;
@@ -1556,11 +1590,38 @@ Interface: abjects:peer-network`;
 
   private async refresh(): Promise<void> {
     if (!this.windowId) return;
-    // Clear tab content containers and repopulate (keeps window stable)
-    for (const tabId of this.tabContents) {
-      await this.request(request(this.id, tabId, 'clearLayoutChildren', {}));
+    if (this.refreshing) {
+      this.refreshPending = true;
+      return;
     }
-    await this.populateTabs();
+    this.refreshing = true;
+    try {
+      do {
+        this.refreshPending = false;
+        for (let i = 0; i < this.tabContents.length; i++) {
+          // The Frontends tab has persistent pairing widgets (checkbox, Generate
+          // button, QR image). populateFrontendsTab() clears its inner list area
+          // in place, so we skip the full teardown here to avoid flicker.
+          if (i === 4 && this.remoteEnableCheckboxId) continue;
+          await this.request(request(this.id, this.tabContents[i], 'clearLayoutChildren', {}));
+        }
+        await this.populateTabs();
+      } while (this.refreshPending && this.windowId);
+    } finally {
+      this.refreshing = false;
+    }
+  }
+
+  private async refreshRemoteStatusLabel(): Promise<void> {
+    if (!this.remoteStatusLabelId || !this.remoteUIAccessId) return;
+    try {
+      const status = await this.request<{ enabled: boolean; peerId: string; signalingUrl: string; connectedCount: number }>(
+        request(this.id, this.remoteUIAccessId, 'getStatus', {})
+      );
+      await this.request(request(this.id, this.remoteStatusLabelId, 'update', {
+        text: formatRemoteStatus(status),
+      }));
+    } catch { /* best effort */ }
   }
 
   private async addDivider(containerId: AbjectId): Promise<void> {
