@@ -18,36 +18,40 @@ import {
   importSigningPublicKey,
   derivePeerIdFromJwk,
   deriveSessionKey,
-  aesEncrypt,
-  aesDecrypt,
+  aesEncryptBytes,
+  aesDecryptBytes,
 } from '../core/identity.js';
 import type { SignalingRelay } from './signaling.js';
-import { gzipSync, gunzipSync } from 'fflate';
+import { deflateSync, inflateSync } from 'fflate';
 import { Log } from '../core/timed-log.js';
 
-// Isomorphic base64 helpers — no Buffer, no Node-only APIs.
-function bytesToBase64(bytes: Uint8Array): string {
-  let bin = '';
-  const CHUNK = 0x8000;
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(bin);
-}
-
-function base64ToBytes(b64: string): Uint8Array {
-  // Be lenient — Node's `Buffer.from(s, 'base64')` accepts URL-safe variants,
-  // missing padding, and whitespace. atob() rejects all of those, so normalise
-  // first to stay compatible with peers that produce non-canonical base64.
-  const cleaned = b64.replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
-  const padded = cleaned.length % 4 === 0
-    ? cleaned
-    : cleaned + '='.repeat(4 - (cleaned.length % 4));
-  const bin = atob(padded);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
+// ── Binary frame format for encrypted DataChannel traffic ───────────────
+//
+// All encrypted payloads ride as Uint8Array frames. This avoids base64
+// inflation (~33%) and the JSON envelope overhead that plagued the old
+// gz+base64-in-JSON wrapping. Handshake and ping/pong stay as small JSON
+// strings — they predate the session key anyway.
+//
+// Complete frame:
+//   byte 0:        type (0x01–0x04 — see FRAME_* below)
+//   bytes 1–12:    IV (12 bytes for AES-GCM)
+//   bytes 13+:     ciphertext (compressed-then-encrypted if type even)
+//
+// Chunk frame (when a complete frame exceeds MAX_CHUNK_SIZE):
+//   byte 0:        0x05
+//   bytes 1–4:     chunk id (uint32 BE)
+//   bytes 5–6:     idx       (uint16 BE)
+//   bytes 7–8:     total     (uint16 BE)
+//   bytes 9+:      slice of the original complete-frame bytes
+//
+// Reassembled chunks concat into a complete-frame byte sequence starting
+// at byte 0 — which is then parsed by the same code path.
+const FRAME_ENC_MSG       = 0x01; // encrypted AbjectMessage, plaintext uncompressed
+const FRAME_ENC_MSG_GZ    = 0x02; // encrypted AbjectMessage, plaintext deflate-compressed
+const FRAME_ENC_RAW       = 0x03; // encrypted raw UI payload, plaintext uncompressed
+const FRAME_ENC_RAW_GZ    = 0x04; // encrypted raw UI payload, plaintext deflate-compressed
+const FRAME_CHUNK         = 0x05;
+const COMPRESS_THRESHOLD  = 256;  // bytes — skip deflate for small payloads
 
 const log = new Log('PeerTransport');
 
@@ -91,7 +95,7 @@ export class PeerTransport extends Transport {
   private pingInterval?: ReturnType<typeof setInterval>;
   private lastPongReceived: number = 0;
   private chunkCounter = 0;
-  private pendingChunks: Map<string, { total: number; parts: Map<number, string>; timer: ReturnType<typeof setTimeout>; warnTimer: ReturnType<typeof setTimeout> }> = new Map();
+  private pendingChunks: Map<string, { total: number; parts: Map<number, Uint8Array>; size: number; timer: ReturnType<typeof setTimeout>; warnTimer: ReturnType<typeof setTimeout> }> = new Map();
   private connectionTimer?: ReturnType<typeof setTimeout>;
 
   constructor(config: PeerTransportConfig) {
@@ -331,28 +335,56 @@ export class PeerTransport extends Transport {
   private rawMessageHandler?: (data: string) => void;
 
   /**
-   * Internal: encrypt + (optionally) compress + (optionally) chunk a string.
-   * raw=true signals the receiver to deliver via onRawMessage instead of onMessage.
+   * Internal: compress (if worthwhile) → encrypt → frame → chunk → send.
+   * Encrypted payloads ride as binary Uint8Array frames over the DataChannel;
+   * see the FRAME_* layout at the top of this file. The raw flag distinguishes
+   * UI-protocol bytes (delivered via onRawMessage) from AbjectMessage JSON.
    */
   private async sendEncryptedString(data: string, raw = false): Promise<void> {
     const encoder = new TextEncoder();
-    const encrypted = await aesEncrypt(this.sessionKey!, encoder.encode(data));
-    const payload = JSON.stringify({ enc: true, raw: raw || undefined, ...encrypted });
-
-    const compressed = gzipSync(encoder.encode(payload));
-    const b64 = bytesToBase64(compressed);
-
-    if (b64.length <= MAX_CHUNK_SIZE) {
-      this.dataChannel!.send(JSON.stringify({ gz: true, data: b64 }));
-    } else {
-      const chunkId = String(this.chunkCounter++);
-      const total = Math.ceil(b64.length / MAX_CHUNK_SIZE);
-      for (let i = 0; i < total; i++) {
-        const slice = b64.slice(i * MAX_CHUNK_SIZE, (i + 1) * MAX_CHUNK_SIZE);
-        this.dataChannel!.send(JSON.stringify({ chunk: true, id: chunkId, idx: i, total, data: slice }));
+    let plaintext: Uint8Array = encoder.encode(data);
+    let compressed = false;
+    if (plaintext.byteLength >= COMPRESS_THRESHOLD) {
+      const deflated = deflateSync(plaintext) as Uint8Array;
+      // Only adopt the compressed form if it actually shrank — for already
+      // dense payloads deflate can grow them slightly.
+      if (deflated.byteLength < plaintext.byteLength) {
+        plaintext = deflated;
+        compressed = true;
       }
-      log.info(`sent ${total} chunks (${b64.length} bytes compressed) to ${this.remotePeerId.slice(0, 16)}`);
     }
+
+    const { iv, ciphertext } = await aesEncryptBytes(this.sessionKey!, plaintext);
+
+    const type = raw
+      ? (compressed ? FRAME_ENC_RAW_GZ : FRAME_ENC_RAW)
+      : (compressed ? FRAME_ENC_MSG_GZ : FRAME_ENC_MSG);
+
+    const frame = new Uint8Array(1 + iv.byteLength + ciphertext.byteLength);
+    frame[0] = type;
+    frame.set(iv, 1);
+    frame.set(ciphertext, 1 + iv.byteLength);
+
+    if (frame.byteLength <= MAX_CHUNK_SIZE) {
+      this.dataChannel!.send(frame);
+      return;
+    }
+
+    const chunkId = this.chunkCounter++;
+    const payloadPerChunk = MAX_CHUNK_SIZE - 9; // 1 type + 4 id + 2 idx + 2 total
+    const total = Math.ceil(frame.byteLength / payloadPerChunk);
+    for (let i = 0; i < total; i++) {
+      const slice = frame.subarray(i * payloadPerChunk, (i + 1) * payloadPerChunk);
+      const chunkFrame = new Uint8Array(9 + slice.byteLength);
+      const dv = new DataView(chunkFrame.buffer);
+      chunkFrame[0] = FRAME_CHUNK;
+      dv.setUint32(1, chunkId, false);
+      dv.setUint16(5, i, false);
+      dv.setUint16(7, total, false);
+      chunkFrame.set(slice, 9);
+      this.dataChannel!.send(chunkFrame);
+    }
+    log.info(`sent ${total} chunks (${frame.byteLength} bytes binary) to ${this.remotePeerId.slice(0, 16)}`);
   }
 
   /**
@@ -440,6 +472,10 @@ export class PeerTransport extends Transport {
   }
 
   private setupDataChannel(dc: RTCDataChannel): void {
+    // Receive binary frames as ArrayBuffer (default in browsers is 'blob',
+    // which forces an async .arrayBuffer() round-trip per message).
+    try { dc.binaryType = 'arraybuffer'; } catch { /* not supported on this stack */ }
+
     let opened = false;
     const onOpen = () => {
       if (opened) return;
@@ -466,7 +502,19 @@ export class PeerTransport extends Transport {
     };
 
     dc.onmessage = (event) => {
-      this.handleIncomingData(event.data as string);
+      const d = event.data as unknown;
+      if (typeof d === 'string') {
+        this.handleIncomingString(d);
+      } else if (d instanceof ArrayBuffer) {
+        this.handleIncomingBinary(new Uint8Array(d));
+      } else if (ArrayBuffer.isView(d)) {
+        this.handleIncomingBinary(new Uint8Array((d as ArrayBufferView).buffer, (d as ArrayBufferView).byteOffset, (d as ArrayBufferView).byteLength));
+      } else if (d && typeof (d as { arrayBuffer?: () => Promise<ArrayBuffer> }).arrayBuffer === 'function') {
+        // Blob fallback (some WebRTC stacks deliver binary as Blob)
+        void (d as Blob).arrayBuffer().then((ab) => this.handleIncomingBinary(new Uint8Array(ab)));
+      } else {
+        log.warn(`unexpected DataChannel message type: ${typeof d}`);
+      }
     };
 
     // Callee may receive a DataChannel already in 'open' state via ondatachannel,
@@ -491,13 +539,14 @@ export class PeerTransport extends Transport {
   }
 
   /**
-   * Handle incoming data from the DataChannel.
+   * Handle an incoming JSON-string DataChannel message: handshake, ping/pong,
+   * or (during handshake) an unencrypted AbjectMessage. All encrypted payloads
+   * arrive as binary frames via handleIncomingBinary().
    */
-  private async handleIncomingData(data: string): Promise<void> {
+  private async handleIncomingString(data: string): Promise<void> {
     try {
       const parsed = JSON.parse(data);
 
-      // Ping/pong keepalive (handled before handshake/encryption checks)
       if (parsed.ping) {
         this.dataChannel?.send(JSON.stringify({ pong: true, ts: parsed.ts }));
         return;
@@ -507,99 +556,125 @@ export class PeerTransport extends Transport {
         return;
       }
 
-      // Handshake message
       if (parsed.handshake) {
         await this.handleHandshakeMessage(parsed);
         return;
       }
 
-      // Chunked message — reassemble before processing
-      if (parsed.chunk) {
-        const reassembled = this.handleChunk(parsed);
-        if (!reassembled) return; // waiting for more chunks
-        // Reassembled data is gz-compressed — decompress and re-parse
-        const decompressed = new TextDecoder().decode(gunzipSync(base64ToBytes(reassembled)));
-        await this.handleIncomingData(decompressed);
-        return;
-      }
-
-      // Compressed (non-chunked) message — decompress and re-parse
-      if (parsed.gz) {
-        const decompressed = new TextDecoder().decode(gunzipSync(base64ToBytes(parsed.data)));
-        await this.handleIncomingData(decompressed);
-        return;
-      }
-
-      // Encrypted message
-      if (parsed.enc && this.sessionKey) {
-        const plaintext = await aesDecrypt(this.sessionKey, parsed.iv, parsed.ciphertext);
-        const decoder = new TextDecoder();
-        const msgData = decoder.decode(plaintext);
-        if (parsed.raw) {
-          // Raw string payload (UI protocol) — deliver via onRawMessage
-          this.rawMessageHandler?.(msgData);
-          return;
-        }
-        const message = deserialize(msgData);
-        log.info(`recv encrypted from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
-        this.events.onMessage?.(message);
-        return;
-      }
-
-      // Encrypted message but no session key yet — drop it
-      if (parsed.enc && !this.sessionKey) {
-        log.warn(`recv encrypted msg from ${this.remotePeerId.slice(0, 16)} but no session key yet — dropping`);
-        return;
-      }
-
-      // Unencrypted message (during handshake or if encryption not yet established)
+      // Pre-handshake unencrypted AbjectMessage
       const message = deserialize(data);
       log.info(`recv unencrypted from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
       this.events.onMessage?.(message);
     } catch (err) {
-      log.error('Failed to handle message:', err);
+      log.error('Failed to handle string message:', err);
       this.events.onError?.(err instanceof Error ? err : new Error(String(err)));
     }
   }
 
   /**
-   * Handle a chunk of a multi-part message. Returns the reassembled base64
-   * string when all chunks are received, or null if still waiting.
+   * Handle an incoming binary DataChannel frame — see FRAME_* layout at the
+   * top of this file. Reassembles chunks, decrypts, decompresses, and
+   * dispatches via onMessage (AbjectMessage) or onRawMessage (UI bytes).
    */
-  private handleChunk(parsed: { id: string; idx: number; total: number; data: string }): string | null {
-    let entry = this.pendingChunks.get(parsed.id);
+  private async handleIncomingBinary(frame: Uint8Array): Promise<void> {
+    try {
+      if (frame.byteLength === 0) return;
+      const type = frame[0];
+
+      if (type === FRAME_CHUNK) {
+        const reassembled = this.handleChunk(frame);
+        if (!reassembled) return;
+        await this.handleIncomingBinary(reassembled);
+        return;
+      }
+
+      if (type !== FRAME_ENC_MSG && type !== FRAME_ENC_MSG_GZ
+          && type !== FRAME_ENC_RAW && type !== FRAME_ENC_RAW_GZ) {
+        log.warn(`unknown binary frame type 0x${type.toString(16)} from ${this.remotePeerId.slice(0, 16)}`);
+        return;
+      }
+
+      if (!this.sessionKey) {
+        log.warn(`recv encrypted binary from ${this.remotePeerId.slice(0, 16)} but no session key yet — dropping`);
+        return;
+      }
+
+      const iv = frame.subarray(1, 13);
+      const ciphertext = frame.subarray(13);
+      let plaintext = await aesDecryptBytes(this.sessionKey, iv, ciphertext);
+      if (type === FRAME_ENC_MSG_GZ || type === FRAME_ENC_RAW_GZ) {
+        plaintext = inflateSync(plaintext);
+      }
+
+      const msgData = new TextDecoder().decode(plaintext);
+
+      if (type === FRAME_ENC_RAW || type === FRAME_ENC_RAW_GZ) {
+        this.rawMessageHandler?.(msgData);
+        return;
+      }
+
+      const message = deserialize(msgData);
+      log.info(`recv encrypted from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
+      this.events.onMessage?.(message);
+    } catch (err) {
+      log.error('Failed to handle binary frame:', err);
+      this.events.onError?.(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  /**
+   * Handle a binary chunk frame — see FRAME_CHUNK layout at the top of this
+   * file. Returns the reassembled complete-frame bytes when all chunks have
+   * arrived, or null if still waiting.
+   */
+  private handleChunk(frame: Uint8Array): Uint8Array | null {
+    const dv = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+    const chunkId = String(dv.getUint32(1, false));
+    const idx = dv.getUint16(5, false);
+    const total = dv.getUint16(7, false);
+    const slice = frame.subarray(9);
+
+    let entry = this.pendingChunks.get(chunkId);
     if (!entry) {
       const timer = setTimeout(() => {
-        log.warn(`chunk reassembly timeout for id=${parsed.id}, discarding`);
-        this.pendingChunks.delete(parsed.id);
+        log.warn(`chunk reassembly timeout for id=${chunkId}, discarding`);
+        this.pendingChunks.delete(chunkId);
       }, CHUNK_REASSEMBLY_TIMEOUT);
       const warnTimer = setTimeout(() => {
-        const current = this.pendingChunks.get(parsed.id);
+        const current = this.pendingChunks.get(chunkId);
         if (!current) return;
         log.warn(
-          `chunk reassembly slow for id=${parsed.id}: ${current.parts.size}/${current.total} after ${CHUNK_REASSEMBLY_WARN_AT}ms from ${this.remotePeerId.slice(0, 16)}`
+          `chunk reassembly slow for id=${chunkId}: ${current.parts.size}/${current.total} after ${CHUNK_REASSEMBLY_WARN_AT}ms from ${this.remotePeerId.slice(0, 16)}`
         );
       }, CHUNK_REASSEMBLY_WARN_AT);
-      entry = { total: parsed.total, parts: new Map(), timer, warnTimer };
-      this.pendingChunks.set(parsed.id, entry);
+      entry = { total, parts: new Map(), size: 0, timer, warnTimer };
+      this.pendingChunks.set(chunkId, entry);
     }
 
-    entry.parts.set(parsed.idx, parsed.data);
+    if (!entry.parts.has(idx)) {
+      // subarray shares the backing ArrayBuffer with the original event; copy
+      // so the entry survives independent of future incoming frames.
+      const copy = new Uint8Array(slice.byteLength);
+      copy.set(slice);
+      entry.parts.set(idx, copy);
+      entry.size += copy.byteLength;
+    }
 
     if (entry.parts.size < entry.total) return null;
 
-    // All chunks received — reassemble
     clearTimeout(entry.timer);
     clearTimeout(entry.warnTimer);
-    this.pendingChunks.delete(parsed.id);
+    this.pendingChunks.delete(chunkId);
 
-    const pieces: string[] = [];
+    const out = new Uint8Array(entry.size);
+    let off = 0;
     for (let i = 0; i < entry.total; i++) {
-      pieces.push(entry.parts.get(i)!);
+      const part = entry.parts.get(i)!;
+      out.set(part, off);
+      off += part.byteLength;
     }
-    const reassembled = pieces.join('');
-    log.info(`reassembled ${entry.total} chunks (${reassembled.length} bytes) from ${this.remotePeerId.slice(0, 16)}`);
-    return reassembled;
+    log.info(`reassembled ${entry.total} chunks (${out.byteLength} bytes binary) from ${this.remotePeerId.slice(0, 16)}`);
+    return out;
   }
 
   /**
