@@ -38,6 +38,16 @@ function isP2PDefault(): boolean {
   return (import.meta.env.VITE_DEFAULT_MODE as string | undefined) === 'p2p';
 }
 
+/** True when this client session is or could be P2P (pairing URL, an
+ *  existing paired desktop, or a p2p-default build). The Reset/re-pair
+ *  button is only meaningful in these cases; plain WebSocket clients
+ *  have no pairing to reset. */
+function isP2PMode(): boolean {
+  if (getPairingPayloadFromUrl()) return true;
+  if (getMostRecentPairedDesktop()) return true;
+  return isP2PDefault();
+}
+
 function chooseTransport(): ClientTransport | null {
   // 1. Pairing mode — `?pair=…` in URL
   const payload = getPairingPayloadFromUrl();
@@ -247,7 +257,9 @@ function start(): void {
     return;
   }
 
-  wireResetButton();
+  // Reset/re-pair only applies to P2P clients; WebSocket clients have
+  // nothing to reset.
+  if (isP2PMode()) wireResetButton();
 
   // Guard against double initialization (HMR or module re-execution)
   const existing = container.querySelector('canvas');
