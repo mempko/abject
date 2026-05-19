@@ -14,6 +14,8 @@ import { error, request } from '../../core/message.js';
 import { require as requireContract } from '../../core/contracts.js';
 import { Capabilities } from '../../core/capability.js';
 import { Log } from '../../core/timed-log.js';
+import * as path from 'node:path';
+import * as fs from 'node:fs/promises';
 
 const log = new Log('WebBrowser');
 
@@ -25,6 +27,12 @@ interface BrowseOptions {
   timeout?: number;
   userAgent?: string;
   viewport?: { width: number; height: number };
+  /**
+   * Named persistent profile in the caller's workspace. Cookies, localStorage,
+   * IndexedDB, and service workers survive across calls and process restarts.
+   * Omit (or empty) for a fresh ephemeral session.
+   */
+  profile?: string;
 }
 
 interface ExtractedElement {
@@ -82,6 +90,29 @@ interface TrackedPage {
   owner: AbjectId;
   createdAt: number;
   lastActivity: number;
+  /** Profile key ({workspaceId}/{profileName}) the page was opened against, if any. */
+  profileKey?: string;
+}
+
+/** A persistent BrowserContext kept alive across openPage calls for one profile. */
+interface ProfileContext {
+  /** Workspace this profile belongs to (parsed from the caller's typeId). */
+  workspaceId: string;
+  /** Profile name as supplied by the caller. */
+  name: string;
+  /** Cached Playwright BrowserContext. */
+  context: {
+    newPage: (opts?: unknown) => Promise<unknown>;
+    close: () => Promise<void>;
+    on: (event: string, fn: () => void) => void;
+  };
+  /** Absolute on-disk directory for the profile. */
+  dir: string;
+  /** Number of TrackedPages currently using this context. */
+  openPages: number;
+  /** Wall-clock timestamps for the metadata index. */
+  createdAt: number;
+  lastUsed: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -718,6 +749,43 @@ const STATEFUL_METHODS: MethodDeclaration[] = [
   },
 ];
 
+const PROFILE_METHODS: MethodDeclaration[] = [
+  {
+    name: 'listProfiles',
+    description: 'List persistent browser profiles in the caller\'s workspace. Each entry is a named jar of cookies/localStorage/IndexedDB that survives across calls and process restarts.',
+    parameters: [],
+    returns: {
+      kind: 'array',
+      elementType: {
+        kind: 'object',
+        properties: {
+          name: { kind: 'primitive', primitive: 'string' },
+          createdAt: { kind: 'primitive', primitive: 'number' },
+          lastUsed: { kind: 'primitive', primitive: 'number' },
+          openPages: { kind: 'primitive', primitive: 'number' },
+        },
+      },
+    },
+  },
+  {
+    name: 'deleteProfile',
+    description: 'Permanently delete a persistent browser profile (closes any open context, removes the on-disk directory, and forgets the metadata).',
+    parameters: [
+      {
+        name: 'profile',
+        type: { kind: 'primitive', primitive: 'string' },
+        description: 'Profile name to delete',
+      },
+    ],
+    returns: {
+      kind: 'object',
+      properties: {
+        deleted: { kind: 'primitive', primitive: 'boolean' },
+      },
+    },
+  },
+];
+
 /**
  * WebBrowser capability object — headless browser via Playwright.
  */
@@ -726,6 +794,18 @@ export class WebBrowser extends Abject {
   private chromium: unknown = null;
   private pages: Map<string, TrackedPage> = new Map();
   private pageCounter = 0;
+
+  /** Cached persistent contexts keyed by `{workspaceId}/{profileName}`. */
+  private profileContexts: Map<string, ProfileContext> = new Map();
+  /** Cached AbjectId → workspaceId so we don't hit the registry on every call. */
+  private callerWorkspaceCache: Map<AbjectId, string> = new Map();
+  private registryId?: AbjectId;
+  private storageId?: AbjectId;
+  /** Absolute base dir for all on-disk profile jars. */
+  private profilesRoot: string;
+
+  /** Storage key for the profile metadata index ({name, createdAt, lastUsed}). */
+  private static readonly PROFILES_INDEX_KEY = 'web-browser:profiles';
 
   constructor() {
     super({
@@ -738,7 +818,7 @@ export class WebBrowser extends Abject {
             id: WEB_BROWSER_INTERFACE,
             name: 'WebBrowser',
             description: 'Headless browser operations — one-shot and stateful page API',
-            methods: [...ONE_SHOT_METHODS, ...STATEFUL_METHODS],
+            methods: [...ONE_SHOT_METHODS, ...STATEFUL_METHODS, ...PROFILE_METHODS],
           },
         requiredCapabilities: [],
         providedCapabilities: [Capabilities.WEB_BROWSE],
@@ -746,8 +826,12 @@ export class WebBrowser extends Abject {
       },
     });
 
+    const dataDir = process.env.ABJECTS_DATA_DIR ?? '.abjects';
+    this.profilesRoot = path.resolve(dataDir, 'browser-profiles');
+
     this.setupOneShotHandlers();
     this.setupStatefulHandlers();
+    this.setupProfileHandlers();
     this.setupCleanupHandlers();
   }
 
@@ -824,7 +908,7 @@ export class WebBrowser extends Abject {
   private setupOneShotHandlers(): void {
     this.on('getRenderedHtml', (msg: AbjectMessage) => {
       const { url, options } = msg.payload as { url: string; options?: BrowseOptions };
-      this.doGetRenderedHtml(url, options).then(
+      this.doGetRenderedHtml(msg.routing.from, url, options).then(
         (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'BROWSER_ERROR',
@@ -837,7 +921,7 @@ export class WebBrowser extends Abject {
 
     this.on('screenshot', (msg: AbjectMessage) => {
       const { url, options } = msg.payload as { url: string; options?: BrowseOptions };
-      this.doScreenshot(url, options).then(
+      this.doScreenshot(msg.routing.from, url, options).then(
         (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'BROWSER_ERROR',
@@ -852,7 +936,7 @@ export class WebBrowser extends Abject {
       const { url, selector, options } = msg.payload as {
         url: string; selector: string; options?: BrowseOptions;
       };
-      this.doExtractFromPage(url, selector, options).then(
+      this.doExtractFromPage(msg.routing.from, url, selector, options).then(
         (result) => this.sendDeferredReply(msg, result),
         (err) => {
           this.send(error(msg, 'BROWSER_ERROR',
@@ -1191,12 +1275,14 @@ export class WebBrowser extends Abject {
 
   protected override async onInit(): Promise<void> {
     const registryId = await this.discoverDep('Registry');
+    this.registryId = registryId ?? undefined;
     if (registryId) {
       try {
         await this.request(request(this.id, registryId,
           'subscribe', {}));
       } catch { /* best effort */ }
     }
+    this.storageId = await this.discoverDep('Storage') ?? undefined;
   }
 
   // ===========================================================================
@@ -1207,7 +1293,8 @@ export class WebBrowser extends Abject {
     owner: AbjectId,
     options?: BrowseOptions,
   ): Promise<{ pageId: string }> {
-    const page = await this.createPage(options) as PlaywrightPage;
+    const profileKey = await this.resolveProfileKey(owner, options?.profile);
+    const page = await this.createPage(owner, options) as PlaywrightPage;
     const pageId = this.generatePageId();
 
     const tracked: TrackedPage = {
@@ -1215,15 +1302,24 @@ export class WebBrowser extends Abject {
       owner,
       createdAt: Date.now(),
       lastActivity: Date.now(),
+      profileKey,
     };
 
     this.pages.set(pageId, tracked);
-    log.info(`openPage → ${pageId}`);
+    if (profileKey) {
+      const ctx = this.profileContexts.get(profileKey);
+      if (ctx) ctx.openPages++;
+    }
+    log.info(`openPage → ${pageId}${profileKey ? ` (profile=${profileKey})` : ''}`);
     this.changed('pageOpened', { pageId, owner });
 
     // Auto-remove from map if the page closes externally
     page.on('close', () => {
-      this.pages.delete(pageId);
+      const removed = this.pages.delete(pageId);
+      if (removed && profileKey) {
+        const ctx = this.profileContexts.get(profileKey);
+        if (ctx && ctx.openPages > 0) ctx.openPages--;
+      }
       this.changed('pageClosed', { pageId });
     });
 
@@ -1270,20 +1366,44 @@ export class WebBrowser extends Abject {
   }
 
   /**
-   * Create a new page with the given options.
+   * Create a new page. If `options.profile` is set, the page is opened in the
+   * caller's persistent BrowserContext (cookies / localStorage / IndexedDB
+   * survive across calls). Otherwise the existing ephemeral path is used.
    */
-  private async createPage(options?: BrowseOptions): Promise<unknown> {
-    const browser = await this.ensureBrowser() as {
-      newPage: (opts?: unknown) => Promise<unknown>;
-    };
-
+  private async createPage(callerId: AbjectId, options?: BrowseOptions): Promise<unknown> {
     const pageOpts: Record<string, unknown> = {
       acceptDownloads: true,  // Prevent "Download is starting" errors for non-HTML responses
     };
     if (options?.userAgent) pageOpts.userAgent = options.userAgent;
     if (options?.viewport) pageOpts.viewport = options.viewport;
 
+    if (options?.profile) {
+      const ctx = await this.ensureProfileContext(callerId, options.profile, options);
+      return ctx.context.newPage(pageOpts);
+    }
+
+    const browser = await this.ensureBrowser() as {
+      newPage: (opts?: unknown) => Promise<unknown>;
+    };
     return browser.newPage(pageOpts);
+  }
+
+  /**
+   * Acquire a page and return a release callback that closes the page
+   * (ephemeral path) or just releases the reference (persistent profile —
+   * keeps the BrowserContext alive so the next call still has cookies).
+   */
+  private async acquirePage(
+    callerId: AbjectId,
+    options?: BrowseOptions,
+  ): Promise<{ page: PlaywrightPage; release: () => Promise<void> }> {
+    const page = await this.createPage(callerId, options) as PlaywrightPage;
+    return {
+      page,
+      release: async () => {
+        try { await page.close(); } catch { /* already closed */ }
+      },
+    };
   }
 
   /** Safely read page title, returning fallback if execution context was destroyed. */
@@ -1359,10 +1479,11 @@ export class WebBrowser extends Abject {
   // ===========================================================================
 
   private async doGetRenderedHtml(
+    callerId: AbjectId,
     url: string,
     options?: BrowseOptions,
   ): Promise<{ html: string; url: string; title: string }> {
-    const page = await this.createPage(options) as PlaywrightPage;
+    const { page, release } = await this.acquirePage(callerId, options);
     try {
       await this.navigatePage(page, url, options);
       const finalUrl = page.url();
@@ -1370,15 +1491,16 @@ export class WebBrowser extends Abject {
       const title = await this.safeTitle(page, finalUrl);
       return { html, url: finalUrl, title };
     } finally {
-      await page.close();
+      await release();
     }
   }
 
   private async doScreenshot(
+    callerId: AbjectId,
     url: string,
     options?: BrowseOptions,
   ): Promise<{ dataUri: string; width: number; height: number }> {
-    const page = await this.createPage(options) as PlaywrightPage;
+    const { page, release } = await this.acquirePage(callerId, options);
     try {
       await this.navigatePage(page, url, options);
       const buffer = await page.screenshot({ type: 'png', fullPage: false });
@@ -1387,16 +1509,17 @@ export class WebBrowser extends Abject {
       const viewport = this.safeViewportSize(page);
       return { dataUri, width: viewport.width, height: viewport.height };
     } finally {
-      await page.close();
+      await release();
     }
   }
 
   private async doExtractFromPage(
+    callerId: AbjectId,
     url: string,
     selector: string,
     options?: BrowseOptions,
   ): Promise<ExtractedElement[]> {
-    const page = await this.createPage(options) as PlaywrightPage;
+    const { page, release } = await this.acquirePage(callerId, options);
     try {
       await this.navigatePage(page, url, { ...options, waitFor: options?.waitFor ?? selector });
       const results = await page.$$eval(selector, (els: Element[]) => {
@@ -1415,8 +1538,237 @@ export class WebBrowser extends Abject {
       });
       return results as ExtractedElement[];
     } finally {
-      await page.close();
+      await release();
     }
+  }
+
+  // ===========================================================================
+  // Profile (persistent context) management
+  // ===========================================================================
+
+  /** Sanitize a profile name to a safe filesystem segment. */
+  private sanitizeProfileName(name: string): string {
+    return name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 64);
+  }
+
+  /**
+   * Resolve the caller's workspace by looking up its registration. Falls back
+   * to `system` if the caller has no scoped typeId (legacy / unscoped).
+   */
+  private async resolveCallerWorkspace(callerId: AbjectId): Promise<string> {
+    const cached = this.callerWorkspaceCache.get(callerId);
+    if (cached) return cached;
+
+    let workspaceId = 'system';
+    if (this.registryId) {
+      try {
+        const reg = await this.request<{ typeId?: string } | null>(
+          request(this.id, this.registryId, 'lookup', { objectId: callerId }),
+        );
+        const parts = reg?.typeId?.split('/');
+        if (parts && parts.length >= 3 && parts[1]) workspaceId = parts[1];
+      } catch { /* fall back to 'system' */ }
+    }
+    this.callerWorkspaceCache.set(callerId, workspaceId);
+    return workspaceId;
+  }
+
+  /**
+   * Return the profile key (`{workspaceId}/{profileName}`) for the caller, or
+   * undefined if no profile was requested. Caller-supplied name is sanitized.
+   */
+  private async resolveProfileKey(
+    callerId: AbjectId,
+    profile: string | undefined,
+  ): Promise<string | undefined> {
+    if (!profile) return undefined;
+    const sanitized = this.sanitizeProfileName(profile);
+    if (!sanitized) return undefined;
+    const wsId = await this.resolveCallerWorkspace(callerId);
+    return `${wsId}/${sanitized}`;
+  }
+
+  /**
+   * Lazily launch (or reuse) a persistent BrowserContext for the named profile
+   * in the caller's workspace.
+   */
+  private async ensureProfileContext(
+    callerId: AbjectId,
+    profileName: string,
+    options?: BrowseOptions,
+  ): Promise<ProfileContext> {
+    const wsId = await this.resolveCallerWorkspace(callerId);
+    const safeName = this.sanitizeProfileName(profileName);
+    requireContract(safeName.length > 0, `Invalid profile name: ${profileName}`);
+    const key = `${wsId}/${safeName}`;
+
+    const existing = this.profileContexts.get(key);
+    if (existing) {
+      existing.lastUsed = Date.now();
+      await this.writeProfileIndex(key, existing);
+      return existing;
+    }
+
+    const dir = path.join(this.profilesRoot, wsId, safeName);
+    await fs.mkdir(dir, { recursive: true });
+
+    // Lazy-load Playwright to match the existing pattern in ensureBrowser().
+    if (!this.chromium) {
+      const pw = await import('playwright');
+      this.chromium = pw.chromium;
+    }
+
+    const launchOptions: Record<string, unknown> = { headless: true };
+    if (process.env.ELECTRON_PACKAGED) {
+      launchOptions.args = ['--no-sandbox', '--disable-setuid-sandbox'];
+    }
+    if (options?.userAgent) launchOptions.userAgent = options.userAgent;
+    if (options?.viewport) launchOptions.viewport = options.viewport;
+    launchOptions.acceptDownloads = true;
+
+    const context = await (this.chromium as {
+      launchPersistentContext: (dir: string, opts: unknown) => Promise<{
+        newPage: (opts?: unknown) => Promise<unknown>;
+        close: () => Promise<void>;
+        on: (event: string, fn: () => void) => void;
+      }>;
+    }).launchPersistentContext(dir, launchOptions);
+
+    const now = Date.now();
+    const entry: ProfileContext = {
+      workspaceId: wsId,
+      name: safeName,
+      context,
+      dir,
+      openPages: 0,
+      createdAt: now,
+      lastUsed: now,
+    };
+
+    // Drop the cached entry if Playwright closes the context out from under us.
+    context.on('close', () => {
+      const current = this.profileContexts.get(key);
+      if (current === entry) this.profileContexts.delete(key);
+    });
+
+    this.profileContexts.set(key, entry);
+    await this.writeProfileIndex(key, entry);
+    this.changed('profileOpened', { profile: safeName, workspaceId: wsId });
+    log.info(`profile context ready: ${key} (${dir})`);
+    return entry;
+  }
+
+  /** Persist the metadata for a single profile under the Storage index. */
+  private async writeProfileIndex(key: string, entry: ProfileContext): Promise<void> {
+    if (!this.storageId) return;
+    try {
+      const index = await this.readProfileIndex();
+      index[key] = {
+        workspaceId: entry.workspaceId,
+        name: entry.name,
+        dir: entry.dir,
+        createdAt: index[key]?.createdAt ?? entry.createdAt,
+        lastUsed: entry.lastUsed,
+      };
+      await this.request(request(this.id, this.storageId, 'set',
+        { key: WebBrowser.PROFILES_INDEX_KEY, value: index }));
+    } catch { /* best effort */ }
+  }
+
+  /** Drop a single profile entry from the Storage index. */
+  private async deleteProfileIndex(key: string): Promise<void> {
+    if (!this.storageId) return;
+    try {
+      const index = await this.readProfileIndex();
+      if (key in index) {
+        delete index[key];
+        await this.request(request(this.id, this.storageId, 'set',
+          { key: WebBrowser.PROFILES_INDEX_KEY, value: index }));
+      }
+    } catch { /* best effort */ }
+  }
+
+  private async readProfileIndex(): Promise<Record<string, {
+    workspaceId: string; name: string; dir: string; createdAt: number; lastUsed: number;
+  }>> {
+    if (!this.storageId) return {};
+    try {
+      const v = await this.request<Record<string, {
+        workspaceId: string; name: string; dir: string; createdAt: number; lastUsed: number;
+      }> | null>(request(this.id, this.storageId, 'get', { key: WebBrowser.PROFILES_INDEX_KEY }));
+      return v ?? {};
+    } catch {
+      return {};
+    }
+  }
+
+  private setupProfileHandlers(): void {
+    this.on('listProfiles', (msg: AbjectMessage) => {
+      this.doListProfiles(msg.routing.from).then(
+        (result) => this.sendDeferredReply(msg, result),
+        (err) => this.send(error(msg, 'BROWSER_ERROR',
+          err instanceof Error ? err.message : String(err))),
+      );
+      return DEFERRED_REPLY;
+    });
+
+    this.on('deleteProfile', (msg: AbjectMessage) => {
+      const { profile } = msg.payload as { profile: string };
+      this.doDeleteProfile(msg.routing.from, profile).then(
+        (result) => this.sendDeferredReply(msg, result),
+        (err) => this.send(error(msg, 'BROWSER_ERROR',
+          err instanceof Error ? err.message : String(err))),
+      );
+      return DEFERRED_REPLY;
+    });
+  }
+
+  private async doListProfiles(callerId: AbjectId): Promise<Array<{
+    name: string; createdAt: number; lastUsed: number; openPages: number;
+  }>> {
+    const wsId = await this.resolveCallerWorkspace(callerId);
+    const index = await this.readProfileIndex();
+    const prefix = `${wsId}/`;
+    const results: Array<{ name: string; createdAt: number; lastUsed: number; openPages: number }> = [];
+    for (const [key, meta] of Object.entries(index)) {
+      if (!key.startsWith(prefix)) continue;
+      const live = this.profileContexts.get(key);
+      results.push({
+        name: meta.name,
+        createdAt: meta.createdAt,
+        lastUsed: live?.lastUsed ?? meta.lastUsed,
+        openPages: live?.openPages ?? 0,
+      });
+    }
+    return results;
+  }
+
+  private async doDeleteProfile(
+    callerId: AbjectId,
+    profileName: string,
+  ): Promise<{ deleted: boolean }> {
+    const wsId = await this.resolveCallerWorkspace(callerId);
+    const safeName = this.sanitizeProfileName(profileName);
+    requireContract(safeName.length > 0, `Invalid profile name: ${profileName}`);
+    const key = `${wsId}/${safeName}`;
+
+    // Close any open context first so Playwright releases the user-data-dir.
+    const live = this.profileContexts.get(key);
+    if (live) {
+      this.profileContexts.delete(key);
+      try { await live.context.close(); } catch { /* ignore */ }
+    }
+
+    // Remove the on-disk profile directory.
+    const dir = path.join(this.profilesRoot, wsId, safeName);
+    try {
+      await fs.rm(dir, { recursive: true, force: true });
+    } catch { /* best effort */ }
+
+    await this.deleteProfileIndex(key);
+    this.changed('profileDeleted', { profile: safeName, workspaceId: wsId });
+    log.info(`profile deleted: ${key}`);
+    return { deleted: true };
   }
 
   // ===========================================================================
@@ -1431,6 +1783,11 @@ export class WebBrowser extends Abject {
       } catch { /* ignore cleanup errors */ }
       this.browser = null;
     }
+    // Close every persistent profile context.
+    for (const [, entry] of this.profileContexts) {
+      try { await entry.context.close(); } catch { /* ignore */ }
+    }
+    this.profileContexts.clear();
   }
 
   protected override askPrompt(_question: string): string {
@@ -1438,6 +1795,30 @@ export class WebBrowser extends Abject {
 
 Use WebBrowser for JavaScript-rendered pages (React SPAs, Instagram, Twitter, etc.).
 For static HTML pages, prefer HttpClient.get() + WebParser instead.
+
+### PERSISTENT PROFILES (remember logins)
+
+Pass \`options.profile: '<name>'\` to any method to use a per-workspace persistent
+profile. Cookies, localStorage, IndexedDB, and service workers survive across
+calls AND process restarts — log in once, stay logged in. Omit \`profile\` for
+an ephemeral fresh session.
+
+  // First call: log in interactively, cookies are stored.
+  const { pageId } = await this.call(this.dep('WebBrowser'), 'openPage',
+    { options: { profile: 'gmail' } });
+  await this.call(this.dep('WebBrowser'), 'navigateTo',
+    { pageId, url: 'https://mail.google.com' });
+  // … perform login …
+  await this.call(this.dep('WebBrowser'), 'closePage', { pageId });
+
+  // Days later, same profile name → already logged in:
+  const next = await this.call(this.dep('WebBrowser'), 'openPage',
+    { options: { profile: 'gmail' } });
+
+Manage profiles:
+  await this.call(this.dep('WebBrowser'), 'listProfiles', {});
+  // → [{ name: 'gmail', createdAt, lastUsed, openPages }]
+  await this.call(this.dep('WebBrowser'), 'deleteProfile', { profile: 'gmail' });
 
 ### ONE-SHOT METHODS (open, do work, auto-close)
 

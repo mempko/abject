@@ -2,40 +2,61 @@
 const features = [
   {
     icon: '{>}',
-    title: 'Spoken Into Being',
-    hook: 'Describe what you want. It appears. Alive. Watching.',
-    desc: 'Say "a todo list that syncs with my calendar" in plain English. The system writes a manifest, generates code via LLM, and spawns a running object with its own window. From words to living software in seconds.',
+    abjects: 'ObjectCreator · Chat',
+    title: 'Speak it into existence.',
+    hook: '"A todo list that syncs my calendar." Type those words. A window appears.',
+    desc: 'Chat decomposes your sentence. The LLM writes a manifest. ObjectCreator spawns the abject. The result is a real running object with its own window, its own mailbox, and source code you can open and read.',
   },
   {
     icon: '{@}',
-    title: 'No Servers, No Masters',
-    hook: 'Your identity is your public key. Your network is your contacts. No cloud required.',
-    desc: "Every peer's true name is the SHA-256 hash of its signing key. Connect directly over encrypted WebRTC channels. Peers find each other through stateless signaling relays, then talk peer-to-peer. Networks grow by introduction, not registration.",
+    abjects: 'IdentityObject · PeerRegistry',
+    title: 'Your address is a public key.',
+    hook: 'No accounts. No signup. No cloud asking for your email.',
+    desc: "Every peer's true name is the SHA-256 hash of its ECDSA P-256 key. Connect over encrypted WebRTC with ECDH key exchange and AES-256-GCM. The signaling server only helps two peers find each other; it never sees a byte of the conversation.",
   },
   {
     icon: '{=}',
-    title: 'Shared Goals, Many Minds',
-    hook: 'Post a goal. Abjects explain how they can help. The best approach wins.',
-    desc: 'Goals fracture into tasks in a shared TupleSpace synced across peers. Abjects that can help self-assess via the ask protocol. Work distributes across machines. If one peer drops, stale claims expire and others pick up where it left off.',
+    abjects: 'ScrumMaster · GoalManager · TupleSpace',
+    title: 'Post a goal. Watch the swarm converge.',
+    hook: 'No dispatcher. No queue. No central state holder.',
+    desc: 'The goal lives in a TupleSpace synced across peers via CRDT. Abjects answer "what can you do?" through the Ask Protocol; the ScrumMaster picks the best fit each round. Work distributes itself across machines without ever talking to a server.',
   },
   {
     icon: '{!}',
-    title: 'Scars That Teach',
-    hook: 'Every failure is fed back into the wound. The proxy that grows back is smarter.',
-    desc: 'When error rates cross 10%, the system collects recent failures and generates a new proxy with the error history as context. The replacement accounts for exactly the mistakes that killed its predecessor.',
+    abjects: 'Negotiator · ProxyGenerator · HealthMonitor',
+    title: 'Break it. It tries to grow back.',
+    hook: 'Error rate crosses 10%. The LLM drafts a replacement from the crash data.',
+    desc: 'When a proxy starts failing, Abject collects the recent errors and asks the LLM to generate a smarter proxy with those failures as context. The hot-swap is invisible when it works; when it doesn\'t, you find out in the logs instead of in production. The replacement accounts for exactly the mistakes that killed its predecessor.',
   },
   {
     icon: '{~}',
-    title: 'Skills From the Wild',
-    hook: 'Drop a SKILL.md into the folder. Claude Code or OpenClaw format. Both work.',
-    desc: 'Abjects learn new abilities from portable skill files without integration code. The skill registry scans, parses, and injects instructions at runtime. The system grows by adoption, not by programming.',
+    abjects: 'SkillRegistry',
+    title: 'Drop a SKILL.md. The agents already know.',
+    hook: 'Claude Code or OpenClaw format. Both work, both at once.',
+    desc: 'Skills are markdown files. No build, no install, no registry to register with. The SkillRegistry watches the folder; the next time an abject needs a new ability, it reads what landed. The system grows by adoption, not by programming.',
   },
   {
     icon: '{*}',
-    title: 'Memory That Persists',
-    hook: 'What one abject learns, all abjects know.',
-    desc: 'Facts, insights, and references persist in a searchable knowledge base synced across peers via CRDT. Abjects recall what was learned in previous sessions, on other machines, by other abjects.',
+    abjects: 'KnowledgeBase',
+    title: 'What one abject learns, every abject knows.',
+    hook: 'A CRDT knowledge base that crosses machines and survives crashes.',
+    desc: 'Save a fact. Save a snippet. Save a reference. Every abject can ask. Every peer syncs. Lose a peer, the memory stays. Add a peer, it gets every fact from the past three weeks.',
   },
+];
+
+const capabilities = [
+  { icon: '{W}', name: 'Web Browsing', desc: 'Headless Playwright automation' },
+  { icon: '{S}', name: 'Web Search', desc: 'Search and fetch with parsing' },
+  { icon: '{$}', name: 'Shell Execution', desc: 'Run commands on the host' },
+  { icon: '{/}', name: 'Host Filesystem', desc: 'Read and write real files' },
+  { icon: '{#}', name: 'Screenshots', desc: 'Capture canvas, widgets, pages' },
+  { icon: '{C}', name: 'Scheduled Tasks', desc: 'Cron-like per-workspace jobs' },
+  { icon: '{K}', name: 'Knowledge Base', desc: 'Persistent memory, CRDT-synced' },
+  { icon: '{.}', name: 'Portable Skills', desc: 'Claude Code & OpenClaw formats' },
+  { icon: '{P}', name: 'File Transfer', desc: 'Peer-to-peer, encrypted' },
+  { icon: '{M}', name: 'Media Streaming', desc: 'Audio and video capture' },
+  { icon: '{&}', name: 'Shared State', desc: 'LWW-CRDT across peers' },
+  { icon: '{!}', name: 'Permission Gates', desc: 'Capability-gated trust model' },
 ];
 ---
 
@@ -43,17 +64,39 @@ const features = [
   <div class="container">
     <h2 class="section-title">What Lurks Inside</h2>
     <p class="features-intro">
-      Every capability below is an Abject itself: a living object with a manifest, a mailbox, and the ability to explain itself to any other object that asks.
+      Every one of these is an abject: a living object you can message, kill, restart, fork, or ask what it just did.
     </p>
     <div class="feature-grid">
       {features.map((f) => (
         <div class="card feature-card">
-          <span class="card-icon">{f.icon}</span>
+          <div class="card-header">
+            <span class="card-icon">{f.icon}</span>
+            <span class="card-abjects">{f.abjects}</span>
+          </div>
           <h3>{f.title}</h3>
           <p class="hook">{f.hook}</p>
           <p>{f.desc}</p>
         </div>
       ))}
+    </div>
+
+    <div id="capabilities" class="cap-block">
+      <h3 class="cap-heading">What the Abjects Can Touch</h3>
+      <p class="cap-intro">
+        Every capability is an abject. Every abject can ask any other what it does.
+        The system's reach grows by spawning new abjects, not by adding framework plugins.
+      </p>
+      <div class="cap-grid">
+        {capabilities.map((c) => (
+          <div class="cap-pill">
+            <span class="cap-icon">{c.icon}</span>
+            <div class="cap-text">
+              <span class="cap-name">{c.name}</span>
+              <span class="cap-desc">{c.desc}</span>
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   </div>
 </section>
@@ -86,6 +129,14 @@ const features = [
     }
   }
 
+  .card-header {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+  }
+
   .card-icon {
     display: inline-block;
     font-family: var(--font-mono);
@@ -96,7 +147,15 @@ const features = [
     border: 1px solid var(--border-accent);
     padding: 0.4rem 0.6rem;
     border-radius: 6px;
-    margin-bottom: 0.75rem;
+  }
+
+  .card-abjects {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--text-dim);
+    letter-spacing: 0.01em;
+    line-height: 1.4;
   }
 
   .feature-card .hook {
@@ -105,5 +164,91 @@ const features = [
     font-size: 0.9rem;
     margin-bottom: 0.5rem;
     line-height: 1.5;
+  }
+
+  .cap-block {
+    margin-top: 4rem;
+    scroll-margin-top: 80px;
+  }
+
+  .cap-heading {
+    text-align: center;
+    font-size: 1.5rem;
+    color: var(--text-primary);
+    margin-bottom: 0.75rem;
+  }
+
+  .cap-intro {
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 1rem;
+    max-width: 640px;
+    margin: 0 auto 2rem;
+    line-height: 1.6;
+  }
+
+  .cap-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.75rem;
+    max-width: 900px;
+    margin: 0 auto;
+  }
+
+  .cap-pill {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.7rem 0.9rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .cap-pill:hover {
+    border-color: var(--border-accent);
+    box-shadow: 0 0 12px var(--eldritch-glow);
+  }
+
+  .cap-icon {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--eldritch);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .cap-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .cap-name {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    line-height: 1.3;
+  }
+
+  .cap-desc {
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    line-height: 1.3;
+  }
+
+  @media (max-width: 768px) {
+    .cap-grid {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+
+  @media (max-width: 520px) {
+    .cap-grid {
+      grid-template-columns: repeat(2, 1fr);
+    }
   }
 </style>

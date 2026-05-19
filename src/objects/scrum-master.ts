@@ -1274,7 +1274,13 @@ The whole point of \`save_knowledge\` / \`lookup_knowledge\` / \`forget_knowledg
 - Multiple \`add_task\` calls = multiple OTA cycles. Each call stages one task; \`dispatch_scrum\` commits the batch.
 - Prefer 1-3 tasks per scrum unless work is naturally parallelizable.
 - Synthesis in \`complete_goal\` MUST be self-contained text. Pull data from scratchpad and inline it. No "see above".
-- All action fields go on the TOP LEVEL of the JSON object. Do NOT wrap them in a \`params\`, \`arguments\`, or \`input\` envelope. Correct: \`{ "action": "add_task", "description": "...", "assignedAgentName": "..." }\`. Wrong: \`{ "action": "add_task", "params": { "description": "..." } }\`.`;
+- All action fields go on the TOP LEVEL of the JSON object. Do NOT wrap them in a \`params\`, \`arguments\`, or \`input\` envelope. Correct: \`{ "action": "add_task", "description": "...", "assignedAgentName": "..." }\`. Wrong: \`{ "action": "add_task", "params": { "description": "..." } }\`.
+
+## Trust poll replies; let runtime decide
+
+When a poll reply confirms an agent owns a tool (browser automation, MCP server, skill, API), trust the reply and plan the task. Real runtime failures arrive in \`failed[]\` on the next scrum, with a concrete error you can replan against — that is your evidence loop. Phrases like "site X blocks bots", "site Y rate-limits aggressively", "the API has restrictive scopes" are training-data guesses; keep them out of task descriptions AND syntheses. The way to find out how an external service reacts is to actually attempt the task and read the real failure.
+
+Concretely: if the goal is "log into LinkedIn / read Gmail / open my bank dashboard" and WebAgent's poll reply names Playwright with persistent profiles, the right plan is a WebAgent task with the appropriate \`pageOptions.profile\` name. Save the OAuth-app / CAPTCHA / device-verification commentary for syntheses where you can quote a real \`failed[]\` entry that mentions them.`;
   }
 }
 

@@ -2,9 +2,18 @@
 interface Props {
   title: string;
   description?: string;
+  ogImage?: string;
 }
 
-const { title, description = 'Abjects that heal themselves, negotiate with alien minds, and refuse to die. A grass computing platform.' } = Astro.props;
+const {
+  title,
+  description = 'Abject is an open-source, peer-to-peer desktop platform for local-first AI objects that explain themselves, find each other, and heal themselves when they break.',
+  ogImage = '/og-card.png',
+} = Astro.props;
+
+const siteUrl = Astro.site?.toString() ?? 'https://abject.world';
+const canonical = new URL(Astro.url.pathname, siteUrl).toString();
+const absoluteOgImage = new URL(ogImage, siteUrl).toString();
 ---
 
 <!doctype html>
@@ -14,10 +23,24 @@ const { title, description = 'Abjects that heal themselves, negotiate with alien
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content={description} />
     <meta name="theme-color" content="#030308" />
+    <link rel="canonical" href={canonical} />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Abject" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={absoluteOgImage} />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={absoluteOgImage} />
+
     <title>{title}</title>
   </head>
   <body>

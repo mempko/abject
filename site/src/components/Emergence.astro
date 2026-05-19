@@ -10,12 +10,12 @@
     </div>
     <p class="emergence-subtitle"><em>What rises when no one gives the orders.</em></p>
     <p class="emergence-thesis">
-      Every agent framework starts with a planner that decomposes a goal, assigns tasks to LLM agents, and watches them report back. Abject starts with a Goal and nothing else. The Goal fractures into sub-goals and tasks. Tasks surface in the TupleSpace, a shared pool visible to every abject on every connected peer. Agents watch. Programs watch. Abjects that an agent created five minutes ago to handle exactly this kind of work? They watch too. Anything can claim a task. Progress flows back up through the Goal tree. If a task fails, the swarm remembers and routes around the damage. No dispatcher. No scheduler. No single point of failure. Just a Goal, and the minds (some thinking, some just executing) that converge on it.
+      Other agent frameworks decide the plan before the first task runs and assign it to a fixed lineup. Abject runs the plan in <em>scrums</em>. The <em>ScrumMaster</em> reviews what happened, stages the next round of tasks, dispatches them, and waits for the round to finish before deciding what to plan next. Tasks land in a shared TupleSpace visible to every abject on every connected peer. Anything that can do the work claims it: an agent thinking with an LLM, an abject doing deterministic work with code, an abject another agent spawned five minutes ago. When a task fails, the failure flows into the next scrum and the planner decides whether to retry, route around it, or give up. No fixed pipeline. No monolithic plan. Just a Goal, a planner that keeps re-planning, and the minds that converge on it.
     </p>
 
     <!-- Zone B2: Goal Hierarchy Diagram -->
     <div class="goal-diagram">
-      <h3 class="diagram-label diagram-label-new">The Descent</h3>
+      <p class="diagram-label diagram-label-new">The Descent</p>
       <svg class="diagram-svg diagram-svg-new" viewBox="0 0 700 440" xmlns="http://www.w3.org/2000/svg">
         <defs>
           <filter id="em-gd-glow">
@@ -87,10 +87,10 @@
         <text x="240" y="293" text-anchor="middle" fill="#39ff8e" font-size="12" font-family="monospace">WebAgent</text>
         <text x="240" y="320" text-anchor="middle" fill="rgba(57,255,142,0.35)" font-size="9" font-family="monospace">agent</text>
 
-        <!-- Program: spawned by agent -->
+        <!-- Worker: spawned by agent, deterministic code -->
         <rect x="325" y="270" width="110" height="36" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.25)" stroke-width="1.5"/>
         <text x="380" y="289" text-anchor="middle" fill="rgba(57,255,142,0.7)" font-size="12" font-family="monospace">{`{}`} Parser</text>
-        <text x="380" y="320" text-anchor="middle" fill="rgba(57,255,142,0.3)" font-size="9" font-family="monospace">program</text>
+        <text x="380" y="320" text-anchor="middle" fill="rgba(57,255,142,0.3)" font-size="9" font-family="monospace">worker</text>
 
         <!-- Peer B: remote abject -->
         <rect x="480" y="260" width="170" height="52" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.2)" stroke-width="1" stroke-dasharray="5 3"/>
@@ -115,8 +115,8 @@
         <text x="48" y="258" fill="rgba(57,255,142,0.3)" font-size="9" font-family="monospace">progress &#8593;</text>
 
         <!-- Caption -->
-        <text x="350" y="420" text-anchor="middle" fill="rgba(57,255,142,0.5)" font-size="11" font-family="monospace" font-style="italic">goal fractures into sub-goals. sub-goals spawn tasks.</text>
-        <text x="350" y="435" text-anchor="middle" fill="rgba(57,255,142,0.5)" font-size="11" font-family="monospace" font-style="italic">agents and programs claim. progress flows home.</text>
+        <text x="350" y="420" text-anchor="middle" fill="rgba(57,255,142,0.5)" font-size="11" font-family="monospace" font-style="italic">scrum stages tasks. sub-goals get their own rounds.</text>
+        <text x="350" y="435" text-anchor="middle" fill="rgba(57,255,142,0.5)" font-size="11" font-family="monospace" font-style="italic">any abject can claim. rounds converge. the planner returns.</text>
       </svg>
     </div>
 
@@ -127,7 +127,7 @@
         <div class="step-label">I</div>
         <h3 class="step-title">The Descent</h3>
         <p class="step-tagline">A goal descends through the layers of what must be done.</p>
-        <p>User states a goal. An agent decomposes it into sub-goals and typed tasks via AgentPlan. Tasks drop into TupleSpace as tuples. The goal tree syncs across peers via CRDT. An agent might even spawn a new programmatic abject to handle a task type. The swarm grows itself.</p>
+        <p>User states a goal. The ScrumMaster opens the first scrum: it reviews the goal, polls available workers about what they can do, then stages a round of tasks and dispatches them into TupleSpace. The goal tree syncs across peers via CRDT. Tasks the planner couldn't anticipate get added in later scrums as the system learns what the work actually needs.</p>
       </div>
 
       <div class="step-connector">
@@ -140,7 +140,7 @@
         <div class="step-label">II</div>
         <h3 class="step-title">The Reaching</h3>
         <p class="step-tagline">Abjects sense what they were made for.</p>
-        <p>When a task surfaces, every registered abject is asked: "How would you accomplish this?" Each self-assesses via the ask protocol. Abjects that can't help reply PASS. Among viable candidates, an evaluator picks the most efficient approach. TupleSpace syncs via CRDT across WebRTC. Optimistic claims with LWW, no locks. Not every hand that reaches needs a brain behind it.</p>
+        <p>The ScrumMaster polls registered workers through the ask protocol: "Can you do this? How?" Workers that can't help reply PASS; the planner assigns each task to the most fitting candidate. Tasks land in TupleSpace, which syncs across peers via CRDT over WebRTC. Optimistic claims with LWW, no locks. Not every hand that reaches needs a brain behind it.</p>
       </div>
 
       <div class="step-connector">
@@ -152,8 +152,8 @@
       <div class="step">
         <div class="step-label">III</div>
         <h3 class="step-title">The Convergence</h3>
-        <p class="step-tagline">Progress flows upward through the tree.</p>
-        <p>Task completion propagates up the goal hierarchy via real-time events. Sub-goals complete when all their tasks finish. Parent goals complete when all sub-goals finish. Multiple abjects on different machines converge without direct coordination. An agent and a program it spawned two minutes ago both report to the same Goal.</p>
+        <p class="step-tagline">A round finishes; the planner returns.</p>
+        <p>Every task in the current scrum runs to a terminal state (done, failed, or skipped) somewhere on the mesh. When the round is complete, the GoalManager emits <code>goalReadyForCompletion</code>. ScrumMaster wakes for the next scrum, reviews what the round produced and what it didn't, and decides: declare the goal done, plan another round of tasks, or fail the goal. Multiple abjects on different machines converge on the same Goal without ever speaking to each other directly.</p>
       </div>
 
       <div class="step-connector">
@@ -165,8 +165,8 @@
       <div class="step">
         <div class="step-label">IV</div>
         <h3 class="step-title">The Scar</h3>
-        <p class="step-tagline">Failure is not the end. It is a lesson the swarm remembers.</p>
-        <p>Failed tasks release their claim. Failure history prevents the same abject from retrying. Three attempts maximum, then permanently dead. GoalObserver auto-fails stale and runaway goals. The system has an immune response.</p>
+        <p class="step-tagline">Failure is not the end. It is context for the next scrum.</p>
+        <p>Failed tasks attach their error and the worker that failed them to the goal's history. There is no per-task retry budget; the next scrum reads the failure and decides what to do about it: schedule a corrective task, route the work to a different abject, or fail the goal entirely. A GoalObserver watches from outside and auto-fails goals that go silent for too long. Nothing is patched into amnesia; every scar is a fact the next round can reason about.</p>
       </div>
 
     </div>
@@ -180,7 +180,7 @@
         <div class="compare-systems">AutoGen &middot; CrewAI &middot; LangGraph</div>
         <div class="compare-diagrams">
           <div class="diagram-old">
-            <h3 class="diagram-label">The Old Way</h3>
+            <p class="diagram-label">The Old Way</p>
             <svg class="diagram-svg diagram-svg-old" viewBox="0 0 620 170" xmlns="http://www.w3.org/2000/svg">
               <defs>
                 <marker id="em-arrow-dim" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
@@ -216,7 +216,7 @@
             </svg>
           </div>
           <div class="diagram-new">
-            <h3 class="diagram-label diagram-label-new">The Inversion</h3>
+            <p class="diagram-label diagram-label-new">The Inversion</p>
             <svg class="diagram-svg diagram-svg-new" viewBox="0 0 620 310" xmlns="http://www.w3.org/2000/svg">
               <defs>
                 <filter id="em-glow-green">
@@ -288,7 +288,7 @@
           </div>
           <div class="compare-side compare-abjects">
             <span class="compare-tag compare-tag-abjects">Abject</span>
-            <p>A Goal decomposes recursively at runtime, shaped by what workers discover as they work. Agents can spawn purpose-built programs for repetitive tasks: no LLM calls, just code, running alongside the thinkers. No plan survives contact with reality, so the plan rewrites itself.</p>
+            <p>A goal is planned in scrums. Each round, the ScrumMaster reviews what the previous round produced and decides what to plan next, then commits a batch of tasks to TupleSpace. Workers ask the ScrumMaster what they can do; some think with an LLM, some just run code. No plan survives contact with reality, so the plan rewrites itself, one scrum at a time.</p>
           </div>
         </div>
       </div>
@@ -356,7 +356,7 @@
           </div>
           <div class="compare-side compare-abjects">
             <span class="compare-tag compare-tag-abjects">Abject</span>
-            <p>Goals are CRDTs that sync across peers through encrypted WebRTC channels with no central server. Kill a peer and the goal survives on every other peer that subscribed. The workers crossing the wire aren't all LLM agents; some are programs that agents spawned to do the grunt work.</p>
+            <p>Goals are CRDTs that sync across peers through encrypted WebRTC channels with no central server. Kill a peer and the goal survives on every other peer that subscribed. The workers crossing the wire aren't all LLM agents; any abject can register as a worker, including deterministic ones that just run code.</p>
           </div>
         </div>
       </div>
@@ -408,10 +408,10 @@
           <line x1="780" y1="95" x2="700" y2="75" stroke="#39ff8e" stroke-width="1.5" marker-end="url(#em-cf-arrow-green)" filter="url(#em-cf-glow)"/>
           <text x="752" y="82" fill="rgba(57,255,142,0.5)" font-size="8" font-family="monospace">claim</text>
 
-          <!-- Attempt counter -->
-          <text x="660" y="100" text-anchor="middle" fill="rgba(57,255,142,0.4)" font-size="9" font-family="monospace" font-style="italic">attempt 2/3</text>
+          <!-- Failure feeds next scrum -->
+          <text x="660" y="100" text-anchor="middle" fill="rgba(57,255,142,0.4)" font-size="9" font-family="monospace" font-style="italic">next scrum decides</text>
 
-          <text x="660" y="150" text-anchor="middle" fill="rgba(57,255,142,0.5)" font-size="10" font-family="monospace" font-style="italic">failure is a lesson, not a death sentence.</text>
+          <text x="660" y="150" text-anchor="middle" fill="rgba(57,255,142,0.5)" font-size="10" font-family="monospace" font-style="italic">failure is context the next scrum reads.</text>
         </svg>
         <div class="compare-pair">
           <div class="compare-side compare-them">
@@ -420,7 +420,7 @@
           </div>
           <div class="compare-side compare-abjects">
             <span class="compare-tag compare-tag-abjects">Abject</span>
-            <p>Failed tasks release their claim and return to the TupleSpace. The system remembers who failed and routes to a different worker next time. Three strikes and the task dies; too many dead tasks and the GoalObserver kills the entire goal.</p>
+            <p>A failed task ends the current round with its error attached to the goal's history. The next scrum reads that history and decides what to do: schedule a corrective task, route the work to a different abject, or fail the goal. There is no fixed retry budget; the planner adapts each round. A separate GoalObserver auto-fails goals that go silent for too long.</p>
           </div>
         </div>
       </div>
@@ -429,8 +429,8 @@
 
     <!-- Zone E: Closing -->
     <div class="emergence-closing">
-      <p class="closing-line">Four primitives. That's all it takes. A goal tree that decomposes work recursively. A shared space where tasks are visible to every agent and every program on every peer. Optimistic claims that resolve themselves without locks. Failure memory that prevents the same mistake twice.</p>
-      <p class="closing-line closing-vivid">From these, something unreasonable emerges: agents and programs on different continents converging on the same objective without ever speaking to each other. Retry chains that route around damage like a river finding its way around a rock. Other frameworks coordinate agents. Abject grows organisms.</p>
+      <p class="closing-line">Four primitives. That's all it takes. A goal tree that decomposes work recursively. A shared TupleSpace where tasks are visible to every worker on every peer. Optimistic claims that resolve themselves without locks. A planner that runs in rounds, reads what each round produced (including the failures), and decides what to plan next.</p>
+      <p class="closing-line closing-vivid">From these, something unreasonable emerges: workers on different continents converging on the same objective without ever speaking to each other directly. Plans that rewrite themselves after each round, routing around damage like a river finding its way around a rock. Other frameworks coordinate agents. Abject grows organisms.</p>
       <p class="closing-definition"><em>emergence</em> (n.) - complex behavior that arises from simple local interactions. No conductor. No score. The music plays itself.</p>
     </div>
 

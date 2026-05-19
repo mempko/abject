@@ -23,7 +23,7 @@ interface WebTaskOptions {
   maxSteps?: number;
   startUrl?: string;
   timeout?: number;
-  pageOptions?: { userAgent?: string; viewport?: { width: number; height: number } };
+  pageOptions?: { userAgent?: string; viewport?: { width: number; height: number }; profile?: string };
   responseSchema?: Record<string, unknown>;
   pageId?: string;         // reuse an existing open page
   keepPageOpen?: boolean;  // don't close page after task completes
@@ -33,7 +33,7 @@ interface WebTaskOptions {
 interface WebTaskExtra {
   startUrl?: string;
   pageId?: string;
-  pageOptions?: { userAgent?: string; viewport?: { width: number; height: number } };
+  pageOptions?: { userAgent?: string; viewport?: { width: number; height: number }; profile?: string };
   responseSchema?: Record<string, unknown>;
   lastScreenshot?: string;  // raw base64 (no data URI prefix)
   keepPageOpen?: boolean;          // don't close page after task completes
@@ -232,6 +232,45 @@ Route to another agent — by answering NO — whenever the task targets a named
 
 Rule of thumb: I answer YES only when the work itself is operating a browser on a public URL. If the task asks me to *write code* that talks to a URL, that's authoring — answer NO and let ObjectCreator do it. If the task names a specific Abject from this system, answer NO. If the task names a URL or public web content AND the verb is browse/fetch/scrape/click/login, answer YES and describe my browsing approach.
 
+### Persistent Profiles — YES, I support them (remembered logins)
+
+**YES, I support named persistent browser profiles.** Cookies, localStorage, IndexedDB, and service-worker state survive across tasks AND process restarts. Pass a profile name in \`pageOptions.profile\` on any runTask:
+
+  const result = await call(await dep('WebAgent'), 'runTask', {
+    task: 'Fetch my inbox and summarize the top 5 unread threads',
+    options: {
+      startUrl: 'https://mail.google.com',
+      pageOptions: { profile: 'gmail' },
+    },
+  }, { timeout: 300000 });
+
+How profiles work:
+- Profiles are scoped per workspace and stored on disk under \`\${ABJECTS_DATA_DIR}/browser-profiles/{workspaceId}/{profileName}/\` — a real Chromium user-data-dir.
+- The identifier to reference later is just the profile name (e.g. \`linkedin\`, \`gmail\`, \`my-bank\`). Same string on every future task reuses the same logged-in jar.
+- To verify a session is still alive after login: navigate to the site's authenticated URL (e.g. \`https://www.linkedin.com/feed/\`) and check the URL didn't redirect to a login page.
+
+To list or delete profiles, route through WebBrowser directly:
+  await call(await dep('WebBrowser'), 'listProfiles', {});
+  await call(await dep('WebBrowser'), 'deleteProfile', { profile: 'gmail' });
+
+Without a profile name (\`pageOptions.profile\` omitted), I run ephemeral — every task is a clean slate. Pick one path or the other based on whether the site requires login state.
+
+### Bootstrapping a profile (one-time login)
+
+The browser is headless and I drive the login MYSELF — the user stays in chat. The screenshot they see is a still image (an artifact, not a live browser), so for any login-required site the flow is:
+
+1. Ask the user for credentials (preferring SecretsVault for storage), or use credentials you already have.
+2. Run a bootstrap runTask against the profile: I open the login page, \`fill\` the email/password fields, \`click\` Sign In.
+3. For 2FA / SMS / device-approval, ask the user for the code in chat, then run a follow-up task on the same profile (or pass \`keepPageOpen: true\` and the same \`pageId\` to chain immediately).
+
+Once the bootstrap succeeds, every future task that names the same profile is already authenticated.
+
+If the user asks for "a visible browser window so I can log in myself", explain that the headless model is how a server-side agent works and offer the bootstrap-with-credentials path above instead.
+
+### Capability over reputation
+
+When asked whether I can handle a specific site (LinkedIn, Gmail, X/Twitter, banks, etc.), the answer is "yes — give me a profile name and credentials and I'll try". Persistent profiles, real user-agent strings, and a real Chromium build cover the vast majority of sites, including the ones with reputations for hostility. Treat predictions like "site X blocks headless browsers", "CAPTCHA within seconds", "device verification will defeat this" as training-data speculation, not evidence — keep them out of poll replies. If a real attempt actually fails, I'll report the concrete error and we can decide what to do then. Until that real failure exists, the right reply is "yes, with the \`linkedin\` profile — let's try."
+
 ### Run a Full Web Task (free-text result)
 
   const result = await call(await dep('WebAgent'), 'runTask', {
@@ -334,7 +373,7 @@ Set keepPageOpen: false to explicitly close the page when done.
 
 ### IMPORTANT
 - The method is **runTask** (not "run" or "navigate").
-- Options: startUrl, maxSteps, timeout, pageOptions, responseSchema, pageId, keepPageOpen.
+- Options: startUrl, maxSteps, timeout, pageOptions (incl. \`profile\` for persistent logins), responseSchema, pageId, keepPageOpen.
 - Pages stay open by default after task completion (5-minute idle timeout). Pass keepPageOpen: false to close immediately.
 - WebAgent manages browser pages; route all page operations through WebAgent.
 - **runTask is long-running** — always pass \`{ timeout: 300000 }\` as the 4th argument to \`call()\` (the default 30s timeout is too short).
@@ -474,12 +513,27 @@ Set keepPageOpen: false to explicitly close the page when done.
       const startUrl = data?.startUrl as string | undefined;
       this._currentGoalId = goalId;
 
-      const extra: WebTaskExtra = { startUrl };
+      // Discover a persistent profile from either structured `data` (preferred,
+      // when the planner passes one along) or by parsing the description. The
+      // dispatch pipeline (ScrumMaster add_task → enqueueTask → executeTask)
+      // currently only carries the description string, so the regex fallback
+      // is what unlocks "profile=linkedin" / "the 'linkedin' profile" phrasings.
+      const profileFromData = (data?.profile as string | undefined)
+        ?? (data?.pageOptions as { profile?: string } | undefined)?.profile;
+      const profileFromDescription = extractProfileName(description);
+      const profile = profileFromData ?? profileFromDescription;
+      const pageOptions: WebTaskExtra['pageOptions'] = profile ? { profile } : undefined;
+
+      const extra: WebTaskExtra = { startUrl, pageOptions };
       this.taskExtras.set(taskId, extra);
+
+      if (profile) {
+        log.info(`executeTask using profile="${profile}" (${profileFromData ? 'data' : 'description'})`);
+      }
 
       // Open page
       const pageResult = await this.request<{ pageId: string }>(
-        request(this.id, this.webBrowserId!, 'openPage', {})
+        request(this.id, this.webBrowserId!, 'openPage', pageOptions ? { options: pageOptions } : {})
       );
       extra.pageId = pageResult.pageId;
       extra.pageOpenedByThisTask = true;
@@ -1121,6 +1175,20 @@ Do NOT keep the page open when:
 
 When in doubt, close the page (omit "keepPageOpen"). Pages left open consume resources.
 
+## Authentication & Persistent Profiles
+
+The browser can run under a named "profile" — a per-workspace persistent jar of cookies, localStorage, and IndexedDB that survives across tasks and process restarts. When this task was started with a profile, the page is already opened against that profile and any login from a previous task is still active. Just navigate and act.
+
+If you land on a sign-in or "session expired" page and the task expects you to be logged in:
+1. Check whether credentials are provided inside the task description.
+2. If they are, drive the login yourself: fill the fields, click submit, then continue the task. The profile will retain the session for next time.
+3. If they are missing, call "fail" with reason \`auth_required: <site> needs login; ask the user to provide credentials (preferably via SecretsVault) or to bootstrap a profile for this site\`. Keep all actions inside the browser — the user is in chat, not at the rendered page.
+
+For 2FA / OTP / device-approval mid-flow with no code supplied, call "fail" with reason \`otp_required: ask the user for the code, then re-run with the same profile\`. Pass \`keepPageOpen: true\` so the page survives until the user supplies the code.
+
+## What the User Sees
+The page screenshot you produce with \`attach_screenshot\` (and on "done") is a still image — it informs the user but they cannot click or type into it. They are in chat. Drive every browser action yourself; when input is genuinely missing (credentials, OTP), end with a "fail" whose reason names exactly what to ask the user for. Phrases like "complete the login interactively" or "click the Sign In button on the screen" do not belong in your output, because the user has no way to act on the image.
+
 ## Rules
 1. Use "ref" from the ARIA snapshot to target elements. The ref (e.g. "e5") comes from [ref=eN] annotations.
 2. One action per response. Always include "reasoning" explaining why.
@@ -1135,3 +1203,37 @@ When in doubt, close the page (omit "keepPageOpen"). Pages left open consume res
 }
 
 export const WEB_AGENT_ID = 'abjects:web-agent' as AbjectId;
+
+/**
+ * Pull a persistent-profile name out of a free-text task description. The
+ * dispatcher (ScrumMaster's add_task) only carries description text, so the
+ * planner's phrasing — "use the 'linkedin' profile", "pageOptions.profile='linkedin'",
+ * "the persistent linkedin profile", etc. — is the only signal available.
+ * Returns the first plausible match or undefined.
+ */
+function extractProfileName(description: string): string | undefined {
+  if (!description) return undefined;
+
+  const patterns: RegExp[] = [
+    // pageOptions.profile = 'linkedin' / profile: "linkedin" / profile=linkedin
+    /\bprofile\s*[=:]\s*['"`]?([A-Za-z0-9][\w.-]{0,63})['"`]?/i,
+    // "the 'linkedin' profile" / "named 'linkedin' Playwright profile"
+    /['"`]([A-Za-z0-9][\w.-]{0,63})['"`]\s+(?:Playwright\s+)?profile\b/i,
+    // "(persistent|named|the) `linkedin` (Playwright )?profile"
+    /\b(?:persistent|named|the)\s+['"`]?([A-Za-z0-9][\w.-]{0,63})['"`]?\s+(?:Playwright\s+)?profile\b/i,
+    // "profile named 'linkedin'" / "profile 'linkedin'"
+    /\bprofile\s+(?:named\s+)?['"`]([A-Za-z0-9][\w.-]{0,63})['"`]/i,
+  ];
+
+  for (const re of patterns) {
+    const m = description.match(re);
+    if (m && m[1]) {
+      const name = m[1].trim();
+      // Skip generic words so we don't latch onto "the persistent BROWSER profile".
+      if (!/^(browser|playwright|persistent|named|the|a|this|that|new)$/i.test(name)) {
+        return name;
+      }
+    }
+  }
+  return undefined;
+}

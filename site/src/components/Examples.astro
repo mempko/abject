@@ -1,0 +1,130 @@
+---
+const examples = [
+  {
+    glyph: '{¤}',
+    title: 'Friday, 2 AM. Your agent is still reading.',
+    body: 'You went to bed. An abject pulled 47 papers from your RSS feeds, ranked them against your open projects, drafted a one-page summary, and pinned it to the canvas. The tokens came from your local Ollama. No surprise bill. No surprise rate limit at hour three. Wake up. Coffee. Read.',
+  },
+  {
+    glyph: '{↻}',
+    title: 'Your scraper crashed. Twenty seconds later, the work routes around it.',
+    body: 'The failed task attaches its error to the goal\'s history. The next scrum reads what just broke, picks a different abject, and stages the retry. No 30-minute chain running off a cliff. The plan rewrites itself round by round.',
+  },
+  {
+    glyph: '{△}',
+    title: 'Click. Your friend\'s cursor is on your canvas.',
+    body: 'She\'s in Berlin. You\'re in Brooklyn. Both on Wi-Fi. Pin a note; she draws an arrow to it; you watch her cursor move in real time. End-to-end encrypted WebRTC, ECDH key exchange, AES-256-GCM. The signaling relay never sees a byte.',
+  },
+  {
+    glyph: '{∇}',
+    title: 'Twenty words. A new program appears.',
+    body: '"Watch ~/Downloads. When a PDF lands, rename it by its title, move it to ~/Papers/{year}." Chat decomposes the goal, the LLM writes the manifest, ObjectCreator spawns the abject. A new window opens. It is already running.',
+  },
+];
+---
+
+<section id="examples" class="examples-section">
+  <div class="container">
+    <h2 class="section-title">What People Build</h2>
+    <p class="examples-subtitle">A handful of things abjects are good at. Some of these you can do elsewhere; all of them, here, you own.</p>
+
+    <div class="examples-grid">
+      {examples.map((e) => (
+        <div class="card example-card">
+          <span class="example-glyph">{e.glyph}</span>
+          <h3 class="example-title">{e.title}</h3>
+          <p class="example-body">{e.body}</p>
+        </div>
+      ))}
+    </div>
+
+    <p class="examples-footer">Free. Local. Yours. <a href="#downloads">Download Abject</a>.</p>
+  </div>
+</section>
+
+<style>
+  .examples-section {
+    background: transparent;
+  }
+
+  .examples-subtitle {
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 1rem;
+    max-width: 640px;
+    margin: -1.5rem auto 2.5rem;
+    line-height: 1.7;
+  }
+
+  .examples-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1.25rem;
+    max-width: 900px;
+    margin: 0 auto;
+  }
+
+  @media (max-width: 700px) {
+    .examples-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .example-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+
+  .example-glyph {
+    display: inline-block;
+    align-self: flex-start;
+    font-family: var(--font-mono);
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--eldritch);
+    background: var(--eldritch-glow);
+    border: 1px solid var(--border-accent);
+    padding: 0.35rem 0.55rem;
+    border-radius: 6px;
+  }
+
+  .example-title {
+    color: var(--text-primary);
+    font-size: 1.05rem;
+    line-height: 1.4;
+    margin: 0;
+  }
+
+  .example-body {
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+    line-height: 1.65;
+    margin: 0;
+  }
+
+  .examples-footer {
+    text-align: center;
+    margin-top: 2.5rem;
+    color: var(--text-dim);
+    font-size: 0.9rem;
+    font-style: italic;
+  }
+
+  .examples-footer a {
+    color: var(--eldritch-dim);
+    border-bottom: 1px solid rgba(43, 204, 110, 0.3);
+    padding-bottom: 1px;
+    transition: color 0.2s, border-color 0.2s;
+  }
+
+  .examples-footer a:hover {
+    color: var(--eldritch);
+    border-bottom-color: var(--eldritch);
+  }
+
+  .examples-footer em {
+    color: var(--void-purple);
+    font-style: italic;
+  }
+</style>

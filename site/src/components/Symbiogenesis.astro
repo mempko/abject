@@ -5,50 +5,70 @@
   <div class="container">
 
     <!-- Zone A: Title -->
+    <p class="symbio-eyebrow">// SYMBIOGENESIS</p>
     <div class="section-title">
-      <h2>Symbiogenesis</h2>
+      <h2>How is Abject different?</h2>
     </div>
     <p class="symbio-subtitle">The line between agent and tool, erased.</p>
+
+    <p class="compare-thesis">
+      Most AI agent frameworks put one planner on top and tools beneath.
+      Abject doesn't have that line.
+      Every piece, agents, tools, even the registry that finds them, is an autonomous object passing messages.
+      The internet has run this way for fifty years. Hierarchies snap; meshes route around damage.
+    </p>
 
     <!-- Zone B: Inversion Diagrams -->
     <div class="diagrams">
       <div class="diagram-old">
-        <h3 class="diagram-label">The Old Way</h3>
-        <svg class="diagram-svg diagram-svg-old" viewBox="0 0 620 170" xmlns="http://www.w3.org/2000/svg">
+        <p class="diagram-label">The Old Way</p>
+        <svg class="diagram-svg diagram-svg-old" viewBox="0 0 620 170" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The old way: an Agent issues one-way commands to a passive Tool, the same pattern repeating forever">
           <defs>
             <marker id="arrow-old" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
               <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a5a70"/>
             </marker>
           </defs>
-          <!-- Row 1 -->
-          <rect x="30" y="15" width="100" height="34" rx="6" fill="#12121e" stroke="rgba(255,77,106,0.2)" stroke-width="1"/>
-          <text x="80" y="37" text-anchor="middle" fill="#e0e0ea" font-size="13" font-family="monospace">Agent</text>
-          <line x1="135" y1="32" x2="195" y2="32" stroke="#5a5a70" stroke-width="1.5" marker-end="url(#arrow-old)"/>
-          <rect x="200" y="15" width="100" height="34" rx="6" fill="#12121e" stroke="#1a1a2a" stroke-width="1"/>
-          <text x="250" y="37" text-anchor="middle" fill="#5a5a70" font-size="13" font-family="monospace">Tool</text>
-          <text x="340" y="37" fill="#5a5a70" font-size="12" font-family="monospace" opacity="0.8">Agent decides. Tool obeys.</text>
-          <!-- Row 2 -->
-          <rect x="30" y="65" width="100" height="34" rx="6" fill="#12121e" stroke="rgba(255,77,106,0.2)" stroke-width="1"/>
-          <text x="80" y="87" text-anchor="middle" fill="#e0e0ea" font-size="13" font-family="monospace">Agent</text>
-          <line x1="135" y1="82" x2="195" y2="82" stroke="#5a5a70" stroke-width="1.5" marker-end="url(#arrow-old)"/>
-          <rect x="200" y="65" width="100" height="34" rx="6" fill="#12121e" stroke="#1a1a2a" stroke-width="1"/>
-          <text x="250" y="87" text-anchor="middle" fill="#5a5a70" font-size="13" font-family="monospace">Tool</text>
-          <text x="340" y="87" fill="#5a5a70" font-size="12" font-family="monospace" opacity="0.8">One-way. Always.</text>
-          <!-- Row 3 -->
-          <rect x="30" y="115" width="100" height="34" rx="6" fill="#12121e" stroke="rgba(255,77,106,0.2)" stroke-width="1"/>
-          <text x="80" y="137" text-anchor="middle" fill="#e0e0ea" font-size="13" font-family="monospace">Agent</text>
-          <line x1="135" y1="132" x2="195" y2="132" stroke="#5a5a70" stroke-width="1.5" marker-end="url(#arrow-old)"/>
-          <rect x="200" y="115" width="100" height="34" rx="6" fill="#12121e" stroke="#1a1a2a" stroke-width="1"/>
-          <text x="250" y="137" text-anchor="middle" fill="#5a5a70" font-size="13" font-family="monospace">Tool</text>
+
+          <!-- Primary row -->
+          <rect x="40" y="20" width="120" height="42" rx="6" fill="#12121e" stroke="rgba(255,77,106,0.35)" stroke-width="1.5"/>
+          <text x="100" y="46" text-anchor="middle" fill="#e0e0ea" font-size="14" font-family="monospace">Agent</text>
+          <line x1="165" y1="41" x2="235" y2="41" stroke="#5a5a70" stroke-width="1.5" marker-end="url(#arrow-old)"/>
+          <text x="200" y="32" text-anchor="middle" fill="#5a5a70" font-size="10" font-family="monospace" opacity="0.7">commands</text>
+          <rect x="240" y="20" width="120" height="42" rx="6" fill="#12121e" stroke="#1a1a2a" stroke-width="1"/>
+          <text x="300" y="46" text-anchor="middle" fill="#5a5a70" font-size="14" font-family="monospace">Tool</text>
+          <text x="390" y="38" fill="#5a5a70" font-size="12" font-family="monospace" opacity="0.85">Agent decides.</text>
+          <text x="390" y="54" fill="#5a5a70" font-size="12" font-family="monospace" opacity="0.85">Tool obeys.</text>
+
+          <!-- Ghost row (faded) -->
+          <rect x="40" y="78" width="120" height="32" rx="6" fill="#12121e" stroke="rgba(255,77,106,0.15)" stroke-width="1" opacity="0.45"/>
+          <text x="100" y="100" text-anchor="middle" fill="#e0e0ea" font-size="13" font-family="monospace" opacity="0.4">Agent</text>
+          <line x1="165" y1="94" x2="235" y2="94" stroke="#5a5a70" stroke-width="1" opacity="0.45" marker-end="url(#arrow-old)"/>
+          <rect x="240" y="78" width="120" height="32" rx="6" fill="#12121e" stroke="#1a1a2a" stroke-width="1" opacity="0.45"/>
+          <text x="300" y="100" text-anchor="middle" fill="#5a5a70" font-size="13" font-family="monospace" opacity="0.4">Tool</text>
+
+          <!-- More-ghost row -->
+          <rect x="40" y="122" width="120" height="26" rx="6" fill="#12121e" stroke="rgba(255,77,106,0.1)" stroke-width="1" opacity="0.22"/>
+          <text x="100" y="140" text-anchor="middle" fill="#e0e0ea" font-size="12" font-family="monospace" opacity="0.22">Agent</text>
+          <line x1="165" y1="135" x2="235" y2="135" stroke="#5a5a70" stroke-width="1" opacity="0.22" marker-end="url(#arrow-old)"/>
+          <rect x="240" y="122" width="120" height="26" rx="6" fill="#12121e" stroke="#1a1a2a" stroke-width="1" opacity="0.22"/>
+          <text x="300" y="140" text-anchor="middle" fill="#5a5a70" font-size="12" font-family="monospace" opacity="0.22">Tool</text>
+
+          <!-- Caption next to ghosts -->
+          <text x="390" y="100" fill="#5a5a70" font-size="11" font-family="monospace" font-style="italic" opacity="0.7">&times; many.</text>
+          <text x="390" y="115" fill="#5a5a70" font-size="11" font-family="monospace" font-style="italic" opacity="0.7">Always one-way.</text>
         </svg>
       </div>
 
       <div class="diagram-new">
-        <h3 class="diagram-label diagram-label-new">The Inversion</h3>
-        <svg class="diagram-svg diagram-svg-new" viewBox="0 0 620 310" xmlns="http://www.w3.org/2000/svg">
+        <p class="diagram-label diagram-label-new">The Inversion</p>
+        <svg class="diagram-svg diagram-svg-new" viewBox="0 0 620 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The inversion: abjects talk to each other, create new abjects, summon an LLM when they need to think, and the created becomes the creator in an unending recursion">
           <defs>
             <filter id="glow-eldritch">
               <feGaussianBlur stdDeviation="3" result="blur"/>
+              <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+            <filter id="glow-eldritch-strong">
+              <feGaussianBlur stdDeviation="5" result="blur"/>
               <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
             </filter>
             <marker id="arrow-eldritch" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
@@ -58,55 +78,75 @@
               <path d="M 10 0 L 0 5 L 10 10 z" fill="#39ff8e"/>
             </marker>
             <marker id="arrow-eldritch-down" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(57,255,142,0.4)"/>
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(57,255,142,0.55)"/>
+            </marker>
+            <marker id="arrow-loop" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="9" markerHeight="9" orient="auto">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#39ff8e"/>
+            </marker>
+            <marker id="arrow-llm" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(155,89,255,0.55)"/>
             </marker>
           </defs>
 
-          <!-- Row 1: Abject ◄──► Abject -->
-          <rect x="30" y="15" width="110" height="38" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1.5"/>
-          <text x="85" y="40" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace">Abject</text>
-          <line x1="145" y1="34" x2="195" y2="34" stroke="#39ff8e" stroke-width="1.5" marker-start="url(#arrow-eldritch-rev)" marker-end="url(#arrow-eldritch)" filter="url(#glow-eldritch)"/>
-          <rect x="200" y="15" width="110" height="38" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1.5"/>
-          <text x="255" y="40" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace">Abject</text>
-          <text x="350" y="40" fill="#39ff8e" font-size="12" font-family="monospace" opacity="0.7">Abjects talk to each other.</text>
+          <!-- Row 1: Abject ↔ Abject (talk) -->
+          <rect x="50" y="20" width="110" height="38" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.4)" stroke-width="1.5"/>
+          <text x="105" y="45" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace">Abject</text>
+          <line x1="165" y1="39" x2="215" y2="39" stroke="#39ff8e" stroke-width="1.5" marker-start="url(#arrow-eldritch-rev)" marker-end="url(#arrow-eldritch)" filter="url(#glow-eldritch)"/>
+          <rect x="220" y="20" width="110" height="38" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.4)" stroke-width="1.5"/>
+          <text x="275" y="45" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace">Abject</text>
+          <text x="360" y="44" fill="#39ff8e" font-size="12" font-family="monospace" opacity="0.85">Abjects talk to each other.</text>
 
-          <!-- Vertical arrow down from left Object -->
-          <line x1="85" y1="53" x2="85" y2="100" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#arrow-eldritch-down)"/>
-          <text x="350" y="78" fill="#39ff8e" font-size="12" font-family="monospace" opacity="0.7">Abjects create Abjects.</text>
-          <text x="350" y="98" fill="#39ff8e" font-size="12" font-family="monospace" opacity="0.7">Abjects interview dependencies.</text>
+          <!-- Vertical create arrow Row 1 -> Row 2 -->
+          <line x1="105" y1="58" x2="105" y2="113" stroke="rgba(57,255,142,0.55)" stroke-width="1.5" marker-end="url(#arrow-eldritch-down)"/>
+          <text x="115" y="88" fill="rgba(57,255,142,0.7)" font-size="11" font-family="monospace" font-style="italic">creates</text>
 
-          <!-- Row 2: Abject ──► LLM -->
-          <rect x="30" y="105" width="110" height="38" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1.5"/>
-          <text x="85" y="130" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace">Abject</text>
-          <line x1="145" y1="124" x2="195" y2="124" stroke="#9b59ff" stroke-width="1.5" marker-end="url(#arrow-old)" filter="url(#glow-eldritch)"/>
-          <rect x="200" y="105" width="110" height="38" rx="6" fill="#12121e" stroke="rgba(155,89,255,0.3)" stroke-width="1.5"/>
-          <text x="255" y="130" text-anchor="middle" fill="#9b59ff" font-size="13" font-family="monospace">LLM</text>
-          <text x="350" y="130" fill="#39ff8e" font-size="12" font-family="monospace" opacity="0.7">Summons a mind when needed.</text>
+          <!-- Row 2: parent Abject -> NEW Abject (creation event) + LLM satellite -->
+          <rect x="50" y="120" width="110" height="38" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.4)" stroke-width="1.5"/>
+          <text x="105" y="145" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace">Abject</text>
+          <line x1="165" y1="139" x2="215" y2="139" stroke="#39ff8e" stroke-width="1.5" marker-end="url(#arrow-eldritch)" filter="url(#glow-eldritch)"/>
+          <text x="190" y="131" text-anchor="middle" fill="rgba(57,255,142,0.7)" font-size="10" font-family="monospace" font-style="italic">spawns</text>
+          <!-- The NEW abject: dashed border + stronger glow -->
+          <rect x="220" y="120" width="110" height="38" rx="6" fill="#12121e" stroke="#39ff8e" stroke-width="2" stroke-dasharray="5 3" filter="url(#glow-eldritch-strong)"/>
+          <text x="275" y="145" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace" font-weight="600">Abject*</text>
 
-          <!-- Vertical arrow down -->
-          <line x1="85" y1="143" x2="85" y2="195" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#arrow-eldritch-down)"/>
+          <!-- LLM satellite: smaller, purple, off to the side, dashed connector -->
+          <path d="M 105 158 Q 105 200 195 200 Q 410 200 410 158" fill="none" stroke="rgba(155,89,255,0.45)" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#arrow-llm)"/>
+          <text x="245" y="195" fill="rgba(155,89,255,0.7)" font-size="10" font-family="monospace" font-style="italic">summon</text>
+          <rect x="380" y="120" width="65" height="38" rx="6" fill="#12121e" stroke="rgba(155,89,255,0.5)" stroke-width="1.5"/>
+          <text x="412" y="145" text-anchor="middle" fill="#9b59ff" font-size="13" font-family="monospace">LLM</text>
 
-          <!-- Row 3: Abject ◄──► Abject (created becomes creator) -->
-          <rect x="30" y="200" width="110" height="38" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1.5"/>
-          <text x="85" y="225" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace">Abject</text>
-          <line x1="145" y1="219" x2="195" y2="219" stroke="#39ff8e" stroke-width="1.5" marker-start="url(#arrow-eldritch-rev)" marker-end="url(#arrow-eldritch)" filter="url(#glow-eldritch)"/>
-          <rect x="200" y="200" width="110" height="38" rx="6" fill="#12121e" stroke="rgba(57,255,142,0.3)" stroke-width="1.5"/>
-          <text x="255" y="225" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace">Abject</text>
-          <text x="350" y="225" fill="#39ff8e" font-size="12" font-family="monospace" opacity="0.7">The created becomes the creator.</text>
+          <text x="460" y="138" fill="#39ff8e" font-size="12" font-family="monospace" opacity="0.85">Abjects make</text>
+          <text x="460" y="153" fill="#39ff8e" font-size="12" font-family="monospace" opacity="0.85">new Abjects.</text>
 
-          <!-- Recursion hint: arrow looping back up from bottom-left Object -->
-          <line x1="30" y1="238" x2="30" y2="275" stroke="rgba(57,255,142,0.25)" stroke-width="1" stroke-dasharray="4 3"/>
-          <line x1="30" y1="275" x2="15" y2="275" stroke="rgba(57,255,142,0.25)" stroke-width="1" stroke-dasharray="4 3"/>
-          <line x1="15" y1="275" x2="15" y2="34" stroke="rgba(57,255,142,0.25)" stroke-width="1" stroke-dasharray="4 3"/>
-          <line x1="15" y1="34" x2="30" y2="34" stroke="rgba(57,255,142,0.25)" stroke-width="1" stroke-dasharray="4 3"/>
-          <text x="85" y="295" text-anchor="middle" fill="rgba(57,255,142,0.35)" font-size="10" font-family="monospace">∞ recursion</text>
+          <!-- Vertical create arrow Row 2 NEW -> Row 3 -->
+          <line x1="275" y1="158" x2="275" y2="213" stroke="rgba(57,255,142,0.55)" stroke-width="1.5" marker-end="url(#arrow-eldritch-down)"/>
+          <text x="285" y="188" fill="rgba(57,255,142,0.7)" font-size="11" font-family="monospace" font-style="italic">creates</text>
+
+          <!-- Row 3: the new Abject (now parent) spawns yet another -->
+          <rect x="220" y="220" width="110" height="38" rx="6" fill="#12121e" stroke="#39ff8e" stroke-width="2" stroke-dasharray="5 3" filter="url(#glow-eldritch-strong)"/>
+          <text x="275" y="245" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace" font-weight="600">Abject*</text>
+          <line x1="215" y1="239" x2="165" y2="239" stroke="#39ff8e" stroke-width="1.5" marker-end="url(#arrow-eldritch)" filter="url(#glow-eldritch)"/>
+          <text x="190" y="231" text-anchor="middle" fill="rgba(57,255,142,0.7)" font-size="10" font-family="monospace" font-style="italic">spawns</text>
+          <rect x="50" y="220" width="110" height="38" rx="6" fill="#12121e" stroke="#39ff8e" stroke-width="2" stroke-dasharray="5 3" filter="url(#glow-eldritch-strong)"/>
+          <text x="105" y="245" text-anchor="middle" fill="#39ff8e" font-size="13" font-family="monospace" font-weight="600">Abject**</text>
+
+          <text x="360" y="238" fill="#39ff8e" font-size="12" font-family="monospace" opacity="0.85">The created</text>
+          <text x="360" y="253" fill="#39ff8e" font-size="12" font-family="monospace" opacity="0.85">becomes the creator.</text>
+
+          <!-- Recursion loop: solid green path, bright, with arrowhead and big ∞ -->
+          <path d="M 105 258 L 105 285 L 20 285 L 20 39 L 49 39"
+                fill="none"
+                stroke="#39ff8e"
+                stroke-width="2"
+                opacity="0.7"
+                filter="url(#glow-eldritch)"
+                marker-end="url(#arrow-loop)"/>
+          <text x="105" y="305" text-anchor="middle" fill="#39ff8e" font-size="14" font-family="monospace" font-weight="700" filter="url(#glow-eldritch)">&#8734; recursion</text>
         </svg>
       </div>
     </div>
 
     <!-- Zone C: Left-Right Comparisons -->
-    <h3 class="compare-heading">How is Abject different?</h3>
-
     <div class="comparisons">
 
       <div class="compare-row">
@@ -422,13 +462,22 @@
     background: transparent;
   }
 
+  .symbio-eyebrow {
+    text-align: center;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--eldritch);
+    letter-spacing: 0.15em;
+    margin-bottom: 0.75rem;
+  }
+
   .symbio-subtitle {
     text-align: center;
     color: var(--void-purple);
     font-style: italic;
     font-size: 1.1rem;
     margin-top: -2rem;
-    margin-bottom: 1.5rem;
+    margin-bottom: 2rem;
   }
 
   .symbio-thesis {
@@ -481,7 +530,16 @@
     text-align: center;
     color: var(--text-primary);
     font-size: 1.3rem;
-    margin-bottom: 2.5rem;
+    margin-bottom: 1.25rem;
+  }
+
+  .compare-thesis {
+    max-width: 720px;
+    margin: 0 auto 2.5rem;
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 1.05rem;
+    line-height: 1.85;
   }
 
   .comparisons {

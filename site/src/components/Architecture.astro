@@ -42,85 +42,83 @@
       </div>
     </div>
 
-    <div class="arch-detail">
-      <h3>The Proxy Ritual</h3>
-      <p>When Abject A speaks a language Abject B cannot comprehend, the Negotiator reads both their manifests and invokes the LLM to generate a living translator:</p>
+    <div class="arch-cake">
+      <h3>The Layer Cake</h3>
+      <p class="arch-cake-intro">Inside the Depths, abjects organize into three tiers. Workspaces at the top are isolated bubbles, each with its own zoo of abjects. They rest on a shared layer of system abjects, which all talk to each other through a single MessageBus underneath.</p>
 
-      <svg class="proxy-svg" viewBox="0 0 740 300" xmlns="http://www.w3.org/2000/svg">
+      <svg class="cake-svg" viewBox="0 0 720 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Abject's layered architecture: workspaces on top, system abjects in the middle, and a single MessageBus at the base">
         <defs>
-          <filter id="pr-glow-g">
-            <feGaussianBlur stdDeviation="3" result="blur"/>
+          <filter id="cake-glow">
+            <feGaussianBlur stdDeviation="2.5" result="blur"/>
             <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
           </filter>
-          <filter id="pr-glow-p">
-            <feGaussianBlur stdDeviation="3" result="blur"/>
-            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-          </filter>
-          <marker id="pr-arrow-g" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-            <path d="M 0 0 L 10 5 L 0 10 z" fill="#39ff8e"/>
-          </marker>
-          <marker id="pr-arrow-g-rev" viewBox="0 0 10 10" refX="0" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-            <path d="M 10 0 L 0 5 L 10 10 z" fill="#39ff8e"/>
-          </marker>
-          <marker id="pr-arrow-p" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-            <path d="M 0 0 L 10 5 L 0 10 z" fill="#9b59ff"/>
+          <marker id="cake-flow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(57,255,142,0.5)"/>
           </marker>
         </defs>
 
-        <!-- Object A -->
-        <rect x="30" y="110" width="140" height="80" rx="8" fill="#12121e" stroke="rgba(57,255,142,0.35)" stroke-width="1.5"/>
-        <text x="100" y="145" text-anchor="middle" fill="#39ff8e" font-weight="600" font-size="15" font-family="monospace">Abject A</text>
-        <text x="100" y="168" text-anchor="middle" fill="#5a5a70" font-size="10" font-family="monospace">interface X</text>
+        <!-- Tier 3 label -->
+        <text x="40" y="22" fill="#9a9aae" font-size="11" font-family="monospace" letter-spacing="0.12em">// WORKSPACES (isolated)</text>
 
-        <!-- Object B -->
-        <rect x="570" y="110" width="140" height="80" rx="8" fill="#12121e" stroke="rgba(57,255,142,0.35)" stroke-width="1.5"/>
-        <text x="640" y="145" text-anchor="middle" fill="#39ff8e" font-weight="600" font-size="15" font-family="monospace">Abject B</text>
-        <text x="640" y="168" text-anchor="middle" fill="#5a5a70" font-size="10" font-family="monospace">interface Y</text>
+        <!-- Workspace A -->
+        <rect x="40" y="35" width="310" height="175" rx="10" fill="#0e0e18" stroke="rgba(57,255,142,0.4)" stroke-width="1.5" stroke-dasharray="6 3"/>
+        <text x="58" y="58" fill="rgba(57,255,142,0.7)" font-size="11" font-family="monospace" font-weight="600">workspace: default</text>
+        <text x="60" y="86" fill="#39ff8e" font-size="13" font-family="monospace">Chat</text>
+        <text x="60" y="108" fill="#39ff8e" font-size="13" font-family="monospace">ScrumMaster</text>
+        <text x="60" y="130" fill="#39ff8e" font-size="13" font-family="monospace">GoalManager &middot; TupleSpace</text>
+        <text x="60" y="152" fill="#39ff8e" font-size="13" font-family="monospace">KnowledgeBase</text>
+        <text x="60" y="174" fill="#39ff8e" font-size="13" font-family="monospace">SkillRegistry &middot; Theme</text>
+        <text x="60" y="198" fill="rgba(57,255,142,0.55)" font-size="11" font-family="monospace" font-style="italic">+ Goals, Jobs, Web, ...</text>
 
-        <!-- Incompatibility marker -->
-        <text x="370" y="118" text-anchor="middle" fill="#ff4d6a" font-size="18" font-family="monospace" font-weight="700">&#x2260;</text>
-        <line x1="170" y1="115" x2="340" y2="115" stroke="rgba(255,77,106,0.25)" stroke-width="1" stroke-dasharray="4 4"/>
-        <line x1="400" y1="115" x2="570" y2="115" stroke="rgba(255,77,106,0.25)" stroke-width="1" stroke-dasharray="4 4"/>
+        <!-- Workspace B -->
+        <rect x="370" y="35" width="310" height="175" rx="10" fill="#0e0e18" stroke="rgba(57,255,142,0.4)" stroke-width="1.5" stroke-dasharray="6 3"/>
+        <text x="388" y="58" fill="rgba(57,255,142,0.7)" font-size="11" font-family="monospace" font-weight="600">workspace: research</text>
+        <text x="390" y="86" fill="#39ff8e" font-size="13" font-family="monospace">Chat</text>
+        <text x="390" y="108" fill="#39ff8e" font-size="13" font-family="monospace">ScrumMaster</text>
+        <text x="390" y="130" fill="#39ff8e" font-size="13" font-family="monospace">GoalManager &middot; TupleSpace</text>
+        <text x="390" y="152" fill="#39ff8e" font-size="13" font-family="monospace">WebBrowserViewer</text>
+        <text x="390" y="174" fill="#39ff8e" font-size="13" font-family="monospace">KnowledgeBase</text>
+        <text x="390" y="198" fill="rgba(57,255,142,0.55)" font-size="11" font-family="monospace" font-style="italic">each workspace, its own zoo</text>
 
-        <!-- Negotiator -->
-        <rect x="295" y="18" width="150" height="38" rx="6" fill="#12121e" stroke="rgba(155,89,255,0.4)" stroke-width="1.5"/>
-        <text x="370" y="43" text-anchor="middle" fill="#9b59ff" font-size="13" font-family="monospace" font-weight="600">Negotiator</text>
+        <!-- Down arrows: Workspaces → System tier -->
+        <line x1="120" y1="210" x2="120" y2="245" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#cake-flow)"/>
+        <line x1="200" y1="210" x2="200" y2="245" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#cake-flow)"/>
+        <line x1="280" y1="210" x2="280" y2="245" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#cake-flow)"/>
+        <line x1="430" y1="210" x2="430" y2="245" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#cake-flow)"/>
+        <line x1="520" y1="210" x2="520" y2="245" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#cake-flow)"/>
+        <line x1="610" y1="210" x2="610" y2="245" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#cake-flow)"/>
 
-        <!-- Negotiator reads Object A manifest -->
-        <line x1="310" y1="56" x2="130" y2="110" stroke="#9b59ff" stroke-width="1" stroke-dasharray="5 3" filter="url(#pr-glow-p)"/>
-        <text x="190" y="72" fill="#9b59ff" font-size="9" font-family="monospace" opacity="0.7">reads manifest</text>
+        <!-- Tier 2 label -->
+        <text x="40" y="242" fill="#9a9aae" font-size="11" font-family="monospace" letter-spacing="0.12em">// SYSTEM ABJECTS (shared)</text>
 
-        <!-- Negotiator reads Object B manifest -->
-        <line x1="430" y1="56" x2="610" y2="110" stroke="#9b59ff" stroke-width="1" stroke-dasharray="5 3" filter="url(#pr-glow-p)"/>
-        <text x="548" y="72" fill="#9b59ff" font-size="9" font-family="monospace" opacity="0.7" text-anchor="end">reads manifest</text>
+        <!-- Tier 2: System Abjects band -->
+        <rect x="40" y="255" width="640" height="100" rx="10" fill="#0e0e18" stroke="rgba(57,255,142,0.5)" stroke-width="1.5"/>
+        <text x="360" y="285" text-anchor="middle" fill="#39ff8e" font-size="14" font-family="monospace">Registry &middot; Factory &middot; LLMObject &middot; ObjectCreator &middot; ProxyGenerator</text>
+        <text x="360" y="310" text-anchor="middle" fill="#39ff8e" font-size="14" font-family="monospace">Negotiator &middot; HealthMonitor &middot; WorkspaceManager &middot; Supervisor</text>
+        <text x="360" y="335" text-anchor="middle" fill="#39ff8e" font-size="14" font-family="monospace">IdentityObject &middot; PeerRegistry &middot; RemoteRegistry</text>
 
-        <!-- LLM invocation arrow -->
-        <line x1="370" y1="56" x2="370" y2="82" stroke="#9b59ff" stroke-width="1.5" marker-end="url(#pr-arrow-p)" filter="url(#pr-glow-p)"/>
-        <text x="370" y="96" text-anchor="middle" fill="#5a5a70" font-size="9" font-family="monospace">LLM conjures</text>
+        <!-- Down arrows: System → MessageBus -->
+        <line x1="120" y1="355" x2="120" y2="390" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#cake-flow)"/>
+        <line x1="240" y1="355" x2="240" y2="390" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#cake-flow)"/>
+        <line x1="360" y1="355" x2="360" y2="390" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#cake-flow)"/>
+        <line x1="480" y1="355" x2="480" y2="390" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#cake-flow)"/>
+        <line x1="600" y1="355" x2="600" y2="390" stroke="rgba(57,255,142,0.4)" stroke-width="1" marker-end="url(#cake-flow)"/>
 
-        <!-- Proxy Object (the living translator) -->
-        <rect x="300" y="195" width="140" height="55" rx="8" fill="#12121e" stroke="rgba(57,255,142,0.5)" stroke-width="2" filter="url(#pr-glow-g)"/>
-        <text x="370" y="218" text-anchor="middle" fill="#39ff8e" font-weight="700" font-size="14" font-family="monospace">Proxy</text>
-        <text x="370" y="237" text-anchor="middle" fill="#5a5a70" font-size="9" font-family="monospace">X &#x2194; Y translator</text>
+        <!-- Tier 1 label -->
+        <text x="40" y="387" fill="#9a9aae" font-size="11" font-family="monospace" letter-spacing="0.12em">// MESSAGEBUS (substrate)</text>
 
-        <!-- Negotiator spawns Proxy -->
-        <line x1="370" y1="96" x2="370" y2="192" stroke="rgba(57,255,142,0.4)" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#pr-arrow-g)"/>
+        <!-- Tier 1: MessageBus band -->
+        <rect x="40" y="400" width="640" height="90" rx="10" fill="#0e0e18" stroke="#39ff8e" stroke-width="2" filter="url(#cake-glow)"/>
+        <line x1="60" y1="416" x2="660" y2="416" stroke="rgba(57,255,142,0.3)" stroke-width="0.5"/>
+        <line x1="60" y1="474" x2="660" y2="474" stroke="rgba(57,255,142,0.3)" stroke-width="0.5"/>
+        <text x="360" y="437" text-anchor="middle" fill="#39ff8e" font-size="18" font-family="monospace" font-weight="700">MessageBus</text>
+        <text x="360" y="462" text-anchor="middle" fill="rgba(57,255,142,0.75)" font-size="12" font-family="monospace" font-style="italic">every message between any two abjects flows here</text>
 
-        <!-- Object A <-> Proxy (bidirectional) -->
-        <line x1="170" y1="170" x2="298" y2="215" stroke="#39ff8e" stroke-width="1.5" marker-start="url(#pr-arrow-g-rev)" marker-end="url(#pr-arrow-g)" filter="url(#pr-glow-g)"/>
-
-        <!-- Proxy <-> Object B (bidirectional) -->
-        <line x1="442" y1="215" x2="570" y2="170" stroke="#39ff8e" stroke-width="1.5" marker-start="url(#pr-arrow-g-rev)" marker-end="url(#pr-arrow-g)" filter="url(#pr-glow-g)"/>
-
-        <!-- Labels on data flow arrows -->
-        <text x="210" y="205" fill="rgba(57,255,142,0.5)" font-size="9" font-family="monospace">interface X</text>
-        <text x="530" y="205" fill="rgba(57,255,142,0.5)" font-size="9" font-family="monospace" text-anchor="end">interface Y</text>
-
-        <!-- Bottom note -->
-        <text x="370" y="280" text-anchor="middle" fill="#5a5a70" font-size="10" font-family="monospace" font-style="italic">the proxy is a real Abject, with its own manifest and handlers</text>
+        <!-- Caption -->
+        <text x="360" y="520" text-anchor="middle" fill="#9a9aae" font-size="11" font-family="monospace" font-style="italic">workspaces are isolated; everything underneath is shared</text>
       </svg>
 
-      <p class="arch-note">The proxy is not a shim. It is a real Abject, with a manifest, handlers, and a will to survive.</p>
+      <p class="arch-note">Layers are conceptual, not enforced by privilege. The MessageBus does not know what a "system abject" is. Everything is just an abject sending messages.</p>
     </div>
   </div>
 </section>
@@ -227,25 +225,26 @@
     color: var(--text-dim);
   }
 
-  .arch-detail {
-    max-width: 600px;
+  .arch-cake {
+    max-width: 760px;
     margin: 0 auto;
     text-align: center;
   }
 
-  .arch-detail h3 {
+  .arch-cake h3 {
     color: var(--text-primary);
     margin-bottom: 0.75rem;
   }
 
-  .arch-detail p {
+  .arch-cake-intro {
     color: var(--text-secondary);
-    margin-bottom: 1rem;
+    margin-bottom: 1.5rem;
+    line-height: 1.7;
   }
 
-  .proxy-svg {
+  .cake-svg {
     width: 100%;
-    max-width: 740px;
+    max-width: 720px;
     display: block;
     margin: 0 auto 1rem;
   }
@@ -254,5 +253,6 @@
     font-size: 0.9rem;
     color: var(--text-dim);
     font-style: italic;
+    margin-top: 1rem;
   }
 </style>
