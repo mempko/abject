@@ -18,6 +18,7 @@ import type {
   AuthResultMsg,
 } from '../server/ws-protocol.js';
 import type { AbyssBgControl } from './abyss-bg.js';
+import type { ClientTransport } from './transport.js';
 
 /**
  * The thin browser frontend that owns the Canvas and Compositor.
@@ -37,7 +38,7 @@ const ASCII_MAX = 126;
 export class FrontendClient {
   private compositor: Compositor;
   private canvas: HTMLCanvasElement;
-  private ws: WebSocket | null = null;
+  private transport: ClientTransport | null = null;
   private focusedSurface?: string;
   private grabbedSurface?: string;
   private currentSelectedText = '';
@@ -51,7 +52,6 @@ export class FrontendClient {
   private panningViewport = false;
   /** Scrollbar thumb drag in progress. */
   private draggingScrollbar = false;
-  private reconnectAttempt = 0;
   private mobileMode = false;
   private mobileTabTouchStartX?: number;  // track start X for tap vs scroll detection
   private mobileKeyboardProxy?: HTMLInputElement;  // hidden input for virtual keyboard
@@ -61,10 +61,6 @@ export class FrontendClient {
   // Two-finger pan state
   private panLastMidX?: number;
   private panLastMidY?: number;
-  // Stay at 200ms for many attempts to catch tsx --watch restarts quickly,
-  // then back off to 1s. ECONNREFUSED returns instantly on localhost so
-  // fast retries don't waste resources.
-  private static readonly RECONNECT_DELAYS = [100, 100, 200, 200, 200, 200, 200, 200, 200, 200, 500, 1000];
   /** Client-side drag state for zero-latency window moves */
   private localDragState?: {
     surfaceId: string;
@@ -252,34 +248,28 @@ export class FrontendClient {
   }
 
   /**
-   * Connect to the backend WebSocket server.
+   * Connect via a pluggable transport (WebSocket for local dev, WebRTC for
+   * paired remote clients). The transport owns its own reconnect logic.
    */
-  connect(url: string): void {
-    const t0 = performance.now();
-    const clog = (msg: string) => console.log(`[WS-CLIENT T+${Math.round(performance.now() - t0)}ms] ${msg}`);
-
+  async connect(transport: ClientTransport): Promise<void> {
     this.showConnecting();
-
-    clog(`new WebSocket(${url})`);
-    this.ws = new WebSocket(url);
-    clog('WebSocket constructor returned');
+    this.transport = transport;
     this.authenticated = false;
 
-    this.ws.onopen = () => {
-      clog('onopen fired');
+    transport.onOpen(() => {
       console.log('[Frontend] Connected to backend');
-      this.reconnectAttempt = 0;
       // Clear stale surfaces from any previous connection before replaying state
       this.compositor.clearAllSurfaces();
       this.focusedSurface = undefined;
       this.grabbedSurface = undefined;
       this.localDragState = undefined;
+      this.authenticated = false;
       // Don't send ready yet — wait for auth status from server
-    };
+    });
 
-    this.ws.onmessage = (evt) => {
+    transport.onMessage((data: string) => {
       try {
-        const msg = JSON.parse(evt.data as string);
+        const msg = JSON.parse(data);
 
         // Handle auth protocol before authenticated
         if (!this.authenticated) {
@@ -298,40 +288,23 @@ export class FrontendClient {
       } catch (err) {
         console.error('[Frontend] Failed to parse backend message:', err);
       }
-    };
+    });
 
-    this.ws.onclose = (ev) => {
-      clog(`onclose fired (code=${ev.code})`);
-      console.log(`[Frontend] Disconnected from backend (code=${ev.code})`);
-      this.ws = null;
+    transport.onClose(() => {
+      console.log('[Frontend] Transport closed');
       this.authenticated = false;
+    });
 
-      // Auto-reconnect. ECONNREFUSED returns instantly on localhost so
-      // fast retries when the server is down don't waste resources.
-      // Don't force-close CONNECTING sockets — that poisons Firefox's
-      // connection cache and causes minutes of phantom failures.
-      const delays = FrontendClient.RECONNECT_DELAYS;
-      const delay = delays[Math.min(this.reconnectAttempt, delays.length - 1)];
-      this.reconnectAttempt++;
-      setTimeout(() => {
-        console.log(`[Frontend] Reconnecting (attempt ${this.reconnectAttempt}, delay ${delay}ms)...`);
-        this.connect(url);
-      }, delay);
-    };
-
-    this.ws.onerror = (err) => {
-      clog('onerror fired');
-      console.error('[Frontend] WebSocket error:', err);
-    };
+    await transport.connect();
   }
 
   /**
    * Disconnect from the backend.
    */
   disconnect(): void {
-    if (this.ws) {
-      this.ws.close(1000, 'Client disconnect');
-      this.ws = null;
+    if (this.transport) {
+      this.transport.close();
+      this.transport = null;
     }
   }
 
@@ -496,8 +469,8 @@ export class FrontendClient {
   }
 
   private sendRaw(msg: Record<string, unknown>): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(msg));
+    if (this.transport && this.transport.ready) {
+      this.transport.send(JSON.stringify(msg));
     }
   }
 
@@ -1290,8 +1263,8 @@ export class FrontendClient {
   // ── Send to backend ────────────────────────────────────────────────────
 
   private sendToBackend(msg: FrontendToBackendMsg): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(msg));
+    if (this.transport && this.transport.ready) {
+      this.transport.send(JSON.stringify(msg));
     }
   }
 }

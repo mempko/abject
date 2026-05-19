@@ -1447,8 +1447,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 120, height: 36 },
     }));
-
   }
+
 
   /**
    * Hide the global settings window.
