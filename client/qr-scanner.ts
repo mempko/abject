@@ -65,7 +65,7 @@ export async function startQrScanner(opts: {
     ctx.drawImage(opts.video, 0, 0, w, h);
     const imageData = ctx.getImageData(0, 0, w, h);
     const code = jsQR(imageData.data, imageData.width, imageData.height, {
-      inversionAttempts: 'dontInvert',
+      inversionAttempts: 'attemptBoth',
     });
     if (code && code.data) {
       stopped = true;

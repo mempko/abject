@@ -309,8 +309,8 @@ export class RemoteUIAccess extends Abject {
     const encoded = base64UrlEncode(JSON.stringify(payload));
     const qrUrl = `${this.clientBaseUrl}/?pair=${encoded}`;
     const qrDataUrl = await QRCode.toDataURL(qrUrl, {
-      width: 256,
-      margin: 1,
+      width: 512,
+      margin: 4,
       errorCorrectionLevel: 'M',
     });
 
