@@ -303,8 +303,29 @@ export class PeerTransport extends Transport {
 
     if (this.sessionKey) {
       await this.sendEncryptedString(data);
-    } else {
-      this.dataChannel!.send(data);
+    } else if (!this.trySend(data)) {
+      throw new Error('DataChannel send failed (channel closed or native throw)');
+    }
+  }
+
+  /**
+   * Centralized DataChannel send. Re-checks readyState immediately before
+   * the native call and wraps the call in try/catch so a synchronous throw
+   * from libdatachannel (which can otherwise propagate as Napi::Error into
+   * a noexcept native frame and terminate the process) lands on a single
+   * catchable path. Triggers a clean disconnect on any failure.
+   */
+  private trySend(data: string): boolean {
+    try {
+      const dc = this.dataChannel;
+      if (!dc || dc.readyState !== 'open') return false;
+      dc.send(data);
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`DataChannel send failed for ${this.remotePeerId.slice(0, 16)}: ${msg}`);
+      this.handleDisconnect(`Send threw: ${msg}`);
+      return false;
     }
   }
 
@@ -343,13 +364,17 @@ export class PeerTransport extends Transport {
     const b64 = bytesToBase64(compressed);
 
     if (b64.length <= MAX_CHUNK_SIZE) {
-      this.dataChannel!.send(JSON.stringify({ gz: true, data: b64 }));
+      if (!this.trySend(JSON.stringify({ gz: true, data: b64 }))) {
+        throw new Error('DataChannel send failed');
+      }
     } else {
       const chunkId = String(this.chunkCounter++);
       const total = Math.ceil(b64.length / MAX_CHUNK_SIZE);
       for (let i = 0; i < total; i++) {
         const slice = b64.slice(i * MAX_CHUNK_SIZE, (i + 1) * MAX_CHUNK_SIZE);
-        this.dataChannel!.send(JSON.stringify({ chunk: true, id: chunkId, idx: i, total, data: slice }));
+        if (!this.trySend(JSON.stringify({ chunk: true, id: chunkId, idx: i, total, data: slice }))) {
+          throw new Error(`DataChannel send failed mid-chunk (${i + 1}/${total})`);
+        }
       }
       log.info(`sent ${total} chunks (${b64.length} bytes compressed) to ${this.remotePeerId.slice(0, 16)}`);
     }
@@ -487,7 +512,7 @@ export class PeerTransport extends Transport {
       publicSigningKey: this.localPublicSigningKey,
       publicExchangeKey: this.localPublicExchangeKey,
     });
-    this.dataChannel!.send(handshakeMsg);
+    this.trySend(handshakeMsg);
   }
 
   /**
@@ -499,7 +524,7 @@ export class PeerTransport extends Transport {
 
       // Ping/pong keepalive (handled before handshake/encryption checks)
       if (parsed.ping) {
-        this.dataChannel?.send(JSON.stringify({ pong: true, ts: parsed.ts }));
+        this.trySend(JSON.stringify({ pong: true, ts: parsed.ts }));
         return;
       }
       if (parsed.pong) {
@@ -651,9 +676,7 @@ export class PeerTransport extends Transport {
         return;
       }
 
-      if (this.dataChannel?.readyState === 'open') {
-        this.dataChannel.send(JSON.stringify({ ping: true, ts: Date.now() }));
-      }
+      this.trySend(JSON.stringify({ ping: true, ts: Date.now() }));
     }, this.config.heartbeatInterval);
   }
 
