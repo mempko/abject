@@ -53,7 +53,9 @@ await build({
   outdir: 'dist-server',
   banner: {
     // Shim require() for ESM bundles that import CJS packages at runtime
-    js: `import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);`,
+    // Alias the imported binding so it can't collide with a `createRequire`
+    // import inside a bundled ESM dependency (e.g. fflate).
+    js: `import { createRequire as __abjectsCreateRequire } from 'node:module'; const require = __abjectsCreateRequire(import.meta.url);`,
   },
 });
 
@@ -67,7 +69,9 @@ await build({
   },
   outdir: 'dist-server',
   banner: {
-    js: `import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);`,
+    // Alias the imported binding so it can't collide with a `createRequire`
+    // import inside a bundled ESM dependency (e.g. fflate).
+    js: `import { createRequire as __abjectsCreateRequire } from 'node:module'; const require = __abjectsCreateRequire(import.meta.url);`,
   },
 });
 
