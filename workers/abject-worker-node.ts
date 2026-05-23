@@ -95,10 +95,10 @@ constructors.set('Storage', (args?: unknown) => {
   const opts = args as { dbName?: string } | undefined;
   if (opts?.dbName) {
     const wsId = opts.dbName.replace('abjects-storage-', '');
-    const storagePath = path.join(process.cwd(), dataDir, `ws-${wsId}`, 'storage.json');
+    const storagePath = path.resolve(dataDir, `ws-${wsId}`, 'storage.json');
     return new NodeStorage(storagePath);
   }
-  return new NodeStorage(path.join(process.cwd(), dataDir, 'storage.json'));
+  return new NodeStorage(path.resolve(dataDir, 'storage.json'));
 });
 constructors.set('Timer', () => new Timer());
 constructors.set('Clipboard', () => new Clipboard());
@@ -147,7 +147,7 @@ constructors.set('WebFetch', () => new WebFetch());
 constructors.set('Screenshot', () => new Screenshot());
 constructors.set('SkillRegistry', () => {
   const dataDir = process.env.ABJECTS_DATA_DIR ?? '.abjects';
-  return new SkillRegistry(path.join(process.cwd(), dataDir, 'skills'));
+  return new SkillRegistry(path.resolve(dataDir, 'skills'));
 });
 constructors.set('SkillBrowser', () => new SkillBrowser());
 constructors.set('SkillAgent', () => new SkillAgent());

@@ -190,7 +190,7 @@ export class SkillRegistry extends Abject {
       },
     });
 
-    this.skillsDir = skillsDir ?? path.join(process.cwd(), process.env.ABJECTS_DATA_DIR ?? '.abjects', 'skills');
+    this.skillsDir = skillsDir ?? path.resolve(process.env.ABJECTS_DATA_DIR ?? '.abjects', 'skills');
     this.setupHandlers();
   }
 

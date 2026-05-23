@@ -168,10 +168,10 @@ export async function bootAbjectsCore(opts: BootOptions): Promise<BootResult> {
     const o = args as { dbName?: string } | undefined;
     if (o?.dbName) {
       const wsId = o.dbName.replace('abjects-storage-', '');
-      const storagePath = path.join(process.cwd(), DATA_DIR, `ws-${wsId}`, 'storage.json');
+      const storagePath = path.resolve(DATA_DIR, `ws-${wsId}`, 'storage.json');
       return new NodeStorage(storagePath);
     }
-    return new NodeStorage(path.join(process.cwd(), DATA_DIR, 'storage.json'));
+    return new NodeStorage(path.resolve(DATA_DIR, 'storage.json'));
   });
   runtime.objectFactory.registerConstructor('Timer', () => new Timer());
   runtime.objectFactory.registerConstructor('Clipboard', () => new Clipboard());
