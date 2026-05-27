@@ -209,6 +209,13 @@ A synthetic \`call(<canvasId>, 'input', { type: 'mousedown', x, y, button: 0 })\
     return '';
   }
 
+  // A canvas owns its entire content area; the scriptable content draws its
+  // own focus cues if it wants them. Painting the base class accent ring on
+  // keyboard focus puts an unwanted border around the drawing surface.
+  protected override suppressGenericFocusRing(): boolean {
+    return true;
+  }
+
   protected async applyUpdate(updates: Record<string, unknown>): Promise<void> {
     // When rect changes (layout recalculation), notify the ScriptableAbject
     if (updates.rect !== undefined) {
