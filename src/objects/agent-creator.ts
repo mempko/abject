@@ -29,12 +29,6 @@ export class AgentCreator extends Abject {
   private jobManagerId?: AbjectId;
 
   private taskExtras = new Map<string, TaskExtra>();
-  private pendingTickets = new Map<string, {
-    resolve: (v: unknown) => void;
-    reject: (e: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-    timeoutMs: number;
-  }>();
 
   constructor() {
     super({
@@ -139,17 +133,7 @@ When invited to a Sprint Plan, describe what I'd build and how I'd compose it ac
       };
     });
 
-    this.on('taskResult', async (msg: AbjectMessage) => {
-      const payload = msg.payload as { ticketId: string };
-      const pending = this.pendingTickets.get(payload.ticketId);
-      if (pending) {
-        pending.resolve(payload);
-      }
-    });
-
-    // Each callback proves the agent is still working, so reset the inactivity timeout.
     this.on('agentObserve', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
       const { taskId } = msg.payload as { taskId: string; step: number };
       const extra = this.taskExtras.get(taskId);
       if (extra?.lastResult) {
@@ -159,7 +143,6 @@ When invited to a Sprint Plan, describe what I'd build and how I'd compose it ac
     });
 
     this.on('agentAct', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
       const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
       const extra = this.taskExtras.get(taskId) ?? {};
       this.taskExtras.set(taskId, extra);
@@ -168,15 +151,11 @@ When invited to a Sprint Plan, describe what I'd build and how I'd compose it ac
     });
 
     this.on('agentPhaseChanged', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
       const { newPhase } = msg.payload as { taskId: string; step: number; oldPhase: string; newPhase: string };
       if (this.jobManagerId) {
         this.send(event(this.id, this.jobManagerId, 'progress', { phase: newPhase }));
       }
     });
-
-    this.on('agentIntermediateAction', async () => { this.resetPendingTicketTimeouts(); });
-    this.on('agentActionResult', async () => { this.resetPendingTicketTimeouts(); });
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -207,97 +186,6 @@ When invited to a Sprint Plan, describe what I'd build and how I'd compose it ac
     }));
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // System Prompt
-  // ═══════════════════════════════════════════════════════════════════
-
-  private buildSystemPrompt(): string {
-    return `You are AgentCreator, an advisory object for creating autonomous objects.
-
-## What You Do
-
-You advise ScrumMaster on how autonomous agents, schedulers, and watchers should be composed. ScrumMaster owns planning; ObjectCreator owns executable object creation and modification.
-
-## Available Actions
-
-| Action | Fields | Description |
-|--------|--------|-------------|
-| done | result | All done. Summarize what was created. |
-| fail | reason | Cannot complete. |
-| reply | message | Progress update. |
-
-## Design Guidance
-
-When asked for advice, describe the component objects ScrumMaster should plan:
-
-- agent object: registers with AgentAbject and handles delegated tasks autonomously
-- scheduler object: timer-based object that submits Jobs via JobManager when triggers fire
-- watcher object: observes other objects and submits Jobs via JobManager on events
-- regular object: single-purpose service or UI object
-
-Schedulers and watchers MUST use JobManager.submitJob in their trigger handlers, never call GoalManager directly.
-
-## Rules
-
-- Agents do work, schedulers trigger work. Timed systems should be planned as separate agent and scheduler object-creation tasks. The system has a built-in Scheduler object for all timed triggers.
-- When the request involves a specific time or recurring schedule, advise ScrumMaster to plan at least two ObjectCreator tasks: one for the agent and one for the scheduler.
-- If assigned executable work, fail and explain that ScrumMaster should plan ObjectCreator tasks.
-
-## Output Format
-
-Respond with ONE JSON object inside \`\`\`json fenced code markers. Output ONLY the JSON block — no prose around it. Any one-sentence note belongs in the action's \`reasoning\` field; the parser only reads the JSON.`;
-  }
-
-  // ═══════════════════════════════════════════════════════════════════
-  // Ticket waiting
-  // ═══════════════════════════════════════════════════════════════════
-
-  private resetPendingTicketTimeouts(): void {
-    for (const [ticketId, entry] of this.pendingTickets) {
-      clearTimeout(entry.timer);
-      entry.timer = setTimeout(() => {
-        this.pendingTickets.delete(ticketId);
-        if (this.agentAbjectId) {
-          this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
-        }
-        entry.reject(new Error(`Task ${ticketId} timed out after ${entry.timeoutMs}ms of inactivity`));
-      }, entry.timeoutMs);
-    }
-  }
-
-  private waitForTaskResult(ticketId: string, timeout: number): Promise<{ success: boolean; result?: unknown; error?: string }> {
-    return new Promise((resolve, reject) => {
-      const makeTimer = () => setTimeout(() => {
-        this.pendingTickets.delete(ticketId);
-        if (this.agentAbjectId) {
-          this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
-        }
-        reject(new Error(`Task ${ticketId} timed out after ${timeout}ms of inactivity`));
-      }, timeout);
-
-      const entry = {
-        timer: makeTimer(),
-        timeoutMs: timeout,
-        resolve: (payload: unknown) => {
-          clearTimeout(entry.timer);
-          this.pendingTickets.delete(ticketId);
-          const p = payload as { success?: boolean; result?: unknown; error?: string; state?: { result?: unknown; error?: string } };
-          const success = p.success !== false && !p.error;
-          resolve({
-            success,
-            result: p.result ?? p.state?.result,
-            error: p.error ?? p.state?.error,
-          });
-        },
-        reject: (err: Error) => {
-          clearTimeout(entry.timer);
-          this.pendingTickets.delete(ticketId);
-          reject(err);
-        },
-      };
-      this.pendingTickets.set(ticketId, entry);
-    });
-  }
 }
 
 export const AGENT_CREATOR_ID = 'abjects:agent-creator' as AbjectId;
