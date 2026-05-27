@@ -755,6 +755,7 @@ The registered object must implement these handlers to participate in the agent 
           agentId: agent.agentId,
           name: agent.name,
           description: agent.description,
+          canExecute: agent.canExecute,
           status: activeTasks > 0 ? 'busy' : 'idle',
           activeTasks,
         };

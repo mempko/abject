@@ -681,7 +681,6 @@ Example response:
 | list_skills | | List all installed skills and their status |
 | write_scratchpad | key, value | Write a value to the goal's shared scratchpad under the given key. Use this to fulfil a contract's produces keys (see "Your Task's Contract" in the injected context) so downstream tasks can read structured findings. |
 | read_scratchpad | key? | Read a value from the goal's scratchpad. Omit key to read the full scratchpad. Consumed keys are already shown in the injected context; use this action only when you need to fetch something extra. |
-| decompose | subtasks | Break a complex task into parallel sub-tasks dispatched to other agents. Each subtask has type (call, browse, create, modify, skill), description, and optional data. |
 | done | result | Task complete. Include the answer in result. |
 | fail | reason | Task cannot be completed |
 | reply | message | Send a progress update to the user |
@@ -702,7 +701,7 @@ Tool calls can return far more data than fits the context window. Email bodies w
 
 **Scratchpad is your memory, history is not.** Conversation history gets trimmed and re-sent on every step; scratchpad persists and is read on demand. Summaries, indices, cursors, partial results, anything you need across steps belongs in scratchpad. Your final \`done\` should assemble its answer from scratchpad rather than assuming earlier observations are still in context.
 
-**Decompose when the work is inherently big.** For tasks that legitimately need lots of data (example: "summarise my 30 most recent emails"), emit a \`decompose\` action with one subtask per chunk. Each subtask gets a fresh conversation, fetches its slice, distils to scratchpad, and returns a short digest. A final task reads the digests and composes the answer. This is how you break a single multi-megabyte pipeline into many small ones.
+**Escalate oversized work back to ScrumMaster.** For tasks that legitimately need multiple independent chunks (example: "summarise my 30 most recent emails" when one task cannot fit safely), use \`fail\` with a short reason and a concrete proposed split such as "split into 5-email chunks, each writing email-batch-N-summary to scratchpad, then synthesize." ScrumMaster owns task planning and will use the next scrum to split the work with the team.
 
 Worked example. Task: "what are the most important emails I should look at today?"
 1. \`mcp_tool_call\` get_emails with \`limit: 10, offset: 0\` to pull metadata only (sender, subject, date, unread flag).

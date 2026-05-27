@@ -66,6 +66,18 @@ interface StagedTask {
   consumes?: string[];
 }
 
+function compactLine(value: unknown, max = 220): string {
+  return safeStringify(value, max).replace(/\s+/g, ' ').trim();
+}
+
+function knowledgeTag(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+}
+
 export class ScrumMaster extends Abject {
   private goalManagerId?: AbjectId;
   private agentAbjectId?: AbjectId;
@@ -562,11 +574,11 @@ export class ScrumMaster extends Abject {
     // are runtime-configurable (SkillAgent's installed skills, MCPBridge's
     // tool list). The planner should call `poll_team` (which uses the ask
     // protocol) when it needs to know what agents can actually do.
-    const team = await this.request<Array<{ agentId: AbjectId; name: string; description: string }>>(
+    const team = await this.request<Array<{ agentId: AbjectId; name: string; description: string; canExecute?: boolean }>>(
       request(this.id, this.agentAbjectId, 'listAgents', {}),
     );
     const eligibleTeamNames = team
-      .filter(a => a.name !== 'Chat' && a.name !== 'ScrumMaster')
+      .filter(a => a.canExecute !== false && a.name !== 'Chat' && a.name !== 'ScrumMaster')
       .map(a => a.name);
 
     const scratchpad = goal.scratchpad ?? {};
@@ -801,7 +813,110 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     await this.request(
       request(this.id, this.goalManagerId, 'completeGoal', { goalId, result: synthesis }),
     );
+    await this.autoSaveCompletionLesson(goalId, synthesis).catch((err) => {
+      log.warn(`autoSaveCompletionLesson failed for ${goalId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+    });
     this.changed('sprintCompleted', { goalId });
+  }
+
+  /**
+   * Save the plan that actually worked as ScrumMaster memory. This does not
+   * route around the goal system: future scrums see the lesson through
+   * review_scrum's relevantKnowledge and can still poll the current team when
+   * the recalled lesson is stale or incomplete.
+   */
+  private async autoSaveCompletionLesson(goalId: string, synthesis: string): Promise<void> {
+    if (!this.goalManagerId) return;
+    const kbId = await this.getKnowledgeBaseId();
+    if (!kbId) return;
+
+    const goal = await this.request<{
+      title: string; description: string; scratchpad?: Record<string, unknown>;
+    } | null>(
+      request(this.id, this.goalManagerId, 'getGoal', { goalId }),
+      5000,
+    ).catch(() => null);
+    if (!goal) return;
+
+    const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
+      request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId }),
+      5000,
+    ).catch(() => [] as Array<{ id: string; fields: Record<string, unknown> }>);
+
+    const completed = tasks.filter(t => t.fields.status === 'done');
+    const failed = tasks.filter(t => t.fields.status === 'permanently_failed');
+    if (completed.length === 0 && failed.length === 0) return;
+
+    const agentNames = new Map<string, string>();
+    if (this.agentAbjectId) {
+      const team = await this.request<Array<{ agentId: AbjectId; name: string }>>(
+        request(this.id, this.agentAbjectId, 'listAgents', {}),
+        5000,
+      ).catch(() => [] as Array<{ agentId: AbjectId; name: string }>);
+      for (const member of team) agentNames.set(member.agentId, member.name);
+    }
+
+    const describeTask = (task: { id: string; fields: Record<string, unknown> }): string => {
+      const agentId = task.fields.assignedAgentId as string | undefined;
+      const agentName = agentId ? agentNames.get(agentId) ?? agentId.slice(0, 8) : 'unassigned';
+      const description = compactLine(task.fields.description ?? '(no description)', 280);
+      const produces = (task.fields.produces as Array<{ key?: string }> | undefined)
+        ?.map(p => p.key)
+        .filter((key): key is string => typeof key === 'string' && key.length > 0) ?? [];
+      const consumes = (task.fields.consumes as string[] | undefined)
+        ?.filter(key => typeof key === 'string' && key.length > 0) ?? [];
+      const contracts: string[] = [];
+      if (consumes.length > 0) contracts.push(`consumes ${consumes.join(', ')}`);
+      if (produces.length > 0) contracts.push(`produces ${produces.join(', ')}`);
+      return `- ${agentName}: ${description}${contracts.length > 0 ? ` (${contracts.join('; ')})` : ''}`;
+    };
+
+    const completedLines = completed.map(describeTask);
+    const failedLines = failed.map(t => {
+      const base = describeTask(t);
+      const error = compactLine(t.fields.error ?? 'unknown failure', 240);
+      return `${base} [failed: ${error}]`;
+    });
+
+    const scratchpadKeys = Object.keys(goal.scratchpad ?? {}).sort();
+    const titleSource = compactLine(goal.title || goal.description, 140);
+    const title = `Scrum plan: ${titleSource}`;
+    const participatingAgents = [...new Set(completed
+      .map(t => t.fields.assignedAgentId as string | undefined)
+      .filter((id): id is string => Boolean(id))
+      .map(id => agentNames.get(id) ?? id.slice(0, 8)))];
+    const tags = [
+      'scrum',
+      'planning',
+      'goal-system',
+      ...participatingAgents.map(knowledgeTag).filter(Boolean),
+    ];
+
+    const content = [
+      `Goal shape:\n${goal.description}`,
+      completedLines.length > 0
+        ? `Working plan:\n${completedLines.join('\n')}`
+        : 'Working plan:\n(no completed worker tasks recorded)',
+      failedLines.length > 0
+        ? `Failures/replans to remember:\n${failedLines.join('\n')}`
+        : 'Failures/replans to remember:\n(none recorded)',
+      scratchpadKeys.length > 0
+        ? `Scratchpad keys produced:\n${scratchpadKeys.map(k => `- ${k}`).join('\n')}`
+        : 'Scratchpad keys produced:\n(none)',
+      `Final answer excerpt:\n${synthesis.slice(0, 1800)}`,
+      'Planning note: this is memory for future ScrumMaster reviews. Future goals still go through the goal system; use this lesson as context, then poll the current team if capability or state may have changed.',
+    ].join('\n\n');
+
+    await this.request(
+      request(this.id, kbId, 'remember', {
+        title,
+        content,
+        type: 'learned',
+        tags: [...new Set(tags)],
+      }),
+      5000,
+    );
+    log.info(`autoSaveCompletionLesson: "${title.slice(0, 80)}"`);
   }
 
   /**
@@ -1264,7 +1379,7 @@ Do NOT guess based on agent name alone. The relevant capability may or may not b
    - Unreachable → \`fail_goal\`.
 
 **Knowledge as memory across sprints:**
-The whole point of \`save_knowledge\` / \`lookup_knowledge\` / \`forget_knowledge\` is to amortize discovery work. The first goal of any kind may need an exploratory team poll to find which agent owns the relevant capability. Once that's discovered and the goal completes successfully, save the lesson — describe the goal shape, the agent that handled it, and the method that did the work. Every future scrum on a similar goal surfaces the lesson in \`relevantKnowledge\` and the planner skips straight to \`add_task\` with the right assignment — no team poll. When the cached lesson stops being true (the agent renamed, a tool was removed, the user switched providers), \`forget_knowledge\` removes the bad entry so the planner re-discovers via a poll.
+The whole point of \`save_knowledge\` / \`lookup_knowledge\` / \`forget_knowledge\` is to amortize discovery work. The first goal of any kind may need an exploratory team poll to find which agent owns the relevant capability. When a sprint completes, ScrumMaster automatically saves a compact "Scrum plan" lesson with the tasks and agents that actually worked. Use manual \`save_knowledge\` only for extra durable facts the automatic plan lesson would not capture, such as user preferences, provider-specific constraints, or a corrected tool mapping. Every future scrum on a similar goal surfaces prior lessons in \`relevantKnowledge\` and lets the planner choose faster while still staying inside the goal system. When a cached lesson stops being true (the agent renamed, a tool was removed, the user switched providers), \`forget_knowledge\` removes the bad entry so the planner re-discovers via a poll.
 
 ## Rules
 

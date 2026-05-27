@@ -1142,13 +1142,8 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Output ONLY
   For multi-statement scripts, wrap in an IIFE: (() => { ...code...; return result; })()
   For APIs or plain-text endpoints, use fetch: { "action": "extract", "script": "fetch('https://api.example.com/data').then(r => r.json())" }
 
-### Task Decomposition
-- decompose: Break a complex task into parallel sub-tasks dispatched to other agents.
-  { "action": "decompose", "subtasks": [
-    { "type": "browse", "description": "Navigate to page X and extract data" },
-    { "type": "call", "description": "Fetch API endpoint Y" }
-  ] }
-  Use when the task requires multiple independent steps that could run in parallel.
+### Scrum escalation
+If the browser task is too broad, belongs to another specialist, or needs multiple independent work streams, do not split it yourself. Use fail with a concise reason and, when useful, a proposed split. ScrumMaster will review the failure and plan the next scrum with the team.
 
 ### Scratchpad (data handoff to downstream tasks)
 - write_scratchpad: Write a value to the goal's shared scratchpad under a named key. Use this to fulfil a contract's produces keys (see "Your Task's Contract" in the injected context) so downstream tasks can read structured findings.

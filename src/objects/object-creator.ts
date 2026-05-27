@@ -13,7 +13,7 @@
  * Three banner-delimited sections below:
  *   1. INFRASTRUCTURE   — types, dep resolution, message wrappers, progress.
  *   2. LOCAL OPERATIONS — tools that touch agent-local state (drafts,
- *                         compile, validate, review, decompose, terminals).
+ *                         compile, validate, review, terminals).
  *   3. AGENT SHELL      — AgentAbject registration, observe/act handlers,
  *                         system prompt, task lifecycle, finalization.
  */
@@ -822,36 +822,6 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     };
   }
 
-  /**
-   * Spawn child goals via AgentAbject's existing decompose machinery. Each
-   * subtask declares produces / consumes contracts; the goal scratchpad
-   * carries handoff data automatically. Used to split "diagnose then modify"
-   * or "investigate then create" into independent sub-loops.
-   */
-  private async opDecompose(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
-    const subtasks = action.subtasks;
-    if (!Array.isArray(subtasks) || subtasks.length === 0) {
-      return { ok: false, summary: 'decompose: subtasks empty', error: 'subtasks must be a non-empty array' };
-    }
-    // AgentAbject handles decompose at its own level — we just surface the
-    // intent. The loop step that produced this action will be re-dispatched
-    // by AgentAbject as a `decompose` action it natively understands. To
-    // keep our agent's contract simple, we record the intent and let the
-    // outer AgentAbject treat the action as terminal-like (it spawns child
-    // goals and waits). For our purposes, mark the outer loop as paused
-    // until child goals report; AgentAbject's decompose path handles that.
-    state.turnLog.push({
-      turn: state.turn,
-      action: 'decompose',
-      ok: true,
-      summary: `decompose: ${subtasks.length} subtask${subtasks.length === 1 ? '' : 's'} — handled by AgentAbject`,
-    });
-    return {
-      ok: true,
-      summary: `decompose: ${subtasks.length} subtask${subtasks.length === 1 ? '' : 's'} requested (AgentAbject will spawn child goals)`,
-    };
-  }
-
   /** Send an intermediate user-visible chat bubble. Loop continues. */
   private async opReply(_state: LoopState, action: AgentAction, callerId?: AbjectId): Promise<{ ok: boolean; summary: string }> {
     const text = (action.text as string | undefined) ?? '';
@@ -1465,9 +1435,6 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         case 'deploy_update':
           res = await this.opDeployUpdate(state, action);
           break;
-        case 'decompose':
-          res = await this.opDecompose(state, action);
-          break;
         case 'reply':
           res = await this.opReply(state, action, callerId);
           break;
@@ -1675,7 +1642,6 @@ Emit EXACTLY ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothi
 - \`review_semantics()\` — LLM reviewer reads the drafts plus all known dependency manifests + usage guides and flags semantic issues (wrong payload shape, enum-like values not in the guide, missing await, etc.). May emit follow-up \`questions\` for specific deps.
 - \`deploy_spawn({})\` — deploy the staged drafts as a NEW Abject. Internally messages Factory.spawn with the manifest, source, and the right owner / parent / registryHint. Use for create flows. No payload: the staged drafts are read from loop state.
 - \`deploy_update({objectId?, targetName?})\` — deploy the staged source onto an EXISTING object. Internally hot-swaps the live object via its \`updateSource\` handler, then updates Registry's cached source + manifest, then persists via AbjectStore so the change survives a restart. The target is taken from \`objectId\` (UUID) or \`targetName\` (registered name) in the action payload, or from the task's target if it was started as a modify. If you investigated and discovered you should be modifying an existing object even though the loop kind is \`create\`, pass \`{objectId: "<id>"}\` here.
-- \`decompose({subtasks: [{description, dependsOn?, produces?, consumes?, role?}]})\` — split into sub-goals. Each subtask shares the goal scratchpad via \`produces\` / \`consumes\` contracts. Use for "diagnose then modify" or "investigate then create".
 - \`reply({text})\` — send an intermediate user-visible chat bubble. Loop continues.
 - \`ask_user({question, assumptions?})\` — surface a clarifying question. The user's answer arrives as a new task with the answer in the prompt; finish the current loop with \`done\` after this.
 
@@ -1698,6 +1664,8 @@ Deployment (use the local actions — they read your staged drafts and run the p
 - Spawn a new object: \`{ "action": "deploy_spawn" }\` after both \`draft_manifest\` (or \`draft_via_llm({kind: "manifest"})\`) and \`draft_source\` (or \`draft_via_llm({kind: "source"})\`).
 - Update an existing object: \`{ "action": "deploy_update" }\` after \`draft_diff\` (preferred for surgical edits) or after \`draft_source\` (only when wholesale rewrite is intended). If the loop started as a modify, the target source is preloaded into \`state.targetSource\` and the deploy target is set automatically. If the loop started as create but you discovered the user actually wanted to modify an existing object (e.g. "fix the Pong game" → you found Pong already exists), pass the target explicitly: \`{ "action": "deploy_update", "objectId": "<id>" }\` or \`{ "action": "deploy_update", "targetName": "Pong" }\`. **deploy_update hot-swaps source ONLY** — it does not rerun \`show()\` or recreate widgets the object already spawned. If the change touches \`show()\`, \`createCanvas\`, or any other widget wiring, also call \`hide()\` then \`show()\` on the target after deploy_update so the new wiring takes effect, OR tell the user to close and re-open the window. An idempotent \`show()\` will silently keep the OLD widgets otherwise, and your fix won't be observable.
 - Probe: \`call("<Name>", "probe", {})\` — verifies dep references resolve in the deployed object.
+
+ScrumMaster owns multi-task planning. If the assigned creation/modification task is too broad or needs another specialist first, use \`fail({reason})\` with a concise proposed next scrum rather than trying to split the work locally.
 
 ANTI-PATTERNS — do not do these:
 - \`call("Factory", "spawn", ...)\` — you cannot supply the right owner / parentId, and you cannot inline the drafted manifest+source through a JSON action payload. Use \`deploy_spawn\`.
