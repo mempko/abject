@@ -112,8 +112,6 @@ export class BackendUI extends Abject {
   private sessionStore?: SessionStore;
   /** Font metrics from frontend: font -> char -> pixel width */
   private fontMetrics: Map<string, Map<string, number>> = new Map();
-  /** Hash of last draw commands per surface for dedup */
-  private lastDrawHash: Map<string, string> = new Map();
 
   constructor() {
     super({
@@ -1228,7 +1226,6 @@ IMPORTANT:
     }
 
     this.surfaces.delete(surfaceId);
-    this.lastDrawHash.delete(surfaceId);
 
     this.sendToFrontend({
       type: 'destroySurface',
@@ -1247,7 +1244,6 @@ IMPORTANT:
     for (const [surfaceId, state] of this.surfaces.entries()) {
       if (state.objectId === objectId) {
         this.surfaces.delete(surfaceId);
-        this.lastDrawHash.delete(surfaceId);
         this.sendToFrontend({ type: 'destroySurface', surfaceId });
         if (this.focusedSurface === surfaceId) this.focusedSurface = undefined;
         count++;
@@ -1265,36 +1261,23 @@ IMPORTANT:
       (cmd) => this.surfaces.get(cmd.surfaceId)?.objectId === objectId
     );
 
-    // Store draw commands per surface (each batch is a full redraw)
-    // and deduplicate: skip surfaces whose draw commands haven't changed
-    const commandsBySurface = new Map<string, Array<{ type: string; surfaceId: string; params: unknown }>>();
+    // Snapshot the latest draw batch per surface so reconnecting clients can
+    // be replayed (handleClientReady reuses state.lastDrawCommands).
+    const touched = new Set<string>();
     for (const cmd of validCommands) {
-      let batch = commandsBySurface.get(cmd.surfaceId);
-      if (!batch) {
-        batch = [];
-        commandsBySurface.set(cmd.surfaceId, batch);
+      const state = this.surfaces.get(cmd.surfaceId);
+      if (!state) continue;
+      if (!touched.has(cmd.surfaceId)) {
+        state.lastDrawCommands = [];
+        touched.add(cmd.surfaceId);
       }
-      batch.push(cmd);
+      state.lastDrawCommands.push(cmd);
     }
 
-    const changedCommands: Array<{ type: string; surfaceId: string; params: unknown }> = [];
-    for (const [surfaceId, batch] of commandsBySurface) {
-      const hash = JSON.stringify(batch);
-      const prevHash = this.lastDrawHash.get(surfaceId);
-      const state = this.surfaces.get(surfaceId);
-      if (state) {
-        state.lastDrawCommands = batch;
-      }
-      if (hash !== prevHash) {
-        this.lastDrawHash.set(surfaceId, hash);
-        changedCommands.push(...batch);
-      }
-    }
-
-    if (changedCommands.length > 0) {
+    if (validCommands.length > 0) {
       this.sendToFrontend({
         type: 'draw',
-        commands: changedCommands,
+        commands: validCommands,
       });
     }
 
@@ -1614,7 +1597,6 @@ IMPORTANT:
         log.info(`Received font metrics from ${clientId} for ${Object.keys(fmMsg.metrics).length} fonts (additive)`);
         // Only fire fontMetricsChanged on first metrics arrival
         if (!hadMetrics) {
-          this.lastDrawHash.clear();
           const notifiedOwners = new Set<string>();
           for (const state of this.surfaces.values()) {
             if (!notifiedOwners.has(state.objectId)) {

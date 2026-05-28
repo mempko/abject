@@ -168,6 +168,12 @@ export abstract class WidgetAbject extends Abject {
   protected _renderText: string = '';
   protected _renderRect: Rect = { x: 0, y: 0, width: 0, height: 0 };
   protected _renderStyle: WidgetStyle = {};
+  /**
+   * Optional viewport clip propagated by scrolling parents (in absolute
+   * surface coords). Tall widgets like markdown bubbles use this to skip
+   * emitting draw commands for lines outside the visible scroll area.
+   */
+  protected _renderViewportClip: { top: number; bottom: number } | null = null;
 
   private setupWidgetHandlers(): void {
     this.on('render', async (msg: AbjectMessage) => {
@@ -177,7 +183,13 @@ export abstract class WidgetAbject extends Abject {
       this._renderText = this.text;
       this._renderRect = { ...this.rect };
       this._renderStyle = { ...this.style };
-      const { surfaceId, ox, oy } = msg.payload as { surfaceId: string; ox: number; oy: number };
+      const { surfaceId, ox, oy, viewportClip } = msg.payload as {
+        surfaceId: string;
+        ox: number;
+        oy: number;
+        viewportClip?: { top: number; bottom: number };
+      };
+      this._renderViewportClip = viewportClip ?? null;
       const commands = await this.buildDrawCommands(surfaceId, ox, oy);
 
       // Generic keyboard-focus ring. Drawn AFTER the widget so it always

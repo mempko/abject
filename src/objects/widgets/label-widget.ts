@@ -462,10 +462,18 @@ export class LabelWidget extends WidgetAbject {
     // has extra height (e.g., bubble-style labels with surrounding padding).
     const yShift = Math.max(0, Math.floor((h - layout.totalHeight) / 2));
 
+    // Viewport-level culling: a parent scrolling layout may pass an absolute
+    // surface clip so we can skip emitting commands for lines outside the
+    // visible scroll area. Big win for tall markdown bubbles partly visible
+    // at the top/bottom of the scroll viewport.
+    const clip = this._renderViewportClip;
+
     for (const line of layout.lines) {
       const lineTop = oy + yShift + line.y;
+      const lineBottom = lineTop + line.height;
       const textY = lineTop + line.height * 0.7;
       if (lineTop > oy + h) break; // past bottom edge
+      if (clip && (lineBottom < clip.top || lineTop > clip.bottom)) continue;
 
       // Image line: emit imageUrl draw command and continue.
       // The compositor handles loading & caching for both http and data: URIs.
@@ -661,10 +669,14 @@ export class LabelWidget extends WidgetAbject {
       const totalTextHeight = lines.length * lineHeight;
       const yShift = Math.max(0, Math.floor((h - totalTextHeight) / 2));
 
+      // Viewport-level culling — see comments in buildMarkdownDrawCommands.
+      const clip = this._renderViewportClip;
+
       for (let i = 0; i < lines.length; i++) {
         const lineY = oy + yShift + i * lineHeight;
         const textY = lineY + lineHeight * 0.7;
         if (textY - lineHeight > oy + h) break; // past bottom edge
+        if (clip && (lineY + lineHeight < clip.top || lineY > clip.bottom)) continue;
 
         // Selection highlight for this line
         if (selStart && selEnd && i >= selStart.line && i <= selEnd.line) {

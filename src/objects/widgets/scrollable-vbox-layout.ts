@@ -107,49 +107,55 @@ export class ScrollableVBoxLayout extends VBoxLayout {
     const clipTop = oy + cr.y;
     const clipBottom = clipTop + cr.height;
 
-    for (const child of normalChildren) {
-      const childOy = oy + child.rect.y - this.scrollTop;
-      const childBottom = childOy + child.rect.height;
+    const viewportClip = { top: clipTop, bottom: clipBottom };
 
-      // Skip fully off-screen children
-      if (childBottom < clipTop || childOy > clipBottom) continue;
-
-      try {
-        const childCmds = await this.request<unknown[]>(
-          request(this.id, child.widgetId, 'render', {
-            surfaceId,
-            ox: ox + child.rect.x,
-            oy: childOy,
-          })
-        );
-        if (Array.isArray(childCmds)) {
-          commands.push(...childCmds);
+    // Fan render requests out in parallel — they all go through the bus, so
+    // queuing them at once removes microtask hops between siblings.
+    const normalResults = await Promise.all(
+      normalChildren.map(async (child) => {
+        const childOy = oy + child.rect.y - this.scrollTop;
+        const childBottom = childOy + child.rect.height;
+        // Skip fully off-screen children
+        if (childBottom < clipTop || childOy > clipBottom) return null;
+        try {
+          return await this.request<unknown[]>(
+            request(this.id, child.widgetId, 'render', {
+              surfaceId,
+              ox: ox + child.rect.x,
+              oy: childOy,
+              viewportClip,
+            })
+          );
+        } catch {
+          return null;
         }
-      } catch {
-        // Widget may have been destroyed
-      }
+      })
+    );
+    for (const childCmds of normalResults) {
+      if (Array.isArray(childCmds)) commands.push(...childCmds);
     }
 
     commands.push({ type: 'restore', surfaceId, params: {} });
 
     // Render expanded children outside the clip region so dropdowns aren't clipped
-    for (const child of expandedChildList) {
-      const childOy = oy + child.rect.y - this.scrollTop;
-
-      try {
-        const childCmds = await this.request<unknown[]>(
-          request(this.id, child.widgetId, 'render', {
-            surfaceId,
-            ox: ox + child.rect.x,
-            oy: childOy,
-          })
-        );
-        if (Array.isArray(childCmds)) {
-          commands.push(...childCmds);
+    const expandedResults = await Promise.all(
+      expandedChildList.map(async (child) => {
+        const childOy = oy + child.rect.y - this.scrollTop;
+        try {
+          return await this.request<unknown[]>(
+            request(this.id, child.widgetId, 'render', {
+              surfaceId,
+              ox: ox + child.rect.x,
+              oy: childOy,
+            })
+          );
+        } catch {
+          return null;
         }
-      } catch {
-        // Widget may have been destroyed
-      }
+      })
+    );
+    for (const childCmds of expandedResults) {
+      if (Array.isArray(childCmds)) commands.push(...childCmds);
     }
 
     // Draw scrollbar if content overflows

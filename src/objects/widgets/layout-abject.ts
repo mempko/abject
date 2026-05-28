@@ -435,6 +435,12 @@ export abstract class LayoutAbject extends WidgetAbject {
     const childRects = this.calculateChildRects(contentRect);
     const commands: unknown[] = [];
 
+    // Forward the viewport clip from a scrolling ancestor down to children
+    // (e.g. labels inside a VBox inside a ScrollableVBox). Subclasses that
+    // own a scrollable viewport (ScrollableVBoxLayout) replace this with
+    // their own clip rect before delegating.
+    const viewportClip = this._renderViewportClip;
+
     // First pass: render all non-expanded children in parallel
     const nonExpanded = childRects.filter((cr) => !this.expandedChildren.has(cr.widgetId));
     const nonExpandedResults = await Promise.all(
@@ -445,6 +451,7 @@ export abstract class LayoutAbject extends WidgetAbject {
               surfaceId,
               ox: ox + cr.rect.x,
               oy: oy + cr.rect.y,
+              viewportClip,
             })
           );
         } catch {
@@ -466,6 +473,7 @@ export abstract class LayoutAbject extends WidgetAbject {
               surfaceId,
               ox: ox + cr.rect.x,
               oy: oy + cr.rect.y,
+              viewportClip,
             })
           );
         } catch {

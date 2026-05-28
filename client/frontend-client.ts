@@ -46,6 +46,16 @@ export class FrontendClient {
   private loginFormHandler: ((e: Event) => void) | null = null;
   private pendingMouseMove: FrontendToBackendMsg | null = null;
   private mouseMoveRafId = 0;
+  /** Per-surface accumulated wheel deltas; flushed once per animation frame. */
+  private pendingWheels: Map<string, {
+    surfaceId: string;
+    x: number;
+    y: number;
+    deltaX: number;
+    deltaY: number;
+    modifiers: { shift: boolean; ctrl: boolean; alt: boolean; meta: boolean };
+  }> = new Map();
+  private wheelRafId = 0;
   /** Fonts for which we've already shipped a full ASCII metrics table. */
   private measuredFonts: Set<string> = new Set();
   /** Middle-click-drag pan in progress. */
@@ -1156,21 +1166,54 @@ export class FrontendClient {
     }
 
     const { x: wx, y: wy } = this.compositor.viewportToWorkspace(x, y);
-    this.sendToBackend({
-      type: 'input',
-      inputType: 'wheel',
-      surfaceId: surface.id,
-      x: wx - surface.rect.x,
-      y: wy - surface.rect.y,
-      deltaX: e.deltaX,
-      deltaY: e.deltaY,
-      modifiers: {
-        shift: e.shiftKey,
-        ctrl: e.ctrlKey,
-        alt: e.altKey,
-        meta: e.metaKey,
-      },
-    });
+    const localX = wx - surface.rect.x;
+    const localY = wy - surface.rect.y;
+    const modifiers = {
+      shift: e.shiftKey,
+      ctrl: e.ctrlKey,
+      alt: e.altKey,
+      meta: e.metaKey,
+    };
+
+    // Trackpads emit wheel events at 60–120Hz. Coalesce into one input per
+    // animation frame so a fast scroll doesn't fan out into a flood of
+    // backend round-trips (and the worker re-renders that come with them).
+    const prev = this.pendingWheels.get(surface.id);
+    if (prev) {
+      prev.deltaX += e.deltaX;
+      prev.deltaY += e.deltaY;
+      prev.x = localX;
+      prev.y = localY;
+      prev.modifiers = modifiers;
+    } else {
+      this.pendingWheels.set(surface.id, {
+        surfaceId: surface.id,
+        x: localX,
+        y: localY,
+        deltaX: e.deltaX,
+        deltaY: e.deltaY,
+        modifiers,
+      });
+    }
+
+    if (!this.wheelRafId) {
+      this.wheelRafId = requestAnimationFrame(() => {
+        this.wheelRafId = 0;
+        for (const w of this.pendingWheels.values()) {
+          this.sendToBackend({
+            type: 'input',
+            inputType: 'wheel',
+            surfaceId: w.surfaceId,
+            x: w.x,
+            y: w.y,
+            deltaX: w.deltaX,
+            deltaY: w.deltaY,
+            modifiers: w.modifiers,
+          });
+        }
+        this.pendingWheels.clear();
+      });
+    }
   }
 
   private handleKeyEvent(e: KeyboardEvent, type: 'keydown' | 'keyup'): void {
