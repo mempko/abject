@@ -49,6 +49,9 @@ const log = new Log('ScrumMaster');
 
 const SCRUM_MASTER_INTERFACE: InterfaceId = 'abjects:scrum-master';
 
+/** Scratchpad key where a completed sprint's working plan is recorded on the goal. */
+const SCRUM_PLAN_KEY = 'scrum/plan';
+
 /** A single team-member contribution returned by a poll_team ask. */
 interface TeamContribution {
   agentName: string;
@@ -68,14 +71,6 @@ interface StagedTask {
 
 function compactLine(value: unknown, max = 220): string {
   return safeStringify(value, max).replace(/\s+/g, ' ').trim();
-}
-
-function knowledgeTag(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 48);
 }
 
 export class ScrumMaster extends Abject {
@@ -813,22 +808,21 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     await this.request(
       request(this.id, this.goalManagerId, 'completeGoal', { goalId, result: synthesis }),
     );
-    await this.autoSaveCompletionLesson(goalId, synthesis).catch((err) => {
-      log.warn(`autoSaveCompletionLesson failed for ${goalId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+    await this.recordCompletionPlan(goalId, synthesis).catch((err) => {
+      log.warn(`recordCompletionPlan failed for ${goalId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
     });
     this.changed('sprintCompleted', { goalId });
   }
 
   /**
-   * Save the plan that actually worked as ScrumMaster memory. This does not
-   * route around the goal system: future scrums see the lesson through
-   * review_scrum's relevantKnowledge and can still poll the current team when
-   * the recalled lesson is stale or incomplete.
+   * Record the plan that actually worked on the goal's own scratchpad. This is
+   * the goal's record of how it was achieved; it lives and dies with the goal,
+   * so it never pollutes the shared KnowledgeBase. Reusable cross-goal lessons
+   * (goal-shape → agent/method mappings) are the LLM's deliberate job via the
+   * save_knowledge action; this auto-record is just the local plan.
    */
-  private async autoSaveCompletionLesson(goalId: string, synthesis: string): Promise<void> {
+  private async recordCompletionPlan(goalId: string, synthesis: string): Promise<void> {
     if (!this.goalManagerId) return;
-    const kbId = await this.getKnowledgeBaseId();
-    if (!kbId) return;
 
     const goal = await this.request<{
       title: string; description: string; scratchpad?: Record<string, unknown>;
@@ -878,45 +872,40 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
       return `${base} [failed: ${error}]`;
     });
 
-    const scratchpadKeys = Object.keys(goal.scratchpad ?? {}).sort();
-    const titleSource = compactLine(goal.title || goal.description, 140);
-    const title = `Scrum plan: ${titleSource}`;
+    const scratchpadKeys = Object.keys(goal.scratchpad ?? {})
+      .filter(k => k !== SCRUM_PLAN_KEY)
+      .sort();
     const participatingAgents = [...new Set(completed
       .map(t => t.fields.assignedAgentId as string | undefined)
       .filter((id): id is string => Boolean(id))
       .map(id => agentNames.get(id) ?? id.slice(0, 8)))];
-    const tags = [
-      'scrum',
-      'planning',
-      'goal-system',
-      ...participatingAgents.map(knowledgeTag).filter(Boolean),
-    ];
 
-    const content = [
+    const plan = [
       `Goal shape:\n${goal.description}`,
+      participatingAgents.length > 0
+        ? `Participating agents:\n${participatingAgents.join(', ')}`
+        : 'Participating agents:\n(none)',
       completedLines.length > 0
         ? `Working plan:\n${completedLines.join('\n')}`
         : 'Working plan:\n(no completed worker tasks recorded)',
       failedLines.length > 0
-        ? `Failures/replans to remember:\n${failedLines.join('\n')}`
-        : 'Failures/replans to remember:\n(none recorded)',
+        ? `Failures/replans:\n${failedLines.join('\n')}`
+        : 'Failures/replans:\n(none recorded)',
       scratchpadKeys.length > 0
         ? `Scratchpad keys produced:\n${scratchpadKeys.map(k => `- ${k}`).join('\n')}`
         : 'Scratchpad keys produced:\n(none)',
       `Final answer excerpt:\n${synthesis.slice(0, 1800)}`,
-      'Planning note: this is memory for future ScrumMaster reviews. Future goals still go through the goal system; use this lesson as context, then poll the current team if capability or state may have changed.',
     ].join('\n\n');
 
     await this.request(
-      request(this.id, kbId, 'remember', {
-        title,
-        content,
-        type: 'learned',
-        tags: [...new Set(tags)],
+      request(this.id, this.goalManagerId, 'writeGoalData', {
+        goalId,
+        key: SCRUM_PLAN_KEY,
+        value: plan,
       }),
       5000,
     );
-    log.info(`autoSaveCompletionLesson: "${title.slice(0, 80)}"`);
+    log.info(`recordCompletionPlan: ${goalId.slice(0, 8)} → scratchpad["${SCRUM_PLAN_KEY}"]`);
   }
 
   /**
@@ -1324,24 +1313,26 @@ Declare the goal unreachable. Use when no team member can contribute and replann
 Commit the currently-staged batch: addTask each into TupleSpace, enqueue dep-free tasks immediately, defer dependents until upstream completes. Required after one or more \`add_task\` calls. Errors if staged is empty.
 
 ### \`save_knowledge({ title, content, type?, tags? })\`
-Persist a lesson to KnowledgeBase. Future scrums' \`review_scrum\` will surface it via auto-recall. Use this to bank rediscovery work so the team doesn't repeat slow Registry walks every time. Good candidates:
+Persist a genuinely reusable insight to KnowledgeBase. The user browses these entries directly and future scrums auto-recall them in \`review_scrum\`, so each one should read like a standalone fact or lesson that holds on its own, not a log of this sprint.
 
-- **Goal-shape → agent/method mappings**: which agent ended up handling a class of goal, and which method or tool of theirs did the work
-- **Pattern lessons**: when one approach beats another for a particular goal shape, with the reason
-- **User-identity facts learned during a sprint**: identifiers, addresses, account names confirmed by an actual successful task
-- **Constraints discovered**: a permission, dependency, or precondition that mattered
+Save ONLY when this sprint rediscovered something non-obvious that cost real effort and will recur on unrelated future goals. Good candidates:
 
-The point is the lesson should be reusable on the NEXT goal of the same shape. Always describe the lesson in terms of capability/goal-shape, never as a context-free name dump.
+- A capability that was hard to locate: which kind of tool or method turned out to handle a class of work, when that was not obvious from a registry walk.
+- An approach that beat the obvious one, with the reason it won.
+- A constraint that mattered: a permission, dependency, or precondition that was not apparent up front.
+- A user-identity fact confirmed by a successful task: an address, account, or identifier.
 
-Don't save:
-- The synthesis itself (the user already saw it via complete_goal)
-- Task-specific details (those belong in goal scratchpad)
+Most sprints save nothing. When the work was routine or the team found what it needed quickly, skip it. The plan that worked is already recorded on the goal's scratchpad, so this is reserved for lessons worth carrying to a different goal later.
+
+Write the entry as the insight itself. The title states the takeaway (for example "Bulk inbox triage needs an agent that drives a real browser"), phrased so a reader who never saw this sprint understands it. Avoid titles that name this goal or begin with "Goal shape".
+
+Skip:
+- The synthesis the user already saw via \`complete_goal\`
+- The working plan and task-specific details (those live on the goal scratchpad)
 - One-off observations unlikely to recur
 
 \`type\`: 'fact' (durable truth), 'learned' (lesson from outcome), 'insight' (analysis), 'reference' (pointer). Defaults to 'learned'.
-\`tags\`: short keywords for filterable retrieval — pick whatever describes the goal domain (the topic the lesson is about) plus the agent/method involved.
-
-Best timing: just BEFORE \`complete_goal\` on a successful sprint, when you know the lesson actually worked end-to-end.
+\`tags\`: short keywords describing the topic plus any capability involved.
 
 Returns \`{ id, title }\`.
 
