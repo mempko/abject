@@ -25,10 +25,10 @@ import type { ClientTransport } from './transport.js';
  */
 /** Fonts to pre-measure for server-side text width computation */
 const MEASURED_FONTS = [
-  '14px "Inter", system-ui, sans-serif',   // WIDGET_FONT
-  '600 13px "Inter", system-ui, sans-serif', // TITLE_FONT
-  '13px "JetBrains Mono", "Fira Code", monospace', // CODE_FONT
-  '14px system-ui',                         // legacy WIDGET_FONT
+  '14px "Spectral", Georgia, "Times New Roman", serif',        // WIDGET_FONT
+  '600 14px "Fraunces", "Spectral", Georgia, serif',           // TITLE_FONT
+  '13px "Spline Sans Mono", "JetBrains Mono", monospace',      // CODE_FONT
+  '14px system-ui',                                            // legacy WIDGET_FONT
 ];
 
 /** ASCII printable range pre-measured for every new font we see. */
@@ -271,6 +271,7 @@ export class FrontendClient {
       // Clear stale surfaces from any previous connection before replaying state
       this.compositor.clearAllSurfaces();
       this.focusedSurface = undefined;
+      this.compositor.setFocusedSurface(undefined);
       this.grabbedSurface = undefined;
       this.localDragState = undefined;
       this.authenticated = false;
@@ -517,6 +518,9 @@ export class FrontendClient {
 
       case 'setFocused':
         this.focusedSurface = msg.surfaceId;
+        if (msg.glowColor) this.compositor.setFocusGlowColor(msg.glowColor);
+        if (typeof msg.glowRadius === 'number') this.compositor.setFocusGlowRadius(msg.glowRadius);
+        this.compositor.setFocusedSurface(msg.surfaceId);
         break;
 
       case 'measureTextRequest':
@@ -949,6 +953,7 @@ export class FrontendClient {
     if (type === 'mousedown') {
       this.grabbedSurface = surface.id;
       this.focusedSurface = surface.id;
+      this.compositor.setFocusedSurface(surface.id);
     }
     if (type === 'mouseup') {
       this.grabbedSurface = undefined;
@@ -1071,6 +1076,7 @@ export class FrontendClient {
     if (type === 'mousedown' && surface) {
       this.grabbedSurface = surface.id;
       this.focusedSurface = surface.id;
+      this.compositor.setFocusedSurface(surface.id);
     }
 
     if (type === 'mouseup') {

@@ -73,6 +73,10 @@ export interface SetZIndexMsg extends WsEnvelope {
 export interface SetFocusedMsg extends WsEnvelope {
   type: 'setFocused';
   surfaceId: string;
+  /** Accent color for the compositor's focus-glow halo (theme accent). */
+  glowColor?: string;
+  /** Window corner radius so the halo matches the window silhouette. */
+  glowRadius?: number;
 }
 
 export interface MeasureTextRequestMsg extends WsEnvelope {

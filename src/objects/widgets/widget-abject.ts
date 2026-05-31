@@ -18,21 +18,64 @@ import {
   WidgetStyle,
   WidgetType,
   ThemeData,
-  MIDNIGHT_BLOOM,
+  ARCANE_GRIMOIRE,
   WIDGET_INTERFACE,
   WIDGET_FONT,
+  BODY_FONT_STACK,
+  DISPLAY_FONT_STACK,
+  MONO_FONT_STACK,
+  withAlpha,
 } from './widget-types.js';
 import { Tween, pulse as motionPulse } from '../../ui/motion.js';
 
 
 
+// Theme color tokens that may be baked into a WidgetStyle. On a theme change we
+// remap any style color matching the OLD theme's token to the NEW theme's
+// corresponding token, so colors baked into a widget's style (e.g. a row's
+// `background: theme.windowBg`) follow the theme without needing a rebuild.
+// `updateTheme` updates `this.theme` but cannot otherwise re-resolve a resolved
+// hex back to the token it came from.
+const THEME_REMAP_KEYS: Array<keyof ThemeData> = [
+  'windowBg', 'titleBarBg', 'buttonBg', 'inputBg', 'selectBg', 'selectHover', 'activeItemBg', 'destructiveBg', 'progressTrack', 'sliderTrack',
+  'accent', 'accentSecondary', 'accentTertiary', 'actionBg', 'actionBorder', 'activeItemBorder', 'buttonBorder', 'inputBorder', 'inputBorderFocus', 'windowBorder', 'divider', 'destructiveBorder',
+  'textPrimary', 'textSecondary', 'textTertiary', 'buttonText', 'actionText', 'destructiveText', 'textHeading', 'textDescription', 'textMeta', 'sectionLabel', 'linkColor',
+  'statusSuccess', 'statusError', 'statusErrorBright', 'statusWarning', 'statusNeutral', 'statusInfo',
+];
+
+function remapColor(color: string | undefined, oldT: ThemeData, newT: ThemeData): string | undefined {
+  if (!color) return color;
+  for (const k of THEME_REMAP_KEYS) {
+    if (oldT[k] === color) {
+      const next = newT[k];
+      if (typeof next === 'string') return next;
+    }
+  }
+  return color;
+}
+
+/** Remap a WidgetStyle's color fields from the old theme's tokens to the new theme's. */
+export function remapStyleColors(style: WidgetStyle, oldT: ThemeData, newT: ThemeData): WidgetStyle {
+  return {
+    ...style,
+    background: remapColor(style.background, oldT, newT),
+    color: remapColor(style.color, oldT, newT),
+    borderColor: remapColor(style.borderColor, oldT, newT),
+  };
+}
+
 /**
- * Build a CSS font string from a WidgetStyle.
+ * Build a CSS font string from a WidgetStyle, selecting the Arcane Grimoire font
+ * stack named by `style.fontFamily` (body serif by default).
  */
 export function buildFont(style: WidgetStyle): string {
   const weight = style.fontWeight ?? 'normal';
   const size = style.fontSize ?? 14;
-  return `${weight} ${size}px "Inter", system-ui, sans-serif`;
+  const stack =
+    style.fontFamily === 'display' ? DISPLAY_FONT_STACK
+    : style.fontFamily === 'mono' ? MONO_FONT_STACK
+    : BODY_FONT_STACK;
+  return `${weight} ${size}px ${stack}`;
 }
 
 /**
@@ -158,7 +201,7 @@ export abstract class WidgetAbject extends Abject {
     this.ownerId = config.ownerId;
     this.href = config.href ?? '';
     this.uiServerId = config.uiServerId;
-    this.theme = config.theme ?? MIDNIGHT_BLOOM;
+    this.theme = config.theme ?? ARCANE_GRIMOIRE;
     this.syncDisabledVisible();
 
     this.setupWidgetHandlers();
@@ -272,7 +315,11 @@ export abstract class WidgetAbject extends Abject {
     });
 
     this.on('updateTheme', async (msg: AbjectMessage) => {
-      this.theme = msg.payload as ThemeData;
+      const newTheme = msg.payload as ThemeData;
+      // Remap any colors baked into this widget's style from the old theme's
+      // tokens to the new theme's, so styled widgets follow theme changes.
+      this.style = remapStyleColors(this.style, this.theme, newTheme);
+      this.theme = newTheme;
       await this.requestRedraw();
       return true;
     });
@@ -331,7 +378,7 @@ export abstract class WidgetAbject extends Abject {
           y: oy,
           width: this.rect.width,
           height: this.rect.height,
-          stroke: `rgba(57, 255, 142, ${alpha.toFixed(3)})`,
+          stroke: withAlpha(this.theme.accent, alpha),
           lineWidth: 1.5,
           radius: r,
         },

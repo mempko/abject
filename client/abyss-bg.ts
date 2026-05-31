@@ -6,9 +6,11 @@
  * Deliberately low-key so it doesn't compete with the UI.
  */
 
-const ELDRITCH = { r: 57, g: 255, b: 142 };
-const VOID_PURPLE = { r: 155, g: 89, b: 255 };
-const ICHOR = { r: 255, g: 77, b: 106 };
+// Arcane Grimoire palette: rune-green bioluminescence, violet sigil light, and
+// ember ichor — kept in sync with the ARCANE_GRIMOIRE theme accents.
+const ELDRITCH = { r: 91, g: 229, b: 160 };   // #5be5a0 rune green
+const VOID_PURPLE = { r: 139, g: 123, b: 255 }; // #8b7bff violet sigil
+const ICHOR = { r: 255, g: 92, b: 119 };       // #ff5c77 ember
 
 interface Particle {
   x: number;

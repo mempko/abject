@@ -128,8 +128,8 @@ export class TreeWidget extends WidgetAbject {
       Math.floor((this.scrollTop + h) / this.itemHeight),
     );
 
-    const font = '13px "Inter", system-ui, sans-serif';
-    const secondaryFont = '11px "Inter", system-ui, sans-serif';
+    const font = '13px "Spectral", Georgia, "Times New Roman", serif';
+    const secondaryFont = '11px "Spectral", Georgia, "Times New Roman", serif';
 
     for (let i = firstVisible; i <= lastVisible; i++) {
       const item = this.items[i];
@@ -169,7 +169,7 @@ export class TreeWidget extends WidgetAbject {
           params: {
             x: textX, y: itemY + this.itemHeight / 2,
             text: arrow,
-            font: '11px "Inter", system-ui, sans-serif',
+            font: '11px "Spectral", Georgia, "Times New Roman", serif',
             fill: this.theme.textSecondary,
             baseline: 'middle',
           },
@@ -195,7 +195,7 @@ export class TreeWidget extends WidgetAbject {
           params: {
             x: textX, y: itemY + this.itemHeight / 2,
             text: item.icon,
-            font: '12px "Inter", system-ui, sans-serif',
+            font: '12px "Spectral", Georgia, "Times New Roman", serif',
             fill: iconColor,
             baseline: 'middle',
           },

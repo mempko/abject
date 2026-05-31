@@ -4,7 +4,7 @@
  * All communication is via message passing:
  *   getTheme        → returns the current ThemeData
  *   setTheme        → merges partial theme, persists, broadcasts themeChanged
- *   resetTheme      → resets to MIDNIGHT_BLOOM default
+ *   resetTheme      → resets to ARCANE_GRIMOIRE default
  *   listPresets     → built-in + user-registered ThemePresets
  *   setThemeById    → swap to a preset by id (atomic, no merge)
  *   getActiveThemeId→ id of the active preset, or 'custom' after setTheme()
@@ -18,7 +18,7 @@ import { request } from '../core/message.js';
 import { require as contractRequire } from '../core/contracts.js';
 import {
   ThemeData,
-  MIDNIGHT_BLOOM,
+  ARCANE_GRIMOIRE,
   ThemePreset,
   BUILTIN_THEME_PRESETS,
   DEFAULT_THEME_ID,
@@ -26,6 +26,7 @@ import {
   getBuiltinThemeById,
   fillThemeDefaults,
 } from '../core/theme-data.js';
+import { withAlpha } from './widgets/widget-types.js';
 
 /**
  * Deep-merge a partial theme update over the current theme.
@@ -60,7 +61,7 @@ const CUSTOM_THEME_ID = 'custom';
 export const THEME_ID = 'abjects:theme' as AbjectId;
 
 export class ThemeAbject extends Abject {
-  private currentTheme: ThemeData = { ...MIDNIGHT_BLOOM };
+  private currentTheme: ThemeData = { ...ARCANE_GRIMOIRE };
   private activeThemeId: string = DEFAULT_THEME_ID;
   private userPresets: Map<string, ThemePreset> = new Map();
   private storageId?: AbjectId;
@@ -162,7 +163,7 @@ export class ThemeAbject extends Abject {
     });
 
     this.on('resetTheme', async () => {
-      this.currentTheme = { ...MIDNIGHT_BLOOM };
+      this.currentTheme = { ...ARCANE_GRIMOIRE };
       this.activeThemeId = DEFAULT_THEME_ID;
       this.applyBodyBackground();
       await this.persistTheme();
@@ -243,7 +244,7 @@ export class ThemeAbject extends Abject {
 
       // If the removed preset was active, fall back to the default and re-broadcast.
       if (this.activeThemeId === id) {
-        this.currentTheme = { ...MIDNIGHT_BLOOM };
+        this.currentTheme = { ...ARCANE_GRIMOIRE };
         this.activeThemeId = DEFAULT_THEME_ID;
         this.applyBodyBackground();
         await this.persistTheme();
@@ -301,7 +302,7 @@ export class ThemeAbject extends Abject {
             request(this.id, this.storageId, 'get', { key: STORAGE_KEY })
           );
           if (saved && typeof saved === 'object' && 'canvasBg' in saved) {
-            this.currentTheme = mergeTheme(MIDNIGHT_BLOOM, saved);
+            this.currentTheme = mergeTheme(ARCANE_GRIMOIRE, saved);
             this.activeThemeId = CUSTOM_THEME_ID;
           }
         } catch {
@@ -329,17 +330,23 @@ export class ThemeAbject extends Abject {
 
   private applyBodyBackground(): void {
     if (typeof document !== 'undefined') {
-      // Layered backdrop:
-      //   1. Faint dot grid — gives the abyss a sense of space without
-      //      attracting the eye. 24-px pitch with a 1-px dot at <4% alpha.
-      //   2. Two soft accent ellipses for depth.
-      //   3. The flat canvas color underneath.
+      // Layered abyss, all derived from the active theme so the void tracks the
+      // accent palette:
+      //   1. Faint rune-dot grid — gives the void a sense of space without
+      //      attracting the eye. 26-px pitch with a 1-px dot at low alpha.
+      //   2. Soft rune-green + violet sigil blooms rising from below for depth.
+      //   3. A vignette that draws the eye inward and deepens the edges.
+      //   4. The flat canvas color underneath.
+      const rune = this.currentTheme.accent;
+      const sigil = this.currentTheme.accentSecondary;
       document.body.style.backgroundImage = [
-        'radial-gradient(circle at 1px 1px, rgba(57,255,142,0.06) 1px, transparent 1.6px)',
-        'radial-gradient(ellipse 60% 50% at 50% 30%, rgba(57,255,142,0.04) 0%, transparent 60%)',
-        'radial-gradient(ellipse 40% 40% at 70% 20%, rgba(155,89,255,0.03) 0%, transparent 50%)',
+        `radial-gradient(circle at 1px 1px, ${withAlpha(rune, 0.05)} 1px, transparent 1.6px)`,
+        `radial-gradient(ellipse 70% 55% at 50% 108%, ${withAlpha(rune, 0.06)} 0%, transparent 60%)`,
+        `radial-gradient(ellipse 45% 45% at 12% 78%, ${withAlpha(sigil, 0.045)} 0%, transparent 55%)`,
+        `radial-gradient(ellipse 40% 40% at 88% 70%, ${withAlpha(rune, 0.035)} 0%, transparent 55%)`,
+        `radial-gradient(ellipse 120% 90% at 50% 50%, transparent 55%, rgba(0,0,0,0.55) 100%)`,
       ].join(', ');
-      document.body.style.backgroundSize = '24px 24px, auto, auto';
+      document.body.style.backgroundSize = '26px 26px, auto, auto, auto, auto';
       document.body.style.backgroundColor = this.currentTheme.canvasBg;
     }
   }

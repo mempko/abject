@@ -4,9 +4,9 @@
 
 import { AbjectId, InterfaceId } from '../../core/types.js';
 
-// Re-export ThemeData and MIDNIGHT_BLOOM from core (canonical source)
+// Re-export ThemeData and default theme constants from core (canonical source)
 export type { ThemeData } from '../../core/theme-data.js';
-export { MIDNIGHT_BLOOM } from '../../core/theme-data.js';
+export { MIDNIGHT_BLOOM, ARCANE_GRIMOIRE } from '../../core/theme-data.js';
 
 // ── Interface IDs ──────────────────────────────────────────────────────────
 
@@ -24,6 +24,7 @@ export interface WidgetStyle {
   fontSize?: number;
   fontWeight?: 'normal' | 'bold';
   align?: 'left' | 'center' | 'right';
+  fontFamily?: 'body' | 'display' | 'mono';  // font stack to use; defaults to body
   radius?: number;
   wordWrap?: boolean;
   disabled?: boolean;
@@ -44,9 +45,16 @@ export interface Rect {
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-export const WIDGET_FONT = '14px "Inter", system-ui, sans-serif';
-export const TITLE_FONT = '600 13px "Inter", system-ui, sans-serif';
-export const CODE_FONT = '13px "JetBrains Mono", "Fira Code", monospace';
+// Font stacks for the Arcane Grimoire look: a screen-serif body, a characterful
+// display serif for titles/headings, and a refined mono. Defined once here so
+// every widget that builds an ad-hoc font string stays in the same family.
+export const BODY_FONT_STACK = '"Spectral", Georgia, "Times New Roman", serif';
+export const DISPLAY_FONT_STACK = '"Fraunces", "Spectral", Georgia, serif';
+export const MONO_FONT_STACK = '"Spline Sans Mono", "JetBrains Mono", monospace';
+
+export const WIDGET_FONT = `14px ${BODY_FONT_STACK}`;
+export const TITLE_FONT = `600 14px ${DISPLAY_FONT_STACK}`;
+export const CODE_FONT = `13px ${MONO_FONT_STACK}`;
 export const DEFAULT_LINE_HEIGHT = 18;
 export const TITLE_BAR_HEIGHT = 36;
 export const EDGE_SIZE = 10;
@@ -90,4 +98,20 @@ export function darkenColor(hex: string, amount = 20): string {
   const g = Math.max(0, parseInt(c.substring(2, 4), 16) - amount);
   const b = Math.max(0, parseInt(c.substring(4, 6), 16) - amount);
   return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+}
+
+/**
+ * Convert a hex color (#rgb or #rrggbb) into an `rgba(...)` string at the given
+ * alpha. Lets theme-driven chrome (window accent line, focus rings) derive
+ * translucent strokes from a solid `theme.accent` instead of hardcoding colors.
+ * If the input is already an rgb()/rgba() string it is returned unchanged.
+ */
+export function withAlpha(color: string, alpha: number): string {
+  if (!color.startsWith('#')) return color;
+  let c = color.slice(1);
+  if (c.length === 3) c = c.split('').map((ch) => ch + ch).join('');
+  const r = parseInt(c.substring(0, 2), 16);
+  const g = parseInt(c.substring(2, 4), 16);
+  const b = parseInt(c.substring(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }

@@ -210,6 +210,11 @@ export class Compositor {
   private animationFrameId?: number;
   private needsRender = false;
   private activeWorkspaceId?: string;
+  // Focused window gets a soft accent halo drawn behind it (on the desktop, so
+  // it extends beyond the window edges and content can't cover it).
+  private focusedSurfaceId?: string;
+  private focusGlowColor = 'rgba(91, 229, 160, 0.55)'; // Arcane rune-green default
+  private focusGlowRadius = 7; // window corner radius, so the halo matches the window
   private imageCache: Map<string, { img: HTMLImageElement; loaded: boolean }> = new Map();
   private static IMAGE_CACHE_MAX = 100;
   private liveDataImages: Map<string, { img: HTMLImageElement; width: number; height: number }> = new Map();
@@ -462,6 +467,71 @@ export class Compositor {
       this.sortSurfaces();
       this.needsRender = true;
     }
+  }
+
+  /** Set which surface is focused (gets the accent glow halo). */
+  setFocusedSurface(surfaceId: string | undefined): void {
+    if (this.focusedSurfaceId === surfaceId) return;
+    this.focusedSurfaceId = surfaceId;
+    this.needsRender = true;
+  }
+
+  /** Set the focus-glow color (theme accent). */
+  setFocusGlowColor(color: string): void {
+    if (this.focusGlowColor === color) return;
+    this.focusGlowColor = color;
+    this.needsRender = true;
+  }
+
+  /** Set the focus-glow corner radius to match the focused window's radius. */
+  setFocusGlowRadius(radius: number): void {
+    if (this.focusGlowRadius === radius || !(radius >= 0)) return;
+    this.focusGlowRadius = radius;
+    this.needsRender = true;
+  }
+
+  /**
+   * Draw a soft accent halo around a focused window's rect, on the desktop
+   * canvas (in workspace coords — caller has already applied the scroll
+   * translate). Drawn before the surface image so window content covers the
+   * inward spill, leaving the outward halo visible beyond the window edges.
+   */
+  private drawFocusGlow(rect: Rect): void {
+    const ctx = this.ctx;
+    // Pure BLOOM (no ring line): fill the window silhouette inset behind the
+    // window and show only its outward shadow. Two passes — a tight bright halo
+    // hugging the edge plus a soft wider falloff — so it reads as a real glow
+    // around the single window border, not a second outline.
+    // Match the window's silhouette (its corner radius, hugged with a 1px inset)
+    // so the bloom is uniform on the edges AND the corners.
+    const inset = 1;
+    const x = rect.x + inset;
+    const y = rect.y + inset;
+    const w = rect.width - inset * 2;
+    const h = rect.height - inset * 2;
+    if (w <= 0 || h <= 0) return;
+    const radius = Math.max(0, Math.min(this.focusGlowRadius, w / 2, h / 2));
+    ctx.save();
+    ctx.fillStyle = this.focusGlowColor;
+    ctx.shadowColor = this.focusGlowColor;
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.lineTo(x + w - radius, y);
+    ctx.arcTo(x + w, y, x + w, y + radius, radius);
+    ctx.lineTo(x + w, y + h - radius);
+    ctx.arcTo(x + w, y + h, x + w - radius, y + h, radius);
+    ctx.lineTo(x + radius, y + h);
+    ctx.arcTo(x, y + h, x, y + h - radius, radius);
+    ctx.lineTo(x, y + radius);
+    ctx.arcTo(x, y, x + radius, y, radius);
+    ctx.closePath();
+    ctx.globalAlpha = 0.5;
+    ctx.shadowBlur = 10;
+    ctx.fill();
+    ctx.globalAlpha = 0.3;
+    ctx.shadowBlur = 24;
+    ctx.fill();
+    ctx.restore();
   }
 
   /**
@@ -1030,6 +1100,10 @@ export class Compositor {
       if (!surface.visible || !surface.drawn) continue;
       if (this.isWorkspaceFiltered(surface)) continue;
 
+      if (surface.id === this.focusedSurfaceId) {
+        this.drawFocusGlow(surface.rect);
+      }
+
       this.ctx.drawImage(
         surface.canvas,
         surface.rect.x,
@@ -1291,7 +1365,7 @@ export class Compositor {
     this.ctx.rect(0, barY, w, tabH);
     this.ctx.clip();
 
-    this.ctx.font = '12px "Inter", system-ui, sans-serif';
+    this.ctx.font = '12px "Spectral", Georgia, "Times New Roman", serif';
     this.ctx.textAlign = 'center';
     this.ctx.textBaseline = 'middle';
 

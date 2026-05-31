@@ -8,6 +8,7 @@
 
 import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
 import { Abject } from '../core/abject.js';
+import type { ThemeData } from '../core/theme-data.js';
 import { event, request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
@@ -44,6 +45,11 @@ export class Taskbar extends Abject {
 
   // Minimized window state (survives rebuilds)
   private minimizedWindows: Map<string, { windowId: AbjectId; title: string }> = new Map();
+
+  // Accent the current UI was built with, so we know when a theme change needs a
+  // rebuild to re-bake baked label colors (this.theme updates silently via the
+  // theme-dependent protocol, so it can't be the comparison point).
+  private lastBuiltAccent?: string;
 
   // Debounce timer for registry events
   private updateTimer?: ReturnType<typeof setTimeout>;
@@ -139,9 +145,20 @@ windows" section so the user can restore windows from the taskbar.
 
   private setupHandlers(): void {
     this.on('show', async (msg: AbjectMessage) => {
-      const payload = msg.payload as { yOffset?: number } | undefined;
+      const payload = msg.payload as { yOffset?: number; theme?: ThemeData } | undefined;
       if (payload?.yOffset !== undefined) {
         this.yOffset = payload.yOffset;
+      }
+      if (payload?.theme && typeof payload.theme === 'object' && 'canvasBg' in payload.theme) {
+        this.theme = payload.theme;
+      }
+      // Rebuild if the accent differs from what the UI was actually built with
+      // (this.theme updates silently via the theme-dependent protocol, so the
+      // baked "Abjects"/"Windows" label colors only refresh on a rebuild —
+      // show() alone just repositions an already-visible taskbar).
+      if (this.windowId && this.lastBuiltAccent !== undefined && this.theme.accent !== this.lastBuiltAccent) {
+        await this.rebuild();
+        return true;
       }
       return this.show();
     });
@@ -279,6 +296,9 @@ windows" section so the user can restore windows from the taskbar.
   }
 
   private async populateContent(): Promise<void> {
+    // Record the accent the labels are being baked with (used to decide when a
+    // theme change needs a rebuild).
+    this.lastBuiltAccent = this.theme.accent;
     const showableObjects = await this.discoverShowableObjects();
 
     // No blocking getState queries. Buttons render unstyled immediately.
@@ -303,7 +323,7 @@ windows" section so the user can restore windows from the taskbar.
 
     // [0] Header label
     specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A0 Abjects',
-      style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } });
+      style: { color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display' } });
     // [1] Gear button (AppExplorer)
     specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699',
       style: { fontSize: 13 } });
@@ -343,7 +363,7 @@ windows" section so the user can restore windows from the taskbar.
     const minimizedCount = this.minimizedWindows.size;
     if (minimizedCount > 0) {
       specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A1 Windows',
-        style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } });
+        style: { color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display' } });
       for (const [, { title }] of this.minimizedWindows) {
         specs.push({ type: 'button', windowId: this.windowId!, text: title });
       }

@@ -91,6 +91,10 @@ export interface ClientMeta {
 export class BackendUI extends Abject {
   private surfaces: Map<string, SurfaceState> = new Map();
   private focusedSurface?: string;
+  /** Accent color for the focused window's glow halo (last focused window's theme accent). */
+  private focusGlowColor?: string;
+  /** Corner radius of the focused window, so the halo matches its silhouette. */
+  private focusGlowRadius?: number;
   private mouseGrabAbject?: AbjectId;  // WindowManager grabs mouse during drag
   private mouseGrabClientId?: string;  // Which client owns the current resize grab
   private pendingRequests: Map<string, { resolve: (value: unknown) => void; reject: (e: Error) => void }> = new Map();
@@ -531,8 +535,8 @@ export class BackendUI extends Abject {
     });
 
     this.on('focus', async (msg: AbjectMessage) => {
-      const { surfaceId } = msg.payload as { surfaceId: string };
-      return this.handleFocus(msg.routing.from, surfaceId);
+      const { surfaceId, glowColor, glowRadius } = msg.payload as { surfaceId: string; glowColor?: string; glowRadius?: number };
+      return this.handleFocus(msg.routing.from, surfaceId, glowColor, glowRadius);
     });
 
     this.on('getDisplayInfo', async () => {
@@ -1354,7 +1358,7 @@ IMPORTANT:
     return true;
   }
 
-  private handleFocus(objectId: AbjectId, surfaceId: string): boolean {
+  private handleFocus(objectId: AbjectId, surfaceId: string, glowColor?: string, glowRadius?: number): boolean {
     const state = this.surfaces.get(surfaceId);
     if (!state || state.objectId !== objectId) {
       return false;
@@ -1362,6 +1366,8 @@ IMPORTANT:
 
     const oldFocus = this.focusedSurface;
     this.focusedSurface = surfaceId;
+    if (glowColor) this.focusGlowColor = glowColor;
+    if (typeof glowRadius === 'number') this.focusGlowRadius = glowRadius;
 
     // Send focus lost to previous owner
     if (oldFocus && oldFocus !== surfaceId) {
@@ -1374,10 +1380,13 @@ IMPORTANT:
     // Send focus gained to new owner
     this.sendFocusEvent(objectId, surfaceId, true);
 
-    // Tell frontend which surface is focused (for keyboard routing)
+    // Tell frontend which surface is focused (for keyboard routing) and the
+    // accent color for the focus-glow halo.
     this.sendToFrontend({
       type: 'setFocused',
       surfaceId,
+      glowColor: this.focusGlowColor,
+      glowRadius: this.focusGlowRadius,
     });
 
     return true;
@@ -1871,6 +1880,8 @@ IMPORTANT:
       this.sendToClient({
         type: 'setFocused',
         surfaceId: this.focusedSurface,
+        glowColor: this.focusGlowColor,
+        glowRadius: this.focusGlowRadius,
       }, clientId);
     }
 

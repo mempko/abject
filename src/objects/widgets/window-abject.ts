@@ -15,11 +15,12 @@ import { request, event } from '../../core/message.js';
 import {
   Rect,
   ThemeData,
-  MIDNIGHT_BLOOM,
+  ARCANE_GRIMOIRE,
   WINDOW_INTERFACE,
   TITLE_BAR_HEIGHT,
   TITLE_FONT,
   lightenColor,
+  withAlpha,
 } from './widget-types.js';
 import { iconCommands } from '../../ui/icons.js';
 import { Tween, shimmer as motionShimmer } from '../../ui/motion.js';
@@ -174,7 +175,7 @@ export class WindowAbject extends Abject {
     this.resizable = config.resizable ?? false;
     this.draggable = config.draggable ?? false;
     this.zIndex = config.zIndex ?? 100;
-    this.theme = config.theme ?? MIDNIGHT_BLOOM;
+    this.theme = config.theme ?? ARCANE_GRIMOIRE;
 
     this.setupHandlers();
   }
@@ -293,11 +294,10 @@ export class WindowAbject extends Abject {
       const { focused } = msg.payload as { surfaceId: string; focused: boolean };
       this.windowFocused = focused;
 
-      if (focused) {
-        this.startShimmer();
-      } else {
-        this.stopShimmer();
-      }
+      // Focus is shown with a static accent border + a soft compositor halo,
+      // so no continuous shimmer animation is needed (avoids repainting the
+      // focused window every frame). Cancel any legacy tween.
+      this.stopShimmer();
 
       // When window loses focus, send mouseleave to hovered child so it
       // clears hover highlight (the mouse may never
@@ -430,6 +430,10 @@ method calls on 'abjects:widgets' interface:
     await this.request<boolean>(
       request(this.id, this.uiServerId, 'focus', {
         surfaceId: this.surfaceId,
+        // Accent + corner radius for the compositor's focus-glow halo so it
+        // matches the theme and the window silhouette.
+        glowColor: this.theme.accent,
+        glowRadius: this.theme.windowRadius,
       })
     );
     await this.renderWindow();
@@ -524,7 +528,9 @@ method calls on 'abjects:widgets' interface:
       });
       commands.push({ type: 'restore', surfaceId: sid, params: {} });
 
-      // Window background (drawn without shadow)
+      // Window background with its single neutral border. Focus is signalled by
+      // the compositor's accent glow halo (drawn behind the window), so there is
+      // no separate accent border line — that would just duplicate the glow.
       commands.push({
         type: 'rect',
         surfaceId: sid,
@@ -542,13 +548,7 @@ method calls on 'abjects:widgets' interface:
       });
       commands.push({ type: 'restore', surfaceId: sid, params: {} });
 
-      // Accent border — fades when not focused (de-saturation = unfocused signal)
-      const borderAlpha = focused ? 0.22 : 0.06;
-      commands.push({
-        type: 'rect',
-        surfaceId: sid,
-        params: { x: 0, y: 0, width: w, height: h, stroke: `rgba(57, 255, 142, ${borderAlpha})`, radius: this.theme.windowRadius },
-      });
+
     }
 
     if (!this.chromeless) {
@@ -618,70 +618,25 @@ method calls on 'abjects:widgets' interface:
       drawButton(minCx, 'minimize');
       drawButton(closeCx, 'close');
 
-      // Signature accent line — *the* iconic element of every window.
-      // Focused: full-width gradient (accent → soft → accent) plus a moving
-      //   shimmer highlight that traces left → right. The shimmer is what makes
-      //   the focused window feel "alive" without distracting motion elsewhere.
-      // Unfocused: a single hairline at divider color, no glow.
+      // Title-bar divider — a single quiet hairline separating the title bar
+      // from content. Focus is carried by the accent border + compositor halo,
+      // so this stays calm: a faint accent tint when focused, plain divider when
+      // not (no bright bar, no glow).
       const lineY = tbh;
-      if (focused) {
-        commands.push({ type: 'save', surfaceId: sid, params: {} });
-        commands.push({
-          type: 'shadow',
-          surfaceId: sid,
-          params: { color: tokens.glow.focus.color, blur: tokens.glow.focus.blur, offsetY: 0 },
-        });
-        commands.push({
-          type: 'linearGradient',
-          surfaceId: sid,
-          params: {
-            x0: 0, y0: lineY, x1: w, y1: lineY,
-            stops: [
-              { offset: 0,    color: 'rgba(57, 255, 142, 0.10)' },
-              { offset: 0.5,  color: 'rgba(57, 255, 142, 0.95)' },
-              { offset: 1,    color: 'rgba(57, 255, 142, 0.10)' },
-            ],
-          },
-        });
-        commands.push({
-          type: 'rect',
-          surfaceId: sid,
-          params: { x: 0, y: lineY - 1, width: w, height: 2 },
-        });
-        commands.push({ type: 'restore', surfaceId: sid, params: {} });
-
-        // Shimmer highlight: a small bright spot travelling along the line.
-        // Width is 18% of the window; centered on shimmerPos × w.
-        const shimmerW = Math.max(80, w * 0.18);
-        const shimmerCx = this.shimmerPos * (w + shimmerW) - shimmerW / 2;
-        commands.push({ type: 'save', surfaceId: sid, params: {} });
-        commands.push({
-          type: 'linearGradient',
-          surfaceId: sid,
-          params: {
-            x0: shimmerCx - shimmerW / 2, y0: lineY,
-            x1: shimmerCx + shimmerW / 2, y1: lineY,
-            stops: [
-              { offset: 0,   color: 'rgba(255, 255, 255, 0)' },
-              { offset: 0.5, color: 'rgba(255, 255, 255, 0.8)' },
-              { offset: 1,   color: 'rgba(255, 255, 255, 0)' },
-            ],
-          },
-        });
-        commands.push({
-          type: 'rect',
-          surfaceId: sid,
-          params: { x: shimmerCx - shimmerW / 2, y: lineY - 1, width: shimmerW, height: 2 },
-        });
-        commands.push({ type: 'restore', surfaceId: sid, params: {} });
-      } else {
-        commands.push({
-          type: 'line',
-          surfaceId: sid,
-          params: { x1: 0, y1: lineY, x2: w, y2: lineY, stroke: this.theme.divider, lineWidth: 1 },
-        });
-      }
+      commands.push({
+        type: 'line',
+        surfaceId: sid,
+        params: {
+          x1: 0, y1: lineY, x2: w, y2: lineY,
+          stroke: focused ? withAlpha(this.theme.accent, 0.28) : this.theme.divider,
+          lineWidth: 1,
+        },
+      });
     }
+
+    // (Focused-window outer glow halo is drawn by the compositor behind the
+    // window — see Compositor.drawFocusGlow — so it can extend beyond the window
+    // edges without being clipped by the window surface or covered by content.)
 
     // Resize grip — vector icon in the bottom-right corner
     if (this.resizable) {

@@ -10,6 +10,7 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
+import type { ThemeData } from '../core/theme-data.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 
@@ -29,6 +30,8 @@ export class WorkspaceSwitcher extends Abject {
   private workspaceBrowserId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
+  /** True when WorkspaceManager pushed a theme into the pending show(). */
+  private pushedTheme = false;
 
   /** Button AbjectId → workspace ID */
   private workspaceSwitchButtons: Map<AbjectId, string> = new Map();
@@ -144,6 +147,7 @@ the WorkspaceBrowser for discovering remote workspaces.
         activeWorkspaceId?: string;
         settingsId?: AbjectId;
         yOffset?: number;
+        theme?: ThemeData;
       } | undefined;
       if (payload?.workspaces) {
         this.cachedWorkspaces = payload.workspaces;
@@ -154,6 +158,11 @@ the WorkspaceBrowser for discovering remote workspaces.
       }
       if (payload?.yOffset !== undefined) {
         this.cachedYOffset = payload.yOffset;
+      }
+      // WorkspaceManager pushes the active workspace's theme on switch/startup.
+      if (payload?.theme && typeof payload.theme === 'object' && 'canvasBg' in payload.theme) {
+        this.theme = payload.theme;
+        this.pushedTheme = true;
       }
       return this.show();
     });
@@ -244,7 +253,36 @@ the WorkspaceBrowser for discovering remote workspaces.
     });
   }
 
+  /**
+   * Pull the active workspace's theme from WidgetManager before (re)building.
+   * As a global object outside any workspace, the switcher can't rely on
+   * `discoverDep('Theme')` (returns the first registered Theme, not the active
+   * one), so it would otherwise rebuild with a stale palette on startup and
+   * workspace switch.
+   */
+  private async refreshActiveTheme(): Promise<void> {
+    if (!this.widgetManagerId) return;
+    try {
+      const theme = await this.request<ThemeData>(
+        request(this.id, this.widgetManagerId, 'getActiveTheme', {})
+      );
+      if (theme && typeof theme === 'object' && 'canvasBg' in theme) {
+        this.theme = theme;
+      }
+    } catch {
+      // Keep the cached theme if WidgetManager isn't ready.
+    }
+  }
+
   async show(): Promise<boolean> {
+    // If WorkspaceManager already pushed the active theme into this show(), use
+    // it; otherwise pull it ourselves (e.g. a self-initiated re-show on create).
+    if (this.pushedTheme) {
+      this.pushedTheme = false;
+    } else {
+      await this.refreshActiveTheme();
+    }
+
     // Always destroy and rebuild
     if (this.windowId) {
       await this.request(
@@ -301,6 +339,8 @@ the WorkspaceBrowser for discovering remote workspaces.
       })
     );
 
+    // Active space ring matches the active-item highlight used by the other
+    // toolbars (Taskbar/global toolbar) for consistency.
     const wsActiveStyle = { background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
 
     // Build workspace buttons
@@ -322,7 +362,7 @@ the WorkspaceBrowser for discovering remote workspaces.
       // Batch create all widgets: header label, settings button, workspace buttons, +, Browse
       const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
       // 0: header label
-      specs.push({ type: 'label', windowId: this.windowId!, text: '\u25C8 Spaces', style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } });
+      specs.push({ type: 'label', windowId: this.windowId!, text: '\u25C8 Spaces', style: { color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display' } });
       // 1: "+" button (in header row)
       specs.push({ type: 'button', windowId: this.windowId!, text: '+', style: { fontSize: 13, align: 'center' } });
       // 2: settings gear button

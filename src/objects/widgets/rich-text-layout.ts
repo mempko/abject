@@ -71,8 +71,8 @@ function buildFontForStyle(
   isBold: boolean,
 ): string {
   const family = style === 'code'
-    ? '"JetBrains Mono", "Fira Code", monospace'
-    : '"Inter", system-ui, sans-serif';
+    ? '"Spline Sans Mono", "JetBrains Mono", monospace'
+    : '"Spectral", Georgia, "Times New Roman", serif';
   const size = style === 'code' ? baseFontSize - 1 : Math.round(baseFontSize * headingScale);
   const weight = (style === 'bold' || style === 'bold-italic' || isBold) ? 'bold' : 'normal';
   const italic = (style === 'italic' || style === 'bold-italic') ? 'italic ' : '';
@@ -286,7 +286,7 @@ async function layoutCodeBlock(
 ): Promise<void> {
   const codeFontSize = baseFontSize - 1;
   const lineHeight = codeFontSize + 4;
-  const font = `${codeFontSize}px "JetBrains Mono", "Fira Code", monospace`;
+  const font = `${codeFontSize}px "Spline Sans Mono", "JetBrains Mono", monospace`;
   const fill = theme.textPrimary;
   const codeText = block.spans[0]?.text ?? '';
   const codeLines = codeText.split('\n');
@@ -319,7 +319,7 @@ function tableFontForSpan(style: SpanStyle, size: number, isHeader: boolean): st
   const italic = (style === 'italic' || style === 'bold-italic') ? 'italic ' : '';
   const weight = (isHeader || style === 'bold' || style === 'bold-italic') ? 'bold' : 'normal';
   // Use monospace for the whole table so fixed-width column padding still aligns.
-  return `${italic}${weight} ${size}px "JetBrains Mono", "Fira Code", monospace`;
+  return `${italic}${weight} ${size}px "Spline Sans Mono", "JetBrains Mono", monospace`;
 }
 
 /** Word-wrap plain text into monospace lines of at most `maxChars`. */

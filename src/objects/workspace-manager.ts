@@ -15,6 +15,7 @@ import {
   SpawnResult,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
+import type { ThemeData } from '../core/theme-data.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
@@ -706,12 +707,25 @@ export class WorkspaceManager extends Abject {
     const ws = this.workspaces.get(this.activeWorkspaceId);
     if (!ws) return false;
 
+    // Resolve the active workspace's theme once and push it into each global
+    // toolbar's show() so they rebuild with the correct palette. The global
+    // toolbars are outside any workspace, so they can't resolve the active
+    // theme themselves reliably; pushing it here is deterministic and runs on
+    // both startup and every workspace switch (both flow through refreshTaskbar).
+    let activeTheme: ThemeData | undefined;
+    if (this.widgetManagerId) {
+      try {
+        activeTheme = await this.request<ThemeData>(
+          request(this.id, this.widgetManagerId, 'getActiveTheme', {}));
+      } catch { /* WidgetManager not ready — toolbars fall back to cached theme */ }
+    }
+
     // Stack order: GlobalToolbar → WorkspaceSwitcher → Taskbar
     let yOffset = 8;
 
     if (this.globalToolbarId) {
       try {
-        await this.request(request(this.id, this.globalToolbarId, 'show', { yOffset }));
+        await this.request(request(this.id, this.globalToolbarId, 'show', { yOffset, theme: activeTheme }));
         const toolbarHeight = await this.request<number>(
           request(this.id, this.globalToolbarId, 'getHeight', {}));
         yOffset = yOffset + toolbarHeight + 8;
@@ -728,6 +742,7 @@ export class WorkspaceManager extends Abject {
             activeWorkspaceId: this.activeWorkspaceId,
             settingsId: settingsEntry?.id,
             yOffset,
+            theme: activeTheme,
           }));
         const switcherHeight = await this.request<number>(
           request(this.id, this.workspaceSwitcherId, 'getHeight', {}));
@@ -739,6 +754,7 @@ export class WorkspaceManager extends Abject {
       try {
         await this.request(request(this.id, ws.taskbarId, 'show', {
           yOffset,
+          theme: activeTheme,
         }));
       } catch (err) {
         wsLog.warn('Failed to refresh taskbar:', err);

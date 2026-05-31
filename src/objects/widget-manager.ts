@@ -54,7 +54,7 @@ import {
   WidgetStyle,
   Rect,
   ThemeData,
-  MIDNIGHT_BLOOM,
+  ARCANE_GRIMOIRE,
 } from './widgets/widget-types.js';
 
 export type { WidgetStyle } from './widgets/widget-types.js';
@@ -67,7 +67,7 @@ const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 export class WidgetManager extends Abject {
   private uiServerId?: AbjectId;
   private consoleId?: AbjectId;
-  private defaultTheme: ThemeData = MIDNIGHT_BLOOM;
+  private defaultTheme: ThemeData = ARCANE_GRIMOIRE;
   private workspaceThemes: Map<string, { themeId: AbjectId; theme: ThemeData }> = new Map();
   /**
    * The currently active workspace. System-level widgets (workspace switcher,
@@ -76,6 +76,7 @@ export class WidgetManager extends Abject {
    */
   private activeWorkspaceId?: string;
   private windowManagerId?: AbjectId;
+  private workspaceManagerId?: AbjectId;
 
   // Tracking spawned Abjects (Set<AbjectId>, NOT references — network transparent)
   private spawnedWindows: Set<AbjectId> = new Set();
@@ -795,6 +796,18 @@ export class WidgetManager extends Abject {
       return true;
     });
 
+    /**
+     * Authoritative active-workspace theme. System-level containers that rebuild
+     * their own widgets (global toolbar, workspace switcher) pull this at the
+     * top of show() so they re-skin on startup and workspace switch — they can't
+     * rely on `discoverDep('Theme')` (returns the first registered Theme, not the
+     * active one) and the per-widget `updateTheme` broadcast can't re-resolve the
+     * accent colors they bake into label styles at build time.
+     */
+    this.on('getActiveTheme', async () => {
+      return this.activeTheme();
+    });
+
     this.on('getObjectWorkspace', async (msg: AbjectMessage) => {
       const { objectId } = msg.payload as { objectId: string };
       return this.objectWorkspaces.get(objectId as AbjectId) ?? null;
@@ -859,6 +872,12 @@ export class WidgetManager extends Abject {
           // the whole frame flips colour together.
           if (changedWorkspaceId === this.activeWorkspaceId) {
             this.broadcastThemeToSystemWidgets(newTheme);
+            // updateTheme can't recolor an explicit style.color (e.g. the
+            // toolbar section labels baked from theme.accent), so ask
+            // WorkspaceManager to rebuild the global toolbars too. Covers the
+            // startup race where a workspace's persisted theme loads after the
+            // first refreshTaskbar.
+            void this.requestTaskbarRefresh();
           }
           return;
         }
@@ -987,21 +1006,50 @@ export class WidgetManager extends Abject {
     );
   }
 
+  /**
+   * The active workspace's theme — the palette system-level chrome (global
+   * toolbar, workspace switcher, modal dialogs) should wear so it re-skins
+   * together with the active workspace's content. Falls back to the default
+   * theme before any workspace is active.
+   */
+  private activeTheme(): ThemeData {
+    const entry = this.activeWorkspaceId
+      ? this.workspaceThemes.get(this.activeWorkspaceId)
+      : undefined;
+    return entry?.theme ?? this.defaultTheme;
+  }
+
+  /**
+   * Ask WorkspaceManager to rebuild the global toolbars (fire-and-forget so we
+   * never block or deadlock — refreshTaskbar calls back into getActiveTheme).
+   */
+  private async requestTaskbarRefresh(): Promise<void> {
+    if (!this.workspaceManagerId) {
+      this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
+    }
+    if (this.workspaceManagerId) {
+      try {
+        this.send(request(this.id, this.workspaceManagerId, 'refreshTaskbar', {}));
+      } catch { /* WorkspaceManager not reachable */ }
+    }
+  }
+
   /** Get theme for a window's owner (traces windowOwners → objectWorkspaces → workspace theme). */
   private getThemeForWindow(windowId: AbjectId): ThemeData {
     const ownerId = this.windowOwners.get(windowId);
     if (ownerId) return this.getThemeForOwner(ownerId);
-    return this.defaultTheme;
+    return this.activeTheme();
   }
 
-  /** Get theme for a given owner AbjectId (looks up owner's workspace → workspace theme → default). */
+  /** Get theme for a given owner AbjectId (looks up owner's workspace → workspace theme → active). */
   private getThemeForOwner(ownerId: AbjectId): ThemeData {
     const wsId = this.objectWorkspaces.get(ownerId);
     if (wsId) {
       const entry = this.workspaceThemes.get(wsId);
       if (entry) return entry.theme;
     }
-    return this.defaultTheme;
+    // Untagged (system-level) owners follow the active workspace's theme.
+    return this.activeTheme();
   }
 
   /**
@@ -1303,7 +1351,7 @@ await this.call(canvasId, 'draw', {
   commands: [
     { type: 'clear', surfaceId: 'c', params: { color: '#1a1a2e' } },
     { type: 'rect', surfaceId: 'c', params: { x: 10, y: 10, width: 50, height: 50, fill: '#ff0' } },
-    { type: 'circle', surfaceId: 'c', params: { cx: 100, cy: 100, radius: 30, fill: '#39ff8e' } },
+    { type: 'circle', surfaceId: 'c', params: { cx: 100, cy: 100, radius: 30, fill: '#5be5a0' } },
   ]
 });
 

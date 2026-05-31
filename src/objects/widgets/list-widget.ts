@@ -156,7 +156,7 @@ export class ListWidget extends WidgetAbject {
           params: {
             x: sx + 6, y: sy + sh / 2,
             text: this.searchText,
-            font: '12px "Inter", system-ui, sans-serif',
+            font: '12px "Spectral", Georgia, "Times New Roman", serif',
             fill: this.theme.textPrimary,
             baseline: 'middle',
           },
@@ -168,7 +168,7 @@ export class ListWidget extends WidgetAbject {
           params: {
             x: sx + 6, y: sy + sh / 2,
             text: '\u{1F50D} Search...',
-            font: '12px "Inter", system-ui, sans-serif',
+            font: '12px "Spectral", Georgia, "Times New Roman", serif',
             fill: this.theme.textPlaceholder,
             baseline: 'middle',
           },
@@ -179,7 +179,7 @@ export class ListWidget extends WidgetAbject {
       if (this.searchFocused) {
         const beforeCursor = this.searchText.substring(0, this.searchCursorPos);
         const cursorX = sx + 6 + (beforeCursor.length > 0
-          ? await this.measureText(surfaceId, beforeCursor, '12px "Inter", system-ui, sans-serif')
+          ? await this.measureText(surfaceId, beforeCursor, '12px "Spectral", Georgia, "Times New Roman", serif')
           : 0);
         commands.push({
           type: 'line',
@@ -211,8 +211,8 @@ export class ListWidget extends WidgetAbject {
       Math.floor((this.scrollTop + listH) / this.itemHeight)
     );
 
-    const font = '13px "Inter", system-ui, sans-serif';
-    const secondaryFont = '11px "Inter", system-ui, sans-serif';
+    const font = '13px "Spectral", Georgia, "Times New Roman", serif';
+    const secondaryFont = '11px "Spectral", Georgia, "Times New Roman", serif';
 
     for (let i = firstVisible; i <= lastVisible; i++) {
       const item = this.filteredItems[i];

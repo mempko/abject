@@ -15,7 +15,7 @@ import {
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request } from '../core/message.js';
 import type { ThemeData } from '../core/theme-data.js';
-import { MIDNIGHT_BLOOM } from '../core/theme-data.js';
+import { ARCANE_GRIMOIRE } from '../core/theme-data.js';
 
 const MODAL_DIALOG_INTERFACE: InterfaceId = 'abjects:modal-dialog' as InterfaceId;
 
@@ -26,7 +26,7 @@ export class ModalDialog extends Abject {
   private confirmBtnId?: AbjectId;
   private cancelBtnId?: AbjectId;
   private pendingResolve?: (confirmed: boolean) => void;
-  private dialogTheme: ThemeData = MIDNIGHT_BLOOM;
+  private dialogTheme: ThemeData = ARCANE_GRIMOIRE;
 
   constructor() {
     super({

@@ -25,7 +25,7 @@ import { INTROSPECT_METHODS, INTROSPECT_EVENTS, formatManifestAsDescription } fr
 import type { InterfaceId } from './types.js';
 import { Log } from './timed-log.js';
 import type { ThemeData } from './theme-data.js';
-import { MIDNIGHT_BLOOM } from './theme-data.js';
+import { ARCANE_GRIMOIRE } from './theme-data.js';
 
 const log = new Log('ABJECT');
 
@@ -412,10 +412,12 @@ export abstract class Abject {
   }
 
   /**
-   * Get the current theme. Returns cached theme or MIDNIGHT_BLOOM default.
-   * WidgetAbject overrides this field directly (set from config).
+   * Get the current theme. Returns cached theme or ARCANE_GRIMOIRE default
+   * (must match DEFAULT_THEME_ID so objects built before the persisted theme
+   * loads don't flash a mismatched palette). WidgetAbject overrides this field
+   * directly (set from config).
    */
-  protected theme: ThemeData = MIDNIGHT_BLOOM;
+  protected theme: ThemeData = ARCANE_GRIMOIRE;
 
   /**
    * Discover the Theme object, fetch the current theme, cache it, and

@@ -199,12 +199,12 @@ const SHARED_TOKENS: DesignTokens = {
     xxxl: 32,
   },
   type: {
-    caption:    { font: '"Inter", system-ui, sans-serif',          size: 11, weight: '400', lineHeight: 14 },
-    body:       { font: '"Inter", system-ui, sans-serif',          size: 14, weight: '400', lineHeight: 20 },
-    bodyStrong: { font: '"Inter", system-ui, sans-serif',          size: 14, weight: '600', lineHeight: 20 },
-    title:      { font: '"Inter", system-ui, sans-serif',          size: 13, weight: '600', lineHeight: 18 },
-    display:    { font: '"Inter", system-ui, sans-serif',          size: 18, weight: '700', lineHeight: 24 },
-    code:       { font: '"JetBrains Mono", "Fira Code", monospace', size: 13, weight: '400', lineHeight: 18 },
+    caption:    { font: '"Spectral", Georgia, serif',                 size: 11, weight: '400', lineHeight: 14 },
+    body:       { font: '"Spectral", Georgia, serif',                 size: 14, weight: '400', lineHeight: 20 },
+    bodyStrong: { font: '"Spectral", Georgia, serif',                 size: 14, weight: '600', lineHeight: 20 },
+    title:      { font: '"Fraunces", "Spectral", Georgia, serif',     size: 14, weight: '600', lineHeight: 18 },
+    display:    { font: '"Fraunces", "Spectral", Georgia, serif',     size: 19, weight: '600', lineHeight: 24 },
+    code:       { font: '"Spline Sans Mono", "JetBrains Mono", monospace', size: 13, weight: '400', lineHeight: 18 },
   },
   radius: {
     sm: 4,
@@ -235,6 +235,119 @@ const SHARED_TOKENS: DesignTokens = {
     accent: { blur: 10, color: 'rgba(57, 255, 142, 0.35)' },
     danger: { blur: 14, color: 'rgba(255, 77, 106, 0.5)' },
   },
+};
+
+// Local hex→rgba (theme-data.ts stays import-free to avoid a cycle with
+// widget-types.ts, which re-exports from here).
+function glowRgba(hex: string, alpha: number): string {
+  const c = hex.replace('#', '');
+  const full = c.length === 3 ? c.split('').map((ch) => ch + ch).join('') : c;
+  const r = parseInt(full.slice(0, 2), 16);
+  const g = parseInt(full.slice(2, 4), 16);
+  const b = parseInt(full.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+// Build the shared design tokens with the focus/accent glow halos tinted to a
+// theme's own accent, so the focus glow matches each theme rather than leaking
+// the shared green. Danger keeps the conventional red error glow.
+function tokensWithGlow(accent: string): DesignTokens {
+  return {
+    ...SHARED_TOKENS,
+    glow: {
+      focus:  { blur: 18, color: glowRgba(accent, 0.5) },
+      accent: { blur: 10, color: glowRgba(accent, 0.32) },
+      danger: SHARED_TOKENS.glow.danger,
+    },
+  };
+}
+
+export const ARCANE_GRIMOIRE: ThemeData = {
+  canvasBg: '#05060a',
+  windowBg: '#13141f',
+  titleBarBg: '#1c1f2e',
+  accent: '#5be5a0',
+  accentSecondary: '#8b7bff',
+  accentTertiary: '#ff5c77',
+  textPrimary: '#e8e6dc',
+  textSecondary: '#9a98a8',
+  textTertiary: '#5e5c70',
+  textPlaceholder: '#3a3a48',
+  buttonBg: '#1f2030',
+  buttonBorder: '#32344c',
+  buttonText: '#e8e6dc',
+  inputBg: '#07080e',
+  inputBorder: '#24263a',
+  inputBorderFocus: '#5be5a0',
+  windowBorder: '#30335a',
+  divider: '#24263a',
+  resizeGrip: '#5e5c70',
+  progressTrack: '#0a0b12',
+  progressFill: '#8b7bff',
+  cursor: '#5be5a0',
+  checkboxCheckedBg: '#5be5a0',
+  checkboxBorder: '#2a2b3d',
+  checkmarkColor: '#05060a',
+  selectBg: '#10111c',
+  selectHover: '#181a28',
+  selectArrow: '#5e5c70',
+  selectionBg: 'rgba(91, 229, 160, 0.20)',
+  sliderTrack: '#0a0b12',
+  sliderFill: '#8b7bff',
+  sliderThumb: '#8b7bff',
+  sliderThumbBorder: '#2a2b3d',
+  windowRadius: 7,
+  widgetRadius: 6,
+  titleBarHeight: 36,
+  titleButtonSize: 24,
+  titleButtonMargin: 6,
+  titleButtonIconSize: 14,
+  titleButtonHoverBg: '#22243a',
+  titleCloseHoverBg: '#ff5c77',
+
+  // ── Semantic action buttons ──
+  actionBg: '#5be5a0',
+  actionText: '#05060a',
+  actionBorder: '#5be5a0',
+
+  // ── Destructive buttons ──
+  destructiveBg: '#2a1a22',
+  destructiveText: '#e57184',
+  destructiveBorder: '#c4566b',
+
+  // ── Active sidebar/list item highlight ──
+  // Kept a step above the lifted windowBg so selected rows stay visible.
+  activeItemBg: '#222539',
+  activeItemBorder: '#5be5a0',
+
+  // ── Status indicators ──
+  statusSuccess: '#8fe0b0',
+  statusError: '#ff5c77',
+  statusErrorBright: '#ff8097',
+  statusWarning: '#8b7bff',
+  statusNeutral: '#6b6980',
+  statusInfo: '#7cb6e5',
+
+  // ── Semantic text ──
+  textHeading: '#f2f0e6',
+  textDescription: '#c4c2b8',
+  textMeta: '#8e8c9c',
+  sectionLabel: '#6b6980',
+
+  // ── Scrollbar ──
+  scrollbarTrack: 'rgba(232,230,220,0.04)',
+  scrollbarThumb: 'rgba(232,230,220,0.14)',
+  scrollbarThumbHover: 'rgba(91,229,160,0.32)',
+
+  // ── Shadow ──
+  shadowColor: 'rgba(0,0,0,0.75)',
+  dropdownShadow: 'rgba(0,0,0,0.55)',
+
+  // ── Links ──
+  linkColor: '#8b7bff',
+
+  // ── Design Tokens ──
+  tokens: tokensWithGlow('#5be5a0'),
 };
 
 export const MIDNIGHT_BLOOM: ThemeData = {
@@ -321,7 +434,7 @@ export const MIDNIGHT_BLOOM: ThemeData = {
   linkColor: '#6ea8fe',
 
   // ── Design Tokens ──
-  tokens: SHARED_TOKENS,
+  tokens: tokensWithGlow('#39ff8e'),
 };
 
 // ── Paper (light) ──────────────────────────────────────────────────────────
@@ -391,7 +504,7 @@ export const PAPER_LIGHT: ThemeData = {
   shadowColor: 'rgba(50,40,30,0.18)',
   dropdownShadow: 'rgba(50,40,30,0.15)',
   linkColor: '#1f4fc4',
-  tokens: SHARED_TOKENS,
+  tokens: tokensWithGlow('#4a4ad9'),
 };
 
 // ── High Contrast ──────────────────────────────────────────────────────────
@@ -461,7 +574,7 @@ export const HIGH_CONTRAST: ThemeData = {
   shadowColor: 'rgba(0,0,0,0.95)',
   dropdownShadow: 'rgba(0,0,0,0.9)',
   linkColor: '#00e5ff',
-  tokens: SHARED_TOKENS,
+  tokens: tokensWithGlow('#ffd700'),
 };
 
 // ── Sunset ─────────────────────────────────────────────────────────────────
@@ -531,7 +644,7 @@ export const SUNSET: ThemeData = {
   shadowColor: 'rgba(0,0,0,0.7)',
   dropdownShadow: 'rgba(0,0,0,0.5)',
   linkColor: '#ffd29a',
-  tokens: SHARED_TOKENS,
+  tokens: tokensWithGlow('#ffb454'),
 };
 
 // ── Ocean ──────────────────────────────────────────────────────────────────
@@ -601,7 +714,7 @@ export const OCEAN: ThemeData = {
   shadowColor: 'rgba(0,0,0,0.7)',
   dropdownShadow: 'rgba(0,0,0,0.5)',
   linkColor: '#7ab8d9',
-  tokens: SHARED_TOKENS,
+  tokens: tokensWithGlow('#3ae0d8'),
 };
 
 // ── Monochrome ─────────────────────────────────────────────────────────────
@@ -671,7 +784,7 @@ export const MONOCHROME: ThemeData = {
   shadowColor: 'rgba(0,0,0,0.7)',
   dropdownShadow: 'rgba(0,0,0,0.5)',
   linkColor: '#a0a0c0',
-  tokens: SHARED_TOKENS,
+  tokens: tokensWithGlow('#c0c0c0'),
 };
 
 // ── Dracula ────────────────────────────────────────────────────────────────
@@ -741,7 +854,7 @@ export const DRACULA: ThemeData = {
   shadowColor: 'rgba(0,0,0,0.7)',
   dropdownShadow: 'rgba(0,0,0,0.5)',
   linkColor: '#8be9fd',
-  tokens: SHARED_TOKENS,
+  tokens: tokensWithGlow('#ff79c6'),
 };
 
 // ── Solarized Light ────────────────────────────────────────────────────────
@@ -811,7 +924,78 @@ export const SOLARIZED_LIGHT: ThemeData = {
   shadowColor: 'rgba(50,40,30,0.18)',
   dropdownShadow: 'rgba(50,40,30,0.15)',
   linkColor: '#268bd2',
-  tokens: SHARED_TOKENS,
+  tokens: tokensWithGlow('#268bd2'),
+};
+
+// ── Rosé Pine ────────────────────────────────────────────────────────────────
+// Muted, elegant: a dusky violet-grey base lit by soft rose, iris, and gold.
+export const ROSE_PINE: ThemeData = {
+  canvasBg: '#16141f',
+  windowBg: '#1f1d2e',
+  titleBarBg: '#26233a',
+  accent: '#ebbcba',
+  accentSecondary: '#c4a7e7',
+  accentTertiary: '#eb6f92',
+  textPrimary: '#e0def4',
+  textSecondary: '#908caa',
+  textTertiary: '#6e6a86',
+  textPlaceholder: '#504c68',
+  buttonBg: '#2a2740',
+  buttonBorder: '#403d52',
+  buttonText: '#e0def4',
+  inputBg: '#191724',
+  inputBorder: '#403d52',
+  inputBorderFocus: '#ebbcba',
+  windowBorder: '#403d52',
+  divider: '#26233a',
+  resizeGrip: '#6e6a86',
+  progressTrack: '#191724',
+  progressFill: '#c4a7e7',
+  cursor: '#ebbcba',
+  checkboxCheckedBg: '#ebbcba',
+  checkboxBorder: '#403d52',
+  checkmarkColor: '#191724',
+  selectBg: '#1f1d2e',
+  selectHover: '#26233a',
+  selectArrow: '#6e6a86',
+  selectionBg: 'rgba(235, 188, 186, 0.20)',
+  sliderTrack: '#191724',
+  sliderFill: '#c4a7e7',
+  sliderThumb: '#c4a7e7',
+  sliderThumbBorder: '#403d52',
+  windowRadius: 8,
+  widgetRadius: 6,
+  titleBarHeight: 36,
+  titleButtonSize: 24,
+  titleButtonMargin: 6,
+  titleButtonIconSize: 14,
+  titleButtonHoverBg: '#2a2740',
+  titleCloseHoverBg: '#eb6f92',
+  actionBg: '#ebbcba',
+  actionText: '#191724',
+  actionBorder: '#ebbcba',
+  destructiveBg: '#2e1a24',
+  destructiveText: '#eb6f92',
+  destructiveBorder: '#b4637a',
+  activeItemBg: '#26233a',
+  activeItemBorder: '#ebbcba',
+  statusSuccess: '#9ccfd8',
+  statusError: '#eb6f92',
+  statusErrorBright: '#f6849f',
+  statusWarning: '#f6c177',
+  statusNeutral: '#6e6a86',
+  statusInfo: '#c4a7e7',
+  textHeading: '#e0def4',
+  textDescription: '#c8c4e0',
+  textMeta: '#908caa',
+  sectionLabel: '#6e6a86',
+  scrollbarTrack: 'rgba(224,222,244,0.05)',
+  scrollbarThumb: 'rgba(224,222,244,0.18)',
+  scrollbarThumbHover: 'rgba(235,188,186,0.4)',
+  shadowColor: 'rgba(0,0,0,0.7)',
+  dropdownShadow: 'rgba(0,0,0,0.5)',
+  linkColor: '#9ccfd8',
+  tokens: tokensWithGlow('#ebbcba'),
 };
 
 // ── Theme catalogue ────────────────────────────────────────────────────────
@@ -824,9 +1008,10 @@ export interface ThemePreset {
   theme: ThemeData;
 }
 
-export const DEFAULT_THEME_ID = 'midnight-bloom';
+export const DEFAULT_THEME_ID = 'arcane-grimoire';
 
 export const BUILTIN_THEME_PRESETS: readonly ThemePreset[] = [
+  { id: 'arcane-grimoire', name: 'Arcane Grimoire', description: 'Ink void with rune-green and violet sigil accents', builtin: true, theme: ARCANE_GRIMOIRE },
   { id: 'midnight-bloom', name: 'Midnight Bloom', description: 'Dark with green and purple accents', builtin: true, theme: MIDNIGHT_BLOOM },
   { id: 'paper-light',    name: 'Paper',          description: 'Warm light theme with indigo accent', builtin: true, theme: PAPER_LIGHT },
   { id: 'high-contrast',  name: 'High Contrast',  description: 'Black, white, and yellow for accessibility', builtin: true, theme: HIGH_CONTRAST },
@@ -835,6 +1020,7 @@ export const BUILTIN_THEME_PRESETS: readonly ThemePreset[] = [
   { id: 'monochrome',     name: 'Monochrome',     description: 'Neutral grays with silver accent',   builtin: true, theme: MONOCHROME },
   { id: 'dracula',        name: 'Dracula',        description: 'Pink, purple, cyan on plum',         builtin: true, theme: DRACULA },
   { id: 'solarized-light',name: 'Solarized Light',description: 'Warm cream with classic blue accent',builtin: true, theme: SOLARIZED_LIGHT },
+  { id: 'rose-pine',      name: 'Rosé Pine',      description: 'Muted dusky violet with soft rose and iris', builtin: true, theme: ROSE_PINE },
 ] as const;
 
 export function getBuiltinThemeById(id: string): ThemeData | undefined {
@@ -850,5 +1036,5 @@ export function isBuiltinThemeId(id: string): boolean {
  * MIDNIGHT_BLOOM. Used so user-registered themes that omit fields still render.
  */
 export function fillThemeDefaults(partial: Partial<ThemeData>): ThemeData {
-  return { ...MIDNIGHT_BLOOM, ...partial, tokens: partial.tokens ?? MIDNIGHT_BLOOM.tokens };
+  return { ...ARCANE_GRIMOIRE, ...partial, tokens: partial.tokens ?? ARCANE_GRIMOIRE.tokens };
 }

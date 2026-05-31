@@ -117,6 +117,7 @@ export {
   TITLE_BAR_HEIGHT,
   EDGE_SIZE,
   MIDNIGHT_BLOOM,
+  ARCANE_GRIMOIRE,
 } from './objects/widgets/widget-types.js';
 export type { WidgetType, Rect, WidgetStyle as WidgetAbjectStyle, SizePolicy, LayoutChildConfig, SpacerConfig, ThemeData } from './objects/widgets/widget-types.js';
 

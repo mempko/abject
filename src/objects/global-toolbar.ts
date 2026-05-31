@@ -8,6 +8,7 @@
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
+import type { ThemeData } from '../core/theme-data.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 
@@ -30,6 +31,8 @@ export class GlobalToolbar extends Abject {
 
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
+  /** True when WorkspaceManager pushed a theme into the pending show(). */
+  private pushedTheme = false;
   private settingsBtnId?: AbjectId;
   private networkBtnId?: AbjectId;
   private explorerBtnId?: AbjectId;
@@ -125,7 +128,12 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
 
   private setupHandlers(): void {
     this.on('show', async (msg: AbjectMessage) => {
-      const { yOffset } = msg.payload as { yOffset?: number } ?? {};
+      const { yOffset, theme } = msg.payload as { yOffset?: number; theme?: ThemeData } ?? {};
+      // WorkspaceManager pushes the active workspace's theme on switch/startup.
+      if (theme && typeof theme === 'object' && 'canvasBg' in theme) {
+        this.theme = theme;
+        this.pushedTheme = true;
+      }
       return this.show(yOffset ?? 8);
     });
 
@@ -238,7 +246,35 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
     }
   }
 
+  /**
+   * Pull the active workspace's theme from WidgetManager before (re)building.
+   * `discoverDep('Theme')` can't be trusted here (it returns the first registered
+   * Theme, not the active workspace's), so the toolbar would otherwise rebuild
+   * with a stale palette on startup and workspace switch.
+   */
+  private async refreshActiveTheme(): Promise<void> {
+    if (!this.widgetManagerId) return;
+    try {
+      const theme = await this.request<ThemeData>(
+        request(this.id, this.widgetManagerId, 'getActiveTheme', {})
+      );
+      if (theme && typeof theme === 'object' && 'canvasBg' in theme) {
+        this.theme = theme;
+      }
+    } catch {
+      // Keep the cached theme if WidgetManager isn't ready.
+    }
+  }
+
   async show(yOffset = 8): Promise<boolean> {
+    // If WorkspaceManager already pushed the active theme into this show(), use
+    // it; otherwise pull it ourselves (e.g. a self-initiated re-show).
+    if (this.pushedTheme) {
+      this.pushedTheme = false;
+    } else {
+      await this.refreshActiveTheme();
+    }
+
     // Always destroy and rebuild (position may have changed)
     if (this.windowId) {
       await this.request(
@@ -307,7 +343,7 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
-          { type: 'label', windowId: this.windowId!, text: '\u2699 System', style: { color: this.theme.accent, fontSize: 11, fontWeight: 'bold' } },
+          { type: 'label', windowId: this.windowId!, text: '\u2699 System', style: { color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display' } },
           { type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13 } },
           { type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Network' },
           { type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0D Explorer' },
