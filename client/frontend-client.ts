@@ -604,6 +604,7 @@ export class FrontendClient {
       msg.inputPassthrough ?? false,
       false, // inputMonitor
       msg.title,
+      msg.transparent ?? false,
     );
 
     this.sendToBackend({

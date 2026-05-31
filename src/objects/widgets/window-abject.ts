@@ -420,6 +420,7 @@ method calls on 'abjects:widgets' interface:
       request(this.id, this.uiServerId, 'createSurface', {
         rect: this.rect,
         zIndex: this.zIndex,
+        transparent: this.transparent,
       })
     );
     // Forward title to frontend for mobile tab bar

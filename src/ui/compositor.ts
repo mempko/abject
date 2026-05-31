@@ -24,6 +24,7 @@ export interface Surface {
   ctx: OffscreenCanvasRenderingContext2D;
   dirty: boolean;
   drawn: boolean;        // false until first draw batch; prevents rendering empty surfaces
+  transparent: boolean;  // window paints no background; skip the focus-glow halo (it would bleed through)
   workspaceId?: string;  // undefined = always visible (global objects)
   title?: string;        // window title for mobile tab bar
 }
@@ -295,6 +296,7 @@ export class Compositor {
     inputPassthrough = false,
     inputMonitor = false,
     title?: string,
+    transparent = false,
   ): string {
     require(objectId !== '', 'objectId is required');
     require(rect.width > 0 && rect.height > 0, 'Surface must have positive dimensions');
@@ -317,6 +319,7 @@ export class Compositor {
       ctx: ctx!,
       dirty: true,
       drawn: false,
+      transparent,
       title,
     };
 
@@ -1100,7 +1103,10 @@ export class Compositor {
       if (!surface.visible || !surface.drawn) continue;
       if (this.isWorkspaceFiltered(surface)) continue;
 
-      if (surface.id === this.focusedSurfaceId) {
+      // Skip the focus-glow halo for transparent windows: the glow fills the
+      // window silhouette behind the surface, which would bleed through a
+      // surface that paints no background of its own (e.g. toasts).
+      if (surface.id === this.focusedSurfaceId && !surface.transparent) {
         this.drawFocusGlow(surface.rect);
       }
 

@@ -28,6 +28,8 @@ export interface CreateSurfaceMsg extends WsEnvelope {
   zIndex: number;
   inputPassthrough?: boolean;
   title?: string;
+  /** Window paints no background; the compositor skips its focus-glow halo. */
+  transparent?: boolean;
 }
 
 export interface SetSurfaceTitleMsg extends WsEnvelope {

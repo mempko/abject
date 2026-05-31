@@ -39,6 +39,7 @@ export interface SurfaceState {
   zIndex: number;
   inputPassthrough: boolean;
   inputMonitor: boolean;
+  transparent: boolean;
   lastDrawCommands: Array<{ type: string; surfaceId: string; params: unknown }>;
   workspaceId?: string;
   title?: string;
@@ -487,13 +488,14 @@ export class BackendUI extends Abject {
 
   private setupHandlers(): void {
     this.on('createSurface', async (msg: AbjectMessage) => {
-      const { rect, zIndex, inputPassthrough, inputMonitor } = msg.payload as {
+      const { rect, zIndex, inputPassthrough, inputMonitor, transparent } = msg.payload as {
         rect: { x: number; y: number; width: number; height: number };
         zIndex?: number;
         inputPassthrough?: boolean;
         inputMonitor?: boolean;
+        transparent?: boolean;
       };
-      return this.handleCreateSurface(msg.routing.from, rect, zIndex, inputPassthrough, inputMonitor);
+      return this.handleCreateSurface(msg.routing.from, rect, zIndex, inputPassthrough, inputMonitor, transparent);
     });
 
     this.on('destroySurface', async (msg: AbjectMessage) => {
@@ -1195,7 +1197,8 @@ IMPORTANT:
     rect: { x: number; y: number; width: number; height: number },
     zIndex?: number,
     inputPassthrough?: boolean,
-    inputMonitor?: boolean
+    inputMonitor?: boolean,
+    transparent?: boolean
   ): string {
     const surfaceId = `surface-${objectId}-${this.surfaceCounter++}`;
     const z = zIndex ?? 0;
@@ -1207,6 +1210,7 @@ IMPORTANT:
       zIndex: z,
       inputPassthrough: inputPassthrough ?? false,
       inputMonitor: inputMonitor ?? false,
+      transparent: transparent ?? false,
       lastDrawCommands: [],
     });
 
@@ -1217,6 +1221,7 @@ IMPORTANT:
       rect,
       zIndex: z,
       inputPassthrough: inputPassthrough ?? false,
+      transparent: transparent ?? false,
     });
 
     this.log('debug', 'createSurface', { surfaceId, objectId, rect, zIndex });
@@ -1842,6 +1847,7 @@ IMPORTANT:
         rect: { ...state.rect },
         zIndex: state.zIndex,
         inputPassthrough: state.inputPassthrough,
+        transparent: state.transparent,
         title: state.title,
       }, clientId);
     }
