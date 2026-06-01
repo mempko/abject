@@ -323,6 +323,24 @@ export abstract class LayoutAbject extends WidgetAbject {
       return true;
     });
 
+    // Forward `removeChild` up the owner chain until it reaches the WINDOW.
+    // A widget placed in this layout may still be a *direct* child of the
+    // window (e.g. a canvas added via createCanvas, which the window sizes to
+    // the full content area and re-fills on every resize). addLayoutChild(ren)
+    // sends `removeChild` to detach it from that full-content path — but a
+    // NESTED layout's owner is its PARENT LAYOUT, not the window, and layouts
+    // had no `removeChild` handler, so the message was silently dropped and the
+    // widget kept being painted full-content over its layout siblings. Bubbling
+    // to `this.ownerId` reaches the window (whose `removeChild` does the real
+    // detach) regardless of nesting depth; the chain terminates at the window.
+    this.on('removeChild', async (msg: AbjectMessage) => {
+      const { widgetId } = msg.payload as { widgetId: AbjectId };
+      this.send(
+        request(this.id, this.ownerId, 'removeChild', { widgetId })
+      );
+      return true;
+    });
+
     this.on('clearLayoutChildren', async () => {
       this.layoutChildren = [];
       this.hoveredLayoutChildId = undefined;
