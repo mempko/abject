@@ -288,23 +288,52 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return this.request<T>(request(this.id, target, method, payload), timeoutMs);
   }
 
-  /** Resolve a name or UUID to an AbjectId. */
+  /**
+   * Resolve a reference (live AbjectId, durable TypeId, or registered name) to
+   * the CURRENT live AbjectId.
+   *
+   * An id-shaped string is NOT trusted blindly: AbjectIds are ephemeral and
+   * churn every time AbjectStore restores an object on restart, so a stale id
+   * captured in a prior session (or baked into a goal / KnowledgeBase entry)
+   * must be verified against the live registry before use. If it isn't live,
+   * we fall through to TypeId and name resolution rather than silently adopting
+   * a dead id (which is exactly what made getSource return nothing earlier).
+   */
   private async resolveTarget(nameOrId: string): Promise<AbjectId | undefined> {
     if (!nameOrId) return undefined;
-    if (nameOrId.includes('-') && nameOrId.length > 20) return nameOrId as AbjectId;
-    if (this.registryId) {
-      try {
-        const hits = await this.sendRequest<ObjectRegistration[]>(this.registryId, 'discover', { name: nameOrId });
-        if (hits && hits.length > 0) return hits[0].id;
-      } catch { /* fall through */ }
+    const idShaped = nameOrId.includes('-') && nameOrId.length > 20;
+
+    // Fast path: an id-shaped string that is a live registration.
+    if (idShaped && await this.isLiveRegistration(nameOrId as AbjectId)) {
+      return nameOrId as AbjectId;
     }
-    if (this.systemRegistryId) {
+
+    for (const registryId of [this.registryId, this.systemRegistryId]) {
+      if (!registryId) continue;
+      // Durable TypeId → current AbjectId.
       try {
-        const hits = await this.sendRequest<ObjectRegistration[]>(this.systemRegistryId, 'discover', { name: nameOrId });
+        const live = await this.sendRequest<AbjectId | null>(registryId, 'resolveType', { typeId: nameOrId });
+        if (live) return live;
+      } catch { /* fall through */ }
+      // Registered name → first live AbjectId.
+      try {
+        const hits = await this.sendRequest<ObjectRegistration[]>(registryId, 'discover', { name: nameOrId });
         if (hits && hits.length > 0) return hits[0].id;
       } catch { /* fall through */ }
     }
     return undefined;
+  }
+
+  /** True if `id` is a currently-registered object in either registry. */
+  private async isLiveRegistration(id: AbjectId): Promise<boolean> {
+    for (const registryId of [this.registryId, this.systemRegistryId]) {
+      if (!registryId) continue;
+      try {
+        const reg = await this.sendRequest<ObjectRegistration | null>(registryId, 'lookup', { objectId: id });
+        if (reg) return true;
+      } catch { /* fall through */ }
+    }
+    return false;
   }
 
   /** Report progress to an upstream caller (for GoalManager / JobBrowser visibility). */
@@ -382,7 +411,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       return {
         ok: false,
         summary: 'draft_diff: no base source',
-        error: 'draft_diff requires an existing source to edit. For modify loops the target source is loaded automatically; for create flows use draft_source instead.',
+        error: 'draft_diff requires an existing source to edit. For modify loops the target source is loaded automatically. If you discovered the goal is about an existing object, call load_target({objectId|targetName}) to adopt it and load its source, then draft_diff. For a brand-new object, use draft_source instead.',
       };
     }
 
@@ -413,6 +442,56 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return {
       ok: true,
       summary: `draft_diff: ${parsed.blocks.length} block${parsed.blocks.length === 1 ? '' : 's'} applied${stackedNote}, source now ${result.source!.split('\n').length} lines${parseNote}`,
+    };
+  }
+
+  /**
+   * Adopt an existing object as the loop's modify target. Resolves a UUID or
+   * registered name, loads its current source into `state.targetSource`, and
+   * pivots the loop to a modify (so `draft_diff` has a base and `deploy_update`
+   * has a target). This is how a loop that began as a create — because no
+   * target was supplied at dispatch — recovers once it discovers (via ask /
+   * describe / discover) that the goal is really about an existing Abject.
+   * Idempotent: calling it again with the same target is a no-op refresh.
+   */
+  private async opLoadTarget(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
+    const nameOrId = (action.objectId ?? action.target ?? action.targetName ?? action.objectName) as string | undefined;
+    if (typeof nameOrId !== 'string' || nameOrId.length === 0) {
+      return { ok: false, summary: 'load_target: missing target', error: 'pass {objectId} or {targetName} naming the existing object to modify' };
+    }
+    const resolvedId = await this.resolveTarget(nameOrId);
+    if (!resolvedId) {
+      return {
+        ok: false,
+        summary: `load_target: not found: ${nameOrId}`,
+        error: `Could not resolve target "${nameOrId}". Use call("Registry", "ask", {question: "is there an object that handles X?"}) or call("Registry", "discover", {name: "..."}) to find it first.`,
+      };
+    }
+
+    let source: string | undefined;
+    if (this.registryId) {
+      try {
+        const src = await this.sendRequest<string | null>(this.registryId, 'getSource', { objectId: resolvedId }, 5000);
+        if (typeof src === 'string' && src.length > 0) source = src;
+      } catch { /* best effort */ }
+    }
+
+    state.targetObjectId = resolvedId;
+    state.targetName = nameOrId.includes('-') && nameOrId.length > 20 ? undefined : nameOrId;
+    if (source !== undefined) state.targetSource = source;
+    // Pivot the loop: from here this is a modification of an existing object.
+    if (state.kind === 'create') state.kind = 'modify';
+
+    const label = state.targetName ?? resolvedId.slice(0, 8);
+    if (source === undefined) {
+      return {
+        ok: true,
+        summary: `load_target: ${label} adopted as modify target (no source on file — fetch via call("Registry", "getSource") if needed, or draft fresh source)`,
+      };
+    }
+    return {
+      ok: true,
+      summary: `load_target: ${label} adopted as modify target, ${source.split('\n').length} lines of source loaded (edit with draft_diff, deploy with deploy_update)`,
     };
   }
 
@@ -1417,6 +1496,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         case 'draft_diff':
           res = await this.opDraftDiff(state, action);
           break;
+        case 'load_target':
+          res = await this.opLoadTarget(state, action);
+          break;
         case 'draft_via_llm':
           res = await this.opDraftViaLlm(state, action);
           break;
@@ -1623,6 +1705,7 @@ Emit EXACTLY ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothi
 
 ## Local operations (no message target)
 
+- \`load_target({objectId?, targetName?})\` — adopt an EXISTING object as this loop's modify target: resolves the name/UUID, loads its current source into loop state, and switches the loop to a modify. Use this when the loop started without a target (kind \`create\`) but you discovered — via \`call("Registry", "ask"/"discover", …)\` or \`describe\` — that the goal is really about an object that already exists (e.g. "fix the GraphViewer window" → GraphViewer is already registered). After \`load_target\`, edit with \`draft_diff\` and ship with \`deploy_update\` (no need to repeat the id). For a genuinely new object, skip this and use \`draft_source\` instead.
 - \`draft_manifest({manifest, usedObjects?})\` — stage a manifest you've authored. Used before \`deploy_spawn\`.
 - \`draft_source({source})\` — stage handler-map source you've authored. The format is a single parenthesized object literal: \`({ method(msg) { ... } })\`. Use this for new objects (create flow).
 - \`draft_diff({blocks})\` — apply SEARCH/REPLACE blocks to the existing source. **Strongly prefer this for any modification of an existing object** — it lets you edit a few lines without re-emitting the whole file. Each block:

@@ -337,13 +337,22 @@ Each line shows one registered object: id, name, description, and non-meta metho
     });
 
     this.on('getSource', async (msg: AbjectMessage) => {
-      const { objectId } = msg.payload as { objectId: AbjectId };
-      return this.getObjectSource(objectId);
+      // Accept an AbjectId, TypeId, or registered name. AbjectIds churn on
+      // restart, so a caller may hold a stale one; resolveRegistration falls
+      // back to the durable TypeId / name so the live source is still found.
+      const { objectId, typeId, name, ref } = msg.payload as {
+        objectId?: string; typeId?: string; name?: string; ref?: string;
+      };
+      return this.getObjectSource(ref ?? objectId ?? typeId ?? name ?? '');
     });
 
     this.on('updateSource', async (msg: AbjectMessage) => {
-      const { objectId, source } = msg.payload as { objectId: AbjectId; source: string };
-      const reg = this.objects.get(objectId);
+      // Resolve the same way as getSource so an edit deployed against a stale
+      // AbjectId still lands on the live registration.
+      const { objectId, typeId, name, ref, source } = msg.payload as {
+        objectId?: string; typeId?: string; name?: string; ref?: string; source: string;
+      };
+      const reg = this.resolveRegistration(ref ?? objectId ?? typeId ?? name ?? '');
       if (!reg) return false;
       reg.source = source;
       return true;
@@ -670,10 +679,42 @@ Each line shows one registered object: id, name, description, and non-meta metho
 
   /**
    * Get the source code for an object, if it's scriptable.
+   *
+   * Accepts a live AbjectId, a durable TypeId, or a registered name. The
+   * AbjectId is ephemeral — it changes every time AbjectStore restores an
+   * object on restart — so a caller holding an id captured in a previous
+   * session would otherwise silently get `null` (the source lives under the
+   * new id). Resolving by TypeId / name recovers the live object so a stale
+   * AbjectId no longer blocks a source fetch.
    */
-  getObjectSource(objectId: AbjectId): string | null {
-    const reg = this.objects.get(objectId);
+  getObjectSource(ref: string): string | null {
+    const reg = this.resolveRegistration(ref);
     return reg?.source ?? null;
+  }
+
+  /**
+   * Resolve a reference (live AbjectId, durable TypeId, or registered name)
+   * to its current registration. Tries id first (fast path), then the durable
+   * TypeId index, then the name index (first live entry wins).
+   */
+  private resolveRegistration(ref: string): ObjectRegistration | undefined {
+    const direct = this.objects.get(ref as AbjectId);
+    if (direct) return direct;
+
+    const byType = this.byTypeId.get(ref as TypeId);
+    if (byType) {
+      const reg = this.objects.get(byType);
+      if (reg) return reg;
+    }
+
+    const named = this.byName.get(ref);
+    if (named) {
+      for (const id of named) {
+        const reg = this.objects.get(id);
+        if (reg) return reg;
+      }
+    }
+    return undefined;
   }
 
   /**

@@ -124,6 +124,12 @@ interface QueuedTask {
   dispatchTupleId?: string;
   callerId: AbjectId;
   enqueuedAt: number;
+  /**
+   * Opaque task-specific data forwarded to the agent's executeTask `data`
+   * field (e.g. ScrumMaster passes `{ target }` so an authoring agent works
+   * on a known existing object). AgentAbject does not interpret it.
+   */
+  data?: Record<string, unknown>;
 }
 
 interface TaskEntry {
@@ -397,6 +403,7 @@ export class AgentAbject extends Abject {
                 { name: 'responseSchema', type: { kind: 'object', properties: {} }, description: 'JSON Schema for structured result', optional: true },
                 { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal this task belongs to (for cancellation cascades and progress)', optional: true },
                 { name: 'dispatchTupleId', type: { kind: 'primitive', primitive: 'string' }, description: 'TupleSpace tuple ID — when set, AgentAbject calls completeTask/failTask on this tuple after the OTA loop terminates', optional: true },
+                { name: 'data', type: { kind: 'object', properties: {} }, description: 'Opaque task-specific data forwarded to the agent\'s executeTask `data` field (e.g. { target } naming a concrete object). AgentAbject does not interpret it.', optional: true },
               ],
               returns: { kind: 'object', properties: {
                 taskId: { kind: 'primitive', primitive: 'string' },
@@ -864,6 +871,7 @@ The registered object must implement these handlers to participate in the agent 
         goalId,
         dispatchTupleId,
         callerId: explicitCaller,
+        data,
       } = msg.payload as {
         agentId: AbjectId;
         task: string;
@@ -875,6 +883,7 @@ The registered object must implement these handlers to participate in the agent 
         goalId?: string;
         dispatchTupleId?: string;
         callerId?: AbjectId;
+        data?: Record<string, unknown>;
       };
       if (!targetAgentId) throw new Error('enqueueTask requires agentId');
       const agent = this.registeredAgents.get(targetAgentId);
@@ -899,6 +908,7 @@ The registered object must implement these handlers to participate in the agent 
         dispatchTupleId,
         callerId,
         enqueuedAt: Date.now(),
+        data,
       };
       q.pending.push(queued);
       const queuePosition = q.pending.length - 1 + (q.inFlight ? 1 : 0);
@@ -1476,6 +1486,7 @@ The registered object must implement these handlers to participate in the agent 
       config: queued.config,
       responseSchema: queued.responseSchema,
       dispatchTupleId: queued.dispatchTupleId ?? queued.taskId,
+      data: queued.data,
     }));
   }
 
@@ -2034,7 +2045,7 @@ The registered object must implement these handlers to participate in the agent 
       if (currentProduces.length > 0 || currentConsumes.length > 0) {
         ctx += `\n\n## Your Task's Contract`;
         if (currentProduces.length > 0) {
-          ctx += `\n\nThis task is expected to write the following scratchpad keys before reporting done. Use writeGoalData(goalId, key, value) for each one. Keep the \`done\` result as a short human-readable summary; downstream tasks will read the structured data from the scratchpad.`;
+          ctx += `\n\nThis task is expected to write the following scratchpad keys before reporting done. Use writeGoalData(key, value) for each one. Keep the \`done\` result as a short human-readable summary; downstream tasks will read the structured data from the scratchpad.`;
           for (const p of currentProduces) {
             ctx += `\n- **${p.key}**: ${p.description}`;
           }
@@ -2116,6 +2127,16 @@ The registered object must implement these handlers to participate in the agent 
       }
     } catch { /* best effort */ }
 
+    // Always-present guidance on how object identity works. Agents reference
+    // objects constantly (in goals, scratchpad, calls, and saved knowledge);
+    // they need to know which handle survives a restart and which does not.
+    prompt += `\n\n## Object identity
+Every Abject has two kinds of handle:
+- Its **registered name** (e.g. "GraphViewer") and its **typeId** are DURABLE — they persist across restarts and always point at the live object.
+- Its **AbjectId** (a UUID like \`adac6cc1-...\`) is EPHEMERAL — objects are re-spawned with a fresh AbjectId every time they are restored on restart, so a UUID copied from an earlier goal, scratchpad, or saved memory is usually stale and resolves to nothing.
+
+Reference objects by their registered name wherever possible — name-based calls and lookups always reach the live object. When you write a goal, hand off a target, or save a fact about an object, use its name (and typeId if you have one), not its UUID.`;
+
     // Always-present guidance on memory tools
     prompt += `\n\n## Memory Tools
 
@@ -2134,6 +2155,15 @@ After remembering, you will be prompted to continue with the task.`;
 
     if (entry.goalId) {
       prompt += `
+
+## Goal context & helpers
+This task belongs to a goal. When you run code (a \`call\`/code action), the goal's id is already bound as \`_goalId\` — you never need to look it up, scan \`listGoals\`, or pass a goalId yourself. These helpers are pre-bound and already close over \`_goalId\`:
+- \`getGoal()\` -- the current Goal object
+- \`getTasksForGoal(status)\` -- list this goal's tasks
+- \`updateGoal(message, phase)\` -- report progress on this goal
+- \`writeGoalData(key, value)\` / \`readGoalData(key)\` -- the shared scratchpad (below)
+
+**Finishing your work:** end your loop with your terminal \`done\` (or \`fail\`) action describing what YOUR task accomplished. That reports your task's outcome automatically — you do NOT call \`completeTask\`/\`failTask\` yourself. Whether the overall GOAL is complete, needs more tasks, or has failed is decided by the scrum process, not by you: it reviews each round's task outcomes and scratchpad and chooses to add tasks, complete, or fail the goal. So \`completeGoal\`, \`failGoal\`, \`addTask\`, and \`claimTask\` are also bound, but they belong to a goal you own end-to-end (a solo run with no scrum) — leave them alone while executing a dispatched task and simply report \`done\`/\`fail\`.
 
 **Goal Scratchpad** (shared with agents working on this same goal):
 - \`writeGoalData(key, value)\` -- save intermediate findings for other agents in this goal

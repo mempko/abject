@@ -67,6 +67,14 @@ interface StagedTask {
   dependsOnIdx: number[];
   produces?: Array<{ key: string; description: string }>;
   consumes?: string[];
+  /**
+   * Optional concrete target object (UUID or registered name) when the task
+   * operates on an existing Abject. Threaded to the agent's executeTask as
+   * `data.target`. The assigned agent decides what to do with it (e.g.
+   * ObjectCreator treats a known target as a modify loop and preloads its
+   * source). Omit when unknown — the agent resolves the target itself.
+   */
+  target?: string;
 }
 
 function compactLine(value: unknown, max = 220): string {
@@ -94,6 +102,8 @@ export class ScrumMaster extends Abject {
     agentId: AbjectId;
     description: string;
     blockers: Set<string>;
+    /** Concrete target object, threaded to executeTask when finally enqueued. */
+    target?: string;
   }>();
 
   /**
@@ -719,6 +729,10 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     const dependsOnIdx = (action.dependsOn as number[] | undefined);
     const produces = action.produces as Array<{ key: string; description: string }> | undefined;
     const consumes = action.consumes as string[] | undefined;
+    // Optional concrete target object (UUID or registered name) when the task
+    // operates on an existing Abject. Threads through to the agent's
+    // executeTask as `data.target`. Accept common aliases the LLM might emit.
+    const target = (action.target ?? action.objectId ?? action.objectName) as string | undefined;
 
     if (!description || !assignedAgentName) {
       return { success: false, error: 'add_task requires description and assignedAgentName' };
@@ -762,9 +776,11 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
       dependsOnIdx: resolvedDeps,
       produces,
       consumes,
+      target,
     });
 
-    log.info(`add_task (staged): "${description.slice(0, 60)}" → ${assignedAgentName} (deps: ${resolvedDeps.length === 0 ? 'none' : resolvedDeps.join(',')}); ${inflight.staged.length} staged total`);
+    const targetNote = target ? ` →${target}` : '';
+    log.info(`add_task (staged): "${description.slice(0, 60)}" → ${assignedAgentName}${targetNote} (deps: ${resolvedDeps.length === 0 ? 'none' : resolvedDeps.join(',')}); ${inflight.staged.length} staged total`);
     return {
       success: true,
       data: {
@@ -1153,6 +1169,7 @@ Rules:
           agentId: inflight.staged[i].assignedAgentId,
           description: inflight.staged[i].description,
           blockers: new Set(blockerSets[i]),
+          target: inflight.staged[i].target,
         });
         log.info(`dispatch: task ${taskIds[i].slice(0, 8)} deferred on ${blockerSets[i].length} dep(s): ${blockerSets[i].map(d => d.slice(0, 8)).join(', ')}`);
       }
@@ -1161,13 +1178,15 @@ Rules:
     // Phase 3: enqueue dependency-free tasks.
     for (let i = 0; i < taskIds.length; i++) {
       if (blockerSets[i].length === 0) {
+        const staged = inflight.staged[i];
         await this.request(
           request(this.id, this.agentAbjectId, 'enqueueTask', {
-            agentId: inflight.staged[i].assignedAgentId,
-            task: inflight.staged[i].description,
+            agentId: staged.assignedAgentId,
+            task: staged.description,
             taskId: taskIds[i],
             goalId,
             dispatchTupleId: taskIds[i],
+            data: staged.target ? { target: staged.target } : undefined,
           }),
         );
       }
@@ -1183,13 +1202,13 @@ Rules:
 
   private async unblockDependents(completedTaskId: string): Promise<void> {
     if (!this.agentAbjectId) return;
-    const newlyReady: Array<{ taskId: string; goalId: string; agentId: AbjectId; description: string }> = [];
+    const newlyReady: Array<{ taskId: string; goalId: string; agentId: AbjectId; description: string; target?: string }> = [];
     for (const [pendingId, info] of this.pendingDeps) {
       if (!info.blockers.has(completedTaskId)) continue;
       info.blockers.delete(completedTaskId);
       if (info.blockers.size === 0) {
         this.pendingDeps.delete(pendingId);
-        newlyReady.push({ taskId: pendingId, goalId: info.goalId, agentId: info.agentId, description: info.description });
+        newlyReady.push({ taskId: pendingId, goalId: info.goalId, agentId: info.agentId, description: info.description, target: info.target });
       }
     }
     for (const t of newlyReady) {
@@ -1201,6 +1220,7 @@ Rules:
           taskId: t.taskId,
           goalId: t.goalId,
           dispatchTupleId: t.taskId,
+          data: t.target ? { target: t.target } : undefined,
         }),
       ).catch(err => log.warn(`enqueueTask(${t.taskId.slice(0, 8)}) failed: ${err instanceof Error ? err.message : String(err)}`));
     }
@@ -1277,11 +1297,12 @@ Restrict via \`members\` when you can narrow the candidate set to a couple of pl
 
 Returns \`{ contributions: [{ agentName, text }, ...] }\`. Each \`text\` is the agent's full reply naming its capabilities and proposed contribution. PASS / empty replies are filtered out.
 
-### \`add_task({ description, assignedAgentName, dependsOn?, produces?, consumes? })\` — STAGE only
+### \`add_task({ description, assignedAgentName, target?, dependsOn?, produces?, consumes? })\` — STAGE only
 Append one task to the current scrum's plan. **This does NOT commit** — it stages the task locally. Call \`dispatch_scrum\` to commit and enqueue all staged tasks at once, or call \`complete_goal\` to abandon them.
 
 - \`description\`: 1-3 sentences. Concrete, atomic, runnable end-to-end through one agent's loop.
 - \`assignedAgentName\`: must match a name in the team roster (from \`review_scrum\`).
+- \`target\`: OPTIONAL. The concrete object the task operates on, when the goal already names an existing Abject (e.g. "fix the GraphViewer window"). **Prefer the registered name (e.g. "GraphViewer") over a raw UUID** — AbjectIds are ephemeral and change every restart, so an id copied from an older goal or memory is often stale and won't resolve, whereas the name is durable. Pass it so the agent works on that object instead of guessing. The agent decides what to do with it — don't try to specify "create" vs "modify"; that's the agent's call. Omit when there's no known target.
 - \`dependsOn\`: array of indices into THIS scrum's prior add_task calls (0-indexed). Omit for default sequential (each task waits on the previous). Pass \`[]\` for parallel-eligible.
 - \`produces\`: \`[{ key, description }, ...]\` — scratchpad keys this task will write.
 - \`consumes\`: \`["key", ...]\` — scratchpad keys this task expects to read (auto-injected into the agent's context).
@@ -1290,6 +1311,8 @@ Returns \`{ position, stagedCount, deps }\`. Multiple add_task calls accumulate.
 
 ### \`complete_goal({ hint?, synthesis? })\` — TERMINAL success
 Mark the goal completed.
+
+**Complete only when the goal's outcome durably holds.** A task's \`done\` is its own report, not proof the goal is achieved. When the latest round resolved the goal with a temporary or runtime-only workaround, left its result unverified, or recommended a durable follow-up, the goal is not finished — stage that follow-up via \`add_task\` + \`dispatch_scrum\` instead of completing here. Reserve \`complete_goal\` for when the user-visible outcome genuinely holds (and would survive a restart).
 
 **Prefer the fast path.** Most of the time you should omit \`synthesis\` and just emit \`{ "action": "complete_goal" }\` (or include a one-sentence \`hint\` that biases the framing). ScrumMaster auto-synthesizes the user-facing markdown from the goal description + scratchpad on the FAST tier (haiku). That's typically 5–10s on haiku vs 60s+ if you generate the synthesis yourself on smart tier — a major speedup since you've already done the hard reasoning.
 
@@ -1365,7 +1388,8 @@ Do NOT guess based on agent name alone. The relevant capability may or may not b
 **Subsequent scrum (currentScrumNumber>0):**
 1. \`review_scrum\` to see completed tasks, scratchpad, and \`relevantKnowledge\`.
 2. Decide based on what you see:
-   - User's intent satisfied → if you learned something durable (tool/provider mapping, pattern, user fact), call \`save_knowledge\` first, THEN \`complete_goal\` with a self-contained synthesis built from scratchpad data. **No team poll needed for review-only scrums.**
+   - User's intent durably satisfied AND the outcome holds → if you learned something durable (tool/provider mapping, pattern, user fact), call \`save_knowledge\` first, THEN \`complete_goal\` with a self-contained synthesis built from scratchpad data. **No team poll needed for review-only scrums.** A task reporting \`done\` means that task's work finished — it is the agent's claim, not proof the goal is achieved. Before completing, confirm the goal's user-visible outcome actually holds (e.g. a \`windowVisible: true\` self-report or "should now work" is a claim; for "something is broken / not working" goals, look for evidence the symptom is genuinely gone).
+   - A completed task describes its result as a temporary or runtime workaround, flags it as unverified, notes it would regress on restart, or recommends durable follow-up work → the goal is NOT yet done. Stage that durable follow-up: \`add_task\` to the agent whose capability can change the underlying object itself (its source/definition, so the fix survives a restart), then \`dispatch_scrum\`. Honor an executing agent's own recommendation for a durable fix rather than discarding it at completion — a transient runtime call changes state only until the next restart, while the durable fix changes the thing that was broken.
    - Failed tasks need correction → \`add_task\` with corrective work, possibly polling specific agents first if approach is unclear, then \`dispatch_scrum\`. If a cached \`relevantKnowledge\` entry led the prior round astray, \`forget_knowledge\` it before planning the corrective task.
    - Unreachable → \`fail_goal\`.
 
