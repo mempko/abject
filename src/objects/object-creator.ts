@@ -630,6 +630,13 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         errors.push({ kind: 'unknown-dep', callSite: { line, snippet }, depName, methodName });
         continue;
       }
+      // Fail open when the dep's method surface was never introspected. A dep
+      // learned via `ask` (prose usage guide) carries an empty methods map, so
+      // an empty set means "unknown surface", not "no methods" — flagging every
+      // call against it would false-flag legitimate, working calls (the exact
+      // failure mode this validator's doc promises to avoid). Skip; the agent
+      // can `describe` the dep to populate methods and get real checking.
+      if (dep.methods.size === 0) continue;
       if (!dep.methods.has(methodName)) {
         errors.push({
           kind: 'unknown-method',
@@ -1123,6 +1130,15 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     // observation renderer see what's been learned.
     const summary = this.mergeDiscoveryIntoDeps(state, target, resolvedId, method, response);
 
+    // Backfill the dep's structured method surface when it isn't known yet
+    // (e.g. learned via `ask`, which records prose, not methods). One describe
+    // per distinct dep; gives validate_calls real coverage instead of an empty
+    // set. Skipped for describe (already populated) and the modify target's own
+    // id (its source is loaded, not a call dependency).
+    if (method !== 'describe' && resolvedId !== state.targetObjectId) {
+      await this.ensureDepMethods(state, target, resolvedId);
+    }
+
     // Detect deploy lifecycle so finalizeLoop can build the right
     // CreationResult shape and the agent shell can emit objectCreated /
     // objectModified events.
@@ -1172,20 +1188,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       const ir = response as Partial<IntrospectResult>;
       const manifest = ir.manifest;
       if (!manifest) return null;
-      const methods = new Map<string, MethodSignature>();
-      for (const m of manifest.interface?.methods ?? []) {
-        methods.set(m.name, {
-          name: m.name,
-          description: m.description,
-          params: (m.parameters ?? []).map(p => ({
-            name: p.name,
-            optional: p.optional,
-            typeHint: this.renderTypeHint(p.type),
-          })),
-          returns: this.renderTypeHint(m.returns),
-        });
-      }
-      const events = new Set<string>((manifest.interface?.events ?? []).map(e => e.name));
+      const { methods, events } = this.methodsFromManifest(manifest);
       const key = manifest.name ?? targetName;
       const existing = state.deps.get(key);
       state.deps.set(key, {
@@ -1214,6 +1217,56 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
 
     return null;
+  }
+
+  /** Convert a manifest's interface into the dep-record method/event shape. */
+  private methodsFromManifest(manifest: AbjectManifest): { methods: Map<string, MethodSignature>; events: Set<string> } {
+    const methods = new Map<string, MethodSignature>();
+    for (const m of manifest.interface?.methods ?? []) {
+      methods.set(m.name, {
+        name: m.name,
+        description: m.description,
+        params: (m.parameters ?? []).map(p => ({
+          name: p.name,
+          optional: p.optional,
+          typeHint: this.renderTypeHint(p.type),
+        })),
+        returns: this.renderTypeHint(m.returns),
+      });
+    }
+    const events = new Set<string>((manifest.interface?.events ?? []).map(e => e.name));
+    return { methods, events };
+  }
+
+  /**
+   * Backfill a touched dependency's structured method surface from its live
+   * manifest. The agent often learns a dep via `ask` (prose how-to), which
+   * records a usage guide but leaves `methods` empty — so validate_calls has
+   * nothing to check and either skips (fail-open) or, before that, false-flags.
+   * Here we have the resolved id, so fetch the manifest once via `describe` and
+   * merge the methods in, giving the validator real coverage (it can now catch
+   * genuine wrong-method-name mistakes). Best-effort and idempotent: only
+   * fetches when the dep's method surface is still empty.
+   */
+  private async ensureDepMethods(state: LoopState, depName: string, depId: AbjectId): Promise<void> {
+    if (!depName) return;
+    const existing = state.deps.get(depName);
+    if (existing && existing.methods.size > 0) return; // surface already known
+    let manifest: AbjectManifest | undefined;
+    try {
+      const ir = await this.sendRequest<Partial<IntrospectResult>>(depId, 'describe', {}, 5000);
+      manifest = ir?.manifest as AbjectManifest | undefined;
+    } catch { /* best effort — leave empty, validate_calls fails open */ }
+    if (!manifest?.interface) return;
+    const { methods, events } = this.methodsFromManifest(manifest);
+    if (methods.size === 0) return;
+    state.deps.set(depName, {
+      depName,
+      depId,
+      methods,
+      events: existing?.events && existing.events.size > 0 ? existing.events : events,
+      usageGuide: existing?.usageGuide ?? '',
+    });
   }
 
   /** Best-effort English type rendering for the structured methods block. */
