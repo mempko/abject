@@ -2163,7 +2163,7 @@ This task belongs to a goal. When you run code (a \`call\`/code action), the goa
 - \`updateGoal(message, phase)\` -- report progress on this goal
 - \`writeGoalData(key, value)\` / \`readGoalData(key)\` -- the shared scratchpad (below)
 
-**Finishing your work:** end your loop with your terminal \`done\` (or \`fail\`) action describing what YOUR task accomplished. That reports your task's outcome automatically — you do NOT call \`completeTask\`/\`failTask\` yourself. Whether the overall GOAL is complete, needs more tasks, or has failed is decided by the scrum process, not by you: it reviews each round's task outcomes and scratchpad and chooses to add tasks, complete, or fail the goal. So \`completeGoal\`, \`failGoal\`, \`addTask\`, and \`claimTask\` are also bound, but they belong to a goal you own end-to-end (a solo run with no scrum) — leave them alone while executing a dispatched task and simply report \`done\`/\`fail\`.
+**Finishing your work:** end your loop with your terminal \`done\` (or \`fail\`) action describing what YOUR task accomplished. That is the whole report — the system records your task's outcome from it. Deciding whether the overall GOAL is then complete, needs more tasks, or has failed belongs to the scrum process, which reviews each round's outcomes and scratchpad and chooses to add tasks, complete, or fail the goal. So focus on your task and report it cleanly. (\`completeGoal\`, \`failGoal\`, and \`addTask\` are bound for the separate case where you own a goal end-to-end with no scrum running it; reserve them for that.)
 
 **Goal Scratchpad** (shared with agents working on this same goal):
 - \`writeGoalData(key, value)\` -- save intermediate findings for other agents in this goal
