@@ -133,6 +133,12 @@ export interface AbjectManifest {
   requiredCapabilities: CapabilityRequest[];
   providedCapabilities?: CapabilityId[];
   tags?: string[];
+  /**
+   * Optional display glyph (a single emoji or character) shown next to the
+   * object's name in launchers like the Abjects rail. Objects without one fall
+   * back to a default icon, so older manifests keep working unchanged.
+   */
+  icon?: string;
 }
 
 // =============================================================================

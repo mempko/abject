@@ -21,6 +21,8 @@ const TASKBAR_INTERFACE: InterfaceId = 'abjects:taskbar';
 const BTN_W = 120;
 const BTN_H = 30;
 const LABEL_H = 20;
+/** Fallback glyph for user objects whose manifest declares no icon. */
+const DEFAULT_OBJECT_ICON = '◆';
 
 export class Taskbar extends Abject {
   private widgetManagerId?: AbjectId;
@@ -334,9 +336,9 @@ windows" section so the user can restore windows from the taskbar.
       color: this.theme.textPrimary, radius: this.theme.tokens.radius.sm,
       align: 'left', fontSize: 12,
     };
-    // User objects stay in readable primary ink; the icon-less, slightly
-    // smaller rows are distinction enough without sacrificing legibility.
-    const objStyle = { ...appStyle, fontSize: 11 };
+    // User objects use the same font/size/ink as the apps; their icon (declared
+    // emoji or the default glyph) is the only distinction, so the rail is uniform.
+    const objStyle = appStyle;
     const gearStyle = { background: ghostBg, borderColor: this.theme.windowBg, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13 };
 
     // [0] Header label
@@ -372,10 +374,12 @@ windows" section so the user can restore windows from the taskbar.
       specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCC1 Files', style: appStyle });
     }
 
-    // User object buttons (demoted to secondary ink).
+    // User object buttons. Use the manifest icon when present, else a neutral
+    // default so older objects (created before icons) still render an icon.
     const userObjStartIdx = specs.length;
     for (const obj of showableObjects) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: obj.manifest.name, style: objStyle });
+      const icon = obj.manifest.icon?.trim() || DEFAULT_OBJECT_ICON;
+      specs.push({ type: 'button', windowId: this.windowId!, text: `${icon}  ${obj.manifest.name}`, style: objStyle });
     }
 
     // Minimized window section

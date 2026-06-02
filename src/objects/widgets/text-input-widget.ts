@@ -1007,6 +1007,13 @@ export class TextInputWidget extends WidgetAbject {
       return { consumed: false };
     }
 
+    // Vertical arrows are meaningless in a single-line input — let them bubble
+    // so a parent (e.g. the command palette) can drive list navigation while
+    // the input keeps text focus. (Word-wrap inputs consumed them above.)
+    if (key === 'ArrowUp' || key === 'ArrowDown') {
+      return { consumed: false };
+    }
+
     return { consumed: true };
   }
 

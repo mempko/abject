@@ -988,6 +988,12 @@ method calls on 'abjects:widgets' interface:
           // toasts). Esc dismisses them by reusing the existing close path,
           // which WidgetManager forwards to the window's owner.
           this.changed('windowCloseRequested', {});
+        } else {
+          // Bubble any other unhandled key to the window's owner so it can
+          // implement app-level keyboard navigation (e.g. the command palette
+          // moving its selection with the arrow keys). Owners that don't
+          // register a 'keyUnhandled' handler simply ignore it.
+          this.changed('keyUnhandled', { key: e.key, code: e.code, modifiers: e.modifiers });
         }
       }
     } catch {
