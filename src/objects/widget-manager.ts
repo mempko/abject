@@ -1753,6 +1753,15 @@ await this.call(timerId, 'addDependent', {});
   ): Promise<AbjectId> {
     require(this.uiServerId !== undefined, 'UIServer not set');
 
+    // Keep app windows clear of the left dock. The System/Spaces/Abjects rails
+    // live at x≈8..160; generated objects often request a small x (80, 100),
+    // which opens them tucked under the rails. Nudge the initial position right.
+    // Chromeless windows (the rails themselves, modal backdrops) are exempt.
+    const RESERVED_LEFT = 176;
+    if (!options?.chromeless && rect.x < RESERVED_LEFT) {
+      rect = { ...rect, x: RESERVED_LEFT };
+    }
+
     const ownerTheme = this.getThemeForOwner(owner);
     const win = new WindowAbject({
       title,

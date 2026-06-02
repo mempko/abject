@@ -13,6 +13,7 @@ import { request } from '../core/message.js';
 import type { ThemeData } from '../core/theme-data.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+import { lightenColor } from './widgets/widget-types.js';
 
 const log = new Log('WorkspaceSwitcher');
 
@@ -339,9 +340,17 @@ the WorkspaceBrowser for discovering remote workspaces.
       })
     );
 
-    // Active space ring matches the active-item highlight used by the other
-    // toolbars (Taskbar/global toolbar) for consistency.
-    const wsActiveStyle = { background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
+    // "Grimoire index" styling shared with the System/Abjects rails: flat,
+    // borderless, left-aligned ghost rows. The active space keeps the accent
+    // highlight on top of that base.
+    const ghostBg = lightenColor(this.theme.windowBg, 5);
+    const appStyle = {
+      background: ghostBg, borderColor: this.theme.windowBg,
+      color: this.theme.textPrimary, radius: this.theme.tokens.radius.sm,
+      align: 'left', fontSize: 12,
+    };
+    const gearStyle = { background: ghostBg, borderColor: this.theme.windowBg, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13, align: 'center' };
+    const wsActiveStyle = { ...appStyle, background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
 
     // Build workspace buttons
     if (hasWorkspaces) {
@@ -364,18 +373,18 @@ the WorkspaceBrowser for discovering remote workspaces.
       // 0: header label
       specs.push({ type: 'label', windowId: this.windowId!, text: '\u25C8 Spaces', style: { color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display' } });
       // 1: "+" button (in header row)
-      specs.push({ type: 'button', windowId: this.windowId!, text: '+', style: { fontSize: 13, align: 'center' } });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '+', style: gearStyle });
       // 2: settings gear button
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13, align: 'center' } });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: gearStyle });
       // 3..N+2: workspace buttons
       for (const ws of workspaces) {
         const isActive = ws.id === this.cachedActiveWorkspaceId;
         const accessIcon = ws.accessMode === 'public' ? '\uD83C\uDF0D' : ws.accessMode === 'private' ? '\uD83D\uDD11' : '\uD83D\uDD12';
         const accessLabel = ws.accessMode === 'public' ? 'public' : ws.accessMode === 'private' ? 'private' : 'protected';
-        specs.push({ type: 'button', windowId: this.windowId!, text: `${accessIcon} ${ws.name}`, ...(isActive ? { style: wsActiveStyle } : {}) });
+        specs.push({ type: 'button', windowId: this.windowId!, text: `${accessIcon} ${ws.name}`, style: isActive ? wsActiveStyle : appStyle });
       }
       // Browse button
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0E Browse' });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0E Browse', style: appStyle });
 
       const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs })

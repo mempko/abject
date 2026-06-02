@@ -11,6 +11,7 @@ import { request } from '../core/message.js';
 import type { ThemeData } from '../core/theme-data.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+import { lightenColor } from './widgets/widget-types.js';
 
 const log = new Log('GlobalToolbar');
 
@@ -339,17 +340,27 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
       preferredSize: { height: labelH },
     }));
 
+    // "Grimoire index" styling: flat, borderless, left-aligned rows (matches
+    // the Abjects rail) rather than boxed pills.
+    const ghostBg = lightenColor(this.theme.windowBg, 5);
+    const appStyle = {
+      background: ghostBg, borderColor: this.theme.windowBg,
+      color: this.theme.textPrimary, radius: this.theme.tokens.radius.sm,
+      align: 'left', fontSize: 12,
+    };
+    const gearStyle = { background: ghostBg, borderColor: this.theme.windowBg, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13 };
+
     // Batch create all widgets: header label, gear button, action buttons
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
           { type: 'label', windowId: this.windowId!, text: '\u2699 System', style: { color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display' } },
-          { type: 'button', windowId: this.windowId!, text: '\u2699', style: { fontSize: 13 } },
-          { type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Network' },
-          { type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0D Explorer' },
-          { type: 'button', windowId: this.windowId!, text: '\u2699\uFE0F Procs' },
-          { type: 'button', windowId: this.windowId!, text: '\uD83D\uDC41 The Eye' },
-          { type: 'button', windowId: this.windowId!, text: '\uD83D\uDD14 Notifications' },
+          { type: 'button', windowId: this.windowId!, text: '\u2699', style: gearStyle },
+          { type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Network', style: appStyle },
+          { type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0D Explorer', style: appStyle },
+          { type: 'button', windowId: this.windowId!, text: '\u2699\uFE0F Procs', style: appStyle },
+          { type: 'button', windowId: this.windowId!, text: '\uD83D\uDC41 The Eye', style: appStyle },
+          { type: 'button', windowId: this.windowId!, text: '\uD83D\uDD14 Notifications', style: appStyle },
         ],
       })
     );

@@ -12,6 +12,7 @@ import type { ThemeData } from '../core/theme-data.js';
 import { event, request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
+import { lightenColor } from './widgets/widget-types.js';
 
 const log = new Log('Taskbar');
 
@@ -323,55 +324,67 @@ windows" section so the user can restore windows from the taskbar.
     // ---- Batch create all widgets ----
     const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
 
+    // "Grimoire index" styling: flat, borderless, left-aligned rows rather than
+    // boxed pills. Apps render in primary ink; user objects are demoted to
+    // secondary so the eye lands on the built-in apps and the active entry.
+    const sectionLabelStyle = { color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display' };
+    const ghostBg = lightenColor(this.theme.windowBg, 5);
+    const appStyle = {
+      background: ghostBg, borderColor: this.theme.windowBg,
+      color: this.theme.textPrimary, radius: this.theme.tokens.radius.sm,
+      align: 'left', fontSize: 12,
+    };
+    // User objects stay in readable primary ink; the icon-less, slightly
+    // smaller rows are distinction enough without sacrificing legibility.
+    const objStyle = { ...appStyle, fontSize: 11 };
+    const gearStyle = { background: ghostBg, borderColor: this.theme.windowBg, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13 };
+
     // [0] Header label
-    specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A0 Abjects',
-      style: { color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display' } });
+    specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A0 Abjects', style: sectionLabelStyle });
     // [1] Gear button (AppExplorer)
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699',
-      style: { fontSize: 13 } });
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: gearStyle });
     // [2] Chat (opens ChatBrowser overview)
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCAC Chat' });
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCAC Chat', style: appStyle });
     // [3?] Goals (optional)
     if (this.goalBrowserId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDFAF Goals' });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDFAF Goals', style: appStyle });
     }
     // [4] Jobs
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCCB Jobs' });
+    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCCB Jobs', style: appStyle });
     // [5?] Knowledge (optional)
     if (this.knowledgeBrowserId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83E\uDDE0 Knowledge' });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83E\uDDE0 Knowledge', style: appStyle });
     }
     // [6?] Agents (optional)
     if (this.agentBrowserId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83E\uDD16 Agents' });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83E\uDD16 Agents', style: appStyle });
     }
     // [7?] Schedules (optional)
     if (this.schedulerBrowserId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\u23F0 Schedules' });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\u23F0 Schedules', style: appStyle });
     }
     // [8?] Web (optional)
     if (this.webBrowserViewerId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Web' });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Web', style: appStyle });
     }
     // [9?] Files (optional)
     if (this.fileManagerId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCC1 Files' });
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCC1 Files', style: appStyle });
     }
 
-    // User object buttons
+    // User object buttons (demoted to secondary ink).
     const userObjStartIdx = specs.length;
     for (const obj of showableObjects) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: obj.manifest.name });
+      specs.push({ type: 'button', windowId: this.windowId!, text: obj.manifest.name, style: objStyle });
     }
 
     // Minimized window section
     const minimizedStartIdx = specs.length;
     const minimizedCount = this.minimizedWindows.size;
     if (minimizedCount > 0) {
-      specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A1 Windows',
-        style: { color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display' } });
+      specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A1 Windows', style: sectionLabelStyle });
       for (const [, { title }] of this.minimizedWindows) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: title });
+        specs.push({ type: 'button', windowId: this.windowId!, text: title, style: objStyle });
       }
     }
 
@@ -518,8 +531,11 @@ windows" section so the user can restore windows from the taskbar.
    */
   private async updateButtonStyle(targetId: AbjectId, visible: boolean): Promise<void> {
     if (!this.windowId) return;
+    // Toggle only bg/border (style updates merge), so each button keeps its
+    // creation-time ink (primary for apps, secondary for objects). Active gets
+    // the accent highlight; inactive restores the flat ghost row.
     const activeStyle = { background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
-    const inactiveStyle = { background: undefined, borderColor: undefined };
+    const inactiveStyle = { background: lightenColor(this.theme.windowBg, 5), borderColor: this.theme.windowBg };
     const style = visible ? activeStyle : inactiveStyle;
 
     for (const [btnId, tid] of this.systemButtons) {
