@@ -42,6 +42,8 @@ import { GoalManager } from '../src/objects/goal-manager.js';
 import { GoalBrowser } from '../src/objects/goal-browser.js';
 import { KnowledgeBase } from '../src/objects/knowledge-base.js';
 import { KnowledgeBrowser } from '../src/objects/knowledge-browser.js';
+import { FileManager } from '../src/objects/file-manager.js';
+import { FileViewer } from '../src/objects/file-viewer.js';
 import { AgentBrowser } from '../src/objects/agent-browser.js';
 import { AgentCreator } from '../src/objects/agent-creator.js';
 import { Scheduler } from '../src/objects/scheduler.js';
@@ -457,7 +459,10 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('Timer', () => new Timer());
   runtime.objectFactory.registerConstructor('Clipboard', () => new Clipboard());
   runtime.objectFactory.registerConstructor('Console', () => new Console());
-  runtime.objectFactory.registerConstructor('FileSystem', () => new FileSystem());
+  runtime.objectFactory.registerConstructor('FileSystem', (args?: unknown) => {
+    const opts = args as { workspaceId?: string } | undefined;
+    return new FileSystem(opts?.workspaceId);
+  });
   runtime.objectFactory.registerConstructor('Theme', () => new ThemeAbject());
   runtime.objectFactory.registerConstructor('WindowManager', () => new WindowManager());
   runtime.objectFactory.registerConstructor('WidgetManager', () => new WidgetManager());
@@ -479,6 +484,8 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('GoalBrowser', () => new GoalBrowser());
   runtime.objectFactory.registerConstructor('KnowledgeBase', () => new KnowledgeBase());
   runtime.objectFactory.registerConstructor('KnowledgeBrowser', () => new KnowledgeBrowser());
+  runtime.objectFactory.registerConstructor('FileManager', () => new FileManager());
+  runtime.objectFactory.registerConstructor('FileViewer', () => new FileViewer());
   runtime.objectFactory.registerConstructor('AgentBrowser', () => new AgentBrowser());
   runtime.objectFactory.registerConstructor('AgentCreator', () => new AgentCreator());
   runtime.objectFactory.registerConstructor('Scheduler', () => new Scheduler());
@@ -560,6 +567,7 @@ async function main(): Promise<void> {
       'GoalManager', 'GoalBrowser', 'GoalObserver',
       'JobManager', 'JobBrowser',
       'KnowledgeBase', 'KnowledgeBrowser',
+      'FileManager', 'FileViewer',
       'AgentAbject', 'ScrumMaster', 'AgentBrowser', 'AgentCreator',
       'ObjectAgent', 'SkillAgent', 'WebAgent',
       'Scheduler', 'SchedulerBrowser',
@@ -607,7 +615,8 @@ async function main(): Promise<void> {
   const timerId = await supervisedSpawn('Timer');
   const clipboardId = await supervisedSpawn('Clipboard');
   const consoleId = await supervisedSpawn('Console');
-  const filesystemId = await supervisedSpawn('FileSystem');
+  // FileSystem is now per-workspace (spawned by WorkspaceManager rooted at
+  // ~/.abject/ws-<id>/files); no global instance.
   const webParserId = await supervisedSpawn('WebParser');
   const webBrowserId = await supervisedSpawn('WebBrowser');
   // WebAgent is per-workspace (spawned by WorkspaceManager), not global
@@ -863,7 +872,7 @@ async function main(): Promise<void> {
   // ALL objects are now spawned and init'd — safe to start health monitoring.
   const monitoredIds = [
     httpClientId, llmId, storageId, timerId, clipboardId,
-    consoleId, filesystemId, webParserId, webBrowserId,
+    consoleId, webParserId, webBrowserId,
     shellExecutorId, hostFilesystemId, webSearchId, webFetchId,
     windowManagerId, widgetManagerId,
     identityId, peerRegistryId, remoteRegistryId, peerRouterId,

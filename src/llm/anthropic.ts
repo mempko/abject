@@ -38,6 +38,11 @@ type AnthropicContentBlock = {
   type: 'image';
   source: { type: 'base64'; media_type: string; data: string };
   cache_control?: CacheControl;
+} | {
+  type: 'document';
+  source: { type: 'base64'; media_type: string; data: string };
+  title?: string;
+  cache_control?: CacheControl;
 };
 
 type AnthropicSystemBlock = {
@@ -440,6 +445,9 @@ export class AnthropicProvider extends BaseLLMProvider {
     if (typeof content === 'string') return content;
     return content.map((part): AnthropicContentBlock => {
       if (part.type === 'text') return { type: 'text', text: part.text };
+      if (part.type === 'document') {
+        return { type: 'document', source: { type: 'base64', media_type: part.mediaType, data: part.data }, title: part.name };
+      }
       return { type: 'image', source: { type: 'base64', media_type: part.mediaType, data: part.data } };
     });
   }

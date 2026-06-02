@@ -85,6 +85,11 @@ export class FrontendClient {
   private lastCanvasY = 0;
   private abyssBg?: AbyssBgControl;
   private resizableSurfaces: Set<string> = new Set();
+  private fileUploadProxy?: HTMLInputElement;
+  /** Surface that requested the file picker; the chosen file routes back to it. */
+  private fileUploadTargetSurface?: string;
+  /** Monotonic counter to give each upload a unique id for chunk reassembly. */
+  private nextUploadSeq = 0;
 
   constructor(canvas: HTMLCanvasElement, abyssBg?: AbyssBgControl) {
     this.canvas = canvas;
@@ -94,6 +99,7 @@ export class FrontendClient {
     this.setupInputListeners();
     this.setupMobileKeyboard();
     this.setupViewportShift();
+    this.setupFileUpload();
   }
 
   private detectMobileMode(): void {
@@ -219,6 +225,81 @@ export class FrontendClient {
       } as FrontendToBackendMsg);
     }
     proxy.value = '';
+  }
+
+  /**
+   * Wire the hidden file input (opened on demand by the backend) and canvas
+   * drag-drop. Selected/dropped files are read as base64 and streamed to the
+   * backend in chunks tagged with the target surface.
+   */
+  private setupFileUpload(): void {
+    const proxy = document.getElementById('file-upload-proxy') as HTMLInputElement | null;
+    if (proxy) {
+      this.fileUploadProxy = proxy;
+      proxy.addEventListener('change', () => {
+        const files = proxy.files;
+        const surfaceId = this.fileUploadTargetSurface;
+        if (files && surfaceId) {
+          for (const file of Array.from(files)) {
+            void this.uploadFile(file, surfaceId);
+          }
+        }
+        // Reset so selecting the same file again re-fires change.
+        proxy.value = '';
+        this.fileUploadTargetSurface = undefined;
+      });
+    }
+
+    // Drag-and-drop onto the canvas: route to the surface under the drop point.
+    this.canvas.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+    });
+    this.canvas.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const files = e.dataTransfer?.files;
+      if (!files || files.length === 0) return;
+      const rect = this.canvas.getBoundingClientRect();
+      const surface = this.compositor.surfaceAt(e.clientX - rect.left, e.clientY - rect.top);
+      const surfaceId = surface?.id ?? this.focusedSurface;
+      if (!surfaceId) return;
+      for (const file of Array.from(files)) {
+        void this.uploadFile(file, surfaceId);
+      }
+    });
+  }
+
+  /** Read a File as base64 and send it to the backend in chunks. */
+  private async uploadFile(file: File, surfaceId: string): Promise<void> {
+    const buf = await file.arrayBuffer();
+    const base64 = this.arrayBufferToBase64(buf);
+    const uploadId = `${surfaceId}-${this.nextUploadSeq++}`;
+    // ~700 KB of base64 per chunk keeps individual JSON frames modest.
+    const CHUNK = 700_000;
+    const chunkCount = Math.max(1, Math.ceil(base64.length / CHUNK));
+    const mimeType = file.type || 'application/octet-stream';
+    for (let i = 0; i < chunkCount; i++) {
+      this.sendToBackend({
+        type: 'fileUpload',
+        surfaceId,
+        uploadId,
+        name: file.name,
+        mimeType,
+        base64: base64.slice(i * CHUNK, (i + 1) * CHUNK),
+        chunkIndex: i,
+        chunkCount,
+      } as FrontendToBackendMsg);
+    }
+  }
+
+  private arrayBufferToBase64(buf: ArrayBuffer): string {
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    const STEP = 0x8000; // avoid call-stack limits in String.fromCharCode.apply
+    for (let i = 0; i < bytes.length; i += STEP) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + STEP));
+    }
+    return btoa(binary);
   }
 
   /** Focus the hidden input proxy to trigger the mobile virtual keyboard. */
@@ -583,6 +664,15 @@ export class FrontendClient {
 
       case 'setCursor':
         this.canvas.style.cursor = msg.cursor || 'default';
+        break;
+
+      case 'openFilePicker':
+        if (this.fileUploadProxy) {
+          this.fileUploadTargetSurface = msg.surfaceId;
+          this.fileUploadProxy.accept = msg.accept ?? '';
+          this.fileUploadProxy.multiple = msg.multiple ?? false;
+          this.fileUploadProxy.click();
+        }
         break;
 
       case 'captureSurfaceRequest':

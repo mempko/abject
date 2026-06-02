@@ -45,6 +45,8 @@ export { ChatBrowser, CHAT_BROWSER_ID } from './objects/chat-browser.js';
 export { AbjectStore, ABJECT_STORE_ID } from './objects/abject-store.js';
 export { KnowledgeBase, KNOWLEDGE_BASE_ID } from './objects/knowledge-base.js';
 export { KnowledgeBrowser, KNOWLEDGE_BROWSER_ID } from './objects/knowledge-browser.js';
+export { FileManager, FILE_MANAGER_ID } from './objects/file-manager.js';
+export { FileViewer, FILE_VIEWER_ID } from './objects/file-viewer.js';
 export { AgentBrowser, AGENT_BROWSER_ID } from './objects/agent-browser.js';
 export { AgentCreator, AGENT_CREATOR_ID } from './objects/agent-creator.js';
 export { Scheduler, SCHEDULER_ID } from './objects/scheduler.js';

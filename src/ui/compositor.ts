@@ -1028,8 +1028,11 @@ export class Compositor {
     y: number,
     width: number,
     height: number,
-    radius: number
+    radiusInput: number
   ): void {
+    // Clamp to half the smaller dimension so a "pill" radius (e.g. 999) renders
+    // as a true pill instead of drawing giant arcs that escape the rect.
+    const radius = Math.max(0, Math.min(radiusInput, width / 2, height / 2));
     ctx.moveTo(x + radius, y);
     ctx.lineTo(x + width - radius, y);
     ctx.arcTo(x + width, y, x + width, y + radius, radius);

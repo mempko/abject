@@ -6,7 +6,9 @@ import { require, requireNonEmpty } from '../core/contracts.js';
 
 export interface TextPart { type: 'text'; text: string; }
 export interface ImagePart { type: 'image'; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'; data: string; }
-export type ContentPart = TextPart | ImagePart;
+/** A document (e.g. a PDF) sent as base64. `name` is an optional display label. */
+export interface DocumentPart { type: 'document'; mediaType: 'application/pdf'; data: string; name?: string; }
+export type ContentPart = TextPart | ImagePart | DocumentPart;
 
 export interface LLMMessage {
   role: 'system' | 'user' | 'assistant';

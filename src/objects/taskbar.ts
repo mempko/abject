@@ -31,6 +31,7 @@ export class Taskbar extends Abject {
   private knowledgeBrowserId?: AbjectId;
   private agentBrowserId?: AbjectId;
   private schedulerBrowserId?: AbjectId;
+  private fileManagerId?: AbjectId;
   private registryId?: AbjectId;
   private windowManagerId?: AbjectId;
 
@@ -135,6 +136,7 @@ windows" section so the user can restore windows from the taskbar.
     this.knowledgeBrowserId = await this.discoverDep('KnowledgeBrowser') ?? undefined;
     this.agentBrowserId = await this.discoverDep('AgentBrowser') ?? undefined;
     this.schedulerBrowserId = await this.discoverDep('SchedulerBrowser') ?? undefined;
+    this.fileManagerId = await this.discoverDep('FileManager') ?? undefined;
     this.registryId = await this.requireDep('Registry');
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
 
@@ -351,6 +353,10 @@ windows" section so the user can restore windows from the taskbar.
     if (this.webBrowserViewerId) {
       specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Web' });
     }
+    // [9?] Files (optional)
+    if (this.fileManagerId) {
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCC1 Files' });
+    }
 
     // User object buttons
     const userObjStartIdx = specs.length;
@@ -386,6 +392,7 @@ windows" section so the user can restore windows from the taskbar.
     if (this.agentBrowserId) this.systemButtons.set(widgetIds[idx++], this.agentBrowserId);
     if (this.schedulerBrowserId) this.systemButtons.set(widgetIds[idx++], this.schedulerBrowserId);
     if (this.webBrowserViewerId) this.systemButtons.set(widgetIds[idx++], this.webBrowserViewerId);
+    if (this.fileManagerId) this.systemButtons.set(widgetIds[idx++], this.fileManagerId);
 
     for (let i = 0; i < showableObjects.length; i++) {
       this.userObjButtons.set(widgetIds[userObjStartIdx + i], showableObjects[i].id);
@@ -443,6 +450,7 @@ windows" section so the user can restore windows from the taskbar.
     // Subscribe as dependent of system objects for visibility change events
     const depIds = [this.appExplorerId!, this.chatBrowserId!, this.jobBrowserId!];
     if (this.webBrowserViewerId) depIds.push(this.webBrowserViewerId);
+    if (this.fileManagerId) depIds.push(this.fileManagerId);
     if (this.goalBrowserId) depIds.push(this.goalBrowserId);
     if (this.knowledgeBrowserId) depIds.push(this.knowledgeBrowserId);
     if (this.agentBrowserId) depIds.push(this.agentBrowserId);
@@ -487,7 +495,7 @@ windows" section so the user can restore windows from the taskbar.
 
   private computeHeight(userObjectCount: number): number {
     // Always-present row buttons: Chat + Jobs (gear sits in header row, not counted).
-    const systemBtnCount = 2 + (this.webBrowserViewerId ? 1 : 0) + (this.goalBrowserId ? 1 : 0) + (this.knowledgeBrowserId ? 1 : 0) + (this.agentBrowserId ? 1 : 0) + (this.schedulerBrowserId ? 1 : 0);
+    const systemBtnCount = 2 + (this.webBrowserViewerId ? 1 : 0) + (this.fileManagerId ? 1 : 0) + (this.goalBrowserId ? 1 : 0) + (this.knowledgeBrowserId ? 1 : 0) + (this.agentBrowserId ? 1 : 0) + (this.schedulerBrowserId ? 1 : 0);
     const minimizedCount = this.minimizedWindows.size;
     const totalBtnCount = systemBtnCount + userObjectCount + minimizedCount;
     const extraHeight = (LABEL_H + this.theme.tokens.space.sm)

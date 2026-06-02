@@ -863,6 +863,26 @@ You are this object. Your capabilities are exactly what the manifest above descr
   }
 
   /**
+   * Show a modal text-input dialog and return the entered string, or null if
+   * the user cancelled. Returns null when there is no UI available.
+   */
+  protected async prompt(opts: {
+    title: string;
+    message: string;
+    defaultValue?: string;
+    placeholder?: string;
+    confirmLabel?: string;
+    cancelLabel?: string;
+  }): Promise<string | null> {
+    const wmId = await this.discoverDep('WidgetManager');
+    if (!wmId) return null; // no UI → nothing to enter
+    return this.request<string | null>(
+      request(this.id, wmId, 'showPromptDialog', opts),
+      120000 // generous timeout for user typing
+    );
+  }
+
+  /**
    * Handle an incoming message from the processing loop (synchronous).
    *
    * Calls the handler but never awaits it. If the handler returns a Promise

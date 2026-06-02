@@ -57,7 +57,7 @@ const INFRA_OBJECTS = [
 /** UI objects — deferred for inactive workspaces, spawned on first switch. */
 const UI_OBJECTS = [
   'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser', 'KnowledgeBrowser', 'AgentBrowser', 'SchedulerBrowser',
-  'WebBrowserViewer', 'ChatBrowser', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
+  'WebBrowserViewer', 'FileManager', 'FileViewer', 'ChatBrowser', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
   'CommandPalette', 'NotificationCenter', 'WindowSwitcher',
 ] as const;
 
@@ -1179,10 +1179,26 @@ export class WorkspaceManager extends Abject {
     const wsStorageId = wsStorageResult.objectId;
     log.timed('registry + storage ready');
 
+    // 2b. Spawn workspace-scoped FileSystem (on-disk, rooted at ~/.abject/ws-<id>/files).
+    // workspaceId is carried in constructorArgs so the instance roots itself even
+    // when placed in a worker thread. Not in INFRA_OBJECTS — spawned explicitly here.
+    const wsFileSystemTypeId = this.computeTypeId(workspaceId, 'FileSystem');
+    const wsFileSystemResult = await this.request<SpawnResult>(
+      request(this.id, this.factoryId!, 'spawn', {
+        manifest: { name: 'FileSystem', description: `Workspace filesystem for '${name}'`,
+          version: '2.0.0', requiredCapabilities: [], tags: ['system'] },
+        registryHint: wsRegistryId,
+        constructorArgs: { workspaceId },
+        typeId: wsFileSystemTypeId,
+      })
+    );
+    const wsFileSystemId = wsFileSystemResult.objectId;
+
     // 3. Spawn per-workspace objects (in dependency order)
     // Factory auto-registers each in the workspace registry via registryHint
-    const childIds: AbjectId[] = [wsRegistryId, wsStorageId];
+    const childIds: AbjectId[] = [wsRegistryId, wsStorageId, wsFileSystemId];
     let taskbarId: AbjectId = '' as AbjectId;
+    let abjectStoreId: AbjectId | undefined;
     const uiObjects: Array<{ id: AbjectId; iface: InterfaceId }> = [];
     const childTypeIds = new Map<AbjectId, TypeId>();
 
@@ -1191,6 +1207,7 @@ export class WorkspaceManager extends Abject {
     const storTypeId = this.computeTypeId(workspaceId, 'Storage');
     if (regTypeId) childTypeIds.set(wsRegistryId, regTypeId);
     if (storTypeId) childTypeIds.set(wsStorageId, storTypeId);
+    if (wsFileSystemTypeId) childTypeIds.set(wsFileSystemId, wsFileSystemTypeId);
 
     // Map object names to their interface IDs for UI object tracking
     const uiIfaceMap: Record<string, InterfaceId> = {
@@ -1222,6 +1239,10 @@ export class WorkspaceManager extends Abject {
       const objId = result.objectId;
       childIds.push(objId);
       if (typeId) childTypeIds.set(objId, typeId);
+
+      if (objName === 'AbjectStore') {
+        abjectStoreId = objId;
+      }
 
       if (objName === 'Taskbar') {
         taskbarId = objId;
@@ -1262,8 +1283,8 @@ export class WorkspaceManager extends Abject {
     log.timed(`all ${objectsToSpawn.length} objects spawned`);
 
     // 4. Restore persisted user-created abjects for this workspace
-    // AbjectStore is at index 0 in PER_WORKSPACE_OBJECTS, so childIds[2]
-    const abjectStoreId = childIds[2];
+    // abjectStoreId is captured by name during the spawn loop above (don't rely
+    // on a positional index — childIds ordering changes when infra is added).
     if (abjectStoreId) {
       try {
         await this.request(

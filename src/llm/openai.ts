@@ -37,7 +37,10 @@ export interface OpenAIConfig {
   extraHeaders?: Record<string, string>;
 }
 
-type OpenAIContentPart = { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } };
+type OpenAIContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+  | { type: 'file'; file: { filename: string; file_data: string } };
 
 interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant';
@@ -335,6 +338,9 @@ export class OpenAIProvider extends BaseLLMProvider {
     if (typeof content === 'string') return content;
     return content.map((part): OpenAIContentPart => {
       if (part.type === 'text') return { type: 'text', text: part.text };
+      if (part.type === 'document') {
+        return { type: 'file', file: { filename: part.name ?? 'document.pdf', file_data: `data:${part.mediaType};base64,${part.data}` } };
+      }
       return { type: 'image_url', image_url: { url: `data:${part.mediaType};base64,${part.data}` } };
     });
   }

@@ -165,6 +165,20 @@ export interface CaptureDesktopRequestMsg extends WsEnvelope {
   requestId: string;
 }
 
+/**
+ * Ask the client to open a native file picker. The chosen file(s) come back as
+ * one or more {@link FileUploadMsg} carrying base64 chunks tagged with the same
+ * surfaceId so the backend can route them to the surface that requested them.
+ */
+export interface OpenFilePickerMsg extends WsEnvelope {
+  type: 'openFilePicker';
+  surfaceId: string;
+  /** Optional `accept` attribute for the file input (e.g. 'image/*,.pdf'). */
+  accept?: string;
+  /** Allow selecting multiple files. */
+  multiple?: boolean;
+}
+
 // =============================================================================
 // Auth messages (server -> client)
 // =============================================================================
@@ -207,6 +221,7 @@ export type BackendToFrontendMsg =
   | SetCursorMsg
   | CaptureSurfaceRequestMsg
   | CaptureDesktopRequestMsg
+  | OpenFilePickerMsg
   | AuthRequiredMsg
   | AuthNotRequiredMsg
   | AuthResultMsg;
@@ -314,8 +329,26 @@ export interface GlobalShortcutMsg extends WsEnvelope {
   combo: 'commandPalette' | 'windowSwitcher';
 }
 
+/**
+ * A file uploaded from the client (via picker or drag-drop), delivered as one
+ * or more base64 chunks. The backend reassembles chunks keyed by `uploadId`
+ * and, once complete, hands the full file to the object owning `surfaceId`.
+ */
+export interface FileUploadMsg extends WsEnvelope {
+  type: 'fileUpload';
+  surfaceId: string;
+  uploadId: string;
+  name: string;
+  mimeType: string;
+  /** Base64 of this chunk. */
+  base64: string;
+  chunkIndex: number;
+  chunkCount: number;
+}
+
 export type FrontendToBackendMsg =
   | InputMsg
+  | FileUploadMsg
   | EndWindowDragMsg
   | MeasureTextReplyMsg
   | DisplayInfoReplyMsg

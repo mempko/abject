@@ -271,6 +271,27 @@ export class WindowAbject extends Abject {
       await this.handleInputEvent(inputEvent);
     });
 
+    // Owner (e.g. Chat) asks to open a native file picker for this window's
+    // surface. The chosen file comes back as a 'fileUploaded' event below.
+    this.on('openFilePicker', async (msg: AbjectMessage) => {
+      const { accept, multiple } = msg.payload as { accept?: string; multiple?: boolean };
+      if (this.surfaceId) {
+        this.send(request(this.id, this.uiServerId, 'openFilePicker', {
+          surfaceId: this.surfaceId, accept, multiple,
+        }));
+      }
+      return true;
+    });
+
+    // A file picked or dropped onto this window arrives from UIServer (the
+    // surface owner). Re-emit it to the window's owner via the dependency
+    // protocol (WidgetManager forwards 'fileUploaded' to the owner).
+    this.on('fileUploaded', async (msg: AbjectMessage) => {
+      const payload = msg.payload as { name: string; mimeType: string; base64: string };
+      this.changed('fileUploaded', payload);
+      return true;
+    });
+
     // Child dirty notification — schedule a frame render
     this.on('childDirty', async () => {
       if (this.destroying) return;

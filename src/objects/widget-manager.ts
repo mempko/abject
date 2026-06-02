@@ -833,6 +833,18 @@ export class WidgetManager extends Abject {
       return DEFERRED_REPLY;
     });
 
+    this.on('showPromptDialog', (msg: AbjectMessage) => {
+      const opts = msg.payload as {
+        title: string; message: string; defaultValue?: string; placeholder?: string;
+        confirmLabel?: string; cancelLabel?: string;
+      };
+      this.spawnPromptDialog(opts).then(
+        (value) => this.sendDeferredReply(msg, value),
+        () => this.sendDeferredReply(msg, null),
+      );
+      return DEFERRED_REPLY;
+    });
+
     this.on('objectUnregistered', async (msg: AbjectMessage) => {
       const objectId = msg.payload as AbjectId;
       await this.destroyWindowsForOwner(objectId);
@@ -1002,6 +1014,20 @@ export class WidgetManager extends Abject {
         ...opts,
         theme: this.defaultTheme,
       }),
+      120000,
+    );
+  }
+
+  /** Spawn an ephemeral ModalDialog in text-input mode; resolves to the entered string or null. */
+  private async spawnPromptDialog(opts: {
+    title: string; message: string; defaultValue?: string; placeholder?: string;
+    confirmLabel?: string; cancelLabel?: string;
+  }): Promise<string | null> {
+    const dialog = new ModalDialog();
+    dialog.setWidgetManagerId(this.id);
+    await dialog.init(this.bus, this.id);
+    return this.request<string | null>(
+      request(this.id, dialog.id, 'showPrompt', { ...opts, theme: this.defaultTheme }),
       120000,
     );
   }

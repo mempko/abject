@@ -25,7 +25,9 @@ export class ModalDialog extends Abject {
   private dialogWindowId?: AbjectId;
   private confirmBtnId?: AbjectId;
   private cancelBtnId?: AbjectId;
-  private pendingResolve?: (confirmed: boolean) => void;
+  private inputWidgetId?: AbjectId;
+  private promptMode = false;
+  private pendingResolve?: (result: boolean | string | null) => void;
   private dialogTheme: ThemeData = ARCANE_GRIMOIRE;
 
   constructor() {
@@ -51,6 +53,20 @@ export class ModalDialog extends Abject {
                 { name: 'theme', type: { kind: 'reference', reference: 'ThemeData' }, description: 'Theme data for styling', optional: true },
               ],
               returns: { kind: 'primitive', primitive: 'boolean' },
+            },
+            {
+              name: 'showPrompt',
+              description: 'Show a dialog with a text input and return the entered string, or null if cancelled.',
+              parameters: [
+                { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Dialog title' },
+                { name: 'message', type: { kind: 'primitive', primitive: 'string' }, description: 'Dialog message' },
+                { name: 'defaultValue', type: { kind: 'primitive', primitive: 'string' }, description: 'Initial input value', optional: true },
+                { name: 'placeholder', type: { kind: 'primitive', primitive: 'string' }, description: 'Input placeholder', optional: true },
+                { name: 'confirmLabel', type: { kind: 'primitive', primitive: 'string' }, description: 'Confirm button label', optional: true },
+                { name: 'cancelLabel', type: { kind: 'primitive', primitive: 'string' }, description: 'Cancel button label', optional: true },
+                { name: 'theme', type: { kind: 'reference', reference: 'ThemeData' }, description: 'Theme data for styling', optional: true },
+              ],
+              returns: { kind: 'union', variants: [{ kind: 'primitive', primitive: 'string' }, { kind: 'primitive', primitive: 'null' }] },
             },
           ],
         },
@@ -115,35 +131,72 @@ Interface: abjects:modal-dialog`;
       return DEFERRED_REPLY;
     });
 
+    this.on('showPrompt', (msg: AbjectMessage) => {
+      this.promptMode = true;
+      this.handleShow(msg).then(
+        async (result) => {
+          await this.destroyWindows();
+          this.sendDeferredReply(msg, result);
+          this.stop().catch(() => {});
+        },
+        async () => {
+          await this.destroyWindows();
+          this.sendDeferredReply(msg, null);
+          this.stop().catch(() => {});
+        },
+      );
+      return DEFERRED_REPLY;
+    });
+
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
 
-      if (fromId === this.confirmBtnId && aspect === 'click') {
-        this.pendingResolve?.(true);
+      // Confirm: in prompt mode resolve with the input's current value.
+      if ((fromId === this.confirmBtnId && aspect === 'click') ||
+          (fromId === this.inputWidgetId && aspect === 'submit')) {
+        await this.resolveConfirm();
         return;
       }
       if (fromId === this.cancelBtnId && aspect === 'click') {
-        this.pendingResolve?.(false);
+        this.pendingResolve?.(this.cancelResult());
         return;
       }
       if (fromId === this.dialogWindowId && aspect === 'windowCloseRequested') {
-        this.pendingResolve?.(false);
+        this.pendingResolve?.(this.cancelResult());
         return;
       }
     });
 
     this.on('windowCloseRequested', async () => {
-      this.pendingResolve?.(false);
+      this.pendingResolve?.(this.cancelResult());
     });
 
     // Backdrop click dismisses the dialog (like cancel)
     this.on('input', async (msg: AbjectMessage) => {
       const input = msg.payload as { type?: string };
       if (input.type === 'mousedown') {
-        this.pendingResolve?.(false);
+        this.pendingResolve?.(this.cancelResult());
       }
     });
+  }
+
+  /** Cancel resolves to null in prompt mode, false for confirm dialogs. */
+  private cancelResult(): boolean | null {
+    return this.promptMode ? null : false;
+  }
+
+  /** Confirm resolves to the input string in prompt mode, true otherwise. */
+  private async resolveConfirm(): Promise<void> {
+    if (this.promptMode && this.inputWidgetId) {
+      let value = '';
+      try {
+        value = await this.request<string>(request(this.id, this.inputWidgetId, 'getValue', {}));
+      } catch { /* input gone */ }
+      this.pendingResolve?.(value ?? '');
+    } else {
+      this.pendingResolve?.(true);
+    }
   }
 
   /**
@@ -163,7 +216,7 @@ Interface: abjects:modal-dialog`;
     }
   }
 
-  private async handleShow(msg: AbjectMessage): Promise<boolean> {
+  private async handleShow(msg: AbjectMessage): Promise<boolean | string | null> {
     const {
       title,
       message: dialogMessage,
@@ -171,6 +224,8 @@ Interface: abjects:modal-dialog`;
       cancelLabel,
       destructive,
       theme,
+      defaultValue,
+      placeholder,
     } = msg.payload as {
       title: string;
       message: string;
@@ -178,6 +233,8 @@ Interface: abjects:modal-dialog`;
       cancelLabel?: string;
       destructive?: boolean;
       theme?: ThemeData;
+      defaultValue?: string;
+      placeholder?: string;
     };
 
     if (theme) this.dialogTheme = theme;
@@ -261,6 +318,30 @@ Interface: abjects:modal-dialog`;
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
 
+    // Prompt mode: insert a text input below the message.
+    if (this.promptMode) {
+      const { widgetIds: [inputId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, wmId, 'create', {
+          specs: [{
+            type: 'textInput', windowId: this.dialogWindowId,
+            text: defaultValue ?? '', placeholder: placeholder ?? '',
+          }],
+        })
+      );
+      this.inputWidgetId = inputId;
+      await this.request(request(this.id, rootLayoutId, 'addLayoutChild', {
+        widgetId: inputId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 32 },
+      }));
+      await this.request(request(this.id, inputId, 'addDependent', {}));
+      try {
+        await this.request(request(this.id, this.dialogWindowId, 'focusChild', {
+          widgetId: inputId, parentChildId: rootLayoutId,
+        }));
+      } catch { /* best effort focus */ }
+    }
+
     // Spacer
     await this.request(request(this.id, rootLayoutId, 'addLayoutSpacer', {}));
 
@@ -295,7 +376,7 @@ Interface: abjects:modal-dialog`;
     }));
 
     // Wait for user response
-    return new Promise<boolean>((resolve) => {
+    return new Promise<boolean | string | null>((resolve) => {
       this.pendingResolve = resolve;
     });
   }

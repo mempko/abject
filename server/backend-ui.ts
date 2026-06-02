@@ -22,6 +22,7 @@ import type {
   FontMetricsMsg,
   InputMsg,
   EndWindowDragMsg,
+  FileUploadMsg,
 } from './ws-protocol.js';
 import type { AuthConfig, SessionStore } from './auth.js';
 import type { UITransport } from './ui-transport.js';
@@ -91,6 +92,8 @@ export interface ClientMeta {
 
 export class BackendUI extends Abject {
   private surfaces: Map<string, SurfaceState> = new Map();
+  /** In-progress file uploads, keyed by uploadId, awaiting all chunks. */
+  private fileUploads: Map<string, { surfaceId: string; name: string; mimeType: string; chunks: string[]; received: number; chunkCount: number }> = new Map();
   private focusedSurface?: string;
   /** Accent color for the focused window's glow halo (last focused window's theme accent). */
   private focusGlowColor?: string;
@@ -565,6 +568,15 @@ export class BackendUI extends Abject {
     this.on('showMobileKeyboard', async (msg: AbjectMessage) => {
       const { show } = msg.payload as { show: boolean };
       this.sendToFrontend({ type: 'showMobileKeyboard', show });
+      return true;
+    });
+
+    // An object (e.g. a Chat window) asks the client to open a native file
+    // picker for one of its surfaces. The chosen file comes back as fileUpload
+    // chunks and is delivered to the surface owner as a 'fileUploaded' event.
+    this.on('openFilePicker', async (msg: AbjectMessage) => {
+      const { surfaceId, accept, multiple } = msg.payload as { surfaceId: string; accept?: string; multiple?: boolean };
+      this.sendToFrontend({ type: 'openFilePicker', surfaceId, accept, multiple });
       return true;
     });
 
@@ -1554,6 +1566,10 @@ IMPORTANT:
         break;
       }
 
+      case 'fileUpload':
+        this.handleFileUpload(msg);
+        break;
+
       case 'measureTextReply': {
         const pending = this.pendingRequests.get(msg.requestId!);
         if (pending) {
@@ -1640,6 +1656,45 @@ IMPORTANT:
         // Acknowledgment from frontend -- no action needed
         break;
     }
+  }
+
+  /**
+   * Reassemble an uploaded file from its base64 chunks. Once the final chunk
+   * arrives, deliver the whole file to the surface owner as a single
+   * 'fileUploaded' event — buffering here (rather than forwarding each chunk)
+   * keeps the owner's mailbox to one message regardless of file size.
+   */
+  private handleFileUpload(msg: FileUploadMsg): void {
+    let entry = this.fileUploads.get(msg.uploadId);
+    if (!entry) {
+      entry = {
+        surfaceId: msg.surfaceId,
+        name: msg.name,
+        mimeType: msg.mimeType,
+        chunks: new Array<string>(msg.chunkCount).fill(''),
+        received: 0,
+        chunkCount: msg.chunkCount,
+      };
+      this.fileUploads.set(msg.uploadId, entry);
+    }
+    if (msg.chunkIndex >= 0 && msg.chunkIndex < entry.chunks.length && entry.chunks[msg.chunkIndex] === '') {
+      entry.chunks[msg.chunkIndex] = msg.base64;
+      entry.received++;
+    }
+    if (entry.received < entry.chunkCount) return;
+
+    this.fileUploads.delete(msg.uploadId);
+    const base64 = entry.chunks.join('');
+    const owner = this.surfaces.get(entry.surfaceId)?.objectId;
+    if (!owner) {
+      log.warn(`fileUpload for unknown surface ${entry.surfaceId}, dropping`);
+      return;
+    }
+    this.send(event(this.id, owner as AbjectId, 'fileUploaded', {
+      name: entry.name,
+      mimeType: entry.mimeType,
+      base64,
+    }));
   }
 
   private async handleFrontendInput(msg: InputMsg, clientId: string): Promise<void> {
