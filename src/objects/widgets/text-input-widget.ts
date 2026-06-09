@@ -913,6 +913,9 @@ export class TextInputWidget extends WidgetAbject {
     }
 
     if (key === 'Home') {
+      // Empty input: nothing to navigate. Let the key bubble so a container
+      // (e.g. a chat transcript) can use it to scroll to the top.
+      if (this.text.length === 0) return { consumed: false };
       if (this.wordWrap && this.cachedWrappedLines && !(ctrl || meta)) {
         // Move to start of current visual line
         const lines = this.cachedWrappedLines;
@@ -944,6 +947,9 @@ export class TextInputWidget extends WidgetAbject {
     }
 
     if (key === 'End') {
+      // Empty input: nothing to navigate. Let the key bubble so a container
+      // (e.g. a chat transcript) can use it to scroll to the bottom.
+      if (this.text.length === 0) return { consumed: false };
       if (this.wordWrap && this.cachedWrappedLines && !(ctrl || meta)) {
         // Move to end of current visual line
         const lines = this.cachedWrappedLines;

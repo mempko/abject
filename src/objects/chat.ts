@@ -523,6 +523,19 @@ export class Chat extends Abject {
 
     this.on('windowCloseRequested', async () => { await this.hide(); });
 
+    // The text input keeps focus but doesn't consume PageUp/PageDown, so the
+    // window bubbles them here. Forward to the message log so the conversation
+    // scrolls a page at a time without reaching for the mouse.
+    this.on('keyUnhandled', async (msg: AbjectMessage) => {
+      const { key } = msg.payload as { key?: string };
+      if (!this.messageLogId) return;
+      if (key === 'PageUp' || key === 'PageDown' || key === 'Home' || key === 'End') {
+        try {
+          await this.request(request(this.id, this.messageLogId, 'scrollKey', { key }));
+        } catch { /* log gone */ }
+      }
+    });
+
     this.on('windowResized', async (msg: AbjectMessage) => {
       const { width, height } = msg.payload as { width: number; height: number };
       if (typeof width === 'number' && width > 0 && width !== this.currentWindowWidth) {
