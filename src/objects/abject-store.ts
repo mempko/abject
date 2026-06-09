@@ -39,6 +39,27 @@ export interface RestoreResult {
 }
 
 /**
+ * A manifest is well-formed only if it is a structured object with a non-empty
+ * name and an interface carrying a methods array. The known corruption mode is
+ * free-form text (an LLM saving a markdown description into the `manifest`
+ * field), which leaves name/interface undefined and crashes the
+ * ScriptableAbject constructor ("reading 'methods'").
+ */
+function isValidManifest(m: unknown): m is AbjectManifest {
+  if (!m || typeof m !== 'object') return false;
+  const manifest = m as Partial<AbjectManifest>;
+  if (typeof manifest.name !== 'string' || manifest.name.length === 0) return false;
+  const iface = manifest.interface as { methods?: unknown } | undefined;
+  if (!iface || typeof iface !== 'object' || !Array.isArray(iface.methods)) return false;
+  return true;
+}
+
+/** A snapshot is restorable only if its manifest is well-formed. */
+function isRestorableSnapshot(snap: AbjectSnapshot): boolean {
+  return isValidManifest(snap?.manifest);
+}
+
+/**
  * Persists and restores user-created scriptable abjects.
  */
 export class AbjectStore extends Abject {
@@ -249,6 +270,10 @@ export class AbjectStore extends Abject {
   ): Promise<boolean> {
     precondition(objectId !== '', 'objectId must not be empty');
     precondition(source !== '', 'source must not be empty');
+    precondition(
+      isValidManifest(manifest),
+      'manifest must be a structured AbjectManifest with a non-empty name and interface.methods (refusing to persist free-form text)',
+    );
 
     // Discover peerId lazily if not yet known
     if (!this.peerId) {
@@ -371,6 +396,21 @@ export class AbjectStore extends Abject {
     this.snapshots.clear();
 
     for (const snap of snapshotList) {
+      // Guard against corrupted snapshots whose manifest was persisted as
+      // free-form text instead of a structured AbjectManifest (e.g. an LLM
+      // saving a markdown description into the `manifest`/`source` fields). A
+      // missing name or interface would crash the ScriptableAbject constructor
+      // in the worker ("reading 'methods'"). Skip and drop them — they can
+      // never spawn, so re-persisting without them purges the corruption.
+      if (!isRestorableSnapshot(snap)) {
+        result.failed++;
+        const label = (snap.manifest as { name?: unknown } | undefined)?.name ?? snap.objectId;
+        const errMsg = `Dropping unrestorable snapshot '${label}': manifest missing name or interface`;
+        result.errors.push(errMsg);
+        log.warn(errMsg);
+        continue;
+      }
+
       try {
         // Compute typeId for restored object (use saved typeId or compute fresh)
         const typeId = snap.typeId || this.computeTypeId(snap.manifest.name) || snap.objectId;
