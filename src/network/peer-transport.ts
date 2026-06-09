@@ -94,6 +94,14 @@ export class PeerTransport extends Transport {
   private pendingChunks: Map<string, { total: number; parts: Map<number, string>; timer: ReturnType<typeof setTimeout>; warnTimer: ReturnType<typeof setTimeout> }> = new Map();
   private connectionTimer?: ReturnType<typeof setTimeout>;
 
+  // Throttled recv logging — per-message logs at 60fps UI traffic drown the
+  // log, so aggregate and emit a summary at most once per window.
+  private recvLogCount = 0;
+  private recvLogLastEmit = 0;
+  private droppedNoConsumerCount = 0;
+  private droppedNoConsumerLastEmit = 0;
+  private static readonly RECV_LOG_INTERVAL_MS = 5_000;
+
   constructor(config: PeerTransportConfig) {
     super({ ...config, heartbeatInterval: config.heartbeatInterval ?? 10_000 });
     this.localPeerId = config.localPeerId;
@@ -516,6 +524,36 @@ export class PeerTransport extends Transport {
   }
 
   /**
+   * Log an inbound routed message, throttled: the first message logs
+   * immediately, then at most one summary line per RECV_LOG_INTERVAL_MS
+   * carrying the count of messages received since the last line.
+   */
+  private logRecv(kind: 'encrypted' | 'unencrypted', message: AbjectMessage): void {
+    this.recvLogCount++;
+    const now = Date.now();
+    if (now - this.recvLogLastEmit < PeerTransport.RECV_LOG_INTERVAL_MS) return;
+    const suppressed = this.recvLogCount - 1;
+    const tail = suppressed > 0 ? ` (+${suppressed} more in last ${Math.round((now - this.recvLogLastEmit) / 1000)}s)` : '';
+    log.info(`recv ${kind} from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} type=${message.header.type} method=${message.routing.method ?? '?'}${tail}`);
+    this.recvLogCount = 0;
+    this.recvLogLastEmit = now;
+  }
+
+  /**
+   * A routed AbjectMessage arrived but no onMessage consumer is wired (e.g. a
+   * RemoteUIAccess transport, which only handles raw UI traffic). The message
+   * is dropped; warn (throttled) so this never becomes a silent black hole.
+   */
+  private logDroppedNoConsumer(message: AbjectMessage): void {
+    this.droppedNoConsumerCount++;
+    const now = Date.now();
+    if (now - this.droppedNoConsumerLastEmit < PeerTransport.RECV_LOG_INTERVAL_MS) return;
+    log.warn(`dropping routed message from ${this.remotePeerId.slice(0, 16)} — no onMessage consumer on this transport (to=${message.routing.to.slice(0, 20)} method=${message.routing.method ?? '?'}, ${this.droppedNoConsumerCount} dropped since last report)`);
+    this.droppedNoConsumerCount = 0;
+    this.droppedNoConsumerLastEmit = now;
+  }
+
+  /**
    * Handle incoming data from the DataChannel.
    */
   private async handleIncomingData(data: string): Promise<void> {
@@ -566,8 +604,12 @@ export class PeerTransport extends Transport {
           return;
         }
         const message = deserialize(msgData);
-        log.info(`recv encrypted from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
-        this.events.onMessage?.(message);
+        this.logRecv('encrypted', message);
+        if (this.events.onMessage) {
+          this.events.onMessage(message);
+        } else {
+          this.logDroppedNoConsumer(message);
+        }
         return;
       }
 
@@ -579,8 +621,12 @@ export class PeerTransport extends Transport {
 
       // Unencrypted message (during handshake or if encryption not yet established)
       const message = deserialize(data);
-      log.info(`recv unencrypted from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
-      this.events.onMessage?.(message);
+      this.logRecv('unencrypted', message);
+      if (this.events.onMessage) {
+        this.events.onMessage(message);
+      } else {
+        this.logDroppedNoConsumer(message);
+      }
     } catch (err) {
       log.error('Failed to handle message:', err);
       this.events.onError?.(err instanceof Error ? err : new Error(String(err)));

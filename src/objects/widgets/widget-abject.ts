@@ -328,6 +328,19 @@ export abstract class WidgetAbject extends Abject {
       await this.stop();
       return true;
     });
+
+    // The bus sends this when one of our events bounced off an unregistered
+    // recipient. If that recipient is our owner (window/layout), we are an
+    // orphan — the destroy cascade missed us. Self-destruct so animation
+    // loops (busy pulse, canvas tweens) stop instead of firing childDirty at
+    // the dead owner forever (locally and across peers).
+    this.on('recipientGone', async (msg: AbjectMessage) => {
+      const { recipient } = msg.payload as { recipient?: AbjectId };
+      if (recipient && recipient === this.ownerId) {
+        await this.stop();
+      }
+      return true;
+    });
   }
 
   /**

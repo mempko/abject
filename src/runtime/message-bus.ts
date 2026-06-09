@@ -8,7 +8,7 @@
 
 import { AbjectMessage, AbjectId, AbjectError } from '../core/types.js';
 import { require, ensure, invariant, requireNonEmpty } from '../core/contracts.js';
-import { request as createRequest, error as createError, resetSequence } from '../core/message.js';
+import { request as createRequest, error as createError, event as createEvent, resetSequence } from '../core/message.js';
 import { Mailbox } from './mailbox.js';
 import type { WorkerPool } from './worker-pool.js';
 import type { WorkerBridge } from './worker-bridge.js';
@@ -150,17 +150,20 @@ export class MessageBus implements MessageBusLike {
           'RECIPIENT_NOT_FOUND',
           `Recipient ${recipient} is not registered`,
         );
-        const senderMailbox = this.mailboxes.get(sender);
-        if (senderMailbox) {
-          senderMailbox.send(errorReply);
-          this.messageCount++;
-        } else if (this.workerObjects.has(sender)) {
-          const senderBridge = this.getBridgeForObject(sender);
-          if (senderBridge) {
-            senderBridge.deliverMessage(errorReply);
-            this.messageCount++;
-          }
-        }
+        this.deliverToSender(sender, errorReply);
+      }
+
+      // For undeliverable events, tell the sender its recipient is gone so it
+      // can stop emitting (e.g. an animating widget whose window was destroyed
+      // would otherwise fire childDirty at frame rate forever). Guard against
+      // recursion: never notify about an undeliverable recipientGone itself.
+      if (message.header.type === 'event' && recipient && message.routing.method !== 'recipientGone') {
+        const sender = message.routing.from;
+        const notice = createEvent(recipient, sender, 'recipientGone', {
+          recipient,
+          method: message.routing.method,
+        });
+        this.deliverToSender(sender, notice);
       }
 
       this.notifyUndeliverable(message);
@@ -171,6 +174,25 @@ export class MessageBus implements MessageBusLike {
     const mailbox = this.mailboxes.get(recipient)!;
     mailbox.send(message);
     this.messageCount++;
+  }
+
+  /**
+   * Deliver a bus-generated message (error reply, recipientGone notice) to a
+   * sender that may live locally or in a worker. Silently drops if the sender
+   * is gone too.
+   */
+  private deliverToSender(sender: AbjectId, message: AbjectMessage): void {
+    const senderMailbox = this.mailboxes.get(sender);
+    if (senderMailbox) {
+      senderMailbox.send(message);
+      this.messageCount++;
+    } else if (this.workerObjects.has(sender)) {
+      const senderBridge = this.getBridgeForObject(sender);
+      if (senderBridge) {
+        senderBridge.deliverMessage(message);
+        this.messageCount++;
+      }
+    }
   }
 
   /**
