@@ -32,6 +32,8 @@ export class GlobalToolbar extends Abject {
 
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
+  /** Single-flight guard for show()'s destroy+rebuild (prevents duplicate rails). */
+  private buildingUI = false;
   /** True when WorkspaceManager pushed a theme into the pending show(). */
   private pushedTheme = false;
   private settingsBtnId?: AbjectId;
@@ -268,6 +270,12 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
   }
 
   async show(yOffset = 8): Promise<boolean> {
+    // Single-flight: a second show() racing in during a workspace switch would
+    // destroy+recreate the window concurrently and leave two stacked rails
+    // (duplicate header). Bail if a build is already in flight.
+    if (this.buildingUI) return true;
+    this.buildingUI = true;
+    try {
     // If WorkspaceManager already pushed the active theme into this show(), use
     // it; otherwise pull it ourselves (e.g. a self-initiated re-show).
     if (this.pushedTheme) {
@@ -402,6 +410,9 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
     this.send(request(this.id, this.notificationsBtnId, 'addDependent', {}));
 
     return true;
+    } finally {
+      this.buildingUI = false;
+    }
   }
 
   async hide(): Promise<boolean> {

@@ -36,6 +36,17 @@ export class NodeWorkerAdapter implements WorkerLike {
     }
 
     this.worker.on('message', (data) => {
+      // tsx/Node `--watch` mode instruments worker threads to report every
+      // module they import/require back to the parent via the worker's parent
+      // port (e.g. `{ 'watch:import': [...] }`). These internal watch messages
+      // are not part of the Abject worker protocol — drop them so they don't
+      // flood the bridge as "Unknown message type from worker".
+      if (data && typeof data === 'object') {
+        const keys = Object.keys(data as Record<string, unknown>);
+        if (keys.length === 1 && keys[0].startsWith('watch:')) {
+          return;
+        }
+      }
       this.onmessage?.({ data });
     });
 

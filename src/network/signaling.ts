@@ -291,8 +291,15 @@ export class SignalingClient implements SignalingRelay {
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
-      if (this.endpoint) {
-        this.connect(this.endpoint).catch(console.error);
+      const endpoint = this.endpoint;
+      if (endpoint) {
+        // A reconnect failure is expected (e.g. a signaling server that is
+        // down). Log a quiet one-liner — the backoff schedule already reports
+        // the next attempt — instead of dumping a full stack trace each retry.
+        this.connect(endpoint).catch((err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`Reconnect to ${endpoint} failed: ${msg}`);
+        });
       }
     }, delay);
   }

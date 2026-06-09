@@ -31,6 +31,8 @@ export class WorkspaceSwitcher extends Abject {
   private workspaceBrowserId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
+  /** Single-flight guard for show()'s destroy+rebuild (prevents duplicate rails). */
+  private buildingUI = false;
   /** True when WorkspaceManager pushed a theme into the pending show(). */
   private pushedTheme = false;
 
@@ -276,6 +278,12 @@ the WorkspaceBrowser for discovering remote workspaces.
   }
 
   async show(): Promise<boolean> {
+    // Single-flight: a second show() racing in during a workspace switch would
+    // destroy+recreate the window concurrently and leave two stacked rails
+    // (duplicate header). Bail if a build is already in flight.
+    if (this.buildingUI) return true;
+    this.buildingUI = true;
+    try {
     // If WorkspaceManager already pushed the active theme into this show(), use
     // it; otherwise pull it ourselves (e.g. a self-initiated re-show on create).
     if (this.pushedTheme) {
@@ -431,6 +439,9 @@ the WorkspaceBrowser for discovering remote workspaces.
     }
 
     return true;
+    } finally {
+      this.buildingUI = false;
+    }
   }
 
   async hide(): Promise<boolean> {

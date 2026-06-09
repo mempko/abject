@@ -41,6 +41,8 @@ export class Taskbar extends Abject {
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
   private yOffset = 8;
+  /** Single-flight guard: buildUI sets windowId only after an async round-trip. */
+  private buildingUI = false;
 
   // Button -> target maps for click dispatch
   private systemButtons: Map<AbjectId, AbjectId> = new Map();
@@ -228,7 +230,17 @@ windows" section so the user can restore windows from the taskbar.
       await this.resizeWindow();
       return true;
     }
-    await this.buildUI();
+    // buildUI() sets this.windowId only after the async createWindowAbject
+    // resolves. Without a synchronous guard, a second show() racing in during
+    // a workspace switch passes the windowId check and builds a *second*
+    // window (duplicate header). Single-flight buildUI to prevent that.
+    if (this.buildingUI) return true;
+    this.buildingUI = true;
+    try {
+      await this.buildUI();
+    } finally {
+      this.buildingUI = false;
+    }
     this.changed('visibility', true);
     return true;
   }
