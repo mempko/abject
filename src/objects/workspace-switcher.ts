@@ -328,6 +328,7 @@ the WorkspaceBrowser for discovering remote workspaces.
         zIndex: 1000,
         chromeless: true,
         draggable: true,
+        closable: false,
       })
     );
 

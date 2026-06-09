@@ -107,6 +107,14 @@ export class WindowManager extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
+                name: 'closeWindow',
+                description: 'Close the window owning a surface',
+                parameters: [
+                  { name: 'surfaceId', type: { kind: 'primitive', primitive: 'string' }, description: 'Surface ID whose window to close' },
+                ],
+                returns: { kind: 'primitive', primitive: 'undefined' },
+              },
+              {
                 name: 'getWindows',
                 description: 'Return list of tracked windows',
                 parameters: [],
@@ -257,6 +265,16 @@ export class WindowManager extends Abject {
     this.on('raiseWindow', async (msg: AbjectMessage) => {
       const { surfaceId } = msg.payload as { surfaceId: string };
       return this.raiseWindow(surfaceId);
+    });
+
+    // Close the window owning a surface — replays the title-bar close path.
+    // Used by the mobile card overview (flick-up-to-close).
+    this.on('closeWindow', async (msg: AbjectMessage) => {
+      const { surfaceId } = msg.payload as { surfaceId: string };
+      const info = this.windows.get(surfaceId);
+      if (info) {
+        this.send(event(this.id, info.windowId, 'titleBarAction', { action: 'close' }));
+      }
     });
 
     this.on('getWindows', async () => {

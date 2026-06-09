@@ -23,6 +23,7 @@ import type {
   InputMsg,
   EndWindowDragMsg,
   FileUploadMsg,
+  CloseWindowMsg,
 } from './ws-protocol.js';
 import type { AuthConfig, SessionStore } from './auth.js';
 import type { UITransport } from './ui-transport.js';
@@ -41,6 +42,7 @@ export interface SurfaceState {
   inputPassthrough: boolean;
   inputMonitor: boolean;
   transparent: boolean;
+  closable: boolean;
   lastDrawCommands: Array<{ type: string; surfaceId: string; params: unknown }>;
   workspaceId?: string;
   title?: string;
@@ -491,14 +493,15 @@ export class BackendUI extends Abject {
 
   private setupHandlers(): void {
     this.on('createSurface', async (msg: AbjectMessage) => {
-      const { rect, zIndex, inputPassthrough, inputMonitor, transparent } = msg.payload as {
+      const { rect, zIndex, inputPassthrough, inputMonitor, transparent, closable } = msg.payload as {
         rect: { x: number; y: number; width: number; height: number };
         zIndex?: number;
         inputPassthrough?: boolean;
         inputMonitor?: boolean;
         transparent?: boolean;
+        closable?: boolean;
       };
-      return this.handleCreateSurface(msg.routing.from, rect, zIndex, inputPassthrough, inputMonitor, transparent);
+      return this.handleCreateSurface(msg.routing.from, rect, zIndex, inputPassthrough, inputMonitor, transparent, closable);
     });
 
     this.on('destroySurface', async (msg: AbjectMessage) => {
@@ -1210,7 +1213,8 @@ IMPORTANT:
     zIndex?: number,
     inputPassthrough?: boolean,
     inputMonitor?: boolean,
-    transparent?: boolean
+    transparent?: boolean,
+    closable?: boolean
   ): string {
     const surfaceId = `surface-${objectId}-${this.surfaceCounter++}`;
     const z = zIndex ?? 0;
@@ -1223,6 +1227,7 @@ IMPORTANT:
       inputPassthrough: inputPassthrough ?? false,
       inputMonitor: inputMonitor ?? false,
       transparent: transparent ?? false,
+      closable: closable ?? true,
       lastDrawCommands: [],
     });
 
@@ -1234,6 +1239,7 @@ IMPORTANT:
       zIndex: z,
       inputPassthrough: inputPassthrough ?? false,
       transparent: transparent ?? false,
+      closable: closable ?? true,
     });
 
     this.log('debug', 'createSurface', { surfaceId, objectId, rect, zIndex });
@@ -1648,6 +1654,14 @@ IMPORTANT:
         break;
       }
 
+      case 'closeWindow': {
+        const m = msg as CloseWindowMsg;
+        if (this.windowManagerId) {
+          this.send(event(this.id, this.windowManagerId, 'closeWindow', { surfaceId: m.surfaceId }));
+        }
+        break;
+      }
+
       case 'endWindowDrag':
         this.handleEndWindowDrag(msg as EndWindowDragMsg, clientId);
         break;
@@ -1903,6 +1917,7 @@ IMPORTANT:
         zIndex: state.zIndex,
         inputPassthrough: state.inputPassthrough,
         transparent: state.transparent,
+        closable: state.closable,
         title: state.title,
       }, clientId);
     }

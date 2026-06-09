@@ -35,6 +35,8 @@ export interface WindowConfig {
   draggable?: boolean;
   zIndex?: number;
   theme?: ThemeData;
+  /** Whether the mobile card overview may close this window (default true). */
+  closable?: boolean;
 }
 
 /**
@@ -47,6 +49,7 @@ export class WindowAbject extends Abject {
   private rect: Rect;
   private chromeless: boolean;
   private transparent: boolean;
+  private closable: boolean;
   private resizable: boolean;
   private draggable: boolean;
   private zIndex: number;
@@ -172,6 +175,7 @@ export class WindowAbject extends Abject {
     this.rect = { ...config.rect };
     this.chromeless = config.chromeless ?? false;
     this.transparent = config.transparent ?? false;
+    this.closable = config.closable ?? true;
     this.resizable = config.resizable ?? false;
     this.draggable = config.draggable ?? false;
     this.zIndex = config.zIndex ?? 100;
@@ -442,6 +446,7 @@ method calls on 'abjects:widgets' interface:
         rect: this.rect,
         zIndex: this.zIndex,
         transparent: this.transparent,
+        closable: this.closable,
       })
     );
     // Forward title to frontend for mobile tab bar

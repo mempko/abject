@@ -6,7 +6,7 @@
  * Handles measureText and displayInfo requests locally.
  */
 
-import { Compositor, DrawCommand } from '../src/ui/compositor.js';
+import { Compositor, DrawCommand, MobileViewState } from '../src/ui/compositor.js';
 import type { AbjectId } from '../src/core/types.js';
 import type {
   BackendToFrontendMsg,
@@ -63,7 +63,6 @@ export class FrontendClient {
   /** Scrollbar thumb drag in progress. */
   private draggingScrollbar = false;
   private mobileMode = false;
-  private mobileTabTouchStartX?: number;  // track start X for tap vs scroll detection
   private mobileKeyboardProxy?: HTMLInputElement;  // hidden input for virtual keyboard
   // Pinch-zoom state
   private pinchStartDist?: number;
@@ -71,6 +70,25 @@ export class FrontendClient {
   // Two-finger pan state
   private panLastMidX?: number;
   private panLastMidY?: number;
+
+  // ── Single-finger gesture state machine (mobile) ──
+  private static readonly DOUBLE_TAP_MS = 300;
+  private static readonly TAP_SLOP_PX = 10;
+  private static readonly EDGE_SWIPE_TRIGGER_PX = 40;
+  private static readonly LONG_PRESS_MS = 350;
+  private static readonly FLICK_VELOCITY = 0.6;  // px/ms upward to close a card
+  private static readonly CARD_CLOSE_DISTANCE = 120;  // px dragged up to close
+  /** Per-touch gesture descriptor (single finger). */
+  private activeTouch?: {
+    startX: number; startY: number; startTime: number;
+    lastX: number; lastY: number; lastTime: number; lastVy: number;
+    mode: 'undecided' | 'content' | 'pan' | 'edgeSwipe' | 'edgeConsumed' | 'cardPan' | 'cardClose' | 'cardReorder';
+    cardId?: string;
+    longPressTimer?: ReturnType<typeof setTimeout>;
+  };
+  private lastTapTime = 0;
+  private lastTapX = 0;
+  private lastTapY = 0;
   /** Client-side drag state for zero-latency window moves */
   private localDragState?: {
     surfaceId: string;
@@ -695,6 +713,7 @@ export class FrontendClient {
       false, // inputMonitor
       msg.title,
       msg.transparent ?? false,
+      msg.closable ?? true,
     );
 
     this.sendToBackend({
@@ -901,8 +920,10 @@ export class FrontendClient {
       this.canvas.focus();
       const canvasRect = this.canvas.getBoundingClientRect();
 
-      // Two-finger touch: start pinch-zoom
+      // Two-finger touch: start pinch-zoom (not in card overview)
       if (e.touches.length === 2) {
+        this.cancelActiveTouch();
+        if (this.compositor.getMobileView() === MobileViewState.CARD_OVERVIEW) return;
         const t0 = e.touches[0], t1 = e.touches[1];
         this.pinchStartDist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
         this.pinchStartZoom = 1; // relative
@@ -913,15 +934,7 @@ export class FrontendClient {
 
       const touch = e.touches[0];
       if (!touch) return;
-      const cy = touch.clientY - canvasRect.top;
-      const cx = touch.clientX - canvasRect.left;
-      // Start tab bar scroll gesture if touching the tab bar
-      if (this.compositor.isInMobileTabBar(cy)) {
-        this.mobileTabTouchStartX = cx;
-        this.compositor.mobileTabDragStart(cx);
-        return;
-      }
-      this.handleTouchEvent(touch, 'mousedown');
+      this.onTouchStart(touch, touch.clientX - canvasRect.left, touch.clientY - canvasRect.top);
     }, { passive: false });
 
     this.canvas.addEventListener('touchmove', (e) => {
@@ -950,14 +963,7 @@ export class FrontendClient {
 
       const touch = e.touches[0];
       if (!touch) return;
-      const cx = touch.clientX - canvasRect.left;
-      const cy = touch.clientY - canvasRect.top;
-      // Continue tab bar scroll gesture
-      if (this.compositor.isInMobileTabBar(cy) || this.compositor.isMobileTabDragging) {
-        this.compositor.mobileTabDragMove(cx);
-        return;
-      }
-      this.handleTouchEvent(touch, 'mousemove');
+      this.onTouchMove(touch, touch.clientX - canvasRect.left, touch.clientY - canvasRect.top);
     }, { passive: false });
 
     this.canvas.addEventListener('touchend', (e) => {
@@ -969,27 +975,198 @@ export class FrontendClient {
         this.pinchStartZoom = undefined;
         this.panLastMidX = undefined;
         this.panLastMidY = undefined;
-        // If one finger remains, don't generate mouseup
+        // If one finger remains, don't generate a single-finger gesture
         if (e.touches.length === 1) return;
       }
 
       const touch = e.changedTouches[0];
       if (!touch) return;
       const canvasRect = this.canvas.getBoundingClientRect();
-      const cx = touch.clientX - canvasRect.left;
-      const cy = touch.clientY - canvasRect.top;
-      // End tab bar scroll gesture -- if barely moved, treat as tap
-      if (this.compositor.isMobileTabDragging) {
-        const moved = Math.abs(cx - (this.mobileTabTouchStartX ?? cx));
-        this.mobileTabTouchStartX = undefined;
-        this.compositor.mobileTabDragEnd();
-        if (moved < 10) {
-          this.compositor.handleMobileTabTap(cx, cy);
+      this.onTouchEnd(touch, touch.clientX - canvasRect.left, touch.clientY - canvasRect.top);
+    }, { passive: false });
+  }
+
+  private cancelActiveTouch(): void {
+    if (this.activeTouch?.longPressTimer) clearTimeout(this.activeTouch.longPressTimer);
+    this.activeTouch = undefined;
+  }
+
+  /** Begin a single-finger gesture; the mode is chosen by view state + start location. */
+  private onTouchStart(touch: Touch, cx: number, cy: number): void {
+    const now = performance.now();
+    const at = this.activeTouch = {
+      startX: cx, startY: cy, startTime: now,
+      lastX: cx, lastY: cy, lastTime: now, lastVy: 0,
+      mode: 'undecided' as const,
+    } as NonNullable<FrontendClient['activeTouch']>;
+
+    const view = this.compositor.getMobileView();
+
+    if (view === MobileViewState.CARD_OVERVIEW) {
+      at.cardId = this.compositor.cardAt(cx, cy);
+      const id = at.cardId;
+      if (id) {
+        at.longPressTimer = setTimeout(() => {
+          if (this.activeTouch === at && at.mode === 'undecided') {
+            at.mode = 'cardReorder';
+            this.compositor.cardReorderBegin(id);
+          }
+        }, FrontendClient.LONG_PRESS_MS);
+      }
+      return;
+    }
+
+    // Native states: bottom band arms the swipe-up; fit-mode forwards content input.
+    if (this.compositor.isInGestureHandle(cy)) {
+      at.mode = 'edgeSwipe';
+      return;
+    }
+    if (view === MobileViewState.NATIVE_FIT) {
+      at.mode = 'content';
+      this.handleTouchEvent(touch, 'mousedown');
+    }
+    // NATIVE_ZOOMED: stay 'undecided' — pan on move, click on tap.
+  }
+
+  private onTouchMove(touch: Touch, cx: number, cy: number): void {
+    const at = this.activeTouch;
+    if (!at) return;
+    const now = performance.now();
+    const dxStep = cx - at.lastX;
+    const dyStep = cy - at.lastY;
+    at.lastVy = dyStep / Math.max(1, now - at.lastTime);
+    at.lastX = cx; at.lastY = cy; at.lastTime = now;
+    const movedDist = Math.hypot(cx - at.startX, cy - at.startY);
+
+    switch (at.mode) {
+      case 'edgeConsumed':
+        return;
+      case 'edgeSwipe':
+        if (at.startY - cy > FrontendClient.EDGE_SWIPE_TRIGGER_PX) {
+          this.compositor.enterCardOverview();
+          at.mode = 'edgeConsumed';
+        }
+        return;
+      case 'content':
+        this.handleTouchEvent(touch, 'mousemove');
+        return;
+      case 'pan':
+        this.compositor.mobilePan(dxStep, dyStep);
+        return;
+      case 'cardReorder':
+        this.compositor.cardReorder(dxStep);
+        return;
+      case 'cardPan':
+        this.compositor.cardDeckPan(dxStep);
+        return;
+      case 'cardClose':
+        this.compositor.cardCloseDrag(dyStep);
+        return;
+      case 'undecided': {
+        if (movedDist <= FrontendClient.TAP_SLOP_PX) return;
+        if (at.longPressTimer) { clearTimeout(at.longPressTimer); at.longPressTimer = undefined; }
+        if (this.compositor.getMobileView() === MobileViewState.CARD_OVERVIEW) {
+          const dxTotal = cx - at.startX;
+          const dyTotal = cy - at.startY;
+          if (at.cardId && dyTotal < 0 && Math.abs(dyTotal) > Math.abs(dxTotal)
+              && this.compositor.isSurfaceClosable(at.cardId)) {
+            at.mode = 'cardClose';
+            this.compositor.cardCloseDragBegin(at.cardId);
+            this.compositor.cardCloseDrag(dyTotal);
+          } else {
+            at.mode = 'cardPan';
+            this.compositor.cardDeckPan(cx - at.startX);
+          }
+        } else {
+          // NATIVE_ZOOMED → pan
+          at.mode = 'pan';
+          this.compositor.mobilePan(cx - at.startX, cy - at.startY);
         }
         return;
       }
-      this.handleTouchEvent(touch, 'mouseup');
-    }, { passive: false });
+    }
+  }
+
+  private onTouchEnd(touch: Touch, cx: number, cy: number): void {
+    const at = this.activeTouch;
+    this.activeTouch = undefined;
+    if (!at) return;
+    if (at.longPressTimer) clearTimeout(at.longPressTimer);
+
+    const movedDist = Math.hypot(cx - at.startX, cy - at.startY);
+    const isTap = movedDist < FrontendClient.TAP_SLOP_PX && (performance.now() - at.startTime) < 500;
+
+    switch (at.mode) {
+      case 'content':
+        this.handleTouchEvent(touch, 'mouseup');
+        if (isTap) this.maybeDoubleTap(cx, cy);
+        return;
+      case 'edgeSwipe':
+        // Tap (or partial swipe) on the bottom indicator also opens the overview.
+        this.compositor.enterCardOverview();
+        return;
+      case 'pan':
+      case 'edgeConsumed':
+        return;
+      case 'cardReorder':
+        this.compositor.cardReorderEnd();
+        return;
+      case 'cardPan':
+        this.compositor.cardDeckSnap();
+        return;
+      case 'cardClose': {
+        const draggedUp = at.startY - at.lastY;
+        const shouldClose = at.lastVy < -FrontendClient.FLICK_VELOCITY
+          || draggedUp > FrontendClient.CARD_CLOSE_DISTANCE;
+        if (at.cardId && shouldClose) {
+          this.closeWindowForSurface(at.cardId);
+          this.compositor.cardFlickClose(at.cardId);
+        } else if (at.cardId) {
+          this.compositor.cardSnapBack(at.cardId);
+        }
+        return;
+      }
+      case 'undecided': {
+        if (!isTap) return;
+        if (this.compositor.getMobileView() === MobileViewState.CARD_OVERVIEW) {
+          const chip = this.compositor.closeChipAt(cx, cy);
+          if (chip) {
+            this.closeWindowForSurface(chip);
+            this.compositor.cardFlickClose(chip);
+          } else if (at.cardId) {
+            this.compositor.exitCardOverview(at.cardId);
+          } else if (this.compositor.isInGestureHandle(cy)) {
+            // Tap the handle to leave the overview without picking a card.
+            this.compositor.exitCardOverview();
+          }
+        } else {
+          // NATIVE_ZOOMED tap → forward a click, and detect double-tap.
+          this.handleTouchEvent(touch, 'mousedown');
+          this.handleTouchEvent(touch, 'mouseup');
+          this.maybeDoubleTap(cx, cy);
+        }
+        return;
+      }
+    }
+  }
+
+  /** Toggle 1:1 native zoom on a quick second tap near the first. */
+  private maybeDoubleTap(cx: number, cy: number): void {
+    const now = performance.now();
+    if (now - this.lastTapTime < FrontendClient.DOUBLE_TAP_MS
+        && Math.hypot(cx - this.lastTapX, cy - this.lastTapY) < FrontendClient.TAP_SLOP_PX) {
+      this.compositor.mobileToggleNativeZoom(cx, cy);
+      this.lastTapTime = 0; // consume, so a third tap doesn't re-trigger
+    } else {
+      this.lastTapTime = now;
+      this.lastTapX = cx;
+      this.lastTapY = cy;
+    }
+  }
+
+  /** Ask the backend to close the window owning a surface (card flick-up). */
+  private closeWindowForSurface(surfaceId: string): void {
+    this.sendToBackend({ type: 'closeWindow', surfaceId });
   }
 
   private handleTouchEvent(
@@ -1002,13 +1179,6 @@ export class FrontendClient {
 
     this.lastCanvasX = canvasX;
     this.lastCanvasY = canvasY;
-
-    // In mobile mode, check tab bar taps first
-    if (this.mobileMode && type === 'mousedown') {
-      if (this.compositor.handleMobileTabTap(canvasX, canvasY)) {
-        return; // tab bar consumed the tap
-      }
-    }
 
     // Hit test
     const hitSurface = this.compositor.surfaceAt(canvasX, canvasY);

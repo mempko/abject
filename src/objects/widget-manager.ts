@@ -128,6 +128,7 @@ export class WidgetManager extends Abject {
                   { name: 'zIndex', type: { kind: 'primitive', primitive: 'number' }, description: 'Z-index for stacking order', optional: true },
                   { name: 'chromeless', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, no title bar', optional: true },
                   { name: 'resizable', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, window is resizable', optional: true },
+                  { name: 'closable', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If false, the mobile card overview cannot close this window (default true)', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -432,7 +433,7 @@ export class WidgetManager extends Abject {
 
     // Direct factory: create window, return AbjectId (not shim string)
     this.on('createWindowAbject', async (msg: AbjectMessage) => {
-      const { title, rect, zIndex, chromeless, transparent, resizable, draggable } = msg.payload as {
+      const { title, rect, zIndex, chromeless, transparent, resizable, draggable, closable } = msg.payload as {
         title: string;
         rect: { x: number; y: number; width: number; height: number };
         zIndex?: number;
@@ -440,8 +441,9 @@ export class WidgetManager extends Abject {
         transparent?: boolean;
         resizable?: boolean;
         draggable?: boolean;
+        closable?: boolean;
       };
-      return this.createWindowDirect(msg.routing.from, title, rect, { chromeless, transparent, resizable, draggable, zIndex });
+      return this.createWindowDirect(msg.routing.from, title, rect, { chromeless, transparent, resizable, draggable, zIndex, closable });
     });
 
     // Direct factory: destroy window by AbjectId (not shim string)
@@ -1749,7 +1751,7 @@ await this.call(timerId, 'addDependent', {});
     owner: AbjectId,
     title: string,
     rect: { x: number; y: number; width: number; height: number },
-    options?: { chromeless?: boolean; transparent?: boolean; resizable?: boolean; draggable?: boolean; zIndex?: number }
+    options?: { chromeless?: boolean; transparent?: boolean; resizable?: boolean; draggable?: boolean; zIndex?: number; closable?: boolean }
   ): Promise<AbjectId> {
     require(this.uiServerId !== undefined, 'UIServer not set');
 
@@ -1771,6 +1773,7 @@ await this.call(timerId, 'addDependent', {});
       transparent: options?.transparent,
       resizable: options?.resizable,
       draggable: options?.draggable,
+      closable: options?.closable,
       zIndex: options?.zIndex ?? 100,
       theme: ownerTheme,
     });

@@ -314,6 +314,7 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
         zIndex: 1000,
         chromeless: true,
         draggable: true,
+        closable: false,
       })
     );
 

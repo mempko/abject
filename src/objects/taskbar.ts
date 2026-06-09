@@ -286,6 +286,7 @@ windows" section so the user can restore windows from the taskbar.
         zIndex: 999,
         chromeless: true,
         draggable: true,
+        closable: false,
       })
     );
 

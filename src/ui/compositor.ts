@@ -4,6 +4,19 @@
 
 import { AbjectId } from '../core/types.js';
 import { require, ensure } from '../core/contracts.js';
+import { Tween, DECELERATE, ACCELERATE } from './motion.js';
+
+/**
+ * Mobile interaction states (WebOS-style).
+ * - NATIVE_FIT: one window shown fit-to-screen; single finger = content input.
+ * - NATIVE_ZOOMED: window shown at 1:1 native pixels; single finger pans.
+ * - CARD_OVERVIEW: all windows as cards; gestures flip/close/open/reorder them.
+ */
+export enum MobileViewState {
+  NATIVE_FIT = 'fit',
+  NATIVE_ZOOMED = 'zoomed',
+  CARD_OVERVIEW = 'overview',
+}
 
 export interface Rect {
   x: number;
@@ -25,6 +38,7 @@ export interface Surface {
   dirty: boolean;
   drawn: boolean;        // false until first draw batch; prevents rendering empty surfaces
   transparent: boolean;  // window paints no background; skip the focus-glow halo (it would bleed through)
+  closable: boolean;     // mobile card overview may flick this closed (false for system rails)
   workspaceId?: string;  // undefined = always visible (global objects)
   title?: string;        // window title for mobile tab bar
 }
@@ -242,18 +256,32 @@ export class Compositor {
   // ── Mobile mode state ──
   private mobileMode = false;
   private mobileFocusedSurfaceId?: string;
-  private static readonly MOBILE_TAB_BAR_HEIGHT = 44;
-  private static readonly MOBILE_TAB_WIDTH = 100;  // fixed width per tab
-  private mobileTabScrollX = 0;  // horizontal scroll offset for tab bar
-  private mobileTabDragStartX?: number;  // for swipe-to-scroll
-  private mobileTabDragStartScroll?: number;
-  /** Cached mobile transform for coordinate mapping */
+  private mobileView = MobileViewState.NATIVE_FIT;
+  /** Slim bottom band that hints the swipe-up gesture (replaces the tab bar). */
+  private static readonly MOBILE_GESTURE_HANDLE_HEIGHT = 28;
+  /** Cached mobile transform for coordinate mapping (native states). */
   private mobileTransform = { scale: 1, offsetX: 0, offsetY: 0 };
-  // Pinch-zoom state: userZoom multiplies the fit-to-screen base scale
+  // Pinch / double-tap zoom state: userZoom multiplies the fit-to-screen base scale.
   private mobileUserZoom = 1;
-  private static readonly MOBILE_MAX_ZOOM = 3;  // 3x beyond fit-to-screen
+  private static readonly MOBILE_MAX_ZOOM = 3;  // pinch ceiling beyond fit-to-screen
   private mobilePanX = 0;  // pan offset when zoomed in
   private mobilePanY = 0;
+
+  // ── Card overview state ──
+  /** Stable, mutable deck order (surfaceIds), independent of z-index. */
+  private mobileCardOrder: string[] = [];
+  /** Carousel offset measured in card slots (active index = round(scroll)). */
+  private mobileCardScroll = 0;
+  /** Per-card drag in progress (flick-close or long-press reorder). */
+  private cardDragState?: { surfaceId: string; dx: number; dy: number; reorder: boolean };
+  /** Reveal progress 0→1 when entering the overview. */
+  private cardRevealT = 1;
+  /** Active overview/zoom tween (only one runs at a time). */
+  private cardAnim?: Tween;
+  // Overview layout fractions of the available content area.
+  private static readonly CARD_BOX_W_FRAC = 0.72;
+  private static readonly CARD_BOX_H_FRAC = 0.54;
+  private static readonly CARD_SLOT_FRAC = 0.82;  // center-to-center spacing / box width
 
   constructor(canvas: HTMLCanvasElement) {
     require(canvas !== null, 'canvas is required');
@@ -297,6 +325,7 @@ export class Compositor {
     inputMonitor = false,
     title?: string,
     transparent = false,
+    closable = true,
   ): string {
     require(objectId !== '', 'objectId is required');
     require(rect.width > 0 && rect.height > 0, 'Surface must have positive dimensions');
@@ -320,6 +349,7 @@ export class Compositor {
       dirty: true,
       drawn: false,
       transparent,
+      closable,
       title,
     };
 
@@ -1298,10 +1328,19 @@ export class Compositor {
     this.panDrag = undefined;
   }
 
+  private get mobileAvailHeight(): number {
+    return this.height - Compositor.MOBILE_GESTURE_HANDLE_HEIGHT;
+  }
+
   private renderMobile(): void {
-    const tabH = Compositor.MOBILE_TAB_BAR_HEIGHT;
+    if (this.mobileView === MobileViewState.CARD_OVERVIEW) {
+      this.renderCardOverview();
+      this.renderGestureHandle();
+      return;
+    }
+
     const availW = this.width;
-    const availH = this.height - tabH;
+    const availH = this.mobileAvailHeight;
 
     // Find focused surface (or fallback to top visible)
     const surface = this.mobileFocusedSurfaceId
@@ -1311,7 +1350,7 @@ export class Compositor {
     if (surface && surface.drawn && surface.visible) {
       // Base scale: fit window into available area
       const baseScale = Math.min(availW / surface.rect.width, availH / surface.rect.height);
-      // Final scale: base * user pinch-zoom (min zoom = fit-to-screen)
+      // Final scale: base * user zoom (min zoom = fit-to-screen)
       const scale = baseScale * this.mobileUserZoom;
 
       // When zoomed in, allow panning. Clamp pan so content stays visible.
@@ -1328,7 +1367,7 @@ export class Compositor {
       // Cache transform for coordinate mapping
       this.mobileTransform = { scale, offsetX, offsetY };
 
-      // Clip to content area (above tab bar)
+      // Clip to content area (above the gesture handle)
       this.ctx.save();
       this.ctx.beginPath();
       this.ctx.rect(0, 0, availW, availH);
@@ -1339,68 +1378,205 @@ export class Compositor {
       this.ctx.restore();
     }
 
-    this.renderMobileTabBar();
+    this.renderGestureHandle();
   }
 
-  private renderMobileTabBar(): void {
-    const tabH = Compositor.MOBILE_TAB_BAR_HEIGHT;
-    const tabW = Compositor.MOBILE_TAB_WIDTH;
-    const w = this.width;
-    const barY = this.height - tabH;
-
-    // Background
-    this.ctx.fillStyle = '#0d0d14';
-    this.ctx.fillRect(0, barY, w, tabH);
-
-    // Top border
-    this.ctx.strokeStyle = '#2a2a3a';
-    this.ctx.lineWidth = 1;
-    this.ctx.beginPath();
-    this.ctx.moveTo(0, barY);
-    this.ctx.lineTo(w, barY);
-    this.ctx.stroke();
-
-    const tabs = this.getMobileVisibleSurfaces();
-    if (tabs.length === 0) return;
-
-    // Clamp scroll offset
-    const totalWidth = tabs.length * tabW;
-    const maxScroll = Math.max(0, totalWidth - w);
-    this.mobileTabScrollX = Math.max(0, Math.min(this.mobileTabScrollX, maxScroll));
-
-    // Clip to tab bar area and draw scrolled tabs
+  /** Slim centered pill hinting the swipe-up-from-bottom gesture. */
+  private renderGestureHandle(): void {
+    const h = Compositor.MOBILE_GESTURE_HANDLE_HEIGHT;
+    const y = this.height - h / 2;
+    const pillW = 120;
+    const pillH = 4;
+    const x = (this.width - pillW) / 2;
     this.ctx.save();
-    this.ctx.beginPath();
-    this.ctx.rect(0, barY, w, tabH);
-    this.ctx.clip();
+    this.ctx.fillStyle = this.mobileView === MobileViewState.CARD_OVERVIEW
+      ? 'rgba(139,139,255,0.6)'
+      : 'rgba(160,160,190,0.4)';
+    this.roundRectPath(x, y - pillH / 2, pillW, pillH, pillH / 2);
+    this.ctx.fill();
+    this.ctx.restore();
+  }
 
-    this.ctx.font = '12px "Spectral", Georgia, "Times New Roman", serif';
-    this.ctx.textAlign = 'center';
-    this.ctx.textBaseline = 'middle';
+  // ── Card overview (WebOS-style) ─────────────────────────────────────
 
-    for (let i = 0; i < tabs.length; i++) {
-      const tab = tabs[i];
-      const tx = i * tabW - this.mobileTabScrollX;
+  /** Sync mobileCardOrder with the currently visible surfaces. */
+  private reconcileCardOrder(): void {
+    const vis = this.getMobileVisibleSurfaces().map(s => s.id);
+    const visSet = new Set(vis);
+    // Drop destroyed/hidden surfaces, preserve existing positions.
+    this.mobileCardOrder = this.mobileCardOrder.filter(id => visSet.has(id));
+    // Append newly-visible surfaces at the end.
+    const known = new Set(this.mobileCardOrder);
+    for (const id of vis) if (!known.has(id)) this.mobileCardOrder.push(id);
+    // Clamp scroll to deck bounds.
+    const n = this.mobileCardOrder.length;
+    this.mobileCardScroll = Math.max(0, Math.min(this.mobileCardScroll, Math.max(0, n - 1)));
+  }
 
-      // Skip tabs fully outside viewport
-      if (tx + tabW < 0 || tx > w) continue;
+  /** Card box dimensions and slot spacing for the current viewport. */
+  private cardMetrics(): { boxW: number; boxH: number; slotW: number; cx: number; cy: number } {
+    const availH = this.mobileAvailHeight;
+    const boxW = this.width * Compositor.CARD_BOX_W_FRAC;
+    const boxH = availH * Compositor.CARD_BOX_H_FRAC;
+    return {
+      boxW,
+      boxH,
+      slotW: boxW * Compositor.CARD_SLOT_FRAC,
+      cx: this.width / 2,
+      cy: availH / 2,
+    };
+  }
 
-      const isActive = tab.id === this.mobileFocusedSurfaceId ||
-        (!this.mobileFocusedSurfaceId && tab === this.getTopVisibleSurface());
+  /** Eased size factor for a card by its signed slot distance from center. */
+  private cardSizeFactor(slot: number): number {
+    const d = Math.min(Math.abs(slot), 1);
+    return 1 - 0.18 * d;
+  }
 
-      if (isActive) {
-        this.ctx.fillStyle = '#1a1a2e';
-        this.ctx.fillRect(tx + 2, barY + 2, tabW - 4, tabH - 4);
-        this.ctx.fillStyle = '#8b8bff';
-      } else {
-        this.ctx.fillStyle = '#666680';
-      }
+  /** Drawn rect (and surface) for a deck index, applying any active drag. */
+  private cardDrawRect(index: number): { x: number; y: number; w: number; h: number; surface: Surface; slot: number } | undefined {
+    const id = this.mobileCardOrder[index];
+    if (id === undefined) return undefined;
+    const surface = this.surfaces.get(id);
+    if (!surface || !surface.drawn) return undefined;
 
-      const label = (tab.title || tab.id.slice(0, 10)).slice(0, 12);
-      this.ctx.fillText(label, tx + tabW / 2, barY + tabH / 2);
+    const { boxW, boxH, slotW, cx, cy } = this.cardMetrics();
+    let slot = index - this.mobileCardScroll;
+
+    // A reordering card follows the finger horizontally.
+    const drag = this.cardDragState;
+    let dragDx = 0, dragDy = 0;
+    if (drag && drag.surfaceId === id) {
+      if (drag.reorder) dragDx = drag.dx;
+      else dragDy = drag.dy;
     }
 
+    const reveal = 0.92 + 0.08 * this.cardRevealT;
+    const fit = Math.min(boxW / surface.rect.width, boxH / surface.rect.height);
+    const cardScale = fit * this.cardSizeFactor(slot) * reveal;
+    const w = surface.rect.width * cardScale;
+    const h = surface.rect.height * cardScale;
+    const centerX = cx + slot * slotW + dragDx;
+    const centerY = cy + dragDy;
+    return { x: centerX - w / 2, y: centerY - h / 2, w, h, surface, slot };
+  }
+
+  private renderCardOverview(): void {
+    this.reconcileCardOrder();
+    const availH = this.mobileAvailHeight;
+
+    // Dim backdrop.
+    this.ctx.save();
+    this.ctx.fillStyle = 'rgba(8,8,16,0.92)';
+    this.ctx.fillRect(0, 0, this.width, availH);
     this.ctx.restore();
+
+    const n = this.mobileCardOrder.length;
+    if (n === 0) {
+      this.ctx.save();
+      this.ctx.fillStyle = '#666680';
+      this.ctx.font = '16px "Spectral", Georgia, serif';
+      this.ctx.textAlign = 'center';
+      this.ctx.textBaseline = 'middle';
+      this.ctx.fillText('No windows', this.width / 2, availH / 2);
+      this.ctx.restore();
+      return;
+    }
+
+    // Draw far-to-near so the centered card sits on top.
+    const order: number[] = [];
+    for (let i = 0; i < n; i++) order.push(i);
+    order.sort((a, b) => Math.abs(b - this.mobileCardScroll) - Math.abs(a - this.mobileCardScroll));
+
+    for (const i of order) {
+      const r = this.cardDrawRect(i);
+      if (!r) continue;
+      const { x, y, w, h, surface, slot } = r;
+      if (x + w < -40 || x > this.width + 40) continue; // offscreen
+
+      const dist = Math.min(Math.abs(slot), 1.4);
+      let alpha = (1 - 0.4 * dist) * this.cardRevealT;
+      // Fade a card as it is dragged up to close.
+      const drag = this.cardDragState;
+      if (drag && drag.surfaceId === surface.id && !drag.reorder && drag.dy < 0) {
+        alpha *= Math.max(0, 1 - (-drag.dy) / (h * 0.6));
+      }
+      const isActive = Math.round(this.mobileCardScroll) === i;
+
+      this.ctx.save();
+      this.ctx.globalAlpha = Math.max(0, alpha);
+
+      // Card frame + shadow.
+      this.ctx.shadowColor = 'rgba(0,0,0,0.5)';
+      this.ctx.shadowBlur = isActive ? 24 : 12;
+      this.ctx.shadowOffsetY = 6;
+      this.ctx.fillStyle = '#0d0d14';
+      this.roundRectPath(x, y, w, h, 8);
+      this.ctx.fill();
+      this.ctx.shadowColor = 'transparent';
+      this.ctx.shadowBlur = 0;
+
+      // Live snapshot, clipped to rounded card.
+      this.ctx.save();
+      this.roundRectPath(x, y, w, h, 8);
+      this.ctx.clip();
+      this.ctx.drawImage(
+        surface.canvas,
+        0, 0, surface.rect.width, surface.rect.height,
+        x, y, w, h,
+      );
+      this.ctx.restore();
+
+      // Accent border on the active card.
+      if (isActive) {
+        this.ctx.strokeStyle = 'rgba(139,139,255,0.8)';
+        this.ctx.lineWidth = 2;
+        this.roundRectPath(x, y, w, h, 8);
+        this.ctx.stroke();
+      }
+
+      // Title below the card.
+      this.ctx.fillStyle = isActive ? '#c8c8ff' : '#666680';
+      this.ctx.font = '13px "Spectral", Georgia, serif';
+      this.ctx.textAlign = 'center';
+      this.ctx.textBaseline = 'top';
+      const label = (surface.title || surface.id.slice(0, 12)).slice(0, 22);
+      this.ctx.fillText(label, x + w / 2, y + h + 8);
+
+      // Close chip on the active card (only if the window may be closed).
+      if (isActive && surface.closable) {
+        const chip = this.cardCloseChipRect(x, y, w);
+        this.ctx.fillStyle = 'rgba(20,20,34,0.9)';
+        this.ctx.beginPath();
+        this.ctx.arc(chip.cx, chip.cy, chip.r, 0, Math.PI * 2);
+        this.ctx.fill();
+        this.ctx.strokeStyle = '#8b8bff';
+        this.ctx.lineWidth = 1.5;
+        this.ctx.beginPath();
+        this.ctx.moveTo(chip.cx - 4, chip.cy - 4);
+        this.ctx.lineTo(chip.cx + 4, chip.cy + 4);
+        this.ctx.moveTo(chip.cx + 4, chip.cy - 4);
+        this.ctx.lineTo(chip.cx - 4, chip.cy + 4);
+        this.ctx.stroke();
+      }
+
+      this.ctx.restore();
+    }
+  }
+
+  private roundRectPath(x: number, y: number, w: number, h: number, r: number): void {
+    const rr = Math.min(r, w / 2, h / 2);
+    this.ctx.beginPath();
+    this.ctx.moveTo(x + rr, y);
+    this.ctx.arcTo(x + w, y, x + w, y + h, rr);
+    this.ctx.arcTo(x + w, y + h, x, y + h, rr);
+    this.ctx.arcTo(x, y + h, x, y, rr);
+    this.ctx.arcTo(x, y, x + w, y, rr);
+    this.ctx.closePath();
+  }
+
+  private cardCloseChipRect(x: number, y: number, w: number): { cx: number; cy: number; r: number } {
+    return { cx: x + w - 14, cy: y + 14, r: 12 };
   }
 
   /**
@@ -1458,10 +1634,11 @@ export class Compositor {
   }
 
   private mobileHitTest(x: number, y: number): Surface | undefined {
-    const tabH = Compositor.MOBILE_TAB_BAR_HEIGHT;
+    // The card overview handles its own hit-testing.
+    if (this.mobileView === MobileViewState.CARD_OVERVIEW) return undefined;
 
-    // Tab bar area -- handled separately by handleMobileTabTap
-    if (y >= this.height - tabH) return undefined;
+    // Gesture handle band -- reserved for the swipe-up gesture.
+    if (y >= this.height - Compositor.MOBILE_GESTURE_HANDLE_HEIGHT) return undefined;
 
     // Reverse-transform through mobile scale/offset to get surface-local coords
     const surface = this.mobileFocusedSurfaceId
@@ -1492,69 +1669,204 @@ export class Compositor {
     };
   }
 
-  /**
-   * Check if a point is in the mobile tab bar area.
-   */
-  isInMobileTabBar(y: number): boolean {
-    return this.mobileMode && y >= this.height - Compositor.MOBILE_TAB_BAR_HEIGHT;
+  /** Current mobile view state, for gesture routing in the frontend. */
+  getMobileView(): MobileViewState {
+    return this.mobileView;
   }
 
-  /**
-   * Handle a tap on the mobile tab bar. Returns true if a tab was tapped.
-   */
-  handleMobileTabTap(x: number, y: number): boolean {
-    const tabH = Compositor.MOBILE_TAB_BAR_HEIGHT;
-    if (y < this.height - tabH) return false;
-
-    const tabs = this.getMobileVisibleSurfaces();
-    if (tabs.length === 0) return false;
-
-    const tabW = Compositor.MOBILE_TAB_WIDTH;
-    const tabIndex = Math.floor((x + this.mobileTabScrollX) / tabW);
-    if (tabIndex >= 0 && tabIndex < tabs.length) {
-      this.mobileFocusedSurfaceId = tabs[tabIndex].id;
-      this.resetMobileZoom();
-      this.needsRender = true;
-      return true;
-    }
-    return false;
+  /** Whether a point falls within the bottom gesture-handle band. */
+  isInGestureHandle(y: number): boolean {
+    return this.mobileMode && y >= this.height - Compositor.MOBILE_GESTURE_HANDLE_HEIGHT;
   }
 
-  /**
-   * Begin a swipe-to-scroll gesture on the tab bar.
-   */
-  mobileTabDragStart(x: number): void {
-    this.mobileTabDragStartX = x;
-    this.mobileTabDragStartScroll = this.mobileTabScrollX;
-  }
+  // ── Card overview gesture API ───────────────────────────────────────
 
-  /**
-   * Continue a swipe-to-scroll gesture on the tab bar.
-   */
-  mobileTabDragMove(x: number): void {
-    if (this.mobileTabDragStartX === undefined || this.mobileTabDragStartScroll === undefined) return;
-    const dx = this.mobileTabDragStartX - x;
-    this.mobileTabScrollX = this.mobileTabDragStartScroll + dx;
-
-    const tabs = this.getMobileVisibleSurfaces();
-    const maxScroll = Math.max(0, tabs.length * Compositor.MOBILE_TAB_WIDTH - this.width);
-    this.mobileTabScrollX = Math.max(0, Math.min(this.mobileTabScrollX, maxScroll));
+  /** Open the card overview, centering the current window. */
+  enterCardOverview(): void {
+    this.cardAnim?.cancel();
+    this.reconcileCardOrder();
+    const focusId = this.mobileFocusedSurfaceId ?? this.getTopVisibleSurface()?.id;
+    const idx = focusId ? this.mobileCardOrder.indexOf(focusId) : -1;
+    this.mobileCardScroll = idx >= 0 ? idx : 0;
+    this.mobileView = MobileViewState.CARD_OVERVIEW;
+    this.cardDragState = undefined;
+    // Subtle scale-in reveal.
+    this.cardRevealT = 0;
+    this.cardAnim = new Tween({
+      from: 0, to: 1, duration: 200, easing: DECELERATE,
+      onUpdate: (v) => { this.cardRevealT = v; this.needsRender = true; },
+    }).start();
     this.needsRender = true;
   }
 
-  /**
-   * End a swipe-to-scroll gesture on the tab bar.
-   */
-  mobileTabDragEnd(): void {
-    this.mobileTabDragStartX = undefined;
-    this.mobileTabDragStartScroll = undefined;
+  /** Exit the overview, optionally focusing a chosen card. */
+  exitCardOverview(focusSurfaceId?: string): void {
+    this.cardAnim?.cancel();
+    this.cardAnim = undefined;
+    this.cardDragState = undefined;
+    this.cardRevealT = 1;
+    if (focusSurfaceId) {
+      this.setMobileFocusSurface(focusSurfaceId);
+    }
+    this.mobileView = MobileViewState.NATIVE_FIT;
+    this.resetMobileZoom();
+    this.needsRender = true;
   }
 
-  /**
-   * Whether a tab bar drag gesture is in progress.
-   */
-  get isMobileTabDragging(): boolean {
-    return this.mobileTabDragStartX !== undefined;
+  /** Surface whose card contains (x,y) in the overview, preferring the active card. */
+  cardAt(x: number, y: number): string | undefined {
+    if (this.mobileView !== MobileViewState.CARD_OVERVIEW) return undefined;
+    let best: { id: string; slot: number } | undefined;
+    for (let i = 0; i < this.mobileCardOrder.length; i++) {
+      const r = this.cardDrawRect(i);
+      if (!r) continue;
+      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+        if (!best || Math.abs(r.slot) < Math.abs(best.slot)) {
+          best = { id: r.surface.id, slot: r.slot };
+        }
+      }
+    }
+    return best?.id;
+  }
+
+  /** Whether the card overview is allowed to close this surface. */
+  isSurfaceClosable(surfaceId: string): boolean {
+    return this.surfaces.get(surfaceId)?.closable ?? true;
+  }
+
+  /** Surface whose active-card close chip contains (x,y), if any. */
+  closeChipAt(x: number, y: number): string | undefined {
+    if (this.mobileView !== MobileViewState.CARD_OVERVIEW) return undefined;
+    const i = Math.round(this.mobileCardScroll);
+    const r = this.cardDrawRect(i);
+    if (!r || !r.surface.closable) return undefined;
+    const chip = this.cardCloseChipRect(r.x, r.y, r.w);
+    if (Math.hypot(x - chip.cx, y - chip.cy) <= chip.r + 4) return r.surface.id;
+    return undefined;
+  }
+
+  /** Pan the carousel by a canvas-pixel delta (positive dx = drag right). */
+  cardDeckPan(dx: number): void {
+    const { slotW } = this.cardMetrics();
+    const n = this.mobileCardOrder.length;
+    this.mobileCardScroll = Math.max(0, Math.min(n - 1, this.mobileCardScroll - dx / slotW));
+    this.needsRender = true;
+  }
+
+  /** Snap the carousel to the nearest card. */
+  cardDeckSnap(): void {
+    const target = Math.max(0, Math.min(this.mobileCardOrder.length - 1, Math.round(this.mobileCardScroll)));
+    this.animateScroll(target);
+  }
+
+  private animateScroll(target: number): void {
+    this.cardAnim?.cancel();
+    const from = this.mobileCardScroll;
+    if (from === target) { this.needsRender = true; return; }
+    this.cardAnim = new Tween({
+      from, to: target, duration: 220, easing: DECELERATE,
+      onUpdate: (v) => { this.mobileCardScroll = v; this.needsRender = true; },
+    }).start();
+  }
+
+  cardReorderBegin(surfaceId: string): void {
+    this.cardDragState = { surfaceId, dx: 0, dy: 0, reorder: true };
+    this.needsRender = true;
+  }
+
+  /** Drag a reordering card horizontally by accumulated dx; swaps on midpoint crossing. */
+  cardReorder(dx: number): void {
+    const drag = this.cardDragState;
+    if (!drag || !drag.reorder) return;
+    drag.dx += dx;
+    const { slotW } = this.cardMetrics();
+    const idx = this.mobileCardOrder.indexOf(drag.surfaceId);
+    if (idx < 0) return;
+    if (drag.dx > slotW / 2 && idx < this.mobileCardOrder.length - 1) {
+      this.swapCards(idx, idx + 1);
+      drag.dx -= slotW;
+      this.mobileCardScroll = idx + 1;
+    } else if (drag.dx < -slotW / 2 && idx > 0) {
+      this.swapCards(idx, idx - 1);
+      drag.dx += slotW;
+      this.mobileCardScroll = idx - 1;
+    }
+    this.needsRender = true;
+  }
+
+  cardReorderEnd(): void {
+    this.cardDragState = undefined;
+    this.cardDeckSnap();
+  }
+
+  private swapCards(a: number, b: number): void {
+    const tmp = this.mobileCardOrder[a];
+    this.mobileCardOrder[a] = this.mobileCardOrder[b];
+    this.mobileCardOrder[b] = tmp;
+  }
+
+  /** Begin a vertical drag on a card (towards flick-to-close). */
+  cardCloseDragBegin(surfaceId: string): void {
+    this.cardDragState = { surfaceId, dx: 0, dy: 0, reorder: false };
+    this.needsRender = true;
+  }
+
+  cardCloseDrag(dy: number): void {
+    const drag = this.cardDragState;
+    if (!drag || drag.reorder) return;
+    drag.dy += dy;
+    this.needsRender = true;
+  }
+
+  /** Whether a vertical close-drag is in progress (so move/end route to close). */
+  get cardCloseDragOffset(): number | undefined {
+    const drag = this.cardDragState;
+    return drag && !drag.reorder ? drag.dy : undefined;
+  }
+
+  get cardReorderActive(): boolean {
+    return !!this.cardDragState?.reorder;
+  }
+
+  /** Animate a card flying off the top, then drop it from the deck. */
+  cardFlickClose(surfaceId: string): void {
+    const idx = this.mobileCardOrder.indexOf(surfaceId);
+    if (idx < 0) return;
+    const r = this.cardDrawRect(idx);
+    const startDy = (this.cardDragState && this.cardDragState.surfaceId === surfaceId && !this.cardDragState.reorder)
+      ? this.cardDragState.dy : 0;
+    const flyTo = -(this.mobileAvailHeight + (r ? r.h : 400));
+    this.cardDragState = { surfaceId, dx: 0, dy: startDy, reorder: false };
+    this.cardAnim?.cancel();
+    this.cardAnim = new Tween({
+      from: startDy, to: flyTo, duration: 220, easing: ACCELERATE,
+      onUpdate: (v) => {
+        if (this.cardDragState && this.cardDragState.surfaceId === surfaceId) this.cardDragState.dy = v;
+        this.needsRender = true;
+      },
+      onDone: () => {
+        this.mobileCardOrder = this.mobileCardOrder.filter(id => id !== surfaceId);
+        this.cardDragState = undefined;
+        this.cardDeckSnap();
+        this.needsRender = true;
+      },
+    }).start();
+  }
+
+  /** Animate a partially-dragged card back into place. */
+  cardSnapBack(surfaceId: string): void {
+    const drag = this.cardDragState;
+    if (!drag || drag.surfaceId !== surfaceId) { this.cardDragState = undefined; this.needsRender = true; return; }
+    const from = drag.dy;
+    this.cardAnim?.cancel();
+    this.cardAnim = new Tween({
+      from, to: 0, duration: 180, easing: DECELERATE,
+      onUpdate: (v) => {
+        if (this.cardDragState && this.cardDragState.surfaceId === surfaceId) this.cardDragState.dy = v;
+        this.needsRender = true;
+      },
+      onDone: () => { this.cardDragState = undefined; this.needsRender = true; },
+    }).start();
   }
 
   // ── Mobile mode API ─────────────────────────────────────────────────
@@ -1565,47 +1877,75 @@ export class Compositor {
    * Zoom is centered on the pinch midpoint.
    */
   mobilePinchZoom(zoomDelta: number, centerX: number, centerY: number): void {
-    const oldZoom = this.mobileUserZoom;
-    const newZoom = Math.max(1, Math.min(Compositor.MOBILE_MAX_ZOOM, oldZoom * zoomDelta));
-    if (newZoom === oldZoom) return;
-
-    // Adjust pan so the pinch center stays fixed on screen
-    const { scale: oldScale, offsetX: oldOX, offsetY: oldOY } = this.mobileTransform;
-    // Point in surface space under the pinch center
-    const sx = (centerX - oldOX) / oldScale;
-    const sy = (centerY - oldOY) / oldScale;
-
-    this.mobileUserZoom = newZoom;
-
-    // Recompute base scale to get new offset
+    if (this.mobileView === MobileViewState.CARD_OVERVIEW) return;
     const surface = this.mobileFocusedSurfaceId
       ? this.surfaces.get(this.mobileFocusedSurfaceId)
       : this.getTopVisibleSurface();
-    if (surface) {
-      const tabH = Compositor.MOBILE_TAB_BAR_HEIGHT;
-      const availW = this.width;
-      const availH = this.height - tabH;
-      const baseScale = Math.min(availW / surface.rect.width, availH / surface.rect.height);
-      const newScale = baseScale * newZoom;
-      const scaledW = surface.rect.width * newScale;
-      const scaledH = surface.rect.height * newScale;
+    // Allow pinch up to native 1:1 (which may exceed the default ceiling on small screens).
+    const maxZoom = surface
+      ? Math.max(Compositor.MOBILE_MAX_ZOOM, this.nativeZoomTarget(surface))
+      : Compositor.MOBILE_MAX_ZOOM;
 
-      // Where the pinch center should map to in the new scale
-      const newCenterX = sx * newScale;
-      const newCenterY = sy * newScale;
-      // Desired offset so the surface point stays under the finger
-      this.mobilePanX = centerX - (availW / 2) - (newCenterX - scaledW / 2);
-      this.mobilePanY = centerY - (availH / 2) - (newCenterY - scaledH / 2);
+    const oldZoom = this.mobileUserZoom;
+    const newZoom = Math.max(1, Math.min(maxZoom, oldZoom * zoomDelta));
+    if (newZoom === oldZoom) return;
+
+    this.zoomAbout(newZoom, centerX, centerY, surface);
+    this.mobileView = newZoom > 1 ? MobileViewState.NATIVE_ZOOMED : MobileViewState.NATIVE_FIT;
+    this.needsRender = true;
+  }
+
+  /** Fit-to-screen base scale → the user-zoom factor that yields 1:1 native pixels. */
+  private nativeZoomTarget(surface: Surface): number {
+    const baseScale = Math.min(this.width / surface.rect.width, this.mobileAvailHeight / surface.rect.height);
+    return baseScale > 0 ? 1 / baseScale : 1;
+  }
+
+  /** Set zoom while keeping the surface point under (centerX,centerY) fixed. */
+  private zoomAbout(newZoom: number, centerX: number, centerY: number, surface: Surface | undefined): void {
+    const { scale: oldScale, offsetX: oldOX, offsetY: oldOY } = this.mobileTransform;
+    const sx = (centerX - oldOX) / oldScale;
+    const sy = (centerY - oldOY) / oldScale;
+    this.mobileUserZoom = newZoom;
+    if (!surface) return;
+    const availW = this.width;
+    const availH = this.mobileAvailHeight;
+    const baseScale = Math.min(availW / surface.rect.width, availH / surface.rect.height);
+    const newScale = baseScale * newZoom;
+    const scaledW = surface.rect.width * newScale;
+    const scaledH = surface.rect.height * newScale;
+    const newCenterX = sx * newScale;
+    const newCenterY = sy * newScale;
+    this.mobilePanX = centerX - (availW / 2) - (newCenterX - scaledW / 2);
+    this.mobilePanY = centerY - (availH / 2) - (newCenterY - scaledH / 2);
+  }
+
+  /**
+   * Toggle between fit-to-screen and 1:1 native resolution, centered at (x,y).
+   * Double-tap entry point.
+   */
+  mobileToggleNativeZoom(centerX: number, centerY: number): void {
+    if (this.mobileView === MobileViewState.CARD_OVERVIEW) return;
+    const surface = this.mobileFocusedSurfaceId
+      ? this.surfaces.get(this.mobileFocusedSurfaceId)
+      : this.getTopVisibleSurface();
+    if (!surface) return;
+
+    if (this.mobileView === MobileViewState.NATIVE_ZOOMED) {
+      this.resetMobileZoom();
+      this.mobileView = MobileViewState.NATIVE_FIT;
+    } else {
+      this.zoomAbout(this.nativeZoomTarget(surface), centerX, centerY, surface);
+      this.mobileView = MobileViewState.NATIVE_ZOOMED;
     }
-
     this.needsRender = true;
   }
 
   /**
-   * Pan the zoomed view by a delta in canvas pixels.
+   * Pan the zoomed view by a delta in canvas pixels (single-finger when zoomed).
    */
   mobilePan(dx: number, dy: number): void {
-    if (this.mobileUserZoom <= 1) return; // no panning at fit-to-screen
+    if (this.mobileView !== MobileViewState.NATIVE_ZOOMED && this.mobileUserZoom <= 1) return;
     this.mobilePanX += dx;
     this.mobilePanY += dy;
     this.needsRender = true;
@@ -1623,6 +1963,7 @@ export class Compositor {
   setMobileMode(enabled: boolean): void {
     this.mobileMode = enabled;
     this.resetMobileZoom();
+    this.mobileView = MobileViewState.NATIVE_FIT;
     this.needsRender = true;
   }
 
@@ -1633,6 +1974,9 @@ export class Compositor {
   setMobileFocusSurface(surfaceId: string): void {
     this.mobileFocusedSurfaceId = surfaceId;
     this.resetMobileZoom();
+    if (this.mobileView !== MobileViewState.CARD_OVERVIEW) {
+      this.mobileView = MobileViewState.NATIVE_FIT;
+    }
     this.needsRender = true;
   }
 

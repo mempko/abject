@@ -30,6 +30,9 @@ export interface CreateSurfaceMsg extends WsEnvelope {
   title?: string;
   /** Window paints no background; the compositor skips its focus-glow halo. */
   transparent?: boolean;
+  /** Whether the mobile card overview may close this surface (default true).
+   * System rails (taskbar, switchers, toolbars) set this false. */
+  closable?: boolean;
 }
 
 export interface SetSurfaceTitleMsg extends WsEnvelope {
@@ -142,6 +145,16 @@ export interface SetSurfaceResizableMsg extends WsEnvelope {
 export interface ShowMobileKeyboardMsg extends WsEnvelope {
   type: 'showMobileKeyboard';
   show: boolean;
+}
+
+/**
+ * Ask the backend to close the window owning a surface. Sent by the mobile
+ * card overview when a card is flicked up to close. Routed to WindowManager,
+ * which replays the same close path as the title-bar close button.
+ */
+export interface CloseWindowMsg extends WsEnvelope {
+  type: 'closeWindow';
+  surfaceId: string;
 }
 
 /**
@@ -349,6 +362,7 @@ export interface FileUploadMsg extends WsEnvelope {
 export type FrontendToBackendMsg =
   | InputMsg
   | FileUploadMsg
+  | CloseWindowMsg
   | EndWindowDragMsg
   | MeasureTextReplyMsg
   | DisplayInfoReplyMsg
