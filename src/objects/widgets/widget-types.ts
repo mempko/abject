@@ -36,6 +36,43 @@ export interface WidgetStyle {
 
 export type WidgetType = 'label' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image' | 'themeSwatch';
 
+// ── Draw commands ──────────────────────────────────────────────────────────
+
+/**
+ * The complete draw-command vocabulary executed by the Compositor. Single
+ * source of truth: the Compositor derives its DrawCommand type from it, and
+ * CanvasWidget validates incoming `draw` calls against it (the Compositor
+ * skips unknown types silently, which used to produce blank canvases).
+ */
+export const DRAW_COMMAND_TYPES = [
+  'rect', 'text', 'line', 'image', 'imageUrl', 'clear', 'path',
+  'save', 'restore', 'clip', 'translate',
+  'circle', 'arc', 'ellipse', 'polygon', 'rotate', 'scale',
+  'globalAlpha', 'shadow', 'setLineDash', 'linearGradient', 'radialGradient',
+  'bezierCurve', 'quadraticCurve',
+] as const;
+
+export type DrawCommandType = typeof DRAW_COMMAND_TYPES[number];
+
+/**
+ * HTML5 Canvas API names that code generators commonly reach for but that are
+ * NOT part of the vocabulary, mapped to the correct equivalent. Used to build
+ * actionable rejection messages.
+ */
+export const DRAW_COMMAND_ALIASES: Record<string, string> = {
+  fillRect: 'rect with params {x, y, width, height, fill}',
+  strokeRect: 'rect with params {x, y, width, height, stroke, lineWidth}',
+  clearRect: 'rect with params {x, y, width, height, fill: <background color>}',
+  fillText: 'text with params {x, y, text, fill, font}',
+  strokeText: 'text with params {x, y, text, stroke, font}',
+  drawImage: 'image with params {x, y, width, height, data} or imageUrl with params {x, y, width, height, url}',
+  beginPath: 'path with params {path: <SVG path string>, fill?, stroke?} (each command is self-contained; there is no path-building state)',
+  moveTo: 'line or path commands (each command is self-contained; there is no path-building state)',
+  lineTo: 'line with params {x1, y1, x2, y2, stroke, lineWidth}',
+  fill: 'a fill param on the shape command itself (rect/circle/path all take fill)',
+  stroke: 'a stroke param on the shape command itself (rect/circle/path all take stroke)',
+};
+
 export interface Rect {
   x: number;
   y: number;

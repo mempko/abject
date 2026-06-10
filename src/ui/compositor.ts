@@ -5,6 +5,7 @@
 import { AbjectId } from '../core/types.js';
 import { require, ensure } from '../core/contracts.js';
 import { Tween, DECELERATE, ACCELERATE } from './motion.js';
+import type { DrawCommandType } from '../objects/widgets/widget-types.js';
 
 /**
  * Mobile interaction states (WebOS-style).
@@ -44,10 +45,7 @@ export interface Surface {
 }
 
 export interface DrawCommand {
-  type: 'rect' | 'text' | 'line' | 'image' | 'imageUrl' | 'clear' | 'path' | 'save' | 'restore' | 'clip' | 'translate'
-    | 'circle' | 'arc' | 'ellipse' | 'polygon' | 'rotate' | 'scale'
-    | 'globalAlpha' | 'shadow' | 'setLineDash' | 'linearGradient' | 'radialGradient'
-    | 'bezierCurve' | 'quadraticCurve';
+  type: DrawCommandType;
   surfaceId: string;
   params: unknown;
 }

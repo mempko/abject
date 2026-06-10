@@ -1137,6 +1137,13 @@ Layout:   this.call(this.dep('WidgetManager'), 'createVBox', { windowId, margins
 Widgets:  this.call(this.dep('WidgetManager'), 'create', { specs: [{ type, windowId, ... }] })
 Canvas:   this.call(this.dep('WidgetManager'), 'createCanvas', { windowId, inputTargetId: this.id })
 Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', params }] })
+          Command types: rect, text, line, circle, arc, ellipse, polygon, path, imageUrl, clear,
+          save, restore, clip, translate, rotate, scale, globalAlpha, shadow, setLineDash,
+          linearGradient, radialGradient, bezierCurve, quadraticCurve.
+          This is NOT the HTML5 Canvas API — fillRect/fillText/drawImage batches are rejected with an error.
+          rect: {x, y, width, height, fill?, stroke?, radius?}   text: {x, y, text, fill?, font?, align?}
+          line: {x1, y1, x2, y2, stroke?, lineWidth?}            circle: {cx, cy, radius, fill?, stroke?}
+          Ask the canvas widget itself for the full per-command param reference before writing a renderer.
 Size:     this.call(canvasId, 'getCanvasSize', {})
 Input:    Pass inputTargetId on createCanvas, then implement input(msg) — read msg.payload.{type,x,y,button,code,key}.
           Real compositor events and synthetic call(canvasId, 'input', payload) BOTH put fields on msg.payload.
