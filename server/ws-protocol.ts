@@ -310,6 +310,16 @@ export interface ReadyMsg extends WsEnvelope {
   type: 'ready';
 }
 
+/**
+ * Sent by the client (debounced) when its viewport changes size, so
+ * display-sized chrome (the sidebar dock) can follow without polling.
+ */
+export interface DisplayResizedMsg extends WsEnvelope {
+  type: 'displayResized';
+  width: number;
+  height: number;
+}
+
 // =============================================================================
 // Auth messages (client -> server)
 // =============================================================================
@@ -370,6 +380,7 @@ export type FrontendToBackendMsg =
   | CaptureDesktopReplyMsg
   | SurfaceCreatedMsg
   | ReadyMsg
+  | DisplayResizedMsg
   | FontMetricsMsg
   | GlobalShortcutMsg
   | AuthLoginMsg

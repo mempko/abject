@@ -136,6 +136,23 @@ export class FrontendClient {
         this.compositor.setMobileMode(this.mobileMode);
       }
     });
+
+    // Tell the backend when the viewport changes size (debounced past the
+    // resize-drag stream) so display-sized chrome like the sidebar dock can
+    // follow. Read the dimensions inside the debounce: the compositor's own
+    // resize handler has updated the canvas by then.
+    let resizeNotifyTimer: ReturnType<typeof setTimeout> | undefined;
+    window.addEventListener('resize', () => {
+      if (resizeNotifyTimer) clearTimeout(resizeNotifyTimer);
+      resizeNotifyTimer = setTimeout(() => {
+        resizeNotifyTimer = undefined;
+        this.sendToBackend({
+          type: 'displayResized',
+          width: this.compositor.width,
+          height: this.compositor.height,
+        });
+      }, 250);
+    });
   }
 
   private setupMobileKeyboard(): void {

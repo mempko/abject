@@ -24,6 +24,7 @@ import type {
   EndWindowDragMsg,
   FileUploadMsg,
   CloseWindowMsg,
+  DisplayResizedMsg,
 } from './ws-protocol.js';
 import type { AuthConfig, SessionStore } from './auth.js';
 import type { UITransport } from './ui-transport.js';
@@ -1657,6 +1658,16 @@ IMPORTANT:
         // A ready client means live display info — dependents sizing UI to the
         // display (e.g. the sidebar dock) re-measure on this signal.
         this.emitFrontendClientsChanged();
+        break;
+      }
+
+      case 'displayResized': {
+        const m = msg as DisplayResizedMsg;
+        if (m.width > 0 && m.height > 0) {
+          this.lastDisplayInfo = { width: m.width, height: m.height };
+          // Same signal as client-ready: display-sized chrome re-measures.
+          this.emitFrontendClientsChanged();
+        }
         break;
       }
 
