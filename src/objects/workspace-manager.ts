@@ -119,6 +119,9 @@ export class WorkspaceManager extends Abject {
   private supervisorId?: AbjectId;
   private workspaceSwitcherId?: AbjectId;
   private globalToolbarId?: AbjectId;
+  private sidebarId?: AbjectId;
+  /** Debounce for display-driven sidebar rebuilds (client connect bursts). */
+  private sidebarRefreshTimer?: ReturnType<typeof setTimeout>;
   private uiServerId?: AbjectId;
   private widgetManagerId?: AbjectId;
   private windowManagerId?: AbjectId;
@@ -472,6 +475,20 @@ export class WorkspaceManager extends Abject {
       return this.refreshTaskbar();
     });
 
+    // UIServer dependency events: a frontend client becoming ready makes
+    // display info live, so rebuild the display-sized sidebar dock. Debounced
+    // because connects and reconnects arrive in bursts.
+    this.on('changed', async (msg: AbjectMessage) => {
+      const { aspect } = msg.payload as { aspect: string };
+      if (aspect === 'frontendClientsChanged' && msg.routing.from === this.uiServerId) {
+        if (this.sidebarRefreshTimer) return;
+        this.sidebarRefreshTimer = setTimeout(() => {
+          this.sidebarRefreshTimer = undefined;
+          this.refreshTaskbar().catch(() => {});
+        }, 250);
+      }
+    });
+
     // Handle objectRegistered events from workspace registries
     this.on('objectRegistered', async (msg: AbjectMessage) => {
       const registryId = msg.routing.from;
@@ -508,9 +525,17 @@ export class WorkspaceManager extends Abject {
     this.supervisorId = await this.discoverDep('Supervisor') ?? undefined;
     this.workspaceSwitcherId = await this.discoverDep('WorkspaceSwitcher') ?? undefined;
     this.globalToolbarId = await this.discoverDep('GlobalToolbar') ?? undefined;
+    this.sidebarId = await this.discoverDep('Sidebar') ?? undefined;
     this.uiServerId = await this.discoverDep('UIServer') ?? undefined;
     this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
+
+    // Re-measure the sidebar dock when a frontend client (re)connects: the
+    // dock is sized to the display, and display info is only live once a
+    // client is ready (a dock built before that uses a stale default size).
+    if (this.uiServerId) {
+      this.send(request(this.id, this.uiServerId, 'addDependent', {}));
+    }
   }
 
   /**
@@ -699,19 +724,21 @@ export class WorkspaceManager extends Abject {
   }
 
   /**
-   * Re-show the active workspace's Taskbar with the current y-offset.
-   * Called by WorkspaceSwitcher after workspace create changes switcher height.
+   * Rebuild the sidebar dock and re-populate its sections (System, Spaces,
+   * Abjects). Called on startup, workspace switch, workspace create, and
+   * whenever a section provider asks for a refresh.
    */
   private async refreshTaskbar(): Promise<boolean> {
     if (!this.activeWorkspaceId) return false;
     const ws = this.workspaces.get(this.activeWorkspaceId);
     if (!ws) return false;
 
-    // Resolve the active workspace's theme once and push it into each global
-    // toolbar's show() so they rebuild with the correct palette. The global
-    // toolbars are outside any workspace, so they can't resolve the active
-    // theme themselves reliably; pushing it here is deterministic and runs on
-    // both startup and every workspace switch (both flow through refreshTaskbar).
+    // Resolve the active workspace's theme once and push it into the sidebar
+    // and each section provider's show() so they rebuild with the correct
+    // palette. The sidebar and global providers are outside any workspace, so
+    // they can't resolve the active theme themselves reliably; pushing it here
+    // is deterministic and runs on both startup and every workspace switch
+    // (both flow through refreshTaskbar).
     let activeTheme: ThemeData | undefined;
     if (this.widgetManagerId) {
       try {
@@ -720,15 +747,33 @@ export class WorkspaceManager extends Abject {
       } catch { /* WidgetManager not ready — toolbars fall back to cached theme */ }
     }
 
-    // Stack order: GlobalToolbar → WorkspaceSwitcher → Taskbar
-    let yOffset = 8;
+    // Lazy-discover the sidebar (spawn-order race on first boot).
+    if (!this.sidebarId) {
+      this.sidebarId = await this.discoverDep('Sidebar') ?? undefined;
+    }
+    if (!this.sidebarId) return false;
+
+    // Rebuild the dock window, then push the fresh section layout IDs into
+    // each provider. Section order: System → Spaces → Abjects.
+    type SidebarSections = { windowId: AbjectId; system: AbjectId; spaces: AbjectId; abjects: AbjectId; compact: boolean };
+    let sections: SidebarSections | null = null;
+    try {
+      await this.request(request(this.id, this.sidebarId, 'show', { theme: activeTheme }));
+      sections = await this.request<SidebarSections | null>(
+        request(this.id, this.sidebarId, 'getSections', {}));
+    } catch (err) {
+      wsLog.warn('Failed to rebuild sidebar:', err);
+    }
+    if (!sections) return false;
 
     if (this.globalToolbarId) {
       try {
-        await this.request(request(this.id, this.globalToolbarId, 'show', { yOffset, theme: activeTheme }));
-        const toolbarHeight = await this.request<number>(
-          request(this.id, this.globalToolbarId, 'getHeight', {}));
-        yOffset = yOffset + toolbarHeight + 8;
+        await this.request(request(this.id, this.globalToolbarId, 'show', {
+          theme: activeTheme,
+          windowId: sections.windowId,
+          sectionLayoutId: sections.system,
+          compact: sections.compact,
+        }));
       } catch { /* toolbar not ready */ }
     }
 
@@ -741,20 +786,21 @@ export class WorkspaceManager extends Abject {
             workspaces: this.listWorkspaces(),
             activeWorkspaceId: this.activeWorkspaceId,
             settingsId: settingsEntry?.id,
-            yOffset,
             theme: activeTheme,
+            windowId: sections.windowId,
+            sectionLayoutId: sections.spaces,
+            compact: sections.compact,
           }));
-        const switcherHeight = await this.request<number>(
-          request(this.id, this.workspaceSwitcherId, 'getHeight', {}));
-        yOffset = yOffset + switcherHeight + 8;
       } catch { /* use default */ }
     }
 
     if (ws.taskbarId) {
       try {
         await this.request(request(this.id, ws.taskbarId, 'show', {
-          yOffset,
           theme: activeTheme,
+          windowId: sections.windowId,
+          sectionLayoutId: sections.abjects,
+          compact: sections.compact,
         }));
       } catch (err) {
         wsLog.warn('Failed to refresh taskbar:', err);

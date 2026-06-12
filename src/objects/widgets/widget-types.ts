@@ -33,6 +33,7 @@ export interface WidgetStyle {
   markdown?: boolean;    // labels only: parse text as markdown and render with rich formatting
   syntaxHighlight?: boolean;  // textArea only: colorize JavaScript tokens
   flat?: boolean;  // buttons only: quiet row (sidebar/toolbar item) — no depth gradient, bevel, or border; hover/press feedback only
+  tooltip?: string;  // hover tooltip text, shown after a dwell via WidgetManager's tooltip service (used by icon-only buttons)
 }
 
 export type WidgetType = 'label' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image' | 'themeSwatch';

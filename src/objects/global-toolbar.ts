@@ -30,12 +30,18 @@ export class GlobalToolbar extends Abject {
   private objectManagerId?: AbjectId;
   private llmMonitorId?: AbjectId;
 
+  /** Sidebar dock window + this rail's section layout (pushed via show()). */
   private windowId?: AbjectId;
-  private rootLayoutId?: AbjectId;
-  /** Single-flight guard for show()'s destroy+rebuild (prevents duplicate rails). */
+  private sectionLayoutId?: AbjectId;
+  /** Single-flight guard for show()'s clear+rebuild (prevents duplicate rows). */
   private buildingUI = false;
   /** True when WorkspaceManager pushed a theme into the pending show(). */
   private pushedTheme = false;
+  /** Accordion state: collapsed sections show only their header row. */
+  private collapsed = false;
+  /** Horizontal dock collapse (pushed via show()): render icon-only rows. */
+  private compact = false;
+  private headerBtnId?: AbjectId;
   private settingsBtnId?: AbjectId;
   private networkBtnId?: AbjectId;
   private explorerBtnId?: AbjectId;
@@ -46,9 +52,6 @@ export class GlobalToolbar extends Abject {
   // Cached lookup for the active workspace's NotificationCenter. Refreshed
   // on every click in case the workspace switched.
   private workspaceManagerId?: AbjectId;
-
-  /** Current window height (queried by WorkspaceManager for Taskbar positioning) */
-  private currentHeight = 0;
 
   constructor() {
     super({
@@ -64,27 +67,26 @@ export class GlobalToolbar extends Abject {
             methods: [
               {
                 name: 'show',
-                description: 'Show the toolbar at a given y offset',
+                description: 'Populate the System section of the sidebar dock',
                 parameters: [
                   {
-                    name: 'yOffset',
-                    type: { kind: 'primitive', primitive: 'number' },
-                    description: 'Y position for the toolbar window',
+                    name: 'windowId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Sidebar dock window to build widgets into',
+                  },
+                  {
+                    name: 'sectionLayoutId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Section layout to add rows to',
                   },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
                 name: 'hide',
-                description: 'Hide the toolbar',
+                description: 'Clear the System section',
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'boolean' },
-              },
-              {
-                name: 'getHeight',
-                description: 'Get the current window height for positioning',
-                parameters: [],
-                returns: { kind: 'primitive', primitive: 'number' },
               },
             ],
           },
@@ -103,22 +105,21 @@ export class GlobalToolbar extends Abject {
     return super.askPrompt(_question) + `\n\n## GlobalToolbar Usage Guide
 
 ### Overview
-Persistent chromeless toolbar positioned above the workspace area. Provides
-quick-access buttons for system-wide panels: GlobalSettings (API keys),
-PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
-(running processes), and LLMMonitor (The Eye).
+Provider of the System section of the sidebar dock. Builds quick-access rows
+for system-wide panels: GlobalSettings (API keys), PeerNetwork (identity and
+contacts), ObjectBrowser (Explorer), ProcessExplorer (running processes), and
+LLMMonitor (The Eye).
 
 ### Methods
-- \`show({ yOffset })\` -- Show the toolbar at the given vertical offset.
-- \`hide()\` -- Destroy the toolbar window.
-- \`getHeight()\` -- Returns the current window height (used by WorkspaceManager
-  for positioning elements below the toolbar).
+- \`show({ windowId, sectionLayoutId, theme? })\` -- Rebuild the section rows
+  inside the given sidebar window/section layout. IDs are cached, so a bare
+  \`show()\` rebuilds in place.
+- \`hide()\` -- Clear the section.
 
 ### Behavior
 - Each button lazily discovers its target object on first click.
-- Clicking a button sends \`show\` to the corresponding system panel.
-- The toolbar rebuilds from scratch on each \`show()\` call so its position
-  can be updated by the caller.
+- Clicking a row sends \`show\` to the corresponding system panel.
+- Clicking the section header toggles the section collapsed (header only).
 
 ### Interface ID
 \`abjects:global-toolbar\``;
@@ -131,21 +132,26 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
 
   private setupHandlers(): void {
     this.on('show', async (msg: AbjectMessage) => {
-      const { yOffset, theme } = msg.payload as { yOffset?: number; theme?: ThemeData } ?? {};
+      const { theme, windowId, sectionLayoutId, compact } = msg.payload as {
+        theme?: ThemeData; windowId?: AbjectId; sectionLayoutId?: AbjectId; compact?: boolean;
+      } ?? {};
       // WorkspaceManager pushes the active workspace's theme on switch/startup.
       if (theme && typeof theme === 'object' && 'canvasBg' in theme) {
         this.theme = theme;
         this.pushedTheme = true;
       }
-      return this.show(yOffset ?? 8);
+      // WorkspaceManager pushes fresh sidebar section IDs after each sidebar
+      // rebuild; a bare show() rebuilds into the cached section.
+      if (windowId && sectionLayoutId) {
+        this.windowId = windowId;
+        this.sectionLayoutId = sectionLayoutId;
+        this.compact = compact ?? false;
+      }
+      return this.show();
     });
 
     this.on('hide', async () => {
       return this.hide();
-    });
-
-    this.on('getHeight', async () => {
-      return this.currentHeight;
     });
 
     this.on('changed', async (msg: AbjectMessage) => {
@@ -153,6 +159,13 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
       if (aspect !== 'click') return;
 
       const fromId = msg.routing.from;
+
+      // Section header — accordion toggle
+      if (fromId === this.headerBtnId) {
+        this.collapsed = !this.collapsed;
+        await this.show();
+        return;
+      }
 
       // Settings button
       if (fromId === this.settingsBtnId) {
@@ -269,11 +282,11 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
     }
   }
 
-  async show(yOffset = 8): Promise<boolean> {
+  async show(): Promise<boolean> {
     // Single-flight: a second show() racing in during a workspace switch would
-    // destroy+recreate the window concurrently and leave two stacked rails
-    // (duplicate header). Bail if a build is already in flight.
+    // clear+repopulate the section concurrently and leave duplicate rows.
     if (this.buildingUI) return true;
+    if (!this.windowId || !this.sectionLayoutId) return false;
     this.buildingUI = true;
     try {
     // If WorkspaceManager already pushed the active theme into this show(), use
@@ -284,66 +297,29 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
       await this.refreshActiveTheme();
     }
 
-    // Always destroy and rebuild (position may have changed)
-    if (this.windowId) {
-      await this.request(
-        request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
-          windowId: this.windowId,
-        })
-      );
-      this.windowId = undefined;
-    }
-
-    // Reset button tracking
+    // Rebuild in place: clear the section, then repopulate.
+    await this.request(request(this.id, this.sectionLayoutId, 'clearLayoutChildren', {}));
+    this.headerBtnId = undefined;
     this.settingsBtnId = undefined;
     this.networkBtnId = undefined;
     this.explorerBtnId = undefined;
     this.processesBtnId = undefined;
     this.llmMonitorBtnId = undefined;
     this.notificationsBtnId = undefined;
-    this.rootLayoutId = undefined;
 
     const btnW = 120;
     const btnH = 30;
     const labelH = 20;
-    const padding = 16;
-    const spacing = 6;
 
-    // Height: padding + label row + 5 buttons + padding
-    const barHeight = padding + labelH + (spacing + btnH) * 5 + padding;
-    const barWidth = btnW + padding * 2;
-
-    this.currentHeight = barHeight;
-
-    this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: '\u2699 System',
-        rect: { x: 8, y: yOffset, width: barWidth, height: barHeight },
-        zIndex: 1000,
-        chromeless: true,
-        draggable: true,
-        closable: false,
-      })
-    );
-
-    // Create root VBox layout
-    this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createVBox', {
-        windowId: this.windowId,
-        margins: { top: padding, right: padding, bottom: padding, left: padding },
-        spacing,
-      })
-    );
-
-    // Header row: "System" label + gear (settings) button
+    // Header row: collapse-toggle header button + gear (settings) button
     const headerRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId,
+        parentLayoutId: this.sectionLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
+    await this.request(request(this.id, this.sectionLayoutId, 'updateLayoutChild', {
       widgetId: headerRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: labelH },
@@ -351,63 +327,76 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
 
     // "Grimoire index" styling: flat, borderless, left-aligned rows (matches
     // the Abjects rail) rather than boxed pills.
+    const compact = this.compact;
     const ghostBg = lightenColor(this.theme.windowBg, 5);
     const appStyle = {
       background: ghostBg, flat: true,
       color: this.theme.textPrimary, radius: this.theme.tokens.radius.sm,
-      align: 'left', fontSize: 12,
+      align: compact ? 'center' : 'left', fontSize: compact ? 14 : 12,
     };
     const gearStyle = { background: ghostBg, flat: true, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13 };
+    const headerStyle = { background: this.theme.windowBg, flat: true, color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display', align: compact ? 'center' : 'left' };
+    const chevron = this.collapsed ? '\u25B8' : '\u25BE';
+    const row = (icon: string, label: string) => (compact ? icon : `${icon} ${label}`);
+    // Compact rows are icon-only, so the label moves into a hover tooltip.
+    const rowStyle = (label: string) => (compact ? { ...appStyle, tooltip: label } : appStyle);
 
-    // Batch create all widgets: header label, gear button, action buttons
+    // Batch create all widgets: header button, gear button, action buttons.
+    // Compact mode drops the gear from the header (no horizontal room).
+    const specs: Array<Record<string, unknown>> = [
+      { type: 'button', windowId: this.windowId, text: compact ? '\u2699' : `${chevron} \u2699 System`, style: compact ? { ...headerStyle, tooltip: 'System' } : headerStyle },
+    ];
+    if (!compact) {
+      specs.push({ type: 'button', windowId: this.windowId, text: '\u2699', style: gearStyle });
+    }
+    const rowStartIdx = specs.length;
+    if (!this.collapsed) {
+      specs.push(
+        { type: 'button', windowId: this.windowId, text: row('\uD83C\uDF10', 'Network'), style: rowStyle('Network') },
+        { type: 'button', windowId: this.windowId, text: row('\uD83D\uDD0D', 'Explorer'), style: rowStyle('Explorer') },
+        { type: 'button', windowId: this.windowId, text: row('\u2699\uFE0F', 'Procs'), style: rowStyle('Procs') },
+        { type: 'button', windowId: this.windowId, text: row('\uD83D\uDC41', 'The Eye'), style: rowStyle('The Eye') },
+        { type: 'button', windowId: this.windowId, text: row('\uD83D\uDD14', 'Notifications'), style: rowStyle('Notifications') },
+      );
+    }
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', {
-        specs: [
-          { type: 'label', windowId: this.windowId!, text: '\u2699 System', style: { color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display' } },
-          { type: 'button', windowId: this.windowId!, text: '\u2699', style: gearStyle },
-          { type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Network', style: appStyle },
-          { type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0D Explorer', style: appStyle },
-          { type: 'button', windowId: this.windowId!, text: '\u2699\uFE0F Procs', style: appStyle },
-          { type: 'button', windowId: this.windowId!, text: '\uD83D\uDC41 The Eye', style: appStyle },
-          { type: 'button', windowId: this.windowId!, text: '\uD83D\uDD14 Notifications', style: appStyle },
-        ],
-      })
+      request(this.id, this.widgetManagerId!, 'create', { specs })
     );
 
-    const labelId = widgetIds[0];
-    this.settingsBtnId = widgetIds[1];
-    this.networkBtnId = widgetIds[2];
-    this.explorerBtnId = widgetIds[3];
-    this.processesBtnId = widgetIds[4];
-    this.llmMonitorBtnId = widgetIds[5];
-    this.notificationsBtnId = widgetIds[6];
+    this.headerBtnId = widgetIds[0];
+    this.settingsBtnId = compact ? undefined : widgetIds[1];
 
-    // Add header row children: label + gear button
-    await this.request(request(this.id, headerRowId, 'addLayoutChildren', {
-      children: [
-        { widgetId: labelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: labelH } },
-        { widgetId: this.settingsBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } },
-      ],
-    }));
+    // Add header row children: header toggle (+ gear when expanded)
+    const headerChildren: Array<Record<string, unknown>> = [
+      { widgetId: this.headerBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: labelH } },
+    ];
+    if (this.settingsBtnId) {
+      headerChildren.push({ widgetId: this.settingsBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } });
+    }
+    await this.request(request(this.id, headerRowId, 'addLayoutChildren', { children: headerChildren }));
 
-    // Add action buttons to root layout
-    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChildren', {
-      children: [
-        { widgetId: this.networkBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
-        { widgetId: this.explorerBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
-        { widgetId: this.processesBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
-        { widgetId: this.llmMonitorBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
-        { widgetId: this.notificationsBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
-      ],
-    }));
+    if (!this.collapsed) {
+      this.networkBtnId = widgetIds[rowStartIdx];
+      this.explorerBtnId = widgetIds[rowStartIdx + 1];
+      this.processesBtnId = widgetIds[rowStartIdx + 2];
+      this.llmMonitorBtnId = widgetIds[rowStartIdx + 3];
+      this.notificationsBtnId = widgetIds[rowStartIdx + 4];
+
+      await this.request(request(this.id, this.sectionLayoutId, 'addLayoutChildren', {
+        children: [
+          { widgetId: this.networkBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
+          { widgetId: this.explorerBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
+          { widgetId: this.processesBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
+          { widgetId: this.llmMonitorBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
+          { widgetId: this.notificationsBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } },
+        ],
+      }));
+    }
 
     // Fire-and-forget: register as dependent for all buttons
-    this.send(request(this.id, this.settingsBtnId, 'addDependent', {}));
-    this.send(request(this.id, this.networkBtnId, 'addDependent', {}));
-    this.send(request(this.id, this.explorerBtnId, 'addDependent', {}));
-    this.send(request(this.id, this.processesBtnId, 'addDependent', {}));
-    this.send(request(this.id, this.llmMonitorBtnId, 'addDependent', {}));
-    this.send(request(this.id, this.notificationsBtnId, 'addDependent', {}));
+    for (const btnId of widgetIds) {
+      this.send(request(this.id, btnId, 'addDependent', {}));
+    }
 
     return true;
     } finally {
@@ -416,16 +405,15 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
   }
 
   async hide(): Promise<boolean> {
-    if (!this.windowId) return true;
-
-    await this.request(
-      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
-        windowId: this.windowId,
-      })
-    );
-
+    if (this.sectionLayoutId) {
+      // Best-effort: the sidebar may already have destroyed the section.
+      try {
+        await this.request(request(this.id, this.sectionLayoutId, 'clearLayoutChildren', {}));
+      } catch { /* section gone */ }
+    }
     this.windowId = undefined;
-    this.rootLayoutId = undefined;
+    this.sectionLayoutId = undefined;
+    this.headerBtnId = undefined;
     this.settingsBtnId = undefined;
     this.networkBtnId = undefined;
     this.explorerBtnId = undefined;

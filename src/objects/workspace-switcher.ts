@@ -29,12 +29,18 @@ export class WorkspaceSwitcher extends Abject {
   private widgetManagerId?: AbjectId;
   private workspaceManagerId?: AbjectId;
   private workspaceBrowserId?: AbjectId;
+  /** Sidebar dock window + this rail's section layout (pushed via show()). */
   private windowId?: AbjectId;
-  private rootLayoutId?: AbjectId;
-  /** Single-flight guard for show()'s destroy+rebuild (prevents duplicate rails). */
+  private sectionLayoutId?: AbjectId;
+  /** Single-flight guard for show()'s clear+rebuild (prevents duplicate rows). */
   private buildingUI = false;
   /** True when WorkspaceManager pushed a theme into the pending show(). */
   private pushedTheme = false;
+  /** Accordion state: collapsed sections show only their header row. */
+  private collapsed = false;
+  /** Horizontal dock collapse (pushed via show()): render icon-only rows. */
+  private compact = false;
+  private headerBtnId?: AbjectId;
 
   /** Button AbjectId → workspace ID */
   private workspaceSwitchButtons: Map<AbjectId, string> = new Map();
@@ -48,12 +54,6 @@ export class WorkspaceSwitcher extends Abject {
   /** Cached workspace data (pushed by WorkspaceManager via show payload) */
   private cachedWorkspaces: Array<{ id: string; name: string; accessMode: string }> = [];
   private cachedActiveWorkspaceId?: string;
-
-  /** Cached y offset for rebuilds (set by WorkspaceManager) */
-  private cachedYOffset = 8;
-
-  /** Current window height (queried by WorkspaceManager for Taskbar positioning) */
-  private currentHeight = 0;
 
   constructor() {
     super({
@@ -86,15 +86,9 @@ export class WorkspaceSwitcher extends Abject {
               },
               {
                 name: 'hide',
-                description: 'Hide the workspace switcher',
+                description: 'Clear the Spaces section',
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'boolean' },
-              },
-              {
-                name: 'getHeight',
-                description: 'Get the current window height for Taskbar positioning',
-                parameters: [],
-                returns: { kind: 'primitive', primitive: 'number' },
               },
             ],
           },
@@ -113,24 +107,24 @@ export class WorkspaceSwitcher extends Abject {
     return super.askPrompt(_question) + `\n\n## WorkspaceSwitcher Usage Guide
 
 ### Overview
-Global chromeless bar for switching between workspaces. Shows one button per
+Provider of the Spaces section of the sidebar dock. Shows one row per
 workspace (with access-mode icons), a "+" button to create new workspaces,
-a gear button to open workspace Settings, and a "Browse" button to open
+a gear button to open workspace Settings, and a "Browse" row to open
 the WorkspaceBrowser for discovering remote workspaces.
 
 ### Methods
-- \`show({ workspaces, activeWorkspaceId, settingsId?, yOffset? })\` -- Show or
-  rebuild the switcher with the given workspace list. The active workspace
-  button is highlighted.
-- \`hide()\` -- Destroy the switcher window.
-- \`getHeight()\` -- Returns the current window height (used by WorkspaceManager
-  for positioning the Taskbar below).
+- \`show({ workspaces, activeWorkspaceId, settingsId?, windowId?, sectionLayoutId?, theme? })\` --
+  Rebuild the section rows with the given workspace list inside the sidebar
+  section. IDs are cached, so a bare \`show()\` rebuilds in place. The active
+  workspace row is highlighted.
+- \`hide()\` -- Clear the section.
 
 ### Behavior
-- Clicking a workspace button sends \`switchWorkspace\` to WorkspaceManager.
-- Clicking "+" creates a new workspace and refreshes the bar.
+- Clicking a workspace row sends \`switchWorkspace\` to WorkspaceManager.
+- Clicking "+" creates a new workspace and asks WorkspaceManager to refresh.
 - Clicking the gear opens the per-workspace Settings panel.
 - Clicking "Browse" opens WorkspaceBrowser for remote workspace discovery.
+- Clicking the section header toggles the section collapsed (header only).
 - Exists outside any workspace to avoid deadlocks during workspace switches.
 
 ### Interface ID
@@ -149,7 +143,9 @@ the WorkspaceBrowser for discovering remote workspaces.
         workspaces?: Array<{ id: string; name: string; accessMode: string }>;
         activeWorkspaceId?: string;
         settingsId?: AbjectId;
-        yOffset?: number;
+        windowId?: AbjectId;
+        sectionLayoutId?: AbjectId;
+        compact?: boolean;
         theme?: ThemeData;
       } | undefined;
       if (payload?.workspaces) {
@@ -159,8 +155,12 @@ the WorkspaceBrowser for discovering remote workspaces.
       if (payload?.settingsId !== undefined) {
         this.settingsId = payload.settingsId;
       }
-      if (payload?.yOffset !== undefined) {
-        this.cachedYOffset = payload.yOffset;
+      // WorkspaceManager pushes fresh sidebar section IDs after each sidebar
+      // rebuild; a bare show() rebuilds into the cached section.
+      if (payload?.windowId && payload?.sectionLayoutId) {
+        this.windowId = payload.windowId;
+        this.sectionLayoutId = payload.sectionLayoutId;
+        this.compact = payload.compact ?? false;
       }
       // WorkspaceManager pushes the active workspace's theme on switch/startup.
       if (payload?.theme && typeof payload.theme === 'object' && 'canvasBg' in payload.theme) {
@@ -174,15 +174,18 @@ the WorkspaceBrowser for discovering remote workspaces.
       return this.hide();
     });
 
-    this.on('getHeight', async () => {
-      return this.currentHeight;
-    });
-
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect } = msg.payload as { aspect: string; value?: unknown };
       if (aspect !== 'click') return;
 
       const fromId = msg.routing.from;
+
+      // Section header — accordion toggle
+      if (fromId === this.headerBtnId) {
+        this.collapsed = !this.collapsed;
+        await this.show();
+        return;
+      }
 
       // Lazy-discover WorkspaceManager if not yet found (spawn order race)
       if (!this.workspaceManagerId) {
@@ -210,8 +213,8 @@ the WorkspaceBrowser for discovering remote workspaces.
             this.cachedWorkspaces = await this.request<Array<{ id: string; name: string; accessMode: string }>>(
               request(this.id, this.workspaceManagerId,
                 'listWorkspaces', {}));
-            await this.show();
-            // Tell WM to refresh the taskbar position (switcher height may have changed)
+            // Tell WM to rebuild the sidebar (it pushes fresh section IDs back
+            // into this rail's show()).
             this.send(request(this.id, this.workspaceManagerId,
               'refreshTaskbar', {}));
             await this.notify(`Workspace "${name}" created`, 'success');
@@ -282,6 +285,7 @@ the WorkspaceBrowser for discovering remote workspaces.
     // destroy+recreate the window concurrently and leave two stacked rails
     // (duplicate header). Bail if a build is already in flight.
     if (this.buildingUI) return true;
+    if (!this.windowId || !this.sectionLayoutId) return false;
     this.buildingUI = true;
     try {
     // If WorkspaceManager already pushed the active theme into this show(), use
@@ -292,22 +296,15 @@ the WorkspaceBrowser for discovering remote workspaces.
       await this.refreshActiveTheme();
     }
 
-    // Always destroy and rebuild
-    if (this.windowId) {
-      await this.request(
-        request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
-          windowId: this.windowId,
-        })
-      );
-      this.windowId = undefined;
-    }
+    // Rebuild in place: clear the section, then repopulate.
+    await this.request(request(this.id, this.sectionLayoutId!, 'clearLayoutChildren', {}));
 
     // Reset button tracking
     this.workspaceSwitchButtons.clear();
+    this.headerBtnId = undefined;
     this.workspaceCreateBtnId = undefined;
     this.browseBtnId = undefined;
     this.settingsBtnId = undefined;
-    this.rootLayoutId = undefined;
 
     const workspaces = this.cachedWorkspaces;
     const hasWorkspaces = workspaces.length > 0;
@@ -315,127 +312,103 @@ the WorkspaceBrowser for discovering remote workspaces.
     const btnW = 120;
     const btnH = 30;
     const labelH = 20;
-    const padding = 16;
-    const spacing = 6;
-
-    // Workspace section: label + all workspace buttons + Browse button ("+" is in header row)
-    const wsBtnCount = hasWorkspaces ? workspaces.length + 1 : 0; // +1 for "Browse"
-    const wsLabelCount = hasWorkspaces ? 1 : 0;
-    const extraHeight = wsLabelCount * (labelH + spacing);
-    const barWidth = btnW + padding * 2;
-    const barHeight = padding + extraHeight
-      + (wsBtnCount > 0 ? wsBtnCount * (btnH + spacing) : 0)
-      - spacing + padding;
-
-    this.currentHeight = barHeight;
-
-    this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: '\u25C8 Spaces',
-        rect: { x: 8, y: this.cachedYOffset, width: barWidth, height: barHeight },
-        zIndex: 1000,
-        chromeless: true,
-        draggable: true,
-        closable: false,
-      })
-    );
-
-    // Create root VBox layout
-    this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createVBox', {
-        windowId: this.windowId,
-        margins: { top: padding, right: padding, bottom: padding, left: padding },
-        spacing,
-      })
-    );
 
     // "Grimoire index" styling shared with the System/Abjects rails: flat,
     // borderless, left-aligned ghost rows. The active space keeps the accent
     // highlight on top of that base.
+    const compact = this.compact;
     const ghostBg = lightenColor(this.theme.windowBg, 5);
     const appStyle = {
       background: ghostBg, flat: true,
       color: this.theme.textPrimary, radius: this.theme.tokens.radius.sm,
-      align: 'left', fontSize: 12,
+      align: compact ? 'center' : 'left', fontSize: compact ? 14 : 12,
     };
     const gearStyle = { background: ghostBg, flat: true, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13, align: 'center' };
     const wsActiveStyle = { ...appStyle, background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
+    const headerStyle = { background: this.theme.windowBg, flat: true, color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display', align: compact ? 'center' : 'left' };
+    const chevron = this.collapsed ? '▸' : '▾';
+    const showRows = !this.collapsed && hasWorkspaces;
 
-    // Build workspace buttons
-    if (hasWorkspaces) {
-      // ── Spaces section header row: "◈ Spaces" label + gear button ──
+    {
+      // ── Spaces section header row: collapse toggle + "+" + gear ──
       const spacesHeaderRowId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-          parentLayoutId: this.rootLayoutId,
+          parentLayoutId: this.sectionLayoutId,
           margins: { top: 0, right: 0, bottom: 0, left: 0 },
           spacing: 4,
         })
       );
-      await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
+      await this.request(request(this.id, this.sectionLayoutId!, 'updateLayoutChild', {
         widgetId: spacesHeaderRowId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: labelH },
       }));
 
-      // Batch create all widgets: header label, settings button, workspace buttons, +, Browse
+      // Batch create all widgets: header toggle (+ "+" and gear when
+      // expanded), then rows. Compact mode drops the header action buttons
+      // (no horizontal room) and renders icon-only rows.
       const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
-      // 0: header label
-      specs.push({ type: 'label', windowId: this.windowId!, text: '\u25C8 Spaces', style: { color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display' } });
-      // 1: "+" button (in header row)
-      specs.push({ type: 'button', windowId: this.windowId!, text: '+', style: gearStyle });
-      // 2: settings gear button
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: gearStyle });
-      // 3..N+2: workspace buttons
-      for (const ws of workspaces) {
-        const isActive = ws.id === this.cachedActiveWorkspaceId;
-        const accessIcon = ws.accessMode === 'public' ? '\uD83C\uDF0D' : ws.accessMode === 'private' ? '\uD83D\uDD11' : '\uD83D\uDD12';
-        const accessLabel = ws.accessMode === 'public' ? 'public' : ws.accessMode === 'private' ? 'private' : 'protected';
-        specs.push({ type: 'button', windowId: this.windowId!, text: `${accessIcon} ${ws.name}`, style: isActive ? wsActiveStyle : appStyle });
+      // 0: header collapse-toggle button
+      specs.push({ type: 'button', windowId: this.windowId!, text: compact ? '\u25C8' : `${chevron} \u25C8 Spaces`, style: compact ? { ...headerStyle, tooltip: 'Spaces' } : headerStyle });
+      if (!compact) {
+        // "+" button and settings gear (in header row)
+        specs.push({ type: 'button', windowId: this.windowId!, text: '+', style: gearStyle });
+        specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: gearStyle });
       }
-      // Browse button
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDD0E Browse', style: appStyle });
+      const rowStartIdx = specs.length;
+      if (showRows) {
+        // workspace buttons
+        for (const ws of workspaces) {
+          const isActive = ws.id === this.cachedActiveWorkspaceId;
+          const accessIcon = ws.accessMode === 'public' ? '\uD83C\uDF0D' : ws.accessMode === 'private' ? '\uD83D\uDD11' : '\uD83D\uDD12';
+          const baseStyle = isActive ? wsActiveStyle : appStyle;
+          specs.push({ type: 'button', windowId: this.windowId!, text: compact ? accessIcon : `${accessIcon} ${ws.name}`, style: compact ? { ...baseStyle, tooltip: ws.name } : baseStyle });
+        }
+        // Browse button
+        specs.push({ type: 'button', windowId: this.windowId!, text: compact ? '\uD83D\uDD0E' : '\uD83D\uDD0E Browse', style: compact ? { ...appStyle, tooltip: 'Browse' } : appStyle });
+      }
 
       const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', { specs })
       );
 
-      const spacesHeaderLabelId = widgetIds[0];
-      this.workspaceCreateBtnId = widgetIds[1];
-      this.settingsBtnId = widgetIds[2];
+      this.headerBtnId = widgetIds[0];
+      this.workspaceCreateBtnId = compact ? undefined : widgetIds[1];
+      this.settingsBtnId = compact ? undefined : widgetIds[2];
 
-      // Add header row children: label + "+" + gear
-      await this.request(request(this.id, spacesHeaderRowId, 'addLayoutChildren', {
-        children: [
-          { widgetId: spacesHeaderLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: labelH } },
-          { widgetId: this.workspaceCreateBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } },
-          { widgetId: this.settingsBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } },
-        ],
-      }));
-
-      // Map workspace buttons and build root layout children
-      const rootChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize: Record<string, number> }> = [];
-      for (let i = 0; i < workspaces.length; i++) {
-        const btnId = widgetIds[3 + i];
-        this.workspaceSwitchButtons.set(btnId, workspaces[i].id);
-        rootChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
+      // Add header row children: toggle (+ "+" + gear when expanded)
+      const headerChildren: Array<Record<string, unknown>> = [
+        { widgetId: this.headerBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: labelH } },
+      ];
+      if (this.workspaceCreateBtnId) {
+        headerChildren.push({ widgetId: this.workspaceCreateBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } });
       }
+      if (this.settingsBtnId) {
+        headerChildren.push({ widgetId: this.settingsBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: labelH } });
+      }
+      await this.request(request(this.id, spacesHeaderRowId, 'addLayoutChildren', { children: headerChildren }));
 
-      this.browseBtnId = widgetIds[3 + workspaces.length];
-      rootChildren.push({ widgetId: this.browseBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
+      if (showRows) {
+        // Map workspace buttons and build section children
+        const sectionChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize: Record<string, number> }> = [];
+        for (let i = 0; i < workspaces.length; i++) {
+          const btnId = widgetIds[rowStartIdx + i];
+          this.workspaceSwitchButtons.set(btnId, workspaces[i].id);
+          sectionChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
+        }
 
-      // Batch add all to root layout
-      await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChildren', {
-        children: rootChildren,
-      }));
+        this.browseBtnId = widgetIds[rowStartIdx + workspaces.length];
+        sectionChildren.push({ widgetId: this.browseBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: btnW, height: btnH } });
+
+        await this.request(request(this.id, this.sectionLayoutId!, 'addLayoutChildren', {
+          children: sectionChildren,
+        }));
+      }
 
       // Fire-and-forget: register as dependent for all interactive buttons
-      this.send(request(this.id, this.workspaceCreateBtnId, 'addDependent', {}));
-      this.send(request(this.id, this.settingsBtnId, 'addDependent', {}));
-      for (let i = 0; i < workspaces.length; i++) {
-        this.send(request(this.id, widgetIds[3 + i], 'addDependent', {}));
+      for (const btnId of widgetIds) {
+        this.send(request(this.id, btnId, 'addDependent', {}));
       }
-      this.send(request(this.id, this.browseBtnId, 'addDependent', {}));
-
     }
 
     return true;
@@ -445,17 +418,16 @@ the WorkspaceBrowser for discovering remote workspaces.
   }
 
   async hide(): Promise<boolean> {
-    if (!this.windowId) return true;
-
-    await this.request(
-      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
-        windowId: this.windowId,
-      })
-    );
-
+    if (this.sectionLayoutId) {
+      // Best-effort: the sidebar may already have destroyed the section.
+      try {
+        await this.request(request(this.id, this.sectionLayoutId, 'clearLayoutChildren', {}));
+      } catch { /* section gone */ }
+    }
     this.windowId = undefined;
-    this.rootLayoutId = undefined;
+    this.sectionLayoutId = undefined;
     this.workspaceSwitchButtons.clear();
+    this.headerBtnId = undefined;
     this.workspaceCreateBtnId = undefined;
     this.browseBtnId = undefined;
     this.settingsBtnId = undefined;

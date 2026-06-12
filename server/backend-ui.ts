@@ -49,7 +49,7 @@ export interface SurfaceState {
 }
 
 export interface InputEvent {
-  type: 'mousedown' | 'mouseup' | 'mousemove' | 'keydown' | 'keyup' | 'wheel' | 'paste';
+  type: 'mousedown' | 'mouseup' | 'mousemove' | 'mouseleave' | 'keydown' | 'keyup' | 'wheel' | 'paste';
   surfaceId?: string;
   x?: number;
   y?: number;
@@ -112,6 +112,8 @@ export class BackendUI extends Abject {
   private windowManagerId?: AbjectId;
   private currentSelectedText = '';
   private lastDisplayInfo: { width: number; height: number } = { width: 1280, height: 720 };
+  /** Last hovered surface per client, to synthesize mouseleave on change. */
+  private hoverSurfaceByClient: Map<string, string | undefined> = new Map();
   private lastMouseX = 0;
   private lastMouseY = 0;
   /** Which client sent the last mousedown (for requestDrag targeting). */
@@ -1099,6 +1101,7 @@ IMPORTANT:
     });
     newTransport.onClose(() => {
       this.clients.delete(clientId);
+      this.hoverSurfaceByClient.delete(clientId);
       log.info(`Client ${clientId} disconnected (${this.clients.size} remaining)`);
       // Release resize grab if this client owned it
       if (this.mouseGrabClientId === clientId) {
@@ -1651,6 +1654,9 @@ IMPORTANT:
         }
         log.info(`Client ${clientId} ready (${this.clients.size} total)`);
         this.replayStateToClient(clientId);
+        // A ready client means live display info — dependents sizing UI to the
+        // display (e.g. the sidebar dock) re-measure on this signal.
+        this.emitFrontendClientsChanged();
         break;
       }
 
@@ -1718,6 +1724,23 @@ IMPORTANT:
       this.lastMouseX = (msg.x ?? 0) + (surfState?.rect.x ?? 0);
       this.lastMouseY = (msg.y ?? 0) + (surfState?.rect.y ?? 0);
       this.lastInputClientId = clientId;
+    }
+
+    // ── Synthesize mouseleave when the pointer changes surface ──
+    // Hit-testing happens client-side per event, so without this a window
+    // never learns the pointer left it (stale hover backplates, stranded
+    // tooltips). Tracked per client so two connected clients don't fight.
+    if (msg.inputType === 'mousemove' && !this.mouseGrabAbject) {
+      const prev = this.hoverSurfaceByClient.get(clientId);
+      if (prev !== msg.surfaceId) {
+        if (prev) {
+          const prevState = this.surfaces.get(prev);
+          if (prevState) {
+            await this.sendInputEvent(prevState.objectId, { type: 'mouseleave', surfaceId: prev });
+          }
+        }
+        this.hoverSurfaceByClient.set(clientId, msg.surfaceId);
+      }
     }
 
     // ── Cursor hint: ask WindowManager which CSS cursor fits the current

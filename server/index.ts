@@ -60,6 +60,7 @@ import type { RestartType } from '../src/runtime/supervisor.js';
 import { WorkspaceManager } from '../src/objects/workspace-manager.js';
 import { WorkspaceRegistry } from '../src/objects/workspace-registry.js';
 import { WorkspaceSwitcher } from '../src/objects/workspace-switcher.js';
+import { Sidebar } from '../src/objects/sidebar.js';
 import { GlobalSettings } from '../src/objects/global-settings.js';
 import { GlobalToolbar } from '../src/objects/global-toolbar.js';
 import { PeerNetwork } from '../src/objects/peer-network.js';
@@ -502,6 +503,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('WorkspaceManager', () => new WorkspaceManager());
   runtime.objectFactory.registerConstructor('WorkspaceRegistry', () => new WorkspaceRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
+  runtime.objectFactory.registerConstructor('Sidebar', () => new Sidebar());
   runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
   runtime.objectFactory.registerConstructor('GlobalToolbar', () => new GlobalToolbar());
   runtime.objectFactory.registerConstructor('PeerNetwork', () => new PeerNetwork());
@@ -843,7 +845,9 @@ async function main(): Promise<void> {
   const negotiatorId = await supervisedSpawn('Negotiator', 'permanent', systemTypeId('Negotiator'));
   const healthMonitorId = await supervisedSpawn('HealthMonitor', 'permanent', systemTypeId('HealthMonitor'));
 
-  // WorkspaceSwitcher is a global UI (never hidden during workspace switch)
+  // Sidebar owns the dock window the rails populate; WorkspaceSwitcher is a
+  // global UI (never hidden during workspace switch)
+  const sidebarId = await supervisedSpawn('Sidebar', 'permanent', systemTypeId('Sidebar'));
   const workspaceSwitcherId = await supervisedSpawn('WorkspaceSwitcher', 'permanent', systemTypeId('WorkspaceSwitcher'));
 
   log.timed('global UI + services spawned');

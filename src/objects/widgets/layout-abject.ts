@@ -372,6 +372,10 @@ export abstract class LayoutAbject extends WidgetAbject {
       }
       this.layoutDirty = true;
       this.scheduleRelayout();
+      // A child's size change shifts this layout's own preferred height; an
+      // auto-sized nested layout must pass that up or the parent keeps
+      // allocating the stale height (e.g. a collapsed sidebar section).
+      this.notifyParentOfSizeChange().catch(() => {});
       return true;
     });
 

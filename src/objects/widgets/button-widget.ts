@@ -5,12 +5,18 @@
  * Consumes mousedown events and fires a 'click' change notification.
  */
 
+import { AbjectId } from '../../core/types.js';
+import { request } from '../../core/message.js';
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
 import { lightenColor, darkenColor, withAlpha, gradientRect } from './widget-types.js';
 
 export class ButtonWidget extends WidgetAbject {
   private hovered = false;
   private pressed = false;
+
+  // Tooltip service plumbing (only used when style.tooltip is set)
+  private tooltipManagerId?: AbjectId;
+  private tooltipActive = false;
 
   constructor(config: WidgetConfig) {
     super(config);
@@ -167,6 +173,7 @@ export class ButtonWidget extends WidgetAbject {
   protected async processInput(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
     if (input.type === 'mousedown') {
       this.pressed = true;
+      this.cancelTooltip();
       // Click fires immediately so call sites don't need to wait for mouseup;
       // the visible press animation runs in parallel and is cleared on
       // mouseup or mouseleave below.
@@ -184,6 +191,7 @@ export class ButtonWidget extends WidgetAbject {
     if (input.type === 'mousemove') {
       if (!this.hovered) {
         this.hovered = true;
+        this.requestTooltip(input);
         await this.requestRedraw();
       }
       return { consumed: true };
@@ -192,6 +200,7 @@ export class ButtonWidget extends WidgetAbject {
       const wasInteracting = this.hovered || this.pressed;
       this.hovered = false;
       this.pressed = false;
+      this.cancelTooltip();
       if (wasInteracting) await this.requestRedraw();
       return { consumed: true };
     }
@@ -203,6 +212,43 @@ export class ButtonWidget extends WidgetAbject {
       }
     }
     return { consumed: false };
+  }
+
+  /**
+   * Ask the WidgetManager tooltip service to show style.tooltip after a
+   * dwell, anchored just right of this button. The widget's screen origin is
+   * recovered from the event's global coordinates minus its local ones (the
+   * dispatch chain re-localizes x/y at every layer but passes globalX/globalY
+   * through untouched).
+   */
+  private requestTooltip(input: Record<string, unknown>): void {
+    const text = this.style.tooltip;
+    if (!text || this.disabled) return;
+    const globalX = input.globalX as number | undefined;
+    const globalY = input.globalY as number | undefined;
+    if (globalX === undefined || globalY === undefined) return;
+    const localX = (input.x as number | undefined) ?? 0;
+    const localY = (input.y as number | undefined) ?? 0;
+    const anchorX = globalX - localX + this.rect.width + 8;
+    const anchorY = globalY - localY + this.rect.height / 2;
+    this.tooltipActive = true;
+    void (async () => {
+      if (!this.tooltipManagerId) {
+        this.tooltipManagerId = await this.discoverDep('WidgetManager') ?? undefined;
+      }
+      // Re-check: the hover may have ended while we were discovering.
+      if (this.tooltipManagerId && this.tooltipActive) {
+        this.send(request(this.id, this.tooltipManagerId, 'requestTooltip', { text, x: anchorX, y: anchorY }));
+      }
+    })();
+  }
+
+  private cancelTooltip(): void {
+    if (!this.tooltipActive) return;
+    this.tooltipActive = false;
+    if (this.tooltipManagerId) {
+      this.send(request(this.id, this.tooltipManagerId, 'cancelTooltip', {}));
+    }
   }
 
   protected override suppressGenericFocusRing(): boolean {

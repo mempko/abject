@@ -60,6 +60,7 @@ export { WorkspaceManager, WORKSPACE_MANAGER_ID } from './objects/workspace-mana
 export type { WorkspaceAccessMode, SharedWorkspaceInfo } from './objects/workspace-manager.js';
 export { WorkspaceRegistry, WORKSPACE_REGISTRY_ID } from './objects/workspace-registry.js';
 export { WorkspaceSwitcher, WORKSPACE_SWITCHER_ID } from './objects/workspace-switcher.js';
+export { Sidebar, SIDEBAR_ID, SIDEBAR_WIDTH } from './objects/sidebar.js';
 export { GlobalSettings, GLOBAL_SETTINGS_ID } from './objects/global-settings.js';
 export { GlobalToolbar, GLOBAL_TOOLBAR_ID } from './objects/global-toolbar.js';
 export { PeerNetwork, PEER_NETWORK_ID } from './objects/peer-network.js';

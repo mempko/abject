@@ -38,6 +38,12 @@ export interface WindowConfig {
   theme?: ThemeData;
   /** Whether the mobile card overview may close this window (default true). */
   closable?: boolean;
+  /**
+   * Whether the window grabs focus when created (default true). Passive
+   * popups (tooltips) must not steal focus — the focus loss would send a
+   * mouseleave to the hovered widget that summoned them.
+   */
+  focusOnCreate?: boolean;
 }
 
 /**
@@ -51,6 +57,7 @@ export class WindowAbject extends Abject {
   private chromeless: boolean;
   private transparent: boolean;
   private closable: boolean;
+  private focusOnCreate: boolean;
   private resizable: boolean;
   private draggable: boolean;
   private zIndex: number;
@@ -177,6 +184,7 @@ export class WindowAbject extends Abject {
     this.chromeless = config.chromeless ?? false;
     this.transparent = config.transparent ?? false;
     this.closable = config.closable ?? true;
+    this.focusOnCreate = config.focusOnCreate ?? true;
     this.resizable = config.resizable ?? false;
     this.draggable = config.draggable ?? false;
     this.zIndex = config.zIndex ?? 100;
@@ -455,15 +463,17 @@ method calls on 'abjects:widgets' interface:
       surfaceId: this.surfaceId,
       title: this.title,
     }));
-    await this.request<boolean>(
-      request(this.id, this.uiServerId, 'focus', {
-        surfaceId: this.surfaceId,
-        // Accent + corner radius for the compositor's focus-glow halo so it
-        // matches the theme and the window silhouette.
-        glowColor: this.theme.accent,
-        glowRadius: this.theme.windowRadius,
-      })
-    );
+    if (this.focusOnCreate) {
+      await this.request<boolean>(
+        request(this.id, this.uiServerId, 'focus', {
+          surfaceId: this.surfaceId,
+          // Accent + corner radius for the compositor's focus-glow halo so it
+          // matches the theme and the window silhouette.
+          glowColor: this.theme.accent,
+          glowRadius: this.theme.windowRadius,
+        })
+      );
+    }
     await this.renderWindow();
   }
 

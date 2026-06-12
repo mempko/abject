@@ -38,11 +38,16 @@ export class Taskbar extends Abject {
   private registryId?: AbjectId;
   private windowManagerId?: AbjectId;
 
+  /** Sidebar dock window + this rail's section layout (pushed via show()). */
   private windowId?: AbjectId;
-  private rootLayoutId?: AbjectId;
-  private yOffset = 8;
-  /** Single-flight guard: buildUI sets windowId only after an async round-trip. */
+  private sectionLayoutId?: AbjectId;
+  /** Single-flight guard for clear+repopulate of the section. */
   private buildingUI = false;
+  /** Accordion state: collapsed sections show only their header row. */
+  private collapsed = false;
+  /** Horizontal dock collapse (pushed via show()): render icon-only rows. */
+  private compact = false;
+  private headerBtnId?: AbjectId;
 
   // Button -> target maps for click dispatch
   private systemButtons: Map<AbjectId, AbjectId> = new Map();
@@ -51,11 +56,6 @@ export class Taskbar extends Abject {
 
   // Minimized window state (survives rebuilds)
   private minimizedWindows: Map<string, { windowId: AbjectId; title: string }> = new Map();
-
-  // Accent the current UI was built with, so we know when a theme change needs a
-  // rebuild to re-bake baked label colors (this.theme updates silently via the
-  // theme-dependent protocol, so it can't be the comparison point).
-  private lastBuiltAccent?: string;
 
   // Debounce timer for registry events
   private updateTimer?: ReturnType<typeof setTimeout>;
@@ -109,14 +109,16 @@ export class Taskbar extends Abject {
     return super.askPrompt(_question) + `\n\n## Taskbar Usage Guide
 
 ### Overview
-Persistent vertical toolbar pinned to the left edge of the screen. Displays
-launch buttons for core workspace apps (Chat, Goals, Jobs, Web) and any
-user-created objects that expose show/hide methods. Also shows a "minimized
-windows" section so the user can restore windows from the taskbar.
+Provider of the Abjects section of the sidebar dock. Displays launch rows for
+core workspace apps (Chat, Goals, Jobs, Web) and any user-created objects that
+expose show/hide methods. Also shows a "minimized windows" list so the user
+can restore windows from the sidebar.
 
 ### Methods
-- \`show()\` -- Show the taskbar. Accepts optional \`{ yOffset }\` to position vertically.
-- \`hide()\` -- Destroy the taskbar window and clear all button state.
+- \`show({ windowId?, sectionLayoutId?, theme? })\` -- Rebuild the section rows
+  inside the sidebar section. IDs are cached, so a bare \`show()\` rebuilds in
+  place.
+- \`hide()\` -- Clear the section and all button state.
 - \`getState()\` -- Returns \`{ visible: boolean }\`.
 
 ### Behavior
@@ -152,20 +154,18 @@ windows" section so the user can restore windows from the taskbar.
 
   private setupHandlers(): void {
     this.on('show', async (msg: AbjectMessage) => {
-      const payload = msg.payload as { yOffset?: number; theme?: ThemeData } | undefined;
-      if (payload?.yOffset !== undefined) {
-        this.yOffset = payload.yOffset;
-      }
+      const payload = msg.payload as {
+        theme?: ThemeData; windowId?: AbjectId; sectionLayoutId?: AbjectId; compact?: boolean;
+      } | undefined;
       if (payload?.theme && typeof payload.theme === 'object' && 'canvasBg' in payload.theme) {
         this.theme = payload.theme;
       }
-      // Rebuild if the accent differs from what the UI was actually built with
-      // (this.theme updates silently via the theme-dependent protocol, so the
-      // baked "Abjects"/"Windows" label colors only refresh on a rebuild —
-      // show() alone just repositions an already-visible taskbar).
-      if (this.windowId && this.lastBuiltAccent !== undefined && this.theme.accent !== this.lastBuiltAccent) {
-        await this.rebuild();
-        return true;
+      // WorkspaceManager pushes fresh sidebar section IDs after each sidebar
+      // rebuild; a bare show() rebuilds into the cached section.
+      if (payload?.windowId && payload?.sectionLayoutId) {
+        this.windowId = payload.windowId;
+        this.sectionLayoutId = payload.sectionLayoutId;
+        this.compact = payload.compact ?? false;
       }
       return this.show();
     });
@@ -173,8 +173,6 @@ windows" section so the user can restore windows from the taskbar.
     this.on('hide', async () => this.hide());
 
     this.on('getState', async () => ({ visible: !!this.windowId }));
-
-    this.on('windowCloseRequested', async () => { await this.hide(); });
 
     this.on('changed', async (msg: AbjectMessage) => {
       const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
@@ -187,6 +185,13 @@ windows" section so the user can restore windows from the taskbar.
       if (aspect !== 'click') return;
 
       const fromId = msg.routing.from;
+
+      // Section header — accordion toggle
+      if (fromId === this.headerBtnId) {
+        this.collapsed = !this.collapsed;
+        await this.rebuild();
+        return;
+      }
 
       // Launch button clicked
       const targetId = this.systemButtons.get(fromId) ?? this.userObjButtons.get(fromId);
@@ -225,19 +230,11 @@ windows" section so the user can restore windows from the taskbar.
   // ---- Show / Hide / Rebuild ----
 
   async show(): Promise<boolean> {
-    if (this.windowId) {
-      // Already visible, just reposition
-      await this.resizeWindow();
-      return true;
-    }
-    // buildUI() sets this.windowId only after the async createWindowAbject
-    // resolves. Without a synchronous guard, a second show() racing in during
-    // a workspace switch passes the windowId check and builds a *second*
-    // window (duplicate header). Single-flight buildUI to prevent that.
     if (this.buildingUI) return true;
+    if (!this.windowId || !this.sectionLayoutId) return false;
     this.buildingUI = true;
     try {
-      await this.buildUI();
+      await this.rebuildSection();
     } finally {
       this.buildingUI = false;
     }
@@ -246,14 +243,15 @@ windows" section so the user can restore windows from the taskbar.
   }
 
   async hide(): Promise<boolean> {
-    if (!this.windowId) return true;
-    await this.request(
-      request(this.id, this.widgetManagerId!, 'destroyWindowAbject', {
-        windowId: this.windowId,
-      })
-    );
+    if (this.sectionLayoutId) {
+      // Best-effort: the sidebar may already have destroyed the section.
+      try {
+        await this.request(request(this.id, this.sectionLayoutId, 'clearLayoutChildren', {}));
+      } catch { /* section gone */ }
+    }
     this.windowId = undefined;
-    this.rootLayoutId = undefined;
+    this.sectionLayoutId = undefined;
+    this.headerBtnId = undefined;
     this.systemButtons.clear();
     this.userObjButtons.clear();
     this.restoreButtons.clear();
@@ -270,67 +268,47 @@ windows" section so the user can restore windows from the taskbar.
   }
 
   /**
-   * Rebuild content inside the existing window. Clears root layout and repopulates.
+   * Rebuild content inside the existing sidebar section. Clears the section
+   * layout and repopulates.
    */
   private async rebuild(): Promise<void> {
-    if (!this.windowId || !this.rootLayoutId) return;
-
-    // Clear all children from root layout
-    await this.request(request(this.id, this.rootLayoutId, 'clearLayoutChildren', {}));
-    this.systemButtons.clear();
-    this.userObjButtons.clear();
-    this.restoreButtons.clear();
-
-    await this.populateContent();
-    await this.resizeWindow();
+    if (this.buildingUI) return;
+    if (!this.windowId || !this.sectionLayoutId) return;
+    this.buildingUI = true;
+    try {
+      await this.rebuildSection();
+    } finally {
+      this.buildingUI = false;
+    }
   }
 
   // ---- UI Construction ----
 
-  private async buildUI(): Promise<void> {
-    const showableObjects = await this.discoverShowableObjects();
-    const barHeight = this.computeHeight(showableObjects.length);
-
-    this.windowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createWindowAbject', {
-        title: '\u25A0 Abjects',
-        rect: { x: 8, y: this.yOffset, width: BTN_W + this.theme.tokens.space.xl * 2, height: barHeight },
-        zIndex: 999,
-        chromeless: true,
-        draggable: true,
-        closable: false,
-      })
-    );
-
-    this.rootLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createVBox', {
-        windowId: this.windowId,
-        margins: { top: this.theme.tokens.space.xl, right: this.theme.tokens.space.xl, bottom: this.theme.tokens.space.xl, left: this.theme.tokens.space.xl },
-        spacing: this.theme.tokens.space.sm,
-      })
-    );
-
+  private async rebuildSection(): Promise<void> {
+    await this.request(request(this.id, this.sectionLayoutId!, 'clearLayoutChildren', {}));
+    this.headerBtnId = undefined;
+    this.systemButtons.clear();
+    this.userObjButtons.clear();
+    this.restoreButtons.clear();
     await this.populateContent();
   }
 
   private async populateContent(): Promise<void> {
-    // Record the accent the labels are being baked with (used to decide when a
-    // theme change needs a rebuild).
-    this.lastBuiltAccent = this.theme.accent;
-    const showableObjects = await this.discoverShowableObjects();
+    const collapsed = this.collapsed;
+    const showableObjects = collapsed ? [] : await this.discoverShowableObjects();
 
     // No blocking getState queries. Buttons render unstyled immediately.
     // Visibility events from system objects update styles via updateButtonStyle().
 
-    // ---- Header row: "Abjects" label + gear button ----
+    // ---- Header row: collapse-toggle header button + gear button ----
     const headerRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: this.rootLayoutId!,
+        parentLayoutId: this.sectionLayoutId!,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
     );
-    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
+    await this.request(request(this.id, this.sectionLayoutId!, 'updateLayoutChild', {
       widgetId: headerRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: LABEL_H },
@@ -342,66 +320,80 @@ windows" section so the user can restore windows from the taskbar.
     // "Grimoire index" styling: flat, borderless, left-aligned rows rather than
     // boxed pills. Apps render in primary ink; user objects are demoted to
     // secondary so the eye lands on the built-in apps and the active entry.
-    const sectionLabelStyle = { color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display' };
+    const compact = this.compact;
+    const sectionLabelStyle = { color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display', align: compact ? 'center' : 'left' };
     const ghostBg = lightenColor(this.theme.windowBg, 5);
     const appStyle = {
       background: ghostBg, flat: true,
       color: this.theme.textPrimary, radius: this.theme.tokens.radius.sm,
-      align: 'left', fontSize: 12,
+      align: compact ? 'center' : 'left', fontSize: compact ? 14 : 12,
     };
     // User objects use the same font/size/ink as the apps; their icon (declared
     // emoji or the default glyph) is the only distinction, so the rail is uniform.
     const objStyle = appStyle;
     const gearStyle = { background: ghostBg, flat: true, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13 };
 
-    // [0] Header label
-    specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A0 Abjects', style: sectionLabelStyle });
-    // [1] Gear button (AppExplorer)
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: gearStyle });
-    // [2] Chat (opens ChatBrowser overview)
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCAC Chat', style: appStyle });
-    // [3?] Goals (optional)
-    if (this.goalBrowserId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDFAF Goals', style: appStyle });
+    const headerStyle = { background: this.theme.windowBg, flat: true, color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display', align: compact ? 'center' : 'left' };
+    const chevron = collapsed ? '\u25B8' : '\u25BE';
+    const row = (icon: string, label: string) => (compact ? icon : `${icon} ${label}`);
+    // Compact rows are icon-only, so the label moves into a hover tooltip.
+    const rowStyle = (label: string) => (compact ? { ...appStyle, tooltip: label } : appStyle);
+
+    // [0] Header collapse-toggle button. Compact mode drops the gear from the
+    // header (no horizontal room).
+    specs.push({ type: 'button', windowId: this.windowId!, text: compact ? '\u25A0' : `${chevron} \u25A0 Abjects`, style: compact ? { ...headerStyle, tooltip: 'Abjects' } : headerStyle });
+    if (!compact) {
+      // [1] Gear button (AppExplorer)
+      specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: gearStyle });
     }
-    // [4] Jobs
-    specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCCB Jobs', style: appStyle });
-    // [5?] Knowledge (optional)
-    if (this.knowledgeBrowserId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83E\uDDE0 Knowledge', style: appStyle });
-    }
-    // [6?] Agents (optional)
-    if (this.agentBrowserId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83E\uDD16 Agents', style: appStyle });
-    }
-    // [7?] Schedules (optional)
-    if (this.schedulerBrowserId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\u23F0 Schedules', style: appStyle });
-    }
-    // [8?] Web (optional)
-    if (this.webBrowserViewerId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83C\uDF10 Web', style: appStyle });
-    }
-    // [9?] Files (optional)
-    if (this.fileManagerId) {
-      specs.push({ type: 'button', windowId: this.windowId!, text: '\uD83D\uDCC1 Files', style: appStyle });
+    const sysRowStartIdx = specs.length;
+    if (!collapsed) {
+      // Chat (opens ChatBrowser overview)
+      specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83D\uDCAC', 'Chat'), style: rowStyle('Chat') });
+      // Goals (optional)
+      if (this.goalBrowserId) {
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83C\uDFAF', 'Goals'), style: rowStyle('Goals') });
+      }
+      // Jobs
+      specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83D\uDCCB', 'Jobs'), style: rowStyle('Jobs') });
+      // Knowledge (optional)
+      if (this.knowledgeBrowserId) {
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83E\uDDE0', 'Knowledge'), style: rowStyle('Knowledge') });
+      }
+      // Agents (optional)
+      if (this.agentBrowserId) {
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83E\uDD16', 'Agents'), style: rowStyle('Agents') });
+      }
+      // Schedules (optional)
+      if (this.schedulerBrowserId) {
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('\u23F0', 'Schedules'), style: rowStyle('Schedules') });
+      }
+      // Web (optional)
+      if (this.webBrowserViewerId) {
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83C\uDF10', 'Web'), style: rowStyle('Web') });
+      }
+      // Files (optional)
+      if (this.fileManagerId) {
+        specs.push({ type: 'button', windowId: this.windowId!, text: row('\uD83D\uDCC1', 'Files'), style: rowStyle('Files') });
+      }
     }
 
     // User object buttons. Use the manifest icon when present, else a neutral
     // default so older objects (created before icons) still render an icon.
+    // (showableObjects is empty when collapsed.)
     const userObjStartIdx = specs.length;
     for (const obj of showableObjects) {
       const icon = obj.manifest.icon?.trim() || DEFAULT_OBJECT_ICON;
-      specs.push({ type: 'button', windowId: this.windowId!, text: `${icon}  ${obj.manifest.name}`, style: objStyle });
+      specs.push({ type: 'button', windowId: this.windowId!, text: compact ? icon : `${icon}  ${obj.manifest.name}`, style: compact ? { ...objStyle, tooltip: obj.manifest.name } : objStyle });
     }
 
-    // Minimized window section
+    // Minimized window section (hidden while collapsed)
     const minimizedStartIdx = specs.length;
-    const minimizedCount = this.minimizedWindows.size;
+    const minimizedCount = collapsed ? 0 : this.minimizedWindows.size;
     if (minimizedCount > 0) {
-      specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A1 Windows', style: sectionLabelStyle });
+      specs.push({ type: 'label', windowId: this.windowId!, text: compact ? '\u25A1' : '\u25A1 Windows', style: sectionLabelStyle });
       for (const [, { title }] of this.minimizedWindows) {
-        specs.push({ type: 'button', windowId: this.windowId!, text: title, style: objStyle });
+        specs.push({ type: 'button', windowId: this.windowId!, text: compact ? '\u25A1' : title, style: compact ? { ...objStyle, tooltip: title } : objStyle });
       }
     }
 
@@ -410,61 +402,69 @@ windows" section so the user can restore windows from the taskbar.
     );
 
     // ---- Map button IDs to targets ----
-    const headerLabelId = widgetIds[0];
-    const gearBtnId = widgetIds[1];
-    this.systemButtons.set(gearBtnId, this.appExplorerId!);
+    this.headerBtnId = widgetIds[0];
+    const gearBtnId = compact ? undefined : widgetIds[1];
+    if (gearBtnId) {
+      this.systemButtons.set(gearBtnId, this.appExplorerId!);
+    }
 
-    let idx = 2;
-    this.systemButtons.set(widgetIds[idx++], this.chatBrowserId!);
-    if (this.goalBrowserId) this.systemButtons.set(widgetIds[idx++], this.goalBrowserId);
-    this.systemButtons.set(widgetIds[idx++], this.jobBrowserId!);
-    if (this.knowledgeBrowserId) this.systemButtons.set(widgetIds[idx++], this.knowledgeBrowserId);
-    if (this.agentBrowserId) this.systemButtons.set(widgetIds[idx++], this.agentBrowserId);
-    if (this.schedulerBrowserId) this.systemButtons.set(widgetIds[idx++], this.schedulerBrowserId);
-    if (this.webBrowserViewerId) this.systemButtons.set(widgetIds[idx++], this.webBrowserViewerId);
-    if (this.fileManagerId) this.systemButtons.set(widgetIds[idx++], this.fileManagerId);
+    if (!collapsed) {
+      let idx = sysRowStartIdx;
+      this.systemButtons.set(widgetIds[idx++], this.chatBrowserId!);
+      if (this.goalBrowserId) this.systemButtons.set(widgetIds[idx++], this.goalBrowserId);
+      this.systemButtons.set(widgetIds[idx++], this.jobBrowserId!);
+      if (this.knowledgeBrowserId) this.systemButtons.set(widgetIds[idx++], this.knowledgeBrowserId);
+      if (this.agentBrowserId) this.systemButtons.set(widgetIds[idx++], this.agentBrowserId);
+      if (this.schedulerBrowserId) this.systemButtons.set(widgetIds[idx++], this.schedulerBrowserId);
+      if (this.webBrowserViewerId) this.systemButtons.set(widgetIds[idx++], this.webBrowserViewerId);
+      if (this.fileManagerId) this.systemButtons.set(widgetIds[idx++], this.fileManagerId);
+    }
 
     for (let i = 0; i < showableObjects.length; i++) {
       this.userObjButtons.set(widgetIds[userObjStartIdx + i], showableObjects[i].id);
     }
 
     // ---- Add header row children ----
-    await this.request(request(this.id, headerRowId, 'addLayoutChildren', {
-      children: [
-        { widgetId: headerLabelId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: LABEL_H } },
-        { widgetId: gearBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: LABEL_H } },
-      ],
-    }));
+    const headerChildren: Array<Record<string, unknown>> = [
+      { widgetId: this.headerBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: LABEL_H } },
+    ];
+    if (gearBtnId) {
+      headerChildren.push({ widgetId: gearBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: 24, height: LABEL_H } });
+    }
+    await this.request(request(this.id, headerRowId, 'addLayoutChildren', { children: headerChildren }));
+    this.send(request(this.id, this.headerBtnId, 'addDependent', {}));
 
-    // ---- Add root layout children ----
-    const rootChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize: Record<string, number> }> = [];
+    // ---- Add section layout children ----
+    const sectionChildren: Array<{ widgetId: AbjectId; sizePolicy: Record<string, string>; preferredSize: Record<string, number> }> = [];
 
-    // System buttons in declaration order (skip header label + gear at indices 0–1).
-    for (let i = 2; i < userObjStartIdx; i++) {
-      rootChildren.push({ widgetId: widgetIds[i], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: BTN_H } });
+    // System buttons in declaration order (skip the header-row widgets).
+    for (let i = sysRowStartIdx; i < userObjStartIdx; i++) {
+      sectionChildren.push({ widgetId: widgetIds[i], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: BTN_H } });
     }
 
     // User object buttons
     for (let i = 0; i < showableObjects.length; i++) {
-      rootChildren.push({ widgetId: widgetIds[userObjStartIdx + i], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: BTN_H } });
+      sectionChildren.push({ widgetId: widgetIds[userObjStartIdx + i], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: BTN_H } });
     }
 
     // Minimized window section
     if (minimizedCount > 0) {
       let mIdx = minimizedStartIdx;
-      rootChildren.push({ widgetId: widgetIds[mIdx++], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: LABEL_H } });
+      sectionChildren.push({ widgetId: widgetIds[mIdx++], sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: LABEL_H } });
       let surfaceIdx = 0;
       for (const [surfaceId] of this.minimizedWindows) {
         const btnId = widgetIds[mIdx + surfaceIdx];
         this.restoreButtons.set(btnId, surfaceId);
-        rootChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: BTN_H } });
+        sectionChildren.push({ widgetId: btnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { width: BTN_W, height: BTN_H } });
         surfaceIdx++;
       }
     }
 
-    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChildren', {
-      children: rootChildren,
-    }));
+    if (sectionChildren.length > 0) {
+      await this.request(request(this.id, this.sectionLayoutId!, 'addLayoutChildren', {
+        children: sectionChildren,
+      }));
+    }
 
     // Register as dependent of all buttons (for click events)
     for (const [btnId] of this.systemButtons) {
@@ -521,25 +521,6 @@ windows" section so the user can restore windows from the taskbar.
       const names = obj.manifest.interface.methods.map((m) => m.name);
       return names.includes('show') && names.includes('hide');
     });
-  }
-
-  private computeHeight(userObjectCount: number): number {
-    // Always-present row buttons: Chat + Jobs (gear sits in header row, not counted).
-    const systemBtnCount = 2 + (this.webBrowserViewerId ? 1 : 0) + (this.fileManagerId ? 1 : 0) + (this.goalBrowserId ? 1 : 0) + (this.knowledgeBrowserId ? 1 : 0) + (this.agentBrowserId ? 1 : 0) + (this.schedulerBrowserId ? 1 : 0);
-    const minimizedCount = this.minimizedWindows.size;
-    const totalBtnCount = systemBtnCount + userObjectCount + minimizedCount;
-    const extraHeight = (LABEL_H + this.theme.tokens.space.sm)
-      + (minimizedCount > 0 ? (LABEL_H + this.theme.tokens.space.sm) : 0);
-    return this.theme.tokens.space.xl + extraHeight + totalBtnCount * (BTN_H + this.theme.tokens.space.sm) - this.theme.tokens.space.sm + this.theme.tokens.space.xl;
-  }
-
-  private async resizeWindow(): Promise<void> {
-    if (!this.windowId) return;
-    const showableObjects = await this.discoverShowableObjects();
-    const barHeight = this.computeHeight(showableObjects.length);
-    await this.request(request(this.id, this.windowId, 'windowRect', {
-      x: 8, y: this.yOffset, width: BTN_W + this.theme.tokens.space.xl * 2, height: barHeight,
-    }));
   }
 
   /**

@@ -100,6 +100,16 @@ export class WidgetManager extends Abject {
   // Maps widget AbjectId → parent WindowAbject AbjectId (for workspace tracing)
   private widgetToWindow: Map<AbjectId, AbjectId> = new Map();
 
+  // ── Tooltip service state ──
+  // One shared tooltip at a time: a tiny chromeless window created after a
+  // hover dwell and destroyed on cancel/auto-hide.
+  private tooltipWindowId?: AbjectId;
+  private tooltipShowTimer?: ReturnType<typeof setTimeout>;
+  private tooltipHideTimer?: ReturnType<typeof setTimeout>;
+  private tooltipSource?: AbjectId;
+  /** Bumped on every schedule/cancel; in-flight shows abort when stale. */
+  private tooltipGeneration = 0;
+
   constructor() {
     super({
       manifest: {
@@ -720,6 +730,25 @@ export class WidgetManager extends Abject {
       return this.request<{ width: number; height: number }>(
         request(this.id, this.uiServerId!, 'getDisplayInfo', {})
       );
+    });
+
+    // ── Tooltip service ──
+    // Widgets with a style.tooltip request a tooltip on hover-start (anchored
+    // in screen coordinates) and cancel it on leave/press. The manager owns
+    // the dwell delay, the floating tooltip window, and the auto-hide.
+    this.on('requestTooltip', async (msg: AbjectMessage) => {
+      const { text, x, y } = msg.payload as { text: string; x: number; y: number };
+      if (!text || typeof x !== 'number' || typeof y !== 'number') return false;
+      this.scheduleTooltip(msg.routing.from, text, x, y);
+      return true;
+    });
+
+    this.on('cancelTooltip', async (msg: AbjectMessage) => {
+      // Only the widget whose request is pending/visible may cancel it, so a
+      // stale leave from button A can't kill button B's fresh request.
+      if (this.tooltipSource && msg.routing.from !== this.tooltipSource) return true;
+      await this.hideTooltip();
+      return true;
     });
 
     this.on('raiseWindow', async (msg: AbjectMessage) => {
@@ -1762,7 +1791,7 @@ await this.call(timerId, 'addDependent', {});
     owner: AbjectId,
     title: string,
     rect: { x: number; y: number; width: number; height: number },
-    options?: { chromeless?: boolean; transparent?: boolean; resizable?: boolean; draggable?: boolean; zIndex?: number; closable?: boolean }
+    options?: { chromeless?: boolean; transparent?: boolean; resizable?: boolean; draggable?: boolean; zIndex?: number; closable?: boolean; focusOnCreate?: boolean }
   ): Promise<AbjectId> {
     require(this.uiServerId !== undefined, 'UIServer not set');
 
@@ -1785,6 +1814,7 @@ await this.call(timerId, 'addDependent', {});
       resizable: options?.resizable,
       draggable: options?.draggable,
       closable: options?.closable,
+      focusOnCreate: options?.focusOnCreate,
       zIndex: options?.zIndex ?? 100,
       theme: ownerTheme,
     });
@@ -1828,6 +1858,103 @@ await this.call(timerId, 'addDependent', {});
     }
 
     return win.id;
+  }
+
+  // ── Tooltip service implementation ─────────────────────────────────
+
+  private static readonly TOOLTIP_DELAY_MS = 450;
+  private static readonly TOOLTIP_AUTO_HIDE_MS = 5000;
+  private static readonly TOOLTIP_HEIGHT = 26;
+
+  private scheduleTooltip(source: AbjectId, text: string, x: number, y: number): void {
+    if (this.tooltipShowTimer) clearTimeout(this.tooltipShowTimer);
+    // Replace any visible tooltip immediately; the new one shows after its
+    // own dwell so quick scans across buttons don't strobe tooltips.
+    void this.destroyTooltipWindow();
+    this.tooltipSource = source;
+    const generation = ++this.tooltipGeneration;
+    this.tooltipShowTimer = setTimeout(() => {
+      this.tooltipShowTimer = undefined;
+      this.showTooltipNow(generation, text, x, y).catch(() => {});
+    }, WidgetManager.TOOLTIP_DELAY_MS);
+  }
+
+  private async showTooltipNow(generation: number, text: string, x: number, y: number): Promise<void> {
+    await this.destroyTooltipWindow();
+    const theme = this.activeTheme();
+
+    // Size to the text (estimate fallback when font metrics are not loaded).
+    let textW = text.length * 7.5;
+    try {
+      const measured = await this.request<number>(
+        request(this.id, this.uiServerId!, 'measureText', { surfaceId: '', text })
+      );
+      if (typeof measured === 'number' && measured > 0) textW = measured;
+    } catch { /* keep estimate */ }
+    const h = WidgetManager.TOOLTIP_HEIGHT;
+    const w = Math.min(320, Math.ceil(textW) + 20);
+
+    // Anchor: x is the left edge, y the vertical center. Clamp on-screen.
+    let dx = Math.round(x);
+    let dy = Math.round(y - h / 2);
+    try {
+      const info = await this.request<{ width: number; height: number }>(
+        request(this.id, this.uiServerId!, 'getDisplayInfo', {})
+      );
+      if (info?.width) {
+        dx = Math.max(4, Math.min(dx, info.width - w - 4));
+        dy = Math.max(4, Math.min(dy, info.height - h - 4));
+      }
+    } catch { /* unclamped */ }
+
+    // A cancel may have landed while we awaited the measure/display
+    // round-trips; a stale show must not resurrect a dismissed tooltip.
+    if (generation !== this.tooltipGeneration) return;
+
+    const windowId = await this.createWindowDirect(this.id, 'tooltip',
+      { x: dx, y: dy, width: w, height: h },
+      { chromeless: true, draggable: false, closable: false, zIndex: 9300, focusOnCreate: false });
+    await this.createWidgetFromSpec({
+      type: 'label',
+      windowId,
+      rect: { x: 0, y: 6, width: w, height: h - 10 },
+      text,
+      style: { color: theme.textPrimary, fontSize: 12, align: 'center' },
+    });
+    if (generation !== this.tooltipGeneration) {
+      // Canceled during creation — tear the window straight back down.
+      try { await this.destroyWindowDirect(windowId); } catch { /* gone */ }
+      return;
+    }
+    this.tooltipWindowId = windowId;
+
+    // Backstop: never leave a tooltip stranded (e.g. its widget died before
+    // sending cancel).
+    if (this.tooltipHideTimer) clearTimeout(this.tooltipHideTimer);
+    this.tooltipHideTimer = setTimeout(() => { this.hideTooltip().catch(() => {}); }, WidgetManager.TOOLTIP_AUTO_HIDE_MS);
+  }
+
+  private async hideTooltip(): Promise<void> {
+    this.tooltipGeneration++;
+    if (this.tooltipShowTimer) {
+      clearTimeout(this.tooltipShowTimer);
+      this.tooltipShowTimer = undefined;
+    }
+    if (this.tooltipHideTimer) {
+      clearTimeout(this.tooltipHideTimer);
+      this.tooltipHideTimer = undefined;
+    }
+    this.tooltipSource = undefined;
+    await this.destroyTooltipWindow();
+  }
+
+  private async destroyTooltipWindow(): Promise<void> {
+    const windowId = this.tooltipWindowId;
+    if (!windowId) return;
+    this.tooltipWindowId = undefined;
+    try {
+      await this.destroyWindowDirect(windowId);
+    } catch { /* already gone */ }
   }
 
   // ── Factory: destroyWindowDirect — destroy by AbjectId ─────────────
