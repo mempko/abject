@@ -21,27 +21,94 @@ import {
   CANVAS_INTERFACE,
   DRAW_COMMAND_TYPES,
   DRAW_COMMAND_ALIASES,
+  CANVAS_CTX_PROPERTIES,
 } from './widget-types.js';
 
 const VALID_DRAW_TYPES = new Set<string>(DRAW_COMMAND_TYPES);
 
 /**
- * Required params per command type for the common shapes. Catches the second
- * failure mode after wrong type names: right type, wrong param names (e.g.
- * {w, h, color} instead of {width, height, fill}), which draws nothing.
- * Only the load-bearing fields are checked; optional styling is not.
+ * Required params per command type. Catches the second failure mode after
+ * wrong type names: right type, wrong param names (e.g. {w, h, color} instead
+ * of {width, height, fill}), which draws nothing. Only the load-bearing
+ * fields are checked; optional styling is not. A '|' in an entry lists
+ * accepted alternatives (high-level vs canvas-API dialect names).
  */
 const REQUIRED_PARAMS: Record<string, string[]> = {
+  // High-level shapes
   rect: ['x', 'y', 'width', 'height'],
   text: ['x', 'y', 'text'],
   line: ['x1', 'y1', 'x2', 'y2'],
-  circle: ['cx', 'cy', 'radius'],
-  arc: ['cx', 'cy', 'radius', 'startAngle', 'endAngle'],
-  ellipse: ['cx', 'cy', 'radiusX', 'radiusY'],
+  circle: ['cx|x', 'cy|y', 'radius'],
+  arc: ['cx|x', 'cy|y', 'radius', 'startAngle', 'endAngle'],
+  ellipse: ['cx|x', 'cy|y', 'radiusX', 'radiusY'],
+  polygon: ['points'],
+  path: ['path'],
   imageUrl: ['x', 'y', 'url'],
-  clip: ['x', 'y', 'width', 'height'],
   translate: ['x', 'y'],
+  rotate: ['angle'],
+  linearGradient: ['x0', 'y0', 'x1', 'y1', 'stops'],
+  radialGradient: ['cx0', 'cy0', 'r0', 'cx1', 'cy1', 'r1', 'stops'],
+  conicGradient: ['startAngle', 'cx', 'cy', 'stops'],
+  globalAlpha: ['alpha|value'],
+  setLineDash: ['segments|value'],
+  // Canvas 2D API methods
+  clearRect: ['x', 'y', 'width', 'height'],
+  fillRect: ['x', 'y', 'width', 'height'],
+  strokeRect: ['x', 'y', 'width', 'height'],
+  fillText: ['text', 'x', 'y'],
+  strokeText: ['text', 'x', 'y'],
+  moveTo: ['x', 'y'],
+  lineTo: ['x', 'y'],
+  bezierCurveTo: ['cp1x', 'cp1y', 'cp2x', 'cp2y', 'x', 'y'],
+  quadraticCurveTo: ['cpx', 'cpy', 'x', 'y'],
+  arcTo: ['x1', 'y1', 'x2', 'y2', 'radius'],
+  roundRect: ['x', 'y', 'width', 'height'],
+  transform: ['a', 'b', 'c', 'd', 'e', 'f'],
+  setTransform: ['a', 'b', 'c', 'd', 'e', 'f'],
+  drawImage: ['url|data', 'dx|x', 'dy|y'],
+  putImageData: ['data', 'width', 'height'],
 };
+
+// Context property commands all carry their value as params.value.
+for (const prop of CANVAS_CTX_PROPERTIES) {
+  REQUIRED_PARAMS[prop] = ['value'];
+}
+
+/**
+ * Shorthand param names accepted as aliases for the canonical names. Code
+ * generators routinely emit the SVG-style short forms ({cx, cy, r} for a
+ * circle), so renaming them here keeps pre-existing apps drawing instead of
+ * rejecting the whole batch. Gradient params (r0/r1) are unaffected.
+ */
+const PARAM_ALIASES: Record<string, string> = {
+  r: 'radius',
+  rx: 'radiusX',
+  ry: 'radiusY',
+  w: 'width',
+  h: 'height',
+};
+
+/**
+ * Rewrite shorthand param names to their canonical equivalents. A shorthand
+ * is only renamed when the canonical name is absent. Input objects are not
+ * mutated.
+ */
+function normalizeDrawCommands(commands: unknown[]): unknown[] {
+  return commands.map((cmd) => {
+    const c = cmd as { params?: Record<string, unknown> };
+    const params = c?.params;
+    if (!params || typeof params !== 'object') return cmd;
+    let renamed: Record<string, unknown> | undefined;
+    for (const [alias, canonical] of Object.entries(PARAM_ALIASES)) {
+      if (params[alias] !== undefined && params[canonical] === undefined) {
+        renamed ??= { ...params };
+        renamed[canonical] = renamed[alias];
+        delete renamed[alias];
+      }
+    }
+    return renamed ? { ...(cmd as object), params: renamed } : cmd;
+  });
+}
 
 /**
  * Validate a draw command batch. Returns a list of human-actionable problem
@@ -67,7 +134,7 @@ function validateDrawCommands(commands: unknown[]): string[] {
     const required = REQUIRED_PARAMS[type];
     if (required) {
       const params = c.params ?? {};
-      const missing = required.filter((k) => params[k] === undefined);
+      const missing = required.filter((spec) => !spec.split('|').some((k) => params[k] !== undefined));
       if (missing.length > 0) {
         problems.set(`${type}:params`, `'${type}' command missing required params {${missing.join(', ')}} — got {${Object.keys(params).join(', ')}}`);
       }
@@ -147,11 +214,9 @@ export class CanvasWidget extends WidgetAbject {
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## CanvasWidget — Draw Commands
 
-I render the \`draw\` commands you send me. **This is NOT the HTML5 Canvas API** — there is no fillRect/fillText/beginPath and no stateful context. Each command is a self-contained object: \`{ type, surfaceId: 'c', params }\` (surfaceId is rewritten internally; any string works). I REJECT the whole batch with an error if any command has an unknown type or is missing required params — nothing is drawn until every command is valid.
+I render the \`draw\` commands you send me. Each command is an object \`{ type, surfaceId: 'c', params }\` (surfaceId is rewritten internally; any string works). Commands execute in order against a stateful 2D context, and two dialects mix freely: high-level self-contained shapes, and the standard HTML5 Canvas 2D API (every context method is a command type with params named after the MDN argument names; every settable context property is a command with params \`{ value }\`). I REJECT the whole batch with an error if any command has an unknown type or is missing required params — nothing is drawn until every command is valid.
 
-### Vocabulary (complete)
-
-Shapes (all take optional \`fill\`, \`stroke\`, \`lineWidth\` in params):
+### High-level shapes (all take optional \`fill\`, \`stroke\`, \`lineWidth\` in params)
 - \`rect\` — { x, y, width, height, fill?, stroke?, lineWidth?, radius? }   (radius = rounded corners)
 - \`circle\` — { cx, cy, radius, fill?, stroke? }
 - \`ellipse\` — { cx, cy, radiusX, radiusY, rotation?, fill?, stroke? }
@@ -166,13 +231,28 @@ Text and images:
 - \`text\` — { x, y, text, fill?, font? ('bold 14px sans-serif'), align? ('left'|'center'|'right'), baseline?, maxWidth? }
 - \`imageUrl\` — { x, y, width?, height?, url }
 
-State and effects (mirror canvas2d semantics, as commands):
+State and effects:
 - \`clear\` — { color? } (fills the whole canvas; use as the first command each frame)
-- \`save\` / \`restore\` — {} (always balance them)
-- \`clip\` — { x, y, width, height }, \`translate\` — { x, y }, \`rotate\` — { angle }, \`scale\` — { x, y }
-- \`globalAlpha\` — { alpha }, \`shadow\` — { color, blur, offsetX?, offsetY? }, \`setLineDash\` — { segments: [n, n] }
+- \`shadow\` — { color, blur, offsetX?, offsetY? }
 - \`linearGradient\` — { x0, y0, x1, y1, stops: [{offset, color},...] } (becomes the fill for subsequent shapes until changed)
-- \`radialGradient\` — { cx0, cy0, r0, cx1, cy1, r1, stops: [...] }
+- \`radialGradient\` — { cx0, cy0, r0, cx1, cy1, r1, stops: [...] }, \`conicGradient\` — { startAngle, cx, cy, stops: [...] }
+
+### Canvas 2D API commands
+Methods (params use the MDN argument names):
+- \`fillRect\` / \`strokeRect\` / \`clearRect\` — { x, y, width, height }
+- \`fillText\` / \`strokeText\` — { text, x, y, maxWidth? }
+- \`beginPath\` / \`closePath\` — {}; \`moveTo\` / \`lineTo\` — { x, y }
+- \`arc\` / \`circle\` / \`ellipse\` / \`rect\` with no fill/stroke param build the current path like their ctx counterparts (shapes accept x/y for cx/cy)
+- \`roundRect\` — { x, y, width, height, radii }; \`arcTo\` — { x1, y1, x2, y2, radius }
+- \`bezierCurveTo\` — { cp1x, cp1y, cp2x, cp2y, x, y }; \`quadraticCurveTo\` — { cpx, cpy, x, y }
+- \`fill\` — { fillRule?, fillStyle?, path? } and \`stroke\` — { strokeStyle?, lineWidth?, path? } act on the current path (or on an SVG \`path\` string if given)
+- \`clip\` — {} clips to the current path; { x, y, width, height } rect-clips
+- \`save\` / \`restore\` — {} (always balance them); \`translate\` — { x, y }; \`rotate\` — { angle }; \`scale\` — { x, y }; \`transform\` / \`setTransform\` — { a, b, c, d, e, f }; \`resetTransform\` — {}
+- \`drawImage\` — { url, dx, dy, dWidth?, dHeight?, sx?, sy?, sWidth?, sHeight? }
+- \`putImageData\` — { data: <flat RGBA number array>, width, height, dx?, dy? }
+- \`setLineDash\` — { segments: [n, n] }
+
+Properties (one command each, params { value }): \`fillStyle\`, \`strokeStyle\`, \`lineWidth\`, \`lineCap\`, \`lineJoin\`, \`miterLimit\`, \`lineDashOffset\`, \`font\`, \`textAlign\`, \`textBaseline\`, \`direction\`, \`letterSpacing\`, \`wordSpacing\`, \`globalAlpha\` (also accepts { alpha }), \`globalCompositeOperation\`, \`filter\`, \`shadowColor\`, \`shadowBlur\`, \`shadowOffsetX\`, \`shadowOffsetY\`, \`imageSmoothingEnabled\`, \`imageSmoothingQuality\`. The \`fillStyle\`/\`strokeStyle\` value may also be a gradient descriptor: { x0, y0, x1, y1, stops } (linear), { cx0, cy0, r0, cx1, cy1, r1, stops } (radial), or { startAngle, cx, cy, stops } (conic).
 
 ### Frame pattern
 
@@ -182,13 +262,23 @@ async _render() {
   const { width: W, height: H } = await this.call(this._canvasId, 'getCanvasSize', {});
   const cmds = [];
   cmds.push({ type: 'clear', surfaceId: 'c', params: { color: '#0f172a' } });
+  // High-level dialect:
   cmds.push({ type: 'rect', surfaceId: 'c', params: { x: 16, y: 16, width: 200, height: 80, fill: '#1e293b', stroke: '#334155', radius: 8 } });
   cmds.push({ type: 'text', surfaceId: 'c', params: { x: 24, y: 40, text: 'Hello', fill: '#f1f5f9', font: 'bold 16px sans-serif' } });
+  // Canvas-API dialect:
+  cmds.push({ type: 'beginPath', surfaceId: 'c', params: {} });
+  cmds.push({ type: 'moveTo', surfaceId: 'c', params: { x: 20, y: 140 } });
+  cmds.push({ type: 'lineTo', surfaceId: 'c', params: { x: 120, y: 110 } });
+  cmds.push({ type: 'fillStyle', surfaceId: 'c', params: { value: '#5be5a0' } });
+  cmds.push({ type: 'fill', surfaceId: 'c', params: {} });
   await this.call(this._canvasId, 'draw', { commands: cmds });
 }
 \`\`\`
 
-Common mistakes that I reject: \`fillRect\`/\`strokeRect\` (use \`rect\` with fill/stroke), \`fillText\` (use \`text\`), \`drawImage\` (use \`imageUrl\`), \`w\`/\`h\` (use \`width\`/\`height\`), \`color\` on shapes (use \`fill\` or \`stroke\`).
+Notes:
+- Shorthand param names \`r\`, \`rx\`, \`ry\`, \`w\`, \`h\` are accepted and treated as \`radius\`, \`radiusX\`, \`radiusY\`, \`width\`, \`height\`; \`color\` on shapes is rejected (use \`fill\` or \`stroke\`).
+- I draw into the parent window's surface, so \`clear\`, \`reset\`, and \`clearRect\` become opaque background fills (default '#000') rather than transparent erases, and \`setTransform\` coordinates are window-absolute — prefer \`save\`/\`translate\`/\`restore\` or \`transform\`.
+- Value-returning context APIs (measureText, getImageData, isPointInPath, getTransform, createPattern) have no command form — a draw batch cannot return data.
 
 ## CanvasWidget — Input Forwarding
 
@@ -226,13 +316,14 @@ A synthetic \`call(<canvasId>, 'input', { type: 'mousedown', x, y, button: 0 })\
 
   private setupCanvasHandlers(): void {
     this.on('draw', async (msg: AbjectMessage) => {
-      const { commands } = msg.payload as { commands: unknown[] };
+      const payload = msg.payload as { commands: unknown[] };
+      const commands = normalizeDrawCommands(payload.commands ?? []);
 
       // Reject invalid batches loudly instead of letting the compositor skip
       // unknown commands silently (the caller would see a blank canvas and no
       // error). The thrown message names every distinct problem plus the
       // valid vocabulary, so a code-generating caller can self-correct.
-      const problems = validateDrawCommands(commands ?? []);
+      const problems = validateDrawCommands(commands);
       if (problems.length > 0) {
         throw new Error(
           `Invalid draw commands (nothing was drawn): ${problems.join('; ')}. ` +
@@ -242,7 +333,7 @@ A synthetic \`call(<canvasId>, 'input', { type: 'mousedown', x, y, button: 0 })\
         );
       }
 
-      this.storedCommands = commands ?? [];
+      this.storedCommands = commands;
       await this.requestRedraw();
       return true;
     });
@@ -268,13 +359,33 @@ A synthetic \`call(<canvasId>, 'input', { type: 'mousedown', x, y, button: 0 })\
     for (const cmd of this.storedCommands) {
       const c = cmd as { type: string; surfaceId?: string; params?: Record<string, unknown> };
 
-      if (c.type === 'clear') {
-        // Replace 'clear' with a filled rect (clear would affect the entire window surface)
+      if (c.type === 'clear' || c.type === 'reset') {
+        // Replace with a filled rect (clear/reset would wipe the entire
+        // window surface and its context state, including this wrapper's
+        // translate/clip)
         const color = (c.params as { color?: string })?.color;
         commands.push({
           type: 'rect',
           surfaceId,
           params: { x: 0, y: 0, width: w, height: h, fill: color ?? '#000' },
+        });
+      } else if (c.type === 'clearRect') {
+        // clearRect would punch a transparent hole in the shared window
+        // surface; paint the background color instead
+        const p = (c.params ?? {}) as { x?: number; y?: number; width?: number; height?: number };
+        commands.push({
+          type: 'rect',
+          surfaceId,
+          params: { x: p.x ?? 0, y: p.y ?? 0, width: p.width ?? w, height: p.height ?? h, fill: '#000' },
+        });
+      } else if (c.type === 'putImageData') {
+        // putImageData ignores the canvas transform, so the wrapper's
+        // translate does not apply — bake the widget offset into dx/dy
+        const p = (c.params ?? {}) as { dx?: number; dy?: number };
+        commands.push({
+          ...c,
+          surfaceId,
+          params: { ...(c.params ?? {}), dx: (p.dx ?? 0) + ox, dy: (p.dy ?? 0) + oy },
         });
       } else {
         // Replace surfaceId with the window's surfaceId

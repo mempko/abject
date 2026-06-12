@@ -21,6 +21,7 @@ import {
   TITLE_FONT,
   lightenColor,
   withAlpha,
+  gradientRect,
 } from './widget-types.js';
 import { iconCommands } from '../../ui/icons.js';
 import { Tween, shimmer as motionShimmer } from '../../ui/motion.js';
@@ -579,47 +580,41 @@ method calls on 'abjects:widgets' interface:
     }
 
     if (!this.chromeless) {
-      // Title bar — flat fill (the accent line below carries the visual weight,
-      // so the bar itself stays quiet to avoid competing).
-      commands.push({
-        type: 'rect',
-        surfaceId: sid,
-        params: { x: 0, y: 0, width: w, height: tbh, fill: this.theme.titleBarBg, radius: this.theme.windowRadius },
-      });
-      commands.push({
-        type: 'rect',
-        surfaceId: sid,
-        params: { x: 0, y: tbh - 6, width: w, height: 6, fill: this.theme.titleBarBg },
-      });
+      // Title bar — top corners rounded to match the window shell, flat
+      // bottom edge, with a barely-there vertical gradient lighting the bar
+      // from above. The accent line below carries the visual weight, so the
+      // bar itself stays quiet to avoid competing.
+      commands.push(...gradientRect(sid, {
+        x: 0, y: 0, width: w, height: tbh,
+        radii: [this.theme.windowRadius, this.theme.windowRadius, 0, 0],
+        gradient: { x0: 0, y0: 0, x1: 0, y1: tbh, stops: [
+          { offset: 0, color: lightenColor(this.theme.titleBarBg, 6 * tokens.surface.gradient) },
+          { offset: 1, color: this.theme.titleBarBg },
+        ] },
+      }));
 
-      // Title text — accent glow when focused, desaturated when not (Von Restorff)
+      // Title text — accent glow when focused, desaturated when not (Von
+      // Restorff). A touch of letter spacing gives the title a deliberate,
+      // engraved feel.
       const titleColor = focused ? this.theme.textPrimary : this.theme.textSecondary;
+      commands.push({ type: 'save', surfaceId: sid, params: {} });
+      commands.push({ type: 'letterSpacing', surfaceId: sid, params: { value: '0.4px' } });
       if (focused) {
-        commands.push({ type: 'save', surfaceId: sid, params: {} });
         commands.push({
           type: 'shadow',
           surfaceId: sid,
           params: { color: tokens.glow.accent.color, blur: tokens.glow.accent.blur },
         });
-        commands.push({
-          type: 'text',
-          surfaceId: sid,
-          params: {
-            x: 14, y: tbh / 2,
-            text: this.title, font: TITLE_FONT, fill: titleColor, baseline: 'middle',
-          },
-        });
-        commands.push({ type: 'restore', surfaceId: sid, params: {} });
-      } else {
-        commands.push({
-          type: 'text',
-          surfaceId: sid,
-          params: {
-            x: 14, y: tbh / 2,
-            text: this.title, font: TITLE_FONT, fill: titleColor, baseline: 'middle',
-          },
-        });
       }
+      commands.push({
+        type: 'text',
+        surfaceId: sid,
+        params: {
+          x: 14, y: tbh / 2,
+          text: this.title, font: TITLE_FONT, fill: titleColor, baseline: 'middle',
+        },
+      });
+      commands.push({ type: 'restore', surfaceId: sid, params: {} });
 
       // Close and minimize buttons — vector icons in 24×24 hit boxes (Fitts).
       // Hovered button gets a faint accent-colored backplate.
@@ -677,10 +672,6 @@ method calls on 'abjects:widgets' interface:
         lineWidth: 1.25,
       }));
     }
-
-    // Suppress unused-import warning for legacy lightenColor (kept for callers
-    // that still import it via this module).
-    void lightenColor;
 
     // Render children in parallel — request draw commands from each child widget (Morphic drawOn:)
     const childResults = await Promise.all(

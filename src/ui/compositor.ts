@@ -6,6 +6,7 @@ import { AbjectId } from '../core/types.js';
 import { require, ensure } from '../core/contracts.js';
 import { Tween, DECELERATE, ACCELERATE } from './motion.js';
 import type { DrawCommandType } from '../objects/widgets/widget-types.js';
+import { CANVAS_CTX_METHODS, CANVAS_CTX_PROPERTIES } from '../objects/widgets/widget-types.js';
 
 /**
  * Mobile interaction states (WebOS-style).
@@ -90,6 +91,11 @@ export interface ImageParams {
   y: number;
   width?: number;
   height?: number;
+  // Optional source rectangle (drawImage 9-arg form)
+  sx?: number;
+  sy?: number;
+  sWidth?: number;
+  sHeight?: number;
   data: ImageBitmap | HTMLImageElement | ImageData;
 }
 
@@ -98,6 +104,11 @@ export interface ImageUrlParams {
   y: number;
   width?: number;
   height?: number;
+  // Optional source rectangle (drawImage 9-arg form)
+  sx?: number;
+  sy?: number;
+  sWidth?: number;
+  sHeight?: number;
   url: string;
 }
 
@@ -113,6 +124,9 @@ export interface PathParams {
 export interface CircleParams {
   cx: number;
   cy: number;
+  // Canvas-API dialect aliases for cx/cy
+  x?: number;
+  y?: number;
   radius: number;
   fill?: string;
   stroke?: string;
@@ -122,6 +136,9 @@ export interface CircleParams {
 export interface ArcParams {
   cx: number;
   cy: number;
+  // Canvas-API dialect aliases for cx/cy (ctx.arc takes x, y)
+  x?: number;
+  y?: number;
   radius: number;
   startAngle: number;
   endAngle: number;
@@ -134,9 +151,15 @@ export interface ArcParams {
 export interface EllipseParams {
   cx: number;
   cy: number;
+  // Canvas-API dialect aliases for cx/cy (ctx.ellipse takes x, y)
+  x?: number;
+  y?: number;
   radiusX: number;
   radiusY: number;
   rotation?: number;
+  startAngle?: number;
+  endAngle?: number;
+  counterclockwise?: boolean;
   fill?: string;
   stroke?: string;
   lineWidth?: number;
@@ -210,6 +233,35 @@ export interface RadialGradientParams {
   cy1: number;
   r1: number;
   stops: GradientStop[];
+}
+
+/**
+ * Conic gradient descriptor (createConicGradient has no high-level command
+ * interface of its own beyond this).
+ */
+export interface ConicGradientParams {
+  startAngle: number;
+  cx: number;
+  cy: number;
+  stops: GradientStop[];
+}
+
+/**
+ * Draw an image honoring the optional dest size and source rectangle
+ * (the drawImage 3/5/9-argument forms).
+ */
+function blitImage(
+  ctx: OffscreenCanvasRenderingContext2D,
+  img: CanvasImageSource,
+  p: ImageParams | ImageUrlParams,
+): void {
+  if (p.sx !== undefined && p.sy !== undefined && p.sWidth !== undefined && p.sHeight !== undefined) {
+    ctx.drawImage(img, p.sx, p.sy, p.sWidth, p.sHeight, p.x, p.y, p.width ?? p.sWidth, p.height ?? p.sHeight);
+  } else if (p.width && p.height) {
+    ctx.drawImage(img, p.x, p.y, p.width, p.height);
+  } else {
+    ctx.drawImage(img, p.x, p.y);
+  }
 }
 
 /**
@@ -634,21 +686,7 @@ export class Compositor {
 
     switch (command.type) {
       case 'clear': {
-        // Fully reset canvas state to prevent leaks from a previous frame's
-        // unbalanced save/restore (e.g. a child render that errored mid-draw,
-        // leaving residual translate/clip on the context). Without this, clearRect
-        // operates in the wrong coordinate space and fails to clear the full surface.
-        if (typeof (ctx as unknown as { reset?: () => void }).reset === 'function') {
-          (ctx as unknown as { reset: () => void }).reset();
-        } else {
-          ctx.setTransform(1, 0, 0, 1, 0, 0);
-        }
-        ctx.globalAlpha = 1.0;
-        ctx.shadowColor = 'transparent';
-        ctx.shadowBlur = 0;
-        ctx.shadowOffsetX = 0;
-        ctx.shadowOffsetY = 0;
-        ctx.clearRect(0, 0, surface.rect.width, surface.rect.height);
+        this.resetSurfaceState(surface);
         const p = command.params as { color?: string };
         if (p?.color) {
           ctx.fillStyle = p.color;
@@ -657,8 +695,19 @@ export class Compositor {
         break;
       }
 
+      case 'reset':
+        // ctx.reset() semantics: wipe the bitmap and all context state.
+        this.resetSurfaceState(surface);
+        break;
+
       case 'rect': {
         const p = command.params as RectParams;
+        if (!p.fill && !p.stroke && !p.radius) {
+          // Canvas-API dialect: style-less rect adds to the current path
+          // (beginPath … rect … fill), like ctx.rect().
+          ctx.rect(p.x, p.y, p.width, p.height);
+          break;
+        }
         ctx.beginPath();
         if (p.radius && p.radius > 0) {
           this.roundRect(ctx, p.x, p.y, p.width, p.height, p.radius);
@@ -713,11 +762,31 @@ export class Compositor {
 
       case 'image': {
         const p = command.params as ImageParams;
-        if (p.width && p.height) {
-          ctx.drawImage(p.data as CanvasImageSource, p.x, p.y, p.width, p.height);
-        } else {
-          ctx.drawImage(p.data as CanvasImageSource, p.x, p.y);
-        }
+        blitImage(ctx, p.data as CanvasImageSource, p);
+        break;
+      }
+
+      case 'drawImage': {
+        // Canvas-API dialect: route to image/imageUrl with the MDN argument
+        // names mapped onto the existing async-loading machinery.
+        const p = command.params as Record<string, unknown>;
+        const params = {
+          x: (p.dx ?? p.x) as number,
+          y: (p.dy ?? p.y) as number,
+          width: (p.dWidth ?? p.width) as number | undefined,
+          height: (p.dHeight ?? p.height) as number | undefined,
+          sx: p.sx as number | undefined,
+          sy: p.sy as number | undefined,
+          sWidth: p.sWidth as number | undefined,
+          sHeight: p.sHeight as number | undefined,
+          url: p.url as string,
+          data: (p.data ?? p.image) as ImageParams['data'],
+        };
+        this.draw({
+          type: params.url !== undefined ? 'imageUrl' : 'image',
+          surfaceId: command.surfaceId,
+          params,
+        });
         break;
       }
 
@@ -730,11 +799,7 @@ export class Compositor {
           // on every frame after the first decode.
           const cachedData = this.imageCache.get(p.url);
           if (cachedData && cachedData.loaded) {
-            if (p.width && p.height) {
-              ctx.drawImage(cachedData.img, p.x, p.y, p.width, p.height);
-            } else {
-              ctx.drawImage(cachedData.img, p.x, p.y);
-            }
+            blitImage(ctx, cachedData.img, p);
             break;
           }
 
@@ -743,11 +808,7 @@ export class Compositor {
           // continually swap data URIs (remote views, etc.).
           const live = this.liveDataImages.get(sid);
           if (live) {
-            if (p.width && p.height) {
-              ctx.drawImage(live.img, p.x, p.y, p.width, p.height);
-            } else {
-              ctx.drawImage(live.img, p.x, p.y);
-            }
+            blitImage(ctx, live.img, p);
           }
 
           // Async load: populate both the live (per-surface) cache and the
@@ -767,11 +828,7 @@ export class Compositor {
             if (surf) {
               surf.ctx.save();
               surf.ctx.setTransform(savedTransform);
-              if (p.width && p.height) {
-                surf.ctx.drawImage(img, p.x, p.y, p.width, p.height);
-              } else {
-                surf.ctx.drawImage(img, p.x, p.y);
-              }
+              blitImage(surf.ctx, img, p);
               surf.ctx.restore();
               surf.dirty = true;
             }
@@ -783,11 +840,7 @@ export class Compositor {
           // Regular URL path: use imageCache with CORS fallback
           const cached = this.imageCache.get(p.url);
           if (cached && cached.loaded) {
-            if (p.width && p.height) {
-              ctx.drawImage(cached.img, p.x, p.y, p.width, p.height);
-            } else {
-              ctx.drawImage(cached.img, p.x, p.y);
-            }
+            blitImage(ctx, cached.img, p);
           } else if (!cached) {
             // Evict oldest entries if cache is full
             if (this.imageCache.size >= Compositor.IMAGE_CACHE_MAX) {
@@ -804,11 +857,7 @@ export class Compositor {
               if (surf) {
                 surf.ctx.save();
                 surf.ctx.setTransform(savedTransform);
-                if (p.width && p.height) {
-                  surf.ctx.drawImage(image, p.x, p.y, p.width, p.height);
-                } else {
-                  surf.ctx.drawImage(image, p.x, p.y);
-                }
+                blitImage(surf.ctx, image, p);
                 surf.ctx.restore();
                 surf.dirty = true;
               }
@@ -856,10 +905,18 @@ export class Compositor {
         break;
 
       case 'clip': {
-        const p = command.params as RectParams;
-        ctx.beginPath();
-        ctx.rect(p.x, p.y, p.width, p.height);
-        ctx.clip();
+        const p = (command.params ?? {}) as Partial<RectParams> & { fillRule?: CanvasFillRule };
+        if (p.x !== undefined && p.y !== undefined && p.width !== undefined && p.height !== undefined) {
+          // High-level dialect: self-contained rectangular clip.
+          ctx.beginPath();
+          ctx.rect(p.x, p.y, p.width, p.height);
+          ctx.clip();
+        } else if (p.fillRule) {
+          // Canvas-API dialect: clip to the current path.
+          ctx.clip(p.fillRule);
+        } else {
+          ctx.clip();
+        }
         break;
       }
 
@@ -871,8 +928,15 @@ export class Compositor {
 
       case 'circle': {
         const p = command.params as CircleParams;
+        const cx = p.cx ?? p.x ?? 0;
+        const cy = p.cy ?? p.y ?? 0;
+        if (!p.fill && !p.stroke) {
+          // Style-less circle adds to the current path for a later fill/stroke.
+          ctx.arc(cx, cy, p.radius, 0, Math.PI * 2);
+          break;
+        }
         ctx.beginPath();
-        ctx.arc(p.cx, p.cy, p.radius, 0, Math.PI * 2);
+        ctx.arc(cx, cy, p.radius, 0, Math.PI * 2);
         if (p.fill) {
           ctx.fillStyle = p.fill;
           ctx.fill();
@@ -887,11 +951,19 @@ export class Compositor {
 
       case 'arc': {
         const p = command.params as ArcParams;
+        const cx = p.cx ?? p.x ?? 0;
+        const cy = p.cy ?? p.y ?? 0;
+        if (!p.fill && !p.stroke) {
+          // Canvas-API dialect: ctx.arc() path building, connecting from the
+          // current point as in a browser.
+          ctx.arc(cx, cy, p.radius, p.startAngle, p.endAngle, p.counterclockwise ?? false);
+          break;
+        }
         ctx.beginPath();
         if (p.fill) {
-          ctx.moveTo(p.cx, p.cy);
+          ctx.moveTo(cx, cy);
         }
-        ctx.arc(p.cx, p.cy, p.radius, p.startAngle, p.endAngle, p.counterclockwise ?? false);
+        ctx.arc(cx, cy, p.radius, p.startAngle, p.endAngle, p.counterclockwise ?? false);
         if (p.fill) {
           ctx.closePath();
           ctx.fillStyle = p.fill;
@@ -907,8 +979,17 @@ export class Compositor {
 
       case 'ellipse': {
         const p = command.params as EllipseParams;
+        const cx = p.cx ?? p.x ?? 0;
+        const cy = p.cy ?? p.y ?? 0;
+        if (!p.fill && !p.stroke) {
+          // Canvas-API dialect: ctx.ellipse() path building.
+          ctx.ellipse(cx, cy, p.radiusX, p.radiusY, p.rotation ?? 0,
+            p.startAngle ?? 0, p.endAngle ?? Math.PI * 2, p.counterclockwise ?? false);
+          break;
+        }
         ctx.beginPath();
-        ctx.ellipse(p.cx, p.cy, p.radiusX, p.radiusY, p.rotation ?? 0, 0, Math.PI * 2);
+        ctx.ellipse(cx, cy, p.radiusX, p.radiusY, p.rotation ?? 0,
+          p.startAngle ?? 0, p.endAngle ?? Math.PI * 2, p.counterclockwise ?? false);
         if (p.fill) {
           ctx.fillStyle = p.fill;
           ctx.fill();
@@ -959,8 +1040,36 @@ export class Compositor {
       }
 
       case 'globalAlpha': {
-        const p = command.params as { alpha: number };
-        ctx.globalAlpha = p.alpha;
+        const p = command.params as { alpha?: number; value?: number };
+        ctx.globalAlpha = p.alpha ?? p.value ?? 1;
+        break;
+      }
+
+      case 'fill': {
+        // Canvas-API dialect: fill the current path (or an SVG path string).
+        const p = (command.params ?? {}) as { fillStyle?: string; color?: string; fillRule?: CanvasFillRule; path?: string };
+        const style = p.fillStyle ?? p.color;
+        if (style) ctx.fillStyle = style;
+        if (p.path) {
+          const path2d = new Path2D(p.path);
+          if (p.fillRule) ctx.fill(path2d, p.fillRule); else ctx.fill(path2d);
+        } else {
+          if (p.fillRule) ctx.fill(p.fillRule); else ctx.fill();
+        }
+        break;
+      }
+
+      case 'stroke': {
+        // Canvas-API dialect: stroke the current path (or an SVG path string).
+        const p = (command.params ?? {}) as { strokeStyle?: string; color?: string; lineWidth?: number; path?: string };
+        const style = p.strokeStyle ?? p.color;
+        if (style) ctx.strokeStyle = style;
+        if (p.lineWidth !== undefined) ctx.lineWidth = p.lineWidth;
+        if (p.path) {
+          ctx.stroke(new Path2D(p.path));
+        } else {
+          ctx.stroke();
+        }
         break;
       }
 
@@ -974,8 +1083,8 @@ export class Compositor {
       }
 
       case 'setLineDash': {
-        const p = command.params as { segments: number[] };
-        ctx.setLineDash(p.segments);
+        const p = command.params as { segments?: number[]; value?: number[] };
+        ctx.setLineDash(p.segments ?? p.value ?? []);
         break;
       }
 
@@ -998,6 +1107,24 @@ export class Compositor {
         }
         ctx.fillStyle = grad;
         ctx.strokeStyle = grad;
+        break;
+      }
+
+      case 'conicGradient': {
+        const p = command.params as ConicGradientParams;
+        const grad = ctx.createConicGradient(p.startAngle, p.cx, p.cy);
+        for (const stop of p.stops) {
+          grad.addColorStop(stop.offset, stop.color);
+        }
+        ctx.fillStyle = grad;
+        ctx.strokeStyle = grad;
+        break;
+      }
+
+      case 'putImageData': {
+        const p = command.params as { data: number[] | Uint8ClampedArray; width: number; height: number; dx?: number; dy?: number };
+        const pixels = (p.data instanceof Uint8ClampedArray ? p.data : new Uint8ClampedArray(p.data)) as Uint8ClampedArray<ArrayBuffer>;
+        ctx.putImageData(new ImageData(pixels, p.width, p.height), p.dx ?? 0, p.dy ?? 0);
         break;
       }
 
@@ -1040,11 +1167,90 @@ export class Compositor {
         }
         break;
       }
+
+      default:
+        // Canvas 2D API pass-through: context methods (named args per
+        // CANVAS_CTX_METHODS) and settable properties ({ value } commands).
+        this.applyContextCommand(ctx, command.type, command.params as Record<string, unknown> | undefined);
+        break;
     }
 
     surface.dirty = true;
     surface.drawn = true;
     this.needsRender = true;
+  }
+
+  /**
+   * Fully reset a surface's context state and wipe its bitmap. Prevents leaks
+   * from a previous frame's unbalanced save/restore (e.g. a child render that
+   * errored mid-draw, leaving residual translate/clip on the context). Without
+   * this, clearRect operates in the wrong coordinate space and fails to clear
+   * the full surface.
+   */
+  private resetSurfaceState(surface: Surface): void {
+    const ctx = surface.ctx;
+    if (typeof (ctx as unknown as { reset?: () => void }).reset === 'function') {
+      (ctx as unknown as { reset: () => void }).reset();
+    } else {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+    }
+    ctx.globalAlpha = 1.0;
+    ctx.shadowColor = 'transparent';
+    ctx.shadowBlur = 0;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+    ctx.clearRect(0, 0, surface.rect.width, surface.rect.height);
+  }
+
+  /**
+   * Execute a Canvas 2D API command generically: call the context method with
+   * args looked up by name from params, or assign a settable property from
+   * params.value. fillStyle/strokeStyle values may be gradient descriptors.
+   */
+  private applyContextCommand(
+    ctx: OffscreenCanvasRenderingContext2D,
+    type: DrawCommandType,
+    params: Record<string, unknown> | undefined,
+  ): void {
+    const argNames = CANVAS_CTX_METHODS[type];
+    if (argNames) {
+      const args = argNames.map((name) => params?.[name]);
+      while (args.length > 0 && args[args.length - 1] === undefined) {
+        args.pop();
+      }
+      (ctx as unknown as Record<string, (...a: unknown[]) => void>)[type](...args);
+      return;
+    }
+    if ((CANVAS_CTX_PROPERTIES as readonly string[]).includes(type)) {
+      let value = params?.value;
+      if ((type === 'fillStyle' || type === 'strokeStyle') && value !== null && typeof value === 'object') {
+        value = this.buildGradient(ctx, value as Record<string, unknown>);
+      }
+      (ctx as unknown as Record<string, unknown>)[type] = value;
+    }
+  }
+
+  /**
+   * Build a CanvasGradient from a descriptor object. The kind is inferred from
+   * the coordinates present: radial (cx0/r0), conic (startAngle), else linear.
+   */
+  private buildGradient(
+    ctx: OffscreenCanvasRenderingContext2D,
+    d: Record<string, unknown>,
+  ): CanvasGradient {
+    const n = (v: unknown): number => (typeof v === 'number' ? v : 0);
+    let grad: CanvasGradient;
+    if (d.r0 !== undefined || d.cx0 !== undefined) {
+      grad = ctx.createRadialGradient(n(d.cx0), n(d.cy0), n(d.r0), n(d.cx1), n(d.cy1), n(d.r1));
+    } else if (d.startAngle !== undefined) {
+      grad = ctx.createConicGradient(n(d.startAngle), n(d.cx), n(d.cy));
+    } else {
+      grad = ctx.createLinearGradient(n(d.x0), n(d.y0), n(d.x1), n(d.y1));
+    }
+    for (const stop of (d.stops ?? []) as GradientStop[]) {
+      grad.addColorStop(stop.offset, stop.color);
+    }
+    return grad;
   }
 
   /**

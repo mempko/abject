@@ -353,11 +353,11 @@ PeerNetwork (identity and contacts), ObjectBrowser (Explorer), ProcessExplorer
     // the Abjects rail) rather than boxed pills.
     const ghostBg = lightenColor(this.theme.windowBg, 5);
     const appStyle = {
-      background: ghostBg, borderColor: this.theme.windowBg,
+      background: ghostBg, flat: true,
       color: this.theme.textPrimary, radius: this.theme.tokens.radius.sm,
       align: 'left', fontSize: 12,
     };
-    const gearStyle = { background: ghostBg, borderColor: this.theme.windowBg, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13 };
+    const gearStyle = { background: ghostBg, flat: true, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13 };
 
     // Batch create all widgets: header label, gear button, action buttons
     const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(

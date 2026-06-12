@@ -354,11 +354,11 @@ the WorkspaceBrowser for discovering remote workspaces.
     // highlight on top of that base.
     const ghostBg = lightenColor(this.theme.windowBg, 5);
     const appStyle = {
-      background: ghostBg, borderColor: this.theme.windowBg,
+      background: ghostBg, flat: true,
       color: this.theme.textPrimary, radius: this.theme.tokens.radius.sm,
       align: 'left', fontSize: 12,
     };
-    const gearStyle = { background: ghostBg, borderColor: this.theme.windowBg, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13, align: 'center' };
+    const gearStyle = { background: ghostBg, flat: true, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13, align: 'center' };
     const wsActiveStyle = { ...appStyle, background: this.theme.activeItemBg, borderColor: this.theme.activeItemBorder };
 
     // Build workspace buttons

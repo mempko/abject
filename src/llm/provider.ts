@@ -471,6 +471,100 @@ export function getTextContent(msg: LLMMessage): string {
   return msg.content.filter((p): p is TextPart => p.type === 'text').map(p => p.text).join('');
 }
 
+// ── Conversation size utilities ─────────────────────────────────────────────
+// Shared by LLMObject's `compress` method and AgentAbject's conversation
+// budget enforcement.
+
+/** A message shape loose enough for both LLMMessage and agent conversations. */
+export interface SizedMessage {
+  role: string;
+  content: string | ContentPart[];
+}
+
+/**
+ * Truncate a string keeping head and tail with an elision marker. Head gets
+ * the larger share — openings carry instructions/structure; tails carry the
+ * most recent values.
+ */
+export function truncateText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const head = Math.floor(maxChars * 0.7);
+  const tail = maxChars - head;
+  return `${text.slice(0, head)}\n…[${text.length - maxChars} chars elided to fit context budget]…\n${text.slice(-tail)}`;
+}
+
+/** Total text chars in one message (image/document parts count 0). */
+export function messageTextChars(msg: SizedMessage): number {
+  if (typeof msg.content === 'string') return msg.content.length;
+  let total = 0;
+  for (const part of msg.content) {
+    if ('text' in part && typeof part.text === 'string') total += part.text.length;
+  }
+  return total;
+}
+
+/** Total text chars across a conversation. */
+export function conversationTextChars(msgs: SizedMessage[]): number {
+  return msgs.reduce((sum, m) => sum + messageTextChars(m), 0);
+}
+
+/** Shrink one message's text content to roughly `target` chars in place. */
+export function truncateMessageTo(msg: SizedMessage, target: number): void {
+  if (typeof msg.content === 'string') {
+    msg.content = truncateText(msg.content, target);
+    return;
+  }
+  // Multi-part content: shrink the largest text part until the total fits.
+  // Non-text parts (images, documents) are left alone.
+  for (let guard = 0; guard < msg.content.length + 1; guard++) {
+    const total = messageTextChars(msg);
+    if (total <= target) return;
+    let largestIdx = -1;
+    let largestLen = 0;
+    msg.content.forEach((part, i) => {
+      if ('text' in part && typeof part.text === 'string' && part.text.length > largestLen) {
+        largestLen = part.text.length;
+        largestIdx = i;
+      }
+    });
+    if (largestIdx === -1) return;
+    const part = msg.content[largestIdx] as { text: string };
+    part.text = truncateText(part.text, Math.max(1000, largestLen - (total - target)));
+  }
+}
+
+/**
+ * Hard guarantee that a conversation fits `maxChars`: repeatedly
+ * head+tail-truncate the largest message until under budget. Deterministic,
+ * no LLM involved, position-blind, always converges (each pass shrinks the
+ * current largest message toward `floorChars`).
+ */
+export function enforceConversationCharBudget(
+  msgs: SizedMessage[],
+  maxChars: number,
+  floorChars = 4000,
+): void {
+  for (let guard = 0; guard < msgs.length * 2; guard++) {
+    const total = conversationTextChars(msgs);
+    if (total <= maxChars) return;
+
+    let largestIdx = -1;
+    let largestLen = floorChars;
+    msgs.forEach((m, i) => {
+      const len = messageTextChars(m);
+      if (len > largestLen) {
+        largestLen = len;
+        largestIdx = i;
+      }
+    });
+    if (largestIdx === -1) return; // everything at floor — nothing left to shrink
+
+    // Shrink by the overage (plus marker allowance), never below the floor.
+    const target = Math.max(floorChars, largestLen - (total - maxChars) - 200);
+    truncateMessageTo(msgs[largestIdx], target);
+  }
+}
+
 /**
  * Create a user message with text and images.
  */

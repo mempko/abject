@@ -187,9 +187,23 @@ export function errorFromException(
   originalMessage: AbjectMessage,
   err: unknown
 ): AbjectMessage<AbjectError> {
+  // Errors that already crossed a request hop arrive as "CODE: message"
+  // (request() rejects with `${code}: ${message}`). Re-wrapping that verbatim
+  // under UNHANDLED_EXCEPTION stutters at every hop ("UNHANDLED_EXCEPTION:
+  // UNHANDLED_EXCEPTION: …") and buries the original code. Lift the embedded
+  // code back into the payload instead — repeatedly, in case the message has
+  // already accumulated multiple layers.
+  let code = 'UNHANDLED_EXCEPTION';
+  let message = err instanceof Error ? err.message : String(err);
+  let m: RegExpExecArray | null;
+  while ((m = /^([A-Z][A-Z0-9_]{2,}): (.+)$/s.exec(message)) !== null) {
+    code = m[1];
+    message = m[2];
+  }
+
   const errorPayload: AbjectError = {
-    code: 'UNHANDLED_EXCEPTION',
-    message: err instanceof Error ? err.message : String(err),
+    code,
+    message,
     stack: err instanceof Error ? err.stack : undefined,
   };
 

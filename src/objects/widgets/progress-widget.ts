@@ -6,7 +6,7 @@
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
-import { lightenColor } from './widget-types.js';
+import { lightenColor, gradientRect } from './widget-types.js';
 import { Tween, shimmer as motionShimmer } from '../../ui/motion.js';
 
 export interface ProgressWidgetConfig extends WidgetConfig {
@@ -85,39 +85,38 @@ export class ProgressWidget extends WidgetAbject {
 
       commands.push({ type: 'save', surfaceId, params: {} });
       commands.push({ type: 'clip', surfaceId, params: { x: ox, y: oy, width: w, height: h } });
-      commands.push({
-        type: 'linearGradient',
-        surfaceId,
-        params: { x0: segX, y0: 0, x1: segX + segW, y1: 0, stops: [
+      commands.push(...gradientRect(surfaceId, {
+        x: segX, y: oy, width: segW, height: h, radii: radius,
+        gradient: { x0: segX, y0: 0, x1: segX + segW, y1: 0, stops: [
           { offset: 0,    color: 'rgba(0,0,0,0)' },
           { offset: 0.5,  color: lightenColor(fillColor, 30) },
           { offset: 1,    color: 'rgba(0,0,0,0)' },
         ] },
-      });
-      commands.push({
-        type: 'rect',
-        surfaceId,
-        params: { x: segX, y: oy, width: segW, height: h, radius },
-      });
+      }));
       commands.push({ type: 'restore', surfaceId, params: {} });
     } else if (this.progressValue > 0) {
-      // Determinate fill with left-to-right gradient
+      // Determinate fill: left-to-right gradient that brightens toward the
+      // leading edge, plus a soft top gloss for a pill-of-light feel. Both
+      // scale with the theme's surface treatment (flat themes get a plain
+      // solid fill).
+      const surface = this.theme.tokens.surface;
       const fillWidth = Math.max(radius * 2, w * this.progressValue);
-      commands.push({ type: 'save', surfaceId, params: {} });
-      commands.push({
-        type: 'linearGradient',
-        surfaceId,
-        params: { x0: ox, y0: 0, x1: ox + fillWidth, y1: 0, stops: [
+      commands.push(...gradientRect(surfaceId, {
+        x: ox, y: oy, width: fillWidth, height: h, radii: radius,
+        gradient: { x0: ox, y0: 0, x1: ox + fillWidth, y1: 0, stops: [
           { offset: 0, color: fillColor },
-          { offset: 1, color: lightenColor(fillColor, 30) },
+          { offset: 1, color: lightenColor(fillColor, 30 * surface.gradient) },
         ] },
-      });
-      commands.push({
-        type: 'rect',
-        surfaceId,
-        params: { x: ox, y: oy, width: fillWidth, height: h, fill: fillColor, radius },
-      });
-      commands.push({ type: 'restore', surfaceId, params: {} });
+      }));
+      if (surface.gloss > 0) {
+        commands.push(...gradientRect(surfaceId, {
+          x: ox, y: oy, width: fillWidth, height: Math.max(2, h / 2), radii: [radius, radius, 0, 0],
+          gradient: { x0: 0, y0: oy, x1: 0, y1: oy + h / 2, stops: [
+            { offset: 0, color: `rgba(255,255,255,${surface.gloss})` },
+            { offset: 1, color: 'rgba(255,255,255,0)' },
+          ] },
+        }));
+      }
     }
 
     // Optional percentage text

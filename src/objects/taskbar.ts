@@ -345,14 +345,14 @@ windows" section so the user can restore windows from the taskbar.
     const sectionLabelStyle = { color: this.theme.accent, fontSize: 12, fontWeight: 'bold', fontFamily: 'display' };
     const ghostBg = lightenColor(this.theme.windowBg, 5);
     const appStyle = {
-      background: ghostBg, borderColor: this.theme.windowBg,
+      background: ghostBg, flat: true,
       color: this.theme.textPrimary, radius: this.theme.tokens.radius.sm,
       align: 'left', fontSize: 12,
     };
     // User objects use the same font/size/ink as the apps; their icon (declared
     // emoji or the default glyph) is the only distinction, so the rail is uniform.
     const objStyle = appStyle;
-    const gearStyle = { background: ghostBg, borderColor: this.theme.windowBg, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13 };
+    const gearStyle = { background: ghostBg, flat: true, color: this.theme.textSecondary, radius: this.theme.tokens.radius.sm, fontSize: 13 };
 
     // [0] Header label
     specs.push({ type: 'label', windowId: this.windowId!, text: '\u25A0 Abjects', style: sectionLabelStyle });

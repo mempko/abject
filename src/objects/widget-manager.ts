@@ -1137,12 +1137,17 @@ Layout:   this.call(this.dep('WidgetManager'), 'createVBox', { windowId, margins
 Widgets:  this.call(this.dep('WidgetManager'), 'create', { specs: [{ type, windowId, ... }] })
 Canvas:   this.call(this.dep('WidgetManager'), 'createCanvas', { windowId, inputTargetId: this.id })
 Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', params }] })
-          Command types: rect, text, line, circle, arc, ellipse, polygon, path, imageUrl, clear,
-          save, restore, clip, translate, rotate, scale, globalAlpha, shadow, setLineDash,
-          linearGradient, radialGradient, bezierCurve, quadraticCurve.
-          This is NOT the HTML5 Canvas API — fillRect/fillText/drawImage batches are rejected with an error.
+          Two dialects mix freely:
+          High-level shapes: rect, text, line, circle, arc, ellipse, polygon, path, imageUrl, clear,
+          shadow, linearGradient, radialGradient, conicGradient, bezierCurve, quadraticCurve.
+          HTML5 Canvas 2D API: every context method is a command type (params use the MDN argument
+          names: fillRect {x,y,width,height}, fillText {text,x,y}, beginPath {}, moveTo/lineTo {x,y},
+          fill/stroke {}, drawImage {url,dx,dy,...}, save/restore/translate/rotate/scale/transform, ...)
+          and every settable context property is a command taking {value} (fillStyle, font, lineWidth, ...).
+          Commands run in order against a stateful context, so path building works as in a browser.
           rect: {x, y, width, height, fill?, stroke?, radius?}   text: {x, y, text, fill?, font?, align?}
           line: {x1, y1, x2, y2, stroke?, lineWidth?}            circle: {cx, cy, radius, fill?, stroke?}
+          Invalid batches (unknown type, missing required params) are rejected with an error naming the problem.
           Ask the canvas widget itself for the full per-command param reference before writing a renderer.
 Size:     this.call(canvasId, 'getCanvasSize', {})
 Input:    Pass inputTargetId on createCanvas, then implement input(msg) — read msg.payload.{type,x,y,button,code,key}.
@@ -1348,9 +1353,8 @@ const { width, height } = await this.call(canvasId, 'getCanvasSize', {});
 //   // Missing: await this.call(rootLayout, 'addLayoutChildren', { children: [{ widgetId: canvasId, ... }] });
 // FIX: Always call addLayoutChildren to add the canvas to your root layout.
 
-// WRONG: Using 'r' instead of 'radius' for circles.
-//   { type: 'circle', params: { cx: 50, cy: 50, r: 10, fill: '#f00' } }  <-- silently draws nothing
-// FIX: { type: 'circle', params: { cx: 50, cy: 50, radius: 10, fill: '#f00' } }
+// Prefer 'radius' for circles ('r' is accepted as a shorthand alias, as are rx/ry/w/h):
+//   { type: 'circle', params: { cx: 50, cy: 50, radius: 10, fill: '#f00' } }
 
 // WRONG: Using 'fontSize' for text.
 //   { type: 'text', params: { text: 'hi', x: 0, y: 0, fontSize: 14 } }  <-- ignored

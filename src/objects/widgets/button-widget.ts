@@ -6,7 +6,7 @@
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
-import { lightenColor, darkenColor } from './widget-types.js';
+import { lightenColor, darkenColor, withAlpha, gradientRect } from './widget-types.js';
 
 export class ButtonWidget extends WidgetAbject {
   private hovered = false;
@@ -88,30 +88,45 @@ export class ButtonWidget extends WidgetAbject {
       commands.push({ type: 'restore', surfaceId, params: {} });
     }
 
-    // Subtle top-to-bottom gradient for depth
-    commands.push({ type: 'save', surfaceId, params: {} });
-    commands.push({
-      type: 'linearGradient',
-      surfaceId,
-      params: { x0: 0, y0: oy, x1: 0, y1: oy + h, stops: [
-        { offset: 0, color: fill },
-        { offset: 1, color: darkenColor(fill, 15) },
-      ] },
-    });
-    commands.push({
-      type: 'rect',
-      surfaceId,
-      params: {
-        x: ox,
-        y: oy,
-        width: w,
-        height: h,
-        fill,
+    if (style.flat) {
+      // Flat variant for sidebar/toolbar rows: a quiet fill with no depth
+      // treatment and no implicit border, so stacked rows read as a list
+      // rather than a pile of raised chips. An explicit borderColor (e.g.
+      // the active-item accent outline) still draws.
+      commands.push({
+        type: 'rect',
+        surfaceId,
+        params: {
+          x: ox, y: oy, width: w, height: h, fill, radius,
+          ...(style.borderColor ? { stroke: style.borderColor } : {}),
+        },
+      });
+    } else {
+      // Soft top-to-bottom gradient for depth — kept gentle (matching the tab
+      // bar treatment) so rows of buttons read as calm surfaces, not pills.
+      // Intensity is theme-driven: tokens.surface.gradient of 0 means flat.
+      const surface = tokens.surface;
+      commands.push(...gradientRect(surfaceId, {
+        x: ox, y: oy, width: w, height: h, radii: radius,
+        gradient: { x0: 0, y0: oy, x1: 0, y1: oy + h, stops: [
+          { offset: 0, color: lightenColor(fill, 4 * surface.gradient) },
+          { offset: 1, color: darkenColor(fill, 6 * surface.gradient) },
+        ] },
         stroke: style.borderColor ?? this.theme.buttonBorder,
-        radius,
-      },
-    });
-    commands.push({ type: 'restore', surfaceId, params: {} });
+      }));
+      // Top bevel derived from the button's own fill, so dark buttons stay
+      // quiet while bright primary buttons still catch a little light.
+      if (surface.bevel > 0) {
+        commands.push({
+          type: 'line',
+          surfaceId,
+          params: {
+            x1: ox + radius, y1: oy + 1, x2: ox + w - radius, y2: oy + 1,
+            stroke: withAlpha(lightenColor(fill, 55), surface.bevel), lineWidth: 1,
+          },
+        });
+      }
+    }
 
     // Truncate text with ellipsis if it exceeds button width (with padding)
     const padding = 8;

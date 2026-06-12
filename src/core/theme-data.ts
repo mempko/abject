@@ -83,6 +83,21 @@ export interface GlowTokens {
   danger: GlowToken;
 }
 
+/**
+ * Surface depth treatment — how dimensional widget surfaces look. Widgets
+ * derive the actual colors from their theme fills at draw time; these tokens
+ * only control the intensity of the treatment, so a theme can be glossy
+ * (1 / 0.25 / 0.16), subtle, or perfectly flat (all zeros — HIGH_CONTRAST).
+ */
+export interface SurfaceTokens {
+  /** Multiplier on lighten/darken deltas for depth gradients. 0 = flat fills. */
+  gradient: number;
+  /** Alpha of the 1px top bevel highlight on buttons. 0 = no bevel. */
+  bevel: number;
+  /** Alpha of gloss overlays (e.g. progress fill highlight). 0 = no gloss. */
+  gloss: number;
+}
+
 export interface DesignTokens {
   space: SpaceTokens;
   type: TypeTokens;
@@ -91,6 +106,7 @@ export interface DesignTokens {
   easing: EasingTokens;
   elevation: ElevationTokens;
   glow: GlowTokens;
+  surface: SurfaceTokens;
 }
 
 // ── Theme ──────────────────────────────────────────────────────────────────
@@ -235,7 +251,15 @@ const SHARED_TOKENS: DesignTokens = {
     accent: { blur: 10, color: 'rgba(57, 255, 142, 0.35)' },
     danger: { blur: 14, color: 'rgba(255, 77, 106, 0.5)' },
   },
+  surface: {
+    gradient: 1,
+    bevel: 0.25,
+    gloss: 0.16,
+  },
 };
+
+/** Perfectly flat surfaces — for accessibility and minimalist themes. */
+export const FLAT_SURFACE: SurfaceTokens = { gradient: 0, bevel: 0, gloss: 0 };
 
 // Local hex→rgba (theme-data.ts stays import-free to avoid a cycle with
 // widget-types.ts, which re-exports from here).
@@ -574,7 +598,7 @@ export const HIGH_CONTRAST: ThemeData = {
   shadowColor: 'rgba(0,0,0,0.95)',
   dropdownShadow: 'rgba(0,0,0,0.9)',
   linkColor: '#00e5ff',
-  tokens: tokensWithGlow('#ffd700'),
+  tokens: { ...tokensWithGlow('#ffd700'), surface: FLAT_SURFACE },
 };
 
 // ── Sunset ─────────────────────────────────────────────────────────────────
@@ -784,7 +808,7 @@ export const MONOCHROME: ThemeData = {
   shadowColor: 'rgba(0,0,0,0.7)',
   dropdownShadow: 'rgba(0,0,0,0.5)',
   linkColor: '#a0a0c0',
-  tokens: tokensWithGlow('#c0c0c0'),
+  tokens: { ...tokensWithGlow('#c0c0c0'), surface: FLAT_SURFACE },
 };
 
 // ── Dracula ────────────────────────────────────────────────────────────────

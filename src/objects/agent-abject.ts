@@ -18,6 +18,7 @@ import { request, event } from '../core/message.js';
 import { requireDefined } from '../core/contracts.js';
 import type { JobResult } from './job-manager.js';
 import type { ContentPart } from '../llm/provider.js';
+import { truncateText, conversationTextChars, enforceConversationCharBudget } from '../llm/provider.js';
 import type { EnabledSkillSummary } from '../core/skill-types.js';
 import { Log } from '../core/timed-log.js';
 
@@ -2217,9 +2218,16 @@ This task belongs to a goal. When you run code (a \`call\`/code action), the goa
       return;
     }
 
+    // Cap at ingestion — a single fat observation (a Registry dump, a
+    // scraped page, a scratchpad readback) must never ride into the prompt
+    // whole. Action results get the same treatment in
+    // addActionResultToConversation; the budget enforcer in trimConversation
+    // is the backstop for everything else.
+    const observation = truncateText(task.observation, AgentAbject.MAX_OBSERVATION_CHARS);
+
     task.llmMessages.push({
       role: 'user',
-      content: `[Step ${task.step + 1}/${task.maxSteps}]${urgency}\n${task.observation}`,
+      content: `[Step ${task.step + 1}/${task.maxSteps}]${urgency}\n${observation}`,
     });
   }
 
@@ -2256,20 +2264,12 @@ This task belongs to a goal. When you run code (a \`call\`/code action), the goa
   /** How many recent messages to keep verbatim after compression. Covers the
    *  current observation, the current action, and the prior action cycle. */
   private static readonly KEEP_RECENT_MESSAGES = 4;
-
-  private conversationChars(msgs: { content: string | ContentPart[] }[]): number {
-    let total = 0;
-    for (const m of msgs) {
-      if (typeof m.content === 'string') {
-        total += m.content.length;
-      } else {
-        for (const part of m.content) {
-          if ('text' in part && typeof part.text === 'string') total += part.text.length;
-        }
-      }
-    }
-    return total;
-  }
+  /** Per-observation cap applied at ingestion (head+tail slice). */
+  private static readonly MAX_OBSERVATION_CHARS = 60000;
+  /** Floor below which the budget enforcer stops shrinking a message. With
+   *  maxConversationMessages=32, 32 × 4k = 128k < MAX_CONVERSATION_CHARS, so
+   *  enforcement always converges. */
+  private static readonly TRUNCATION_FLOOR_CHARS = 4000;
 
   private async trimConversation(entry: TaskEntry): Promise<void> {
     const task = entry.state;
@@ -2283,91 +2283,56 @@ This task belongs to a goal. When you run code (a \`call\`/code action), the goa
       task.llmMessages = [...pinned, ...recent];
     }
 
-    // 2. Byte cap — only kick in if a single fat observation (e.g. an
-    //    accidental Registry.list dump) blew past the budget. Compress the
-    //    middle block with a fast LLM pass and replace it with a summary.
-    if (this.conversationChars(task.llmMessages) <= AgentAbject.MAX_CONVERSATION_CHARS) {
+    // 2. Byte cap — only kick in if the conversation blew past the budget
+    //    (e.g. an accidental Registry.list dump). Delegate to the LLM
+    //    object's `compress` method: it split-distills oversized messages
+    //    with the fast tier, summarizes the middle block, and falls back to
+    //    deterministic truncation internally.
+    if (conversationTextChars(task.llmMessages) <= AgentAbject.MAX_CONVERSATION_CHARS) {
       return;
     }
-
-    const keepRecent = AgentAbject.KEEP_RECENT_MESSAGES;
-    const middleEnd = Math.max(pinnedCount, task.llmMessages.length - keepRecent);
-    if (middleEnd <= pinnedCount) {
-      // Nothing compressible (pinned + recent already fill the budget). Fall
-      // back to hard-truncating the oldest non-pinned message to fit.
-      if (task.llmMessages.length > pinnedCount) {
-        const victim = task.llmMessages[pinnedCount];
-        if (typeof victim.content === 'string') {
-          victim.content = `[Earlier message truncated to fit context budget] ${victim.content.slice(0, 4000)}`;
-        }
-      }
-      return;
-    }
-
-    const pinned = task.llmMessages.slice(0, pinnedCount);
-    const middle = task.llmMessages.slice(pinnedCount, middleEnd);
-    const recent = task.llmMessages.slice(middleEnd);
 
     try {
-      const summary = await this.compressMiddle(middle, entry.state.task);
-      task.llmMessages = [
-        ...pinned,
-        { role: 'user', content: `[Earlier context — distilled by fast-tier compressor]\n${summary}` },
-        ...recent,
-      ];
+      this.llmId = await this.resolveDep('LLM', this.llmId);
+      const result = await this.request<{ messages: typeof task.llmMessages; originalChars: number; compressedChars: number; methods: string[] }>(
+        request(this.id, this.llmId, 'compress', {
+          messages: task.llmMessages,
+          options: {
+            targetChars: AgentAbject.MAX_CONVERSATION_CHARS,
+            pinnedCount,
+            keepRecent: AgentAbject.KEEP_RECENT_MESSAGES,
+            taskHint: entry.state.task,
+          },
+        }),
+        120000,
+      );
+      task.llmMessages = result.messages;
+      log.info(`trimConversation: compressed ${result.originalChars} → ${result.compressedChars} chars (${result.methods.join('+')})`);
     } catch (err) {
-      // Compressor failed — fall back to dropping the middle entirely so we
-      // at least stay under the API limit. Losing raw history beats a 400.
-      log.warn(`trimConversation: compression failed (${err instanceof Error ? err.message : String(err)}) — dropping middle block`);
-      task.llmMessages = [
-        ...pinned,
-        { role: 'user', content: `[Earlier context dropped: ${middle.length} messages elided to fit context budget]` },
-        ...recent,
-      ];
+      // Compression unavailable (LLM gone, timeout) — losing raw history
+      // beats a 400. Drop the middle block, then enforce the budget locally.
+      log.warn(`trimConversation: compress failed (${err instanceof Error ? err.message : String(err)}) — falling back to local truncation`);
+      const keepRecent = AgentAbject.KEEP_RECENT_MESSAGES;
+      const middleEnd = Math.max(pinnedCount, task.llmMessages.length - keepRecent);
+      if (middleEnd > pinnedCount) {
+        const dropped = middleEnd - pinnedCount;
+        task.llmMessages = [
+          ...task.llmMessages.slice(0, pinnedCount),
+          { role: 'user', content: `[Earlier context dropped: ${dropped} messages elided to fit context budget]` },
+          ...task.llmMessages.slice(middleEnd),
+        ];
+      }
     }
-  }
 
-  /**
-   * Fast-tier LLM pass that distills an arbitrary middle block of the
-   * agent's conversation into a compact summary. The summary is injected
-   * back as a single synthetic user message so the agent can keep working
-   * with the key findings, errors, and partial results intact.
-   */
-  private async compressMiddle(
-    middle: { role: string; content: string | ContentPart[] }[],
-    taskDescription: string,
-  ): Promise<string> {
-    const serialized = middle.map((m, i) => {
-      const text = typeof m.content === 'string'
-        ? m.content
-        : m.content.map((p) => ('text' in p && typeof p.text === 'string' ? p.text : '[non-text part]')).join('\n');
-      return `---- message ${i + 1} (${m.role}) ----\n${text}`;
-    }).join('\n\n');
-
-    const systemPrompt = `You are compressing the middle of an agent's working conversation so the agent can keep going without losing its progress. Distil the messages below into a tight, factual summary (target: under 2000 chars). Include every one of:
-- findings and discovered facts (IDs, names, states, values)
-- actions attempted and their outcomes (what succeeded, what failed, error messages)
-- partial results that later steps will need
-- decisions made and rejected options
-- blockers and what is still unknown
-Omit: duplicated schema dumps, long method catalogs, step numbers, decorative headers. Write in neutral prose with bullet points — this is context, not a narrative.`;
-
-    const userPrompt = `Agent task: "${taskDescription.slice(0, 400)}"\n\nMessages to distil (${middle.length} total):\n\n${serialized}`;
-
-    this.llmId = await this.resolveDep('LLM', this.llmId);
-    const result = await this.request<{ content: string }>(
-      request(this.id, this.llmId, 'complete', {
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        options: { tier: 'fast', maxTokens: 2048 },
-      }),
-      30000,
+    // 3. Budget guarantee, no matter which path ran above. Deterministically
+    //    shrink the largest messages, wherever they sit (a fat system prompt
+    //    or a fat message in the keep-recent window is exactly how a
+    //    3.1M-char prompt once reached the API as a 400).
+    enforceConversationCharBudget(
+      task.llmMessages,
+      AgentAbject.MAX_CONVERSATION_CHARS,
+      AgentAbject.TRUNCATION_FLOOR_CHARS,
     );
-    const summary = result.content?.trim();
-    if (!summary) throw new Error('empty summary');
-    return summary;
   }
 
   // ═══════════════════════════════════════════════════════════════════

@@ -7,6 +7,7 @@
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
+import { lightenColor, gradientRect } from './widget-types.js';
 
 export interface SliderWidgetConfig extends WidgetConfig {
   min?: number;
@@ -77,33 +78,50 @@ export class SliderWidget extends WidgetAbject {
       },
     });
 
-    // Active fill (from left to thumb)
+    // Active fill (from left to thumb) — brightens toward the thumb so the
+    // filled portion reads as "charged".
     if (fraction > 0) {
       const fillWidth = Math.max(trackRadius * 2, (w - THUMB_RADIUS * 2) * fraction + THUMB_RADIUS);
-      commands.push({
-        type: 'rect',
-        surfaceId,
-        params: {
-          x: ox, y: trackY, width: fillWidth, height: TRACK_HEIGHT,
-          fill: this.style.color ?? this.theme.sliderFill,
-          radius: trackRadius,
-        },
-      });
+      const fillColor = this.style.color ?? this.theme.sliderFill;
+      const g = this.theme.tokens.surface.gradient;
+      commands.push(...gradientRect(surfaceId, {
+        x: ox, y: trackY, width: fillWidth, height: TRACK_HEIGHT, radii: trackRadius,
+        gradient: { x0: ox, y0: 0, x1: ox + fillWidth, y1: 0, stops: [
+          { offset: 0, color: fillColor },
+          { offset: 1, color: lightenColor(fillColor, 20 * g) },
+        ] },
+      }));
     }
 
-    // Thumb circle
+    // Thumb — radial gradient with an off-center highlight gives it a
+    // dimensional, tactile feel; a soft glow while dragging confirms the grab.
+    const thumbCy = oy + h / 2;
+    const thumbColor = this.theme.sliderThumb;
+    commands.push({ type: 'save', surfaceId, params: {} });
+    if (this.dragging && !this.disabled) {
+      commands.push({
+        type: 'shadow',
+        surfaceId,
+        params: { color: this.theme.inputBorderFocus, blur: 10 },
+      });
+    }
     commands.push({
-      type: 'circle',
+      type: 'fillStyle',
       surfaceId,
-      params: {
-        cx: thumbX,
-        cy: oy + h / 2,
-        radius: THUMB_RADIUS,
-        fill: this.theme.sliderThumb,
-        stroke: this.theme.sliderThumbBorder,
-        lineWidth: 2,
-      },
+      params: { value: {
+        cx0: thumbX - THUMB_RADIUS * 0.35, cy0: thumbCy - THUMB_RADIUS * 0.4, r0: THUMB_RADIUS * 0.15,
+        cx1: thumbX, cy1: thumbCy, r1: THUMB_RADIUS,
+        stops: [
+          { offset: 0, color: lightenColor(thumbColor, 35 * this.theme.tokens.surface.gradient) },
+          { offset: 1, color: thumbColor },
+        ],
+      } },
     });
+    commands.push({ type: 'beginPath', surfaceId, params: {} });
+    commands.push({ type: 'circle', surfaceId, params: { cx: thumbX, cy: thumbCy, radius: THUMB_RADIUS } });
+    commands.push({ type: 'fill', surfaceId, params: {} });
+    commands.push({ type: 'stroke', surfaceId, params: { strokeStyle: this.theme.sliderThumbBorder, lineWidth: 2 } });
+    commands.push({ type: 'restore', surfaceId, params: {} });
 
     // Value text to the right (if there's room and label text is present)
     if (this.text) {

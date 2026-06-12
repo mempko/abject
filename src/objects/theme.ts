@@ -46,6 +46,7 @@ function mergeTheme(current: ThemeData, partial: Partial<ThemeData>): ThemeData 
       easing:    { ...current.tokens.easing,    ...(t.easing    ?? {}) },
       elevation: { ...current.tokens.elevation, ...(t.elevation ?? {}) },
       glow:      { ...current.tokens.glow,      ...(t.glow      ?? {}) },
+      surface:   { ...current.tokens.surface,   ...(t.surface   ?? {}) },
     };
   }
   return next;

@@ -8,7 +8,7 @@
 
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { request } from '../../core/message.js';
-import { Rect } from './widget-types.js';
+import { Rect, gradientRect } from './widget-types.js';
 import { VBoxLayout } from './vbox-layout.js';
 import { LayoutConfig, ChildRect, isSpacer } from './layout-abject.js';
 
@@ -257,28 +257,13 @@ export class ScrollableVBoxLayout extends VBoxLayout {
       const thumbY = oy + sb.thumbY;
 
       // Scrollbar thumb with gradient
-      commands.push({ type: 'save', surfaceId, params: {} });
-      commands.push({
-        type: 'linearGradient',
-        surfaceId,
-        params: { x0: trackX, y0: 0, x1: trackX + SCROLLBAR_WIDTH, y1: 0, stops: [
+      commands.push(...gradientRect(surfaceId, {
+        x: trackX + 1, y: thumbY, width: SCROLLBAR_WIDTH - 2, height: thumbHeight, radii: 3,
+        gradient: { x0: trackX, y0: 0, x1: trackX + SCROLLBAR_WIDTH, y1: 0, stops: [
           { offset: 0, color: this.theme.scrollbarThumb },
           { offset: 1, color: this.theme.scrollbarThumbHover },
         ] },
-      });
-      commands.push({
-        type: 'rect',
-        surfaceId,
-        params: {
-          x: trackX + 1,
-          y: thumbY,
-          width: SCROLLBAR_WIDTH - 2,
-          height: thumbHeight,
-          radius: 3,
-          fill: this.theme.scrollbarThumb,
-        },
-      });
-      commands.push({ type: 'restore', surfaceId, params: {} });
+      }));
     }
 
     return commands;

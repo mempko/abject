@@ -337,7 +337,18 @@ export class AnthropicProvider extends BaseLLMProvider {
     });
 
     if (!response.ok) {
-      throw new Error(`Anthropic API error: ${response.status}`);
+      // Surface the API's own error detail — a bare status code is
+      // unactionable (400 alone doesn't say "prompt too long" vs "roles must
+      // alternate" vs "max_tokens too large").
+      const errorText = await response.text().catch(() => '');
+      let detail = errorText;
+      try {
+        const parsed = JSON.parse(errorText) as { error?: { type?: string; message?: string } };
+        if (parsed.error?.message) {
+          detail = parsed.error.type ? `${parsed.error.type}: ${parsed.error.message}` : parsed.error.message;
+        }
+      } catch { /* not JSON — use raw text */ }
+      throw new Error(`Anthropic API error: ${response.status}${detail ? ` — ${detail.slice(0, 500)}` : ''}`);
     }
 
     const reader = response.body?.getReader();
