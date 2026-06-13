@@ -13,8 +13,28 @@ import { Mat4, mat3NormalMatrix } from './math.js';
 import { Geometry } from './primitives.js';
 import {
   QUAD_VS, SURFACE_FS, GLOW_FS, FLAT_FS,
-  OVERLAY_VS, OVERLAY_FS, MESH_VS, MESH_FS, MAX_MESH_LIGHTS,
+  OVERLAY_VS, OVERLAY_FS, MESH_VS, MESH_FS, MESH_INSTANCED_VS, MAX_MESH_LIGHTS,
 } from './shaders.js';
+
+/** One instance for an instanced mesh draw: a transform plus an albedo tint. */
+export interface MeshInstance {
+  position: [number, number, number];
+  scale?: number | [number, number, number];
+  rotation?: [number, number, number];
+  color?: [number, number, number];
+}
+
+/** GPU state for an instanced mesh: shared geometry + a per-instance buffer. */
+export interface InstancedMesh {
+  vao: WebGLVertexArrayObject;
+  posBuf: WebGLBuffer;
+  normBuf: WebGLBuffer;
+  idxBuf: WebGLBuffer;
+  instBuf: WebGLBuffer;
+  count: number;          // index count
+  indexType: number;
+  instanceCount: number;
+}
 
 export interface RGBA { r: number; g: number; b: number; a: number }
 
@@ -371,10 +391,12 @@ export class GlRenderer {
     'uFogEnabled', 'uFogColor', 'uFogRange',
   ];
 
-  /** Bind the mesh program and set every material/lighting/fog uniform. */
-  private useMeshMaterial(o: MeshMaterialOpts): ProgramInfo {
+  /** Bind the mesh (or instanced-mesh) program and set every material uniform. */
+  private useMeshMaterial(o: MeshMaterialOpts, instanced = false): ProgramInfo {
     const gl = this.gl;
-    const p = this.getProgram('mesh', MESH_VS, MESH_FS, GlRenderer.MESH_UNIFORMS);
+    const p = instanced
+      ? this.getProgram('meshInstanced', MESH_INSTANCED_VS, MESH_FS, GlRenderer.MESH_UNIFORMS)
+      : this.getProgram('mesh', MESH_VS, MESH_FS, GlRenderer.MESH_UNIFORMS);
     gl.useProgram(p.program);
     gl.uniformMatrix4fv(p.uniforms.uModel, false, o.model);
     gl.uniformMatrix4fv(p.uniforms.uViewProj, false, o.viewProj);
@@ -526,6 +548,77 @@ export class GlRenderer {
     gl.deleteBuffer(mesh.colorBuf);
     gl.deleteBuffer(mesh.uvBuf);
     gl.deleteBuffer(mesh.idxBuf);
+    gl.deleteVertexArray(mesh.vao);
+  }
+
+  // ── Instanced meshes (one geometry drawn many times) ─────────────────
+
+  /** Build an instanced mesh from a base geometry; fill instances with updateInstances. */
+  createInstancedMesh(geometry: Geometry): InstancedMesh {
+    const gl = this.gl;
+    const vao = gl.createVertexArray()!;
+    gl.bindVertexArray(vao);
+    const posBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, geometry.positions, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+    const normBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, normBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, geometry.normals, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+    // Per-instance attributes: mat4 (locations 4-7) + color (8), stride 19 floats.
+    const instBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+    const stride = 19 * 4;
+    for (let c = 0; c < 4; c++) {
+      gl.enableVertexAttribArray(4 + c);
+      gl.vertexAttribPointer(4 + c, 4, gl.FLOAT, false, stride, c * 16);
+      gl.vertexAttribDivisor(4 + c, 1);
+    }
+    gl.enableVertexAttribArray(8);
+    gl.vertexAttribPointer(8, 3, gl.FLOAT, false, stride, 16 * 4);
+    gl.vertexAttribDivisor(8, 1);
+    const idxBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geometry.indices, gl.STATIC_DRAW);
+    gl.bindVertexArray(null);
+    return {
+      vao, posBuf, normBuf, idxBuf, instBuf,
+      count: geometry.indices.length,
+      indexType: geometry.indices instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT,
+      instanceCount: 0,
+    };
+  }
+
+  /** Upload a packed instance buffer (19 floats per instance: mat4 + rgb). */
+  updateInstances(mesh: InstancedMesh, data: Float32Array, instanceCount: number): void {
+    const gl = this.gl;
+    gl.bindVertexArray(mesh.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.instBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+    gl.bindVertexArray(null);
+    mesh.instanceCount = instanceCount;
+  }
+
+  drawInstanced(mesh: InstancedMesh, o: MeshMaterialOpts): void {
+    if (mesh.instanceCount === 0) return;
+    const gl = this.gl;
+    const p = this.useMeshMaterial(o, true);
+    gl.uniform1i(p.uniforms.uUseVertexColor, 1); // instance color drives albedo
+    gl.bindVertexArray(mesh.vao);
+    gl.enable(gl.DEPTH_TEST);
+    gl.drawElementsInstanced(gl.TRIANGLES, mesh.count, mesh.indexType, 0, mesh.instanceCount);
+    gl.disable(gl.DEPTH_TEST);
+  }
+
+  deleteInstancedMesh(mesh: InstancedMesh): void {
+    const gl = this.gl;
+    gl.deleteBuffer(mesh.posBuf);
+    gl.deleteBuffer(mesh.normBuf);
+    gl.deleteBuffer(mesh.idxBuf);
+    gl.deleteBuffer(mesh.instBuf);
     gl.deleteVertexArray(mesh.vao);
   }
 

@@ -1314,6 +1314,9 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           'surface:<surfaceId>' (wrap another window's live 2D content onto 3D geometry); params.billboard:true
           makes a mesh always face the camera (labels, sprites); params.drawMode 'points'|'lines' renders the
           vertices as a particle cloud or polyline (graphs, constellations) with params.pointSize.
+          INSTANCING: params.instances = [{ position:[x,y,z], scale?, rotation?, color? }, ...] draws ONE geometry
+          many times in a single GPU call — the right way to do starfields, particles, swarms, or grids of shapes
+          (re-send instances in an 'update' op to move them).
           LIGHTS: lightType 'point'|'directional'|'spot' with color, intensity, range (falloff px), and for spots
           angle + penumbra. ENVIRONMENT: add a kind:'environment' node with { ambient, fog: { color, near, far } }
           for scene-wide mood and depth.

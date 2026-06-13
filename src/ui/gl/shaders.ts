@@ -175,6 +175,38 @@ void main() {
 }
 `;
 
+/**
+ * Instanced variant: one geometry drawn many times, each instance carrying
+ * its own model matrix (locations 4-7) and color (location 8). Reuses MESH_FS
+ * (vertex color path = instance color). uModel is the parent node transform.
+ */
+export const MESH_INSTANCED_VS = `#version 300 es
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNormal;
+layout(location = 4) in vec4 iM0;
+layout(location = 5) in vec4 iM1;
+layout(location = 6) in vec4 iM2;
+layout(location = 7) in vec4 iM3;
+layout(location = 8) in vec3 iColor;
+uniform mat4 uModel;
+uniform mat4 uViewProj;
+uniform float uPointSize;
+out vec3 vWorldPos;
+out vec3 vNormal;
+out vec3 vColor;
+out vec2 vUv;
+void main() {
+  mat4 m = uModel * mat4(iM0, iM1, iM2, iM3);
+  vec4 world = m * vec4(aPos, 1.0);
+  vWorldPos = world.xyz;
+  vNormal = mat3(m) * aNormal;
+  vColor = iColor;
+  vUv = vec2(0.0);
+  gl_PointSize = uPointSize;
+  gl_Position = uViewProj * world;
+}
+`;
+
 export const MESH_FS = `#version 300 es
 precision highp float;
 in vec3 vWorldPos;

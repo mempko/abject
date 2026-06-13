@@ -70,6 +70,8 @@ export interface SceneOp {
    *          metalness/roughness (0..1) drive the PBR look; texture is a URL/
    *          data-URI or 'surface:<surfaceId>'; billboard:true faces the camera;
    *          drawMode 'lines'|'points' renders vertices as a strip/cloud.
+   *          instances: [{ position, scale?, rotation?, color? }, ...] draws the
+   *          mesh once per instance in a single GPU call (particles, fields).
    * - light: { lightType: 'point'|'directional'|'spot', color?, intensity?,
    *           direction? [x,y,z], range?, angle?, penumbra? }
    * - environment: { ambient?, fog?: { color?, near, far } } — scene-wide mood.
@@ -372,6 +374,19 @@ export function validateSceneOps(ops: unknown[]): string[] {
       }
       if (params.pointSize !== undefined && typeof params.pointSize !== 'number') {
         problems.set(`${o.id}:pointSize`, `'${o.id}': params.pointSize must be a number (px)`);
+      }
+      if (params.instances !== undefined) {
+        if (!Array.isArray(params.instances)) {
+          problems.set(`${o.id}:instances`, `'${o.id}': params.instances must be an array of { position, scale?, rotation?, color? }`);
+        } else {
+          for (let i = 0; i < params.instances.length; i++) {
+            const inst = params.instances[i] as Record<string, unknown>;
+            if (!inst || typeof inst !== 'object' || !isVec3(inst.position)) {
+              problems.set(`${o.id}:instances`, `'${o.id}': instances[${i}] needs a position [x, y, z]`);
+              break;
+            }
+          }
+        }
       }
     }
     if (kind === 'light') {

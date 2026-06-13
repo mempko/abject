@@ -14,7 +14,7 @@ import { require, ensure } from '../core/contracts.js';
 import { Tween, DECELERATE, ACCELERATE } from './motion.js';
 import type { DrawCommandType } from '../objects/widgets/widget-types.js';
 import { CANVAS_CTX_METHODS, CANVAS_CTX_PROPERTIES } from '../objects/widgets/widget-types.js';
-import { GlRenderer, parseCssColor, RGBA, MeshLight, DynamicMesh, FogOpts, DrawMode } from './gl/renderer.js';
+import { GlRenderer, parseCssColor, RGBA, MeshLight, DynamicMesh, InstancedMesh, MeshInstance, FogOpts, DrawMode } from './gl/renderer.js';
 import { MAX_MESH_LIGHTS } from './gl/shaders.js';
 import { Overlay2D } from './gl/overlay-2d.js';
 import { SceneStore, VocabNode } from './gl/scene.js';
@@ -339,8 +339,15 @@ export class Compositor {
    * destruction, and minimized windows in one place.
    */
   private customMeshes = new Map<string, { rev: number; geom: Geometry; handle: DynamicMesh }>();
-  /** Node keys whose custom mesh was drawn this frame; drives end-of-frame pruning. */
+  /**
+   * Instanced meshes (one geometry, many copies) keyed by full node key. Base
+   * geometry rebuilds when its signature changes; the instance buffer
+   * re-uploads when the params.instances array reference changes.
+   */
+  private instancedMeshes = new Map<string, { baseSig: string; instRef: unknown; handle: InstancedMesh }>();
+  /** Node keys whose custom/instanced mesh was drawn this frame; drives pruning. */
   private touchedCustomMeshes = new Set<string>();
+  private touchedInstanced = new Set<string>();
   /** Mesh albedo textures loaded from URL/data-URI, cached by source string. */
   private meshTextures = new Map<string, { tex: WebGLTexture; loaded: boolean }>();
   /**
@@ -438,6 +445,7 @@ export class Compositor {
       // from the retained scene store on the next frame (no deleteDynamicMesh
       // — the underlying GL objects no longer exist).
       this.customMeshes.clear();
+      this.instancedMeshes.clear();
       // Mesh textures are gone too; drop the cache so resolveTexture reloads.
       this.meshTextures.clear();
       this.overlay.invalidate();
@@ -1489,6 +1497,7 @@ export class Compositor {
     // Advance declarative animations; keep the loop alive while any run.
     if (this.stepAnimations(performance.now())) this.needsRender = true;
     this.touchedCustomMeshes.clear();
+    this.touchedInstanced.clear();
     this.renderer.beginFrame();
     if (this.mobileMode) {
       this.renderMobile();
@@ -1731,7 +1740,10 @@ export class Compositor {
         fog: env.fog,
         cameraPos: this.cameraPos,
       };
-      if (hasCustomGeometry(node.params)) {
+      if (Array.isArray(node.params.instances) && (node.params.instances as unknown[]).length > 0) {
+        const handle = this.instancedHandle(key, node);
+        if (handle) this.renderer.drawInstanced(handle, material);
+      } else if (hasCustomGeometry(node.params)) {
         const handle = this.customMeshHandle(key, node);
         if (handle) this.renderer.drawDynamicMesh(handle, material);
       } else {
@@ -1741,6 +1753,53 @@ export class Compositor {
         });
       }
     }
+  }
+
+  /**
+   * Get (or rebuild) the instanced-mesh handle for a node carrying
+   * params.instances. The base geometry is rebuilt only when its signature
+   * changes; the per-instance buffer (matrix + color) is repacked only when
+   * the instances array reference changes. Marks the key touched for pruning.
+   */
+  private instancedHandle(key: string, node: VocabNode): InstancedMesh | undefined {
+    const fullKey = `${key}/${node.id}`;
+    this.touchedInstanced.add(fullKey);
+    const custom = hasCustomGeometry(node.params);
+    const baseSig = custom ? `geom:${node.geomRev}` : `prim:${(node.params.primitive as string) ?? 'box'}`;
+    let entry = this.instancedMeshes.get(fullKey);
+    if (!entry || entry.baseSig !== baseSig) {
+      if (entry) this.renderer.deleteInstancedMesh(entry.handle);
+      let geom: Geometry;
+      if (custom) {
+        const g = node.params.geometry as CustomGeometryParam;
+        geom = customGeometry(g.positions, g.indices, g.normals, g.colors, g.uvs);
+      } else {
+        geom = getGeometry((node.params.primitive as MeshPrimitive) ?? 'box');
+      }
+      entry = { baseSig, instRef: undefined, handle: this.renderer.createInstancedMesh(geom) };
+      this.instancedMeshes.set(fullKey, entry);
+    }
+    const instances = node.params.instances as MeshInstance[];
+    if (entry.instRef !== instances) {
+      const baseColor = parseCssColor(resolveSceneColor((node.params.color as string) ?? '#ffffff', this.sceneTheme));
+      const data = new Float32Array(instances.length * 19);
+      for (let i = 0; i < instances.length; i++) {
+        const inst = instances[i];
+        const pos = inst.position ?? [0, 0, 0];
+        const rot = inst.rotation ?? [0, 0, 0];
+        const s = inst.scale ?? 1;
+        const sc: [number, number, number] = typeof s === 'number' ? [s, s, s] : s;
+        const m = mat4TRS(pos[0], pos[1], pos[2], rot[0], rot[1], rot[2], sc[0], sc[1], sc[2]);
+        data.set(m, i * 19);
+        const col = inst.color
+          ? parseCssColor(resolveSceneColor(inst.color as unknown as string, this.sceneTheme))
+          : baseColor;
+        data[i * 19 + 16] = col.r; data[i * 19 + 17] = col.g; data[i * 19 + 18] = col.b;
+      }
+      this.renderer.updateInstances(entry.handle, data, instances.length);
+      entry.instRef = instances;
+    }
+    return entry.handle;
   }
 
   /** Build a renderer light from a 'light' node's params (point/dir/spot). */
@@ -2041,11 +2100,19 @@ export class Compositor {
    * retained scene store rebuilds any that reappear. Called once per frame.
    */
   private pruneCustomMeshes(): void {
-    if (this.customMeshes.size === 0) return;
-    for (const [fullKey, entry] of this.customMeshes) {
-      if (this.touchedCustomMeshes.has(fullKey)) continue;
-      this.renderer.deleteDynamicMesh(entry.handle);
-      this.customMeshes.delete(fullKey);
+    if (this.customMeshes.size > 0) {
+      for (const [fullKey, entry] of this.customMeshes) {
+        if (this.touchedCustomMeshes.has(fullKey)) continue;
+        this.renderer.deleteDynamicMesh(entry.handle);
+        this.customMeshes.delete(fullKey);
+      }
+    }
+    if (this.instancedMeshes.size > 0) {
+      for (const [fullKey, entry] of this.instancedMeshes) {
+        if (this.touchedInstanced.has(fullKey)) continue;
+        this.renderer.deleteInstancedMesh(entry.handle);
+        this.instancedMeshes.delete(fullKey);
+      }
     }
   }
 
