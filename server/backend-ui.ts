@@ -26,6 +26,7 @@ import type {
   CloseWindowMsg,
   DisplayResizedMsg,
 } from './ws-protocol.js';
+import { validateSceneOps, normalizeSceneOps, SCENE_NODE_KINDS, type SceneOp, type SceneTheme } from '../src/ui/gl/scene-types.js';
 import type { AuthConfig, SessionStore } from './auth.js';
 import type { UITransport } from './ui-transport.js';
 import { WebSocketUITransport } from './ui-transport.js';
@@ -45,12 +46,25 @@ export interface SurfaceState {
   transparent: boolean;
   closable: boolean;
   lastDrawCommands: Array<{ type: string; surfaceId: string; params: unknown }>;
+  /**
+   * Retained scene-vocabulary nodes riding this surface's slab, compacted
+   * to their latest definition (add + merged updates) for reconnect replay.
+   */
+  sceneNodes: Map<string, SceneOp>;
+  /**
+   * Decorations: scene nodes contributed by abjects OTHER than the surface
+   * owner (nodeId -> contributor). Their input routes to the contributor and
+   * they tear down when the contributor dies.
+   */
+  sceneContributors: Map<string, AbjectId>;
+  /** Abject-requested slab transform (tilt/float), replayed on reconnect. */
+  slabTransform?: { rotation?: [number, number, number]; z?: number };
   workspaceId?: string;
   title?: string;
 }
 
 export interface InputEvent {
-  type: 'mousedown' | 'mouseup' | 'mousemove' | 'mouseleave' | 'keydown' | 'keyup' | 'wheel' | 'paste';
+  type: 'mousedown' | 'mouseup' | 'mousemove' | 'mouseenter' | 'mouseleave' | 'keydown' | 'keyup' | 'wheel' | 'paste';
   surfaceId?: string;
   x?: number;
   y?: number;
@@ -102,6 +116,21 @@ export class BackendUI extends Abject {
   private focusGlowColor?: string;
   /** Corner radius of the focused window, so the halo matches its silhouette. */
   private focusGlowRadius?: number;
+  /** Active workspace's palette subset for the 3D scene (replayed on reconnect). */
+  private sceneTheme?: SceneTheme;
+  /**
+   * World-scope scene nodes (the global scene graph beyond windows), keyed by
+   * owning abject. Positions are workspace px; nodes live until removed or
+   * their owner dies. Compacted like per-surface nodes for reconnect replay.
+   */
+  private worldScenes: Map<AbjectId, Map<string, SceneOp>> = new Map();
+  /**
+   * The selected 3D scene node: set on node mousedown, cleared when focus
+   * moves elsewhere. While set, keyboard input routes to the node's owner
+   * (with focus/blur events bracketing the selection) — widget-style focus
+   * for scene geometry.
+   */
+  private focusedNode?: { scope: 'window' | 'world'; surfaceId?: string; ownerId?: AbjectId; nodeId: string };
   private mouseGrabAbject?: AbjectId;  // WindowManager grabs mouse during drag
   private mouseGrabClientId?: string;  // Which client owns the current resize grab
   private pendingRequests: Map<string, { resolve: (value: unknown) => void; reject: (e: Error) => void }> = new Map();
@@ -131,7 +160,7 @@ export class BackendUI extends Abject {
       manifest: {
         name: 'UIServer',
         description:
-          'X11-style display server. Manages surfaces, draw commands, and routes input events to surface owners. Use cases: draw shapes/text/images directly on surfaces, handle raw mouse and keyboard input events.',
+          'X11-style display server rendering a native WebGL2 3D desktop scene. Manages surfaces (slabs in the 3D scene), 2D draw commands, retained 3D scene ops (scene: mesh/light nodes with primitives box/sphere/plane/cylinder, theme-token colors), slab transforms (setSurfaceTransform), and routes input events to surface owners. Use cases: draw shapes/text/images on surfaces, render lit 3D content attached to windows, handle raw mouse and keyboard input events.',
         version: '1.0.0',
         interface: {
             id: UI_INTERFACE,
@@ -270,6 +299,54 @@ export class BackendUI extends Abject {
                     name: 'surfaceId',
                     type: { kind: 'primitive', primitive: 'string' },
                     description: 'The surface to focus',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'scene',
+                description: 'Apply retained 3D scene ops. Default scope: your window\'s subtree (every window is a slab in the 3D scene; nodes travel with it, positions are px from the window center). With world: true, nodes attach to the GLOBAL scene graph instead — positions are workspace px, no window needed (desktop pets, ambient décor); params.layer: "back" (default, behind windows) or "front" (above windows). Ops: { op: "add"|"update"|"remove", id, parentId?, kind: "mesh"|"light"|"group", transform: { position?: [x,y,z], rotation?: [rx,ry,rz], scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder", color, emissive?, opacity?, layer? }. Light params: { lightType: "point"|"directional", color?, direction? }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed (world nodes also tear down when their owner dies). Example: await this.call(uiId, "scene", { world: true, ops: [{ op: "add", id: "pet", kind: "mesh", transform: { position: [400, 600, 30], scale: 40 }, params: { primitive: "sphere", color: "$accent" } }] })',
+                parameters: [
+                  {
+                    name: 'surfaceId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Target surface (defaults to your first surface; ignored with world: true)',
+                    optional: true,
+                  },
+                  {
+                    name: 'world',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'Attach nodes to the global scene graph (workspace coordinates) instead of a window',
+                    optional: true,
+                  },
+                  {
+                    name: 'ops',
+                    type: { kind: 'array', elementType: { kind: 'reference', reference: 'SceneOp' } },
+                    description: 'Scene operations (validated; invalid batches are rejected with the vocabulary)',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'setSurfaceTransform',
+                description: 'Tilt or float your window\'s slab in the 3D scene (visual only — input picking follows automatically). rotation: [rx, ry, rz] radians; z: px toward the viewer.',
+                parameters: [
+                  {
+                    name: 'surfaceId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Your surface',
+                  },
+                  {
+                    name: 'rotation',
+                    type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'number' } },
+                    description: 'Euler radians [rx, ry, rz]',
+                    optional: true,
+                  },
+                  {
+                    name: 'z',
+                    type: { kind: 'primitive', primitive: 'number' },
+                    description: 'Lift toward the viewer in px',
+                    optional: true,
                   },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
@@ -519,6 +596,40 @@ export class BackendUI extends Abject {
       return this.handleDraw(msg.routing.from, commands);
     });
 
+    // ── Scene vocabulary: retained 3D nodes riding a window's slab, or
+    // attached to the WORLD (the global scene graph beyond windows) ──
+    this.on('scene', async (msg: AbjectMessage) => {
+      const { surfaceId, world, ops, contributorId } = msg.payload as {
+        surfaceId?: string; world?: boolean; ops: SceneOp[]; contributorId?: AbjectId;
+      };
+      if (world) {
+        return this.handleWorldSceneOps(msg.routing.from, ops);
+      }
+      // contributorId is trusted only because the direct caller must own the
+      // surface (windows relay decoration batches from other abjects).
+      return this.handleSceneOps(msg.routing.from, surfaceId, ops, contributorId);
+    });
+
+    this.on('setSceneTheme', async (msg: AbjectMessage) => {
+      const { theme } = msg.payload as { theme: SceneTheme };
+      if (!theme || typeof theme !== 'object' || !theme.colors) return false;
+      this.sceneTheme = theme;
+      this.sendToFrontend({ type: 'setSceneTheme', theme: theme as unknown as Record<string, unknown> });
+      return true;
+    });
+
+    this.on('setSurfaceTransform', async (msg: AbjectMessage) => {
+      const { surfaceId, rotation, z } = msg.payload as {
+        surfaceId: string; rotation?: [number, number, number]; z?: number;
+      };
+      const state = this.surfaces.get(surfaceId);
+      if (!state) return false;
+      contractRequire(state.objectId === msg.routing.from, 'setSurfaceTransform: caller does not own the surface');
+      state.slabTransform = { rotation, z };
+      this.sendToFrontend({ type: 'setSurfaceTransform', surfaceId, rotation, z });
+      return true;
+    });
+
     this.on('moveSurface', async (msg: AbjectMessage) => {
       const { surfaceId, x, y } = msg.payload as {
         surfaceId: string;
@@ -668,6 +779,8 @@ export class BackendUI extends Abject {
     this.on('objectUnregistered', async (msg: AbjectMessage) => {
       const objectId = msg.payload as AbjectId;
       this.destroySurfacesForObject(objectId);
+      this.destroyWorldSceneForObject(objectId);
+      this.destroyDecorationsForObject(objectId);
     });
 
     this.on('updateAuth', async (msg: AbjectMessage) => {
@@ -974,6 +1087,86 @@ Each draw command has exactly 3 fields: { type, surfaceId, params }
 'shadow' - Set shadow. params: { color, blur, offsetX?, offsetY? }
 'linearGradient'/'radialGradient' - Set gradient fill+stroke
 
+### 3D Scene (retained)
+
+THE DESKTOP IS A NATIVE 3D SCENE (WebGL2-backed) — no Three.js needed; 3D is
+built in. Your surface is a slab in that scene. For anything 3D (spinning
+shapes, lit geometry, depth), attach retained scene nodes — GPU-rendered and
+animated by updating transforms, which beats simulating 3D with projection
+math on a 2D canvas. Nodes travel with the surface (you must own the surface
+— for WidgetManager windows, call 'scene' on the WINDOW instead; windows
+accept scene ops from ANY abject, so you can decorate windows you don't own,
+discovered via WidgetManager listWindows — decoration input routes back to
+the contributor and decorations tear down when the contributor dies):
+
+  await this.call(this.dep('UIServer'), 'scene', { surfaceId, ops: [
+    { op: 'add', id: 'orb', kind: 'mesh',
+      transform: { position: [0, 0, 40], scale: 30 },   // px from slab center, +z toward viewer
+      params: { primitive: 'sphere', color: '$accent' } },
+    { op: 'add', id: 'key', kind: 'light',
+      transform: { position: [120, -200, 300] },
+      params: { lightType: 'point', color: '#ffffff' } },
+  ]});
+
+Kinds: mesh (primitive: plane|box|sphere|cylinder; params color, emissive?,
+opacity?), light (lightType: point|directional; color?, direction?), group.
+transform: { position: [x,y,z], rotation: [rx,ry,rz] radians, scale: n|[x,y,z] }.
+COORDINATES ARE Y-DOWN, the screen convention: +y moves DOWN, +x right, +z
+toward the viewer (this differs from y-up 3D engines). Mouse dx/dy therefore
+map DIRECTLY onto position dx/dy — apply both with the same sign, no flips.
+The camera is a long lens (the desktop UI must stay undistorted), so small
+objects read near-isometric. For visible perspective, go BIG: scale 200+ and
+vary z across the scene — depth shows when it's a meaningful fraction of the
+camera distance (~1.9x viewport height).
+Colors accept '#hex', 'rgb(a)', or theme tokens ('$accent', '$statusError',
+'$windowBg', ...) that re-resolve on every theme change. Nodes are RETAINED
+until { op: 'remove', id }; invalid batches are rejected with the vocabulary.
+Tilt/float the whole slab: this.call(this.dep('UIServer'), 'setSurfaceTransform',
+{ surfaceId, rotation: [0, 0.1, 0], z: 20 }).
+
+WORLD SCOPE — the global scene graph beyond windows. Pass world: true and
+positions become workspace px ([x, y, z], +z toward viewer); no window or
+surface needed. Use for desktop pets, ambient décor, free-floating geometry.
+params.layer: 'back' (default — renders behind all windows) or 'front'
+(above them). Nodes are namespaced to YOUR abject, retained across
+reconnects, and torn down automatically if your abject dies. A pet that
+walks: add a group of meshes once, then update the group's position/rotation
+from a Timer tick:
+
+  await this.call(this.dep('UIServer'), 'scene', { world: true, ops: [
+    { op: 'add', id: 'pet', kind: 'group', transform: { position: [400, 600, 30] } },
+    { op: 'add', id: 'body', parentId: 'pet', kind: 'mesh',
+      transform: { scale: [60, 40, 40] }, params: { primitive: 'sphere', color: '$accent' } },
+    { op: 'add', id: 'head', parentId: 'pet', kind: 'mesh',
+      transform: { position: [40, -20, 0], scale: 28 }, params: { primitive: 'sphere', color: '$accent' } },
+  ]});
+  // each tick:
+  await this.call(this.dep('UIServer'), 'scene', { world: true, ops: [
+    { op: 'update', id: 'pet', transform: { position: [x, y, 30], rotation: [0, heading, wobble] } },
+  ]});
+
+MESH INPUT — scene nodes are full input targets, like widgets. You receive
+'nodeInput' events for meshes you own:
+  this.on('nodeInput', (msg) => {
+    const { type, nodeId, x, y, key, code, button, world } = msg.payload;
+    // type: 'mousedown' | 'mouseup' | 'mousemove' | 'mouseenter' | 'mouseleave'
+    //     | 'focus' | 'blur' | 'keydown' | 'keyup'
+  });
+- Hover: mouseenter/mouseleave fire on hover changes; mousemove streams while
+  the pointer is over the mesh (~60fps, rAF-batched).
+- Drag capture: after mousedown on a mesh, mousemove keeps streaming to that
+  mesh until mouseup, even when the cursor outruns it. To drag a node, apply
+  the input deltas directly — both axes share the screen convention (y-down),
+  so position = [startX + dx, startY + dy, z] with NO sign flips.
+- Selection + keyboard: clicking a mesh SELECTS it ('focus' event); while
+  selected, keydown/keyup events route to you (key, code, modifiers). Focus
+  moves away ('blur') when the user clicks anything else. React to focus by
+  e.g. boosting the node's emissive via a scene update.
+World-scope hits deliver straight to you (x,y in workspace px). Window-scope
+hits deliver to the WINDOW's owner with windowId in the payload (x,y relative
+to the window). Picking is exact 3D ray casting, so it works on rotated and
+animated meshes — click the pet mid-walk.
+
 ### Input Injection
 
 Simulate a mouse click on a surface (mousedown + mouseup):
@@ -1233,6 +1426,8 @@ IMPORTANT:
       transparent: transparent ?? false,
       closable: closable ?? true,
       lastDrawCommands: [],
+      sceneNodes: new Map(),
+      sceneContributors: new Map(),
     });
 
     this.sendToFrontend({
@@ -1256,6 +1451,7 @@ IMPORTANT:
       return false;
     }
 
+    if (this.focusedNode?.surfaceId === surfaceId) this.focusedNode = undefined;
     this.surfaces.delete(surfaceId);
 
     this.sendToFrontend({
@@ -1314,6 +1510,210 @@ IMPORTANT:
 
     this.log('debug', 'draw', { objectId, commandCount: commands.length });
     return true;
+  }
+
+  /**
+   * Apply a scene-vocabulary op batch to a surface's subtree: validate
+   * loudly (callers self-correct from the error, like the canvas
+   * vocabulary), compact into the retained per-surface node map for
+   * reconnect replay, and broadcast.
+   */
+  private handleSceneOps(objectId: AbjectId, surfaceId: string | undefined, rawOps: SceneOp[], contributorId?: AbjectId): boolean {
+    // Forgiving field aliases (e.g. parent → parentId) before anything else.
+    const ops = normalizeSceneOps(rawOps) as SceneOp[];
+    // Default to the caller's first surface so windowless callers fail loudly
+    // and single-window abjects don't need to track their surfaceId.
+    let state = surfaceId ? this.surfaces.get(surfaceId) : undefined;
+    if (!state) {
+      for (const s of this.surfaces.values()) {
+        if (s.objectId === objectId) { state = s; break; }
+      }
+    }
+    contractRequire(state !== undefined, 'scene: no surface — create a window first');
+    contractRequire(state!.objectId === objectId, 'scene: caller does not own the surface');
+
+    const problems = validateSceneOps(ops);
+    if (problems.length > 0) {
+      throw new Error(
+        `Invalid scene ops (nothing was applied): ${problems.join('; ')}. ` +
+        `Node kinds: ${SCENE_NODE_KINDS.join(', ')}. ` +
+        `Shape: { op: 'add'|'update'|'remove', id, parentId?, kind?, transform: { position?, rotation?, scale? }, params } — ` +
+        `e.g. { op: 'add', id: 'orb', kind: 'mesh', transform: { position: [0, 0, 40], scale: 30 }, params: { primitive: 'sphere', color: '$accent' } }.`
+      );
+    }
+
+    // Compact into retained state: adds insert, updates merge, removes delete.
+    const foreign = contributorId !== undefined && contributorId !== state!.objectId;
+    for (const op of ops) {
+      if (op.op === 'remove') {
+        state!.sceneNodes.delete(op.id);
+        state!.sceneContributors.delete(op.id);
+        continue;
+      }
+      if (op.op === 'add') {
+        state!.sceneNodes.set(op.id, { ...op });
+        if (foreign) state!.sceneContributors.set(op.id, contributorId!);
+        continue;
+      }
+      const existing = state!.sceneNodes.get(op.id);
+      if (!existing) continue;
+      if (op.transform) existing.transform = { ...existing.transform, ...op.transform };
+      if (op.params) existing.params = { ...existing.params, ...op.params };
+      if (op.parentId !== undefined) existing.parentId = op.parentId;
+    }
+
+    this.sendToFrontend({
+      type: 'sceneOps',
+      surfaceId: state!.surfaceId,
+      ops: ops as unknown as Array<Record<string, unknown>>,
+    });
+    this.log('debug', 'sceneOps', { objectId, surfaceId: state!.surfaceId, opCount: ops.length });
+    return true;
+  }
+
+  /**
+   * Apply a WORLD-scope scene-op batch: nodes attach to the global scene
+   * graph (workspace coordinates) rather than a window, scoped to the
+   * calling abject's own namespace. Same validation, retention, and replay
+   * semantics as window subtrees; nodes are torn down when the owner dies.
+   */
+  private handleWorldSceneOps(objectId: AbjectId, rawOps: SceneOp[]): boolean {
+    const ops = normalizeSceneOps(rawOps) as SceneOp[];
+    const problems = validateSceneOps(ops);
+    if (problems.length > 0) {
+      throw new Error(
+        `Invalid world scene ops (nothing was applied): ${problems.join('; ')}. ` +
+        `Node kinds: ${SCENE_NODE_KINDS.join(', ')}. ` +
+        `World positions are workspace px ([x, y, z], +z toward the viewer); params.layer: 'back' (default, behind windows) or 'front'. ` +
+        `e.g. { op: 'add', id: 'pet-body', kind: 'mesh', transform: { position: [400, 600, 30], scale: 40 }, params: { primitive: 'sphere', color: '$accent' } }.`
+      );
+    }
+
+    let nodes = this.worldScenes.get(objectId);
+    if (!nodes) {
+      nodes = new Map();
+      this.worldScenes.set(objectId, nodes);
+    }
+    for (const op of ops) {
+      if (op.op === 'remove') {
+        nodes.delete(op.id);
+        continue;
+      }
+      if (op.op === 'add') {
+        nodes.set(op.id, { ...op });
+        continue;
+      }
+      const existing = nodes.get(op.id);
+      if (!existing) continue;
+      if (op.transform) existing.transform = { ...existing.transform, ...op.transform };
+      if (op.params) existing.params = { ...existing.params, ...op.params };
+      if (op.parentId !== undefined) existing.parentId = op.parentId;
+    }
+    if (nodes.size === 0) this.worldScenes.delete(objectId);
+
+    this.sendToFrontend({
+      type: 'sceneOps',
+      surfaceId: '',
+      world: true,
+      ownerId: objectId,
+      ops: ops as unknown as Array<Record<string, unknown>>,
+    });
+    this.log('debug', 'worldSceneOps', { objectId, opCount: ops.length });
+    return true;
+  }
+
+  /**
+   * Deliver a node input event to the node's owner: world-scope straight to
+   * the owning abject (only if it really owns world nodes — no spoofed
+   * routing), window-scope to the window, which relays to its owner —
+   * except decorations (foreign-contributed nodes), which go straight to
+   * their contributor.
+   */
+  private deliverNodeEvent(
+    target: { scope: 'window' | 'world'; surfaceId?: string; ownerId?: AbjectId },
+    payload: Record<string, unknown>,
+  ): void {
+    if (target.scope === 'world' && target.ownerId) {
+      if (this.worldScenes.has(target.ownerId)) {
+        this.send(event(this.id, target.ownerId, 'nodeInput', payload));
+      }
+      return;
+    }
+    if (target.surfaceId) {
+      const state = this.surfaces.get(target.surfaceId);
+      if (state) {
+        // Decorations route straight to their contributor (with the host
+        // window's id attached); the owner's own nodes go through the window.
+        const nodeId = payload.nodeId as string | undefined;
+        const contributor = nodeId ? state.sceneContributors.get(nodeId) : undefined;
+        if (contributor) {
+          this.send(event(this.id, contributor, 'nodeInput', { ...payload, windowId: state.objectId }));
+        } else {
+          this.send(event(this.id, state.objectId, 'nodeInput', payload));
+        }
+      }
+    }
+  }
+
+  /** Move node keyboard focus, bracketing the change with blur/focus events. */
+  private setFocusedNode(target?: { scope: 'window' | 'world'; surfaceId?: string; ownerId?: AbjectId; nodeId: string }): void {
+    const prev = this.focusedNode;
+    if (prev && target && prev.nodeId === target.nodeId
+      && prev.surfaceId === target.surfaceId && prev.ownerId === target.ownerId) {
+      return;
+    }
+    if (prev) {
+      this.deliverNodeEvent(prev, { type: 'blur', nodeId: prev.nodeId, world: prev.scope === 'world' });
+    }
+    this.focusedNode = target;
+    if (target) {
+      this.deliverNodeEvent(target, { type: 'focus', nodeId: target.nodeId, world: target.scope === 'world' });
+    }
+  }
+
+  /**
+   * Tear down decorations a dead abject contributed to OTHER abjects' windows,
+   * so host windows never accumulate orphaned foreign nodes.
+   */
+  private destroyDecorationsForObject(objectId: AbjectId): void {
+    for (const state of this.surfaces.values()) {
+      const dead: string[] = [];
+      for (const [nodeId, contributor] of state.sceneContributors) {
+        if (contributor === objectId) dead.push(nodeId);
+      }
+      if (dead.length === 0) continue;
+      for (const nodeId of dead) {
+        state.sceneNodes.delete(nodeId);
+        state.sceneContributors.delete(nodeId);
+        if (this.focusedNode?.surfaceId === state.surfaceId && this.focusedNode.nodeId === nodeId) {
+          this.focusedNode = undefined;
+        }
+      }
+      this.sendToFrontend({
+        type: 'sceneOps',
+        surfaceId: state.surfaceId,
+        ops: dead.map((id) => ({ op: 'remove', id })),
+      });
+    }
+  }
+
+  /** Tear down an owner's world nodes (owner unregistered/died). */
+  private destroyWorldSceneForObject(objectId: AbjectId): void {
+    if (this.focusedNode?.ownerId === objectId) this.focusedNode = undefined;
+    const nodes = this.worldScenes.get(objectId);
+    if (!nodes || nodes.size === 0) {
+      this.worldScenes.delete(objectId);
+      return;
+    }
+    const removes = [...nodes.keys()].map((id) => ({ op: 'remove', id }));
+    this.worldScenes.delete(objectId);
+    this.sendToFrontend({
+      type: 'sceneOps',
+      surfaceId: '',
+      world: true,
+      ownerId: objectId,
+      ops: removes,
+    });
   }
 
   private handleMoveSurface(
@@ -1816,6 +2216,50 @@ IMPORTANT:
       }
     }
 
+    // ── 3D scene-node input: mesh nodes are input targets like widgets.
+    // World-scope hits route straight to the owning abject; window-subtree
+    // hits route to the window, which forwards to its owner as 'nodeInput'.
+    if (msg.nodeId) {
+      const target = {
+        scope: (msg.nodeScope ?? 'window') as 'window' | 'world',
+        surfaceId: msg.surfaceId,
+        ownerId: msg.nodeOwnerId as AbjectId | undefined,
+        nodeId: msg.nodeId,
+      };
+      // Selection: a clicked node takes keyboard focus until focus moves.
+      if (msg.inputType === 'mousedown') {
+        this.setFocusedNode(target);
+      }
+      this.deliverNodeEvent(target, {
+        type: msg.inputType,
+        nodeId: msg.nodeId,
+        world: target.scope === 'world',
+        x: msg.x,
+        y: msg.y,
+        button: msg.button,
+        modifiers: msg.modifiers,
+      });
+      return;
+    }
+
+    // A non-node mousedown moves focus away from any selected node.
+    if (msg.inputType === 'mousedown' && this.focusedNode) {
+      this.setFocusedNode(undefined);
+    }
+
+    // Keyboard routes to the selected node while one holds focus.
+    if ((msg.inputType === 'keydown' || msg.inputType === 'keyup') && this.focusedNode) {
+      this.deliverNodeEvent(this.focusedNode, {
+        type: msg.inputType,
+        nodeId: this.focusedNode.nodeId,
+        world: this.focusedNode.scope === 'world',
+        key: msg.key,
+        code: msg.code,
+        modifiers: msg.modifiers,
+      });
+      return;
+    }
+
     const inputEvent: InputEvent = {
       type: msg.inputType,
       surfaceId: msg.surfaceId,
@@ -1992,6 +2436,41 @@ IMPORTANT:
         surfaceId: this.focusedSurface,
         glowColor: this.focusGlowColor,
         glowRadius: this.focusGlowRadius,
+      }, clientId);
+    }
+
+    // 6. Replay the scene: theme, slab transforms, and retained vocab nodes
+    if (this.sceneTheme) {
+      this.sendToClient({
+        type: 'setSceneTheme',
+        theme: this.sceneTheme as unknown as Record<string, unknown>,
+      }, clientId);
+    }
+    for (const state of this.surfaces.values()) {
+      if (state.slabTransform) {
+        this.sendToClient({
+          type: 'setSurfaceTransform',
+          surfaceId: state.surfaceId,
+          rotation: state.slabTransform.rotation,
+          z: state.slabTransform.z,
+        }, clientId);
+      }
+      if (state.sceneNodes.size > 0) {
+        this.sendToClient({
+          type: 'sceneOps',
+          surfaceId: state.surfaceId,
+          ops: [...state.sceneNodes.values()] as unknown as Array<Record<string, unknown>>,
+        }, clientId);
+      }
+    }
+    for (const [ownerId, nodes] of this.worldScenes) {
+      if (nodes.size === 0) continue;
+      this.sendToClient({
+        type: 'sceneOps',
+        surfaceId: '',
+        world: true,
+        ownerId,
+        ops: [...nodes.values()] as unknown as Array<Record<string, unknown>>,
       }, clientId);
     }
 

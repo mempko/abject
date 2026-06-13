@@ -235,6 +235,9 @@ export type BackendToFrontendMsg =
   | CaptureSurfaceRequestMsg
   | CaptureDesktopRequestMsg
   | OpenFilePickerMsg
+  | SceneOpsMsg
+  | SetSceneThemeMsg
+  | SetSurfaceTransformMsg
   | AuthRequiredMsg
   | AuthNotRequiredMsg
   | AuthResultMsg;
@@ -245,7 +248,12 @@ export type BackendToFrontendMsg =
 
 export interface InputMsg extends WsEnvelope {
   type: 'input';
-  inputType: 'mousedown' | 'mouseup' | 'mousemove' | 'keydown' | 'keyup' | 'wheel' | 'paste';
+  /** Set when the hit target is a 3D scene-vocabulary mesh node. */
+  nodeId?: string;
+  nodeScope?: 'window' | 'world';
+  /** Owning abject for world-scope node hits. */
+  nodeOwnerId?: string;
+  inputType: 'mousedown' | 'mouseup' | 'mousemove' | 'mouseenter' | 'mouseleave' | 'keydown' | 'keyup' | 'wheel' | 'paste';
   surfaceId?: string;
   x?: number;
   y?: number;
@@ -304,6 +312,35 @@ export interface CaptureDesktopReplyMsg extends WsEnvelope {
 export interface SurfaceCreatedMsg extends WsEnvelope {
   type: 'surfaceCreated';
   surfaceId: string;
+}
+
+/**
+ * Retained 3D scene operations: either for a surface's subtree (meshes,
+ * lights, groups riding a window's slab) or, with world=true, for the
+ * global scene graph in workspace coordinates, namespaced per owner.
+ */
+export interface SceneOpsMsg extends WsEnvelope {
+  type: 'sceneOps';
+  surfaceId: string;
+  /** World scope: nodes attach to the desktop scene, not a window. */
+  world?: boolean;
+  /** Owning abject for world-scope nodes (namespacing + teardown). */
+  ownerId?: string;
+  ops: Array<Record<string, unknown>>;
+}
+
+/** Active workspace's palette subset for the 3D scene chrome and $tokens. */
+export interface SetSceneThemeMsg extends WsEnvelope {
+  type: 'setSceneTheme';
+  theme: Record<string, unknown>;
+}
+
+/** Abject-requested slab transform: tilt/float a window in the scene. */
+export interface SetSurfaceTransformMsg extends WsEnvelope {
+  type: 'setSurfaceTransform';
+  surfaceId: string;
+  rotation?: [number, number, number];
+  z?: number;
 }
 
 export interface ReadyMsg extends WsEnvelope {

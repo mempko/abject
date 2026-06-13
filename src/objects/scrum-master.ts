@@ -1396,6 +1396,8 @@ Do NOT guess based on agent name alone. The relevant capability may or may not b
 **Knowledge as memory across sprints:**
 The whole point of \`save_knowledge\` / \`lookup_knowledge\` / \`forget_knowledge\` is to amortize discovery work. The first goal of any kind may need an exploratory team poll to find which agent owns the relevant capability. When a sprint completes, ScrumMaster automatically saves a compact "Scrum plan" lesson with the tasks and agents that actually worked. Use manual \`save_knowledge\` only for extra durable facts the automatic plan lesson would not capture, such as user preferences, provider-specific constraints, or a corrected tool mapping. Every future scrum on a similar goal surfaces prior lessons in \`relevantKnowledge\` and lets the planner choose faster while still staying inside the goal system. When a cached lesson stops being true (the agent renamed, a tool was removed, the user switched providers), \`forget_knowledge\` removes the bad entry so the planner re-discovers via a poll.
 
+Lessons record what WORKED — agent/task mappings, payload shapes, scratchpad conventions. Never save categorical claims that a capability does NOT exist ("there is no X API", "Y is not supported"): the platform evolves, those claims go stale silently, and a recalled negative will override live discovery on every future goal. If a capability seemed absent this sprint, that observation belongs in the synthesis for THIS goal only; the next sprint re-discovers. Likewise, treat recalled lessons containing such negatives as suspect — prefer the live guides.
+
 ## Rules
 
 - Output ONE action per cycle as JSON in a \`\`\`json\`\`\` block. Output ONLY the JSON block — no prose around it. Any one-sentence note belongs in the JSON's \`reasoning\` field.
@@ -1410,7 +1412,9 @@ The whole point of \`save_knowledge\` / \`lookup_knowledge\` / \`forget_knowledg
 
 When a poll reply confirms an agent owns a tool (browser automation, MCP server, skill, API), trust the reply and plan the task. Real runtime failures arrive in \`failed[]\` on the next scrum, with a concrete error you can replan against — that is your evidence loop. Phrases like "site X blocks bots", "site Y rate-limits aggressively", "the API has restrictive scopes" are training-data guesses; keep them out of task descriptions AND syntheses. The way to find out how an external service reacts is to actually attempt the task and read the real failure.
 
-Concretely: if the goal is "log into LinkedIn / read Gmail / open my bank dashboard" and WebAgent's poll reply names Playwright with persistent profiles, the right plan is a WebAgent task with the appropriate \`pageOptions.profile\` name. Save the OAuth-app / CAPTCHA / device-verification commentary for syntheses where you can quote a real \`failed[]\` entry that mentions them.`;
+Concretely: if the goal is "log into LinkedIn / read Gmail / open my bank dashboard" and WebAgent's poll reply names Playwright with persistent profiles, the right plan is a WebAgent task with the appropriate \`pageOptions.profile\` name. Save the OAuth-app / CAPTCHA / device-verification commentary for syntheses where you can quote a real \`failed[]\` entry that mentions them.
+
+The same discipline applies to the PLATFORM's own capabilities (rendering, UI, storage). The platform evolves past your training data and past saved lessons — the desktop, for example, is a native 3D scene where windows can host real meshes and lights, alongside 2D canvases. Task descriptions state the OUTCOME ("a visibly rotating 3D cube in a window") and direct the builder to the live vocabularies (builders ask the UI objects for current capabilities at build time). Hedges like "X may not be supported" and implementation prescriptions like "use 2D canvas with manual projection math" are training-data guesses — leave them out and let the builder's live discovery decide the approach.`;
   }
 }
 

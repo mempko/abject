@@ -1,5 +1,12 @@
 /**
- * Canvas-based compositor for rendering object surfaces.
+ * 3D compositor for rendering object surfaces.
+ *
+ * Every window surface is a slab in a WebGL2 scene: its content is still an
+ * OffscreenCanvas painted by the 2D draw-command vocabulary, uploaded as a
+ * texture onto rounded slab geometry rendered with a perspective camera.
+ * Scene-vocabulary nodes (meshes, lights) attach to a window's subtree and
+ * travel with it. The compositor stays behaviorally dumb — it renders state
+ * and resolves picking; decisions stay server-side.
  */
 
 import { AbjectId } from '../core/types.js';
@@ -7,6 +14,13 @@ import { require, ensure } from '../core/contracts.js';
 import { Tween, DECELERATE, ACCELERATE } from './motion.js';
 import type { DrawCommandType } from '../objects/widgets/widget-types.js';
 import { CANVAS_CTX_METHODS, CANVAS_CTX_PROPERTIES } from '../objects/widgets/widget-types.js';
+import { GlRenderer, parseCssColor, RGBA, MeshLight } from './gl/renderer.js';
+import { Overlay2D } from './gl/overlay-2d.js';
+import { SceneStore } from './gl/scene.js';
+import { SceneOp, SceneTheme, MeshPrimitive, resolveSceneColor } from './gl/scene-types.js';
+import { getGeometry } from './gl/primitives.js';
+import { Mat4, mat4Identity, mat4Multiply, mat4PerspectiveYDown, mat4Translation, mat4TRS, mat4Invert } from './gl/math.js';
+import { rayFromScreen, raySurfaceHit, rayMeshHit, Ray } from './gl/picking.js';
 
 /**
  * Mobile interaction states (WebOS-style).
@@ -38,6 +52,7 @@ export interface Surface {
   canvas: OffscreenCanvas;
   ctx: OffscreenCanvasRenderingContext2D;
   dirty: boolean;
+  tainted: boolean;      // canvas tainted by a cross-origin image; texture upload is unsafe, render the last-good texture
   drawn: boolean;        // false until first draw batch; prevents rendering empty surfaces
   transparent: boolean;  // window paints no background; skip the focus-glow halo (it would bleed through)
   closable: boolean;     // mobile card overview may flick this closed (false for system rails)
@@ -267,22 +282,55 @@ function blitImage(
 /**
  * The compositor manages surfaces and renders them to a canvas.
  */
+/** Per-surface GPU + animation state managed by the compositor. */
+interface SurfaceGlState {
+  texture?: WebGLTexture;
+  /** Model matrix from the last sync (used for ray picking). */
+  model: Mat4;
+  /** Drag tilt (radians), spring-settled toward the decaying target. */
+  tiltX: number;
+  tiltY: number;
+  tiltTargetX: number;
+  tiltTargetY: number;
+  /** Focus lift toward the camera (px), eased toward its target. */
+  lift: number;
+  /** Abject-requested slab transform (setSurfaceTransform). */
+  userRotation?: [number, number, number];
+  userZ?: number;
+  lastMoveX?: number;
+  lastMoveY?: number;
+}
+
 export class Compositor {
   private canvas: HTMLCanvasElement;
-  private ctx: CanvasRenderingContext2D;
+  private renderer: GlRenderer;
+  private overlay: Overlay2D;
+  private sceneStore = new SceneStore();
+  private sceneTheme?: SceneTheme;
+  private surfaceGl: Map<string, SurfaceGlState> = new Map();
+  /** Owners with world-scope scene nodes (keys into sceneStore: `world:<ownerId>`). */
+  private worldKeys: Set<string> = new Set();
+  private viewProj: Mat4 = mat4Identity();
+  private invViewProj: Mat4 = mat4Identity();
+  private cameraPos: [number, number, number] = [0, 0, 1];
   private surfaces: Map<string, Surface> = new Map();
   private sortedSurfaces: Surface[] = [];
   private animationFrameId?: number;
   private needsRender = false;
   private activeWorkspaceId?: string;
-  // Focused window gets a soft accent halo drawn behind it (on the desktop, so
-  // it extends beyond the window edges and content can't cover it).
+  // Focused window gets an accent rim + bloom and lifts toward the camera.
   private focusedSurfaceId?: string;
   private focusGlowColor = 'rgba(91, 229, 160, 0.55)'; // Arcane rune-green default
   private focusGlowRadius = 7; // window corner radius, so the halo matches the window
   private imageCache: Map<string, { img: HTMLImageElement; loaded: boolean }> = new Map();
   private static IMAGE_CACHE_MAX = 100;
   private liveDataImages: Map<string, { img: HTMLImageElement; width: number; height: number }> = new Map();
+  /** Camera field of view; distance derives so the z=0 plane is ~1:1 px. */
+  private static readonly CAMERA_FOV = (30 * Math.PI) / 180;
+  /** Focus lift in px toward the camera — subtle enough that server-side
+   * rect math (resize edges) stays within a few px of the projection. */
+  private static readonly FOCUS_LIFT = 14;
+  private static readonly TILT_MAX = 0.05; // radians
 
   // ── Desktop scroll state ──
   /**
@@ -337,9 +385,15 @@ export class Compositor {
     require(canvas !== null, 'canvas is required');
 
     this.canvas = canvas;
-    const ctx = canvas.getContext('2d');
-    require(ctx !== null, 'Failed to get 2D context');
-    this.ctx = ctx!;
+    this.renderer = new GlRenderer(canvas);
+    this.overlay = new Overlay2D(this.renderer);
+    this.renderer.onContextRestored = () => {
+      // GPU state is gone; OffscreenCanvases retain content, so re-upload all.
+      for (const state of this.surfaceGl.values()) state.texture = undefined;
+      for (const surface of this.surfaces.values()) surface.dirty = true;
+      this.overlay.invalidate();
+      this.needsRender = true;
+    };
 
     // Handle resize
     this.handleResize();
@@ -356,9 +410,10 @@ export class Compositor {
     const dpr = window.devicePixelRatio || 1;
     const rect = this.canvas.getBoundingClientRect();
 
-    this.canvas.width = rect.width * dpr;
-    this.canvas.height = rect.height * dpr;
-    this.ctx.scale(dpr, dpr);
+    this.renderer.setSize(rect.width, rect.height, dpr);
+    this.renderer.cssWidth = rect.width;
+    this.renderer.cssHeight = rect.height;
+    this.overlay.resize(rect.width, rect.height, dpr);
 
     this.needsRender = true;
   }
@@ -397,6 +452,7 @@ export class Compositor {
       canvas: offscreen,
       ctx: ctx!,
       dirty: true,
+      tainted: false,
       drawn: false,
       transparent,
       closable,
@@ -418,6 +474,10 @@ export class Compositor {
     const deleted = this.surfaces.delete(surfaceId);
     if (deleted) {
       this.liveDataImages.delete(surfaceId);
+      const glState = this.surfaceGl.get(surfaceId);
+      if (glState?.texture) this.renderer.deleteTexture(glState.texture);
+      this.surfaceGl.delete(surfaceId);
+      this.sceneStore.removeForSurface(surfaceId);
       this.sortSurfaces();
       this.needsRender = true;
     }
@@ -428,6 +488,12 @@ export class Compositor {
    * Destroy all surfaces. Used when reconnecting to backend.
    */
   clearAllSurfaces(): void {
+    for (const glState of this.surfaceGl.values()) {
+      if (glState.texture) this.renderer.deleteTexture(glState.texture);
+    }
+    this.surfaceGl.clear();
+    this.sceneStore.clear();
+    this.worldKeys.clear();
     this.surfaces.clear();
     this.sortedSurfaces = [];
     this.liveDataImages.clear();
@@ -457,22 +523,30 @@ export class Compositor {
     const surface = this.surfaces.get(surfaceId);
     if (!surface || !surface.drawn) return null;
 
-    const blob = await surface.canvas.convertToBlob({ type: 'image/png' });
-    const buffer = await blob.arrayBuffer();
-    const bytes = new Uint8Array(buffer);
-    let binary = '';
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-    return {
-      imageBase64: btoa(binary),
-      width: surface.rect.width,
-      height: surface.rect.height,
-    };
+    try {
+      // convertToBlob throws on a canvas tainted by a cross-origin image.
+      const blob = await surface.canvas.convertToBlob({ type: 'image/png' });
+      const buffer = await blob.arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      return {
+        imageBase64: btoa(binary),
+        width: surface.rect.width,
+        height: surface.rect.height,
+      };
+    } catch {
+      return null;
+    }
   }
 
   /**
    * Capture the entire desktop as a base64-encoded PNG.
    */
   captureDesktop(): { imageBase64: string; width: number; height: number } {
+    // The GL drawing buffer is invalidated after compositing, so render
+    // synchronously and read back in the same task.
+    this.render();
     const dataUrl = this.canvas.toDataURL('image/png');
     const imageBase64 = dataUrl.split(',')[1] ?? '';
     return {
@@ -505,10 +579,38 @@ export class Compositor {
   moveSurface(surfaceId: string, x: number, y: number): void {
     const surface = this.surfaces.get(surfaceId);
     if (surface) {
+      // Drag tilt: lean the slab a few degrees toward the motion (visual
+      // only; spring-settles in syncDesktop as the target decays).
+      const glState = this.glState(surfaceId);
+      if (glState.lastMoveX !== undefined && glState.lastMoveY !== undefined) {
+        const dx = x - glState.lastMoveX;
+        const dy = y - glState.lastMoveY;
+        const k = 0.004;
+        const max = Compositor.TILT_MAX;
+        glState.tiltTargetY = Math.max(-max, Math.min(max, dx * k));
+        glState.tiltTargetX = Math.max(-max, Math.min(max, -dy * k));
+      }
+      glState.lastMoveX = x;
+      glState.lastMoveY = y;
+
       surface.rect.x = x;
       surface.rect.y = y;
       this.needsRender = true;
     }
+  }
+
+  /** Per-surface GPU/animation state, created on demand. */
+  private glState(surfaceId: string): SurfaceGlState {
+    let state = this.surfaceGl.get(surfaceId);
+    if (!state) {
+      state = {
+        model: mat4Identity(),
+        tiltX: 0, tiltY: 0, tiltTargetX: 0, tiltTargetY: 0,
+        lift: 0,
+      };
+      this.surfaceGl.set(surfaceId, state);
+    }
+    return state;
   }
 
   /**
@@ -573,48 +675,47 @@ export class Compositor {
     this.needsRender = true;
   }
 
+  // ── Scene vocabulary (retained 3D nodes) ─────────────────────────────
+
   /**
-   * Draw a soft accent halo around a focused window's rect, on the desktop
-   * canvas (in workspace coords — caller has already applied the scroll
-   * translate). Drawn before the surface image so window content covers the
-   * inward spill, leaving the outward halo visible beyond the window edges.
+   * Apply a validated scene-op batch to a surface's subtree. Ops are
+   * retained: nodes persist until removed or the surface is destroyed.
    */
-  private drawFocusGlow(rect: Rect): void {
-    const ctx = this.ctx;
-    // Pure BLOOM (no ring line): fill the window silhouette inset behind the
-    // window and show only its outward shadow. Two passes — a tight bright halo
-    // hugging the edge plus a soft wider falloff — so it reads as a real glow
-    // around the single window border, not a second outline.
-    // Match the window's silhouette (its corner radius, hugged with a 1px inset)
-    // so the bloom is uniform on the edges AND the corners.
-    const inset = 1;
-    const x = rect.x + inset;
-    const y = rect.y + inset;
-    const w = rect.width - inset * 2;
-    const h = rect.height - inset * 2;
-    if (w <= 0 || h <= 0) return;
-    const radius = Math.max(0, Math.min(this.focusGlowRadius, w / 2, h / 2));
-    ctx.save();
-    ctx.fillStyle = this.focusGlowColor;
-    ctx.shadowColor = this.focusGlowColor;
-    ctx.beginPath();
-    ctx.moveTo(x + radius, y);
-    ctx.lineTo(x + w - radius, y);
-    ctx.arcTo(x + w, y, x + w, y + radius, radius);
-    ctx.lineTo(x + w, y + h - radius);
-    ctx.arcTo(x + w, y + h, x + w - radius, y + h, radius);
-    ctx.lineTo(x + radius, y + h);
-    ctx.arcTo(x, y + h, x, y + h - radius, radius);
-    ctx.lineTo(x, y + radius);
-    ctx.arcTo(x, y, x + radius, y, radius);
-    ctx.closePath();
-    ctx.globalAlpha = 0.5;
-    ctx.shadowBlur = 10;
-    ctx.fill();
-    ctx.globalAlpha = 0.3;
-    ctx.shadowBlur = 24;
-    ctx.fill();
-    ctx.restore();
+  applySceneOps(surfaceId: string, ops: SceneOp[]): void {
+    this.sceneStore.apply(surfaceId, ops);
+    this.needsRender = true;
+  }
+
+  /**
+   * Apply a world-scope scene-op batch: nodes in the global scene graph,
+   * positioned in workspace coordinates, namespaced per owning abject.
+   */
+  applyWorldSceneOps(ownerId: string, ops: SceneOp[]): void {
+    const key = `world:${ownerId}`;
+    this.sceneStore.apply(key, ops);
+    this.worldKeys.add(key);
+    this.needsRender = true;
+  }
+
+  /**
+   * Set the scene theme (active workspace palette subset). Slab chrome,
+   * shadows, rim glow, and `$token` material colors all re-resolve against
+   * it — the 3D equivalent of widgets re-deriving colors from this.theme.
+   */
+  setSceneTheme(theme: SceneTheme): void {
+    this.sceneTheme = theme;
+    this.needsRender = true;
+  }
+
+  /**
+   * Abject-requested slab transform: tilt/float a window in the scene.
+   * Purely visual; picking follows automatically via the model matrix.
+   */
+  setSurfaceTransform(surfaceId: string, transform: { rotation?: [number, number, number]; z?: number }): void {
+    const state = this.glState(surfaceId);
+    state.userRotation = transform.rotation;
+    state.userZ = transform.z;
+    this.needsRender = true;
   }
 
   /**
@@ -863,14 +964,15 @@ export class Compositor {
               }
               this.needsRender = true;
             };
+            // Load with CORS so the decoded pixels can be uploaded to WebGL.
+            // We deliberately do NOT retry without crossOrigin on failure: a
+            // non-CORS image taints the surface canvas, and a tainted canvas
+            // makes texImage2D throw, which would break the whole desktop.
+            // Cross-origin images that need to display must be fetched
+            // server-side (HttpClient.getBase64) and drawn as data: URIs.
             entry.img.crossOrigin = 'anonymous';
             entry.img.onload = () => drawToSurface(entry.img);
-            entry.img.onerror = () => {
-              const fallback = new Image();
-              fallback.onload = () => drawToSurface(fallback);
-              fallback.onerror = () => this.imageCache.delete(p.url);
-              fallback.src = p.url;
-            };
+            entry.img.onerror = () => this.imageCache.delete(p.url);
             entry.img.src = p.url;
           }
           // If cached but not yet loaded, skip — will render on next frame when load completes
@@ -1294,8 +1396,9 @@ export class Compositor {
   private startRenderLoop(): void {
     const render = () => {
       if (this.needsRender) {
-        this.render();
+        // Clear BEFORE rendering so an animating frame can re-request.
         this.needsRender = false;
+        this.render();
       }
       this.animationFrameId = requestAnimationFrame(render);
     };
@@ -1310,54 +1413,261 @@ export class Compositor {
       cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = undefined;
     }
+    this.renderer.dispose();
   }
 
   /**
-   * Render all surfaces to the main canvas.
+   * Render the scene.
    */
   private render(): void {
-    // Clear main canvas
-    this.ctx.clearRect(
-      0,
-      0,
-      this.canvas.width / (window.devicePixelRatio || 1),
-      this.canvas.height / (window.devicePixelRatio || 1)
-    );
-
+    if (this.renderer.isContextLost) return;
+    this.renderer.beginFrame();
     if (this.mobileMode) {
       this.renderMobile();
     } else {
       this.renderDesktop();
     }
+    this.overlay.draw();
+  }
+
+  /**
+   * Perspective camera whose z=0 plane maps ~1:1 to CSS pixels. The eye sits
+   * over the viewport center (plus scroll), so desktop scroll is a camera
+   * truck and lifted/tilted slabs gain genuine parallax.
+   */
+  private updateCamera(scrollX: number, scrollY: number): void {
+    const w = Math.max(1, this.width);
+    const h = Math.max(1, this.height);
+    const dist = (h / 2) / Math.tan(Compositor.CAMERA_FOV / 2);
+    const eyeX = w / 2 + scrollX;
+    const eyeY = h / 2 + scrollY;
+    this.cameraPos = [eyeX, eyeY, dist];
+    const proj = mat4PerspectiveYDown(Compositor.CAMERA_FOV, w / h, dist / 10, dist * 4);
+    const view = mat4Translation(-eyeX, -eyeY, -dist);
+    this.viewProj = mat4Multiply(proj, view);
+    this.invViewProj = mat4Invert(this.viewProj);
+  }
+
+  /** Theme-derived chrome values with arcane defaults pre-theme. */
+  private chromeColors(): { shadow: RGBA; glow: RGBA; radius: number; depth: number } {
+    const t = this.sceneTheme;
+    return {
+      shadow: parseCssColor(t?.shadow.color ?? 'rgba(0,0,0,0.55)'),
+      glow: parseCssColor(t?.glow.focusColor ?? this.focusGlowColor),
+      radius: t?.windowRadius ?? this.focusGlowRadius,
+      depth: t?.surface.gradient ?? 1,
+    };
   }
 
   private renderDesktop(): void {
     this.clampScroll();
+    this.updateCamera(this.scrollX, this.scrollY);
 
-    this.ctx.save();
-    this.ctx.translate(-this.scrollX, -this.scrollY);
+    const chrome = this.chromeColors();
+    let animating = false;
+
+    // World-scope nodes behind the windows (desktop décor, roaming pets).
+    this.drawWorldNodes('back');
+
     for (const surface of this.sortedSurfaces) {
       if (!surface.visible || !surface.drawn) continue;
       if (this.isWorkspaceFiltered(surface)) continue;
 
-      // Skip the focus-glow halo for transparent windows: the glow fills the
-      // window silhouette behind the surface, which would bleed through a
-      // surface that paints no background of its own (e.g. toasts).
-      if (surface.id === this.focusedSurfaceId && !surface.transparent) {
-        this.drawFocusGlow(surface.rect);
+      const state = this.glState(surface.id);
+      const focused = surface.id === this.focusedSurfaceId;
+
+      // Ease the focus lift and spring-settle the drag tilt.
+      const liftTarget = focused ? Compositor.FOCUS_LIFT : 0;
+      state.lift += (liftTarget - state.lift) * 0.25;
+      if (Math.abs(state.lift - liftTarget) < 0.1) state.lift = liftTarget;
+      else animating = true;
+      state.tiltTargetX *= 0.82;
+      state.tiltTargetY *= 0.82;
+      state.tiltX += (state.tiltTargetX - state.tiltX) * 0.3;
+      state.tiltY += (state.tiltTargetY - state.tiltY) * 0.3;
+      if (Math.abs(state.tiltX) > 0.0005 || Math.abs(state.tiltY) > 0.0005) animating = true;
+      else { state.tiltX = 0; state.tiltY = 0; }
+
+      const { rect } = surface;
+      const cx = rect.x + rect.width / 2;
+      const cy = rect.y + rect.height / 2;
+      const rot = state.userRotation ?? [0, 0, 0];
+      const z = state.lift + (state.userZ ?? 0);
+      const model = mat4TRS(
+        cx, cy, z,
+        state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
+        rect.width, rect.height, 1,
+      );
+      state.model = model;
+
+      const radius = surface.transparent ? 0 : Math.min(chrome.radius, rect.width / 2, rect.height / 2);
+
+      if (!surface.transparent) {
+        // Soft shadow beneath the slab — deeper when focused (depth scaled
+        // by the theme's surface treatment; flat themes get flat desktops).
+        const shadowSigma = (focused ? 16 : 9) * Math.max(0.25, chrome.depth);
+        const pad = shadowSigma * 4;
+        const shadowModel = mat4TRS(
+          cx, cy + (focused ? 12 : 7), z - 1,
+          state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
+          rect.width + pad * 2, rect.height + pad * 2, 1,
+        );
+        this.renderer.drawGlow({
+          model: shadowModel, viewProj: this.viewProj,
+          quadWidth: rect.width + pad * 2, quadHeight: rect.height + pad * 2,
+          halfWidth: rect.width / 2 - 1, halfHeight: rect.height / 2 - 1,
+          radius,
+          color: chrome.shadow,
+          a1: focused ? 0.55 : 0.4, sigma1: shadowSigma,
+        });
+
+        // Focus bloom: the accent halo around the focused slab.
+        if (focused) {
+          const pad2 = 56;
+          const glowModel = mat4TRS(
+            cx, cy, z - 0.5,
+            state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
+            rect.width + pad2 * 2, rect.height + pad2 * 2, 1,
+          );
+          this.renderer.drawGlow({
+            model: glowModel, viewProj: this.viewProj,
+            quadWidth: rect.width + pad2 * 2, quadHeight: rect.height + pad2 * 2,
+            halfWidth: rect.width / 2 - 1, halfHeight: rect.height / 2 - 1,
+            radius,
+            color: chrome.glow,
+            a1: 0.5, sigma1: 5,
+            a2: 0.3, sigma2: 12,
+          });
+        }
       }
 
-      this.ctx.drawImage(
-        surface.canvas,
-        surface.rect.x,
-        surface.rect.y,
-        surface.rect.width,
-        surface.rect.height
-      );
-    }
-    this.ctx.restore();
+      this.drawSurfaceSlab(surface, state, model, {
+        radius,
+        dim: focused || surface.transparent ? 1 : 0.93,
+        opacity: 1,
+        rim: focused && !surface.transparent
+          ? { ...chrome.glow, a: chrome.glow.a * 0.9 }
+          : undefined,
+      });
 
-    this.renderScrollbars();
+      // Scene-vocabulary nodes ride the window's UNSCALED frame (the slab
+      // model bakes in the window's px size, which would distort meshes).
+      const frame = mat4TRS(
+        cx, cy, z,
+        state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
+        1, 1, 1,
+      );
+      this.drawVocabNodes(surface, frame);
+    }
+
+    // World-scope nodes above the windows (params.layer: 'front').
+    this.drawWorldNodes('front');
+
+    this.renderScrollbarsOverlay();
+    if (animating) this.needsRender = true;
+  }
+
+  /** Upload (if dirty) and draw one surface slab. */
+  private drawSurfaceSlab(
+    surface: Surface,
+    state: SurfaceGlState,
+    model: Mat4,
+    opts: { radius: number; dim: number; opacity: number; rim?: RGBA; scissor?: { x: number; y: number; width: number; height: number } },
+  ): void {
+    if (!state.texture) {
+      state.texture = this.renderer.createTexture();
+      surface.dirty = true;
+    }
+    if (surface.dirty && !surface.tainted) {
+      const ok = this.renderer.uploadTexture(state.texture, surface.canvas);
+      surface.dirty = false;
+      if (!ok) {
+        // Cross-origin image tainted this canvas: texImage2D can no longer
+        // read it. Stop retrying; the slab keeps its last-good texture (or the
+        // 1x1 placeholder) so the rest of the desktop renders normally.
+        surface.tainted = true;
+        console.warn(`[Compositor] surface ${surface.id} tainted by a cross-origin image; freezing its texture`);
+      }
+    }
+    this.renderer.drawSurface({
+      model,
+      viewProj: this.viewProj,
+      texture: state.texture,
+      width: surface.rect.width,
+      height: surface.rect.height,
+      radius: opts.radius,
+      dim: opts.dim,
+      opacity: opts.opacity,
+      rimColor: opts.rim,
+      rimWidth: 2.5,
+      scissor: opts.scissor,
+    });
+  }
+
+  /** Draw the retained scene-vocabulary nodes attached to a surface. */
+  private drawVocabNodes(surface: Surface, surfaceModel: Mat4): void {
+    this.drawNodeTree(surface.id, surfaceModel);
+  }
+
+  /**
+   * Draw a retained node tree (a window subtree or a world-scope namespace)
+   * against a frame matrix. When `layer` is given, only meshes whose
+   * params.layer matches render (world trees draw 'back' meshes behind the
+   * windows and 'front' meshes above them); lights illuminate both passes.
+   */
+  private drawNodeTree(key: string, surfaceModel: Mat4, layer?: 'back' | 'front'): void {
+    const nodes = this.sceneStore.nodesForSurface(key);
+    if (nodes.length === 0) return;
+
+    // Collect lights first (they illuminate every mesh in this subtree).
+    const lights: MeshLight[] = [];
+    for (const node of nodes) {
+      if (node.kind !== 'light' || lights.length >= 4) continue;
+      const world = this.sceneStore.worldMatrix(node, surfaceModel);
+      const color = parseCssColor(resolveSceneColor((node.params.color as string) ?? '#ffffff', this.sceneTheme));
+      const lightType = node.params.lightType as string;
+      if (lightType === 'directional') {
+        const dir = (node.params.direction as [number, number, number]) ?? [0, 0.4, -1];
+        lights.push({ pos: [dir[0], dir[1], dir[2], 0], color: [color.r, color.g, color.b] });
+      } else {
+        lights.push({ pos: [world[12], world[13], world[14], 1], color: [color.r, color.g, color.b] });
+      }
+    }
+    if (lights.length === 0) {
+      // Default key light from the camera's upper left.
+      lights.push({ pos: [-0.4, -0.5, -1, 0], color: [0.9, 0.9, 0.95] });
+    }
+
+    for (const node of nodes) {
+      if (node.kind !== 'mesh') continue;
+      if (layer !== undefined && ((node.params.layer as string) ?? 'back') !== layer) continue;
+      const world = this.sceneStore.worldMatrix(node, surfaceModel);
+      const color = parseCssColor(resolveSceneColor((node.params.color as string) ?? '#ffffff', this.sceneTheme));
+      const emissiveStr = node.params.emissive as string | undefined;
+      this.renderer.drawMesh({
+        model: world,
+        viewProj: this.viewProj,
+        geometry: getGeometry((node.params.primitive as MeshPrimitive) ?? 'box'),
+        color,
+        emissive: emissiveStr ? parseCssColor(resolveSceneColor(emissiveStr, this.sceneTheme)) : undefined,
+        opacity: (node.params.opacity as number) ?? 1,
+        lights,
+        cameraPos: this.cameraPos,
+      });
+    }
+  }
+
+  /** Draw all world-scope node trees for one layer (workspace coordinates). */
+  private drawWorldNodes(layer: 'back' | 'front'): void {
+    if (this.worldKeys.size === 0) return;
+    const identity = mat4Identity();
+    for (const key of this.worldKeys) {
+      if (this.sceneStore.nodesForSurface(key).length === 0) {
+        this.worldKeys.delete(key);
+        continue;
+      }
+      this.drawNodeTree(key, identity, layer);
+    }
   }
 
   /**
@@ -1408,50 +1718,50 @@ export class Compositor {
     return { x: this.scrollX, y: this.scrollY };
   }
 
-  private renderScrollbars(): void {
+  /** Screen-space chrome for the desktop (scrollbars) on the 2D overlay. */
+  private renderScrollbarsOverlay(): void {
     const ws = this.getWorkspaceSize();
     const needH = ws.width > this.width;
     const needV = ws.height > this.height;
+    const ctx = this.overlay.begin();
     if (!needH && !needV) return;
+    this.overlay.markContent();
 
     const SZ = Compositor.SCROLLBAR_SIZE;
     const M = Compositor.SCROLLBAR_MARGIN;
-    this.ctx.save();
 
     if (needV) {
       // Track
-      this.ctx.fillStyle = 'rgba(0,0,0,0.25)';
-      this.ctx.fillRect(this.width - SZ - M, M, SZ, this.height - 2 * M - (needH ? SZ + M : 0));
+      ctx.fillStyle = 'rgba(0,0,0,0.25)';
+      ctx.fillRect(this.width - SZ - M, M, SZ, this.height - 2 * M - (needH ? SZ + M : 0));
       // Thumb
       const trackH = this.height - 2 * M - (needH ? SZ + M : 0);
       const thumbH = Math.max(24, (this.height / ws.height) * trackH);
       const thumbY = M + (this.scrollY / (ws.height - this.height)) * (trackH - thumbH);
-      this.ctx.fillStyle = 'rgba(180,180,200,0.6)';
-      this.scrollbarThumbPath(this.width - SZ - M, thumbY, SZ, thumbH, 4);
-      this.ctx.fill();
+      ctx.fillStyle = 'rgba(180,180,200,0.6)';
+      this.roundRectOn(ctx, this.width - SZ - M, thumbY, SZ, thumbH, 4);
+      ctx.fill();
     }
     if (needH) {
-      this.ctx.fillStyle = 'rgba(0,0,0,0.25)';
-      this.ctx.fillRect(M, this.height - SZ - M, this.width - 2 * M - (needV ? SZ + M : 0), SZ);
+      ctx.fillStyle = 'rgba(0,0,0,0.25)';
+      ctx.fillRect(M, this.height - SZ - M, this.width - 2 * M - (needV ? SZ + M : 0), SZ);
       const trackW = this.width - 2 * M - (needV ? SZ + M : 0);
       const thumbW = Math.max(24, (this.width / ws.width) * trackW);
       const thumbX = M + (this.scrollX / (ws.width - this.width)) * (trackW - thumbW);
-      this.ctx.fillStyle = 'rgba(180,180,200,0.6)';
-      this.scrollbarThumbPath(thumbX, this.height - SZ - M, thumbW, SZ, 4);
-      this.ctx.fill();
+      ctx.fillStyle = 'rgba(180,180,200,0.6)';
+      this.roundRectOn(ctx, thumbX, this.height - SZ - M, thumbW, SZ, 4);
+      ctx.fill();
     }
-
-    this.ctx.restore();
   }
 
-  private scrollbarThumbPath(x: number, y: number, w: number, h: number, r: number): void {
-    const ctx = this.ctx;
+  private roundRectOn(ctx: OffscreenCanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
+    const rr = Math.min(r, w / 2, h / 2);
     ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.arcTo(x + w, y, x + w, y + h, r);
-    ctx.arcTo(x + w, y + h, x, y + h, r);
-    ctx.arcTo(x, y + h, x, y, r);
-    ctx.arcTo(x, y, x + w, y, r);
+    ctx.moveTo(x + rr, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rr);
+    ctx.arcTo(x + w, y + h, x, y + h, rr);
+    ctx.arcTo(x, y + h, x, y, rr);
+    ctx.arcTo(x, y, x + w, y, rr);
     ctx.closePath();
   }
 
@@ -1537,9 +1847,10 @@ export class Compositor {
   }
 
   private renderMobile(): void {
+    this.updateCamera(0, 0);
+
     if (this.mobileView === MobileViewState.CARD_OVERVIEW) {
       this.renderCardOverview();
-      this.renderGestureHandle();
       return;
     }
 
@@ -1571,34 +1882,39 @@ export class Compositor {
       // Cache transform for coordinate mapping
       this.mobileTransform = { scale, offsetX, offsetY };
 
-      // Clip to content area (above the gesture handle)
-      this.ctx.save();
-      this.ctx.beginPath();
-      this.ctx.rect(0, 0, availW, availH);
-      this.ctx.clip();
-      this.ctx.translate(offsetX, offsetY);
-      this.ctx.scale(scale, scale);
-      this.ctx.drawImage(surface.canvas, 0, 0, surface.rect.width, surface.rect.height);
-      this.ctx.restore();
+      const state = this.glState(surface.id);
+      const model = mat4TRS(
+        offsetX + scaledW / 2, offsetY + scaledH / 2, 0,
+        0, 0, 0,
+        scaledW, scaledH, 1,
+      );
+      state.model = model;
+      this.drawSurfaceSlab(surface, state, model, {
+        radius: 0,
+        dim: 1,
+        opacity: 1,
+        // Clip to content area (above the gesture handle)
+        scissor: { x: 0, y: 0, width: availW, height: availH },
+      });
     }
 
-    this.renderGestureHandle();
+    const ctx = this.overlay.begin();
+    this.drawGestureHandle(ctx);
+    this.overlay.markContent();
   }
 
   /** Slim centered pill hinting the swipe-up-from-bottom gesture. */
-  private renderGestureHandle(): void {
+  private drawGestureHandle(ctx: OffscreenCanvasRenderingContext2D): void {
     const h = Compositor.MOBILE_GESTURE_HANDLE_HEIGHT;
     const y = this.height - h / 2;
     const pillW = 120;
     const pillH = 4;
     const x = (this.width - pillW) / 2;
-    this.ctx.save();
-    this.ctx.fillStyle = this.mobileView === MobileViewState.CARD_OVERVIEW
+    ctx.fillStyle = this.mobileView === MobileViewState.CARD_OVERVIEW
       ? 'rgba(139,139,255,0.6)'
       : 'rgba(160,160,190,0.4)';
-    this.roundRectPath(x, y - pillH / 2, pillW, pillH, pillH / 2);
-    this.ctx.fill();
-    this.ctx.restore();
+    this.roundRectOn(ctx, x, y - pillH / 2, pillW, pillH, pillH / 2);
+    ctx.fill();
   }
 
   // ── Card overview (WebOS-style) ─────────────────────────────────────
@@ -1668,22 +1984,23 @@ export class Compositor {
   private renderCardOverview(): void {
     this.reconcileCardOrder();
     const availH = this.mobileAvailHeight;
+    const chrome = this.chromeColors();
 
-    // Dim backdrop.
-    this.ctx.save();
-    this.ctx.fillStyle = 'rgba(8,8,16,0.92)';
-    this.ctx.fillRect(0, 0, this.width, availH);
-    this.ctx.restore();
+    // Dim backdrop quad.
+    const backdropModel = mat4TRS(this.width / 2, availH / 2, -2, 0, 0, 0, this.width, availH, 1);
+    this.renderer.drawFlat(backdropModel, this.viewProj, { r: 8 / 255, g: 8 / 255, b: 16 / 255, a: 0.92 });
+
+    const overlayCtx = this.overlay.begin();
+    this.overlay.markContent();
 
     const n = this.mobileCardOrder.length;
     if (n === 0) {
-      this.ctx.save();
-      this.ctx.fillStyle = '#666680';
-      this.ctx.font = '16px "Spectral", Georgia, serif';
-      this.ctx.textAlign = 'center';
-      this.ctx.textBaseline = 'middle';
-      this.ctx.fillText('No windows', this.width / 2, availH / 2);
-      this.ctx.restore();
+      overlayCtx.fillStyle = '#666680';
+      overlayCtx.font = '16px "Spectral", Georgia, serif';
+      overlayCtx.textAlign = 'center';
+      overlayCtx.textBaseline = 'middle';
+      overlayCtx.fillText('No windows', this.width / 2, availH / 2);
+      this.drawGestureHandle(overlayCtx);
       return;
     }
 
@@ -1705,78 +2022,78 @@ export class Compositor {
       if (drag && drag.surfaceId === surface.id && !drag.reorder && drag.dy < 0) {
         alpha *= Math.max(0, 1 - (-drag.dy) / (h * 0.6));
       }
+      alpha = Math.max(0, alpha);
       const isActive = Math.round(this.mobileCardScroll) === i;
 
-      this.ctx.save();
-      this.ctx.globalAlpha = Math.max(0, alpha);
+      // Real depth: off-center cards recede and turn toward the center.
+      const cx = x + w / 2;
+      const cy = y + h / 2;
+      const zRecede = -Math.min(Math.abs(slot), 2) * 90;
+      const yTurn = -Math.max(-1.2, Math.min(1.2, slot)) * 0.32;
+      const state = this.glState(surface.id);
+      const model = mat4TRS(cx, cy, zRecede, 0, yTurn, 0, w, h, 1);
+      state.model = model;
 
-      // Card frame + shadow.
-      this.ctx.shadowColor = 'rgba(0,0,0,0.5)';
-      this.ctx.shadowBlur = isActive ? 24 : 12;
-      this.ctx.shadowOffsetY = 6;
-      this.ctx.fillStyle = '#0d0d14';
-      this.roundRectPath(x, y, w, h, 8);
-      this.ctx.fill();
-      this.ctx.shadowColor = 'transparent';
-      this.ctx.shadowBlur = 0;
+      // Card shadow.
+      const pad = 40;
+      this.renderer.drawGlow({
+        model: mat4TRS(cx, cy + 6, zRecede - 1, 0, yTurn, 0, w + pad * 2, h + pad * 2, 1),
+        viewProj: this.viewProj,
+        quadWidth: w + pad * 2, quadHeight: h + pad * 2,
+        halfWidth: w / 2, halfHeight: h / 2,
+        radius: 8,
+        color: { r: 0, g: 0, b: 0, a: 0.5 * alpha },
+        a1: 1, sigma1: (isActive ? 24 : 12) / 2,
+      });
 
-      // Live snapshot, clipped to rounded card.
-      this.ctx.save();
-      this.roundRectPath(x, y, w, h, 8);
-      this.ctx.clip();
-      this.ctx.drawImage(
-        surface.canvas,
-        0, 0, surface.rect.width, surface.rect.height,
-        x, y, w, h,
-      );
-      this.ctx.restore();
+      // Card frame fill behind transparent content (sharp rounded rect via
+      // the glow shader with a sub-pixel sigma).
+      this.renderer.drawGlow({
+        model,
+        viewProj: this.viewProj,
+        quadWidth: w, quadHeight: h,
+        halfWidth: w / 2, halfHeight: h / 2,
+        radius: 8,
+        color: { r: 13 / 255, g: 13 / 255, b: 20 / 255, a: alpha },
+        a1: 1, sigma1: 0.4,
+      });
 
-      // Accent border on the active card.
-      if (isActive) {
-        this.ctx.strokeStyle = 'rgba(139,139,255,0.8)';
-        this.ctx.lineWidth = 2;
-        this.roundRectPath(x, y, w, h, 8);
-        this.ctx.stroke();
-      }
+      this.drawSurfaceSlab(surface, state, model, {
+        radius: 8,
+        dim: 1,
+        opacity: alpha,
+        rim: isActive ? { ...chrome.glow, a: 0.8 * alpha } : undefined,
+      });
 
-      // Title below the card.
-      this.ctx.fillStyle = isActive ? '#c8c8ff' : '#666680';
-      this.ctx.font = '13px "Spectral", Georgia, serif';
-      this.ctx.textAlign = 'center';
-      this.ctx.textBaseline = 'top';
+      // Title below the card (active card sits unrotated, so 2D chrome aligns).
+      overlayCtx.globalAlpha = alpha;
+      overlayCtx.fillStyle = isActive ? '#c8c8ff' : '#666680';
+      overlayCtx.font = '13px "Spectral", Georgia, serif';
+      overlayCtx.textAlign = 'center';
+      overlayCtx.textBaseline = 'top';
       const label = (surface.title || surface.id.slice(0, 12)).slice(0, 22);
-      this.ctx.fillText(label, x + w / 2, y + h + 8);
+      overlayCtx.fillText(label, x + w / 2, y + h + 8);
 
       // Close chip on the active card (only if the window may be closed).
       if (isActive && surface.closable) {
         const chip = this.cardCloseChipRect(x, y, w);
-        this.ctx.fillStyle = 'rgba(20,20,34,0.9)';
-        this.ctx.beginPath();
-        this.ctx.arc(chip.cx, chip.cy, chip.r, 0, Math.PI * 2);
-        this.ctx.fill();
-        this.ctx.strokeStyle = '#8b8bff';
-        this.ctx.lineWidth = 1.5;
-        this.ctx.beginPath();
-        this.ctx.moveTo(chip.cx - 4, chip.cy - 4);
-        this.ctx.lineTo(chip.cx + 4, chip.cy + 4);
-        this.ctx.moveTo(chip.cx + 4, chip.cy - 4);
-        this.ctx.lineTo(chip.cx - 4, chip.cy + 4);
-        this.ctx.stroke();
+        overlayCtx.fillStyle = 'rgba(20,20,34,0.9)';
+        overlayCtx.beginPath();
+        overlayCtx.arc(chip.cx, chip.cy, chip.r, 0, Math.PI * 2);
+        overlayCtx.fill();
+        overlayCtx.strokeStyle = '#8b8bff';
+        overlayCtx.lineWidth = 1.5;
+        overlayCtx.beginPath();
+        overlayCtx.moveTo(chip.cx - 4, chip.cy - 4);
+        overlayCtx.lineTo(chip.cx + 4, chip.cy + 4);
+        overlayCtx.moveTo(chip.cx + 4, chip.cy - 4);
+        overlayCtx.lineTo(chip.cx - 4, chip.cy + 4);
+        overlayCtx.stroke();
       }
-
-      this.ctx.restore();
+      overlayCtx.globalAlpha = 1;
     }
-  }
 
-  private roundRectPath(x: number, y: number, w: number, h: number, r: number): void {
-    const rr = Math.min(r, w / 2, h / 2);
-    this.ctx.beginPath();
-    this.ctx.moveTo(x + rr, y);
-    this.ctx.arcTo(x + w, y, x + w, y + h, rr);
-    this.ctx.arcTo(x + w, y + h, x, y + h, rr);
-    this.ctx.arcTo(x, y + h, x, y, rr);
-    this.ctx.arcTo(x, y, x + w, y, rr);
-    this.ctx.closePath();
+    this.drawGestureHandle(overlayCtx);
   }
 
   private cardCloseChipRect(x: number, y: number, w: number): { cx: number; cy: number; r: number } {
@@ -1784,14 +2101,16 @@ export class Compositor {
   }
 
   /**
-   * Find surface at a point.
+   * Find surface at a point. Desktop picking casts a ray through the camera
+   * and intersects each slab's plane in its local space (so lifted/tilted
+   * windows pick exactly), then keeps the existing per-pixel alpha test so
+   * transparent pixels pass clicks through.
    */
   surfaceAt(x: number, y: number): Surface | undefined {
     if (this.mobileMode) {
       return this.mobileHitTest(x, y);
     }
-    // Translate viewport coords → workspace coords
-    return this.desktopHitTest(x + this.scrollX, y + this.scrollY);
+    return this.desktopHitTest(x, y);
   }
 
   /**
@@ -1802,7 +2121,139 @@ export class Compositor {
     return { x: x + this.scrollX, y: y + this.scrollY };
   }
 
-  private desktopHitTest(x: number, y: number): Surface | undefined {
+  /**
+   * Find the topmost scene-vocabulary MESH node at a viewport point — the
+   * 3D analogue of widget hit-testing. Follows visual order: front-layer
+   * world nodes, then each window's subtree meshes and slab top-down
+   * (an opaque slab occludes everything beneath it), then back-layer world
+   * nodes. Returns the node plus its scope so input can route to the owner.
+   */
+  nodeAt(x: number, y: number): { scope: 'window' | 'world'; surfaceId?: string; ownerId?: string; nodeId: string } | undefined {
+    if (this.mobileMode) return undefined;
+    this.clampScroll();
+    this.updateCamera(this.scrollX, this.scrollY);
+    const ray = rayFromScreen(x, y, this.width, this.height, this.invViewProj);
+
+    // 1. World nodes above all windows
+    const front = this.hitWorldNodes(ray, 'front');
+    if (front) return front;
+
+    // 2. Windows top-down: subtree meshes render above their slab
+    for (let i = this.sortedSurfaces.length - 1; i >= 0; i--) {
+      const surface = this.sortedSurfaces[i];
+      if (!surface.visible || !surface.drawn) continue;
+      if (this.isWorkspaceFiltered(surface)) continue;
+
+      const state = this.surfaceGl.get(surface.id);
+      const { rect } = surface;
+      const cx = rect.x + rect.width / 2;
+      const cy = rect.y + rect.height / 2;
+      const slabModel = state?.model ?? mat4TRS(cx, cy, 0, 0, 0, 0, rect.width, rect.height, 1);
+
+      const frame = mat4TRS(
+        cx, cy, (state?.lift ?? 0) + (state?.userZ ?? 0),
+        (state?.tiltX ?? 0) + (state?.userRotation?.[0] ?? 0),
+        (state?.tiltY ?? 0) + (state?.userRotation?.[1] ?? 0),
+        state?.userRotation?.[2] ?? 0,
+        1, 1, 1,
+      );
+      const nodeId = this.hitNodeTree(ray, surface.id, frame);
+      if (nodeId) return { scope: 'window', surfaceId: surface.id, nodeId };
+
+      if (surface.inputPassthrough) continue;
+      const hit = raySurfaceHit(ray, slabModel, rect.width, rect.height);
+      if (!hit) continue;
+      try {
+        const pixel = surface.ctx.getImageData(
+          Math.max(0, Math.min(rect.width - 1, Math.floor(hit.x))),
+          Math.max(0, Math.min(rect.height - 1, Math.floor(hit.y))),
+          1, 1
+        ).data;
+        if (pixel[3] === 0) continue;
+      } catch { /* tainted — opaque */ }
+      // Opaque slab occludes everything beneath; the click belongs to it.
+      return undefined;
+    }
+
+    // 3. World nodes behind the windows
+    return this.hitWorldNodes(ray, 'back');
+  }
+
+  private hitWorldNodes(ray: Ray, layer: 'back' | 'front'): { scope: 'world'; ownerId: string; nodeId: string } | undefined {
+    const identity = mat4Identity();
+    let best: { ownerId: string; nodeId: string; t: number } | undefined;
+    for (const key of this.worldKeys) {
+      const nodeId = this.hitNodeTree(ray, key, identity, layer, (t, id) => {
+        if (!best || t < best.t) best = { ownerId: key.slice('world:'.length), nodeId: id, t };
+      });
+      void nodeId;
+    }
+    return best ? { scope: 'world', ownerId: best.ownerId, nodeId: best.nodeId } : undefined;
+  }
+
+  /**
+   * Ray-test the meshes of one retained node tree. Returns the closest hit
+   * node id (or reports hits via `collect` for cross-tree comparison).
+   */
+  private hitNodeTree(
+    ray: Ray,
+    key: string,
+    frame: Mat4,
+    layer?: 'back' | 'front',
+    collect?: (t: number, nodeId: string) => void,
+  ): string | undefined {
+    const nodes = this.sceneStore.nodesForSurface(key);
+    if (nodes.length === 0) return undefined;
+    let bestId: string | undefined;
+    let bestT = Infinity;
+    for (const node of nodes) {
+      if (node.kind !== 'mesh') continue;
+      if (layer !== undefined && ((node.params.layer as string) ?? 'back') !== layer) continue;
+      const model = this.sceneStore.worldMatrix(node, frame);
+      const t = rayMeshHit(ray, model, ((node.params.primitive as string) ?? 'box') as 'plane' | 'box' | 'sphere' | 'cylinder');
+      if (t === null) continue;
+      if (collect) collect(t, node.id);
+      if (t < bestT) {
+        bestT = t;
+        bestId = node.id;
+      }
+    }
+    return bestId;
+  }
+
+  /**
+   * Find the surface at a viewport point AND the exact surface-local
+   * coordinates of the hit (projection-correct even for lifted/tilted
+   * slabs). Prefer this over subtracting rect origins.
+   */
+  surfaceLocalAt(x: number, y: number): { surface: Surface; x: number; y: number } | undefined {
+    if (this.mobileMode) {
+      const surface = this.mobileHitTest(x, y);
+      if (!surface) return undefined;
+      const local = this.mobileToSurfaceCoords(x, y);
+      return { surface, x: local.x, y: local.y };
+    }
+    const surface = this.desktopHitTest(x, y);
+    if (!surface) return undefined;
+    const state = this.surfaceGl.get(surface.id);
+    const { rect } = surface;
+    const model = state?.model ?? mat4TRS(
+      rect.x + rect.width / 2, rect.y + rect.height / 2, 0,
+      0, 0, 0, rect.width, rect.height, 1,
+    );
+    const ray = rayFromScreen(x, y, this.width, this.height, this.invViewProj);
+    const hit = raySurfaceHit(ray, model, rect.width, rect.height);
+    if (!hit) return undefined;
+    return { surface, x: hit.x, y: hit.y };
+  }
+
+  private desktopHitTest(viewportX: number, viewportY: number): Surface | undefined {
+    // The camera follows scroll; make sure matrices reflect the current state
+    // even if no frame has rendered since the last scroll.
+    this.clampScroll();
+    this.updateCamera(this.scrollX, this.scrollY);
+    const ray = rayFromScreen(viewportX, viewportY, this.width, this.height, this.invViewProj);
+
     // Iterate in reverse z-order (top to bottom)
     for (let i = this.sortedSurfaces.length - 1; i >= 0; i--) {
       const surface = this.sortedSurfaces[i];
@@ -1810,29 +2261,32 @@ export class Compositor {
       if (this.isWorkspaceFiltered(surface)) continue;
       if (surface.inputPassthrough) continue;
 
+      const state = this.surfaceGl.get(surface.id);
       const { rect } = surface;
-      if (
-        x >= rect.x &&
-        x < rect.x + rect.width &&
-        y >= rect.y &&
-        y < rect.y + rect.height
-      ) {
-        // Transparent pixels pass input through to surfaces below.
-        // getImageData throws on tainted canvases (cross-origin images
-        // loaded without CORS); treat those surfaces as fully opaque.
-        try {
-          const pixel = surface.ctx.getImageData(
-            Math.floor(x - rect.x),
-            Math.floor(y - rect.y),
-            1, 1
-          ).data;
-          if (pixel[3] === 0) continue;
-        } catch {
-          // Canvas tainted by cross-origin image — treat as opaque
-        }
+      // The slab's last model matrix (falls back to an untransformed slab
+      // for surfaces that haven't rendered yet).
+      const model = state?.model ?? mat4TRS(
+        rect.x + rect.width / 2, rect.y + rect.height / 2, 0,
+        0, 0, 0, rect.width, rect.height, 1,
+      );
+      const hit = raySurfaceHit(ray, model, rect.width, rect.height);
+      if (!hit) continue;
 
-        return surface;
+      // Transparent pixels pass input through to surfaces below.
+      // getImageData throws on tainted canvases (cross-origin images
+      // loaded without CORS); treat those surfaces as fully opaque.
+      try {
+        const pixel = surface.ctx.getImageData(
+          Math.max(0, Math.min(rect.width - 1, Math.floor(hit.x))),
+          Math.max(0, Math.min(rect.height - 1, Math.floor(hit.y))),
+          1, 1
+        ).data;
+        if (pixel[3] === 0) continue;
+      } catch {
+        // Canvas tainted by cross-origin image — treat as opaque
       }
+
+      return surface;
     }
     return undefined;
   }
