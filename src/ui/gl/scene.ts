@@ -59,8 +59,20 @@ export class SceneStore {
       if (!node) continue;
       if (op.transform) node.transform = { ...node.transform, ...op.transform };
       if (op.params) {
+        // Deep-merge `geometry` so a positions-only deform update (the cheap
+        // path the geomRev design exists for) keeps the existing indices and
+        // any supplied normals. A shallow spread would replace the whole
+        // geometry object, dropping indices and collapsing the mesh into a
+        // sequential triangle soup — the surface renders as disjoint strips.
+        const prevGeom = node.params.geometry as Record<string, unknown> | undefined;
+        const nextGeom = op.params.geometry as Record<string, unknown> | undefined;
         node.params = { ...node.params, ...op.params };
-        if (op.params.geometry !== undefined) node.geomRev++;
+        if (op.params.geometry !== undefined) {
+          if (prevGeom && nextGeom) {
+            node.params.geometry = { ...prevGeom, ...nextGeom };
+          }
+          node.geomRev++;
+        }
       }
       if (op.parentId !== undefined) node.parentId = op.parentId;
     }
@@ -88,6 +100,11 @@ export class SceneStore {
   clear(): void {
     this.nodes.clear();
     this.bySurface.clear();
+  }
+
+  /** Look up a single node by its surface key and node id. */
+  getNode(surfaceId: string, id: string): VocabNode | undefined {
+    return this.nodes.get(`${surfaceId}/${id}`);
   }
 
   nodesForSurface(surfaceId: string): VocabNode[] {

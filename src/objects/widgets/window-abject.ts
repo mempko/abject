@@ -152,7 +152,7 @@ export class WindowAbject extends Abject {
               },
               {
                 name: 'scene',
-                description: 'Apply retained 3D scene ops to this window\'s subtree. The window is a slab in a 3D scene; mesh/light/group nodes attach to it and travel with it. ANY abject may call this — you do not need to own the window. Decorations from other abjects route their nodeInput back to the contributor and tear down when the contributor dies (prefix your node ids to avoid collisions). Ops: { op: "add"|"update"|"remove", id, parentId?, kind: "mesh"|"light"|"group", transform: { position?: [x,y,z] px from window center (+z toward viewer, y-DOWN), rotation?: [rx,ry,rz] radians, scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder", color, emissive?, opacity? } for a built-in shape, OR { geometry: { positions:[x,y,z,...], indices?:[...], normals?:[...] }, color, ... } for an arbitrary polygonal mesh (positions are local px; indices default to a triangle soup; normals auto-computed; re-send geometry in an "update" op to deform it every frame — heightfields, water, generated surfaces). Light params: { lightType: "point"|"directional", color?, direction? }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed.',
+                description: 'Apply retained 3D scene ops to this window\'s subtree. The window is a slab in a 3D scene; mesh/light/group nodes attach to it and travel with it. ANY abject may call this — you do not need to own the window. Decorations from other abjects route their nodeInput back to the contributor and tear down when the contributor dies (prefix your node ids to avoid collisions). Ops: { op: "add"|"update"|"remove"|"animate", id, parentId?, kind: "mesh"|"light"|"group"|"environment", transform: { position?: [x,y,z] px from window center (+z toward viewer, y-DOWN), rotation?: [rx,ry,rz] radians, scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder"|"cone"|"torus"|"icosphere", color, emissive?, opacity?, metalness?(0..1), roughness?(0..1), texture?(url|dataURI|"surface:<id>"), billboard?, drawMode?("triangles"|"lines"|"points"), pointSize? } for a built-in shape, OR { geometry: { positions:[x,y,z,...], indices?:[...], normals?:[...], colors?:[r,g,b,...](0..1 per vertex), uvs?:[u,v,...] }, color, ... } for an arbitrary polygonal mesh (re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional"|"spot", color?, intensity?, direction?, range?, angle?, penumbra? }. Environment params (scene mood): { ambient?, fog?: { color?, near, far } }. ANIMATE (client-side, one op instead of per-frame updates): { op:"animate", id, params: { preset?:"spin"|"orbit"|"bob"|"pulse", channel?:"position"|"rotation"|"scale"|"color"|"emissive"|"opacity", to?, from?, duration?, easing?, loop?, yoyo?, delay?, path?:[[x,y,z],...], stop?:true } }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed.',
                 parameters: [
                   { name: 'ops', type: { kind: 'array', elementType: { kind: 'reference', reference: 'SceneOp' } }, description: 'Scene operations (invalid batches rejected with the vocabulary)' },
                 ],
@@ -517,19 +517,29 @@ point|directional), group. Positions are px from the window center
 (+z toward the viewer); colors take '#hex' or theme tokens ('$accent', ...).
 A mesh can carry CUSTOM polygons instead of a primitive for arbitrary or
 deformable surfaces (waves, terrain, generated shapes): params { geometry:
-{ positions: [x,y,z, ...], indices?: [...], normals?: [...] }, color }.
-Re-send geometry in an 'update' op each tick to deform it (buffers reuse, so
-per-frame morphing is cheap) — the way to draw a continuous changing surface
-rather than a grid of discrete tiles.
+{ positions: [x,y,z, ...], indices?: [...], normals?: [...], colors?: [r,g,b,...]
+(0..1 per vertex), uvs?: [u,v,...] }, color }. Re-send geometry in an 'update'
+op each tick to deform it (buffers reuse, so per-frame morphing is cheap).
+Primitives: plane, box, sphere, cylinder, cone, torus, icosphere. Material
+params: metalness/roughness (0..1, PBR), emissive (glow), texture (url|dataURI|
+'surface:<id>'), billboard (face camera), drawMode 'points'|'lines' + pointSize.
+Lights: lightType 'point'|'directional'|'spot' with color, intensity, range,
+angle, penumbra. A kind:'environment' node sets { ambient, fog:{color,near,far} }.
+ANIMATE without per-frame messages: { op:'animate', id, params:{ preset:'spin'|
+'orbit'|'bob'|'pulse' } } or { channel:'position'|'rotation'|'scale'|'color'|
+'emissive'|'opacity', to, duration, easing?, loop?, yoyo?, path? }; stop with
+{ stop:true }.
 COORDINATES ARE Y-DOWN (screen convention): +y moves DOWN, the same
 direction as input y — mouse deltas map onto positions with no sign flips.
 Nodes persist until { op: 'remove', id }. Tilt/float the window itself:
 \`call(windowId, 'setSlabTransform', { rotation: [0, 0.1, 0], z: 20 })\`.
-Meshes are FULL INPUT TARGETS: the window's owner receives 'nodeInput'
+Meshes are DECORATIVE BY DEFAULT and pass clicks through to the widgets/
+canvas beneath them. Add interactive:true to a mesh's params to make it an
+input target; then the window's owner receives 'nodeInput'
 events — payload { type, nodeId, x, y, key?, code?, button?, windowId }
 where type is mousedown|mouseup|mousemove|mouseenter|mouseleave|focus|blur|
-keydown|keyup. Clicking a mesh selects it; keyboard routes to it until the
-user clicks elsewhere. Drag capture is built in: after mousedown on a mesh,
+keydown|keyup. Clicking an interactive mesh selects it; keyboard routes to it
+until the user clicks elsewhere. Drag capture is built in: after mousedown on a mesh,
 mousemove streams to it until mouseup — drag = position [startX + dx,
 startY + dy, z], both axes same sign.
 DECORATING: you may attach scene nodes to a window you do NOT own — find it

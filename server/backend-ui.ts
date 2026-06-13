@@ -36,6 +36,22 @@ const log = new Log('BackendUI');
 const UI_INTERFACE = 'abjects:ui';
 const WIDGET_FONT = '14px "Inter", system-ui, sans-serif';
 
+/**
+ * Merge an update op's params into a retained node, deep-merging `geometry`
+ * so a positions-only deform update keeps the existing indices/uvs. A shallow
+ * spread would drop indices from the retained snapshot, so reconnect replay
+ * would rebuild the mesh as a disjoint triangle soup. Mirrors the client
+ * SceneStore merge so retained state and live state stay identical.
+ */
+function mergeSceneParams(node: SceneOp, incoming: Record<string, unknown>): void {
+  const prevGeom = node.params?.geometry as Record<string, unknown> | undefined;
+  const nextGeom = incoming.geometry as Record<string, unknown> | undefined;
+  node.params = { ...(node.params ?? {}), ...incoming };
+  if (incoming.geometry !== undefined && prevGeom && nextGeom) {
+    node.params.geometry = { ...prevGeom, ...nextGeom };
+  }
+}
+
 export interface SurfaceState {
   surfaceId: string;
   objectId: AbjectId;
@@ -305,7 +321,7 @@ export class BackendUI extends Abject {
               },
               {
                 name: 'scene',
-                description: 'Apply retained 3D scene ops. Default scope: your window\'s subtree (every window is a slab in the 3D scene; nodes travel with it, positions are px from the window center). With world: true, nodes attach to the GLOBAL scene graph instead — positions are workspace px, no window needed (desktop pets, ambient décor); params.layer: "back" (default, behind windows) or "front" (above windows). Ops: { op: "add"|"update"|"remove", id, parentId?, kind: "mesh"|"light"|"group", transform: { position?: [x,y,z], rotation?: [rx,ry,rz], scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder", color, emissive?, opacity?, layer? } for a built-in shape, OR { geometry: { positions:[x,y,z,...], indices?:[...], normals?:[...] }, color, ... } for an arbitrary polygonal mesh (indices default to a triangle soup; normals auto-computed; re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional", color?, direction? }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed (world nodes also tear down when their owner dies). Example: await this.call(uiId, "scene", { world: true, ops: [{ op: "add", id: "pet", kind: "mesh", transform: { position: [400, 600, 30], scale: 40 }, params: { primitive: "sphere", color: "$accent" } }] })',
+                description: 'Apply retained 3D scene ops. Default scope: your window\'s subtree (every window is a slab in the 3D scene; nodes travel with it, positions are px from the window center). With world: true, nodes attach to the GLOBAL scene graph instead — positions are workspace px, no window needed (desktop pets, ambient décor); params.layer: "back" (default, behind windows) or "front" (above windows). Ops: { op: "add"|"update"|"remove"|"animate", id, parentId?, kind: "mesh"|"light"|"group"|"environment", transform: { position?: [x,y,z], rotation?: [rx,ry,rz], scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder"|"cone"|"torus"|"icosphere", color, emissive?, opacity?, layer?, metalness?(0..1), roughness?(0..1), texture?(url|dataURI|"surface:<id>"), billboard?, drawMode?("triangles"|"lines"|"points"), pointSize? } for a built-in shape, OR { geometry: { positions, indices?, normals?, colors?(per-vertex rgb 0..1), uvs? }, color, ... } for an arbitrary polygonal mesh (re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional"|"spot", color?, intensity?, direction?, range?, angle?, penumbra? }. Environment params: { ambient?, fog?:{ color?, near, far } }. ANIMATE (client-side): { op:"animate", id, params:{ preset?:"spin"|"orbit"|"bob"|"pulse", channel?:"position"|"rotation"|"scale"|"color"|"emissive"|"opacity", to?, from?, duration?, easing?, loop?, yoyo?, delay?, path?, stop?:true } }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed (world nodes also tear down when their owner dies). Example: await this.call(uiId, "scene", { world: true, ops: [{ op: "add", id: "pet", kind: "mesh", transform: { position: [400, 600, 30], scale: 40 }, params: { primitive: "sphere", color: "$accent" } }] })',
                 parameters: [
                   {
                     name: 'surfaceId',
@@ -1122,6 +1138,28 @@ is cheap. This is how you render a continuous changing surface rather than a
 grid of discrete primitive tiles:
   await this.call(this.dep('UIServer'), 'scene', { surfaceId, ops: [
     { op: 'update', id: 'water', params: { geometry: { positions: nextPositions } } } ]});
+Custom geometry also takes geometry.colors (flat [r,g,b,...] 0..1 per vertex —
+gradients/heatmaps) and geometry.uvs (flat [u,v,...]) for texturing.
+
+PRIMITIVES: plane, box, sphere, cylinder, cone, torus, icosphere.
+MATERIALS: params.metalness/roughness (0..1) give a PBR look (glass, metal,
+glossy water); params.emissive glows; params.texture is a url/data-URI or
+'surface:<surfaceId>' (wrap a window's live 2D content onto geometry);
+params.billboard faces the camera; params.drawMode 'points'|'lines' draws the
+vertices as a cloud/polyline (params.pointSize). LIGHTS: lightType
+'point'|'directional'|'spot' with color, intensity, range, and (spot) angle +
+penumbra. ENVIRONMENT: a kind:'environment' node { ambient, fog:{ color, near,
+far } } sets scene-wide mood/depth.
+
+ANIMATION — declarative and client-side, so one op animates at the native
+frame rate instead of a transform message per tick:
+  await this.call(this.dep('UIServer'), 'scene', { surfaceId, ops: [
+    { op: 'animate', id: 'orb', params: { preset: 'spin', duration: 4000 } } ]});
+Presets: spin, orbit (center/radius/plane), bob (amplitude), pulse (scale). Or
+a channel: { op:'animate', id, params:{ channel:'position'|'rotation'|'scale'|
+'color'|'emissive'|'opacity', to, from?, duration, easing?, loop?, yoyo?,
+delay?, path?:[[x,y,z],...] } }. Stop with params:{ stop:true }. Animations are
+transient client state — re-issue them after a reconnect if you want them back.
 COORDINATES ARE Y-DOWN, the screen convention: +y moves DOWN, +x right, +z
 toward the viewer (this differs from y-up 3D engines). Mouse dx/dy therefore
 map DIRECTLY onto position dx/dy — apply both with the same sign, no flips.
@@ -1554,8 +1592,12 @@ IMPORTANT:
     }
 
     // Compact into retained state: adds insert, updates merge, removes delete.
+    // 'animate' ops are transient client-side animations — forward them but
+    // never merge them into the retained node (their channel/to/duration are
+    // not node params and would corrupt the snapshot + reconnect replay).
     const foreign = contributorId !== undefined && contributorId !== state!.objectId;
     for (const op of ops) {
+      if (op.op === 'animate') continue;
       if (op.op === 'remove') {
         state!.sceneNodes.delete(op.id);
         state!.sceneContributors.delete(op.id);
@@ -1569,7 +1611,7 @@ IMPORTANT:
       const existing = state!.sceneNodes.get(op.id);
       if (!existing) continue;
       if (op.transform) existing.transform = { ...existing.transform, ...op.transform };
-      if (op.params) existing.params = { ...existing.params, ...op.params };
+      if (op.params) mergeSceneParams(existing, op.params);
       if (op.parentId !== undefined) existing.parentId = op.parentId;
     }
 
@@ -1606,6 +1648,7 @@ IMPORTANT:
       this.worldScenes.set(objectId, nodes);
     }
     for (const op of ops) {
+      if (op.op === 'animate') continue;
       if (op.op === 'remove') {
         nodes.delete(op.id);
         continue;
@@ -1617,7 +1660,7 @@ IMPORTANT:
       const existing = nodes.get(op.id);
       if (!existing) continue;
       if (op.transform) existing.transform = { ...existing.transform, ...op.transform };
-      if (op.params) existing.params = { ...existing.params, ...op.params };
+      if (op.params) mergeSceneParams(existing, op.params);
       if (op.parentId !== undefined) existing.parentId = op.parentId;
     }
     if (nodes.size === 0) this.worldScenes.delete(objectId);

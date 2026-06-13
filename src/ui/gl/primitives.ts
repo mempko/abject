@@ -9,6 +9,10 @@ export interface Geometry {
   normals: Float32Array;
   /** 16-bit for the static unit primitives; 32-bit for large custom meshes. */
   indices: Uint16Array | Uint32Array;
+  /** Optional per-vertex RGB (0..1), 3 per vertex — gradients, heatmaps. */
+  colors?: Float32Array;
+  /** Optional per-vertex UV, 2 per vertex — albedo texturing. */
+  uvs?: Float32Array;
 }
 
 /** Unit plane in xy, centered, facing +z. */
@@ -18,6 +22,7 @@ export function planeGeometry(): Geometry {
       -0.5, -0.5, 0,  0.5, -0.5, 0,  0.5, 0.5, 0,  -0.5, 0.5, 0,
     ]),
     normals: new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]),
+    uvs: new Float32Array([0, 1, 1, 1, 1, 0, 0, 0]),
     indices: new Uint16Array([0, 1, 2, 0, 2, 3]),
   };
 }
@@ -54,6 +59,7 @@ export function boxGeometry(): Geometry {
 export function sphereGeometry(widthSegments = 24, heightSegments = 16): Geometry {
   const p: number[] = [];
   const n: number[] = [];
+  const uv: number[] = [];
   const idx: number[] = [];
   for (let y = 0; y <= heightSegments; y++) {
     const v = y / heightSegments;
@@ -66,6 +72,7 @@ export function sphereGeometry(widthSegments = 24, heightSegments = 16): Geometr
       const nz = Math.sin(phi) * Math.sin(theta);
       p.push(nx * 0.5, ny * 0.5, nz * 0.5);
       n.push(nx, ny, nz);
+      uv.push(u, v);
     }
   }
   const stride = widthSegments + 1;
@@ -75,6 +82,93 @@ export function sphereGeometry(widthSegments = 24, heightSegments = 16): Geometr
       idx.push(a, a + stride, a + 1, a + 1, a + stride, a + stride + 1);
     }
   }
+  return { positions: new Float32Array(p), normals: new Float32Array(n), uvs: new Float32Array(uv), indices: new Uint16Array(idx) };
+}
+
+/** Unit-diameter cone along y (apex at +0.5, base circle at -0.5). */
+export function coneGeometry(radialSegments = 24): Geometry {
+  const p: number[] = [], n: number[] = [], idx: number[] = [];
+  const apex = p.length / 3; p.push(0, 0.5, 0); n.push(0, 1, 0);
+  for (let i = 0; i <= radialSegments; i++) {
+    const th = (i / radialSegments) * Math.PI * 2;
+    const c = Math.cos(th), s = Math.sin(th);
+    p.push(c * 0.5, -0.5, s * 0.5);
+    // side normal tilted up toward the apex
+    const ny = 0.4472, nl = 0.8944;
+    n.push(c * nl, ny, s * nl);
+  }
+  for (let i = 0; i < radialSegments; i++) idx.push(apex, apex + 1 + i, apex + 1 + i + 1);
+  // base cap
+  const center = p.length / 3; p.push(0, -0.5, 0); n.push(0, -1, 0);
+  for (let i = 0; i <= radialSegments; i++) {
+    const th = (i / radialSegments) * Math.PI * 2;
+    p.push(Math.cos(th) * 0.5, -0.5, Math.sin(th) * 0.5); n.push(0, -1, 0);
+  }
+  for (let i = 0; i < radialSegments; i++) idx.push(center, center + 1 + i, center + 1 + i + 1);
+  return { positions: new Float32Array(p), normals: new Float32Array(n), indices: new Uint16Array(idx) };
+}
+
+/** Torus in the xz plane (outer radius 0.5, tube radius 0.18). */
+export function torusGeometry(radial = 32, tubular = 18, tube = 0.18): Geometry {
+  const p: number[] = [], n: number[] = [], idx: number[] = [];
+  const R = 0.5 - tube;
+  for (let i = 0; i <= radial; i++) {
+    const u = (i / radial) * Math.PI * 2;
+    const cu = Math.cos(u), su = Math.sin(u);
+    for (let j = 0; j <= tubular; j++) {
+      const v = (j / tubular) * Math.PI * 2;
+      const cv = Math.cos(v), sv = Math.sin(v);
+      p.push((R + tube * cv) * cu, tube * sv, (R + tube * cv) * su);
+      n.push(cv * cu, sv, cv * su);
+    }
+  }
+  const stride = tubular + 1;
+  for (let i = 0; i < radial; i++) {
+    for (let j = 0; j < tubular; j++) {
+      const a = i * stride + j;
+      idx.push(a, a + stride, a + 1, a + 1, a + stride, a + stride + 1);
+    }
+  }
+  return { positions: new Float32Array(p), normals: new Float32Array(n), indices: new Uint16Array(idx) };
+}
+
+/** Subdivided icosphere (rounder than the UV sphere, no pole pinch). */
+export function icosphereGeometry(subdivisions = 2): Geometry {
+  const t = (1 + Math.sqrt(5)) / 2;
+  let verts: number[][] = [
+    [-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
+    [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
+    [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1],
+  ].map((v) => { const l = Math.hypot(v[0], v[1], v[2]); return [v[0] / l, v[1] / l, v[2] / l]; });
+  let faces: number[][] = [
+    [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
+    [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+    [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
+    [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1],
+  ];
+  for (let s = 0; s < subdivisions; s++) {
+    const mid = new Map<string, number>();
+    const next: number[][] = [];
+    const midpoint = (a: number, b: number): number => {
+      const key = a < b ? `${a}_${b}` : `${b}_${a}`;
+      const hit = mid.get(key);
+      if (hit !== undefined) return hit;
+      const va = verts[a], vb = verts[b];
+      const m = [(va[0] + vb[0]) / 2, (va[1] + vb[1]) / 2, (va[2] + vb[2]) / 2];
+      const l = Math.hypot(m[0], m[1], m[2]);
+      const idx = verts.length; verts.push([m[0] / l, m[1] / l, m[2] / l]); mid.set(key, idx);
+      return idx;
+    };
+    for (const [a, b, c] of faces) {
+      const ab = midpoint(a, b), bc = midpoint(b, c), ca = midpoint(c, a);
+      next.push([a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]);
+    }
+    faces = next;
+  }
+  const p: number[] = [], n: number[] = [];
+  for (const v of verts) { p.push(v[0] * 0.5, v[1] * 0.5, v[2] * 0.5); n.push(v[0], v[1], v[2]); }
+  const idx: number[] = [];
+  for (const f of faces) idx.push(f[0], f[1], f[2]);
   return { positions: new Float32Array(p), normals: new Float32Array(n), indices: new Uint16Array(idx) };
 }
 
@@ -158,6 +252,8 @@ export function customGeometry(
   rawPositions: ArrayLike<number>,
   rawIndices?: ArrayLike<number>,
   rawNormals?: ArrayLike<number>,
+  rawColors?: ArrayLike<number>,
+  rawUvs?: ArrayLike<number>,
 ): Geometry {
   const positions = rawPositions instanceof Float32Array ? rawPositions : Float32Array.from(rawPositions);
   const vertexCount = Math.floor(positions.length / 3);
@@ -171,18 +267,29 @@ export function customGeometry(
   const normals = rawNormals && rawNormals.length === positions.length
     ? (rawNormals instanceof Float32Array ? rawNormals : Float32Array.from(rawNormals))
     : computeNormals(positions, indices);
-  return { positions, normals, indices };
+  const colors = rawColors && rawColors.length === vertexCount * 3
+    ? (rawColors instanceof Float32Array ? rawColors : Float32Array.from(rawColors))
+    : undefined;
+  const uvs = rawUvs && rawUvs.length === vertexCount * 2
+    ? (rawUvs instanceof Float32Array ? rawUvs : Float32Array.from(rawUvs))
+    : undefined;
+  return { positions, normals, indices, colors, uvs };
 }
 
 const cache = new Map<string, Geometry>();
 
+export type PrimitiveKind = 'plane' | 'box' | 'sphere' | 'cylinder' | 'cone' | 'torus' | 'icosphere';
+
 /** Shared geometry instances by primitive name (renderer caches VAOs per instance). */
-export function getGeometry(kind: 'plane' | 'box' | 'sphere' | 'cylinder'): Geometry {
+export function getGeometry(kind: PrimitiveKind): Geometry {
   let g = cache.get(kind);
   if (!g) {
     g = kind === 'plane' ? planeGeometry()
       : kind === 'box' ? boxGeometry()
       : kind === 'sphere' ? sphereGeometry()
+      : kind === 'cone' ? coneGeometry()
+      : kind === 'torus' ? torusGeometry()
+      : kind === 'icosphere' ? icosphereGeometry()
       : cylinderGeometry();
     cache.set(kind, g);
   }

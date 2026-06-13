@@ -8,6 +8,7 @@
  */
 
 export type Mat4 = Float32Array; // length 16, column-major
+export type Mat3 = Float32Array; // length 9, column-major
 export type Vec3 = { x: number; y: number; z: number };
 
 export function vec3(x = 0, y = 0, z = 0): Vec3 {
@@ -143,6 +144,27 @@ export function mat4TransformPoint(m: Mat4, p: Vec3): Vec3 {
   const w = m[3] * p.x + m[7] * p.y + m[11] * p.z + m[15];
   const inv = w !== 0 ? 1 / w : 1;
   return { x: x * inv, y: y * inv, z: z * inv };
+}
+
+/**
+ * Normal matrix: transpose(inverse(upper-left 3x3 of model)). Lets normals
+ * stay perpendicular to the surface under non-uniform scale (ellipsoids,
+ * stretched water grids), which a bare mat3(model) gets wrong.
+ */
+export function mat3NormalMatrix(m: Mat4): Mat3 {
+  const a = m[0], b = m[1], c = m[2];
+  const d = m[4], e = m[5], f = m[6];
+  const g = m[8], h = m[9], i = m[10];
+  const A = e * i - f * h, B = f * g - d * i, C = d * h - e * g;
+  let det = a * A + b * B + c * C;
+  const out = new Float32Array(9);
+  if (!det) { out[0] = out[4] = out[8] = 1; return out; }
+  det = 1 / det;
+  // inverse(M3)^T, column-major
+  out[0] = A * det;            out[1] = B * det;            out[2] = C * det;
+  out[3] = (c * h - b * i) * det; out[4] = (a * i - c * g) * det; out[5] = (b * g - a * h) * det;
+  out[6] = (b * f - c * e) * det; out[7] = (c * d - a * f) * det; out[8] = (a * e - b * d) * det;
+  return out;
 }
 
 /** Transform a direction (w=0) by a matrix (no translation, no divide). */

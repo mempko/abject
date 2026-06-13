@@ -14,11 +14,14 @@ import { require, ensure } from '../core/contracts.js';
 import { Tween, DECELERATE, ACCELERATE } from './motion.js';
 import type { DrawCommandType } from '../objects/widgets/widget-types.js';
 import { CANVAS_CTX_METHODS, CANVAS_CTX_PROPERTIES } from '../objects/widgets/widget-types.js';
-import { GlRenderer, parseCssColor, RGBA, MeshLight, DynamicMesh } from './gl/renderer.js';
+import { GlRenderer, parseCssColor, RGBA, MeshLight, DynamicMesh, FogOpts, DrawMode } from './gl/renderer.js';
+import { MAX_MESH_LIGHTS } from './gl/shaders.js';
 import { Overlay2D } from './gl/overlay-2d.js';
 import { SceneStore, VocabNode } from './gl/scene.js';
 import { SceneOp, SceneTheme, MeshPrimitive, CustomGeometryParam, resolveSceneColor, hasCustomGeometry } from './gl/scene-types.js';
 import { getGeometry, customGeometry, Geometry } from './gl/primitives.js';
+import { cubicBezier, STANDARD, LINEAR, EMPHASIZE } from './motion.js';
+import { EasingCurve } from '../core/theme-data.js';
 import { Mat4, mat4Identity, mat4Multiply, mat4PerspectiveYDown, mat4Translation, mat4TRS, mat4Invert } from './gl/math.js';
 import { rayFromScreen, raySurfaceHit, rayMeshHit, rayCustomMeshHit, Ray } from './gl/picking.js';
 
@@ -301,6 +304,28 @@ interface SurfaceGlState {
   lastMoveY?: number;
 }
 
+/**
+ * One running declarative animation channel on a scene node. Evaluated each
+ * frame against performance.now(); writes straight into the node's retained
+ * transform/params so rendering and picking see the animated values.
+ */
+interface NodeAnim {
+  channel: 'position' | 'rotation' | 'scale' | 'color' | 'emissive' | 'opacity' | 'orbit';
+  from: number[];
+  to: number[];
+  start: number;          // performance.now() of channel start (delay already applied)
+  duration: number;
+  curve: EasingCurve;
+  loop: boolean;
+  yoyo: boolean;
+  /** Orbit: circle center, radius, and plane. */
+  center?: [number, number, number];
+  radius?: number;
+  plane?: 'xy' | 'xz' | 'yz';
+  /** Position path: piecewise-linear waypoints traversed over duration. */
+  path?: number[][];
+}
+
 export class Compositor {
   private canvas: HTMLCanvasElement;
   private renderer: GlRenderer;
@@ -316,6 +341,14 @@ export class Compositor {
   private customMeshes = new Map<string, { rev: number; geom: Geometry; handle: DynamicMesh }>();
   /** Node keys whose custom mesh was drawn this frame; drives end-of-frame pruning. */
   private touchedCustomMeshes = new Set<string>();
+  /** Mesh albedo textures loaded from URL/data-URI, cached by source string. */
+  private meshTextures = new Map<string, { tex: WebGLTexture; loaded: boolean }>();
+  /**
+   * Active declarative animations, keyed by full node key. Driven entirely
+   * client-side off the render loop, so a spinning cube or rippling pulse is
+   * ONE 'animate' scene op instead of a transform message every frame.
+   */
+  private nodeAnims = new Map<string, { surfaceKey: string; id: string; anims: NodeAnim[] }>();
   private sceneTheme?: SceneTheme;
   private surfaceGl: Map<string, SurfaceGlState> = new Map();
   /** Owners with world-scope scene nodes (keys into sceneStore: `world:<ownerId>`). */
@@ -405,6 +438,8 @@ export class Compositor {
       // from the retained scene store on the next frame (no deleteDynamicMesh
       // — the underlying GL objects no longer exist).
       this.customMeshes.clear();
+      // Mesh textures are gone too; drop the cache so resolveTexture reloads.
+      this.meshTextures.clear();
       this.overlay.invalidate();
       this.needsRender = true;
     };
@@ -696,7 +731,24 @@ export class Compositor {
    * retained: nodes persist until removed or the surface is destroyed.
    */
   applySceneOps(surfaceId: string, ops: SceneOp[]): void {
-    this.sceneStore.apply(surfaceId, ops);
+    this.applyOps(surfaceId, ops);
+  }
+
+  /**
+   * Split a batch: 'animate' ops drive the client-side animation engine,
+   * 'remove' ops also cancel any animations on that node, and everything else
+   * mutates the retained scene store. Animations are intentionally NOT stored
+   * in the scene tree — they are transient client state, re-issued by the
+   * owner after a reconnect if persistence is wanted.
+   */
+  private applyOps(surfaceKey: string, ops: SceneOp[]): void {
+    const rest: SceneOp[] = [];
+    for (const op of ops) {
+      if (op.op === 'animate') { this.startOrStopAnim(surfaceKey, op); continue; }
+      if (op.op === 'remove') this.nodeAnims.delete(`${surfaceKey}/${op.id}`);
+      rest.push(op);
+    }
+    if (rest.length > 0) this.sceneStore.apply(surfaceKey, rest);
     this.needsRender = true;
   }
 
@@ -706,9 +758,8 @@ export class Compositor {
    */
   applyWorldSceneOps(ownerId: string, ops: SceneOp[]): void {
     const key = `world:${ownerId}`;
-    this.sceneStore.apply(key, ops);
     this.worldKeys.add(key);
-    this.needsRender = true;
+    this.applyOps(key, ops);
   }
 
   /**
@@ -1435,6 +1486,8 @@ export class Compositor {
    */
   private render(): void {
     if (this.renderer.isContextLost) return;
+    // Advance declarative animations; keep the loop alive while any run.
+    if (this.stepAnimations(performance.now())) this.needsRender = true;
     this.touchedCustomMeshes.clear();
     this.renderer.beginFrame();
     if (this.mobileMode) {
@@ -1635,38 +1688,47 @@ export class Compositor {
     const nodes = this.sceneStore.nodesForSurface(key);
     if (nodes.length === 0) return;
 
+    // Scene-wide environment (ambient + fog) from an 'environment' node, if any.
+    const env = this.environmentFor(nodes);
+
     // Collect lights first (they illuminate every mesh in this subtree).
     const lights: MeshLight[] = [];
     for (const node of nodes) {
-      if (node.kind !== 'light' || lights.length >= 4) continue;
-      const world = this.sceneStore.worldMatrix(node, surfaceModel);
-      const color = parseCssColor(resolveSceneColor((node.params.color as string) ?? '#ffffff', this.sceneTheme));
-      const lightType = node.params.lightType as string;
-      if (lightType === 'directional') {
-        const dir = (node.params.direction as [number, number, number]) ?? [0, 0.4, -1];
-        lights.push({ pos: [dir[0], dir[1], dir[2], 0], color: [color.r, color.g, color.b] });
-      } else {
-        lights.push({ pos: [world[12], world[13], world[14], 1], color: [color.r, color.g, color.b] });
-      }
+      if (node.kind !== 'light' || lights.length >= MAX_MESH_LIGHTS) continue;
+      lights.push(this.buildLight(node, surfaceModel));
     }
     if (lights.length === 0) {
-      // Default key light from the camera's upper left.
-      lights.push({ pos: [-0.4, -0.5, -1, 0], color: [0.9, 0.9, 0.95] });
+      // Default key light from the camera's upper left (directional → dir).
+      lights.push({ pos: [0, 0, 0, 0], color: [0.9, 0.9, 0.95], dir: [-0.4, -0.5, -1] });
     }
 
-    for (const node of nodes) {
-      if (node.kind !== 'mesh') continue;
-      if (layer !== undefined && ((node.params.layer as string) ?? 'back') !== layer) continue;
+    // Transparent meshes draw last, back-to-front, so they composite correctly
+    // over opaque geometry. Opaque meshes keep scene order (depth test sorts).
+    const meshes = nodes.filter((n) =>
+      n.kind === 'mesh' && (layer === undefined || ((n.params.layer as string) ?? 'back') === layer));
+    const opaque = meshes.filter((n) => ((n.params.opacity as number) ?? 1) >= 1 && !n.params.texture);
+    const transparent = meshes.filter((n) => !opaque.includes(n));
+    transparent.sort((a, b) => this.nodeCameraDepth(b, surfaceModel) - this.nodeCameraDepth(a, surfaceModel));
+
+    for (const node of [...opaque, ...transparent]) {
       const world = this.sceneStore.worldMatrix(node, surfaceModel);
       const color = parseCssColor(resolveSceneColor((node.params.color as string) ?? '#ffffff', this.sceneTheme));
       const emissiveStr = node.params.emissive as string | undefined;
+      const billboard = node.params.billboard === true;
       const material = {
-        model: world,
+        model: billboard ? this.billboardMatrix(world) : world,
         viewProj: this.viewProj,
         color,
         emissive: emissiveStr ? parseCssColor(resolveSceneColor(emissiveStr, this.sceneTheme)) : undefined,
         opacity: (node.params.opacity as number) ?? 1,
+        metalness: node.params.metalness as number | undefined,
+        roughness: node.params.roughness as number | undefined,
+        texture: this.resolveTexture(node.params.texture as string | undefined),
+        drawMode: node.params.drawMode as DrawMode | undefined,
+        pointSize: node.params.pointSize as number | undefined,
         lights,
+        ambient: env.ambient,
+        fog: env.fog,
         cameraPos: this.cameraPos,
       };
       if (hasCustomGeometry(node.params)) {
@@ -1678,6 +1740,272 @@ export class Compositor {
           geometry: getGeometry((node.params.primitive as MeshPrimitive) ?? 'box'),
         });
       }
+    }
+  }
+
+  /** Build a renderer light from a 'light' node's params (point/dir/spot). */
+  private buildLight(node: VocabNode, surfaceModel: Mat4): MeshLight {
+    const world = this.sceneStore.worldMatrix(node, surfaceModel);
+    const col = parseCssColor(resolveSceneColor((node.params.color as string) ?? '#ffffff', this.sceneTheme));
+    const intensity = (node.params.intensity as number) ?? 1;
+    const color: [number, number, number] = [col.r * intensity, col.g * intensity, col.b * intensity];
+    const type = node.params.lightType as string;
+    const dir = (node.params.direction as [number, number, number]) ?? [0, 0.4, -1];
+    if (type === 'directional') {
+      return { pos: [0, 0, 0, 0], color, dir };
+    }
+    const pos: [number, number, number, number] = [world[12], world[13], world[14], type === 'spot' ? 2 : 1];
+    const range = (node.params.range as number) ?? 0;
+    if (type === 'spot') {
+      const angle = (node.params.angle as number) ?? Math.PI / 6;
+      const penumbra = Math.min(1, Math.max(0, (node.params.penumbra as number) ?? 0.3));
+      return { pos, color, dir, range, spotInner: Math.cos(angle * (1 - penumbra)), spotOuter: Math.cos(angle) };
+    }
+    return { pos, color, range };
+  }
+
+  /** Resolve a node's ambient/fog 'environment' settings for a subtree. */
+  private environmentFor(nodes: VocabNode[]): { ambient?: [number, number, number]; fog?: FogOpts } {
+    const node = nodes.find((n) => n.kind === 'environment');
+    if (!node) return {};
+    const out: { ambient?: [number, number, number]; fog?: FogOpts } = {};
+    if (node.params.ambient !== undefined) {
+      const c = parseCssColor(resolveSceneColor(node.params.ambient as string, this.sceneTheme));
+      out.ambient = [c.r, c.g, c.b];
+    }
+    const fog = node.params.fog as { color?: string; near: number; far: number } | undefined;
+    if (fog && typeof fog.near === 'number' && typeof fog.far === 'number') {
+      const c = parseCssColor(resolveSceneColor(fog.color ?? '#0a0a14', this.sceneTheme));
+      out.fog = { color: [c.r, c.g, c.b], near: fog.near, far: fog.far };
+    }
+    return out;
+  }
+
+  /** Camera-space depth (for transparency sorting): larger = nearer. */
+  private nodeCameraDepth(node: VocabNode, surfaceModel: Mat4): number {
+    const m = this.sceneStore.worldMatrix(node, surfaceModel);
+    const dx = m[12] - this.cameraPos[0], dy = m[13] - this.cameraPos[1], dz = m[14] - this.cameraPos[2];
+    return -(dx * dx + dy * dy + dz * dz);
+  }
+
+  /**
+   * Replace a node's rotation with a camera-facing basis while keeping its
+   * world position and scale (extracted from the basis-vector lengths).
+   * Billboards keep sprites/labels readable from any camera angle.
+   */
+  private billboardMatrix(world: Mat4): Mat4 {
+    const px = world[12], py = world[13], pz = world[14];
+    const sx = Math.hypot(world[0], world[1], world[2]) || 1;
+    const sy = Math.hypot(world[4], world[5], world[6]) || 1;
+    const sz = Math.hypot(world[8], world[9], world[10]) || 1;
+    let fx = this.cameraPos[0] - px, fy = this.cameraPos[1] - py, fz = this.cameraPos[2] - pz;
+    const fl = Math.hypot(fx, fy, fz) || 1; fx /= fl; fy /= fl; fz /= fl;       // forward (toward camera)
+    // right = up × forward, with world up (0,1,0)
+    let rx = 1 * fz - 0 * fy, ry = 0 * fx - 0 * fz, rz = 0 * fy - 1 * fx;
+    const rl = Math.hypot(rx, ry, rz) || 1; rx /= rl; ry /= rl; rz /= rl;
+    const ux = fy * rz - fz * ry, uy = fz * rx - fx * rz, uz = fx * ry - fy * rx;  // up = forward × right
+    const m = new Float32Array(16);
+    m[0] = rx * sx; m[1] = ry * sx; m[2] = rz * sx; m[3] = 0;
+    m[4] = ux * sy; m[5] = uy * sy; m[6] = uz * sy; m[7] = 0;
+    m[8] = fx * sz; m[9] = fy * sz; m[10] = fz * sz; m[11] = 0;
+    m[12] = px; m[13] = py; m[14] = pz; m[15] = 1;
+    return m;
+  }
+
+  /**
+   * Resolve a mesh material's `texture` param to a GL texture. Accepts a
+   * 'surface:<surfaceId>' reference (reuse a window's live content texture)
+   * or a URL / data-URI (loaded once, async, then cached). Returns undefined
+   * until an image finishes loading; the load triggers a re-render.
+   */
+  private resolveTexture(src: string | undefined): WebGLTexture | undefined {
+    if (!src) return undefined;
+    if (src.startsWith('surface:')) {
+      return this.surfaceGl.get(src.slice('surface:'.length))?.texture;
+    }
+    const hit = this.meshTextures.get(src);
+    if (hit) return hit.tex;
+    const tex = this.renderer.createTexture();
+    this.meshTextures.set(src, { tex, loaded: false });
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      this.renderer.uploadTexture(tex, img);
+      const e = this.meshTextures.get(src);
+      if (e) e.loaded = true;
+      this.needsRender = true;
+    };
+    img.src = src;
+    return tex;
+  }
+
+  // ── Declarative animation engine ─────────────────────────────────────
+
+  private static readonly EASINGS: Record<string, EasingCurve> = {
+    linear: LINEAR, standard: STANDARD, decelerate: [0, 0, 0.2, 1],
+    accelerate: [0.4, 0, 1, 1], emphasize: EMPHASIZE,
+  };
+
+  /** Start (or stop) animations on a node from an 'animate' op's params. */
+  private startOrStopAnim(surfaceKey: string, op: SceneOp): void {
+    const fullKey = `${surfaceKey}/${op.id}`;
+    const p = (op.params ?? {}) as Record<string, unknown>;
+    if (p.stop === true) { this.nodeAnims.delete(fullKey); return; }
+    const node = this.sceneStore.getNode(surfaceKey, op.id);
+    if (!node) return;
+    const built = this.buildAnims(node, p);
+    if (built.length === 0) return;
+    const existing = this.nodeAnims.get(fullKey)?.anims ?? [];
+    // Replace same-channel animations; keep others (so spin + bob can coexist).
+    const channels = new Set(built.map((a) => a.channel));
+    const merged = existing.filter((a) => !channels.has(a.channel)).concat(built);
+    this.nodeAnims.set(fullKey, { surfaceKey, id: op.id, anims: merged });
+    this.needsRender = true;
+  }
+
+  /** Expand an animate spec (preset or explicit channel) into NodeAnims. */
+  private buildAnims(node: VocabNode, p: Record<string, unknown>): NodeAnim[] {
+    const now = performance.now();
+    const curve = this.easingOf(p.easing);
+    const delay = (p.delay as number) ?? 0;
+    const base = { start: now + delay, loop: p.loop === true, yoyo: p.yoyo === true, curve };
+    const preset = p.preset as string | undefined;
+    if (preset) {
+      const dur = (p.duration as number) ?? (preset === 'spin' ? 6000 : preset === 'orbit' ? 8000 : 1500);
+      if (preset === 'spin') {
+        const axis = (p.axis as string) ?? 'y';
+        const cur = this.vecOf(node, 'rotation');
+        const to = [...cur]; const ai = axis === 'x' ? 0 : axis === 'z' ? 2 : 1; to[ai] += Math.PI * 2;
+        return [{ ...base, channel: 'rotation', from: cur, to, duration: dur, loop: true, curve: LINEAR }];
+      }
+      if (preset === 'bob') {
+        const amp = (p.amplitude as number) ?? 20; const cur = this.vecOf(node, 'position');
+        return [{ ...base, channel: 'position', from: cur, to: [cur[0], cur[1] + amp, cur[2]], duration: dur, loop: true, yoyo: true, curve: EMPHASIZE }];
+      }
+      if (preset === 'pulse') {
+        const k = (p.scale as number) ?? 1.15; const cur = this.vecOf(node, 'scale');
+        return [{ ...base, channel: 'scale', from: cur, to: cur.map((v) => v * k), duration: dur, loop: true, yoyo: true, curve: EMPHASIZE }];
+      }
+      if (preset === 'orbit') {
+        const cur = this.vecOf(node, 'position');
+        const center = (p.center as [number, number, number]) ?? [cur[0], cur[1], cur[2]];
+        const radius = (p.radius as number) ?? 100;
+        const plane = ((p.plane as string) ?? 'xz') as 'xy' | 'xz' | 'yz';
+        return [{ ...base, channel: 'orbit', from: cur, to: cur, duration: dur, loop: true, center, radius, plane }];
+      }
+      return [];
+    }
+    const channel = p.channel as NodeAnim['channel'];
+    if (!channel) return [];
+    const duration = (p.duration as number) ?? 800;
+    if (channel === 'position' && Array.isArray(p.path)) {
+      const path = (p.path as number[][]);
+      return [{ ...base, channel, from: this.vecOf(node, 'position'), to: path[path.length - 1] ?? [0, 0, 0], duration, path }];
+    }
+    const from = p.from !== undefined ? this.channelValue(channel, p.from) : this.vecOf(node, channel);
+    const to = this.channelValue(channel, p.to);
+    return [{ ...base, channel, from, to, duration }];
+  }
+
+  private easingOf(e: unknown): EasingCurve {
+    if (Array.isArray(e) && e.length === 4 && e.every((n) => typeof n === 'number')) return e as unknown as EasingCurve;
+    if (typeof e === 'string' && Compositor.EASINGS[e]) return Compositor.EASINGS[e];
+    return STANDARD;
+  }
+
+  /** Current numeric vector for a channel, read from the node. */
+  private vecOf(node: VocabNode, channel: NodeAnim['channel']): number[] {
+    const t = node.transform;
+    if (channel === 'position') return [...(t.position ?? [0, 0, 0])];
+    if (channel === 'rotation') return [...(t.rotation ?? [0, 0, 0])];
+    if (channel === 'scale') { const s = t.scale ?? 1; return typeof s === 'number' ? [s, s, s] : [...s]; }
+    if (channel === 'opacity') return [(node.params.opacity as number) ?? 1];
+    // color / emissive
+    const c = parseCssColor(resolveSceneColor((node.params[channel === 'color' ? 'color' : 'emissive'] as string) ?? '#ffffff', this.sceneTheme));
+    return [c.r, c.g, c.b];
+  }
+
+  /** Coerce an animate target value into the channel's numeric vector form. */
+  private channelValue(channel: NodeAnim['channel'], v: unknown): number[] {
+    if (channel === 'color' || channel === 'emissive') {
+      const c = parseCssColor(resolveSceneColor(v as string, this.sceneTheme));
+      return [c.r, c.g, c.b];
+    }
+    if (channel === 'opacity') return [typeof v === 'number' ? v : 1];
+    if (channel === 'scale' && typeof v === 'number') return [v, v, v];
+    return Array.isArray(v) ? (v as number[]) : [0, 0, 0];
+  }
+
+  /**
+   * Advance every active animation and write results into node transforms/
+   * params. Returns true while any animation is still running so the render
+   * loop keeps requesting frames. Drops animations whose node is gone.
+   */
+  private stepAnimations(now: number): boolean {
+    if (this.nodeAnims.size === 0) return false;
+    let active = false;
+    for (const [key, entry] of this.nodeAnims) {
+      const node = this.sceneStore.getNode(entry.surfaceKey, entry.id);
+      if (!node) { this.nodeAnims.delete(key); continue; }
+      const live: NodeAnim[] = [];
+      for (const a of entry.anims) {
+        const done = this.applyAnim(node, a, now);
+        if (!done) { live.push(a); active = true; }
+      }
+      if (live.length === 0) this.nodeAnims.delete(key);
+      else entry.anims = live;
+    }
+    return active;
+  }
+
+  /** Apply one animation channel to a node at time `now`. Returns true if finished. */
+  private applyAnim(node: VocabNode, a: NodeAnim, now: number): boolean {
+    const elapsed = now - a.start;
+    if (elapsed < 0) return false; // still in delay
+    if (a.channel === 'orbit') {
+      const ang = (elapsed / a.duration) * Math.PI * 2;
+      const c = a.center ?? [0, 0, 0], r = a.radius ?? 100;
+      const co = Math.cos(ang) * r, si = Math.sin(ang) * r;
+      const pos = a.plane === 'xy' ? [c[0] + co, c[1] + si, c[2]]
+        : a.plane === 'yz' ? [c[0], c[1] + co, c[2] + si]
+        : [c[0] + co, c[1], c[2] + si];
+      node.transform = { ...node.transform, position: pos as [number, number, number] };
+      return false; // orbit loops forever
+    }
+    let t = a.duration > 0 ? elapsed / a.duration : 1;
+    let finished = false;
+    if (t >= 1) {
+      if (a.loop) {
+        const cycle = Math.floor(t);
+        t = t - cycle;
+        if (a.yoyo && cycle % 2 === 1) t = 1 - t;
+      } else { t = 1; finished = true; }
+    }
+    const eased = cubicBezier(a.curve, Math.max(0, Math.min(1, t)));
+    const v = a.path ? this.samplePath(a.path, eased) : a.from.map((f, i) => f + (a.to[i] - f) * eased);
+    this.writeChannel(node, a.channel, v);
+    return finished;
+  }
+
+  /** Piecewise-linear sample of a waypoint path at progress 0..1. */
+  private samplePath(path: number[][], t: number): number[] {
+    if (path.length === 1) return path[0];
+    const seg = t * (path.length - 1);
+    const i = Math.min(path.length - 2, Math.floor(seg));
+    const f = seg - i;
+    const a = path[i], b = path[i + 1];
+    return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+  }
+
+  /** Write an animated value into the node's retained transform/params. */
+  private writeChannel(node: VocabNode, channel: NodeAnim['channel'], v: number[]): void {
+    if (channel === 'position') node.transform = { ...node.transform, position: [v[0], v[1], v[2]] };
+    else if (channel === 'rotation') node.transform = { ...node.transform, rotation: [v[0], v[1], v[2]] };
+    else if (channel === 'scale') node.transform = { ...node.transform, scale: [v[0], v[1], v[2]] };
+    else if (channel === 'opacity') node.params = { ...node.params, opacity: v[0] };
+    else { // color / emissive
+      const css = `rgb(${Math.round(v[0] * 255)}, ${Math.round(v[1] * 255)}, ${Math.round(v[2] * 255)})`;
+      node.params = { ...node.params, [channel]: css };
     }
   }
 
@@ -1695,7 +2023,7 @@ export class Compositor {
     if (entry && entry.rev === node.geomRev) return entry.handle;
     const g = node.params.geometry as CustomGeometryParam | undefined;
     if (!g || !Array.isArray(g.positions)) return entry?.handle;
-    const geom = customGeometry(g.positions, g.indices, g.normals);
+    const geom = customGeometry(g.positions, g.indices, g.normals, g.colors, g.uvs);
     if (!entry) {
       entry = { rev: node.geomRev, geom, handle: this.renderer.createDynamicMesh() };
       this.customMeshes.set(fullKey, entry);
@@ -2272,6 +2600,11 @@ export class Compositor {
     let bestT = Infinity;
     for (const node of nodes) {
       if (node.kind !== 'mesh') continue;
+      // Meshes are decorative by default: only those that explicitly opt in with
+      // `params.interactive === true` are click/drag/keyboard targets. Without
+      // this, a full-window decorative mesh (e.g. a water surface) would ray-
+      // intercept every click and starve the window's widgets / input canvas.
+      if (node.params.interactive !== true) continue;
       if (layer !== undefined && ((node.params.layer as string) ?? 'back') !== layer) continue;
       const model = this.sceneStore.worldMatrix(node, frame);
       let t: number | null;

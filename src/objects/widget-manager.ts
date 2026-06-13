@@ -1306,6 +1306,24 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           every frame is cheap): this.call(windowId, 'scene', { ops: [{ op: 'update', id: 'water',
           params: { geometry: { positions: nextPositions } } }] }). This is the way to render a
           continuous, changing surface rather than a grid of discrete primitive tiles.
+          Custom geometry also takes per-vertex colors (geometry.colors: flat [r,g,b,...] 0..1 — gradients,
+          heatmaps, a fluid's color ramp baked into the surface) and uvs (geometry.uvs) for texturing.
+          PRIMITIVES: plane, box, sphere, cylinder, cone, torus, icosphere.
+          MATERIALS: params.metalness and params.roughness (0..1) drive a PBR look (glass, brushed metal,
+          glossy water); params.emissive makes a mesh glow; params.texture is a URL, data-URI, or
+          'surface:<surfaceId>' (wrap another window's live 2D content onto 3D geometry); params.billboard:true
+          makes a mesh always face the camera (labels, sprites); params.drawMode 'points'|'lines' renders the
+          vertices as a particle cloud or polyline (graphs, constellations) with params.pointSize.
+          LIGHTS: lightType 'point'|'directional'|'spot' with color, intensity, range (falloff px), and for spots
+          angle + penumbra. ENVIRONMENT: add a kind:'environment' node with { ambient, fog: { color, near, far } }
+          for scene-wide mood and depth.
+          ANIMATION (declarative — ONE op, runs at native frame rate; do NOT send a transform message every
+          tick): this.call(windowId, 'scene', { ops: [{ op: 'animate', id: 'cube',
+          params: { preset: 'spin', duration: 4000 } }] }). Presets: spin, orbit (center/radius/plane), bob
+          (amplitude), pulse (scale). Or animate any channel explicitly: { op:'animate', id, params:{ channel:
+          'position'|'rotation'|'scale'|'color'|'emissive'|'opacity', to, from?, duration, easing?, loop?, yoyo?,
+          delay?, path?:[[x,y,z],...] } }. Stop with params:{ stop:true }. Animations are client-side and
+          transient — re-issue them after a reconnect if you need them to persist.
           COMPOUND SHAPES (a turtle = shell + head + legs, a character, anything with parts): add a
           'group' node, then add each part with parentId set to the group's id (the field is parentId,
           NOT parent). Parts inherit the group's transform, so you move/rotate the whole thing by
@@ -1358,7 +1376,10 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           Edge anchoring note: positions are relative to the window CENTER, so window MOVES are free,
           and only a RESIZE shifts your edge offset — addDependent on the host window itself to receive
           its windowResized changed-event and recompute -height/2 then.
-          MESH INPUT: scene nodes are full input targets like widgets. Implement nodeInput(msg) — payload
+          MESH INPUT: meshes are decorative by default and pass clicks through to the widgets/canvas
+          beneath them. To make a mesh a click/drag/keyboard target, add interactive:true to its params
+          ({ op:'add', kind:'mesh', params:{ ..., interactive:true } }). Interactive meshes are full
+          input targets like widgets. Implement nodeInput(msg) — payload
           { type, nodeId, x, y, key?, code?, button?, world?, windowId? } where type is
           'mousedown'|'mouseup'|'mousemove'|'mouseenter'|'mouseleave'|'focus'|'blur'|'keydown'|'keyup'.
           Clicking a mesh SELECTS it (focus); keyboard then routes to it until the user clicks elsewhere

@@ -52,12 +52,16 @@ The hand-rolled WebGL2 engine:
 | File | Contents |
 |---|---|
 | `math.ts` | Column-major Mat4/Vec3 math (perspective with y-down, TRS, invert, ray transforms) |
-| `renderer.ts` | GL context, program cache, premultiplied-alpha textures, context-loss recovery, typed draw calls (surface slab, SDF glow/shadow, flat quad, Blinn-Phong mesh, re-uploadable dynamic mesh, overlay) |
-| `shaders.ts` | GLSL sources (rounded-slab SDF mask + rim, gaussian-erf glow, mesh lighting) |
-| `primitives.ts` | plane/box/sphere/cylinder generators + custom polygonal geometry (arbitrary positions/indices, auto-computed normals) |
+| `renderer.ts` | GL context, program cache, premultiplied-alpha textures, context-loss recovery, typed draw calls (surface slab, SDF glow/shadow, flat quad, metallic-roughness mesh with vertex color/texture/spot lights/fog, re-uploadable dynamic mesh, overlay) |
+| `shaders.ts` | GLSL sources (rounded-slab SDF mask + rim, gaussian-erf glow, metallic-roughness mesh lighting) |
+| `primitives.ts` | plane/box/sphere/cylinder/cone/torus/icosphere generators + custom polygonal geometry (positions/indices/normals/colors/uvs, auto-computed normals) |
 | `scene.ts` | Retained client store for scene-vocabulary nodes (tracks a geometry revision so dynamic meshes re-upload only on change) |
-| `scene-types.ts` | The scene vocabulary: node kinds, validation (incl. custom geometry), `$token` colors, `SceneTheme` (shared with the server) |
+| `scene-types.ts` | The scene vocabulary: node kinds (mesh/light/group/environment), the `animate` op, validation (incl. custom geometry, materials, lights), `$token` colors, `SceneTheme` (shared with the server) |
 | `picking.ts` | Camera-ray → slab-local px conversion; ray-primitive and ray-triangle (custom mesh) hit tests |
+
+The compositor owns mesh-material resolution, an `environment`-node ambient/fog
+lookup, billboard matrices, a mesh-texture cache, and a client-side declarative
+animation engine (presets + per-channel tweens + paths) driven off the render loop.
 | `overlay-2d.ts` | Screen-space 2D chrome canvas composited as the final pass |
 
 ## Design

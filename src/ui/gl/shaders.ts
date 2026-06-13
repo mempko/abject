@@ -140,23 +140,37 @@ out vec4 outColor;
 void main() { outColor = texture(uTex, vUv); }
 `;
 
+/** Max simultaneous lights the mesh shader evaluates. */
+export const MAX_MESH_LIGHTS = 8;
+
 /**
- * Blinn-Phong mesh shader for scene-vocabulary nodes. Ambient + up to 4
- * lights (directional when w=0, point when w=1). Colors premultiplied at
- * output. Normals renormalized after the model transform (uniform-ish scale
- * assumed for UI-scale objects).
+ * Metallic-roughness mesh shader for scene-vocabulary nodes. Supports
+ * per-vertex color (location 2), albedo texture UVs (location 3),
+ * point/directional/spot lights with range falloff, distance fog, and a
+ * Cook-Torrance-lite specular term. Output is premultiplied alpha. Normals
+ * use a proper normal matrix so non-uniform scale (stretched water grids,
+ * ellipsoids) stays lit correctly.
  */
 export const MESH_VS = `#version 300 es
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec3 aColor;
+layout(location = 3) in vec2 aUv;
 uniform mat4 uModel;
 uniform mat4 uViewProj;
+uniform mat3 uNormalMat;
+uniform float uPointSize;
 out vec3 vWorldPos;
 out vec3 vNormal;
+out vec3 vColor;
+out vec2 vUv;
 void main() {
   vec4 world = uModel * vec4(aPos, 1.0);
   vWorldPos = world.xyz;
-  vNormal = mat3(uModel) * aNormal;
+  vNormal = uNormalMat * aNormal;
+  vColor = aColor;
+  vUv = aUv;
+  gl_PointSize = uPointSize;
   gl_Position = uViewProj * world;
 }
 `;
@@ -165,29 +179,85 @@ export const MESH_FS = `#version 300 es
 precision highp float;
 in vec3 vWorldPos;
 in vec3 vNormal;
-uniform vec3  uColor;
+in vec3 vColor;
+in vec2 vUv;
+uniform vec3  uColor;        // albedo
 uniform vec3  uEmissive;
 uniform float uOpacity;
+uniform float uMetalness;
+uniform float uRoughness;
 uniform vec3  uAmbient;
 uniform vec3  uCameraPos;
+uniform bool  uUseVertexColor;
+uniform bool  uUseTexture;
+uniform sampler2D uTex;
 uniform int   uLightCount;
-uniform vec4  uLightPos[4];     // xyz + w (0=directional dir, 1=point pos)
-uniform vec3  uLightColor[4];
+uniform vec4  uLightPos[${MAX_MESH_LIGHTS}];   // xyz + w (0=dir, 1=point, 2=spot)
+uniform vec3  uLightColor[${MAX_MESH_LIGHTS}]; // rgb * intensity
+uniform vec4  uLightDir[${MAX_MESH_LIGHTS}];   // xyz aim dir (dir/spot), w = range (0 = infinite)
+uniform vec4  uLightSpot[${MAX_MESH_LIGHTS}];  // x=cosInner, y=cosOuter, z=isSpot
+uniform bool  uFogEnabled;
+uniform vec3  uFogColor;
+uniform vec2  uFogRange;      // near, far
 out vec4 outColor;
+
+const float PI = 3.14159265359;
+float distGGX(float ndh, float a) { float a2 = a * a; float d = ndh * ndh * (a2 - 1.0) + 1.0; return a2 / max(PI * d * d, 1e-5); }
+float gSchlick(float ndx, float k) { return ndx / (ndx * (1.0 - k) + k); }
+float gSmith(float ndv, float ndl, float r) { float k = (r + 1.0) * (r + 1.0) / 8.0; return gSchlick(ndv, k) * gSchlick(ndl, k); }
+vec3 fresnel(float ct, vec3 f0) { return f0 + (1.0 - f0) * pow(clamp(1.0 - ct, 0.0, 1.0), 5.0); }
+
 void main() {
-  vec3 n = normalize(vNormal);
-  vec3 view = normalize(uCameraPos - vWorldPos);
-  vec3 c = uColor * uAmbient + uEmissive;
-  for (int i = 0; i < 4; i++) {
+  vec3 albedo = uColor;
+  if (uUseVertexColor) albedo *= vColor;
+  float alpha = uOpacity;
+  if (uUseTexture) { vec4 t = texture(uTex, vUv); albedo *= t.rgb; alpha *= t.a; }
+
+  vec3 N = normalize(vNormal);
+  vec3 V = normalize(uCameraPos - vWorldPos);
+  if (dot(N, V) < 0.0) N = -N;   // two-sided: author surfaces need not get winding right
+
+  vec3 F0 = mix(vec3(0.04), albedo, uMetalness);
+  float rough = clamp(uRoughness, 0.04, 1.0);
+  float a = rough * rough;
+  vec3 Lo = vec3(0.0);
+  for (int i = 0; i < ${MAX_MESH_LIGHTS}; i++) {
     if (i >= uLightCount) break;
-    vec3 lv = uLightPos[i].w > 0.5
-      ? normalize(uLightPos[i].xyz - vWorldPos)
-      : normalize(-uLightPos[i].xyz);
-    float diff = max(dot(n, lv), 0.0);
-    vec3 h = normalize(lv + view);
-    float spec = pow(max(dot(n, h), 0.0), 32.0) * 0.35;
-    c += uColor * uLightColor[i] * diff + uLightColor[i] * spec;
+    vec3 L; float atten = 1.0;
+    if (uLightPos[i].w < 0.5) {
+      L = normalize(-uLightDir[i].xyz);                 // directional
+    } else {
+      vec3 toL = uLightPos[i].xyz - vWorldPos;
+      float dist = length(toL);
+      L = toL / max(dist, 1e-4);
+      float range = uLightDir[i].w;
+      if (range > 0.0) { float f = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0); atten *= f * f; }
+      if (uLightSpot[i].z > 0.5) {                      // spot cone
+        float cd = dot(normalize(-uLightDir[i].xyz), -L);
+        atten *= smoothstep(uLightSpot[i].y, uLightSpot[i].x, cd);
+      }
+    }
+    if (atten <= 0.0) continue;
+    vec3 radiance = uLightColor[i] * atten;
+    float NdL = max(dot(N, L), 0.0);
+    vec3 H = normalize(V + L);
+    float NdV = max(dot(N, V), 1e-4);
+    float NdH = max(dot(N, H), 0.0);
+    float VdH = max(dot(V, H), 0.0);
+    float D = distGGX(NdH, a);
+    float G = gSmith(NdV, NdL, rough);
+    vec3  F = fresnel(VdH, F0);
+    vec3 spec = (D * G) * F / max(4.0 * NdV * NdL, 1e-4);
+    vec3 kd = (vec3(1.0) - F) * (1.0 - uMetalness);
+    Lo += (kd * albedo + spec) * radiance * NdL;
   }
-  outColor = vec4(c * uOpacity, uOpacity);
+  vec3 color = uAmbient * albedo + Lo + uEmissive;
+
+  if (uFogEnabled) {
+    float d = length(uCameraPos - vWorldPos);
+    float f = clamp((uFogRange.y - d) / max(uFogRange.y - uFogRange.x, 1e-3), 0.0, 1.0);
+    color = mix(uFogColor, color, f);
+  }
+  outColor = vec4(color * alpha, alpha);
 }
 `;

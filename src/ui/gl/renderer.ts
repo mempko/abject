@@ -9,11 +9,11 @@
  */
 
 import { require } from '../../core/contracts.js';
-import { Mat4 } from './math.js';
+import { Mat4, mat3NormalMatrix } from './math.js';
 import { Geometry } from './primitives.js';
 import {
   QUAD_VS, SURFACE_FS, GLOW_FS, FLAT_FS,
-  OVERLAY_VS, OVERLAY_FS, MESH_VS, MESH_FS,
+  OVERLAY_VS, OVERLAY_FS, MESH_VS, MESH_FS, MAX_MESH_LIGHTS,
 } from './shaders.js';
 
 export interface RGBA { r: number; g: number; b: number; a: number }
@@ -70,10 +70,22 @@ export interface GlowDrawOpts {
 }
 
 export interface MeshLight {
-  /** xyz = position (point) or direction (directional); w: 1=point, 0=directional */
+  /** xyz = position (point/spot) or direction slot (directional); w: 0=directional, 1=point, 2=spot */
   pos: [number, number, number, number];
+  /** rgb already multiplied by intensity */
   color: [number, number, number];
+  /** Aim direction for directional and spot lights. */
+  dir?: [number, number, number];
+  /** Falloff range in px (0 = infinite). Point/spot only. */
+  range?: number;
+  /** Spot cone, as cosines of the inner (full) and outer (zero) angles. */
+  spotInner?: number;
+  spotOuter?: number;
 }
+
+export interface FogOpts { color: [number, number, number]; near: number; far: number }
+
+export type DrawMode = 'triangles' | 'lines' | 'points';
 
 /** Material + lighting for a mesh draw, independent of where the geometry lives. */
 export interface MeshMaterialOpts {
@@ -82,9 +94,17 @@ export interface MeshMaterialOpts {
   color: RGBA;
   emissive?: RGBA;
   opacity?: number;
+  metalness?: number;
+  roughness?: number;
   ambient?: [number, number, number];
   lights?: MeshLight[];
   cameraPos: [number, number, number];
+  /** Albedo texture sampled by the geometry's UVs. */
+  texture?: WebGLTexture;
+  fog?: FogOpts;
+  /** triangles (default), lines (LINE_STRIP over vertices), or points. */
+  drawMode?: DrawMode;
+  pointSize?: number;
 }
 
 export interface MeshDrawOpts extends MeshMaterialOpts {
@@ -102,9 +122,13 @@ export interface DynamicMesh {
   vao: WebGLVertexArrayObject;
   posBuf: WebGLBuffer;
   normBuf: WebGLBuffer;
+  colorBuf: WebGLBuffer;
+  uvBuf: WebGLBuffer;
   idxBuf: WebGLBuffer;
   count: number;
+  vertexCount: number;
   indexType: number; // gl.UNSIGNED_SHORT | gl.UNSIGNED_INT
+  hasColor: boolean;
 }
 
 export class GlRenderer {
@@ -113,7 +137,7 @@ export class GlRenderer {
   private programs = new Map<string, ProgramInfo>();
   private quadVao!: WebGLVertexArrayObject;
   private overlayVao!: WebGLVertexArrayObject;
-  private meshVaos = new WeakMap<Geometry, { vao: WebGLVertexArrayObject; count: number; indexType: number }>();
+  private meshVaos = new WeakMap<Geometry, { vao: WebGLVertexArrayObject; count: number; vertexCount: number; indexType: number; hasColor: boolean }>();
   private contextLost = false;
   /** Called after the context is restored so the owner can re-upload state. */
   onContextRestored?: () => void;
@@ -243,7 +267,7 @@ export class GlRenderer {
    * transparent pixel instead so a single bad surface can never abort the
    * whole desktop render. The caller marks the surface so it stops retrying.
    */
-  uploadTexture(tex: WebGLTexture, source: OffscreenCanvas | HTMLCanvasElement): boolean {
+  uploadTexture(tex: WebGLTexture, source: OffscreenCanvas | HTMLCanvasElement | HTMLImageElement | ImageBitmap): boolean {
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
@@ -339,44 +363,86 @@ export class GlRenderer {
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
 
-  /** Bind the mesh program and set every material/lighting uniform. */
-  private useMeshMaterial(o: MeshMaterialOpts): void {
+  private static readonly MESH_UNIFORMS = [
+    'uModel', 'uViewProj', 'uNormalMat', 'uPointSize', 'uColor', 'uEmissive', 'uOpacity',
+    'uMetalness', 'uRoughness', 'uAmbient', 'uCameraPos',
+    'uUseVertexColor', 'uUseTexture', 'uTex',
+    'uLightCount', 'uLightPos', 'uLightColor', 'uLightDir', 'uLightSpot',
+    'uFogEnabled', 'uFogColor', 'uFogRange',
+  ];
+
+  /** Bind the mesh program and set every material/lighting/fog uniform. */
+  private useMeshMaterial(o: MeshMaterialOpts): ProgramInfo {
     const gl = this.gl;
-    const p = this.getProgram('mesh', MESH_VS, MESH_FS, [
-      'uModel', 'uViewProj', 'uColor', 'uEmissive', 'uOpacity', 'uAmbient',
-      'uCameraPos', 'uLightCount', 'uLightPos', 'uLightColor',
-    ]);
+    const p = this.getProgram('mesh', MESH_VS, MESH_FS, GlRenderer.MESH_UNIFORMS);
     gl.useProgram(p.program);
     gl.uniformMatrix4fv(p.uniforms.uModel, false, o.model);
     gl.uniformMatrix4fv(p.uniforms.uViewProj, false, o.viewProj);
+    gl.uniformMatrix3fv(p.uniforms.uNormalMat, false, mat3NormalMatrix(o.model));
+    gl.uniform1f(p.uniforms.uPointSize, o.pointSize ?? 4);
     gl.uniform3f(p.uniforms.uColor, o.color.r, o.color.g, o.color.b);
     const em = o.emissive ?? { r: 0, g: 0, b: 0, a: 0 };
     gl.uniform3f(p.uniforms.uEmissive, em.r * em.a, em.g * em.a, em.b * em.a);
     gl.uniform1f(p.uniforms.uOpacity, o.opacity ?? 1);
+    gl.uniform1f(p.uniforms.uMetalness, Math.min(1, Math.max(0, o.metalness ?? 0)));
+    gl.uniform1f(p.uniforms.uRoughness, Math.min(1, Math.max(0, o.roughness ?? 0.55)));
     const amb = o.ambient ?? [0.35, 0.35, 0.4];
     gl.uniform3f(p.uniforms.uAmbient, amb[0], amb[1], amb[2]);
     gl.uniform3f(p.uniforms.uCameraPos, o.cameraPos[0], o.cameraPos[1], o.cameraPos[2]);
-    const lights = (o.lights ?? []).slice(0, 4);
+
+    if (o.texture) {
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, o.texture);
+      gl.uniform1i(p.uniforms.uTex, 0);
+      gl.uniform1i(p.uniforms.uUseTexture, 1);
+    } else {
+      gl.uniform1i(p.uniforms.uUseTexture, 0);
+    }
+
+    const lights = (o.lights ?? []).slice(0, MAX_MESH_LIGHTS);
     gl.uniform1i(p.uniforms.uLightCount, lights.length);
     if (lights.length > 0) {
-      const pos = new Float32Array(16);
-      const col = new Float32Array(12);
+      const pos = new Float32Array(MAX_MESH_LIGHTS * 4);
+      const col = new Float32Array(MAX_MESH_LIGHTS * 3);
+      const dir = new Float32Array(MAX_MESH_LIGHTS * 4);
+      const spot = new Float32Array(MAX_MESH_LIGHTS * 4);
       lights.forEach((l, i) => {
         pos.set(l.pos, i * 4);
         col.set(l.color, i * 3);
+        const d = l.dir ?? [0, 1, 0];
+        dir.set([d[0], d[1], d[2], l.range ?? 0], i * 4);
+        const isSpot = l.pos[3] >= 1.5 ? 1 : 0;
+        spot.set([l.spotInner ?? 1, l.spotOuter ?? 0, isSpot, 0], i * 4);
       });
       gl.uniform4fv(p.uniforms.uLightPos, pos);
       gl.uniform3fv(p.uniforms.uLightColor, col);
+      gl.uniform4fv(p.uniforms.uLightDir, dir);
+      gl.uniform4fv(p.uniforms.uLightSpot, spot);
     }
+
+    if (o.fog) {
+      gl.uniform1i(p.uniforms.uFogEnabled, 1);
+      gl.uniform3f(p.uniforms.uFogColor, o.fog.color[0], o.fog.color[1], o.fog.color[2]);
+      gl.uniform2f(p.uniforms.uFogRange, o.fog.near, o.fog.far);
+    } else {
+      gl.uniform1i(p.uniforms.uFogEnabled, 0);
+    }
+    return p;
   }
 
   drawMesh(o: MeshDrawOpts): void {
     const gl = this.gl;
-    this.useMeshMaterial(o);
+    const p = this.useMeshMaterial(o);
     const entry = this.getMeshVao(o.geometry);
+    gl.uniform1i(p.uniforms.uUseVertexColor, entry.hasColor ? 1 : 0);
     gl.bindVertexArray(entry.vao);
     gl.enable(gl.DEPTH_TEST);
-    gl.drawElements(gl.TRIANGLES, entry.count, entry.indexType, 0);
+    const mode = o.drawMode ?? 'triangles';
+    if (mode === 'triangles') {
+      gl.drawElements(gl.TRIANGLES, entry.count, entry.indexType, 0);
+    } else {
+      gl.drawArrays(mode === 'lines' ? gl.LINE_STRIP : gl.POINTS, 0, entry.vertexCount);
+    }
     gl.disable(gl.DEPTH_TEST);
   }
 
@@ -395,10 +461,16 @@ export class GlRenderer {
     gl.bindBuffer(gl.ARRAY_BUFFER, normBuf);
     gl.enableVertexAttribArray(1);
     gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+    const colorBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, colorBuf);
+    gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 0, 0);
+    const uvBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+    gl.vertexAttribPointer(3, 2, gl.FLOAT, false, 0, 0);
     const idxBuf = gl.createBuffer()!;
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
     gl.bindVertexArray(null);
-    return { vao, posBuf, normBuf, idxBuf, count: 0, indexType: gl.UNSIGNED_INT };
+    return { vao, posBuf, normBuf, colorBuf, uvBuf, idxBuf, count: 0, vertexCount: 0, indexType: gl.UNSIGNED_INT, hasColor: false };
   }
 
   /** (Re-)upload a dynamic mesh's vertex data. Cheap to call every frame. */
@@ -409,20 +481,41 @@ export class GlRenderer {
     gl.bufferData(gl.ARRAY_BUFFER, geometry.positions, gl.DYNAMIC_DRAW);
     gl.bindBuffer(gl.ARRAY_BUFFER, mesh.normBuf);
     gl.bufferData(gl.ARRAY_BUFFER, geometry.normals, gl.DYNAMIC_DRAW);
+    if (geometry.colors) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.colorBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, geometry.colors, gl.DYNAMIC_DRAW);
+      gl.enableVertexAttribArray(2);
+      mesh.hasColor = true;
+    } else if (mesh.hasColor) {
+      gl.disableVertexAttribArray(2);
+      mesh.hasColor = false;
+    }
+    if (geometry.uvs) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.uvBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, geometry.uvs, gl.DYNAMIC_DRAW);
+      gl.enableVertexAttribArray(3);
+    }
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.idxBuf);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geometry.indices, gl.DYNAMIC_DRAW);
     gl.bindVertexArray(null);
     mesh.count = geometry.indices.length;
+    mesh.vertexCount = Math.floor(geometry.positions.length / 3);
     mesh.indexType = geometry.indices instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
   }
 
   drawDynamicMesh(mesh: DynamicMesh, o: MeshMaterialOpts): void {
     if (mesh.count === 0) return;
     const gl = this.gl;
-    this.useMeshMaterial(o);
+    const p = this.useMeshMaterial(o);
+    gl.uniform1i(p.uniforms.uUseVertexColor, mesh.hasColor ? 1 : 0);
     gl.bindVertexArray(mesh.vao);
     gl.enable(gl.DEPTH_TEST);
-    gl.drawElements(gl.TRIANGLES, mesh.count, mesh.indexType, 0);
+    const mode = o.drawMode ?? 'triangles';
+    if (mode === 'triangles') {
+      gl.drawElements(gl.TRIANGLES, mesh.count, mesh.indexType, 0);
+    } else {
+      gl.drawArrays(mode === 'lines' ? gl.LINE_STRIP : gl.POINTS, 0, mesh.vertexCount);
+    }
     gl.disable(gl.DEPTH_TEST);
   }
 
@@ -430,6 +523,8 @@ export class GlRenderer {
     const gl = this.gl;
     gl.deleteBuffer(mesh.posBuf);
     gl.deleteBuffer(mesh.normBuf);
+    gl.deleteBuffer(mesh.colorBuf);
+    gl.deleteBuffer(mesh.uvBuf);
     gl.deleteBuffer(mesh.idxBuf);
     gl.deleteVertexArray(mesh.vao);
   }
@@ -445,7 +540,7 @@ export class GlRenderer {
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
-  private getMeshVao(geometry: Geometry): { vao: WebGLVertexArrayObject; count: number; indexType: number } {
+  private getMeshVao(geometry: Geometry): { vao: WebGLVertexArrayObject; count: number; vertexCount: number; indexType: number; hasColor: boolean } {
     let entry = this.meshVaos.get(geometry);
     if (entry) return entry;
     const gl = this.gl;
@@ -461,6 +556,20 @@ export class GlRenderer {
     gl.bufferData(gl.ARRAY_BUFFER, geometry.normals, gl.STATIC_DRAW);
     gl.enableVertexAttribArray(1);
     gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+    if (geometry.colors) {
+      const colorBuf = gl.createBuffer()!;
+      gl.bindBuffer(gl.ARRAY_BUFFER, colorBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, geometry.colors, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(2);
+      gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 0, 0);
+    }
+    if (geometry.uvs) {
+      const uvBuf = gl.createBuffer()!;
+      gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, geometry.uvs, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(3);
+      gl.vertexAttribPointer(3, 2, gl.FLOAT, false, 0, 0);
+    }
     const idxBuf = gl.createBuffer()!;
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geometry.indices, gl.STATIC_DRAW);
@@ -468,7 +577,9 @@ export class GlRenderer {
     entry = {
       vao,
       count: geometry.indices.length,
+      vertexCount: Math.floor(geometry.positions.length / 3),
       indexType: geometry.indices instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT,
+      hasColor: !!geometry.colors,
     };
     this.meshVaos.set(geometry, entry);
     return entry;
