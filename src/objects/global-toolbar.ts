@@ -344,7 +344,7 @@ LLMMonitor (The Eye).
     // Batch create all widgets: header button, gear button, action buttons.
     // Compact mode drops the gear from the header (no horizontal room).
     const specs: Array<Record<string, unknown>> = [
-      { type: 'button', windowId: this.windowId, text: compact ? '\u2699' : `${chevron} \u2699 System`, style: compact ? { ...headerStyle, tooltip: 'System' } : headerStyle },
+      { type: 'button', windowId: this.windowId, text: compact ? '\u2699' : `${chevron} System`, style: compact ? { ...headerStyle, tooltip: 'System' } : headerStyle },
     ];
     if (!compact) {
       specs.push({ type: 'button', windowId: this.windowId, text: '\u2699', style: gearStyle });

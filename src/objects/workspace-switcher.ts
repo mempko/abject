@@ -349,7 +349,7 @@ the WorkspaceBrowser for discovering remote workspaces.
       // (no horizontal room) and renders icon-only rows.
       const specs: Array<{ type: string; windowId: AbjectId; text: string; style?: Record<string, unknown> }> = [];
       // 0: header collapse-toggle button
-      specs.push({ type: 'button', windowId: this.windowId!, text: compact ? '\u25C8' : `${chevron} \u25C8 Spaces`, style: compact ? { ...headerStyle, tooltip: 'Spaces' } : headerStyle });
+      specs.push({ type: 'button', windowId: this.windowId!, text: compact ? '\u25C8' : `${chevron} Spaces`, style: compact ? { ...headerStyle, tooltip: 'Spaces' } : headerStyle });
       if (!compact) {
         // "+" button and settings gear (in header row)
         specs.push({ type: 'button', windowId: this.windowId!, text: '+', style: gearStyle });

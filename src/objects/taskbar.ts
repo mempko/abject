@@ -341,7 +341,7 @@ can restore windows from the sidebar.
 
     // [0] Header collapse-toggle button. Compact mode drops the gear from the
     // header (no horizontal room).
-    specs.push({ type: 'button', windowId: this.windowId!, text: compact ? '\u25A0' : `${chevron} \u25A0 Abjects`, style: compact ? { ...headerStyle, tooltip: 'Abjects' } : headerStyle });
+    specs.push({ type: 'button', windowId: this.windowId!, text: compact ? '\u25A0' : `${chevron} Abjects`, style: compact ? { ...headerStyle, tooltip: 'Abjects' } : headerStyle });
     if (!compact) {
       // [1] Gear button (AppExplorer)
       specs.push({ type: 'button', windowId: this.windowId!, text: '\u2699', style: gearStyle });
