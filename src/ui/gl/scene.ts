@@ -15,6 +15,12 @@ export interface VocabNode {
   kind: SceneNodeKind;
   transform: SceneTransform;
   params: Record<string, unknown>;
+  /**
+   * Bumped each time an applied op supplies `params.geometry`, so the
+   * renderer can tell a cheap transform/color update apart from one that
+   * deforms a custom mesh and re-upload the GPU buffers only when needed.
+   */
+  geomRev: number;
 }
 
 export class SceneStore {
@@ -37,6 +43,7 @@ export class SceneStore {
           kind: op.kind!,
           transform: op.transform ?? {},
           params: op.params ?? {},
+          geomRev: op.params?.geometry !== undefined ? 1 : 0,
         };
         this.nodes.set(key, node);
         let set = this.bySurface.get(surfaceId);
@@ -51,7 +58,10 @@ export class SceneStore {
       const node = this.nodes.get(key);
       if (!node) continue;
       if (op.transform) node.transform = { ...node.transform, ...op.transform };
-      if (op.params) node.params = { ...node.params, ...op.params };
+      if (op.params) {
+        node.params = { ...node.params, ...op.params };
+        if (op.params.geometry !== undefined) node.geomRev++;
+      }
       if (op.parentId !== undefined) node.parentId = op.parentId;
     }
   }

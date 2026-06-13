@@ -14,13 +14,13 @@ import { require, ensure } from '../core/contracts.js';
 import { Tween, DECELERATE, ACCELERATE } from './motion.js';
 import type { DrawCommandType } from '../objects/widgets/widget-types.js';
 import { CANVAS_CTX_METHODS, CANVAS_CTX_PROPERTIES } from '../objects/widgets/widget-types.js';
-import { GlRenderer, parseCssColor, RGBA, MeshLight } from './gl/renderer.js';
+import { GlRenderer, parseCssColor, RGBA, MeshLight, DynamicMesh } from './gl/renderer.js';
 import { Overlay2D } from './gl/overlay-2d.js';
-import { SceneStore } from './gl/scene.js';
-import { SceneOp, SceneTheme, MeshPrimitive, resolveSceneColor } from './gl/scene-types.js';
-import { getGeometry } from './gl/primitives.js';
+import { SceneStore, VocabNode } from './gl/scene.js';
+import { SceneOp, SceneTheme, MeshPrimitive, CustomGeometryParam, resolveSceneColor, hasCustomGeometry } from './gl/scene-types.js';
+import { getGeometry, customGeometry, Geometry } from './gl/primitives.js';
 import { Mat4, mat4Identity, mat4Multiply, mat4PerspectiveYDown, mat4Translation, mat4TRS, mat4Invert } from './gl/math.js';
-import { rayFromScreen, raySurfaceHit, rayMeshHit, Ray } from './gl/picking.js';
+import { rayFromScreen, raySurfaceHit, rayMeshHit, rayCustomMeshHit, Ray } from './gl/picking.js';
 
 /**
  * Mobile interaction states (WebOS-style).
@@ -306,6 +306,16 @@ export class Compositor {
   private renderer: GlRenderer;
   private overlay: Overlay2D;
   private sceneStore = new SceneStore();
+  /**
+   * GPU buffers for mesh nodes carrying custom `params.geometry`, keyed by
+   * full node key (`<surfaceKey>/<nodeId>`). Rebuilt only when the node's
+   * geometry revision changes; entries not drawn in a frame are pruned (and
+   * their GL buffers freed) at frame end, which covers node removal, surface
+   * destruction, and minimized windows in one place.
+   */
+  private customMeshes = new Map<string, { rev: number; geom: Geometry; handle: DynamicMesh }>();
+  /** Node keys whose custom mesh was drawn this frame; drives end-of-frame pruning. */
+  private touchedCustomMeshes = new Set<string>();
   private sceneTheme?: SceneTheme;
   private surfaceGl: Map<string, SurfaceGlState> = new Map();
   /** Owners with world-scope scene nodes (keys into sceneStore: `world:<ownerId>`). */
@@ -391,6 +401,10 @@ export class Compositor {
       // GPU state is gone; OffscreenCanvases retain content, so re-upload all.
       for (const state of this.surfaceGl.values()) state.texture = undefined;
       for (const surface of this.surfaces.values()) surface.dirty = true;
+      // Custom-mesh GPU handles are now invalid; drop them so they rebuild
+      // from the retained scene store on the next frame (no deleteDynamicMesh
+      // — the underlying GL objects no longer exist).
+      this.customMeshes.clear();
       this.overlay.invalidate();
       this.needsRender = true;
     };
@@ -1421,6 +1435,7 @@ export class Compositor {
    */
   private render(): void {
     if (this.renderer.isContextLost) return;
+    this.touchedCustomMeshes.clear();
     this.renderer.beginFrame();
     if (this.mobileMode) {
       this.renderMobile();
@@ -1428,6 +1443,7 @@ export class Compositor {
       this.renderDesktop();
     }
     this.overlay.draw();
+    this.pruneCustomMeshes();
   }
 
   /**
@@ -1644,16 +1660,64 @@ export class Compositor {
       const world = this.sceneStore.worldMatrix(node, surfaceModel);
       const color = parseCssColor(resolveSceneColor((node.params.color as string) ?? '#ffffff', this.sceneTheme));
       const emissiveStr = node.params.emissive as string | undefined;
-      this.renderer.drawMesh({
+      const material = {
         model: world,
         viewProj: this.viewProj,
-        geometry: getGeometry((node.params.primitive as MeshPrimitive) ?? 'box'),
         color,
         emissive: emissiveStr ? parseCssColor(resolveSceneColor(emissiveStr, this.sceneTheme)) : undefined,
         opacity: (node.params.opacity as number) ?? 1,
         lights,
         cameraPos: this.cameraPos,
-      });
+      };
+      if (hasCustomGeometry(node.params)) {
+        const handle = this.customMeshHandle(key, node);
+        if (handle) this.renderer.drawDynamicMesh(handle, material);
+      } else {
+        this.renderer.drawMesh({
+          ...material,
+          geometry: getGeometry((node.params.primitive as MeshPrimitive) ?? 'box'),
+        });
+      }
+    }
+  }
+
+  /**
+   * Get (or build/refresh) the GPU handle for a custom-geometry mesh node.
+   * The Float32/Uint32 arrays are rebuilt and re-uploaded only when the
+   * node's geometry revision changes; transform/color updates reuse the
+   * existing buffers. Marks the key touched so it survives end-of-frame
+   * pruning.
+   */
+  private customMeshHandle(key: string, node: VocabNode): DynamicMesh | undefined {
+    const fullKey = `${key}/${node.id}`;
+    this.touchedCustomMeshes.add(fullKey);
+    let entry = this.customMeshes.get(fullKey);
+    if (entry && entry.rev === node.geomRev) return entry.handle;
+    const g = node.params.geometry as CustomGeometryParam | undefined;
+    if (!g || !Array.isArray(g.positions)) return entry?.handle;
+    const geom = customGeometry(g.positions, g.indices, g.normals);
+    if (!entry) {
+      entry = { rev: node.geomRev, geom, handle: this.renderer.createDynamicMesh() };
+      this.customMeshes.set(fullKey, entry);
+    } else {
+      entry.geom = geom;
+      entry.rev = node.geomRev;
+    }
+    this.renderer.updateDynamicMesh(entry.handle, geom);
+    return entry.handle;
+  }
+
+  /**
+   * Free GPU buffers for custom meshes that were not drawn this frame —
+   * removed nodes, destroyed surfaces, or windows that went off-screen. The
+   * retained scene store rebuilds any that reappear. Called once per frame.
+   */
+  private pruneCustomMeshes(): void {
+    if (this.customMeshes.size === 0) return;
+    for (const [fullKey, entry] of this.customMeshes) {
+      if (this.touchedCustomMeshes.has(fullKey)) continue;
+      this.renderer.deleteDynamicMesh(entry.handle);
+      this.customMeshes.delete(fullKey);
     }
   }
 
@@ -2210,7 +2274,13 @@ export class Compositor {
       if (node.kind !== 'mesh') continue;
       if (layer !== undefined && ((node.params.layer as string) ?? 'back') !== layer) continue;
       const model = this.sceneStore.worldMatrix(node, frame);
-      const t = rayMeshHit(ray, model, ((node.params.primitive as string) ?? 'box') as 'plane' | 'box' | 'sphere' | 'cylinder');
+      let t: number | null;
+      if (hasCustomGeometry(node.params)) {
+        const g = node.params.geometry as CustomGeometryParam;
+        t = rayCustomMeshHit(ray, model, g.positions, g.indices);
+      } else {
+        t = rayMeshHit(ray, model, ((node.params.primitive as string) ?? 'box') as 'plane' | 'box' | 'sphere' | 'cylinder');
+      }
       if (t === null) continue;
       if (collect) collect(t, node.id);
       if (t < bestT) {

@@ -52,12 +52,12 @@ The hand-rolled WebGL2 engine:
 | File | Contents |
 |---|---|
 | `math.ts` | Column-major Mat4/Vec3 math (perspective with y-down, TRS, invert, ray transforms) |
-| `renderer.ts` | GL context, program cache, premultiplied-alpha textures, context-loss recovery, typed draw calls (surface slab, SDF glow/shadow, flat quad, Blinn-Phong mesh, overlay) |
+| `renderer.ts` | GL context, program cache, premultiplied-alpha textures, context-loss recovery, typed draw calls (surface slab, SDF glow/shadow, flat quad, Blinn-Phong mesh, re-uploadable dynamic mesh, overlay) |
 | `shaders.ts` | GLSL sources (rounded-slab SDF mask + rim, gaussian-erf glow, mesh lighting) |
-| `primitives.ts` | plane/box/sphere/cylinder geometry generators |
-| `scene.ts` | Retained client store for scene-vocabulary nodes |
-| `scene-types.ts` | The scene vocabulary: node kinds, validation, `$token` colors, `SceneTheme` (shared with the server) |
-| `picking.ts` | Camera-ray → slab-local px conversion |
+| `primitives.ts` | plane/box/sphere/cylinder generators + custom polygonal geometry (arbitrary positions/indices, auto-computed normals) |
+| `scene.ts` | Retained client store for scene-vocabulary nodes (tracks a geometry revision so dynamic meshes re-upload only on change) |
+| `scene-types.ts` | The scene vocabulary: node kinds, validation (incl. custom geometry), `$token` colors, `SceneTheme` (shared with the server) |
+| `picking.ts` | Camera-ray → slab-local px conversion; ray-primitive and ray-triangle (custom mesh) hit tests |
 | `overlay-2d.ts` | Screen-space 2D chrome canvas composited as the final pass |
 
 ## Design

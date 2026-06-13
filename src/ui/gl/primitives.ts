@@ -7,7 +7,8 @@
 export interface Geometry {
   positions: Float32Array;
   normals: Float32Array;
-  indices: Uint16Array;
+  /** 16-bit for the static unit primitives; 32-bit for large custom meshes. */
+  indices: Uint16Array | Uint32Array;
 }
 
 /** Unit plane in xy, centered, facing +z. */
@@ -111,6 +112,66 @@ export function cylinderGeometry(radialSegments = 24): Geometry {
     }
   }
   return { positions: new Float32Array(p), normals: new Float32Array(n), indices: new Uint16Array(idx) };
+}
+
+/**
+ * Per-vertex smooth normals for an indexed triangle mesh: accumulate each
+ * face normal onto its three vertices, then normalize. Used when a custom
+ * mesh supplies positions/indices but no normals, so arbitrary surfaces
+ * (heightfields, deformable water, generated geometry) light correctly
+ * without the author hand-computing normals.
+ */
+export function computeNormals(positions: Float32Array, indices: Uint16Array | Uint32Array): Float32Array {
+  const normals = new Float32Array(positions.length);
+  for (let i = 0; i < indices.length; i += 3) {
+    const ia = indices[i] * 3, ib = indices[i + 1] * 3, ic = indices[i + 2] * 3;
+    const ax = positions[ia], ay = positions[ia + 1], az = positions[ia + 2];
+    const bx = positions[ib], by = positions[ib + 1], bz = positions[ib + 2];
+    const cx = positions[ic], cy = positions[ic + 1], cz = positions[ic + 2];
+    const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+    const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+    // Cross(e1, e2) — magnitude is proportional to triangle area, so larger
+    // faces weight the shared-vertex normal more (area-weighted smoothing).
+    const nx = e1y * e2z - e1z * e2y;
+    const ny = e1z * e2x - e1x * e2z;
+    const nz = e1x * e2y - e1y * e2x;
+    normals[ia] += nx; normals[ia + 1] += ny; normals[ia + 2] += nz;
+    normals[ib] += nx; normals[ib + 1] += ny; normals[ib + 2] += nz;
+    normals[ic] += nx; normals[ic + 1] += ny; normals[ic + 2] += nz;
+  }
+  for (let i = 0; i < normals.length; i += 3) {
+    const x = normals[i], y = normals[i + 1], z = normals[i + 2];
+    const len = Math.hypot(x, y, z) || 1;
+    normals[i] = x / len; normals[i + 1] = y / len; normals[i + 2] = z / len;
+  }
+  return normals;
+}
+
+/**
+ * Build a Geometry from arbitrary polygonal data supplied by a scene node's
+ * `params.geometry`. `positions` is a flat [x,y,z,...] array; `indices`
+ * (flat triangle list) defaults to a sequential triangle soup; `normals`
+ * are computed smooth when absent. Indices are 32-bit so meshes can exceed
+ * the 65k-vertex 16-bit ceiling (a 200x200 heightfield is 40k vertices).
+ */
+export function customGeometry(
+  rawPositions: ArrayLike<number>,
+  rawIndices?: ArrayLike<number>,
+  rawNormals?: ArrayLike<number>,
+): Geometry {
+  const positions = rawPositions instanceof Float32Array ? rawPositions : Float32Array.from(rawPositions);
+  const vertexCount = Math.floor(positions.length / 3);
+  const indices = rawIndices
+    ? Uint32Array.from(rawIndices)
+    : (() => {
+        const seq = new Uint32Array(vertexCount);
+        for (let i = 0; i < vertexCount; i++) seq[i] = i;
+        return seq;
+      })();
+  const normals = rawNormals && rawNormals.length === positions.length
+    ? (rawNormals instanceof Float32Array ? rawNormals : Float32Array.from(rawNormals))
+    : computeNormals(positions, indices);
+  return { positions, normals, indices };
 }
 
 const cache = new Map<string, Geometry>();

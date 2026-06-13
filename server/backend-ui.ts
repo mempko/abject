@@ -305,7 +305,7 @@ export class BackendUI extends Abject {
               },
               {
                 name: 'scene',
-                description: 'Apply retained 3D scene ops. Default scope: your window\'s subtree (every window is a slab in the 3D scene; nodes travel with it, positions are px from the window center). With world: true, nodes attach to the GLOBAL scene graph instead — positions are workspace px, no window needed (desktop pets, ambient décor); params.layer: "back" (default, behind windows) or "front" (above windows). Ops: { op: "add"|"update"|"remove", id, parentId?, kind: "mesh"|"light"|"group", transform: { position?: [x,y,z], rotation?: [rx,ry,rz], scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder", color, emissive?, opacity?, layer? }. Light params: { lightType: "point"|"directional", color?, direction? }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed (world nodes also tear down when their owner dies). Example: await this.call(uiId, "scene", { world: true, ops: [{ op: "add", id: "pet", kind: "mesh", transform: { position: [400, 600, 30], scale: 40 }, params: { primitive: "sphere", color: "$accent" } }] })',
+                description: 'Apply retained 3D scene ops. Default scope: your window\'s subtree (every window is a slab in the 3D scene; nodes travel with it, positions are px from the window center). With world: true, nodes attach to the GLOBAL scene graph instead — positions are workspace px, no window needed (desktop pets, ambient décor); params.layer: "back" (default, behind windows) or "front" (above windows). Ops: { op: "add"|"update"|"remove", id, parentId?, kind: "mesh"|"light"|"group", transform: { position?: [x,y,z], rotation?: [rx,ry,rz], scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder", color, emissive?, opacity?, layer? } for a built-in shape, OR { geometry: { positions:[x,y,z,...], indices?:[...], normals?:[...] }, color, ... } for an arbitrary polygonal mesh (indices default to a triangle soup; normals auto-computed; re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional", color?, direction? }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed (world nodes also tear down when their owner dies). Example: await this.call(uiId, "scene", { world: true, ops: [{ op: "add", id: "pet", kind: "mesh", transform: { position: [400, 600, 30], scale: 40 }, params: { primitive: "sphere", color: "$accent" } }] })',
                 parameters: [
                   {
                     name: 'surfaceId',
@@ -1111,6 +1111,17 @@ the contributor and decorations tear down when the contributor dies):
 Kinds: mesh (primitive: plane|box|sphere|cylinder; params color, emissive?,
 opacity?), light (lightType: point|directional; color?, direction?), group.
 transform: { position: [x,y,z], rotation: [rx,ry,rz] radians, scale: n|[x,y,z] }.
+CUSTOM / DEFORMABLE MESHES — when no built-in primitive fits (a wave surface,
+terrain, a generated or morphing shape), give the mesh node its own polygons
+instead of a primitive: params { geometry: { positions: [x,y,z, ...], indices?:
+[...], normals?: [...] }, color, ... }. positions is a flat local-px vertex
+list; indices a flat triangle list (omit for a sequential triangle soup);
+normals auto-compute smooth when omitted. Re-send geometry in an 'update' op to
+DEFORM the mesh — GPU buffers are reused, so animating a heightfield every frame
+is cheap. This is how you render a continuous changing surface rather than a
+grid of discrete primitive tiles:
+  await this.call(this.dep('UIServer'), 'scene', { surfaceId, ops: [
+    { op: 'update', id: 'water', params: { geometry: { positions: nextPositions } } } ]});
 COORDINATES ARE Y-DOWN, the screen convention: +y moves DOWN, +x right, +z
 toward the viewer (this differs from y-up 3D engines). Mouse dx/dy therefore
 map DIRECTLY onto position dx/dy — apply both with the same sign, no flips.

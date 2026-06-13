@@ -1297,6 +1297,15 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           this.call(windowId, 'scene', { ops: [{ op: 'update', id: 'cube', transform: { rotation: [rx, ry, 0] } }] })
           Kinds: mesh (primitive: plane|box|sphere|cylinder), light (lightType: point|directional), group.
           transform: { position: [x,y,z] px from window center (+z toward viewer), rotation: [rx,ry,rz] radians, scale: n|[x,y,z] }.
+          ARBITRARY/DEFORMABLE MESHES: when no built-in primitive fits (a wave surface, terrain, a
+          generated or morphing shape), a mesh node can carry its own polygons instead of a primitive:
+          params: { geometry: { positions: [x,y,z, ...], indices?: [...], normals?: [...] }, color }.
+          positions are local px (a flat vertex list); indices is a flat triangle list (omit for a
+          sequential triangle soup); normals auto-compute (smooth) when omitted. Re-send geometry in an
+          'update' op each tick to DEFORM it (the GPU buffers are reused, so animating a heightfield
+          every frame is cheap): this.call(windowId, 'scene', { ops: [{ op: 'update', id: 'water',
+          params: { geometry: { positions: nextPositions } } }] }). This is the way to render a
+          continuous, changing surface rather than a grid of discrete primitive tiles.
           COMPOUND SHAPES (a turtle = shell + head + legs, a character, anything with parts): add a
           'group' node, then add each part with parentId set to the group's id (the field is parentId,
           NOT parent). Parts inherit the group's transform, so you move/rotate the whole thing by

@@ -152,7 +152,7 @@ export class WindowAbject extends Abject {
               },
               {
                 name: 'scene',
-                description: 'Apply retained 3D scene ops to this window\'s subtree. The window is a slab in a 3D scene; mesh/light/group nodes attach to it and travel with it. ANY abject may call this — you do not need to own the window. Decorations from other abjects route their nodeInput back to the contributor and tear down when the contributor dies (prefix your node ids to avoid collisions). Ops: { op: "add"|"update"|"remove", id, parentId?, kind: "mesh"|"light"|"group", transform: { position?: [x,y,z] px from window center (+z toward viewer, y-DOWN), rotation?: [rx,ry,rz] radians, scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder", color, emissive?, opacity? }. Light params: { lightType: "point"|"directional", color?, direction? }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed.',
+                description: 'Apply retained 3D scene ops to this window\'s subtree. The window is a slab in a 3D scene; mesh/light/group nodes attach to it and travel with it. ANY abject may call this — you do not need to own the window. Decorations from other abjects route their nodeInput back to the contributor and tear down when the contributor dies (prefix your node ids to avoid collisions). Ops: { op: "add"|"update"|"remove", id, parentId?, kind: "mesh"|"light"|"group", transform: { position?: [x,y,z] px from window center (+z toward viewer, y-DOWN), rotation?: [rx,ry,rz] radians, scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder", color, emissive?, opacity? } for a built-in shape, OR { geometry: { positions:[x,y,z,...], indices?:[...], normals?:[...] }, color, ... } for an arbitrary polygonal mesh (positions are local px; indices default to a triangle soup; normals auto-computed; re-send geometry in an "update" op to deform it every frame — heightfields, water, generated surfaces). Light params: { lightType: "point"|"directional", color?, direction? }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed.',
                 parameters: [
                   { name: 'ops', type: { kind: 'array', elementType: { kind: 'reference', reference: 'SceneOp' } }, description: 'Scene operations (invalid batches rejected with the vocabulary)' },
                 ],
@@ -515,6 +515,12 @@ The window is a slab in a 3D desktop. Attach retained 3D nodes to it:
 Kinds: mesh (primitive: plane|box|sphere|cylinder), light (lightType:
 point|directional), group. Positions are px from the window center
 (+z toward the viewer); colors take '#hex' or theme tokens ('$accent', ...).
+A mesh can carry CUSTOM polygons instead of a primitive for arbitrary or
+deformable surfaces (waves, terrain, generated shapes): params { geometry:
+{ positions: [x,y,z, ...], indices?: [...], normals?: [...] }, color }.
+Re-send geometry in an 'update' op each tick to deform it (buffers reuse, so
+per-frame morphing is cheap) — the way to draw a continuous changing surface
+rather than a grid of discrete tiles.
 COORDINATES ARE Y-DOWN (screen convention): +y moves DOWN, the same
 direction as input y — mouse deltas map onto positions with no sign flips.
 Nodes persist until { op: 'remove', id }. Tilt/float the window itself:

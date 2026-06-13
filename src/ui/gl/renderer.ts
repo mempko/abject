@@ -75,10 +75,10 @@ export interface MeshLight {
   color: [number, number, number];
 }
 
-export interface MeshDrawOpts {
+/** Material + lighting for a mesh draw, independent of where the geometry lives. */
+export interface MeshMaterialOpts {
   model: Mat4;
   viewProj: Mat4;
-  geometry: Geometry;
   color: RGBA;
   emissive?: RGBA;
   opacity?: number;
@@ -87,13 +87,33 @@ export interface MeshDrawOpts {
   cameraPos: [number, number, number];
 }
 
+export interface MeshDrawOpts extends MeshMaterialOpts {
+  geometry: Geometry;
+}
+
+/**
+ * A GPU mesh whose vertex buffers can be re-uploaded in place — the backing
+ * store for scene nodes carrying custom `params.geometry`. The compositor
+ * owns one handle per custom-mesh node and re-uploads it only when the
+ * node's geometry revision changes, so deforming a surface every frame
+ * reuses the same buffers instead of leaking a VAO per update.
+ */
+export interface DynamicMesh {
+  vao: WebGLVertexArrayObject;
+  posBuf: WebGLBuffer;
+  normBuf: WebGLBuffer;
+  idxBuf: WebGLBuffer;
+  count: number;
+  indexType: number; // gl.UNSIGNED_SHORT | gl.UNSIGNED_INT
+}
+
 export class GlRenderer {
   readonly canvas: HTMLCanvasElement;
   private gl: WebGL2RenderingContext;
   private programs = new Map<string, ProgramInfo>();
   private quadVao!: WebGLVertexArrayObject;
   private overlayVao!: WebGLVertexArrayObject;
-  private meshVaos = new WeakMap<Geometry, { vao: WebGLVertexArrayObject; count: number }>();
+  private meshVaos = new WeakMap<Geometry, { vao: WebGLVertexArrayObject; count: number; indexType: number }>();
   private contextLost = false;
   /** Called after the context is restored so the owner can re-upload state. */
   onContextRestored?: () => void;
@@ -319,14 +339,14 @@ export class GlRenderer {
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
 
-  drawMesh(o: MeshDrawOpts): void {
+  /** Bind the mesh program and set every material/lighting uniform. */
+  private useMeshMaterial(o: MeshMaterialOpts): void {
     const gl = this.gl;
     const p = this.getProgram('mesh', MESH_VS, MESH_FS, [
       'uModel', 'uViewProj', 'uColor', 'uEmissive', 'uOpacity', 'uAmbient',
       'uCameraPos', 'uLightCount', 'uLightPos', 'uLightColor',
     ]);
     gl.useProgram(p.program);
-    gl.bindVertexArray(this.getMeshVao(o.geometry).vao);
     gl.uniformMatrix4fv(p.uniforms.uModel, false, o.model);
     gl.uniformMatrix4fv(p.uniforms.uViewProj, false, o.viewProj);
     gl.uniform3f(p.uniforms.uColor, o.color.r, o.color.g, o.color.b);
@@ -348,9 +368,70 @@ export class GlRenderer {
       gl.uniform4fv(p.uniforms.uLightPos, pos);
       gl.uniform3fv(p.uniforms.uLightColor, col);
     }
+  }
+
+  drawMesh(o: MeshDrawOpts): void {
+    const gl = this.gl;
+    this.useMeshMaterial(o);
+    const entry = this.getMeshVao(o.geometry);
+    gl.bindVertexArray(entry.vao);
     gl.enable(gl.DEPTH_TEST);
-    gl.drawElements(gl.TRIANGLES, this.getMeshVao(o.geometry).count, gl.UNSIGNED_SHORT, 0);
+    gl.drawElements(gl.TRIANGLES, entry.count, entry.indexType, 0);
     gl.disable(gl.DEPTH_TEST);
+  }
+
+  // ── Dynamic (custom-geometry) meshes ─────────────────────────────────
+
+  /** Allocate an empty dynamic mesh; fill it with updateDynamicMesh. */
+  createDynamicMesh(): DynamicMesh {
+    const gl = this.gl;
+    const vao = gl.createVertexArray()!;
+    gl.bindVertexArray(vao);
+    const posBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+    const normBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, normBuf);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+    const idxBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+    gl.bindVertexArray(null);
+    return { vao, posBuf, normBuf, idxBuf, count: 0, indexType: gl.UNSIGNED_INT };
+  }
+
+  /** (Re-)upload a dynamic mesh's vertex data. Cheap to call every frame. */
+  updateDynamicMesh(mesh: DynamicMesh, geometry: Geometry): void {
+    const gl = this.gl;
+    gl.bindVertexArray(mesh.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.posBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, geometry.positions, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.normBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, geometry.normals, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.idxBuf);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geometry.indices, gl.DYNAMIC_DRAW);
+    gl.bindVertexArray(null);
+    mesh.count = geometry.indices.length;
+    mesh.indexType = geometry.indices instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+  }
+
+  drawDynamicMesh(mesh: DynamicMesh, o: MeshMaterialOpts): void {
+    if (mesh.count === 0) return;
+    const gl = this.gl;
+    this.useMeshMaterial(o);
+    gl.bindVertexArray(mesh.vao);
+    gl.enable(gl.DEPTH_TEST);
+    gl.drawElements(gl.TRIANGLES, mesh.count, mesh.indexType, 0);
+    gl.disable(gl.DEPTH_TEST);
+  }
+
+  deleteDynamicMesh(mesh: DynamicMesh): void {
+    const gl = this.gl;
+    gl.deleteBuffer(mesh.posBuf);
+    gl.deleteBuffer(mesh.normBuf);
+    gl.deleteBuffer(mesh.idxBuf);
+    gl.deleteVertexArray(mesh.vao);
   }
 
   drawOverlay(tex: WebGLTexture): void {
@@ -364,7 +445,7 @@ export class GlRenderer {
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
-  private getMeshVao(geometry: Geometry): { vao: WebGLVertexArrayObject; count: number } {
+  private getMeshVao(geometry: Geometry): { vao: WebGLVertexArrayObject; count: number; indexType: number } {
     let entry = this.meshVaos.get(geometry);
     if (entry) return entry;
     const gl = this.gl;
@@ -384,7 +465,11 @@ export class GlRenderer {
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geometry.indices, gl.STATIC_DRAW);
     gl.bindVertexArray(null);
-    entry = { vao, count: geometry.indices.length };
+    entry = {
+      vao,
+      count: geometry.indices.length,
+      indexType: geometry.indices instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT,
+    };
     this.meshVaos.set(geometry, entry);
     return entry;
   }

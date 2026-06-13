@@ -6,7 +6,7 @@
  * click-through even when slabs are tilted or lifted.
  */
 
-import { Mat4, Vec3, mat4Invert, mat4TransformDir, mat4TransformPoint, vec3Normalize, vec3Sub } from './math.js';
+import { Mat4, Vec3, mat4Invert, mat4TransformDir, mat4TransformPoint, vec3Cross, vec3Dot, vec3Normalize, vec3Sub } from './math.js';
 
 export interface Ray {
   origin: Vec3;
@@ -95,6 +95,57 @@ export function rayMeshHit(
   const dy = hitWorld.y - ray.origin.y;
   const dz = hitWorld.z - ray.origin.z;
   return Math.hypot(dx, dy, dz);
+}
+
+/**
+ * Intersect a ray with a custom polygonal mesh under `model`. The ray is
+ * pulled into the mesh's local space and tested against every triangle
+ * (Möller–Trumbore, double-sided since the scene disables face culling).
+ * `positions` is a flat [x,y,z,...] array; `indices` a flat triangle list,
+ * or undefined for a sequential triangle soup. Returns the world-space
+ * distance to the nearest hit, or null. Linear in triangle count, but
+ * picking runs on click, not per frame.
+ */
+export function rayCustomMeshHit(
+  ray: Ray,
+  model: Mat4,
+  positions: ArrayLike<number>,
+  indices?: ArrayLike<number>,
+): number | null {
+  const inv = mat4Invert(model);
+  const o = mat4TransformPoint(inv, ray.origin);
+  const d = mat4TransformDir(inv, ray.dir);
+  const triCount = indices ? Math.floor(indices.length / 3) : Math.floor(positions.length / 9);
+  let best: number | null = null;
+  const EPS = 1e-8;
+  for (let t = 0; t < triCount; t++) {
+    const i0 = indices ? indices[t * 3] : t * 3;
+    const i1 = indices ? indices[t * 3 + 1] : t * 3 + 1;
+    const i2 = indices ? indices[t * 3 + 2] : t * 3 + 2;
+    const a = { x: positions[i0 * 3], y: positions[i0 * 3 + 1], z: positions[i0 * 3 + 2] };
+    const b = { x: positions[i1 * 3], y: positions[i1 * 3 + 1], z: positions[i1 * 3 + 2] };
+    const c = { x: positions[i2 * 3], y: positions[i2 * 3 + 1], z: positions[i2 * 3 + 2] };
+    const e1 = vec3Sub(b, a);
+    const e2 = vec3Sub(c, a);
+    const pv = vec3Cross(d, e2);
+    const det = vec3Dot(e1, pv);
+    if (Math.abs(det) < EPS) continue; // ray parallel to triangle
+    const invDet = 1 / det;
+    const tv = vec3Sub(o, a);
+    const u = vec3Dot(tv, pv) * invDet;
+    if (u < 0 || u > 1) continue;
+    const qv = vec3Cross(tv, e1);
+    const v = vec3Dot(d, qv) * invDet;
+    if (v < 0 || u + v > 1) continue;
+    const tLocal = vec3Dot(e2, qv) * invDet;
+    if (tLocal < 0) continue;
+    // Convert local hit distance to world distance along the original ray.
+    const hitLocal = { x: o.x + d.x * tLocal, y: o.y + d.y * tLocal, z: o.z + d.z * tLocal };
+    const hitWorld = mat4TransformPoint(model, hitLocal);
+    const dist = Math.hypot(hitWorld.x - ray.origin.x, hitWorld.y - ray.origin.y, hitWorld.z - ray.origin.z);
+    if (best === null || dist < best) best = dist;
+  }
+  return best;
 }
 
 /**

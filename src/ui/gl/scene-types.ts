@@ -53,10 +53,29 @@ export interface SceneOp {
   /**
    * Per-kind params:
    * - mesh:  { primitive, color, emissive?, opacity? }   colors: '#hex' or '$token'
+   *          OR custom polygonal geometry instead of a primitive:
+   *          { geometry: { positions: number[], indices?: number[], normals?: number[] }, color, ... }
+   *          `positions` is a flat [x,y,z,...] list; `indices` a flat triangle
+   *          list (defaults to a sequential triangle soup); `normals` are
+   *          computed smooth when omitted. Re-send geometry in an 'update' op
+   *          to deform the mesh dynamically (heightfields, animated surfaces).
    * - light: { lightType: 'point'|'directional', color?, direction? [x,y,z] }
    * - group: {}
    */
   params?: Record<string, unknown>;
+}
+
+/** A mesh node's params carry custom geometry rather than a named primitive. */
+export interface CustomGeometryParam {
+  positions: number[];
+  indices?: number[];
+  normals?: number[];
+}
+
+/** True when a mesh node's params define custom polygonal geometry. */
+export function hasCustomGeometry(params: Record<string, unknown> | undefined): boolean {
+  const g = params?.geometry as { positions?: unknown } | undefined;
+  return !!g && typeof g === 'object' && Array.isArray((g as { positions?: unknown }).positions);
 }
 
 /** The theme subset the 3D scene renders from (pushed via setSceneTheme). */
@@ -90,8 +109,10 @@ const OP_FIELD_ALIASES: Record<string, string> = {
  * else in the vocabulary, so the rejection message points the right way.
  */
 const OP_FIELD_HINTS: Record<string, string> = {
-  mesh: 'put the shape in params.primitive (one of ' + MESH_PRIMITIVES.join(', ') + ')',
+  mesh: 'put the shape in params.primitive (one of ' + MESH_PRIMITIVES.join(', ') + ') or params.geometry for a custom mesh',
   primitive: 'nest it under params: { primitive: ... }',
+  geometry: 'nest it under params: { geometry: { positions, indices?, normals? } }',
+  positions: 'nest it under params: { geometry: { positions: [...] } }',
   material: 'put the color in params.color',
   color: 'nest it under params: { color: ... }',
   position: 'nest it under transform: { position: [x, y, z] }',
@@ -150,6 +171,57 @@ function validTransform(t: unknown): string | null {
   return null;
 }
 
+/** True for a flat numeric array (every entry a finite number). */
+function isNumberArray(v: unknown): v is number[] {
+  return Array.isArray(v) && v.every((n) => typeof n === 'number' && Number.isFinite(n));
+}
+
+/**
+ * Validate a mesh node's custom geometry. Returns [problemKey, message]
+ * pairs (empty when valid). Keeps the same loud, human-actionable tone as
+ * the rest of the vocabulary so a generator that ships a ragged array or
+ * out-of-range index learns exactly what to fix.
+ */
+function validateGeometry(id: string, geometry: unknown): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  const g = geometry as Record<string, unknown> | null;
+  if (!g || typeof g !== 'object') {
+    return [[`${id}:geometry`, `'${id}': params.geometry must be an object { positions, indices?, normals? }`]];
+  }
+  if (!isNumberArray(g.positions)) {
+    return [[`${id}:positions`, `'${id}': params.geometry.positions must be a flat [x, y, z, ...] number array`]];
+  }
+  const positions = g.positions;
+  if (positions.length < 9 || positions.length % 3 !== 0) {
+    out.push([`${id}:positions`, `'${id}': params.geometry.positions length must be a multiple of 3 and describe at least one triangle (≥ 9 numbers); got ${positions.length}`]);
+  }
+  const vertexCount = Math.floor(positions.length / 3);
+  if (g.indices !== undefined) {
+    if (!isNumberArray(g.indices)) {
+      out.push([`${id}:indices`, `'${id}': params.geometry.indices must be a flat number array of triangle vertex indices`]);
+    } else {
+      const idx = g.indices;
+      if (idx.length % 3 !== 0) {
+        out.push([`${id}:indices`, `'${id}': params.geometry.indices length must be a multiple of 3 (triangle list); got ${idx.length}`]);
+      }
+      for (let i = 0; i < idx.length; i++) {
+        if (!Number.isInteger(idx[i]) || idx[i] < 0 || idx[i] >= vertexCount) {
+          out.push([`${id}:indices`, `'${id}': params.geometry.indices[${i}] = ${idx[i]} is out of range (0..${vertexCount - 1})`]);
+          break;
+        }
+      }
+    }
+  }
+  if (g.normals !== undefined) {
+    if (!isNumberArray(g.normals)) {
+      out.push([`${id}:normals`, `'${id}': params.geometry.normals must be a flat [x, y, z, ...] number array`]);
+    } else if (g.normals.length !== positions.length) {
+      out.push([`${id}:normals`, `'${id}': params.geometry.normals length (${g.normals.length}) must equal positions length (${positions.length}); omit it to auto-compute`]);
+    }
+  }
+  return out;
+}
+
 /**
  * Validate a scene op batch. Returns human-actionable problems (empty when
  * valid), deduplicated, naming the vocabulary — same philosophy as the
@@ -191,9 +263,16 @@ export function validateSceneOps(ops: unknown[]): string[] {
     }
     const params = o.params ?? {};
     const kind = o.kind;
-    if (kind === 'mesh' || (o.op === 'update' && params.primitive !== undefined)) {
-      if (o.op === 'add' && !(MESH_PRIMITIVES as readonly string[]).includes(params.primitive as string)) {
-        problems.set(`${o.id}:primitive`, `'${o.id}': mesh needs params.primitive — one of ${MESH_PRIMITIVES.join(', ')}`);
+    const touchesGeometry = params.geometry !== undefined;
+    if (kind === 'mesh' || (o.op === 'update' && (params.primitive !== undefined || touchesGeometry))) {
+      const custom = hasCustomGeometry(params);
+      // An 'add' mesh needs a shape: a named primitive OR custom geometry.
+      if (o.op === 'add' && !custom && !(MESH_PRIMITIVES as readonly string[]).includes(params.primitive as string)) {
+        problems.set(`${o.id}:primitive`, `'${o.id}': mesh needs params.primitive — one of ${MESH_PRIMITIVES.join(', ')} — or params.geometry: { positions, indices?, normals? }`);
+      }
+      // Validate custom geometry whenever it is present (add or deforming update).
+      if (touchesGeometry) {
+        for (const p of validateGeometry(o.id, params.geometry)) problems.set(p[0], p[1]);
       }
       if (o.op === 'add' && !isSceneColor(params.color)) {
         problems.set(`${o.id}:color`, `'${o.id}': mesh needs params.color — '#hex', 'rgb(a)', or a theme token ($${SCENE_THEME_TOKENS.join(', $')})`);
