@@ -422,6 +422,14 @@ export function validateSceneOps(ops: unknown[]): string[] {
           }
         }
       }
+      if (params.bloom !== undefined && params.bloom !== true && params.bloom !== false) {
+        const b = params.bloom as Record<string, unknown> | null;
+        if (!b || typeof b !== 'object'
+          || (b.threshold !== undefined && typeof b.threshold !== 'number')
+          || (b.intensity !== undefined && typeof b.intensity !== 'number')) {
+          problems.set(`${o.id}:bloom`, `'${o.id}': environment params.bloom must be true or { threshold?, intensity? }`);
+        }
+      }
     }
   }
   return [...problems.values()];

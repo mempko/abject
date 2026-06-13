@@ -356,6 +356,9 @@ export class Compositor {
    * ONE 'animate' scene op instead of a transform message every frame.
    */
   private nodeAnims = new Map<string, { surfaceKey: string; id: string; anims: NodeAnim[] }>();
+  /** Global bloom post-effect config, set by an 'environment' node's `bloom`. */
+  private bloomConfig?: { threshold: number; intensity: number };
+  private bloomOwnerKey?: string;
   private sceneTheme?: SceneTheme;
   private surfaceGl: Map<string, SurfaceGlState> = new Map();
   /** Owners with world-scope scene nodes (keys into sceneStore: `world:<ownerId>`). */
@@ -757,7 +760,29 @@ export class Compositor {
       rest.push(op);
     }
     if (rest.length > 0) this.sceneStore.apply(surfaceKey, rest);
+    // Pick up bloom config from any 'environment' node (global post-effect).
+    for (const op of rest) this.syncBloomFrom(surfaceKey, op);
     this.needsRender = true;
+  }
+
+  /** Update the global bloom config when an 'environment' node changes. */
+  private syncBloomFrom(surfaceKey: string, op: SceneOp): void {
+    const fullKey = `${surfaceKey}/${op.id}`;
+    if (op.op === 'remove') {
+      if (this.bloomOwnerKey === fullKey) { this.bloomConfig = undefined; this.bloomOwnerKey = undefined; }
+      return;
+    }
+    const node = this.sceneStore.getNode(surfaceKey, op.id);
+    if (node?.kind !== 'environment') return;
+    const b = node.params.bloom as boolean | { threshold?: number; intensity?: number } | undefined;
+    if (b) {
+      this.bloomConfig = b === true
+        ? { threshold: 0.6, intensity: 1 }
+        : { threshold: b.threshold ?? 0.6, intensity: b.intensity ?? 1 };
+      this.bloomOwnerKey = fullKey;
+    } else if (this.bloomOwnerKey === fullKey) {
+      this.bloomConfig = undefined; this.bloomOwnerKey = undefined;
+    }
   }
 
   /**
@@ -1504,6 +1529,8 @@ export class Compositor {
     } else {
       this.renderDesktop();
     }
+    // Bloom is a post pass over the rendered scene, beneath the 2D chrome.
+    if (this.bloomConfig) this.renderer.applyBloom(this.bloomConfig.threshold, this.bloomConfig.intensity);
     this.overlay.draw();
     this.pruneCustomMeshes();
   }

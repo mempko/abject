@@ -122,6 +122,43 @@ out vec4 outColor;
 void main() { outColor = uColor; }
 `;
 
+/**
+ * Bloom bright-pass: keep only pixels above a luminance threshold (soft knee),
+ * feeding the blur chain. Samples a copy of the rendered scene.
+ */
+export const BRIGHT_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uTex;
+uniform float uThreshold;
+out vec4 outColor;
+void main() {
+  vec3 c = texture(uTex, vUv).rgb;
+  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  float k = clamp((l - uThreshold) / max(l, 1e-4), 0.0, 1.0);
+  outColor = vec4(c * k, 1.0);
+}
+`;
+
+/** Separable 9-tap gaussian blur; uDir is the per-tap texel step (h then v). */
+export const BLUR_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uTex;
+uniform vec2 uDir;
+out vec4 outColor;
+void main() {
+  float w[5];
+  w[0] = 0.227027; w[1] = 0.194595; w[2] = 0.121622; w[3] = 0.054054; w[4] = 0.016216;
+  vec3 c = texture(uTex, vUv).rgb * w[0];
+  for (int i = 1; i < 5; i++) {
+    c += texture(uTex, vUv + uDir * float(i)).rgb * w[i];
+    c += texture(uTex, vUv - uDir * float(i)).rgb * w[i];
+  }
+  outColor = vec4(c, 1.0);
+}
+`;
+
 /** Fullscreen overlay: blit the 2D chrome canvas over everything. */
 export const OVERLAY_VS = `#version 300 es
 layout(location = 0) in vec2 aPos;   // fullscreen triangle in clip space

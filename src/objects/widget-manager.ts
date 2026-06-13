@@ -1318,8 +1318,9 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           many times in a single GPU call — the right way to do starfields, particles, swarms, or grids of shapes
           (re-send instances in an 'update' op to move them).
           LIGHTS: lightType 'point'|'directional'|'spot' with color, intensity, range (falloff px), and for spots
-          angle + penumbra. ENVIRONMENT: add a kind:'environment' node with { ambient, fog: { color, near, far } }
-          for scene-wide mood and depth.
+          angle + penumbra. ENVIRONMENT: add a kind:'environment' node with { ambient, fog: { color, near, far },
+          bloom: true|{ threshold, intensity } } for scene-wide mood, depth, and a glow post-effect on bright/
+          emissive meshes (neon, highlights).
           ANIMATION (declarative — ONE op, runs at native frame rate; do NOT send a transform message every
           tick): this.call(windowId, 'scene', { ops: [{ op: 'animate', id: 'cube',
           params: { preset: 'spin', duration: 4000 } }] }). Presets: spin, orbit (center/radius/plane), bob

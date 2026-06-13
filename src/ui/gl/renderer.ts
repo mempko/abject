@@ -14,6 +14,7 @@ import { Geometry } from './primitives.js';
 import {
   QUAD_VS, SURFACE_FS, GLOW_FS, FLAT_FS,
   OVERLAY_VS, OVERLAY_FS, MESH_VS, MESH_FS, MESH_INSTANCED_VS, MAX_MESH_LIGHTS,
+  BRIGHT_FS, BLUR_FS,
 } from './shaders.js';
 
 /** One instance for an instanced mesh draw: a transform plus an albedo tint. */
@@ -181,6 +182,7 @@ export class GlRenderer {
       this.contextLost = false;
       this.programs.clear();
       this.meshVaos = new WeakMap();
+      this.disposeBloomTargets();   // GPU FBOs/textures are gone; reallocate lazily
       this.initStaticResources();
       this.onContextRestored?.();
     });
@@ -631,6 +633,110 @@ export class GlRenderer {
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.uniform1i(p.uniforms.uTex, 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  // ── Bloom (opt-in post pass) ─────────────────────────────────────────
+
+  private bloomSceneTex?: WebGLTexture;
+  private bloomFbo: WebGLFramebuffer[] = [];
+  private bloomTex: WebGLTexture[] = [];
+  private bloomW = 0;
+  private bloomH = 0;
+
+  private ensureBloomTargets(): void {
+    const gl = this.gl;
+    const w = Math.max(1, this.canvas.width >> 1);
+    const h = Math.max(1, this.canvas.height >> 1);
+    if (this.bloomSceneTex && this.bloomW === w && this.bloomH === h) return;
+    // (Re)allocate the scene copy and two half-res ping-pong targets.
+    this.disposeBloomTargets();
+    this.bloomW = w; this.bloomH = h;
+    this.bloomSceneTex = this.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.bloomSceneTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, this.canvas.width, this.canvas.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    for (let i = 0; i < 2; i++) {
+      const tex = this.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      const fbo = gl.createFramebuffer()!;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      this.bloomTex[i] = tex; this.bloomFbo[i] = fbo;
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  private disposeBloomTargets(): void {
+    const gl = this.gl;
+    if (this.bloomSceneTex) gl.deleteTexture(this.bloomSceneTex);
+    this.bloomFbo.forEach((f) => gl.deleteFramebuffer(f));
+    this.bloomTex.forEach((t) => gl.deleteTexture(t));
+    this.bloomSceneTex = undefined; this.bloomFbo = []; this.bloomTex = []; this.bloomW = 0; this.bloomH = 0;
+  }
+
+  private blitFullscreen(): void {
+    this.gl.bindVertexArray(this.overlayVao);
+    this.gl.drawArrays(this.gl.TRIANGLES, 0, 3);
+  }
+
+  /**
+   * Apply bloom as an additive post pass: copy the current backbuffer, extract
+   * bright pixels, gaussian-blur them, and add the result back. Operates on a
+   * copy, so a failure here can only affect the glow, never the base render.
+   * Call after the scene draws and before the 2D chrome overlay.
+   */
+  applyBloom(threshold: number, intensity: number, iterations = 3): void {
+    const gl = this.gl;
+    if (this.contextLost) return;
+    this.ensureBloomTargets();
+    // 1. Snapshot the lit backbuffer.
+    gl.bindTexture(gl.TEXTURE_2D, this.bloomSceneTex!);
+    gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 0, 0, this.canvas.width, this.canvas.height, 0);
+
+    gl.disable(gl.BLEND);
+    gl.viewport(0, 0, this.bloomW, this.bloomH);
+
+    // 2. Bright-pass scene → bloomTex[0].
+    const bright = this.getProgram('bloomBright', OVERLAY_VS, BRIGHT_FS, ['uTex', 'uThreshold']);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.bloomFbo[0]);
+    gl.useProgram(bright.program);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.bloomSceneTex!);
+    gl.uniform1i(bright.uniforms.uTex, 0);
+    gl.uniform1f(bright.uniforms.uThreshold, threshold);
+    this.blitFullscreen();
+
+    // 3. Separable gaussian, ping-ponging between the two half-res targets.
+    const blur = this.getProgram('bloomBlur', OVERLAY_VS, BLUR_FS, ['uTex', 'uDir']);
+    gl.useProgram(blur.program);
+    let src = 0;
+    for (let i = 0; i < iterations * 2; i++) {
+      const horizontal = i % 2 === 0;
+      const dst = src ^ 1;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.bloomFbo[dst]);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.bloomTex[src]);
+      gl.uniform1i(blur.uniforms.uTex, 0);
+      gl.uniform2f(blur.uniforms.uDir, horizontal ? 1 / this.bloomW : 0, horizontal ? 0 : 1 / this.bloomH);
+      this.blitFullscreen();
+      src = dst;
+    }
+
+    // 4. Additively composite the blurred glow onto the backbuffer.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    const comp = this.getProgram('overlay', OVERLAY_VS, OVERLAY_FS, ['uTex']);
+    gl.useProgram(comp.program);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.bloomTex[src]);
+    gl.uniform1i(comp.uniforms.uTex, 0);
+    // Scale glow by intensity via repeated additive blits (cheap, 1-3x).
+    const passes = Math.max(1, Math.round(intensity));
+    for (let i = 0; i < passes; i++) this.blitFullscreen();
+    // Restore the standard premultiplied source-over blend.
+    gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
 
   private getMeshVao(geometry: Geometry): { vao: WebGLVertexArrayObject; count: number; vertexCount: number; indexType: number; hasColor: boolean } {
