@@ -273,6 +273,34 @@ export class GlRenderer {
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   }
 
+  /**
+   * Clip subsequent draws to a screen rect (CSS px from the top-left). Used to
+   * keep a window's occluded 3D children inside the window's bounds. Pass a
+   * rect to enable, then clearScissor() when done.
+   */
+  setScissor(r: { x: number; y: number; width: number; height: number }): void {
+    const gl = this.gl;
+    const dpr = this.canvas.width / Math.max(1, this.cssWidth);
+    gl.enable(gl.SCISSOR_TEST);
+    gl.scissor(
+      Math.round(r.x * dpr),
+      Math.round(this.canvas.height - (r.y + r.height) * dpr),
+      Math.round(r.width * dpr),
+      Math.round(r.height * dpr),
+    );
+  }
+
+  clearScissor(): void {
+    this.gl.disable(this.gl.SCISSOR_TEST);
+  }
+
+  /** Clear just the depth buffer (scissor must be off). Gives a fresh depth
+   * range so a later pass (e.g. non-occluded overlay meshes) sits on top. */
+  clearDepth(): void {
+    this.gl.disable(this.gl.SCISSOR_TEST);
+    this.gl.clear(this.gl.DEPTH_BUFFER_BIT);
+  }
+
   // ── Textures ─────────────────────────────────────────────────────────
 
   createTexture(): WebGLTexture {

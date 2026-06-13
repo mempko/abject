@@ -107,6 +107,42 @@ export class SceneStore {
     return this.nodes.get(`${surfaceId}/${id}`);
   }
 
+  /**
+   * Material/behaviour params a child inherits from its ancestors (a group can
+   * set the color, opacity, occlusion, shadow casting, etc. for its whole
+   * subtree). Intrinsic params — primitive, geometry, instances, lightType,
+   * direction, fog, bloom — are NOT inherited; they belong to the node itself.
+   */
+  private static readonly INHERITABLE = [
+    'color', 'emissive', 'opacity', 'metalness', 'roughness',
+    'texture', 'drawMode', 'pointSize', 'layer', 'occlude', 'castShadow',
+  ];
+
+  /**
+   * Resolve a node's effective params by overlaying inheritable params from
+   * its ancestor chain (root first, nearer ancestors and the node itself
+   * winning), then the node's own full params. Mirrors how worldMatrix walks
+   * the parent chain for transforms.
+   */
+  resolveParams(node: VocabNode): Record<string, unknown> {
+    const ancestors: VocabNode[] = [];
+    let cur = node;
+    while (cur.parentId) {
+      const p = this.nodes.get(`${cur.surfaceId}/${cur.parentId}`);
+      if (!p) break;
+      ancestors.unshift(p);
+      cur = p;
+    }
+    if (ancestors.length === 0) return node.params;
+    const inherited: Record<string, unknown> = {};
+    for (const a of ancestors) {
+      for (const k of SceneStore.INHERITABLE) {
+        if (a.params[k] !== undefined) inherited[k] = a.params[k];
+      }
+    }
+    return { ...inherited, ...node.params };
+  }
+
   nodesForSurface(surfaceId: string): VocabNode[] {
     const set = this.bySurface.get(surfaceId);
     if (!set || set.size === 0) return [];

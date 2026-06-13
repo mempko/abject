@@ -65,6 +65,13 @@ animation engine (presets + per-channel tweens + paths) driven off the render
 loop, and post/auxiliary passes: opt-in bloom (`environment.bloom`) and opt-in
 directional shadow maps (`light.castShadow`, auto-fit ortho frustum). Both are
 contained — they only run when enabled and never disturb the base render.
+
+Window 3D children are **occluded by default**: scissor-clipped to the window's
+content rect (below the title bar) so they can't spill across the desktop or
+cover the chrome. `params.occlude: false` opts a node out (drawn on top,
+unclipped — pop-out 3D / decorations). Children **inherit** their parent group's
+material/behaviour params (`SceneStore.resolveParams`); only geometry/primitive/
+instances are per-node.
 | `overlay-2d.ts` | Screen-space 2D chrome canvas composited as the final pass |
 
 ## Design

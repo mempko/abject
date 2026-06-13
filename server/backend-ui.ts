@@ -321,7 +321,7 @@ export class BackendUI extends Abject {
               },
               {
                 name: 'scene',
-                description: 'Apply retained 3D scene ops. Default scope: your window\'s subtree (every window is a slab in the 3D scene; nodes travel with it, positions are px from the window center). With world: true, nodes attach to the GLOBAL scene graph instead — positions are workspace px, no window needed (desktop pets, ambient décor); params.layer: "back" (default, behind windows) or "front" (above windows). Ops: { op: "add"|"update"|"remove"|"animate", id, parentId?, kind: "mesh"|"light"|"group"|"environment", transform: { position?: [x,y,z], rotation?: [rx,ry,rz], scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder"|"cone"|"torus"|"icosphere", color, emissive?, opacity?, layer?, metalness?(0..1), roughness?(0..1), texture?(url|dataURI|"surface:<id>"), billboard?, drawMode?("triangles"|"lines"|"points"), pointSize?, instances?:[{position,scale?,rotation?,color?},...](one geometry drawn many times in a single call — particles/fields) } for a built-in shape, OR { geometry: { positions, indices?, normals?, colors?(per-vertex rgb 0..1), uvs? }, color, ... } for an arbitrary polygonal mesh (re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional"|"spot", color?, intensity?, direction?, range?, angle?, penumbra?, castShadow?(directional — casters shadow each other) }. Environment params: { ambient?, fog?:{ color?, near, far }, bloom?:true|{ threshold?, intensity? } (glow on bright/emissive meshes) }. ANIMATE (client-side): { op:"animate", id, params:{ preset?:"spin"|"orbit"|"bob"|"pulse", channel?:"position"|"rotation"|"scale"|"color"|"emissive"|"opacity", to?, from?, duration?, easing?, loop?, yoyo?, delay?, path?, stop?:true } }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed (world nodes also tear down when their owner dies). Example: await this.call(uiId, "scene", { world: true, ops: [{ op: "add", id: "pet", kind: "mesh", transform: { position: [400, 600, 30], scale: 40 }, params: { primitive: "sphere", color: "$accent" } }] })',
+                description: 'Apply retained 3D scene ops. Default scope: your window\'s subtree (every window is a slab in the 3D scene; nodes travel with it, positions are px from the window center). With world: true, nodes attach to the GLOBAL scene graph instead — positions are workspace px, no window needed (desktop pets, ambient décor); params.layer: "back" (default, behind windows) or "front" (above windows). Ops: { op: "add"|"update"|"remove"|"animate", id, parentId?, kind: "mesh"|"light"|"group"|"environment", transform: { position?: [x,y,z], rotation?: [rx,ry,rz], scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder"|"cone"|"torus"|"icosphere", color, emissive?, opacity?, layer?, metalness?(0..1), roughness?(0..1), texture?(url|dataURI|"surface:<id>"), billboard?, drawMode?("triangles"|"lines"|"points"), pointSize?, occlude?(default true: clipped to the window & below the title bar; false = draw on top / pop out), instances?:[{position,scale?,rotation?,color?},...](one geometry drawn many times in a single call — particles/fields) } for a built-in shape, OR { geometry: { positions, indices?, normals?, colors?(per-vertex rgb 0..1), uvs? }, color, ... } for an arbitrary polygonal mesh (re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional"|"spot", color?, intensity?, direction?, range?, angle?, penumbra?, castShadow?(directional — casters shadow each other) }. Environment params: { ambient?, fog?:{ color?, near, far }, bloom?:true|{ threshold?, intensity? } (glow on bright/emissive meshes) }. ANIMATE (client-side): { op:"animate", id, params:{ preset?:"spin"|"orbit"|"bob"|"pulse", channel?:"position"|"rotation"|"scale"|"color"|"emissive"|"opacity", to?, from?, duration?, easing?, loop?, yoyo?, delay?, path?, stop?:true } }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed (world nodes also tear down when their owner dies). Example: await this.call(uiId, "scene", { world: true, ops: [{ op: "add", id: "pet", kind: "mesh", transform: { position: [400, 600, 30], scale: 40 }, params: { primitive: "sphere", color: "$accent" } }] })',
                 parameters: [
                   {
                     name: 'surfaceId',
@@ -1164,6 +1164,22 @@ a channel: { op:'animate', id, params:{ channel:'position'|'rotation'|'scale'|
 'color'|'emissive'|'opacity', to, from?, duration, easing?, loop?, yoyo?,
 delay?, path?:[[x,y,z],...] } }. Stop with params:{ stop:true }. Animations are
 transient client state — re-issue them after a reconnect if you want them back.
+
+OCCLUSION (window scope): a window's 3D children are clipped to the window's
+content area and sit below the title bar by default — they can't spill across
+the desktop or cover the chrome. Set params.occlude:false to let a node draw on
+top / extend past the window (pop-out 3D, decorations over the chrome). Occluded
+3D draws on top of the window's own 2D background, so an immersive all-3D window
+should BE its 3D content, not hide it behind a full-window opaque backdrop mesh.
+
+INHERITANCE: a child inherits its parent group's material/behaviour params —
+color, emissive, opacity, metalness, roughness, texture, drawMode, pointSize,
+layer, occlude, castShadow — unless it overrides them. primitive/geometry/
+instances are per-node. Transforms already compose down the parent chain.
+
+DISTANCES ARE CAMERA-RELATIVE: fog near/far and light range are px from the
+camera, which sits ~1.9x viewport height back (~1300px). A fog far of a few
+hundred px fogs the whole scene to one flat color. Use far ~1900+, or omit fog.
 COORDINATES ARE Y-DOWN, the screen convention: +y moves DOWN, +x right, +z
 toward the viewer (this differs from y-up 3D engines). Mouse dx/dy therefore
 map DIRECTLY onto position dx/dy — apply both with the same sign, no flips.

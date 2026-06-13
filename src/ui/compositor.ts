@@ -13,7 +13,7 @@ import { AbjectId } from '../core/types.js';
 import { require, ensure } from '../core/contracts.js';
 import { Tween, DECELERATE, ACCELERATE } from './motion.js';
 import type { DrawCommandType } from '../objects/widgets/widget-types.js';
-import { CANVAS_CTX_METHODS, CANVAS_CTX_PROPERTIES } from '../objects/widgets/widget-types.js';
+import { CANVAS_CTX_METHODS, CANVAS_CTX_PROPERTIES, TITLE_BAR_HEIGHT } from '../objects/widgets/widget-types.js';
 import { GlRenderer, parseCssColor, RGBA, MeshLight, DynamicMesh, InstancedMesh, MeshInstance, FogOpts, DrawMode, ShadowOpts } from './gl/renderer.js';
 import { MAX_MESH_LIGHTS } from './gl/shaders.js';
 import { Overlay2D } from './gl/overlay-2d.js';
@@ -1662,7 +1662,11 @@ export class Compositor {
         state.tiltX + rot[0], state.tiltY + rot[1], rot[2],
         1, 1, 1,
       );
-      this.drawVocabNodes(surface, frame);
+      // Occluded children (default): clipped to the window's content rect, so
+      // they stay inside the frame and below the title bar. Overlay children
+      // (occlude:false): unclipped, drawn on top — pop-out 3D / decorations.
+      this.drawVocabNodes(surface, frame, 'occluded');
+      this.drawVocabNodes(surface, frame, 'overlay');
     }
 
     // World-scope nodes above the windows (params.layer: 'front').
@@ -1709,18 +1713,44 @@ export class Compositor {
     });
   }
 
-  /** Draw the retained scene-vocabulary nodes attached to a surface. */
-  private drawVocabNodes(surface: Surface, surfaceModel: Mat4): void {
-    this.drawNodeTree(surface.id, surfaceModel);
+  /**
+   * Draw a window's scene-vocabulary nodes in one of two passes:
+   * - 'occluded' (default for window children): clipped to the window's screen
+   *   rect and drawn BEFORE the slab, so the window's chrome/content occludes
+   *   them and they cannot spill across the desktop.
+   * - 'overlay': nodes whose resolved params set `occlude: false`, drawn AFTER
+   *   the slab with no clip, so they sit on top and may extend past the window
+   *   (pop-out 3D, decorations meant to be visible over the chrome).
+   */
+  private drawVocabNodes(surface: Surface, surfaceModel: Mat4, pass: 'occluded' | 'overlay'): void {
+    // Clip occluded children to the window's CONTENT rect (in screen px): inset
+    // the title bar + a thin border on chromed windows so 3D can never paint
+    // over the title bar or escape the frame. Transparent windows have no
+    // chrome, so they clip to the full rect.
+    const titleBar = surface.transparent ? 0 : TITLE_BAR_HEIGHT;
+    const border = surface.transparent ? 0 : 2;
+    const clip = {
+      x: surface.rect.x - this.scrollX + border,
+      y: surface.rect.y - this.scrollY + titleBar,
+      width: Math.max(0, surface.rect.width - border * 2),
+      height: Math.max(0, surface.rect.height - titleBar - border),
+    };
+    this.drawNodeTree(surface.id, surfaceModel, undefined, clip, pass);
   }
 
   /**
-   * Draw a retained node tree (a window subtree or a world-scope namespace)
-   * against a frame matrix. When `layer` is given, only meshes whose
-   * params.layer matches render (world trees draw 'back' meshes behind the
-   * windows and 'front' meshes above them); lights illuminate both passes.
+   * Draw a retained node tree (a window subtree or a world-scope namespace).
+   * `layer` filters world meshes (back/front). `clip` + `pass` drive window
+   * occlusion: when given, meshes are partitioned by their resolved `occlude`
+   * param and only the matching pass is drawn (occluded meshes are scissored
+   * to `clip`). World trees pass neither and draw every mesh unclipped.
    */
-  private drawNodeTree(key: string, surfaceModel: Mat4, layer?: 'back' | 'front'): void {
+  private drawNodeTree(
+    key: string, surfaceModel: Mat4,
+    layer?: 'back' | 'front',
+    clip?: { x: number; y: number; width: number; height: number },
+    pass?: 'occluded' | 'overlay',
+  ): void {
     const nodes = this.sceneStore.nodesForSurface(key);
     if (nodes.length === 0) return;
 
@@ -1745,55 +1775,69 @@ export class Compositor {
       lights.push({ pos: [0, 0, 0, 0], color: [0.9, 0.9, 0.95], dir: [-0.4, -0.5, -1] });
     }
 
-    // Transparent meshes draw last, back-to-front, so they composite correctly
-    // over opaque geometry. Opaque meshes keep scene order (depth test sorts).
-    const meshes = nodes.filter((n) =>
-      n.kind === 'mesh' && (layer === undefined || ((n.params.layer as string) ?? 'back') === layer));
-    const opaque = meshes.filter((n) => ((n.params.opacity as number) ?? 1) >= 1 && !n.params.texture);
-    const transparent = meshes.filter((n) => !opaque.includes(n));
-    transparent.sort((a, b) => this.nodeCameraDepth(b, surfaceModel) - this.nodeCameraDepth(a, surfaceModel));
+    // Resolve each mesh's effective params (inheriting from ancestor groups),
+    // then keep only those in this layer + occlusion pass.
+    let entries = nodes
+      .filter((n) => n.kind === 'mesh')
+      .map((n) => ({ node: n, rp: this.sceneStore.resolveParams(n) }))
+      .filter(({ rp }) => layer === undefined || ((rp.layer as string) ?? 'back') === layer);
+    if (pass) {
+      entries = entries.filter(({ rp }) => (pass === 'overlay') === (rp.occlude === false));
+    }
+    if (entries.length === 0) return;
+
+    // Transparent meshes draw last, back-to-front, so they composite correctly.
+    const opaque = entries.filter(({ rp }) => ((rp.opacity as number) ?? 1) >= 1 && !rp.texture);
+    const transparent = entries.filter((e) => !opaque.includes(e));
+    transparent.sort((a, b) => this.nodeCameraDepth(b.node, surfaceModel) - this.nodeCameraDepth(a.node, surfaceModel));
 
     // Opt-in directional shadows: render a depth map from the light's POV,
-    // auto-fitting the ortho frustum to the casters' world AABB.
-    const shadow = shadowLightIndex >= 0 && shadowDir
-      ? this.renderShadowPass(key, meshes, surfaceModel, shadowDir, shadowLightIndex)
+    // auto-fitting the ortho frustum to the casters' world AABB. Casters are
+    // this pass's meshes; skip on the overlay pass (overlay nodes pop out).
+    const shadow = shadowLightIndex >= 0 && shadowDir && pass !== 'overlay'
+      ? this.renderShadowPass(key, entries.map((e) => e.node), surfaceModel, shadowDir, shadowLightIndex)
       : undefined;
 
-    for (const node of [...opaque, ...transparent]) {
+    const scissored = clip !== undefined && pass === 'occluded';
+    if (scissored) this.renderer.setScissor(clip);
+
+    for (const { node, rp } of [...opaque, ...transparent]) {
       const world = this.sceneStore.worldMatrix(node, surfaceModel);
-      const color = parseCssColor(resolveSceneColor((node.params.color as string) ?? '#ffffff', this.sceneTheme));
-      const emissiveStr = node.params.emissive as string | undefined;
-      const billboard = node.params.billboard === true;
+      const color = parseCssColor(resolveSceneColor((rp.color as string) ?? '#ffffff', this.sceneTheme));
+      const emissiveStr = rp.emissive as string | undefined;
+      const billboard = rp.billboard === true;
       const material = {
         model: billboard ? this.billboardMatrix(world) : world,
         viewProj: this.viewProj,
         color,
         emissive: emissiveStr ? parseCssColor(resolveSceneColor(emissiveStr, this.sceneTheme)) : undefined,
-        opacity: (node.params.opacity as number) ?? 1,
-        metalness: node.params.metalness as number | undefined,
-        roughness: node.params.roughness as number | undefined,
-        texture: this.resolveTexture(node.params.texture as string | undefined),
-        drawMode: node.params.drawMode as DrawMode | undefined,
-        pointSize: node.params.pointSize as number | undefined,
+        opacity: (rp.opacity as number) ?? 1,
+        metalness: rp.metalness as number | undefined,
+        roughness: rp.roughness as number | undefined,
+        texture: this.resolveTexture(rp.texture as string | undefined),
+        drawMode: rp.drawMode as DrawMode | undefined,
+        pointSize: rp.pointSize as number | undefined,
         lights,
         ambient: env.ambient,
         fog: env.fog,
         shadow,
         cameraPos: this.cameraPos,
       };
-      if (Array.isArray(node.params.instances) && (node.params.instances as unknown[]).length > 0) {
+      if (Array.isArray(rp.instances) && (rp.instances as unknown[]).length > 0) {
         const handle = this.instancedHandle(key, node);
         if (handle) this.renderer.drawInstanced(handle, material);
-      } else if (hasCustomGeometry(node.params)) {
+      } else if (hasCustomGeometry(rp)) {
         const handle = this.customMeshHandle(key, node);
         if (handle) this.renderer.drawDynamicMesh(handle, material);
       } else {
         this.renderer.drawMesh({
           ...material,
-          geometry: getGeometry((node.params.primitive as MeshPrimitive) ?? 'box'),
+          geometry: getGeometry((rp.primitive as MeshPrimitive) ?? 'box'),
         });
       }
     }
+
+    if (scissored) this.renderer.clearScissor();
   }
 
   /**

@@ -1329,6 +1329,22 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           'position'|'rotation'|'scale'|'color'|'emissive'|'opacity', to, from?, duration, easing?, loop?, yoyo?,
           delay?, path?:[[x,y,z],...] } }. Stop with params:{ stop:true }. Animations are client-side and
           transient — re-issue them after a reconnect if you need them to persist.
+          OCCLUSION (default): 3D nodes attached to a window are CLIPPED to the window's content area and sit
+          BELOW its title bar — they cannot spill across the desktop or cover the chrome, so the window stays
+          movable/closable. To let a node escape the frame (3D that pops OUT of the window, or a decoration
+          drawn over the chrome) set params.occlude:false. NOTE: occluded 3D draws on top of the window's own
+          2D background; for an immersive all-3D scene (fish tank, space view) create the window with the
+          tank/scene as 3D meshes and DON'T expect a separate giant backdrop plane — a full-window opaque mesh
+          just hides everything. A modest backdrop sized to the window (or none) is right.
+          INHERITANCE: a child node inherits its parent group's material/behaviour params — color, emissive,
+          opacity, metalness, roughness, texture, drawMode, pointSize, layer, occlude, castShadow — unless it
+          sets its own. Set color/occlude/castShadow once on a group and the whole subtree follows. Transforms
+          already compose down the parent chain; only primitive/geometry/instances are per-node (never inherited).
+          DEPTH & FOG GOTCHA: fog near/far and light range are distances FROM THE CAMERA in px, and the camera
+          sits ~1.9x the viewport height back (~1300px). Per-window 3D lives ~1300px from the camera, so a fog
+          far of a few hundred px fogs the ENTIRE scene to one flat color (washes out all meshes). Use fog
+          near ~1100 / far ~1900+, or omit fog. Scale and z must be a meaningful fraction of the scene for depth
+          to read (go big: scale 100+).
           COMPOUND SHAPES (a turtle = shell + head + legs, a character, anything with parts): add a
           'group' node, then add each part with parentId set to the group's id (the field is parentId,
           NOT parent). Parts inherit the group's transform, so you move/rotate the whole thing by

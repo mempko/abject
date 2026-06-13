@@ -369,6 +369,9 @@ export function validateSceneOps(ops: unknown[]): string[] {
       if (params.billboard !== undefined && typeof params.billboard !== 'boolean') {
         problems.set(`${o.id}:billboard`, `'${o.id}': params.billboard must be true|false`);
       }
+      if (params.occlude !== undefined && typeof params.occlude !== 'boolean') {
+        problems.set(`${o.id}:occlude`, `'${o.id}': params.occlude must be true|false (false = draw on top, not clipped to the window)`);
+      }
       if (params.drawMode !== undefined && !(DRAW_MODES as readonly string[]).includes(params.drawMode as string)) {
         problems.set(`${o.id}:drawMode`, `'${o.id}': params.drawMode must be one of ${DRAW_MODES.join(', ')}`);
       }
