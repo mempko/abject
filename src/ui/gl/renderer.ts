@@ -14,7 +14,7 @@ import { Geometry } from './primitives.js';
 import {
   QUAD_VS, SURFACE_FS, GLOW_FS, FLAT_FS,
   OVERLAY_VS, OVERLAY_FS, MESH_VS, MESH_FS, MESH_INSTANCED_VS, MAX_MESH_LIGHTS,
-  BRIGHT_FS, BLUR_FS,
+  BRIGHT_FS, BLUR_FS, DEPTH_VS, DEPTH_FS, SHADOW_SIZE,
 } from './shaders.js';
 
 /** One instance for an instanced mesh draw: a transform plus an albedo tint. */
@@ -106,6 +106,9 @@ export interface MeshLight {
 
 export interface FogOpts { color: [number, number, number]; near: number; far: number }
 
+/** Shadow sampling state passed to a mesh draw when a shadow pass has run. */
+export interface ShadowOpts { map: WebGLTexture; lightVP: Mat4; lightIndex: number }
+
 export type DrawMode = 'triangles' | 'lines' | 'points';
 
 /** Material + lighting for a mesh draw, independent of where the geometry lives. */
@@ -123,6 +126,7 @@ export interface MeshMaterialOpts {
   /** Albedo texture sampled by the geometry's UVs. */
   texture?: WebGLTexture;
   fog?: FogOpts;
+  shadow?: ShadowOpts;
   /** triangles (default), lines (LINE_STRIP over vertices), or points. */
   drawMode?: DrawMode;
   pointSize?: number;
@@ -183,6 +187,7 @@ export class GlRenderer {
       this.programs.clear();
       this.meshVaos = new WeakMap();
       this.disposeBloomTargets();   // GPU FBOs/textures are gone; reallocate lazily
+      this.disposeShadow();
       this.initStaticResources();
       this.onContextRestored?.();
     });
@@ -391,6 +396,7 @@ export class GlRenderer {
     'uUseVertexColor', 'uUseTexture', 'uTex',
     'uLightCount', 'uLightPos', 'uLightColor', 'uLightDir', 'uLightSpot',
     'uFogEnabled', 'uFogColor', 'uFogRange',
+    'uShadowEnabled', 'uShadowLight', 'uShadowMap', 'uLightVP',
   ];
 
   /** Bind the mesh (or instanced-mesh) program and set every material uniform. */
@@ -450,6 +456,17 @@ export class GlRenderer {
       gl.uniform2f(p.uniforms.uFogRange, o.fog.near, o.fog.far);
     } else {
       gl.uniform1i(p.uniforms.uFogEnabled, 0);
+    }
+
+    if (o.shadow) {
+      gl.uniform1i(p.uniforms.uShadowEnabled, 1);
+      gl.uniform1i(p.uniforms.uShadowLight, o.shadow.lightIndex);
+      gl.uniformMatrix4fv(p.uniforms.uLightVP, false, o.shadow.lightVP);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, o.shadow.map);
+      gl.uniform1i(p.uniforms.uShadowMap, 1);
+    } else {
+      gl.uniform1i(p.uniforms.uShadowEnabled, 0);
     }
     return p;
   }
@@ -622,6 +639,84 @@ export class GlRenderer {
     gl.deleteBuffer(mesh.idxBuf);
     gl.deleteBuffer(mesh.instBuf);
     gl.deleteVertexArray(mesh.vao);
+  }
+
+  // ── Shadow map (opt-in directional shadows) ──────────────────────────
+
+  private shadowFbo?: WebGLFramebuffer;
+  private shadowTex?: WebGLTexture;
+
+  /** The depth texture written by the last shadow pass (for mesh sampling). */
+  get shadowMap(): WebGLTexture | undefined { return this.shadowTex; }
+
+  private ensureShadowTarget(): void {
+    if (this.shadowTex) return;
+    const gl = this.gl;
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, SHADOW_SIZE, SHADOW_SIZE, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, gl.NONE);
+    const fbo = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, tex, 0);
+    gl.drawBuffers([gl.NONE]);
+    gl.readBuffer(gl.NONE);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.shadowTex = tex; this.shadowFbo = fbo;
+  }
+
+  private disposeShadow(): void {
+    const gl = this.gl;
+    if (this.shadowTex) gl.deleteTexture(this.shadowTex);
+    if (this.shadowFbo) gl.deleteFramebuffer(this.shadowFbo);
+    this.shadowTex = undefined; this.shadowFbo = undefined;
+  }
+
+  /** Begin the depth-only shadow pass from the light's POV. */
+  beginShadowPass(lightVP: Mat4): void {
+    this.ensureShadowTarget();
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.shadowFbo!);
+    gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE);
+    gl.disable(gl.BLEND);
+    gl.enable(gl.DEPTH_TEST);
+    gl.clear(gl.DEPTH_BUFFER_BIT);
+    const p = this.getProgram('depth', DEPTH_VS, DEPTH_FS, ['uLightVP', 'uModel']);
+    gl.useProgram(p.program);
+    gl.uniformMatrix4fv(p.uniforms.uLightVP, false, lightVP);
+  }
+
+  /** Draw a caster's depth (static geometry) during a shadow pass. */
+  drawDepthGeometry(geometry: Geometry, model: Mat4): void {
+    const gl = this.gl;
+    const p = this.getProgram('depth', DEPTH_VS, DEPTH_FS, ['uLightVP', 'uModel']);
+    gl.uniformMatrix4fv(p.uniforms.uModel, false, model);
+    const entry = this.getMeshVao(geometry);
+    gl.bindVertexArray(entry.vao);
+    gl.drawElements(gl.TRIANGLES, entry.count, entry.indexType, 0);
+  }
+
+  /** Draw a caster's depth (dynamic/custom mesh) during a shadow pass. */
+  drawDepthDynamic(mesh: DynamicMesh, model: Mat4): void {
+    if (mesh.count === 0) return;
+    const gl = this.gl;
+    const p = this.getProgram('depth', DEPTH_VS, DEPTH_FS, ['uLightVP', 'uModel']);
+    gl.uniformMatrix4fv(p.uniforms.uModel, false, model);
+    gl.bindVertexArray(mesh.vao);
+    gl.drawElements(gl.TRIANGLES, mesh.count, mesh.indexType, 0);
+  }
+
+  /** End the shadow pass: restore the backbuffer and standard blend. */
+  endShadowPass(): void {
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.enable(gl.BLEND);
+    gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
 
   drawOverlay(tex: WebGLTexture): void {

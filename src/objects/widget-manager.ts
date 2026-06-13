@@ -1317,8 +1317,9 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           INSTANCING: params.instances = [{ position:[x,y,z], scale?, rotation?, color? }, ...] draws ONE geometry
           many times in a single GPU call — the right way to do starfields, particles, swarms, or grids of shapes
           (re-send instances in an 'update' op to move them).
-          LIGHTS: lightType 'point'|'directional'|'spot' with color, intensity, range (falloff px), and for spots
-          angle + penumbra. ENVIRONMENT: add a kind:'environment' node with { ambient, fog: { color, near, far },
+          LIGHTS: lightType 'point'|'directional'|'spot' with color, intensity, range (falloff px), for spots
+          angle + penumbra, and castShadow:true on a directional light (meshes cast shadows on each other,
+          frustum auto-fit to the scene). ENVIRONMENT: add a kind:'environment' node with { ambient, fog: { color, near, far },
           bloom: true|{ threshold, intensity } } for scene-wide mood, depth, and a glow post-effect on bright/
           emissive meshes (neon, highlights).
           ANIMATION (declarative — ONE op, runs at native frame rate; do NOT send a transform message every

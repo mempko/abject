@@ -51,6 +51,38 @@ export function mat4PerspectiveYDown(fovY: number, aspect: number, near: number,
   return m;
 }
 
+/** Right-handed look-at view matrix (column-major). */
+export function mat4LookAt(eye: Vec3, target: Vec3, up: Vec3, out?: Mat4): Mat4 {
+  const m = out ?? new Float32Array(16);
+  let zx = eye.x - target.x, zy = eye.y - target.y, zz = eye.z - target.z;
+  let zl = Math.hypot(zx, zy, zz) || 1; zx /= zl; zy /= zl; zz /= zl;
+  let xx = up.y * zz - up.z * zy, xy = up.z * zx - up.x * zz, xz = up.x * zy - up.y * zx;
+  let xl = Math.hypot(xx, xy, xz) || 1; xx /= xl; xy /= xl; xz /= xl;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  m[0] = xx; m[1] = yx; m[2] = zx; m[3] = 0;
+  m[4] = xy; m[5] = yy; m[6] = zy; m[7] = 0;
+  m[8] = xz; m[9] = yz; m[10] = zz; m[11] = 0;
+  m[12] = -(xx * eye.x + xy * eye.y + xz * eye.z);
+  m[13] = -(yx * eye.x + yy * eye.y + yz * eye.z);
+  m[14] = -(zx * eye.x + zy * eye.y + zz * eye.z);
+  m[15] = 1;
+  return m;
+}
+
+/** Orthographic projection (column-major, right-handed, z in [-1,1]). */
+export function mat4Ortho(l: number, r: number, b: number, t: number, n: number, f: number, out?: Mat4): Mat4 {
+  const m = out ?? new Float32Array(16);
+  m.fill(0);
+  m[0] = 2 / (r - l);
+  m[5] = 2 / (t - b);
+  m[10] = -2 / (f - n);
+  m[12] = -(r + l) / (r - l);
+  m[13] = -(t + b) / (t - b);
+  m[14] = -(f + n) / (f - n);
+  m[15] = 1;
+  return m;
+}
+
 /** Translation matrix. */
 export function mat4Translation(x: number, y: number, z: number, out?: Mat4): Mat4 {
   const m = mat4Identity(out);

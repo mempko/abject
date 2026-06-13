@@ -180,6 +180,22 @@ void main() { outColor = texture(uTex, vUv); }
 /** Max simultaneous lights the mesh shader evaluates. */
 export const MAX_MESH_LIGHTS = 8;
 
+/** Shadow map resolution (square depth texture). */
+export const SHADOW_SIZE = 1024;
+
+/** Depth-only pass from the shadow light's POV (renders caster depth). */
+export const DEPTH_VS = `#version 300 es
+layout(location = 0) in vec3 aPos;
+uniform mat4 uLightVP;
+uniform mat4 uModel;
+void main() { gl_Position = uLightVP * uModel * vec4(aPos, 1.0); }
+`;
+
+export const DEPTH_FS = `#version 300 es
+precision highp float;
+void main() {}
+`;
+
 /**
  * Metallic-roughness mesh shader for scene-vocabulary nodes. Supports
  * per-vertex color (location 2), albedo texture UVs (location 3),
@@ -268,9 +284,29 @@ uniform vec4  uLightSpot[${MAX_MESH_LIGHTS}];  // x=cosInner, y=cosOuter, z=isSp
 uniform bool  uFogEnabled;
 uniform vec3  uFogColor;
 uniform vec2  uFogRange;      // near, far
+uniform bool  uShadowEnabled;
+uniform int   uShadowLight;   // index of the shadow-casting light
+uniform sampler2D uShadowMap;
+uniform mat4  uLightVP;
 out vec4 outColor;
 
 const float PI = 3.14159265359;
+const float SHADOW_TEXEL = 1.0 / ${SHADOW_SIZE}.0;
+
+float shadowFactor(vec3 N, vec3 L) {
+  vec4 lp = uLightVP * vec4(vWorldPos, 1.0);
+  vec3 proj = lp.xyz / lp.w * 0.5 + 0.5;
+  if (proj.z > 1.0 || proj.x < 0.0 || proj.x > 1.0 || proj.y < 0.0 || proj.y > 1.0) return 1.0;
+  float bias = max(0.003 * (1.0 - dot(N, L)), 0.0008);
+  float sh = 0.0;
+  for (int x = -1; x <= 1; x++) {
+    for (int y = -1; y <= 1; y++) {
+      float d = textureLod(uShadowMap, proj.xy + vec2(x, y) * SHADOW_TEXEL, 0.0).r;
+      sh += (proj.z - bias > d) ? 0.0 : 1.0;
+    }
+  }
+  return sh / 9.0;
+}
 float distGGX(float ndh, float a) { float a2 = a * a; float d = ndh * ndh * (a2 - 1.0) + 1.0; return a2 / max(PI * d * d, 1e-5); }
 float gSchlick(float ndx, float k) { return ndx / (ndx * (1.0 - k) + k); }
 float gSmith(float ndv, float ndl, float r) { float k = (r + 1.0) * (r + 1.0) / 8.0; return gSchlick(ndv, k) * gSchlick(ndl, k); }
@@ -318,7 +354,8 @@ void main() {
     vec3  F = fresnel(VdH, F0);
     vec3 spec = (D * G) * F / max(4.0 * NdV * NdL, 1e-4);
     vec3 kd = (vec3(1.0) - F) * (1.0 - uMetalness);
-    Lo += (kd * albedo + spec) * radiance * NdL;
+    float sf = (uShadowEnabled && i == uShadowLight) ? shadowFactor(N, L) : 1.0;
+    Lo += (kd * albedo + spec) * radiance * NdL * sf;
   }
   vec3 color = uAmbient * albedo + Lo + uEmissive;
 

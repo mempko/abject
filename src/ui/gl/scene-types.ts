@@ -404,6 +404,9 @@ export function validateSceneOps(ops: unknown[]): string[] {
           problems.set(`${o.id}:${k}`, `'${o.id}': light params.${k} must be a number`);
         }
       }
+      if (params.castShadow !== undefined && typeof params.castShadow !== 'boolean') {
+        problems.set(`${o.id}:castShadow`, `'${o.id}': light params.castShadow must be true|false (directional lights only)`);
+      }
     }
     if (kind === 'environment') {
       if (params.ambient !== undefined && !isSceneColor(params.ambient)) {

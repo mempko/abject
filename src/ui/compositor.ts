@@ -14,7 +14,7 @@ import { require, ensure } from '../core/contracts.js';
 import { Tween, DECELERATE, ACCELERATE } from './motion.js';
 import type { DrawCommandType } from '../objects/widgets/widget-types.js';
 import { CANVAS_CTX_METHODS, CANVAS_CTX_PROPERTIES } from '../objects/widgets/widget-types.js';
-import { GlRenderer, parseCssColor, RGBA, MeshLight, DynamicMesh, InstancedMesh, MeshInstance, FogOpts, DrawMode } from './gl/renderer.js';
+import { GlRenderer, parseCssColor, RGBA, MeshLight, DynamicMesh, InstancedMesh, MeshInstance, FogOpts, DrawMode, ShadowOpts } from './gl/renderer.js';
 import { MAX_MESH_LIGHTS } from './gl/shaders.js';
 import { Overlay2D } from './gl/overlay-2d.js';
 import { SceneStore, VocabNode } from './gl/scene.js';
@@ -22,7 +22,7 @@ import { SceneOp, SceneTheme, MeshPrimitive, CustomGeometryParam, resolveSceneCo
 import { getGeometry, customGeometry, Geometry } from './gl/primitives.js';
 import { cubicBezier, STANDARD, LINEAR, EMPHASIZE } from './motion.js';
 import { EasingCurve } from '../core/theme-data.js';
-import { Mat4, mat4Identity, mat4Multiply, mat4PerspectiveYDown, mat4Translation, mat4TRS, mat4Invert } from './gl/math.js';
+import { Mat4, mat4Identity, mat4Multiply, mat4PerspectiveYDown, mat4Translation, mat4TRS, mat4Invert, mat4LookAt, mat4Ortho, mat4TransformPoint, vec3 } from './gl/math.js';
 import { rayFromScreen, raySurfaceHit, rayMeshHit, rayCustomMeshHit, Ray } from './gl/picking.js';
 
 /**
@@ -1728,9 +1728,16 @@ export class Compositor {
     const env = this.environmentFor(nodes);
 
     // Collect lights first (they illuminate every mesh in this subtree).
+    // Note the first shadow-casting directional light's index + direction.
     const lights: MeshLight[] = [];
+    let shadowLightIndex = -1;
+    let shadowDir: [number, number, number] | undefined;
     for (const node of nodes) {
       if (node.kind !== 'light' || lights.length >= MAX_MESH_LIGHTS) continue;
+      if (shadowLightIndex < 0 && node.params.lightType === 'directional' && node.params.castShadow === true) {
+        shadowLightIndex = lights.length;
+        shadowDir = (node.params.direction as [number, number, number]) ?? [0, 0.4, -1];
+      }
       lights.push(this.buildLight(node, surfaceModel));
     }
     if (lights.length === 0) {
@@ -1745,6 +1752,12 @@ export class Compositor {
     const opaque = meshes.filter((n) => ((n.params.opacity as number) ?? 1) >= 1 && !n.params.texture);
     const transparent = meshes.filter((n) => !opaque.includes(n));
     transparent.sort((a, b) => this.nodeCameraDepth(b, surfaceModel) - this.nodeCameraDepth(a, surfaceModel));
+
+    // Opt-in directional shadows: render a depth map from the light's POV,
+    // auto-fitting the ortho frustum to the casters' world AABB.
+    const shadow = shadowLightIndex >= 0 && shadowDir
+      ? this.renderShadowPass(key, meshes, surfaceModel, shadowDir, shadowLightIndex)
+      : undefined;
 
     for (const node of [...opaque, ...transparent]) {
       const world = this.sceneStore.worldMatrix(node, surfaceModel);
@@ -1765,6 +1778,7 @@ export class Compositor {
         lights,
         ambient: env.ambient,
         fog: env.fog,
+        shadow,
         cameraPos: this.cameraPos,
       };
       if (Array.isArray(node.params.instances) && (node.params.instances as unknown[]).length > 0) {
@@ -1865,6 +1879,89 @@ export class Compositor {
       out.fog = { color: [c.r, c.g, c.b], near: fog.near, far: fog.far };
     }
     return out;
+  }
+
+  /**
+   * Render the directional shadow map: gather the casters' world AABB, fit an
+   * orthographic light frustum to it (so the map adapts to any scene with no
+   * magic constants), then draw caster depth from the light's POV. Returns the
+   * sampling state for the mesh pass, or undefined if there is nothing to cast.
+   * Instanced meshes receive shadows but do not cast them (v1).
+   */
+  private renderShadowPass(
+    key: string, meshes: VocabNode[], surfaceModel: Mat4,
+    dir: [number, number, number], lightIndex: number,
+  ): ShadowOpts | undefined {
+    const casters = meshes.filter((n) => !Array.isArray(n.params.instances));
+    if (casters.length === 0) return undefined;
+
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    const built: Array<{ node: VocabNode; world: Mat4; custom: boolean }> = [];
+    for (const node of casters) {
+      const world = this.sceneStore.worldMatrix(node, surfaceModel);
+      const custom = hasCustomGeometry(node.params);
+      const [lo, hi] = custom
+        ? this.positionsAABB((node.params.geometry as CustomGeometryParam).positions)
+        : [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]] as [number[], number[]];
+      for (let i = 0; i < 8; i++) {
+        const p = mat4TransformPoint(world, vec3(
+          i & 1 ? hi[0] : lo[0], i & 2 ? hi[1] : lo[1], i & 4 ? hi[2] : lo[2]));
+        minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+        minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+        minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z);
+      }
+      built.push({ node, world, custom });
+    }
+
+    const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, cz = (minZ + maxZ) / 2;
+    const radius = Math.max(1, 0.5 * Math.hypot(maxX - minX, maxY - minY, maxZ - minZ));
+    let dl = Math.hypot(dir[0], dir[1], dir[2]) || 1;
+    const d: [number, number, number] = [dir[0] / dl, dir[1] / dl, dir[2] / dl];
+    const up = Math.abs(d[1]) > 0.99 ? vec3(0, 0, 1) : vec3(0, 1, 0);
+    const dist = radius * 2 + 50;
+    const eye = vec3(cx - d[0] * dist, cy - d[1] * dist, cz - d[2] * dist);
+    const view = mat4LookAt(eye, vec3(cx, cy, cz), up);
+
+    // Fit the ortho box to the AABB in light space.
+    let lminX = Infinity, lminY = Infinity, lminZ = Infinity, lmaxX = -Infinity, lmaxY = -Infinity, lmaxZ = -Infinity;
+    for (let i = 0; i < 8; i++) {
+      const p = mat4TransformPoint(view, vec3(
+        i & 1 ? maxX : minX, i & 2 ? maxY : minY, i & 4 ? maxZ : minZ));
+      lminX = Math.min(lminX, p.x); lmaxX = Math.max(lmaxX, p.x);
+      lminY = Math.min(lminY, p.y); lmaxY = Math.max(lmaxY, p.y);
+      lminZ = Math.min(lminZ, p.z); lmaxZ = Math.max(lmaxZ, p.z);
+    }
+    const pad = radius * 0.05 + 1;
+    const ortho = mat4Ortho(lminX - pad, lmaxX + pad, lminY - pad, lmaxY + pad, -(lmaxZ + dist), -(lminZ - pad));
+    const lightVP = mat4Multiply(ortho, view);
+
+    this.renderer.beginShadowPass(lightVP);
+    for (const item of built) {
+      if (item.custom) {
+        const handle = this.customMeshHandle(key, item.node);
+        if (handle) this.renderer.drawDepthDynamic(handle, item.world);
+      } else {
+        this.renderer.drawDepthGeometry(getGeometry((item.node.params.primitive as MeshPrimitive) ?? 'box'), item.world);
+      }
+    }
+    this.renderer.endShadowPass();
+    const map = this.renderer.shadowMap;
+    return map ? { map, lightVP, lightIndex } : undefined;
+  }
+
+  /** Local-space AABB [min,max] of a flat positions array. */
+  private positionsAABB(positions: number[]): [number[], number[]] {
+    let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i + 2 < positions.length; i += 3) {
+      for (let a = 0; a < 3; a++) {
+        const v = positions[i + a];
+        if (v < lo[a]) lo[a] = v;
+        if (v > hi[a]) hi[a] = v;
+      }
+    }
+    if (!isFinite(lo[0])) { lo = [-0.5, -0.5, -0.5]; hi = [0.5, 0.5, 0.5]; }
+    return [lo, hi];
   }
 
   /** Camera-space depth (for transparency sorting): larger = nearer. */

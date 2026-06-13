@@ -60,8 +60,11 @@ The hand-rolled WebGL2 engine:
 | `picking.ts` | Camera-ray → slab-local px conversion; ray-primitive and ray-triangle (custom mesh) hit tests |
 
 The compositor owns mesh-material resolution, an `environment`-node ambient/fog
-lookup, billboard matrices, a mesh-texture cache, and a client-side declarative
-animation engine (presets + per-channel tweens + paths) driven off the render loop.
+lookup, billboard matrices, a mesh-texture cache, a client-side declarative
+animation engine (presets + per-channel tweens + paths) driven off the render
+loop, and post/auxiliary passes: opt-in bloom (`environment.bloom`) and opt-in
+directional shadow maps (`light.castShadow`, auto-fit ortho frustum). Both are
+contained — they only run when enabled and never disturb the base render.
 | `overlay-2d.ts` | Screen-space 2D chrome canvas composited as the final pass |
 
 ## Design
