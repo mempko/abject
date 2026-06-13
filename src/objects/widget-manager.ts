@@ -1340,11 +1340,11 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           opacity, metalness, roughness, texture, drawMode, pointSize, layer, occlude, castShadow — unless it
           sets its own. Set color/occlude/castShadow once on a group and the whole subtree follows. Transforms
           already compose down the parent chain; only primitive/geometry/instances are per-node (never inherited).
-          DEPTH & FOG GOTCHA: fog near/far and light range are distances FROM THE CAMERA in px, and the camera
-          sits ~1.9x the viewport height back (~1300px). Per-window 3D lives ~1300px from the camera, so a fog
-          far of a few hundred px fogs the ENTIRE scene to one flat color (washes out all meshes). Use fog
-          near ~1100 / far ~1900+, or omit fog. Scale and z must be a meaningful fraction of the scene for depth
-          to read (go big: scale 100+).
+          FOG is SCENE-RELATIVE: fog.near/far are depth in px measured BEHIND the content plane (the
+          camera-to-content baseline is added for you), so use SMALL values — e.g. near 0, far 400 for a tank
+          ~300px deep. Do NOT pass camera-distance values like far 2000+; that puts fog so far back it never
+          shows. far should be roughly the depth of your scene. light range is world-space px (distance from
+          the light). For depth to read, scale and z must be a meaningful fraction of the scene (go big: 100+).
           COMPOUND SHAPES (a turtle = shell + head + legs, a character, anything with parts): add a
           'group' node, then add each part with parentId set to the group's id (the field is parentId,
           NOT parent). Parts inherit the group's transform, so you move/rotate the whole thing by

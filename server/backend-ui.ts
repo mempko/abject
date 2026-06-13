@@ -1177,9 +1177,11 @@ color, emissive, opacity, metalness, roughness, texture, drawMode, pointSize,
 layer, occlude, castShadow — unless it overrides them. primitive/geometry/
 instances are per-node. Transforms already compose down the parent chain.
 
-DISTANCES ARE CAMERA-RELATIVE: fog near/far and light range are px from the
-camera, which sits ~1.9x viewport height back (~1300px). A fog far of a few
-hundred px fogs the whole scene to one flat color. Use far ~1900+, or omit fog.
+FOG IS SCENE-RELATIVE: fog.near/far are depth in px BEHIND the content plane
+(the camera-to-content baseline is added automatically), so use SMALL values —
+e.g. near 0, far 400 for a tank ~300px deep. far should roughly match your
+scene's depth; do NOT pass camera-distance values (far 2000+) — fog would never
+show. light range is world-space px (distance from the light to the surface).
 COORDINATES ARE Y-DOWN, the screen convention: +y moves DOWN, +x right, +z
 toward the viewer (this differs from y-up 3D engines). Mouse dx/dy therefore
 map DIRECTLY onto position dx/dy — apply both with the same sign, no flips.

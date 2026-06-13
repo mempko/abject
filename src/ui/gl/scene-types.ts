@@ -424,7 +424,7 @@ export function validateSceneOps(ops: unknown[]): string[] {
             problems.set(`${o.id}:fogColor`, `'${o.id}': fog.color must be a color or $token`);
           }
           if (typeof fog.near !== 'number' || typeof fog.far !== 'number') {
-            problems.set(`${o.id}:fogRange`, `'${o.id}': fog needs numeric near and far (px from camera)`);
+            problems.set(`${o.id}:fogRange`, `'${o.id}': fog needs numeric near and far — SCENE-relative depth in px behind the content (small values, e.g. near 0, far 400), NOT camera distance`);
           }
         }
       }

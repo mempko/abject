@@ -524,7 +524,7 @@ Primitives: plane, box, sphere, cylinder, cone, torus, icosphere. Material
 params: metalness/roughness (0..1, PBR), emissive (glow), texture (url|dataURI|
 'surface:<id>'), billboard (face camera), drawMode 'points'|'lines' + pointSize.
 Lights: lightType 'point'|'directional'|'spot' with color, intensity, range,
-angle, penumbra. A kind:'environment' node sets { ambient, fog:{color,near,far} }.
+angle, penumbra. A kind:'environment' node sets { ambient, fog:{color,near,far} (near/far = depth in px behind the content, small e.g. 0..400), bloom }.
 ANIMATE without per-frame messages: { op:'animate', id, params:{ preset:'spin'|
 'orbit'|'bob'|'pulse' } } or { channel:'position'|'rotation'|'scale'|'color'|
 'emissive'|'opacity', to, duration, easing?, loop?, yoyo?, path? }; stop with

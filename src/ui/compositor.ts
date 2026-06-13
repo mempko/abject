@@ -1920,7 +1920,12 @@ export class Compositor {
     const fog = node.params.fog as { color?: string; near: number; far: number } | undefined;
     if (fog && typeof fog.near === 'number' && typeof fog.far === 'number') {
       const c = parseCssColor(resolveSceneColor(fog.color ?? '#0a0a14', this.sceneTheme));
-      out.fog = { color: [c.r, c.g, c.b], near: fog.near, far: fog.far };
+      // fog.near/far are SCENE-relative depth (px behind the content plane), not
+      // camera-relative — the camera distance scales with the live viewport, so
+      // an author can't know it. Add the camera-to-content baseline here so a
+      // small near/far works at any viewport size.
+      const baseline = this.cameraPos[2];
+      out.fog = { color: [c.r, c.g, c.b], near: baseline + fog.near, far: baseline + fog.far };
     }
     return out;
   }
