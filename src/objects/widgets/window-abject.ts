@@ -11,6 +11,7 @@ import {
   AbjectMessage,
 } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
+import { require as contractRequire } from '../../core/contracts.js';
 import { request, event } from '../../core/message.js';
 import {
   Rect,
@@ -89,7 +90,7 @@ export class WindowAbject extends Abject {
     super({
       manifest: {
         name: 'Window',
-        description: 'Composite window morph — owns surface, contains child widgets',
+        description: 'Composite window morph — owns surface, contains child widgets. The window is a slab in the desktop\'s native 3D scene: scene({ ops }) attaches retained 3D meshes/lights to it, setSlabTransform tilts/floats it.',
         version: '1.0.0',
         interface: {
             id: WINDOW_INTERFACE,
@@ -128,6 +129,12 @@ export class WindowAbject extends Abject {
                 returns: { kind: 'reference', reference: 'Rect' },
               },
               {
+                name: 'getTitle',
+                description: 'Get window title',
+                parameters: [],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
                 name: 'destroy',
                 description: 'Destroy this window and all children',
                 parameters: [],
@@ -140,6 +147,23 @@ export class WindowAbject extends Abject {
                   { name: 'widgetId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId of the widget to focus' },
                   { name: 'parentChildId', type: { kind: 'primitive', primitive: 'string' }, description: 'The window\'s direct child (e.g. layout) that contains widgetId. Defaults to widgetId.', optional: true },
                   { name: 'via', type: { kind: 'primitive', primitive: 'string' }, description: '"keyboard" | "mouse"', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'scene',
+                description: 'Apply retained 3D scene ops to this window\'s subtree. The window is a slab in a 3D scene; mesh/light/group nodes attach to it and travel with it. ANY abject may call this — you do not need to own the window. Decorations from other abjects route their nodeInput back to the contributor and tear down when the contributor dies (prefix your node ids to avoid collisions). Ops: { op: "add"|"update"|"remove"|"animate", id, parentId?, kind: "mesh"|"light"|"group"|"environment", transform: { position?: [x,y,z] px from window center (+z toward viewer, y-DOWN), rotation?: [rx,ry,rz] radians, scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder"|"cone"|"torus"|"icosphere", color, emissive?, opacity?, metalness?(0..1), roughness?(0..1), texture?(url|dataURI|"surface:<id>"), billboard?, drawMode?("triangles"|"lines"|"points"), pointSize?, occlude?(default true: clipped to the window & below the title bar; false = draw on top / pop out), instances?:[{position,scale?,rotation?,color?},...](draw the mesh many times in one call — particles/fields) } for a built-in shape, OR { geometry: { positions:[x,y,z,...], indices?:[...], normals?:[...], colors?:[r,g,b,...](0..1 per vertex), uvs?:[u,v,...] }, color, ... } for an arbitrary polygonal mesh (re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional"|"spot", color?, intensity?, direction?, range?, angle?, penumbra?, castShadow?(directional — meshes cast shadows on each other) }. Environment params (scene mood): { ambient?, fog?: { color?, near, far }, bloom?: true|{ threshold?, intensity? } (glow on bright/emissive meshes) }. ANIMATE (client-side, one op instead of per-frame updates): { op:"animate", id, params: { preset?:"spin"|"orbit"|"bob"|"pulse", channel?:"position"|"rotation"|"scale"|"color"|"emissive"|"opacity", to?, from?, duration?, easing?, loop?, yoyo?, delay?, path?:[[x,y,z],...], stop?:true } }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed. OCCLUSION: window 3D children are clipped to the window and sit below the title bar by default (set params.occlude:false to pop out / draw on top). INHERITANCE: children inherit a parent group\'s material params (color, opacity, metalness, roughness, texture, occlude, castShadow, ...) unless they set their own.',
+                parameters: [
+                  { name: 'ops', type: { kind: 'array', elementType: { kind: 'reference', reference: 'SceneOp' } }, description: 'Scene operations (invalid batches rejected with the vocabulary)' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'setSlabTransform',
+                description: 'Tilt or float this window\'s slab in the 3D scene (visual only — input picking follows automatically).',
+                parameters: [
+                  { name: 'rotation', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'number' } }, description: 'Euler radians [rx, ry, rz]', optional: true },
+                  { name: 'z', type: { kind: 'primitive', primitive: 'number' }, description: 'Lift toward the viewer in px', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -249,6 +273,41 @@ export class WindowAbject extends Abject {
 
     this.on('getRect', async () => {
       return { ...this.rect };
+    });
+
+    this.on('getTitle', async () => {
+      return this.title;
+    });
+
+    // Input on a 3D node in this window's subtree: forward to the window's
+    // owner via the dependent chain (WidgetManager relays 'nodeInput'),
+    // mirroring how widget clicks reach owners.
+    this.on('nodeInput', async (msg: AbjectMessage) => {
+      this.changed('nodeInput', msg.payload);
+      return true;
+    });
+
+    // ── 3D scene: the window owns its surface, so it fronts the scene
+    // vocabulary for its owner AND for decorators — any abject may attach
+    // nodes to this window's subtree. The caller's identity rides along so
+    // UIServer routes the nodes' input back to the contributor and tears the
+    // nodes down if the contributor dies.
+    this.on('scene', async (msg: AbjectMessage) => {
+      const { ops } = msg.payload as { ops: unknown[] };
+      contractRequire(this.surfaceId !== undefined, 'scene: window has no surface yet');
+      return this.request<boolean>(
+        request(this.id, this.uiServerId, 'scene', {
+          surfaceId: this.surfaceId, ops, contributorId: msg.routing.from,
+        })
+      );
+    });
+
+    this.on('setSlabTransform', async (msg: AbjectMessage) => {
+      const { rotation, z } = msg.payload as { rotation?: [number, number, number]; z?: number };
+      contractRequire(this.surfaceId !== undefined, 'setSlabTransform: window has no surface yet');
+      return this.request<boolean>(
+        request(this.id, this.uiServerId, 'setSurfaceTransform', { surfaceId: this.surfaceId, rotation, z })
+      );
     });
 
     this.on('destroy', async () => {
@@ -443,9 +502,60 @@ method calls on 'abjects:widgets' interface:
     await this.hide();
   });
 
+### 3D Scene
+
+The window is a slab in a 3D desktop. Attach retained 3D nodes to it:
+
+  await this.call(windowId, 'scene', { ops: [
+    { op: 'add', id: 'orb', kind: 'mesh',
+      transform: { position: [0, 0, 40], scale: 30 },
+      params: { primitive: 'sphere', color: '$accent' } },
+  ] });
+
+Kinds: mesh (primitive: plane|box|sphere|cylinder), light (lightType:
+point|directional), group. Positions are px from the window center
+(+z toward the viewer); colors take '#hex' or theme tokens ('$accent', ...).
+A mesh can carry CUSTOM polygons instead of a primitive for arbitrary or
+deformable surfaces (waves, terrain, generated shapes): params { geometry:
+{ positions: [x,y,z, ...], indices?: [...], normals?: [...], colors?: [r,g,b,...]
+(0..1 per vertex), uvs?: [u,v,...] }, color }. Re-send geometry in an 'update'
+op each tick to deform it (buffers reuse, so per-frame morphing is cheap).
+Primitives: plane, box, sphere, cylinder, cone, torus, icosphere. Material
+params: metalness/roughness (0..1, PBR), emissive (glow), texture (url|dataURI|
+'surface:<id>'), billboard (face camera), drawMode 'points'|'lines' + pointSize.
+Lights: lightType 'point'|'directional'|'spot' with color, intensity, range,
+angle, penumbra. A kind:'environment' node sets { ambient, fog:{color,near,far} (near/far = depth in px behind the content, small e.g. 0..400), bloom }.
+ANIMATE without per-frame messages: { op:'animate', id, params:{ preset:'spin'|
+'orbit'|'bob'|'pulse' } } or { channel:'position'|'rotation'|'scale'|'color'|
+'emissive'|'opacity', to, duration, easing?, loop?, yoyo?, path? }; stop with
+{ stop:true }.
+COORDINATES ARE Y-DOWN (screen convention): +y moves DOWN, the same
+direction as input y — mouse deltas map onto positions with no sign flips.
+Nodes persist until { op: 'remove', id }. Tilt/float the window itself:
+\`call(windowId, 'setSlabTransform', { rotation: [0, 0.1, 0], z: 20 })\`.
+Meshes are DECORATIVE BY DEFAULT and pass clicks through to the widgets/
+canvas beneath them. Add interactive:true to a mesh's params to make it an
+input target; then the window's owner receives 'nodeInput'
+events — payload { type, nodeId, x, y, key?, code?, button?, windowId }
+where type is mousedown|mouseup|mousemove|mouseenter|mouseleave|focus|blur|
+keydown|keyup. Clicking an interactive mesh selects it; keyboard routes to it
+until the user clicks elsewhere. Drag capture is built in: after mousedown on a mesh,
+mousemove streams to it until mouseup — drag = position [startX + dx,
+startY + dy, z], both axes same sign.
+DECORATING: you may attach scene nodes to a window you do NOT own — find it
+via WidgetManager listWindows, then call its 'scene' with your nodes. Your
+nodes' nodeInput events come back to YOU (windowId in the payload), and they
+tear down automatically if your abject dies. Prefix node ids with your name
+to avoid colliding with the window owner's nodes. Decoration nodes ride the
+slab — they follow drags, resizes, hide/show with zero tracking code (the
+top edge is y = -height/2 from center; recompute it on the window's
+windowResized event via addDependent). For host open/close, observe
+WidgetManager's windowCreated/windowDestroyed changed-events and re-attach
+by re-matching title/owner.
+
 ### Interface ID
 
-'abjects:window' — for addChild, removeChild, setTitle, getRect, destroy`;
+'abjects:window' — for addChild, removeChild, setTitle, getRect, destroy, scene, setSlabTransform`;
   }
 
   protected async onInit(): Promise<void> {

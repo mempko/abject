@@ -115,7 +115,7 @@ export class WidgetManager extends Abject {
       manifest: {
         name: 'WidgetManager',
         description:
-          'Widget factory — spawns WindowAbject and WidgetAbject instances on the bus. Primary API returns AbjectIds for direct message passing. Legacy shim for ScriptableAbjects. Use cases: build windowed apps with buttons/inputs/labels, create a canvas for games or visualizations, layout widgets in vertical/horizontal stacks.',
+          'Widget factory — spawns WindowAbject and WidgetAbject instances on the bus. Primary API returns AbjectIds for direct message passing. Legacy shim for ScriptableAbjects. Windows are slabs in the desktop\'s native WebGL2 3D scene: call(windowId, "scene", { ops }) attaches real 3D meshes/lights to a window, and 2D canvases draw charts/sprites/text. Use cases: build windowed apps with buttons/inputs/labels, render lit spinning/orbiting 3D content via scene nodes, create a canvas for 2D games or visualizations, layout widgets in vertical/horizontal stacks.',
         version: '2.0.0',
         interface: {
             id: WIDGETS_INTERFACE,
@@ -149,6 +149,12 @@ export class WidgetManager extends Abject {
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window AbjectId to destroy' },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'listWindows',
+                description: 'List every live window: [{ windowId, ownerId, title, rect }]. Use this to find an EXISTING window (match by title or owner) — e.g. to decorate it with 3D scene nodes via this.call(windowId, "scene", { ops }) without owning or rebuilding it.',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'object', properties: {} } },
               },
               {
                 name: 'createVBox',
@@ -413,6 +419,29 @@ export class WidgetManager extends Abject {
                   },
                 },
               },
+              {
+                name: 'windowCreated',
+                description: 'A window came into existence (any owner). Decorators watch this to attach scene nodes to a host window when it (re)opens.',
+                payload: {
+                  kind: 'object',
+                  properties: {
+                    windowId: { kind: 'primitive', primitive: 'string' },
+                    ownerId: { kind: 'primitive', primitive: 'string' },
+                    title: { kind: 'primitive', primitive: 'string' },
+                  },
+                },
+              },
+              {
+                name: 'windowDestroyed',
+                description: 'A window was destroyed (any owner). Decorators watch this to learn their host is gone; scene nodes on it are already torn down.',
+                payload: {
+                  kind: 'object',
+                  properties: {
+                    windowId: { kind: 'primitive', primitive: 'string' },
+                    ownerId: { kind: 'primitive', primitive: 'string' },
+                  },
+                },
+              },
             ],
           },
         requiredCapabilities: [],
@@ -460,6 +489,26 @@ export class WidgetManager extends Abject {
     this.on('destroyWindowAbject', async (msg: AbjectMessage) => {
       const { windowId } = msg.payload as { windowId: AbjectId };
       return this.destroyWindowDirect(windowId);
+    });
+
+    // Discovery: every live window with its owner, title, and rect — lets
+    // any abject find an existing window (e.g. to decorate it with scene
+    // nodes) instead of rebuilding the app behind it.
+    this.on('listWindows', async () => {
+      const out: Array<{ windowId: AbjectId; ownerId: AbjectId; title: string; rect: Rect }> = [];
+      const entries = [...this.windowOwners.entries()];
+      await Promise.all(entries.map(async ([windowId, ownerId]) => {
+        try {
+          const [title, rect] = await Promise.all([
+            this.request<string>(request(this.id, windowId, 'getTitle', {}), 3000),
+            this.request<Rect>(request(this.id, windowId, 'getRect', {}), 3000),
+          ]);
+          out.push({ windowId, ownerId, title, rect });
+        } catch {
+          // window mid-teardown — skip it
+        }
+      }));
+      return out;
     });
 
     // ── Batch widget creation (unified create method) ──
@@ -935,6 +984,19 @@ export class WidgetManager extends Abject {
         return;
       }
 
+      // Forward 3D scene-node input (clicks on meshes in the window's
+      // subtree) to the window's owner, payload intact.
+      if (aspect === 'nodeInput') {
+        const ownerId = this.windowOwners.get(fromId);
+        if (ownerId) {
+          this.send(event(this.id, ownerId, 'nodeInput', {
+            windowId: fromId,
+            ...(value as Record<string, unknown>),
+          }));
+        }
+        return;
+      }
+
       // Translate widget changed events to old-style widgetEvent messages
       const shimId = this.widgetIdToShimId.get(fromId);
       const windowShimId = this.widgetToWindowShimId.get(fromId);
@@ -1126,6 +1188,49 @@ export class WidgetManager extends Abject {
         try { this.send(event(this.id, id, 'updateTheme', theme)); } catch { /* gone */ }
       }
     }
+    this.pushSceneTheme(theme);
+  }
+
+  /**
+   * Push the active theme's palette subset to UIServer for the 3D scene:
+   * slab chrome (shadows, rim glow, corner radius), the depth treatment
+   * intensity, and the `$token` colors that scene-vocabulary materials
+   * re-resolve on every theme change. Same authority and same trigger
+   * points as the 2D system-widget theme broadcast.
+   */
+  private pushSceneTheme(theme: ThemeData): void {
+    if (!this.uiServerId) return;
+    const sceneTheme = {
+      colors: {
+        accent: theme.accent,
+        accentSecondary: theme.accentSecondary,
+        accentTertiary: theme.accentTertiary,
+        windowBg: theme.windowBg,
+        windowBorder: theme.windowBorder,
+        canvasBg: theme.canvasBg,
+        shadowColor: theme.shadowColor,
+        textPrimary: theme.textPrimary,
+        textSecondary: theme.textSecondary,
+        statusSuccess: theme.statusSuccess,
+        statusError: theme.statusError,
+        statusWarning: theme.statusWarning,
+        statusInfo: theme.statusInfo,
+      },
+      windowRadius: theme.windowRadius,
+      surface: { ...theme.tokens.surface },
+      glow: {
+        focusBlur: theme.tokens.glow.focus.blur,
+        focusColor: theme.tokens.glow.focus.color,
+        accentBlur: theme.tokens.glow.accent.blur,
+        accentColor: theme.tokens.glow.accent.color,
+      },
+      shadow: {
+        color: theme.shadowColor,
+        blur: theme.tokens.elevation.level2.blur,
+        offsetY: theme.tokens.elevation.level2.offsetY,
+      },
+    };
+    this.send(request(this.id, this.uiServerId, 'setSceneTheme', { theme: sceneTheme }));
   }
 
   /** Get workspace ID for a widget/window by tracing through windowOwners → objectWorkspaces. */
@@ -1178,6 +1283,134 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           line: {x1, y1, x2, y2, stroke?, lineWidth?}            circle: {cx, cy, radius, fill?, stroke?}
           Invalid batches (unknown type, missing required params) are rejected with an error naming the problem.
           Ask the canvas widget itself for the full per-command param reference before writing a renderer.
+3D scene: THE DESKTOP IS A NATIVE 3D SCENE (WebGL2-backed) — no Three.js needed; 3D is built in.
+          Every window is a slab in the scene, and real 3D content (meshes with lighting, rotation,
+          depth) renders via RETAINED scene nodes attached to YOUR WINDOW (the window owns the
+          surface, so scene calls go to the windowId, not UIServer). For anything 3D — spinning
+          shapes, orbiting objects, lit geometry — scene nodes are the way: GPU-rendered and
+          animated by updating a node's transform, which beats simulating 3D with projection math
+          on a 2D canvas.
+          this.call(windowId, 'scene', { ops: [{ op: 'add', id: 'cube', kind: 'mesh',
+            transform: { position: [0, 0, 40], rotation: [0.5, 0.8, 0], scale: 60 },
+            params: { primitive: 'box', color: '$accent' } }] })
+          Animate from a Timer tick by updating the transform:
+          this.call(windowId, 'scene', { ops: [{ op: 'update', id: 'cube', transform: { rotation: [rx, ry, 0] } }] })
+          Kinds: mesh (primitive: plane|box|sphere|cylinder), light (lightType: point|directional), group.
+          transform: { position: [x,y,z] px from window center (+z toward viewer), rotation: [rx,ry,rz] radians, scale: n|[x,y,z] }.
+          ARBITRARY/DEFORMABLE MESHES: when no built-in primitive fits (a wave surface, terrain, a
+          generated or morphing shape), a mesh node can carry its own polygons instead of a primitive:
+          params: { geometry: { positions: [x,y,z, ...], indices?: [...], normals?: [...] }, color }.
+          positions are local px (a flat vertex list); indices is a flat triangle list (omit for a
+          sequential triangle soup); normals auto-compute (smooth) when omitted. Re-send geometry in an
+          'update' op each tick to DEFORM it (the GPU buffers are reused, so animating a heightfield
+          every frame is cheap): this.call(windowId, 'scene', { ops: [{ op: 'update', id: 'water',
+          params: { geometry: { positions: nextPositions } } }] }). This is the way to render a
+          continuous, changing surface rather than a grid of discrete primitive tiles.
+          Custom geometry also takes per-vertex colors (geometry.colors: flat [r,g,b,...] 0..1 — gradients,
+          heatmaps, a fluid's color ramp baked into the surface) and uvs (geometry.uvs) for texturing.
+          PRIMITIVES: plane, box, sphere, cylinder, cone, torus, icosphere.
+          MATERIALS: params.metalness and params.roughness (0..1) drive a PBR look (glass, brushed metal,
+          glossy water); params.emissive makes a mesh glow; params.texture is a URL, data-URI, or
+          'surface:<surfaceId>' (wrap another window's live 2D content onto 3D geometry); params.billboard:true
+          makes a mesh always face the camera (labels, sprites); params.drawMode 'points'|'lines' renders the
+          vertices as a particle cloud or polyline (graphs, constellations) with params.pointSize.
+          INSTANCING: params.instances = [{ position:[x,y,z], scale?, rotation?, color? }, ...] draws ONE geometry
+          many times in a single GPU call — the right way to do starfields, particles, swarms, or grids of shapes
+          (re-send instances in an 'update' op to move them).
+          LIGHTS: lightType 'point'|'directional'|'spot' with color, intensity, range (falloff px), for spots
+          angle + penumbra, and castShadow:true on a directional light (meshes cast shadows on each other,
+          frustum auto-fit to the scene). ENVIRONMENT: add a kind:'environment' node with { ambient, fog: { color, near, far },
+          bloom: true|{ threshold, intensity } } for scene-wide mood, depth, and a glow post-effect on bright/
+          emissive meshes (neon, highlights).
+          ANIMATION (declarative — ONE op, runs at native frame rate; do NOT send a transform message every
+          tick): this.call(windowId, 'scene', { ops: [{ op: 'animate', id: 'cube',
+          params: { preset: 'spin', duration: 4000 } }] }). Presets: spin, orbit (center/radius/plane), bob
+          (amplitude), pulse (scale). Or animate any channel explicitly: { op:'animate', id, params:{ channel:
+          'position'|'rotation'|'scale'|'color'|'emissive'|'opacity', to, from?, duration, easing?, loop?, yoyo?,
+          delay?, path?:[[x,y,z],...] } }. Stop with params:{ stop:true }. Animations are client-side and
+          transient — re-issue them after a reconnect if you need them to persist.
+          OCCLUSION (default): 3D nodes attached to a window are CLIPPED to the window's content area and sit
+          BELOW its title bar — they cannot spill across the desktop or cover the chrome, so the window stays
+          movable/closable. To let a node escape the frame (3D that pops OUT of the window, or a decoration
+          drawn over the chrome) set params.occlude:false. NOTE: occluded 3D draws on top of the window's own
+          2D background; for an immersive all-3D scene (fish tank, space view) create the window with the
+          tank/scene as 3D meshes and DON'T expect a separate giant backdrop plane — a full-window opaque mesh
+          just hides everything. A modest backdrop sized to the window (or none) is right.
+          INHERITANCE: a child node inherits its parent group's material/behaviour params — color, emissive,
+          opacity, metalness, roughness, texture, drawMode, pointSize, layer, occlude, castShadow — unless it
+          sets its own. Set color/occlude/castShadow once on a group and the whole subtree follows. Transforms
+          already compose down the parent chain; only primitive/geometry/instances are per-node (never inherited).
+          FOG is SCENE-RELATIVE: fog.near/far are depth in px measured BEHIND the content plane (the
+          camera-to-content baseline is added for you), so use SMALL values — e.g. near 0, far 400 for a tank
+          ~300px deep. Do NOT pass camera-distance values like far 2000+; that puts fog so far back it never
+          shows. far should be roughly the depth of your scene. light range is world-space px (distance from
+          the light). For depth to read, scale and z must be a meaningful fraction of the scene (go big: 100+).
+          COMPOUND SHAPES (a turtle = shell + head + legs, a character, anything with parts): add a
+          'group' node, then add each part with parentId set to the group's id (the field is parentId,
+          NOT parent). Parts inherit the group's transform, so you move/rotate the whole thing by
+          updating ONLY the group each tick — the parts follow. Without parentId the parts detach and
+          pile up at the window center while the group moves invisibly. Each op's only fields are
+          { op, id, parentId?, kind, transform, params } — the shape goes in params.primitive and the
+          color in params.color, never as top-level mesh/material/color fields.
+          COORDINATES ARE Y-DOWN (screen convention): +y moves DOWN, matching input coordinates —
+          mouse dx/dy map directly onto position dx/dy with the SAME sign, no axis flips.
+          The camera is a long lens (desktop UI stays undistorted), so small objects read near-isometric.
+          For visible perspective/foreshortening, go BIG: scale 200+ and vary z (e.g. position z 100-300) —
+          depth must be a meaningful fraction of the scene to show.
+          Colors take '#hex' or theme tokens ('$accent', '$statusError', ...) that re-resolve on theme change.
+          Nodes persist until removed ({ op: 'remove', id }). Tilt/float the whole window with
+          this.call(windowId, 'setSlabTransform', { rotation: [0, 0.1, 0], z: 20 }).
+          WORLD SCOPE: free-floating 3D (desktop pets, ambient décor, draggable objects that live on
+          the desktop itself) needs no window at all —
+          this.call(this.dep('UIServer'), 'scene', { world: true, ops: [...] }) attaches nodes to the
+          GLOBAL scene graph in workspace px; params.layer 'back' (default, behind windows) or 'front'.
+          When the user asks for a standalone 3D object (not an app UI), prefer world scope over
+          creating a window just to host the mesh.
+          DECORATING EXISTING WINDOWS: any abject may attach scene nodes to a window it does NOT
+          own — including built-in app windows. Find the window with
+          this.call(this.dep('WidgetManager'), 'listWindows', {}) → [{ windowId, ownerId, title, rect }]
+          (match by title), then this.call(windowId, 'scene', { ops }) with YOUR nodes. Prefix node
+          ids with your abject's name to avoid colliding with the owner's nodes. Your nodes' nodeInput
+          events route back to YOU (windowId in the payload), and your nodes tear down automatically
+          if your abject dies or the window closes. This is THE way to add visuals to an existing app's
+          window (ornaments, effects, companions) — decorate it; never rebuild the app in a new window.
+          Decoration nodes ride the window's slab: they follow every drag, resize, hide, show, and
+          workspace switch with ZERO tracking code. A separate "overlay window" CANNOT do this —
+          windows have no method to reposition themselves programmatically, and windowMoved/windowResized
+          events go only to a window's own observers — so always decorate the real window instead.
+          Node positions are px from the window CENTER (y-down): the top edge is y = -height/2, so a
+          critter walking the top edge of a 440x520 window sits at position [walkX, -260, 30].
+          HOST LIFECYCLE: observe WidgetManager (addDependent) and watch two changed-events:
+          'windowDestroyed' { windowId, ownerId } tells you your host closed (your nodes are already
+          gone — just stop animating); 'windowCreated' { windowId, ownerId, title } tells you a window
+          (re)opened — re-match by title/ownerId and re-add your nodes. Worked decorator shape:
+            // attach: find host, add nodes at its top edge
+            const wins = await this.call(this.dep('WidgetManager'), 'listWindows', {});
+            const host = wins.find(w => /conversation/i.test(w.title));
+            await this.call(host.windowId, 'scene', { ops: [
+              { op: 'add', id: 'me-critter', kind: 'mesh',
+                transform: { position: [0, -host.rect.height/2, 30], scale: 18 },
+                params: { primitive: 'sphere', color: '$accent' } } ] });
+            // animate: Timer tick updates the transform — the window itself needs no tracking
+            await this.call(host.windowId, 'scene', { ops: [
+              { op: 'update', id: 'me-critter', transform: { position: [x, -host.rect.height/2, 30] } } ] });
+          Edge anchoring note: positions are relative to the window CENTER, so window MOVES are free,
+          and only a RESIZE shifts your edge offset — addDependent on the host window itself to receive
+          its windowResized changed-event and recompute -height/2 then.
+          MESH INPUT: meshes are decorative by default and pass clicks through to the widgets/canvas
+          beneath them. To make a mesh a click/drag/keyboard target, add interactive:true to its params
+          ({ op:'add', kind:'mesh', params:{ ..., interactive:true } }). Interactive meshes are full
+          input targets like widgets. Implement nodeInput(msg) — payload
+          { type, nodeId, x, y, key?, code?, button?, world?, windowId? } where type is
+          'mousedown'|'mouseup'|'mousemove'|'mouseenter'|'mouseleave'|'focus'|'blur'|'keydown'|'keyup'.
+          Clicking a mesh SELECTS it (focus); keyboard then routes to it until the user clicks elsewhere
+          (blur). Hover gives mouseenter/mouseleave plus streaming mousemove. DRAG CAPTURE is built in:
+          after mousedown on a mesh, mousemove keeps streaming to it until mouseup even when the cursor
+          outruns the mesh — drag by applying input deltas directly (y-down on both sides, so
+          position = [startX + dx, startY + dy, z], no sign flips). Window-subtree hits arrive
+          at the window's owner; world hits arrive at the node's owner directly. Picking is real 3D ray
+          casting, so rotated/animated meshes hit correctly.
+          The 2D canvas above is for 2D content (charts, sprites, text); the scene is for 3D.
 Size:     this.call(canvasId, 'getCanvasSize', {})
 Input:    Pass inputTargetId on createCanvas, then implement input(msg) — read msg.payload.{type,x,y,button,code,key}.
           Real compositor events and synthetic call(canvasId, 'input', payload) BOTH put fields on msg.payload.
@@ -1857,6 +2090,9 @@ await this.call(timerId, 'addDependent', {});
       } catch { /* WindowManager may not be ready */ }
     }
 
+    // Announce to dependents — decorators watch these to find new hosts.
+    this.changed('windowCreated', { windowId: win.id, ownerId: owner, title, rect: { ...rect } });
+
     return win.id;
   }
 
@@ -1962,6 +2198,7 @@ await this.call(timerId, 'addDependent', {});
   private async destroyWindowDirect(windowId: AbjectId): Promise<boolean> {
     if (!this.spawnedWindows.has(windowId)) return false;
     console.debug(`[WidgetManager] destroyWindowDirect(${windowId})`);
+    const destroyedOwner = this.windowOwners.get(windowId);
 
     // Unregister from WindowManager
     if (this.windowManagerId) {
@@ -2013,6 +2250,10 @@ await this.call(timerId, 'addDependent', {});
         }
       }
     }
+
+    // Announce to dependents — decorators of this window learn their host is
+    // gone and can wait for a windowCreated to re-attach.
+    this.changed('windowDestroyed', { windowId, ownerId: destroyedOwner });
 
     return true;
   }

@@ -7,6 +7,7 @@
  */
 
 import { Compositor, DrawCommand, MobileViewState } from '../src/ui/compositor.js';
+import type { SceneOp, SceneTheme } from '../src/ui/gl/scene-types.js';
 import type { AbjectId } from '../src/core/types.js';
 import type {
   BackendToFrontendMsg,
@@ -41,6 +42,14 @@ export class FrontendClient {
   private transport: ClientTransport | null = null;
   private focusedSurface?: string;
   private grabbedSurface?: string;
+  /** Currently hovered 3D scene node (mesh), for enter/leave synthesis. */
+  private hoveredNode?: { scope: 'window' | 'world'; surfaceId?: string; ownerId?: string; nodeId: string };
+  /**
+   * Drag capture for 3D nodes: set on node mousedown, released on mouseup.
+   * While set, mousemove streams to this node even when the cursor outruns
+   * the mesh — smooth drags, like window/widget grabs.
+   */
+  private grabbedNode?: { scope: 'window' | 'world'; surfaceId?: string; ownerId?: string; nodeId: string };
   private currentSelectedText = '';
   private authenticated = false;
   private loginFormHandler: ((e: Event) => void) | null = null;
@@ -639,6 +648,22 @@ export class FrontendClient {
         this.compositor.setFocusedSurface(msg.surfaceId);
         break;
 
+      case 'sceneOps':
+        if (msg.world && msg.ownerId) {
+          this.compositor.applyWorldSceneOps(msg.ownerId, msg.ops as unknown as SceneOp[]);
+        } else {
+          this.compositor.applySceneOps(msg.surfaceId, msg.ops as unknown as SceneOp[]);
+        }
+        break;
+
+      case 'setSceneTheme':
+        this.compositor.setSceneTheme(msg.theme as unknown as SceneTheme);
+        break;
+
+      case 'setSurfaceTransform':
+        this.compositor.setSurfaceTransform(msg.surfaceId, { rotation: msg.rotation, z: msg.z });
+        break;
+
       case 'measureTextRequest':
         this.handleMeasureTextRequest(msg.requestId!, msg.surfaceId, msg.text, msg.font);
         break;
@@ -1186,6 +1211,29 @@ export class FrontendClient {
     this.sendToBackend({ type: 'closeWindow', surfaceId });
   }
 
+  /** Send a 3D node input event (enter/leave are immediate, not batched). */
+  private sendNodeInput(
+    inputType: 'mouseenter' | 'mouseleave',
+    node: { scope: 'window' | 'world'; surfaceId?: string; ownerId?: string; nodeId: string },
+    wx: number,
+    wy: number,
+    e: MouseEvent,
+  ): void {
+    const nodeSurface = node.surfaceId ? this.compositor.getSurface(node.surfaceId) : undefined;
+    this.sendToBackend({
+      type: 'input',
+      inputType,
+      surfaceId: node.surfaceId,
+      nodeId: node.nodeId,
+      nodeScope: node.scope,
+      nodeOwnerId: node.ownerId,
+      x: nodeSurface ? wx - nodeSurface.rect.x : wx,
+      y: nodeSurface ? wy - nodeSurface.rect.y : wy,
+      button: e.button,
+      modifiers: { shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey },
+    } as unknown as FrontendToBackendMsg);
+  }
+
   private handleTouchEvent(
     touch: Touch,
     type: 'mousedown' | 'mouseup' | 'mousemove'
@@ -1317,15 +1365,62 @@ export class FrontendClient {
     // Workspace coords (surface.rect is in workspace space, mouse is in viewport)
     const { x: wx, y: wy } = this.compositor.viewportToWorkspace(x, y);
 
-    // Hit test locally — compositor is local
-    const hitSurface = this.compositor.surfaceAt(x, y);
+    // Node drag capture: a held node receives the mouseup wherever it lands.
+    if (type === 'mouseup' && this.grabbedNode) {
+      const held = this.grabbedNode;
+      this.grabbedNode = undefined;
+      const heldSurface = held.surfaceId ? this.compositor.getSurface(held.surfaceId) : undefined;
+      this.sendToBackend({
+        type: 'input',
+        inputType: 'mouseup',
+        surfaceId: held.surfaceId,
+        nodeId: held.nodeId,
+        nodeScope: held.scope,
+        nodeOwnerId: held.ownerId,
+        x: heldSurface ? wx - heldSurface.rect.x : wx,
+        y: heldSurface ? wy - heldSurface.rect.y : wy,
+        button: e.button,
+        modifiers: { shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey },
+      } as unknown as FrontendToBackendMsg);
+      return;
+    }
+
+    // 3D scene-node hit test: mesh nodes are click targets (like widgets).
+    // Only when no drag/grab is in flight — drags belong to their surface.
+    if ((type === 'mousedown' || type === 'mouseup') && !this.grabbedSurface && !this.localDragState) {
+      const node = this.compositor.nodeAt(x, y);
+      if (node) {
+        if (type === 'mousedown') this.grabbedNode = node;
+        const nodeSurface = node.surfaceId ? this.compositor.getSurface(node.surfaceId) : undefined;
+        this.sendToBackend({
+          type: 'input',
+          inputType: type,
+          surfaceId: node.surfaceId,
+          nodeId: node.nodeId,
+          nodeScope: node.scope,
+          nodeOwnerId: node.ownerId,
+          x: nodeSurface ? wx - nodeSurface.rect.x : wx,
+          y: nodeSurface ? wy - nodeSurface.rect.y : wy,
+          button: e.button,
+          modifiers: { shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey },
+        } as unknown as FrontendToBackendMsg);
+        return;
+      }
+    }
+
+    // Hit test locally — compositor is local. surfaceLocalAt returns
+    // projection-correct local coords (slabs may be lifted/tilted in 3D).
+    const hit = this.compositor.surfaceLocalAt(x, y);
+    const hitSurface = hit?.surface;
     const grabbed = this.grabbedSurface
       ? this.compositor.getSurface(this.grabbedSurface)
       : undefined;
     const surface = grabbed ?? hitSurface;
 
-    const localX = surface ? wx - surface.rect.x : wx;
-    const localY = surface ? wy - surface.rect.y : wy;
+    // Grabbed surfaces use rect math (the pointer may be outside the slab
+    // mid-drag); free hits use the exact ray-hit coords.
+    const localX = !grabbed && hit ? hit.x : surface ? wx - surface.rect.x : wx;
+    const localY = !grabbed && hit ? hit.y : surface ? wy - surface.rect.y : wy;
 
     // For resize drags (grabbedSurface set, no local drag), include globalX/globalY
     // to avoid stale local→global reconstruction on the server
@@ -1398,11 +1493,81 @@ export class FrontendClient {
     this.updateCursor(x, y);
 
     const { x: wx, y: wy } = this.compositor.viewportToWorkspace(x, y);
-    const hitSurface = this.compositor.surfaceAt(x, y);
-    const surface = hitSurface;
 
-    const localX = surface ? wx - surface.rect.x : wx;
-    const localY = surface ? wy - surface.rect.y : wy;
+    // Node drag capture: while a node is held, every mousemove streams to it
+    // regardless of what's under the cursor — drags stay smooth even when the
+    // pointer outruns the mesh. Hover enter/leave is suspended for the drag.
+    if (this.grabbedNode) {
+      const held = this.grabbedNode;
+      const heldSurface = held.surfaceId ? this.compositor.getSurface(held.surfaceId) : undefined;
+      this.pendingMouseMove = {
+        type: 'input',
+        inputType: 'mousemove',
+        surfaceId: held.surfaceId,
+        nodeId: held.nodeId,
+        nodeScope: held.scope,
+        nodeOwnerId: held.ownerId,
+        x: heldSurface ? wx - heldSurface.rect.x : wx,
+        y: heldSurface ? wy - heldSurface.rect.y : wy,
+        button: e.button,
+        modifiers: { shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey },
+      } as unknown as FrontendToBackendMsg;
+      if (!this.mouseMoveRafId) {
+        this.mouseMoveRafId = requestAnimationFrame(() => {
+          this.mouseMoveRafId = 0;
+          if (this.pendingMouseMove) {
+            this.sendToBackend(this.pendingMouseMove);
+            this.pendingMouseMove = null;
+          }
+        });
+      }
+      return;
+    }
+
+    // 3D node hover: meshes receive mousemove like widgets, with synthesized
+    // enter/leave on hover changes (sent immediately; moves are rAF-batched).
+    const node = this.compositor.nodeAt(x, y);
+    if (this.hoveredNode && (!node || node.nodeId !== this.hoveredNode.nodeId
+        || node.surfaceId !== this.hoveredNode.surfaceId || node.ownerId !== this.hoveredNode.ownerId)) {
+      this.sendNodeInput('mouseleave', this.hoveredNode, wx, wy, e);
+      this.hoveredNode = undefined;
+    }
+    if (node && !this.hoveredNode) {
+      this.hoveredNode = node;
+      this.sendNodeInput('mouseenter', node, wx, wy, e);
+    }
+    if (node) {
+      const nodeSurface = node.surfaceId ? this.compositor.getSurface(node.surfaceId) : undefined;
+      this.pendingMouseMove = {
+        type: 'input',
+        inputType: 'mousemove',
+        surfaceId: node.surfaceId,
+        nodeId: node.nodeId,
+        nodeScope: node.scope,
+        nodeOwnerId: node.ownerId,
+        x: nodeSurface ? wx - nodeSurface.rect.x : wx,
+        y: nodeSurface ? wy - nodeSurface.rect.y : wy,
+        button: e.button,
+        modifiers: { shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey },
+      } as unknown as FrontendToBackendMsg;
+      if (!this.mouseMoveRafId) {
+        this.mouseMoveRafId = requestAnimationFrame(() => {
+          this.mouseMoveRafId = 0;
+          if (this.pendingMouseMove) {
+            this.sendToBackend(this.pendingMouseMove);
+            this.pendingMouseMove = null;
+          }
+        });
+      }
+      return;
+    }
+
+    // Projection-correct local coords (slabs may be lifted/tilted in 3D).
+    const hit = this.compositor.surfaceLocalAt(x, y);
+    const surface = hit?.surface;
+
+    const localX = hit ? hit.x : wx;
+    const localY = hit ? hit.y : wy;
 
     this.pendingMouseMove = {
       type: 'input',

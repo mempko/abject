@@ -279,6 +279,7 @@ Notes:
 - Shorthand param names \`r\`, \`rx\`, \`ry\`, \`w\`, \`h\` are accepted and treated as \`radius\`, \`radiusX\`, \`radiusY\`, \`width\`, \`height\`; \`color\` on shapes is rejected (use \`fill\` or \`stroke\`).
 - I draw into the parent window's surface, so \`clear\`, \`reset\`, and \`clearRect\` become opaque background fills (default '#000') rather than transparent erases, and \`setTransform\` coordinates are window-absolute — prefer \`save\`/\`translate\`/\`restore\` or \`transform\`.
 - Value-returning context APIs (measureText, getImageData, isPointInPath, getTransform, createPattern) have no command form — a draw batch cannot return data.
+- For real 3D content (meshes, lights) attach retained scene nodes to your WINDOW instead: \`call(windowId, 'scene', { ops: [...] })\` — ask the window for its scene vocabulary. This canvas stays the way to draw 2D.
 
 ## CanvasWidget — Input Forwarding
 

@@ -70,7 +70,7 @@ Capabilities are permissions granted to objects. Each has an ID string in the fo
 │                    Browser Main Thread                       │
 │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌───────────────┐  │
 │  │ Message  │ │ Network  │ │   LLM    │ │ UI Compositor │  │
-│  │   Bus    │ │  Layer   │ │ Gateway  │ │   (Canvas)    │  │
+│  │   Bus    │ │  Layer   │ │ Gateway  │ │   (WebGL2 3D) │  │
 │  └────┬─────┘ └────┬─────┘ └────┬─────┘ └───────┬───────┘  │
 └───────┼────────────┼────────────┼───────────────┼──────────┘
         │      postMessage API    │               │
@@ -171,7 +171,7 @@ Secure WASM execution for user-created objects.
 Browser application shell and canvas rendering.
 
 - **`app.ts`** - Application shell. Creates canvas element, Compositor, UIServer, Runtime. `App.start()` starts Runtime and sets up input listeners. `createApp()` factory for one-line bootstrap.
-- **`compositor.ts`** - Canvas-based surface compositor. Each surface is an `OffscreenCanvas` with its own 2D context. `requestAnimationFrame` render loop (only renders when `needsRender` flag set). Z-order sorted rendering (bottom-to-top). DPI-aware (`devicePixelRatio` scaling). Draw commands: `rect` (optional rounded corners), `text`, `line`, `image`, `path`, `clear`. Hit testing: `surfaceAt(x, y)` iterates reverse z-order.
+- **`compositor.ts`** - 3D surface compositor (hand-rolled WebGL2, `src/ui/gl/`). Each surface is an `OffscreenCanvas` with its own 2D context — painted by the 2D draw-command vocabulary — uploaded as the texture of a slab in a perspective 3D scene. Slabs get theme-driven shadows, focus rim/bloom + z-lift, and drag tilt. A retained scene vocabulary (mesh/light/group nodes, `$token` theme colors) attaches 3D content to a window's subtree. `requestAnimationFrame` render loop (only renders when `needsRender` flag set). Hit testing: camera-ray picking per slab + per-pixel alpha test.
 
 ## 4. Data Flow Diagrams
 
@@ -300,12 +300,13 @@ From the source code: "correctness over performance." In a dynamic message-passi
 
 Objects with incompatible interfaces can still communicate. The proxy is a real object in the system - it has a manifest, receives messages, and follows the same protocol. When it fails, the LLM can regenerate it with error context from the previous attempt, progressively improving the translation.
 
-### 5.4 Why Canvas-Based UI (X11 Model)
+### 5.4 Why a 3D-Native UI over Isolated 2D Surfaces (X11 Model)
 
-Each object gets an isolated `OffscreenCanvas` surface. The compositor manages z-ordering and rendering. No DOM manipulation by objects - all rendering through draw commands. This provides:
-- Isolation between objects (each draws to its own canvas)
-- Centralized compositing (one render loop)
-- Familiar model (X11 surface/window semantics)
+Each object gets an isolated `OffscreenCanvas` surface painted via 2D draw commands; the compositor renders every surface as a textured slab in a WebGL2 3D scene (depth, lighting, focus bloom, drag tilt). 3D objects attach to a window's subtree through a retained scene vocabulary (`scene` ops on UIServer) with theme-token colors. No DOM manipulation by objects - all rendering through messages. This provides:
+- Isolation between objects (each rasterizes to its own canvas)
+- Centralized compositing (one render loop, one scene)
+- 2D content as a first-class texture type on 3D surfaces — text keeps the browser's rasterizer
+- Familiar model (X11 surface/window semantics) with a spatial presentation layer
 
 ### 5.5 Why Web Workers and WASM
 
