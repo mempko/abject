@@ -185,6 +185,22 @@ export interface SpacerConfig {
   stretch?: number;
 }
 
+/**
+ * Optional card/panel styling for a layout container. When set, the layout
+ * paints a rounded background and/or border spanning its full rect before
+ * delegating to children. Field names match WidgetStyle so the existing
+ * theme-remap path (remapStyleColors) handles `background`/`borderColor` on a
+ * theme change. `borderWidth` is width-only (not theme-dependent). With no
+ * LayoutStyle set, a layout stays invisible exactly as before. Card padding is
+ * the layout's existing `margins` — there is no separate padding field.
+ */
+export interface LayoutStyle {
+  background?: string;
+  borderColor?: string;
+  borderWidth?: number;
+  radius?: number;
+}
+
 // ── Color Utilities ───────────────────────────────────────────────────
 
 /**

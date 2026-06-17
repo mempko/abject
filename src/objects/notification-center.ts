@@ -21,7 +21,6 @@ import { Abject } from '../core/abject.js';
 import { request } from '../core/message.js';
 import { Tween, fadeIn as motionFadeIn, fadeOut as motionFadeOut } from '../ui/motion.js';
 import type { ListItem } from './widgets/list-widget.js';
-import type { IconName } from '../ui/icons.js';
 
 const NOTIFICATION_INTERFACE: InterfaceId = 'abjects:notify' as InterfaceId;
 export const NOTIFICATION_CENTER_ID = 'abjects:notification-center' as AbjectId;
@@ -58,13 +57,6 @@ const DEFAULT_DURATION_MS = 4000;
 const MAX_HISTORY = 100;
 const VIEWER_WIDTH = 420;
 const VIEWER_HEIGHT = 480;
-
-const LEVEL_ICON: Record<NotificationLevel, IconName> = {
-  info:    'info',
-  success: 'check',
-  warning: 'warning',
-  error:   'close',
-};
 
 export class NotificationCenter extends Abject {
   private widgetManagerId?: AbjectId;
@@ -511,8 +503,7 @@ export class NotificationCenter extends Abject {
       label: entry.message,
       value: entry.id,
       secondary: formatRelativeTime(now - entry.timestamp),
-      iconName: LEVEL_ICON[entry.level],
-      iconColor: this.colorForLevel(entry.level),
+      badge: { text: entry.level, color: this.colorForLevel(entry.level) },
     }));
   }
 

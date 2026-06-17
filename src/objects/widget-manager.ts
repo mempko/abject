@@ -52,6 +52,7 @@ import { LayoutAbject, LayoutMargins } from './widgets/layout-abject.js';
 import {
   WidgetType,
   WidgetStyle,
+  LayoutStyle,
   Rect,
   ThemeData,
   ARCANE_GRIMOIRE,
@@ -163,6 +164,7 @@ export class WidgetManager extends Abject {
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -173,6 +175,7 @@ export class WidgetManager extends Abject {
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -184,6 +187,7 @@ export class WidgetManager extends Abject {
                   { name: 'autoSize', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Auto-compute preferred height from children (use inside ScrollableVBox)', optional: true },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -195,6 +199,7 @@ export class WidgetManager extends Abject {
                   { name: 'autoSize', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Auto-compute preferred height from children (use inside ScrollableVBox)', optional: true },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -206,6 +211,7 @@ export class WidgetManager extends Abject {
                   { name: 'autoScroll', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Pin to bottom when new content is added (for chat/log views). Default false.', optional: true },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -217,6 +223,7 @@ export class WidgetManager extends Abject {
                   { name: 'autoScroll', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Pin to bottom when new content is added (for chat/log views). Default false.', optional: true },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -227,6 +234,7 @@ export class WidgetManager extends Abject {
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window AbjectId (used as ownerId for removeChild routing)' },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -237,6 +245,7 @@ export class WidgetManager extends Abject {
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window AbjectId (used as ownerId for removeChild routing)' },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -248,6 +257,7 @@ export class WidgetManager extends Abject {
                   { name: 'autoScroll', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Pin to bottom when new content is added. Default false.', optional: true },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -565,12 +575,15 @@ export class WidgetManager extends Abject {
         windowId: AbjectId;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createLayoutWidget(payload.windowId, new VBoxLayout({
         ownerId: payload.windowId,
         uiServerId: this.uiServerId!,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForWindow(payload.windowId),
       }));
     });
 
@@ -579,12 +592,15 @@ export class WidgetManager extends Abject {
         windowId: AbjectId;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createLayoutWidget(payload.windowId, new HBoxLayout({
         ownerId: payload.windowId,
         uiServerId: this.uiServerId!,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForWindow(payload.windowId),
       }));
     });
 
@@ -594,12 +610,15 @@ export class WidgetManager extends Abject {
         autoSize?: boolean;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createNestedLayout(payload.parentLayoutId, new VBoxLayout({
         ownerId: payload.parentLayoutId,
         uiServerId: this.uiServerId!,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForOwner(payload.parentLayoutId),
       }), payload.autoSize);
     });
 
@@ -609,12 +628,15 @@ export class WidgetManager extends Abject {
         autoSize?: boolean;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createNestedLayout(payload.parentLayoutId, new HBoxLayout({
         ownerId: payload.parentLayoutId,
         uiServerId: this.uiServerId!,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForOwner(payload.parentLayoutId),
       }), payload.autoSize);
     });
 
@@ -624,6 +646,7 @@ export class WidgetManager extends Abject {
         autoScroll?: boolean;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createLayoutWidget(payload.windowId, new ScrollableVBoxLayout({
         ownerId: payload.windowId,
@@ -631,6 +654,8 @@ export class WidgetManager extends Abject {
         autoScroll: payload.autoScroll,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForWindow(payload.windowId),
       }));
     });
 
@@ -641,6 +666,7 @@ export class WidgetManager extends Abject {
         autoScroll?: boolean;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createNestedLayout(payload.parentLayoutId, new ScrollableVBoxLayout({
         ownerId: payload.parentLayoutId,
@@ -648,6 +674,8 @@ export class WidgetManager extends Abject {
         autoScroll: payload.autoScroll,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForOwner(payload.parentLayoutId),
       }), payload.autoSize);
     });
 
@@ -658,12 +686,15 @@ export class WidgetManager extends Abject {
         windowId: AbjectId;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createDetachedLayout(new VBoxLayout({
         ownerId: payload.windowId,
         uiServerId: this.uiServerId!,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForWindow(payload.windowId),
       }));
     });
 
@@ -672,12 +703,15 @@ export class WidgetManager extends Abject {
         windowId: AbjectId;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createDetachedLayout(new HBoxLayout({
         ownerId: payload.windowId,
         uiServerId: this.uiServerId!,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForWindow(payload.windowId),
       }));
     });
 
@@ -687,6 +721,7 @@ export class WidgetManager extends Abject {
         autoScroll?: boolean;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createDetachedLayout(new ScrollableVBoxLayout({
         ownerId: payload.windowId,
@@ -694,6 +729,8 @@ export class WidgetManager extends Abject {
         autoScroll: payload.autoScroll,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForWindow(payload.windowId),
       }));
     });
 
@@ -1262,6 +1299,28 @@ export class WidgetManager extends Abject {
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## WidgetManager Usage Guide
 
+### Choosing widgets vs canvas (read this first)
+
+Reach for composed WIDGETS as the default for application UIs: forms, lists, dashboards,
+settings panels, toolbars, cards, and stat panels. Widgets give you theming, input routing,
+focus, keyboard handling, hit-testing, and live updates for free, so a polished, card-based
+look is a short composition rather than a hand-painted renderer. Style layout containers
+(createVBox/createHBox) with { background, borderColor, borderWidth, radius } to build cards
+and panels, and use the rich \`list\` item fields (badge, detail, actions) for card rows with
+chips and buttons. Prefer this path whenever the screen is made of standard controls and
+content rows.
+
+Reach for the CANVAS when the content is genuinely freeform: charts and graphs, data
+visualizations, games, simulations, particle effects, and pixel-exact or continuously
+animated rendering. These are things widgets do not model, and the 2D canvas (plus the 3D
+scene for lit/animated geometry) is the right tool.
+
+Combine BOTH in one window where it fits: keep the chrome (tabs, toolbars, stat cards,
+buttons, inputs, list rows) as widgets in a layout, and embed a canvas inside that layout for
+the chart or visualization panel. A dashboard whose surrounding UI is widgets and whose one
+analytics panel is a canvas chart is the ideal shape (see "Canvas with Toolbar" below for how
+to add a canvas to a layout).
+
 ### Quick Reference
 
 All operations use this.call(). There are no shorthand methods.
@@ -1493,7 +1552,7 @@ select - Dropdown select (params: options[], selectedIndex). Keyboard: Enter/Spa
 tabBar - Tab bar (params: tabs[] of labels, selectedIndex). Fires 'change' event with selected index. Keyboard: ArrowLeft/Right to switch tabs.
 slider - Numeric range slider (params: min, max, step, value). Fires 'change' event with numeric value as string. Keyboard: ArrowLeft/Right ±step, Home/End for min/max. Click track or drag thumb.
 image - Image display (params: url, fit 'contain'|'cover'|'fill', alt). Fires 'click' on mousedown (register via addDependent to receive). Param: href — when set, clicking opens the URL in the user's browser. Update URL via this.call(imgId, 'update', { url: '...' }).
-list - Scrollable list (params: items[], selectedIndex?, searchable?, itemHeight?). Fires 'selectionChanged'.
+list - Scrollable list (params: items[], selectedIndex?, searchable?, itemHeight?). Fires 'selectionChanged'. Each item is { label, value, secondary?, iconName?, iconColor? }. RICH CARD ROWS: add any of badge, detail, or actions to an item and it renders as a two-line card row instead of a plain text line. badge: { text, color?, textColor? } is a colored leading chip (e.g. a percentage or status). detail (or secondary) is a muted second line under label. actions: [{ id, label, color?, textColor? }] are right-aligned buttons; clicking one fires a 'changed' event with aspect 'action' and value JSON { index, value, actionId } (row selection is unaffected). Rich rows auto-size to a comfortable height, so itemHeight is optional (set it only to make rows even taller). Example item: { label: 'Bitcoin above $100k by year end', value: 'p1', detail: 'created 2026-01-02  ·  #crypto', badge: { text: '80%', color: '#7ad19a', textColor: '#0f1226' }, actions: [{ id: 'right', label: '✓ Right', color: '#2e6b3c' }, { id: 'wrong', label: '✗ Wrong', color: '#7a2e36' }] }.
 tree - Hierarchical tree view (params: treeItems[], selectedId?, itemHeight?). Items have id, label, icon?, iconColor?, secondary?, depth, expanded?, hasChildren?. Fires 'selectionChanged' and 'toggle'.
 splitPane - Resizable split view (params: orientation?, dividerPosition?, minSize?).
 
@@ -1547,6 +1606,31 @@ createNestedScrollableVBox - Nested scrollable vertical layout inside another la
 createDetachedVBox - Detached vertical layout (not auto-added to any parent). Use as a split pane child.
 createDetachedHBox - Detached horizontal layout (not auto-added to any parent). Use as a split pane child.
 createDetachedScrollableVBox - Detached scrollable vertical layout (not auto-added to any parent). Use as a split pane child.
+
+### Styled Containers (cards & panels)
+
+Every layout factory accepts an optional \`style\`: { background, borderColor, borderWidth, radius }.
+With a style set, the layout paints a rounded background and/or border spanning its full rect
+before its children draw, so a plain VBox/HBox becomes a card or panel. The layout's \`margins\`
+act as the card's inner padding. With no \`style\`, the layout stays invisible (positioning only).
+Change a card's look at runtime with this.call(layoutId, 'update', { style: { background, borderColor, radius } }).
+Colors follow the active theme on a theme change, so reading colors from the theme keeps a card on-palette.
+
+// A card: a styled VBox holding a title and body
+const card = await this.call(this.dep('WidgetManager'), 'createVBox', {
+  windowId: winId, margins: { top: 14, right: 16, bottom: 14, left: 16 }, spacing: 6,
+  style: { background: '#161a3a', borderColor: '#262c5a', borderWidth: 1, radius: 12 }
+});
+
+// A 4-up stat-card grid: an HBox of styled VBox cards
+const grid = await this.call(this.dep('WidgetManager'), 'createHBox', { windowId: winId, spacing: 12 });
+for (const stat of stats) {
+  const cell = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
+    parentLayoutId: grid, margins: { top: 12, right: 14, bottom: 12, left: 14 }, spacing: 4,
+    style: { background: '#161a3a', borderColor: '#262c5a', radius: 10 }
+  });
+  // add a small label and a large value label as children of \`cell\`
+}
 
 ### Canvas Drawing (games, animations, visualizations)
 

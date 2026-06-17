@@ -17,7 +17,9 @@ import { WidgetAbject, WidgetConfig } from './widget-abject.js';
 import {
   Rect,
   LayoutChildConfig,
+  LayoutStyle,
   SpacerConfig,
+  ThemeData,
   LAYOUT_INTERFACE,
 } from './widget-types.js';
 
@@ -106,6 +108,10 @@ export interface LayoutConfig {
   uiServerId: AbjectId;
   margins?: Partial<LayoutMargins>;
   spacing?: number;
+  /** Optional card/panel styling (background, border, radius). Invisible when absent. */
+  style?: LayoutStyle;
+  /** Theme used to resolve default radius and to follow theme changes. */
+  theme?: ThemeData;
 }
 
 /**
@@ -124,10 +130,12 @@ export abstract class LayoutAbject extends WidgetAbject {
 
   constructor(config: LayoutConfig, layoutType: 'vbox' | 'hbox') {
     super({
-      type: 'label', // layouts render nothing themselves
+      type: 'label', // layouts render nothing themselves (unless given a card `style`)
       rect: { x: 0, y: 0, width: 0, height: 0 },
       ownerId: config.ownerId,
       uiServerId: config.uiServerId,
+      style: config.style,
+      theme: config.theme,
     });
 
     // Override manifest for layout
@@ -448,6 +456,31 @@ export abstract class LayoutAbject extends WidgetAbject {
     }
   }
 
+  /**
+   * Build the optional card/panel background command for a styled layout.
+   * Returns null when neither a background nor a border is set, so an
+   * unstyled layout emits nothing and renders byte-for-byte as before. The
+   * rect spans the layout's full outer rect (not the content rect) so the
+   * border frames the margin gutter, which acts as card padding.
+   */
+  protected buildBackgroundCommand(surfaceId: string, ox: number, oy: number): unknown | null {
+    const s = this._renderStyle as LayoutStyle;
+    if (!s.background && !s.borderColor) return null;
+    const params: Record<string, unknown> = {
+      x: ox,
+      y: oy,
+      width: this._renderRect.width,
+      height: this._renderRect.height,
+      radius: s.radius ?? this.theme.widgetRadius,
+    };
+    if (s.background) params.fill = s.background;
+    if (s.borderColor) {
+      params.stroke = s.borderColor;
+      params.lineWidth = s.borderWidth ?? 1;
+    }
+    return { type: 'rect', surfaceId, params };
+  }
+
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
     // Flush pending relayout before rendering — the render IS the frame
     // boundary, so all mutations between renders are automatically batched.
@@ -456,6 +489,10 @@ export abstract class LayoutAbject extends WidgetAbject {
     const contentRect = this.getContentRect();
     const childRects = this.calculateChildRects(contentRect);
     const commands: unknown[] = [];
+
+    // Card/panel background (if styled) paints first, behind all children.
+    const bg = this.buildBackgroundCommand(surfaceId, ox, oy);
+    if (bg) commands.push(bg);
 
     // Forward the viewport clip from a scrolling ancestor down to children
     // (e.g. labels inside a VBox inside a ScrollableVBox). Subclasses that
