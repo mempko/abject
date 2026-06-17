@@ -955,6 +955,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       'Each handler takes a single `msg` argument; payload is `msg.payload`. Inter-object work is `await this.call(target, method, payload)` where `target` is `this.dep("Name")` or `this.find("Name")`.',
       'Use ONLY methods listed in the provided dependency manifests / usage guides. Do not invent method names.',
       'Method names that are not in the framework or in a dependency\'s manifest do not exist — pick a real one or restructure.',
+      'When a dependency\'s usage guide documents a higher-level building block that fits the need, compose it rather than re-implementing equivalent behavior from low-level primitives. Reuse the building blocks; drop to primitives only for what the building blocks do not cover.',
     ].join('\n');
   }
 

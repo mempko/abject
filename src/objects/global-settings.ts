@@ -16,8 +16,10 @@ import { LLMProviderDescription } from '../llm/provider.js';
 const log = new Log('GlobalSettings');
 
 /** Convert a string array to ListItem array for list widgets. */
-function toListItems(arr: string[]): Array<{ label: string; value: string }> {
-  return arr.map(s => ({ label: s, value: s }));
+function toListItems(
+  arr: string[],
+): Array<{ label: string; value: string; actions: Array<{ id: string; label: string }> }> {
+  return arr.map(s => ({ label: s, value: s, actions: [{ id: 'remove', label: 'Remove' }] }));
 }
 
 const GLOBAL_SETTINGS_INTERFACE: InterfaceId = 'abjects:global-settings';
@@ -608,6 +610,28 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }
 
       // ── Permissions tab handlers ──
+
+      // Inline Remove action on any permission list row
+      if (aspect === 'action') {
+        const lists: Array<{ id?: AbjectId; get: () => string[]; set: (v: string[]) => void }> = [
+          { id: this.fsPathListId, get: () => this.fsAllowedPaths, set: v => { this.fsAllowedPaths = v; } },
+          { id: this.shellCmdListId, get: () => this.shellAllowedCmds, set: v => { this.shellAllowedCmds = v; } },
+          { id: this.shellDeniedListId, get: () => this.shellDeniedCmds, set: v => { this.shellDeniedCmds = v; } },
+          { id: this.webDomainListId, get: () => this.webAllowedDomains, set: v => { this.webAllowedDomains = v; } },
+          { id: this.webDeniedListId, get: () => this.webDeniedDomains, set: v => { this.webDeniedDomains = v; } },
+        ];
+        const target = lists.find(l => l.id && l.id === fromId);
+        if (target) {
+          try {
+            const data = JSON.parse(value as string) as { value: string; actionId: string };
+            if (data.actionId === 'remove') {
+              target.set(target.get().filter(x => x !== data.value));
+              await this.request(request(this.id, target.id!, 'update', { items: toListItems(target.get()) }));
+            }
+          } catch { /* malformed payload */ }
+        }
+        return;
+      }
 
       // Filesystem: add path
       if (fromId === this.fsAddBtnId && aspect === 'click') {

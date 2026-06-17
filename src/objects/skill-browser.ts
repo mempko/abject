@@ -328,10 +328,23 @@ pane shows details, configuration, and actions for the selected skill.
   private async updateListWidget(): Promise<void> {
     if (!this.listWidgetId) return;
 
-    const items = this.allSkills.map(s => ({
-      label: `${s.enabled ? (s.mcpStatus === 'error' ? '[err]' : '[on]') : '[off]'} ${s.name}`,
-      value: s.name,
-    }));
+    const items = this.allSkills.map(s => {
+      const state = !s.enabled ? 'off' : (s.mcpStatus === 'error' ? 'err' : 'on');
+      // Narrow master-detail list: a status badge reads at a glance, while
+      // Enable/Disable/Uninstall stay in the detail pane where there is room.
+      return {
+        label: s.name,
+        value: s.name,
+        badge: {
+          text: state === 'off' ? 'Off' : state === 'err' ? 'Error' : 'On',
+          color: state === 'off'
+            ? this.theme.statusNeutral
+            : state === 'err'
+              ? this.theme.statusError
+              : this.theme.statusSuccess,
+        },
+      };
+    });
 
     // Send update directly to the list widget Abject
     await this.request(request(this.id, this.listWidgetId, 'update', {

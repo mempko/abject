@@ -154,6 +154,12 @@ export class ScrollableVBoxLayout extends VBoxLayout {
     const childRects = this.calculateChildRects(cr);
     const commands: unknown[] = [];
 
+    // Card/panel background (if styled) paints OUTSIDE the clip below, so the
+    // rounded border frames the whole card including the margin gutter while
+    // scrolling children stay clipped to the content viewport.
+    const bg = this.buildBackgroundCommand(surfaceId, ox, oy);
+    if (bg) commands.push(bg);
+
     // Clip to content area
     commands.push({ type: 'save', surfaceId, params: {} });
     commands.push({

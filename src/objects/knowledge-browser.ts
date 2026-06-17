@@ -14,7 +14,6 @@ import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { KnowledgeEntry, KnowledgeType } from './knowledge-base.js';
 import type { ListItem } from './widgets/list-widget.js';
-import type { IconName } from '../ui/icons.js';
 
 const log = new Log('KnowledgeBrowser');
 
@@ -27,13 +26,6 @@ const WIN_H = 480;
  * Vector icon names for knowledge types. ListWidget renders these at the
  * row leading edge (via ListItem.iconName); colors come from the theme.
  */
-const TYPE_ICON_NAMES: Record<KnowledgeType, IconName> = {
-  learned:   'check',
-  fact:      'dot',
-  insight:   'plus',
-  reference: 'chevronRight',
-};
-
 const TAB_LABELS = ['All', 'Learned', 'Facts', 'Insights', 'References'];
 const TAB_TYPES: (KnowledgeType | undefined)[] = [undefined, 'learned', 'fact', 'insight', 'reference'];
 
@@ -397,7 +389,7 @@ export class KnowledgeBrowser extends Abject {
         label: entry.title,
         value: entry.id,
         secondary: tagStr,
-        iconName: TYPE_ICON_NAMES[entry.type],
+        badge: { text: entry.type, color: this.typeColor(entry.type) },
       };
     });
 
