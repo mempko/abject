@@ -1057,6 +1057,17 @@ export class PeerRegistry extends Abject {
       log.info(`ICE glare with ${fromPeerId.slice(0, 16)}: they win tiebreak, accepting remote offer`);
       transport.resetForGlare();
       // handleSdpOffer below will create a fresh PeerConnection
+    } else if (transport && transport.signalingState !== 'closed') {
+      // Reconnection: a fresh inbound offer means the remote built a brand-new
+      // RTCPeerConnection (e.g. a mobile client closed and reopened). Any
+      // transport we still hold here is stale — its PeerConnection is in
+      // 'stable'/'have-remote-offer' from the prior session, and renegotiating
+      // it against the peer's new connection never re-establishes ICE/DTLS, so
+      // the DataChannel never opens. Reset it without firing disconnect events
+      // so handleSdpOffer below answers with a fresh PeerConnection on the same
+      // transport object (preserving its event wiring and map entry).
+      log.info(`Reconnect offer from ${fromPeerId.slice(0, 16)} (state=${transport.signalingState}); resetting stale transport`);
+      transport.resetForGlare();
     }
 
     if (!transport) {

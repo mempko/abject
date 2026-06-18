@@ -431,9 +431,29 @@ export class RemoteUIAccess extends Abject {
 
   private async handleIncomingOffer(fromPeerId: string, sdp: RTCSessionDescriptionInit): Promise<void> {
     if (!this.signalingClient || !this.peerId) return;
-    if (this.connectedTransports.has(fromPeerId) || this.pendingAuth.has(fromPeerId)) {
-      // Already handling this peer; ignore duplicate offer
-      return;
+
+    // A fresh inbound offer means the remote built a brand-new RTCPeerConnection
+    // (e.g. a mobile UI client closed and reopened). Any transport we still hold
+    // for this peer is stale — the prior disconnect may not have been detected
+    // yet — and renegotiating the dead PeerConnection never re-establishes the
+    // channel, so the reconnect would silently hang. Tear down the stale
+    // transport(s) first, then answer the new offer with a fresh PeerConnection.
+    // Maps are cleared before disconnect() so the old onDisconnect callback
+    // (cleanupTransport) runs against already-removed state and can't clobber
+    // the new entry we create below.
+    const stale = this.connectedTransports.get(fromPeerId);
+    if (stale) {
+      this.connectedTransports.delete(fromPeerId);
+      log.info(`Reconnect offer from ${fromPeerId.slice(0, 16)}; replacing stale active transport`);
+      try { await stale.disconnect(); } catch { /* ignore */ }
+      this.emitClientsChanged();
+    }
+    const stalePending = this.pendingAuth.get(fromPeerId);
+    if (stalePending) {
+      clearTimeout(stalePending.authTimer);
+      this.pendingAuth.delete(fromPeerId);
+      log.info(`Reconnect offer from ${fromPeerId.slice(0, 16)}; replacing stale pending transport`);
+      try { await stalePending.peerTransport.disconnect(); } catch { /* ignore */ }
     }
 
     const transport = new PeerTransport({
