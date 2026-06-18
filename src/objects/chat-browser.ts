@@ -14,6 +14,7 @@ import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import { lightenColor } from './widgets/widget-types.js';
+import type { ListItem } from './widgets/list-widget.js';
 import type { PersistedConversation } from './chat-manager.js';
 
 const log = new Log('ChatBrowser');
@@ -24,10 +25,7 @@ const ONBOARDING_KEY = 'chat-browser:seen-onboarding';
 
 const OVERVIEW_W = 440;
 const OVERVIEW_H = 520;
-const ROW_H = 44;
 const HEADER_BTN_H = 40;
-
-const DELETE_ICON = '\u2715';
 
 export class ChatBrowser extends Abject {
   private widgetManagerId?: AbjectId;
@@ -36,11 +34,8 @@ export class ChatBrowser extends Abject {
 
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
-  private listLayoutId?: AbjectId;
+  private listWidgetId?: AbjectId;
   private newChatBtnId?: AbjectId;
-
-  private rowOpenBtns = new Map<AbjectId, string>();
-  private rowDeleteBtns = new Map<AbjectId, string>();
 
   private refreshTimer?: ReturnType<typeof setTimeout>;
 
@@ -113,18 +108,29 @@ export class ChatBrowser extends Abject {
     this.on('getState', async () => ({ visible: !!this.windowId }));
 
     this.on('changed', async (msg: AbjectMessage) => {
-      const { aspect } = msg.payload as { aspect: string; value?: unknown };
+      const { aspect, value } = msg.payload as { aspect: string; value?: unknown };
       const fromId = msg.routing.from;
 
-      if (aspect === 'click') {
-        if (fromId === this.newChatBtnId) {
-          await this.requestNewConversation();
+      if (aspect === 'click' && fromId === this.newChatBtnId) {
+        await this.requestNewConversation();
+        return;
+      }
+
+      // Rich list events: clicking a row opens it; the inline Delete action
+      // removes it. Both carry the conversationId in the item's `value`.
+      if (fromId === this.listWidgetId) {
+        if (aspect === 'selectionChanged') {
+          const convId = parseItemValue(value)?.value;
+          if (convId) await this.requestShowConversation(convId);
           return;
         }
-        const openConvId = this.rowOpenBtns.get(fromId);
-        if (openConvId) { await this.requestShowConversation(openConvId); return; }
-        const delConvId = this.rowDeleteBtns.get(fromId);
-        if (delConvId) { await this.requestDeleteConversation(delConvId); return; }
+        if (aspect === 'action') {
+          const data = parseItemValue(value);
+          if (data?.actionId === 'delete' && data.value) {
+            await this.requestDeleteConversation(data.value);
+          }
+          return;
+        }
         return;
       }
 
@@ -260,10 +266,8 @@ export class ChatBrowser extends Abject {
     } catch { /* best effort */ }
     this.windowId = undefined;
     this.rootLayoutId = undefined;
-    this.listLayoutId = undefined;
+    this.listWidgetId = undefined;
     this.newChatBtnId = undefined;
-    this.rowOpenBtns.clear();
-    this.rowDeleteBtns.clear();
     this.changed('visibility', false);
     return true;
   }
@@ -277,8 +281,8 @@ export class ChatBrowser extends Abject {
       try {
         await this.request(request(this.id, this.rootLayoutId, 'clearLayoutChildren', {}));
       } catch { /* best effort */ }
-      this.rowOpenBtns.clear();
-      this.rowDeleteBtns.clear();
+      this.listWidgetId = undefined;
+      this.newChatBtnId = undefined;
       await this.populate();
     }, 80);
   }
@@ -332,16 +336,6 @@ export class ChatBrowser extends Abject {
     }));
     this.send(request(this.id, this.newChatBtnId, 'addDependent', {}));
 
-    // Scrollable list
-    this.listLayoutId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
-        parentLayoutId: this.rootLayoutId,
-        autoScroll: false,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 6,
-      })
-    );
-
     const rows = await this.fetchRoster();
 
     if (rows.length === 0) {
@@ -349,13 +343,44 @@ export class ChatBrowser extends Abject {
       return;
     }
 
-    for (const c of rows) {
-      await this.renderRow(c);
-    }
+    // A single rich ListWidget renders each conversation as a card: title on
+    // the first line, relative time muted below, and an inline Delete action.
+    // Clicking a row opens the conversation; the action button deletes it.
+    const { widgetIds: [listId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [{ type: 'list', windowId: this.windowId, items: [], searchable: false }],
+      })
+    );
+    this.listWidgetId = listId;
+
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.listWidgetId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+    this.send(request(this.id, this.listWidgetId, 'addDependent', {}));
+
+    const items: ListItem[] = rows.map(c => this.toListItem(c));
+    await this.request(request(this.id, this.listWidgetId, 'update', { items }));
+  }
+
+  private toListItem(c: PersistedConversation): ListItem {
+    return {
+      label: c.title,
+      value: c.conversationId,
+      detail: formatRelativeTime(c.lastActiveAt),
+      actions: [
+        {
+          id: 'delete',
+          label: 'Delete',
+          color: this.theme.destructiveBg,
+          textColor: this.theme.destructiveText,
+        },
+      ],
+    };
   }
 
   private async renderEmptyState(): Promise<void> {
-    if (!this.listLayoutId || !this.windowId) return;
+    if (!this.rootLayoutId || !this.windowId) return;
     const text =
       '\u2728  **Start a conversation**\n\n' +
       'Each chat is its own window and keeps its own history. ' +
@@ -377,66 +402,22 @@ export class ChatBrowser extends Abject {
         }],
       })
     );
-    await this.request(request(this.id, this.listLayoutId, 'addLayoutChild', {
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
       widgetId: cardId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 120 },
       alignment: 'center',
     }));
   }
+}
 
-  private async renderRow(c: PersistedConversation): Promise<void> {
-    if (!this.listLayoutId || !this.windowId) return;
-    const rowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: this.listLayoutId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 6,
-      })
-    );
-
-    const relative = formatRelativeTime(c.lastActiveAt);
-    const specs: Array<Record<string, unknown>> = [
-      {
-        type: 'button', windowId: this.windowId,
-        text: `${c.title}   \u00B7  ${relative}`,
-        style: {
-          background: this.theme.windowBg,
-          color: this.theme.textPrimary,
-          borderColor: this.theme.actionBorder,
-          fontSize: 13,
-          radius: 6,
-          align: 'left',
-        },
-      },
-      {
-        type: 'button', windowId: this.windowId, text: DELETE_ICON,
-        style: { fontSize: 13, radius: 6, color: this.theme.destructiveText },
-      },
-    ];
-    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs })
-    );
-    const openBtnId = widgetIds[0];
-    const deleteBtnId = widgetIds[1];
-
-    await this.request(request(this.id, rowId, 'addLayoutChildren', {
-      children: [
-        { widgetId: openBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: ROW_H } },
-        { widgetId: deleteBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 36, height: ROW_H } },
-      ],
-    }));
-    await this.request(request(this.id, this.listLayoutId, 'addLayoutChild', {
-      widgetId: rowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: ROW_H },
-    }));
-
-    this.rowOpenBtns.set(openBtnId, c.conversationId);
-    this.rowDeleteBtns.set(deleteBtnId, c.conversationId);
-    this.send(request(this.id, openBtnId, 'addDependent', {}));
-    this.send(request(this.id, deleteBtnId, 'addDependent', {}));
-  }
+/** Parse a ListWidget event payload (`selectionChanged`/`action`) into fields. */
+function parseItemValue(value: unknown): { value?: string; actionId?: string } | undefined {
+  try {
+    if (typeof value === 'string') return JSON.parse(value);
+    if (value && typeof value === 'object') return value as { value?: string; actionId?: string };
+  } catch { /* malformed */ }
+  return undefined;
 }
 
 function formatRelativeTime(ts: number): string {
