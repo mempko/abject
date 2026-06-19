@@ -467,8 +467,8 @@ WidgetManager registers each window with WindowManager via 'registerWindow':
 
 ### Title Bar Buttons
 
-Non-chromeless windows have close (X) and minimize (_) buttons in the title bar.
-WindowManager hit-tests these on mousedown:
+Non-chromeless windows have help (?), minimize (_), and close (X) buttons in the
+title bar. WindowManager hit-tests these on mousedown:
 
 - Close button (rightmost): sends 'titleBarAction' { action: 'close' } to WindowAbject.
   WindowAbject then emits 'windowCloseRequested' to its dependents (WidgetManager).
@@ -476,6 +476,10 @@ WindowManager hit-tests these on mousedown:
 
 - Minimize button (left of close): WindowManager hides the surface via UIServer,
   sends 'titleBarAction' { action: 'minimize' } to WindowAbject, and notifies Taskbar.
+
+- Help button (left of minimize): sends 'titleBarAction' { action: 'help' } to
+  WindowAbject, which emits 'windowHelpRequested'. WidgetManager re-broadcasts it
+  with the window's owner so the MethodInspector can open an inspector for it.
 
 ### Minimize and Restore Flow
 
@@ -556,6 +560,12 @@ Restore (via 'restoreWindow' method or Taskbar click):
       if (btn === 'minimize') {
         this.minimizeWindow(surfaceId);
         return { grab: false, minimize: surfaceId };
+      }
+      if (btn === 'help') {
+        this.send(
+          event(this.id, info.windowId, 'titleBarAction', { action: 'help' })
+        );
+        return { grab: false };
       }
 
       // No button hit — start drag
@@ -726,27 +736,32 @@ Restore (via 'restoreWindow' method or Taskbar click):
     info: WindowInfo,
     localX: number,
     localY: number,
-  ): 'close' | 'minimize' | null {
+  ): 'close' | 'minimize' | 'help' | null {
     const btnSize = info.titleButtonSize;
     const btnMargin = info.titleButtonMargin;
     const tbHeight = info.titleBarHeight;
     const w = info.rect.width;
+    const cy = tbHeight / 2;
 
     // Only in title bar vertical range
     if (localY >= tbHeight) return null;
 
     // Close button: rightmost
     const closeCx = w - btnMargin - btnSize / 2;
-    const closeCy = tbHeight / 2;
-    if (Math.abs(localX - closeCx) <= btnSize / 2 && Math.abs(localY - closeCy) <= btnSize / 2) {
+    if (Math.abs(localX - closeCx) <= btnSize / 2 && Math.abs(localY - cy) <= btnSize / 2) {
       return 'close';
     }
 
     // Minimize button: left of close
     const minCx = closeCx - btnSize - btnMargin;
-    const minCy = tbHeight / 2;
-    if (Math.abs(localX - minCx) <= btnSize / 2 && Math.abs(localY - minCy) <= btnSize / 2) {
+    if (Math.abs(localX - minCx) <= btnSize / 2 && Math.abs(localY - cy) <= btnSize / 2) {
       return 'minimize';
+    }
+
+    // Help (?) button: left of minimize
+    const helpCx = minCx - btnSize - btnMargin;
+    if (Math.abs(localX - helpCx) <= btnSize / 2 && Math.abs(localY - cy) <= btnSize / 2) {
+      return 'help';
     }
 
     return null;

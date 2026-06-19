@@ -452,6 +452,17 @@ export class WidgetManager extends Abject {
                   },
                 },
               },
+              {
+                name: 'windowHelpRequested',
+                description: 'The help (?) button on a window title bar was clicked. The object inspector watches this to open an inspector for the window owner.',
+                payload: {
+                  kind: 'object',
+                  properties: {
+                    windowId: { kind: 'primitive', primitive: 'string' },
+                    ownerId: { kind: 'primitive', primitive: 'string' },
+                  },
+                },
+              },
             ],
           },
         requiredCapabilities: [],
@@ -1017,6 +1028,17 @@ export class WidgetManager extends Abject {
         const ownerId = this.windowOwners.get(fromId);
         if (ownerId) {
           this.send(event(this.id, ownerId,aspect, { windowId: fromId }));
+        }
+        return;
+      }
+
+      // Help (?) button — re-broadcast to dependents (e.g. the object
+      // inspector) with the window's owner attached, so they can inspect it.
+      // Mirrors the windowCreated/windowDestroyed decorator-broadcast pattern.
+      if (aspect === 'windowHelpRequested') {
+        const ownerId = this.windowOwners.get(fromId);
+        if (ownerId) {
+          this.changed('windowHelpRequested', { windowId: fromId, ownerId });
         }
         return;
       }

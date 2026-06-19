@@ -190,6 +190,11 @@ export class WindowAbject extends Abject {
                 payload: { kind: 'object', properties: {} },
               },
               {
+                name: 'windowHelpRequested',
+                description: 'Help (?) button was clicked — owner should reveal the object inspector',
+                payload: { kind: 'object', properties: {} },
+              },
+              {
                 name: 'windowRestored',
                 description: 'Window was restored from minimized state',
                 payload: { kind: 'object', properties: {} },
@@ -430,6 +435,8 @@ export class WindowAbject extends Abject {
         this.changed('windowCloseRequested', {});
       } else if (action === 'minimize') {
         this.changed('windowMinimized', {});
+      } else if (action === 'help') {
+        this.changed('windowHelpRequested', {});
       } else if (action === 'restore') {
         this.changed('windowRestored', {});
         this.scheduleFrame();
@@ -744,10 +751,11 @@ by re-matching title/owner.
 
       const closeCx = w - btnMargin - btnSize / 2;
       const minCx = closeCx - btnSize - btnMargin;
+      const helpCx = minCx - btnSize - btnMargin;
       const cy = tbh / 2;
 
       const iconColor = focused ? this.theme.textSecondary : this.theme.textTertiary;
-      const drawButton = (cx: number, kind: 'close' | 'minimize') => {
+      const drawButton = (cx: number, kind: 'close' | 'minimize' | 'help') => {
         commands.push(...iconCommands(kind, {
           surfaceId: sid,
           x: cx - iconSize / 2,
@@ -757,6 +765,9 @@ by re-matching title/owner.
         }));
       };
 
+      // Help (?) opens the object inspector for this window's owner. Sits to
+      // the left of minimize so close stays anchored to the right corner.
+      drawButton(helpCx, 'help');
       drawButton(minCx, 'minimize');
       drawButton(closeCx, 'close');
 

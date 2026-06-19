@@ -31,6 +31,7 @@ import { WindowSwitcherAbject } from '../src/objects/window-switcher.js';
 import { Taskbar } from '../src/objects/taskbar.js';
 import { AppExplorer } from '../src/objects/app-explorer.js';
 import { ObjectBrowser } from '../src/objects/object-browser.js';
+import { MethodInspector } from '../src/objects/method-inspector.js';
 import { ObjectCatalog } from '../src/objects/object-catalog.js';
 import { WidgetManager } from '../src/objects/widget-manager.js';
 import { ThemeAbject } from '../src/objects/theme.js';
@@ -478,6 +479,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('WindowSwitcher', () => new WindowSwitcherAbject());
   runtime.objectFactory.registerConstructor('AppExplorer', () => new AppExplorer());
   runtime.objectFactory.registerConstructor('ObjectBrowser', () => new ObjectBrowser());
+  runtime.objectFactory.registerConstructor('MethodInspector', () => new MethodInspector());
   runtime.objectFactory.registerConstructor('ObjectCatalog', () => new ObjectCatalog());
   runtime.objectFactory.registerConstructor('JobManager', () => new JobManager());
   runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
@@ -558,7 +560,7 @@ async function main(): Promise<void> {
       'Storage', 'HttpServer',
       // Global services
       'GlobalSettings', 'PeerNetwork',
-      'ObjectCatalog', 'ObjectBrowser', 'ProcessExplorer', 'LLMMonitor',
+      'ObjectCatalog', 'ObjectBrowser', 'MethodInspector', 'ProcessExplorer', 'LLMMonitor',
       'ProxyGenerator', 'Negotiator', 'HealthMonitor',
       'SkillRegistry', 'SkillBrowser',
       'MCPRegistryClient', 'ClawHubClient', 'CatalogBrowser',
@@ -831,6 +833,7 @@ async function main(): Promise<void> {
   const peerNetworkId = await supervisedSpawn('PeerNetwork', 'permanent', systemTypeId('PeerNetwork'));
   const globalToolbarId = await supervisedSpawn('GlobalToolbar', 'permanent', systemTypeId('GlobalToolbar'));
   const objectBrowserId = await supervisedSpawn('ObjectBrowser', 'permanent', systemTypeId('ObjectBrowser'));
+  const methodInspectorId = await supervisedSpawn('MethodInspector', 'permanent', systemTypeId('MethodInspector'));
   const processExplorerId = await supervisedSpawn('ProcessExplorer', 'permanent', systemTypeId('ProcessExplorer'));
   const llmMonitorId = await supervisedSpawn('LLMMonitor', 'permanent', systemTypeId('LLMMonitor'));
   const skillRegistryId = await supervisedSpawn('SkillRegistry', 'permanent', systemTypeId('SkillRegistry'));
@@ -882,7 +885,7 @@ async function main(): Promise<void> {
     identityId, peerRegistryId, remoteRegistryId, peerRouterId,
     signalingRelayId, peerDiscoveryId,
     workspaceShareRegistryId, workspaceBrowserId, objectCatalogId,
-    globalSettingsId, peerNetworkId, globalToolbarId, objectBrowserId, processExplorerId, skillRegistryId, skillBrowserId,
+    globalSettingsId, peerNetworkId, globalToolbarId, objectBrowserId, methodInspectorId, processExplorerId, skillRegistryId, skillBrowserId,
     mcpRegistryClientId, clawHubClientId, catalogBrowserId,
     secretsVaultId, oauthHelperId,
     proxyGenId, negotiatorId,
