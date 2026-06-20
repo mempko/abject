@@ -132,6 +132,10 @@ Node.js process with worker threads. The **browser client** is the surface: a
 thin Canvas renderer that forwards input and displays composited frames over
 WebSocket. The **signaling server** helps peers find each other in the dark.
 
+For running the signaling server in production behind TLS, and pairing it with a
+TURN relay so peers behind symmetric NAT or cell networks can still connect, see
+[WHISPER.md](WHISPER.md).
+
 ## Architecture
 
 ```
@@ -245,8 +249,13 @@ See [PHILOSOPHY.md](PHILOSOPHY.md) for the principles that carry the fire forwar
 | `SIGNALING_PORT` | `7720` | Signaling server port for P2P discovery |
 | `ABJECTS_DATA_DIR` | `.abjects` | Persistent storage directory |
 | `ABJECTS_WORKER_COUNT` | CPU cores - 1 (max 8) | Worker thread pool size |
+| `TURN_SECRET` | - | Shared secret for the signaling server to mint TURN relay credentials (see [WHISPER.md](WHISPER.md)) |
+| `TURN_URLS` | - | TURN URLs advertised to peers for NAT traversal (see [WHISPER.md](WHISPER.md)) |
 
 API keys can also be configured through the Global Settings UI at runtime.
+
+The signaling server and its optional TURN relay have their own environment and
+deployment guide in [WHISPER.md](WHISPER.md).
 
 ### Using with Ollama (Local LLM)
 
