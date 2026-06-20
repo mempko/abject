@@ -104,6 +104,10 @@ export class RemoteUIAccess extends Abject {
   private connectedTransports: Map<string, PeerTransport> = new Map();
   private pendingAuth: Map<string, PendingAuth> = new Map();
 
+  /** Cached ICE servers (STUN + TURN creds) fetched from the signaling server. */
+  private cachedIceServers?: RTCIceServer[];
+  private cachedIceServersAt = 0;
+
   /** Set by server bootstrap so we can hand the encrypted channel to BackendUI. */
   private attachHandler?: (peerId: string, transport: UITransportLike, meta?: { name?: string }) => void;
 
@@ -429,8 +433,31 @@ export class RemoteUIAccess extends Abject {
     }
   }
 
+  /**
+   * Fetch ICE servers (STUN + TURN relay credentials) from the signaling
+   * server, cached for ~10 minutes. The answerer needs relay candidates too,
+   * so mobile clients on symmetric-NAT cell networks can connect via TURN.
+   */
+  private async resolveIceServers(): Promise<RTCIceServer[] | undefined> {
+    const TEN_MIN = 10 * 60 * 1000;
+    if (this.cachedIceServers && Date.now() - this.cachedIceServersAt < TEN_MIN) {
+      return this.cachedIceServers;
+    }
+    if (!this.signalingClient) return this.cachedIceServers;
+    try {
+      const servers = await this.signalingClient.requestIceServers();
+      if (servers.length > 0) {
+        this.cachedIceServers = servers;
+        this.cachedIceServersAt = Date.now();
+      }
+    } catch { /* keep prior cache / fall back to default STUN */ }
+    return this.cachedIceServers;
+  }
+
   private async handleIncomingOffer(fromPeerId: string, sdp: RTCSessionDescriptionInit): Promise<void> {
     if (!this.signalingClient || !this.peerId) return;
+
+    const iceServers = await this.resolveIceServers();
 
     // A fresh inbound offer means the remote built a brand-new RTCPeerConnection
     // (e.g. a mobile UI client closed and reopened). Any transport we still hold
@@ -463,6 +490,7 @@ export class RemoteUIAccess extends Abject {
       localPublicSigningKey: this.signingPubJwk!,
       localPublicExchangeKey: this.exchangePubJwk!,
       localExchangePrivateKey: this.exchangeKeyPair!.privateKey,
+      iceServers,
     });
 
     transport.on({
