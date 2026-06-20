@@ -103,6 +103,13 @@ export class RemoteUIAccess extends Abject {
   private authorizedClients: Map<string, AuthorizedClient> = new Map();
   private connectedTransports: Map<string, PeerTransport> = new Map();
   private pendingAuth: Map<string, PendingAuth> = new Map();
+  /**
+   * Transports that have answered an offer but whose DataChannel handshake has
+   * not completed yet. Tracked here so trickled ICE candidates (e.g. a mobile
+   * client's relay candidate, which arrives after the offer) can be delivered
+   * during negotiation — before the transport reaches pendingAuth/connected.
+   */
+  private negotiatingTransports: Map<string, PeerTransport> = new Map();
 
   /** Cached ICE servers (STUN + TURN creds) fetched from the signaling server. */
   private cachedIceServers?: RTCIceServer[];
@@ -396,11 +403,11 @@ export class RemoteUIAccess extends Abject {
         log.warn(`incoming offer failed for ${fromPeerId.slice(0, 16)}: ${err}`);
       }),
       onSdpAnswer: (fromPeerId, sdp) => {
-        const t = this.connectedTransports.get(fromPeerId) ?? this.pendingAuth.get(fromPeerId)?.peerTransport;
+        const t = this.lookupTransport(fromPeerId);
         if (t) t.handleSdpAnswer(sdp).catch(() => {});
       },
       onIceCandidate: (fromPeerId, candidate) => {
-        const t = this.connectedTransports.get(fromPeerId) ?? this.pendingAuth.get(fromPeerId)?.peerTransport;
+        const t = this.lookupTransport(fromPeerId);
         if (t) t.handleIceCandidate(candidate).catch(() => {});
       },
       onError: (err) => log.warn(`signaling error: ${err}`),
@@ -427,6 +434,10 @@ export class RemoteUIAccess extends Abject {
       try { await p.peerTransport.disconnect(); } catch { /* ignore */ }
     }
     this.pendingAuth.clear();
+    for (const [, t] of this.negotiatingTransports) {
+      try { await t.disconnect(); } catch { /* ignore */ }
+    }
+    this.negotiatingTransports.clear();
     if (this.signalingClient) {
       try { await this.signalingClient.disconnect(); } catch { /* ignore */ }
       this.signalingClient = undefined;
@@ -482,6 +493,12 @@ export class RemoteUIAccess extends Abject {
       log.info(`Reconnect offer from ${fromPeerId.slice(0, 16)}; replacing stale pending transport`);
       try { await stalePending.peerTransport.disconnect(); } catch { /* ignore */ }
     }
+    const staleNegotiating = this.negotiatingTransports.get(fromPeerId);
+    if (staleNegotiating) {
+      this.negotiatingTransports.delete(fromPeerId);
+      log.info(`Reconnect offer from ${fromPeerId.slice(0, 16)}; replacing stale negotiating transport`);
+      try { await staleNegotiating.disconnect(); } catch { /* ignore */ }
+    }
 
     const transport = new PeerTransport({
       localPeerId: this.peerId,
@@ -499,7 +516,23 @@ export class RemoteUIAccess extends Abject {
       onError: (err) => log.warn(`peer transport error ${fromPeerId.slice(0, 16)}: ${err.message}`),
     });
 
+    // Track the transport during ICE negotiation so trickled candidates
+    // (notably a mobile client's relay candidate, which arrives after the
+    // offer) are delivered before the handshake completes. Without this the
+    // candidates are dropped and the DataChannel never forms on cell networks.
+    this.negotiatingTransports.set(fromPeerId, transport);
+
     await transport.handleSdpOffer(sdp);
+  }
+
+  /**
+   * Find the transport for a peer across all lifecycle stages: connected,
+   * pending auth, or still negotiating ICE.
+   */
+  private lookupTransport(peerId: string): PeerTransport | undefined {
+    return this.connectedTransports.get(peerId)
+      ?? this.pendingAuth.get(peerId)?.peerTransport
+      ?? this.negotiatingTransports.get(peerId);
   }
 
   /**
@@ -514,6 +547,8 @@ export class RemoteUIAccess extends Abject {
       transport.disconnect().catch(() => {});
     }, PRE_AUTH_TIMEOUT_MS);
 
+    // Graduated from ICE negotiation to pending-auth.
+    this.negotiatingTransports.delete(peerId);
     this.pendingAuth.set(peerId, { peerTransport: transport, authTimer });
 
     transport.onRawMessage((data: string) => {
@@ -622,6 +657,7 @@ export class RemoteUIAccess extends Abject {
       clearTimeout(pending.authTimer);
       this.pendingAuth.delete(peerId);
     }
+    this.negotiatingTransports.delete(peerId);
     if (wasConnected) this.emitClientsChanged();
   }
 

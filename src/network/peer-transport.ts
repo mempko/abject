@@ -224,6 +224,12 @@ export class PeerTransport extends Transport {
    * Handle an incoming ICE candidate from the signaling server.
    */
   async handleIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
+    // [ICE-DIAG] Log remote candidate type (what the peer is offering).
+    {
+      const c = candidate.candidate ?? '';
+      const typ = /typ (\w+)/.exec(c)?.[1] ?? '?';
+      log.info(`[ICE-DIAG] REMOTE cand from ${this.remotePeerId.slice(0, 12)}: typ=${typ} ${c.slice(0, 80)}`);
+    }
     if (!this.peerConnection ||
         !this.peerConnection.remoteDescription ||
         this.peerConnection.signalingState === 'have-local-offer') {
@@ -429,14 +435,28 @@ export class PeerTransport extends Transport {
       iceServers: this.iceServers,
     });
 
+    // [ICE-DIAG] Log the ICE servers actually applied to this connection so we
+    // can confirm TURN creds reached the transport.
+    const turnUrls = this.iceServers.flatMap(s => {
+      const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+      return urls.filter(u => u.startsWith('turn'));
+    });
+    log.info(`[ICE-DIAG] PC for ${this.remotePeerId.slice(0, 12)}: ${this.iceServers.length} iceServers, turn=[${turnUrls.join(',')}], hasUser=${this.iceServers.some(s => !!s.username)}`);
+
     // Forward ICE candidates to the remote peer via signaling
     this.peerConnection.onicecandidate = (event) => {
       if (event.candidate) {
+        // [ICE-DIAG] Log local candidate type (host/srflx/relay).
+        const c = event.candidate.candidate;
+        const typ = /typ (\w+)/.exec(c)?.[1] ?? '?';
+        log.info(`[ICE-DIAG] LOCAL cand to ${this.remotePeerId.slice(0, 12)}: typ=${typ} ${c.slice(0, 80)}`);
         this.signalingClient.sendIceCandidate(
           this.localPeerId,
           this.remotePeerId,
           event.candidate.toJSON(),
         );
+      } else {
+        log.info(`[ICE-DIAG] LOCAL gathering complete for ${this.remotePeerId.slice(0, 12)}`);
       }
     };
 
