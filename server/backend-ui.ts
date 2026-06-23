@@ -2143,6 +2143,12 @@ IMPORTANT:
           this.lastDisplayInfo = { width: m.width, height: m.height };
           // Same signal as client-ready: display-sized chrome re-measures.
           this.emitFrontendClientsChanged();
+          // Let the WindowManager re-fit maximized windows to the new viewport.
+          if (this.windowManagerId) {
+            this.send(event(this.id, this.windowManagerId, 'viewportResized', {
+              width: m.width, height: m.height,
+            }));
+          }
         }
         break;
       }

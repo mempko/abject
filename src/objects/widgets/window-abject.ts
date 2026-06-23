@@ -61,6 +61,7 @@ export class WindowAbject extends Abject {
   private focusOnCreate: boolean;
   private resizable: boolean;
   private draggable: boolean;
+  private maximized = false;
   private zIndex: number;
   protected override theme: ThemeData;
 
@@ -440,6 +441,14 @@ export class WindowAbject extends Abject {
       } else if (action === 'restore') {
         this.changed('windowRestored', {});
         this.scheduleFrame();
+      } else if (action === 'maximize') {
+        this.maximized = true;
+        this.changed('windowMaximized', {});
+        this.scheduleFrame();
+      } else if (action === 'unmaximize') {
+        this.maximized = false;
+        this.changed('windowUnmaximized', {});
+        this.scheduleFrame();
       }
     });
 
@@ -489,6 +498,8 @@ WindowAbject translates these into dependency-protocol events:
 - action: 'close'   → emits 'windowCloseRequested' to dependents
 - action: 'minimize' → emits 'windowMinimized' to dependents
 - action: 'restore'  → emits 'windowRestored' to dependents, then re-renders
+- action: 'maximize'  → marks maximized (renders restore glyph), emits 'windowMaximized'
+- action: 'unmaximize' → clears maximized (renders maximize glyph), emits 'windowUnmaximized'
 
 ### Event Flow
 
@@ -750,12 +761,13 @@ by re-matching title/owner.
       const iconSize = this.theme.titleButtonIconSize;
 
       const closeCx = w - btnMargin - btnSize / 2;
-      const minCx = closeCx - btnSize - btnMargin;
+      const maxCx = closeCx - btnSize - btnMargin;
+      const minCx = maxCx - btnSize - btnMargin;
       const helpCx = minCx - btnSize - btnMargin;
       const cy = tbh / 2;
 
       const iconColor = focused ? this.theme.textSecondary : this.theme.textTertiary;
-      const drawButton = (cx: number, kind: 'close' | 'minimize' | 'help') => {
+      const drawButton = (cx: number, kind: 'close' | 'minimize' | 'maximize' | 'restore' | 'help') => {
         commands.push(...iconCommands(kind, {
           surfaceId: sid,
           x: cx - iconSize / 2,
@@ -765,10 +777,12 @@ by re-matching title/owner.
         }));
       };
 
-      // Help (?) opens the object inspector for this window's owner. Sits to
-      // the left of minimize so close stays anchored to the right corner.
+      // Left to right: help (?), minimize, maximize/restore, close. Close stays
+      // anchored to the right corner; the maximize button swaps to a "restore"
+      // glyph (overlapping squares) once the window is maximized.
       drawButton(helpCx, 'help');
       drawButton(minCx, 'minimize');
+      drawButton(maxCx, this.maximized ? 'restore' : 'maximize');
       drawButton(closeCx, 'close');
 
       // Title-bar divider — a single quiet hairline separating the title bar

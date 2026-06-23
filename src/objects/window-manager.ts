@@ -32,6 +32,9 @@ interface WindowInfo {
   chromeless: boolean;
   draggable: boolean;
   minimized: boolean;
+  maximized: boolean;
+  /** Rect to restore to when un-maximized; set while maximized. */
+  savedRect?: Rect;
   title: string;
   titleBarHeight: number;
   titleButtonSize: number;
@@ -59,6 +62,12 @@ export class WindowManager extends Abject {
   private taskbarId?: AbjectId;
   private taskbarsByWorkspace: Map<string, AbjectId> = new Map();
   private dragState?: DragState;
+  /**
+   * Width of the reserved left dock for maximize. Pushed by WorkspaceManager
+   * via 'workAreaChanged' whenever the dock rebuilds (e.g. the compact toggle);
+   * the default matches the non-compact sidebar width before the first push.
+   */
+  private workAreaInsetLeft = 168;
 
   constructor() {
     super({
@@ -211,6 +220,7 @@ export class WindowManager extends Abject {
         chromeless: isChromeless,
         draggable: draggable ?? false,
         minimized: false,
+        maximized: false,
         title: title ?? '',
         titleBarHeight: titleBarHeight ?? TITLE_BAR_HEIGHT,
         titleButtonSize: titleButtonSize ?? 20,
@@ -369,6 +379,24 @@ export class WindowManager extends Abject {
     });
 
     // WorkspaceManager registers per-workspace Taskbars
+    // UIServer notifies us when the display/viewport resizes so maximized
+    // windows re-fit to the new work area.
+    this.on('viewportResized', async () => {
+      await this.reapplyMaximized();
+      return true;
+    });
+
+    // WorkspaceManager notifies us when the reserved dock width changes (e.g.
+    // the sidebar compact toggle) so maximized windows re-fit to the new inset.
+    this.on('workAreaChanged', async (msg: AbjectMessage) => {
+      const { left } = msg.payload as { left?: number };
+      if (typeof left === 'number' && left >= 0) {
+        this.workAreaInsetLeft = left;
+      }
+      await this.reapplyMaximized();
+      return true;
+    });
+
     this.on('registerTaskbar', async (msg: AbjectMessage) => {
       const { taskbarId, workspaceId } = msg.payload as { taskbarId: AbjectId; workspaceId: string };
       this.taskbarsByWorkspace.set(workspaceId, taskbarId);
@@ -421,7 +449,7 @@ export class WindowManager extends Abject {
     const info = this.windows.get(surfaceId);
     if (!info) return 'default';
 
-    const edge = this.detectResizeEdge(info, localX, localY);
+    const edge = info.maximized ? null : this.detectResizeEdge(info, localX, localY);
     if (edge) {
       switch (edge) {
         case 'n': case 's': return 'ns-resize';
@@ -467,14 +495,20 @@ WidgetManager registers each window with WindowManager via 'registerWindow':
 
 ### Title Bar Buttons
 
-Non-chromeless windows have help (?), minimize (_), and close (X) buttons in the
-title bar. WindowManager hit-tests these on mousedown:
+Non-chromeless windows have help (?), minimize (_), maximize (□), and close (X)
+buttons in the title bar. WindowManager hit-tests these on mousedown:
 
 - Close button (rightmost): sends 'titleBarAction' { action: 'close' } to WindowAbject.
   WindowAbject then emits 'windowCloseRequested' to its dependents (WidgetManager).
   WidgetManager forwards this to the window's owner.
 
-- Minimize button (left of close): WindowManager hides the surface via UIServer,
+- Maximize button (left of close): toggles the window between filling the work
+  area (display minus the left dock) and its prior floating rect. Sends
+  'titleBarAction' { action: 'maximize' | 'unmaximize' } to WindowAbject (which
+  swaps the glyph) and pushes the new rect via 'windowRect'. Maximized windows
+  are pinned (no edge-resize, no title-bar drag) and re-fit on viewport resize.
+
+- Minimize button (left of maximize): WindowManager hides the surface via UIServer,
   sends 'titleBarAction' { action: 'minimize' } to WindowAbject, and notifies Taskbar.
 
 - Help button (left of minimize): sends 'titleBarAction' { action: 'help' } to
@@ -533,8 +567,8 @@ Restore (via 'restoreWindow' method or Taskbar click):
     // Always raise the window on mousedown
     await this.raiseWindow(surfaceId);
 
-    // Check resize edges first
-    const edge = this.detectResizeEdge(info, localX, localY);
+    // Maximized windows are pinned to the work area — skip edge-resize.
+    const edge = info.maximized ? null : this.detectResizeEdge(info, localX, localY);
     if (edge) {
       this.dragState = {
         surfaceId,
@@ -561,10 +595,20 @@ Restore (via 'restoreWindow' method or Taskbar click):
         this.minimizeWindow(surfaceId);
         return { grab: false, minimize: surfaceId };
       }
+      if (btn === 'maximize') {
+        this.toggleMaximize(surfaceId);
+        return { grab: false };
+      }
       if (btn === 'help') {
         this.send(
           event(this.id, info.windowId, 'titleBarAction', { action: 'help' })
         );
+        return { grab: false };
+      }
+
+      // Maximized windows are pinned — clicking the title bar (off the buttons)
+      // does not start a move drag.
+      if (info.maximized) {
         return { grab: false };
       }
 
@@ -736,7 +780,7 @@ Restore (via 'restoreWindow' method or Taskbar click):
     info: WindowInfo,
     localX: number,
     localY: number,
-  ): 'close' | 'minimize' | 'help' | null {
+  ): 'close' | 'minimize' | 'maximize' | 'help' | null {
     const btnSize = info.titleButtonSize;
     const btnMargin = info.titleButtonMargin;
     const tbHeight = info.titleBarHeight;
@@ -746,14 +790,21 @@ Restore (via 'restoreWindow' method or Taskbar click):
     // Only in title bar vertical range
     if (localY >= tbHeight) return null;
 
-    // Close button: rightmost
+    // Layout mirrors WindowAbject's render order (right to left): close,
+    // maximize, minimize, help.
     const closeCx = w - btnMargin - btnSize / 2;
     if (Math.abs(localX - closeCx) <= btnSize / 2 && Math.abs(localY - cy) <= btnSize / 2) {
       return 'close';
     }
 
-    // Minimize button: left of close
-    const minCx = closeCx - btnSize - btnMargin;
+    // Maximize/restore button: left of close
+    const maxCx = closeCx - btnSize - btnMargin;
+    if (Math.abs(localX - maxCx) <= btnSize / 2 && Math.abs(localY - cy) <= btnSize / 2) {
+      return 'maximize';
+    }
+
+    // Minimize button: left of maximize
+    const minCx = maxCx - btnSize - btnMargin;
     if (Math.abs(localX - minCx) <= btnSize / 2 && Math.abs(localY - cy) <= btnSize / 2) {
       return 'minimize';
     }
@@ -863,6 +914,91 @@ Restore (via 'restoreWindow' method or Taskbar click):
         );
       } catch { /* Taskbar may be gone */ }
     }
+  }
+
+  // ── Maximize / Restore ──────────────────────────────────────────────
+
+  /**
+   * Toggle a window between maximized (filling the work area) and its prior
+   * floating rect. The work area reserves the left dock so the rails stay
+   * reachable, matching the placement convention in WidgetManager.
+   */
+  private async toggleMaximize(surfaceId: string): Promise<void> {
+    const info = this.windows.get(surfaceId);
+    if (!info || info.chromeless) return;
+
+    if (info.maximized) {
+      const target = info.savedRect ?? info.rect;
+      info.maximized = false;
+      info.savedRect = undefined;
+      info.rect = { ...target };
+      this.applyRect(surfaceId, target);
+      this.send(
+        event(this.id, info.windowId, 'titleBarAction', { action: 'unmaximize' })
+      );
+    } else {
+      info.savedRect = { ...info.rect };
+      const area = await this.getWorkArea();
+      info.maximized = true;
+      info.rect = { ...area };
+      this.applyRect(surfaceId, area);
+      this.send(
+        event(this.id, info.windowId, 'titleBarAction', { action: 'maximize' })
+      );
+    }
+  }
+
+  /**
+   * Re-fit every maximized window to the current work area. Called when the
+   * viewport (browser/canvas) resizes so maximized windows track its size.
+   */
+  private async reapplyMaximized(): Promise<void> {
+    let area: Rect | undefined;
+    for (const [surfaceId, info] of this.windows) {
+      if (!info.maximized) continue;
+      if (!area) area = await this.getWorkArea();
+      info.rect = { ...area };
+      this.applyRect(surfaceId, area);
+    }
+  }
+
+  /**
+   * Compute the maximize target rect: the full display minus the reserved left
+   * dock. The dock width is pushed via 'workAreaChanged' by WorkspaceManager
+   * (which owns the sidebar/dock and its compact toggle), so maximized windows
+   * always clear the System/Spaces/Abjects rails at their current width.
+   */
+  private async getWorkArea(): Promise<Rect> {
+    const left = this.workAreaInsetLeft;
+    let width = 1280;
+    let height = 720;
+    if (this.uiServerId) {
+      try {
+        const info = await this.request<{ width: number; height: number }>(
+          request(this.id, this.uiServerId, 'getDisplayInfo', {})
+        );
+        if (info && info.width > 0 && info.height > 0) {
+          width = info.width;
+          height = info.height;
+        }
+      } catch { /* UIServer may be gone — fall back to defaults */ }
+    }
+    return { x: left, y: 0, width: Math.max(100, width - left), height: Math.max(60, height) };
+  }
+
+  /**
+   * Push a rect to a window's WindowAbject via 'windowRect'. The WindowAbject
+   * updates its UIServer surface, re-lays out children, and re-renders — the
+   * same path used for programmatic resize from the Taskbar.
+   */
+  private applyRect(surfaceId: string, rect: Rect): void {
+    const info = this.windows.get(surfaceId);
+    if (!info) return;
+    this.send(
+      event(this.id, info.windowId, 'windowRect', {
+        x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+      })
+    );
   }
 
   // ── Raise window ─────────────────────────────────────────────────────

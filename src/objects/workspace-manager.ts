@@ -18,6 +18,7 @@ import { Abject } from '../core/abject.js';
 import type { ThemeData } from '../core/theme-data.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
+import { SIDEBAR_WIDTH, SIDEBAR_COMPACT_WIDTH } from './sidebar.js';
 import { Log } from '../core/timed-log.js';
 
 const WORKSPACE_MANAGER_INTERFACE = 'abjects:workspace-manager' as InterfaceId;
@@ -765,6 +766,14 @@ export class WorkspaceManager extends Abject {
       wsLog.warn('Failed to rebuild sidebar:', err);
     }
     if (!sections) return false;
+
+    // Tell WindowManager the reserved dock width so maximized windows re-fit
+    // when the sidebar toggles between compact and full width.
+    if (this.windowManagerId) {
+      this.send(event(this.id, this.windowManagerId, 'workAreaChanged', {
+        left: sections.compact ? SIDEBAR_COMPACT_WIDTH : SIDEBAR_WIDTH,
+      }));
+    }
 
     if (this.globalToolbarId) {
       try {
