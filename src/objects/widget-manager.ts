@@ -1032,6 +1032,30 @@ export class WidgetManager extends Abject {
         return;
       }
 
+      // Forward window geometry changes to the owner. WindowAbject emits a
+      // single 'windowRect' (drag, resize, maximize, programmatic); owners
+      // listen for the split 'windowMoved'/'windowResized' events (e.g. Chat
+      // reflows its bubbles on windowResized). Windows are not widgets, so they
+      // bypass the widget-shim path below and resolve their owner directly.
+      if (aspect === 'windowRect') {
+        const ownerId = this.windowOwners.get(fromId);
+        const { x, y, width, height } = (value ?? {}) as { x: number; y: number; width: number; height: number };
+        if (ownerId) {
+          this.send(event(this.id, ownerId, 'windowMoved', { windowId: fromId, x, y }));
+          this.send(event(this.id, ownerId, 'windowResized', { windowId: fromId, width, height }));
+        }
+        // Keep WindowManager's tracked rect in sync (programmatic resize from owner).
+        if (this.windowManagerId) {
+          const surfaceId = this.windowSurfaces.get(fromId);
+          if (surfaceId) {
+            this.send(event(this.id, this.windowManagerId, 'updateWindowRect', {
+              surfaceId, x, y, width, height,
+            }));
+          }
+        }
+        return;
+      }
+
       // Help (?) button — re-broadcast to dependents (e.g. the object
       // inspector) with the window's owner attached, so they can inspect it.
       // Mirrors the windowCreated/windowDestroyed decorator-broadcast pattern.
@@ -1085,24 +1109,6 @@ export class WidgetManager extends Abject {
       }
 
       // Forward window events
-      if (aspect === 'windowRect') {
-        const { x, y, width, height } = value as { x: number; y: number; width: number; height: number };
-        this.send(
-          event(this.id, ownerId, 'windowMoved', { windowId: windowShimId, x, y })
-        );
-        this.send(
-          event(this.id, ownerId, 'windowResized', { windowId: windowShimId, width, height })
-        );
-        // Keep WindowManager's tracked rect in sync (programmatic resize from owner)
-        if (this.windowManagerId) {
-          const surfaceId = this.windowSurfaces.get(fromId);
-          if (surfaceId) {
-            this.send(event(this.id, this.windowManagerId, 'updateWindowRect', {
-              surfaceId, x, y, width, height,
-            }));
-          }
-        }
-      }
       if (aspect === 'windowMoved') {
         const { x, y } = value as { x: number; y: number };
         this.send(
