@@ -158,6 +158,8 @@ interface TaskEntry {
   parseFailures?: number;
   /** Consecutive LLM streams that returned empty content. Reset on every non-empty response. */
   emptyResponses?: number;
+  /** Consecutive truncated terminal responses (cut off mid-generation). Reset on every complete response. */
+  truncationRetries?: number;
 }
 
 // ─── AgentAbject ─────────────────────────────────────────────────────
@@ -1923,9 +1925,9 @@ The registered object must implement these handlers to participate in the agent 
     this.llmId = await this.resolveDep('LLM', this.llmId);
     // Use streaming — llmChunk events are forwarded to the ticket caller
     this.activeStreamEntry = entry;
-    let llmResult: { content: string };
+    let llmResult: { content: string; stopReason?: string };
     try {
-      llmResult = await this.request<{ content: string }>(
+      llmResult = await this.request<{ content: string; stopReason?: string }>(
         request(this.id, this.llmId, 'stream', {
           messages: task.llmMessages,
           // Thinking is the JSON-action-decision step. Pin it to 'smart' so the
@@ -1970,7 +1972,10 @@ The registered object must implement these handlers to participate in the agent 
     // Add assistant response
     task.llmMessages.push({ role: 'assistant', content: llmResult.content });
 
-    const parsed = this.parseAction(entry, llmResult.content);
+    // 'max_tokens'/'length' means the provider cut the response off
+    // mid-generation, so even a parseable action carries incomplete content.
+    const streamTruncated = llmResult.stopReason === 'max_tokens' || llmResult.stopReason === 'length';
+    const parsed = this.parseAction(entry, llmResult.content, streamTruncated);
     log.info(`[${agentName}] Step ${task.step + 1} — LLM action: ${parsed.action}${parsed.reasoning ? ' (' + parsed.reasoning.slice(0, 60) + ')' : ''}`);
     return parsed;
   }
@@ -2367,6 +2372,42 @@ This task belongs to a goal. When you run code (a \`call\`/code action), the goa
   /** Maximum consecutive empty LLM responses before we force a terminal fail. */
   private static readonly MAX_EMPTY_RESPONSES = 3;
 
+  /** Maximum re-emit attempts for a terminal action cut off mid-generation. */
+  private static readonly MAX_TRUNCATION_RETRIES = 1;
+
+  /**
+   * Handle a terminal action recovered from a truncated (cut-off) response.
+   * Returns a `_reparse` sentinel to request a complete re-emit, or null to
+   * proceed with the action. On the final attempt the partial content is kept
+   * (so the user sees something) but marked as cut off rather than passed off
+   * as a complete reply. Non-terminal actions are left to fail/observe normally.
+   */
+  private handleTruncatedAction(entry: TaskEntry, parsed: AgentAction): AgentAction | null {
+    const terminal = entry.config.terminalActions[parsed.action];
+    if (!terminal) return null;
+
+    entry.truncationRetries = (entry.truncationRetries ?? 0) + 1;
+    if (entry.truncationRetries <= AgentAbject.MAX_TRUNCATION_RETRIES) {
+      entry.state.llmMessages.push({
+        role: 'user',
+        content: `[Error] Your "${parsed.action}" response was cut off mid-generation (the output ended incompletely or hit the length limit). Re-emit the COMPLETE action as a single \`\`\`json block. If the content is long, make it more concise so it finishes within the limit rather than getting truncated again.`,
+      });
+      return { action: '_reparse', reasoning: `Retrying truncated "${parsed.action}" terminal (attempt ${entry.truncationRetries}/${AgentAbject.MAX_TRUNCATION_RETRIES})` };
+    }
+
+    // Retries exhausted: ship the partial content rather than nothing, but mark
+    // it so a cut-off reply is never mistaken for a complete one.
+    for (const field of (terminal.resultFields ?? [])) {
+      const val = parsed[field];
+      if (typeof val === 'string' && val.trim().length > 0) {
+        parsed[field] = `${val}\n\n_(Response was cut off.)_`;
+        break;
+      }
+    }
+    entry.truncationRetries = 0;
+    return null;
+  }
+
   /**
    * Returns null if the parsed action has acceptable content, or a `_reparse`
    * sentinel (or terminal error) if the agent should be asked to try again.
@@ -2417,24 +2458,54 @@ This task belongs to a goal. When you run code (a \`call\`/code action), the goa
     return { action: '_reparse_abort', reasoning: reason };
   }
 
-  private parseAction(entry: TaskEntry, content: string): AgentAction {
+  private parseAction(entry: TaskEntry, content: string, streamTruncated = false): AgentAction {
     // Extract a parsed action from the content (try several wrapper shapes).
+    // `repaired` is set when the action was salvaged from incomplete JSON
+    // (suffix-closing or regex extraction) — a strong truncation signal even
+    // when the provider didn't report stop_reason.
     let parsed: AgentAction | null = null;
-    const jsonMatch = content.match(/```json\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      parsed = this.tryParseActionJson(jsonMatch[1].trim());
+    let repaired = false;
+    const take = (r: { action: AgentAction; repaired: boolean } | null) => {
+      if (r && !parsed) { parsed = r.action; repaired = r.repaired; }
+    };
+
+    // 1. String-aware balanced-brace extraction — the robust primary path.
+    //    Handles action JSON whose string values contain ``` code fences or
+    //    `{`/`}` characters, which the lazy ```json fence regex below would
+    //    mis-cut at the first inner fence (turning a complete reply into a
+    //    truncated one). Skipped strings/escapes mean inner fences and braces
+    //    don't confuse the scan.
+    const balanced = this.extractBalancedJson(content);
+    if (balanced) take(this.tryParseActionJson(balanced));
+
+    // 2. Fenced ```json block (lazy — fine once balanced extraction has had
+    //    first refusal, used mainly when there is no balanced object to find).
+    if (!parsed) {
+      const jsonMatch = content.match(/```json\s*([\s\S]*?)```/);
+      if (jsonMatch) take(this.tryParseActionJson(jsonMatch[1].trim()));
     }
+    // 3. Unclosed ```json fence (genuinely truncated mid-block).
     if (!parsed) {
       const unclosedMatch = content.match(/```json\s*([\s\S]*)/);
-      if (unclosedMatch && !jsonMatch) {
-        parsed = this.tryParseActionJson(unclosedMatch[1].trim());
-      }
+      if (unclosedMatch) take(this.tryParseActionJson(unclosedMatch[1].trim()));
     }
+    // 4. Whole content as a last resort.
     if (!parsed) {
-      parsed = this.tryParseActionJson(content);
+      take(this.tryParseActionJson(content));
     }
 
     if (parsed) {
+      // A terminal action salvaged from a cut-off stream carries incomplete
+      // text/result. Re-prompt for a complete re-emit (then fall back to the
+      // partial with a visible marker) BEFORE the empty-content check, so a
+      // half-message is never silently promoted to a successful reply.
+      if (streamTruncated || repaired) {
+        const truncatedHandling = this.handleTruncatedAction(entry, parsed);
+        if (truncatedHandling) return truncatedHandling;
+      } else {
+        entry.truncationRetries = 0;
+      }
+
       // Reject terminal actions that arrive with all required fields missing
       // or empty. Without this, the framework happily promotes e.g.
       // `{"action": "clarify"}` to a success terminal, but downstream renders
@@ -2477,19 +2548,52 @@ This task belongs to a goal. When you run code (a \`call\`/code action), the goa
     return { action: '_reparse_abort', reasoning: reason };
   }
 
-  private tryParseActionJson(raw: string): AgentAction | null {
+  /**
+   * Extract the first complete, brace-balanced JSON object from `content`,
+   * scanning string literals so that `{`, `}`, and ``` code fences appearing
+   * inside string values (e.g. a markdown answer in a "text" field) do not
+   * terminate the object early. Returns the object substring, or null if no
+   * `{` is found or the braces never balance (a genuinely truncated object,
+   * which the caller's later fallbacks handle).
+   */
+  private extractBalancedJson(content: string): string | null {
+    const start = content.indexOf('{');
+    if (start === -1) return null;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < content.length; i++) {
+      const ch = content[i];
+      if (escaped) { escaped = false; continue; }
+      if (inString) {
+        if (ch === '\\') escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) return content.slice(start, i + 1);
+      }
+    }
+    return null;
+  }
+
+  private tryParseActionJson(raw: string): { action: AgentAction; repaired: boolean } | null {
     try {
       const parsed = JSON.parse(raw);
       if (typeof parsed.action === 'string') {
-        return parsed as AgentAction;
+        return { action: parsed as AgentAction, repaired: false };
       }
     } catch {
-      // Try repairing truncated JSON
+      // Try repairing truncated JSON — these salvage paths mean the original
+      // content was incomplete, which the caller treats as a truncation signal.
       const suffixes = ['"}', '"}]', '}}', '}'];
       for (const suffix of suffixes) {
         try {
           const repaired = JSON.parse(raw + suffix);
-          if (typeof repaired.action === 'string') return repaired as AgentAction;
+          if (typeof repaired.action === 'string') return { action: repaired as AgentAction, repaired: true };
         } catch { /* try next */ }
       }
 
@@ -2501,7 +2605,7 @@ This task belongs to a goal. When you run code (a \`call\`/code action), the goa
         if (textMatch) action.text = textMatch[1].replace(/\\"/g, '"');
         const resultMatch = raw.match(/"result"\s*:\s*"((?:[^"\\]|\\.)*)"/);
         if (resultMatch) action.result = resultMatch[1].replace(/\\"/g, '"');
-        return action;
+        return { action, repaired: true };
       }
     }
     return null;

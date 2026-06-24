@@ -455,7 +455,8 @@ export class LLMObject extends Abject {
       // If provider doesn't support streaming, fall back to complete
       if (!provider.stream) {
         const result = await this.complete(messages, options, providerName, callerId, correlationId);
-        return { content: result.content };
+        // 'length' is the provider-agnostic signal for a truncated response.
+        return { content: result.content, stopReason: result.finishReason === 'length' ? 'max_tokens' : result.finishReason };
       }
 
       const totalChars = messages.reduce((sum, m2) => sum + getTextContent(m2).length, 0);
@@ -491,6 +492,7 @@ export class LLMObject extends Abject {
       }, KEEPALIVE_MS);
 
       let fullContent = '';
+      let stopReason: string | undefined;
       try {
         for await (const chunk of provider.stream(messages, effectiveOptions)) {
           if (activeReq.killed) {
@@ -499,6 +501,7 @@ export class LLMObject extends Abject {
           }
           lastChunkAt = Date.now();
           fullContent += chunk.content;
+          if (chunk.stopReason) stopReason = chunk.stopReason;
           activeReq.outputChars = fullContent.length;
           // Send each chunk as an event back to the requester
           this.send(event(this.id, callerId, 'llmChunk', {
@@ -518,9 +521,9 @@ export class LLMObject extends Abject {
       }
 
       const elapsed = Date.now() - start;
-      log.info(`← ${provider.name} stream | ${fullContent.length} chars | ${elapsed}ms`);
+      log.info(`← ${provider.name} stream | ${fullContent.length} chars | ${elapsed}ms | reason=${stopReason ?? 'unknown'}`);
       this.trackRequestEnd(correlationId, fullContent);
-      return { content: fullContent };
+      return { content: fullContent, stopReason };
     });
 
     this.on('listProviders', async () => {

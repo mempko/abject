@@ -385,7 +385,7 @@ export class AnthropicProvider extends BaseLLMProvider {
         const data = line.slice(6);
         if (data === '[DONE]') {
           if (emittedTextChars === 0) this.warnEmptyStream(eventTypeCounts, blockTypes, deltaTypes, stopReason);
-          yield { content: '', done: true };
+          yield { content: '', done: true, stopReason };
           return;
         }
 
@@ -410,7 +410,7 @@ export class AnthropicProvider extends BaseLLMProvider {
             stopReason = String(event.delta.stop_reason);
           } else if (event.type === 'message_stop') {
             if (emittedTextChars === 0) this.warnEmptyStream(eventTypeCounts, blockTypes, deltaTypes, stopReason);
-            yield { content: '', done: true };
+            yield { content: '', done: true, stopReason };
             return;
           }
         } catch {
@@ -420,7 +420,7 @@ export class AnthropicProvider extends BaseLLMProvider {
     }
 
     if (emittedTextChars === 0) this.warnEmptyStream(eventTypeCounts, blockTypes, deltaTypes, stopReason);
-    yield { content: '', done: true };
+    yield { content: '', done: true, stopReason };
   }
 
   /**

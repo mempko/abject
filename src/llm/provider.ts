@@ -111,6 +111,12 @@ export interface LLMCompletionResult {
 export interface LLMStreamChunk {
   content: string;
   done: boolean;
+  /**
+   * Provider stop reason, set on the terminal (done) chunk when known.
+   * 'length'/'max_tokens' means the response was truncated mid-generation —
+   * consumers must not treat truncated output as a complete answer.
+   */
+  stopReason?: string;
 }
 
 export interface FetchResult {
