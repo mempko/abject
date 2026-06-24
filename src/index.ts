@@ -161,6 +161,15 @@ export { OAuthHelper, OAUTH_HELPER_ID } from './objects/oauth-helper.js';
 export type { OAuthProviderConfig, ConnectedAccount } from './objects/oauth-helper.js';
 export { parseSkillMd } from './core/skill-parser.js';
 export type { ParsedSkill } from './core/skill-parser.js';
+export {
+  discoverHostMcpServers,
+  readMcporterServers,
+  readOpenclawSkillEnv,
+  mcporterConfigCandidates,
+  openclawConfigPath,
+  synthesizeHostSkillMd,
+} from './core/host-mcp-import.js';
+export type { HostMcpServer } from './core/host-mcp-import.js';
 export type { SkillInfo, SkillConfig, EnabledSkillSummary, MCPServerMeta } from './core/skill-types.js';
 export { HttpServer, HTTP_SERVER_ID } from './objects/http-server.js';
 export { MCPBridge, MCP_BRIDGE_ID } from './objects/mcp-bridge.js';

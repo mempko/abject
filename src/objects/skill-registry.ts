@@ -8,6 +8,7 @@
 
 import * as fs from 'fs';
 import * as fsPromises from 'fs/promises';
+import * as os from 'os';
 import * as path from 'path';
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
 import { Abject } from '../core/abject.js';
@@ -15,6 +16,8 @@ import { request } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { require as contractRequire } from '../core/contracts.js';
 import { parseSkillMd, ParsedSkill } from '../core/skill-parser.js';
+import { discoverHostMcpServers, synthesizeHostSkillMd } from '../core/host-mcp-import.js';
+import { sanitiseSkillName } from '../core/skill-synth.js';
 import type { SkillInfo, SkillConfig, EnabledSkillSummary } from '../core/skill-types.js';
 import { Log } from '../core/timed-log.js';
 
@@ -76,7 +79,10 @@ export class SkillRegistry extends Abject {
               parameters: [
                 { name: 'name', type: { kind: 'primitive', primitive: 'string' }, description: 'Skill name' },
               ],
-              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
+              returns: { kind: 'object', properties: {
+                success: { kind: 'primitive', primitive: 'boolean' },
+                warning: { kind: 'primitive', primitive: 'string' },
+              } },
             },
             {
               name: 'disableSkill',
@@ -216,6 +222,10 @@ export class SkillRegistry extends Abject {
       }
     }
 
+    // Import MCP servers already configured on the host (mcporter / openclaw) as
+    // disabled skills, so they can be bridged natively instead of shelled out to.
+    await this.importHostMcpServers();
+
     this.shellExecutorId = await this.discoverDep('ShellExecutor') ?? undefined;
     this.factoryId = await this.discoverDep('Factory') ?? undefined;
     this.secretsVaultId = await this.discoverDep('SecretsVault') ?? undefined;
@@ -332,13 +342,24 @@ whenever the skill set changes.
       await this.pushEnvToShell();
 
       // If this is an MCP server, spawn a bridge
+      let warning: string | undefined;
       if (entry.parsed.mcpServer) {
         await this.spawnMCPBridge(name, entry);
+      } else if (looksLikeMcpSkill(entry.parsed)) {
+        // The skill declares an MCP launcher dependency (e.g. mcporter) but has no
+        // mcp-command frontmatter, so no bridge will start. Surface this softly so
+        // a "successful" enable does not silently fail to expose any tools.
+        warning =
+          `Skill "${name}" looks like it wraps an MCP server (requires ` +
+          `${(entry.parsed.requiredBins ?? []).join(', ')}) but its SKILL.md has no ` +
+          `"mcp-command" frontmatter, so no MCP bridge was started and no tools are exposed. ` +
+          `Add mcp-command/mcp-args, or configure the server in mcporter and re-scan to import it.`;
+        log.warn(warning);
       }
 
       this.changed('skillsChanged', { reason: 'enabled' });
       log.info(`Enabled skill: ${name}`);
-      return { success: true };
+      return warning ? { success: true, warning } : { success: true };
     });
 
     this.on('disableSkill', async (msg: AbjectMessage) => {
@@ -362,6 +383,7 @@ whenever the skill set changes.
 
     this.on('scanSkills', async () => {
       await this.doScan();
+      await this.importHostMcpServers();
       this.changed('skillsChanged', { reason: 'scanned' });
       return { found: this.skills.size };
     });
@@ -607,6 +629,68 @@ whenever the skill set changes.
     }
 
     log.info(`Scanned ${this.skills.size} skills`);
+  }
+
+  /**
+   * Import MCP servers already configured on the host (mcporter / openclaw) as
+   * abjects skills, so they can be bridged natively rather than shelled out to.
+   *
+   * Each discovered server that does not already match an existing skill (by
+   * name, case-insensitive) gets a synthesised SKILL.md with proper
+   * `mcp-command` / `mcp-args` frontmatter. Imported skills start DISABLED — the
+   * user enables them explicitly, which is when the MCP subprocess is launched.
+   * Any env carried over from the host config is seeded into skill config (not
+   * baked into the SKILL.md), matching how abjects already stores skill secrets.
+   *
+   * Set ABJECTS_IMPORT_HOST_MCP=0 to opt out.
+   */
+  private async importHostMcpServers(): Promise<number> {
+    if (process.env.ABJECTS_IMPORT_HOST_MCP === '0') return 0;
+
+    let servers;
+    try {
+      servers = discoverHostMcpServers(os.homedir());
+    } catch (err) {
+      log.info(`Host MCP discovery skipped: ${err instanceof Error ? err.message : String(err)}`);
+      return 0;
+    }
+
+    let imported = 0;
+    let seededConfig = false;
+    for (const server of servers) {
+      // Already represented by a skill (e.g. a hand-written SKILL.md) — leave it be.
+      if (this.findSkillEntry(server.name)) continue;
+
+      const dirName = sanitiseSkillName(server.name);
+      const skillDir = path.join(this.skillsDir, dirName);
+      const skillMdPath = path.join(skillDir, 'SKILL.md');
+      // Never clobber an existing file on disk.
+      if (fs.existsSync(skillMdPath)) continue;
+
+      const content = synthesizeHostSkillMd(server);
+      try {
+        await fsPromises.mkdir(skillDir, { recursive: true });
+        await fsPromises.writeFile(skillMdPath, content, 'utf-8');
+      } catch (err) {
+        log.warn(`Failed to write imported skill "${server.name}": ${err instanceof Error ? err.message : String(err)}`);
+        continue;
+      }
+
+      const parsed = parseSkillMd(content, dirName);
+      this.skills.set(parsed.name, { parsed, enabled: false });
+
+      // Seed host env into skill config (kept out of the SKILL.md file).
+      if (Object.keys(server.env).length > 0 && !this.skillConfigs.get(parsed.name)?.env) {
+        this.skillConfigs.set(parsed.name, { env: { ...server.env } });
+        seededConfig = true;
+      }
+
+      imported++;
+      log.info(`Imported host MCP server "${server.name}" (${server.source}) as skill "${parsed.name}" (disabled)`);
+    }
+
+    if (seededConfig) await this.persistConfigs();
+    return imported;
   }
 
   // ─── State Persistence ──────────────────────────────────────────
@@ -924,6 +1008,19 @@ whenever the skill set changes.
  *
  * Returns a map of envVarName → secretName, or undefined if no secrets declared.
  */
+/**
+ * Heuristic: does this (non-MCP-parsed) skill look like it was meant to wrap an
+ * MCP server but is missing its `mcp-command` frontmatter? We only trust an
+ * explicit declared dependency on a known MCP launcher (mcporter / an mcp-server
+ * package) so the warning stays precise rather than firing on any skill that
+ * happens to mention "mcp".
+ */
+function looksLikeMcpSkill(parsed: ParsedSkill): boolean {
+  if (parsed.mcpServer) return false;
+  const bins = parsed.requiredBins ?? [];
+  return bins.some(b => /^mcporter$|mcp-server/i.test(b));
+}
+
 function extractRequiredSecretMapping(frontmatter: Record<string, unknown>): Record<string, string> | undefined {
   const raw = frontmatter['required-secret'];
   if (raw === undefined || raw === null) return undefined;
