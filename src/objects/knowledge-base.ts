@@ -401,12 +401,25 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     });
 
     this.on('update', async (msg: AbjectMessage) => {
-      const { id, content, title, tags } = msg.payload as {
+      const payload = msg.payload as {
         id: string; content?: string; title?: string; tags?: string[];
+        updates?: { content?: string; title?: string; tags?: string[] };
       };
+      const { id } = payload;
+      // Accept fields either flat on the payload or nested under `updates`;
+      // callers (including LLM-generated ones) reach for both shapes.
+      const content = payload.content ?? payload.updates?.content;
+      const title = payload.title ?? payload.updates?.title;
+      const tags = payload.tags ?? payload.updates?.tags;
       requireNonEmpty(id, 'id');
       const entry = this.entries.get(id);
-      if (!entry) return { success: false };
+      if (!entry) return { success: false, error: `No entry with id "${id}"` };
+
+      // Surface a no-op rather than reporting success: a wrong-shaped payload
+      // that touches no recognized field must not masquerade as an update.
+      if (content === undefined && title === undefined && tags === undefined) {
+        return { success: false, error: 'No updatable fields provided (expected content, title, and/or tags)' };
+      }
 
       this.index.discard(id);
 
