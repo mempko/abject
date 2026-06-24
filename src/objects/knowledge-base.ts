@@ -27,6 +27,14 @@ const log = new Log('KNOWLEDGE-BASE');
 const KNOWLEDGE_BASE_INTERFACE = 'abjects:knowledge-base' as InterfaceId;
 const STORAGE_KEY = 'knowledge-base:entries';
 
+/**
+ * Tag marking a durable fact about the user (home location, name, role,
+ * preferences). Profile-tagged facts are injected into every agent's context
+ * unconditionally, so stable knowledge about the user surfaces even when the
+ * task shares no keywords with it (keyword recall alone would miss it).
+ */
+export const PROFILE_TAG = 'profile';
+
 export type KnowledgeType = 'learned' | 'fact' | 'insight' | 'reference';
 
 export interface KnowledgeEntry {
@@ -242,7 +250,7 @@ Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (age
   const all = await call(await dep('KnowledgeBase'), 'list', { type: 'learned', limit: 20 });
 
 ### When to remember (durable knowledge only)
-- User preferences discovered during interaction
+- User preferences or personal facts (location, name, role) — tag these with "profile" so every future task always has them, even when the task wording does not mention them
 - Facts about the workspace or project structure
 - Stable patterns or capabilities that help future unrelated tasks
 - References to external resources or object capabilities

@@ -17,6 +17,7 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { requireDefined } from '../core/contracts.js';
 import type { JobResult } from './job-manager.js';
+import { PROFILE_TAG } from './knowledge-base.js';
 import type { ContentPart } from '../llm/provider.js';
 import { truncateText, conversationTextChars, enforceConversationCharBudget } from '../llm/provider.js';
 import type { EnabledSkillSummary } from '../core/skill-types.js';
@@ -2107,20 +2108,42 @@ The registered object must implement these handlers to participate in the agent 
       prompt += await this.buildGoalProgressContext(entry.goalId, entry.dispatchTupleId);
     }
 
-    // Inject relevant knowledge from KnowledgeBase
+    // Inject relevant knowledge from KnowledgeBase in two passes:
+    //   1. Durable user-profile facts (PROFILE_TAG), always included regardless
+    //      of the task wording, so stable knowledge about the user (home
+    //      location, name, preferences) is present even when the task shares no
+    //      keywords with it — keyword recall alone would rank it out of the top
+    //      results and the agent would re-ask for something it already knows.
+    //   2. The top entries whose text matches this task.
+    // A profile fact that also matches the query is not repeated.
     try {
       const knowledgeBaseId = await this.discoverDep('KnowledgeBase');
       if (knowledgeBaseId) {
-        const entries = await this.request<Array<{ title: string; type: string; content: string }> | null>(
-          request(this.id, knowledgeBaseId, 'recall', {
-            query: entry.state.task,
-            limit: 5,
-          }),
-          5000,
-        );
-        if (entries && entries.length > 0) {
+        type KEntry = { title: string; type: string; content: string };
+        const [profile, matched] = await Promise.all([
+          this.request<KEntry[] | null>(
+            request(this.id, knowledgeBaseId, 'recall', { tags: [PROFILE_TAG], limit: 10 }),
+            5000,
+          ).catch(() => null),
+          this.request<KEntry[] | null>(
+            request(this.id, knowledgeBaseId, 'recall', { query: entry.state.task, limit: 5 }),
+            5000,
+          ).catch(() => null),
+        ]);
+
+        if (profile && profile.length > 0) {
+          let block = '\n\n## About the User\nDurable facts about the user. Apply them without asking the user to repeat them.\n';
+          for (const e of profile) {
+            block += `- **${e.title}**: ${e.content.slice(0, 2000)}\n`;
+          }
+          prompt += block;
+        }
+
+        const profileTitles = new Set((profile ?? []).map(e => e.title));
+        const relevant = (matched ?? []).filter(e => !profileTitles.has(e.title));
+        if (relevant.length > 0) {
           let kb = '\n\n## Relevant Knowledge\nPrevious agents have learned the following. Use remember(title, content, type, tags) to save new insights.\n';
-          for (const e of entries) {
+          for (const e of relevant) {
             kb += `- **${e.title}** (${e.type}): ${e.content.slice(0, 2000)}\n`;
           }
           prompt += kb;
@@ -2148,7 +2171,7 @@ You can emit a remember action to save knowledge for future tasks:
 \`\`\`
 Types: 'learned' (lessons from outcomes), 'fact' (discovered facts), 'insight' (analysis), 'reference' (pointers)
 When to remember (durable knowledge for future unrelated tasks):
-- User preferences or personal facts they share (location, name, job, etc.)
+- User preferences or personal facts they share (location, name, job, etc.) — tag these with "profile" so they are always available in future tasks, even ones whose wording does not mention them
 - Stable system architecture insights or validated patterns
 - Useful API details or capabilities that are unlikely to change
 Ephemeral problems (runtime errors, connection failures, config issues, workarounds being tried) belong in the goal scratchpad, not the knowledge base. They are relevant to the current goal only.
