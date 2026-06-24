@@ -27,6 +27,14 @@ const log = new Log('KNOWLEDGE-BASE');
 const KNOWLEDGE_BASE_INTERFACE = 'abjects:knowledge-base' as InterfaceId;
 const STORAGE_KEY = 'knowledge-base:entries';
 
+/**
+ * Tag marking a durable fact about the user (home location, name, role,
+ * preferences). Profile-tagged facts are injected into every agent's context
+ * unconditionally, so stable knowledge about the user surfaces even when the
+ * task shares no keywords with it (keyword recall alone would miss it).
+ */
+export const PROFILE_TAG = 'profile';
+
 export type KnowledgeType = 'learned' | 'fact' | 'insight' | 'reference';
 
 export interface KnowledgeEntry {
@@ -242,7 +250,7 @@ Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (age
   const all = await call(await dep('KnowledgeBase'), 'list', { type: 'learned', limit: 20 });
 
 ### When to remember (durable knowledge only)
-- User preferences discovered during interaction
+- User preferences or personal facts (location, name, role) — tag these with "profile" so every future task always has them, even when the task wording does not mention them
 - Facts about the workspace or project structure
 - Stable patterns or capabilities that help future unrelated tasks
 - References to external resources or object capabilities
@@ -393,12 +401,25 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     });
 
     this.on('update', async (msg: AbjectMessage) => {
-      const { id, content, title, tags } = msg.payload as {
+      const payload = msg.payload as {
         id: string; content?: string; title?: string; tags?: string[];
+        updates?: { content?: string; title?: string; tags?: string[] };
       };
+      const { id } = payload;
+      // Accept fields either flat on the payload or nested under `updates`;
+      // callers (including LLM-generated ones) reach for both shapes.
+      const content = payload.content ?? payload.updates?.content;
+      const title = payload.title ?? payload.updates?.title;
+      const tags = payload.tags ?? payload.updates?.tags;
       requireNonEmpty(id, 'id');
       const entry = this.entries.get(id);
-      if (!entry) return { success: false };
+      if (!entry) return { success: false, error: `No entry with id "${id}"` };
+
+      // Surface a no-op rather than reporting success: a wrong-shaped payload
+      // that touches no recognized field must not masquerade as an update.
+      if (content === undefined && title === undefined && tags === undefined) {
+        return { success: false, error: 'No updatable fields provided (expected content, title, and/or tags)' };
+      }
 
       this.index.discard(id);
 
