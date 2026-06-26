@@ -404,6 +404,12 @@ export interface FileUploadMsg extends WsEnvelope {
   base64: string;
   chunkIndex: number;
   chunkCount: number;
+  /**
+   * When true, the assembled file is delivered to the surface's currently
+   * focused child widget (e.g. an image pasted into a text input) rather than
+   * to the surface owner. Lets widgets accept pasted images generically.
+   */
+  toFocusedWidget?: boolean;
 }
 
 export type FrontendToBackendMsg =

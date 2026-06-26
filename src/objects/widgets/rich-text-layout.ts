@@ -151,6 +151,7 @@ export async function layoutRichText(
   baseFontSize: number,
   baseFill: string,
   imageResolver?: ImageResolver,
+  maxImageHeight?: number,
 ): Promise<RichTextLayout> {
   const lines: LayoutLine[] = [];
   let y = 0;
@@ -185,7 +186,7 @@ export async function layoutRichText(
 
     if (block.type === 'image' && block.imageUrl) {
       y += 4; // top padding
-      const dims = computeImageDims(block, maxWidth, imageResolver);
+      const dims = computeImageDims(block, maxWidth, imageResolver, maxImageHeight);
       lines.push({
         runs: [],
         y,
@@ -253,26 +254,40 @@ function computeImageDims(
   block: MarkdownBlock,
   maxWidth: number,
   imageResolver: ImageResolver | undefined,
+  maxImageHeight?: number,
 ): { width: number; height: number } {
+  let width: number;
+  let height: number;
+
   // Explicit `|WxH` hint wins; fit to maxWidth if larger.
   if (block.imageWidth && block.imageHeight) {
     if (block.imageWidth > maxWidth) {
       const scale = maxWidth / block.imageWidth;
-      return { width: maxWidth, height: Math.round(block.imageHeight * scale) };
+      width = maxWidth;
+      height = Math.round(block.imageHeight * scale);
+    } else {
+      width = block.imageWidth;
+      height = block.imageHeight;
     }
-    return { width: block.imageWidth, height: block.imageHeight };
-  }
-  // Probed natural dimensions (resolver returns null while loading).
-  if (imageResolver && block.imageUrl) {
-    const probed = imageResolver(block.imageUrl);
+  } else {
+    // Probed natural dimensions (resolver returns null while loading).
+    const probed = imageResolver && block.imageUrl ? imageResolver(block.imageUrl) : null;
     if (probed && probed.width > 0 && probed.height > 0) {
-      const w = Math.min(probed.width, maxWidth);
-      const h = Math.round(probed.height * (w / probed.width));
-      return { width: w, height: h };
+      width = Math.min(probed.width, maxWidth);
+      height = Math.round(probed.height * (width / probed.width));
+    } else {
+      // Placeholder: full width at 16:9 until natural dims are known.
+      width = maxWidth;
+      height = Math.round(maxWidth * 9 / 16);
     }
   }
-  // Placeholder: full width at 16:9 until natural dims are known.
-  return { width: maxWidth, height: Math.round(maxWidth * 9 / 16) };
+
+  // Optional height cap (composer thumbnails) — scale width to preserve aspect.
+  if (maxImageHeight && height > maxImageHeight && height > 0) {
+    width = Math.round(width * (maxImageHeight / height));
+    height = maxImageHeight;
+  }
+  return { width, height };
 }
 
 async function layoutCodeBlock(

@@ -313,8 +313,13 @@ export class FrontendClient {
     });
   }
 
-  /** Read a File as base64 and send it to the backend in chunks. */
-  private async uploadFile(file: File, surfaceId: string): Promise<void> {
+  /**
+   * Read a File as base64 and send it to the backend in chunks. When
+   * `toFocusedWidget` is set, the assembled file is routed to the focused
+   * child widget (used for images pasted into a text input) instead of the
+   * surface owner.
+   */
+  private async uploadFile(file: File, surfaceId: string, toFocusedWidget = false): Promise<void> {
     const buf = await file.arrayBuffer();
     const base64 = this.arrayBufferToBase64(buf);
     const uploadId = `${surfaceId}-${this.nextUploadSeq++}`;
@@ -332,6 +337,7 @@ export class FrontendClient {
         base64: base64.slice(i * CHUNK, (i + 1) * CHUNK),
         chunkIndex: i,
         chunkCount,
+        ...(toFocusedWidget ? { toFocusedWidget: true } : {}),
       } as FrontendToBackendMsg);
     }
   }
@@ -1716,6 +1722,32 @@ export class FrontendClient {
 
   private handlePasteEvent(e: ClipboardEvent): void {
     if (!this.focusedSurface) return;
+
+    // Image paste: route each image file to the focused widget via the chunked
+    // upload transport (tagged toFocusedWidget) so a widget can accept it.
+    const items = e.clipboardData?.items;
+    const imageFiles: File[] = [];
+    if (items) {
+      for (const item of Array.from(items)) {
+        if (item.kind === 'file' && item.type.startsWith('image/')) {
+          const file = item.getAsFile();
+          if (file) imageFiles.push(file);
+        }
+      }
+    }
+    if (imageFiles.length > 0) {
+      e.preventDefault();
+      let n = 0;
+      for (const file of imageFiles) {
+        // Clipboard images often have no name — synthesize a stable one.
+        const named = file.name
+          ? file
+          : new File([file], `pasted-image-${this.nextUploadSeq + n}.${(file.type.split('/')[1] || 'png')}`, { type: file.type });
+        n++;
+        void this.uploadFile(named, this.focusedSurface, true);
+      }
+      return;
+    }
 
     const pasteText = e.clipboardData?.getData('text') ?? '';
     if (!pasteText) return;

@@ -202,6 +202,12 @@ export class Chat extends Abject {
   private composerRowId?: AbjectId;
   private composerColumnId?: AbjectId;
 
+  /**
+   * Images pasted into the composer (the input emitted their bytes via an
+   * `attach` event). Stored + committed as attachments when the message is sent.
+   */
+  private pendingImages: Array<{ name: string; mimeType: string; base64: string }> = [];
+
   /** Pending ticket promises: ticketId → resolve/reject. */
   private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
 
@@ -572,6 +578,14 @@ export class Chat extends Abject {
         return;
       }
 
+      // The composer references a pasted image inline (data: URI) and handed us
+      // its bytes; remember them so the next send stores + attaches for the LLM.
+      if (fromId === this.textInputId && aspect === 'attach') {
+        const a = value as { name: string; mimeType: string; base64: string } | undefined;
+        if (a?.base64) this.pendingImages.push({ name: a.name, mimeType: a.mimeType, base64: a.base64 });
+        return;
+      }
+
       if (fromId === this.uploadBtnId && aspect === 'click') {
         await this.handleUploadClick();
         return;
@@ -590,16 +604,26 @@ export class Chat extends Abject {
 
       if (fromId === this.textInputId && aspect === 'resize') {
         const { preferredHeight } = (msg.payload as { aspect: string; value: { preferredHeight: number } }).value;
-        // Update text input height in HBox
+        // The composer is nested three deep: input → composerRow → composerColumn
+        // → root VBox. Each layout sizes its child by the child's preferredSize,
+        // so the height must be pushed down all three levels or an inner fixed
+        // height caps the input.
         try {
-          await this.request(request(this.id, this.inputRowId!, 'updateLayoutChild', {
+          // 1. Input within its row (HBox: attach + input + send).
+          await this.request(request(this.id, this.composerRowId!, 'updateLayoutChild', {
             widgetId: this.textInputId,
             preferredSize: { height: preferredHeight },
           }));
-          // Update input row height in root VBox
-          await this.request(request(this.id, this.rootLayoutId!, 'updateLayoutChild', {
-            widgetId: this.inputRowId,
+          // 2. The row within the composer column.
+          await this.request(request(this.id, this.composerColumnId!, 'updateLayoutChild', {
+            widgetId: this.composerRowId,
             preferredSize: { height: preferredHeight },
+          }));
+          // 3. The column within the root VBox (row + hint label + spacing).
+          const columnHeight = preferredHeight + this.theme.tokens.space.xs + this.theme.tokens.space.xl;
+          await this.request(request(this.id, this.rootLayoutId!, 'updateLayoutChild', {
+            widgetId: this.composerColumnId,
+            preferredSize: { height: columnHeight },
           }));
         } catch { /* layout may be gone */ }
         return;
@@ -1349,6 +1373,12 @@ A single successful creation goal is a complete turn. End it with **done**.
             type: 'textInput', windowId: this.windowId,
             placeholder: 'Message the agent\u2026',
             wordWrap: true, maxLines: 6,
+            // Keep the comfortable empty height as the auto-grow floor so the
+            // composer doesn't shrink the moment the first character is typed.
+            minHeight: INPUT_MIN_HEIGHT,
+            // Markdown render mode: pasted images show inline in the composer
+            // while editing stays plain-text.
+            style: { markdown: true },
           },
           {
             type: 'button', windowId: this.windowId, text: ATTACH_GLYPH,
@@ -1389,12 +1419,15 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.sendBtnId = widgetIds[2];
     this.composerHintLabelId = widgetIds[3];
 
-    // Add attach button + input + send button to the composer row.
+    // Add attach button + input + send button to the composer row. The buttons
+    // are fixed-size and bottom-aligned (alignment 'right' = bottom on the HBox
+    // cross-axis) so they stay pinned to the bottom as the input grows taller;
+    // the input expands to fill the row height.
     await this.request(request(this.id, this.composerRowId, 'addLayoutChildren', {
       children: [
-        { widgetId: this.uploadBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: SEND_BTN_SIZE, height: SEND_BTN_SIZE } },
+        { widgetId: this.uploadBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: SEND_BTN_SIZE, height: SEND_BTN_SIZE }, alignment: 'right' as const },
         { widgetId: this.textInputId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: INPUT_MIN_HEIGHT } },
-        { widgetId: this.sendBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: SEND_BTN_SIZE, height: SEND_BTN_SIZE } },
+        { widgetId: this.sendBtnId, sizePolicy: { horizontal: 'fixed', vertical: 'fixed' }, preferredSize: { width: SEND_BTN_SIZE, height: SEND_BTN_SIZE }, alignment: 'right' as const },
       ],
     }));
 
@@ -1739,14 +1772,74 @@ A single successful creation goal is a complete turn. End it with **done**.
       request(this.id, this.textInputId, 'getValue', {})
     );
 
-    if (!text?.trim()) return;
+    // Inline image references in the composer (`![](abject://…)`) become
+    // attachments; the remaining typed text is the message. With no text and
+    // no pasted images there is nothing to send.
+    const cleanText = this.stripImageRefs(text ?? '').trim();
+    if (!cleanText && this.pendingImages.length === 0) return;
 
     // Clear input
     await this.request(
       request(this.id, this.textInputId, 'update', { text: '' })
     );
 
-    this.triggerSend(text.trim());
+    await this.commitPendingImages();
+    this.triggerSend(cleanText);
+  }
+
+  /** Remove block image markdown lines (`![alt](url)`), leaving the typed text. */
+  private stripImageRefs(text: string): string {
+    return text
+      .split('\n')
+      .filter((line) => !/^\s*!\[[^\]]*\]\([^)]+\)\s*$/.test(line))
+      .join('\n');
+  }
+
+  /**
+   * Commit images pasted into the composer: store the bytes in the workspace
+   * FileSystem (so the LLM gets a vision block from the file path) and show each
+   * as an inline image bubble. The bubble renders a `data:` URI directly, since
+   * bubble widgets can't reliably reach the FileSystem to resolve a reference.
+   */
+  private async commitPendingImages(): Promise<void> {
+    if (this.pendingImages.length === 0) return;
+    const images = this.pendingImages;
+    this.pendingImages = [];
+    await this.removeWelcomeState();
+    for (const img of images) {
+      const safeName = (img.name || 'image').replace(/[/\\]/g, '_');
+      const dataUri = `data:${img.mimeType};base64,${img.base64}`;
+
+      // Store the bytes so the LLM receives a vision block read from the path.
+      let path: string | undefined;
+      if (this.fileSystemId) {
+        const convo = this.conversationId ?? this.id;
+        path = `/uploads/${convo}/${Date.now()}-${safeName}`;
+        try {
+          await this.request(
+            request(this.id, this.fileSystemId, 'writeFileBytes', { path, base64: img.base64 }),
+            30000,
+          );
+        } catch (err) {
+          log.warn(`[Chat] failed to store pasted image ${safeName}:`, err);
+          path = undefined;
+        }
+      }
+
+      await this.appendBubble('user', 'You', `![${safeName}](${dataUri})`, true);
+      this.conversationHistory.push({
+        role: 'user',
+        content: `![${safeName}](${dataUri})`,
+        sender: 'You',
+        // With a stored path the attachment carries the image to the LLM (as a
+        // vision block, not the inline data URI). Without one, mark it media so
+        // the heavy data URI never enters the LLM context.
+        ...(path
+          ? { attachment: { path, name: safeName, mimeType: img.mimeType, kind: 'image' as const, injected: false } }
+          : { media: true }),
+      });
+    }
+    this.schedulePersist();
   }
 
   private triggerSend(text: string): void {
@@ -1767,11 +1860,14 @@ A single successful creation goal is a complete turn. End it with **done**.
 
     // Show user message as a right-aligned bubble. User input is plain text —
     // render it without markdown so the wordwrap path honors right alignment
-    // inside the bubble.
-    await this.appendBubble('user', 'You', userText, false);
-    this.conversationHistory.push({ role: 'user', content: userText });
-    this.schedulePersist();
-    this.maybeAutoTitle(userText);
+    // inside the bubble. Skip when empty (e.g. an image-only send, where the
+    // image bubble + attachment were already committed).
+    if (userText) {
+      await this.appendBubble('user', 'You', userText, false);
+      this.conversationHistory.push({ role: 'user', content: userText });
+      this.schedulePersist();
+      this.maybeAutoTitle(userText);
+    }
 
     // Show consolidated activity bubble for the run.
     await this.showActivityBubble();

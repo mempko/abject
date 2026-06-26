@@ -547,6 +547,7 @@ export class WidgetManager extends Abject {
           wordWrap?: boolean;
           minLines?: number;
           maxLines?: number;
+          minHeight?: number;
           monospace?: boolean;
           checked?: boolean;
           value?: number;
@@ -2448,6 +2449,7 @@ await this.call(timerId, 'addDependent', {});
     wordWrap?: boolean;
     minLines?: number;
     maxLines?: number;
+    minHeight?: number;
     monospace?: boolean;
     checked?: boolean;
     value?: number;
@@ -2492,6 +2494,7 @@ await this.call(timerId, 'addDependent', {});
           type: 'textInput', rect, text: spec.text, style: spec.style,
           placeholder: spec.placeholder, masked: spec.masked,
           wordWrap: spec.wordWrap, minLines: spec.minLines, maxLines: spec.maxLines,
+          minHeight: spec.minHeight,
           ...base,
         }), rect);
       case 'textArea':

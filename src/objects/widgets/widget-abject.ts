@@ -14,6 +14,13 @@ import {
 import { Abject } from '../../core/abject.js';
 import { request, event } from '../../core/message.js';
 import {
+  MarkdownImageResolver,
+  isAbjectUrl,
+  isRemoteUrl,
+  parseAbjectUrl,
+  imageMimeForPath,
+} from './markdown-image-resolver.js';
+import {
   Rect,
   WidgetStyle,
   WidgetType,
@@ -497,6 +504,88 @@ export abstract class WidgetAbject extends Abject {
     this.send(event(this.id, this.ownerId, 'childDirty', {
       widgetId: this.id,
     }));
+  }
+
+  // ── Markdown image resolution ────────────────────────────────────────
+  //
+  // Any markdown-rendering widget (LabelWidget bubbles, markdown-mode
+  // TextInputWidget) resolves `![](src)` images through a shared resolver:
+  // `data:` URIs draw directly, `abject://<typeId>/<path>` references are read
+  // from a FileSystem Abject via message passing, and remote http(s) URLs are
+  // fetched server-side into a data URI. Resolution is async with a sync cache,
+  // matching ImageWidget's fetch→cache→redraw pattern.
+
+  private _imageResolver?: MarkdownImageResolver;
+
+  /** Lazily created per-widget image resolver (cache + async fetch). */
+  protected get imageResolver(): MarkdownImageResolver {
+    if (!this._imageResolver) {
+      this._imageResolver = new MarkdownImageResolver({
+        fetchImageSource: (url) => this.fetchImageSource(url),
+        onImageResolved: () => {
+          this.onImageResolved();
+          void this.requestRedraw();
+        },
+      });
+    }
+    return this._imageResolver;
+  }
+
+  /**
+   * Hook fired after an image source resolves. Subclasses that cache a
+   * computed layout (e.g. LabelWidget's rich-text layout) override this to
+   * invalidate it so the resolved dimensions take effect. Default: no-op.
+   */
+  protected onImageResolved(): void {
+    // Default: no-op (requestRedraw is called by the resolver callback).
+  }
+
+  /**
+   * Fetch a non-`data:` markdown image source into a drawable data URI.
+   * Delegated to by the resolver, which owns classification + caching.
+   */
+  protected async fetchImageSource(url: string): Promise<string | null> {
+    if (isAbjectUrl(url)) return this.fetchAbjectImage(url);
+    if (isRemoteUrl(url)) return this.fetchRemoteImage(url);
+    return null;
+  }
+
+  /** Read `abject://<typeId>/<path>` bytes from the referenced FileSystem Abject. */
+  private async fetchAbjectImage(url: string): Promise<string | null> {
+    const regId = await this.resolveRegistryId();
+    if (!regId) return null;
+    for (const { typeId, path } of parseAbjectUrl(url)) {
+      let fsId: AbjectId | null = null;
+      try {
+        fsId = await this.request<AbjectId | null>(
+          request(this.id, regId, 'resolveType', { typeId }),
+        );
+      } catch { fsId = null; }
+      if (!fsId) continue;
+      try {
+        const base64 = await this.request<string>(
+          request(this.id, fsId, 'readFileBytes', { path }),
+        );
+        if (base64) return `data:${imageMimeForPath(path)};base64,${base64}`;
+      } catch { /* read failed for a resolved typeId — give up */ }
+      return null;
+    }
+    return null;
+  }
+
+  /** Fetch a remote image server-side (HttpClient.getBase64) to avoid tainting. */
+  private async fetchRemoteImage(url: string): Promise<string | null> {
+    const httpId = await this.discoverDep('HttpClient');
+    if (!httpId) return null;
+    try {
+      const res = await this.request<{ dataUri?: string }>(
+        request(this.id, httpId, 'getBase64', { url }),
+        20000,
+      );
+      return res?.dataUri ?? null;
+    } catch {
+      return null;
+    }
   }
 
   /**

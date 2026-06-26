@@ -126,7 +126,7 @@ export interface ClientMeta {
 export class BackendUI extends Abject {
   private surfaces: Map<string, SurfaceState> = new Map();
   /** In-progress file uploads, keyed by uploadId, awaiting all chunks. */
-  private fileUploads: Map<string, { surfaceId: string; name: string; mimeType: string; chunks: string[]; received: number; chunkCount: number }> = new Map();
+  private fileUploads: Map<string, { surfaceId: string; name: string; mimeType: string; chunks: string[]; received: number; chunkCount: number; toFocusedWidget?: boolean }> = new Map();
   private focusedSurface?: string;
   /** Accent color for the focused window's glow halo (last focused window's theme accent). */
   private focusGlowColor?: string;
@@ -2187,6 +2187,7 @@ IMPORTANT:
         chunks: new Array<string>(msg.chunkCount).fill(''),
         received: 0,
         chunkCount: msg.chunkCount,
+        toFocusedWidget: msg.toFocusedWidget === true,
       };
       this.fileUploads.set(msg.uploadId, entry);
     }
@@ -2207,6 +2208,7 @@ IMPORTANT:
       name: entry.name,
       mimeType: entry.mimeType,
       base64,
+      ...(entry.toFocusedWidget ? { toFocusedWidget: true } : {}),
     }));
   }
 

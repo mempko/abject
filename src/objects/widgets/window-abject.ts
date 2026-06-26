@@ -365,7 +365,16 @@ export class WindowAbject extends Abject {
     // surface owner). Re-emit it to the window's owner via the dependency
     // protocol (WidgetManager forwards 'fileUploaded' to the owner).
     this.on('fileUploaded', async (msg: AbjectMessage) => {
-      const payload = msg.payload as { name: string; mimeType: string; base64: string };
+      const payload = msg.payload as { name: string; mimeType: string; base64: string; toFocusedWidget?: boolean };
+      // An image pasted into a focused child (e.g. a text input) is delivered
+      // straight to that widget so it can accept the attachment, rather than
+      // bubbling to the window's owner like a picked/dropped file.
+      if (payload.toFocusedWidget && this.focusedChildId) {
+        this.send(event(this.id, this.focusedChildId, 'fileUploaded', {
+          name: payload.name, mimeType: payload.mimeType, base64: payload.base64,
+        }));
+        return true;
+      }
       this.changed('fileUploaded', payload);
       return true;
     });
