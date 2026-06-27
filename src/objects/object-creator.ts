@@ -71,7 +71,7 @@ interface DepMethodIndex {
 
 /** Output from the static call-name walker. */
 interface CallValidationError {
-  kind: 'unknown-dep' | 'unknown-method';
+  kind: 'unknown-dep' | 'unknown-method' | 'name-string-recipient';
   callSite: { line: number; snippet: string };
   depName?: string;
   methodName?: string;
@@ -599,6 +599,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     const inlineDepPattern =
       /^(?:await\s+)?this\.(?:dep|find)\s*\(\s*['"]([^'"]+)['"]\s*\)$/;
+    const stringLiteralPattern = /^['"]([^'"]*)['"]$/;
+    // A literal AbjectId (UUID) or scoped TypeId (peer/ws/Name) is a valid
+    // recipient; a bare registered name is not — see name-string-recipient below.
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const callPattern =
       /this\.call\s*\(\s*([^,]+?)\s*,\s*['"]([^'"]+)['"]\s*,/g;
 
@@ -613,6 +617,25 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         depName = inline[1];
       } else if (/^\w+$/.test(rawArg)) {
         depName = varToDep.get(rawArg);
+      } else {
+        // Bare string literal as the recipient. `this.call(target, …)` routes
+        // by AbjectId and the bus does NOT resolve names on the send path, so a
+        // bare name like this.call("WidgetManager", …) is sent to a recipient
+        // that never exists — the request gets no reply and times out. Resolve
+        // it first via this.dep(name)/this.find(name). A literal UUID or scoped
+        // TypeId (containing "/") is a real id, so allow those.
+        const strLit = rawArg.match(stringLiteralPattern);
+        if (strLit) {
+          const literal = strLit[1];
+          const isRoutableId = uuidPattern.test(literal) || literal.includes('/');
+          if (literal.length > 0 && !isRoutableId) {
+            const before = source.slice(0, mc.index);
+            const line = before.split('\n').length;
+            const snippet = source.slice(mc.index, Math.min(source.length, mc.index + mc[0].length + 30));
+            errors.push({ kind: 'name-string-recipient', callSite: { line, snippet }, depName: literal, methodName });
+          }
+          continue;
+        }
       }
       // this._field, function results, and complex expressions: skip silently.
       if (!depName) continue;
@@ -952,10 +975,14 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return [
       'You are drafting handler-map JavaScript for a ScriptableAbject. Output ONE ```javascript code block.',
       'Format: a single parenthesized object literal: ({ method(msg) { ... }, ... }).',
-      'Each handler takes a single `msg` argument; payload is `msg.payload`. Inter-object work is `await this.call(target, method, payload)` where `target` is `this.dep("Name")` or `this.find("Name")`.',
+      'Each handler takes a single `msg` argument; payload is `msg.payload`. Inter-object work is `await this.call(target, method, payload)` where `target` is a RESOLVED AbjectId.',
+      'In generated handler code, `this.call(target, …)` routes by AbjectId only — the bus does NOT resolve names on the send path. Resolve a dependency to its id first: `const id = await this.dep("Name")` (or `this.find("Name")`), then `await this.call(id, method, payload)` — or inline `await this.call(this.dep("Name"), method, payload)`. NEVER pass a bare name string as the recipient (e.g. `this.call("WidgetManager", …)`); that call is delivered nowhere and times out. (This differs from the ObjectCreator `call` ACTION you use to investigate, which DOES accept a bare name — generated code does not.) Ids returned at runtime (window/canvas/layout ids from create*) are already resolved; pass them directly.',
+      'Build windows/canvas from an async handler and AWAIT each step in order. Awaiting an inter-object call inside your own handler is correct and does NOT deadlock — the reply is delivered while the handler is suspended. A build that times out means a wrong recipient or a missing await, never the awaiting itself; do not detach the build into a fire-and-forget chain to "avoid a deadlock". Ask the window/canvas factory for its build recipe before drafting.',
       'Use ONLY methods listed in the provided dependency manifests / usage guides. Do not invent method names.',
       'Method names that are not in the framework or in a dependency\'s manifest do not exist — pick a real one or restructure.',
       'When a dependency\'s usage guide documents a higher-level building block that fits the need, compose it rather than re-implementing equivalent behavior from low-level primitives. Reuse the building blocks; drop to primitives only for what the building blocks do not cover.',
+      'Prefer composing high-level building blocks over hand-writing equivalents — e.g. render markdown with a markdown-capable label/widget rather than writing your own parser and text-layout engine on a canvas. This keeps the object small and the formatting correct.',
+      'Keep each object focused. When a single object would grow very large (many hundreds of lines) or bundles a reusable sub-capability (a parser, a layout engine, a data store), split that capability into its own Abject and call it. Smaller, composed objects are easier to verify and keep the build loop fast (a huge source blows the context budget and makes the loop lose track of what it already tried).',
     ].join('\n');
   }
 
@@ -1056,6 +1083,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     for (const e of errors) {
       if (e.kind === 'unknown-method') {
         lines.push(`- ${e.depName}.${e.methodName} is not a method. Available: ${(e.availableMethods ?? []).join(', ')}`);
+      } else if (e.kind === 'name-string-recipient') {
+        lines.push(`- this.call("${e.depName}", "${e.methodName}", …) addresses a recipient by name. Message recipients are AbjectIds; the bus does not resolve names on the send path, so this call is delivered nowhere and times out. Resolve the id first: const id = await this.dep("${e.depName}"); await this.call(id, "${e.methodName}", …) — or inline await this.call(this.dep("${e.depName}"), "${e.methodName}", …). (Ids returned at runtime — window/canvas/layout ids from create* — are already resolved and fine to pass directly.)`);
       } else {
         lines.push(`- Dependency "${e.depName}" was not discovered yet. Call describe / ask on it before calling its methods.`);
       }
@@ -1851,6 +1880,8 @@ this.changed('completed', { resultCount });
    2. The handler reads fields from \`msg.payload\` (the real shape and the synthetic shape are identical — both wrap fields under \`msg.payload\`). Do NOT add a "top-level fallback" — there is no top-level event shape.
 
    "I called \`getState\` and the numbers look fine" is NOT verification. \`done\` only after at least one synthetic exercise of each user-requested behavior produced the expected change.
+
+   **A timeout is a routing/await bug, not a deadlock.** If \`show\`, a window build, or any call times out, the cause is almost always a recipient addressed by a bare name instead of a resolved AbjectId (resolve via \`this.dep(name)\` first), or a result that was never awaited — NOT the act of awaiting inside a handler, which is correct and supported. Do not "fix" a timeout by detaching the build into a fire-and-forget chain; fix the recipient or the missing await. When verifying a window opened, drive \`show\` with a short timeout and then poll \`getState\` for the window/canvas ids, rather than sitting on a long blocking call.
 
    **Clean up probe artifacts before finishing.** Anything you create purely to explore or verify — probe windows, scratch widgets, throwaway objects — must be destroyed once it has served its purpose (e.g. \`destroyWindowAbject\` for a window you opened to test rendering). The user's desktop should end the loop containing only what they asked for.
 5. **Diagnostic prompts terminate with a report.** If the user asked HOW something works, WHY it's failing, or to EXPLAIN behavior — answer with \`done({result: "<written report>"})\` after enough read-only calls (\`describe\`, \`ask\`, \`getState\`, \`getObjectLogs\`). Do not draft, do not deploy.

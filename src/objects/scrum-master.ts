@@ -599,6 +599,20 @@ export class ScrumMaster extends Abject {
     // method" lesson → the recall surfaces it → the planner uses it directly.
     const relevantKnowledge = await this.recallKnowledge(goal.description);
 
+    // Loop backstop: many rounds with accumulating failures is the signature of
+    // retrying the same fix. Surface it deterministically so the planner weighs
+    // fail_goal-with-diagnosis against yet another near-identical retry.
+    const roundsSpent = goal.currentScrumNumber ?? 0;
+    let loopWarning: string | undefined;
+    if (roundsSpent >= 4) {
+      loopWarning =
+        `This goal has already run ${roundsSpent} scrum rounds and accumulated ${failed.length} failed task(s). ` +
+        `If recent rounds kept dispatching the same kind of task against the same target and it keeps failing the same way ` +
+        `(compare the failed[].error messages), another near-identical retry will not help — that is a loop. ` +
+        `Either change strategy decisively, or fail_goal with a precise diagnosis (what recurs, what was tried, what would unblock it). ` +
+        `A clear, actionable failure beats an endless "final attempt" loop.`;
+    }
+
     return {
       success: true,
       data: {
@@ -608,6 +622,7 @@ export class ScrumMaster extends Abject {
           currentScrumNumber: goal.currentScrumNumber,
           status: goal.status,
         },
+        ...(loopWarning ? { loopWarning } : {}),
         completed: completed.map(t => ({
           description: (t.fields.description as string ?? '').slice(0, 300),
           producesKeys: ((t.fields.produces as Array<{ key: string }>) ?? []).map(p => p.key),
@@ -1300,7 +1315,7 @@ Returns \`{ contributions: [{ agentName, text }, ...] }\`. Each \`text\` is the 
 ### \`add_task({ description, assignedAgentName, target?, dependsOn?, produces?, consumes? })\` — STAGE only
 Append one task to the current scrum's plan. **This does NOT commit** — it stages the task locally. Call \`dispatch_scrum\` to commit and enqueue all staged tasks at once, or call \`complete_goal\` to abandon them.
 
-- \`description\`: 1-3 sentences. Concrete, atomic, runnable end-to-end through one agent's loop.
+- \`description\`: 1-3 sentences. Concrete, atomic, runnable end-to-end through one agent's loop. **State the OUTCOME, not the implementation.** Describe what must be true when the task is done and let the agent discover how (it asks the live objects for current usage at build time). Do not embed step-by-step code prescriptions or a diagnosis of why a prior round failed — a wrong theory copied into the task description propagates the error into the next round. On a retry, describe the same outcome and, at most, which approach already failed so the agent picks a genuinely different one; never re-stage a task that prescribes the approach a prior round already proved wrong.
 - \`assignedAgentName\`: must match a name in the team roster (from \`review_scrum\`).
 - \`target\`: OPTIONAL. The concrete object the task operates on, when the goal already names an existing Abject (e.g. "fix the GraphViewer window"). **Prefer the registered name (e.g. "GraphViewer") over a raw UUID** — AbjectIds are ephemeral and change every restart, so an id copied from an older goal or memory is often stale and won't resolve, whereas the name is durable. Pass it so the agent works on that object instead of guessing. The agent decides what to do with it — don't try to specify "create" vs "modify"; that's the agent's call. Omit when there's no known target.
 - \`dependsOn\`: array of indices into THIS scrum's prior add_task calls (0-indexed). Omit for default sequential (each task waits on the previous). Pass \`[]\` for parallel-eligible.
@@ -1331,6 +1346,8 @@ Calling \`complete_goal\` after \`add_task\` cleanly abandons the staged batch (
 
 ### \`fail_goal({ reason })\` — TERMINAL error
 Declare the goal unreachable. Use when no team member can contribute and replanning won't help.
+
+**Also fail here to break a loop.** When \`review_scrum\` carries a \`loopWarning\` (the goal has run several rounds with accumulating failures) and the recent rounds keep dispatching the same kind of task against the same target with the same failure, another retry will not help. Stop and \`fail_goal\` with a precise diagnosis: the recurring failure, what was already tried across rounds, and the concrete change that would unblock it (often a fix in platform code, or a capability the team genuinely lacks). A clear failure the user can act on beats an endless "final attempt" loop.
 
 ### \`dispatch_scrum\` — TERMINAL success
 Commit the currently-staged batch: addTask each into TupleSpace, enqueue dep-free tasks immediately, defer dependents until upstream completes. Required after one or more \`add_task\` calls. Errors if staged is empty.

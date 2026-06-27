@@ -54,6 +54,10 @@ export interface AgentTaskState {
   error?: string;
   llmMessages: { role: string; content: string | ContentPart[] }[];
   timeout: number;
+  /** Rolling log of action signatures (action:target:method:errorClass) for loop detection. */
+  actionHistory?: string[];
+  /** Signatures already nudged about, so the loop-detection steer fires once per pattern. */
+  nudgedSignatures?: string[];
 }
 
 export interface AgentTaskOptions {
@@ -1691,6 +1695,13 @@ The registered object must implement these handlers to participate in the agent 
             };
             this.emitActionResult(entry);
             log.info(`[${agentName}] Step ${task.step + 1} — action result: ${actResult.success ? 'success' : 'failed: ' + actResult.error}`);
+
+            // Loop detection: if the same action keeps producing the same result,
+            // repeating it won't help. Steer the LLM toward a different approach
+            // (or a clean `fail`) once per repeated pattern, so a misdiagnosis
+            // can't burn the whole step budget oscillating.
+            this.detectAndSteerOscillation(entry, agentName);
+
             task.step++;
 
             if (task.step >= task.maxSteps) {
@@ -1710,6 +1721,70 @@ The registered object must implement these handlers to participate in the agent 
         log.info(`[${agentName}] Task error at step ${task.step}: ${task.error}`);
       }
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Loop / oscillation detection
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Build a stable signature for the just-executed action + its outcome.
+   * Generic across every agent type: reads the common recipient/method-ish
+   * fields defensively and normalizes the error so transient ids/numbers
+   * (timeouts, UUIDs) don't make every repeat look unique.
+   */
+  private actionSignature(task: AgentTaskState): string {
+    const a = (task.action ?? {}) as Record<string, unknown>;
+    const name = String(a.action ?? 'unknown');
+    const target = String(a.target ?? a.targetName ?? a.objectId ?? a.assignedAgentName ?? '');
+    const method = String(a.method ?? a.kind ?? '');
+    let outcome: string;
+    if (task.lastResult?.success) {
+      outcome = 'ok';
+    } else {
+      outcome = String(task.lastResult?.error ?? 'err')
+        .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '<id>')
+        .replace(/\d+/g, '<n>')
+        .slice(0, 80);
+    }
+    return `${name}:${target}:${method}:${outcome}`;
+  }
+
+  /**
+   * Record the action signature and, when the same action keeps producing the
+   * same result, inject a one-time steering message nudging the agent to change
+   * strategy or fail cleanly. Fires once per distinct repeated pattern.
+   */
+  private detectAndSteerOscillation(entry: TaskEntry, agentName: string): void {
+    const task = entry.state;
+    if (!task.action) return;
+    const sig = this.actionSignature(task);
+    const history = (task.actionHistory ??= []);
+    history.push(sig);
+    // Keep the window bounded — only recent behaviour matters for "stuck".
+    if (history.length > 12) history.shift();
+
+    const occurrences = history.filter(s => s === sig).length;
+    const failing = !task.lastResult?.success;
+    // 3rd identical failure, or 4th identical attempt regardless of outcome
+    // (re-doing the same successful step over and over is also a loop).
+    const stuck = (failing && occurrences >= 3) || occurrences >= 4;
+    if (!stuck) return;
+
+    const nudged = (task.nudgedSignatures ??= []);
+    if (nudged.includes(sig)) return;
+    nudged.push(sig);
+
+    log.info(`[${agentName}] Loop detected — same action repeated ${occurrences}x (${sig.slice(0, 60)}); steering`);
+    task.llmMessages.push({
+      role: 'user',
+      content:
+        `[Loop detected] You have repeated the same action with the same result ${occurrences} times ` +
+        `(action: ${String((task.action as Record<string, unknown>).action)}). Repeating it again will produce the same outcome. ` +
+        `Step back and change approach: re-read the latest error, and ask/describe the dependency it involves to learn the correct usage before retrying. ` +
+        `Fix the root cause the error names rather than re-attempting the identical step. ` +
+        `If the task is genuinely blocked, emit a \`fail\` action with a precise diagnosis: what is blocking you, what you tried, and what would unblock it.`,
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════════

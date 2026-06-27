@@ -1507,6 +1507,46 @@ Events:   this.call(widgetId, 'addDependent', {})   // then implement changed(ms
 Update:   this.call(widgetId, 'update', { text, style, ... })
 Destroy:  this.call(this.dep('WidgetManager'), 'destroyWindowAbject', { windowId })
 
+### Building the window in show() — the async handler model (there is no self-deadlock)
+
+Build your window from inside an async \`show()\` handler and AWAIT each step in order.
+Awaiting an inter-object call from inside your OWN request handler is the correct,
+supported pattern: the runtime delivers the reply while your handler is suspended, so
+the build completes and \`show()\` returns. Awaiting does NOT deadlock your mailbox — every
+built-in window builds exactly this way. When a build call times out, the cause is a wrong
+recipient or a missing await, never the act of awaiting. So when you see a timeout, fix the
+RECIPIENT — do not switch to a detached/fire-and-forget build to "avoid a deadlock"; that
+just hides errors, races the first paint, and leaves windowVisible flapping.
+
+Resolve the factory id ONCE via this.dep('WidgetManager') (cache it in a field). Never pass
+the bare name 'WidgetManager' as a recipient: the bus routes by AbjectId, so a name string is
+delivered nowhere and the call times out. The ids returned by createWindowAbject / createVBox /
+createCanvas ARE resolved AbjectIds — pass them directly. getCanvasSize is safe to await right
+after createCanvas; the widget already exists.
+
+// Canonical await-in-order build:
+async show() {
+  if (this._windowId) {                                    // already open → raise and return
+    await this.call(this._windowId, 'raiseWindow', {}).catch(() => {});
+    return true;
+  }
+  const wm = await this.dep('WidgetManager');              // resolve the factory id once
+  this._windowId = await this.call(wm, 'createWindowAbject', { title: '…', rect: { x: 120, y: 90, width: 1100, height: 720 }, resizable: true });
+  await this.call(this._windowId, 'addDependent', {});     // observe window events (e.g. close)
+  this._layoutId = await this.call(wm, 'createVBox', { windowId: this._windowId, margins: { top: 0, right: 0, bottom: 0, left: 0 }, spacing: 0 });
+  this._canvasId = await this.call(wm, 'createCanvas', { windowId: this._windowId, inputTargetId: this.id });
+  await this.call(this._layoutId, 'addLayoutChild', { widgetId: this._canvasId, sizePolicy: { horizontal: 'expanding', vertical: 'expanding' } });
+  const size = await this.call(this._canvasId, 'getCanvasSize', {});
+  this._cw = size.width; this._ch = size.height;
+  await this._draw();                                       // first paint
+  this._windowVisible = true;
+  return true;
+}
+
+For MARKDOWN or other rich text, prefer a \`label\` widget with style { markdown: true, wordWrap: true }
+(headings, bold, code, lists, links, block images render for free) over hand-writing a parser and
+text-layout engine on a canvas — that keeps your object small and the formatting correct.
+
 ### Complete Workflow Example
 
 // 1. Create a window
