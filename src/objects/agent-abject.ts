@@ -1899,55 +1899,14 @@ The registered object must implement these handlers to participate in the agent 
     code: string,
   ): Promise<AgentActionResult> {
     try {
-      // Prepend goal helper closures so job code can update goals
-      const goalPreamble = entry.goalId && this.goalManagerId
-        ? `const _goalId = '${entry.goalId}';
-           const _goalMgrId = '${this.goalManagerId}';
-           const getGoal = async () => call(_goalMgrId, 'getGoal', { goalId: _goalId });
-           const updateGoal = async (message, phase) => call(_goalMgrId, 'updateProgress', { goalId: _goalId, message, phase });
-           const completeGoal = async (result) => call(_goalMgrId, 'completeGoal', { goalId: _goalId, result });
-           const failGoal = async (error) => call(_goalMgrId, 'failGoal', { goalId: _goalId, error });
-           const addTask = async (description, data) => call(_goalMgrId, 'addTask', { goalId: _goalId, description, data });
-           const claimTask = async (type) => call(_goalMgrId, 'claimTask', { goalId: _goalId, type });
-           const completeTask = async (taskId, result) => call(_goalMgrId, 'completeTask', { taskId, result });
-           const failTask = async (taskId, error) => call(_goalMgrId, 'failTask', { taskId, error });
-           const getTasksForGoal = async (status) => call(_goalMgrId, 'getTasksForGoal', { goalId: _goalId, status });
-           const writeGoalData = async (key, value) => call(_goalMgrId, 'writeGoalData', { goalId: _goalId, key, value });
-           const readGoalData = async (key) => call(_goalMgrId, 'readGoalData', { goalId: _goalId, key });
-           const remember = async (title, content, type, tags) => {
-             const _kbId = await find('KnowledgeBase');
-             if (!_kbId) return null;
-             return call(_kbId, 'remember', { title, content, type: type ?? 'learned', tags: tags ?? [] });
-           };
-           const recall = async (query, type, tags) => {
-             const _kbId = await find('KnowledgeBase');
-             if (!_kbId) return [];
-             return call(_kbId, 'recall', { query, type, tags });
-           };
-          `
-        : `const getGoal = async () => null;
-           const updateGoal = async () => {};
-           const completeGoal = async () => {};
-           const failGoal = async () => {};
-           const addTask = async () => null;
-           const claimTask = async () => null;
-           const completeTask = async () => false;
-           const failTask = async () => false;
-           const getTasksForGoal = async () => [];
-           const writeGoalData = async () => false;
-           const readGoalData = async () => null;
-           const remember = async (title, content, type, tags) => {
-             const _kbId = await find('KnowledgeBase');
-             if (!_kbId) return null;
-             return call(_kbId, 'remember', { title, content, type: type ?? 'learned', tags: tags ?? [] });
-           };
-           const recall = async (query, type, tags) => {
-             const _kbId = await find('KnowledgeBase');
-             if (!_kbId) return [];
-             return call(_kbId, 'recall', { query, type, tags });
-           };
-          `;
-      const fullCode = goalPreamble + code;
+      // The OTA loop's job code is a fixed dispatch wrapper (call → agentObserve
+      // / _think / agentAct); it uses only `call`. Agents act through structured
+      // JSON actions handled in TS, and reach the goal/scratchpad by messaging
+      // GoalManager — they never author code that runs in this job scope. A goal
+      // helper preamble used to be prepended here, but nothing referenced it, so
+      // it has been removed. Goal access is documented in the system prompt as
+      // GoalManager methods reached via the agent's normal actions.
+      const fullCode = code;
 
       const jobMgrId = await this.resolveDep('JobManager', this.jobManagerId);
       const submitMsg = request(this.id, jobMgrId, 'submitJob', {
@@ -2260,20 +2219,15 @@ After remembering, you will be prompted to continue with the task.`;
     if (entry.goalId) {
       prompt += `
 
-## Goal context & helpers
-This task belongs to a goal. When you run code (a \`call\`/code action), the goal's id is already bound as \`_goalId\` — you never need to look it up, scan \`listGoals\`, or pass a goalId yourself. These helpers are pre-bound and already close over \`_goalId\`:
-- \`getGoal()\` -- the current Goal object
-- \`getTasksForGoal(status)\` -- list this goal's tasks
-- \`updateGoal(message, phase)\` -- report progress on this goal
-- \`writeGoalData(key, value)\` / \`readGoalData(key)\` -- the shared scratchpad (below)
+## Goal context
+This task belongs to a goal whose id is \`${entry.goalId}\` — you never need to look it up, scan \`listGoals\`, or guess a goalId; use this one. GoalManager owns the goal and a scratchpad shared by every agent working on it. You reach GoalManager the same way you reach any object: through your normal action vocabulary (for most agents that is a \`call\` action targeting "GoalManager"; some agents also expose a dedicated scratchpad action). These are GoalManager METHODS — invoke them through your actions, they are not free-standing functions you call directly. Each takes the goalId above:
+- \`getGoal({goalId})\` / \`getTasksForGoal({goalId, status})\` -- read the goal and its tasks
+- \`updateProgress({goalId, message, phase})\` -- report progress
+- \`writeGoalData({goalId, key, value})\` / \`readGoalData({goalId, key})\` -- the shared scratchpad
 
-**Finishing your work:** end your loop with your terminal \`done\` (or \`fail\`) action describing what YOUR task accomplished. That is the whole report — the system records your task's outcome from it. Deciding whether the overall GOAL is then complete, needs more tasks, or has failed belongs to the scrum process, which reviews each round's outcomes and scratchpad and chooses to add tasks, complete, or fail the goal. So focus on your task and report it cleanly. (\`completeGoal\`, \`failGoal\`, and \`addTask\` are bound for the separate case where you own a goal end-to-end with no scrum running it; reserve them for that.)
+**Goal scratchpad** (shared with the other agents on this goal): write intermediate findings, specs, and errors here so collaborators can read them, and fulfill each of your task's declared \`produces\` keys by writing it to the scratchpad (\`writeGoalData\`). Read \`consumes\` data the same way (\`readGoalData\`). Prefer the scratchpad over \`remember\` for anything tied to the current task.
 
-**Goal Scratchpad** (shared with agents working on this same goal):
-- \`writeGoalData(key, value)\` -- save intermediate findings for other agents in this goal
-- \`readGoalData(key)\` -- read data another agent saved to this goal
-- Use for: partial results, specs, errors encountered, debugging context, data one agent discovers that another needs
-- Prefer scratchpad over remember for anything tied to the current task`;
+**Finishing your work:** end your loop with your terminal \`done\` (or \`fail\`) action describing what YOUR task accomplished. That is the whole report — the system records your task's outcome from it. Deciding whether the overall GOAL is then complete, needs more tasks, or has failed belongs to the scrum process, which reviews each round's outcomes and scratchpad and chooses to add tasks, complete, or fail the goal. So focus on your task and report it cleanly. (Calling GoalManager's \`completeGoal\` / \`failGoal\` / \`addTask\` yourself is only for the separate case where you own a goal end-to-end with no scrum running it; reserve them for that.)`;
     }
 
     if (prompt) {
