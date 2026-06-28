@@ -26,7 +26,7 @@ import { ScriptableAbject } from './scriptable-abject.js';
 import { systemMessage, userMessage, LLMMessage } from '../llm/provider.js';
 import type { AgentAction } from './agent-abject.js';
 import { Log } from '../core/timed-log.js';
-import { applyDiff, parseSearchReplaceBlocks } from './source-diff.js';
+import { applyDiff, parseSearchReplaceBlocks, levenshtein } from './source-diff.js';
 
 const log = new Log('OBJECT-CREATOR');
 
@@ -380,10 +380,54 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   }
 
   /** Stage a source draft. */
+  /**
+   * Pull a field from an action, tolerant of the model wrapping args in a
+   * `params`/`arguments`/`input` envelope and of common field aliases. Keeps
+   * a single mis-keyed payload from wasting a whole step on a "missing X" error.
+   */
+  private actionField(action: AgentAction, keys: string[]): unknown {
+    const envelopes = [action, action.params, action.arguments, action.input]
+      .filter((e): e is Record<string, unknown> => !!e && typeof e === 'object');
+    for (const env of envelopes) {
+      for (const k of keys) {
+        const v = env[k];
+        if (v !== undefined && v !== null) return v;
+      }
+    }
+    return undefined;
+  }
+
+  /** Valid action verbs this loop dispatches, for unknown-action recovery. */
+  private static readonly VALID_ACTIONS = [
+    'call', 'draft_manifest', 'draft_source', 'draft_diff', 'load_target', 'draft_via_llm',
+    'compile', 'validate_calls', 'review_semantics', 'deploy_spawn', 'deploy_update',
+    'reply', 'ask_user', 'done', 'fail',
+  ];
+
+  /**
+   * Build a recovery message for an unrecognized action: list the valid verbs
+   * and suggest the closest one. Steers common confusions (e.g. inventing a
+   * goal-data write action) back to the real toolset instead of burning a step.
+   */
+  private unknownActionError(got: string): string {
+    const valid = ObjectCreator.VALID_ACTIONS;
+    const lower = (got ?? '').toLowerCase();
+    let suggestion: string | undefined;
+    let best = Infinity;
+    for (const v of valid) {
+      const d = levenshtein(lower, v);
+      if (d < best) { best = d; suggestion = v; }
+    }
+    // Only offer a suggestion when it's actually close.
+    const hint = suggestion && best <= Math.ceil(suggestion.length / 2) ? ` Did you mean "${suggestion}"?` : '';
+    return `Unknown action "${got}". Valid actions: ${valid.join(', ')}.${hint} ` +
+      `There is no goal-data or scratchpad write action in this loop — carry results in your own \`done\` result, and read context from your observation.`;
+  }
+
   private async opDraftSource(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
-    const source = action.source as string | undefined;
+    const source = this.actionField(action, ['source', 'code', 'draftSource', 'src']) as string | undefined;
     if (typeof source !== 'string' || source.length === 0) {
-      return { ok: false, summary: 'draft_source: missing source', error: 'source must be a non-empty string' };
+      return { ok: false, summary: 'draft_source: missing source', error: 'source must be a non-empty string (pass it as the `source` field)' };
     }
     state.draftSource = source;
     return { ok: true, summary: `draft_source: ${source.split('\n').length} lines staged` };
@@ -402,9 +446,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * surrounding context).
    */
   private async opDraftDiff(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
-    const blocksText = action.blocks as string | undefined;
+    const blocksText = this.actionField(action, ['blocks', 'diff', 'search_replace', 'searchReplace', 'patch', 'edits']) as string | undefined;
     if (typeof blocksText !== 'string' || blocksText.length === 0) {
-      return { ok: false, summary: 'draft_diff: missing blocks', error: 'blocks must be a non-empty string of SEARCH/REPLACE blocks' };
+      return { ok: false, summary: 'draft_diff: missing blocks', error: 'blocks must be a non-empty string of SEARCH/REPLACE blocks, passed as the `blocks` field. Format: <<<<<<< SEARCH\\n...\\n=======\\n...\\n>>>>>>> REPLACE. For a full rewrite use draft_source instead.' };
     }
     const base = state.draftSource ?? state.targetSource;
     if (!base) {
@@ -427,12 +471,21 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     const result = applyDiff(base, parsed.blocks);
     if (!result.ok) {
-      const errorLines = result.errors.map((e) => `  - ${e.message}`).join('\n');
+      const errorLines = result.errors.map((e) => {
+        let line = `  - ${e.message}`;
+        // Show the closest region actually in the source so the next attempt can
+        // copy it verbatim instead of guessing at whitespace again.
+        if (e.nearest) {
+          line += `\n    Closest text in source (around line ${e.nearest.line}) — copy this EXACTLY into your SEARCH:\n` +
+            e.nearest.text.split('\n').map((l) => `    | ${l}`).join('\n');
+        }
+        return line;
+      }).join('\n');
       const parseNote = parsed.parseErrors.length > 0 ? `\nParse warnings: ${parsed.parseErrors.join('; ')}` : '';
       return {
         ok: false,
         summary: `draft_diff: ${result.applied}/${parsed.blocks.length} applied, ${result.errors.length} failed`,
-        error: `Some SEARCH/REPLACE blocks could not be applied:\n${errorLines}${parseNote}\n\nFix the failing blocks and call draft_diff again with a fresh blocks payload.`,
+        error: `Some SEARCH/REPLACE blocks could not be applied:\n${errorLines}${parseNote}\n\nFix the failing blocks and call draft_diff again with a fresh blocks payload. If a block stays hard to match, fall back to draft_source with the full corrected source.`,
       };
     }
 
@@ -563,9 +616,70 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     const err = ScriptableAbject.tryCompile(state.draftSource);
     state.lastValidation = { ...(state.lastValidation ?? {}), compile: err ?? '' };
     if (err) {
-      return { ok: false, summary: `compile: ${err.slice(0, 120)}`, error: err };
+      return { ok: false, summary: `compile: ${err.slice(0, 120)}`, error: this.augmentCompileError(state.draftSource, err) };
     }
     return { ok: true, summary: 'compile: OK' };
+  }
+
+  /**
+   * Augment a raw compile error with a likely location. JS engine messages like
+   * "Unexpected token '}'" carry no position for sandboxed source, so we locate
+   * the first bracket imbalance ourselves and show the surrounding lines. The
+   * original error is preserved; this only adds a hint plus a draft_source
+   * fallback note for errors that resist localization.
+   */
+  private augmentCompileError(source: string, err: string): string {
+    const lines = source.split('\n');
+    const imbalance = this.findBracketImbalance(source);
+    let detail = '';
+    if (imbalance) {
+      const ctxStart = Math.max(0, imbalance.line - 3);
+      const ctxEnd = Math.min(lines.length, imbalance.line + 2);
+      const ctx = lines.slice(ctxStart, ctxEnd)
+        .map((l, k) => `  ${ctxStart + k + 1 === imbalance.line ? '>' : ' '} ${ctxStart + k + 1}: ${l}`)
+        .join('\n');
+      detail = `\n\nLikely bracket problem: ${imbalance.message} (near line ${imbalance.line}):\n${ctx}`;
+    }
+    detail += `\n\nSource is ${lines.length} lines. If the syntax error is hard to localize, regenerate the whole object with draft_source rather than patching around it.`;
+    return `${err}${detail}`;
+  }
+
+  /**
+   * Lightweight bracket/paren/brace balance scanner. Skips string literals,
+   * template literals, and comments so their contents don't count. Returns the
+   * first imbalance (or the earliest unclosed opener at EOF), or null when
+   * balanced. Best-effort — regex literals are treated as division, so a hint
+   * may occasionally be off, but the original error is always preserved.
+   */
+  private findBracketImbalance(source: string): { line: number; message: string } | null {
+    const stack: { ch: string; line: number }[] = [];
+    const closerToOpener: Record<string, string> = { ')': '(', ']': '[', '}': '{' };
+    let line = 1;
+    let inStr: string | null = null;
+    let inLineComment = false;
+    let inBlockComment = false;
+    for (let i = 0; i < source.length; i++) {
+      const c = source[i];
+      const prev = source[i - 1];
+      if (c === '\n') { line++; inLineComment = false; continue; }
+      if (inLineComment) continue;
+      if (inBlockComment) { if (prev === '*' && c === '/') inBlockComment = false; continue; }
+      if (inStr) { if (c === inStr && prev !== '\\') inStr = null; continue; }
+      if (c === '/' && source[i + 1] === '/') { inLineComment = true; continue; }
+      if (c === '/' && source[i + 1] === '*') { inBlockComment = true; continue; }
+      if (c === '"' || c === "'" || c === '`') { inStr = c; continue; }
+      if (c === '(' || c === '[' || c === '{') { stack.push({ ch: c, line }); continue; }
+      if (c === ')' || c === ']' || c === '}') {
+        const open = stack.pop();
+        if (!open) return { line, message: `unexpected closing '${c}' with no matching opener` };
+        if (open.ch !== closerToOpener[c]) return { line, message: `'${c}' closes a '${open.ch}' opened on line ${open.line}` };
+      }
+    }
+    if (stack.length > 0) {
+      const last = stack[stack.length - 1];
+      return { line: last.line, message: `'${last.ch}' opened on line ${last.line} is never closed` };
+    }
+    return null;
   }
 
   /**
@@ -1615,7 +1729,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
           res = this.opFail(state, action);
           break;
         default:
-          res = { ok: false, summary: `unknown action: ${action.action}`, error: `Unknown action: ${action.action}` };
+          res = { ok: false, summary: `unknown action: ${action.action}`, error: this.unknownActionError(action.action) };
       }
     } catch (err) {
       res = { ok: false, summary: 'action threw', error: err instanceof Error ? err.message : String(err) };

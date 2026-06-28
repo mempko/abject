@@ -43,6 +43,8 @@ export interface BlockError {
   reason: 'not_found' | 'ambiguous' | 'identical';
   message: string;
   search: string;
+  /** For not_found: the closest matching region actually present in the source. */
+  nearest?: { text: string; line: number };
 }
 
 export interface ApplyDiffResult {
@@ -177,6 +179,9 @@ export function applyDiff(source: string, blocks: SearchReplaceBlock[]): ApplyDi
         reason,
         message: `block ${i + 1}: ${msg}`,
         search: block.search,
+        // For a not-found block, show the closest region that IS in the source
+        // so the LLM can match it verbatim instead of guessing again.
+        nearest: reason === 'not_found' ? (findClosestRegion(current, block.search) ?? undefined) : undefined,
       });
     }
   }
@@ -226,7 +231,7 @@ function* lineTrimmedReplacer(content: string, find: string): Generator<string> 
   }
 }
 
-function levenshtein(a: string, b: string): number {
+export function levenshtein(a: string, b: string): number {
   if (a === '' || b === '') return Math.max(a.length, b.length);
   const m = Array.from({ length: a.length + 1 }, (_, i) =>
     Array.from({ length: b.length + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)),
@@ -444,4 +449,40 @@ function replaceUnique(content: string, search: string, replacement: string): st
     throw new Error('SEARCH text not found in source. Check whitespace, indentation, and that the snippet exists verbatim.');
   }
   throw new Error('SEARCH text matched multiple locations. Add more surrounding context (3+ lines on each side) to make the match unique.');
+}
+
+/**
+ * For a SEARCH that didn't match, find the region of `content` that most
+ * resembles it, so the caller can show the LLM the actual text to target.
+ * Anchors on the most distinctive (longest) non-trivial SEARCH line and scores
+ * each source line by single-line edit distance — cheap, no whole-window
+ * Levenshtein. Returns the matching span (sized to the search) and its 1-based
+ * start line, or null when nothing is close enough.
+ */
+export function findClosestRegion(content: string, search: string): { text: string; line: number } | null {
+  const contentLines = content.split('\n');
+  const searchLines = search.split('\n');
+  const significant = searchLines.filter((l) => l.trim().length > 2);
+  if (significant.length === 0 || contentLines.length === 0) return null;
+
+  const anchor = significant.reduce((a, b) => (b.trim().length > a.trim().length ? b : a)).trim();
+  const cap = (s: string) => s.slice(0, 120);
+  let bestLine = -1;
+  let bestScore = Infinity;
+  for (let i = 0; i < contentLines.length; i++) {
+    const t = contentLines[i].trim();
+    if (t.length === 0) continue;
+    const norm = levenshtein(cap(t), cap(anchor)) / Math.max(t.length, anchor.length, 1);
+    if (norm < bestScore) {
+      bestScore = norm;
+      bestLine = i;
+    }
+  }
+  // Require a reasonable resemblance; otherwise a hint would mislead.
+  if (bestLine < 0 || bestScore > 0.6) return null;
+
+  const span = Math.max(1, searchLines.length);
+  const start = Math.max(0, bestLine - 1);
+  const end = Math.min(contentLines.length, start + span + 2);
+  return { text: contentLines.slice(start, end).join('\n'), line: start + 1 };
 }
