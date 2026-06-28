@@ -117,6 +117,43 @@ export class Factory extends Abject {
                 returns: { kind: 'reference', reference: 'SpawnResult' },
               },
               {
+                name: 'instantiate',
+                description: 'Create a fresh runtime INSTANCE of an existing object\'s type — same manifest/source, a NEW identity, and its own (empty by default) data. Unlike clone, it does NOT copy the source object\'s data and does NOT carry its typeId, so you get a blank new instance of the same kind, not a fork of its current state. Use this to open another live instance/window of an existing source-backed object (e.g. a second editor). Resolves the source object by objectId or typeId across the registryHint, global, and remote registries. The instance is ephemeral (no typeId), so persist any per-instance state under your own document key rather than relying on snapshot/restore.',
+                parameters: [
+                  {
+                    name: 'objectId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'The AbjectId of an existing instance whose type to instantiate (or pass typeId)',
+                    optional: true,
+                  },
+                  {
+                    name: 'typeId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'The durable TypeId of the object type to instantiate (alternative to objectId)',
+                    optional: true,
+                  },
+                  {
+                    name: 'data',
+                    type: { kind: 'object', properties: {} },
+                    description: 'Initial data for the new instance (default empty). NOT copied from the source object.',
+                    optional: true,
+                  },
+                  {
+                    name: 'registryHint',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Registry to resolve the source object in and register the new instance in (e.g. your workspace registry, this.parentId). Searched first.',
+                    optional: true,
+                  },
+                  {
+                    name: 'parentId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Parent/owner of the new instance (defaults to Factory)',
+                    optional: true,
+                  },
+                ],
+                returns: { kind: 'reference', reference: 'SpawnResult' },
+              },
+              {
                 name: 'registerConstructor',
                 description: 'Register a constructor for a named Abject type',
                 parameters: [
@@ -169,6 +206,14 @@ export class Factory extends Abject {
     this.on('clone', async (msg: AbjectMessage) => {
       const { objectId, registryHint } = msg.payload as { objectId: AbjectId; registryHint?: AbjectId };
       return this.clone(objectId, registryHint);
+    });
+
+    this.on('instantiate', async (msg: AbjectMessage) => {
+      const req = msg.payload as {
+        objectId?: AbjectId; typeId?: TypeId; data?: Record<string, unknown>;
+        registryHint?: AbjectId; parentId?: AbjectId;
+      };
+      return this.instantiate(req);
     });
 
     this.on('respawn', async (msg: AbjectMessage) => {
@@ -267,22 +312,99 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
   }
 
   /**
+   * Resolve an object's registration by AbjectId OR durable TypeId. Searches,
+   * in order: the caller's registryHint (where workspace/user objects actually
+   * live), the global Factory registry, a typeId->id resolve in each, then
+   * remote workspace registries. This is why a bare global lookup used to miss
+   * live user objects ("not found in any registry") — they register in their
+   * workspace registry, not the global one.
+   */
+  private async resolveRegistration(idOrTypeId: string, registryHint?: AbjectId): Promise<ObjectRegistration | null> {
+    const registries: AbjectId[] = [];
+    if (registryHint) registries.push(registryHint);
+    if (this._factoryRegistryId && !registries.includes(this._factoryRegistryId)) {
+      registries.push(this._factoryRegistryId);
+    }
+
+    // Direct lookup by AbjectId in each candidate registry.
+    for (const regId of registries) {
+      try {
+        const reg = await this.request<ObjectRegistration | null>(
+          request(this.id, regId, 'lookup', { objectId: idOrTypeId as AbjectId })
+        );
+        if (reg) return reg;
+      } catch { /* registry unreachable */ }
+    }
+
+    // Treat it as a TypeId (scoped, contains '/'): resolve to a live id, then look up.
+    if (idOrTypeId.includes('/')) {
+      for (const regId of registries) {
+        try {
+          const liveId = await this.request<AbjectId | null>(
+            request(this.id, regId, 'resolveType', { typeId: idOrTypeId as TypeId })
+          );
+          if (liveId) {
+            const reg = await this.request<ObjectRegistration | null>(
+              request(this.id, regId, 'lookup', { objectId: liveId })
+            );
+            if (reg) return reg;
+          }
+        } catch { /* registry unreachable */ }
+      }
+    }
+
+    // Fall back to remote workspace registries.
+    return this.findInRemoteRegistries(idOrTypeId as AbjectId);
+  }
+
+  /**
+   * Create a fresh runtime INSTANCE of an existing object's type: same manifest
+   * and source, a NEW identity, and its own (empty by default) data. Unlike
+   * clone(), it does NOT deep-copy the source object's data and does NOT carry
+   * its typeId — so you get a blank new instance of the same kind, not a fork of
+   * the original's current state. Use this for "open another live instance of
+   * this object" (e.g. a second editor window bound to a different document).
+   * The instance is ephemeral (no typeId → not snapshot/restored by typeId);
+   * persist per-instance state under your own document key.
+   */
+  async instantiate(req: {
+    objectId?: AbjectId; typeId?: TypeId; data?: Record<string, unknown>;
+    registryHint?: AbjectId; parentId?: AbjectId;
+  }): Promise<SpawnResult> {
+    require(this._factoryBus !== undefined, 'Factory must have a message bus');
+    require(this._factoryRegistryId !== undefined, 'Factory must have a registry');
+    const key = req.objectId ?? req.typeId;
+    require(typeof key === 'string' && key.length > 0, 'instantiate requires objectId or typeId');
+
+    const reg = await this.resolveRegistration(key as string, req.registryHint);
+    require(reg !== null, `Object '${key}' not found in any registry (cannot instantiate)`);
+    require(
+      !!reg!.source,
+      `Object '${key}' has no source to instantiate. Only source-backed objects (ScriptableAbjects/Organisms) can be instantiated; constructor-backed system objects cannot.`,
+    );
+
+    // Fresh instance: source + manifest, caller's data (default empty), and
+    // deliberately NO typeId so it has its own ephemeral identity rather than
+    // colliding with the source object's durable snapshot key.
+    const spawnReq: SpawnRequest = {
+      manifest: reg!.manifest,
+      source: reg!.source,
+      owner: reg!.owner,
+      data: req.data ?? {},
+    };
+    if (req.registryHint) spawnReq.registryHint = req.registryHint;
+    if (req.parentId) spawnReq.parentId = req.parentId;
+    return this.spawn(spawnReq);
+  }
+
+  /**
    * Clone an existing object — creates a new instance with the same manifest/source but a new ID.
    */
   async clone(objectId: AbjectId, registryHint?: AbjectId): Promise<SpawnResult> {
     require(this._factoryBus !== undefined, 'Factory must have a message bus');
     require(this._factoryRegistryId !== undefined, 'Factory must have a registry');
 
-    // Search local registry first
-    let reg = await this.request<ObjectRegistration | null>(
-      request(this.id, this._factoryRegistryId!, 'lookup', { objectId })
-    );
-
-    // If not found locally, search remote workspace registries
-    if (!reg) {
-      reg = await this.findInRemoteRegistries(objectId);
-    }
-
+    const reg = await this.resolveRegistration(objectId, registryHint);
     require(reg !== null, `Object '${objectId}' not found in any registry`);
 
     // Delegate to spawn with the same manifest and source.

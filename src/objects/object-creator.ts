@@ -71,7 +71,7 @@ interface DepMethodIndex {
 
 /** Output from the static call-name walker. */
 interface CallValidationError {
-  kind: 'unknown-dep' | 'unknown-method' | 'name-string-recipient';
+  kind: 'unknown-dep' | 'unknown-method' | 'name-string-recipient' | 'hardcoded-id';
   callSite: { line: number; snippet: string };
   depName?: string;
   methodName?: string;
@@ -798,6 +798,23 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       }
     }
 
+    // Hardcoded AbjectId literals: a baked-in UUID is an ephemeral runtime id
+    // that changes on every restart, so it is stale and unroutable next boot.
+    // There is no legitimate reason for generated source to embed one — ids must
+    // be resolved at runtime (dep/find/discover). Flag each distinct literal.
+    const uuidLiteral = /['"]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})['"]/gi;
+    const seenIds = new Set<string>();
+    let mu: RegExpExecArray | null;
+    while ((mu = uuidLiteral.exec(source)) !== null) {
+      const id = mu[1];
+      if (seenIds.has(id)) continue;
+      seenIds.add(id);
+      const before = source.slice(0, mu.index);
+      const line = before.split('\n').length;
+      const snippet = source.slice(mu.index, Math.min(source.length, mu.index + mu[0].length + 20));
+      errors.push({ kind: 'hardcoded-id', callSite: { line, snippet }, depName: id });
+    }
+
     state.lastValidation = { ...(state.lastValidation ?? {}), calls: errors };
 
     if (errors.length === 0) {
@@ -805,7 +822,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
 
     const summary = `validate_calls: ${errors.length} issue${errors.length === 1 ? '' : 's'} — ` +
-      errors.slice(0, 3).map(e => `${e.depName ?? '?'}.${e.methodName}`).join(', ') +
+      errors.slice(0, 3).map(e => e.kind === 'hardcoded-id'
+        ? `hardcoded id ${(e.depName ?? '').slice(0, 8)}…`
+        : `${e.depName ?? '?'}.${e.methodName}`).join(', ') +
       (errors.length > 3 ? ', …' : '');
     return { ok: false, summary, issues: errors, error: this.formatCallErrors(errors) };
   }
@@ -1212,6 +1231,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         lines.push(`- ${e.depName}.${e.methodName} is not a method. Available: ${(e.availableMethods ?? []).join(', ')}`);
       } else if (e.kind === 'name-string-recipient') {
         lines.push(`- this.call("${e.depName}", "${e.methodName}", …) addresses a recipient by name. Message recipients are AbjectIds; the bus does not resolve names on the send path, so this call is delivered nowhere and times out. Resolve the id first: const id = await this.dep("${e.depName}"); await this.call(id, "${e.methodName}", …) — or inline await this.call(this.dep("${e.depName}"), "${e.methodName}", …). (Ids returned at runtime — window/canvas/layout ids from create* — are already resolved and fine to pass directly.)`);
+      } else if (e.kind === 'hardcoded-id') {
+        lines.push(`- Hardcoded AbjectId literal "${e.depName}" at line ${e.callSite.line}. AbjectIds are ephemeral — they change on every restart, so a baked-in id is stale and unroutable next boot (a frequent cause of "works now, broken after restart"). Resolve the object at runtime instead: const id = await this.dep("<Name>") (system/dependency objects), or this.find("<Name>"), or call("Registry", "discover", { name: "<Name>" }). Never store a literal AbjectId in source or this.data.`);
       } else {
         lines.push(`- Dependency "${e.depName}" was not discovered yet. Call describe / ask on it before calling its methods.`);
       }
