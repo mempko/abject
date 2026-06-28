@@ -405,12 +405,26 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   ];
 
   /**
-   * Build a recovery message for an unrecognized action: list the valid verbs
-   * and suggest the closest one. Steers common confusions (e.g. inventing a
-   * goal-data write action) back to the real toolset instead of burning a step.
+   * Build a recovery message for an unrecognized action. The most common cause
+   * is the model emitting another object's METHOD as a top-level action verb
+   * (e.g. `writeGoalData`, which is a real GoalManager method) — redirect that
+   * to the `call` action. Otherwise list the valid verbs and suggest the closest.
    */
-  private unknownActionError(got: string): string {
+  private unknownActionError(got: string, state: LoopState): string {
     const valid = ObjectCreator.VALID_ACTIONS;
+
+    // Did the model use a discovered object's method name as the action?
+    // Steer it to the call form against the owning object.
+    const owners: string[] = [];
+    for (const [name, dep] of state.deps) {
+      if (dep.methods.has(got)) owners.push(name);
+    }
+    if (owners.length > 0) {
+      const target = owners[0];
+      return `"${got}" is a method on ${owners.map(o => `"${o}"`).join(' / ')}, not a loop action. ` +
+        `Invoke it with the call action: {"action":"call","target":"${target}","method":"${got}","payload":{ ... }}.`;
+    }
+
     const lower = (got ?? '').toLowerCase();
     let suggestion: string | undefined;
     let best = Infinity;
@@ -418,10 +432,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       const d = levenshtein(lower, v);
       if (d < best) { best = d; suggestion = v; }
     }
-    // Only offer a suggestion when it's actually close.
     const hint = suggestion && best <= Math.ceil(suggestion.length / 2) ? ` Did you mean "${suggestion}"?` : '';
     return `Unknown action "${got}". Valid actions: ${valid.join(', ')}.${hint} ` +
-      `There is no goal-data or scratchpad write action in this loop — carry results in your own \`done\` result, and read context from your observation.`;
+      `If "${got}" is a method on another object (for example writeGoalData/readGoalData on GoalManager), call it via {"action":"call","target":"<object>","method":"${got}","payload":{ ... }}.`;
   }
 
   private async opDraftSource(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
@@ -1729,7 +1742,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
           res = this.opFail(state, action);
           break;
         default:
-          res = { ok: false, summary: `unknown action: ${action.action}`, error: this.unknownActionError(action.action) };
+          res = { ok: false, summary: `unknown action: ${action.action}`, error: this.unknownActionError(action.action, state) };
       }
     } catch (err) {
       res = { ok: false, summary: 'action threw', error: err instanceof Error ? err.message : String(err) };
@@ -1958,7 +1971,7 @@ Verification (after deploy):
 - Behavioral test: \`call("<DeployedName>", "<method>", <payload>)\` — invoke a real method and check the response.
 
 Persistence:
-- Goal scratchpad (per-goal handoff): \`call("GoalManager", "writeGoalData", {goalId, key, value})\` / \`readGoalData\`.
+- Goal scratchpad (per-goal handoff): \`call("GoalManager", "writeGoalData", {goalId, key, value})\` / \`readGoalData\`. This is also how you fulfill your task's declared \`produces\` keys — write each one to the scratchpad with this call (it is a GoalManager method invoked via \`call\`, NOT a top-level action verb).
 - KnowledgeBase (cross-session facts): \`call("KnowledgeBase", "remember", {title, content, type, tags})\` / \`recall\`.
 
 # Event emission
@@ -2003,7 +2016,7 @@ this.changed('completed', { resultCount });
 7. **Storage scopes — pick the right one for each piece of data.** The decision rule: *if two people both ran a clone of this object, should they each see the same value?* If yes, the data belongs to the object. If no, it belongs to the user.
 
    - **Same-turn context** — keep it in your response.
-   - **Per-goal handoff between subtasks** — goal scratchpad via \`writeGoalData\` / \`readGoalData\`.
+   - **Per-goal handoff between subtasks** — goal scratchpad via \`call("GoalManager", "writeGoalData", {goalId, key, value})\` / \`call("GoalManager", "readGoalData", {goalId, key})\` (GoalManager methods, invoked with the \`call\` action — not top-level verbs).
    - **Internal object data (\`this.data\`)** — state intrinsic to the object's purpose that SHOULD travel with the object when it is cloned, restored from snapshot, or shared with another peer. Examples: a counter the object reports, the contents of a note an object represents, learned parameters, accumulated history that defines the object. ScriptableAbject source code reads and writes \`this.data\` (a plain JSON-serializable object) directly, e.g. \`this.data.count = (this.data.count ?? 0) + 1\`. Persist with \`await this.saveData()\` after mutations you want to survive restart and travel with clones. Hot-reloads (\`updateSource\` / \`deploy_update\`) preserve \`this.data\`.
    - **External Storage / dependency objects** — use the Storage capability (or a dedicated dependency object) for data that is user-specific, secret, or otherwise should NOT be copied when the object is cloned or shared with another peer. API keys, OAuth tokens, personal preferences, anything tied to *this user on this machine*. Read with \`call(this.dep('Storage'), 'get', {key})\`, write with \`call(this.dep('Storage'), 'set', {key, value})\`.
    - **KnowledgeBase** — durable cross-session user-facing facts the user wants to recall later (notes, preferences, learned facts about the user). Not for per-task state.
