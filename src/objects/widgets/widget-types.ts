@@ -58,7 +58,7 @@ export type WidgetType = 'label' | 'button' | 'textInput' | 'textArea' | 'checkb
  */
 export const DRAW_COMMAND_TYPES = [
   // High-level self-contained shapes
-  'rect', 'text', 'line', 'image', 'imageUrl', 'clear', 'path',
+  'rect', 'text', 'markdown', 'line', 'image', 'imageUrl', 'clear', 'path',
   'save', 'restore', 'clip', 'translate',
   'circle', 'arc', 'ellipse', 'polygon', 'rotate', 'scale',
   'globalAlpha', 'shadow', 'setLineDash', 'linearGradient', 'radialGradient',

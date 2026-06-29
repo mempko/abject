@@ -14,6 +14,8 @@ import {
 } from '../../core/types.js';
 import { event } from '../../core/message.js';
 import { WidgetAbject, WidgetConfig } from './widget-abject.js';
+import { parseMarkdown } from './markdown.js';
+import { layoutRichText } from './rich-text-layout.js';
 import {
   WidgetType,
   Rect,
@@ -37,6 +39,7 @@ const REQUIRED_PARAMS: Record<string, string[]> = {
   // High-level shapes
   rect: ['x', 'y', 'width', 'height'],
   text: ['x', 'y', 'text'],
+  markdown: ['x', 'y', 'text'],
   line: ['x1', 'y1', 'x2', 'y2'],
   circle: ['cx|x', 'cy|y', 'radius'],
   arc: ['cx|x', 'cy|y', 'radius', 'startAngle', 'endAngle'],
@@ -152,6 +155,10 @@ export interface CanvasWidgetConfig extends WidgetConfig {
  */
 export class CanvasWidget extends WidgetAbject {
   private storedCommands: unknown[] = [];
+  /** Cache of expanded markdown layouts, keyed by text+geometry, so re-renders
+   *  don't re-run the (async, round-tripping) layout for unchanged blocks.
+   *  Cleared when an image finishes resolving so resolved dims take effect. */
+  private mdCache = new Map<string, unknown[]>();
   private inputTargetId: AbjectId;
 
   constructor(config: CanvasWidgetConfig) {
@@ -388,6 +395,12 @@ A synthetic \`call(<canvasId>, 'input', { type: 'mousedown', x, y, button: 0 })\
           surfaceId,
           params: { ...(c.params ?? {}), dx: (p.dx ?? 0) + ox, dy: (p.dy ?? 0) + oy },
         });
+      } else if (c.type === 'markdown') {
+        // Expand a markdown block into primitive text/imageUrl/rect/line
+        // commands using the same engine the label widget uses. Coordinates
+        // are canvas-local (the wrapper's translate already applied).
+        const expanded = await this.expandMarkdown(surfaceId, (c.params ?? {}) as Record<string, unknown>);
+        for (const e of expanded) commands.push(e);
       } else {
         // Replace surfaceId with the window's surfaceId
         commands.push({ ...c, surfaceId });
@@ -397,6 +410,85 @@ A synthetic \`call(<canvasId>, 'input', { type: 'mousedown', x, y, button: 0 })\
     commands.push({ type: 'restore', surfaceId, params: {} });
 
     return commands;
+  }
+
+  /** Invalidate the markdown layout cache when an image resolves so the next
+   *  render picks up the now-known image dimensions. */
+  protected override onImageResolved(): void {
+    this.mdCache.clear();
+  }
+
+  /**
+   * Expand a `markdown` draw command into primitive draw commands (text /
+   * imageUrl / rect / line), reusing the shared markdown parser + rich-text
+   * layout + image resolver — the same engine the label widget uses. Emits at
+   * canvas-local coordinates (the buildDrawCommands wrapper's translate already
+   * applied). Params: { x, y, text, maxWidth?, fontSize?, fill?, maxImageHeight? }.
+   */
+  private async expandMarkdown(surfaceId: string, params: Record<string, unknown>): Promise<unknown[]> {
+    const x = Number(params.x ?? 0);
+    const y = Number(params.y ?? 0);
+    const text = String(params.text ?? '');
+    const maxWidth = Number(params.maxWidth ?? params.width ?? this.rect.width - x);
+    const fontSize = Number(params.fontSize ?? 14);
+    const fill = String(params.fill ?? this.theme.textPrimary);
+    const maxImageHeight = params.maxImageHeight !== undefined ? Number(params.maxImageHeight) : undefined;
+    if (!text) return [];
+
+    const key = `${x}|${y}|${maxWidth}|${fontSize}|${fill}|${maxImageHeight ?? ''}|${text}`;
+    const cached = this.mdCache.get(key);
+    if (cached) return cached;
+
+    const measureFn = (t: string, font: string): Promise<number> => this.measureText(surfaceId, t, font);
+    let layout;
+    try {
+      const parsed = parseMarkdown(text);
+      layout = await layoutRichText(
+        parsed, maxWidth, measureFn, this.theme, fontSize, fill,
+        this.imageResolver.resolveDims, maxImageHeight,
+      );
+    } catch {
+      // On any layout failure, fall back to a single plain-text command so the
+      // node still shows its content rather than vanishing.
+      const fallback = [{ type: 'text', surfaceId, params: { x, y: y + fontSize, text, font: `${fontSize}px sans-serif`, fill, baseline: 'alphabetic' } }];
+      return fallback;
+    }
+
+    const out: unknown[] = [];
+    const pad = 0;
+    for (const line of layout.lines) {
+      const lineTop = y + line.y;
+      const textY = lineTop + line.height * 0.7;
+
+      if (line.image) {
+        const drawUrl = this.imageResolver.drawableUrl(line.image.url);
+        if (drawUrl) {
+          out.push({ type: 'imageUrl', surfaceId, params: { x: x + pad + line.indent, y: lineTop, width: line.image.width, height: line.image.height, url: drawUrl } });
+        }
+        continue;
+      }
+      if (line.codeBackground) {
+        out.push({ type: 'rect', surfaceId, params: { x, y: lineTop, width: maxWidth, height: line.height, fill: this.theme.inputBg } });
+      }
+      if (line.quoteBorder) {
+        out.push({ type: 'line', surfaceId, params: { x1: x + 4, y1: lineTop, x2: x + 4, y2: lineTop + line.height, stroke: this.theme.accentSecondary, lineWidth: 2 } });
+      }
+      let runX = x + pad + line.indent;
+      for (const run of line.runs) {
+        if (run.text.length === 0) continue;
+        if (!line.codeBackground && line.blockType !== 'table' && run.fill === this.theme.accent && run.font.includes('Mono')) {
+          out.push({ type: 'rect', surfaceId, params: { x: runX - 2, y: lineTop + 1, width: run.width + 4, height: line.height - 2, fill: this.theme.inputBg, radius: 3 } });
+        }
+        out.push({ type: 'text', surfaceId, params: { x: runX, y: textY, text: run.text, font: run.font, fill: run.fill, baseline: 'alphabetic' } });
+        if (run.href) {
+          out.push({ type: 'line', surfaceId, params: { x1: runX, y1: textY + 2, x2: runX + run.width, y2: textY + 2, stroke: run.fill, lineWidth: 1 } });
+        }
+        runX += run.width;
+      }
+    }
+
+    this.mdCache.set(key, out);
+    return out;
   }
 
   protected async processInput(input: Record<string, unknown>): Promise<{ consumed: boolean; focusWidgetId?: AbjectId }> {

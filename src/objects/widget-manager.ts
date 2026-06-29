@@ -1369,6 +1369,12 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           Commands run in order against a stateful context, so path building works as in a browser.
           rect: {x, y, width, height, fill?, stroke?, radius?}   text: {x, y, text, fill?, font?, align?}
           line: {x1, y1, x2, y2, stroke?, lineWidth?}            circle: {cx, cy, radius, fill?, stroke?}
+          markdown: {x, y, text, maxWidth?, fontSize?, fill?, maxImageHeight?} — render a markdown block
+          (bold, italic, inline code, headings, bullet/numbered lists, links, blockquotes, code blocks, and
+          inline images via ![alt](url) where url is a data:image/* URI, an abject:// ref, or http(s)) onto
+          the canvas at (x,y), wrapping to maxWidth. Same rich renderer as markdown labels, so you get rich
+          text + images inside a pannable/zoomable canvas without hand-rolling a parser. Use this instead of
+          the plain text command whenever node/cell content may contain markdown or images.
           Invalid batches (unknown type, missing required params) are rejected with an error naming the problem.
           Ask the canvas widget itself for the full per-command param reference before writing a renderer.
 3D scene: THE DESKTOP IS A NATIVE 3D SCENE (WebGL2-backed) — no Three.js needed; 3D is built in.

@@ -124,6 +124,11 @@ export interface ClipboardWriteMsg extends WsEnvelope {
   text: string;
 }
 
+export interface ClipboardWriteImageMsg extends WsEnvelope {
+  type: 'clipboardWriteImage';
+  image: string;
+}
+
 export interface OpenUrlMsg extends WsEnvelope {
   type: 'openUrl';
   url: string;
@@ -227,6 +232,7 @@ export type BackendToFrontendMsg =
   | SetSurfaceWorkspaceMsg
   | SetActiveWorkspaceMsg
   | ClipboardWriteMsg
+  | ClipboardWriteImageMsg
   | OpenUrlMsg
   | StartWindowDragMsg
   | SetSurfaceResizableMsg

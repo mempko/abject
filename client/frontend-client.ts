@@ -704,6 +704,18 @@ export class FrontendClient {
         );
         break;
 
+      case 'clipboardWriteImage':
+        // Write an image (data:image/* URI) to the OS clipboard via ClipboardItem.
+        (async () => {
+          try {
+            const blob = await (await fetch(msg.image)).blob();
+            await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+          } catch (err) {
+            console.warn('[Frontend] Clipboard image write failed:', err);
+          }
+        })();
+        break;
+
       case 'openUrl':
         window.open((msg as { url: string }).url, '_blank');
         break;
