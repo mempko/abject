@@ -21,6 +21,7 @@ import { wrapText, estimateWrappedLineCount } from './word-wrap.js';
 import { wordBoundaryLeft, wordBoundaryRight, EditHistory, type EditKind } from './text-edit-helpers.js';
 import { parseMarkdown } from './markdown.js';
 import { layoutRichText, type RichTextLayout } from './rich-text-layout.js';
+import { renderRichTextCommands } from './markdown-render.js';
 
 interface InputSnapshot {
   text: string;
@@ -752,73 +753,17 @@ export class TextInputWidget extends WidgetAbject {
     const topPad = 6;
     const sel = (focused && !this.masked) ? this.getSelection() : null;
 
-    for (const line of layout.lines) {
-      const lineTop = oy + topPad + line.y;
-      const textY = lineTop + line.height * 0.7;
-      if (lineTop > oy + h) break;
-
-      // Inline image (atomic reference token).
-      if (line.image) {
-        const drawUrl = this.imageResolver.drawableUrl(line.image.url);
-        if (drawUrl) {
-          commands.push({
-            type: 'imageUrl', surfaceId,
-            params: { x: ox + textPadding + line.indent, y: lineTop, width: line.image.width, height: line.image.height, url: drawUrl },
-          });
-        } else {
-          // Placeholder frame while the image resolves.
-          commands.push({
-            type: 'rect', surfaceId,
-            params: { x: ox + textPadding + line.indent, y: lineTop, width: line.image.width, height: line.image.height, fill: this.theme.inputBg, stroke: this.theme.inputBorder, radius: 4 },
-          });
-        }
-        continue;
-      }
-
-      if (line.codeBackground) {
-        commands.push({ type: 'rect', surfaceId, params: { x: ox, y: lineTop, width: w, height: line.height, fill: this.theme.inputBg } });
-      }
-      if (line.quoteBorder) {
-        commands.push({ type: 'line', surfaceId, params: { x1: ox + 4, y1: lineTop, x2: ox + 4, y2: lineTop + line.height, stroke: this.theme.accentSecondary, lineWidth: 2 } });
-      }
-
-      // Selection highlight (per-run, by source offsets).
-      if (sel) {
-        let selRunX = ox + textPadding + line.indent;
-        for (const run of line.runs) {
-          if (run.text.length === 0) { selRunX += run.width; continue; }
-          const overlapStart = Math.max(sel.start, run.sourceStart);
-          const overlapEnd = Math.min(sel.end, run.sourceEnd);
-          if (overlapStart < overlapEnd) {
-            const dispStart = Math.min(overlapStart - run.sourceStart, run.text.length);
-            const dispEnd = Math.min(overlapEnd - run.sourceStart, run.text.length);
-            let hlX = selRunX;
-            let hlW = run.width;
-            if (dispStart > 0) hlX = selRunX + await this.measureText(surfaceId, run.text.substring(0, dispStart), run.font);
-            if (dispEnd < run.text.length) hlW = await this.measureText(surfaceId, run.text.substring(dispStart, dispEnd), run.font);
-            else hlW = (selRunX + run.width) - hlX;
-            if (hlW > 0) {
-              commands.push({ type: 'rect', surfaceId, params: { x: hlX, y: lineTop, width: hlW, height: line.height, fill: this.theme.selectionBg } });
-            }
-          }
-          selRunX += run.width;
-        }
-      }
-
-      // Styled runs.
-      let runX = ox + textPadding + line.indent;
-      for (const run of line.runs) {
-        if (run.text.length === 0) continue;
-        commands.push({
-          type: 'text', surfaceId,
-          params: { x: runX, y: textY, text: run.text, font: run.font, fill: run.fill, baseline: 'alphabetic' },
-        });
-        if (run.href) {
-          commands.push({ type: 'line', surfaceId, params: { x1: runX, y1: textY + 2, x2: runX + run.width, y2: textY + 2, stroke: run.fill, lineWidth: 1 } });
-        }
-        runX += run.width;
-      }
-    }
+    const lineCommands = await renderRichTextCommands(layout, {
+      surfaceId, ox, oy, width: w, height: h,
+      theme: this.theme,
+      drawableUrl: (u) => this.imageResolver.drawableUrl(u),
+      yShift: topPad, textPadding,
+      selection: sel,
+      measure: (t, font) => this.measureText(surfaceId, t, font),
+      inlineCodeBg: false,
+      imagePlaceholder: true,
+    });
+    for (const c of lineCommands) commands.push(c);
 
     // Cursor.
     if (focused) {

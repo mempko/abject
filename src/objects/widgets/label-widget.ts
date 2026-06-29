@@ -18,6 +18,7 @@ import { wrapText } from './word-wrap.js';
 import { event } from '../../core/message.js';
 import { parseMarkdown } from './markdown.js';
 import { layoutRichText, type RichTextLayout, type StyledRun } from './rich-text-layout.js';
+import { renderRichTextCommands } from './markdown-render.js';
 
 export class LabelWidget extends WidgetAbject {
   // Word-wrap cache
@@ -331,135 +332,16 @@ export class LabelWidget extends WidgetAbject {
     // at the top/bottom of the scroll viewport.
     const clip = this._renderViewportClip;
 
-    for (const line of layout.lines) {
-      const lineTop = oy + yShift + line.y;
-      const lineBottom = lineTop + line.height;
-      const textY = lineTop + line.height * 0.7;
-      if (lineTop > oy + h) break; // past bottom edge
-      if (clip && (lineBottom < clip.top || lineTop > clip.bottom)) continue;
-
-      // Image line: emit imageUrl draw command and continue. The resolver
-      // turns abject:// references and remote URLs into a drawable data URI
-      // (kicking an async fetch + redraw on a miss); data: URIs pass through.
-      // Until it resolves, drawableUrl is null and we simply skip painting —
-      // the layout already reserved the space and a redraw follows on resolve.
-      if (line.image) {
-        const drawUrl = this.imageResolver.drawableUrl(line.image.url);
-        if (drawUrl) {
-          commands.push({
-            type: 'imageUrl', surfaceId,
-            params: {
-              x: ox + textPadding + line.indent,
-              y: lineTop,
-              width: line.image.width,
-              height: line.image.height,
-              url: drawUrl,
-            },
-          });
-        }
-        continue;
-      }
-
-      // Code block background
-      if (line.codeBackground) {
-        commands.push({
-          type: 'rect', surfaceId,
-          params: { x: ox, y: lineTop, width: w, height: line.height, fill: this.theme.inputBg },
-        });
-      }
-
-      // Blockquote left border
-      if (line.quoteBorder) {
-        commands.push({
-          type: 'line', surfaceId,
-          params: {
-            x1: ox + 4, y1: lineTop,
-            x2: ox + 4, y2: lineTop + line.height,
-            stroke: this.theme.accentSecondary, lineWidth: 2,
-          },
-        });
-      }
-
-      // Selection highlights for this line (drawn before text so text renders on top)
-      if (sel) {
-        let selRunX = ox + textPadding + line.indent;
-        for (const run of line.runs) {
-          if (run.text.length === 0) continue;
-          // Check if this run overlaps the selection (source offsets)
-          const overlapStart = Math.max(sel.start, run.sourceStart);
-          const overlapEnd = Math.min(sel.end, run.sourceEnd);
-          if (overlapStart < overlapEnd) {
-            // Partial or full overlap — compute pixel bounds
-            const runTextLen = run.sourceEnd - run.sourceStart;
-            const charStart = overlapStart - run.sourceStart;
-            const charEnd = overlapEnd - run.sourceStart;
-            // Map character offsets to display text offsets (clamped to run.text length)
-            const dispStart = Math.min(charStart, run.text.length);
-            const dispEnd = Math.min(charEnd, run.text.length);
-
-            let hlX = selRunX;
-            let hlW = run.width;
-            if (dispStart > 0) {
-              const beforeW = await this.measureText(surfaceId, run.text.substring(0, dispStart), run.font);
-              hlX = selRunX + beforeW;
-            }
-            if (dispEnd < run.text.length) {
-              const selectedW = await this.measureText(surfaceId, run.text.substring(dispStart, dispEnd), run.font);
-              hlW = selectedW;
-            } else {
-              hlW = (selRunX + run.width) - hlX;
-            }
-
-            if (hlW > 0) {
-              commands.push({
-                type: 'rect', surfaceId,
-                params: {
-                  x: hlX, y: lineTop,
-                  width: hlW, height: line.height,
-                  fill: this.theme.selectionBg,
-                },
-              });
-            }
-          }
-          selRunX += run.width;
-        }
-      }
-
-      // Render each styled run
-      let runX = ox + textPadding + line.indent;
-      for (const run of line.runs) {
-        if (run.text.length === 0) continue;
-
-        // Inline code background (not for code-block/table lines which already have their own styling)
-        if (!line.codeBackground && line.blockType !== 'table' && run.fill === this.theme.accent && run.font.includes('Mono')) {
-          const codePadH = 2;
-          const codePadV = 1;
-          commands.push({
-            type: 'rect', surfaceId,
-            params: {
-              x: runX - codePadH, y: lineTop + codePadV,
-              width: run.width + codePadH * 2, height: line.height - codePadV * 2,
-              fill: this.theme.inputBg, radius: 3,
-            },
-          });
-        }
-
-        commands.push({
-          type: 'text', surfaceId,
-          params: { x: runX, y: textY, text: run.text, font: run.font, fill: run.fill, baseline: 'alphabetic' },
-        });
-
-        // Link underline
-        if (run.href) {
-          commands.push({
-            type: 'line', surfaceId,
-            params: { x1: runX, y1: textY + 2, x2: runX + run.width, y2: textY + 2, stroke: run.fill, lineWidth: 1 },
-          });
-        }
-
-        runX += run.width;
-      }
-    }
+    const lineCommands = await renderRichTextCommands(layout, {
+      surfaceId, ox, oy, width: w, height: h,
+      theme: this.theme,
+      drawableUrl: (u) => this.imageResolver.drawableUrl(u),
+      yShift, textPadding,
+      viewportClip: clip,
+      selection: sel,
+      measure: (t, font) => this.measureText(surfaceId, t, font),
+    });
+    for (const c of lineCommands) commands.push(c);
 
     commands.push({ type: 'restore', surfaceId, params: {} });
     return commands;

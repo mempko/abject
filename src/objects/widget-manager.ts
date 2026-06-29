@@ -29,6 +29,7 @@ const log = new Log('WidgetManager');
 import { ModalDialog } from './modal-dialog.js';
 import { WindowAbject } from './widgets/window-abject.js';
 import { LabelWidget } from './widgets/label-widget.js';
+import { MarkdownWidget } from './widgets/markdown-widget.js';
 import { ButtonWidget } from './widgets/button-widget.js';
 import { TextInputWidget, TextInputWidgetConfig } from './widgets/text-input-widget.js';
 import { TextAreaWidget, TextAreaWidgetConfig } from './widgets/text-area-widget.js';
@@ -272,7 +273,7 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'create',
-                description: 'Create one or more widgets in a single request. Each spec has { type, windowId, ...typeSpecificProps }. Supported types: label, button, textInput, textArea, checkbox, progress, divider, select, tabBar, slider, image, list, splitPane. Returns { widgetIds: AbjectId[] } in same order as specs.',
+                description: 'Create one or more widgets in a single request. Each spec has { type, windowId, ...typeSpecificProps }. Supported types: label, markdown, button, textInput, textArea, checkbox, progress, divider, select, tabBar, slider, image, list, splitPane. Returns { widgetIds: AbjectId[] } in same order as specs.',
                 parameters: [
                   { name: 'specs', type: { kind: 'array', elementType: { kind: 'reference', reference: 'WidgetSpec' } }, description: 'Array of widget creation specs. Each spec needs at minimum: { type, windowId }. Additional props depend on type (e.g. text, style, placeholder, checked, options, tabs, etc.)' },
                 ],
@@ -1617,6 +1618,7 @@ await this.call(this.dep('WidgetManager'), 'destroyWindowAbject', { windowId: wi
 ### Widget Types (used as \`type\` in create() specs)
 
 label - Static text display. Fires 'click' on mousedown (register via addDependent to receive). Param: href — when set, renders as a clickable link (underlined, link color) that opens in the user's browser. Style: { wordWrap: true } for multi-line text. Style: { selectable: true } to allow users to click-drag, double-click, Shift+click, Ctrl+A, and Ctrl+C to select and copy text (read-only). Style: { markdown: true, wordWrap: true } for rich text rendering (bold, italic, inline code, clickable links, headings, bullet lists, code blocks, blockquotes, and block-level images via ![alt](url) — url may be http(s) or a data:image/* base64 URI; add a |WxH hint inside alt like ![chart|480x240](url) so layout knows the size before the image loads).
+markdown - Rich markdown display (a label preconfigured for markdown + wordWrap, so you don't need the style flags). Renders bold, italic, inline code, headings, bullet/numbered lists, links, blockquotes, code blocks, and inline images (![alt](url) where url is a data:image/* base64 URI, an abject:// reference, or http(s); add a |WxH hint in alt like ![chart|480x240](url)). Param: text — the markdown source. Style: { selectable: true } for read-only select/copy; { fontSize, color }. Update content with this.call(id, 'update', { text: '...' }). Use this for any text that may contain markdown or images; for markdown drawn directly onto a canvas (e.g. graph nodes), use the canvas 'markdown' draw command instead.
 button - Clickable button (listen for 'changed' with aspect 'click'). Param: href — when set, clicking also opens the URL in the user's browser. Keyboard: Enter/Space when focused.
 textInput - Single-line text input (aspects: 'change', 'submit')
 textArea - Multi-line text area (params: monospace?)
@@ -2531,6 +2533,10 @@ await this.call(timerId, 'addDependent', {});
         return this.createTypedWidget(spec.windowId, new LabelWidget({
           type: 'label', rect, text: spec.text, style: spec.style, ...base,
         }), rect);
+      case 'markdown':
+        return this.createTypedWidget(spec.windowId, new MarkdownWidget({
+          type: 'markdown', rect, text: spec.text, style: spec.style, ...base,
+        }), rect);
       case 'button':
         return this.createTypedWidget(spec.windowId, new ButtonWidget({
           type: 'button', rect, text: spec.text, style: spec.style, ...base,
@@ -2742,6 +2748,9 @@ await this.call(timerId, 'addDependent', {});
     switch (config.type) {
       case 'label':
         widget = new LabelWidget(baseConfig);
+        break;
+      case 'markdown':
+        widget = new MarkdownWidget(baseConfig);
         break;
       case 'button':
         widget = new ButtonWidget(baseConfig);

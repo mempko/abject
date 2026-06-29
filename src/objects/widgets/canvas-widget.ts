@@ -16,6 +16,7 @@ import { event } from '../../core/message.js';
 import { WidgetAbject, WidgetConfig } from './widget-abject.js';
 import { parseMarkdown } from './markdown.js';
 import { layoutRichText } from './rich-text-layout.js';
+import { renderRichTextCommands } from './markdown-render.js';
 import {
   WidgetType,
   Rect,
@@ -454,38 +455,11 @@ A synthetic \`call(<canvasId>, 'input', { type: 'mousedown', x, y, button: 0 })\
       return fallback;
     }
 
-    const out: unknown[] = [];
-    const pad = 0;
-    for (const line of layout.lines) {
-      const lineTop = y + line.y;
-      const textY = lineTop + line.height * 0.7;
-
-      if (line.image) {
-        const drawUrl = this.imageResolver.drawableUrl(line.image.url);
-        if (drawUrl) {
-          out.push({ type: 'imageUrl', surfaceId, params: { x: x + pad + line.indent, y: lineTop, width: line.image.width, height: line.image.height, url: drawUrl } });
-        }
-        continue;
-      }
-      if (line.codeBackground) {
-        out.push({ type: 'rect', surfaceId, params: { x, y: lineTop, width: maxWidth, height: line.height, fill: this.theme.inputBg } });
-      }
-      if (line.quoteBorder) {
-        out.push({ type: 'line', surfaceId, params: { x1: x + 4, y1: lineTop, x2: x + 4, y2: lineTop + line.height, stroke: this.theme.accentSecondary, lineWidth: 2 } });
-      }
-      let runX = x + pad + line.indent;
-      for (const run of line.runs) {
-        if (run.text.length === 0) continue;
-        if (!line.codeBackground && line.blockType !== 'table' && run.fill === this.theme.accent && run.font.includes('Mono')) {
-          out.push({ type: 'rect', surfaceId, params: { x: runX - 2, y: lineTop + 1, width: run.width + 4, height: line.height - 2, fill: this.theme.inputBg, radius: 3 } });
-        }
-        out.push({ type: 'text', surfaceId, params: { x: runX, y: textY, text: run.text, font: run.font, fill: run.fill, baseline: 'alphabetic' } });
-        if (run.href) {
-          out.push({ type: 'line', surfaceId, params: { x1: runX, y1: textY + 2, x2: runX + run.width, y2: textY + 2, stroke: run.fill, lineWidth: 1 } });
-        }
-        runX += run.width;
-      }
-    }
+    const out = await renderRichTextCommands(layout, {
+      surfaceId, ox: x, oy: y, width: maxWidth, height: this.rect.height,
+      theme: this.theme, drawableUrl: (u) => this.imageResolver.drawableUrl(u),
+      textPadding: 0,
+    });
 
     this.mdCache.set(key, out);
     return out;
