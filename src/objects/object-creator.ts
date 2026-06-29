@@ -399,7 +399,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
   /** Valid action verbs this loop dispatches, for unknown-action recovery. */
   private static readonly VALID_ACTIONS = [
-    'call', 'draft_manifest', 'draft_source', 'draft_diff', 'load_target', 'draft_via_llm',
+    'call', 'draft_manifest', 'draft_source', 'draft_diff', 'read_draft',
+    'replace_handler', 'add_handler', 'remove_handler', 'load_target', 'draft_via_llm',
     'compile', 'validate_calls', 'review_semantics', 'deploy_spawn', 'deploy_update',
     'reply', 'ask_user', 'done', 'fail',
   ];
@@ -461,7 +462,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   private async opDraftDiff(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
     const blocksText = this.actionField(action, ['blocks', 'diff', 'search_replace', 'searchReplace', 'patch', 'edits']) as string | undefined;
     if (typeof blocksText !== 'string' || blocksText.length === 0) {
-      return { ok: false, summary: 'draft_diff: missing blocks', error: 'blocks must be a non-empty string of SEARCH/REPLACE blocks, passed as the `blocks` field. Format: <<<<<<< SEARCH\\n...\\n=======\\n...\\n>>>>>>> REPLACE. For a full rewrite use draft_source instead.' };
+      return { ok: false, summary: 'draft_diff: missing blocks', error: 'blocks must be a non-empty string of SEARCH/REPLACE blocks, passed as the `blocks` field. Format: <<<<<<< SEARCH\\n...\\n=======\\n...\\n>>>>>>> REPLACE. For editing one method, prefer replace_handler({name, body}) — name-addressed, no SEARCH text to match. To rewrite the whole object use draft_source.' };
     }
     const base = state.draftSource ?? state.targetSource;
     if (!base) {
@@ -498,7 +499,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       return {
         ok: false,
         summary: `draft_diff: ${result.applied}/${parsed.blocks.length} applied, ${result.errors.length} failed`,
-        error: `Some SEARCH/REPLACE blocks could not be applied:\n${errorLines}${parseNote}\n\nFix the failing blocks and call draft_diff again with a fresh blocks payload. If a block stays hard to match, fall back to draft_source with the full corrected source.`,
+        error: `Some SEARCH/REPLACE blocks could not be applied:\n${errorLines}${parseNote}\n\nFix the failing blocks and call draft_diff again. If the edit is one method, the robust path is read_draft({handler:"<name>"}) to see its exact current text, then replace_handler({name:"<name>", body:"<full method>"}) — no SEARCH matching. For a whole-object rewrite use draft_source.`,
       };
     }
 
@@ -509,6 +510,225 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       ok: true,
       summary: `draft_diff: ${parsed.blocks.length} block${parsed.blocks.length === 1 ? '' : 's'} applied${stackedNote}, source now ${result.source!.split('\n').length} lines${parseNote}`,
     };
+  }
+
+  // ── Structure-aware editing of the staged handler-map object literal ──────
+  //
+  // Generated objects are a single `({ name(msg){...}, _helper(){...}, prop: v })`
+  // literal, so the natural — and whitespace-proof — edit unit is a top-level
+  // member addressed by NAME. These ops parse that literal and replace / add /
+  // remove one member, avoiding the SEARCH-text matching that makes draft_diff
+  // fragile on large files. read_draft lets the agent edit against ground truth
+  // (the current stage) instead of reconstructing it from memory.
+
+  /** Index of the `}` matching the `{` at openIndex. String/comment aware. -1 if none. */
+  private matchBrace(source: string, openIndex: number): number {
+    let depth = 0;
+    let inStr: string | null = null;
+    let lc = false;
+    let bc = false;
+    for (let i = openIndex; i < source.length; i++) {
+      const c = source[i];
+      const prev = source[i - 1];
+      if (lc) { if (c === '\n') lc = false; continue; }
+      if (bc) { if (prev === '*' && c === '/') bc = false; continue; }
+      if (inStr) { if (c === inStr && prev !== '\\') inStr = null; continue; }
+      if (c === '/' && source[i + 1] === '/') { lc = true; continue; }
+      if (c === '/' && source[i + 1] === '*') { bc = true; continue; }
+      if (c === '"' || c === "'" || c === '`') { inStr = c; continue; }
+      if (c === '{') depth++;
+      else if (c === '}') { depth--; if (depth === 0) return i; }
+    }
+    return -1;
+  }
+
+  /** Extract the key name from a member's source text (handles method shorthand and key: value). */
+  private memberName(memberText: string): string {
+    const m = memberText.match(/^(?:async\s+|get\s+|set\s+|\*\s*)*(?:(['"])([^'"]+)\1|([A-Za-z0-9_$]+))/);
+    return m ? (m[2] ?? m[3] ?? '') : '';
+  }
+
+  /**
+   * Parse top-level members of the `({ ... })` handler map. Returns the object
+   * literal's brace span plus each member's name and [start, end) text span
+   * (excluding separating commas/whitespace). String/template/comment aware.
+   * Returns null when the outer literal can't be located.
+   */
+  private parseHandlerMembers(source: string): {
+    objStart: number; objEnd: number;
+    members: Array<{ name: string; start: number; end: number }>;
+  } | null {
+    const objStart = source.indexOf('{');
+    if (objStart < 0) return null;
+    const objEnd = this.matchBrace(source, objStart);
+    if (objEnd < 0) return null;
+
+    const members: Array<{ name: string; start: number; end: number }> = [];
+    let depth = 0;
+    let inStr: string | null = null;
+    let lc = false;
+    let bc = false;
+    let memberStart = -1;
+
+    const record = (end: number): void => {
+      if (memberStart < 0) return;
+      let s = memberStart;
+      while (s < end && /\s/.test(source[s])) s++;
+      let e = end;
+      while (e > s && /\s/.test(source[e - 1])) e--;
+      if (e > s) members.push({ name: this.memberName(source.slice(s, e)), start: s, end: e });
+      memberStart = -1;
+    };
+
+    for (let i = objStart + 1; i < objEnd; i++) {
+      const c = source[i];
+      const prev = source[i - 1];
+      if (lc) { if (c === '\n') lc = false; continue; }
+      if (bc) { if (prev === '*' && c === '/') bc = false; continue; }
+      if (inStr) { if (c === inStr && prev !== '\\') inStr = null; continue; }
+      if (c === '/' && source[i + 1] === '/') { lc = true; continue; }
+      if (c === '/' && source[i + 1] === '*') { bc = true; continue; }
+      if (c === '"' || c === "'" || c === '`') { if (depth === 0 && memberStart < 0) memberStart = i; inStr = c; continue; }
+      if (c === '{' || c === '(' || c === '[') { if (depth === 0 && memberStart < 0) memberStart = i; depth++; continue; }
+      if (c === '}' || c === ')' || c === ']') { depth--; continue; }
+      if (depth === 0 && c === ',') { record(i); continue; }
+      if (depth === 0 && memberStart < 0 && !/\s/.test(c)) memberStart = i;
+    }
+    record(objEnd);
+    return { objStart, objEnd, members };
+  }
+
+  private opReadDraft(state: LoopState, action: AgentAction): { ok: boolean; summary: string; error?: string; data?: unknown } {
+    const base = state.draftSource ?? state.targetSource;
+    if (!base) {
+      return { ok: false, summary: 'read_draft: nothing staged', error: 'No staged or target source yet. Use draft_source for a new object, or load_target to adopt an existing one.' };
+    }
+    const numbered = (text: string, startLine = 1): string =>
+      text.split('\n').map((l, i) => `${startLine + i}\t${l}`).join('\n');
+
+    const handler = this.actionField(action, ['handler', 'name', 'method']) as string | undefined;
+    const grep = this.actionField(action, ['grep', 'search', 'pattern']) as string | undefined;
+    const lineRange = this.actionField(action, ['lineRange', 'lines', 'range']);
+
+    if (handler) {
+      const parsed = this.parseHandlerMembers(base);
+      const m = parsed?.members.find(x => x.name === handler);
+      if (!m) {
+        return { ok: false, summary: `read_draft: no handler "${handler}"`, error: `No top-level member named "${handler}". Available: ${parsed ? parsed.members.map(x => x.name).join(', ') : '(could not parse object literal)'}.` };
+      }
+      const startLine = base.slice(0, m.start).split('\n').length;
+      return { ok: true, summary: `read_draft: ${handler}`, data: numbered(base.slice(m.start, m.end), startLine) };
+    }
+
+    if (lineRange) {
+      let a = 0;
+      let b = 0;
+      if (typeof lineRange === 'string') {
+        const mm = lineRange.match(/(\d+)\s*-\s*(\d+)/);
+        if (mm) { a = parseInt(mm[1], 10); b = parseInt(mm[2], 10); }
+      } else if (lineRange && typeof lineRange === 'object') {
+        const lr = lineRange as { start?: number; end?: number };
+        a = lr.start ?? 0; b = lr.end ?? 0;
+      }
+      if (a > 0 && b >= a) {
+        const lines = base.split('\n').slice(a - 1, b);
+        return { ok: true, summary: `read_draft: lines ${a}-${b}`, data: numbered(lines.join('\n'), a) };
+      }
+      return { ok: false, summary: 'read_draft: bad lineRange', error: 'lineRange must be "start-end" or { start, end } with start>=1.' };
+    }
+
+    if (grep) {
+      let re: RegExp;
+      try { re = new RegExp(grep, 'i'); } catch { return { ok: false, summary: 'read_draft: bad grep', error: `Invalid grep pattern: ${grep}` }; }
+      const hits = base.split('\n')
+        .map((l, i) => ({ n: i + 1, l }))
+        .filter(x => re.test(x.l))
+        .slice(0, 60)
+        .map(x => `${x.n}\t${x.l}`)
+        .join('\n');
+      return { ok: true, summary: `read_draft: grep "${grep}"`, data: hits || '(no matches)' };
+    }
+
+    // Default: a compact outline (member names + line ranges) so the agent can
+    // navigate without pulling the whole file into context, then read one member.
+    const parsed = this.parseHandlerMembers(base);
+    const total = base.split('\n').length;
+    if (!parsed || parsed.members.length === 0) {
+      return { ok: true, summary: `read_draft: ${total} lines`, data: numbered(base) };
+    }
+    const outline = parsed.members.map(m => {
+      const sl = base.slice(0, m.start).split('\n').length;
+      const el = base.slice(0, m.end).split('\n').length;
+      return `  ${m.name}  (lines ${sl}-${el}, ${el - sl + 1} ln)`;
+    }).join('\n');
+    return {
+      ok: true,
+      summary: `read_draft: outline (${parsed.members.length} members, ${total} lines)`,
+      data: `Staged source: ${total} lines, ${parsed.members.length} top-level members. Read one with read_draft({handler:"name"}), or read_draft({lineRange:"a-b"}) / read_draft({grep:"..."}).\n${outline}`,
+    };
+  }
+
+  private opReplaceHandler(state: LoopState, action: AgentAction): { ok: boolean; summary: string; error?: string } {
+    const base = state.draftSource ?? state.targetSource;
+    if (!base) return { ok: false, summary: 'replace_handler: no source', error: 'Nothing staged. Use draft_source for a new object, or load_target to adopt an existing one.' };
+    const name = this.actionField(action, ['name', 'handler', 'method']) as string | undefined;
+    const body = this.actionField(action, ['body', 'source', 'member', 'text', 'code']) as string | undefined;
+    if (!name) return { ok: false, summary: 'replace_handler: missing name', error: 'replace_handler requires {name} — the existing member to replace.' };
+    if (typeof body !== 'string' || !body.trim()) return { ok: false, summary: 'replace_handler: missing body', error: 'replace_handler requires {body} — the FULL member text including its signature, e.g. "openMap(msg) { ... }".' };
+    const parsed = this.parseHandlerMembers(base);
+    if (!parsed) return { ok: false, summary: 'replace_handler: unparseable', error: 'Could not locate the handler-map object literal. Use draft_diff or draft_source instead.' };
+    const m = parsed.members.find(x => x.name === name);
+    if (!m) return { ok: false, summary: `replace_handler: no "${name}"`, error: `No top-level member named "${name}". Available: ${parsed.members.map(x => x.name).join(', ')}. To add a new member use add_handler.` };
+    const next = base.slice(0, m.start) + body.trim() + base.slice(m.end);
+    state.draftSource = next;
+    return { ok: true, summary: `replace_handler: "${name}" replaced, source now ${next.split('\n').length} lines. Run compile next.` };
+  }
+
+  private opAddHandler(state: LoopState, action: AgentAction): { ok: boolean; summary: string; error?: string } {
+    const base = state.draftSource ?? state.targetSource;
+    if (!base) return { ok: false, summary: 'add_handler: no source', error: 'Nothing staged. Use draft_source for a new object, or load_target to adopt an existing one.' };
+    const name = this.actionField(action, ['name', 'handler', 'method']) as string | undefined;
+    const body = this.actionField(action, ['body', 'source', 'member', 'text', 'code']) as string | undefined;
+    if (!name) return { ok: false, summary: 'add_handler: missing name', error: 'add_handler requires {name}.' };
+    if (typeof body !== 'string' || !body.trim()) return { ok: false, summary: 'add_handler: missing body', error: 'add_handler requires {body} — the full member text, e.g. "myMethod(msg) { ... }".' };
+    const parsed = this.parseHandlerMembers(base);
+    if (!parsed) return { ok: false, summary: 'add_handler: unparseable', error: 'Could not locate the handler-map object literal. Use draft_diff or draft_source instead.' };
+    if (parsed.members.some(x => x.name === name)) {
+      return { ok: false, summary: `add_handler: "${name}" exists`, error: `A member named "${name}" already exists — use replace_handler to change it.` };
+    }
+    let j = parsed.objEnd - 1;
+    while (j > parsed.objStart && /\s/.test(base[j])) j--;
+    const needsComma = base[j] !== ',' && base[j] !== '{';
+    const insertion = (needsComma ? ',' : '') + '\n\n  ' + body.trim() + '\n';
+    const next = base.slice(0, parsed.objEnd) + insertion + base.slice(parsed.objEnd);
+    state.draftSource = next;
+    return { ok: true, summary: `add_handler: "${name}" added, source now ${next.split('\n').length} lines. Run compile next.` };
+  }
+
+  private opRemoveHandler(state: LoopState, action: AgentAction): { ok: boolean; summary: string; error?: string } {
+    const base = state.draftSource ?? state.targetSource;
+    if (!base) return { ok: false, summary: 'remove_handler: no source', error: 'Nothing staged. Use draft_source or load_target first.' };
+    const name = this.actionField(action, ['name', 'handler', 'method']) as string | undefined;
+    if (!name) return { ok: false, summary: 'remove_handler: missing name', error: 'remove_handler requires {name}.' };
+    const parsed = this.parseHandlerMembers(base);
+    if (!parsed) return { ok: false, summary: 'remove_handler: unparseable', error: 'Could not locate the handler-map object literal. Use draft_diff or draft_source instead.' };
+    const m = parsed.members.find(x => x.name === name);
+    if (!m) return { ok: false, summary: `remove_handler: no "${name}"`, error: `No top-level member named "${name}". Available: ${parsed.members.map(x => x.name).join(', ')}.` };
+    let s = m.start;
+    let e = m.end;
+    // Absorb one trailing comma, or (for the last member) the preceding comma.
+    let k = e;
+    while (k < parsed.objEnd && /\s/.test(base[k])) k++;
+    if (base[k] === ',') {
+      e = k + 1;
+    } else {
+      let p = s - 1;
+      while (p > parsed.objStart && /\s/.test(base[p])) p--;
+      if (base[p] === ',') s = p;
+    }
+    const next = base.slice(0, s) + base.slice(e);
+    state.draftSource = next;
+    return { ok: true, summary: `remove_handler: "${name}" removed, source now ${next.split('\n').length} lines. Run compile next.` };
   }
 
   /**
@@ -1729,6 +1949,18 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         case 'draft_diff':
           res = await this.opDraftDiff(state, action);
           break;
+        case 'read_draft':
+          res = this.opReadDraft(state, action);
+          break;
+        case 'replace_handler':
+          res = this.opReplaceHandler(state, action);
+          break;
+        case 'add_handler':
+          res = this.opAddHandler(state, action);
+          break;
+        case 'remove_handler':
+          res = this.opRemoveHandler(state, action);
+          break;
         case 'load_target':
           res = await this.opLoadTarget(state, action);
           break;
@@ -1938,10 +2170,10 @@ Emit EXACTLY ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothi
 
 ## Local operations (no message target)
 
-- \`load_target({objectId?, targetName?})\` — adopt an EXISTING object as this loop's modify target: resolves the name/UUID, loads its current source into loop state, and switches the loop to a modify. Use this when the loop started without a target (kind \`create\`) but you discovered — via \`call("Registry", "ask"/"discover", …)\` or \`describe\` — that the goal is really about an object that already exists (e.g. "fix the GraphViewer window" → GraphViewer is already registered). After \`load_target\`, edit with \`draft_diff\` and ship with \`deploy_update\` (no need to repeat the id). For a genuinely new object, skip this and use \`draft_source\` instead.
+- \`load_target({objectId?, targetName?})\` — adopt an EXISTING object as this loop's modify target: resolves the name/UUID, loads its current source into loop state, and switches the loop to a modify. Use this when the loop started without a target (kind \`create\`) but you discovered — via \`call("Registry", "ask"/"discover", …)\` or \`describe\` — that the goal is really about an object that already exists (e.g. "fix the GraphViewer window" → GraphViewer is already registered). After \`load_target\`, inspect with \`read_draft\`, edit with \`replace_handler\` / \`add_handler\` / \`remove_handler\` (or \`draft_diff\` for sub-method edits), then ship with \`deploy_update\` (no need to repeat the id). For a genuinely new object, skip this and use \`draft_source\` instead.
 - \`draft_manifest({manifest, usedObjects?})\` — stage a manifest you've authored. Used before \`deploy_spawn\`. Include an \`icon\` (a single emoji that fits the object, e.g. 🌤 / 📝 / 🎮) — it appears next to the object's name in launchers.
 - \`draft_source({source})\` — stage handler-map source you've authored. The format is a single parenthesized object literal: \`({ method(msg) { ... } })\`. Use this for new objects (create flow).
-- \`draft_diff({blocks})\` — apply SEARCH/REPLACE blocks to the existing source. **Strongly prefer this for any modification of an existing object** — it lets you edit a few lines without re-emitting the whole file. Each block:
+- \`draft_diff({blocks})\` — apply SEARCH/REPLACE blocks to the existing source. Good for small edits that span or sit inside members; for replacing a whole method prefer \`replace_handler\` (no SEARCH matching). Either way you edit without re-emitting the whole file. Each block:
 
   \`\`\`
   <<<<<<< SEARCH
@@ -1952,6 +2184,10 @@ Emit EXACTLY ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothi
   \`\`\`
 
   Multiple blocks may appear in one \`blocks\` payload and are applied in order. SEARCH must match a UNIQUE location in the current source — include 2–3 lines of surrounding context if a snippet would otherwise match in more than one place. Whitespace is forgiven (line-trimmed match), but matching the indentation exactly is safer. Successive \`draft_diff\` calls stack on the prior result, so you can layer fixes. To insert new code, use a SEARCH that matches a nearby anchor and include both the anchor and your insertion in REPLACE.
+- \`read_draft({handler? , lineRange?, grep?})\` — read the CURRENT staged source so you edit against ground truth instead of memory. No args → a compact outline (each top-level member with its line range). \`{handler:"name"}\` → that member's exact current text (line-numbered). \`{lineRange:"a-b"}\` → those lines. \`{grep:"pattern"}\` → matching lines. Editing nothing, read-only. **Read before you edit** a large object — it prevents the SEARCH-mismatch and "wrong remembered text" failures.
+- \`replace_handler({name, body})\` — replace the ENTIRE top-level member named \`name\` (a method or property of the \`({ … })\` literal) with \`body\` (the full member text, including its signature, e.g. \`"openMap(msg) { … }"\`). Located by name via the object literal's structure — no SEARCH text, whitespace-proof, unaffected by file size. **This is the preferred way to modify one method**; reach for it before \`draft_diff\`. Run \`compile\` after.
+- \`add_handler({name, body})\` — insert a NEW top-level member (full member text). Errors if \`name\` already exists (use replace_handler then). Run \`compile\` after.
+- \`remove_handler({name})\` — delete the top-level member named \`name\` (and its separating comma). Run \`compile\` after.
 - \`draft_via_llm({kind: "manifest" | "source", instructions})\` — ask an LLM to draft for you. It sees current loop state. Use when authoring a brand-new manifest or source from scratch is too large for one think-step. Do NOT use this for modifications of existing objects — use \`draft_diff\` instead, since the LLM consistently truncates "preserve everything else" rewrites.
 - \`compile()\` — run a syntax check on the staged source. Fails fast on parse errors.
 - \`validate_calls()\` — static check: every \`this.call(x, "method", …)\` site is checked against the live manifest of the target dep. Run AFTER compile.
