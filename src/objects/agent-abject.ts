@@ -1738,6 +1738,11 @@ The registered object must implement these handlers to participate in the agent 
     const name = String(a.action ?? 'unknown');
     const target = String(a.target ?? a.targetName ?? a.objectId ?? a.assignedAgentName ?? '');
     const method = String(a.method ?? a.kind ?? '');
+    // Subject distinguishes actions that operate on a named member/slice (e.g.
+    // read_draft / replace_handler / add_handler) so editing several different
+    // handlers in a row isn't mistaken for repeating one — a real loop repeats
+    // the SAME subject and still collapses to one signature.
+    const subject = String(a.handler ?? a.name ?? a.lineRange ?? a.grep ?? a.key ?? '');
     let outcome: string;
     if (task.lastResult?.success) {
       outcome = 'ok';
@@ -1747,7 +1752,7 @@ The registered object must implement these handlers to participate in the agent 
         .replace(/\d+/g, '<n>')
         .slice(0, 80);
     }
-    return `${name}:${target}:${method}:${outcome}`;
+    return `${name}:${target}:${method}:${subject}:${outcome}`;
   }
 
   /**
