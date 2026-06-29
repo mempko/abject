@@ -466,8 +466,16 @@ export class ScriptableAbject extends Abject {
    * User code cannot override these; they are silently skipped during compile.
    * ObjectCreator imports this set to exclude them from verification and LLM prompts.
    */
+  // NOTE: windowCloseRequested is deliberately NOT protected. It is the one
+  // window-lifecycle callback user objects are meant to handle (e.g. a
+  // multi-window object closing only the window whose X was clicked). The bus
+  // keeps one handler per method, and installDefaultCloseHandler() already
+  // installs a default (→ hide()) ONLY when the object defines no override. If
+  // it were protected, the user's handler would be silently dropped and the
+  // default would fire for every window the object owns — closing the wrong
+  // window (e.g. a manager's main window when an editor's X is clicked).
   static readonly PROTECTED_HANDLERS = new Set([
-    'getSource', 'getData', 'updateSource', 'probe', 'windowCloseRequested',
+    'getSource', 'getData', 'updateSource', 'probe',
     'describe', 'ask', 'getRegistry',
     'ping', 'addDependent', 'removeDependent',
   ]);
