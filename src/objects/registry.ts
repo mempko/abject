@@ -171,7 +171,12 @@ export class Registry extends Abject {
             events: [
               {
                 name: 'objectRegistered',
-                description: 'Emitted when an Abject is registered',
+                description: 'Emitted when a NEW Abject is registered (first time). Lists that track which objects exist should rebuild on this.',
+                payload: { kind: 'reference', reference: 'ObjectRegistration' },
+              },
+              {
+                name: 'objectUpdated',
+                description: 'Emitted when an ALREADY-registered Abject re-registers (data save, source hot-swap, status refresh). Identity/name are unchanged, so presence-only lists should ignore this; subscribe only if you display live per-object detail.',
                 payload: { kind: 'reference', reference: 'ObjectRegistration' },
               },
               {
@@ -434,13 +439,17 @@ Each line shows one registered object: id, name, description, and non-meta metho
       );
     }
 
-    // Auto-generate unique name
+    // Re-registration of an already-known objectId (a ScriptableAbject saving
+    // its data, a source hot-swap, or a status refresh) must reuse the existing
+    // name. Minting a fresh makeUniqueName() on every save leaked "-N" suffixes
+    // (e.g. MindmapManager-735 after 735 keystroke-saves) and re-indexed for no
+    // reason.
+    const existing = this.objects.get(objectId);
     const baseName = name ?? manifest.name;
-    const uniqueName = this.makeUniqueName(baseName);
+    const uniqueName = existing ? existing.name : this.makeUniqueName(baseName);
 
     // Preserve existing data if caller didn't pass any (re-registration after
     // a Status update shouldn't wipe internal data carried by ScriptableAbjects).
-    const existing = this.objects.get(objectId);
     const finalData = data !== undefined ? data : existing?.data;
 
     const registration: ObjectRegistration = {
@@ -492,8 +501,13 @@ Each line shows one registered object: id, name, description, and non-meta metho
     }
     this.byName.get(uniqueName)!.add(objectId);
 
-    // Notify subscribers
-    this.notifySubscribers('objectRegistered', registration);
+    // Notify subscribers. A genuinely NEW object fires objectRegistered so
+    // abjects lists (AppExplorer, Taskbar, …) add it. A re-registration of an
+    // existing object fires the quieter objectUpdated, so those lists do NOT
+    // rebuild on every data save — that spurious rebuild made the abjects
+    // sidebar flicker on each keystroke while editing. Subscribers that only
+    // track presence ignore objectUpdated; those that want live updates opt in.
+    this.notifySubscribers(existing ? 'objectUpdated' : 'objectRegistered', registration);
 
     this.checkInvariants();
     return true;
