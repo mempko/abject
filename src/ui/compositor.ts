@@ -872,6 +872,24 @@ export class Compositor {
     }
   }
 
+  /** Resolve `$token` colors in a draw command's params against the active theme. */
+  private resolveCommandColors(command: DrawCommand): void {
+    const p = command.params as Record<string, unknown> | undefined;
+    if (!p) return;
+    const tok = (v: unknown): unknown =>
+      (typeof v === 'string' && v.charCodeAt(0) === 36 /* $ */) ? resolveSceneColor(v, this.sceneTheme) : v;
+    if (p.fill !== undefined) p.fill = tok(p.fill);
+    if (p.stroke !== undefined) p.stroke = tok(p.stroke);
+    if (p.color !== undefined) p.color = tok(p.color);
+    if (p.shadowColor !== undefined) p.shadowColor = tok(p.shadowColor);
+    if (p.value !== undefined) p.value = tok(p.value); // fillStyle/strokeStyle/shadowColor property-commands
+    if (Array.isArray(p.stops)) {
+      for (const s of p.stops as Array<Record<string, unknown>>) {
+        if (s && s.color !== undefined) s.color = tok(s.color);
+      }
+    }
+  }
+
   /**
    * Execute a draw command on a surface.
    */
@@ -880,6 +898,13 @@ export class Compositor {
     if (!surface) {
       return;
     }
+
+    // Resolve `$token` theme colors in any color-bearing param against the
+    // active palette, so canvas draw commands can use $accent / $textPrimary /
+    // $windowBg etc. and stay cohesive with the desktop theme — the 2D
+    // equivalent of the scene's $token material colors. Non-$ strings and
+    // gradient descriptor objects pass through untouched.
+    this.resolveCommandColors(command);
 
     const ctx = surface.ctx;
 

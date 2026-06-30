@@ -1351,6 +1351,35 @@ the chart or visualization panel. A dashboard whose surrounding UI is widgets an
 analytics panel is a canvas chart is the ideal shape (see "Canvas with Toolbar" below for how
 to add a canvas to a layout).
 
+### Designing apps that look good (read this before drawing)
+
+A working app and a beautiful app differ in craft, not effort. Aim for "looks designed", not
+"looks like a debug view". Principles, in priority order:
+
+1. **Use ONE cohesive palette — derive it from the active theme.** Do NOT pick a different color
+   per element. Canvas draw colors accept theme tokens directly: \`fill: '$accent'\`,
+   \`'$accentSecondary'\`, \`'$accentTertiary'\`, \`'$windowBg'\`, \`'$canvasBg'\`, \`'$windowBorder'\`,
+   \`'$textPrimary'\`, \`'$textSecondary'\`, \`'$shadowColor'\` — they resolve to the user's theme and
+   keep your app cohesive with the desktop. For a fuller palette or computed shades, fetch it once:
+   \`const theme = await this.call(this.dep('WidgetManager'), 'getActiveTheme', {})\` and read
+   \`theme.tokens\`. Reach for hand-picked hex ONLY when the app deliberately wants its own identity
+   (a game, a themed presentation) — and even then design a small, consistent palette (bg, surface,
+   text, muted-text, accent, success, error), not ad-hoc colors.
+2. **Create depth — avoid flat fills.** Back the window with a subtle vertical gradient
+   (\`linearGradient\`) or layered panels rather than one solid color; use rgba/alpha for soft
+   overlays, glows, and muted secondary text. Group related content into cards: a panel rect with a
+   slightly lifted background, rounded corners, and a faint border or shadow.
+3. **Typography hierarchy.** Give titles, body, and captions distinct sizes AND weights (e.g. bold
+   22–34px title, 14–16px body, 11–12px muted caption). Pick a font that fits the app's character
+   and use it consistently. Don't render everything at one size/weight.
+4. **Spacing & alignment.** Consistent padding, generous whitespace, and a clear grid. Align edges;
+   give interactive targets room. Rounded corners (a consistent radius) on cards/buttons.
+5. **Accent with purpose.** The accent color marks the primary action / current selection /
+   highlight — used sparingly. Use semantic colors (success green, error red) only for state.
+6. **Polish.** Show hover/pressed states on interactive elements; a touch of subtle animation
+   (driven by a Timer tick) brings a UI alive. Define your palette and a few small reusable draw
+   helpers (e.g. a text helper, a card helper) up front so styling stays uniform across the app.
+
 ### Quick Reference
 
 All operations use this.call(). There are no shorthand methods.
@@ -1370,6 +1399,10 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           Commands run in order against a stateful context, so path building works as in a browser.
           rect: {x, y, width, height, fill?, stroke?, radius?}   text: {x, y, text, fill?, font?, align?}
           line: {x1, y1, x2, y2, stroke?, lineWidth?}            circle: {cx, cy, radius, fill?, stroke?}
+          Any fill/stroke/color accepts a '#hex'/'rgb(a)' value OR a theme token: '$accent',
+          '$accentSecondary', '$accentTertiary', '$windowBg', '$canvasBg', '$windowBorder',
+          '$textPrimary', '$textSecondary', '$shadowColor' — tokens resolve to the active theme so
+          your canvas stays cohesive with the desktop. Prefer tokens over hardcoded hex.
           markdown: {x, y, text, maxWidth?, fontSize?, fill?, maxImageHeight?} — render a markdown block
           (bold, italic, inline code, headings, bullet/numbered lists, links, blockquotes, code blocks, and
           inline images via ![alt](url) where url is a data:image/* URI, an abject:// ref, or http(s)) onto
