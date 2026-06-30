@@ -201,7 +201,7 @@ export class CanvasWidget extends WidgetAbject {
           events: [
             {
               name: 'input',
-              description: 'Raw mouse/keyboard input forwarded to inputTargetId. Payload fields are on msg.payload: { type: "mousedown"|"mousemove"|"mouseup"|"mouseleave"|"keydown"|"wheel"|"canvasResize", x?: number, y?: number, button?: number, code?: string, key?: string, modifiers?: object, width?: number, height?: number }. The same shape is used by both real compositor events and synthetic call(target, "input", payload) calls.',
+              description: 'Raw mouse/keyboard input forwarded to inputTargetId. Payload fields are on msg.payload: { type: "mousedown"|"mousemove"|"mouseup"|"mouseleave"|"keydown"|"wheel"|"canvasResize"|"paste", x?: number, y?: number, button?: number, code?: string, key?: string, modifiers?: object, width?: number, height?: number, pasteText?: string, image?: string }. A real clipboard paste while this canvas is focused arrives as { type: "paste" } with pasteText (text paste) and/or image (a data:image/* URI when an image was pasted/dropped) — read msg.payload.image to accept a pasted image; do NOT rely on the Clipboard object to read a real OS paste. The same shape is used by both real compositor events and synthetic call(target, "input", payload) calls.',
               payload: { kind: 'object', properties: {
                 type: { kind: 'primitive', primitive: 'string' },
                 x: { kind: 'primitive', primitive: 'number' },
@@ -349,6 +349,21 @@ A synthetic \`call(<canvasId>, 'input', { type: 'mousedown', x, y, button: 0 })\
 
     this.on('getCanvasSize', async () => {
       return { width: this.rect.width, height: this.rect.height };
+    });
+
+    // An image pasted or dropped while this canvas is the focused widget is
+    // delivered here by the window (toFocusedWidget). The canvas has no UI of
+    // its own, so forward it to the input target as a `paste` input event
+    // carrying the image as a data: URI — the same channel mouse/keyboard input
+    // uses. Canvas apps read `msg.payload.image` in their input('paste')
+    // handler. Without this, pasted images dead-end at the canvas (text inputs
+    // get this for free; the canvas did not).
+    this.on('fileUploaded', async (msg: AbjectMessage) => {
+      const { name, mimeType, base64 } = msg.payload as { name?: string; mimeType?: string; base64?: string };
+      if (!base64 || !(mimeType ?? '').startsWith('image/')) return true;
+      const image = `data:${mimeType};base64,${base64}`;
+      this.send(event(this.id, this.inputTargetId, 'input', { type: 'paste', image, name: name ?? 'image', mimeType }));
+      return true;
     });
   }
 
