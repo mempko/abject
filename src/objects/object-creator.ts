@@ -161,7 +161,7 @@ export class ObjectCreator extends Abject {
         name: 'ObjectCreator',
         description:
           'Creates new Abjects and modifies existing ones through a ReAct loop over message passing. ' +
-          'Investigates targets and dependencies via the universal ask protocol and describe introspection, drafts code, validates drafts against live manifests, deploys, and verifies behavior. ' +
+          'Learns how to use targets and dependencies primarily through the universal ask protocol (prose usage, examples, design guidance), drafts code, validates drafts against live manifests, deploys, and verifies behavior. ' +
           'Handles any task about building, authoring, fixing, changing, updating, modifying, redesigning, or improving an Abject — including bridges, proxies, relays, wrappers, adapters, and integrations. ' +
           'Diagnostic questions about an object terminate with a written report instead of a modification.',
         version: '2.0.0',
@@ -2162,8 +2162,8 @@ Emit EXACTLY ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothi
 
 Investigation:
 - Discover: \`call("Registry", "ask", {question: "which object handles X?"})\`
-- Inspect: \`call("<Name>", "describe", {})\` — returns the manifest.
-- Learn: \`call("<Name>", "ask", {question: "how do I call Y?"})\` — returns prose usage.
+- Learn how to use it (PRIMARY): \`call("<Name>", "ask", {question: "how do I call Y? how do I build a good Z? how do I make it look good?"})\` — returns prose usage, examples, and design guidance. This is how you understand an object.
+- Reflect (raw, rarely needed): \`call("<Name>", "describe", {})\` — the structured manifest only; it does not teach usage, and asking a dependency already fetches its manifest for validation, so you seldom need this.
 - Read source: \`call("Registry", "getSource", {objectId: "<id>"})\`
 - Read state: \`call("<Name>", "getState", {})\`
 - Read logs: \`call("Console", "getObjectLogs", {objectId: "<id-or-name>", count: 20})\`
@@ -2203,7 +2203,7 @@ this.changed('completed', { resultCount });
 # Discipline
 
 1. **Ask before guessing.** When you don't know whether an object exists, what its API is, what its state means, or what method to call — \`ask\`. The Registry, the target object, or any candidate dep will answer.
-2. **Investigate before drafting.** For modifications: \`describe\` the target, \`ask\` it any open questions, \`getSource\` to see its current code, \`getState\` if relevant. For creations: \`ask\` the Registry for what's available, \`describe\` likely deps, \`ask\` each chosen dep for usage examples. Only draft when the call surface is known.
+2. **Investigate before drafting — \`ask\` is how you learn to use an object.** \`ask\` returns prose usage: examples, patterns, design guidance, the right way to call something. \`describe\` is programmatic reflection (the raw manifest) — it lists method names/params but does NOT teach usage, so it is rarely what you want, and you almost never need to call it yourself: asking a dependency automatically fetches its manifest for call-validation. So: for CREATIONS, \`ask\` the Registry what's available, then \`ask\` each chosen dependency open questions — "how do I use you?", "how do I build a good X?", "how do I make this look good?" — and only \`draft\` once you understand the surface. For MODIFICATIONS, \`ask\` the target your open questions, \`getSource\` to read its current code, \`getState\` if relevant. Prefer \`ask\` over \`describe\` everywhere; reach for \`describe\` only when you specifically need the raw structured manifest.
 3. **Validate before deploying.** After any \`draft_source\`, \`draft_diff\`, or \`draft_via_llm\`: always \`compile\`; then \`validate_calls\`; for non-trivial logic also \`review_semantics\`. Deploy only when compile is clean and validators agree.
 4. **Verify behavior after deploying — really test what the user asked for.** After deploy, you must exercise the specific behavior the user requested, not just check that the object exists. \`call show\` and reading \`getState\` are not enough by themselves.
 
