@@ -24,6 +24,7 @@ import { request, event } from '../core/message.js';
 import { IntrospectResult } from '../core/introspect.js';
 import { ScriptableAbject } from './scriptable-abject.js';
 import { systemMessage, userMessage, LLMMessage } from '../llm/provider.js';
+import type { ContentPart } from '../llm/provider.js';
 import type { AgentAction } from './agent-abject.js';
 import { Log } from '../core/timed-log.js';
 import { applyDiff, parseSearchReplaceBlocks, levenshtein } from './source-diff.js';
@@ -121,6 +122,13 @@ interface LoopState {
   terminal?: { kind: 'done' | 'fail'; result?: unknown; error?: string };
   spawnedObjectId?: AbjectId;
   deployedViaUpdateSource?: boolean;
+  /**
+   * Snapshot of `draftSource` as it was at the last successful deploy
+   * (deploy_spawn / deploy_update). When `draftSource` differs from this, the
+   * live object is running stale code — the observation flags it and the loop
+   * is told not to finish until it is deployed. Compiling is not deploying.
+   */
+  lastDeployedSource?: string;
 }
 
 /** Per-task bookkeeping: the caller's message to deferred-reply to, plus loop state. */
@@ -133,6 +141,13 @@ interface TaskExtra {
   goalId?: string;
   deferredMsg?: AbjectMessage;
   state: LoopState;
+  /**
+   * Multimodal content (an image part) staged by the previous `act` to ride
+   * into the NEXT observation — e.g. a screenshot captured via
+   * Screenshot.captureWindow, so the agent can visually inspect what it
+   * rendered. Consumed (and cleared) by handleObserve.
+   */
+  lastLlmContent?: ContentPart[];
 }
 
 /**
@@ -1108,6 +1123,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       ).catch(err => log.warn('deploy_spawn: AbjectStore.save failed:', err instanceof Error ? err.message : String(err)));
     }
 
+    state.lastDeployedSource = state.draftSource;
+
     return {
       ok: true,
       summary: `deploy_spawn: ${state.draftManifest.name} spawned as ${result.objectId.slice(0, 8)}`,
@@ -1242,6 +1259,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
 
     state.deployedViaUpdateSource = true;
+    state.lastDeployedSource = state.draftSource;
     state.targetObjectId = targetId; // Stamp so finalizeLoop emits objectModified correctly.
     if (targetLabel && !state.targetName) state.targetName = targetLabel;
 
@@ -1505,6 +1523,29 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       summary: summary ?? `call ${target}.${method}: ok`,
       data: response,
     };
+  }
+
+  /**
+   * When a `call` returns image bytes — the shape Screenshot.captureWindow /
+   * captureDesktop reply with ({ imageBase64, width, height }) — feed the
+   * actual pixels to the NEXT think as an image part so the agent can SEE what
+   * it rendered, and scrub the base64 out of the textual action result so a
+   * ~50KB blob never bloats the transcript. The agent verifies layout, color,
+   * spacing, and polish visually instead of guessing from getState numbers.
+   */
+  private captureVisionFromCall(
+    extra: TaskExtra,
+    action: AgentAction,
+    res: { ok: boolean; summary: string; data?: unknown; error?: string },
+  ): void {
+    if (!res.ok || !res.data || typeof res.data !== 'object') return;
+    const img = res.data as { imageBase64?: string; width?: number; height?: number };
+    if (typeof img.imageBase64 !== 'string' || img.imageBase64.length === 0) return;
+
+    const dims = `${img.width ?? '?'}x${img.height ?? '?'}`;
+    extra.lastLlmContent = [{ type: 'image', mediaType: 'image/png', data: img.imageBase64 }];
+    res.data = `Screenshot captured (${dims}). The rendered image is attached to the next observation — inspect it visually: judge centering, alignment, spacing, color cohesion, typographic hierarchy, and overall polish against the goal, and note any specific element that looks off so you can fix it.`;
+    res.summary = `call ${action.target}.${action.method}: screenshot ${dims} (attached for visual review)`;
   }
 
   /**
@@ -1869,7 +1910,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
   // ── Observe / Act ─────────────────────────────────────────────────────
 
-  private async handleObserve(taskId: string): Promise<{ observation: string; tier: string }> {
+  private async handleObserve(taskId: string): Promise<{ observation: string; tier: string; llmContent?: ContentPart[] }> {
     // Look up by AgentAbject-assigned ticketId; AgentAbject calls back with the
     // taskId we sent on startTask, so look for an entry whose state matches.
     // Since we keyed by ticketId, find by taskId-in-context: AgentAbject passes
@@ -1879,7 +1920,21 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       return { observation: 'No active task. Reply with done({result: "no task"}).', tier: 'smart' };
     }
     extra.state.turn += 1;
-    return { observation: this.renderObservation(extra.state), tier: this.chooseObserveTier(extra.state) };
+    const observation = this.renderObservation(extra.state);
+
+    // A screenshot staged by the previous act rides in as an image part, and
+    // judging a rendered image is a reasoning step — force the smart tier so
+    // the visual critique isn't done on a cheaper model.
+    if (extra.lastLlmContent) {
+      const llmContent: ContentPart[] = [
+        { type: 'text', text: observation },
+        ...extra.lastLlmContent,
+      ];
+      extra.lastLlmContent = undefined;
+      return { observation, tier: 'smart', llmContent };
+    }
+
+    return { observation, tier: this.chooseObserveTier(extra.state) };
   }
 
   /**
@@ -1921,6 +1976,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       switch (action.action) {
         case 'call':
           res = await this.opCall(state, action);
+          this.captureVisionFromCall(extra, action, res);
           break;
         case 'draft_manifest':
           res = await this.opDraftManifest(state, action);
@@ -2052,8 +2108,23 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     lines.push('DRAFTS');
     lines.push(`  manifest: ${state.draftManifest ? state.draftManifest.name : '(not drafted)'}`);
-    lines.push(`  source:   ${state.draftSource ? `${state.draftSource.split('\n').length} lines` : '(not drafted)'}`);
+    const hasUndeployed = !!state.draftSource && state.draftSource !== state.lastDeployedSource;
+    const deployState = !state.draftSource
+      ? '(not drafted)'
+      : hasUndeployed
+        ? `${state.draftSource.split('\n').length} lines — ⚠️ NOT YET DEPLOYED (live object still runs old code)`
+        : `${state.draftSource.split('\n').length} lines — deployed (live)`;
+    lines.push(`  source:   ${deployState}`);
     lines.push('');
+
+    if (hasUndeployed) {
+      const deployVerb = state.kind === 'create' && !state.spawnedObjectId ? 'deploy_spawn' : 'deploy_update';
+      lines.push('⚠️ UNDEPLOYED EDITS — your staged source differs from what is live. Compiling is NOT deploying.');
+      lines.push(`   Run ${deployVerb} to make these edits live before you finish. Do NOT call done with an undeployed draft —`);
+      lines.push('   the loop would report success while the user still sees the old object.');
+      lines.push('   If your edit touched show() / createCanvas / widget wiring, also hide() then show() the target after deploy so the new wiring takes effect.');
+      lines.push('');
+    }
 
     if (state.lastValidation) {
       lines.push('LAST VALIDATION');
@@ -2247,6 +2318,10 @@ this.changed('completed', { resultCount });
 
    "I called \`getState\` and the numbers look fine" is NOT verification. \`done\` only after at least one synthetic exercise of each user-requested behavior produced the expected change.
 
+   **See what you built — visual work needs a visual check.** \`getState\` proves logic; it says nothing about whether the thing looks right. For ANY object with a window, canvas, or drawn UI — and ALWAYS when the goal mentions look, layout, alignment, spacing, color, "beautiful", "polished", or a redesign — capture a screenshot and inspect it before finishing: \`call("Screenshot", "captureWindow", { objectId: "<the object's id>" })\`. The rendered image is attached to your next observation; judge it against the goal — centering, alignment, spacing (no accidental empty voids), color cohesion, typographic hierarchy, legibility of every state (e.g. used/disabled vs active), and overall polish. If anything looks off, edit, redeploy, and screenshot again. Do NOT declare a visual goal done on the strength of \`getState\` alone — Round-after-round rework happens precisely when an agent reports "looks beautiful" without ever looking. (Make sure the window is actually shown first; capture returns null if there is no visible window.)
+
+   **Verify once, don't grind.** Each behavior needs ONE representative check, not a sweep. A single correct guess and a single wrong guess prove the guess handler; you do not need to play the whole game. Repeating the same \`call\` (e.g. guessing letter after letter, or polling \`getState\` over and over) burns steps and triggers loop-steering without adding confidence. Drive each distinct behavior once, take one screenshot for the visual, then \`done\`.
+
    **A timeout is a routing/await bug, not a deadlock.** If \`show\`, a window build, or any call times out, the cause is almost always a recipient addressed by a bare name instead of a resolved AbjectId (resolve via \`this.dep(name)\` first), or a result that was never awaited — NOT the act of awaiting inside a handler, which is correct and supported. Do not "fix" a timeout by detaching the build into a fire-and-forget chain; fix the recipient or the missing await. When verifying a window opened, drive \`show\` with a short timeout and then poll \`getState\` for the window/canvas ids, rather than sitting on a long blocking call.
 
    **Clean up probe artifacts before finishing.** Anything you create purely to explore or verify — probe windows, scratch widgets, throwaway objects — must be destroyed once it has served its purpose (e.g. \`destroyWindowAbject\` for a window you opened to test rendering). The user's desktop should end the loop containing only what they asked for.
@@ -2264,14 +2339,15 @@ this.changed('completed', { resultCount });
 
    When a single object holds both kinds of data — for example, a notes app that holds the notes themselves AND a private API key for an external service — split them: notes go in \`this.data.notes\` (cloneable), API key goes in Storage (not cloneable).
 8. **User credentials are explicit consent.** When the user shares a username, password, API key, bearer token, or other secret in the task and asks you to wire it into an object, embed it in the source. This runtime is the user's own local system; persisted source lives in their \`.abjects\` directory on their own disk and never leaves it. Don't refuse on "plaintext credentials" grounds, don't lecture about secret stores, and don't substitute placeholders that block the integration. Wire the actual value through. If they ever swap to a secrets backend later, that's a separate refactor — not your call here.
-9. **Terminate crisply.** \`done\` carries either a spawned object id, a modified object id, or a written report. \`fail\` carries a precise reason — what couldn't be done, what was tried, what's available instead.
+9. **Deploy before done — compiling is not deploying.** A clean \`compile\` only proves the draft parses; it does NOT change the live object. The single most common silent failure is finishing a task whose best edits were compiled but never deployed — the loop reports success while the user still sees the old object, forcing them to ask again. Before \`done\`, your staged source MUST be live: the observation's DRAFTS line reads "deployed (live)" when it is, or flags "⚠️ NOT YET DEPLOYED" when it isn't. If it is flagged, run \`deploy_update\` (or \`deploy_spawn\` for a new object) — and, if the edit touched \`show()\`/\`createCanvas\`/widget wiring, \`hide()\` then \`show()\` the target — and then re-verify. Never end a multi-task goal by leaving the next task to deploy your work; ship what you edited.
+10. **Terminate crisply.** \`done\` carries either a spawned object id, a modified object id, or a written report — and only after your edits are deployed and verified (functionally, and visually for UI). \`fail\` carries a precise reason — what couldn't be done, what was tried, what's available instead.
 
 # What's in your observation
 
 The TASK section gives the kind, target (if any), and goal.
 The KNOWN OBJECTS section is everything you have learned via \`describe\` / \`ask\` so far. Method names listed there are the only valid names — copy them verbatim.
 The TARGET SOURCE section (modify loops only) shows the current code of the object being edited, preloaded from the Registry. Author SEARCH/REPLACE blocks against the exact text shown here.
-The DRAFTS section shows what manifest / source you have staged.
+The DRAFTS section shows what manifest / source you have staged, and whether that source is deployed (live) or has undeployed edits.
 The LAST VALIDATION section shows the most recent compile / validate_calls / review_semantics result.
 The RECENT TURNS section is your action log so you remember what you have already done.
 
