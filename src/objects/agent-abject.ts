@@ -1944,6 +1944,20 @@ The registered object must implement these handlers to participate in the agent 
   // Think (LLM conversation management)
   // ═══════════════════════════════════════════════════════════════════
 
+  /**
+   * Resolve the model tier for the thinking (JSON-action-decision) step from
+   * the agent's last observe hint. The decision step never drops to 'fast':
+   * haiku unreliably emits the action envelope under load, so the floor is
+   * 'balanced'. An agent opts a routine state down to 'balanced' by returning
+   * tier:'balanced' (or 'fast') from agentObserve; any other hint — including
+   * none — keeps the default 'smart'. This is how per-state tiering reaches the
+   * OTA loop: cheap mechanical/verification steps run on balanced, hard ones
+   * (drafting code, diagnosing errors, planning) stay on smart.
+   */
+  private resolveThinkTier(hint?: string): 'smart' | 'balanced' {
+    return (hint === 'balanced' || hint === 'fast') ? 'balanced' : 'smart';
+  }
+
   private async think(entry: TaskEntry): Promise<AgentAction> {
     const task = entry.state;
 
@@ -1969,10 +1983,12 @@ The registered object must implement these handlers to participate in the agent 
       llmResult = await this.request<{ content: string; stopReason?: string }>(
         request(this.id, this.llmId, 'stream', {
           messages: task.llmMessages,
-          // Thinking is the JSON-action-decision step. Pin it to 'smart' so the
-          // model reliably emits the envelope instead of prose. The observe
-          // tier hint only applies to observation LLM calls, not thinking.
-          options: { tier: 'smart', maxTokens: 16384, cacheKey: entry.state.id },
+          // Thinking is the JSON-action-decision step. Tier comes from the
+          // agent's per-state observe hint, floored at 'balanced' (never 'fast'
+          // — haiku drops the action envelope under load). Routine/verification
+          // states run on balanced; hard states (code gen, error recovery,
+          // planning) stay on smart. Agents that send no hint stay on smart.
+          options: { tier: this.resolveThinkTier(entry.observeTier), maxTokens: 16384, cacheKey: entry.state.id },
         }),
         120000,
       );

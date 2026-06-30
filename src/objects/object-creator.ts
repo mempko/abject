@@ -1879,7 +1879,33 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       return { observation: 'No active task. Reply with done({result: "no task"}).', tier: 'smart' };
     }
     extra.state.turn += 1;
-    return { observation: this.renderObservation(extra.state), tier: 'smart' };
+    return { observation: this.renderObservation(extra.state), tier: this.chooseObserveTier(extra.state) };
+  }
+
+  /**
+   * Per-state model tier for the next think decision. Mechanical, error-free
+   * progress — compiling, validating, deploying, and verifying a healthy
+   * object — decides its (trivial) next step on 'balanced'. Anything that needs
+   * real reasoning stays on 'smart': the initial architecture, any code-
+   * producing step (draft_source / draft_diff / replace_/add_/remove_handler),
+   * error diagnosis, or a verification call that surfaced a problem. The OTA
+   * loop floors thinking at balanced, so 'fast' is never used here.
+   */
+  private chooseObserveTier(state: LoopState): 'smart' | 'balanced' {
+    const log = state.turnLog ?? [];
+    const last = log[log.length - 1];
+    if (!last || !last.ok) return 'smart'; // first step, or last action failed → reason / recover
+    const ROUTINE = new Set([
+      'compile', 'validate_calls', 'deploy_spawn', 'deploy_update',
+      'call', 'read_draft', 'getState', 'ask', 'discover', 'load_target',
+    ]);
+    if (!ROUTINE.has(last.action)) return 'smart'; // code generation / design step
+    // A "successful" verification call can still surface a runtime problem —
+    // that needs reasoning even though the action itself succeeded.
+    if (/\b(error|exception|fail|threw|cannot read|undefined|not found|not registered)\b/i.test(last.summary)) {
+      return 'smart';
+    }
+    return 'balanced';
   }
 
   private async handleAct(taskId: string, action: AgentAction, _callerId: AbjectId): Promise<{ success: boolean; data?: unknown; error?: string }> {

@@ -860,9 +860,12 @@ Set keepPageOpen: false to explicitly close the page when done.
 
       const refCount = (snapshot.match(/\[ref=e\d+\]/g) || []).length;
 
-      // Pick LLM tier based on page complexity
+      // Pick LLM tier for the think decision by page complexity. The hint is
+      // now honored by the OTA loop (floored at balanced), so a simple page
+      // decides on 'balanced' and a complex one keeps 'smart' — no regression
+      // on hard navigation, savings on easy pages.
       const tier = (refCount <= WebAgent.FAST_TIER_REF_THRESHOLD && snapshot.length <= WebAgent.FAST_TIER_CHAR_THRESHOLD)
-        ? 'fast' : 'balanced';
+        ? 'balanced' : 'smart';
       log.info(`Observe: URL=${url} | ${refCount} elements (ARIA snapshot, ${snapshot.length} chars) tier=${tier}`);
 
       // Truncate very large snapshots to stay within token budget
