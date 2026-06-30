@@ -264,7 +264,7 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'createCanvas',
-                description: 'Create a canvas drawing widget inside a window. Returns the canvas widget AbjectId. Draw to it via this.call(canvasId, "draw", { commands: [...] }). Get size via this.call(canvasId, "getCanvasSize", {}). The canvas forwards mouse/keyboard input from the compositor to inputTargetId via an `input` event whose fields land on msg.payload — same shape as a synthetic call(canvasId, "input", payload).',
+                description: 'Create a canvas drawing widget inside a window. Returns the canvas widget AbjectId. Draw to it via this.call(canvasId, "draw", { commands: [...] }). Get size via this.call(canvasId, "getCanvasSize", {}). The canvas forwards mouse/keyboard input from the compositor to inputTargetId via an `input` event whose fields land on msg.payload — same shape as a synthetic call(canvasId, "input", payload). STYLING: draw fill/stroke colors accept theme tokens — "$accent", "$accentSecondary", "$windowBg", "$canvasBg", "$windowBorder", "$textPrimary", "$textSecondary", "$shadowColor" — which resolve to the user\'s desktop theme. Prefer these over hardcoded hex so the app looks cohesive; ask WidgetManager "how do I make this look good?" for the full design guide (palette, depth, typography, spacing, polish) before drawing.',
                 parameters: [
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
                   { name: 'inputTargetId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId that receives `input` events for this canvas. Defaults to msg.routing.from (the object that sent createCanvas). Always pass `inputTargetId: this.id` explicitly from a ScriptableAbject — the default works in simple cases but breaks any time createCanvas is called by a helper or proxy on the user object\'s behalf.', optional: true },
@@ -1362,9 +1362,11 @@ A working app and a beautiful app differ in craft, not effort. Aim for "looks de
    \`'$textPrimary'\`, \`'$textSecondary'\`, \`'$shadowColor'\` — they resolve to the user's theme and
    keep your app cohesive with the desktop. For a fuller palette or computed shades, fetch it once:
    \`const theme = await this.call(this.dep('WidgetManager'), 'getActiveTheme', {})\` and read
-   \`theme.tokens\`. Reach for hand-picked hex ONLY when the app deliberately wants its own identity
-   (a game, a themed presentation) — and even then design a small, consistent palette (bg, surface,
-   text, muted-text, accent, success, error), not ad-hoc colors.
+   \`theme.tokens\`. **Chrome always uses theme tokens** — text, buttons, panels, on-screen keys,
+   borders, backgrounds: these should be \`$accent\`/\`$textPrimary\`/\`$windowBg\` etc. so the app sits
+   in the user's desktop, not a foreign color scheme. Reach for hand-picked hex ONLY for genuine
+   *illustration/content* the theme can't express (a game's character art, a chart's data series, a
+   themed scene) — and even there design a small, consistent palette, never ad-hoc per-element colors.
 2. **Create depth — avoid flat fills.** Back the window with a subtle vertical gradient
    (\`linearGradient\`) or layered panels rather than one solid color; use rgba/alpha for soft
    overlays, glows, and muted secondary text. Group related content into cards: a panel rect with a

@@ -1304,6 +1304,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       'When a dependency\'s usage guide documents a higher-level building block that fits the need, compose it rather than re-implementing equivalent behavior from low-level primitives. Reuse the building blocks; drop to primitives only for what the building blocks do not cover.',
       'Prefer composing high-level building blocks over hand-writing equivalents — e.g. render markdown with a markdown-capable label/widget rather than writing your own parser and text-layout engine on a canvas. This keeps the object small and the formatting correct.',
       'Keep each object focused. When a single object would grow very large (many hundreds of lines) or bundles a reusable sub-capability (a parser, a layout engine, a data store), split that capability into its own Abject and call it. Smaller, composed objects are easier to verify and keep the build loop fast (a huge source blows the context budget and makes the loop lose track of what it already tried).',
+      'Make UI look designed, not like a debug view. Before drawing a window/canvas UI, ask the rendering object (the window/canvas factory) "how do I make this look good?" to get its design guide, and use theme colors so the app is cohesive with the user\'s desktop — for canvas draws this means theme tokens like fill: "$accent" / "$textPrimary" / "$windowBg" rather than hardcoded hex. Reserve hand-picked colors for genuine illustration the theme can\'t express.',
     ].join('\n');
   }
 
