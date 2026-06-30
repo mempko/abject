@@ -160,15 +160,22 @@ export class ScrollableVBoxLayout extends VBoxLayout {
     const bg = this.buildBackgroundCommand(surfaceId, ox, oy);
     if (bg) commands.push(bg);
 
-    // Clip to content area
+    // Clip to content area. Only the VERTICAL extent must be tight — that is
+    // what hides scrolled-away rows. Horizontally nothing scrolls, so clipping
+    // children to exactly their own width would shave the left/right edge of a
+    // full-width row's border and rounded corners (the active-item highlight in
+    // the sidebar). Bleed the horizontal clip a few px into the surrounding
+    // margin gutter so those borders render in full; children are still laid
+    // out within the content rect, so this never lets content spill visibly.
+    const xBleed = 4;
     commands.push({ type: 'save', surfaceId, params: {} });
     commands.push({
       type: 'clip',
       surfaceId,
       params: {
-        x: ox + cr.x,
+        x: ox + cr.x - xBleed,
         y: oy + cr.y,
-        width: cr.width,
+        width: cr.width + xBleed * 2,
         height: cr.height,
       },
     });

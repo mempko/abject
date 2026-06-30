@@ -2257,11 +2257,18 @@ await this.call(timerId, 'addDependent', {});
    */
   private normalizeWindowRect(rect: SizeInput | undefined): { x: number; y: number; width: number; height: number } {
     const c = coerceRect(rect); // resolves w/h or width/height
+    // The clamp guards against the *invisible* window — a caller that gave no
+    // size (or zero, the old w/h-unresolved bug) gets a usable default. But an
+    // explicit small positive size is intentional (e.g. the 56px compact dock
+    // rail), so respect it; only enforce a tiny visible floor so nothing can be
+    // created effectively invisible. Don't bump small-but-deliberate widths up
+    // to the full default.
+    const MIN_VISIBLE = 24;
     return {
       x: Number.isFinite(rect?.x) ? c.x : 80,
       y: Number.isFinite(rect?.y) ? c.y : 60,
-      width: c.width >= 80 ? c.width : 480,
-      height: c.height >= 80 ? c.height : 360,
+      width: c.width > 0 ? Math.max(c.width, MIN_VISIBLE) : 480,
+      height: c.height > 0 ? Math.max(c.height, MIN_VISIBLE) : 360,
     };
   }
 

@@ -59,6 +59,7 @@ export class Taskbar extends Abject {
 
   // Debounce timer for registry events
   private updateTimer?: ReturnType<typeof setTimeout>;
+  private openStateTimer?: ReturnType<typeof setTimeout>;
 
   constructor() {
     super({
@@ -225,6 +226,11 @@ can restore windows from the sidebar.
 
     this.on('objectRegistered', async () => this.scheduleRebuild());
     this.on('objectUnregistered', async () => this.scheduleRebuild());
+
+    // WidgetManager broadcasts these (with the owning app's id) whenever any
+    // window opens or closes — the authoritative signal for the open highlight.
+    this.on('windowCreated', async () => this.scheduleOpenStateRefresh());
+    this.on('windowDestroyed', async () => this.scheduleOpenStateRefresh());
   }
 
   // ---- Show / Hide / Rebuild ----
@@ -243,6 +249,7 @@ can restore windows from the sidebar.
   }
 
   async hide(): Promise<boolean> {
+    if (this.openStateTimer) { clearTimeout(this.openStateTimer); this.openStateTimer = undefined; }
     if (this.sectionLayoutId) {
       // Best-effort: the sidebar may already have destroyed the section.
       try {
@@ -489,23 +496,50 @@ can restore windows from the sidebar.
       this.send(request(this.id, depId, 'addDependent', {}));
     }
 
-    // Fire-and-forget: query visibility and update button styles asynchronously.
+    // Subscribe to WidgetManager so a window opening or closing — for ANY app,
+    // system browser or user-authored scriptable alike — updates the open
+    // highlight. This is the single authoritative source; scriptable apps don't
+    // reliably emit visibility or return it from getState, and window-level
+    // visibility events carry the window's id, not the owning app's.
+    if (this.widgetManagerId) {
+      this.send(request(this.id, this.widgetManagerId, 'addDependent', {}));
+    }
+
+    // Fire-and-forget: derive the open highlight from live window ownership.
     // This doesn't block rendering; buttons appear immediately, styles follow.
-    void this.refreshButtonStyles();
+    void this.refreshOpenStates();
   }
 
-  private async refreshButtonStyles(): Promise<void> {
+  /**
+   * Set every button's active highlight from the set of currently-open windows
+   * and their owners (WidgetManager.listWindows). An app is "open" exactly when
+   * it owns at least one live window — uniform for system browsers and
+   * user-authored scriptable apps, and self-correcting (closed apps go
+   * inactive), so click-away and close are reflected and every open app shows.
+   */
+  private async refreshOpenStates(): Promise<void> {
+    if (!this.windowId) return;
+    const owners = new Set<AbjectId>();
+    if (this.widgetManagerId) {
+      try {
+        const windows = await this.request<Array<{ ownerId?: AbjectId }>>(
+          request(this.id, this.widgetManagerId, 'listWindows', {}), 2000
+        );
+        for (const w of windows ?? []) if (w?.ownerId) owners.add(w.ownerId);
+      } catch { /* WidgetManager unavailable */ }
+    }
     const allButtons = [...this.systemButtons, ...this.userObjButtons];
     for (const [, targetId] of allButtons) {
-      try {
-        const state = await this.request<{ visible?: boolean }>(
-          request(this.id, targetId, 'getState', {}), 2000
-        );
-        if (state?.visible) {
-          await this.updateButtonStyle(targetId, true);
-        }
-      } catch { /* object unavailable */ }
+      await this.updateButtonStyle(targetId, owners.has(targetId));
     }
+  }
+
+  private scheduleOpenStateRefresh(): void {
+    if (this.openStateTimer) return;
+    this.openStateTimer = setTimeout(() => {
+      this.openStateTimer = undefined;
+      void this.refreshOpenStates();
+    }, 80);
   }
 
   // ---- Helpers ----
