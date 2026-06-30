@@ -1599,6 +1599,17 @@ For MARKDOWN or other rich text, prefer a \`label\` widget with style { markdown
 (headings, bold, code, lists, links, block images render for free) over hand-writing a parser and
 text-layout engine on a canvas — that keeps your object small and the formatting correct.
 
+### Structure: Model-View (Smalltalk sense)
+
+Keep the domain and the display apart. The MODEL is \`this.data\` (the document, i.e. what the app IS) plus
+pure helpers that hold the rules (validate, compute, apply a change); it never draws. The VIEW is your
+render method (\`_draw\`) which displays the model AND your input handlers which handle interaction with it:
+the view both shows and controls interaction. On input, apply a model helper to \`this.data\`, then redraw.
+Hold window/canvas/layout ids and other transient view state in \`this._\` fields, never in \`this.data\`.
+A controller only appears when one model has more than one view/mode (it picks which view to show); it is
+not the input path. Guard public handlers with \`this.ensure(cond, msg)\` and re-check object invariants
+with \`this.invariant(cond, msg)\` after each mutation.
+
 ### Closing and reopening a window — reset ALL window-scoped ids together
 
 When a window closes (the user clicks X, or you call destroyWindowAbject), the window AND every

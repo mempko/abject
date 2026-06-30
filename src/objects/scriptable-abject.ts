@@ -483,7 +483,7 @@ export class ScriptableAbject extends Abject {
   /** Keys on the this-proxy that must not be overwritten by user handler code. */
   private static readonly PROXY_BUILTINS = new Set([
     'call', 'dep', 'find', 'changed', 'emit', 'observe', 'id',
-    'data', 'saveData',
+    'data', 'saveData', 'ensure', 'invariant',
   ]);
 
   /**
@@ -532,6 +532,18 @@ export class ScriptableAbject extends Abject {
 
     const saveDataFn = async (): Promise<void> => self.saveData();
 
+    // Design-by-Contract helpers for handler code. The sandbox forbids the
+    // `require(` token, so preconditions and postconditions both use `ensure`;
+    // `invariant` is for object-state invariants (call from _checkInvariants()
+    // after a mutation). Both throw a clear ContractViolation when the
+    // condition is false, surfacing in the caller's reply / the object logs.
+    const ensureFn = (cond: unknown, message?: string): void => {
+      if (!cond) throw new Error(`ContractViolation (ensure): ${message ?? 'condition failed'}`);
+    };
+    const invariantFn = (cond: unknown, message?: string): void => {
+      if (!cond) throw new Error(`ContractViolation (invariant): ${message ?? 'invariant failed'}`);
+    };
+
     const proxy: Record<string, unknown> = {
       call: callFn,
       dep: depFn,
@@ -540,6 +552,8 @@ export class ScriptableAbject extends Abject {
       emit: emitFn,
       observe: observeFn,
       saveData: saveDataFn,
+      ensure: ensureFn,
+      invariant: invariantFn,
     };
     // `id` must read live from the Abject so handler code that captures
     // `this.id` (e.g. `inputTargetId: this.id` on createCanvas) sees the

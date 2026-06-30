@@ -1307,6 +1307,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       'Each method has { name, description, parameters: [{ name, type: { kind: "primitive"|"reference"|"array"|"object", … }, description, optional? }], returns }.',
       'Set `icon` to a single emoji that best represents the object, shown next to its name in launchers (e.g. weather → 🌤, notes → 📝, a game → 🎮, a chart → 📊). Pick something distinctive and relevant.',
       'Use the provided usage guides verbatim — do not invent method names on dependencies.',
+      'Name interface methods for the user-facing use cases they perform (the DCI contexts) rather than generic CRUD. When the object is the model half of a Model-View split, keep its interface to domain operations and a getState/changed surface, with no window/show/draw methods on a model.',
     ].join('\n');
   }
 
@@ -1322,6 +1323,14 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       'When a dependency\'s usage guide documents a higher-level building block that fits the need, compose it rather than re-implementing equivalent behavior from low-level primitives. Reuse the building blocks; drop to primitives only for what the building blocks do not cover.',
       'Prefer composing high-level building blocks over hand-writing equivalents — e.g. render markdown with a markdown-capable label/widget rather than writing your own parser and text-layout engine on a canvas. This keeps the object small and the formatting correct.',
       'Keep each object focused. When a single object would grow very large (many hundreds of lines) or bundles a reusable sub-capability (a parser, a layout engine, a data store), split that capability into its own Abject and call it. Smaller, composed objects are easier to verify and keep the build loop fast (a huge source blows the context budget and makes the loop lose track of what it already tried).',
+      // Architecture for objects with a UI: Model-View (Smalltalk sense), DCI, Design by Contract.
+      'Structure any object that has a UI as Model and View, in the original Smalltalk sense.',
+      'MODEL: this.data holds the domain document (the plain data the object IS), and pure helper methods hold the domain rules (validate input, compute results, apply a change to this.data). The model never draws and never references a window, canvas, or widget. Keep transient/view state (window/canvas/layout ids, hover, scroll, cursor, drag, animation clocks) in this._ instance fields, out of this.data.',
+      'VIEW: one render method (e.g. _draw / _render) DISPLAYS the model, and the input/event handlers HANDLE the user\'s interaction with that display. In this sense the view both shows the model and handles interaction; input handling belongs to the view, not to a separate controller. On an interaction, apply the change through a model helper, then re-render. The view carries no domain rules of its own.',
+      'CONTROLLER (only when there is more than one view or mode): a controller selects the KIND of view of the model (which view/mode is shown, switching modes, coordinating multiple views over one model). It is NOT the input path; that is the view\'s job. A single-view object needs no controller, so do not invent one.',
+      'Keep the flow one-directional: interaction in the view leads to a model helper mutating this.data, then a re-display. For any other view or observer, the model announces a change with this.changed(aspect, value); the model never calls into a view.',
+      'DCI: name each user-facing use case as the handler that performs that scenario (the context), and express behavior as small role helpers (what the object DOES), while this.data stays plain data (what the object IS). Prefer scenario names over generic CRUD.',
+      'Design by Contract on every public handler: open with a precondition using this.ensure(condition, message) (the caller\'s obligation); guarantee a result with a postcondition this.ensure(...) before returning; keep object-state invariants in a _checkInvariants() helper that uses this.invariant(condition, message), and call _checkInvariants() after each mutation. this.ensure and this.invariant are provided and throw a clear ContractViolation when the condition is false. Use these, because the sandbox forbids the require() token.',
       'Make UI look designed, not like a debug view. Before drawing a window/canvas UI, ask the rendering object (the window/canvas factory) "how do I make this look good?" to get its design guide, and use theme colors so the app is cohesive with the user\'s desktop — for canvas draws this means theme tokens like fill: "$accent" / "$textPrimary" / "$windowBg" rather than hardcoded hex. Reserve hand-picked colors for genuine illustration the theme can\'t express.',
     ].join('\n');
   }
@@ -1330,6 +1339,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return [
       'You are a strict code reviewer for an Abject handler map. You receive: the new object\'s manifest, the drafted source, and for each known dependency its manifest methods + usage guide.',
       'Flag SEMANTIC issues that a static method-name check cannot catch: wrong payload shape, enum-like string values not listed in the usage guide (including MCP toolName values), missing await on consumed results, event handler name / payload shape mismatches, cached dep IDs in state.',
+      'For objects with a UI, also flag STRUCTURAL issues against Model-View (Smalltalk sense) plus Design by Contract: domain rules living in the render/view code instead of the model; the model drawing or referencing a window/canvas/widget; this.data holding transient view state (window/canvas/layout ids, hover, scroll, animation) that belongs in this._ fields; input handling pulled out of the view into a separate "controller" (in this architecture the view handles interaction, and a controller only selects the kind of view of the model); public handlers with no precondition this.ensure(...) check; mutations with no _checkInvariants() / this.invariant(...) follow-up. Note: a view that drives model changes from its input handlers is CORRECT, so do not flag that.',
       'Trust the usage guide. If a value is not listed there, it is wrong — regardless of how reasonable it looks.',
       'Guide precedence: the dependency that OWNS a call is authoritative for that call. A factory\'s guide also governs the objects it creates (e.g. a window/canvas id returned at runtime — methods documented in the factory\'s guide for those ids are valid). Catalog or registry summaries of OTHER objects are weaker evidence: a registry answer saying "no object has X" does not override a first-party guide that documents X on itself or on the objects it creates.',
       '',
@@ -2296,6 +2306,17 @@ this.changed('completed', { resultCount });
 \`this.changed\` broadcasts to every Abject that subscribed via \`await this.observe(targetId)\` (a thin helper that sends the universal \`addDependent\` protocol message — both forms are equivalent and you'll see either in existing source). Subscribers implement either \`changed(msg)\` (dispatch by \`msg.payload.aspect\`) or a method named after each aspect (\`progress(msg)\`, \`completed(msg)\`). Both delivery shapes carry the same value.
 
 \`this.emit(toId, eventName, payload)\` is a separate primitive: it sends a single event to one specific recipient whose id you already hold — the first argument is the recipient, the second is the event name. Choose \`this.changed\` for broadcasting to observers (the typical case); choose \`this.emit\` only when targeting a known recipient.
+
+# Architecture for objects with a UI
+
+Author UI objects as **Model-View in the original Smalltalk sense**, with **DCI** and **Design by Contract**:
+- **Model**: \`this.data\` is the domain document (plain data: what the object IS) and pure helper methods hold the domain rules. The model never draws and never touches a window/canvas/widget. Transient view state (window/canvas/layout ids, hover, scroll, animation) lives in \`this._\` fields, never in \`this.data\`.
+- **View**: one render method displays the model AND the input/event handlers handle the user's interaction with it. The view both shows and controls interaction; on an interaction it applies a model helper then re-renders. No domain rules in the view.
+- **Controller**: only when there is more than one view/mode. It selects the KIND of view of the model (which view, switching modes, coordinating views). It is NOT the input path. A single-view object needs no controller.
+- **DCI**: name handlers for the use case they perform (the context); express behavior as small role helpers; keep \`this.data\` dumb.
+- **Design by Contract**: \`this.ensure(cond, msg)\` for pre/postconditions on every public handler; \`this.invariant(cond, msg)\` inside a \`_checkInvariants()\` helper called after each mutation. Both are provided and throw on failure; the sandbox forbids \`require()\`.
+
+For a complex, stateful UI this Model-View split is often two cooperating Abjects (a model object plus a view object that observes it); for a small app it is two clearly separated sections of one handler map. The detailed drafting rules are applied when you draft source.
 
 # Discipline
 
