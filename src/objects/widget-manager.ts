@@ -133,7 +133,7 @@ export class WidgetManager extends Abject {
             methods: [
               {
                 name: 'createWindowAbject',
-                description: 'Create a window and return its AbjectId. Example: const winId = await this.call(this.dep("WidgetManager"), "createWindowAbject", { title: "My Window", rect: { x: 100, y: 100, width: 400, height: 300 }, resizable: true })',
+                description: 'Create a window and return its AbjectId. Example: const winId = await this.call(this.dep("WidgetManager"), "createWindowAbject", { title: "My Window", rect: { x: 100, y: 100, width: 400, height: 300 }, resizable: true }). The rect uses width/height (NOT the w/h that canvas draw commands use — though w/h is tolerated). A window with no/zero size is clamped to a visible minimum so it can never be created invisible.',
                 parameters: [
                   { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Window title' },
                   { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height } — position and size' },
@@ -496,7 +496,7 @@ export class WidgetManager extends Abject {
     this.on('createWindowAbject', async (msg: AbjectMessage) => {
       const { title, rect, zIndex, chromeless, transparent, resizable, draggable, closable } = msg.payload as {
         title: string;
-        rect: { x: number; y: number; width: number; height: number };
+        rect: { x: number; y: number; width?: number; height?: number; w?: number; h?: number };
         zIndex?: number;
         chromeless?: boolean;
         transparent?: boolean;
@@ -504,7 +504,7 @@ export class WidgetManager extends Abject {
         draggable?: boolean;
         closable?: boolean;
       };
-      return this.createWindowDirect(msg.routing.from, title, rect, { chromeless, transparent, resizable, draggable, zIndex, closable });
+      return this.createWindowDirect(msg.routing.from, title, this.normalizeWindowRect(rect), { chromeless, transparent, resizable, draggable, zIndex, closable });
     });
 
     // Direct factory: destroy window by AbjectId (not shim string)
@@ -2243,6 +2243,28 @@ await this.call(timerId, 'addDependent', {});
   }
 
   // ── Factory: createWindowDirect — returns AbjectId ──────────────────
+
+  /**
+   * Normalize a window rect from a caller. Accepts `w`/`h` as aliases for
+   * `width`/`height` (the canvas draw schema uses w/h, so generated code often
+   * carries that habit over to window rects), and enforces a sane minimum so a
+   * window is never created zero-size and invisible — the failure mode where a
+   * game "works" under programmatic verification but shows no window. Missing
+   * x/y default to a cascade-friendly origin.
+   */
+  private normalizeWindowRect(
+    rect: { x?: number; y?: number; width?: number; height?: number; w?: number; h?: number } | undefined,
+  ): { x: number; y: number; width: number; height: number } {
+    const r = rect ?? {};
+    const width = r.width ?? r.w ?? 0;
+    const height = r.height ?? r.h ?? 0;
+    return {
+      x: Number.isFinite(r.x) ? (r.x as number) : 80,
+      y: Number.isFinite(r.y) ? (r.y as number) : 60,
+      width: width >= 80 ? width : 480,
+      height: height >= 80 ? height : 360,
+    };
+  }
 
   private async createWindowDirect(
     owner: AbjectId,
