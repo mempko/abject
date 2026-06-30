@@ -237,6 +237,11 @@ export class Factory extends Abject {
     });
   }
 
+  // Spawn/clone/instantiate semantics agents use to create objects correctly.
+  protected override askTier(): 'smart' | 'balanced' | 'fast' {
+    return 'balanced';
+  }
+
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## Factory Usage Guide
 

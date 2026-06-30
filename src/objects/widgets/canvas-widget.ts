@@ -219,6 +219,11 @@ export class CanvasWidget extends WidgetAbject {
     this.setupCanvasHandlers();
   }
 
+  // Drawing API + theme-token guidance agents consult to render canvas UIs.
+  protected override askTier(): 'smart' | 'balanced' | 'fast' {
+    return 'balanced';
+  }
+
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## CanvasWidget — Draw Commands
 

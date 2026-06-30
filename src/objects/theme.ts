@@ -386,6 +386,11 @@ export class ThemeAbject extends Abject {
     }
   }
 
+  // Large theming/token reference consulted when styling apps to match the desktop.
+  protected override askTier(): 'smart' | 'balanced' | 'fast' {
+    return 'balanced';
+  }
+
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## Theme Usage Guide
 

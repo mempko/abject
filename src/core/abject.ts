@@ -502,13 +502,26 @@ You are this object. Your capabilities are exactly what the manifest above descr
   }
 
   /**
+   * Model tier for this object's `ask` answers. Default 'fast' (haiku) — right
+   * for the many objects with small, mechanical APIs where the answer is a
+   * straight reading of the manifest. Override to 'balanced' for objects whose
+   * ask guidance is rich and build-critical — the surfaces agents consult to
+   * BUILD and STYLE apps or DISCOVER capabilities (e.g. WidgetManager, Registry)
+   * — where a shallow haiku synthesis drops nuance and causes downstream
+   * mistakes. Reserve 'smart' for code generation, not Q&A.
+   */
+  protected askTier(): 'smart' | 'balanced' | 'fast' {
+    return 'fast';
+  }
+
+  /**
    * Handle an 'ask' request. Override for custom behavior (e.g., querying
    * Registry to discover which objects can help before answering).
-   * Default: build prompt via askPrompt(), send to LLM via askLlm().
+   * Default: build prompt via askPrompt(), send to LLM via askLlm() at askTier().
    */
   protected async handleAsk(question: string): Promise<string> {
     const prompt = this.askPrompt(question);
-    return this.askLlm(prompt, question);
+    return this.askLlm(prompt, question, this.askTier());
   }
 
   /**

@@ -1326,6 +1326,13 @@ export class WidgetManager extends Abject {
     } catch { /* logging should never break the caller */ }
   }
 
+  // The richest ask surface in the system — UI/canvas/layout/lifecycle/design
+  // guidance agents rely on to build and STYLE apps. Shallow answers here cause
+  // flat, broken UIs, so synthesize at balanced rather than fast.
+  protected override askTier(): 'smart' | 'balanced' | 'fast' {
+    return 'balanced';
+  }
+
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## WidgetManager Usage Guide
 

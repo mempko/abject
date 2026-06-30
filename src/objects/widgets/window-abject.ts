@@ -491,6 +491,11 @@ export class WindowAbject extends Abject {
     });
   }
 
+  // Window lifecycle/API (create, layout, close/reopen) agents build against.
+  protected override askTier(): 'smart' | 'balanced' | 'fast' {
+    return 'balanced';
+  }
+
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## WindowAbject Usage Guide
 

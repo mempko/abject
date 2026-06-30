@@ -1316,6 +1316,11 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     return content.trim();
   }
 
+  // LLM usage/tiers/streaming guidance agents consult when adding AI features.
+  protected override askTier(): 'smart' | 'balanced' | 'fast' {
+    return 'balanced';
+  }
+
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## LLM Usage Guide
 

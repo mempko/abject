@@ -271,8 +271,14 @@ Each line shows one registered object: id, name, description, and non-meta metho
     return super.askPrompt(_question) + '\n\n' + source;
   }
 
+  // Capability discovery/routing — agents lean on these answers to find the
+  // right object to call, so synthesize at balanced rather than fast.
+  protected override askTier(): 'smart' | 'balanced' | 'fast' {
+    return 'balanced';
+  }
+
   protected override async handleAsk(question: string): Promise<string> {
-    return this.askLlm(this.askPrompt(question), question, 'fast');
+    return this.askLlm(this.askPrompt(question), question, this.askTier());
   }
 
   private setupHandlers(): void {
