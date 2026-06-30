@@ -521,12 +521,56 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   // fragile on large files. read_draft lets the agent edit against ground truth
   // (the current stage) instead of reconstructing it from memory.
 
-  /** Index of the `}` matching the `{` at openIndex. String/comment aware. -1 if none. */
+  /** Keywords after which a `/` begins a regex literal, not division. */
+  private static readonly REGEX_PRECEDING_KEYWORDS = new Set([
+    'return', 'typeof', 'instanceof', 'in', 'of', 'case', 'do', 'else',
+    'yield', 'await', 'delete', 'void', 'new', 'throw',
+  ]);
+
+  /**
+   * Heuristic: does the `/` at index i begin a regex literal (vs a division
+   * operator)? `prevSig` is the last significant (non-space/comment) char before
+   * it. A `/` is division only right after a value (identifier/number/closer/
+   * string) — unless that value is a regex-preceding keyword like `return`.
+   * Errs toward division (the prior, regex-blind behavior), so it never
+   * mis-skips real code; it only newly recognizes regexes after punctuation.
+   */
+  private isRegexStart(source: string, i: number, prevSig: string): boolean {
+    if (prevSig === '') return true;
+    if (/[A-Za-z0-9_$)\]}'"`]/.test(prevSig)) {
+      if (/[A-Za-z_$]/.test(prevSig)) {
+        let j = i - 1;
+        while (j >= 0 && /\s/.test(source[j])) j--;
+        const end = j;
+        while (j >= 0 && /[A-Za-z0-9_$]/.test(source[j])) j--;
+        return ObjectCreator.REGEX_PRECEDING_KEYWORDS.has(source.slice(j + 1, end + 1));
+      }
+      return false;
+    }
+    return true;
+  }
+
+  /** Index of the closing `/` of a regex literal starting at slashIndex, or -1. */
+  private regexEnd(source: string, slashIndex: number): number {
+    let inClass = false;
+    for (let i = slashIndex + 1; i < source.length; i++) {
+      const c = source[i];
+      if (c === '\\') { i++; continue; }
+      if (c === '\n') return -1;
+      if (inClass) { if (c === ']') inClass = false; continue; }
+      if (c === '[') { inClass = true; continue; }
+      if (c === '/') return i;
+    }
+    return -1;
+  }
+
+  /** Index of the `}` matching the `{` at openIndex. String/comment/regex aware. -1 if none. */
   private matchBrace(source: string, openIndex: number): number {
     let depth = 0;
     let inStr: string | null = null;
     let lc = false;
     let bc = false;
+    let prevSig = '';
     for (let i = openIndex; i < source.length; i++) {
       const c = source[i];
       const prev = source[i - 1];
@@ -535,9 +579,14 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       if (inStr) { if (c === inStr && prev !== '\\') inStr = null; continue; }
       if (c === '/' && source[i + 1] === '/') { lc = true; continue; }
       if (c === '/' && source[i + 1] === '*') { bc = true; continue; }
-      if (c === '"' || c === "'" || c === '`') { inStr = c; continue; }
+      if (c === '/' && this.isRegexStart(source, i, prevSig)) {
+        const e = this.regexEnd(source, i);
+        if (e > i) { i = e; prevSig = '/'; continue; }
+      }
+      if (c === '"' || c === "'" || c === '`') { inStr = c; prevSig = c; continue; }
       if (c === '{') depth++;
       else if (c === '}') { depth--; if (depth === 0) return i; }
+      if (!/\s/.test(c)) prevSig = c;
     }
     return -1;
   }
@@ -569,6 +618,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     let lc = false;
     let bc = false;
     let memberStart = -1;
+    let prevSig = '';
 
     const record = (end: number): void => {
       if (memberStart < 0) return;
@@ -588,11 +638,16 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       if (inStr) { if (c === inStr && prev !== '\\') inStr = null; continue; }
       if (c === '/' && source[i + 1] === '/') { lc = true; continue; }
       if (c === '/' && source[i + 1] === '*') { bc = true; continue; }
-      if (c === '"' || c === "'" || c === '`') { if (depth === 0 && memberStart < 0) memberStart = i; inStr = c; continue; }
-      if (c === '{' || c === '(' || c === '[') { if (depth === 0 && memberStart < 0) memberStart = i; depth++; continue; }
-      if (c === '}' || c === ')' || c === ']') { depth--; continue; }
-      if (depth === 0 && c === ',') { record(i); continue; }
+      if (c === '/' && this.isRegexStart(source, i, prevSig)) {
+        const e = this.regexEnd(source, i);
+        if (e > i) { i = e; prevSig = '/'; continue; }
+      }
+      if (c === '"' || c === "'" || c === '`') { if (depth === 0 && memberStart < 0) memberStart = i; inStr = c; prevSig = c; continue; }
+      if (c === '{' || c === '(' || c === '[') { if (depth === 0 && memberStart < 0) memberStart = i; depth++; prevSig = c; continue; }
+      if (c === '}' || c === ')' || c === ']') { depth--; prevSig = c; continue; }
+      if (depth === 0 && c === ',') { record(i); prevSig = c; continue; }
       if (depth === 0 && memberStart < 0 && !/\s/.test(c)) memberStart = i;
+      if (!/\s/.test(c)) prevSig = c;
     }
     record(objEnd);
     return { objStart, objEnd, members };
@@ -881,8 +936,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * Lightweight bracket/paren/brace balance scanner. Skips string literals,
    * template literals, and comments so their contents don't count. Returns the
    * first imbalance (or the earliest unclosed opener at EOF), or null when
-   * balanced. Best-effort — regex literals are treated as division, so a hint
-   * may occasionally be off, but the original error is always preserved.
+   * balanced. String/comment/regex aware; the original error is always preserved.
    */
   private findBracketImbalance(source: string): { line: number; message: string } | null {
     const stack: { ch: string; line: number }[] = [];
@@ -891,6 +945,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     let inStr: string | null = null;
     let inLineComment = false;
     let inBlockComment = false;
+    let prevSig = '';
     for (let i = 0; i < source.length; i++) {
       const c = source[i];
       const prev = source[i - 1];
@@ -900,7 +955,12 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       if (inStr) { if (c === inStr && prev !== '\\') inStr = null; continue; }
       if (c === '/' && source[i + 1] === '/') { inLineComment = true; continue; }
       if (c === '/' && source[i + 1] === '*') { inBlockComment = true; continue; }
-      if (c === '"' || c === "'" || c === '`') { inStr = c; continue; }
+      if (c === '/' && this.isRegexStart(source, i, prevSig)) {
+        const e = this.regexEnd(source, i);
+        if (e > i) { i = e; prevSig = '/'; continue; }
+      }
+      if (c === '"' || c === "'" || c === '`') { inStr = c; prevSig = c; continue; }
+      if (!/\s/.test(c)) prevSig = c;
       if (c === '(' || c === '[' || c === '{') { stack.push({ ch: c, line }); continue; }
       if (c === ')' || c === ']' || c === '}') {
         const open = stack.pop();
