@@ -277,7 +277,7 @@ and to Registry for new scheduler/watcher objects being created.
           { type: 'label', windowId: this.windowId, text: 'Select an item',
             style: { fontSize: 14, fontWeight: 'bold', color: this.theme.textHeading, wordWrap: true } },
           // 1: description
-          { type: 'label', windowId: this.windowId, text: '',
+          { type: 'markdown', windowId: this.windowId, text: '',
             style: { fontSize: 12, color: this.theme.textPrimary, wordWrap: true, markdown: true } },
           // 2: metadata
           { type: 'label', windowId: this.windowId, text: '',

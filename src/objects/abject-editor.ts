@@ -256,7 +256,7 @@ export class AbjectEditor extends Abject {
           // 6: add handler button
           { type: 'button', windowId: this.windowId, text: '+ Add' },
           // 7: status label
-          { type: 'label', windowId: this.windowId, text: '',
+          { type: 'markdown', windowId: this.windowId, text: '',
             style: { fontSize: 12, wordWrap: true, markdown: true } },
           // 8: add handler text input (hidden initially)
           { type: 'textInput', windowId: this.windowId, placeholder: 'handler name...',

@@ -223,7 +223,7 @@ Use Toggle to enable/disable, Delete to remove.
         specs: [
           { type: 'label', windowId: this.windowId, text: 'Select a schedule',
             style: { fontSize: 14, fontWeight: 'bold', color: this.theme.textHeading, wordWrap: true } },
-          { type: 'label', windowId: this.windowId, text: '',
+          { type: 'markdown', windowId: this.windowId, text: '',
             style: { fontSize: 12, color: this.theme.textPrimary, wordWrap: true, markdown: true } },
           { type: 'label', windowId: this.windowId, text: '',
             style: { fontSize: 11, color: this.theme.textSecondary, wordWrap: true } },

@@ -388,7 +388,7 @@ export class ChatBrowser extends Abject {
     const { widgetIds: [cardId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [{
-          type: 'label', windowId: this.windowId, text,
+          type: 'markdown', windowId: this.windowId, text,
           style: {
             color: this.theme.textPrimary,
             fontSize: 13,

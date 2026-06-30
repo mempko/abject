@@ -234,7 +234,7 @@ export class KnowledgeBrowser extends Abject {
           // 4: divider
           { type: 'divider', windowId: this.windowId },
           // 5: content (markdown, selectable)
-          { type: 'label', windowId: this.windowId, text: '',
+          { type: 'markdown', windowId: this.windowId, text: '',
             style: { fontSize: 12, color: this.theme.textPrimary, wordWrap: true, markdown: true, selectable: true } },
           // 6: delete button
           { type: 'button', windowId: this.windowId, text: 'Forget',
