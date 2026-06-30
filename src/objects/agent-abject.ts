@@ -2091,7 +2091,7 @@ The registered object must implement these handlers to participate in the agent 
       if (currentProduces.length > 0 || currentConsumes.length > 0) {
         ctx += `\n\n## Your Task's Contract`;
         if (currentProduces.length > 0) {
-          ctx += `\n\nThis task is expected to write the following scratchpad keys before reporting done. Use writeGoalData(key, value) for each one. Keep the \`done\` result as a short human-readable summary; downstream tasks will read the structured data from the scratchpad.`;
+          ctx += `\n\nThis task is expected to write the following scratchpad keys before reporting done. Write each one with GoalManager's writeGoalData method, invoked through your normal action — \`call("GoalManager", "writeGoalData", {goalId, key, value})\` — NOT a top-level \`writeGoalData\` action verb. Keep the \`done\` result as a short human-readable summary; downstream tasks will read the structured data from the scratchpad.`;
           for (const p of currentProduces) {
             ctx += `\n- **${p.key}**: ${p.description}`;
           }
@@ -2122,7 +2122,7 @@ The registered object must implement these handlers to participate in the agent 
             ctx += `\n\nConsumed keys not yet written: ${missing.join(', ')}. Earlier tasks should have produced these; if they are missing, the auto-mirror at tasks/<taskId>/result may hold the raw completion output as a fallback.`;
           }
         } else {
-          ctx += `\n\n## Shared Goal Data (scratchpad)\nOther agents working on this goal have shared the following data. Use writeGoalData(key, value) to add your own findings.\n\`\`\`json\n${JSON.stringify(scratchpad, null, 2)}\n\`\`\``;
+          ctx += `\n\n## Shared Goal Data (scratchpad)\nOther agents working on this goal have shared the following data. Add your own findings with \`call("GoalManager", "writeGoalData", {goalId, key, value})\` (a GoalManager method, not a top-level action verb).\n\`\`\`json\n${JSON.stringify(scratchpad, null, 2)}\n\`\`\``;
         }
       }
 
