@@ -1589,6 +1589,27 @@ For MARKDOWN or other rich text, prefer a \`label\` widget with style { markdown
 (headings, bold, code, lists, links, block images render for free) over hand-writing a parser and
 text-layout engine on a canvas — that keeps your object small and the formatting correct.
 
+### Closing and reopening a window — reset ALL window-scoped ids together
+
+When a window closes (the user clicks X, or you call destroyWindowAbject), the window AND every
+layout, canvas, and widget inside it are destroyed — their ids become dead. So your teardown must
+null EVERY id tied to that window in one place, not just some of them. The classic bug: hide()
+nulls \`_windowId\` and \`_canvasId\` but forgets \`_layoutId\`. On reopen, show()'s \`if (!this._layoutId)\`
+guard sees the stale id, SKIPS creating a new layout, and then calls addLayoutChild on the dead
+layout — so the canvas is parented to nothing (blank window) AND the call to the destroyed object
+never replies, blocking for the full request timeout (~30s) before it gives up. That is the
+"window opens blank, then slowly appears" symptom: a stale id from an incomplete teardown.
+
+Two safe patterns:
+- **Full teardown:** one place (hide() AND your windowCloseRequested handler) nulls EVERY window
+  id you stored — window, layouts, canvases, widgets — so the next show() rebuilds from a clean
+  slate. Keep them in one object (e.g. \`this._ui = {}\`) so you can't forget one.
+- **Verify-before-reuse:** in show(), don't trust a stored windowId blindly — a window the user
+  closed is gone. Confirm it still exists (listWindows) before reusing its ids; otherwise rebuild.
+
+Never call a stored id without being sure it's still alive — a call to a destroyed object hangs on
+the request timeout, it doesn't fail fast.
+
 ### Complete Workflow Example
 
 // 1. Create a window
