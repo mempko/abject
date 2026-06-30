@@ -27,8 +27,18 @@ import { systemMessage, userMessage, LLMMessage } from '../llm/provider.js';
 import type { AgentAction } from './agent-abject.js';
 import { Log } from '../core/timed-log.js';
 import { applyDiff, parseSearchReplaceBlocks, levenshtein } from './source-diff.js';
+import * as acorn from 'acorn';
 
 const log = new Log('OBJECT-CREATOR');
+
+/** Minimal structural view of an acorn/ESTree node (acorn's own types omit the
+ *  ESTree node shapes; we read only type/start/end and a few fields). */
+interface AstNode {
+  type: string;
+  start: number;
+  end: number;
+  [key: string]: unknown;
+}
 
 /** Methods provided by the Abject / ScriptableAbject framework; valid on every object. */
 const FRAMEWORK_PROVIDED_METHODS = ScriptableAbject.PROTECTED_HANDLERS;
@@ -521,136 +531,51 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   // fragile on large files. read_draft lets the agent edit against ground truth
   // (the current stage) instead of reconstructing it from memory.
 
-  /** Keywords after which a `/` begins a regex literal, not division. */
-  private static readonly REGEX_PRECEDING_KEYWORDS = new Set([
-    'return', 'typeof', 'instanceof', 'in', 'of', 'case', 'do', 'else',
-    'yield', 'await', 'delete', 'void', 'new', 'throw',
-  ]);
-
   /**
-   * Heuristic: does the `/` at index i begin a regex literal (vs a division
-   * operator)? `prevSig` is the last significant (non-space/comment) char before
-   * it. A `/` is division only right after a value (identifier/number/closer/
-   * string) — unless that value is a regex-preceding keyword like `return`.
-   * Errs toward division (the prior, regex-blind behavior), so it never
-   * mis-skips real code; it only newly recognizes regexes after punctuation.
-   */
-  private isRegexStart(source: string, i: number, prevSig: string): boolean {
-    if (prevSig === '') return true;
-    if (/[A-Za-z0-9_$)\]}'"`]/.test(prevSig)) {
-      if (/[A-Za-z_$]/.test(prevSig)) {
-        let j = i - 1;
-        while (j >= 0 && /\s/.test(source[j])) j--;
-        const end = j;
-        while (j >= 0 && /[A-Za-z0-9_$]/.test(source[j])) j--;
-        return ObjectCreator.REGEX_PRECEDING_KEYWORDS.has(source.slice(j + 1, end + 1));
-      }
-      return false;
-    }
-    return true;
-  }
-
-  /** Index of the closing `/` of a regex literal starting at slashIndex, or -1. */
-  private regexEnd(source: string, slashIndex: number): number {
-    let inClass = false;
-    for (let i = slashIndex + 1; i < source.length; i++) {
-      const c = source[i];
-      if (c === '\\') { i++; continue; }
-      if (c === '\n') return -1;
-      if (inClass) { if (c === ']') inClass = false; continue; }
-      if (c === '[') { inClass = true; continue; }
-      if (c === '/') return i;
-    }
-    return -1;
-  }
-
-  /** Index of the `}` matching the `{` at openIndex. String/comment/regex aware. -1 if none. */
-  private matchBrace(source: string, openIndex: number): number {
-    let depth = 0;
-    let inStr: string | null = null;
-    let lc = false;
-    let bc = false;
-    let prevSig = '';
-    for (let i = openIndex; i < source.length; i++) {
-      const c = source[i];
-      const prev = source[i - 1];
-      if (lc) { if (c === '\n') lc = false; continue; }
-      if (bc) { if (prev === '*' && c === '/') bc = false; continue; }
-      if (inStr) { if (c === inStr && prev !== '\\') inStr = null; continue; }
-      if (c === '/' && source[i + 1] === '/') { lc = true; continue; }
-      if (c === '/' && source[i + 1] === '*') { bc = true; continue; }
-      if (c === '/' && this.isRegexStart(source, i, prevSig)) {
-        const e = this.regexEnd(source, i);
-        if (e > i) { i = e; prevSig = '/'; continue; }
-      }
-      if (c === '"' || c === "'" || c === '`') { inStr = c; prevSig = c; continue; }
-      if (c === '{') depth++;
-      else if (c === '}') { depth--; if (depth === 0) return i; }
-      if (!/\s/.test(c)) prevSig = c;
-    }
-    return -1;
-  }
-
-  /** Extract the key name from a member's source text (handles method shorthand and key: value). */
-  private memberName(memberText: string): string {
-    const m = memberText.match(/^(?:async\s+|get\s+|set\s+|\*\s*)*(?:(['"])([^'"]+)\1|([A-Za-z0-9_$]+))/);
-    return m ? (m[2] ?? m[3] ?? '') : '';
-  }
-
-  /**
-   * Parse top-level members of the `({ ... })` handler map. Returns the object
-   * literal's brace span plus each member's name and [start, end) text span
-   * (excluding separating commas/whitespace). String/template/comment aware.
-   * Returns null when the outer literal can't be located.
+   * Parse the top-level members of the `({ ... })` handler map with a real JS
+   * parser (acorn), so regexes, template literals, comments, and nested syntax
+   * are handled exactly — no hand-rolled scanning. Returns the object literal's
+   * brace span (objStart = index of `{`, objEnd = index of `}`) plus each
+   * top-level member's name and [start, end) source span. Returns null when the
+   * source doesn't parse or has no top-level object literal (callers then fall
+   * back to draft_diff / draft_source).
    */
   private parseHandlerMembers(source: string): {
     objStart: number; objEnd: number;
     members: Array<{ name: string; start: number; end: number }>;
   } | null {
-    const objStart = source.indexOf('{');
-    if (objStart < 0) return null;
-    const objEnd = this.matchBrace(source, objStart);
-    if (objEnd < 0) return null;
+    let program: AstNode;
+    try {
+      program = acorn.parse(source, { ecmaVersion: 'latest' }) as unknown as AstNode;
+    } catch {
+      return null;
+    }
+
+    // The handler map is `({ ... })` → an ExpressionStatement whose expression
+    // is the ObjectExpression. Find it among the top-level statements.
+    let obj: AstNode | null = null;
+    for (const stmt of (program.body as AstNode[] | undefined) ?? []) {
+      const expr = stmt.expression as AstNode | undefined;
+      if (stmt.type === 'ExpressionStatement' && expr?.type === 'ObjectExpression') {
+        obj = expr;
+        break;
+      }
+    }
+    if (!obj) return null;
 
     const members: Array<{ name: string; start: number; end: number }> = [];
-    let depth = 0;
-    let inStr: string | null = null;
-    let lc = false;
-    let bc = false;
-    let memberStart = -1;
-    let prevSig = '';
-
-    const record = (end: number): void => {
-      if (memberStart < 0) return;
-      let s = memberStart;
-      while (s < end && /\s/.test(source[s])) s++;
-      let e = end;
-      while (e > s && /\s/.test(source[e - 1])) e--;
-      if (e > s) members.push({ name: this.memberName(source.slice(s, e)), start: s, end: e });
-      memberStart = -1;
-    };
-
-    for (let i = objStart + 1; i < objEnd; i++) {
-      const c = source[i];
-      const prev = source[i - 1];
-      if (lc) { if (c === '\n') lc = false; continue; }
-      if (bc) { if (prev === '*' && c === '/') bc = false; continue; }
-      if (inStr) { if (c === inStr && prev !== '\\') inStr = null; continue; }
-      if (c === '/' && source[i + 1] === '/') { lc = true; continue; }
-      if (c === '/' && source[i + 1] === '*') { bc = true; continue; }
-      if (c === '/' && this.isRegexStart(source, i, prevSig)) {
-        const e = this.regexEnd(source, i);
-        if (e > i) { i = e; prevSig = '/'; continue; }
+    for (const prop of (obj.properties as AstNode[] | undefined) ?? []) {
+      if (prop.type !== 'Property') continue; // skip SpreadElement etc.
+      let name = '';
+      if (!prop.computed) {
+        const key = prop.key as AstNode | undefined;
+        if (key?.type === 'Identifier') name = String(key.name);
+        else if (key?.type === 'Literal') name = String(key.value);
       }
-      if (c === '"' || c === "'" || c === '`') { if (depth === 0 && memberStart < 0) memberStart = i; inStr = c; prevSig = c; continue; }
-      if (c === '{' || c === '(' || c === '[') { if (depth === 0 && memberStart < 0) memberStart = i; depth++; prevSig = c; continue; }
-      if (c === '}' || c === ')' || c === ']') { depth--; prevSig = c; continue; }
-      if (depth === 0 && c === ',') { record(i); prevSig = c; continue; }
-      if (depth === 0 && memberStart < 0 && !/\s/.test(c)) memberStart = i;
-      if (!/\s/.test(c)) prevSig = c;
+      members.push({ name, start: prop.start, end: prop.end });
     }
-    record(objEnd);
-    return { objStart, objEnd, members };
+    // acorn's node.end is one past the last char; the closing `}` sits at end-1.
+    return { objStart: obj.start, objEnd: obj.end - 1, members };
   }
 
   private opReadDraft(state: LoopState, action: AgentAction): { ok: boolean; summary: string; error?: string; data?: unknown } {
@@ -910,69 +835,30 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   }
 
   /**
-   * Augment a raw compile error with a likely location. JS engine messages like
-   * "Unexpected token '}'" carry no position for sandboxed source, so we locate
-   * the first bracket imbalance ourselves and show the surrounding lines. The
-   * original error is preserved; this only adds a hint plus a draft_source
-   * fallback note for errors that resist localization.
+   * Augment a raw compile error with a precise location. JS engine messages
+   * like "Unexpected token '}'" carry no position for sandboxed source, so we
+   * re-parse with acorn to get the exact line/column of the syntax error and
+   * show the surrounding lines. The original error is always preserved.
    */
   private augmentCompileError(source: string, err: string): string {
     const lines = source.split('\n');
-    const imbalance = this.findBracketImbalance(source);
     let detail = '';
-    if (imbalance) {
-      const ctxStart = Math.max(0, imbalance.line - 3);
-      const ctxEnd = Math.min(lines.length, imbalance.line + 2);
-      const ctx = lines.slice(ctxStart, ctxEnd)
-        .map((l, k) => `  ${ctxStart + k + 1 === imbalance.line ? '>' : ' '} ${ctxStart + k + 1}: ${l}`)
-        .join('\n');
-      detail = `\n\nLikely bracket problem: ${imbalance.message} (near line ${imbalance.line}):\n${ctx}`;
+    try {
+      acorn.parse(source, { ecmaVersion: 'latest' });
+      // acorn parsed cleanly — the vm failure is something other than syntax.
+    } catch (e) {
+      const loc = (e as { loc?: { line: number; column: number } }).loc;
+      if (loc) {
+        const ctxStart = Math.max(0, loc.line - 3);
+        const ctxEnd = Math.min(lines.length, loc.line + 2);
+        const ctx = lines.slice(ctxStart, ctxEnd)
+          .map((l, k) => `  ${ctxStart + k + 1 === loc.line ? '>' : ' '} ${ctxStart + k + 1}: ${l}`)
+          .join('\n');
+        detail = `\n\nSyntax error near line ${loc.line}:${loc.column}:\n${ctx}`;
+      }
     }
     detail += `\n\nSource is ${lines.length} lines. If the syntax error is hard to localize, regenerate the whole object with draft_source rather than patching around it.`;
     return `${err}${detail}`;
-  }
-
-  /**
-   * Lightweight bracket/paren/brace balance scanner. Skips string literals,
-   * template literals, and comments so their contents don't count. Returns the
-   * first imbalance (or the earliest unclosed opener at EOF), or null when
-   * balanced. String/comment/regex aware; the original error is always preserved.
-   */
-  private findBracketImbalance(source: string): { line: number; message: string } | null {
-    const stack: { ch: string; line: number }[] = [];
-    const closerToOpener: Record<string, string> = { ')': '(', ']': '[', '}': '{' };
-    let line = 1;
-    let inStr: string | null = null;
-    let inLineComment = false;
-    let inBlockComment = false;
-    let prevSig = '';
-    for (let i = 0; i < source.length; i++) {
-      const c = source[i];
-      const prev = source[i - 1];
-      if (c === '\n') { line++; inLineComment = false; continue; }
-      if (inLineComment) continue;
-      if (inBlockComment) { if (prev === '*' && c === '/') inBlockComment = false; continue; }
-      if (inStr) { if (c === inStr && prev !== '\\') inStr = null; continue; }
-      if (c === '/' && source[i + 1] === '/') { inLineComment = true; continue; }
-      if (c === '/' && source[i + 1] === '*') { inBlockComment = true; continue; }
-      if (c === '/' && this.isRegexStart(source, i, prevSig)) {
-        const e = this.regexEnd(source, i);
-        if (e > i) { i = e; prevSig = '/'; continue; }
-      }
-      if (c === '"' || c === "'" || c === '`') { inStr = c; prevSig = c; continue; }
-      if (!/\s/.test(c)) prevSig = c;
-      if (c === '(' || c === '[' || c === '{') { stack.push({ ch: c, line }); continue; }
-      if (c === ')' || c === ']' || c === '}') {
-        const open = stack.pop();
-        if (!open) return { line, message: `unexpected closing '${c}' with no matching opener` };
-        if (open.ch !== closerToOpener[c]) return { line, message: `'${c}' closes a '${open.ch}' opened on line ${open.line}` };
-      }
-    }
-    if (stack.length > 0) {
-      const last = stack[stack.length - 1];
-      return { line: last.line, message: `'${last.ch}' opened on line ${last.line} is never closed` };
-    }
-    return null;
   }
 
   /**
