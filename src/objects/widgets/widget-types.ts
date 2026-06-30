@@ -38,6 +38,39 @@ export interface WidgetStyle {
 
 export type WidgetType = 'label' | 'markdown' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image' | 'themeSwatch';
 
+// ── Size/rect input normalization ───────────────────────────────────────────
+// Across the UI, `w`/`h` are the canonical size fields (the canvas draw schema
+// uses them). `width`/`height` are accepted everywhere as backwards-compatible
+// aliases. Callers may send either; these helpers resolve to the internal Rect
+// representation, which keeps width/height. Internals are unchanged.
+
+/** A size/rect from a caller: w/h preferred, width/height accepted. */
+export interface SizeInput {
+  x?: number;
+  y?: number;
+  w?: number;
+  h?: number;
+  width?: number;
+  height?: number;
+}
+
+/** Resolve caller w/h (preferred) or width/height (legacy) to a partial size. */
+export function resolveWH(o: SizeInput | undefined): { width?: number; height?: number } {
+  if (!o) return {};
+  const width = o.w ?? o.width;
+  const height = o.h ?? o.height;
+  const out: { width?: number; height?: number } = {};
+  if (width !== undefined) out.width = width;
+  if (height !== undefined) out.height = height;
+  return out;
+}
+
+/** Resolve a caller rect (w/h or width/height) to a full Rect; missing → 0. */
+export function coerceRect(r: SizeInput | undefined): { x: number; y: number; width: number; height: number } {
+  const s = resolveWH(r);
+  return { x: r?.x ?? 0, y: r?.y ?? 0, width: s.width ?? 0, height: s.height ?? 0 };
+}
+
 // ── Draw commands ──────────────────────────────────────────────────────────
 
 /**

@@ -21,6 +21,8 @@ import {
   SpacerConfig,
   ThemeData,
   LAYOUT_INTERFACE,
+  SizeInput,
+  resolveWH,
 } from './widget-types.js';
 
 export interface ChildRect {
@@ -212,10 +214,11 @@ export abstract class LayoutAbject extends WidgetAbject {
       const { widgetId, sizePolicy, preferredSize, alignment, stretch } = msg.payload as {
         widgetId: AbjectId;
         sizePolicy?: { horizontal?: string; vertical?: string };
-        preferredSize?: { width?: number; height?: number };
+        preferredSize?: SizeInput;
         alignment?: 'left' | 'center' | 'right';
         stretch?: number;
       };
+      const pref = preferredSize ? resolveWH(preferredSize) : undefined;
       const existingIdx = this.layoutChildren.findIndex(
         (c) => !isSpacer(c) && c.widgetId === widgetId
       );
@@ -224,7 +227,7 @@ export abstract class LayoutAbject extends WidgetAbject {
         this.layoutChildren[existingIdx] = {
           widgetId,
           sizePolicy: sizePolicy as LayoutChildConfig['sizePolicy'],
-          preferredSize,
+          preferredSize: pref,
           alignment,
           stretch: stretch ?? 1,
         };
@@ -232,7 +235,7 @@ export abstract class LayoutAbject extends WidgetAbject {
         this.layoutChildren.push({
           widgetId,
           sizePolicy: sizePolicy as LayoutChildConfig['sizePolicy'],
-          preferredSize,
+          preferredSize: pref,
           alignment,
           stretch,
         });
@@ -271,12 +274,13 @@ export abstract class LayoutAbject extends WidgetAbject {
         children: Array<{
           widgetId: AbjectId;
           sizePolicy?: { horizontal?: string; vertical?: string };
-          preferredSize?: { width?: number; height?: number };
+          preferredSize?: SizeInput;
           alignment?: 'left' | 'center' | 'right';
           stretch?: number;
         }>;
       };
       for (const child of children) {
+        const pref = child.preferredSize ? resolveWH(child.preferredSize) : undefined;
         const existingIdx = this.layoutChildren.findIndex(
           (c) => !isSpacer(c) && c.widgetId === child.widgetId
         );
@@ -284,7 +288,7 @@ export abstract class LayoutAbject extends WidgetAbject {
           this.layoutChildren[existingIdx] = {
             widgetId: child.widgetId,
             sizePolicy: child.sizePolicy as LayoutChildConfig['sizePolicy'],
-            preferredSize: child.preferredSize,
+            preferredSize: pref,
             alignment: child.alignment,
             stretch: child.stretch ?? 1,
           };
@@ -292,7 +296,7 @@ export abstract class LayoutAbject extends WidgetAbject {
           this.layoutChildren.push({
             widgetId: child.widgetId,
             sizePolicy: child.sizePolicy as LayoutChildConfig['sizePolicy'],
-            preferredSize: child.preferredSize,
+            preferredSize: pref,
             alignment: child.alignment,
             stretch: child.stretch,
           });
@@ -364,14 +368,15 @@ export abstract class LayoutAbject extends WidgetAbject {
     this.on('updateLayoutChild', async (msg: AbjectMessage) => {
       const { widgetId, preferredSize, sizePolicy, alignment, stretch } = msg.payload as {
         widgetId: AbjectId;
-        preferredSize?: { width?: number; height?: number };
+        preferredSize?: SizeInput;
         sizePolicy?: { horizontal?: string; vertical?: string };
         alignment?: 'left' | 'center' | 'right';
         stretch?: number;
       };
+      const pref = preferredSize ? resolveWH(preferredSize) : undefined;
       for (const child of this.layoutChildren) {
         if (!isSpacer(child) && child.widgetId === widgetId) {
-          if (preferredSize) child.preferredSize = { ...child.preferredSize, ...preferredSize };
+          if (pref) child.preferredSize = { ...child.preferredSize, ...pref };
           if (sizePolicy) child.sizePolicy = { ...child.sizePolicy, ...sizePolicy } as LayoutChildConfig['sizePolicy'];
           if (alignment !== undefined) child.alignment = alignment;
           if (stretch !== undefined) child.stretch = stretch;

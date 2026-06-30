@@ -278,7 +278,8 @@ export class WindowAbject extends Abject {
     });
 
     this.on('getRect', async () => {
-      return { ...this.rect };
+      // w/h are canonical across the UI; width/height kept for compatibility.
+      return { ...this.rect, w: this.rect.width, h: this.rect.height };
     });
 
     this.on('getTitle', async () => {

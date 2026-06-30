@@ -353,7 +353,8 @@ A synthetic \`call(<canvasId>, 'input', { type: 'mousedown', x, y, button: 0 })\
     });
 
     this.on('getCanvasSize', async () => {
-      return { width: this.rect.width, height: this.rect.height };
+      // w/h are canonical across the UI; width/height kept for compatibility.
+      return { w: this.rect.width, h: this.rect.height, width: this.rect.width, height: this.rect.height };
     });
 
     // An image pasted or dropped while this canvas is the focused widget is

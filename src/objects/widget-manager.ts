@@ -57,6 +57,8 @@ import {
   Rect,
   ThemeData,
   ARCANE_GRIMOIRE,
+  SizeInput,
+  coerceRect,
 } from './widgets/widget-types.js';
 
 export type { WidgetStyle } from './widgets/widget-types.js';
@@ -133,7 +135,7 @@ export class WidgetManager extends Abject {
             methods: [
               {
                 name: 'createWindowAbject',
-                description: 'Create a window and return its AbjectId. Example: const winId = await this.call(this.dep("WidgetManager"), "createWindowAbject", { title: "My Window", rect: { x: 100, y: 100, width: 400, height: 300 }, resizable: true }). The rect uses width/height (NOT the w/h that canvas draw commands use — though w/h is tolerated). A window with no/zero size is clamped to a visible minimum so it can never be created invisible.',
+                description: 'Create a window and return its AbjectId. Example: const winId = await this.call(this.dep("WidgetManager"), "createWindowAbject", { title: "My Window", rect: { x: 100, y: 100, w: 400, h: 300 }, resizable: true }). A window with no/zero size is clamped to a visible minimum so it can never be created invisible.',
                 parameters: [
                   { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Window title' },
                   { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height } — position and size' },
@@ -160,7 +162,7 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'createVBox',
-                description: 'Create a vertical box layout inside a window. Returns the layout AbjectId. Add children via this.call(layoutId, "abjects:layout", "addLayoutChild", { widgetId, sizePolicy: { vertical: "fixed" }, preferredSize: { height: 36 } }). Add spacers via this.call(layoutId, "abjects:layout", "addLayoutSpacer", {}).',
+                description: 'Create a vertical box layout inside a window. Returns the layout AbjectId. Add children via this.call(layoutId, "abjects:layout", "addLayoutChild", { widgetId, sizePolicy: { vertical: "fixed" }, preferredSize: { h: 36 } }). Add spacers via this.call(layoutId, "abjects:layout", "addLayoutSpacer", {}).',
                 parameters: [
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
@@ -171,7 +173,7 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'createHBox',
-                description: 'Create a horizontal box layout inside a window. Returns the layout AbjectId. Add children via this.call(layoutId, "abjects:layout", "addLayoutChild", { widgetId, sizePolicy: { horizontal: "expanding" }, preferredSize: { width: 100, height: 36 } }).',
+                description: 'Create a horizontal box layout inside a window. Returns the layout AbjectId. Add children via this.call(layoutId, "abjects:layout", "addLayoutChild", { widgetId, sizePolicy: { horizontal: "expanding" }, preferredSize: { w: 100, h: 36 } }).',
                 parameters: [
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
@@ -785,7 +787,7 @@ export class WidgetManager extends Abject {
         windowId: string;
         id: string;
         type: WidgetType;
-        rect: { x: number; y: number; width: number; height: number };
+        rect: SizeInput;
         text?: string;
         style?: WidgetStyle;
         checked?: boolean;
@@ -796,7 +798,7 @@ export class WidgetManager extends Abject {
         monospace?: boolean;
         masked?: boolean;
       };
-      return this.addWidget(msg.routing.from, payload);
+      return this.addWidget(msg.routing.from, { ...payload, rect: coerceRect(payload.rect) });
     });
 
     this.on('updateWidget', async (msg: AbjectMessage) => {
@@ -808,9 +810,10 @@ export class WidgetManager extends Abject {
         value?: number;
         options?: string[];
         selectedIndex?: number;
-        rect?: { x: number; y: number; width: number; height: number };
+        rect?: SizeInput;
         masked?: boolean;
       };
+      if (updates.rect) updates.rect = coerceRect(updates.rect);
       return this.updateWidget(widgetId, updates);
     });
 
@@ -1580,7 +1583,7 @@ async show() {
     return true;
   }
   const wm = await this.dep('WidgetManager');              // resolve the factory id once
-  this._windowId = await this.call(wm, 'createWindowAbject', { title: '…', rect: { x: 120, y: 90, width: 1100, height: 720 }, resizable: true });
+  this._windowId = await this.call(wm, 'createWindowAbject', { title: '…', rect: { x: 120, y: 90, w: 1100, h: 720 }, resizable: true });
   await this.call(this._windowId, 'addDependent', {});     // observe window events (e.g. close)
   this._layoutId = await this.call(wm, 'createVBox', { windowId: this._windowId, margins: { top: 0, right: 0, bottom: 0, left: 0 }, spacing: 0 });
   this._canvasId = await this.call(wm, 'createCanvas', { windowId: this._windowId, inputTargetId: this.id });
@@ -1621,7 +1624,7 @@ the request timeout, it doesn't fail fast.
 
 // 1. Create a window
 const winId = await this.call(this.dep('WidgetManager'), 'createWindowAbject', {
-  title: 'My Window', rect: { x: 100, y: 100, width: 400, height: 300 }, resizable: true
+  title: 'My Window', rect: { x: 100, y: 100, w: 400, h: 300 }, resizable: true
 });
 
 // 2. Create a vertical layout
@@ -1642,9 +1645,9 @@ const [labelId, btnId, inputId] = widgetIds;
 // 4. Add widgets to layout (layout manages positioning)
 await this.call(layoutId, 'addLayoutChildren', {
   children: [
-    { widgetId: labelId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 } },
-    { widgetId: inputId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 36 } },
-    { widgetId: btnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 100, height: 36 } },
+    { widgetId: labelId, sizePolicy: { vertical: 'fixed' }, preferredSize: { h: 20 } },
+    { widgetId: inputId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { h: 36 } },
+    { widgetId: btnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { w: 100, h: 36 } },
   ]
 });
 
@@ -1803,7 +1806,7 @@ await this.call(rootLayout, 'addLayoutChildren', {
 
 // 1. Create window and root vertical layout
 const winId = await this.call(this.dep('WidgetManager'), 'createWindowAbject', {
-  title: 'My App', rect: { x: 80, y: 60, width: 600, height: 500 }, resizable: true
+  title: 'My App', rect: { x: 80, y: 60, w: 600, h: 500 }, resizable: true
 });
 const rootLayout = await this.call(this.dep('WidgetManager'), 'createVBox', {
   windowId: winId, margins: { top: 0, right: 0, bottom: 0, left: 0 }, spacing: 0
@@ -1815,7 +1818,7 @@ const toolbar = await this.call(this.dep('WidgetManager'), 'createNestedHBox', {
 });
 // Make toolbar fixed height (default expanding would split space 50/50 with canvas)
 await this.call(rootLayout, 'updateLayoutChild', {
-  widgetId: toolbar, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 40 }
+  widgetId: toolbar, sizePolicy: { vertical: 'fixed' }, preferredSize: { h: 40 }
 });
 // Create toolbar buttons and add them to the toolbar layout...
 
@@ -1983,7 +1986,7 @@ Rules for canvas apps:
 
 // Change a child's size policy or preferred size after initial layout:
 await this.call(layoutId, 'updateLayoutChild', {
-  widgetId: childId, sizePolicy: { vertical: 'expanding' }, preferredSize: { height: 200 }
+  widgetId: childId, sizePolicy: { vertical: 'expanding' }, preferredSize: { h: 200 }
 });
 
 ### Utility Methods
@@ -2019,7 +2022,7 @@ const { widgetIds: [header] } = await this.call(this.dep('WidgetManager'), 'crea
   specs: [{ type: 'label', windowId: winId, text: 'Title', style: { fontSize: 18, fontWeight: 'bold' } }]
 });
 await this.call(rootLayout, 'addLayoutChild', {
-  widgetId: header, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 28 }
+  widgetId: header, sizePolicy: { vertical: 'fixed' }, preferredSize: { h: 28 }
 });
 // Scrollable content area (auto-added to parent with expanding policy)
 const scrollArea = await this.call(this.dep('WidgetManager'), 'createNestedScrollableVBox', {
@@ -2037,7 +2040,7 @@ const sidebar = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
 await this.call(hbox, 'updateLayoutChild', {
   widgetId: sidebar,
   sizePolicy: { horizontal: 'fixed' },
-  preferredSize: { width: 200 }
+  preferredSize: { w: 200 }
 });
 const mainArea = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
   parentLayoutId: hbox, spacing: 4
@@ -2051,7 +2054,7 @@ const { widgetIds: [tabBar] } = await this.call(this.dep('WidgetManager'), 'crea
   specs: [{ type: 'tabBar', windowId: winId, tabs: ['Tab A', 'Tab B', 'Tab C'] }]
 });
 await this.call(rootLayout, 'addLayoutChild', {
-  widgetId: tabBar, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 36 }
+  widgetId: tabBar, sizePolicy: { vertical: 'fixed' }, preferredSize: { h: 36 }
 });
 await this.call(tabBar, 'addDependent', {});
 
@@ -2080,7 +2083,7 @@ for (let i = 1; i < tabContents.length; i++) {
 
 // Add a widget to a layout at runtime:
 await this.call(layoutId, 'addLayoutChild', {
-  widgetId: newWidgetId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 36 }
+  widgetId: newWidgetId, sizePolicy: { vertical: 'fixed' }, preferredSize: { h: 36 }
 });
 
 // Remove a widget from its layout (via WidgetManager):
@@ -2252,17 +2255,13 @@ await this.call(timerId, 'addDependent', {});
    * game "works" under programmatic verification but shows no window. Missing
    * x/y default to a cascade-friendly origin.
    */
-  private normalizeWindowRect(
-    rect: { x?: number; y?: number; width?: number; height?: number; w?: number; h?: number } | undefined,
-  ): { x: number; y: number; width: number; height: number } {
-    const r = rect ?? {};
-    const width = r.width ?? r.w ?? 0;
-    const height = r.height ?? r.h ?? 0;
+  private normalizeWindowRect(rect: SizeInput | undefined): { x: number; y: number; width: number; height: number } {
+    const c = coerceRect(rect); // resolves w/h or width/height
     return {
-      x: Number.isFinite(r.x) ? (r.x as number) : 80,
-      y: Number.isFinite(r.y) ? (r.y as number) : 60,
-      width: width >= 80 ? width : 480,
-      height: height >= 80 ? height : 360,
+      x: Number.isFinite(rect?.x) ? c.x : 80,
+      y: Number.isFinite(rect?.y) ? c.y : 60,
+      width: c.width >= 80 ? c.width : 480,
+      height: c.height >= 80 ? c.height : 360,
     };
   }
 
