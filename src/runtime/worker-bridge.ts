@@ -239,6 +239,13 @@ export class WorkerBridge {
       case 'stopped': {
         const objectId = data.objectId!;
         this.hostedObjects.delete(objectId);
+        // Remove from the main bus's worker-routing table so the bus stops
+        // forwarding to this worker and instead fails fast (RECIPIENT_NOT_FOUND)
+        // for any later call. Without this, the bus only drops a worker object
+        // on killInWorker — an object that stops/destroys itself (e.g. a widget
+        // torn down with its window) would linger in workerObjects, and calls to
+        // it would hang to the request timeout instead of rejecting instantly.
+        this.bus.unregisterWorkerObject(objectId);
         const pending = this.pendingKills.get(objectId);
         if (pending) {
           this.pendingKills.delete(objectId);

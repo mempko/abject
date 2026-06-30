@@ -10,7 +10,7 @@
 import { AbjectMessage, AbjectId } from '../core/types.js';
 import { Mailbox } from './mailbox.js';
 import type { MessageBusLike } from './message-bus.js';
-import { resetSequence } from '../core/message.js';
+import { resetSequence, error as createError } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('WorkerBus');
@@ -133,6 +133,7 @@ export class WorkerBus implements MessageBusLike {
     const mailbox = this.mailboxes.get(recipient);
     if (!mailbox) {
       log.warn(`Cannot deliver to ${recipient}: not registered locally`);
+      this.failIfRequest(message);
       return;
     }
     mailbox.send(message);
@@ -146,8 +147,26 @@ export class WorkerBus implements MessageBusLike {
     const mailbox = this.mailboxes.get(recipient);
     if (!mailbox) {
       log.warn(`Cannot deliver peer message to ${recipient}: not registered locally`);
+      this.failIfRequest(message);
       return;
     }
     mailbox.send(message);
+  }
+
+  /**
+   * When a request lands on an object this worker doesn't have (it was
+   * destroyed, or routing is stale), send a correlated RECIPIENT_NOT_FOUND
+   * error reply back to the sender so its request() rejects instantly instead
+   * of waiting out the full timeout. Mirrors the main bus's fail-fast for
+   * unregistered local recipients. Non-requests (events) are simply dropped.
+   */
+  private failIfRequest(message: AbjectMessage): void {
+    if (message.header.type !== 'request') return;
+    const reply = createError(
+      message,
+      'RECIPIENT_NOT_FOUND',
+      `Recipient ${message.routing.to} is not registered (worker)`,
+    );
+    this.send(reply);
   }
 }
