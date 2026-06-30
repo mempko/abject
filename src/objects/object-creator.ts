@@ -618,11 +618,20 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
 
     if (grep) {
-      let re: RegExp;
-      try { re = new RegExp(grep, 'i'); } catch { return { ok: false, summary: 'read_draft: bad grep', error: `Invalid grep pattern: ${grep}` }; }
+      // Treat the pattern as a regex, but fall back to a literal substring
+      // search when it isn't valid regex — agents routinely pass code snippets
+      // like "_handlePaste(session" whose unbalanced parens aren't valid regex.
+      let test: (line: string) => boolean;
+      try {
+        const re = new RegExp(grep, 'i');
+        test = (line) => re.test(line);
+      } catch {
+        const needle = grep.toLowerCase();
+        test = (line) => line.toLowerCase().includes(needle);
+      }
       const hits = base.split('\n')
         .map((l, i) => ({ n: i + 1, l }))
-        .filter(x => re.test(x.l))
+        .filter(x => test(x.l))
         .slice(0, 60)
         .map(x => `${x.n}\t${x.l}`)
         .join('\n');
