@@ -1608,9 +1608,16 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   /**
    * Seed the model cache from each provider's description so the UI can
    * render immediately. Live fetches happen lazily via refreshProviderModels.
+   *
+   * Runs on every AI-tab (re)build, so it must NOT clobber a list already
+   * fetched live this session: doing so reverts the dropdown to the small
+   * fallback catalog, and the `fetchedLiveModels` guard then blocks a re-fetch,
+   * leaving the tier dropdowns stuck on the fallback after the first reopen.
+   * Only seed providers we have not fetched live yet.
    */
   private populateDefaultModelCache(): void {
     for (const desc of this.providerDescriptions) {
+      if (this.fetchedLiveModels.has(desc.id)) continue;
       this.providerModelCache.set(desc.id, [...desc.models]);
     }
   }
