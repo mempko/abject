@@ -17,6 +17,13 @@ export interface LLMMessage {
 
 export type ModelTier = 'smart' | 'balanced' | 'fast';
 
+/**
+ * Reasoning-effort control for models that support it (newer Claude models).
+ * Higher levels spend more tokens on thinking/tool-calls; 'high' is the API
+ * default. Providers that don't support effort ignore this.
+ */
+export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
 export interface LLMCompletionOptions {
   temperature?: number;
   maxTokens?: number;
@@ -24,6 +31,12 @@ export interface LLMCompletionOptions {
   stream?: boolean;
   tier?: ModelTier;
   model?: string;
+  /**
+   * Override the reasoning effort for this call. When omitted the provider
+   * picks a per-tier default. Use a higher level for genuinely hard steps
+   * (e.g. multi-file code reasoning) than the tier's routine default.
+   */
+  effort?: EffortLevel;
   /**
    * Stable identifier that providers may use to improve prompt-cache routing
    * (e.g. OpenAI's `prompt_cache_key`). Set to a per-conversation or per-task
@@ -117,6 +130,16 @@ export interface LLMStreamChunk {
    * consumers must not treat truncated output as a complete answer.
    */
   stopReason?: string;
+  /**
+   * Token usage, set on the terminal (done) chunk when the provider reports
+   * it in-stream. Lets a streaming-backed complete() still return usage.
+   */
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+  };
 }
 
 export interface FetchResult {
