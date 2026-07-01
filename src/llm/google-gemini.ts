@@ -49,6 +49,7 @@ interface GeminiRequest {
     temperature?: number;
     maxOutputTokens?: number;
     stopSequences?: string[];
+    thinkingConfig?: { thinkingLevel?: string };
   };
 }
 
@@ -83,11 +84,24 @@ export class GeminiProvider extends BaseLLMProvider {
   readonly name = 'gemini';
   private model: string;
 
+  // Verified ids: bare gemini-3.1-pro / -flash are not callable on v1beta;
+  // -pro-preview and gemini-3.5-flash are the current accepted ids.
   private static readonly TIER_MODELS: Record<ModelTier, string> = {
-    smart: 'gemini-3.1-pro',
-    balanced: 'gemini-3.1-flash',
+    smart: 'gemini-3.1-pro-preview',
+    balanced: 'gemini-3.5-flash',
     fast: 'gemini-3.1-flash-lite',
   };
+
+  // Thinking counts against maxOutputTokens (default is only ~8192), so size it
+  // generously per tier and drive depth with thinkingLevel. Pro can't disable
+  // thinking; flash-lite runs near-minimal.
+  private static readonly TIER_MAX_OUTPUT: Record<ModelTier, number> = {
+    smart: 32768, balanced: 16384, fast: 8192,
+  };
+  private static readonly TIER_THINKING_LEVEL: Record<ModelTier, string> = {
+    smart: 'high', balanced: 'medium', fast: 'minimal',
+  };
+  private static readonly MODEL_MAX_OUTPUT = 65536;
 
   private resolveModel(options?: LLMCompletionOptions): string {
     if (options?.model) return options.model;
@@ -100,7 +114,7 @@ export class GeminiProvider extends BaseLLMProvider {
       baseUrl: config.baseUrl ?? 'https://generativelanguage.googleapis.com',
       fetchFn: config.fetchFn,
     });
-    this.model = config.model ?? 'gemini-3.1-flash';
+    this.model = config.model ?? 'gemini-3.5-flash';
   }
 
   async isAvailable(): Promise<boolean> {
@@ -124,8 +138,8 @@ export class GeminiProvider extends BaseLLMProvider {
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
       return [
-        { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro' },
-        { id: 'gemini-3.1-flash', name: 'Gemini 3.1 Flash' },
+        { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro' },
+        { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash' },
         { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
       ];
     }
@@ -140,8 +154,8 @@ export class GeminiProvider extends BaseLLMProvider {
       credentialLabel: 'Google Gemini API Key',
       credentialPlaceholder: 'AIza...',
       models: [
-        { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro' },
-        { id: 'gemini-3.1-flash', name: 'Gemini 3.1 Flash' },
+        { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro' },
+        { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash' },
         { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
       ],
       defaultTierModels: GeminiProvider.TIER_MODELS,
@@ -306,8 +320,17 @@ export class GeminiProvider extends BaseLLMProvider {
 
     const gc: GeminiRequest['generationConfig'] = {};
     if (options.temperature !== undefined) gc.temperature = options.temperature;
-    if (options.maxTokens !== undefined) gc.maxOutputTokens = options.maxTokens;
     if (options.stopSequences) gc.stopSequences = options.stopSequences;
+    const tier = options.tier;
+    if (tier) {
+      gc.maxOutputTokens = Math.min(
+        GeminiProvider.MODEL_MAX_OUTPUT,
+        Math.max(GeminiProvider.TIER_MAX_OUTPUT[tier], options.maxTokens ?? 0),
+      );
+      gc.thinkingConfig = { thinkingLevel: GeminiProvider.TIER_THINKING_LEVEL[tier] };
+    } else if (options.maxTokens !== undefined) {
+      gc.maxOutputTokens = options.maxTokens;
+    }
     if (Object.keys(gc).length > 0) request.generationConfig = gc;
 
     return request;

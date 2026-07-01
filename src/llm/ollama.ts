@@ -124,7 +124,10 @@ export class OllamaProvider extends BaseLLMProvider {
       stream: true,
       options: {
         temperature: options.temperature,
-        num_predict: options.maxTokens,
+        // Reasoning-capable local models emit long <think> traces that share
+        // num_predict with the answer; floor a specified cap so it can't be
+        // starved, and leave it unset (Ollama's unbounded default) otherwise.
+        num_predict: options.maxTokens === undefined ? undefined : Math.max(options.maxTokens, 4096),
         stop: options.stopSequences,
       },
     };
@@ -201,7 +204,10 @@ export class OllamaProvider extends BaseLLMProvider {
       stream: true,
       options: {
         temperature: options.temperature,
-        num_predict: options.maxTokens,
+        // Reasoning-capable local models emit long <think> traces that share
+        // num_predict with the answer; floor a specified cap so it can't be
+        // starved, and leave it unset (Ollama's unbounded default) otherwise.
+        num_predict: options.maxTokens === undefined ? undefined : Math.max(options.maxTokens, 4096),
         stop: options.stopSequences,
       },
     };

@@ -8,8 +8,8 @@
  * headers.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription } from './provider.js';
-import { OpenAIProvider } from './openai.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions } from './provider.js';
+import { OpenAIProvider, OpenAIRequest, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('OPENROUTER');
@@ -24,7 +24,7 @@ export interface OpenRouterConfig {
 }
 
 const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
-  smart: 'anthropic/claude-opus-4-6',
+  smart: 'anthropic/claude-opus-4.8',
   balanced: 'openai/gpt-5.4-mini',
   fast: 'meta-llama/llama-3.3-70b-instruct',
 };
@@ -47,6 +47,23 @@ export class OpenRouterProvider extends OpenAIProvider {
       },
     });
     this.name = 'openrouter';
+  }
+
+  // OpenRouter normalizes ONE unified `reasoning: { effort }` across every
+  // underlying model family (effort for OpenAI/Grok, a max_tokens budget for
+  // Claude/Gemini) and silently ignores it for non-reasoning models — so it is
+  // the safe single knob. Underlying models vary in ceiling; 64k is a safe cap.
+  protected override reasoningProfile(_model: string): OpenAIReasoningProfile {
+    return { supportsEffort: false, reasons: true, maxOutput: 64000 };
+  }
+
+  protected override applyReasoning(request: OpenAIRequest, _model: string, options: LLMCompletionOptions): { reasoningActive: boolean } {
+    const effort = this.resolveEffort(options);
+    if (effort && effort !== 'none') {
+      request.reasoning = { effort };
+      return { reasoningActive: true };
+    }
+    return { reasoningActive: false };
   }
 
   override async listModels(): Promise<ModelInfo[]> {

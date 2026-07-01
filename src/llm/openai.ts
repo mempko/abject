@@ -13,6 +13,7 @@ import {
   ModelTier,
   ModelInfo,
   ContentPart,
+  EffortLevel,
   defaultIsRetryable,
 } from './provider.js';
 import { require } from '../core/contracts.js';
@@ -47,7 +48,7 @@ interface OpenAIMessage {
   content: string | OpenAIContentPart[];
 }
 
-interface OpenAIRequest {
+export interface OpenAIRequest {
   model: string;
   messages: OpenAIMessage[];
   max_completion_tokens?: number;
@@ -60,6 +61,24 @@ interface OpenAIRequest {
    * instance across calls, lifting cache hit rate. OpenAI-only.
    */
   prompt_cache_key?: string;
+  /** Reasoning-effort control (GPT-5.x etc.). Not sent by providers that reject it. */
+  reasoning_effort?: string;
+  /** Output-length style hint (GPT-5.x). */
+  verbosity?: string;
+  /** Provider-specific extras (e.g. reasoning, reasoning_split) set by subclass hooks. */
+  [key: string]: unknown;
+}
+
+/** Per-model reasoning capability + output ceiling, provided by each provider. */
+export interface OpenAIReasoningProfile {
+  /** Whether this model accepts `reasoning_effort` (sending it to one that
+   * doesn't — e.g. Grok 4 — hard-fails the request). */
+  supportsEffort: boolean;
+  /** Whether the model reasons at all (drives output-cap headroom + streaming). */
+  reasons: boolean;
+  /** Model's max output-token ceiling (used to clamp the tier cap; also serves
+   * as a small-context guard when set low for small-context models). */
+  maxOutput: number;
 }
 
 interface OpenAIResponse {
@@ -103,6 +122,87 @@ export class OpenAIProvider extends BaseLLMProvider {
   protected resolveModel(options?: LLMCompletionOptions): string {
     if (options?.model) return options.model;
     return options?.tier ? this.tierModels[options.tier] : this.model;
+  }
+
+  // ── Per-tier generation defaults (shared across OpenAI-compatible providers) ──
+  // Same philosophy as the Anthropic provider: reasoning tokens share the output
+  // cap, so an undersized cap starves the answer (empty / finish_reason=length).
+  // Size the cap generously when reasoning is active. Subclasses override
+  // reasoningProfile()/applyReasoning() for their model-specific semantics.
+
+  protected static readonly TIER_EFFORT: Record<ModelTier, EffortLevel> = {
+    smart: 'high',
+    balanced: 'medium',
+    fast: 'low',
+  };
+
+  protected static readonly TIER_MAX_TOKENS: Record<ModelTier, number> = {
+    smart: 32000,
+    balanced: 16000,
+    fast: 4000,
+  };
+
+  /** Floor on the output cap whenever reasoning is active, so the answer fits. */
+  protected static readonly MIN_REASONING_MAX_TOKENS = 16000;
+
+  /** Above this, a non-streaming request risks the long-request limit; route to streaming. */
+  protected static readonly NON_STREAMING_MAX_TOKENS = 20000;
+
+  /**
+   * Model reasoning capability + output ceiling. Base = OpenAI GPT-5.x
+   * (reasoning_effort supported, 128k output). Subclasses override.
+   */
+  protected reasoningProfile(_model: string): OpenAIReasoningProfile {
+    return { supportsEffort: true, reasons: true, maxOutput: 128000 };
+  }
+
+  /**
+   * Effort for this call: explicit override, else per-tier default. Untiered
+   * calls get none (legacy behavior).
+   */
+  protected resolveEffort(options: LLMCompletionOptions): EffortLevel | undefined {
+    return options.effort ?? (options.tier ? OpenAIProvider.TIER_EFFORT[options.tier] : undefined);
+  }
+
+  /**
+   * Apply reasoning fields to the request. Base = OpenAI: set `reasoning_effort`
+   * (+ a `verbosity` hint) when the model supports it. Returns whether reasoning
+   * will actually run (drives cap sizing + the streaming route). Subclasses
+   * override for their own reasoning API (or to send nothing).
+   */
+  protected applyReasoning(request: OpenAIRequest, model: string, options: LLMCompletionOptions): { reasoningActive: boolean } {
+    const profile = this.reasoningProfile(model);
+    if (!profile.supportsEffort) return { reasoningActive: profile.reasons };
+    const effort = this.resolveEffort(options);
+    if (effort) request.reasoning_effort = effort;
+    return { reasoningActive: profile.reasons && effort !== 'none' };
+  }
+
+  /** Output-token cap: tier default (floored by caller request and by the
+   * reasoning minimum), clamped to the model's output ceiling. */
+  protected resolveMaxTokens(model: string, options: LLMCompletionOptions, reasoningActive: boolean): number {
+    const profile = this.reasoningProfile(model);
+    const tier = options.tier;
+    let cap = tier ? OpenAIProvider.TIER_MAX_TOKENS[tier] : (options.maxTokens ?? 4096);
+    cap = Math.max(cap, options.maxTokens ?? 0);
+    if (reasoningActive) cap = Math.max(cap, OpenAIProvider.MIN_REASONING_MAX_TOKENS);
+    return Math.min(cap, profile.maxOutput);
+  }
+
+  /** Build the shared request with reasoning + cap applied. */
+  protected buildRequest(messages: LLMMessage[], options: LLMCompletionOptions, stream: boolean): { request: OpenAIRequest; reasoningActive: boolean } {
+    const model = this.resolveModel(options);
+    const request: OpenAIRequest = {
+      model,
+      messages: messages.map((m) => ({ role: m.role, content: this.mapContent(m.content) })),
+      temperature: options.temperature,
+      stop: options.stopSequences,
+    };
+    if (stream) request.stream = true;
+    if (options.cacheKey) request.prompt_cache_key = options.cacheKey;
+    const { reasoningActive } = this.applyReasoning(request, model, options);
+    request.max_completion_tokens = this.resolveMaxTokens(model, options, reasoningActive);
+    return { request, reasoningActive };
   }
 
   async listModels(): Promise<ModelInfo[]> {
@@ -181,18 +281,12 @@ export class OpenAIProvider extends BaseLLMProvider {
   ): Promise<LLMCompletionResult> {
     require(this.apiKey !== undefined, 'API key is required');
 
-    const request: OpenAIRequest = {
-      model: this.resolveModel(options),
-      messages: messages.map((m) => ({
-        role: m.role,
-        content: this.mapContent(m.content),
-      })),
-      max_completion_tokens: options.maxTokens,
-      temperature: options.temperature,
-      stop: options.stopSequences,
-    };
-    if (options.cacheKey) {
-      request.prompt_cache_key = options.cacheKey;
+    const { request } = this.buildRequest(messages, options, false);
+
+    // A large output cap (reasoning models) can't be served by the plain
+    // endpoint without risking the long-request limit; collect via streaming.
+    if ((request.max_completion_tokens ?? 0) > OpenAIProvider.NON_STREAMING_MAX_TOKENS) {
+      return this.completeViaStream(messages, options);
     }
 
     return this.withRetries(async () => {
@@ -221,26 +315,28 @@ export class OpenAIProvider extends BaseLLMProvider {
     }, { label: `${this.name}.complete` });
   }
 
+  /** Non-streaming result assembled from the streaming path, for large-cap
+   * (reasoning) calls the plain endpoint can't serve. */
+  protected async completeViaStream(messages: LLMMessage[], options: LLMCompletionOptions): Promise<LLMCompletionResult> {
+    let content = '';
+    let stopReason: string | undefined;
+    for await (const chunk of this.stream(messages, options)) {
+      if (chunk.content) content += chunk.content;
+      if (chunk.done) stopReason = chunk.stopReason;
+    }
+    return {
+      content,
+      finishReason: stopReason === 'stop' || stopReason === undefined ? 'stop' : 'length',
+    };
+  }
+
   async *stream(
     messages: LLMMessage[],
     options: LLMCompletionOptions = {}
   ): AsyncIterable<LLMStreamChunk> {
     require(this.apiKey !== undefined, 'API key is required');
 
-    const request: OpenAIRequest = {
-      model: this.resolveModel(options),
-      messages: messages.map((m) => ({
-        role: m.role,
-        content: this.mapContent(m.content),
-      })),
-      max_completion_tokens: options.maxTokens,
-      temperature: options.temperature,
-      stop: options.stopSequences,
-      stream: true,
-    };
-    if (options.cacheKey) {
-      request.prompt_cache_key = options.cacheKey;
-    }
+    const { request } = this.buildRequest(messages, options, true);
 
     const maxAttempts = 3;
     const initialDelayMs = 1000;
@@ -290,6 +386,7 @@ export class OpenAIProvider extends BaseLLMProvider {
 
     const decoder = new TextDecoder();
     let buffer = '';
+    let stopReason: string | undefined;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -305,20 +402,25 @@ export class OpenAIProvider extends BaseLLMProvider {
 
         const data = line.slice(6);
         if (data === '[DONE]') {
-          yield { content: '', done: true };
+          yield { content: '', done: true, stopReason };
           return;
         }
 
         try {
           const event = JSON.parse(data);
+          // Reasoning models put the answer in delta.content; the hidden
+          // reasoning goes to a separate field (reasoning_content /
+          // reasoning_details), which we intentionally do not surface.
           const delta = event.choices?.[0]?.delta?.content;
 
           if (delta) {
             yield { content: delta, done: false };
           }
 
-          if (event.choices?.[0]?.finish_reason) {
-            yield { content: '', done: true };
+          const fr = event.choices?.[0]?.finish_reason;
+          if (fr) {
+            stopReason = String(fr);
+            yield { content: '', done: true, stopReason };
             return;
           }
         } catch {
@@ -327,7 +429,7 @@ export class OpenAIProvider extends BaseLLMProvider {
       }
     }
 
-    yield { content: '', done: true };
+    yield { content: '', done: true, stopReason };
   }
 
   /**

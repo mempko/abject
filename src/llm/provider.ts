@@ -22,7 +22,7 @@ export type ModelTier = 'smart' | 'balanced' | 'fast';
  * Higher levels spend more tokens on thinking/tool-calls; 'high' is the API
  * default. Providers that don't support effort ignore this.
  */
-export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export type EffortLevel = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export interface LLMCompletionOptions {
   temperature?: number;
