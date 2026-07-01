@@ -89,7 +89,7 @@ export class AnthropicProvider extends BaseLLMProvider {
   private model: string;
 
   private static readonly TIER_MODELS: Record<ModelTier, string> = {
-    smart: 'claude-opus-4-7',
+    smart: 'claude-opus-4-8',
     balanced: 'claude-sonnet-4-6',
     fast: 'claude-haiku-4-5-20251001',
   };
@@ -101,10 +101,12 @@ export class AnthropicProvider extends BaseLLMProvider {
 
   async listModels(): Promise<ModelInfo[]> {
     if (!this.apiKey) {
+      log.warn('listModels: no API key on this provider instance; returning the fallback catalog. The dynamic model list only loads for a provider registered with a credential.');
       return this.fallbackModels();
     }
     try {
-      const response = await this.fetch(`${this.baseUrl}/v1/models?limit=1000`, {
+      const url = `${this.baseUrl}/v1/models?limit=1000`;
+      const response = await this.fetch(url, {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json',
@@ -113,21 +115,30 @@ export class AnthropicProvider extends BaseLLMProvider {
           'anthropic-dangerous-direct-browser-access': 'true',
         },
       });
+      if (!response.ok) {
+        log.warn(`listModels: GET ${url} returned ${response.status} ${response.statusText}; falling back. Body: ${String(response.body).slice(0, 300)}`);
+        return this.fallbackModels();
+      }
       const parsed = JSON.parse(response.body) as {
         data?: Array<{ id: string; display_name?: string }>;
       };
       const rows = parsed.data ?? [];
-      if (rows.length === 0) return this.fallbackModels();
+      if (rows.length === 0) {
+        log.warn(`listModels: GET ${url} returned 0 models (unexpected response shape?); falling back. Body: ${String(response.body).slice(0, 300)}`);
+        return this.fallbackModels();
+      }
+      log.info(`listModels: fetched ${rows.length} live Anthropic models`);
       return rows.map(r => ({ id: r.id, name: r.display_name ?? r.id }));
     } catch (err) {
-      log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
+      log.warn(`listModels: fetch failed (${err instanceof Error ? err.message : String(err)}); falling back to the hardcoded catalog`);
       return this.fallbackModels();
     }
   }
 
   private fallbackModels(): ModelInfo[] {
     return [
-      { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
+      { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
+      { id: 'claude-fable-5', name: 'Claude Fable 5' },
       { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
       { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
     ];

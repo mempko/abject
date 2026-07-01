@@ -1704,12 +1704,16 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         request(this.id, this.llmId, 'listProviderModels', payload)
       );
       if (models.length > 0) {
+        log.info(`refreshProviderModels: ${name} returned ${models.length} models`);
         this.providerModelCache.set(name, models);
         this.fetchedLiveModels.add(name);
         await this.onProviderModelsUpdated(name);
+      } else {
+        log.warn(`refreshProviderModels: ${name} returned an empty model list; keeping the fallback catalog`);
       }
-    } catch {
-      // Network error or provider not registered; keep defaults.
+    } catch (err) {
+      // Network error or provider not registered; keep defaults but surface why.
+      log.warn(`refreshProviderModels: ${name} live model fetch failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       this.modelFetchInFlight.delete(name);
     }
