@@ -552,6 +552,7 @@ export class WidgetManager extends Abject {
           maxLines?: number;
           minHeight?: number;
           monospace?: boolean;
+          readOnly?: boolean;
           checked?: boolean;
           value?: number;
           options?: string[];
@@ -796,6 +797,7 @@ export class WidgetManager extends Abject {
         selectedIndex?: number;
         placeholder?: string;
         monospace?: boolean;
+        readOnly?: boolean;
         masked?: boolean;
       };
       return this.addWidget(msg.routing.from, { ...payload, rect: coerceRect(payload.rect) });
@@ -2601,6 +2603,7 @@ await this.call(timerId, 'addDependent', {});
     maxLines?: number;
     minHeight?: number;
     monospace?: boolean;
+    readOnly?: boolean;
     checked?: boolean;
     value?: number;
     options?: string[];
@@ -2654,7 +2657,7 @@ await this.call(timerId, 'addDependent', {});
       case 'textArea':
         return this.createTypedWidget(spec.windowId, new TextAreaWidget({
           type: 'textArea', rect, text: spec.text, style: spec.style,
-          monospace: spec.monospace, ...base,
+          monospace: spec.monospace, readOnly: spec.readOnly, ...base,
         }), rect);
       case 'checkbox':
         return this.createTypedWidget(spec.windowId, new CheckboxWidget({
@@ -2815,6 +2818,7 @@ await this.call(timerId, 'addDependent', {});
       selectedIndex?: number;
       placeholder?: string;
       monospace?: boolean;
+      readOnly?: boolean;
       masked?: boolean;
       tabs?: string[];
       closable?: boolean;
@@ -2868,6 +2872,7 @@ await this.call(timerId, 'addDependent', {});
         widget = new TextAreaWidget({
           ...baseConfig,
           monospace: config.monospace,
+          readOnly: config.readOnly,
         } as TextAreaWidgetConfig);
         break;
       case 'checkbox':

@@ -39,6 +39,12 @@ interface DisplayRow {
 
 export interface TextAreaWidgetConfig extends WidgetConfig {
   monospace?: boolean;
+  /**
+   * When true, the area is a viewer: editing keys and paste are blocked, but
+   * navigation, selection, copy, and scrolling all still work and the text is
+   * drawn at full opacity (unlike `disabled`, which also dims it).
+   */
+  readOnly?: boolean;
 }
 
 export class TextAreaWidget extends WidgetAbject {
@@ -47,6 +53,7 @@ export class TextAreaWidget extends WidgetAbject {
   private scrollTop = 0;
   private lineHeight: number;
   private monospace: boolean;
+  private readOnly: boolean;
   private selAnchorLine: number | null = null;
   private selAnchorCol: number | null = null;
   private dragging = false;
@@ -69,6 +76,7 @@ export class TextAreaWidget extends WidgetAbject {
   constructor(config: TextAreaWidgetConfig) {
     super(config);
     this.monospace = config.monospace ?? false;
+    this.readOnly = config.readOnly ?? false;
     this.lineHeight = DEFAULT_LINE_HEIGHT;
   }
 
@@ -77,7 +85,8 @@ export class TextAreaWidget extends WidgetAbject {
   }
 
   protected override wantsMobileKeyboard(): boolean {
-    return true;
+    // A read-only viewer never asks for the on-screen keyboard.
+    return !this.readOnly;
   }
 
   /** Capture current state for the undo stack. */
@@ -821,8 +830,8 @@ export class TextAreaWidget extends WidgetAbject {
       return { consumed: true };
     }
 
-    // When disabled, block all editing keys but allow navigation/selection above
-    if (this.disabled) {
+    // When disabled or read-only, block editing keys but allow navigation/selection above
+    if (this.disabled || this.readOnly) {
       if (key === 'ArrowLeft' || key === 'ArrowRight' || key === 'ArrowUp' || key === 'ArrowDown'
           || key === 'Home' || key === 'End') {
         // fall through to normal handling below
@@ -1309,7 +1318,7 @@ export class TextAreaWidget extends WidgetAbject {
   }
 
   private async handlePaste(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
-    if (this.disabled) return { consumed: true };
+    if (this.disabled || this.readOnly) return { consumed: true };
     const pasteText = (input.pasteText as string) ?? '';
     if (!pasteText) return { consumed: true };
 
@@ -1364,6 +1373,7 @@ export class TextAreaWidget extends WidgetAbject {
 
   protected applyUpdate(updates: Record<string, unknown>): void {
     if (updates.monospace !== undefined) this.monospace = updates.monospace as boolean;
+    if (updates.readOnly !== undefined) this.readOnly = updates.readOnly as boolean;
     if (updates.errorLine !== undefined) this.errorLine = updates.errorLine as number;
     // When text is set externally, reset cursor to start and clear selection.
     // Also drop the undo history — its snapshots reference the previous text
