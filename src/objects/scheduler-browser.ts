@@ -32,6 +32,7 @@ export class SchedulerBrowser extends Abject {
   private detailLayoutId?: AbjectId;
   private detailTitleId?: AbjectId;
   private detailDescId?: AbjectId;
+  private detailCodeId?: AbjectId;
   private detailMetaId?: AbjectId;
   private toggleBtnId?: AbjectId;
   private deleteBtnId?: AbjectId;
@@ -225,6 +226,10 @@ Use Toggle to enable/disable, Delete to remove.
             style: { fontSize: 14, fontWeight: 'bold', color: this.theme.textHeading, wordWrap: true } },
           { type: 'markdown', windowId: this.windowId, text: '',
             style: { fontSize: 12, color: this.theme.textPrimary, wordWrap: true, markdown: true } },
+          // Job code goes in its own word-wrapping, monospace text area so long
+          // scripts stay fully readable and scroll internally.
+          { type: 'textArea', windowId: this.windowId, text: '', monospace: true,
+            style: { fontSize: 11, color: this.theme.textPrimary, wordWrap: true }, readOnly: true },
           { type: 'label', windowId: this.windowId, text: '',
             style: { fontSize: 11, color: this.theme.textSecondary, wordWrap: true } },
         ],
@@ -232,12 +237,14 @@ Use Toggle to enable/disable, Delete to remove.
     );
     this.detailTitleId = detailIds[0];
     this.detailDescId = detailIds[1];
-    this.detailMetaId = detailIds[2];
+    this.detailCodeId = detailIds[2];
+    this.detailMetaId = detailIds[3];
 
     await this.request(request(this.id, this.detailLayoutId, 'addLayoutChildren', {
       children: [
         { widgetId: this.detailTitleId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 24 } },
-        { widgetId: this.detailDescId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+        { widgetId: this.detailDescId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 56 } },
+        { widgetId: this.detailCodeId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
         { widgetId: this.detailMetaId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 40 } },
       ],
     }));
@@ -319,6 +326,7 @@ Use Toggle to enable/disable, Delete to remove.
     this.detailLayoutId = undefined;
     this.detailTitleId = undefined;
     this.detailDescId = undefined;
+    this.detailCodeId = undefined;
     this.detailMetaId = undefined;
     this.toggleBtnId = undefined;
     this.deleteBtnId = undefined;
@@ -382,7 +390,7 @@ Use Toggle to enable/disable, Delete to remove.
   private async showDetail(): Promise<void> {
     const entry = this.entries[this.selectedIndex];
     if (!entry) {
-      await this.updateDetail('Select a schedule', '', '');
+      await this.updateDetail('Select a schedule', '', '', '');
       return;
     }
 
@@ -398,18 +406,20 @@ Use Toggle to enable/disable, Delete to remove.
     const lastRun = entry.lastRun > 0 ? new Date(entry.lastRun).toLocaleString() : 'Never';
     const nextRun = entry.nextRun > 0 ? new Date(entry.nextRun).toLocaleString() : 'Unknown';
 
-    const desc = `${timing}\n**Enabled:** ${entry.enabled ? 'Yes' : 'No'}\n\n**Job code:**\n\`\`\`\n${entry.jobCode.slice(0, 300)}\n\`\`\``;
+    const desc = `${timing}\n**Enabled:** ${entry.enabled ? 'Yes' : 'No'}`;
+    const code = entry.jobCode || '(no job code)';
     const meta = `Last run: ${lastRun} | Next run: ${nextRun} | ID: ${entry.id}`;
 
-    await this.updateDetail(entry.description, desc, meta);
+    await this.updateDetail(entry.description, desc, code, meta);
   }
 
-  private async updateDetail(title: string, desc: string, meta: string): Promise<void> {
+  private async updateDetail(title: string, desc: string, code: string, meta: string): Promise<void> {
     if (!this.detailTitleId) return;
     try {
       await Promise.all([
         this.request(request(this.id, this.detailTitleId, 'update', { text: title })),
         this.request(request(this.id, this.detailDescId!, 'update', { text: desc })),
+        this.request(request(this.id, this.detailCodeId!, 'update', { text: code })),
         this.request(request(this.id, this.detailMetaId!, 'update', { text: meta })),
       ]);
     } catch { /* widgets may be gone */ }
@@ -451,7 +461,7 @@ Use Toggle to enable/disable, Delete to remove.
       );
       this.selectedIndex = -1;
       await this.loadEntries();
-      await this.updateDetail('Select a schedule', '', '');
+      await this.updateDetail('Select a schedule', '', '', '');
       await this.notify('Schedule deleted', 'success');
     } catch (err) {
       log.warn('Failed to delete schedule:', err);

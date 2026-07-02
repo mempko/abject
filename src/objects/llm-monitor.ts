@@ -795,9 +795,9 @@ export class LLMMonitor extends Abject {
           specs: [
             { type: 'label', windowId: this.detailWindowId, text: summaryText, style: { fontSize: 11, color: this.theme.sectionLabel } },
             { type: 'label', windowId: this.detailWindowId, text: 'Prompt:', style: { fontSize: 11, color: this.theme.accent, fontWeight: 'bold' } },
-            { type: 'textArea', windowId: this.detailWindowId, text: entry.inputMessages || '(no input captured)', style: { fontSize: 11 }, readOnly: true },
+            { type: 'textArea', windowId: this.detailWindowId, text: entry.inputMessages || '(no input captured)', style: { fontSize: 11, wordWrap: true }, readOnly: true },
             { type: 'label', windowId: this.detailWindowId, text: 'Output:', style: { fontSize: 11, color: this.theme.accent, fontWeight: 'bold' } },
-            { type: 'textArea', windowId: this.detailWindowId, text: entry.outputContent || '(no output)', style: { fontSize: 11 }, readOnly: true },
+            { type: 'textArea', windowId: this.detailWindowId, text: entry.outputContent || '(no output)', style: { fontSize: 11, wordWrap: true }, readOnly: true },
           ],
         })
       );

@@ -8,6 +8,7 @@
 import type { ParsedMarkdown, MarkdownBlock, TextSpan, SpanStyle, BlockType } from './markdown.js';
 import { parseInline } from './markdown.js';
 import type { ThemeData } from './widget-types.js';
+import { wrapText } from './word-wrap.js';
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -305,28 +306,35 @@ async function layoutCodeBlock(
   const fill = theme.textPrimary;
   const codeText = block.spans[0]?.text ?? '';
   const codeLines = codeText.split('\n');
+  const indent = 8; // code left padding
+  const availWidth = maxWidth - indent - 8; // leave a small right gutter
   let y = startY;
 
   for (let i = 0; i < codeLines.length; i++) {
-    const text = codeLines[i];
-    const width = text.length > 0 ? await measureFn(text, font) : 0;
-    lines.push({
-      runs: [{
-        text,
-        font,
-        fill,
-        width,
-        sourceStart: block.sourceStart,
-        sourceEnd: block.sourceEnd,
-      }],
-      y,
-      height: lineHeight,
-      indent: 8, // code left padding
-      blockType: 'code-block',
-      blockStart: i === 0,
-      codeBackground: true,
-    });
-    y += lineHeight;
+    // Soft-wrap each source line so long lines stay visible instead of being
+    // clipped at the right edge. Preserves leading indent on the first row.
+    const wrapped = await wrapText(codeLines[i], availWidth, (t) => measureFn(t, font));
+    for (let j = 0; j < wrapped.length; j++) {
+      const text = wrapped[j];
+      const width = text.length > 0 ? await measureFn(text, font) : 0;
+      lines.push({
+        runs: [{
+          text,
+          font,
+          fill,
+          width,
+          sourceStart: block.sourceStart,
+          sourceEnd: block.sourceEnd,
+        }],
+        y,
+        height: lineHeight,
+        indent,
+        blockType: 'code-block',
+        blockStart: i === 0 && j === 0,
+        codeBackground: true,
+      });
+      y += lineHeight;
+    }
   }
 }
 
