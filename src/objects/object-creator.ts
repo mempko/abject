@@ -881,7 +881,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         detail = `\n\nSyntax error near line ${loc.line}:${loc.column}:\n${ctx}`;
       }
     }
-    detail += `\n\nSource is ${lines.length} lines. If the syntax error is hard to localize, regenerate the whole object with draft_source rather than patching around it.`;
+    detail += `\n\nSource is ${lines.length} lines. The failing line and its surrounding context are shown above; you already have the exact location, so do NOT use read_draft to find it again. Fix it in place: replace_handler to rewrite the single member that contains it, or draft_diff for a one-line change; or regenerate the whole object with draft_source. A syntax error at or near the last line is almost always an unbalanced brace/paren/bracket, so check the object literal's closing.`;
     return `${err}${detail}`;
   }
 
@@ -2148,6 +2148,26 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       lines.push('');
     }
 
+    // Stop-reading steer: read_draft is read-only and makes no progress.
+    // Count how many read_drafts run back-to-back with no productive action
+    // between them; two in a row is already a stall (reading→editing→reading is
+    // fine, this only fires on reading→reading). Point straight at the fix.
+    let consecutiveReads = 0;
+    for (let i = state.turnLog.length - 1; i >= 0; i--) {
+      if (state.turnLog[i].action === 'read_draft') consecutiveReads++;
+      else break;
+    }
+    if (consecutiveReads >= 2) {
+      const compileErr = typeof state.lastValidation?.compile === 'string' && state.lastValidation.compile !== '';
+      lines.push(`⚠️ You have called read_draft ${consecutiveReads}× in a row without changing anything. read_draft is read-only, so it makes no progress.`);
+      if (compileErr) {
+        lines.push('   The compile error above already names the exact failing line and shows its context, so you HAVE the location. Do NOT read_draft again to find it. Fix it now: replace_handler to rewrite the one member that contains it, or draft_diff for a small change, or draft_source to regenerate the whole object.');
+      } else {
+        lines.push('   Act now instead of reading again: compile to validate the draft, then deploy_update — or make a targeted replace_handler / draft_diff edit. One more read will not move the build forward.');
+      }
+      lines.push('');
+    }
+
     const recent = state.turnLog.slice(-8);
     if (recent.length > 0) {
       lines.push(`RECENT TURNS (last ${recent.length})`);
@@ -2247,7 +2267,7 @@ Emit EXACTLY ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothi
   \`\`\`
 
   Multiple blocks may appear in one \`blocks\` payload and are applied in order. SEARCH must match a UNIQUE location in the current source — include 2–3 lines of surrounding context if a snippet would otherwise match in more than one place. Whitespace is forgiven (line-trimmed match), but matching the indentation exactly is safer. Successive \`draft_diff\` calls stack on the prior result, so you can layer fixes. To insert new code, use a SEARCH that matches a nearby anchor and include both the anchor and your insertion in REPLACE.
-- \`read_draft({handler? , lineRange?, grep?})\` — read the CURRENT staged source so you edit against ground truth instead of memory. No args → a compact outline (each top-level member with its line range). \`{handler:"name"}\` → that member's exact current text (line-numbered). \`{lineRange:"a-b"}\` → those lines. \`{grep:"pattern"}\` → matching lines. Editing nothing, read-only. **Read before you edit** a large object — it prevents the SEARCH-mismatch and "wrong remembered text" failures.
+- \`read_draft({handler? , lineRange?, grep?})\` — read the CURRENT staged source so you edit against ground truth instead of memory. No args → a compact outline (each top-level member with its line range). \`{handler:"name"}\` → that member's exact current text (line-numbered). \`{lineRange:"a-b"}\` → those lines. \`{grep:"pattern"}\` → matching lines. Editing nothing, read-only. Use it to orient in an EXISTING large object BEFORE editing it (a modify flow): one read of the one member you're about to change. It is NOT for re-reviewing source you just generated: after \`draft_source\`/\`draft_via_llm\`, go straight to \`compile\` (it points to the one broken spot), and only \`read_draft\` the specific member/line a validation error names, once. read_draft is read-only, so repeating it makes no progress; never call it two turns in a row without an edit or a compile between them.
 - \`replace_handler({name, body})\` — replace the ENTIRE top-level member named \`name\` (a method or property of the \`({ … })\` literal) with \`body\` (the full member text, including its signature, e.g. \`"openMap(msg) { … }"\`). Located by name via the object literal's structure — no SEARCH text, whitespace-proof, unaffected by file size. **This is the preferred way to modify one method**; reach for it before \`draft_diff\`. Run \`compile\` after.
 - \`add_handler({name, body})\` — insert a NEW top-level member (full member text). Errors if \`name\` already exists (use replace_handler then). Run \`compile\` after.
 - \`remove_handler({name})\` — delete the top-level member named \`name\` (and its separating comma). Run \`compile\` after.
@@ -2322,7 +2342,7 @@ For a complex, stateful UI this Model-View split is often two cooperating Abject
 
 1. **Ask before guessing.** When you don't know whether an object exists, what its API is, what its state means, or what method to call — \`ask\`. The Registry, the target object, or any candidate dep will answer.
 2. **Investigate before drafting — \`ask\` is how you learn to use an object.** \`ask\` returns prose usage: examples, patterns, design guidance, the right way to call something. \`describe\` is programmatic reflection (the raw manifest) — it lists method names/params but does NOT teach usage, so it is rarely what you want, and you almost never need to call it yourself: asking a dependency automatically fetches its manifest for call-validation. So: for CREATIONS, \`ask\` the Registry what's available, then \`ask\` each chosen dependency open questions — "how do I use you?", "how do I build a good X?", "how do I make this look good?" — and only \`draft\` once you understand the surface. For MODIFICATIONS, \`ask\` the target your open questions, \`getSource\` to read its current code, \`getState\` if relevant. Prefer \`ask\` over \`describe\` everywhere; reach for \`describe\` only when you specifically need the raw structured manifest.
-3. **Validate before deploying.** After any \`draft_source\`, \`draft_diff\`, or \`draft_via_llm\`: always \`compile\`; then \`validate_calls\`; for non-trivial logic also \`review_semantics\`. Deploy only when compile is clean and validators agree.
+3. **Validate before deploying; compile first, don't re-read.** After any \`draft_source\`, \`draft_diff\`, or \`draft_via_llm\`: go straight to \`compile\` (it localizes the one broken spot far faster than re-reading), then \`validate_calls\`; for non-trivial logic also \`review_semantics\`. Deploy only when compile is clean and validators agree. When compile reports a syntax error it already shows the failing line and context, so fix it with \`replace_handler\`/\`draft_diff\` at that line or regenerate with \`draft_source\`; do NOT \`read_draft\` to relocate it. Reading the draft repeatedly with no edit between reads is a stall that burns your step budget and leaves nothing to verify.
 4. **Verify behavior after deploying — really test what the user asked for.** After deploy, you must exercise the specific behavior the user requested, not just check that the object exists. \`call show\` and reading \`getState\` are not enough by themselves.
 
    For each behavior the user mentioned, send a \`call\` that drives it and check the result via \`getState\` or the response. Examples:

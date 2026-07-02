@@ -208,8 +208,10 @@ export class Chat extends Abject {
    */
   private pendingImages: Array<{ name: string; mimeType: string; base64: string }> = [];
 
-  /** Pending ticket promises: ticketId → resolve/reject. */
-  private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number }>();
+  /** Pending ticket promises: ticketId → resolve/reject. `paused` suspends the
+   * timeout while the task is blocked awaiting a goal (the goal has its own
+   * progress-resetting wait, so the chat must not time out before it does). */
+  private pendingTickets = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; timeoutMs: number; paused?: boolean }>();
 
   /** Current active ticket ID (for progress/stream routing). */
   private _currentTicketId?: string;
@@ -716,6 +718,7 @@ export class Chat extends Abject {
           if (aspect === 'goalCompleted') {
             const data = value as { goalId: string; result?: unknown };
             const entry = this.liveGoals.get(data.goalId);
+            const wasDone = entry?.status === 'completed' || entry?.status === 'failed';
             if (entry) {
               entry.status = 'completed';
               this.scheduleActivityRefresh();
@@ -728,6 +731,12 @@ export class Chat extends Abject {
               this.pendingGoalCompletions.delete(data.goalId);
               clearTimeout(pending.timer);
               pending.resolve({ result: data.result, status: 'completed' });
+            } else if (entry && !wasDone) {
+              // No active wait: the chat task that dispatched this goal already
+              // returned, so its normal reply won't fire. Deliver the result
+              // into the conversation so a late success shows up where the user
+              // asked, not just as a standalone popup.
+              void this.deliverLateGoalOutcome({ result: data.result, status: 'completed' });
             }
             return;
           }
@@ -735,6 +744,7 @@ export class Chat extends Abject {
           if (aspect === 'goalFailed') {
             const data = value as { goalId: string; error?: string };
             const entry = this.liveGoals.get(data.goalId);
+            const wasDone = entry?.status === 'completed' || entry?.status === 'failed';
             if (entry) {
               entry.status = 'failed';
               if (data.error) entry.latestMessage = data.error;
@@ -745,6 +755,8 @@ export class Chat extends Abject {
               this.pendingGoalCompletions.delete(data.goalId);
               clearTimeout(pending.timer);
               pending.resolve({ error: data.error, status: 'failed' });
+            } else if (entry && !wasDone) {
+              void this.deliverLateGoalOutcome({ error: data.error, status: 'failed' });
             }
             return;
           }
@@ -892,10 +904,60 @@ export class Chat extends Abject {
     });
   }
 
+  /**
+   * Post a goal outcome that landed after the dispatching chat task already
+   * returned. Without this a late success shows up only as a standalone
+   * Notification window while the conversation's last word is a stale error,
+   * so route it into the chat thread where the user asked.
+   */
+  private async deliverLateGoalOutcome(outcome: { result?: unknown; error?: string; status: 'completed' | 'failed' }): Promise<void> {
+    const text = outcome.status === 'completed'
+      ? (typeof outcome.result === 'string' ? outcome.result : JSON.stringify(outcome.result))
+      : `The goal did not complete: ${outcome.error ?? 'unknown error'}`;
+    if (!text?.trim()) return;
+    try {
+      await this.removeWelcomeState();
+      await this.appendBubble('assistant', 'Agent', text.trim(), true);
+      this.conversationHistory.push({ role: 'assistant', content: text.trim() });
+      this.schedulePersist();
+    } catch (err) {
+      log.warn(`[Chat] deliverLateGoalOutcome failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   /** Reset all pending ticket timeouts (called on progress events). */
   private resetPendingTicketTimeouts(): void {
     for (const [ticketId, entry] of this.pendingTickets) {
+      if (entry.paused) continue;
       clearTimeout(entry.timer);
+      entry.timer = setTimeout(() => {
+        this.pendingTickets.delete(ticketId);
+        entry.reject(new Error(`Task ${ticketId} timed out after ${entry.timeoutMs}ms`));
+      }, entry.timeoutMs);
+    }
+  }
+
+  /**
+   * Suspend a ticket's timeout while its task is blocked awaiting a goal. The
+   * goal has its own 10-minute, progress-resetting wait, so the chat task must
+   * not time out before the goal itself does ("the chat shouldn't time out if
+   * the goal hasn't"). Re-armed by resumeTicketTimeout when the goal wait ends.
+   */
+  private pauseTicketTimeout(ticketId?: string): void {
+    if (!ticketId) return;
+    const entry = this.pendingTickets.get(ticketId);
+    if (entry && !entry.paused) {
+      entry.paused = true;
+      clearTimeout(entry.timer);
+    }
+  }
+
+  /** Re-arm a ticket timeout paused by pauseTicketTimeout (goal wait finished). */
+  private resumeTicketTimeout(ticketId?: string): void {
+    if (!ticketId) return;
+    const entry = this.pendingTickets.get(ticketId);
+    if (entry && entry.paused) {
+      entry.paused = false;
       entry.timer = setTimeout(() => {
         this.pendingTickets.delete(ticketId);
         entry.reject(new Error(`Task ${ticketId} timed out after ${entry.timeoutMs}ms`));
@@ -1052,6 +1114,11 @@ export class Chat extends Abject {
         return { success: false, error: err instanceof Error ? err.message : String(err) };
       }
 
+      // Suspend this chat task's own timeout while we wait on the goal: the
+      // goal's wait (below) is authoritative, so the chat can't time out before
+      // the goal does. Re-armed in the finally so the post-goal reply synthesis
+      // is still bounded.
+      this.pauseTicketTimeout(this._currentTicketId);
       try {
         // Wait for ScrumMaster's DONE decision. The timer resets on every
         // goal-level progress event (scrumPlanned, goalUpdated, etc.) via
@@ -1099,6 +1166,8 @@ export class Chat extends Abject {
           error: err instanceof Error ? err.message : String(err),
           data: { scratchpad, partial: true },
         };
+      } finally {
+        this.resumeTicketTimeout(this._currentTicketId);
       }
     }
 
