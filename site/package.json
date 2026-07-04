@@ -12,5 +12,11 @@
   },
   "devDependencies": {
     "@astrojs/sitemap": "^3.7.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp"
+    ]
   }
 }
