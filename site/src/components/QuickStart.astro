@@ -4,6 +4,10 @@
 <section id="summon">
   <div class="container">
     <h2 class="section-title">Summon the System</h2>
+    <p class="qs-subtitle">
+      The from-source ritual, for developers. If you just want to <em>use</em> Abject,
+      the download above is everything you need; the organism arrives pre-incarnated.
+    </p>
     <div class="qs-grid">
       <div class="qs-code">
         <div class="code-header">
@@ -13,8 +17,8 @@
           <span class="code-title">terminal</span>
         </div>
         <pre><code><span class="c"># Clone the repository</span>
-<span class="cmd">git clone</span> https://github.com/mempko/abjects
-<span class="cmd">cd</span> abjects
+<span class="cmd">git clone</span> https://github.com/mempko/abject
+<span class="cmd">cd</span> abject
 
 <span class="c"># Install dependencies</span>
 <span class="cmd">pnpm conjure</span>
@@ -51,6 +55,19 @@
 </section>
 
 <style>
+  .qs-subtitle {
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 1rem;
+    max-width: 640px;
+    margin: -1.5rem auto 2.5rem;
+    line-height: 1.7;
+  }
+
+  .qs-subtitle em {
+    color: var(--eldritch);
+  }
+
   .qs-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;

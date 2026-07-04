@@ -8,7 +8,8 @@
     </a>
     <div class="nav-links">
       <a href="/ask-protocol">Ask Protocol</a>
-      <a href="/#symbiogenesis">How It Works</a>
+      <a href="/#symbiogenesis">Why Abject?</a>
+      <a href="/#architecture">How It Works</a>
       <a href="/#capabilities">Capabilities</a>
       <a href="/about">About</a>
       <a href="/#downloads">Download</a>
@@ -106,6 +107,23 @@
   .btn-icon:hover {
     border-color: var(--eldritch);
     color: var(--eldritch);
+  }
+
+  @media (max-width: 1080px) {
+    .nav-links {
+      gap: 0.75rem;
+    }
+
+    .nav-links a {
+      font-size: 0.8rem;
+    }
+  }
+
+  @media (max-width: 940px) {
+    .nav-links a[href="/#architecture"],
+    .nav-links a[href="/#capabilities"] {
+      display: none;
+    }
   }
 
   @media (max-width: 600px) {

@@ -33,6 +33,10 @@
   --text-secondary: #c4c2b8;
   --text-dim: #9a98a8;
   --text-code: #c8c4e0;
+  /* Muted diagram ink: dim enough to read as "the dead old way",
+     bright enough to actually read (>=4.5:1 on --bg-primary). */
+  --diagram-muted: #8a8aa0;
+  --diagram-muted-stroke: #6a6a85;
 
   --border: #232539;
   --border-accent: rgba(91, 229, 160, 0.22);

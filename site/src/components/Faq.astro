@@ -1,0 +1,114 @@
+---
+const questions = [
+  {
+    q: 'Do I have to know how to code?',
+    a: 'No. Describe what you want and an abject appears, window and all. Every abject carries its own source code, so the curious can always open the hood, but you never have to. If you can complain, you can program.',
+  },
+  {
+    q: 'Do I need an API key or an AI subscription?',
+    a: 'Abject needs a mind to borrow, and it is flexible about whose. Bring an Anthropic or OpenAI API key, run a local Ollama model (free, private, and entirely on your hardware), or reuse the Claude Code or Codex subscription you already pay for. On first boot the app asks you which mind to summon.',
+  },
+  {
+    q: 'Is it safe to let this thing touch my machine?',
+    a: 'Abjects reach only what you grant. Files, shell, network, and clipboard are permission-gated capabilities: an abject born without one cannot use it, no matter how politely it asks. Untrusted code runs sandboxed, and everything lives on your machine. The horror is thematic. The containment is real.',
+  },
+  {
+    q: 'Do I need the terminal?',
+    a: 'No. Download the desktop app and open it like anything else. The terminal ritual further down is for developers who want to build from source and commune with the depths directly.',
+  },
+  {
+    q: 'What does it cost?',
+    a: 'Nothing. Free and open source under GPL-3.0. No account, no telemetry, no subscription, no trial that expires at the worst moment. The only cost is LLM tokens, and with Ollama even that rounds down to electricity.',
+  },
+];
+---
+
+<section id="faq" class="faq-section">
+  <div class="container">
+    <h2 class="section-title">Questions from the Mortals</h2>
+    <p class="faq-subtitle">Reasonable things to ask before inviting an organism onto your computer.</p>
+
+    <div class="faq-list">
+      {questions.map((item) => (
+        <details class="faq-item">
+          <summary class="faq-q">{item.q}</summary>
+          <p class="faq-a">{item.a}</p>
+        </details>
+      ))}
+    </div>
+  </div>
+</section>
+
+<style>
+  .faq-section {
+    background: transparent;
+  }
+
+  .faq-subtitle {
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 1rem;
+    max-width: 640px;
+    margin: -1.5rem auto 2.5rem;
+    line-height: 1.7;
+  }
+
+  .faq-list {
+    max-width: 720px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .faq-item {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.5rem;
+    transition: border-color 0.3s, box-shadow 0.3s;
+  }
+
+  .faq-item:hover,
+  .faq-item[open] {
+    border-color: var(--border-accent);
+    box-shadow: 0 0 16px var(--eldritch-glow);
+  }
+
+  .faq-q {
+    cursor: pointer;
+    color: var(--text-primary);
+    font-family: var(--font-display);
+    font-size: 1.05rem;
+    font-weight: 600;
+    list-style: none;
+    position: relative;
+    padding-right: 2rem;
+  }
+
+  .faq-q::-webkit-details-marker {
+    display: none;
+  }
+
+  .faq-q::after {
+    content: '{+}';
+    position: absolute;
+    right: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--eldritch);
+  }
+
+  .faq-item[open] .faq-q::after {
+    content: '{-}';
+  }
+
+  .faq-a {
+    margin-top: 0.75rem;
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+    line-height: 1.7;
+  }
+</style>

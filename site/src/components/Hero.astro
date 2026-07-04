@@ -10,15 +10,17 @@
     <p class="hero-desc">
       Abject is an open-source desktop platform for local-first <em>AI objects</em>
       that explain themselves, find each other, and heal themselves when they break.
-      An <em>abject</em> is a small autonomous object (a window, an agent, a tool, a peer)
-      that carries its own description and talks to other abjects through messages.
+      An <em>abject</em> is not an app. It is a small living object (a window, an agent,
+      a tool, a peer) that carries its own description, talks to its neighbors through
+      messages, and answers for itself in plain English.
     </p>
     <p class="hero-persona">
-      For anyone, not just developers. Describe what you want and an abject appears.
+      For anyone, not just developers. Describe what you want and an abject appears,
+      window and all. It keeps working after you stop talking to it.
       No cloud. No surprise rate-limits. No code required.
     </p>
     <p class="hero-ask">
-      Every abject can answer questions about itself in plain English.
+      Ask any abject what it is, and it will tell you. Politely.
       <a href="/ask-protocol" class="thesis-link">Read the Ask Protocol &rarr;</a>
     </p>
     <div class="hero-actions">
@@ -29,6 +31,10 @@
       <video autoplay loop muted playsinline>
         <source src="/abject_demo2_1080.webm" type="video/webm" />
       </video>
+      <p class="hero-demo-caption">
+        Live capture, not a mockup: a task list spoken into existence.
+        The window opens because it was asked to.
+      </p>
     </div>
     <div class="hero-glyphs">
       <div class="hero-glyph">
@@ -221,6 +227,14 @@
     border-radius: 12px;
     border: 1px solid var(--border);
     box-shadow: 0 0 40px rgba(91, 229, 160, 0.08);
+  }
+
+  .hero-demo-caption {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    font-style: italic;
+    margin-top: 0.75rem;
   }
 
   @media (max-width: 600px) {
