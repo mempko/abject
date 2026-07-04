@@ -36,7 +36,7 @@ export interface WidgetStyle {
   tooltip?: string;  // hover tooltip text, shown after a dwell via WidgetManager's tooltip service (used by icon-only buttons)
 }
 
-export type WidgetType = 'label' | 'markdown' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image' | 'themeSwatch';
+export type WidgetType = 'label' | 'markdown' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image' | 'themeSwatch' | 'goalProgress';
 
 // ── Size/rect input normalization ───────────────────────────────────────────
 // Across the UI, `w`/`h` are the canonical size fields (the canvas draw schema

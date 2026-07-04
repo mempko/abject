@@ -372,9 +372,14 @@ export class ScrollableVBoxLayout extends VBoxLayout {
    * Called from flushPendingRelayout via scheduleRelayout.
    */
   protected override async flushPendingRelayout(): Promise<void> {
-    const wasNearBottom = this.maxScroll <= 0 || (this.maxScroll - this.scrollTop) <= SCROLL_STEP * 2;
     await super.flushPendingRelayout();
-    if (this.autoScrollEnabled && this.autoScroll && wasNearBottom) {
+    // `autoScroll` already encodes "the user is pinned to the bottom" — it is
+    // cleared the moment they scroll up (wheel/drag/keys) and set again when
+    // they return to the bottom. Re-deriving a "was near bottom" flag here would
+    // read the post-relayout maxScroll, which has already jumped when a single
+    // child grows a lot in one pass (e.g. the goal widget expanding), so the
+    // follow would be skipped. Trust the flag, matching the rect branch above.
+    if (this.autoScrollEnabled && this.autoScroll) {
       this.scrollTop = this.maxScroll;
     }
   }

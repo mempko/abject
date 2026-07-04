@@ -44,6 +44,8 @@ import { ImageWidget, ImageWidgetConfig } from './widgets/image-widget.js';
 import { ThemeSwatchWidget, ThemeSwatchWidgetConfig } from './widgets/theme-swatch-widget.js';
 import { ListWidget, ListWidgetConfig, ListItem } from './widgets/list-widget.js';
 import { TreeWidget, TreeWidgetConfig, TreeItem } from './widgets/tree-widget.js';
+import { GoalProgressWidget } from './widgets/goal-progress-widget.js';
+import type { GoalRow } from './goal-tree.js';
 import { SplitPaneWidget, SplitPaneConfig } from './widgets/split-pane-widget.js';
 import { WidgetAbject, WidgetConfig } from './widgets/widget-abject.js';
 import { VBoxLayout } from './widgets/vbox-layout.js';
@@ -2618,6 +2620,7 @@ await this.call(timerId, 'addDependent', {});
     alt?: string;
     items?: ListItem[];
     treeItems?: TreeItem[];
+    rows?: GoalRow[];
     selectedId?: string;
     searchable?: boolean;
     itemHeight?: number;
@@ -2719,6 +2722,11 @@ await this.call(timerId, 'addDependent', {});
           type: 'label' as WidgetType, rect, style: spec.style,
           items: spec.treeItems, selectedId: spec.selectedId,
           itemHeight: spec.itemHeight, ...base,
+        }), rect);
+      case 'goalProgress':
+        return this.createTypedWidget(spec.windowId, new GoalProgressWidget({
+          type: 'goalProgress', rect, style: spec.style,
+          rows: spec.rows, ...base,
         }), rect);
       case 'splitPane':
         return this.createTypedWidget(spec.windowId, new SplitPaneWidget({

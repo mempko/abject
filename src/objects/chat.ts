@@ -13,6 +13,7 @@ import { Capabilities } from '../core/capability.js';
 import type { AgentAction } from './agent-abject.js';
 import type { ContentPart } from '../llm/provider.js';
 import { estimateWrappedLineCount } from './widgets/word-wrap.js';
+import { buildGoalRows, type GoalNode } from './goal-tree.js';
 import { estimateMarkdownHeight } from './widgets/markdown.js';
 import { lightenColor, darkenColor } from './widgets/widget-types.js';
 import { Log } from '../core/timed-log.js';
@@ -161,6 +162,9 @@ export class Chat extends Abject {
 
   /** Consolidated "Thinking / activity" bubble used during task execution. */
   private activityBubbleLabelId?: AbjectId;
+  /** Embedded goal-progress widget shown beneath the activity header. */
+  private activityGoalWidgetId?: AbjectId;
+  private activityGoalHeight = 0;
   private activityStep = 0;
   private activityHeader = '\u25CF Thinking\u2026';
   private activityRefreshTimer?: ReturnType<typeof setTimeout>;
@@ -628,6 +632,17 @@ export class Chat extends Abject {
             preferredSize: { height: columnHeight },
           }));
         } catch { /* layout may be gone */ }
+        return;
+      }
+
+      // Embedded goal widget reports its natural height; resize its log slot so
+      // the tree grows to fit and the message log scrolls (no inner scrollbar).
+      if (fromId === this.activityGoalWidgetId && aspect === 'contentHeight') {
+        const h = typeof value === 'number' ? value : Number(value);
+        if (Number.isFinite(h) && Math.abs(h - this.activityGoalHeight) >= 1) {
+          this.activityGoalHeight = h;
+          await this.setLabelHeight(this.activityGoalWidgetId, h);
+        }
         return;
       }
 
@@ -2268,10 +2283,56 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.activityStep = 0;
     this.activityHeader = '\u25CF Thinking\u2026';
     this.activityRefreshLastHeight = 0;
+    this.activityGoalHeight = 0;
     this.stepStreamChars = 0;
     this.liveGoals.clear();
     this.liveTasks.clear();
     this.activityBubbleLabelId = await this.appendBubble('activity', 'Agent', this.activityHeader, false);
+
+    // Embed the shared goal-progress widget directly beneath the header so the
+    // running goal tree renders identically to the Goals window (word-wrapped,
+    // full text) instead of a separate plain-text tree. It sizes itself via a
+    // `contentHeight` event and grows to fit; the message log scrolls.
+    if (this.messageLogId && this.windowId) {
+      const bubbleMaxWidth = this.computeBubbleMaxWidth();
+      const { widgetIds: [goalWidgetId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', {
+          specs: [{ type: 'goalProgress', windowId: this.windowId, rows: [],
+            style: { background: 'transparent' } }],
+        })
+      );
+      this.activityGoalWidgetId = goalWidgetId;
+      await this.request(request(this.id, this.messageLogId, 'addLayoutChild', {
+        widgetId: goalWidgetId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+        preferredSize: { width: bubbleMaxWidth, height: 0 },
+        alignment: 'left',
+      }));
+      this.messageLabelIds.push(goalWidgetId);
+      this.send(request(this.id, goalWidgetId, 'addDependent', {}));
+    }
+  }
+
+  /** Map the live goal snapshot into the shared row model, scoped to the run. */
+  private buildActivityRows() {
+    const goals: GoalNode[] = [];
+    for (const [id, g] of this.liveGoals) {
+      goals.push({
+        id,
+        parentId: g.parentId,
+        title: g.title,
+        description: g.description ?? '',
+        status: g.status,
+        latestMessage: g.latestMessage,
+        latestAgent: g.latestAgent,
+      });
+    }
+    return buildGoalRows({
+      goals,
+      isExpanded: () => true, // inline view is always fully expanded
+      getTasks: (id) => this.liveTasks.get(id) ?? [],
+      rootId: this._currentGoalId,
+    });
   }
 
   /** Fetch goal title and description from GoalManager when we lazily seed a goal entry. */
@@ -2325,86 +2386,9 @@ A single successful creation goal is a complete turn. End it with **done**.
     const header = this.stepStreamChars > 0
       ? `${baseHeader}  \u00B7  ~${Math.max(1, Math.round(this.stepStreamChars / 4))} tok streamed`
       : baseHeader;
-    const tree = this.composeProgressTree();
-    if (!tree) return header;
-    return header + '\n' + tree;
-  }
-
-  /**
-   * Render a Goals-viewer-style indented tree of the goals being worked on
-   * for the current task. Walks from `_currentGoalId` down through any
-   * descendant goals captured in `liveGoals`.
-   */
-  private composeProgressTree(): string {
-    if (!this._currentGoalId || this.liveGoals.size === 0) return '';
-
-    const lines: string[] = [];
-    const visited = new Set<string>();
-
-    const visit = (goalId: string, depth: number): void => {
-      if (visited.has(goalId)) return;
-      visited.add(goalId);
-      const goal = this.liveGoals.get(goalId);
-      if (!goal) return;
-
-      // Goal title with status icon (matches GoalBrowser)
-      const indent = '  '.repeat(depth);
-      const goalIcon = goal.status === 'completed' ? '\u2713'   // ✓
-                     : goal.status === 'failed'    ? '\u2717'   // ✗
-                     : '\u25B8';                                // ▸
-      lines.push(`${indent}${goalIcon} ${goal.title}`);
-
-      // User's intent (description) — shown as the first sub-line so the
-      // reader can verify Chat captured the request faithfully. Truncated
-      // for the activity bubble; GoalBrowser shows the full text.
-      if (goal.description && goal.description.trim() && goal.description.trim() !== goal.title.trim()) {
-        const descIndent = '  '.repeat(depth + 1);
-        const descText = goal.description.length > 240
-          ? goal.description.slice(0, 240) + '…'
-          : goal.description;
-        lines.push(`${descIndent}ℹ ${descText}`);
-      }
-
-      // Render tasks under this goal
-      const tasks = this.liveTasks.get(goalId);
-      if (tasks && tasks.length > 0) {
-        const taskIndent = '  '.repeat(depth + 1);
-        for (const task of tasks) {
-          // Pending + claimedBy → effectively "claimed"
-          const effectiveStatus = task.status === 'pending' && task.claimedBy
-            ? 'claimed' : task.status;
-
-          const tIcon = effectiveStatus === 'done' ? '\u2713'                         // ✓
-                      : effectiveStatus === 'permanently_failed' ? '\u2717'           // ✗
-                      : effectiveStatus === 'claimed' || effectiveStatus === 'in_progress' ? '\u25D1'  // ◑
-                      : '\u25CB';                                                     // ○
-
-          const agent = task.agentName ? `[${task.agentName}] ` : '';
-          const attempts = task.attempts > 0 ? ` (${task.attempts}/${task.maxAttempts})` : '';
-          const desc = task.description.length > 50
-            ? task.description.slice(0, 50) + '\u2026'
-            : task.description;
-          lines.push(`${taskIndent}${tIcon} ${agent}${desc}${attempts}`);
-        }
-      }
-
-      // Latest progress message for active goals (like GoalBrowser's "… ask..." line)
-      if (goal.status === 'active' && goal.latestMessage) {
-        const msgIndent = '  '.repeat(depth + 1);
-        const msg = goal.latestMessage.length > 60
-          ? goal.latestMessage.slice(0, 60) + '\u2026'
-          : goal.latestMessage;
-        lines.push(`${msgIndent}\u2026 ${msg}`);
-      }
-
-      // Recurse into child goals.
-      for (const [childId, child] of this.liveGoals) {
-        if (child.parentId === goalId) visit(childId, depth + 1);
-      }
-    };
-
-    visit(this._currentGoalId, 0);
-    return lines.join('\n');
+    // The goal tree now renders in an embedded GoalProgressWidget beneath this
+    // header (see showActivityBubble), so the header stays a single line.
+    return header;
   }
 
   private updateActivityHeader(header: string): void {
@@ -2435,9 +2419,6 @@ A single successful creation goal is a complete turn. End it with **done**.
     if (!this.activityBubbleLabelId) return;
     const text = this.composeActivityText();
     const innerWidth = this.computeBubbleMaxWidth() - this.theme.tokens.space.xs * 2;
-    // Extra slack: the activity text has many short, variable lines (the goal
-    // tree) whose wrapped-line estimate can run a touch short. Over-allocating
-    // a line keeps the final line ("…working") from clipping under the composer.
     const height = this.estimateBubbleHeight(text, innerWidth, false) + this.theme.tokens.space.lg;
     // Keep the cached bubble text in sync so resize reflow uses the latest.
     const meta = this.messageMetadata.get(this.activityBubbleLabelId);
@@ -2450,6 +2431,14 @@ A single successful creation goal is a complete turn. End it with **done**.
       this.activityRefreshLastHeight = height;
       await this.setLabelHeight(this.activityBubbleLabelId, height);
     }
+    // Feed the embedded goal widget the current row model; it reports its own
+    // height back via a `contentHeight` event (handled in the changed router).
+    if (this.activityGoalWidgetId) {
+      const rows = this.buildActivityRows();
+      try {
+        await this.request(request(this.id, this.activityGoalWidgetId, 'update', { rows }));
+      } catch { /* widget may be gone */ }
+    }
   }
 
   private async removeActivityBubble(): Promise<void> {
@@ -2459,12 +2448,16 @@ A single successful creation goal is a complete turn. End it with **done**.
     }
     if (!this.activityBubbleLabelId) return;
     const id = this.activityBubbleLabelId;
+    const goalWidgetId = this.activityGoalWidgetId;
     this.activityBubbleLabelId = undefined;
+    this.activityGoalWidgetId = undefined;
+    this.activityGoalHeight = 0;
     this.activityStep = 0;
     this.activityRefreshLastHeight = 0;
     this.stepStreamChars = 0;
     this.liveGoals.clear();
     this.liveTasks.clear();
+    if (goalWidgetId) await this.detachLabel(goalWidgetId);
     await this.removeLabel(id);
   }
 
@@ -2530,6 +2523,20 @@ A single successful creation goal is a complete turn. End it with **done**.
           })).catch(() => { /* widget gone */ })
         );
       }
+    }
+
+    // The embedded goal widget carries no metadata (it is not a text bubble),
+    // so it is skipped above. Push the new width explicitly; it re-wraps and
+    // re-reports its height via `contentHeight`.
+    if (this.activityGoalWidgetId) {
+      updates.push(
+        this.request(request(this.id, this.messageLogId, 'updateLayoutChild', {
+          widgetId: this.activityGoalWidgetId,
+          sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+          preferredSize: { width: bubbleMaxWidth, height: this.activityGoalHeight },
+          alignment: 'left',
+        })).catch(() => { /* widget gone */ })
+      );
     }
 
     await Promise.all(updates);

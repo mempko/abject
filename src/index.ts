@@ -107,6 +107,10 @@ export { ListWidget } from './objects/widgets/list-widget.js';
 export type { ListItem, ListWidgetConfig } from './objects/widgets/list-widget.js';
 export { TreeWidget } from './objects/widgets/tree-widget.js';
 export type { TreeItem, TreeWidgetConfig } from './objects/widgets/tree-widget.js';
+export { GoalProgressWidget } from './objects/widgets/goal-progress-widget.js';
+export type { GoalProgressWidgetConfig } from './objects/widgets/goal-progress-widget.js';
+export { buildGoalRows } from './objects/goal-tree.js';
+export type { GoalRow, GoalRowKind, GoalNode, TaskNode, ColorRole } from './objects/goal-tree.js';
 export { SplitPaneWidget } from './objects/widgets/split-pane-widget.js';
 export type { SplitPaneConfig } from './objects/widgets/split-pane-widget.js';
 export {
