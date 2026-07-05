@@ -286,6 +286,11 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
    */
   setRegistryId(id: AbjectId): void {
     this._factoryRegistryId = id;
+    // Keep the base-class registry pointer aligned: it powers discovery-
+    // dependent behavior inherited from Abject (askLlm locating the LLM,
+    // discoverDep). The Runtime constructs Factory directly, so this call
+    // is the only place Factory ever learns which registry it belongs to.
+    this.setRegistryHint(id);
   }
 
   /**

@@ -199,6 +199,21 @@ export class Registry extends Abject {
   }
 
   /**
+   * A registry is its own registry. Discovery-dependent base behavior
+   * (askLlm locating the LLM object, discoverDep) resolves through this
+   * instance unless a different registry was explicitly hinted at init.
+   * The objects being looked up register here eventually, so self-lookup
+   * is the natural path; the global Registry is otherwise the one object
+   * with no registry pointer at all (the Runtime constructs it directly).
+   */
+  protected override async onInit(): Promise<void> {
+    await super.onInit();
+    if (!this.getRegistryId()) {
+      this.setRegistryHint(this.id);
+    }
+  }
+
+  /**
    * Convert a full registration to the lightweight LLM-friendly summary.
    * Filters meta-protocol methods (describe/ask/ping/etc.) that every Abject
    * has but that aren't useful for task-level discovery.
