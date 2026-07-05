@@ -2235,7 +2235,9 @@ When to remember (durable knowledge for future unrelated tasks):
 - Stable system architecture insights or validated patterns
 - Useful API details or capabilities that are unlikely to change
 Ephemeral problems (runtime errors, connection failures, config issues, workarounds being tried) belong in the goal scratchpad, not the knowledge base. They are relevant to the current goal only.
-After remembering, you will be prompted to continue with the task.`;
+After remembering, you will be prompted to continue with the task.
+
+Looking things up mid-task: the KnowledgeBase offers three lookup modes. Use 'recall' with previews: true for keyword search (results carry an id, title, and snippet), 'match' with a pattern for exact identifiers and names, and 'get' with an id to fetch one full entry. Scan previews first, refine your query terms when results are thin, and fetch full entries only for the results you will actually use.`;
 
     if (entry.goalId) {
       prompt += `

@@ -275,6 +275,140 @@ export class OpenAIProvider extends BaseLLMProvider {
     return !!this.apiKey;
   }
 
+  /**
+   * Only first-party OpenAI serves /v1/embeddings. Subclasses (OpenRouter,
+   * DeepSeek, Grok, Kimi, MiniMax) reuse this class for chat completions but
+   * have no embeddings endpoint, so gate on the provider name they reassign.
+   */
+  override supportsEmbeddings(): boolean {
+    return this.name === 'openai' && !!this.apiKey;
+  }
+
+  async embed(texts: string[], options?: { model?: string }): Promise<number[][]> {
+    require(this.apiKey !== undefined, 'API key is required');
+    require(texts.length > 0, 'texts must be non-empty');
+    const model = options?.model ?? 'text-embedding-3-small';
+
+    return this.withRetries(async () => {
+      const response = await this.fetch(`${this.baseUrl}/v1/embeddings`, {
+        method: 'POST',
+        headers: this.buildHeaders(),
+        body: JSON.stringify({ model, input: texts }),
+      }, { timeout: 60000 });
+
+      const data = JSON.parse(response.body) as {
+        data?: Array<{ index: number; embedding: number[] }>;
+      };
+      const rows = data.data ?? [];
+      if (rows.length !== texts.length) {
+        throw new Error(`OpenAI embeddings returned ${rows.length} vectors for ${texts.length} inputs`);
+      }
+      // The API documents index order; sort defensively so output aligns with input.
+      return rows.sort((a, b) => a.index - b.index).map(r => r.embedding);
+    });
+  }
+
+  /**
+   * Speech APIs are first-party OpenAI only, same gating as embeddings: the
+   * OpenAI-compatible subclasses reuse the chat path but serve neither
+   * /v1/audio/transcriptions nor /v1/audio/speech.
+   */
+  override supportsSpeech(): { transcribe: boolean; synthesize: boolean } {
+    const firstParty = this.name === 'openai' && !!this.apiKey;
+    return { transcribe: firstParty, synthesize: firstParty };
+  }
+
+  /**
+   * Speech endpoints move raw audio bytes, and the FetchDelegate/FetchResult
+   * plumbing is text-only (body: string), so both methods use global fetch
+   * directly: transcribe uploads a binary multipart part, synthesize receives
+   * a binary audio body.
+   */
+  async transcribe(
+    audio: { base64: string; mimeType: string },
+    options?: { model?: string; language?: string },
+  ): Promise<{ text: string }> {
+    require(this.apiKey !== undefined, 'API key is required');
+    require(audio.base64.length > 0, 'audio base64 must be non-empty');
+    const model = options?.model ?? 'whisper-1';
+
+    // Build the multipart body by hand from the base64 buffer so the file
+    // part stays binary-safe end to end.
+    const boundary = `----abjects-${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
+    const ext = audio.mimeType.includes('wav') ? 'wav'
+      : audio.mimeType.includes('mp4') ? 'm4a'
+      : audio.mimeType.includes('mpeg') ? 'mp3'
+      : audio.mimeType.includes('ogg') ? 'ogg'
+      : 'webm';
+    const fields: string[] = [`--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${model}\r\n`];
+    if (options?.language) {
+      fields.push(`--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\n${options.language}\r\n`);
+    }
+    const fileHeader = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.${ext}"\r\nContent-Type: ${audio.mimeType}\r\n\r\n`;
+    const closing = `\r\n--${boundary}--\r\n`;
+    const encoder = new TextEncoder();
+    const head = encoder.encode(fields.join('') + fileHeader);
+    const bytes = Uint8Array.from(atob(audio.base64), c => c.charCodeAt(0));
+    const tail = encoder.encode(closing);
+    const body = new Uint8Array(head.length + bytes.length + tail.length);
+    body.set(head, 0);
+    body.set(bytes, head.length);
+    body.set(tail, head.length + bytes.length);
+
+    return this.withRetries(async () => {
+      const response = await fetch(`${this.baseUrl}/v1/audio/transcriptions`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${this.apiKey}`,
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        },
+        body: body as BodyInit,
+      });
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => 'Unknown error');
+        throw new Error(`OpenAI transcription error (${response.status}): ${errorText}`);
+      }
+      const data = await response.json() as { text?: string };
+      return { text: data.text ?? '' };
+    }, { label: `${this.name}.transcribe` });
+  }
+
+  async synthesize(
+    text: string,
+    options?: { model?: string; voice?: string },
+  ): Promise<{ base64: string; mimeType: string }> {
+    require(this.apiKey !== undefined, 'API key is required');
+    require(text.length > 0, 'text must be non-empty');
+    const model = options?.model ?? 'gpt-4o-mini-tts';
+
+    return this.withRetries(async () => {
+      const response = await fetch(`${this.baseUrl}/v1/audio/speech`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          input: text,
+          voice: options?.voice ?? 'alloy',
+          response_format: 'mp3',
+        }),
+      });
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => 'Unknown error');
+        throw new Error(`OpenAI speech error (${response.status}): ${errorText}`);
+      }
+      const buf = new Uint8Array(await response.arrayBuffer());
+      let binary = '';
+      const CHUNK = 0x8000;
+      for (let i = 0; i < buf.length; i += CHUNK) {
+        binary += String.fromCharCode(...buf.subarray(i, i + CHUNK));
+      }
+      return { base64: btoa(binary), mimeType: 'audio/mpeg' };
+    }, { label: `${this.name}.synthesize` });
+  }
+
   async complete(
     messages: LLMMessage[],
     options: LLMCompletionOptions = {}

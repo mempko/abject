@@ -18,6 +18,7 @@ import {
   defaultIsRetryable,
   getTextContent,
 } from './provider.js';
+import { require } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('OLLAMA');
@@ -105,10 +106,45 @@ export class OllamaProvider extends BaseLLMProvider {
         method: 'GET',
         signal: AbortSignal.timeout(5000),
       });
+      this.reachable = response.ok;
       return response.ok;
     } catch {
+      this.reachable = false;
       return false;
     }
+  }
+
+  /** Cached reachability from the last isAvailable() probe (same gate the
+   *  registration path uses). embed() itself still fails soft when the
+   *  embedding model is not pulled; callers fall back to lexical search. */
+  private reachable = false;
+
+  override supportsEmbeddings(): boolean {
+    return this.reachable;
+  }
+
+  async embed(texts: string[], options?: { model?: string }): Promise<number[][]> {
+    require(texts.length > 0, 'texts must be non-empty');
+    const model = options?.model ?? 'nomic-embed-text';
+
+    return this.withRetries(async () => {
+      const response = await fetch(`${this.baseUrl}/api/embed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, input: texts }),
+        signal: AbortSignal.timeout(60000),
+      });
+      if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        throw new Error(`Ollama embed error (${response.status}): ${body.slice(0, 300)}`);
+      }
+      const data = await response.json() as { embeddings?: number[][] };
+      const rows = data.embeddings ?? [];
+      if (rows.length !== texts.length) {
+        throw new Error(`Ollama embeddings returned ${rows.length} vectors for ${texts.length} inputs`);
+      }
+      return rows;
+    });
   }
 
   async complete(

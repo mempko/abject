@@ -150,6 +150,17 @@ export class BackendUI extends Abject {
   private mouseGrabAbject?: AbjectId;  // WindowManager grabs mouse during drag
   private mouseGrabClientId?: string;  // Which client owns the current resize grab
   private pendingRequests: Map<string, { resolve: (value: unknown) => void; reject: (e: Error) => void }> = new Map();
+
+  /** playbackId → Abject to notify of ended/error audio events. */
+  private audioNotify: Map<string, AbjectId> = new Map();
+  /** recordingId → Abject to notify when a media recording completes. */
+  private recordingNotify: Map<string, AbjectId> = new Map();
+  /**
+   * videoId → Abject to notify of video element state (videoEvent). Unlike
+   * audioNotify this is long-lived: a video emits many events over its life,
+   * so entries clear on dispose, not on first event.
+   */
+  private videoNotify: Map<string, AbjectId> = new Map();
   /** All connected frontend clients, keyed by clientId. */
   private clients: Map<string, ClientConnection> = new Map();
   private clientCounter = 0;
@@ -522,6 +533,126 @@ export class BackendUI extends Abject {
                 },
               },
               {
+                name: 'audioPlay',
+                description: 'Relay: start audio playback on the connected frontend client (used by the AudioOutput capability; call AudioOutput, not this, for playback)',
+                parameters: [
+                  { name: 'playbackId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-chosen playback id' },
+                  { name: 'source', type: { kind: 'primitive', primitive: 'string' }, description: 'http(s) URL or data: URI' },
+                  { name: 'volume', type: { kind: 'primitive', primitive: 'number' }, description: '0..1', optional: true },
+                  { name: 'loop', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Loop playback', optional: true },
+                  { name: 'notifyId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId to notify of ended/error via playbackEvent', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'audioControl',
+                description: 'Relay: pause/resume/stop/stopAll a frontend audio playback',
+                parameters: [
+                  { name: 'action', type: { kind: 'primitive', primitive: 'string' }, description: 'pause | resume | stop | stopAll' },
+                  { name: 'playbackId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target playback (omit for stopAll)', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'videoSetup',
+                description: 'Relay: create a client-side video element for a video widget (used by VideoWidget; frames composite client-side into videoFrame regions)',
+                parameters: [
+                  { name: 'videoId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-chosen video element id' },
+                  { name: 'source', type: { kind: 'primitive', primitive: 'string' }, description: 'http(s) URL or data: URI', optional: true },
+                  { name: 'streamId', type: { kind: 'primitive', primitive: 'string' }, description: 'Client-held captured MediaStream id (live source)', optional: true },
+                  { name: 'muted', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Start muted', optional: true },
+                  { name: 'loop', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Loop playback', optional: true },
+                  { name: 'autoplay', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Start playing immediately (default true)', optional: true },
+                  { name: 'notifyId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId to notify of playback state via videoEvent', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'videoControl',
+                description: 'Relay: play/pause/seek/setMuted/dispose a client-side video element',
+                parameters: [
+                  { name: 'videoId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target video element' },
+                  { name: 'action', type: { kind: 'primitive', primitive: 'string' }, description: 'play | pause | seek | setMuted | dispose' },
+                  { name: 'value', type: { kind: 'primitive', primitive: 'number' }, description: 'seek: seconds; setMuted: 1 muted, 0 audible', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'mediaCapture',
+                description: 'Relay: capture mic/camera (or screen with display: true) on the frontend client; returns { streamId, tracks } (used by the MediaStream capability)',
+                parameters: [
+                  { name: 'audio', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Capture audio', optional: true },
+                  { name: 'video', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Capture video', optional: true },
+                  { name: 'display', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Screen share instead of camera', optional: true },
+                ],
+                returns: { kind: 'object', properties: { streamId: { kind: 'primitive', primitive: 'string' } } },
+              },
+              {
+                name: 'mediaCaptureFrame',
+                description: 'Relay: grab one PNG frame of a frontend-captured video stream; returns { base64, width, height }',
+                parameters: [
+                  { name: 'streamId', type: { kind: 'primitive', primitive: 'string' }, description: 'Stream id from mediaCapture' },
+                ],
+                returns: { kind: 'object', properties: { base64: { kind: 'primitive', primitive: 'string' } } },
+              },
+              {
+                name: 'mediaRecordStart',
+                description: 'Relay: start a MediaRecorder on a frontend-captured stream; completion arrives via a recordingReady event to notifyId',
+                parameters: [
+                  { name: 'recordingId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-chosen recording id' },
+                  { name: 'streamId', type: { kind: 'primitive', primitive: 'string' }, description: 'Stream id from mediaCapture' },
+                  { name: 'maxDurationMs', type: { kind: 'primitive', primitive: 'number' }, description: 'Auto-stop after this many ms', optional: true },
+                  { name: 'notifyId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId to notify via recordingReady', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'mediaRecordStop',
+                description: 'Relay: stop an in-progress frontend recording early (recordingReady still fires)',
+                parameters: [
+                  { name: 'recordingId', type: { kind: 'primitive', primitive: 'string' }, description: 'Recording id' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'mediaStreamControl',
+                description: 'Relay: stop a frontend-captured stream or mute/unmute one of its tracks',
+                parameters: [
+                  { name: 'action', type: { kind: 'primitive', primitive: 'string' }, description: 'stopStream | muteTrack' },
+                  { name: 'streamId', type: { kind: 'primitive', primitive: 'string' }, description: 'For stopStream', optional: true },
+                  { name: 'trackId', type: { kind: 'primitive', primitive: 'string' }, description: 'For muteTrack', optional: true },
+                  { name: 'muted', type: { kind: 'primitive', primitive: 'boolean' }, description: 'For muteTrack', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'speechSpeak',
+                description: 'Relay: speak text with the frontend browser speechSynthesis (used by the Speech capability; call Speech, not this, for text-to-speech)',
+                parameters: [
+                  { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Text to speak' },
+                  { name: 'voice', type: { kind: 'primitive', primitive: 'string' }, description: 'Voice name from speechVoices', optional: true },
+                ],
+                returns: { kind: 'object', properties: { spoken: { kind: 'primitive', primitive: 'boolean' } } },
+              },
+              {
+                name: 'speechRecognize',
+                description: 'Relay: live speech recognition on the frontend; returns { text } when the browser recognizes speech, or { audioBase64, mimeType } of a mic recording for server-side transcription',
+                parameters: [
+                  { name: 'maxDurationMs', type: { kind: 'primitive', primitive: 'number' }, description: 'Listening window in ms (default 10000)', optional: true },
+                ],
+                returns: { kind: 'object', properties: {
+                  text: { kind: 'primitive', primitive: 'string' },
+                  audioBase64: { kind: 'primitive', primitive: 'string' },
+                  mimeType: { kind: 'primitive', primitive: 'string' },
+                } },
+              },
+              {
+                name: 'speechVoices',
+                description: 'Relay: list the frontend browser speechSynthesis voice names',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+              },
+              {
                 name: 'listFrontendClients',
                 description: 'List all currently connected frontend UI clients (both WebSocket and WebRTC).',
                 parameters: [],
@@ -752,6 +883,155 @@ export class BackendUI extends Abject {
       const { selectedText } = msg.payload as { selectedText: string };
       this.currentSelectedText = selectedText;
       this.sendToFrontend({ type: 'setSelectedText', text: selectedText });
+    });
+
+    // ── Audio playback relay (AudioOutput capability → frontend) ────────
+    this.on('audioPlay', async (msg: AbjectMessage) => {
+      const { playbackId, source, volume, loop, notifyId } = msg.payload as {
+        playbackId: string; source: string; volume?: number; loop?: boolean; notifyId?: AbjectId;
+      };
+      contractRequire(typeof playbackId === 'string' && playbackId.length > 0, 'audioPlay requires playbackId');
+      contractRequire(typeof source === 'string' && source.length > 0, 'audioPlay requires source');
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; audio output unavailable');
+      if (notifyId) this.audioNotify.set(playbackId, notifyId);
+      this.sendToFrontend({ type: 'audioPlay', playbackId, source, volume, loop });
+      return true;
+    });
+
+    this.on('audioControl', async (msg: AbjectMessage) => {
+      const { action, playbackId } = msg.payload as {
+        action: 'pause' | 'resume' | 'stop' | 'stopAll'; playbackId?: string;
+      };
+      this.sendToFrontend({ type: 'audioControl', action, playbackId });
+      if (action === 'stop' && playbackId) this.audioNotify.delete(playbackId);
+      if (action === 'stopAll') this.audioNotify.clear();
+      return true;
+    });
+
+    // ── Video element relay (VideoWidget → frontend) ────────────────────
+    this.on('videoSetup', async (msg: AbjectMessage) => {
+      const { videoId, source, streamId, muted, loop, autoplay, notifyId } = msg.payload as {
+        videoId: string; source?: string; streamId?: string;
+        muted?: boolean; loop?: boolean; autoplay?: boolean; notifyId?: AbjectId;
+      };
+      contractRequire(typeof videoId === 'string' && videoId.length > 0, 'videoSetup requires videoId');
+      contractRequire(!!source || !!streamId, 'videoSetup requires source or streamId');
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; video unavailable');
+      if (notifyId) this.videoNotify.set(videoId, notifyId);
+      this.sendToFrontend({ type: 'videoSetup', videoId, source, streamId, muted, loop, autoplay });
+      return true;
+    });
+
+    this.on('videoControl', async (msg: AbjectMessage) => {
+      const { videoId, action, value } = msg.payload as {
+        videoId: string; action: 'play' | 'pause' | 'seek' | 'setMuted' | 'dispose'; value?: number;
+      };
+      contractRequire(typeof videoId === 'string' && videoId.length > 0, 'videoControl requires videoId');
+      this.sendToFrontend({ type: 'videoControl', videoId, action, value });
+      if (action === 'dispose') this.videoNotify.delete(videoId);
+      return true;
+    });
+
+    // ── Media capture relay (MediaStream capability → frontend) ─────────
+    this.on('mediaCapture', async (msg: AbjectMessage) => {
+      const { audio, video, display } = msg.payload as {
+        audio?: boolean; video?: boolean; display?: boolean;
+      };
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; media capture unavailable');
+      // Long timeout: the browser shows a permission prompt the user must answer.
+      const reply = await this.requestFromFrontend<{
+        streamId?: string; tracks?: Array<{ id: string; kind: string; label: string }>; error?: string;
+      }>({
+        type: 'mediaCaptureRequest',
+        requestId: this.nextRequestId(),
+        audio: audio ?? true,
+        video: video ?? false,
+        display: display ?? false,
+      }, 60000);
+      if (reply.error || !reply.streamId) throw new Error(reply.error ?? 'media capture failed');
+      return { streamId: reply.streamId, tracks: reply.tracks ?? [] };
+    });
+
+    this.on('mediaCaptureFrame', async (msg: AbjectMessage) => {
+      const { streamId } = msg.payload as { streamId: string };
+      contractRequire(typeof streamId === 'string' && streamId.length > 0, 'mediaCaptureFrame requires streamId');
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; frame capture unavailable');
+      const reply = await this.requestFromFrontend<{
+        base64?: string; width?: number; height?: number; error?: string;
+      }>({
+        type: 'mediaCaptureFrameRequest',
+        requestId: this.nextRequestId(),
+        streamId,
+      }, 15000);
+      if (reply.error || !reply.base64) throw new Error(reply.error ?? 'frame capture failed');
+      return { base64: reply.base64, width: reply.width ?? 0, height: reply.height ?? 0 };
+    });
+
+    this.on('mediaRecordStart', async (msg: AbjectMessage) => {
+      const { recordingId, streamId, maxDurationMs, notifyId } = msg.payload as {
+        recordingId: string; streamId: string; maxDurationMs?: number; notifyId?: AbjectId;
+      };
+      contractRequire(typeof recordingId === 'string' && recordingId.length > 0, 'mediaRecordStart requires recordingId');
+      contractRequire(typeof streamId === 'string' && streamId.length > 0, 'mediaRecordStart requires streamId');
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; recording unavailable');
+      if (notifyId) this.recordingNotify.set(recordingId, notifyId);
+      this.sendToFrontend({ type: 'mediaRecordStart', recordingId, streamId, maxDurationMs });
+      return true;
+    });
+
+    this.on('mediaRecordStop', async (msg: AbjectMessage) => {
+      const { recordingId } = msg.payload as { recordingId: string };
+      this.sendToFrontend({ type: 'mediaRecordStop', recordingId });
+      return true;
+    });
+
+    this.on('mediaStreamControl', async (msg: AbjectMessage) => {
+      const { action, streamId, trackId, muted } = msg.payload as {
+        action: 'stopStream' | 'muteTrack'; streamId?: string; trackId?: string; muted?: boolean;
+      };
+      this.sendToFrontend({ type: 'mediaStreamControl', action, streamId, trackId, muted });
+      return true;
+    });
+
+    // ── Speech relay (Speech capability → frontend browser speech APIs) ──
+    this.on('speechSpeak', async (msg: AbjectMessage) => {
+      const { text, voice } = msg.payload as { text: string; voice?: string };
+      contractRequire(typeof text === 'string' && text.length > 0, 'speechSpeak requires text');
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; speech unavailable');
+      // The client replies when the utterance starts, so the timeout covers
+      // voice loading, not the full spoken duration.
+      const reply = await this.requestFromFrontend<{ spoken?: boolean; error?: string }>({
+        type: 'speechSpeak',
+        requestId: this.nextRequestId(),
+        text,
+        voice,
+      }, 20000);
+      if (reply.error) throw new Error(reply.error);
+      return { spoken: reply.spoken === true };
+    });
+
+    this.on('speechRecognize', async (msg: AbjectMessage) => {
+      const { maxDurationMs } = msg.payload as { maxDurationMs?: number };
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; speech recognition unavailable');
+      const windowMs = Math.min(Math.max(maxDurationMs ?? 10000, 1000), 60000);
+      const reply = await this.requestFromFrontend<{
+        text?: string; audioBase64?: string; mimeType?: string; error?: string;
+      }>({
+        type: 'speechRecognizeRequest',
+        requestId: this.nextRequestId(),
+        maxDurationMs: windowMs,
+      }, windowMs + 30000);
+      if (reply.error) throw new Error(reply.error);
+      return { text: reply.text, audioBase64: reply.audioBase64, mimeType: reply.mimeType };
+    });
+
+    this.on('speechVoices', async () => {
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; speech unavailable');
+      const reply = await this.requestFromFrontend<{ voices?: string[] }>({
+        type: 'speechVoicesRequest',
+        requestId: this.nextRequestId(),
+      }, 10000);
+      return reply.voices ?? [];
     });
 
     this.on('openUrl', async (msg: AbjectMessage) => {
@@ -2095,6 +2375,64 @@ IMPORTANT:
         if (pending) {
           this.pendingRequests.delete(msg.requestId!);
           pending.resolve({ imageBase64: msg.imageBase64, width: msg.width, height: msg.height });
+        }
+        break;
+      }
+
+      case 'mediaCaptureReply':
+      case 'mediaCaptureFrameReply':
+      case 'speechSpeakReply':
+      case 'speechRecognizeReply':
+      case 'speechVoicesReply': {
+        const pending = this.pendingRequests.get(msg.requestId!);
+        if (pending) {
+          this.pendingRequests.delete(msg.requestId!);
+          pending.resolve(msg);
+        }
+        break;
+      }
+
+      case 'audioEvent': {
+        const notifyId = this.audioNotify.get(msg.playbackId);
+        this.audioNotify.delete(msg.playbackId);
+        if (notifyId) {
+          this.send(event(this.id, notifyId, 'playbackEvent', {
+            playbackId: msg.playbackId,
+            event: msg.event,
+            error: msg.error,
+          }));
+        }
+        break;
+      }
+
+      case 'videoEvent': {
+        // Long-lived mapping: a video emits many events; cleared on dispose.
+        const notifyId = this.videoNotify.get(msg.videoId);
+        if (notifyId) {
+          this.send(event(this.id, notifyId, 'videoEvent', {
+            videoId: msg.videoId,
+            event: msg.event,
+            error: msg.error,
+            duration: msg.duration,
+            currentTime: msg.currentTime,
+            width: msg.width,
+            height: msg.height,
+          }));
+        }
+        break;
+      }
+
+      case 'mediaRecordingComplete': {
+        const notifyId = this.recordingNotify.get(msg.recordingId);
+        this.recordingNotify.delete(msg.recordingId);
+        if (notifyId) {
+          this.send(event(this.id, notifyId, 'recordingReady', {
+            recordingId: msg.recordingId,
+            base64: msg.base64,
+            mimeType: msg.mimeType,
+            durationMs: msg.durationMs,
+            error: msg.error,
+          }));
         }
         break;
       }

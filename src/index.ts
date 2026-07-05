@@ -81,6 +81,7 @@ export { WidgetAbject, buildFont, WIDGET_INTERFACE_DECL } from './objects/widget
 export type { WidgetConfig } from './objects/widgets/widget-abject.js';
 export { WindowAbject } from './objects/widgets/window-abject.js';
 export { LabelWidget } from './objects/widgets/label-widget.js';
+export { ContentBlockWidget } from './objects/widgets/content-block-widget.js';
 export { parseMarkdown, estimateMarkdownHeight } from './objects/widgets/markdown.js';
 export type { ParsedMarkdown, MarkdownBlock, TextSpan, SpanStyle, BlockType } from './objects/widgets/markdown.js';
 export { ButtonWidget } from './objects/widgets/button-widget.js';
@@ -112,6 +113,14 @@ export type { GoalProgressWidgetConfig } from './objects/widgets/goal-progress-w
 export { buildGoalRows } from './objects/goal-tree.js';
 export type { GoalRow, GoalRowKind, GoalNode, TaskNode, ColorRole } from './objects/goal-tree.js';
 export { SplitPaneWidget } from './objects/widgets/split-pane-widget.js';
+export { TableWidget } from './objects/widgets/table-widget.js';
+export type { TableColumnSpec, TableWidgetConfig } from './objects/widgets/table-widget.js';
+export { FormWidget } from './objects/widgets/form-widget.js';
+export type { FormSchema, FormFieldSchema, FormWidgetConfig } from './objects/widgets/form-widget.js';
+export { ChartWidget } from './objects/widgets/chart-widget.js';
+export type { ChartWidgetConfig, ChartSeriesSpec, ChartPoint, ChartKind } from './objects/widgets/chart-widget.js';
+export { VideoWidget } from './objects/widgets/video-widget.js';
+export type { VideoWidgetConfig } from './objects/widgets/video-widget.js';
 export type { SplitPaneConfig } from './objects/widgets/split-pane-widget.js';
 export {
   WIDGET_INTERFACE,
@@ -139,6 +148,10 @@ export { FileSystem, FILESYSTEM_ID } from './objects/capabilities/filesystem.js'
 export { SharedState, SHARED_STATE_ID } from './objects/capabilities/shared-state.js';
 export { TupleSpace, TUPLE_SPACE_ID } from './objects/tuple-space.js';
 export type { TupleEntry, TuplePattern } from './objects/tuple-space.js';
+export { TriggerManager, TRIGGER_MANAGER_ID } from './objects/trigger-manager.js';
+export type { TriggerRule, TriggerAction } from './objects/trigger-manager.js';
+export { CollectionStore, COLLECTION_STORE_ID } from './objects/collection-store.js';
+export { DataBrowser, DATA_BROWSER_ID } from './objects/data-browser.js';
 export { FileTransfer, FILE_TRANSFER_ID } from './objects/capabilities/file-transfer.js';
 export { MediaStreamCapability, MEDIA_STREAM_ID } from './objects/capabilities/media-stream.js';
 export { AgentAbject, AGENT_ABJECT_ID } from './objects/agent-abject.js';
@@ -150,6 +163,9 @@ export { HostFileSystem, HOST_FILESYSTEM_ID } from './objects/capabilities/host-
 export { WebSearch, WEB_SEARCH_ID } from './objects/capabilities/web-search.js';
 export { WebFetch, WEB_FETCH_ID } from './objects/capabilities/web-fetch.js';
 export { Screenshot, SCREENSHOT_ID } from './objects/capabilities/screenshot.js';
+export { StreamClient, STREAM_CLIENT_ID } from './objects/capabilities/stream-client.js';
+export { AudioOutput, AUDIO_OUTPUT_ID, createAudioOutput } from './objects/capabilities/audio-output.js';
+export { Speech, SPEECH_ID, createSpeech } from './objects/capabilities/speech.js';
 export { SkillRegistry, SKILL_REGISTRY_ID } from './objects/skill-registry.js';
 export { SkillAgent, SKILL_AGENT_ID } from './objects/skill-agent.js';
 export { ObjectAgent, OBJECT_AGENT_ID } from './objects/object-agent.js';

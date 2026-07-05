@@ -50,6 +50,7 @@ const BUILTIN_METHODS = new Set([
   'describe', 'ask', 'getRegistry', 'ping',
   'addDependent', 'removeDependent', 'changed',
   'progress', 'getSource', 'updateSource', 'probe',
+  'getOrganelleSource',
 ]);
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -129,6 +130,52 @@ export class Organism extends Abject {
 
     this.spec = spec;
     this._organismSource = JSON.stringify(spec);
+    this.setupIntrospectionHandlers();
+  }
+
+  /**
+   * Read-only introspection beyond the membrane: expose one organelle's spec
+   * plus a live data snapshot so tooling (ObjectCreator's extract_organelle)
+   * can deploy it as a standalone object. The organism itself is untouched.
+   * Listed in BUILTIN_METHODS so interface delegation never shadows it.
+   */
+  private setupIntrospectionHandlers(): void {
+    this.on('getOrganelleSource', async (msg: AbjectMessage) => {
+      const { name } = msg.payload as { name: string };
+      contractRequire(
+        typeof name === 'string' && name.length > 0,
+        'getOrganelleSource requires a name'
+      );
+
+      const spec = name === '__interface__'
+        ? this.spec.interface
+        : this.spec.organelles.find((o) => o.name === name);
+      if (!spec) {
+        const names = this.spec.organelles.map((o) => o.name).join(', ');
+        throw new Error(
+          `No organelle named '${name}'. Organelles: ${names}. ` +
+          `Pass '__interface__' for the membrane interface organelle.`
+        );
+      }
+
+      // Live data snapshot when the organelle is running; empty otherwise.
+      let data: Record<string, unknown> = {};
+      const liveId = name === '__interface__'
+        ? this.interfaceId
+        : this.organelleIds.get(name);
+      if (liveId) {
+        try {
+          data = await this.request<Record<string, unknown>>(
+            request(this.id, liveId, 'getData', {}),
+            10000
+          );
+        } catch {
+          // Organelle busy or stopped; manifest + source still replicate.
+        }
+      }
+
+      return { manifest: spec.manifest, source: spec.source, data };
+    });
   }
 
   get organismSource(): string {

@@ -36,7 +36,7 @@ export interface WidgetStyle {
   tooltip?: string;  // hover tooltip text, shown after a dwell via WidgetManager's tooltip service (used by icon-only buttons)
 }
 
-export type WidgetType = 'label' | 'markdown' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image' | 'themeSwatch' | 'goalProgress';
+export type WidgetType = 'label' | 'markdown' | 'contentBlock' | 'button' | 'textInput' | 'textArea' | 'checkbox' | 'progress' | 'divider' | 'select' | 'canvas' | 'tabBar' | 'slider' | 'image' | 'themeSwatch' | 'goalProgress' | 'list' | 'tree' | 'splitPane' | 'table' | 'form' | 'chart' | 'video';
 
 // ── Size/rect input normalization ───────────────────────────────────────────
 // Across the UI, `w`/`h` are the canonical size fields (the canvas draw schema
@@ -91,7 +91,7 @@ export function coerceRect(r: SizeInput | undefined): { x: number; y: number; wi
  */
 export const DRAW_COMMAND_TYPES = [
   // High-level self-contained shapes
-  'rect', 'text', 'markdown', 'line', 'image', 'imageUrl', 'clear', 'path',
+  'rect', 'text', 'markdown', 'line', 'image', 'imageUrl', 'videoFrame', 'clear', 'path',
   'save', 'restore', 'clip', 'translate',
   'circle', 'arc', 'ellipse', 'polygon', 'rotate', 'scale',
   'globalAlpha', 'shadow', 'setLineDash', 'linearGradient', 'radialGradient',

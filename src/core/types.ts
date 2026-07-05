@@ -139,6 +139,17 @@ export interface AbjectManifest {
    * back to a default icon, so older manifests keep working unchanged.
    */
   icon?: string;
+  /**
+   * Prototype lineage. Instances are prototypes (Self-style): cloning a live
+   * object records where the copy came from and how many clone hops separate
+   * it from its original ancestor. Absent on objects that were never cloned.
+   */
+  lineage?: {
+    /** typeId (preferred) or AbjectId of the object this was cloned from. */
+    clonedFrom: string;
+    /** 1 for a clone of an original, parent.generation + 1 otherwise. */
+    generation: number;
+  };
 }
 
 // =============================================================================

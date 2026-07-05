@@ -44,6 +44,7 @@ const STORAGE_KEY_SHELL_DENIED_CMDS = 'global-settings:shellDeniedCmds';
 const STORAGE_KEY_WEB_ENABLED = 'global-settings:webEnabled';
 const STORAGE_KEY_WEB_ALLOWED_DOMAINS = 'global-settings:webAllowedDomains';
 const STORAGE_KEY_WEB_DENIED_DOMAINS = 'global-settings:webDeniedDomains';
+const STORAGE_KEY_CAP_ENFORCEMENT = 'global-settings:capabilityEnforcement';
 
 // Per-tier routing storage keys
 const STORAGE_KEY_TIER_SMART_PROVIDER = 'global-settings:tierSmartProvider';
@@ -177,6 +178,9 @@ export class GlobalSettings extends Abject {
   private webEnabled = true;
   private webAllowedDomains: string[] = [];
   private webDeniedDomains: string[] = [];
+  /** Bus-level capability enforcement for scriptable objects. */
+  private capabilityEnforcement: 'off' | 'warn' | 'enforce' = 'warn';
+  private capEnforceSelectId?: AbjectId;
 
   private unmasked: Set<AbjectId> = new Set();
 
@@ -218,6 +222,31 @@ export class GlobalSettings extends Abject {
                 description: 'Hide the global settings window',
                 parameters: [],
                 returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'getCapabilityEnforcement',
+                description: 'Current bus-level capability enforcement mode for scriptable objects',
+                parameters: [],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
+                name: 'setCapabilityEnforcement',
+                description: 'Set the capability enforcement mode: off, warn, or enforce. Emits capabilityEnforcementChanged.',
+                parameters: [
+                  {
+                    name: 'mode',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'off, warn, or enforce',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+            ],
+            events: [
+              {
+                name: 'capabilityEnforcementChanged',
+                description: 'The capability enforcement mode changed; value is the new mode',
+                payload: { kind: 'primitive', primitive: 'string' },
               },
             ],
           },
@@ -485,6 +514,25 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   }
 
   private setupHandlers(): void {
+    this.on('getCapabilityEnforcement', async () => {
+      return this.capabilityEnforcement;
+    });
+
+    this.on('setCapabilityEnforcement', async (msg: AbjectMessage) => {
+      const { mode } = msg.payload as { mode: string };
+      if (mode !== 'off' && mode !== 'warn' && mode !== 'enforce') return false;
+      this.capabilityEnforcement = mode;
+      if (this.storageId) {
+        try {
+          await this.request(request(this.id, this.storageId, 'set', {
+            key: STORAGE_KEY_CAP_ENFORCEMENT, value: mode,
+          }));
+        } catch { /* persistence is best-effort */ }
+      }
+      this.changed('capabilityEnforcementChanged', mode);
+      return true;
+    });
+
     this.on('show', async () => {
       return this.show();
     });
@@ -502,7 +550,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // Handle permission requests from capability objects
     this.on('requestPermission', async (msg: AbjectMessage) => {
       const { type, resource, description, skillName } = msg.payload as {
-        type: 'shell' | 'directory' | 'skill_shell';
+        type: 'shell' | 'directory' | 'skill_shell' | 'domain';
         resource: string;
         description: string;
         skillName?: string;
@@ -510,7 +558,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       if (type === 'skill_shell' && skillName) {
         return this.showSkillPermissionPrompt(skillName, resource, description);
       }
-      return this.showPermissionPrompt(type as 'shell' | 'directory', resource, description);
+      return this.showPermissionPrompt(type as 'shell' | 'directory' | 'domain', resource, description);
     });
 
     // Handle 'changed' events from widget dependents
@@ -701,6 +749,15 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       // Web: enabled checkbox
       if (fromId === this.webEnabledCheckboxId && aspect === 'change') {
         this.webEnabled = value as boolean;
+        return;
+      }
+      // Capability enforcement mode select
+      if (fromId === this.capEnforceSelectId && aspect === 'change') {
+        const mode = value as string;
+        if (mode === 'off' || mode === 'warn' || mode === 'enforce') {
+          this.capabilityEnforcement = mode;
+          this.changed('capabilityEnforcementChanged', mode);
+        }
         return;
       }
       // Web: add allowed domain
@@ -1532,6 +1589,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.webDeniedAddBtnId = undefined;
     this.webDeniedListId = undefined;
     this.webDeniedRemoveBtnId = undefined;
+    this.capEnforceSelectId = undefined;
     this.permsSaveBtnId = undefined;
     this.unmasked.clear();
 
@@ -2072,6 +2130,15 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_WEB_DENIED_DOMAINS })
       );
       if (webDenyJson) { try { this.webDeniedDomains = JSON.parse(webDenyJson); } catch { /* ignore */ } }
+
+      const capMode = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_CAP_ENFORCEMENT })
+      );
+      if (capMode === 'off' || capMode === 'warn' || capMode === 'enforce') {
+        this.capabilityEnforcement = capMode;
+        // Re-announce so a wired interceptor picks up the persisted mode.
+        this.changed('capabilityEnforcementChanged', capMode);
+      }
     }
 
     // Platform info label
@@ -2408,6 +2475,34 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       preferredSize: { height: 28 },
     }));
 
+    // Capability enforcement mode (bus-level check for created objects)
+    const { widgetIds: [capEnfLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId,
+          text: 'Capability enforcement for created objects (warn logs, enforce blocks)',
+          style: { color: this.theme.textHeading, fontSize: 13 } },
+      ]})
+    );
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: capEnfLabelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+    const capModes = ['off', 'warn', 'enforce'];
+    const { widgetIds: [capEnfSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'select', windowId: this.windowId, options: capModes,
+          selectedIndex: Math.max(0, capModes.indexOf(this.capabilityEnforcement)) },
+      ]})
+    );
+    this.capEnforceSelectId = capEnfSelectId;
+    await this.request(request(this.id, this.capEnforceSelectId, 'addDependent', {}));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: this.capEnforceSelectId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { width: 160, height: 30 },
+    }));
+
     // Allowed domains label
     const { widgetIds: [webAllowLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
@@ -2621,6 +2716,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     await this.request(request(this.id, this.storageId, 'set', {
       key: STORAGE_KEY_WEB_DENIED_DOMAINS, value: JSON.stringify(this.webDeniedDomains),
     }));
+    await this.request(request(this.id, this.storageId, 'set', {
+      key: STORAGE_KEY_CAP_ENFORCEMENT, value: this.capabilityEnforcement,
+    }));
 
     await this.propagatePermissions();
     log.info('Permissions saved and propagated');
@@ -2640,7 +2738,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private _promptDenyAlwaysBtnId?: AbjectId;
 
   private async showPermissionPrompt(
-    type: 'shell' | 'directory',
+    type: 'shell' | 'directory' | 'domain',
     resource: string,
     description: string,
   ): Promise<{ decision: string }> {
@@ -2650,7 +2748,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     if (this._pendingPermissionPrompt) return { decision: 'deny' };
 
     try {
-      const title = type === 'shell' ? 'Shell Permission' : 'Filesystem Permission';
+      const title = type === 'shell' ? 'Shell Permission'
+        : type === 'domain' ? 'Network Permission'
+        : 'Filesystem Permission';
       const windowId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId, 'createWindowAbject', {
           title,
@@ -2925,7 +3025,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     if (this.authorityClaimed) return;
     this.authorityClaimed = true;
 
-    const targets = ['HostFileSystem', 'ShellExecutor', 'HttpClient'];
+    const targets = ['HostFileSystem', 'ShellExecutor', 'HttpClient', 'StreamClient'];
     for (const name of targets) {
       const id = await this.discoverDep(name);
       if (id) {
@@ -2973,6 +3073,23 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         }));
       } catch (e) { log.warn('Failed to propagate HTTP permissions', e); }
     }
+
+    // Streaming permissions follow the web settings: streams are web access
+    // held open, so one switch and one domain list govern both.
+    const streamId = await this.discoverDep('StreamClient');
+    if (streamId) {
+      try {
+        await this.request(request(this.id, streamId, 'updatePermissions', {
+          enabled: this.webEnabled,
+          allowedDomains: this.webAllowedDomains,
+          deniedDomains: this.webDeniedDomains,
+        }));
+      } catch (e) { log.warn('Failed to propagate stream permissions', e); }
+    }
+
+    // Capability enforcement mode: announced as an event; the bootstrap wires
+    // the bus interceptor as a dependent and applies the mode on each change.
+    this.changed('capabilityEnforcementChanged', this.capabilityEnforcement);
   }
 
   /**
@@ -2996,8 +3113,20 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // Always claim authority, even if no permissions saved yet
     await this.claimAuthority();
 
+    // Capability enforcement mode loads independently of the permission keys
+    // so the interceptor hears the persisted (or default) mode at boot.
+    const capMode = await this.request<string | null>(
+      request(this.id, this.storageId, 'get', { key: STORAGE_KEY_CAP_ENFORCEMENT })
+    );
+    if (capMode === 'off' || capMode === 'warn' || capMode === 'enforce') {
+      this.capabilityEnforcement = capMode;
+    }
+
     // Only propagate saved values if at least one permission key was explicitly saved
-    if (fsRo === null && shellEn === null && webEn === null) return;
+    if (fsRo === null && shellEn === null && webEn === null) {
+      this.changed('capabilityEnforcementChanged', this.capabilityEnforcement);
+      return;
+    }
 
     // Load all values
     if (fsRo !== null) this.fsReadOnly = fsRo === 'true';

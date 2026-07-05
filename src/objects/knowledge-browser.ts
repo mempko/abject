@@ -3,7 +3,7 @@
  * agent knowledge base.
  *
  * Split-pane layout: search input + list on the left, detail view on the
- * right. Tab bar for type filtering. Search triggers MiniSearch full-text
+ * right. Tab bar for type filtering. Search triggers FTS5 full-text
  * recall on the KnowledgeBase (searches content, not just titles).
  */
 

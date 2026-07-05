@@ -3,10 +3,14 @@
  *
  * Two-tab layout:
  *   Tab 0 (Agents):    Live list of all registered agents with status
- *   Tab 1 (Watchers):  Discovers watcher-tagged objects, shows their watches
+ *   Tab 1 (Watchers):  TriggerManager rules plus watcher-tagged objects
  *
- * Subscribes to AgentAbject and Registry for real-time updates.
- * Schedules are managed by the separate SchedulerBrowser.
+ * The Watchers tab merges two sources: declarative rules from the built-in
+ * TriggerManager (toggled/removed via enableTrigger/disableTrigger/
+ * removeTrigger) and legacy watcher-tagged objects exposing getState watches.
+ *
+ * Subscribes to AgentAbject, Registry, and TriggerManager for real-time
+ * updates. Schedules are managed by the separate SchedulerBrowser.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId, ObjectRegistration } from '../core/types.js';
@@ -39,6 +43,8 @@ interface AgentInfo {
 }
 
 interface WatchInfo {
+  /** 'trigger' rows come from TriggerManager rules; 'watch' rows from watcher-tagged objects. */
+  kind: 'watch' | 'trigger';
   watcherName: string;
   watcherId: string;
   id: string;
@@ -47,11 +53,13 @@ interface WatchInfo {
   taskDescription: string;
   enabled: boolean;
   triggerCount: number;
+  lastError?: string;
 }
 
 export class AgentBrowser extends Abject {
   private agentAbjectId?: AbjectId;
   private registryId?: AbjectId;
+  private triggerManagerId?: AbjectId;
   private widgetManagerId?: AbjectId;
   private abjectEditorId?: AbjectId;
   private windowId?: AbjectId;
@@ -122,6 +130,7 @@ export class AgentBrowser extends Abject {
     await this.fetchTheme();
     this.agentAbjectId = await this.discoverDep('AgentAbject') ?? undefined;
     this.registryId = await this.discoverDep('Registry') ?? undefined;
+    this.triggerManagerId = await this.discoverDep('TriggerManager') ?? undefined;
     this.widgetManagerId = await this.requireDep('WidgetManager');
   }
 
@@ -148,14 +157,13 @@ export class AgentBrowser extends Abject {
 - \`hide()\` -- Close the agent browser window.
 - \`getState()\` -- Returns { visible, agentCount, watchCount }.
 
-### Three-Tab View
+### Two-Tab View
 - **Agents**: Lists all registered agents with live status (idle/busy), active task count.
-- **Schedules**: Discovers scheduler-tagged objects and shows their schedule entries.
-- **Watchers**: Discovers watcher-tagged objects and shows their event watch entries.
+- **Watchers**: Merges TriggerManager rules (toggle, delete) with watcher-tagged objects and their event watch entries. Schedules live in the separate SchedulerBrowser.
 
 ### Real-Time Updates
-AgentBrowser subscribes to AgentAbject for agent registration/status changes
-and to Registry for new scheduler/watcher objects being created.
+AgentBrowser subscribes to AgentAbject for agent registration/status changes,
+to Registry for new watcher objects, and to TriggerManager for rule activity.
 
 ### Interface ID
 \`abjects:agent-browser\``;
@@ -356,6 +364,9 @@ and to Registry for new scheduler/watcher objects being created.
     if (this.registryId) {
       this.send(request(this.id, this.registryId, 'addDependent', {}));
     }
+    if (this.triggerManagerId) {
+      this.send(request(this.id, this.triggerManagerId, 'addDependent', {}));
+    }
 
     // Populate
     await this.loadTabData();
@@ -372,6 +383,9 @@ and to Registry for new scheduler/watcher objects being created.
     }
     if (this.registryId) {
       this.send(request(this.id, this.registryId, 'removeDependent', {}));
+    }
+    if (this.triggerManagerId) {
+      this.send(request(this.id, this.triggerManagerId, 'removeDependent', {}));
     }
 
     await this.request(
@@ -423,13 +437,51 @@ and to Registry for new scheduler/watcher objects being created.
   }
 
   private async loadWatches(): Promise<void> {
-    if (!this.registryId) { this.watches = []; return; }
     this.watches = [];
+
+    // TriggerManager rules come first: they are the built-in trigger surface.
+    if (!this.triggerManagerId) {
+      this.triggerManagerId = await this.discoverDep('TriggerManager') ?? undefined;
+    }
+    if (this.triggerManagerId) {
+      try {
+        const rules = await this.request<Array<{
+          id: string; name: string; sourceName: string; aspect: string;
+          filter?: string; enabled: boolean; fireCount: number;
+          lastError?: string;
+          action: { targetName: string; method: string };
+        }>>(
+          request(this.id, this.triggerManagerId, 'listTriggers', {}),
+          5000,
+        );
+        for (const r of rules) {
+          this.watches.push({
+            kind: 'trigger',
+            watcherName: 'TriggerManager',
+            watcherId: this.triggerManagerId as string,
+            id: r.id,
+            targetName: `${r.sourceName}.${r.aspect}`,
+            aspectFilter: r.filter,
+            taskDescription: `${r.name}: call ${r.action.targetName}.${r.action.method}`,
+            enabled: r.enabled,
+            triggerCount: r.fireCount,
+            lastError: r.lastError,
+          });
+        }
+      } catch (err) {
+        log.warn('Failed to load trigger rules:', err);
+      }
+    }
+
+    // Legacy watcher-tagged objects exposing getState watches.
+    if (!this.registryId) return;
     try {
       const watchers = await this.request<ObjectRegistration[]>(
         request(this.id, this.registryId, 'discover', { tags: ['watcher'] })
       );
       for (const w of watchers) {
+        // TriggerManager is watcher-tagged but already listed above.
+        if ((w.id as string) === (this.triggerManagerId as string | undefined)) continue;
         try {
           const state = await this.request<{ watches?: Array<{
             id: string; targetName: string; aspectFilter?: string;
@@ -441,6 +493,7 @@ and to Registry for new scheduler/watcher objects being created.
           if (state.watches) {
             for (const watch of state.watches) {
               this.watches.push({
+                kind: 'watch',
                 watcherName: w.name,
                 watcherId: w.id as string,
                 ...watch,
@@ -467,8 +520,9 @@ and to Registry for new scheduler/watcher objects being created.
       case 1:
         return this.watches.map((w, i) => {
           const icon = w.enabled ? '\u25C9' : '\u25CB';  // ◉ or ○
-          const filter = w.aspectFilter ? ` [${w.aspectFilter}]` : '';
-          return { label: `${icon} ${w.targetName}${filter}`, value: String(i), secondary: `${w.triggerCount} fires` };
+          const filter = w.kind === 'watch' && w.aspectFilter ? ` [${w.aspectFilter}]` : '';
+          const fires = w.lastError ? `${w.triggerCount} fires, error` : `${w.triggerCount} fires`;
+          return { label: `${icon} ${w.targetName}${filter}`, value: String(i), secondary: fires };
         });
       default:
         return [];
@@ -513,9 +567,15 @@ and to Registry for new scheduler/watcher objects being created.
       case 1: {
         const watch = this.watches[this.selectedIndex];
         if (!watch) { await this.clearDetail(); return; }
-        const desc = `**Task:** ${watch.taskDescription}\n\n**Target:** ${watch.targetName}\n**Filter:** ${watch.aspectFilter || 'All events'}\n**Enabled:** ${watch.enabled ? 'Yes' : 'No'}`;
-        const meta = `Watcher: ${watch.watcherName} | Triggered: ${watch.triggerCount} times`;
-        await this.updateDetail(`Watch: ${watch.targetName}`, desc, meta);
+        if (watch.kind === 'trigger') {
+          const desc = `**Rule:** ${watch.taskDescription}\n\n**Source event:** ${watch.targetName}\n**Filter:** ${watch.aspectFilter || 'None (all matching events)'}\n**Enabled:** ${watch.enabled ? 'Yes' : 'No'}${watch.lastError ? `\n\n**Last error:** ${watch.lastError}` : ''}`;
+          const meta = `TriggerManager rule ${watch.id} | Fired: ${watch.triggerCount} times`;
+          await this.updateDetail(`Trigger: ${watch.targetName}`, desc, meta);
+        } else {
+          const desc = `**Task:** ${watch.taskDescription}\n\n**Target:** ${watch.targetName}\n**Filter:** ${watch.aspectFilter || 'All events'}\n**Enabled:** ${watch.enabled ? 'Yes' : 'No'}`;
+          const meta = `Watcher: ${watch.watcherName} | Triggered: ${watch.triggerCount} times`;
+          await this.updateDetail(`Watch: ${watch.targetName}`, desc, meta);
+        }
         break;
       }
     }
@@ -585,6 +645,20 @@ and to Registry for new scheduler/watcher objects being created.
       }
       return;
     }
+
+    // TriggerManager events -- refresh the watchers tab on rule activity
+    if (fromId === this.triggerManagerId) {
+      if (aspect === 'triggerFired' || aspect === 'triggerFailed'
+          || aspect === 'triggerAdded' || aspect === 'triggerRemoved'
+          || aspect === 'triggerUpdated') {
+        if (this.activeTab === 1) {
+          await this.loadWatches();
+          await this.rebuildList();
+          if (this.selectedIndex >= 0) await this.showDetailForSelection();
+        }
+      }
+      return;
+    }
   }
 
   private async handleEdit(): Promise<void> {
@@ -620,17 +694,22 @@ and to Registry for new scheduler/watcher objects being created.
       case 1: {
         const watch = this.watches[this.selectedIndex];
         if (!watch) return;
-        const method = watch.enabled ? 'disableWatch' : 'enableWatch';
+        const method = watch.kind === 'trigger'
+          ? (watch.enabled ? 'disableTrigger' : 'enableTrigger')
+          : (watch.enabled ? 'disableWatch' : 'enableWatch');
+        const payload = watch.kind === 'trigger'
+          ? { triggerId: watch.id }
+          : { watchId: watch.id };
         if (this.toggleBtnId) this.send(event(this.id, this.toggleBtnId, 'update', { busy: true }));
         try {
           await this.request(
-            request(this.id, watch.watcherId as AbjectId, method, { watchId: watch.id }),
+            request(this.id, watch.watcherId as AbjectId, method, payload),
             5000,
           );
           watch.enabled = !watch.enabled;
           await this.rebuildList();
           await this.showDetailForSelection();
-          await this.notify(`Watch ${watch.enabled ? 'enabled' : 'disabled'}`, 'success');
+          await this.notify(`${watch.kind === 'trigger' ? 'Trigger' : 'Watch'} ${watch.enabled ? 'enabled' : 'disabled'}`, 'success');
         } catch (err) {
           log.warn('Failed to toggle watch:', err);
           await this.notify('Toggle failed', 'error');
@@ -643,7 +722,37 @@ and to Registry for new scheduler/watcher objects being created.
   }
 
   private async handleDelete(): Promise<void> {
-    if (this.activeTab !== 0 || this.selectedIndex < 0) return;
+    if (this.selectedIndex < 0) return;
+
+    // Watchers tab: TriggerManager rules can be removed directly.
+    if (this.activeTab === 1) {
+      const watch = this.watches[this.selectedIndex];
+      if (!watch || watch.kind !== 'trigger') return;
+      const confirmed = await this.confirm({
+        title: 'Delete Trigger',
+        message: `Delete trigger rule "${watch.taskDescription}"? This cannot be undone.`,
+        confirmLabel: 'Delete',
+        destructive: true,
+      });
+      if (!confirmed) return;
+      try {
+        await this.request(
+          request(this.id, watch.watcherId as AbjectId, 'removeTrigger', { triggerId: watch.id }),
+          5000,
+        );
+        this.selectedIndex = -1;
+        await this.loadWatches();
+        await this.rebuildList();
+        await this.clearDetail();
+        await this.notify('Trigger deleted', 'success');
+      } catch (err) {
+        log.warn('Failed to delete trigger:', err);
+        await this.notify('Delete failed', 'error');
+      }
+      return;
+    }
+
+    if (this.activeTab !== 0) return;
     const agent = this.agents[this.selectedIndex];
     if (!agent) return;
 

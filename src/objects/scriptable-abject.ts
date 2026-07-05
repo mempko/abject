@@ -287,6 +287,56 @@ export class ScriptableAbject extends Abject {
       }
     });
 
+    // Prototype replication across peers: return everything needed to grow an
+    // independent copy of this object elsewhere (manifest + source + optional
+    // data), signed by this peer's identity so the copy carries verifiable
+    // provenance. Reachability is the access gate: a remote caller can only
+    // send this message if the workspace's share mode and whitelist already
+    // admit it, so replicate answers whoever can already talk to the object.
+    // The receiving side spawns the payload locally via its own Factory
+    // (spawn with { manifest, source, data }).
+    this.on('replicate', async (msg: AbjectMessage) => {
+      const { withData } = (msg.payload ?? {}) as { withData?: boolean };
+      let data: Record<string, unknown> | undefined;
+      if (withData !== false) {
+        try {
+          data = JSON.parse(JSON.stringify(this._data));
+        } catch {
+          data = {};
+        }
+      }
+      const manifest = {
+        ...this.manifest,
+        lineage: {
+          clonedFrom: (this.typeId as string | undefined) ?? (this.id as string),
+          generation: (this.manifest.lineage?.generation ?? 0) + 1,
+        },
+      };
+
+      // Provenance signature: hash of name+version+source, signed by this
+      // peer's identity. Absent identity, the payload replicates unsigned.
+      let origin: { peerId?: string; signature?: string; signedAt: number } = {
+        signedAt: Date.now(),
+      };
+      try {
+        const identityId = await this.discoverDep('Identity');
+        if (identityId) {
+          const digestSrc = new TextEncoder().encode(
+            `${manifest.name}@${manifest.version}\n${this._source}`);
+          const digestBuf = await crypto.subtle.digest('SHA-256', digestSrc as BufferSource);
+          const digest = Array.from(new Uint8Array(digestBuf))
+            .map(b => b.toString(16).padStart(2, '0')).join('');
+          const signature = await this.request<string>(
+            request(this.id, identityId, 'sign', { data: digest }));
+          const identity = await this.request<{ peerId?: string }>(
+            request(this.id, identityId, 'getIdentity', {}));
+          origin = { peerId: identity?.peerId, signature, signedAt: Date.now() };
+        }
+      } catch { /* identity unavailable; replicate unsigned */ }
+
+      return { manifest, source: this._source, data, origin };
+    });
+
     this.on('probe', async () => {
       // Extract dep('...') and find('...') references from source
       // Match both this.dep() and bare dep() forms

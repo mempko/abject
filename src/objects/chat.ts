@@ -58,6 +58,8 @@ interface MessageMeta {
   text: string;
   markdown: boolean;
   align: BubbleAlign;
+  /** Last layout height applied from the bubble's contentHeight report. */
+  h?: number;
 }
 
 interface SuggestionChip {
@@ -168,7 +170,6 @@ export class Chat extends Abject {
   private activityStep = 0;
   private activityHeader = '\u25CF Thinking\u2026';
   private activityRefreshTimer?: ReturnType<typeof setTimeout>;
-  private activityRefreshLastHeight = 0;
   /** Streamed character count for the current LLM step. Reset each phase. */
   private stepStreamChars = 0;
 
@@ -635,13 +636,27 @@ export class Chat extends Abject {
         return;
       }
 
-      // Embedded goal widget reports its natural height; resize its log slot so
-      // the tree grows to fit and the message log scrolls (no inner scrollbar).
-      if (fromId === this.activityGoalWidgetId && aspect === 'contentHeight') {
+      // Self-sizing log children (contentBlock bubbles, embedded goal widget)
+      // report their natural height; resize their log slot so content grows to
+      // fit and the message log scrolls (no inner scrollbar, no estimation).
+      if (aspect === 'contentHeight') {
         const h = typeof value === 'number' ? value : Number(value);
-        if (Number.isFinite(h) && Math.abs(h - this.activityGoalHeight) >= 1) {
-          this.activityGoalHeight = h;
-          await this.setLabelHeight(this.activityGoalWidgetId, h);
+        if (!Number.isFinite(h)) return;
+        if (fromId === this.activityGoalWidgetId) {
+          if (Math.abs(h - this.activityGoalHeight) >= 1) {
+            this.activityGoalHeight = h;
+            await this.setLabelHeight(fromId, h);
+          }
+          return;
+        }
+        const meta = this.messageMetadata.get(fromId);
+        if (meta) {
+          // Breathing room around the text inside the bubble background.
+          const padded = h + this.theme.tokens.space.md;
+          if (meta.h === undefined || Math.abs(padded - meta.h) >= 1) {
+            meta.h = padded;
+            await this.setLabelHeight(fromId, padded);
+          }
         }
         return;
       }
@@ -2242,11 +2257,14 @@ A single successful creation goal is a complete turn. End it with **done**.
       // Sender labels have no metadata entry — they are chrome, not content.
     }
 
+    // contentBlock self-measures and reports its real height via a
+    // `contentHeight` event (handled in the changed router); the estimate
+    // above is only the provisional height for the first frame.
     const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
           {
-            type: 'label', windowId: this.windowId, text,
+            type: 'contentBlock', windowId: this.windowId, text,
             style: {
               color,
               fontSize: 13,
@@ -2268,6 +2286,7 @@ A single successful creation goal is a complete turn. End it with **done**.
       preferredSize: { width: bubbleMaxWidth, height: bubbleHeight },
       alignment: align,
     }));
+    this.send(request(this.id, labelId, 'addDependent', {}));
     this.messageLabelIds.push(labelId);
     this.messageMetadata.set(labelId, { role, sender, ts: Date.now(), text, markdown, align });
     if (senderLabelId) {
@@ -2282,7 +2301,6 @@ A single successful creation goal is a complete turn. End it with **done**.
     if (this.activityBubbleLabelId) return;
     this.activityStep = 0;
     this.activityHeader = '\u25CF Thinking\u2026';
-    this.activityRefreshLastHeight = 0;
     this.activityGoalHeight = 0;
     this.stepStreamChars = 0;
     this.liveGoals.clear();
@@ -2418,19 +2436,12 @@ A single successful creation goal is a complete turn. End it with **done**.
   private async refreshActivityBubble(): Promise<void> {
     if (!this.activityBubbleLabelId) return;
     const text = this.composeActivityText();
-    const innerWidth = this.computeBubbleMaxWidth() - this.theme.tokens.space.xs * 2;
-    const height = this.estimateBubbleHeight(text, innerWidth, false) + this.theme.tokens.space.lg;
-    // Keep the cached bubble text in sync so resize reflow uses the latest.
+    // Keep the cached bubble text in sync (metadata is the durable record).
     const meta = this.messageMetadata.get(this.activityBubbleLabelId);
     if (meta) meta.text = text;
+    // The bubble is a contentBlock: it re-measures on the text update and
+    // reports the new height itself, so no estimate/threshold cycle here.
     await this.updateLabel(this.activityBubbleLabelId, text, this.theme.statusNeutral);
-    // Only reflow layout when the height actually changed by at least one
-    // line; avoids a pointless updateLayoutChild round-trip on text-only
-    // updates.
-    if (Math.abs(height - this.activityRefreshLastHeight) >= 17) {
-      this.activityRefreshLastHeight = height;
-      await this.setLabelHeight(this.activityBubbleLabelId, height);
-    }
     // Feed the embedded goal widget the current row model; it reports its own
     // height back via a `contentHeight` event (handled in the changed router).
     if (this.activityGoalWidgetId) {
@@ -2453,7 +2464,6 @@ A single successful creation goal is a complete turn. End it with **done**.
     this.activityGoalWidgetId = undefined;
     this.activityGoalHeight = 0;
     this.activityStep = 0;
-    this.activityRefreshLastHeight = 0;
     this.stepStreamChars = 0;
     this.liveGoals.clear();
     this.liveTasks.clear();
@@ -2491,19 +2501,20 @@ A single successful creation goal is a complete turn. End it with **done**.
     if (!this.messageLogId || !this.windowId) return;
 
     const bubbleMaxWidth = this.computeBubbleMaxWidth();
-    const innerWidth = bubbleMaxWidth - this.theme.tokens.space.xs * 2;
     const updates: Promise<unknown>[] = [];
 
     for (const labelId of this.messageLabelIds) {
       const meta = this.messageMetadata.get(labelId);
       if (!meta) continue;
 
-      const height = this.estimateBubbleHeight(meta.text, innerWidth, meta.markdown);
+      // Width-only update (updateLayoutChild merges preferredSize): the
+      // contentBlock re-wraps at the new width and reports its new height via
+      // contentHeight, which the changed router applies. No estimation.
       updates.push(
         this.request(request(this.id, this.messageLogId, 'updateLayoutChild', {
           widgetId: labelId,
           sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-          preferredSize: { width: bubbleMaxWidth, height },
+          preferredSize: { width: bubbleMaxWidth },
           alignment: meta.align,
         })).catch(() => { /* widget gone */ })
       );
@@ -2546,15 +2557,6 @@ A single successful creation goal is a complete turn. End it with **done**.
     if (this.welcomeWidgetIds.length > 0) {
       await this.removeWelcomeState();
       await this.showWelcomeState();
-    }
-
-    // Keep activity bubble's cached height estimate aligned to avoid a
-    // spurious extra layout write on the next progress tick.
-    if (this.activityBubbleLabelId) {
-      const meta = this.messageMetadata.get(this.activityBubbleLabelId);
-      if (meta) {
-        this.activityRefreshLastHeight = this.estimateBubbleHeight(meta.text, innerWidth, false);
-      }
     }
   }
 

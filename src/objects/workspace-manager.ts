@@ -52,14 +52,14 @@ const INFRA_OBJECTS = [
   'AbjectStore', 'SharedState', 'TupleSpace', 'FileTransfer', 'MediaStream', 'Theme',
   'GoalManager', 'JobManager', 'AgentAbject', 'ScrumMaster', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
   'AgentCreator', 'Scheduler', 'KnowledgeBase', 'ChatManager',
-  'Console',
+  'Console', 'CollectionStore', 'TriggerManager',
 ] as const;
 
 /** UI objects — deferred for inactive workspaces, spawned on first switch. */
 const UI_OBJECTS = [
   'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser', 'KnowledgeBrowser', 'AgentBrowser', 'SchedulerBrowser',
   'WebBrowserViewer', 'FileManager', 'FileViewer', 'ChatBrowser', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
-  'CommandPalette', 'NotificationCenter', 'WindowSwitcher',
+  'CommandPalette', 'NotificationCenter', 'WindowSwitcher', 'DataBrowser',
 ] as const;
 
 /** All per-workspace objects in dependency order. */

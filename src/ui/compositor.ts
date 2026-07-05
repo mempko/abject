@@ -130,6 +130,26 @@ export interface ImageUrlParams {
   url: string;
 }
 
+/**
+ * Marks a surface rect as a live video region. The named client-side video
+ * element (registered via registerVideoElement) composites into this rect on
+ * every animation frame while it plays; the command itself paints nothing.
+ * Regions go stale when a later full surface redraw (a bare `clear`) arrives
+ * without re-emitting them, which stops the per-frame blit for widgets that
+ * scrolled off-screen or were removed.
+ */
+export interface VideoFrameParams {
+  videoId: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** Scroll-viewport clip in surface coordinates (from ScrollableVBox). */
+  clipTop?: number;
+  clipBottom?: number;
+  hidden?: boolean;
+}
+
 export interface PathParams {
   path: Path2D | string;
   fill?: string;
@@ -378,6 +398,21 @@ export class Compositor {
   private imageCache: Map<string, { img: HTMLImageElement; loaded: boolean }> = new Map();
   private static IMAGE_CACHE_MAX = 100;
   private liveDataImages: Map<string, { img: HTMLImageElement; width: number; height: number }> = new Map();
+  /** videoId → client video element (lifecycle owned by FrontendClient). */
+  private videoElements: Map<string, HTMLVideoElement> = new Map();
+  /** videoId → live surface region the element composites into per frame. */
+  private videoRegions: Map<string, {
+    surfaceId: string;
+    x: number; y: number; width: number; height: number;
+    clipTop?: number; clipBottom?: number;
+    hidden: boolean;
+    /** Must match the surface's stamp to stay live (see surfaceVideoStamps). */
+    stamp: number;
+    /** currentTime at last paint; repaint only when it moves (or first paint). */
+    lastTime: number;
+  }> = new Map();
+  /** Per-surface full-redraw counter, bumped by each bare `clear` command. */
+  private surfaceVideoStamps: Map<string, number> = new Map();
   /** Camera field of view; distance derives so the z=0 plane is ~1:1 px. */
   private static readonly CAMERA_FOV = (30 * Math.PI) / 180;
   /** Focus lift in px toward the camera — subtle enough that server-side
@@ -534,6 +569,10 @@ export class Compositor {
     const deleted = this.surfaces.delete(surfaceId);
     if (deleted) {
       this.liveDataImages.delete(surfaceId);
+      this.surfaceVideoStamps.delete(surfaceId);
+      for (const [videoId, region] of this.videoRegions) {
+        if (region.surfaceId === surfaceId) this.videoRegions.delete(videoId);
+      }
       const glState = this.surfaceGl.get(surfaceId);
       if (glState?.texture) this.renderer.deleteTexture(glState.texture);
       this.surfaceGl.delete(surfaceId);
@@ -911,10 +950,32 @@ export class Compositor {
     switch (command.type) {
       case 'clear': {
         this.resetSurfaceState(surface);
+        // A bare clear starts a full surface redraw: bump the video stamp so
+        // only videoFrame regions re-emitted in this redraw keep compositing.
+        this.surfaceVideoStamps.set(
+          command.surfaceId,
+          (this.surfaceVideoStamps.get(command.surfaceId) ?? 0) + 1,
+        );
         const p = command.params as { color?: string };
         if (p?.color) {
           ctx.fillStyle = p.color;
           ctx.fillRect(0, 0, surface.rect.width, surface.rect.height);
+        }
+        break;
+      }
+
+      case 'videoFrame': {
+        const p = command.params as VideoFrameParams;
+        if (p?.videoId && typeof p.x === 'number' && typeof p.y === 'number') {
+          this.videoRegions.set(p.videoId, {
+            surfaceId: command.surfaceId,
+            x: p.x, y: p.y,
+            width: Math.max(0, p.width), height: Math.max(0, p.height),
+            clipTop: p.clipTop, clipBottom: p.clipBottom,
+            hidden: p.hidden === true,
+            stamp: this.surfaceVideoStamps.get(command.surfaceId) ?? 0,
+            lastTime: -1, // force a repaint at the new position
+          });
         }
         break;
       }
@@ -1518,6 +1579,9 @@ export class Compositor {
    */
   private startRenderLoop(): void {
     const render = () => {
+      // Composite playing videos into their surfaces before the render check,
+      // so a fresh frame both updates the canvas and schedules the upload.
+      if (this.blitVideoFrames()) this.needsRender = true;
       if (this.needsRender) {
         // Clear BEFORE rendering so an animating frame can re-request.
         this.needsRender = false;
@@ -1526,6 +1590,84 @@ export class Compositor {
       this.animationFrameId = requestAnimationFrame(render);
     };
     this.animationFrameId = requestAnimationFrame(render);
+  }
+
+  // ── Video compositing ────────────────────────────────────────────────
+
+  /**
+   * Register a client-side video element for videoFrame regions. Element
+   * lifecycle (creation, src/srcObject, disposal) belongs to FrontendClient;
+   * the compositor only reads frames.
+   */
+  registerVideoElement(videoId: string, video: HTMLVideoElement): void {
+    this.videoElements.set(videoId, video);
+    this.needsRender = true;
+  }
+
+  unregisterVideoElement(videoId: string): void {
+    this.videoElements.delete(videoId);
+    this.videoRegions.delete(videoId);
+  }
+
+  /**
+   * Draw the current frame of every live video region into its surface
+   * canvas. Runs every animation frame; cheap when nothing plays because
+   * paints are gated on currentTime movement. Returns true when any surface
+   * was repainted (its texture re-uploads on the following render).
+   */
+  private blitVideoFrames(): boolean {
+    if (this.videoRegions.size === 0) return false;
+    let painted = false;
+    for (const [videoId, region] of this.videoRegions) {
+      if (region.hidden || region.width <= 0 || region.height <= 0) continue;
+      const surface = this.surfaces.get(region.surfaceId);
+      if (!surface || surface.tainted) continue;
+      const stamp = this.surfaceVideoStamps.get(region.surfaceId) ?? 0;
+      if (region.stamp !== stamp) continue; // stale: last full redraw skipped it
+      const video = this.videoElements.get(videoId);
+      if (!video || video.readyState < 2 || video.videoWidth === 0) continue;
+      // Repaint when time moved (playing or a paused seek) or on first paint.
+      const t = video.currentTime;
+      if (t === region.lastTime && !(!video.paused && !video.ended)) continue;
+      region.lastTime = t;
+      this.paintVideoRegion(surface, video, region);
+      surface.dirty = true;
+      painted = true;
+    }
+    return painted;
+  }
+
+  private paintVideoRegion(
+    surface: Surface,
+    video: HTMLVideoElement,
+    region: { x: number; y: number; width: number; height: number; clipTop?: number; clipBottom?: number },
+  ): void {
+    const ctx = surface.ctx;
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    // Clip to the region rect, tightened by any scroll-viewport bounds.
+    const top = Math.max(region.y, region.clipTop ?? region.y);
+    const bottom = Math.min(region.y + region.height, region.clipBottom ?? region.y + region.height);
+    if (bottom <= top) {
+      ctx.restore();
+      return;
+    }
+    ctx.beginPath();
+    ctx.rect(region.x, top, region.width, bottom - top);
+    ctx.clip();
+    // Letterbox background, then contain-fit the frame.
+    ctx.fillStyle = '#000';
+    ctx.fillRect(region.x, region.y, region.width, region.height);
+    const scale = Math.min(region.width / video.videoWidth, region.height / video.videoHeight);
+    const dw = video.videoWidth * scale;
+    const dh = video.videoHeight * scale;
+    ctx.drawImage(
+      video,
+      region.x + (region.width - dw) / 2,
+      region.y + (region.height - dh) / 2,
+      dw, dh,
+    );
+    ctx.restore();
   }
 
   /**

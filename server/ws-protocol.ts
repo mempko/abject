@@ -201,6 +201,111 @@ export interface OpenFilePickerMsg extends WsEnvelope {
 // Auth messages (server -> client)
 // =============================================================================
 
+export interface AudioPlayMsg extends WsEnvelope {
+  type: 'audioPlay';
+  playbackId: string;
+  /** http(s) URL or data: URI (abject:// refs are resolved server-side first). */
+  source: string;
+  volume?: number;
+  loop?: boolean;
+}
+
+export interface AudioControlMsg extends WsEnvelope {
+  type: 'audioControl';
+  action: 'pause' | 'resume' | 'stop' | 'stopAll';
+  playbackId?: string;
+}
+
+export interface MediaCaptureRequestMsg extends WsEnvelope {
+  type: 'mediaCaptureRequest';
+  requestId: string;
+  audio: boolean;
+  video: boolean;
+  /** true = getDisplayMedia (screen share) instead of camera/mic. */
+  display: boolean;
+}
+
+export interface MediaCaptureFrameRequestMsg extends WsEnvelope {
+  type: 'mediaCaptureFrameRequest';
+  requestId: string;
+  streamId: string;
+}
+
+export interface MediaRecordStartMsg extends WsEnvelope {
+  type: 'mediaRecordStart';
+  recordingId: string;
+  streamId: string;
+  maxDurationMs?: number;
+}
+
+export interface MediaRecordStopMsg extends WsEnvelope {
+  type: 'mediaRecordStop';
+  recordingId: string;
+}
+
+export interface MediaStreamControlMsg extends WsEnvelope {
+  type: 'mediaStreamControl';
+  action: 'stopStream' | 'muteTrack';
+  streamId?: string;
+  trackId?: string;
+  muted?: boolean;
+}
+
+/**
+ * Speak text with the browser's built-in speechSynthesis. The client replies
+ * with {@link SpeechSpeakReplyMsg} once the utterance starts (or fails), so
+ * long passages never block the relay round-trip.
+ */
+export interface SpeechSpeakMsg extends WsEnvelope {
+  type: 'speechSpeak';
+  requestId: string;
+  text: string;
+  /** Voice name from speechSynthesis.getVoices(); default voice when omitted. */
+  voice?: string;
+}
+
+/**
+ * Live speech recognition on the client. When the Web Speech API is available
+ * the reply carries the final transcript; otherwise the client records the
+ * microphone for maxDurationMs and replies with the audio for server-side
+ * transcription.
+ */
+export interface SpeechRecognizeRequestMsg extends WsEnvelope {
+  type: 'speechRecognizeRequest';
+  requestId: string;
+  maxDurationMs?: number;
+}
+
+export interface SpeechVoicesRequestMsg extends WsEnvelope {
+  type: 'speechVoicesRequest';
+  requestId: string;
+}
+
+/**
+ * Create (or reconfigure) a client-side video element for a video widget.
+ * Exactly one of source (http(s)/data: URL) or streamId (a client-held
+ * captured MediaStream) is set. Frames never cross the relay: the client
+ * composites the element's current frame into the widget's surface rect
+ * each animation frame (see the compositor's videoFrame regions).
+ */
+export interface VideoSetupMsg extends WsEnvelope {
+  type: 'videoSetup';
+  videoId: string;
+  source?: string;
+  streamId?: string;
+  muted?: boolean;
+  loop?: boolean;
+  autoplay?: boolean;
+}
+
+export interface VideoControlMsg extends WsEnvelope {
+  type: 'videoControl';
+  videoId: string;
+  action: 'play' | 'pause' | 'seek' | 'setMuted' | 'dispose';
+  /** seek: target time in seconds; setMuted: 1 = muted, 0 = audible. */
+  value?: number;
+}
+
 export interface AuthRequiredMsg extends WsEnvelope {
   type: 'authRequired';
 }
@@ -244,6 +349,18 @@ export type BackendToFrontendMsg =
   | SceneOpsMsg
   | SetSceneThemeMsg
   | SetSurfaceTransformMsg
+  | AudioPlayMsg
+  | AudioControlMsg
+  | MediaCaptureRequestMsg
+  | MediaCaptureFrameRequestMsg
+  | MediaRecordStartMsg
+  | MediaRecordStopMsg
+  | MediaStreamControlMsg
+  | SpeechSpeakMsg
+  | SpeechRecognizeRequestMsg
+  | SpeechVoicesRequestMsg
+  | VideoSetupMsg
+  | VideoControlMsg
   | AuthRequiredMsg
   | AuthNotRequiredMsg
   | AuthResultMsg;
@@ -390,6 +507,80 @@ export interface FontMetricsMsg extends WsEnvelope {
  * and sends them here so they aren't swallowed by whichever widget happens
  * to hold focus.
  */
+export interface AudioEventMsg extends WsEnvelope {
+  type: 'audioEvent';
+  playbackId: string;
+  event: 'ended' | 'error';
+  error?: string;
+}
+
+/**
+ * Video element state change on the client, routed to the owning video
+ * widget. 'meta' carries duration and intrinsic size after loadedmetadata;
+ * 'time' is a throttled currentTime tick that drives the seek bar.
+ */
+export interface VideoEventMsg extends WsEnvelope {
+  type: 'videoEvent';
+  videoId: string;
+  event: 'playing' | 'paused' | 'ended' | 'error' | 'meta' | 'time';
+  error?: string;
+  duration?: number;
+  currentTime?: number;
+  width?: number;
+  height?: number;
+}
+
+export interface MediaCaptureReplyMsg extends WsEnvelope {
+  type: 'mediaCaptureReply';
+  requestId: string;
+  streamId?: string;
+  tracks?: Array<{ id: string; kind: string; label: string }>;
+  error?: string;
+}
+
+export interface MediaCaptureFrameReplyMsg extends WsEnvelope {
+  type: 'mediaCaptureFrameReply';
+  requestId: string;
+  base64?: string;
+  width?: number;
+  height?: number;
+  error?: string;
+}
+
+export interface MediaRecordingCompleteMsg extends WsEnvelope {
+  type: 'mediaRecordingComplete';
+  recordingId: string;
+  base64?: string;
+  mimeType?: string;
+  durationMs?: number;
+  error?: string;
+}
+
+export interface SpeechSpeakReplyMsg extends WsEnvelope {
+  type: 'speechSpeakReply';
+  requestId: string;
+  /** True once the utterance began playing on the client. */
+  spoken?: boolean;
+  error?: string;
+}
+
+export interface SpeechRecognizeReplyMsg extends WsEnvelope {
+  type: 'speechRecognizeReply';
+  requestId: string;
+  /** Final transcript when the browser's Web Speech API handled recognition. */
+  text?: string;
+  /** Recorded mic audio (base64) when the browser lacks SpeechRecognition. */
+  audioBase64?: string;
+  mimeType?: string;
+  error?: string;
+}
+
+export interface SpeechVoicesReplyMsg extends WsEnvelope {
+  type: 'speechVoicesReply';
+  requestId: string;
+  voices: string[];
+}
+
 export interface GlobalShortcutMsg extends WsEnvelope {
   type: 'globalShortcut';
   combo: 'commandPalette' | 'windowSwitcher';
@@ -432,6 +623,14 @@ export type FrontendToBackendMsg =
   | DisplayResizedMsg
   | FontMetricsMsg
   | GlobalShortcutMsg
+  | AudioEventMsg
+  | VideoEventMsg
+  | MediaCaptureReplyMsg
+  | MediaCaptureFrameReplyMsg
+  | MediaRecordingCompleteMsg
+  | SpeechSpeakReplyMsg
+  | SpeechRecognizeReplyMsg
+  | SpeechVoicesReplyMsg
   | AuthLoginMsg
   | AuthTokenMsg;
 
