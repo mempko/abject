@@ -312,21 +312,6 @@ export interface LLMProvider {
   describe(): LLMProviderDescription;
 
   /**
-   * Embed texts into vectors (optional). Returns one vector per input text,
-   * in input order. Providers without an embeddings API leave this
-   * unimplemented; callers must check supportsEmbeddings() first.
-   */
-  embed?(texts: string[], options?: { model?: string }): Promise<number[][]>;
-
-  /**
-   * Whether this provider can serve embed() right now (configured with the
-   * credentials it needs). Cheap and synchronous; a true here still allows
-   * embed() to fail at call time (network, missing model), so callers treat
-   * embed errors as a soft signal to fall back to lexical search.
-   */
-  supportsEmbeddings?(): boolean;
-
-  /**
    * Transcribe audio to text (optional). Providers without a speech-to-text
    * API leave this unimplemented; callers check supportsSpeech() first.
    */
@@ -347,9 +332,9 @@ export interface LLMProvider {
 
   /**
    * Which speech directions this provider can serve right now. Cheap and
-   * synchronous, same contract as supportsEmbeddings(): a true still allows
-   * the call to fail at runtime, and callers treat failures as a soft signal
-   * to fall back (browser speech APIs on the client, or a clear error).
+   * synchronous; a true still allows the call to fail at runtime, and
+   * callers treat failures as a soft signal to fall back (browser speech
+   * APIs on the client, or a clear error).
    */
   supportsSpeech?(): { transcribe: boolean; synthesize: boolean };
 }
@@ -377,11 +362,6 @@ export abstract class BaseLLMProvider implements LLMProvider {
 
   async listModels(): Promise<ModelInfo[]> {
     return [];
-  }
-
-  /** Providers opt in by overriding; the default provider has no embeddings API. */
-  supportsEmbeddings(): boolean {
-    return false;
   }
 
   /** Providers opt in by overriding; the default provider has no speech APIs. */

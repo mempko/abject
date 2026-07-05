@@ -276,42 +276,10 @@ export class OpenAIProvider extends BaseLLMProvider {
   }
 
   /**
-   * Only first-party OpenAI serves /v1/embeddings. Subclasses (OpenRouter,
-   * DeepSeek, Grok, Kimi, MiniMax) reuse this class for chat completions but
-   * have no embeddings endpoint, so gate on the provider name they reassign.
-   */
-  override supportsEmbeddings(): boolean {
-    return this.name === 'openai' && !!this.apiKey;
-  }
-
-  async embed(texts: string[], options?: { model?: string }): Promise<number[][]> {
-    require(this.apiKey !== undefined, 'API key is required');
-    require(texts.length > 0, 'texts must be non-empty');
-    const model = options?.model ?? 'text-embedding-3-small';
-
-    return this.withRetries(async () => {
-      const response = await this.fetch(`${this.baseUrl}/v1/embeddings`, {
-        method: 'POST',
-        headers: this.buildHeaders(),
-        body: JSON.stringify({ model, input: texts }),
-      }, { timeout: 60000 });
-
-      const data = JSON.parse(response.body) as {
-        data?: Array<{ index: number; embedding: number[] }>;
-      };
-      const rows = data.data ?? [];
-      if (rows.length !== texts.length) {
-        throw new Error(`OpenAI embeddings returned ${rows.length} vectors for ${texts.length} inputs`);
-      }
-      // The API documents index order; sort defensively so output aligns with input.
-      return rows.sort((a, b) => a.index - b.index).map(r => r.embedding);
-    });
-  }
-
-  /**
-   * Speech APIs are first-party OpenAI only, same gating as embeddings: the
-   * OpenAI-compatible subclasses reuse the chat path but serve neither
-   * /v1/audio/transcriptions nor /v1/audio/speech.
+   * Speech APIs are first-party OpenAI only: the OpenAI-compatible
+   * subclasses (OpenRouter, DeepSeek, Grok, Kimi, MiniMax) reuse the chat
+   * path but serve neither /v1/audio/transcriptions nor /v1/audio/speech,
+   * so gate on the provider name they reassign.
    */
   override supportsSpeech(): { transcribe: boolean; synthesize: boolean } {
     const firstParty = this.name === 'openai' && !!this.apiKey;

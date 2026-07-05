@@ -365,28 +365,6 @@ export class LLMObject extends Abject {
                 returns: { kind: 'reference', reference: 'TierRouting' },
               },
               {
-                name: 'embed',
-                description: 'Embed texts into vectors for semantic search. Returns one vector per input text, in input order. Routes to the first registered provider with an embeddings API unless a provider is named.',
-                parameters: [
-                  { name: 'texts', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Texts to embed (non-empty)' },
-                  { name: 'provider', type: { kind: 'primitive', primitive: 'string' }, description: 'Provider name (optional; auto-selected when omitted)', optional: true },
-                  { name: 'model', type: { kind: 'primitive', primitive: 'string' }, description: 'Embedding model id (optional; provider default when omitted)', optional: true },
-                ],
-                returns: { kind: 'object', properties: {
-                  embeddings: { kind: 'array', elementType: { kind: 'array', elementType: { kind: 'primitive', primitive: 'number' } } },
-                  provider: { kind: 'primitive', primitive: 'string' },
-                } },
-              },
-              {
-                name: 'supportsEmbeddings',
-                description: 'Whether any registered provider can serve embed() right now',
-                parameters: [],
-                returns: { kind: 'object', properties: {
-                  supported: { kind: 'primitive', primitive: 'boolean' },
-                  provider: { kind: 'primitive', primitive: 'string' },
-                } },
-              },
-              {
                 name: 'transcribe',
                 description: 'Transcribe audio to text (speech-to-text). Routes to the first registered provider with a transcription API unless a provider is named.',
                 parameters: [
@@ -630,20 +608,6 @@ export class LLMObject extends Abject {
       this.tierRouting = { ...tierRouting };
       log.info(`Tier routing updated: ${JSON.stringify(this.tierRouting)}`);
       return true;
-    });
-
-    this.on('embed', async (m: AbjectMessage) => {
-      const { texts, provider: providerName, model } = m.payload as {
-        texts: string[]; provider?: string; model?: string;
-      };
-      require(Array.isArray(texts) && texts.length > 0, 'texts must be a non-empty array');
-      require(texts.every(t => typeof t === 'string'), 'texts must be strings');
-      return this.embedTexts(texts, providerName, model);
-    });
-
-    this.on('supportsEmbeddings', async () => {
-      const provider = this.findEmbeddingProvider();
-      return { supported: provider !== undefined, provider: provider?.name };
     });
 
     this.on('transcribe', async (m: AbjectMessage) => {
@@ -1373,59 +1337,6 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     return this.providers.values().next().value;
   }
 
-  /**
-   * Resolve the provider and optional model override for a request.
-   * Priority: explicit providerName > tier routing > default provider.
-   */
-  /** First registered provider that can serve embed() right now. */
-  private findEmbeddingProvider(): LLMProvider | undefined {
-    for (const provider of this.providers.values()) {
-      if (provider.embed && provider.supportsEmbeddings?.()) return provider;
-    }
-    return undefined;
-  }
-
-  /**
-   * Embed texts via the named provider, or the first willing provider when
-   * unnamed. Auto-selection tries each candidate in registration order and
-   * falls through on failure, so a provider that advertises support but is
-   * missing its embedding model (e.g. Ollama without nomic-embed-text pulled)
-   * degrades to the next candidate instead of failing the call.
-   */
-  private async embedTexts(
-    texts: string[],
-    providerName?: string,
-    model?: string,
-  ): Promise<{ embeddings: number[][]; provider: string; model?: string }> {
-    if (providerName) {
-      const provider = this.providers.get(providerName);
-      require(provider !== undefined, `Provider '${providerName}' not registered`);
-      require(provider!.embed !== undefined, `Provider '${providerName}' has no embeddings API`);
-      const embeddings = await provider!.embed!(texts, model ? { model } : undefined);
-      return { embeddings, provider: provider!.name, model };
-    }
-
-    const candidates = [...this.providers.values()]
-      .filter(p => p.embed && p.supportsEmbeddings?.());
-    if (candidates.length === 0) {
-      throw new Error('No registered provider supports embeddings. Configure OpenAI, Gemini, or a reachable Ollama with an embedding model.');
-    }
-
-    const failures: string[] = [];
-    for (const provider of candidates) {
-      try {
-        const start = Date.now();
-        const embeddings = await provider.embed!(texts, model ? { model } : undefined);
-        log.info(`← ${provider.name} embed | ${texts.length} texts | ${Date.now() - start}ms`);
-        return { embeddings, provider: provider.name, model };
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        failures.push(`${provider.name}: ${msg.slice(0, 200)}`);
-      }
-    }
-    throw new Error(`All embedding providers failed. ${failures.join(' | ')}`);
-  }
-
   /** First registered provider that can serve the given speech direction. */
   private findSpeechProvider(direction: 'transcribe' | 'synthesize'): LLMProvider | undefined {
     for (const provider of this.providers.values()) {
@@ -1438,8 +1349,8 @@ Only output the code, no explanations. Use proper formatting and comments.`;
 
   /**
    * Transcribe audio via the named provider, or the first willing provider
-   * when unnamed. Mirrors embedTexts: auto-selection falls through failed
-   * candidates so a flaky provider degrades to the next one.
+   * when unnamed. Auto-selection falls through failed candidates so a flaky
+   * provider degrades to the next one.
    */
   private async transcribeAudio(
     audio: { base64: string; mimeType: string },

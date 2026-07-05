@@ -121,42 +121,6 @@ export class GeminiProvider extends BaseLLMProvider {
     return !!this.apiKey;
   }
 
-  override supportsEmbeddings(): boolean {
-    return !!this.apiKey;
-  }
-
-  async embed(texts: string[], options?: { model?: string }): Promise<number[][]> {
-    require(this.apiKey !== undefined, 'API key is required');
-    require(texts.length > 0, 'texts must be non-empty');
-    const model = options?.model ?? 'text-embedding-004';
-
-    return this.withRetries(async () => {
-      const response = await this.fetch(
-        `${this.baseUrl}/v1beta/models/${model}:batchEmbedContents?key=${this.apiKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            requests: texts.map(text => ({
-              model: `models/${model}`,
-              content: { parts: [{ text }] },
-            })),
-          }),
-        },
-        { timeout: 60000 },
-      );
-
-      const data = JSON.parse(response.body) as {
-        embeddings?: Array<{ values: number[] }>;
-      };
-      const rows = data.embeddings ?? [];
-      if (rows.length !== texts.length) {
-        throw new Error(`Gemini embeddings returned ${rows.length} vectors for ${texts.length} inputs`);
-      }
-      return rows.map(r => r.values);
-    });
-  }
-
   /**
    * Transcription rides generateContent with an inline audio part, which is
    * JSON in and out, so the existing text-only fetch plumbing serves it.

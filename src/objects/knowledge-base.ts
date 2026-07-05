@@ -3,13 +3,10 @@
  *
  * Stores structured knowledge entries that agents can remember, recall,
  * and search. Backed by SQLite (node:sqlite) with an FTS5 full-text index
- * for BM25-ranked lexical retrieval, SharedState for cross-peer sync, and
- * an optional embedding column for hybrid lexical+vector recall when an
- * embeddings-capable LLM provider is configured.
+ * for BM25-ranked lexical retrieval and SharedState for cross-peer sync.
  *
  * Retrieval philosophy (lexical-first): agents query with exact terms and
- * can iterate, which is where BM25 shines; embeddings are an additive
- * ranking signal fused via reciprocal rank fusion, never a replacement.
+ * can iterate, which is where BM25 shines.
  */
 
 import { v4 as uuidv4 } from 'uuid';
@@ -77,9 +74,6 @@ export interface RecallPreview {
   score?: number;
 }
 
-/** Reciprocal rank fusion constant (standard k=60). */
-const RRF_K = 60;
-
 export class KnowledgeBase extends Abject {
   private storageId?: AbjectId;
   private sharedStateId?: AbjectId;
@@ -87,15 +81,13 @@ export class KnowledgeBase extends Abject {
   private entries: Map<string, KnowledgeEntry> = new Map();
   private db?: DatabaseSync;
   private distillTimer?: ReturnType<typeof setInterval>;
-  /** Set by the soft supportsEmbeddings probe; recall/remember read it. */
-  private embedSupported = false;
 
   constructor() {
     super({
       manifest: {
         name: 'KnowledgeBase',
         description:
-          'Persistent agent memory system. Agents remember facts, insights, and lessons learned, then retrieve them three ways: recall (BM25 full-text search, optionally fused with embeddings), match (exact/regex lookup for identifiers), and get (fetch one full entry by id). Knowledge persists across restarts and syncs across peers.',
+          'Persistent agent memory system. Agents remember facts, insights, and lessons learned, then retrieve them three ways: recall (BM25 full-text search), match (exact/regex lookup for identifiers), and get (fetch one full entry by id). Knowledge persists across restarts and syncs across peers.',
         version: '2.0.0',
         interface: {
           id: KNOWLEDGE_BASE_INTERFACE,
@@ -217,15 +209,10 @@ export class KnowledgeBase extends Abject {
 
     log.info(`KnowledgeBase initialized with ${this.entries.size} entries`);
 
-    // Soft probe for embedding support; never blocks init. Re-probed on the
-    // distill timer so a provider configured later still activates hybrid.
-    this.probeEmbeddings();
-
     // Run initial distillation, then periodically every 30 minutes
     this.distill();
     this.distillTimer = setInterval(() => {
       this.distill();
-      this.probeEmbeddings();
     }, 30 * 60 * 1000);
   }
 
@@ -302,8 +289,7 @@ export class KnowledgeBase extends Abject {
         createdAt INTEGER NOT NULL,
         updatedAt INTEGER NOT NULL,
         accessCount INTEGER NOT NULL DEFAULT 0,
-        lastAccessedAt INTEGER NOT NULL DEFAULT 0,
-        embedding BLOB
+        lastAccessedAt INTEGER NOT NULL DEFAULT 0
       );
       CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
         title, content, tags,
@@ -388,16 +374,13 @@ export class KnowledgeBase extends Abject {
     };
   }
 
-  /**
-   * Insert or update an entry row. The embedding is nulled on every content
-   * write (it describes the old text); scheduleEmbed refreshes it async.
-   */
+  /** Insert or update an entry row. */
   private writeEntryToDb(e: KnowledgeEntry): void {
     if (!this.db) return;
     try {
       this.db.prepare(`
-        INSERT INTO entries(id, title, content, type, tags, createdBy, createdAt, updatedAt, accessCount, lastAccessedAt, embedding)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        INSERT INTO entries(id, title, content, type, tags, createdBy, createdAt, updatedAt, accessCount, lastAccessedAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           title = excluded.title,
           content = excluded.content,
@@ -405,8 +388,7 @@ export class KnowledgeBase extends Abject {
           tags = excluded.tags,
           updatedAt = excluded.updatedAt,
           accessCount = excluded.accessCount,
-          lastAccessedAt = excluded.lastAccessedAt,
-          embedding = NULL
+          lastAccessedAt = excluded.lastAccessedAt
       `).run(
         e.id, e.title, e.content, e.type, JSON.stringify(e.tags), e.createdBy,
         e.createdAt, e.updatedAt, e.accessCount, e.lastAccessedAt,
@@ -425,7 +407,7 @@ export class KnowledgeBase extends Abject {
     }
   }
 
-  /** Lightweight access-count bump that preserves the stored embedding. */
+  /** Lightweight access-count bump (leaves entry content untouched). */
   private bumpAccessInDb(e: KnowledgeEntry): void {
     if (!this.db) return;
     try {
@@ -496,122 +478,10 @@ export class KnowledgeBase extends Abject {
     return scored.sort((a, b) => b.score - a.score).slice(0, limit);
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // Embeddings (optional hybrid ranking)
-  // ═══════════════════════════════════════════════════════════════════
-
-  private probeEmbeddings(): void {
-    (async () => {
-      try {
-        if (!this.llmId) this.llmId = await this.discoverDep('LLM') ?? undefined;
-        if (!this.llmId) { this.embedSupported = false; return; }
-        const res = await this.request<{ supported: boolean }>(
-          request(this.id, this.llmId, 'supportsEmbeddings', {}),
-          5000,
-        );
-        const was = this.embedSupported;
-        this.embedSupported = !!res?.supported;
-        if (this.embedSupported && !was) log.info('Embeddings available: hybrid recall active');
-      } catch {
-        this.embedSupported = false;
-      }
-    })().catch(() => { /* soft probe */ });
-  }
-
-  /** Async re-embed of one entry; failures degrade silently to lexical. */
-  private scheduleEmbed(e: KnowledgeEntry): void {
-    if (!this.embedSupported || !this.db || !this.llmId) return;
-    const at = e.updatedAt;
-    (async () => {
-      const res = await this.request<{ embeddings: number[][] }>(
-        request(this.id, this.llmId!, 'embed', { texts: [`${e.title}\n${e.content}`.slice(0, 8000)] }),
-        30000,
-      );
-      const vec = res?.embeddings?.[0];
-      if (!vec || !this.db) return;
-      // Guard: apply only if the row was not rewritten since scheduling.
-      this.db.prepare(`UPDATE entries SET embedding = ? WHERE id = ? AND updatedAt = ?`)
-        .run(this.encodeVec(vec), e.id, at);
-    })().catch(err => {
-      // Soft degrade: lexical search still covers this entry.
-      log.warn(`Embed skipped for "${e.title}": ${err instanceof Error ? err.message : String(err)}`);
-    });
-  }
-
-  private encodeVec(v: number[]): Uint8Array {
-    const f = new Float32Array(v);
-    return new Uint8Array(f.buffer.slice(0));
-  }
-
-  private decodeVec(b: Uint8Array): Float32Array {
-    return new Float32Array(b.buffer, b.byteOffset, Math.floor(b.byteLength / 4));
-  }
-
-  private cosine(a: Float32Array, b: Float32Array): number {
-    const n = Math.min(a.length, b.length);
-    let dot = 0, na = 0, nb = 0;
-    for (let i = 0; i < n; i++) {
-      dot += a[i] * b[i];
-      na += a[i] * a[i];
-      nb += b[i] * b[i];
-    }
-    const denom = Math.sqrt(na) * Math.sqrt(nb);
-    return denom > 0 ? dot / denom : 0;
-  }
-
-  /** Rank entries by cosine similarity to the query vector. */
-  private vectorSearch(queryVec: Float32Array, limit: number): string[] {
-    if (!this.db) return [];
-    try {
-      const rows = this.db.prepare(`SELECT id, embedding FROM entries WHERE embedding IS NOT NULL`)
-        .all() as Array<Record<string, unknown>>;
-      const scored: Array<{ id: string; sim: number }> = [];
-      for (const r of rows) {
-        const blob = r.embedding as Uint8Array | null;
-        if (!blob || blob.byteLength < 8) continue;
-        scored.push({ id: String(r.id), sim: this.cosine(queryVec, this.decodeVec(blob)) });
-      }
-      return scored.sort((a, b) => b.sim - a.sim).slice(0, limit).map(s => s.id);
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * Hybrid recall: run lexical and vector rankings, fuse with reciprocal
-   * rank fusion (k=60). Falls back to pure lexical when embeddings are
-   * unavailable or the query embed fails.
-   */
+  /** Rank entries for recall: BM25 lexical ranking with snippets. */
   private async rankIds(query: string, poolSize: number): Promise<Array<{ id: string; score: number; snippet?: string }>> {
-    const lexical = this.ftsSearch(query, poolSize);
-    const snippets = new Map(lexical.map(l => [l.id, l.snippet]));
-
-    let vectorIds: string[] = [];
-    if (this.embedSupported && this.llmId) {
-      try {
-        const res = await this.request<{ embeddings: number[][] }>(
-          request(this.id, this.llmId, 'embed', { texts: [query.slice(0, 2000)] }),
-          8000,
-        );
-        const vec = res?.embeddings?.[0];
-        if (vec) vectorIds = this.vectorSearch(new Float32Array(vec), poolSize);
-      } catch { /* lexical only this time */ }
-    }
-
-    if (vectorIds.length === 0) {
-      return lexical.map(l => ({ id: l.id, score: l.score, snippet: l.snippet }));
-    }
-
-    const fused = new Map<string, number>();
-    lexical.forEach((l, rank) => {
-      fused.set(l.id, (fused.get(l.id) ?? 0) + 1 / (RRF_K + rank + 1));
-    });
-    vectorIds.forEach((id, rank) => {
-      fused.set(id, (fused.get(id) ?? 0) + 1 / (RRF_K + rank + 1));
-    });
-    return [...fused.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .map(([id, score]) => ({ id, score, snippet: snippets.get(id) }));
+    return this.ftsSearch(query, poolSize)
+      .map(l => ({ id: l.id, score: l.score, snippet: l.snippet }));
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -623,7 +493,7 @@ export class KnowledgeBase extends Abject {
 
 ### Three lookup modes (use them in this order)
 
-1. **recall** searches by meaning and keywords (BM25 full text, title-boosted${this.embedSupported ? ', fused with embeddings' : ''}). Results carry a \`snippet\` and \`score\`. Pass \`previews: true\` to scan cheaply.
+1. **recall** searches by keywords (BM25 full text, title-boosted). Results carry a \`snippet\` and \`score\`. Pass \`previews: true\` to scan cheaply.
 
   const hits = await call(await dep('KnowledgeBase'), 'recall', {
     query: 'ui preferences', limit: 5, previews: true,
@@ -682,7 +552,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     const typeSummary = Object.entries(byType).map(([t, c]) => `${c} ${t}`).join(', ');
     prompt += `\n\n### Current Knowledge Store\n`;
     prompt += `${entries.length} entries${typeSummary ? ` (${typeSummary})` : ''}.`;
-    prompt += ` Retrieval: BM25 lexical${this.embedSupported ? ' + embedding hybrid (RRF)' : ' (embeddings not configured)'}.\n`;
+    prompt += ` Retrieval: BM25 lexical (FTS5).\n`;
     if (entries.length > 0) {
       const recent = entries.slice(-5);
       prompt += '\nRecent entries:\n';
@@ -717,7 +587,6 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
         existing.tags = tags ?? existing.tags;
         existing.updatedAt = Date.now();
         this.writeEntryToDb(existing);
-        this.scheduleEmbed(existing);
         this.syncToSharedState();
         this.changed('entryUpdated', existing);
         log.info(`Updated knowledge: "${title}" (${type})`);
@@ -739,7 +608,6 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
 
       this.entries.set(entry.id, entry);
       this.writeEntryToDb(entry);
-      this.scheduleEmbed(entry);
       this.syncToSharedState();
       this.changed('entryAdded', entry);
       log.info(`Remembered: "${entry.title}" (${entry.type}) [${entry.tags.join(', ')}]`);
@@ -893,7 +761,6 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       entry.updatedAt = Date.now();
 
       this.writeEntryToDb(entry);
-      this.scheduleEmbed(entry);
       this.syncToSharedState();
       this.changed('entryUpdated', entry);
       log.info(`Updated: "${entry.title}"`);
@@ -927,7 +794,6 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
         if (!local || re.updatedAt > local.updatedAt) {
           this.entries.set(re.id, re);
           this.writeEntryToDb(re);
-          this.scheduleEmbed(re);
           merged++;
         }
       }
