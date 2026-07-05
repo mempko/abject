@@ -75,6 +75,9 @@ import { SignalingRelayObject } from '../src/objects/signaling-relay.js';
 import { PeerDiscoveryObject } from '../src/objects/peer-discovery.js';
 import { SharedState } from '../src/objects/capabilities/shared-state.js';
 import { TupleSpace } from '../src/objects/tuple-space.js';
+import { TriggerManager } from '../src/objects/trigger-manager.js';
+import { CollectionStore } from '../src/objects/collection-store.js';
+import { DataBrowser } from '../src/objects/data-browser.js';
 import { FileTransfer } from '../src/objects/capabilities/file-transfer.js';
 import { MediaStreamCapability } from '../src/objects/capabilities/media-stream.js';
 import { WorkspaceShareRegistry, WORKSPACE_SHARE_REGISTRY_ID } from '../src/objects/workspace-share-registry.js';
@@ -82,6 +85,10 @@ import { ShellExecutor } from '../src/objects/capabilities/shell-executor.js';
 import { HostFileSystem } from '../src/objects/capabilities/host-filesystem.js';
 import { WebSearch } from '../src/objects/capabilities/web-search.js';
 import { WebFetch } from '../src/objects/capabilities/web-fetch.js';
+import { StreamClient } from '../src/objects/capabilities/stream-client.js';
+import { AudioOutput } from '../src/objects/capabilities/audio-output.js';
+import { Speech } from '../src/objects/capabilities/speech.js';
+import { createCapabilityInterceptor } from '../src/runtime/capability-interceptor.js';
 import { Screenshot } from '../src/objects/capabilities/screenshot.js';
 import { SkillRegistry } from '../src/objects/skill-registry.js';
 import { SkillBrowser } from '../src/objects/skill-browser.js';
@@ -525,6 +532,12 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('WebBrowserViewer', () => new WebBrowserViewer());
   runtime.objectFactory.registerConstructor('SharedState', () => new SharedState());
   runtime.objectFactory.registerConstructor('TupleSpace', () => new TupleSpace());
+  runtime.objectFactory.registerConstructor('TriggerManager', () => new TriggerManager());
+  runtime.objectFactory.registerConstructor('CollectionStore', () => new CollectionStore());
+  runtime.objectFactory.registerConstructor('DataBrowser', () => new DataBrowser());
+  runtime.objectFactory.registerConstructor('StreamClient', () => new StreamClient());
+  runtime.objectFactory.registerConstructor('AudioOutput', () => new AudioOutput());
+  runtime.objectFactory.registerConstructor('Speech', () => new Speech());
   runtime.objectFactory.registerConstructor('FileTransfer', () => new FileTransfer());
   runtime.objectFactory.registerConstructor('MediaStream', () => new MediaStreamCapability());
   runtime.objectFactory.registerConstructor('ShellExecutor', () => new ShellExecutor());
@@ -557,7 +570,7 @@ async function main(): Promise<void> {
       'Clipboard', 'Console', 'FileSystem',
       'ShellExecutor', 'HostFileSystem',
       'WebSearch', 'WebFetch', 'Screenshot',
-      'Storage', 'HttpServer',
+      'Storage', 'HttpServer', 'StreamClient', 'AudioOutput', 'Speech',
       // Global services
       'GlobalSettings', 'PeerNetwork',
       'ObjectCatalog', 'ObjectBrowser', 'MethodInspector', 'ProcessExplorer', 'LLMMonitor',
@@ -574,6 +587,7 @@ async function main(): Promise<void> {
       'FileManager', 'FileViewer',
       'AgentAbject', 'ScrumMaster', 'AgentBrowser', 'AgentCreator',
       'ObjectAgent', 'SkillAgent', 'WebAgent',
+      'TriggerManager', 'CollectionStore', 'DataBrowser',
       'Scheduler', 'SchedulerBrowser',
       'ObjectCreator', 'Chat', 'ChatManager', 'ChatBrowser', 'AbjectEditor', 'Taskbar',
       'ScriptableAbject',
@@ -628,7 +642,10 @@ async function main(): Promise<void> {
   const hostFilesystemId = await supervisedSpawn('HostFileSystem');
   const webSearchId = await supervisedSpawn('WebSearch');
   const webFetchId = await supervisedSpawn('WebFetch');
+  const streamClientId = await supervisedSpawn('StreamClient');
   const screenshotId = await supervisedSpawn('Screenshot');
+  const audioOutputId = await supervisedSpawn('AudioOutput');
+  const speechId = await supervisedSpawn('Speech');
   const httpServerId = await supervisedSpawn('HttpServer');
   const windowManagerId = await supervisedSpawn('WindowManager');
   const widgetManagerId = await supervisedSpawn('WidgetManager');
@@ -660,6 +677,14 @@ async function main(): Promise<void> {
   const peerRouterObj = runtime.objectFactory.getObject(peerRouterId) as unknown as PeerRouter;
   peerRouterObj.setBus(bus);
   bus.addInterceptor(peerRouterObj);
+
+  // Capability enforcement: gates requests from source-backed (scriptable)
+  // objects to capability providers by declared requiredCapabilities. Added
+  // after PeerRouter so remote-inbound messages are re-addressed before the
+  // capability check sees them. Mode follows GlobalSettings (default: warn);
+  // the subscription is wired after GlobalSettings spawns below.
+  const capInterceptor = createCapabilityInterceptor(registryId, bus);
+  bus.addInterceptor(capInterceptor);
 
   if (DEDICATED_WORKERS) {
     // ── P2P Worker mode ──────────────────────────────────────────────
@@ -830,6 +855,20 @@ async function main(): Promise<void> {
   }
 
   const globalSettingsId = await supervisedSpawn('GlobalSettings', 'permanent', systemTypeId('GlobalSettings'));
+
+  // Capability-enforcement mode: register the interceptor's mailbox as a
+  // GlobalSettings dependent (mode-change events land there) and pull the
+  // initial value in case the boot announce fired before the registration.
+  try {
+    bus.send(message.request(capInterceptor.mailboxId, globalSettingsId, 'addDependent', {}));
+    const mode = await bootstrapRequest<'off' | 'warn' | 'enforce'>(
+      globalSettingsId, 'getCapabilityEnforcement', {});
+    if (mode === 'off' || mode === 'warn' || mode === 'enforce') {
+      capInterceptor.setMode(mode);
+    }
+  } catch (err) {
+    alog.warn(`capability enforcement mode fetch failed (staying at default): ${String(err)}`);
+  }
   const peerNetworkId = await supervisedSpawn('PeerNetwork', 'permanent', systemTypeId('PeerNetwork'));
   const globalToolbarId = await supervisedSpawn('GlobalToolbar', 'permanent', systemTypeId('GlobalToolbar'));
   const objectBrowserId = await supervisedSpawn('ObjectBrowser', 'permanent', systemTypeId('ObjectBrowser'));

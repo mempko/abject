@@ -78,6 +78,24 @@ export const Capabilities = {
 
   // HTTP server
   HTTP_SERVER_LISTEN: 'abjects:http-server:listen' as CapabilityId,
+
+  // Streaming connections (WebSocket/SSE clients)
+  STREAM_CONNECT: 'abjects:stream:connect' as CapabilityId,
+
+  // Audio
+  AUDIO_PLAY: 'abjects:audio:play' as CapabilityId,
+  AUDIO_RECORD: 'abjects:audio:record' as CapabilityId,
+
+  // Speech
+  SPEECH_SYNTHESIZE: 'abjects:speech:synthesize' as CapabilityId,
+  SPEECH_RECOGNIZE: 'abjects:speech:recognize' as CapabilityId,
+
+  // Structured data collections
+  COLLECTION_READ: 'abjects:collection:read' as CapabilityId,
+  COLLECTION_WRITE: 'abjects:collection:write' as CapabilityId,
+
+  // Declarative event triggers
+  TRIGGER_MANAGE: 'abjects:trigger:manage' as CapabilityId,
 } as const;
 
 // =============================================================================

@@ -100,12 +100,18 @@ export class Factory extends Abject {
               },
               {
                 name: 'clone',
-                description: 'Clone an existing Abject (new instance with same manifest/source). Searches local registry first, then remote workspace registries. Pass registryHint to control which registry the clone lands in.',
+                description: 'Clone an existing Abject (new instance with same manifest/source). Instances are prototypes: by default the clone carries a deep copy of the original\'s data and diverges from there; pass withData: false for a fresh-data copy of the same behavior. The clone\'s manifest records lineage (clonedFrom, generation). Searches local registry first, then remote workspace registries. Pass registryHint to control which registry the clone lands in.',
                 parameters: [
                   {
                     name: 'objectId',
                     type: { kind: 'primitive', primitive: 'string' },
                     description: 'The ID of the Abject to clone',
+                  },
+                  {
+                    name: 'withData',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'Copy the original\'s data into the clone (default true). false gives a fresh instance of the same behavior with empty data.',
+                    optional: true,
                   },
                   {
                     name: 'registryHint',
@@ -204,8 +210,10 @@ export class Factory extends Abject {
     });
 
     this.on('clone', async (msg: AbjectMessage) => {
-      const { objectId, registryHint } = msg.payload as { objectId: AbjectId; registryHint?: AbjectId };
-      return this.clone(objectId, registryHint);
+      const { objectId, registryHint, withData } = msg.payload as {
+        objectId: AbjectId; registryHint?: AbjectId; withData?: boolean;
+      };
+      return this.clone(objectId, registryHint, withData ?? true);
     });
 
     this.on('instantiate', async (msg: AbjectMessage) => {
@@ -248,7 +256,7 @@ export class Factory extends Abject {
 ### Methods
 - \`spawn({ manifest, source?, code?, owner?, parentId? })\` — Spawn a new object. If a constructor is registered for the manifest name, uses that. If source is provided and manifest.tags includes 'organism', creates an Organism from a JSON OrganismSpec. If source is provided without the organism tag, creates a ScriptableAbject. Returns { objectId, status }.
 - \`kill({ objectId })\` — Stop and destroy an object. Unregisters from Registry, removes from Supervisor, and stops the object. Returns boolean.
-- \`clone({ objectId, registryHint? })\` — Clone an existing object (new instance with same manifest/source but new ID). Returns { objectId, status }. Works for Organisms -- the clone gets a fresh internal registry, organelles, and interface with new IDs. Searches local registry first, then remote workspace registries. Pass \`registryHint\` (a registry AbjectId) to register the clone in a specific registry (e.g. workspace registry) instead of the global one.
+- \`clone({ objectId, withData?, registryHint? })\` — Clone an existing object (new instance with same manifest/source but new ID). Returns { objectId, status }. Instances are prototypes: the clone carries a deep copy of the original's data by default and then diverges independently; pass \`withData: false\` for a fresh-data copy of the same behavior. The clone's manifest records lineage (\`clonedFrom\`, \`generation\`), so populations of copies stay traceable to their original. Works for Organisms -- the clone gets a fresh internal registry, organelles, and interface with new IDs. Cloning fits source-backed objects (ScriptableAbjects and Organisms); system infrastructure singletons are spawned at bootstrap and are rarely meaningful to clone. Searches local registry first, then remote workspace registries. Pass \`registryHint\` (a registry AbjectId) to register the clone in a specific registry (e.g. workspace registry) instead of the global one.
 - \`respawn({ objectId, constructorName, parentId? })\` — Kill and re-create an object with the same ID. Used by Supervisor for restart.
 - \`registerConstructor(name, factory)\` — Register a constructor function for a named object type.
 
@@ -404,23 +412,39 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
 
   /**
    * Clone an existing object — creates a new instance with the same manifest/source but a new ID.
+   *
+   * Prototype semantics (instances are prototypes, Self-style): by default the
+   * clone carries a deep copy of the original's data and then diverges
+   * independently. Pass withData: false for a fresh instance of the same
+   * behavior with empty data. Every clone records lineage in its manifest:
+   * clonedFrom (the original's typeId when it has one, else its AbjectId) and
+   * generation (parent's generation + 1).
    */
-  async clone(objectId: AbjectId, registryHint?: AbjectId): Promise<SpawnResult> {
+  async clone(objectId: AbjectId, registryHint?: AbjectId, withData = true): Promise<SpawnResult> {
     require(this._factoryBus !== undefined, 'Factory must have a message bus');
     require(this._factoryRegistryId !== undefined, 'Factory must have a registry');
 
     const reg = await this.resolveRegistration(objectId, registryHint);
     require(reg !== null, `Object '${objectId}' not found in any registry`);
 
+    // Lineage: stamp where this copy came from and its clone generation.
+    const manifest: AbjectManifest = {
+      ...reg!.manifest,
+      lineage: {
+        clonedFrom: (reg!.typeId as string | undefined) ?? (objectId as string),
+        generation: (reg!.manifest.lineage?.generation ?? 0) + 1,
+      },
+    };
+
     // Delegate to spawn with the same manifest and source.
     // Internal data clones with the source — that is the point of having data
     // live inside the object.
-    const spawnReq: SpawnRequest = { manifest: reg!.manifest };
+    const spawnReq: SpawnRequest = { manifest };
     if (reg!.source) {
       spawnReq.source = reg!.source;
       spawnReq.owner = reg!.owner;
     }
-    if (reg!.data !== undefined) {
+    if (withData && reg!.data !== undefined) {
       // Deep-copy via JSON so the clone's data is independent of the original's.
       try {
         spawnReq.data = JSON.parse(JSON.stringify(reg!.data));
@@ -428,6 +452,8 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         // Original had non-serializable data; clone starts empty rather than failing.
         spawnReq.data = {};
       }
+    } else if (!withData) {
+      spawnReq.data = {};
     }
     if (registryHint) {
       spawnReq.registryHint = registryHint;

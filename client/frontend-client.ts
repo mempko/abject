@@ -17,6 +17,18 @@ import type {
   SetSelectedTextMsg,
   StartWindowDragMsg,
   AuthResultMsg,
+  AudioPlayMsg,
+  AudioControlMsg,
+  MediaCaptureRequestMsg,
+  MediaCaptureFrameRequestMsg,
+  MediaRecordStartMsg,
+  MediaRecordStopMsg,
+  MediaStreamControlMsg,
+  SpeechSpeakMsg,
+  SpeechRecognizeRequestMsg,
+  SpeechVoicesRequestMsg,
+  VideoSetupMsg,
+  VideoControlMsg,
 } from '../server/ws-protocol.js';
 import type { AbyssBgControl } from './abyss-bg.js';
 import type { ClientTransport } from './transport.js';
@@ -113,6 +125,22 @@ export class FrontendClient {
   private abyssBg?: AbyssBgControl;
   private resizableSurfaces: Set<string> = new Set();
   private fileUploadProxy?: HTMLInputElement;
+
+  // ── Audio playback + media capture state (backend-relayed) ────────────
+  private audioPlaybacks: Map<string, HTMLAudioElement> = new Map();
+  private mediaStreams: Map<string, MediaStream> = new Map();
+  /** Hidden playing <video> per video-bearing stream so frames are grabbable. */
+  private mediaVideoEls: Map<string, HTMLVideoElement> = new Map();
+  /** Video-widget elements keyed by videoId; frames composite via the compositor. */
+  private videoWidgetEls: Map<string, HTMLVideoElement> = new Map();
+  /** Per-video throttle stamp for 'time' events (1/sec drives seek bars). */
+  private videoTimeStamps: Map<string, number> = new Map();
+  private mediaRecorders: Map<string, {
+    recorder: MediaRecorder;
+    chunks: Blob[];
+    startedAt: number;
+    timer?: ReturnType<typeof setTimeout>;
+  }> = new Map();
   /** Surface that requested the file picker; the chosen file routes back to it. */
   private fileUploadTargetSurface?: string;
   /** Monotonic counter to give each upload a unique id for chunk reassembly. */
@@ -760,7 +788,532 @@ export class FrontendClient {
       case 'captureDesktopRequest':
         this.handleCaptureDesktopRequest(msg.requestId!);
         break;
+
+      case 'audioPlay':
+        this.handleAudioPlay(msg as AudioPlayMsg);
+        break;
+
+      case 'audioControl':
+        this.handleAudioControl(msg as AudioControlMsg);
+        break;
+
+      case 'mediaCaptureRequest':
+        this.handleMediaCaptureRequest(msg as MediaCaptureRequestMsg);
+        break;
+
+      case 'mediaCaptureFrameRequest':
+        this.handleMediaCaptureFrameRequest(msg as MediaCaptureFrameRequestMsg);
+        break;
+
+      case 'mediaRecordStart':
+        this.handleMediaRecordStart(msg as MediaRecordStartMsg);
+        break;
+
+      case 'mediaRecordStop':
+        this.handleMediaRecordStop(msg as MediaRecordStopMsg);
+        break;
+
+      case 'mediaStreamControl':
+        this.handleMediaStreamControl(msg as MediaStreamControlMsg);
+        break;
+
+      case 'speechSpeak':
+        this.handleSpeechSpeak(msg as SpeechSpeakMsg);
+        break;
+
+      case 'speechRecognizeRequest':
+        this.handleSpeechRecognize(msg as SpeechRecognizeRequestMsg);
+        break;
+
+      case 'speechVoicesRequest':
+        this.handleSpeechVoices(msg as SpeechVoicesRequestMsg);
+        break;
+
+      case 'videoSetup':
+        this.handleVideoSetup(msg as VideoSetupMsg);
+        break;
+
+      case 'videoControl':
+        this.handleVideoControl(msg as VideoControlMsg);
+        break;
     }
+  }
+
+  // ── Audio playback (relayed from the AudioOutput capability) ─────────
+
+  private handleAudioPlay(msg: AudioPlayMsg): void {
+    try {
+      const audio = new Audio(msg.source);
+      audio.volume = Math.max(0, Math.min(1, msg.volume ?? 1));
+      audio.loop = msg.loop ?? false;
+      audio.addEventListener('ended', () => {
+        // Looping audio never fires 'ended'; map cleanup happens on stop.
+        this.audioPlaybacks.delete(msg.playbackId);
+        this.sendToBackend({ type: 'audioEvent', playbackId: msg.playbackId, event: 'ended' });
+      });
+      audio.addEventListener('error', () => {
+        this.audioPlaybacks.delete(msg.playbackId);
+        this.sendToBackend({
+          type: 'audioEvent', playbackId: msg.playbackId, event: 'error',
+          error: audio.error?.message ?? 'audio element error',
+        });
+      });
+      this.audioPlaybacks.set(msg.playbackId, audio);
+      audio.play().catch(err => {
+        this.audioPlaybacks.delete(msg.playbackId);
+        this.sendToBackend({
+          type: 'audioEvent', playbackId: msg.playbackId, event: 'error',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    } catch (err) {
+      this.sendToBackend({
+        type: 'audioEvent', playbackId: msg.playbackId, event: 'error',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private handleAudioControl(msg: AudioControlMsg): void {
+    if (msg.action === 'stopAll') {
+      for (const [id, audio] of this.audioPlaybacks) {
+        audio.pause();
+        audio.src = '';
+        this.audioPlaybacks.delete(id);
+      }
+      return;
+    }
+    const audio = msg.playbackId ? this.audioPlaybacks.get(msg.playbackId) : undefined;
+    if (!audio) return;
+    switch (msg.action) {
+      case 'pause':
+        audio.pause();
+        break;
+      case 'resume':
+        audio.play().catch(() => { /* reported via error listener */ });
+        break;
+      case 'stop':
+        audio.pause();
+        audio.src = '';
+        this.audioPlaybacks.delete(msg.playbackId!);
+        break;
+    }
+  }
+
+  // ── Video widget elements (relayed from VideoWidget) ─────────────────
+  //
+  // The element lives here (hidden in the DOM for autoplay reliability); the
+  // compositor reads its frames into the widget's videoFrame region every
+  // animation frame, so pixels never cross the relay.
+
+  private handleVideoSetup(msg: VideoSetupMsg): void {
+    // Reconfigure: dispose any prior element under the same id first.
+    this.disposeVideoWidgetEl(msg.videoId);
+
+    const video = document.createElement('video');
+    video.muted = msg.muted ?? false;
+    video.loop = msg.loop ?? false;
+    video.playsInline = true;
+    video.crossOrigin = 'anonymous'; // non-CORS sources fail to error, never taint
+    video.style.position = 'fixed';
+    video.style.left = '-10000px';
+    video.style.width = '1px';
+    video.style.height = '1px';
+
+    const sendEvent = (
+      event: 'playing' | 'paused' | 'ended' | 'error' | 'meta' | 'time',
+      extra: { error?: string } = {},
+    ) => {
+      this.sendToBackend({
+        type: 'videoEvent',
+        videoId: msg.videoId,
+        event,
+        duration: Number.isFinite(video.duration) ? video.duration : undefined,
+        currentTime: video.currentTime,
+        width: video.videoWidth || undefined,
+        height: video.videoHeight || undefined,
+        ...extra,
+      });
+    };
+
+    video.addEventListener('loadedmetadata', () => sendEvent('meta'));
+    video.addEventListener('playing', () => sendEvent('playing'));
+    video.addEventListener('pause', () => sendEvent('paused'));
+    video.addEventListener('ended', () => sendEvent('ended'));
+    video.addEventListener('error', () => sendEvent('error', {
+      error: video.error?.message ?? 'video element error',
+    }));
+    video.addEventListener('timeupdate', () => {
+      const now = performance.now();
+      const last = this.videoTimeStamps.get(msg.videoId) ?? 0;
+      if (now - last >= 1000) {
+        this.videoTimeStamps.set(msg.videoId, now);
+        sendEvent('time');
+      }
+    });
+
+    if (msg.streamId) {
+      const stream = this.mediaStreams.get(msg.streamId);
+      if (!stream) {
+        this.sendToBackend({
+          type: 'videoEvent', videoId: msg.videoId, event: 'error',
+          error: `unknown streamId ${msg.streamId} (capture it first via MediaStream)`,
+        });
+        return;
+      }
+      video.srcObject = stream;
+    } else if (msg.source) {
+      video.src = msg.source;
+    }
+
+    document.body.appendChild(video);
+    this.videoWidgetEls.set(msg.videoId, video);
+    this.compositor.registerVideoElement(msg.videoId, video);
+
+    if (msg.autoplay !== false) {
+      video.play().catch(err => {
+        sendEvent('error', { error: err instanceof Error ? err.message : String(err) });
+      });
+    }
+  }
+
+  private handleVideoControl(msg: VideoControlMsg): void {
+    const video = this.videoWidgetEls.get(msg.videoId);
+    if (!video) return;
+    switch (msg.action) {
+      case 'play':
+        video.play().catch(() => { /* reported via error listener */ });
+        break;
+      case 'pause':
+        video.pause();
+        break;
+      case 'seek':
+        if (typeof msg.value === 'number' && Number.isFinite(msg.value)) {
+          video.currentTime = Math.max(0, msg.value);
+        }
+        break;
+      case 'setMuted':
+        video.muted = msg.value === 1;
+        break;
+      case 'dispose':
+        this.disposeVideoWidgetEl(msg.videoId);
+        break;
+    }
+  }
+
+  private disposeVideoWidgetEl(videoId: string): void {
+    const video = this.videoWidgetEls.get(videoId);
+    if (!video) return;
+    this.compositor.unregisterVideoElement(videoId);
+    this.videoWidgetEls.delete(videoId);
+    this.videoTimeStamps.delete(videoId);
+    video.pause();
+    video.srcObject = null;
+    video.removeAttribute('src');
+    video.load();
+    video.remove();
+  }
+
+  // ── Media capture (relayed from the MediaStream capability) ──────────
+
+  private handleMediaCaptureRequest(msg: MediaCaptureRequestMsg): void {
+    (async () => {
+      try {
+        const stream = msg.display
+          ? await navigator.mediaDevices.getDisplayMedia({ video: true })
+          : await navigator.mediaDevices.getUserMedia({ audio: msg.audio, video: msg.video });
+        this.mediaStreams.set(stream.id, stream);
+
+        // Keep a hidden, playing video element for every video-bearing stream
+        // so captureFrame always has a decoded frame to draw.
+        if (stream.getVideoTracks().length > 0) {
+          const video = document.createElement('video');
+          video.muted = true;
+          video.autoplay = true;
+          video.playsInline = true;
+          video.style.position = 'fixed';
+          video.style.left = '-10000px';
+          video.style.width = '1px';
+          video.style.height = '1px';
+          video.srcObject = stream;
+          document.body.appendChild(video);
+          video.play().catch(() => { /* frame grabs will report failure */ });
+          this.mediaVideoEls.set(stream.id, video);
+        }
+
+        this.sendToBackend({
+          type: 'mediaCaptureReply',
+          requestId: msg.requestId,
+          streamId: stream.id,
+          tracks: stream.getTracks().map(t => ({ id: t.id, kind: t.kind, label: t.label })),
+        });
+      } catch (err) {
+        this.sendToBackend({
+          type: 'mediaCaptureReply',
+          requestId: msg.requestId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })();
+  }
+
+  private handleMediaCaptureFrameRequest(msg: MediaCaptureFrameRequestMsg): void {
+    const video = this.mediaVideoEls.get(msg.streamId);
+    if (!video || video.videoWidth === 0) {
+      this.sendToBackend({
+        type: 'mediaCaptureFrameReply', requestId: msg.requestId,
+        error: video ? 'no decoded frame yet' : 'unknown streamId or stream has no video track',
+      });
+      return;
+    }
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(video, 0, 0);
+      const dataUri = canvas.toDataURL('image/png');
+      this.sendToBackend({
+        type: 'mediaCaptureFrameReply',
+        requestId: msg.requestId,
+        base64: dataUri.slice(dataUri.indexOf(',') + 1),
+        width: canvas.width,
+        height: canvas.height,
+      });
+    } catch (err) {
+      this.sendToBackend({
+        type: 'mediaCaptureFrameReply', requestId: msg.requestId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private handleMediaRecordStart(msg: MediaRecordStartMsg): void {
+    const stream = this.mediaStreams.get(msg.streamId);
+    if (!stream) {
+      this.sendToBackend({
+        type: 'mediaRecordingComplete', recordingId: msg.recordingId,
+        error: 'unknown streamId',
+      });
+      return;
+    }
+    try {
+      const hasVideo = stream.getVideoTracks().length > 0;
+      const mimeType = hasVideo ? 'video/webm' : 'audio/webm';
+      const recorder = new MediaRecorder(stream, MediaRecorder.isTypeSupported(mimeType) ? { mimeType } : undefined);
+      const entry = { recorder, chunks: [] as Blob[], startedAt: Date.now(), timer: undefined as ReturnType<typeof setTimeout> | undefined };
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) entry.chunks.push(e.data); };
+      recorder.onstop = () => {
+        if (entry.timer) clearTimeout(entry.timer);
+        this.mediaRecorders.delete(msg.recordingId);
+        const blob = new Blob(entry.chunks, { type: recorder.mimeType || mimeType });
+        const durationMs = Date.now() - entry.startedAt;
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const dataUri = String(reader.result ?? '');
+          this.sendToBackend({
+            type: 'mediaRecordingComplete',
+            recordingId: msg.recordingId,
+            base64: dataUri.slice(dataUri.indexOf(',') + 1),
+            mimeType: blob.type,
+            durationMs,
+          });
+        };
+        reader.onerror = () => {
+          this.sendToBackend({
+            type: 'mediaRecordingComplete', recordingId: msg.recordingId,
+            error: 'failed to encode recording',
+          });
+        };
+        reader.readAsDataURL(blob);
+      };
+      recorder.onerror = () => {
+        if (entry.timer) clearTimeout(entry.timer);
+        this.mediaRecorders.delete(msg.recordingId);
+        this.sendToBackend({
+          type: 'mediaRecordingComplete', recordingId: msg.recordingId,
+          error: 'MediaRecorder error',
+        });
+      };
+      this.mediaRecorders.set(msg.recordingId, entry);
+      recorder.start();
+      if (msg.maxDurationMs && msg.maxDurationMs > 0) {
+        entry.timer = setTimeout(() => {
+          if (recorder.state !== 'inactive') recorder.stop();
+        }, msg.maxDurationMs);
+      }
+    } catch (err) {
+      this.sendToBackend({
+        type: 'mediaRecordingComplete', recordingId: msg.recordingId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private handleMediaRecordStop(msg: MediaRecordStopMsg): void {
+    const entry = this.mediaRecorders.get(msg.recordingId);
+    if (entry && entry.recorder.state !== 'inactive') {
+      entry.recorder.stop();
+    }
+  }
+
+  private handleMediaStreamControl(msg: MediaStreamControlMsg): void {
+    if (msg.action === 'stopStream' && msg.streamId) {
+      const stream = this.mediaStreams.get(msg.streamId);
+      if (stream) {
+        for (const track of stream.getTracks()) track.stop();
+        this.mediaStreams.delete(msg.streamId);
+      }
+      const video = this.mediaVideoEls.get(msg.streamId);
+      if (video) {
+        video.srcObject = null;
+        video.remove();
+        this.mediaVideoEls.delete(msg.streamId);
+      }
+      return;
+    }
+    if (msg.action === 'muteTrack' && msg.trackId) {
+      for (const stream of this.mediaStreams.values()) {
+        for (const track of stream.getTracks()) {
+          if (track.id === msg.trackId) {
+            track.enabled = !(msg.muted ?? true);
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  // ── Speech (relayed from the Speech capability) ───────────────────────
+
+  private handleSpeechSpeak(msg: SpeechSpeakMsg): void {
+    if (!('speechSynthesis' in window)) {
+      this.sendToBackend({
+        type: 'speechSpeakReply', requestId: msg.requestId,
+        error: 'speechSynthesis unavailable in this browser',
+      });
+      return;
+    }
+    try {
+      const utterance = new SpeechSynthesisUtterance(msg.text);
+      if (msg.voice) {
+        const match = window.speechSynthesis.getVoices().find(v => v.name === msg.voice);
+        if (match) utterance.voice = match;
+      }
+      let replied = false;
+      const replyOnce = (payload: { spoken?: boolean; error?: string }) => {
+        if (replied) return;
+        replied = true;
+        this.sendToBackend({ type: 'speechSpeakReply', requestId: msg.requestId, ...payload });
+      };
+      // Reply on start so long passages never block the relay round-trip.
+      utterance.onstart = () => replyOnce({ spoken: true });
+      utterance.onerror = (e) => replyOnce({ error: `speech error: ${e.error ?? 'unknown'}` });
+      // Some engines skip onstart for empty/whitespace text; onend covers it.
+      utterance.onend = () => replyOnce({ spoken: true });
+      window.speechSynthesis.speak(utterance);
+    } catch (err) {
+      this.sendToBackend({
+        type: 'speechSpeakReply', requestId: msg.requestId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private handleSpeechRecognize(msg: SpeechRecognizeRequestMsg): void {
+    const maxMs = msg.maxDurationMs ?? 10000;
+    type RecognitionCtor = new () => {
+      lang: string; interimResults: boolean; maxAlternatives: number;
+      onresult: ((e: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null;
+      onerror: ((e: { error?: string }) => void) | null;
+      onend: (() => void) | null;
+      start(): void; stop(): void;
+    };
+    const w = window as unknown as {
+      SpeechRecognition?: RecognitionCtor; webkitSpeechRecognition?: RecognitionCtor;
+    };
+    const Recognition = w.SpeechRecognition ?? w.webkitSpeechRecognition;
+
+    if (Recognition) {
+      try {
+        const rec = new Recognition();
+        rec.lang = navigator.language || 'en-US';
+        rec.interimResults = false;
+        rec.maxAlternatives = 1;
+        let transcript = '';
+        let replied = false;
+        const replyOnce = (payload: { text?: string; error?: string }) => {
+          if (replied) return;
+          replied = true;
+          this.sendToBackend({ type: 'speechRecognizeReply', requestId: msg.requestId, ...payload });
+        };
+        const timer = setTimeout(() => { try { rec.stop(); } catch { /* already stopped */ } }, maxMs);
+        rec.onresult = (e) => {
+          for (let i = 0; i < e.results.length; i++) {
+            transcript += e.results[i][0]?.transcript ?? '';
+          }
+        };
+        rec.onerror = (e) => {
+          clearTimeout(timer);
+          // 'no-speech' ends with an empty transcript rather than an error.
+          if (e.error === 'no-speech') replyOnce({ text: '' });
+          else replyOnce({ error: `speech recognition error: ${e.error ?? 'unknown'}` });
+        };
+        rec.onend = () => {
+          clearTimeout(timer);
+          replyOnce({ text: transcript.trim() });
+        };
+        rec.start();
+        return;
+      } catch { /* fall through to mic recording */ }
+    }
+
+    // No Web Speech API: record the mic for the window and let the server
+    // route the audio to a transcription provider.
+    (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const recorder = new MediaRecorder(stream,
+          MediaRecorder.isTypeSupported('audio/webm') ? { mimeType: 'audio/webm' } : undefined);
+        const chunks: Blob[] = [];
+        recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+        recorder.onstop = () => {
+          for (const track of stream.getTracks()) track.stop();
+          const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const dataUri = String(reader.result ?? '');
+            this.sendToBackend({
+              type: 'speechRecognizeReply',
+              requestId: msg.requestId,
+              audioBase64: dataUri.slice(dataUri.indexOf(',') + 1),
+              mimeType: blob.type,
+            });
+          };
+          reader.onerror = () => {
+            this.sendToBackend({
+              type: 'speechRecognizeReply', requestId: msg.requestId,
+              error: 'failed to encode recorded audio',
+            });
+          };
+          reader.readAsDataURL(blob);
+        };
+        recorder.start();
+        setTimeout(() => { if (recorder.state !== 'inactive') recorder.stop(); }, maxMs);
+      } catch (err) {
+        this.sendToBackend({
+          type: 'speechRecognizeReply', requestId: msg.requestId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })();
+  }
+
+  private handleSpeechVoices(msg: SpeechVoicesRequestMsg): void {
+    const voices = 'speechSynthesis' in window
+      ? window.speechSynthesis.getVoices().map(v => v.name)
+      : [];
+    this.sendToBackend({ type: 'speechVoicesReply', requestId: msg.requestId, voices });
   }
 
   private handleCreateSurface(msg: CreateSurfaceMsg): void {

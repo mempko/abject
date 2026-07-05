@@ -26,6 +26,8 @@ import { ScriptableAbject } from './scriptable-abject.js';
 import { systemMessage, userMessage, LLMMessage } from '../llm/provider.js';
 import type { ContentPart } from '../llm/provider.js';
 import type { AgentAction } from './agent-abject.js';
+import { buildOrganismManifest } from './organism.js';
+import type { OrganismSpec, OrganelleSpec } from './organism.js';
 import { Log } from '../core/timed-log.js';
 import { applyDiff, parseSearchReplaceBlocks, levenshtein } from './source-diff.js';
 import * as acorn from 'acorn';
@@ -297,6 +299,7 @@ What I handle:
 - Single-object authoring (new widgets, apps, bridges, proxies, MCP wrappers).
 - Modifying existing Abject source — adding methods, events, manifest entries; fixing handlers; refactoring an Abject's implementation.
 - Investigation that ends in code edits (read source, diagnose, fix).
+- Composing existing source-backed objects into one Organism behind a single membrane interface, and extracting an organelle back out as a standalone object.
 
 What I don't handle:
 - Multi-object autonomous-system composition (agent + scheduler + watcher) — that's AgentCreator.
@@ -427,6 +430,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     'call', 'draft_manifest', 'draft_source', 'draft_diff', 'read_draft',
     'replace_handler', 'add_handler', 'remove_handler', 'load_target', 'draft_via_llm',
     'compile', 'validate_calls', 'review_semantics', 'deploy_spawn', 'deploy_update',
+    'compose_organism', 'extract_organelle',
     'reply', 'ask_user', 'done', 'fail',
   ];
 
@@ -1270,6 +1274,221 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     };
   }
 
+  /**
+   * Compose existing source-backed objects into one Organism. Each named
+   * object's manifest and source are captured from its registration and become
+   * an organelle spec; the staged drafts (draft_manifest for the public
+   * surface, draft_source or the explicit interfaceSource for the forwarding
+   * handler map) become the membrane interface organelle; the whole spec
+   * deploys through Factory.spawn with the organism tag. When no membrane is
+   * staged, both parts are drafted via the existing LLM draft machinery with
+   * the organelle manifests as context. The free-living originals keep
+   * running: composition copies them, so the organism's organelles diverge
+   * from their ancestors independently (endosymbiosis by copy, never capture).
+   */
+  private async opComposeOrganism(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
+    if (!this.factoryId) return { ok: false, summary: 'compose_organism: Factory unavailable', error: 'Factory not resolved' };
+    if (!this.registryId) return { ok: false, summary: 'compose_organism: Registry unavailable', error: 'Registry not resolved' };
+
+    const name = this.actionField(action, ['name']) as string | undefined;
+    const description = this.actionField(action, ['description']) as string | undefined;
+    const organelleNames = this.actionField(action, ['organelleNames', 'organelles']) as string[] | undefined;
+    const interfaceSource = this.actionField(action, ['interfaceSource']) as string | undefined;
+
+    if (!name || !description) {
+      return { ok: false, summary: 'compose_organism: missing name/description', error: 'pass {name, description, organelleNames: ["A", "B"]}' };
+    }
+    if (!Array.isArray(organelleNames) || organelleNames.length === 0 || !organelleNames.every(n => typeof n === 'string' && n.length > 0)) {
+      return { ok: false, summary: 'compose_organism: no organelles', error: 'organelleNames must be a non-empty array of registered object names' };
+    }
+
+    // 1. Capture each organelle's manifest + source from its registration.
+    const organelles: OrganelleSpec[] = [];
+    for (const oName of organelleNames) {
+      const id = await this.resolveTarget(oName);
+      if (!id) {
+        return {
+          ok: false,
+          summary: `compose_organism: not found: ${oName}`,
+          error: `"${oName}" is not a registered object. Find the exact name first via call("Registry", "discover", {name: "..."}) or call("Registry", "ask", {question: "..."}).`,
+        };
+      }
+      let reg: ObjectRegistration | null = null;
+      try {
+        reg = await this.sendRequest<ObjectRegistration | null>(this.registryId, 'lookup', { objectId: id }, 10000);
+      } catch { /* handled below */ }
+      if (!reg?.source) {
+        return {
+          ok: false,
+          summary: `compose_organism: no source: ${oName}`,
+          error: `"${oName}" has no source on file. Only source-backed objects (ScriptableAbjects) can become organelles. System objects stay outside the membrane; organelles reach them through the organism's registry fallback.`,
+        };
+      }
+      organelles.push({ name: oName, manifest: reg.manifest, source: reg.source });
+    }
+
+    // 2. Membrane interface. Staged drafts win; an explicit interfaceSource
+    //    overrides the staged source; anything missing is drafted via LLM with
+    //    the organelle surfaces as context.
+    const organelleContext = organelles
+      .map(o => `- ${o.name}: ${o.manifest.description}; methods: ${(o.manifest.interface.methods ?? []).map(m => m.name).join(', ') || '(none declared)'}`)
+      .join('\n');
+    if (!state.draftManifest) {
+      const r = await this.opDraftViaLlm(state, {
+        action: 'draft_via_llm',
+        kind: 'manifest',
+        instructions:
+          `Manifest for "${name}": ${description}. This is the PUBLIC face of an organism (a composite object). ` +
+          `Declare a small curated interface covering the use cases; implementation is forwarded to these internal organelles ` +
+          `(reachable by name through the organism's internal registry):\n${organelleContext}`,
+      } as AgentAction);
+      if (!r.ok) return { ok: false, summary: 'compose_organism: membrane manifest draft failed', error: r.error };
+    }
+    if (interfaceSource) {
+      state.draftSource = interfaceSource;
+    } else if (!state.draftSource) {
+      const publicMethods = (state.draftManifest!.interface.methods ?? []).map(m => m.name).join(', ');
+      const r = await this.opDraftViaLlm(state, {
+        action: 'draft_via_llm',
+        kind: 'source',
+        instructions:
+          `Handler map for the membrane interface organelle of organism "${name}". ` +
+          `Implement each public method (${publicMethods}) as a thin forwarder to the right internal organelle: ` +
+          `await this.call(await this.dep('<OrganelleName>'), '<method>', msg.payload). ` +
+          `Organelles (discoverable by these exact names through the internal registry):\n${organelleContext}\n` +
+          `Keep contracts (this.ensure) at handler entry; keep domain logic in the organelles.`,
+      } as AgentAction);
+      if (!r.ok) return { ok: false, summary: 'compose_organism: membrane source draft failed', error: r.error };
+    }
+
+    const membraneSource = state.draftSource!;
+    const compileErr = ScriptableAbject.tryCompile(membraneSource);
+    if (compileErr) {
+      return {
+        ok: false,
+        summary: `compose_organism: membrane source does not compile: ${compileErr.slice(0, 100)}`,
+        error: `Fix the staged source (replace_handler / draft_diff / draft_source), run compile, then rerun compose_organism. Error: ${compileErr}`,
+      };
+    }
+
+    // 3. Assemble the spec and deploy through Factory (organism tag + JSON
+    //    OrganismSpec source is the established organism spawn path).
+    const spec: OrganismSpec = {
+      name,
+      description,
+      interface: { name: `${name}Interface`, manifest: state.draftManifest!, source: membraneSource },
+      organelles,
+      tags: ['organism'],
+    };
+    const organismSource = JSON.stringify(spec);
+    const manifest = buildOrganismManifest(spec);
+    const spawnReq: SpawnRequest = {
+      manifest,
+      source: organismSource,
+      owner: this.id,
+      parentId: this.id,
+      registryHint: this.registryId,
+    };
+
+    let result: SpawnResult;
+    try {
+      result = await this.sendRequest<SpawnResult>(this.factoryId, 'spawn', spawnReq, 120000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ok: false, summary: `compose_organism: spawn failed: ${msg.slice(0, 120)}`, error: msg };
+    }
+    if (!result?.objectId) {
+      return { ok: false, summary: 'compose_organism: Factory returned no objectId', error: 'unexpected Factory response' };
+    }
+
+    state.spawnedObjectId = result.objectId;
+    // The staged membrane drafts are now live inside the organism.
+    state.lastDeployedSource = state.draftSource;
+
+    // Persist so the organism survives a restart (same path deploy_spawn uses;
+    // Factory re-detects the organism tag + JSON spec on restore).
+    if (this.abjectStoreId) {
+      this.sendRequest<unknown>(
+        this.abjectStoreId,
+        'save',
+        { objectId: result.objectId, manifest, source: organismSource, owner: this.id },
+        15000,
+      ).catch(err => log.warn('compose_organism: AbjectStore.save failed:', err instanceof Error ? err.message : String(err)));
+    }
+
+    return {
+      ok: true,
+      summary: `compose_organism: ${name} spawned as ${result.objectId.slice(0, 8)} with organelles [${organelleNames.join(', ')}] (originals keep running)`,
+      data: { objectId: result.objectId, name, organelles: organelleNames },
+    };
+  }
+
+  /**
+   * Extract one organelle from an organism and deploy it as a standalone
+   * ScriptableAbject, carrying a snapshot of its live data. The organism is
+   * read, never modified: its internal copy keeps running.
+   */
+  private async opExtractOrganelle(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
+    if (!this.factoryId) return { ok: false, summary: 'extract_organelle: Factory unavailable', error: 'Factory not resolved' };
+
+    const targetRef = this.actionField(action, ['target', 'objectId', 'organismName', 'targetName']) as string | undefined;
+    const organelleName = this.actionField(action, ['organelleName', 'name']) as string | undefined;
+    if (!targetRef || !organelleName) {
+      return { ok: false, summary: 'extract_organelle: missing args', error: 'pass {target: "<organism name or id>", organelleName: "<name>"}' };
+    }
+
+    const organismId = await this.resolveTarget(targetRef);
+    if (!organismId) {
+      return { ok: false, summary: `extract_organelle: organism not found: ${targetRef}`, error: `Could not resolve "${targetRef}". Discover it via call("Registry", "discover", {name: "..."}).` };
+    }
+
+    let payload: { manifest: AbjectManifest; source: string; data?: Record<string, unknown> };
+    try {
+      payload = await this.sendRequest<{ manifest: AbjectManifest; source: string; data?: Record<string, unknown> }>(
+        organismId, 'getOrganelleSource', { name: organelleName }, 15000,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ok: false, summary: `extract_organelle: ${msg.slice(0, 120)}`, error: msg };
+    }
+
+    const spawnReq: SpawnRequest = {
+      manifest: payload.manifest,
+      source: payload.source,
+      data: payload.data,
+      owner: this.id,
+      parentId: this.id,
+      registryHint: this.registryId,
+    };
+    let result: SpawnResult;
+    try {
+      result = await this.sendRequest<SpawnResult>(this.factoryId, 'spawn', spawnReq, 120000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ok: false, summary: `extract_organelle: spawn failed: ${msg.slice(0, 120)}`, error: msg };
+    }
+    if (!result?.objectId) {
+      return { ok: false, summary: 'extract_organelle: Factory returned no objectId', error: 'unexpected Factory response' };
+    }
+
+    state.spawnedObjectId = result.objectId;
+
+    if (this.abjectStoreId) {
+      this.sendRequest<unknown>(
+        this.abjectStoreId,
+        'save',
+        { objectId: result.objectId, manifest: payload.manifest, source: payload.source, owner: this.id },
+        15000,
+      ).catch(err => log.warn('extract_organelle: AbjectStore.save failed:', err instanceof Error ? err.message : String(err)));
+    }
+
+    return {
+      ok: true,
+      summary: `extract_organelle: ${organelleName} extracted from ${targetRef} as standalone ${result.objectId.slice(0, 8)} (the organism keeps its internal copy)`,
+      data: { objectId: result.objectId, organelleName },
+    };
+  }
+
   /** Send an intermediate user-visible chat bubble. Loop continues. */
   private async opReply(_state: LoopState, action: AgentAction, callerId?: AbjectId): Promise<{ ok: boolean; summary: string }> {
     const text = (action.text as string | undefined) ?? '';
@@ -2030,6 +2249,12 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         case 'deploy_update':
           res = await this.opDeployUpdate(state, action);
           break;
+        case 'compose_organism':
+          res = await this.opComposeOrganism(state, action);
+          break;
+        case 'extract_organelle':
+          res = await this.opExtractOrganelle(state, action);
+          break;
         case 'reply':
           res = await this.opReply(state, action, callerId);
           break;
@@ -2277,6 +2502,8 @@ Emit EXACTLY ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothi
 - \`review_semantics()\` — LLM reviewer reads the drafts plus all known dependency manifests + usage guides and flags semantic issues (wrong payload shape, enum-like values not in the guide, missing await, etc.). May emit follow-up \`questions\` for specific deps.
 - \`deploy_spawn({})\` — deploy the staged drafts as a NEW Abject. Internally messages Factory.spawn with the manifest, source, and the right owner / parent / registryHint. Use for create flows. No payload: the staged drafts are read from loop state.
 - \`deploy_update({objectId?, targetName?})\` — deploy the staged source onto an EXISTING object. Internally hot-swaps the live object via its \`updateSource\` handler, then updates Registry's cached source + manifest, then persists via AbjectStore so the change survives a restart. The target is taken from \`objectId\` (UUID) or \`targetName\` (registered name) in the action payload, or from the task's target if it was started as a modify. If you investigated and discovered you should be modifying an existing object even though the loop kind is \`create\`, pass \`{objectId: "<id>"}\` here.
+- \`compose_organism({name, description, organelleNames, interfaceSource?})\` packages EXISTING source-backed objects into ONE Organism: a composite Abject whose organelles (independent internal copies of the named objects) cooperate behind a membrane interface, while external callers see a single object with a single curated surface. The staged drafts define the membrane: \`draft_manifest\` is the organism's public surface and \`draft_source\` (or the explicit \`interfaceSource\`) is the forwarding handler map; when either is missing it is drafted automatically from the organelle manifests. The originals keep running, so remove them afterwards (or tell the user) when the organism replaces them.
+- \`extract_organelle({target, organelleName})\` deploys one organelle of an existing organism as a standalone object, carrying a snapshot of its live data. The organism keeps its internal copy and is never modified. Pass \`organelleName: "__interface__"\` for the membrane itself.
 - \`reply({text})\` — send an intermediate user-visible chat bubble. Loop continues.
 - \`ask_user({question, assumptions?})\` — surface a clarifying question. The user's answer arrives as a new task with the answer in the prompt; finish the current loop with \`done\` after this.
 
@@ -2299,6 +2526,11 @@ Deployment (use the local actions — they read your staged drafts and run the p
 - Spawn a new object: \`{ "action": "deploy_spawn" }\` after both \`draft_manifest\` (or \`draft_via_llm({kind: "manifest"})\`) and \`draft_source\` (or \`draft_via_llm({kind: "source"})\`).
 - Update an existing object: \`{ "action": "deploy_update" }\` after \`draft_diff\` (preferred for surgical edits) or after \`draft_source\` (only when wholesale rewrite is intended). If the loop started as a modify, the target source is preloaded into \`state.targetSource\` and the deploy target is set automatically. If the loop started as create but you discovered the user actually wanted to modify an existing object (e.g. "fix the Pong game" → you found Pong already exists), pass the target explicitly: \`{ "action": "deploy_update", "objectId": "<id>" }\` or \`{ "action": "deploy_update", "targetName": "Pong" }\`. **deploy_update hot-swaps source ONLY** — it does not rerun \`show()\` or recreate widgets the object already spawned. If the change touches \`show()\`, \`createCanvas\`, or any other widget wiring, also call \`hide()\` then \`show()\` on the target after deploy_update so the new wiring takes effect, OR tell the user to close and re-open the window. An idempotent \`show()\` will silently keep the OLD widgets otherwise, and your fix won't be observable.
 - Probe: \`call("<Name>", "probe", {})\` — verifies dep references resolve in the deployed object.
+
+Organism composition:
+- Stage the membrane yourself for a curated surface: \`draft_manifest\` (the public methods) and \`draft_source\` (thin forwarders), then \`{ "action": "compose_organism", "name": "...", "description": "...", "organelleNames": ["A", "B"] }\`.
+- Or let compose_organism draft the membrane: pass only name, description, and organelleNames.
+- Reverse: \`{ "action": "extract_organelle", "target": "<organism>", "organelleName": "A" }\` deploys a standalone copy and leaves the organism intact.
 
 ScrumMaster owns multi-task planning. If the assigned creation/modification task is too broad or needs another specialist first, use \`fail({reason})\` with a concise proposed next scrum rather than trying to split the work locally.
 
@@ -2338,6 +2570,10 @@ Author UI objects as **Model-View in the original Smalltalk sense**, with **DCI*
 
 For a complex, stateful UI this Model-View split is often two cooperating Abjects (a model object plus a view object that observes it); for a small app it is two clearly separated sections of one handler map. The detailed drafting rules are applied when you draft source.
 
+# Organisms (composing objects into one)
+
+An Organism is one Abject with an internal registry: organelles (internal ScriptableAbjects) discover each other by name and cooperate behind a membrane interface, and external callers meet a single object with a single curated surface. Reach for \`compose_organism\` when several cooperating objects form one coherent thing and their interplay is an implementation detail: the user should see one name and one interface (a model object plus its view object that always travel together, a pipeline of steps used only as a whole). Keep objects separate when each part is independently useful to the user or to other objects; free-living objects compose through the registry and the ask protocol just fine. Author the membrane thin: each public method forwards to the right organelle via \`await this.call(await this.dep('<OrganelleName>'), '<method>', msg.payload)\`, with contracts at entry and domain logic staying in the organelles. Composition copies the originals (endosymbiosis by copy), so they keep running until deliberately removed; \`extract_organelle\` is the reverse move and leaves the organism intact.
+
 # Discipline
 
 1. **Ask before guessing.** When you don't know whether an object exists, what its API is, what its state means, or what method to call — \`ask\`. The Registry, the target object, or any candidate dep will answer.
@@ -2372,6 +2608,7 @@ For a complex, stateful UI this Model-View split is often two cooperating Abject
 
    - **Same-turn context** — keep it in your response.
    - **Per-goal handoff between subtasks** — goal scratchpad via \`call("GoalManager", "writeGoalData", {goalId, key, value})\` / \`call("GoalManager", "readGoalData", {goalId, key})\` (GoalManager methods, invoked with the \`call\` action — not top-level verbs).
+   - **Shared structured records** — when the data is records other objects or the user may care about later (entries a tracker collects, rows a logger appends, results an analysis produces), prefer the workspace's shared collection store over private \`this.data\`. Discover it via the registry and \`ask\` it for current usage: collections are created with an optional schema, written through insert/update/remove (each write emits a record change event other objects can react to), and read back with find or SQL-style query. Data in a collection is queryable and composable by objects that have never heard of yours; data in \`this.data\` is visible only to your object. Keep \`this.data\` for the object's own document.
    - **Internal object data (\`this.data\`)** — state intrinsic to the object's purpose that SHOULD travel with the object when it is cloned, restored from snapshot, or shared with another peer. Examples: a counter the object reports, the contents of a note an object represents, learned parameters, accumulated history that defines the object. ScriptableAbject source code reads and writes \`this.data\` (a plain JSON-serializable object) directly, e.g. \`this.data.count = (this.data.count ?? 0) + 1\`. Persist with \`await this.saveData()\` after mutations you want to survive restart and travel with clones. Hot-reloads (\`updateSource\` / \`deploy_update\`) preserve \`this.data\`. Keep \`this.data\` to the DOCUMENT — the content the object represents — and nothing more.
    - **Transient runtime state stays OUT of \`this.data\`** — window/canvas/layout ids, in-progress edit buffers and cursor position, pan/zoom, selection, drag state, hit-test caches, and anything tied to a currently-open window are ephemeral. Hold them in plain instance fields (\`this._sessions\`, \`this._cursor\`, …), NOT \`this.data\`. Instance fields are not persisted and not cloned, which is exactly right: they are meaningless after a restart and are rebuilt when a window (re)opens. Persisting them instead bloats every snapshot and ties saved documents to dead window ids. (A multi-window editor keeps its per-window sessions in \`this._sessions\`; only the maps/notes/documents go in \`this.data\`.)
    - **Persist at commit granularity, not per keystroke.** \`saveData()\` snapshots the whole object and re-registers it, so calling it on every keystroke, pointer move, or animation frame is expensive and churns the system (it can visibly thrash other UI). Call \`saveData()\` when a value is actually finalized — an edit committed on Enter/blur, a node added/renamed/deleted — or debounce rapid edits and save once they settle. Mutate \`this.data\` freely in between; just don't persist on every transient change.

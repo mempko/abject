@@ -779,6 +779,24 @@ export class LabelWidget extends WidgetAbject {
     return { consumed: false };
   }
 
+  /**
+   * Natural height of the current text at the current width, or null before
+   * the first layout pass has populated a cache. Includes the 4px text padding
+   * on both edges so a rect of exactly this height renders without clipping.
+   * Consumed by ContentBlockWidget's contentHeight reporting.
+   */
+  protected naturalContentHeight(): number | null {
+    const textPadding = 4;
+    if (this.style.markdown && this.cachedRichLayout) {
+      return this.cachedRichLayout.totalHeight + textPadding * 2;
+    }
+    if (this.style.wordWrap && this.cachedWrappedLines) {
+      const fontSize = this.style.fontSize ?? 14;
+      return this.cachedWrappedLines.length * (fontSize + 4) + textPadding * 2;
+    }
+    return null;
+  }
+
   protected getWidgetValue(): string {
     return this.text;
   }

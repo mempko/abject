@@ -30,6 +30,9 @@ import { ModalDialog } from './modal-dialog.js';
 import { WindowAbject } from './widgets/window-abject.js';
 import { LabelWidget } from './widgets/label-widget.js';
 import { MarkdownWidget } from './widgets/markdown-widget.js';
+import { ContentBlockWidget } from './widgets/content-block-widget.js';
+import { ChartWidget, ChartKind, ChartSeriesSpec } from './widgets/chart-widget.js';
+import { VideoWidget } from './widgets/video-widget.js';
 import { ButtonWidget } from './widgets/button-widget.js';
 import { TextInputWidget, TextInputWidgetConfig } from './widgets/text-input-widget.js';
 import { TextAreaWidget, TextAreaWidgetConfig } from './widgets/text-area-widget.js';
@@ -45,6 +48,8 @@ import { ThemeSwatchWidget, ThemeSwatchWidgetConfig } from './widgets/theme-swat
 import { ListWidget, ListWidgetConfig, ListItem } from './widgets/list-widget.js';
 import { TreeWidget, TreeWidgetConfig, TreeItem } from './widgets/tree-widget.js';
 import { GoalProgressWidget } from './widgets/goal-progress-widget.js';
+import { TableWidget, TableColumnSpec } from './widgets/table-widget.js';
+import { FormWidget, FormSchema } from './widgets/form-widget.js';
 import type { GoalRow } from './goal-tree.js';
 import { SplitPaneWidget, SplitPaneConfig } from './widgets/split-pane-widget.js';
 import { WidgetAbject, WidgetConfig } from './widgets/widget-abject.js';
@@ -1713,6 +1718,13 @@ image - Image display (params: url, fit 'contain'|'cover'|'fill', alt). Fires 'c
 list - Scrollable list (params: items[], selectedIndex?, searchable?, itemHeight?). Fires 'selectionChanged'. Each item is { label, value, secondary?, iconName?, iconColor? }. RICH CARD ROWS: add any of badge, detail, or actions to an item and it renders as a two-line card row instead of a plain text line. badge: { text, color?, textColor? } is a colored leading chip (e.g. a percentage or status). detail (or secondary) is a muted second line under label. actions: [{ id, label, color?, textColor? }] are right-aligned buttons; clicking one fires a 'changed' event with aspect 'action' and value JSON { index, value, actionId } (row selection is unaffected). Rich rows auto-size to a comfortable height, so itemHeight is optional (set it only to make rows even taller). Example item: { label: 'Bitcoin above $100k by year end', value: 'p1', detail: 'created 2026-01-02  ·  #crypto', badge: { text: '80%', color: '#7ad19a', textColor: '#0f1226' }, actions: [{ id: 'right', label: '✓ Right', color: '#2e6b3c' }, { id: 'wrong', label: '✗ Wrong', color: '#7a2e36' }] }.
 tree - Hierarchical tree view (params: treeItems[], selectedId?, itemHeight?). Items have id, label, icon?, iconColor?, secondary?, depth, expanded?, hasChildren?. Fires 'selectionChanged' and 'toggle'.
 splitPane - Resizable split view (params: orientation?, dividerPosition?, minSize?).
+contentBlock - Auto-height wrapped rich text (a markdown label that measures itself). Give it an expanding width and a provisional fixed height in the layout, register via addDependent, and listen for the 'contentHeight' aspect (value: number) — then call updateLayoutChild on its layout with preferredSize: { h: <that number> }. Use this for chat bubbles, feed entries, and any text whose height you would otherwise have to estimate. Defaults: markdown + wordWrap + selectable on; pass style: { markdown: false } for plain wrapped text. Also fires 'click' like a label.
+goalProgress - Word-wrapping goal/task hierarchy view (params: rows[] built by goal-tree's buildGoalRows). Self-sizes via the 'contentHeight' aspect like contentBlock; fires 'toggle' with { id } when a goal row's expand gutter is clicked. Used by GoalBrowser and Chat's activity bubble; prefer tree for generic hierarchies.
+themeSwatch - Mini window preview of a theme preset (params: themeId, themeName, previewTheme — all required). Fires 'click' with { themeId }. Settings-internal; only useful for theme pickers.
+table - Sortable columnar data grid (params: columns[] of { key, label, width?, align? }, rowsData[] of records keyed by column key, sortable? default true, editable? default false, rowHeight?). Click a header to sort (asc/desc, numeric when values are numbers); columns without width share remaining width. Fires 'rowSelected' with JSON { index, row } (index into the current sorted view, row included so you never re-derive the sort) and, when editable, 'cellEdited' with JSON { index, row, key, value } after a double-click inline edit commits (Enter commits, Escape cancels). Update data with this.call(id, 'update', { rowsData }). Binds naturally to SQL query results: map each result column to { key, label } and pass row objects straight through. Example: { type: 'table', windowId, columns: [{ key: 'name', label: 'Name' }, { key: 'qty', label: 'Qty', width: 60, align: 'right' }], rowsData: [{ name: 'Ash', qty: 3 }] }.
+chart - Declarative data visualization (params: kind 'line'|'bar'|'area'|'pie'|'sparkline', series[] of { name?, points: [{x, y}], color? }, xLabel?, yLabel?, showLegend?, showGrid?, yMin?, yMax?). Colors follow the active theme automatically; give each series a name and set showLegend for a legend row. String x values become category bands (bar charts, labeled buckets); numeric x scales linearly. pie uses series[0] with one point per slice (x is the slice label). Fires 'pointClicked' with JSON { seriesIndex, pointIndex, x, y }. Update live with this.call(id, 'update', { series }). Binds directly to SQL query results: map each row to a point, e.g. rows [[label, total], ...] from query() becomes { type: 'chart', windowId, kind: 'bar', series: [{ points: rows.map(r => ({ x: String(r[0]), y: Number(r[1]) })) }] }. sparkline draws a bare trend line (no axes or grid) sized for stat cards inside styled layout cells.
+form - Schema-driven form (params: schema { properties: { name: { type, title?, description?, enum?, default? } }, required?: string[] }, submitLabel?). One spec builds labeled inputs (string → text input, masked automatically for credential-looking names; number/integer → numeric-validated input; boolean → checkbox; enum → dropdown), a validation status line, and a submit button. Fires 'submit' with a JSON payload of typed values (numbers as numbers, booleans as booleans) only after validation passes; Enter in any text field also submits. It reports its natural height via the 'contentHeight' aspect like contentBlock, so give it an expanding width, a provisional height, and resize on that event. Methods: getValues, setValues { values }. Turn any manifest method's parameters into a form by mapping each parameter to a property; the submit payload is ready to send as the method's payload. Example: { type: 'form', windowId, schema: { properties: { url: { type: 'string', title: 'Feed URL' }, minutes: { type: 'number', default: 30 } }, required: ['url'] }, submitLabel: 'Watch' }.
+video - Video playback (params: source, controls?, muted?, loop?, autoplay? default true). source is an http(s) URL, a data: URI, an abject://<typeId>/<path> file reference, or a live streamId returned by MediaStream capture. Frames composite client-side straight into the window (they never travel through the bus), so playback stays smooth. URL/file sources get a play/pause + seek overlay by default; live streams show a LIVE badge instead (controls default off). Fires 'playing', 'paused', 'ended', and 'error' (message). Update with this.call(id, 'update', { source }) to swap what plays, or { muted }. A window showing a peer's shared camera stream is a video call surface: capture via MediaStream on their side, display the streamId here, and sound follows the stream. Example: { type: 'video', windowId, source: 'https://example.com/clip.mp4' } or { type: 'video', windowId, source: capturedStreamId, muted: true }.
 
 ### Widget Style Properties
 
@@ -2631,6 +2643,26 @@ await this.call(timerId, 'addDependent', {});
     themeName?: string;
     previewTheme?: ThemeData;
     selected?: boolean;
+    columns?: TableColumnSpec[];
+    rowsData?: Record<string, unknown>[];
+    sortable?: boolean;
+    editable?: boolean;
+    rowHeight?: number;
+    schema?: FormSchema;
+    submitLabel?: string;
+    kind?: ChartKind;
+    series?: ChartSeriesSpec[];
+    xLabel?: string;
+    yLabel?: string;
+    showLegend?: boolean;
+    showGrid?: boolean;
+    yMin?: number;
+    yMax?: number;
+    source?: string;
+    controls?: boolean;
+    muted?: boolean;
+    loop?: boolean;
+    autoplay?: boolean;
   }): Promise<AbjectId> {
     const rect = spec.rect ?? { x: 0, y: 0, width: 0, height: 0 };
     const theme = this.getThemeForWindow(spec.windowId);
@@ -2644,6 +2676,10 @@ await this.call(timerId, 'addDependent', {});
       case 'markdown':
         return this.createTypedWidget(spec.windowId, new MarkdownWidget({
           type: 'markdown', rect, text: spec.text, style: spec.style, ...base,
+        }), rect);
+      case 'contentBlock':
+        return this.createTypedWidget(spec.windowId, new ContentBlockWidget({
+          type: 'contentBlock', rect, text: spec.text, style: spec.style, ...base,
         }), rect);
       case 'button':
         return this.createTypedWidget(spec.windowId, new ButtonWidget({
@@ -2713,13 +2749,13 @@ await this.call(timerId, 'addDependent', {});
         } as ThemeSwatchWidgetConfig), rect);
       case 'list':
         return this.createTypedWidget(spec.windowId, new ListWidget({
-          type: 'label' as WidgetType, rect, style: spec.style,
+          type: 'list', rect, style: spec.style,
           items: spec.items, selectedIndex: spec.selectedIndex,
           searchable: spec.searchable, itemHeight: spec.itemHeight, ...base,
         }), rect);
       case 'tree':
         return this.createTypedWidget(spec.windowId, new TreeWidget({
-          type: 'label' as WidgetType, rect, style: spec.style,
+          type: 'tree', rect, style: spec.style,
           items: spec.treeItems, selectedId: spec.selectedId,
           itemHeight: spec.itemHeight, ...base,
         }), rect);
@@ -2728,9 +2764,39 @@ await this.call(timerId, 'addDependent', {});
           type: 'goalProgress', rect, style: spec.style,
           rows: spec.rows, ...base,
         }), rect);
+      case 'table':
+        return this.createTypedWidget(spec.windowId, new TableWidget({
+          type: 'table', rect, style: spec.style,
+          columns: spec.columns, rowsData: spec.rowsData,
+          sortable: spec.sortable, editable: spec.editable,
+          rowHeight: spec.rowHeight, ...base,
+        }), rect);
+      case 'form':
+        return this.createTypedWidget(spec.windowId, new FormWidget({
+          ownerId: spec.windowId, uiServerId: this.uiServerId!, theme,
+          schema: spec.schema, submitLabel: spec.submitLabel,
+        }), rect);
+      case 'chart':
+        return this.createTypedWidget(spec.windowId, new ChartWidget({
+          type: 'chart', rect, style: spec.style,
+          kind: spec.kind, series: spec.series,
+          xLabel: spec.xLabel, yLabel: spec.yLabel,
+          showLegend: spec.showLegend, showGrid: spec.showGrid,
+          yMin: spec.yMin, yMax: spec.yMax, ...base,
+        }), rect);
+      case 'video':
+        require(typeof spec.source === 'string' && spec.source.length > 0,
+          'video spec requires source (URL, data:/abject:// reference, or a captured streamId)');
+        return this.createTypedWidget(spec.windowId, new VideoWidget({
+          type: 'video', rect, style: spec.style,
+          source: spec.source!,
+          controls: spec.controls, muted: spec.muted,
+          loop: spec.loop, autoplay: spec.autoplay,
+          ...base,
+        }), rect);
       case 'splitPane':
         return this.createTypedWidget(spec.windowId, new SplitPaneWidget({
-          type: 'label' as WidgetType, rect, style: spec.style,
+          type: 'splitPane', rect, style: spec.style,
           orientation: spec.orientation, dividerPosition: spec.dividerPosition,
           minSize: spec.minSize, ...base,
         }), rect);
