@@ -7,11 +7,12 @@
 import type { ClientTransport } from './transport.js';
 
 export class WebSocketClientTransport implements ClientTransport {
+  readonly kind = 'websocket' as const;
   private url: string;
   private ws: WebSocket | null = null;
   private reconnectAttempt = 0;
   private closed = false;
-  private msgHandler?: (data: string) => void;
+  private msgHandler?: (data: string | Uint8Array) => void;
   private openHandler?: () => void;
   private closeHandler?: () => void;
   private firstOpenResolve?: () => void;
@@ -31,13 +32,13 @@ export class WebSocketClientTransport implements ClientTransport {
     });
   }
 
-  send(data: string): void {
+  send(data: string | Uint8Array): void {
     if (this.ws && this.ws.readyState === 1) {
       this.ws.send(data);
     }
   }
 
-  onMessage(handler: (data: string) => void): void {
+  onMessage(handler: (data: string | Uint8Array) => void): void {
     this.msgHandler = handler;
   }
 
@@ -69,6 +70,7 @@ export class WebSocketClientTransport implements ClientTransport {
 
     clog(`new WebSocket(${this.url})`);
     this.ws = new WebSocket(this.url);
+    this.ws.binaryType = 'arraybuffer';
 
     this.ws.onopen = () => {
       clog('onopen fired');
@@ -79,7 +81,8 @@ export class WebSocketClientTransport implements ClientTransport {
 
     this.ws.onmessage = (evt) => {
       try {
-        this.msgHandler?.(evt.data as string);
+        const data = evt.data instanceof ArrayBuffer ? new Uint8Array(evt.data) : evt.data as string;
+        this.msgHandler?.(data);
       } catch (err) {
         console.error('[Frontend] Failed to handle backend message:', err);
       }

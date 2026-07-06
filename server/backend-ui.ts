@@ -30,7 +30,9 @@ import { validateSceneOps, normalizeSceneOps, SCENE_NODE_KINDS, type SceneOp, ty
 import type { AuthConfig, SessionStore } from './auth.js';
 import type { UITransport } from './ui-transport.js';
 import { WebSocketUITransport } from './ui-transport.js';
+import { WireEncoder, WireDecoder, isWireFrame } from '../src/network/wire-codec.js';
 import { Log } from '../src/core/timed-log.js';
+import { createHash } from 'node:crypto';
 
 const log = new Log('BackendUI');
 const UI_INTERFACE = 'abjects:ui';
@@ -114,7 +116,41 @@ interface ClientConnection {
   peerId?: string;
   name?: string;
   connectedAt: number;
+  /** Wire codec pair for this connection — stateful, paired with the client's. */
+  enc: WireEncoder;
+  dec: WireDecoder;
+  /**
+   * Whether encodeFrame should deflate large frames. WebRTC transports
+   * already deflate inside PeerTransport, so only WebSocket clients opt in.
+   */
+  deflate: boolean;
+  /** Wire frames sent on this connection (flushes + immediate sends). */
+  framesSent: number;
+  /** Cumulative frames the client reported processing (frameAck). */
+  framesAcked: number;
+  /** Queue index of the last queued single-surface draw, per surface. */
+  queuedDrawIndex: Map<string, number>;
+  /** Queue index of the last queued message touching a surface, per surface. */
+  lastSurfaceTouch: Map<string, number>;
+  /** Queue index of the last queued setCursor, for latest-wins replacement. */
+  queuedCursorIndex?: number;
+  /** Stale messages replaced in-queue since the last diagnostics line. */
+  coalescedDrops: number;
+  lastCoalesceLog: number;
+  /** Image blob hashes already delivered to this client. */
+  sentBlobs: Set<string>;
 }
+
+/**
+ * Flow-control water marks (frames in flight, i.e. sent but not yet acked by
+ * the client). Above HIGH the flush loop pauses and the queue coalesces;
+ * an ack that brings the count to LOW or below resumes flushing.
+ */
+const UNACKED_HIGH = 8;
+const UNACKED_LOW = 3;
+
+/** URL scheme for content-addressed images in draw commands. */
+const ABX_IMAGE_PREFIX = 'abx:sha256:';
 
 /** Optional metadata supplied when registering a transport with addTransport. */
 export interface ClientMeta {
@@ -1627,27 +1663,42 @@ IMPORTANT:
    */
   addTransport(newTransport: UITransport, meta?: ClientMeta): string {
     const clientId = this.nextClientId();
+    const kind = meta?.kind ?? 'websocket';
     const conn: ClientConnection = {
       id: clientId,
       transport: newTransport,
       ready: false,
       sendQueue: [],
       flushScheduled: false,
-      kind: meta?.kind ?? 'websocket',
+      kind,
       peerId: meta?.peerId,
       name: meta?.name,
       connectedAt: Date.now(),
+      enc: new WireEncoder(),
+      dec: new WireDecoder(),
+      deflate: kind === 'websocket',
+      framesSent: 0,
+      framesAcked: 0,
+      queuedDrawIndex: new Map(),
+      lastSurfaceTouch: new Map(),
+      coalescedDrops: 0,
+      lastCoalesceLog: 0,
+      sentBlobs: new Set(),
     };
     this.clients.set(clientId, conn);
     log.info(`Client ${clientId} connected (${this.clients.size} total)`);
     this.emitFrontendClientsChanged();
 
-    newTransport.onMessage((str: string) => {
+    newTransport.onMessage((data: string | Uint8Array) => {
       try {
-        const msg = JSON.parse(str) as FrontendToBackendMsg;
+        const msg = (typeof data === 'string'
+          ? JSON.parse(data)
+          : isWireFrame(data)
+            ? conn.dec.decodeFrame(data)
+            : JSON.parse(new TextDecoder().decode(data))) as FrontendToBackendMsg;
         this.handleFrontendMessage(msg, clientId);
       } catch (err) {
-        log.error('Failed to parse frontend message:', err);
+        log.error('Failed to decode frontend message:', err);
       }
     });
     newTransport.onClose(() => {
@@ -1695,12 +1746,7 @@ IMPORTANT:
   private sendToFrontend(msg: BackendToFrontendMsg): void {
     for (const client of this.clients.values()) {
       if (!client.ready || !client.transport.ready) continue;
-      client.sendQueue.push(msg);
-      if (!client.flushScheduled) {
-        client.flushScheduled = true;
-        const cid = client.id;
-        setTimeout(() => this.flushClientQueue(cid), 0);
-      }
+      this.enqueueForClient(client, msg);
     }
   }
 
@@ -1710,11 +1756,7 @@ IMPORTANT:
   private sendToClient(msg: BackendToFrontendMsg, clientId: string): void {
     const client = this.clients.get(clientId);
     if (!client || !client.ready || !client.transport.ready) return;
-    client.sendQueue.push(msg);
-    if (!client.flushScheduled) {
-      client.flushScheduled = true;
-      setTimeout(() => this.flushClientQueue(clientId), 0);
-    }
+    this.enqueueForClient(client, msg);
   }
 
   /**
@@ -1725,12 +1767,81 @@ IMPORTANT:
     for (const client of this.clients.values()) {
       if (client.id === excludeClientId) continue;
       if (!client.ready || !client.transport.ready) continue;
-      client.sendQueue.push(msg);
-      if (!client.flushScheduled) {
-        client.flushScheduled = true;
-        const cid = client.id;
-        setTimeout(() => this.flushClientQueue(cid), 0);
+      this.enqueueForClient(client, msg);
+    }
+  }
+
+  /**
+   * Queue a message for a client with stale-state coalescing, and schedule a
+   * flush unless the client is over its unacked-frames budget (in that case
+   * the ack handler resumes flushing).
+   *
+   * Coalescing rules — all order-preserving, applied only to messages that
+   * fully supersede an older queued one:
+   *   - a single-surface 'draw' (a full repaint of that surface) replaces the
+   *     previously queued single-surface draw for the same surface, provided
+   *     no later queued message touches that surface;
+   *   - 'setCursor' replaces a previously queued setCursor.
+   * Everything else appends. This keeps a slow client's queue bounded by
+   * state size rather than by frame rate.
+   */
+  private enqueueForClient(client: ClientConnection, msg: BackendToFrontendMsg): void {
+    const queue = client.sendQueue;
+
+    if (msg.type === 'draw') {
+      const surfaces = new Set(msg.commands.map((c) => c.surfaceId));
+      if (surfaces.size === 1) {
+        const sid: string = msg.commands[0].surfaceId;
+        const drawIdx = client.queuedDrawIndex.get(sid);
+        if (drawIdx !== undefined && client.lastSurfaceTouch.get(sid) === drawIdx) {
+          queue[drawIdx] = msg;
+          client.coalescedDrops++;
+          this.maybeScheduleFlush(client);
+          return;
+        }
+        queue.push(msg);
+        client.queuedDrawIndex.set(sid, queue.length - 1);
+        client.lastSurfaceTouch.set(sid, queue.length - 1);
+      } else {
+        queue.push(msg);
+        for (const sid of surfaces) {
+          client.queuedDrawIndex.delete(sid);
+          client.lastSurfaceTouch.set(sid, queue.length - 1);
+        }
       }
+    } else if (msg.type === 'setCursor') {
+      if (client.queuedCursorIndex !== undefined) {
+        queue[client.queuedCursorIndex] = msg;
+        client.coalescedDrops++;
+        this.maybeScheduleFlush(client);
+        return;
+      }
+      queue.push(msg);
+      client.queuedCursorIndex = queue.length - 1;
+    } else {
+      queue.push(msg);
+      const sid = (msg as { surfaceId?: string }).surfaceId;
+      if (sid) client.lastSurfaceTouch.set(sid, queue.length - 1);
+    }
+
+    this.maybeScheduleFlush(client);
+  }
+
+  private maybeScheduleFlush(client: ClientConnection): void {
+    if (client.flushScheduled) return;
+    if (client.framesSent - client.framesAcked > UNACKED_HIGH) return; // ack handler resumes
+    client.flushScheduled = true;
+    const cid = client.id;
+    setTimeout(() => this.flushClientQueue(cid), 0);
+  }
+
+  /** frameAck from a client: record credit and resume flushing if drained. */
+  private handleFrameAck(client: ClientConnection, n: number): void {
+    client.framesAcked = Math.max(client.framesAcked, n);
+    if (client.sendQueue.length > 0
+        && !client.flushScheduled
+        && client.framesSent - client.framesAcked <= UNACKED_LOW) {
+      this.flushClientQueue(client.id);
     }
   }
 
@@ -1741,7 +1852,8 @@ IMPORTANT:
   private sendToClientImmediate(msg: BackendToFrontendMsg, clientId: string): void {
     const client = this.clients.get(clientId);
     if (client && client.ready && client.transport.ready) {
-      client.transport.send(JSON.stringify(msg));
+      client.framesSent++;
+      client.transport.send(client.enc.encodeFrame(msg, client.deflate));
     }
   }
 
@@ -1750,13 +1862,21 @@ IMPORTANT:
     if (!client) return;
     client.flushScheduled = false;
     if (!client.transport.ready || client.sendQueue.length === 0) return;
+    if (client.framesSent - client.framesAcked > UNACKED_HIGH) return; // resumed by frameAck
 
-    if (client.sendQueue.length === 1) {
-      client.transport.send(JSON.stringify(client.sendQueue[0]));
-    } else {
-      client.transport.send(JSON.stringify(client.sendQueue));
-    }
+    const batch = client.sendQueue.length === 1 ? client.sendQueue[0] : client.sendQueue;
+    client.framesSent++;
+    client.transport.send(client.enc.encodeFrame(batch, client.deflate));
     client.sendQueue = [];
+    client.queuedDrawIndex.clear();
+    client.lastSurfaceTouch.clear();
+    client.queuedCursorIndex = undefined;
+
+    if (client.coalescedDrops > 0 && Date.now() - client.lastCoalesceLog > 5_000) {
+      log.info(`client ${client.id}: coalesced ${client.coalescedDrops} stale queued messages (flow control, ${client.framesSent - client.framesAcked} frames in flight)`);
+      client.coalescedDrops = 0;
+      client.lastCoalesceLog = Date.now();
+    }
   }
 
   // ── Surface API ──────────────────────────────────────────────────────
@@ -1809,6 +1929,7 @@ IMPORTANT:
     }
 
     if (this.focusedNode?.surfaceId === surfaceId) this.focusedNode = undefined;
+    this.releaseBlobs(this.blobHashesIn(state.lastDrawCommands));
     this.surfaces.delete(surfaceId);
 
     this.sendToFrontend({
@@ -1827,6 +1948,7 @@ IMPORTANT:
     let count = 0;
     for (const [surfaceId, state] of this.surfaces.entries()) {
       if (state.objectId === objectId) {
+        this.releaseBlobs(this.blobHashesIn(state.lastDrawCommands));
         this.surfaces.delete(surfaceId);
         this.sendToFrontend({ type: 'destroySurface', surfaceId });
         if (this.focusedSurface === surfaceId) this.focusedSurface = undefined;
@@ -1840,10 +1962,17 @@ IMPORTANT:
     objectId: AbjectId,
     commands: Array<{ type: string; surfaceId: string; params: unknown }>
   ): boolean {
-    // Filter commands to only include surfaces owned by the caller
-    const validCommands = commands.filter(
-      (cmd) => this.surfaces.get(cmd.surfaceId)?.objectId === objectId
-    );
+    // Filter commands to only include surfaces owned by the caller, then
+    // intern inline data: URI images into the content-addressed blob store
+    // so repaints and replays reference bytes the client already holds.
+    const validCommands = commands
+      .filter((cmd) => this.surfaces.get(cmd.surfaceId)?.objectId === objectId)
+      .map((cmd) => this.internImageCommand(cmd));
+
+    // Retain the new batch's blobs BEFORE releasing the replaced batch's —
+    // a repaint reusing the same image must not let its refcount touch zero.
+    const hashes = this.blobHashesIn(validCommands);
+    this.retainBlobs(hashes);
 
     // Snapshot the latest draw batch per surface so reconnecting clients can
     // be replayed (handleClientReady reuses state.lastDrawCommands).
@@ -1852,6 +1981,7 @@ IMPORTANT:
       const state = this.surfaces.get(cmd.surfaceId);
       if (!state) continue;
       if (!touched.has(cmd.surfaceId)) {
+        this.releaseBlobs(this.blobHashesIn(state.lastDrawCommands));
         state.lastDrawCommands = [];
         touched.add(cmd.surfaceId);
       }
@@ -1859,6 +1989,14 @@ IMPORTANT:
     }
 
     if (validCommands.length > 0) {
+      if (hashes.length > 0) {
+        // Deliver bytes each client is missing before the draw that uses them
+        // (same ordered queue, so the blob always precedes its first use).
+        for (const client of this.clients.values()) {
+          if (!client.ready || !client.transport.ready) continue;
+          this.queueBlobsForClient(client, hashes);
+        }
+      }
       this.sendToFrontend({
         type: 'draw',
         commands: validCommands,
@@ -1867,6 +2005,74 @@ IMPORTANT:
 
     this.log('debug', 'draw', { objectId, commandCount: commands.length });
     return true;
+  }
+
+  // ── Content-addressed image blobs ────────────────────────────────────
+
+  /** hash → bytes + mime, refcounted by retained lastDrawCommands. */
+  private imageBlobs: Map<string, { bytes: Uint8Array; mime: string; refs: number }> = new Map();
+
+  /**
+   * Rewrite an imageUrl command with an inline base64 data: URI to reference
+   * the blob store by hash. The bytes travel once per client as an
+   * ImageBlobMsg instead of riding inside every repaint.
+   */
+  private internImageCommand(
+    cmd: { type: string; surfaceId: string; params: unknown },
+  ): { type: string; surfaceId: string; params: unknown } {
+    if (cmd.type !== 'imageUrl') return cmd;
+    const url = (cmd.params as { url?: string } | undefined)?.url;
+    if (!url || !url.startsWith('data:')) return cmd;
+    const m = /^data:([^;,]*);base64,(.*)$/s.exec(url);
+    if (!m) return cmd; // non-base64 data URI — leave as-is
+    let bytes: Uint8Array;
+    try {
+      bytes = new Uint8Array(Buffer.from(m[2], 'base64'));
+    } catch {
+      return cmd;
+    }
+    const hash = createHash('sha256').update(bytes).digest('hex');
+    if (!this.imageBlobs.has(hash)) {
+      this.imageBlobs.set(hash, { bytes, mime: m[1] || 'application/octet-stream', refs: 0 });
+    }
+    return { ...cmd, params: { ...(cmd.params as object), url: ABX_IMAGE_PREFIX + hash } };
+  }
+
+  private blobHashesIn(commands: Array<{ type: string; params: unknown }>): string[] {
+    const hashes: string[] = [];
+    for (const cmd of commands) {
+      if (cmd.type !== 'imageUrl') continue;
+      const url = (cmd.params as { url?: string } | undefined)?.url;
+      if (url?.startsWith(ABX_IMAGE_PREFIX)) hashes.push(url.slice(ABX_IMAGE_PREFIX.length));
+    }
+    return hashes;
+  }
+
+  private retainBlobs(hashes: string[]): void {
+    for (const hash of hashes) {
+      const blob = this.imageBlobs.get(hash);
+      if (blob) blob.refs++;
+    }
+  }
+
+  private releaseBlobs(hashes: string[]): void {
+    for (const hash of hashes) {
+      const blob = this.imageBlobs.get(hash);
+      if (!blob) continue;
+      blob.refs--;
+      if (blob.refs <= 0) this.imageBlobs.delete(hash);
+    }
+  }
+
+  /** Queue ImageBlobMsgs for any of the hashes this client hasn't received. */
+  private queueBlobsForClient(client: ClientConnection, hashes: string[]): void {
+    for (const hash of hashes) {
+      if (client.sentBlobs.has(hash)) continue;
+      const blob = this.imageBlobs.get(hash);
+      if (!blob) continue;
+      client.sentBlobs.add(hash);
+      this.enqueueForClient(client, { type: 'imageBlob', hash, mime: blob.mime, bytes: blob.bytes });
+    }
   }
 
   /**
@@ -2331,6 +2537,24 @@ IMPORTANT:
       case 'input':
         this.handleFrontendInput(msg as InputMsg, clientId);
         break;
+
+      case 'frameAck': {
+        const client = this.clients.get(clientId);
+        if (client) this.handleFrameAck(client, msg.n);
+        break;
+      }
+
+      case 'needBlob': {
+        const client = this.clients.get(clientId);
+        const blob = this.imageBlobs.get(msg.hash);
+        if (client && blob) {
+          client.sentBlobs.add(msg.hash);
+          this.sendToClientImmediate({ type: 'imageBlob', hash: msg.hash, mime: blob.mime, bytes: blob.bytes }, clientId);
+        } else {
+          log.warn(`needBlob: no blob ${msg.hash.slice(0, 12)} for client ${clientId} (referenced image no longer retained)`);
+        }
+        break;
+      }
 
       case 'globalShortcut': {
         const m = msg as { combo: string };
@@ -2828,9 +3052,14 @@ IMPORTANT:
       }, clientId);
     }
 
-    // 2. Replay last draw commands for each surface
+    // 2. Replay last draw commands for each surface (image bytes first —
+    // a reconnecting client starts with an empty blob cache)
+    const replayClient = this.clients.get(clientId);
     for (const state of this.surfaces.values()) {
       if (state.lastDrawCommands.length > 0) {
+        if (replayClient) {
+          this.queueBlobsForClient(replayClient, this.blobHashesIn(state.lastDrawCommands));
+        }
         this.sendToClient({
           type: 'draw',
           commands: state.lastDrawCommands,

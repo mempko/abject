@@ -306,6 +306,20 @@ export interface VideoControlMsg extends WsEnvelope {
   value?: number;
 }
 
+/**
+ * Content-addressed image transfer. Draw commands never carry image bytes:
+ * a data: URI arriving from an abject is stored server-side by sha256 and
+ * rewritten to `abx:sha256:<hex>`; each client receives the bytes once via
+ * this message (binary in the wire codec — no base64) and resolves the ref
+ * from its local cache on every subsequent repaint and replay.
+ */
+export interface ImageBlobMsg extends WsEnvelope {
+  type: 'imageBlob';
+  hash: string;
+  mime: string;
+  bytes: Uint8Array;
+}
+
 export interface AuthRequiredMsg extends WsEnvelope {
   type: 'authRequired';
 }
@@ -346,6 +360,7 @@ export type BackendToFrontendMsg =
   | CaptureSurfaceRequestMsg
   | CaptureDesktopRequestMsg
   | OpenFilePickerMsg
+  | ImageBlobMsg
   | SceneOpsMsg
   | SetSceneThemeMsg
   | SetSurfaceTransformMsg
@@ -587,6 +602,29 @@ export interface GlobalShortcutMsg extends WsEnvelope {
 }
 
 /**
+ * End-to-end flow control: the client acks processed wire frames (cumulative
+ * count, throttled to one ack per animation frame). The backend stops
+ * flushing to a client whose unacked frame count crosses the high-water mark
+ * and coalesces queued surface repaints until credit returns — so a slow or
+ * backgrounded client sees the latest state when it catches up instead of a
+ * backlog of stale frames.
+ */
+export interface FrameAckMsg extends WsEnvelope {
+  type: 'frameAck';
+  /** Total wire frames this client has processed on this connection. */
+  n: number;
+}
+
+/**
+ * A draw command referenced an `abx:sha256:` image the client no longer has
+ * cached (eviction). The backend re-sends the ImageBlobMsg.
+ */
+export interface NeedBlobMsg extends WsEnvelope {
+  type: 'needBlob';
+  hash: string;
+}
+
+/**
  * A file uploaded from the client (via picker or drag-drop), delivered as one
  * or more base64 chunks. The backend reassembles chunks keyed by `uploadId`
  * and, once complete, hands the full file to the object owning `surfaceId`.
@@ -611,6 +649,8 @@ export interface FileUploadMsg extends WsEnvelope {
 
 export type FrontendToBackendMsg =
   | InputMsg
+  | FrameAckMsg
+  | NeedBlobMsg
   | FileUploadMsg
   | CloseWindowMsg
   | EndWindowDragMsg

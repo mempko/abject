@@ -178,6 +178,37 @@ export async function aesDecrypt(
   return new Uint8Array(plaintext);
 }
 
+/**
+ * AES-256-GCM encrypt returning the IV and ciphertext as raw bytes. Avoids
+ * the base64 round-trip in `aesEncrypt`/`aesDecrypt` on hot paths (e.g. the
+ * binary frame protocol in PeerTransport).
+ */
+export async function aesEncryptBytes(
+  key: CryptoKey,
+  plaintext: Uint8Array,
+): Promise<{ iv: Uint8Array; ciphertext: Uint8Array }> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: iv as BufferSource },
+    key,
+    plaintext as BufferSource,
+  );
+  return { iv, ciphertext: new Uint8Array(ciphertext) };
+}
+
+export async function aesDecryptBytes(
+  key: CryptoKey,
+  iv: Uint8Array,
+  ciphertext: Uint8Array,
+): Promise<Uint8Array> {
+  const plaintext = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: iv as BufferSource },
+    key,
+    ciphertext as BufferSource,
+  );
+  return new Uint8Array(plaintext);
+}
+
 // =============================================================================
 // Encoding Helpers
 // =============================================================================

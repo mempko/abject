@@ -12,14 +12,20 @@
  */
 
 export interface ClientTransport {
+  /**
+   * Transport flavor. WebRTC compresses inside PeerTransport, so the wire
+   * codec only deflates frames on the websocket path.
+   */
+  readonly kind: 'websocket' | 'webrtc';
+
   /** Establish the connection. Resolves when first `onOpen` has fired. */
   connect(): Promise<void>;
 
-  /** Send a JSON string to the backend. */
-  send(data: string): void;
+  /** Send a binary wire frame (or pre-auth JSON string) to the backend. */
+  send(data: string | Uint8Array): void;
 
   /** Register the incoming-message handler. Replaces any prior handler. */
-  onMessage(handler: (data: string) => void): void;
+  onMessage(handler: (data: string | Uint8Array) => void): void;
 
   /** Fires every time the channel is (re)opened and ready for app data. */
   onOpen(handler: () => void): void;

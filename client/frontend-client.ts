@@ -14,6 +14,7 @@ import type {
   FrontendToBackendMsg,
   CreateSurfaceMsg,
   DrawMsg,
+  ImageBlobMsg,
   SetSelectedTextMsg,
   StartWindowDragMsg,
   AuthResultMsg,
@@ -32,6 +33,7 @@ import type {
 } from '../server/ws-protocol.js';
 import type { AbyssBgControl } from './abyss-bg.js';
 import type { ClientTransport } from './transport.js';
+import { WireEncoder, WireDecoder, isWireFrame } from '../src/network/wire-codec.js';
 
 /**
  * The thin browser frontend that owns the Canvas and Compositor.
@@ -52,6 +54,24 @@ export class FrontendClient {
   private compositor: Compositor;
   private canvas: HTMLCanvasElement;
   private transport: ClientTransport | null = null;
+  /**
+   * Wire codec pair, recreated on every (re)connect to stay in sync with the
+   * fresh per-connection pair BackendUI creates when this client attaches.
+   */
+  private wireEnc = new WireEncoder();
+  private wireDec = new WireDecoder();
+  private wireDeflate = false;
+  /** Wire frames processed on this connection; acked cumulatively per rAF. */
+  private wireFramesReceived = 0;
+  private frameAckScheduled = false;
+  /**
+   * Content-addressed image cache: sha256 → object URL for bytes received
+   * via imageBlob. LRU-capped; evicted entries are re-requested on demand.
+   */
+  private imageBlobUrls: Map<string, string> = new Map();
+  private static readonly IMAGE_BLOB_CACHE_MAX = 300;
+  /** Draw commands waiting on a blob that wasn't cached (evicted or raced). */
+  private pendingBlobDraws: Map<string, DrawCommand[]> = new Map();
   private focusedSurface?: string;
   private grabbedSurface?: string;
   /** Currently hovered 3D scene node (mesh), for enter/leave synthesis. */
@@ -427,6 +447,14 @@ export class FrontendClient {
 
     transport.onOpen(() => {
       console.log('[Frontend] Connected to backend');
+      // Fresh connection — the backend created a fresh codec pair for us
+      this.wireEnc = new WireEncoder();
+      this.wireDec = new WireDecoder();
+      this.wireDeflate = transport.kind === 'websocket';
+      this.wireFramesReceived = 0;
+      for (const url of this.imageBlobUrls.values()) URL.revokeObjectURL(url);
+      this.imageBlobUrls.clear();
+      this.pendingBlobDraws.clear();
       // Clear stale surfaces from any previous connection before replaying state
       this.compositor.clearAllSurfaces();
       this.focusedSurface = undefined;
@@ -437,13 +465,24 @@ export class FrontendClient {
       // Don't send ready yet — wait for auth status from server
     });
 
-    transport.onMessage((data: string) => {
+    transport.onMessage((data: string | Uint8Array) => {
       try {
-        const msg = JSON.parse(data);
+        // Binary wire frames carry the UI protocol; JSON (text frame, or
+        // UTF-8 bytes on the WebRTC path) carries the pre-auth exchange.
+        let msg: unknown;
+        if (typeof data === 'string') {
+          msg = JSON.parse(data);
+        } else if (isWireFrame(data)) {
+          msg = this.wireDec.decodeFrame(data);
+          this.wireFramesReceived++;
+          this.scheduleFrameAck();
+        } else {
+          msg = JSON.parse(new TextDecoder().decode(data));
+        }
 
         // Handle auth protocol before authenticated
         if (!this.authenticated) {
-          this.handleAuthMessage(msg);
+          this.handleAuthMessage(msg as { type: string; [key: string]: unknown });
           return;
         }
 
@@ -456,7 +495,7 @@ export class FrontendClient {
           this.handleBackendMessage(msg as BackendToFrontendMsg);
         }
       } catch (err) {
-        console.error('[Frontend] Failed to parse backend message:', err);
+        console.error('[Frontend] Failed to decode backend message:', err);
       }
     });
 
@@ -640,7 +679,14 @@ export class FrontendClient {
 
   private sendRaw(msg: Record<string, unknown>): void {
     if (this.transport && this.transport.ready) {
-      this.transport.send(JSON.stringify(msg));
+      // Pre-auth messages ride as JSON (the server auth layer reads them off
+      // the raw socket, before the wire codec pair exists); everything after
+      // auth is binary.
+      if (this.authenticated) {
+        this.transport.send(this.wireEnc.encodeFrame(msg, this.wireDeflate));
+      } else {
+        this.transport.send(JSON.stringify(msg));
+      }
     }
   }
 
@@ -655,6 +701,10 @@ export class FrontendClient {
       case 'destroySurface':
         this.compositor.destroySurface(msg.surfaceId);
         this.resizableSurfaces.delete(msg.surfaceId);
+        break;
+
+      case 'imageBlob':
+        this.handleImageBlob(msg as ImageBlobMsg);
         break;
 
       case 'draw':
@@ -1337,7 +1387,57 @@ export class FrontendClient {
 
   private handleDraw(msg: DrawMsg): void {
     for (const cmd of msg.commands) {
-      this.compositor.draw(cmd as DrawCommand);
+      const resolved = this.resolveImageRef(cmd as DrawCommand);
+      if (resolved) this.compositor.draw(resolved);
+    }
+  }
+
+  private static readonly ABX_IMAGE_PREFIX = 'abx:sha256:';
+
+  /**
+   * Translate an `abx:sha256:` image ref to the cached object URL. When the
+   * blob isn't cached (evicted, or lost to a race) the command is parked and
+   * re-executed when the re-requested bytes arrive; the rest of the surface
+   * repaint proceeds without it.
+   */
+  private resolveImageRef(cmd: DrawCommand): DrawCommand | undefined {
+    if (cmd.type !== 'imageUrl') return cmd;
+    const url = (cmd.params as { url?: string }).url;
+    if (!url || !url.startsWith(FrontendClient.ABX_IMAGE_PREFIX)) return cmd;
+    const hash = url.slice(FrontendClient.ABX_IMAGE_PREFIX.length);
+    const objectUrl = this.imageBlobUrls.get(hash);
+    if (objectUrl) {
+      // LRU touch
+      this.imageBlobUrls.delete(hash);
+      this.imageBlobUrls.set(hash, objectUrl);
+      return { ...cmd, params: { ...(cmd.params as object), url: objectUrl } } as DrawCommand;
+    }
+    const pending = this.pendingBlobDraws.get(hash);
+    if (pending) {
+      pending.push(cmd);
+    } else {
+      this.pendingBlobDraws.set(hash, [cmd]);
+      this.sendToBackend({ type: 'needBlob', hash });
+    }
+    return undefined;
+  }
+
+  private handleImageBlob(msg: ImageBlobMsg): void {
+    const bytes = msg.bytes instanceof Uint8Array ? msg.bytes : new Uint8Array(msg.bytes as ArrayBufferLike);
+    const objectUrl = URL.createObjectURL(new Blob([bytes as BlobPart], { type: msg.mime }));
+    this.imageBlobUrls.set(msg.hash, objectUrl);
+    while (this.imageBlobUrls.size > FrontendClient.IMAGE_BLOB_CACHE_MAX) {
+      const [oldest, oldestUrl] = this.imageBlobUrls.entries().next().value as [string, string];
+      URL.revokeObjectURL(oldestUrl);
+      this.imageBlobUrls.delete(oldest);
+    }
+    const parked = this.pendingBlobDraws.get(msg.hash);
+    if (parked) {
+      this.pendingBlobDraws.delete(msg.hash);
+      for (const cmd of parked) {
+        const resolved = this.resolveImageRef(cmd);
+        if (resolved) this.compositor.draw(resolved);
+      }
     }
   }
 
@@ -2353,7 +2453,24 @@ export class FrontendClient {
 
   private sendToBackend(msg: FrontendToBackendMsg): void {
     if (this.transport && this.transport.ready) {
-      this.transport.send(JSON.stringify(msg));
+      this.transport.send(this.wireEnc.encodeFrame(msg, this.wireDeflate));
     }
+  }
+
+  /**
+   * Ack processed wire frames, at most once per animation frame. The backend
+   * uses the in-flight count as flow control: when this tab is slow (or
+   * backgrounded, where rAF stops), it coalesces instead of piling up stale
+   * frames on the socket.
+   */
+  private scheduleFrameAck(): void {
+    if (this.frameAckScheduled) return;
+    this.frameAckScheduled = true;
+    requestAnimationFrame(() => {
+      this.frameAckScheduled = false;
+      if (this.authenticated) {
+        this.sendToBackend({ type: 'frameAck', n: this.wireFramesReceived });
+      }
+    });
   }
 }
