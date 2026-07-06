@@ -184,11 +184,15 @@ src/
   protocol/             # Negotiator, Agreement management, HealthMonitor
   llm/                  # Provider interface + implementations (Anthropic, OpenAI, Ollama)
   network/              # Transport abstraction, WebSocket, PeerTransport, SignalingClient, NetworkBridge
-  sandbox/              # WASM loader, capability-enforced imports
+  sandbox/              # WASM abject hosting: ABI, instance wrapper, module store, extension ingest
   ui/                   # App shell, Canvas Compositor, Window Manager
 server/                 # Node.js backend: server entry, signaling server, node worker adapter
 client/                 # Thin browser client: FrontendClient, input forwarding
-workers/                # Web Worker / Worker Thread entry points
+workers/                # Worker thread entry points (shared Abject pool, P2P, UI)
+native/                 # Bundled WASM system packages (e.g. the C++ KnowledgeBase)
+sdk/cpp/                # C++ SDK for writing abjects that compile to WebAssembly
+examples/               # User-loadable WASM abject packages (install with pnpm forge)
+docs/                   # Specifications (WASM_ABI.md)
 ```
 
 ## Design by Contract

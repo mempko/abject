@@ -160,11 +160,12 @@ Integration: MessageBus notifies `'undeliverable'` subscribers when a message ta
 
 ### 3.8 Sandbox Layer (`src/sandbox/`)
 
-Secure WASM execution for user-created objects.
+WASM abject hosting: abjects written in other languages (C++ SDK in `sdk/cpp/`) run as first-class objects. The contract is `docs/WASM_ABI.md`; the object wrapper is `src/objects/wasm-abject.ts` (`WasmAbject extends Abject`, so WASM objects ride the mailbox, Registry, Supervisor, typeIds, and worker placement unchanged).
 
-- **`wasm-loader.ts`** - `WasmObject` wrapper around `WebAssembly.Instance`. String read/write helpers for WASM memory. Bump allocator fallback when module lacks `alloc` export. `loadWasmObject()`, `compileWasmModule()`, `validateWasmModule()` (checks for required `memory` and `handle` exports).
-- **`wasm-imports.ts`** - Capability-enforced import table. `WasmImportContext`: objectId, capabilities, memory accessor, send/log callbacks. Namespaces: `abjects` (send, log, get_time with capability checks), `env` (abort handler for AssemblyScript, seed), `console` (log/warn/error).
-- **`worker-runtime.ts`** - Main thread ↔ Worker bridge via `WorkerRuntime`. `spawn()` sends WASM bytes to worker, resolves on 'ready'. `sendMessage()` posts serialized `AbjectMessage`. Routes worker messages back through MessageBus. Singleton.
+- **`wasm-abi.ts`** - ABI v1 surface: JSON envelope types (guest↔host), length-prefixed buffer codec, `validateWasmModule()` (required exports + kinds).
+- **`wasm-instance.ts`** - `WasmInstance` wrapper around one `WebAssembly.Instance`: compile + validate + ABI-version check, `init()`/`handle()`/`snapshot()` guest calls, capability-gated `abjects` imports (emit/log/time_ms), minimal WASI preview1 shim (stdout→log, clock, random; no fs/sockets), `extractWasmManifest()` for package time.
+- **`wasm-module-store.ts`** - Content-addressed module storage at `$ABJECTS_DATA_DIR/wasm/<sha256>.wasm`; modules referenced everywhere as `wasm:sha256:<hex>` riding the normal `source` field, so AbjectStore snapshots, clone/instantiate, and respawn work unchanged.
+- **`extensions.ts`** - Package scan/ingest: bundled native system packages (`native/`, shipped in the desktop app as `resources/native`) first, then user extensions (`$ABJECTS_DATA_DIR/extensions/`, installed via `pnpm forge`); a package with `replaces` overrides its built-in Factory type.
 
 ### 3.9 UI Layer (`src/ui/`)
 
@@ -265,25 +266,32 @@ HealthMonitor (every 5s):
 ### 4.5 WASM Object Execution Flow
 
 ```
-Main Thread:
-  WorkerRuntime.spawn(objectId, wasmBytes) →
-    postMessage({ type: 'spawn', objectId, wasmCode }) →
+Boot (server/index.ts):
+  ingestAllExtensions(factory) →
+    native/ (bundled) then $ABJECTS_DATA_DIR/extensions/ (user, wins collisions)
+    module bytes → content-addressed store (wasm:sha256:<hex>)
+    factory.registerWasmType(name, { manifest, source, scope })
 
-Worker Thread:
-  onmessage → type 'spawn' →
-    WebAssembly.compile(wasmCode) →
-    createImports(objectId, capabilities) →
-      abjects.send (requires SEND_MESSAGE)
-      abjects.log (requires LOG)
-      abjects.get_time (requires TIME)
-      env.abort (AssemblyScript handler)
-    WebAssembly.instantiate(module, imports) →
-    instance.exports.init(statePtr, stateLen) →
-    postMessage({ type: 'status', objectId, status: 'ready' })
+Spawn (Factory):
+  spawn({ manifest }) → wasmTypes lookup (overrides built-in constructors) →
+    spawnWasmInWorker: WorkerPool worker constructs
+      new WasmAbject({ manifest, source, owner, data })
+    worker reads module bytes from the store on disk (bytes never cross threads)
 
-Messages routed via postMessage bridge:
-  Main → Worker: { type: 'message', objectId, message: serialized }
-  Worker → Main: { type: 'message', objectId, message: serialized }
+Inside the object (WasmAbject.onInit):
+  WasmInstance.create(bytes) →
+    validate exports + abi version → instantiate with
+      abjects.emit / log / time_ms   (capability-gated)
+      wasi_snapshot_preview1 shim    (no fs/sockets)
+    _initialize() (WASI reactor) → abject_init({ objectId, typeId, data })
+
+Message flow (JSON envelopes, docs/WASM_ABI.md):
+  inbound request/event → '*' handler → abject_handle({ kind: 'message' })
+  guest replies sync (reply/error envelope) or defers (later handle call)
+  guest requests: { kind: 'request', to: '@Name' | id } → host this.request()
+    → result envelope back into abject_handle
+  changed / persist / log envelopes → dependents fan-out, Registry data
+    upsert, host logging
 ```
 
 ## 5. Key Design Decisions

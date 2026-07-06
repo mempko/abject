@@ -27,10 +27,14 @@ src/
   protocol/             # Negotiator, Agreement management, HealthMonitor
   llm/                  # LLM provider interface and implementations (Anthropic, OpenAI, Ollama)
   network/              # Transport abstraction, WebSocket, MockTransport
-  sandbox/              # WASM loader, capability-enforced imports, WorkerRuntime
+  sandbox/              # WASM abject hosting: ABI, instance wrapper, module store, extension ingest
   ui/                   # App shell, Canvas Compositor
 workers/
-  object-runtime.worker.ts  # Web Worker for WASM object execution
+  abject-worker-node.ts # worker_threads entry point for the shared Abject pool
+native/                 # Bundled WASM system packages (committed main.wasm, e.g. C++ KnowledgeBase)
+sdk/cpp/                # C++ SDK for writing WASM abjects
+examples/               # User-loadable WASM abject packages (pnpm forge)
+docs/                   # WASM_ABI.md and other specs
 ```
 
 ## Key Conventions
@@ -175,7 +179,6 @@ replaces the built-in KnowledgeBase. Rebuild bundled packages with
 
 ## Common Pitfalls
 
-- **Worker context**: `object-runtime.worker.ts` has its own `require()` - can't import from `contracts.ts`
 - **Object initialization**: All objects must be `init(bus)` before use; `factory.spawnInstance()` handles this
 - **Mailbox bounds**: Default max queue size is 1000; sending to a full mailbox throws `ContractViolation`
 - **API keys**: Set via `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` environment variables
