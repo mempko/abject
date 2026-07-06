@@ -103,6 +103,8 @@ import { OAuthHelper } from '../src/objects/oauth-helper.js';
 import { RemoteUIAccess } from '../src/objects/remote-ui-access.js';
 import type { UITransportLike } from '../src/network/webrtc-ui-transport.js';
 import { HttpServer } from '../src/objects/http-server.js';
+import { WasmAbject } from '../src/objects/wasm-abject.js';
+import type { WasmAbjectArgs } from '../src/objects/wasm-abject.js';
 import type { MCPBridgeConfig } from '../src/objects/mcp-bridge.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
@@ -560,6 +562,7 @@ async function main(): Promise<void> {
     return new MCPBridge(config);
   });
   runtime.objectFactory.registerConstructor('HttpServer', () => new HttpServer());
+  runtime.objectFactory.registerConstructor('WasmAbject', (args?: unknown) => new WasmAbject(args as WasmAbjectArgs));
 
   // Mark worker-eligible constructors (only used when workerEnabled).
   // Per-workspace objects use registryHint to discover workspace dependencies.
@@ -590,7 +593,7 @@ async function main(): Promise<void> {
       'TriggerManager', 'CollectionStore', 'DataBrowser',
       'Scheduler', 'SchedulerBrowser',
       'ObjectCreator', 'Chat', 'ChatManager', 'ChatBrowser', 'AbjectEditor', 'Taskbar',
-      'ScriptableAbject',
+      'ScriptableAbject', 'WasmAbject',
       // Per-workspace UI
       'WorkspaceBrowser', 'CommandPalette', 'NotificationCenter', 'WindowSwitcher',
     ];

@@ -44,6 +44,17 @@ export { Chat, CHAT_ID } from './objects/chat.js';
 export { ChatManager, CHAT_MANAGER_ID } from './objects/chat-manager.js';
 export { ChatBrowser, CHAT_BROWSER_ID } from './objects/chat-browser.js';
 export { AbjectStore, ABJECT_STORE_ID } from './objects/abject-store.js';
+export { WasmAbject, mergeWasmManifest, WASM_ABJECT_CONSTRUCTOR } from './objects/wasm-abject.js';
+export type { WasmAbjectArgs } from './objects/wasm-abject.js';
+export { WasmInstance, extractWasmManifest } from './sandbox/wasm-instance.js';
+export {
+  isWasmSourceRef, storeWasmModule, loadWasmModule, wasmStoreDir,
+  hashFromWasmRef, decodeBase64Module, WASM_SOURCE_PREFIX,
+} from './sandbox/wasm-module-store.js';
+export { WASM_ABI_VERSION, validateWasmModule } from './sandbox/wasm-abi.js';
+export type {
+  OutboundEnvelope, InboundEnvelope, WasmInitInfo, WasmAbjectExports,
+} from './sandbox/wasm-abi.js';
 export { KnowledgeBase, KNOWLEDGE_BASE_ID } from './objects/knowledge-base.js';
 export { KnowledgeBrowser, KNOWLEDGE_BROWSER_ID } from './objects/knowledge-browser.js';
 export { FileManager, FILE_MANAGER_ID } from './objects/file-manager.js';

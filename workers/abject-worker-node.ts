@@ -86,6 +86,8 @@ import { WebAgent } from '../src/objects/web-agent.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { Organism } from '../src/objects/organism.js';
 import type { OrganismSpec } from '../src/objects/organism.js';
+import { WasmAbject } from '../src/objects/wasm-abject.js';
+import type { WasmAbjectArgs } from '../src/objects/wasm-abject.js';
 
 if (!parentPort) {
   throw new Error('abject-worker-node.ts must be run inside a worker_threads Worker');
@@ -195,6 +197,7 @@ constructors.set('Organism', (args?: unknown) => {
   const spec = args as OrganismSpec;
   return new Organism(spec);
 });
+constructors.set('WasmAbject', (args?: unknown) => new WasmAbject(args as WasmAbjectArgs));
 
 // Global error handlers — report to main thread before the worker dies
 process.on('uncaughtException', (err) => {

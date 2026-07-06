@@ -1,49 +1,53 @@
-# src/sandbox/ - WASM Sandboxing
+# src/sandbox/ - WASM Abject Hosting
 
-Secure sandboxed execution for user-created objects. WASM modules run in a Web Worker with capability-enforced imports.
+Host-side support for abjects written in other languages and compiled to
+WebAssembly. The full host/guest contract is specified in `docs/WASM_ABI.md`;
+the object that ties it into the runtime is `src/objects/wasm-abject.ts`
+(an ordinary Abject subclass, like ScriptableAbject but backed by a module
+instead of a JS source string). A C++ SDK for writing modules lives in
+`sdk/cpp/`.
 
 ## Files
 
-### wasm-loader.ts
+### wasm-abi.ts
 
-WASM module loading and instantiation.
+The ABI v1 surface shared by the host pieces.
 
-- **`WasmObject`**: wrapper around `WebAssembly.Instance`
-  - `init(state)`, `handle(message)`, `manifest()` - standard WASM object interface
-  - String read/write helpers for WASM linear memory
-  - Bump allocator fallback when module has no `alloc` export
-- **`loadWasmObject(bytes, context)`**: compile and instantiate with import context
-- **`compileWasmModule(bytes)`**: pre-compile for later instantiation
-- **`validateWasmModule(module)`**: verify required exports (`memory`, `handle`)
+- Envelope types: guest↔host JSON messages (`reply`, `error`, `request`,
+  `event`, `changed`, `persist`, `log` outbound; `message`, `result` inbound)
+- `WasmAbjectExports`: typed view of a conforming module's exports
+- Length-prefixed buffer codec (`readGuestBuffer`, `readGuestString`)
+- `validateWasmModule(module)`: verify required exports before instantiation
 
-### wasm-imports.ts
+### wasm-instance.ts
 
-Capability-enforced import table for WASM modules.
+`WasmInstance` — wrapper around one instantiated module.
 
-- **`WasmImportContext`**: `objectId`, `capabilities`, `memory` accessor, `send`/`log` callbacks
-- **`abjects` namespace**:
-  - `send(msgPtr, msgLen)` - requires `SEND_MESSAGE` capability
-  - `log(level, msgPtr, msgLen)` - requires `LOG` capability
-  - `get_time()` - requires `TIME` capability
-- **`env` namespace**: `abort` handler (AssemblyScript compatible), `seed` for random
-- **`console` namespace**: `log`, `warn`, `error` for debugging
-- **`createTestContext()`**: minimal context for testing
+- Compiles, validates exports and ABI version, runs `_initialize` (WASI
+  reactor), reads the module's self-declared manifest
+- `init(info)` / `handle(envelope)` / `snapshot()` — the three guest calls
+- Capability-gated `abjects` imports (`emit`, `log`, `time_ms`)
+- Minimal WASI preview1 shim: stdout/stderr to the log, clock, random,
+  empty args/env — deliberately **no** filesystem or sockets
+- `extractWasmManifest(bytes)`: package-time manifest extraction
 
-### worker-runtime.ts
+### wasm-module-store.ts
 
-Main thread interface to the Web Worker.
-
-- **`WorkerRuntime`**: manages `postMessage` bridge to `object-runtime.worker.ts`
-  - `spawn(objectId, wasmBytes)` → sends to worker → resolves when object reports `ready`
-  - `sendMessage(objectId, message)` → serializes and posts to worker
-  - Routes messages from worker back through MessageBus
-- **Singleton**: `getWorkerRuntime()`, `resetWorkerRuntime()` for testing
+Content-addressed module storage at `$ABJECTS_DATA_DIR/wasm/<sha256>.wasm`.
+Modules are referenced everywhere by the wasm source ref `wasm:sha256:<hex>`,
+which rides the same `source` field ScriptableAbjects use — so Registry
+registration, AbjectStore snapshots, clone/instantiate, and Supervisor respawn
+work unchanged. Main thread and worker threads both resolve refs straight from
+disk; module bytes never cross thread boundaries.
 
 ## Security Model
 
-User objects can only:
-- **Send messages** (if they have `SEND_MESSAGE` capability)
-- **Log messages** (if they have `LOG` capability)
-- **Read current time** (if they have `TIME` capability)
+A WASM abject can only:
 
-All other system access must go through capability objects via message passing. The WASM sandbox prevents direct access to DOM, network, storage, or any other browser API.
+- **Emit envelopes** (messages to other abjects) — `abjects:send` capability
+- **Log** — `abjects:log` capability
+- **Read the clock** — `abjects:time` capability
+
+Everything else (storage, network, timers, UI) is reached by messaging
+capability abjects, exactly like every other object in the system. The WASI
+shim exposes no filesystem, environment, or network.

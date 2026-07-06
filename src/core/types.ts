@@ -241,7 +241,15 @@ export interface DiscoveryQuery {
 
 export interface SpawnRequest {
   manifest: AbjectManifest;
+  /** Raw WASM module bytes; hashed into the module store at spawn time. */
   code?: ArrayBuffer;
+  /** WASM module bytes as base64 — the message-passing-friendly form of `code`. */
+  codeBase64?: string;
+  /**
+   * Behavior source. JS handler-map source for ScriptableAbjects, a JSON
+   * OrganismSpec for Organisms (with the 'organism' tag), or a wasm source
+   * ref (`wasm:sha256:<hex>`) for WasmAbjects.
+   */
   source?: string;
   owner?: AbjectId;
   initialState?: unknown;
@@ -260,23 +268,4 @@ export interface SpawnResult {
   status: AbjectStatus;
 }
 
-// =============================================================================
-// WASM Types
-// =============================================================================
-
-export interface WasmObjectExports {
-  init: (statePtr: number, stateLen: number) => void;
-  handle: (msgPtr: number, msgLen: number) => number;
-  manifest: () => number;
-  memory: WebAssembly.Memory;
-  alloc?: (size: number) => number;
-  dealloc?: (ptr: number, size: number) => void;
-}
-
-export interface WasmImports {
-  abjects: {
-    send: (msgPtr: number, msgLen: number) => void;
-    log: (level: number, msgPtr: number, msgLen: number) => void;
-    get_time: () => number;
-  };
-}
+// WASM abject ABI types live in src/sandbox/wasm-abi.ts (see docs/WASM_ABI.md).

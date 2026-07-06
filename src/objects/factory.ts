@@ -25,10 +25,30 @@ import { type WorkerPool, workerIndexForId } from '../runtime/worker-pool.js';
 import { ScriptableAbject, mergeScriptableManifest } from './scriptable-abject.js';
 import { Organism, buildOrganismManifest } from './organism.js';
 import type { OrganismSpec } from './organism.js';
+import { WasmAbject, mergeWasmManifest, WASM_ABJECT_CONSTRUCTOR } from './wasm-abject.js';
+import {
+  isWasmSourceRef,
+  storeWasmModule,
+  decodeBase64Module,
+} from '../sandbox/wasm-module-store.js';
 
 const FACTORY_INTERFACE = 'abjects:factory';
 
 export type ObjectFactory = (args?: unknown) => Abject;
+
+/**
+ * A named WASM type: an installed extension module that spawns under a type
+ * name. When the name matches a built-in constructor, the WASM implementation
+ * takes precedence — that's how a compiled module transparently replaces a
+ * TypeScript system object (`replaces` in abject.json).
+ */
+export interface WasmTypeRegistration {
+  manifest: AbjectManifest;
+  /** wasm source ref: `wasm:sha256:<hex>` */
+  source: string;
+  /** 'system' types spawn once at boot; 'workspace' types spawn per workspace. */
+  scope: 'system' | 'workspace';
+}
 
 /**
  * The Factory object creates and manages object lifecycles.
@@ -36,6 +56,7 @@ export type ObjectFactory = (args?: unknown) => Abject;
 export class Factory extends Abject {
   private spawned: Map<AbjectId, Abject> = new Map();
   private constructors: Map<string, ObjectFactory> = new Map();
+  private wasmTypes: Map<string, WasmTypeRegistration> = new Map();
   private _factoryBus?: MessageBusLike;
   private _factoryRegistryId?: AbjectId;
 
@@ -234,6 +255,8 @@ export class Factory extends Abject {
       return this.respawn(objectId, constructorName, parentId, registryId);
     });
 
+    this.on('listWasmTypes', async () => this.listWasmTypes());
+
     this.on('getObjectInfo', async (msg: AbjectMessage) => {
       const { objectId } = msg.payload as { objectId: AbjectId };
       const isWorker = this.workerSpawned.has(objectId);
@@ -320,6 +343,28 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
   registerConstructor(name: string, factory: ObjectFactory): void {
     require(name !== '', 'name must not be empty');
     this.constructors.set(name, factory);
+  }
+
+  /**
+   * Register a WASM type under a name. Spawns of that name resolve to the
+   * module instead of any registered constructor, so an installed extension
+   * can replace a built-in implementation transparently.
+   */
+  registerWasmType(name: string, registration: WasmTypeRegistration): void {
+    require(name !== '', 'name must not be empty');
+    require(isWasmSourceRef(registration.source), 'registration.source must be a wasm ref');
+    require(registration.manifest?.interface !== undefined, 'registration manifest must declare an interface');
+    this.wasmTypes.set(name, registration);
+    log.info(`WASM type '${name}' registered (${registration.scope}, ${registration.source.slice(0, 30)}...)`);
+  }
+
+  /** Installed WASM types (name + scope), e.g. for WorkspaceManager to spawn
+   *  workspace-scoped extensions alongside the built-in per-workspace set. */
+  listWasmTypes(): Array<{ name: string; scope: 'system' | 'workspace' }> {
+    return Array.from(this.wasmTypes.entries()).map(([name, t]) => ({
+      name,
+      scope: t.scope,
+    }));
   }
 
   /**
@@ -513,6 +558,9 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         } catch { /* may not be registered */ }
       }
 
+      // Capture how the object was tracked before the kill below clears it
+      const trackedName = this.workerSpawned.get(objectId);
+
       // Kill old worker instance if tracked
       if (this.workerSpawned.has(objectId)) {
         // Clear timers before killing so they stop firing immediately
@@ -535,11 +583,20 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         this.workerSpawned.delete(objectId);
       }
 
-      // Respawn in worker with same ID, passing constructor args for ScriptableAbjects
+      // Respawn in worker with same ID, passing constructor args for
+      // source-backed objects (ScriptableAbjects and WasmAbjects). Objects
+      // tracked as WasmAbject respawn as WasmAbject regardless of the
+      // constructorName the Supervisor recorded at spawn time (a wasm type
+      // override may have been spawned under a built-in name).
+      if (trackedName === WASM_ABJECT_CONSTRUCTOR
+          || (existingReg?.source && isWasmSourceRef(existingReg.source))) {
+        constructorName = WASM_ABJECT_CONSTRUCTOR;
+      }
       const isScriptable = constructorName === 'ScriptableAbject';
-      if (isScriptable) {
+      const isWasm = constructorName === WASM_ABJECT_CONSTRUCTOR;
+      if (isScriptable || isWasm) {
         if (!existingReg?.source) {
-          throw new Error(`Cannot respawn ScriptableAbject '${objectId}': registration/source not found in Registry`);
+          throw new Error(`Cannot respawn ${constructorName} '${objectId}': registration/source not found in Registry`);
         }
         await this._workerPool.spawnInWorker(objectId, constructorName, {
           constructorArgs: {
@@ -573,7 +630,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       if (effectiveRegistryId) {
         const regPayload: Record<string, unknown> = { objectId, manifest, status };
         if (preservedTypeId) regPayload.typeId = preservedTypeId;
-        if (isScriptable && existingReg) {
+        if ((isScriptable || isWasm) && existingReg) {
           regPayload.source = existingReg.source;
           regPayload.owner = existingReg.owner;
           if (existingReg.data !== undefined) regPayload.data = existingReg.data;
@@ -659,6 +716,31 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
     require(this._factoryBus !== undefined, 'Factory must have a message bus');
     require(req.manifest !== undefined, 'manifest is required');
 
+    // WASM resolution runs before every other dispatch so installed type
+    // overrides win over built-in constructors (that's what `replaces` means).
+    // 1. A registered WASM type under this name supplies manifest + module ref.
+    const wasmType =
+      !req.source && !req.code && !req.codeBase64
+        ? this.wasmTypes.get(req.manifest.name)
+        : undefined;
+    if (wasmType) {
+      req = { ...req, manifest: wasmType.manifest, source: wasmType.source };
+    }
+    // 2. Raw module bytes are ingested into the content-addressed store and
+    //    replaced by their canonical wasm source ref.
+    if (!req.source && (req.code || req.codeBase64)) {
+      const bytes = req.code
+        ? new Uint8Array(req.code)
+        : decodeBase64Module(req.codeBase64!);
+      const ref = await storeWasmModule(bytes);
+      req = { ...req, source: ref };
+    }
+    // 3. A wasm source ref spawns a WasmAbject (worker-hosted when possible).
+    const isWasm = req.source !== undefined && isWasmSourceRef(req.source);
+    if (isWasm && this._workerPool) {
+      return this.spawnWasmInWorker(req);
+    }
+
     // Check if we have a registered factory
     const factory = this.constructors.get(req.manifest.name);
 
@@ -679,7 +761,15 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
 
     let obj: Abject;
 
-    if (factory) {
+    if (isWasm) {
+      // Spawn a WasmAbject inline (no worker pool available)
+      obj = new WasmAbject({
+        manifest: req.manifest,
+        source: req.source!,
+        owner: req.owner,
+        data: req.data,
+      });
+    } else if (factory) {
       // Use registered factory function
       obj = factory(req.constructorArgs);
     } else if (req.source && req.manifest.tags?.includes('organism')) {
@@ -694,9 +784,6 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         req.owner ?? ('' as AbjectId),
         req.data,
       );
-    } else if (req.code) {
-      // TODO: Load WASM object
-      throw new Error('WASM object spawning not yet implemented');
     } else {
       throw new Error(
         `No constructor registered for '${req.manifest.name}' and no code provided`
@@ -738,6 +825,11 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         payload.owner = obj.owner;
         payload.source = obj.source;
         payload.data = obj.dataSnapshot;
+      } else if (obj instanceof WasmAbject) {
+        if (obj.owner) payload.owner = obj.owner;
+        payload.source = obj.source;
+        const data = obj.dataSnapshot;
+        if (data !== undefined) payload.data = data;
       }
       await this.request(
         request(this.id, targetRegistry, 'register', payload)
@@ -782,6 +874,9 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         payload.source = obj.organismSource;
       } else if (obj instanceof ScriptableAbject) {
         payload.owner = obj.owner;
+        payload.source = obj.source;
+      } else if (obj instanceof WasmAbject) {
+        if (obj.owner) payload.owner = obj.owner;
         payload.source = obj.source;
       }
       await this.request(
@@ -919,6 +1014,77 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
           lastActivity: now,
         },
       };
+      if (req.typeId) regPayload.typeId = req.typeId;
+      if (req.data !== undefined) regPayload.data = req.data;
+      await this.request(
+        request(this.id, targetRegistry, 'register', regPayload)
+      );
+    }
+
+    const now = Date.now();
+    return {
+      objectId,
+      typeId: req.typeId,
+      status: {
+        id: objectId,
+        typeId: req.typeId,
+        state: 'ready',
+        manifest: realManifest,
+        connections: [] as AbjectId[],
+        errorCount: 0,
+        startedAt: now,
+        lastActivity: now,
+      },
+    };
+  }
+
+  /**
+   * Spawn a WasmAbject in a worker thread. Only the wasm source ref crosses
+   * the thread boundary — the worker resolves module bytes from the
+   * content-addressed store on disk.
+   */
+  private async spawnWasmInWorker(req: SpawnRequest): Promise<SpawnResult> {
+    require(this._workerPool !== undefined, 'WorkerPool must be set');
+    require(req.source !== undefined && isWasmSourceRef(req.source), 'wasm source ref is required');
+
+    const objectId = uuidv4() as AbjectId;
+
+    await this._workerPool!.spawnInWorker(objectId, WASM_ABJECT_CONSTRUCTOR, {
+      constructorArgs: {
+        manifest: req.manifest,
+        source: req.source,
+        owner: req.owner ?? '',
+        data: req.data,
+      },
+      registryId: req.registryHint ?? this._factoryRegistryId,
+      parentId: req.parentId ?? this.id,
+    });
+
+    this.workerSpawned.set(objectId, WASM_ABJECT_CONSTRUCTOR);
+
+    // Same merged manifest the worker-side instance declares (introspect + wasm tag)
+    const realManifest = mergeWasmManifest(req.manifest);
+
+    const targetRegistry = req.registryHint ?? (req.skipGlobalRegistry ? undefined : this._factoryRegistryId);
+    if (targetRegistry) this.workerRegistries.set(objectId, targetRegistry);
+    if (targetRegistry) {
+      const now = Date.now();
+      const regPayload: Record<string, unknown> = {
+        objectId,
+        manifest: realManifest,
+        source: req.source,
+        status: {
+          id: objectId,
+          typeId: req.typeId,
+          state: 'ready',
+          manifest: realManifest,
+          connections: [] as AbjectId[],
+          errorCount: 0,
+          startedAt: now,
+          lastActivity: now,
+        },
+      };
+      if (req.owner) regPayload.owner = req.owner;
       if (req.typeId) regPayload.typeId = req.typeId;
       if (req.data !== undefined) regPayload.data = req.data;
       await this.request(
