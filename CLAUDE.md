@@ -27,10 +27,14 @@ src/
   protocol/             # Negotiator, Agreement management, HealthMonitor
   llm/                  # LLM provider interface and implementations (Anthropic, OpenAI, Ollama)
   network/              # Transport abstraction, WebSocket, MockTransport
-  sandbox/              # WASM loader, capability-enforced imports, WorkerRuntime
+  sandbox/              # WASM abject hosting: ABI, instance wrapper, module store, extension ingest
   ui/                   # App shell, Canvas Compositor
 workers/
-  object-runtime.worker.ts  # Web Worker for WASM object execution
+  abject-worker-node.ts # worker_threads entry point for the shared Abject pool
+native/                 # Bundled WASM system packages (committed main.wasm, e.g. C++ KnowledgeBase)
+sdk/cpp/                # C++ SDK for writing WASM abjects
+examples/               # User-loadable WASM abject packages (pnpm forge)
+docs/                   # WASM_ABI.md and other specs
 ```
 
 ## Key Conventions
@@ -138,6 +142,33 @@ Per-workspace objects are spawned automatically for every workspace by `Workspac
 3. Set `providedCapabilities` in manifest, tag with `['capability', '<name>']`
 4. Follow existing patterns (see `http-client.ts` for domain allow/deny, `storage.ts` for IndexedDB)
 
+### New WASM Abject (other languages)
+
+Abjects can be written in any language that compiles to WebAssembly and run
+as first-class objects. The host/guest contract is `docs/WASM_ABI.md`; the
+C++ SDK is `sdk/cpp/` (see its README). Working example: `examples/echo-cpp`
+(full ABI surface, user-loadable via forge). Bundled system packages live in
+`native/` (committed with their built `main.wasm`, ingested at every boot,
+shipped in the desktop app via extraResources); `native/knowledge-base`
+replaces the built-in KnowledgeBase. Rebuild bundled packages with
+`pnpm smelt` after changing their sources.
+
+1. Write the object against `sdk/cpp/include/abject/abject.hpp` (`Object`
+   subclass + `ABJECT_OBJECT(Class)` in one translation unit)
+2. Add an `abject.json`: name, version, `abi: 1`, `scope` ('system' spawns
+   once at boot, 'workspace' spawns per workspace), optional
+   `replaces: '<BuiltinName>'` to take over a built-in type, and a `build`
+   command (usually `bash ../../sdk/cpp/build.sh <src> -o main.wasm`;
+   requires the WASI SDK, default `~/tools/wasi-sdk`, override with
+   `WASI_SDK`)
+3. `pnpm forge <dir>` compiles, validates the ABI, extracts the module's
+   manifest, and installs into `.abjects/extensions/`; the server ingests
+   extensions at boot
+4. No constructor registration is needed anywhere — WASM objects spawn
+   through the generic `WasmAbject` host (already registered on main +
+   worker) and are referenced by content hash (`wasm:sha256:...`) riding the
+   normal `source` field, so persistence/clone/respawn work unchanged
+
 ### New LLM Provider
 
 1. Create in `src/llm/`
@@ -148,7 +179,6 @@ Per-workspace objects are spawned automatically for every workspace by `Workspac
 
 ## Common Pitfalls
 
-- **Worker context**: `object-runtime.worker.ts` has its own `require()` - can't import from `contracts.ts`
 - **Object initialization**: All objects must be `init(bus)` before use; `factory.spawnInstance()` handles this
 - **Mailbox bounds**: Default max queue size is 1000; sending to a full mailbox throws `ContractViolation`
 - **API keys**: Set via `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` environment variables

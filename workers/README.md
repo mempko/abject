@@ -1,45 +1,55 @@
-# workers/ - Web Worker Runtime
+# workers/ - Worker Thread Entry Points
 
-Contains Web Workers and worker_threads entry points for isolated object execution. WASM-based objects use `object-runtime.worker.ts`; native Abject parallelism uses `abject-worker.ts` / `abject-worker-node.ts`.
+Entry points for off-main-thread Abject execution. The Node backend runs a
+pool of `worker_threads` (the `WorkerPool` in `src/runtime/`) plus dedicated
+workers for the P2P and UI subsystems. Each entry point registers the
+constructors it can spawn and runs a `WorkerBus` that routes messages to and
+from the main thread (and directly to peer workers over `MessagePort`s).
 
 ## Files
 
-### object-runtime.worker.ts
+### abject-worker-node.ts
 
-The Web Worker entry point for WASM objects. Manages WASM object lifecycles in isolation from the main thread.
+The Node.js `worker_threads` entry point for the shared worker pool. Hosts
+worker-eligible Abjects (capabilities, agents, browsers, ScriptableAbjects,
+WasmAbjects, Organisms). **Every per-workspace Abject constructor must be
+registered here as well as in `server/index.ts`**; missing the worker
+registration causes silent spawn failures. WASM abjects need no per-module
+entry: the single generic `WasmAbject` constructor covers all of them.
 
 ### abject-worker.ts
 
-Web Worker entry point for Abject parallelism. Runs a `WorkerBus` and hosts a subset of Abject instances (LLM, capabilities, editors, agents, etc.). Communicates with the main thread via structured clone messages.
+Web Worker variant of the same logic (uses the `self` API instead of
+`parentPort`). Kept for browser-context execution.
 
-### abject-worker-node.ts
+### p2p-worker-node.ts
 
-Node.js `worker_threads` variant of `abject-worker.ts`. Same logic but uses `parentPort` instead of the Web Worker `self` API.
+Dedicated worker for the P2P stack (Identity, PeerRegistry, RemoteRegistry,
+SignalingRelay, PeerDiscovery, RemoteUIAccess). Bridged to the main bus via
+`DedicatedWorkerBridge`; emits custom events (`peer-id`, `remote-message`,
+`peer-status`) consumed by `server/index.ts`.
 
-## Message Protocol (Main Thread ↔ Worker)
+### ui-worker-node.ts
 
-| Direction | Type | Payload | Response |
-|-----------|------|---------|----------|
-| Main → Worker | `init` | - | `ready` |
-| Main → Worker | `spawn` | `{ objectId, wasmCode, initialState }` | `status { objectId, 'ready' }` |
-| Both | `message` | `{ objectId, message }` | - |
-| Main → Worker | `kill` | `{ objectId }` | `status { objectId, 'stopped' }` |
-| Worker → Main | `error` | `{ objectId, error }` | - |
-| Worker → Main | `log` | `{ objectId, level, message }` | - |
+Dedicated worker hosting the UI server side (BackendUI surface management)
+when dedicated-worker mode is enabled.
 
-## Implementation Details
+## Message Protocol (Main ↔ Pool Worker)
 
-- Contains its own `require()` assertion (cannot import from `contracts.ts` in worker context)
-- Creates WASM imports with `abjects.send`, `abjects.log`, `abjects.get_time`, `env.abort`
-- Memory management: uses `alloc` export if available, falls back to bump allocation
-- WASM messages serialized as length-prefixed UTF-8 strings
-- Auto-initializes on load
+| Direction | Type | Purpose |
+|-----------|------|---------|
+| Main → Worker | `spawn` | `{ objectId, constructorName, constructorArgs, registryId, parentId }` |
+| Main → Worker | `kill` | Stop an object |
+| Main → Worker | `bus:deliver` | Route a message to a worker-local object |
+| Both | `peer:port` / `peer:place` / `peer:remove` | Direct worker-to-worker routing setup |
+| Worker → Main | `spawned` / `stopped` / `error` | Lifecycle acknowledgements |
 
-## Architecture
+## Notes
 
-```
-Main Thread: WorkerRuntime (src/sandbox/worker-runtime.ts)
-    <── postMessage ──>
-Worker Thread: object-runtime.worker.ts
-    └── WebAssembly.Instance (per object)
-```
+- Workers are spawned by `server/node-worker-adapter.ts`: `tsx`-loaded from
+  TypeScript in dev, plain compiled JS when `ELECTRON_PACKAGED=1`.
+- Object placement across pool workers is deterministic
+  (`workerIndexForId(objectId, workerCount)`).
+- WasmAbjects resolve their module bytes from the content-addressed store on
+  disk (`$ABJECTS_DATA_DIR/wasm/`); module bytes never cross thread
+  boundaries.

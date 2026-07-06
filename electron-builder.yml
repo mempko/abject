@@ -19,6 +19,17 @@ files:
   - playwright-browsers/**/*
   - package.json
 
+# Bundled native (WASM) system packages, ingested at boot from
+# resources/native (see src/sandbox/extensions.ts findBuiltinNativeDir).
+# Shipped as real files, not inside asar: worker threads read the module
+# bytes from disk after the boot ingest copies them into the data dir.
+extraResources:
+  - from: native
+    to: native
+    filter:
+      - "**/abject.json"
+      - "**/*.wasm"
+
 # Workers and native .node binaries must be unpacked from asar
 # (worker_threads and dlopen cannot load from inside asar archives)
 asarUnpack:

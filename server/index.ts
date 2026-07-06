@@ -103,6 +103,9 @@ import { OAuthHelper } from '../src/objects/oauth-helper.js';
 import { RemoteUIAccess } from '../src/objects/remote-ui-access.js';
 import type { UITransportLike } from '../src/network/webrtc-ui-transport.js';
 import { HttpServer } from '../src/objects/http-server.js';
+import { WasmAbject } from '../src/objects/wasm-abject.js';
+import type { WasmAbjectArgs } from '../src/objects/wasm-abject.js';
+import { ingestAllExtensions } from '../src/sandbox/extensions.js';
 import type { MCPBridgeConfig } from '../src/objects/mcp-bridge.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
@@ -560,6 +563,7 @@ async function main(): Promise<void> {
     return new MCPBridge(config);
   });
   runtime.objectFactory.registerConstructor('HttpServer', () => new HttpServer());
+  runtime.objectFactory.registerConstructor('WasmAbject', (args?: unknown) => new WasmAbject(args as WasmAbjectArgs));
 
   // Mark worker-eligible constructors (only used when workerEnabled).
   // Per-workspace objects use registryHint to discover workspace dependencies.
@@ -590,7 +594,7 @@ async function main(): Promise<void> {
       'TriggerManager', 'CollectionStore', 'DataBrowser',
       'Scheduler', 'SchedulerBrowser',
       'ObjectCreator', 'Chat', 'ChatManager', 'ChatBrowser', 'AbjectEditor', 'Taskbar',
-      'ScriptableAbject',
+      'ScriptableAbject', 'WasmAbject',
       // Per-workspace UI
       'WorkspaceBrowser', 'CommandPalette', 'NotificationCenter', 'WindowSwitcher',
     ];
@@ -600,6 +604,16 @@ async function main(): Promise<void> {
   }
 
   log.timed('constructors registered');
+
+  // Ingest WASM packages before anything spawns: bundled native system
+  // packages (native/, shipped with the app) first, then user-installed
+  // extensions (.abjects/extensions/*, which win name collisions). A package
+  // with `replaces` must override its built-in constructor in the Factory
+  // before the first spawn of that name.
+  const wasmExtensions = await ingestAllExtensions(runtime.objectFactory);
+  if (wasmExtensions.length > 0) {
+    log.timed(`WASM extensions ingested (${wasmExtensions.map(e => e.typeName).join(', ')})`);
+  }
 
   // Spawn Supervisor early so it can supervise other objects
   const supervisorId = await factorySpawn('Supervisor');
@@ -893,6 +907,20 @@ async function main(): Promise<void> {
   const workspaceSwitcherId = await supervisedSpawn('WorkspaceSwitcher', 'permanent', systemTypeId('WorkspaceSwitcher'));
 
   log.timed('global UI + services spawned');
+
+  // System-scoped WASM extensions spawn as global objects here (after the
+  // peerId is known so they get {peerId}/system/{Name} typeIds). Extensions
+  // that replace a built-in need no spawn of their own — the built-in's
+  // normal spawn already resolved to the WASM implementation.
+  for (const ext of wasmExtensions) {
+    if (ext.scope !== 'system' || ext.replaces) continue;
+    try {
+      await supervisedSpawn(ext.typeName, 'permanent', systemTypeId(ext.typeName));
+      log.timed(`WASM extension '${ext.typeName}' spawned`);
+    } catch (err) {
+      alog.error(`Failed to spawn WASM extension '${ext.typeName}':`, err);
+    }
+  }
 
   // WorkspaceManager spawns per-workspace objects (Settings, Taskbar, Chat, etc.)
   const workspaceManagerId = await supervisedSpawn('WorkspaceManager', 'permanent', systemTypeId('WorkspaceManager'));

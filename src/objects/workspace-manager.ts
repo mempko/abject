@@ -1273,7 +1273,21 @@ export class WorkspaceManager extends Abject {
       ChatBrowser: CHAT_BROWSER_INTERFACE,
     };
 
-    for (const objName of objectsToSpawn) {
+    // Installed workspace-scoped WASM extensions spawn alongside the built-in
+    // per-workspace set. Extensions replacing a built-in are already in
+    // objectsToSpawn under the built-in's name (the Factory resolves the
+    // override), so only genuinely new type names are appended here.
+    let extensionNames: string[] = [];
+    try {
+      const wasmTypes = await this.request<Array<{ name: string; scope: string }>>(
+        request(this.id, this.factoryId!, 'listWasmTypes', {})
+      );
+      extensionNames = wasmTypes
+        .filter((t) => t.scope === 'workspace' && !objectsToSpawn.includes(t.name))
+        .map((t) => t.name);
+    } catch { /* Factory without WASM support */ }
+
+    for (const objName of [...objectsToSpawn, ...extensionNames]) {
       const typeId = this.computeTypeId(workspaceId, objName);
       let result: SpawnResult;
       try {

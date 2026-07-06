@@ -1,0 +1,280 @@
+{
+  "name": "KnowledgeBaseCpp",
+  "version": "3.0.0",
+  "abi": 1,
+  "wasm": "main.wasm",
+  "scope": "workspace",
+  "replaces": "KnowledgeBase",
+  "build": "bash ../../sdk/cpp/build.sh knowledge-base.cpp -o main.wasm",
+  "manifest": {
+    "description": "Persistent agent memory system (native C++/WASM module). Agents remember facts, insights, and lessons learned, then retrieve them three ways: recall (BM25 full-text search, title-boosted, returns snippets and scores; pass previews: true for compact results, then fetch winners with get), match (exact lookup for identifiers and precise strings, supports 'A|B' alternations), and get (fetch one full entry by id). Remember durable knowledge only: user preferences and personal facts (tag them 'profile'), workspace and project structure, stable patterns, and references. Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (agent analysis), 'reference' (pointers to resources). Knowledge persists across restarts and syncs across peers.",
+    "interface": {
+      "description": "Persistent agent memory system (native C++/WASM module). Agents remember facts, insights, and lessons learned, then retrieve them three ways: recall (BM25 full-text search, title-boosted, returns snippets and scores; pass previews: true for compact results, then fetch winners with get), match (exact lookup for identifiers and precise strings, supports 'A|B' alternations), and get (fetch one full entry by id). Remember durable knowledge only: user preferences and personal facts (tag them 'profile'), workspace and project structure, stable patterns, and references. Types: 'learned' (behavioral lessons), 'fact' (discovered facts), 'insight' (agent analysis), 'reference' (pointers to resources). Knowledge persists across restarts and syncs across peers.",
+      "events": [
+        {
+          "description": "A knowledge entry was added",
+          "name": "entryAdded",
+          "payload": {
+            "kind": "object",
+            "properties": {}
+          }
+        },
+        {
+          "description": "A knowledge entry was updated",
+          "name": "entryUpdated",
+          "payload": {
+            "kind": "object",
+            "properties": {}
+          }
+        },
+        {
+          "description": "A knowledge entry was removed",
+          "name": "entryRemoved",
+          "payload": {
+            "kind": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "id": "abjects:knowledge-base",
+      "methods": [
+        {
+          "description": "Store a knowledge entry. Deduplicates by normalized title+type (updates if exists).",
+          "name": "remember",
+          "parameters": [
+            {
+              "description": "Short summary (max 200 chars)",
+              "name": "title",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "The knowledge content (markdown)",
+              "name": "content",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Entry type: 'learned' | 'fact' | 'insight' | 'reference'",
+              "name": "type",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Tags for search/filtering",
+              "name": "tags",
+              "optional": true,
+              "type": {
+                "kind": "array"
+              }
+            }
+          ],
+          "returns": {
+            "kind": "object",
+            "properties": {}
+          }
+        },
+        {
+          "description": "Search knowledge entries by query (BM25-ranked full text, title-boosted), type, or tags. Each result carries a snippet and score. Pass previews: true for compact {id, title, snippet} results, then fetch winners with get.",
+          "name": "recall",
+          "parameters": [
+            {
+              "description": "Search query (keywords)",
+              "name": "query",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Filter by type",
+              "name": "type",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Filter by tags",
+              "name": "tags",
+              "optional": true,
+              "type": {
+                "kind": "array"
+              }
+            },
+            {
+              "description": "Max results (default 10)",
+              "name": "limit",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "number"
+              }
+            },
+            {
+              "description": "Return compact previews instead of full entries",
+              "name": "previews",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "boolean"
+              }
+            }
+          ],
+          "returns": {
+            "kind": "array"
+          }
+        },
+        {
+          "description": "Exact lookup over titles, content, and tags. Use for identifiers, names, and precise strings. Case-insensitive; 'A|B' matches either literal.",
+          "name": "match",
+          "parameters": [
+            {
+              "description": "Literal substring or 'A|B' alternation",
+              "name": "pattern",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Max results (default 10)",
+              "name": "limit",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "number"
+              }
+            }
+          ],
+          "returns": {
+            "kind": "array"
+          }
+        },
+        {
+          "description": "Fetch one full knowledge entry by id",
+          "name": "get",
+          "parameters": [
+            {
+              "description": "Entry ID",
+              "name": "id",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            }
+          ],
+          "returns": {
+            "kind": "object",
+            "properties": {}
+          }
+        },
+        {
+          "description": "Delete a knowledge entry by ID",
+          "name": "forget",
+          "parameters": [
+            {
+              "description": "Entry ID",
+              "name": "id",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            }
+          ],
+          "returns": {
+            "kind": "object",
+            "properties": {}
+          }
+        },
+        {
+          "description": "Update an existing knowledge entry",
+          "name": "update",
+          "parameters": [
+            {
+              "description": "Entry ID",
+              "name": "id",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "New content",
+              "name": "content",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "New title",
+              "name": "title",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "New tags",
+              "name": "tags",
+              "optional": true,
+              "type": {
+                "kind": "array"
+              }
+            }
+          ],
+          "returns": {
+            "kind": "object",
+            "properties": {}
+          }
+        },
+        {
+          "description": "List knowledge entries, optionally filtered by type",
+          "name": "list",
+          "parameters": [
+            {
+              "description": "Filter by type",
+              "name": "type",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Max results (default 50)",
+              "name": "limit",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "number"
+              }
+            }
+          ],
+          "returns": {
+            "kind": "array"
+          }
+        }
+      ],
+      "name": "KnowledgeBase"
+    },
+    "name": "KnowledgeBase",
+    "requiredCapabilities": [],
+    "tags": [
+      "system",
+      "knowledge"
+    ],
+    "version": "3.0.0"
+  }
+}

@@ -48,6 +48,10 @@ Main entry point. Bootstraps the entire Abjects system on Node.js.
 - Polyfills WebRTC APIs (`RTCPeerConnection`, `RTCDataChannel`, etc.) via `node-datachannel`
 - Creates `Runtime` with optional worker thread pool (auto-detects CPU cores)
 - Registers 40+ object constructors with Factory
+- Ingests WASM packages before anything spawns: bundled native system
+  packages (`native/`, shipped in the desktop app as `resources/native`)
+  first, then user extensions (`$ABJECTS_DATA_DIR/extensions/`), so a
+  package with `replaces` overrides its built-in type
 - Spawns system objects in dependency order via request-reply to Factory
 - Installs `PeerRouter` as message interceptor for P2P routing
 - Starts `NodeWebSocketServer` on port 7719

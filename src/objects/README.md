@@ -42,6 +42,7 @@ Objects that create and adapt other objects using the LLM.
 | `proxy-generator.ts` | `ProxyGenerator` | `PROXY_GENERATOR_ID` | LLM-generated protocol translation proxies (JavaScript handler maps) |
 | `scriptable-abject.ts` | `ScriptableAbject` | `SCRIPTABLE_ABJECT_ID` | Runtime-editable Abject with JavaScript handler source. Emits `sourceUpdated` event |
 | `organism.ts` | `Organism` | `ORGANISM_INTERFACE` | Symbiogenesis: composite Abject with internal registry, organelles discover each other like a biological cell |
+| `wasm-abject.ts` | `WasmAbject` | `WASM_ABJECT_CONSTRUCTOR` | Abject backed by a WebAssembly module (any compiled language, see `docs/WASM_ABI.md`); module referenced by `wasm:sha256:` source ref, hosted via `src/sandbox/` |
 
 ## Agent System
 
