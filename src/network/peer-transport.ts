@@ -10,7 +10,8 @@
 
 import { AbjectMessage } from '../core/types.js';
 import { require as precondition } from '../core/contracts.js';
-import { serialize, deserialize } from '../core/message.js';
+import { serialize, deserialize, validateMessageShape } from '../core/message.js';
+import { WireEncoder, WireDecoder } from './wire-codec.js';
 import { Transport, TransportConfig } from './transport.js';
 import type { PeerId } from '../core/identity.js';
 import {
@@ -311,20 +312,39 @@ export class PeerTransport extends Transport {
 
   /**
    * Send a message to the remote peer.
-   * If session key is established, message is encrypted with AES-256-GCM.
+   * Post-handshake, messages ride as encrypted binary wire-codec frames.
+   * Pre-handshake (no session key yet) they ride as plaintext JSON strings —
+   * the handshake exchange itself predates the codec pair.
    */
   async send(message: AbjectMessage): Promise<void> {
     precondition(this.dataChannel !== undefined, 'DataChannel not open');
     precondition(this.dataChannel!.readyState === 'open', 'DataChannel not open');
 
-    const data = serialize(message);
-
     if (this.sessionKey) {
-      await this.sendEncryptedString(data);
-    } else if (!this.trySend(data)) {
+      // Encode inside the ordered send chain: the wire codec is stateful, so
+      // table mutations must happen in wire order.
+      await this.enqueueSend(() =>
+        this.sendEncryptedBytes(this.wireEnc.encodeFrame(message, false), false));
+    } else if (!this.trySend(serialize(message))) {
       throw new Error('DataChannel send failed (channel closed or native throw)');
     }
   }
+
+  /**
+   * Serialize encrypted sends. AES-GCM encryption is async with no cross-call
+   * ordering guarantee; without this chain two in-flight sends could hit the
+   * DataChannel out of encode order and desync the remote wire decoder.
+   */
+  private enqueueSend(task: () => Promise<void>): Promise<void> {
+    const run = this.sendChain.then(task);
+    this.sendChain = run.catch(() => { /* next send proceeds; caller sees the error via `run` */ });
+    return run;
+  }
+
+  private sendChain: Promise<void> = Promise.resolve();
+  /** Wire codec pair for AbjectMessage frames, per-connection like the session key. */
+  private wireEnc = new WireEncoder();
+  private wireDec = new WireDecoder();
 
   /**
    * Centralized DataChannel send. Re-checks readyState immediately before
@@ -354,36 +374,45 @@ export class PeerTransport extends Transport {
   }
 
   /**
-   * Send a raw string (UI protocol JSON) over the encrypted DataChannel,
-   * bypassing AbjectMessage serialize/deserialize. Compression and chunking
-   * still apply. Used by WebRTCUITransport for browser ↔ server UI traffic.
+   * Send a raw payload (UI protocol wire frame or pre-auth JSON string) over
+   * the encrypted DataChannel, bypassing AbjectMessage serialize/deserialize.
+   * Compression and chunking still apply. Used by WebRTCUITransport for
+   * browser ↔ server UI traffic.
    */
-  async sendRaw(data: string): Promise<void> {
+  async sendRaw(data: string | Uint8Array): Promise<void> {
     precondition(this.dataChannel !== undefined, 'DataChannel not open');
     precondition(this.dataChannel!.readyState === 'open', 'DataChannel not open');
     precondition(this.sessionKey !== undefined, 'Session key not established');
-    await this.sendEncryptedString(data, true);
+    const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+    // Chained for the same ordering reason as send(): the UI wire codec on
+    // top of this path is stateful too.
+    await this.enqueueSend(() => this.sendEncryptedBytes(bytes, true));
   }
 
   /**
-   * Register a handler for raw string messages received post-handshake.
-   * These are messages sent via sendRaw — i.e. UI protocol JSON, not AbjectMessage.
+   * Register a handler for raw payloads received post-handshake — bytes sent
+   * via sendRaw (UI protocol wire frames or pre-auth JSON as UTF-8), not
+   * AbjectMessages. Consumers decode; the transport does not interpret.
    */
-  onRawMessage(handler: (data: string) => void): void {
+  onRawMessage(handler: (data: Uint8Array) => void): void {
     this.rawMessageHandler = handler;
   }
 
-  private rawMessageHandler?: (data: string) => void;
+  private rawMessageHandler?: (data: Uint8Array) => void;
 
   /**
    * Internal: compress (if worthwhile) → encrypt → frame → chunk → send.
    * Encrypted payloads ride as binary Uint8Array frames over the DataChannel;
    * see the FRAME_* layout at the top of this file. The raw flag distinguishes
-   * UI-protocol bytes (delivered via onRawMessage) from AbjectMessage JSON.
+   * UI-protocol bytes (delivered via onRawMessage) from AbjectMessage wire
+   * frames.
    */
   private async sendEncryptedString(data: string, raw = false): Promise<void> {
-    const encoder = new TextEncoder();
-    let plaintext: Uint8Array = encoder.encode(data);
+    await this.sendEncryptedBytes(new TextEncoder().encode(data), raw);
+  }
+
+  private async sendEncryptedBytes(payload: Uint8Array, raw: boolean): Promise<void> {
+    let plaintext: Uint8Array = payload;
     let compressed = false;
     if (plaintext.byteLength >= COMPRESS_THRESHOLD) {
       const deflated = deflateSync(plaintext) as Uint8Array;
@@ -699,14 +728,12 @@ export class PeerTransport extends Transport {
         plaintext = inflateSync(plaintext);
       }
 
-      const msgData = new TextDecoder().decode(plaintext);
-
       if (type === FRAME_ENC_RAW || type === FRAME_ENC_RAW_GZ) {
-        this.rawMessageHandler?.(msgData);
+        this.rawMessageHandler?.(plaintext);
         return;
       }
 
-      const message = deserialize(msgData);
+      const message = validateMessageShape(this.wireDec.decodeFrame(plaintext));
       this.logRecv('encrypted', message);
       if (this.events.onMessage) {
         this.events.onMessage(message);

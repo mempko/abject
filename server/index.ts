@@ -111,7 +111,7 @@ import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
 import { NodeWorkerAdapter } from './node-worker-adapter.js';
 import { DedicatedWorkerBridge } from '../src/runtime/dedicated-worker-bridge.js';
-import { WebSocketUITransport } from './ui-transport.js';
+import { WebSocketUITransport, toUIWireData, postUIWireData, normalizeWsPayload } from './ui-transport.js';
 import { loadAuthConfig, SessionStore, authenticateConnection } from './auth.js';
 import { Log } from '../src/core/timed-log.js';
 import * as path from 'node:path';
@@ -315,14 +315,14 @@ async function main(): Promise<void> {
       const { port1, port2 } = new MessageChannel();
 
       // Relay: ws → port1 (to worker)
-      ws.on('message', (data: Buffer | string) => {
-        port1.postMessage(typeof data === 'string' ? data : data.toString());
+      ws.on('message', (data: Buffer | ArrayBuffer | Buffer[], isBinary: boolean) => {
+        postUIWireData(port1, normalizeWsPayload(data, isBinary));
       });
 
       // Relay: port1 (from worker) → ws
       port1.on('message', (data: unknown) => {
         if (ws.readyState === 1) {
-          ws.send(String(data));
+          ws.send(toUIWireData(data));
         }
       });
 
@@ -363,11 +363,11 @@ async function main(): Promise<void> {
     if (DEDICATED_WORKERS && uiBridge) {
       const { port1, port2 } = new MessageChannel();
 
-      transport.onMessage((data: string) => {
-        port1.postMessage(data);
+      transport.onMessage((data: string | Uint8Array) => {
+        postUIWireData(port1, data);
       });
       port1.on('message', (data: unknown) => {
-        if (transport.ready) transport.send(String(data));
+        if (transport.ready) transport.send(toUIWireData(data));
       });
 
       transport.onClose(() => port1.close());
@@ -394,15 +394,16 @@ async function main(): Promise<void> {
    * Wrap a Node MessagePort (received from the P2P worker after a successful
    * remote-UI pairing) as a UITransportLike — the same interface that
    * BackendUI expects from a direct WebRTCUITransport. The actual encrypted
-   * DataChannel lives in the P2P worker; only string payloads cross the port.
+   * DataChannel lives in the P2P worker; wire frames and pre-auth JSON
+   * strings cross the port unchanged (buffers transferred, not copied).
    */
   function portToUITransport(port: MessagePort): UITransportLike {
-    let msgHandler: ((data: string) => void) | undefined;
+    let msgHandler: ((data: string | Uint8Array) => void) | undefined;
     let closeHandler: (() => void) | undefined;
     let closed = false;
 
     port.on('message', (data) => {
-      msgHandler?.(String(data));
+      msgHandler?.(toUIWireData(data));
     });
     port.on('close', () => {
       closed = true;
@@ -410,9 +411,9 @@ async function main(): Promise<void> {
     });
 
     return {
-      send(data: string): void {
+      send(data: string | Uint8Array): void {
         if (closed) return;
-        port.postMessage(data);
+        postUIWireData(port, data);
       },
       onMessage(handler) { msgHandler = handler; },
       onClose(handler) { closeHandler = handler; },

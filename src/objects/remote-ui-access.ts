@@ -551,16 +551,16 @@ export class RemoteUIAccess extends Abject {
     this.negotiatingTransports.delete(peerId);
     this.pendingAuth.set(peerId, { peerTransport: transport, authTimer });
 
-    transport.onRawMessage((data: string) => {
+    transport.onRawMessage((data: Uint8Array) => {
       void this.handlePreAuthMessage(peerId, transport, data);
     });
   }
 
-  private async handlePreAuthMessage(peerId: string, transport: PeerTransport, data: string): Promise<void> {
+  private async handlePreAuthMessage(peerId: string, transport: PeerTransport, data: Uint8Array): Promise<void> {
     if (!this.pendingAuth.has(peerId)) return; // already authenticated
     let parsed: { type?: string; token?: string; clientName?: string };
     try {
-      parsed = JSON.parse(data);
+      parsed = JSON.parse(new TextDecoder().decode(data));
     } catch {
       log.warn(`pre-auth: invalid JSON from ${peerId.slice(0, 16)}`);
       await transport.disconnect();

@@ -50,6 +50,7 @@ import { PeerDiscoveryObject } from '../src/objects/peer-discovery.js';
 import { RemoteUIAccess } from '../src/objects/remote-ui-access.js';
 import { MessageChannel } from 'node:worker_threads';
 import type { UITransportLike } from '../src/network/webrtc-ui-transport.js';
+import { toUIWireData, postUIWireData } from '../server/ui-transport.js';
 import type { PeerId } from '../src/core/identity.js';
 import { Log } from '../src/core/timed-log.js';
 
@@ -178,9 +179,9 @@ async function bootstrapP2P(config: P2PConfig): Promise<void> {
     remoteUIAccessObj.setAttachHandler((peerId: string, transport: UITransportLike, meta?: { name?: string }) => {
       const { port1, port2 } = new MessageChannel();
 
-      transport.onMessage((data) => port1.postMessage(data));
+      transport.onMessage((data) => postUIWireData(port1, data));
       port1.on('message', (data) => {
-        if (transport.ready) transport.send(String(data));
+        if (transport.ready) transport.send(toUIWireData(data));
       });
 
       transport.onClose(() => port1.close());

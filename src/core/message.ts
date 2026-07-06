@@ -269,7 +269,16 @@ export function serialize(msg: AbjectMessage): string {
  */
 export function deserialize(json: string): AbjectMessage {
   require(json !== '', 'Cannot deserialize empty string');
-  const msg = JSON.parse(json) as AbjectMessage;
+  return validateMessageShape(JSON.parse(json));
+}
+
+/**
+ * Validate that a decoded value (from JSON or the binary wire codec) has the
+ * AbjectMessage envelope shape.
+ */
+export function validateMessageShape(value: unknown): AbjectMessage {
+  const msg = value as AbjectMessage;
+  require(msg !== null && typeof msg === 'object', 'Message must be an object');
   require(msg.header !== undefined, 'Message must have header');
   require(msg.routing !== undefined, 'Message must have routing');
   require(msg.protocol !== undefined, 'Message must have protocol');

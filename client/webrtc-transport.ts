@@ -4,8 +4,8 @@
  * Reuses the existing PeerTransport + SignalingClient from src/network/.
  * The browser holds its own keypair (via identity-store) and connects to a
  * known desktop's peerId. Once the encrypted DataChannel is up, sends a
- * single pairing/reconnect message and then carries the regular UI protocol
- * (BackendToFrontendMsg / FrontendToBackendMsg JSON) over sendRaw.
+ * single pairing/reconnect message (JSON) and then carries the regular UI
+ * protocol as binary wire-codec frames over sendRaw.
  */
 
 import type { ClientTransport } from './transport.js';
@@ -29,13 +29,14 @@ export interface WebRTCTransportOptions {
 }
 
 export class WebRTCClientTransport implements ClientTransport {
+  readonly kind = 'webrtc' as const;
   private opts: WebRTCTransportOptions;
   private identity?: BrowserIdentity;
   private signaling?: SignalingClient;
   private peer?: PeerTransport;
   private iceServers?: RTCIceServer[];
 
-  private msgHandler?: (data: string) => void;
+  private msgHandler?: (data: string | Uint8Array) => void;
   private openHandler?: () => void;
   private closeHandler?: () => void;
   private firstOpenResolve?: () => void;
@@ -61,7 +62,7 @@ export class WebRTCClientTransport implements ClientTransport {
     });
   }
 
-  send(data: string): void {
+  send(data: string | Uint8Array): void {
     if (this.peer && this.peer.isEncrypted) {
       void this.peer.sendRaw(data).catch((err) => {
         console.warn('[webrtc-transport] sendRaw failed:', err);
@@ -69,7 +70,7 @@ export class WebRTCClientTransport implements ClientTransport {
     }
   }
 
-  onMessage(handler: (data: string) => void): void {
+  onMessage(handler: (data: string | Uint8Array) => void): void {
     this.msgHandler = handler;
   }
 
