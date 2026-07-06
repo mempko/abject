@@ -105,7 +105,7 @@ import type { UITransportLike } from '../src/network/webrtc-ui-transport.js';
 import { HttpServer } from '../src/objects/http-server.js';
 import { WasmAbject } from '../src/objects/wasm-abject.js';
 import type { WasmAbjectArgs } from '../src/objects/wasm-abject.js';
-import { ingestExtensions } from '../src/sandbox/extensions.js';
+import { ingestAllExtensions } from '../src/sandbox/extensions.js';
 import type { MCPBridgeConfig } from '../src/objects/mcp-bridge.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
@@ -605,10 +605,12 @@ async function main(): Promise<void> {
 
   log.timed('constructors registered');
 
-  // Ingest installed WASM extensions (.abjects/extensions/*) before anything
-  // spawns: a package with `replaces` must override its built-in constructor
-  // in the Factory before the first spawn of that name.
-  const wasmExtensions = await ingestExtensions(runtime.objectFactory);
+  // Ingest WASM packages before anything spawns: bundled native system
+  // packages (native/, shipped with the app) first, then user-installed
+  // extensions (.abjects/extensions/*, which win name collisions). A package
+  // with `replaces` must override its built-in constructor in the Factory
+  // before the first spawn of that name.
+  const wasmExtensions = await ingestAllExtensions(runtime.objectFactory);
   if (wasmExtensions.length > 0) {
     log.timed(`WASM extensions ingested (${wasmExtensions.map(e => e.typeName).join(', ')})`);
   }

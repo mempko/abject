@@ -203,6 +203,13 @@ Ways to spawn:
   registers as a **wasm type override** in the Factory: any spawn of that name
   resolves to the WASM implementation instead of the built-in constructor,
   which is how a C++ object transparently replaces a TypeScript one.
+- **Bundled native system packages** (`native/<name>/` in the repo, shipped
+  as `resources/native` in the desktop app) use the same package format and
+  are ingested before user extensions on every boot, so they need no install
+  step; a user-installed extension with the same type name overrides the
+  bundled one. Rebuild them in place with `pnpm smelt`
+  (`forge --build-only`), which re-embeds the extracted manifest into the
+  package's `abject.json`.
 
 ## Package format (`.abject` directory)
 

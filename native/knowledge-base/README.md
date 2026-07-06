@@ -1,14 +1,18 @@
 # KnowledgeBase (C++/WASM)
 
 A native replacement for the TypeScript `KnowledgeBase` system object,
-written in C++ against `sdk/cpp` and compiled to WebAssembly. Installed as an
-extension with `replaces: "KnowledgeBase"`, it transparently takes over every
-workspace's knowledge store: the WorkspaceManager spawns `KnowledgeBase` by
-name as always, and the Factory resolves the name to this module.
+written in C++ against `sdk/cpp` and compiled to WebAssembly. It is a
+**bundled system package**: the committed `main.wasm` is ingested at every
+boot (with `replaces: "KnowledgeBase"`), so it transparently takes over
+every workspace's knowledge store: the WorkspaceManager spawns
+`KnowledgeBase` by name as always, and the Factory resolves the name to this
+module. The desktop app ships it under `resources/native`.
+
+After changing the sources, rebuild the committed module (requires the WASI
+SDK at `~/tools/wasi-sdk` or `$WASI_SDK`):
 
 ```bash
-pnpm forge examples/knowledge-base-cpp   # build + validate + install
-pnpm awaken                              # extensions load at boot
+pnpm smelt   # forge --build-only: recompile, validate, re-embed the manifest
 ```
 
 ## What it demonstrates

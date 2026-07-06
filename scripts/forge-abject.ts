@@ -2,7 +2,12 @@
  * forge-abject - compile, validate, and install a WASM abject package.
  *
  * Usage:
- *   pnpm forge <package-dir> [--dest <extensions-dir>] [--no-build]
+ *   pnpm forge <package-dir> [--dest <extensions-dir>] [--no-build] [--build-only]
+ *
+ * --build-only compiles and validates the package in place and embeds the
+ * extracted manifest into the package's own abject.json instead of
+ * installing it. Used for the bundled system packages under native/, which
+ * the server ingests directly (and the desktop app ships as resources).
  *
  * The package dir contains an `abject.json`:
  *   {
@@ -47,10 +52,11 @@ function fail(message: string): never {
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const noBuild = args.includes('--no-build');
+  const buildOnly = args.includes('--build-only');
   const destFlag = args.indexOf('--dest');
   const dest = destFlag >= 0 ? args[destFlag + 1] : extensionsDir();
   const pkgDirArg = args.find((a, i) => !a.startsWith('--') && (destFlag < 0 || i !== destFlag + 1));
-  if (!pkgDirArg) fail('usage: pnpm forge <package-dir> [--dest <extensions-dir>] [--no-build]');
+  if (!pkgDirArg) fail('usage: pnpm forge <package-dir> [--dest <extensions-dir>] [--no-build] [--build-only]');
 
   const pkgDir = path.resolve(pkgDirArg);
   const metaPath = path.join(pkgDir, 'abject.json');
@@ -103,7 +109,34 @@ async function main(): Promise<void> {
     );
   }
 
-  // 3. Install: module + metadata with embedded manifest
+  const kb = (bytes.byteLength / 1024).toFixed(0);
+
+  // 3a. Build-only: embed the manifest into the package's own abject.json
+  // (bundled native packages are ingested straight from their directory).
+  if (buildOnly) {
+    await fs.writeFile(
+      metaPath,
+      JSON.stringify(
+        {
+          name: meta.name,
+          version: meta.version,
+          abi,
+          wasm: wasmRel,
+          scope,
+          ...(meta.replaces ? { replaces: meta.replaces } : {}),
+          ...(meta.build ? { build: meta.build } : {}),
+          manifest,
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+    console.log(`forge: built '${meta.name}' v${meta.version} in place → ${wasmPath}`);
+    console.log(`forge:   type '${typeName}' (${scope}${meta.replaces ? `, replaces built-in ${meta.replaces}` : ''}), module ${kb} KiB, ${manifest.interface.methods.length} methods`);
+    return;
+  }
+
+  // 3b. Install: module + metadata with embedded manifest
   const installDir = path.join(dest, meta.name!);
   await fs.mkdir(installDir, { recursive: true });
   await fs.copyFile(wasmPath, path.join(installDir, 'main.wasm'));
@@ -124,7 +157,6 @@ async function main(): Promise<void> {
     ),
   );
 
-  const kb = (bytes.byteLength / 1024).toFixed(0);
   console.log(`forge: installed '${meta.name}' v${meta.version} → ${installDir}`);
   console.log(`forge:   type '${typeName}' (${scope}${meta.replaces ? `, replaces built-in ${meta.replaces}` : ''}), module ${kb} KiB, ${manifest.interface.methods.length} methods`);
   console.log('forge: restart the backend (pnpm awaken) to load it');

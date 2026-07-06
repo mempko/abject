@@ -142,9 +142,12 @@ Per-workspace objects are spawned automatically for every workspace by `Workspac
 
 Abjects can be written in any language that compiles to WebAssembly and run
 as first-class objects. The host/guest contract is `docs/WASM_ABI.md`; the
-C++ SDK is `sdk/cpp/` (see its README). Working examples: `examples/echo-cpp`
-(full ABI surface) and `examples/knowledge-base-cpp` (replaces the built-in
-KnowledgeBase).
+C++ SDK is `sdk/cpp/` (see its README). Working example: `examples/echo-cpp`
+(full ABI surface, user-loadable via forge). Bundled system packages live in
+`native/` (committed with their built `main.wasm`, ingested at every boot,
+shipped in the desktop app via extraResources); `native/knowledge-base`
+replaces the built-in KnowledgeBase. Rebuild bundled packages with
+`pnpm smelt` after changing their sources.
 
 1. Write the object against `sdk/cpp/include/abject/abject.hpp` (`Object`
    subclass + `ABJECT_OBJECT(Class)` in one translation unit)
