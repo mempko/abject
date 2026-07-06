@@ -1,13 +1,22 @@
-# pnpm settings. pnpm >= 10 reads dependency build-script approvals from
-# here; pnpm 11 stopped reading the package.json "pnpm" field entirely (that
-# field is kept for older pnpm versions and produces a harmless warning).
+# pnpm settings. Dependency build-script approvals are declared in both
+# formats: pnpm 11 reads allowBuilds (a name → boolean map) and removed the
+# older keys; pnpm 10 reads onlyBuiltDependencies/ignoredBuiltDependencies.
+# The package.json "pnpm" field is kept for pnpm <= 9.
 # No "packages" key: this is a single-package repo, not a multi-package
 # workspace (site/ has its own separate pnpm-workspace.yaml).
+
+# pnpm >= 11
+allowBuilds:
+  electron: true
+  esbuild: true
+  node-datachannel: true
+  # Windows-installer tooling; its build script is not needed on Linux/macOS
+  electron-winstaller: false
+
+# pnpm 10
 onlyBuiltDependencies:
   - electron
   - esbuild
   - node-datachannel
-# Windows-installer tooling; its build script is not needed on Linux/macOS.
-# Listed so pnpm 11 treats it as an explicit decision instead of erroring.
 ignoredBuiltDependencies:
   - electron-winstaller
