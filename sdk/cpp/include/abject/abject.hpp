@@ -428,7 +428,9 @@ inline const void* pack_result() {
   for (auto& env : r.out) arr.push_back(std::move(env));
   r.out.clear();
 
-  std::string body = arr.dump();
+  // error_handler_t::replace: invalid UTF-8 in payloads must never trap the
+  // module (dump() aborts on it in noexception mode otherwise).
+  std::string body = arr.dump(-1, ' ', false, json::error_handler_t::replace);
   r.result_storage.resize(4 + body.size());
   uint32_t len = static_cast<uint32_t>(body.size());
   std::memcpy(&r.result_storage[0], &len, 4);
@@ -439,7 +441,7 @@ inline const void* pack_result() {
 /// Pack an arbitrary JSON value (manifest/snapshot returns).
 inline const void* pack_json(const json& value) {
   auto& r = rt();
-  std::string body = value.dump();
+  std::string body = value.dump(-1, ' ', false, json::error_handler_t::replace);
   r.result_storage.resize(4 + body.size());
   uint32_t len = static_cast<uint32_t>(body.size());
   std::memcpy(&r.result_storage[0], &len, 4);

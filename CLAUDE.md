@@ -138,6 +138,30 @@ Per-workspace objects are spawned automatically for every workspace by `Workspac
 3. Set `providedCapabilities` in manifest, tag with `['capability', '<name>']`
 4. Follow existing patterns (see `http-client.ts` for domain allow/deny, `storage.ts` for IndexedDB)
 
+### New WASM Abject (other languages)
+
+Abjects can be written in any language that compiles to WebAssembly and run
+as first-class objects. The host/guest contract is `docs/WASM_ABI.md`; the
+C++ SDK is `sdk/cpp/` (see its README). Working examples: `examples/echo-cpp`
+(full ABI surface) and `examples/knowledge-base-cpp` (replaces the built-in
+KnowledgeBase).
+
+1. Write the object against `sdk/cpp/include/abject/abject.hpp` (`Object`
+   subclass + `ABJECT_OBJECT(Class)` in one translation unit)
+2. Add an `abject.json`: name, version, `abi: 1`, `scope` ('system' spawns
+   once at boot, 'workspace' spawns per workspace), optional
+   `replaces: '<BuiltinName>'` to take over a built-in type, and a `build`
+   command (usually `bash ../../sdk/cpp/build.sh <src> -o main.wasm`;
+   requires the WASI SDK, default `~/tools/wasi-sdk`, override with
+   `WASI_SDK`)
+3. `pnpm forge <dir>` compiles, validates the ABI, extracts the module's
+   manifest, and installs into `.abjects/extensions/`; the server ingests
+   extensions at boot
+4. No constructor registration is needed anywhere — WASM objects spawn
+   through the generic `WasmAbject` host (already registered on main +
+   worker) and are referenced by content hash (`wasm:sha256:...`) riding the
+   normal `source` field, so persistence/clone/respawn work unchanged
+
 ### New LLM Provider
 
 1. Create in `src/llm/`
