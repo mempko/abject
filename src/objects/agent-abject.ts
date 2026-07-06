@@ -17,7 +17,9 @@ import { Abject } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { requireDefined } from '../core/contracts.js';
 import type { JobResult } from './job-manager.js';
+import { PROFILE_TAG } from './knowledge-base.js';
 import type { ContentPart } from '../llm/provider.js';
+import { truncateText, conversationTextChars, enforceConversationCharBudget } from '../llm/provider.js';
 import type { EnabledSkillSummary } from '../core/skill-types.js';
 import { Log } from '../core/timed-log.js';
 
@@ -52,6 +54,10 @@ export interface AgentTaskState {
   error?: string;
   llmMessages: { role: string; content: string | ContentPart[] }[];
   timeout: number;
+  /** Rolling log of action signatures (action:target:method:errorClass) for loop detection. */
+  actionHistory?: string[];
+  /** Signatures already nudged about, so the loop-detection steer fires once per pattern. */
+  nudgedSignatures?: string[];
 }
 
 export interface AgentTaskOptions {
@@ -124,6 +130,12 @@ interface QueuedTask {
   dispatchTupleId?: string;
   callerId: AbjectId;
   enqueuedAt: number;
+  /**
+   * Opaque task-specific data forwarded to the agent's executeTask `data`
+   * field (e.g. ScrumMaster passes `{ target }` so an authoring agent works
+   * on a known existing object). AgentAbject does not interpret it.
+   */
+  data?: Record<string, unknown>;
 }
 
 interface TaskEntry {
@@ -150,6 +162,8 @@ interface TaskEntry {
   parseFailures?: number;
   /** Consecutive LLM streams that returned empty content. Reset on every non-empty response. */
   emptyResponses?: number;
+  /** Consecutive truncated terminal responses (cut off mid-generation). Reset on every complete response. */
+  truncationRetries?: number;
 }
 
 // ─── AgentAbject ─────────────────────────────────────────────────────
@@ -397,6 +411,7 @@ export class AgentAbject extends Abject {
                 { name: 'responseSchema', type: { kind: 'object', properties: {} }, description: 'JSON Schema for structured result', optional: true },
                 { name: 'goalId', type: { kind: 'primitive', primitive: 'string' }, description: 'Goal this task belongs to (for cancellation cascades and progress)', optional: true },
                 { name: 'dispatchTupleId', type: { kind: 'primitive', primitive: 'string' }, description: 'TupleSpace tuple ID — when set, AgentAbject calls completeTask/failTask on this tuple after the OTA loop terminates', optional: true },
+                { name: 'data', type: { kind: 'object', properties: {} }, description: 'Opaque task-specific data forwarded to the agent\'s executeTask `data` field (e.g. { target } naming a concrete object). AgentAbject does not interpret it.', optional: true },
               ],
               returns: { kind: 'object', properties: {
                 taskId: { kind: 'primitive', primitive: 'string' },
@@ -755,6 +770,7 @@ The registered object must implement these handlers to participate in the agent 
           agentId: agent.agentId,
           name: agent.name,
           description: agent.description,
+          canExecute: agent.canExecute,
           status: activeTasks > 0 ? 'busy' : 'idle',
           activeTasks,
         };
@@ -863,6 +879,7 @@ The registered object must implement these handlers to participate in the agent 
         goalId,
         dispatchTupleId,
         callerId: explicitCaller,
+        data,
       } = msg.payload as {
         agentId: AbjectId;
         task: string;
@@ -874,6 +891,7 @@ The registered object must implement these handlers to participate in the agent 
         goalId?: string;
         dispatchTupleId?: string;
         callerId?: AbjectId;
+        data?: Record<string, unknown>;
       };
       if (!targetAgentId) throw new Error('enqueueTask requires agentId');
       const agent = this.registeredAgents.get(targetAgentId);
@@ -898,6 +916,7 @@ The registered object must implement these handlers to participate in the agent 
         dispatchTupleId,
         callerId,
         enqueuedAt: Date.now(),
+        data,
       };
       q.pending.push(queued);
       const queuePosition = q.pending.length - 1 + (q.inFlight ? 1 : 0);
@@ -1475,6 +1494,7 @@ The registered object must implement these handlers to participate in the agent 
       config: queued.config,
       responseSchema: queued.responseSchema,
       dispatchTupleId: queued.dispatchTupleId ?? queued.taskId,
+      data: queued.data,
     }));
   }
 
@@ -1675,6 +1695,13 @@ The registered object must implement these handlers to participate in the agent 
             };
             this.emitActionResult(entry);
             log.info(`[${agentName}] Step ${task.step + 1} — action result: ${actResult.success ? 'success' : 'failed: ' + actResult.error}`);
+
+            // Loop detection: if the same action keeps producing the same result,
+            // repeating it won't help. Steer the LLM toward a different approach
+            // (or a clean `fail`) once per repeated pattern, so a misdiagnosis
+            // can't burn the whole step budget oscillating.
+            this.detectAndSteerOscillation(entry, agentName);
+
             task.step++;
 
             if (task.step >= task.maxSteps) {
@@ -1694,6 +1721,75 @@ The registered object must implement these handlers to participate in the agent 
         log.info(`[${agentName}] Task error at step ${task.step}: ${task.error}`);
       }
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Loop / oscillation detection
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Build a stable signature for the just-executed action + its outcome.
+   * Generic across every agent type: reads the common recipient/method-ish
+   * fields defensively and normalizes the error so transient ids/numbers
+   * (timeouts, UUIDs) don't make every repeat look unique.
+   */
+  private actionSignature(task: AgentTaskState): string {
+    const a = (task.action ?? {}) as Record<string, unknown>;
+    const name = String(a.action ?? 'unknown');
+    const target = String(a.target ?? a.targetName ?? a.objectId ?? a.assignedAgentName ?? '');
+    const method = String(a.method ?? a.kind ?? '');
+    // Subject distinguishes actions that operate on a named member/slice (e.g.
+    // read_draft / replace_handler / add_handler) so editing several different
+    // handlers in a row isn't mistaken for repeating one — a real loop repeats
+    // the SAME subject and still collapses to one signature.
+    const subject = String(a.handler ?? a.name ?? a.lineRange ?? a.grep ?? a.key ?? '');
+    let outcome: string;
+    if (task.lastResult?.success) {
+      outcome = 'ok';
+    } else {
+      outcome = String(task.lastResult?.error ?? 'err')
+        .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '<id>')
+        .replace(/\d+/g, '<n>')
+        .slice(0, 80);
+    }
+    return `${name}:${target}:${method}:${subject}:${outcome}`;
+  }
+
+  /**
+   * Record the action signature and, when the same action keeps producing the
+   * same result, inject a one-time steering message nudging the agent to change
+   * strategy or fail cleanly. Fires once per distinct repeated pattern.
+   */
+  private detectAndSteerOscillation(entry: TaskEntry, agentName: string): void {
+    const task = entry.state;
+    if (!task.action) return;
+    const sig = this.actionSignature(task);
+    const history = (task.actionHistory ??= []);
+    history.push(sig);
+    // Keep the window bounded — only recent behaviour matters for "stuck".
+    if (history.length > 12) history.shift();
+
+    const occurrences = history.filter(s => s === sig).length;
+    const failing = !task.lastResult?.success;
+    // 3rd identical failure, or 4th identical attempt regardless of outcome
+    // (re-doing the same successful step over and over is also a loop).
+    const stuck = (failing && occurrences >= 3) || occurrences >= 4;
+    if (!stuck) return;
+
+    const nudged = (task.nudgedSignatures ??= []);
+    if (nudged.includes(sig)) return;
+    nudged.push(sig);
+
+    log.info(`[${agentName}] Loop detected — same action repeated ${occurrences}x (${sig.slice(0, 60)}); steering`);
+    task.llmMessages.push({
+      role: 'user',
+      content:
+        `[Loop detected] You have repeated the same action with the same result ${occurrences} times ` +
+        `(action: ${String((task.action as Record<string, unknown>).action)}). Repeating it again will produce the same outcome. ` +
+        `Step back and change approach: re-read the latest error, and ask/describe the dependency it involves to learn the correct usage before retrying. ` +
+        `Fix the root cause the error names rather than re-attempting the identical step. ` +
+        `If the task is genuinely blocked, emit a \`fail\` action with a precise diagnosis: what is blocking you, what you tried, and what would unblock it.`,
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1808,55 +1904,14 @@ The registered object must implement these handlers to participate in the agent 
     code: string,
   ): Promise<AgentActionResult> {
     try {
-      // Prepend goal helper closures so job code can update goals
-      const goalPreamble = entry.goalId && this.goalManagerId
-        ? `const _goalId = '${entry.goalId}';
-           const _goalMgrId = '${this.goalManagerId}';
-           const getGoal = async () => call(_goalMgrId, 'getGoal', { goalId: _goalId });
-           const updateGoal = async (message, phase) => call(_goalMgrId, 'updateProgress', { goalId: _goalId, message, phase });
-           const completeGoal = async (result) => call(_goalMgrId, 'completeGoal', { goalId: _goalId, result });
-           const failGoal = async (error) => call(_goalMgrId, 'failGoal', { goalId: _goalId, error });
-           const addTask = async (description, data) => call(_goalMgrId, 'addTask', { goalId: _goalId, description, data });
-           const claimTask = async (type) => call(_goalMgrId, 'claimTask', { goalId: _goalId, type });
-           const completeTask = async (taskId, result) => call(_goalMgrId, 'completeTask', { taskId, result });
-           const failTask = async (taskId, error) => call(_goalMgrId, 'failTask', { taskId, error });
-           const getTasksForGoal = async (status) => call(_goalMgrId, 'getTasksForGoal', { goalId: _goalId, status });
-           const writeGoalData = async (key, value) => call(_goalMgrId, 'writeGoalData', { goalId: _goalId, key, value });
-           const readGoalData = async (key) => call(_goalMgrId, 'readGoalData', { goalId: _goalId, key });
-           const remember = async (title, content, type, tags) => {
-             const _kbId = await find('KnowledgeBase');
-             if (!_kbId) return null;
-             return call(_kbId, 'remember', { title, content, type: type ?? 'learned', tags: tags ?? [] });
-           };
-           const recall = async (query, type, tags) => {
-             const _kbId = await find('KnowledgeBase');
-             if (!_kbId) return [];
-             return call(_kbId, 'recall', { query, type, tags });
-           };
-          `
-        : `const getGoal = async () => null;
-           const updateGoal = async () => {};
-           const completeGoal = async () => {};
-           const failGoal = async () => {};
-           const addTask = async () => null;
-           const claimTask = async () => null;
-           const completeTask = async () => false;
-           const failTask = async () => false;
-           const getTasksForGoal = async () => [];
-           const writeGoalData = async () => false;
-           const readGoalData = async () => null;
-           const remember = async (title, content, type, tags) => {
-             const _kbId = await find('KnowledgeBase');
-             if (!_kbId) return null;
-             return call(_kbId, 'remember', { title, content, type: type ?? 'learned', tags: tags ?? [] });
-           };
-           const recall = async (query, type, tags) => {
-             const _kbId = await find('KnowledgeBase');
-             if (!_kbId) return [];
-             return call(_kbId, 'recall', { query, type, tags });
-           };
-          `;
-      const fullCode = goalPreamble + code;
+      // The OTA loop's job code is a fixed dispatch wrapper (call → agentObserve
+      // / _think / agentAct); it uses only `call`. Agents act through structured
+      // JSON actions handled in TS, and reach the goal/scratchpad by messaging
+      // GoalManager — they never author code that runs in this job scope. A goal
+      // helper preamble used to be prepended here, but nothing referenced it, so
+      // it has been removed. Goal access is documented in the system prompt as
+      // GoalManager methods reached via the agent's normal actions.
+      const fullCode = code;
 
       const jobMgrId = await this.resolveDep('JobManager', this.jobManagerId);
       const submitMsg = request(this.id, jobMgrId, 'submitJob', {
@@ -1889,6 +1944,20 @@ The registered object must implement these handlers to participate in the agent 
   // Think (LLM conversation management)
   // ═══════════════════════════════════════════════════════════════════
 
+  /**
+   * Resolve the model tier for the thinking (JSON-action-decision) step from
+   * the agent's last observe hint. The decision step never drops to 'fast':
+   * haiku unreliably emits the action envelope under load, so the floor is
+   * 'balanced'. An agent opts a routine state down to 'balanced' by returning
+   * tier:'balanced' (or 'fast') from agentObserve; any other hint — including
+   * none — keeps the default 'smart'. This is how per-state tiering reaches the
+   * OTA loop: cheap mechanical/verification steps run on balanced, hard ones
+   * (drafting code, diagnosing errors, planning) stay on smart.
+   */
+  private resolveThinkTier(hint?: string): 'smart' | 'balanced' {
+    return (hint === 'balanced' || hint === 'fast') ? 'balanced' : 'smart';
+  }
+
   private async think(entry: TaskEntry): Promise<AgentAction> {
     const task = entry.state;
 
@@ -1909,15 +1978,17 @@ The registered object must implement these handlers to participate in the agent 
     this.llmId = await this.resolveDep('LLM', this.llmId);
     // Use streaming — llmChunk events are forwarded to the ticket caller
     this.activeStreamEntry = entry;
-    let llmResult: { content: string };
+    let llmResult: { content: string; stopReason?: string };
     try {
-      llmResult = await this.request<{ content: string }>(
+      llmResult = await this.request<{ content: string; stopReason?: string }>(
         request(this.id, this.llmId, 'stream', {
           messages: task.llmMessages,
-          // Thinking is the JSON-action-decision step. Pin it to 'smart' so the
-          // model reliably emits the envelope instead of prose. The observe
-          // tier hint only applies to observation LLM calls, not thinking.
-          options: { tier: 'smart', maxTokens: 16384, cacheKey: entry.state.id },
+          // Thinking is the JSON-action-decision step. Tier comes from the
+          // agent's per-state observe hint, floored at 'balanced' (never 'fast'
+          // — haiku drops the action envelope under load). Routine/verification
+          // states run on balanced; hard states (code gen, error recovery,
+          // planning) stay on smart. Agents that send no hint stay on smart.
+          options: { tier: this.resolveThinkTier(entry.observeTier), maxTokens: 16384, cacheKey: entry.state.id },
         }),
         120000,
       );
@@ -1956,7 +2027,10 @@ The registered object must implement these handlers to participate in the agent 
     // Add assistant response
     task.llmMessages.push({ role: 'assistant', content: llmResult.content });
 
-    const parsed = this.parseAction(entry, llmResult.content);
+    // 'max_tokens'/'length' means the provider cut the response off
+    // mid-generation, so even a parseable action carries incomplete content.
+    const streamTruncated = llmResult.stopReason === 'max_tokens' || llmResult.stopReason === 'length';
+    const parsed = this.parseAction(entry, llmResult.content, streamTruncated);
     log.info(`[${agentName}] Step ${task.step + 1} — LLM action: ${parsed.action}${parsed.reasoning ? ' (' + parsed.reasoning.slice(0, 60) + ')' : ''}`);
     return parsed;
   }
@@ -2033,7 +2107,7 @@ The registered object must implement these handlers to participate in the agent 
       if (currentProduces.length > 0 || currentConsumes.length > 0) {
         ctx += `\n\n## Your Task's Contract`;
         if (currentProduces.length > 0) {
-          ctx += `\n\nThis task is expected to write the following scratchpad keys before reporting done. Use writeGoalData(goalId, key, value) for each one. Keep the \`done\` result as a short human-readable summary; downstream tasks will read the structured data from the scratchpad.`;
+          ctx += `\n\nThis task is expected to write the following scratchpad keys before reporting done. Write each one with GoalManager's writeGoalData method, invoked through your normal action — \`call("GoalManager", "writeGoalData", {goalId, key, value})\` — NOT a top-level \`writeGoalData\` action verb. Keep the \`done\` result as a short human-readable summary; downstream tasks will read the structured data from the scratchpad.`;
           for (const p of currentProduces) {
             ctx += `\n- **${p.key}**: ${p.description}`;
           }
@@ -2064,7 +2138,7 @@ The registered object must implement these handlers to participate in the agent 
             ctx += `\n\nConsumed keys not yet written: ${missing.join(', ')}. Earlier tasks should have produced these; if they are missing, the auto-mirror at tasks/<taskId>/result may hold the raw completion output as a fallback.`;
           }
         } else {
-          ctx += `\n\n## Shared Goal Data (scratchpad)\nOther agents working on this goal have shared the following data. Use writeGoalData(key, value) to add your own findings.\n\`\`\`json\n${JSON.stringify(scratchpad, null, 2)}\n\`\`\``;
+          ctx += `\n\n## Shared Goal Data (scratchpad)\nOther agents working on this goal have shared the following data. Add your own findings with \`call("GoalManager", "writeGoalData", {goalId, key, value})\` (a GoalManager method, not a top-level action verb).\n\`\`\`json\n${JSON.stringify(scratchpad, null, 2)}\n\`\`\``;
         }
       }
 
@@ -2094,26 +2168,58 @@ The registered object must implement these handlers to participate in the agent 
       prompt += await this.buildGoalProgressContext(entry.goalId, entry.dispatchTupleId);
     }
 
-    // Inject relevant knowledge from KnowledgeBase
+    // Inject relevant knowledge from KnowledgeBase in two passes:
+    //   1. Durable user-profile facts (PROFILE_TAG), always included regardless
+    //      of the task wording, so stable knowledge about the user (home
+    //      location, name, preferences) is present even when the task shares no
+    //      keywords with it — keyword recall alone would rank it out of the top
+    //      results and the agent would re-ask for something it already knows.
+    //   2. The top entries whose text matches this task.
+    // A profile fact that also matches the query is not repeated.
     try {
       const knowledgeBaseId = await this.discoverDep('KnowledgeBase');
       if (knowledgeBaseId) {
-        const entries = await this.request<Array<{ title: string; type: string; content: string }> | null>(
-          request(this.id, knowledgeBaseId, 'recall', {
-            query: entry.state.task,
-            limit: 5,
-          }),
-          5000,
-        );
-        if (entries && entries.length > 0) {
+        type KEntry = { title: string; type: string; content: string };
+        const [profile, matched] = await Promise.all([
+          this.request<KEntry[] | null>(
+            request(this.id, knowledgeBaseId, 'recall', { tags: [PROFILE_TAG], limit: 10 }),
+            5000,
+          ).catch(() => null),
+          this.request<KEntry[] | null>(
+            request(this.id, knowledgeBaseId, 'recall', { query: entry.state.task, limit: 5 }),
+            5000,
+          ).catch(() => null),
+        ]);
+
+        if (profile && profile.length > 0) {
+          let block = '\n\n## About the User\nDurable facts about the user. Apply them without asking the user to repeat them.\n';
+          for (const e of profile) {
+            block += `- **${e.title}**: ${e.content.slice(0, 2000)}\n`;
+          }
+          prompt += block;
+        }
+
+        const profileTitles = new Set((profile ?? []).map(e => e.title));
+        const relevant = (matched ?? []).filter(e => !profileTitles.has(e.title));
+        if (relevant.length > 0) {
           let kb = '\n\n## Relevant Knowledge\nPrevious agents have learned the following. Use remember(title, content, type, tags) to save new insights.\n';
-          for (const e of entries) {
+          for (const e of relevant) {
             kb += `- **${e.title}** (${e.type}): ${e.content.slice(0, 2000)}\n`;
           }
           prompt += kb;
         }
       }
     } catch { /* best effort */ }
+
+    // Always-present guidance on how object identity works. Agents reference
+    // objects constantly (in goals, scratchpad, calls, and saved knowledge);
+    // they need to know which handle survives a restart and which does not.
+    prompt += `\n\n## Object identity
+Every Abject has two kinds of handle:
+- Its **registered name** (e.g. "GraphViewer") and its **typeId** are DURABLE — they persist across restarts and always point at the live object.
+- Its **AbjectId** (a UUID like \`adac6cc1-...\`) is EPHEMERAL — objects are re-spawned with a fresh AbjectId every time they are restored on restart, so a UUID copied from an earlier goal, scratchpad, or saved memory is usually stale and resolves to nothing.
+
+Reference objects by their registered name wherever possible — name-based calls and lookups always reach the live object. When you write a goal, hand off a target, or save a fact about an object, use its name (and typeId if you have one), not its UUID.`;
 
     // Always-present guidance on memory tools
     prompt += `\n\n## Memory Tools
@@ -2125,20 +2231,26 @@ You can emit a remember action to save knowledge for future tasks:
 \`\`\`
 Types: 'learned' (lessons from outcomes), 'fact' (discovered facts), 'insight' (analysis), 'reference' (pointers)
 When to remember (durable knowledge for future unrelated tasks):
-- User preferences or personal facts they share (location, name, job, etc.)
+- User preferences or personal facts they share (location, name, job, etc.) — tag these with "profile" so they are always available in future tasks, even ones whose wording does not mention them
 - Stable system architecture insights or validated patterns
 - Useful API details or capabilities that are unlikely to change
 Ephemeral problems (runtime errors, connection failures, config issues, workarounds being tried) belong in the goal scratchpad, not the knowledge base. They are relevant to the current goal only.
-After remembering, you will be prompted to continue with the task.`;
+After remembering, you will be prompted to continue with the task.
+
+Looking things up mid-task: the KnowledgeBase offers three lookup modes. Use 'recall' with previews: true for keyword search (results carry an id, title, and snippet), 'match' with a pattern for exact identifiers and names, and 'get' with an id to fetch one full entry. Scan previews first, refine your query terms when results are thin, and fetch full entries only for the results you will actually use.`;
 
     if (entry.goalId) {
       prompt += `
 
-**Goal Scratchpad** (shared with agents working on this same goal):
-- \`writeGoalData(key, value)\` -- save intermediate findings for other agents in this goal
-- \`readGoalData(key)\` -- read data another agent saved to this goal
-- Use for: partial results, specs, errors encountered, debugging context, data one agent discovers that another needs
-- Prefer scratchpad over remember for anything tied to the current task`;
+## Goal context
+This task belongs to a goal whose id is \`${entry.goalId}\` — you never need to look it up, scan \`listGoals\`, or guess a goalId; use this one. GoalManager owns the goal and a scratchpad shared by every agent working on it. You reach GoalManager the same way you reach any object: through your normal action vocabulary (for most agents that is a \`call\` action targeting "GoalManager"; some agents also expose a dedicated scratchpad action). These are GoalManager METHODS — invoke them through your actions, they are not free-standing functions you call directly. Each takes the goalId above:
+- \`getGoal({goalId})\` / \`getTasksForGoal({goalId, status})\` -- read the goal and its tasks
+- \`updateProgress({goalId, message, phase})\` -- report progress
+- \`writeGoalData({goalId, key, value})\` / \`readGoalData({goalId, key})\` -- the shared scratchpad
+
+**Goal scratchpad** (shared with the other agents on this goal): write intermediate findings, specs, and errors here so collaborators can read them, and fulfill each of your task's declared \`produces\` keys by writing it to the scratchpad (\`writeGoalData\`). Read \`consumes\` data the same way (\`readGoalData\`). Prefer the scratchpad over \`remember\` for anything tied to the current task.
+
+**Finishing your work:** end your loop with your terminal \`done\` (or \`fail\`) action describing what YOUR task accomplished. That is the whole report — the system records your task's outcome from it. Deciding whether the overall GOAL is then complete, needs more tasks, or has failed belongs to the scrum process, which reviews each round's outcomes and scratchpad and chooses to add tasks, complete, or fail the goal. So focus on your task and report it cleanly. (Calling GoalManager's \`completeGoal\` / \`failGoal\` / \`addTask\` yourself is only for the separate case where you own a goal end-to-end with no scrum running it; reserve them for that.)`;
     }
 
     if (prompt) {
@@ -2186,9 +2298,16 @@ After remembering, you will be prompted to continue with the task.`;
       return;
     }
 
+    // Cap at ingestion — a single fat observation (a Registry dump, a
+    // scraped page, a scratchpad readback) must never ride into the prompt
+    // whole. Action results get the same treatment in
+    // addActionResultToConversation; the budget enforcer in trimConversation
+    // is the backstop for everything else.
+    const observation = truncateText(task.observation, AgentAbject.MAX_OBSERVATION_CHARS);
+
     task.llmMessages.push({
       role: 'user',
-      content: `[Step ${task.step + 1}/${task.maxSteps}]${urgency}\n${task.observation}`,
+      content: `[Step ${task.step + 1}/${task.maxSteps}]${urgency}\n${observation}`,
     });
   }
 
@@ -2225,20 +2344,12 @@ After remembering, you will be prompted to continue with the task.`;
   /** How many recent messages to keep verbatim after compression. Covers the
    *  current observation, the current action, and the prior action cycle. */
   private static readonly KEEP_RECENT_MESSAGES = 4;
-
-  private conversationChars(msgs: { content: string | ContentPart[] }[]): number {
-    let total = 0;
-    for (const m of msgs) {
-      if (typeof m.content === 'string') {
-        total += m.content.length;
-      } else {
-        for (const part of m.content) {
-          if ('text' in part && typeof part.text === 'string') total += part.text.length;
-        }
-      }
-    }
-    return total;
-  }
+  /** Per-observation cap applied at ingestion (head+tail slice). */
+  private static readonly MAX_OBSERVATION_CHARS = 60000;
+  /** Floor below which the budget enforcer stops shrinking a message. With
+   *  maxConversationMessages=32, 32 × 4k = 128k < MAX_CONVERSATION_CHARS, so
+   *  enforcement always converges. */
+  private static readonly TRUNCATION_FLOOR_CHARS = 4000;
 
   private async trimConversation(entry: TaskEntry): Promise<void> {
     const task = entry.state;
@@ -2252,91 +2363,56 @@ After remembering, you will be prompted to continue with the task.`;
       task.llmMessages = [...pinned, ...recent];
     }
 
-    // 2. Byte cap — only kick in if a single fat observation (e.g. an
-    //    accidental Registry.list dump) blew past the budget. Compress the
-    //    middle block with a fast LLM pass and replace it with a summary.
-    if (this.conversationChars(task.llmMessages) <= AgentAbject.MAX_CONVERSATION_CHARS) {
+    // 2. Byte cap — only kick in if the conversation blew past the budget
+    //    (e.g. an accidental Registry.list dump). Delegate to the LLM
+    //    object's `compress` method: it split-distills oversized messages
+    //    with the fast tier, summarizes the middle block, and falls back to
+    //    deterministic truncation internally.
+    if (conversationTextChars(task.llmMessages) <= AgentAbject.MAX_CONVERSATION_CHARS) {
       return;
     }
-
-    const keepRecent = AgentAbject.KEEP_RECENT_MESSAGES;
-    const middleEnd = Math.max(pinnedCount, task.llmMessages.length - keepRecent);
-    if (middleEnd <= pinnedCount) {
-      // Nothing compressible (pinned + recent already fill the budget). Fall
-      // back to hard-truncating the oldest non-pinned message to fit.
-      if (task.llmMessages.length > pinnedCount) {
-        const victim = task.llmMessages[pinnedCount];
-        if (typeof victim.content === 'string') {
-          victim.content = `[Earlier message truncated to fit context budget] ${victim.content.slice(0, 4000)}`;
-        }
-      }
-      return;
-    }
-
-    const pinned = task.llmMessages.slice(0, pinnedCount);
-    const middle = task.llmMessages.slice(pinnedCount, middleEnd);
-    const recent = task.llmMessages.slice(middleEnd);
 
     try {
-      const summary = await this.compressMiddle(middle, entry.state.task);
-      task.llmMessages = [
-        ...pinned,
-        { role: 'user', content: `[Earlier context — distilled by fast-tier compressor]\n${summary}` },
-        ...recent,
-      ];
+      this.llmId = await this.resolveDep('LLM', this.llmId);
+      const result = await this.request<{ messages: typeof task.llmMessages; originalChars: number; compressedChars: number; methods: string[] }>(
+        request(this.id, this.llmId, 'compress', {
+          messages: task.llmMessages,
+          options: {
+            targetChars: AgentAbject.MAX_CONVERSATION_CHARS,
+            pinnedCount,
+            keepRecent: AgentAbject.KEEP_RECENT_MESSAGES,
+            taskHint: entry.state.task,
+          },
+        }),
+        120000,
+      );
+      task.llmMessages = result.messages;
+      log.info(`trimConversation: compressed ${result.originalChars} → ${result.compressedChars} chars (${result.methods.join('+')})`);
     } catch (err) {
-      // Compressor failed — fall back to dropping the middle entirely so we
-      // at least stay under the API limit. Losing raw history beats a 400.
-      log.warn(`trimConversation: compression failed (${err instanceof Error ? err.message : String(err)}) — dropping middle block`);
-      task.llmMessages = [
-        ...pinned,
-        { role: 'user', content: `[Earlier context dropped: ${middle.length} messages elided to fit context budget]` },
-        ...recent,
-      ];
+      // Compression unavailable (LLM gone, timeout) — losing raw history
+      // beats a 400. Drop the middle block, then enforce the budget locally.
+      log.warn(`trimConversation: compress failed (${err instanceof Error ? err.message : String(err)}) — falling back to local truncation`);
+      const keepRecent = AgentAbject.KEEP_RECENT_MESSAGES;
+      const middleEnd = Math.max(pinnedCount, task.llmMessages.length - keepRecent);
+      if (middleEnd > pinnedCount) {
+        const dropped = middleEnd - pinnedCount;
+        task.llmMessages = [
+          ...task.llmMessages.slice(0, pinnedCount),
+          { role: 'user', content: `[Earlier context dropped: ${dropped} messages elided to fit context budget]` },
+          ...task.llmMessages.slice(middleEnd),
+        ];
+      }
     }
-  }
 
-  /**
-   * Fast-tier LLM pass that distills an arbitrary middle block of the
-   * agent's conversation into a compact summary. The summary is injected
-   * back as a single synthetic user message so the agent can keep working
-   * with the key findings, errors, and partial results intact.
-   */
-  private async compressMiddle(
-    middle: { role: string; content: string | ContentPart[] }[],
-    taskDescription: string,
-  ): Promise<string> {
-    const serialized = middle.map((m, i) => {
-      const text = typeof m.content === 'string'
-        ? m.content
-        : m.content.map((p) => ('text' in p && typeof p.text === 'string' ? p.text : '[non-text part]')).join('\n');
-      return `---- message ${i + 1} (${m.role}) ----\n${text}`;
-    }).join('\n\n');
-
-    const systemPrompt = `You are compressing the middle of an agent's working conversation so the agent can keep going without losing its progress. Distil the messages below into a tight, factual summary (target: under 2000 chars). Include every one of:
-- findings and discovered facts (IDs, names, states, values)
-- actions attempted and their outcomes (what succeeded, what failed, error messages)
-- partial results that later steps will need
-- decisions made and rejected options
-- blockers and what is still unknown
-Omit: duplicated schema dumps, long method catalogs, step numbers, decorative headers. Write in neutral prose with bullet points — this is context, not a narrative.`;
-
-    const userPrompt = `Agent task: "${taskDescription.slice(0, 400)}"\n\nMessages to distil (${middle.length} total):\n\n${serialized}`;
-
-    this.llmId = await this.resolveDep('LLM', this.llmId);
-    const result = await this.request<{ content: string }>(
-      request(this.id, this.llmId, 'complete', {
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        options: { tier: 'fast', maxTokens: 2048 },
-      }),
-      30000,
+    // 3. Budget guarantee, no matter which path ran above. Deterministically
+    //    shrink the largest messages, wherever they sit (a fat system prompt
+    //    or a fat message in the keep-recent window is exactly how a
+    //    3.1M-char prompt once reached the API as a 400).
+    enforceConversationCharBudget(
+      task.llmMessages,
+      AgentAbject.MAX_CONVERSATION_CHARS,
+      AgentAbject.TRUNCATION_FLOOR_CHARS,
     );
-    const summary = result.content?.trim();
-    if (!summary) throw new Error('empty summary');
-    return summary;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -2347,6 +2423,42 @@ Omit: duplicated schema dumps, long method catalogs, step numbers, decorative he
   private static readonly MAX_PARSE_FAILURES = 2;
   /** Maximum consecutive empty LLM responses before we force a terminal fail. */
   private static readonly MAX_EMPTY_RESPONSES = 3;
+
+  /** Maximum re-emit attempts for a terminal action cut off mid-generation. */
+  private static readonly MAX_TRUNCATION_RETRIES = 1;
+
+  /**
+   * Handle a terminal action recovered from a truncated (cut-off) response.
+   * Returns a `_reparse` sentinel to request a complete re-emit, or null to
+   * proceed with the action. On the final attempt the partial content is kept
+   * (so the user sees something) but marked as cut off rather than passed off
+   * as a complete reply. Non-terminal actions are left to fail/observe normally.
+   */
+  private handleTruncatedAction(entry: TaskEntry, parsed: AgentAction): AgentAction | null {
+    const terminal = entry.config.terminalActions[parsed.action];
+    if (!terminal) return null;
+
+    entry.truncationRetries = (entry.truncationRetries ?? 0) + 1;
+    if (entry.truncationRetries <= AgentAbject.MAX_TRUNCATION_RETRIES) {
+      entry.state.llmMessages.push({
+        role: 'user',
+        content: `[Error] Your "${parsed.action}" response was cut off mid-generation (the output ended incompletely or hit the length limit). Re-emit the COMPLETE action as a single \`\`\`json block. If the content is long, make it more concise so it finishes within the limit rather than getting truncated again.`,
+      });
+      return { action: '_reparse', reasoning: `Retrying truncated "${parsed.action}" terminal (attempt ${entry.truncationRetries}/${AgentAbject.MAX_TRUNCATION_RETRIES})` };
+    }
+
+    // Retries exhausted: ship the partial content rather than nothing, but mark
+    // it so a cut-off reply is never mistaken for a complete one.
+    for (const field of (terminal.resultFields ?? [])) {
+      const val = parsed[field];
+      if (typeof val === 'string' && val.trim().length > 0) {
+        parsed[field] = `${val}\n\n_(Response was cut off.)_`;
+        break;
+      }
+    }
+    entry.truncationRetries = 0;
+    return null;
+  }
 
   /**
    * Returns null if the parsed action has acceptable content, or a `_reparse`
@@ -2398,24 +2510,54 @@ Omit: duplicated schema dumps, long method catalogs, step numbers, decorative he
     return { action: '_reparse_abort', reasoning: reason };
   }
 
-  private parseAction(entry: TaskEntry, content: string): AgentAction {
+  private parseAction(entry: TaskEntry, content: string, streamTruncated = false): AgentAction {
     // Extract a parsed action from the content (try several wrapper shapes).
+    // `repaired` is set when the action was salvaged from incomplete JSON
+    // (suffix-closing or regex extraction) — a strong truncation signal even
+    // when the provider didn't report stop_reason.
     let parsed: AgentAction | null = null;
-    const jsonMatch = content.match(/```json\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      parsed = this.tryParseActionJson(jsonMatch[1].trim());
+    let repaired = false;
+    const take = (r: { action: AgentAction; repaired: boolean } | null) => {
+      if (r && !parsed) { parsed = r.action; repaired = r.repaired; }
+    };
+
+    // 1. String-aware balanced-brace extraction — the robust primary path.
+    //    Handles action JSON whose string values contain ``` code fences or
+    //    `{`/`}` characters, which the lazy ```json fence regex below would
+    //    mis-cut at the first inner fence (turning a complete reply into a
+    //    truncated one). Skipped strings/escapes mean inner fences and braces
+    //    don't confuse the scan.
+    const balanced = this.extractBalancedJson(content);
+    if (balanced) take(this.tryParseActionJson(balanced));
+
+    // 2. Fenced ```json block (lazy — fine once balanced extraction has had
+    //    first refusal, used mainly when there is no balanced object to find).
+    if (!parsed) {
+      const jsonMatch = content.match(/```json\s*([\s\S]*?)```/);
+      if (jsonMatch) take(this.tryParseActionJson(jsonMatch[1].trim()));
     }
+    // 3. Unclosed ```json fence (genuinely truncated mid-block).
     if (!parsed) {
       const unclosedMatch = content.match(/```json\s*([\s\S]*)/);
-      if (unclosedMatch && !jsonMatch) {
-        parsed = this.tryParseActionJson(unclosedMatch[1].trim());
-      }
+      if (unclosedMatch) take(this.tryParseActionJson(unclosedMatch[1].trim()));
     }
+    // 4. Whole content as a last resort.
     if (!parsed) {
-      parsed = this.tryParseActionJson(content);
+      take(this.tryParseActionJson(content));
     }
 
     if (parsed) {
+      // A terminal action salvaged from a cut-off stream carries incomplete
+      // text/result. Re-prompt for a complete re-emit (then fall back to the
+      // partial with a visible marker) BEFORE the empty-content check, so a
+      // half-message is never silently promoted to a successful reply.
+      if (streamTruncated || repaired) {
+        const truncatedHandling = this.handleTruncatedAction(entry, parsed);
+        if (truncatedHandling) return truncatedHandling;
+      } else {
+        entry.truncationRetries = 0;
+      }
+
       // Reject terminal actions that arrive with all required fields missing
       // or empty. Without this, the framework happily promotes e.g.
       // `{"action": "clarify"}` to a success terminal, but downstream renders
@@ -2458,19 +2600,52 @@ Omit: duplicated schema dumps, long method catalogs, step numbers, decorative he
     return { action: '_reparse_abort', reasoning: reason };
   }
 
-  private tryParseActionJson(raw: string): AgentAction | null {
+  /**
+   * Extract the first complete, brace-balanced JSON object from `content`,
+   * scanning string literals so that `{`, `}`, and ``` code fences appearing
+   * inside string values (e.g. a markdown answer in a "text" field) do not
+   * terminate the object early. Returns the object substring, or null if no
+   * `{` is found or the braces never balance (a genuinely truncated object,
+   * which the caller's later fallbacks handle).
+   */
+  private extractBalancedJson(content: string): string | null {
+    const start = content.indexOf('{');
+    if (start === -1) return null;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < content.length; i++) {
+      const ch = content[i];
+      if (escaped) { escaped = false; continue; }
+      if (inString) {
+        if (ch === '\\') escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) return content.slice(start, i + 1);
+      }
+    }
+    return null;
+  }
+
+  private tryParseActionJson(raw: string): { action: AgentAction; repaired: boolean } | null {
     try {
       const parsed = JSON.parse(raw);
       if (typeof parsed.action === 'string') {
-        return parsed as AgentAction;
+        return { action: parsed as AgentAction, repaired: false };
       }
     } catch {
-      // Try repairing truncated JSON
+      // Try repairing truncated JSON — these salvage paths mean the original
+      // content was incomplete, which the caller treats as a truncation signal.
       const suffixes = ['"}', '"}]', '}}', '}'];
       for (const suffix of suffixes) {
         try {
           const repaired = JSON.parse(raw + suffix);
-          if (typeof repaired.action === 'string') return repaired as AgentAction;
+          if (typeof repaired.action === 'string') return { action: repaired as AgentAction, repaired: true };
         } catch { /* try next */ }
       }
 
@@ -2482,7 +2657,7 @@ Omit: duplicated schema dumps, long method catalogs, step numbers, decorative he
         if (textMatch) action.text = textMatch[1].replace(/\\"/g, '"');
         const resultMatch = raw.match(/"result"\s*:\s*"((?:[^"\\]|\\.)*)"/);
         if (resultMatch) action.result = resultMatch[1].replace(/\\"/g, '"');
-        return action;
+        return { action, repaired: true };
       }
     }
     return null;

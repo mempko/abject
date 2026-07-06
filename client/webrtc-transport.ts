@@ -33,6 +33,7 @@ export class WebRTCClientTransport implements ClientTransport {
   private identity?: BrowserIdentity;
   private signaling?: SignalingClient;
   private peer?: PeerTransport;
+  private iceServers?: RTCIceServer[];
 
   private msgHandler?: (data: string) => void;
   private openHandler?: () => void;
@@ -125,8 +126,16 @@ export class WebRTCClientTransport implements ClientTransport {
           this.identity!.publicSigningKeyJwk,
           this.identity!.publicExchangeKeyJwk,
           'remote-ui-client');
-        // Once registered, initiate the SDP offer immediately.
-        void this.initiatePeerHandshake(remote);
+        // Fetch ICE servers (STUN + TURN relay creds) from the signaling
+        // server, then initiate the SDP offer. TURN lets the DataChannel
+        // form even on symmetric-NAT cell networks where direct fails.
+        void (async () => {
+          try {
+            const servers = await signaling.requestIceServers();
+            if (servers.length > 0) this.iceServers = servers;
+          } catch { /* fall back to default STUN */ }
+          await this.initiatePeerHandshake(remote);
+        })();
       },
       onSdpAnswer: (fromPeerId, sdp) => {
         if (fromPeerId === remote.peerId && this.peer) {
@@ -161,6 +170,7 @@ export class WebRTCClientTransport implements ClientTransport {
       localPublicSigningKey: this.identity.publicSigningKeyJwk,
       localPublicExchangeKey: this.identity.publicExchangeKeyJwk,
       localExchangePrivateKey: this.identity.exchangeKeyPair.privateKey,
+      iceServers: this.iceServers,
     });
     this.peer = peer;
 

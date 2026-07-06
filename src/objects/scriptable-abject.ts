@@ -287,6 +287,56 @@ export class ScriptableAbject extends Abject {
       }
     });
 
+    // Prototype replication across peers: return everything needed to grow an
+    // independent copy of this object elsewhere (manifest + source + optional
+    // data), signed by this peer's identity so the copy carries verifiable
+    // provenance. Reachability is the access gate: a remote caller can only
+    // send this message if the workspace's share mode and whitelist already
+    // admit it, so replicate answers whoever can already talk to the object.
+    // The receiving side spawns the payload locally via its own Factory
+    // (spawn with { manifest, source, data }).
+    this.on('replicate', async (msg: AbjectMessage) => {
+      const { withData } = (msg.payload ?? {}) as { withData?: boolean };
+      let data: Record<string, unknown> | undefined;
+      if (withData !== false) {
+        try {
+          data = JSON.parse(JSON.stringify(this._data));
+        } catch {
+          data = {};
+        }
+      }
+      const manifest = {
+        ...this.manifest,
+        lineage: {
+          clonedFrom: (this.typeId as string | undefined) ?? (this.id as string),
+          generation: (this.manifest.lineage?.generation ?? 0) + 1,
+        },
+      };
+
+      // Provenance signature: hash of name+version+source, signed by this
+      // peer's identity. Absent identity, the payload replicates unsigned.
+      let origin: { peerId?: string; signature?: string; signedAt: number } = {
+        signedAt: Date.now(),
+      };
+      try {
+        const identityId = await this.discoverDep('Identity');
+        if (identityId) {
+          const digestSrc = new TextEncoder().encode(
+            `${manifest.name}@${manifest.version}\n${this._source}`);
+          const digestBuf = await crypto.subtle.digest('SHA-256', digestSrc as BufferSource);
+          const digest = Array.from(new Uint8Array(digestBuf))
+            .map(b => b.toString(16).padStart(2, '0')).join('');
+          const signature = await this.request<string>(
+            request(this.id, identityId, 'sign', { data: digest }));
+          const identity = await this.request<{ peerId?: string }>(
+            request(this.id, identityId, 'getIdentity', {}));
+          origin = { peerId: identity?.peerId, signature, signedAt: Date.now() };
+        }
+      } catch { /* identity unavailable; replicate unsigned */ }
+
+      return { manifest, source: this._source, data, origin };
+    });
+
     this.on('probe', async () => {
       // Extract dep('...') and find('...') references from source
       // Match both this.dep() and bare dep() forms
@@ -466,8 +516,16 @@ export class ScriptableAbject extends Abject {
    * User code cannot override these; they are silently skipped during compile.
    * ObjectCreator imports this set to exclude them from verification and LLM prompts.
    */
+  // NOTE: windowCloseRequested is deliberately NOT protected. It is the one
+  // window-lifecycle callback user objects are meant to handle (e.g. a
+  // multi-window object closing only the window whose X was clicked). The bus
+  // keeps one handler per method, and installDefaultCloseHandler() already
+  // installs a default (→ hide()) ONLY when the object defines no override. If
+  // it were protected, the user's handler would be silently dropped and the
+  // default would fire for every window the object owns — closing the wrong
+  // window (e.g. a manager's main window when an editor's X is clicked).
   static readonly PROTECTED_HANDLERS = new Set([
-    'getSource', 'getData', 'updateSource', 'probe', 'windowCloseRequested',
+    'getSource', 'getData', 'updateSource', 'probe',
     'describe', 'ask', 'getRegistry',
     'ping', 'addDependent', 'removeDependent',
   ]);
@@ -475,7 +533,7 @@ export class ScriptableAbject extends Abject {
   /** Keys on the this-proxy that must not be overwritten by user handler code. */
   private static readonly PROXY_BUILTINS = new Set([
     'call', 'dep', 'find', 'changed', 'emit', 'observe', 'id',
-    'data', 'saveData',
+    'data', 'saveData', 'ensure', 'invariant',
   ]);
 
   /**
@@ -524,6 +582,18 @@ export class ScriptableAbject extends Abject {
 
     const saveDataFn = async (): Promise<void> => self.saveData();
 
+    // Design-by-Contract helpers for handler code. The sandbox forbids the
+    // `require(` token, so preconditions and postconditions both use `ensure`;
+    // `invariant` is for object-state invariants (call from _checkInvariants()
+    // after a mutation). Both throw a clear ContractViolation when the
+    // condition is false, surfacing in the caller's reply / the object logs.
+    const ensureFn = (cond: unknown, message?: string): void => {
+      if (!cond) throw new Error(`ContractViolation (ensure): ${message ?? 'condition failed'}`);
+    };
+    const invariantFn = (cond: unknown, message?: string): void => {
+      if (!cond) throw new Error(`ContractViolation (invariant): ${message ?? 'invariant failed'}`);
+    };
+
     const proxy: Record<string, unknown> = {
       call: callFn,
       dep: depFn,
@@ -532,6 +602,8 @@ export class ScriptableAbject extends Abject {
       emit: emitFn,
       observe: observeFn,
       saveData: saveDataFn,
+      ensure: ensureFn,
+      invariant: invariantFn,
     };
     // `id` must read live from the Abject so handler code that captures
     // `this.id` (e.g. `inputTargetId: this.id` on createCanvas) sees the

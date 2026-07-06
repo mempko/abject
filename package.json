@@ -1,6 +1,6 @@
 {
   "name": "abjects",
-  "version": "0.4.14",
+  "version": "0.7.11",
   "description": "LLM-Mediated Object System",
   "author": {
     "name": "mempko",
@@ -18,6 +18,8 @@
     "scry2": "VITE_WS_PORT=7721 VITE_CLIENT_PORT=5175 vite --config vite.client.config.ts",
     "awaken3": "ABJECTS_DATA_DIR=.abjects3 WS_PORT=7722 tsx --watch server/index.ts",
     "scry3": "VITE_WS_PORT=7722 VITE_CLIENT_PORT=5176 vite --config vite.client.config.ts",
+    "forge": "tsx scripts/forge-abject.ts",
+    "smelt": "tsx scripts/forge-abject.ts native/knowledge-base --build-only",
     "asc": "asc",
     "hack": "tsx hack/security-audit.ts",
     "bind": "node build-server.mjs",
@@ -31,6 +33,7 @@
     "release": "node release.mjs"
   },
   "dependencies": {
+    "acorn": "^8.17.0",
     "ajv": "^8.12.0",
     "fflate": "^0.8.2",
     "jsqr": "^1.4.0",

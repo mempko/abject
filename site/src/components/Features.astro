@@ -5,21 +5,21 @@ const features = [
     abjects: 'ObjectCreator · Chat',
     title: 'Speak it into existence.',
     hook: '"A todo list that syncs my calendar." Type those words. A window appears.',
-    desc: 'Chat decomposes your sentence. The LLM writes a manifest. ObjectCreator spawns the abject. The result is a real running object with its own window, its own mailbox, and source code you can open and read.',
+    desc: 'You describe. The system interviews the objects that already exist, writes a new one, and gives it a window, a mailbox, and a voice. Not a chat answer that scrolls away: a real running object with source code you can open and read. It was born knowing its neighbors.',
   },
   {
     icon: '{@}',
     abjects: 'IdentityObject · PeerRegistry',
     title: 'Your address is a public key.',
     hook: 'No accounts. No signup. No cloud asking for your email.',
-    desc: "Every peer's true name is the SHA-256 hash of its ECDSA P-256 key. Connect over encrypted WebRTC with ECDH key exchange and AES-256-GCM. The signaling server only helps two peers find each other; it never sees a byte of the conversation.",
+    desc: 'Your machine\'s true name is a cryptographic key it generated itself. Nobody issued it, so nobody can revoke it. Sharing with a friend is like handing them a key, not giving a landlord a copy: every message is sealed end to end, and the relay that introduces you never sees a byte of the conversation.',
   },
   {
     icon: '{=}',
     abjects: 'ScrumMaster · GoalManager · TupleSpace',
     title: 'Post a goal. Watch the swarm converge.',
     hook: 'No dispatcher. No queue. No central state holder.',
-    desc: 'The goal lives in a TupleSpace synced across peers via CRDT. Abjects answer "what can you do?" through the Ask Protocol; the ScrumMaster picks the best fit each round. Work distributes itself across machines without ever talking to a server.',
+    desc: 'A goal is a job board, not a to-do list. It is posted where every abject on every connected machine can see it. Whoever can do the work claims a piece; a planner reviews each round and redraws the plan around what actually happened. No server ever holds the strings.',
   },
   {
     icon: '{!}',
@@ -40,7 +40,7 @@ const features = [
     abjects: 'KnowledgeBase',
     title: 'What one abject learns, every abject knows.',
     hook: 'A CRDT knowledge base that crosses machines and survives crashes.',
-    desc: 'Save a fact. Save a snippet. Save a reference. Every abject can ask. Every peer syncs. Lose a peer, the memory stays. Add a peer, it gets every fact from the past three weeks.',
+    desc: 'Save a fact. Save a snippet. Save a reference. Every abject can ask. Every peer syncs. Lose a machine, the memory stays. Add a machine, it inherits everything the others learned. The organism does not forget just because a limb fell off.',
   },
 ];
 

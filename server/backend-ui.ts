@@ -22,7 +22,11 @@ import type {
   FontMetricsMsg,
   InputMsg,
   EndWindowDragMsg,
+  FileUploadMsg,
+  CloseWindowMsg,
+  DisplayResizedMsg,
 } from './ws-protocol.js';
+import { validateSceneOps, normalizeSceneOps, SCENE_NODE_KINDS, type SceneOp, type SceneTheme } from '../src/ui/gl/scene-types.js';
 import type { AuthConfig, SessionStore } from './auth.js';
 import type { UITransport } from './ui-transport.js';
 import { WebSocketUITransport } from './ui-transport.js';
@@ -32,6 +36,22 @@ const log = new Log('BackendUI');
 const UI_INTERFACE = 'abjects:ui';
 const WIDGET_FONT = '14px "Inter", system-ui, sans-serif';
 
+/**
+ * Merge an update op's params into a retained node, deep-merging `geometry`
+ * so a positions-only deform update keeps the existing indices/uvs. A shallow
+ * spread would drop indices from the retained snapshot, so reconnect replay
+ * would rebuild the mesh as a disjoint triangle soup. Mirrors the client
+ * SceneStore merge so retained state and live state stay identical.
+ */
+function mergeSceneParams(node: SceneOp, incoming: Record<string, unknown>): void {
+  const prevGeom = node.params?.geometry as Record<string, unknown> | undefined;
+  const nextGeom = incoming.geometry as Record<string, unknown> | undefined;
+  node.params = { ...(node.params ?? {}), ...incoming };
+  if (incoming.geometry !== undefined && prevGeom && nextGeom) {
+    node.params.geometry = { ...prevGeom, ...nextGeom };
+  }
+}
+
 export interface SurfaceState {
   surfaceId: string;
   objectId: AbjectId;
@@ -39,13 +59,28 @@ export interface SurfaceState {
   zIndex: number;
   inputPassthrough: boolean;
   inputMonitor: boolean;
+  transparent: boolean;
+  closable: boolean;
   lastDrawCommands: Array<{ type: string; surfaceId: string; params: unknown }>;
+  /**
+   * Retained scene-vocabulary nodes riding this surface's slab, compacted
+   * to their latest definition (add + merged updates) for reconnect replay.
+   */
+  sceneNodes: Map<string, SceneOp>;
+  /**
+   * Decorations: scene nodes contributed by abjects OTHER than the surface
+   * owner (nodeId -> contributor). Their input routes to the contributor and
+   * they tear down when the contributor dies.
+   */
+  sceneContributors: Map<string, AbjectId>;
+  /** Abject-requested slab transform (tilt/float), replayed on reconnect. */
+  slabTransform?: { rotation?: [number, number, number]; z?: number };
   workspaceId?: string;
   title?: string;
 }
 
 export interface InputEvent {
-  type: 'mousedown' | 'mouseup' | 'mousemove' | 'keydown' | 'keyup' | 'wheel' | 'paste';
+  type: 'mousedown' | 'mouseup' | 'mousemove' | 'mouseenter' | 'mouseleave' | 'keydown' | 'keyup' | 'wheel' | 'paste';
   surfaceId?: string;
   x?: number;
   y?: number;
@@ -90,10 +125,42 @@ export interface ClientMeta {
 
 export class BackendUI extends Abject {
   private surfaces: Map<string, SurfaceState> = new Map();
+  /** In-progress file uploads, keyed by uploadId, awaiting all chunks. */
+  private fileUploads: Map<string, { surfaceId: string; name: string; mimeType: string; chunks: string[]; received: number; chunkCount: number; toFocusedWidget?: boolean }> = new Map();
   private focusedSurface?: string;
+  /** Accent color for the focused window's glow halo (last focused window's theme accent). */
+  private focusGlowColor?: string;
+  /** Corner radius of the focused window, so the halo matches its silhouette. */
+  private focusGlowRadius?: number;
+  /** Active workspace's palette subset for the 3D scene (replayed on reconnect). */
+  private sceneTheme?: SceneTheme;
+  /**
+   * World-scope scene nodes (the global scene graph beyond windows), keyed by
+   * owning abject. Positions are workspace px; nodes live until removed or
+   * their owner dies. Compacted like per-surface nodes for reconnect replay.
+   */
+  private worldScenes: Map<AbjectId, Map<string, SceneOp>> = new Map();
+  /**
+   * The selected 3D scene node: set on node mousedown, cleared when focus
+   * moves elsewhere. While set, keyboard input routes to the node's owner
+   * (with focus/blur events bracketing the selection) — widget-style focus
+   * for scene geometry.
+   */
+  private focusedNode?: { scope: 'window' | 'world'; surfaceId?: string; ownerId?: AbjectId; nodeId: string };
   private mouseGrabAbject?: AbjectId;  // WindowManager grabs mouse during drag
   private mouseGrabClientId?: string;  // Which client owns the current resize grab
   private pendingRequests: Map<string, { resolve: (value: unknown) => void; reject: (e: Error) => void }> = new Map();
+
+  /** playbackId → Abject to notify of ended/error audio events. */
+  private audioNotify: Map<string, AbjectId> = new Map();
+  /** recordingId → Abject to notify when a media recording completes. */
+  private recordingNotify: Map<string, AbjectId> = new Map();
+  /**
+   * videoId → Abject to notify of video element state (videoEvent). Unlike
+   * audioNotify this is long-lived: a video emits many events over its life,
+   * so entries clear on dispose, not on first event.
+   */
+  private videoNotify: Map<string, AbjectId> = new Map();
   /** All connected frontend clients, keyed by clientId. */
   private clients: Map<string, ClientConnection> = new Map();
   private clientCounter = 0;
@@ -102,6 +169,8 @@ export class BackendUI extends Abject {
   private windowManagerId?: AbjectId;
   private currentSelectedText = '';
   private lastDisplayInfo: { width: number; height: number } = { width: 1280, height: 720 };
+  /** Last hovered surface per client, to synthesize mouseleave on change. */
+  private hoverSurfaceByClient: Map<string, string | undefined> = new Map();
   private lastMouseX = 0;
   private lastMouseY = 0;
   /** Which client sent the last mousedown (for requestDrag targeting). */
@@ -112,15 +181,13 @@ export class BackendUI extends Abject {
   private sessionStore?: SessionStore;
   /** Font metrics from frontend: font -> char -> pixel width */
   private fontMetrics: Map<string, Map<string, number>> = new Map();
-  /** Hash of last draw commands per surface for dedup */
-  private lastDrawHash: Map<string, string> = new Map();
 
   constructor() {
     super({
       manifest: {
         name: 'UIServer',
         description:
-          'X11-style display server. Manages surfaces, draw commands, and routes input events to surface owners. Use cases: draw shapes/text/images directly on surfaces, handle raw mouse and keyboard input events.',
+          'X11-style display server rendering a native WebGL2 3D desktop scene. Manages surfaces (slabs in the 3D scene), 2D draw commands, retained 3D scene ops (scene: mesh/light nodes with primitives box/sphere/plane/cylinder, theme-token colors), slab transforms (setSurfaceTransform), and routes input events to surface owners. Use cases: draw shapes/text/images on surfaces, render lit 3D content attached to windows, handle raw mouse and keyboard input events.',
         version: '1.0.0',
         interface: {
             id: UI_INTERFACE,
@@ -259,6 +326,54 @@ export class BackendUI extends Abject {
                     name: 'surfaceId',
                     type: { kind: 'primitive', primitive: 'string' },
                     description: 'The surface to focus',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'scene',
+                description: 'Apply retained 3D scene ops. Default scope: your window\'s subtree (every window is a slab in the 3D scene; nodes travel with it, positions are px from the window center). With world: true, nodes attach to the GLOBAL scene graph instead — positions are workspace px, no window needed (desktop pets, ambient décor); params.layer: "back" (default, behind windows) or "front" (above windows). Ops: { op: "add"|"update"|"remove"|"animate", id, parentId?, kind: "mesh"|"light"|"group"|"environment", transform: { position?: [x,y,z], rotation?: [rx,ry,rz], scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder"|"cone"|"torus"|"icosphere", color, emissive?, opacity?, layer?, metalness?(0..1), roughness?(0..1), texture?(url|dataURI|"surface:<id>"), billboard?, drawMode?("triangles"|"lines"|"points"), pointSize?, occlude?(default true: clipped to the window & below the title bar; false = draw on top / pop out), instances?:[{position,scale?,rotation?,color?},...](one geometry drawn many times in a single call — particles/fields) } for a built-in shape, OR { geometry: { positions, indices?, normals?, colors?(per-vertex rgb 0..1), uvs? }, color, ... } for an arbitrary polygonal mesh (re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional"|"spot", color?, intensity?, direction?, range?, angle?, penumbra?, castShadow?(directional — casters shadow each other) }. Environment params: { ambient?, fog?:{ color?, near, far }, bloom?:true|{ threshold?, intensity? } (glow on bright/emissive meshes) }. ANIMATE (client-side): { op:"animate", id, params:{ preset?:"spin"|"orbit"|"bob"|"pulse", channel?:"position"|"rotation"|"scale"|"color"|"emissive"|"opacity", to?, from?, duration?, easing?, loop?, yoyo?, delay?, path?, stop?:true } }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed (world nodes also tear down when their owner dies). Example: await this.call(uiId, "scene", { world: true, ops: [{ op: "add", id: "pet", kind: "mesh", transform: { position: [400, 600, 30], scale: 40 }, params: { primitive: "sphere", color: "$accent" } }] })',
+                parameters: [
+                  {
+                    name: 'surfaceId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Target surface (defaults to your first surface; ignored with world: true)',
+                    optional: true,
+                  },
+                  {
+                    name: 'world',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'Attach nodes to the global scene graph (workspace coordinates) instead of a window',
+                    optional: true,
+                  },
+                  {
+                    name: 'ops',
+                    type: { kind: 'array', elementType: { kind: 'reference', reference: 'SceneOp' } },
+                    description: 'Scene operations (validated; invalid batches are rejected with the vocabulary)',
+                  },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'setSurfaceTransform',
+                description: 'Tilt or float your window\'s slab in the 3D scene (visual only — input picking follows automatically). rotation: [rx, ry, rz] radians; z: px toward the viewer.',
+                parameters: [
+                  {
+                    name: 'surfaceId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Your surface',
+                  },
+                  {
+                    name: 'rotation',
+                    type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'number' } },
+                    description: 'Euler radians [rx, ry, rz]',
+                    optional: true,
+                  },
+                  {
+                    name: 'z',
+                    type: { kind: 'primitive', primitive: 'number' },
+                    description: 'Lift toward the viewer in px',
+                    optional: true,
                   },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
@@ -418,6 +533,126 @@ export class BackendUI extends Abject {
                 },
               },
               {
+                name: 'audioPlay',
+                description: 'Relay: start audio playback on the connected frontend client (used by the AudioOutput capability; call AudioOutput, not this, for playback)',
+                parameters: [
+                  { name: 'playbackId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-chosen playback id' },
+                  { name: 'source', type: { kind: 'primitive', primitive: 'string' }, description: 'http(s) URL or data: URI' },
+                  { name: 'volume', type: { kind: 'primitive', primitive: 'number' }, description: '0..1', optional: true },
+                  { name: 'loop', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Loop playback', optional: true },
+                  { name: 'notifyId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId to notify of ended/error via playbackEvent', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'audioControl',
+                description: 'Relay: pause/resume/stop/stopAll a frontend audio playback',
+                parameters: [
+                  { name: 'action', type: { kind: 'primitive', primitive: 'string' }, description: 'pause | resume | stop | stopAll' },
+                  { name: 'playbackId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target playback (omit for stopAll)', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'videoSetup',
+                description: 'Relay: create a client-side video element for a video widget (used by VideoWidget; frames composite client-side into videoFrame regions)',
+                parameters: [
+                  { name: 'videoId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-chosen video element id' },
+                  { name: 'source', type: { kind: 'primitive', primitive: 'string' }, description: 'http(s) URL or data: URI', optional: true },
+                  { name: 'streamId', type: { kind: 'primitive', primitive: 'string' }, description: 'Client-held captured MediaStream id (live source)', optional: true },
+                  { name: 'muted', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Start muted', optional: true },
+                  { name: 'loop', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Loop playback', optional: true },
+                  { name: 'autoplay', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Start playing immediately (default true)', optional: true },
+                  { name: 'notifyId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId to notify of playback state via videoEvent', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'videoControl',
+                description: 'Relay: play/pause/seek/setMuted/dispose a client-side video element',
+                parameters: [
+                  { name: 'videoId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target video element' },
+                  { name: 'action', type: { kind: 'primitive', primitive: 'string' }, description: 'play | pause | seek | setMuted | dispose' },
+                  { name: 'value', type: { kind: 'primitive', primitive: 'number' }, description: 'seek: seconds; setMuted: 1 muted, 0 audible', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'mediaCapture',
+                description: 'Relay: capture mic/camera (or screen with display: true) on the frontend client; returns { streamId, tracks } (used by the MediaStream capability)',
+                parameters: [
+                  { name: 'audio', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Capture audio', optional: true },
+                  { name: 'video', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Capture video', optional: true },
+                  { name: 'display', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Screen share instead of camera', optional: true },
+                ],
+                returns: { kind: 'object', properties: { streamId: { kind: 'primitive', primitive: 'string' } } },
+              },
+              {
+                name: 'mediaCaptureFrame',
+                description: 'Relay: grab one PNG frame of a frontend-captured video stream; returns { base64, width, height }',
+                parameters: [
+                  { name: 'streamId', type: { kind: 'primitive', primitive: 'string' }, description: 'Stream id from mediaCapture' },
+                ],
+                returns: { kind: 'object', properties: { base64: { kind: 'primitive', primitive: 'string' } } },
+              },
+              {
+                name: 'mediaRecordStart',
+                description: 'Relay: start a MediaRecorder on a frontend-captured stream; completion arrives via a recordingReady event to notifyId',
+                parameters: [
+                  { name: 'recordingId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-chosen recording id' },
+                  { name: 'streamId', type: { kind: 'primitive', primitive: 'string' }, description: 'Stream id from mediaCapture' },
+                  { name: 'maxDurationMs', type: { kind: 'primitive', primitive: 'number' }, description: 'Auto-stop after this many ms', optional: true },
+                  { name: 'notifyId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId to notify via recordingReady', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'mediaRecordStop',
+                description: 'Relay: stop an in-progress frontend recording early (recordingReady still fires)',
+                parameters: [
+                  { name: 'recordingId', type: { kind: 'primitive', primitive: 'string' }, description: 'Recording id' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'mediaStreamControl',
+                description: 'Relay: stop a frontend-captured stream or mute/unmute one of its tracks',
+                parameters: [
+                  { name: 'action', type: { kind: 'primitive', primitive: 'string' }, description: 'stopStream | muteTrack' },
+                  { name: 'streamId', type: { kind: 'primitive', primitive: 'string' }, description: 'For stopStream', optional: true },
+                  { name: 'trackId', type: { kind: 'primitive', primitive: 'string' }, description: 'For muteTrack', optional: true },
+                  { name: 'muted', type: { kind: 'primitive', primitive: 'boolean' }, description: 'For muteTrack', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'speechSpeak',
+                description: 'Relay: speak text with the frontend browser speechSynthesis (used by the Speech capability; call Speech, not this, for text-to-speech)',
+                parameters: [
+                  { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Text to speak' },
+                  { name: 'voice', type: { kind: 'primitive', primitive: 'string' }, description: 'Voice name from speechVoices', optional: true },
+                ],
+                returns: { kind: 'object', properties: { spoken: { kind: 'primitive', primitive: 'boolean' } } },
+              },
+              {
+                name: 'speechRecognize',
+                description: 'Relay: live speech recognition on the frontend; returns { text } when the browser recognizes speech, or { audioBase64, mimeType } of a mic recording for server-side transcription',
+                parameters: [
+                  { name: 'maxDurationMs', type: { kind: 'primitive', primitive: 'number' }, description: 'Listening window in ms (default 10000)', optional: true },
+                ],
+                returns: { kind: 'object', properties: {
+                  text: { kind: 'primitive', primitive: 'string' },
+                  audioBase64: { kind: 'primitive', primitive: 'string' },
+                  mimeType: { kind: 'primitive', primitive: 'string' },
+                } },
+              },
+              {
+                name: 'speechVoices',
+                description: 'Relay: list the frontend browser speechSynthesis voice names',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+              },
+              {
                 name: 'listFrontendClients',
                 description: 'List all currently connected frontend UI clients (both WebSocket and WebRTC).',
                 parameters: [],
@@ -485,13 +720,15 @@ export class BackendUI extends Abject {
 
   private setupHandlers(): void {
     this.on('createSurface', async (msg: AbjectMessage) => {
-      const { rect, zIndex, inputPassthrough, inputMonitor } = msg.payload as {
+      const { rect, zIndex, inputPassthrough, inputMonitor, transparent, closable } = msg.payload as {
         rect: { x: number; y: number; width: number; height: number };
         zIndex?: number;
         inputPassthrough?: boolean;
         inputMonitor?: boolean;
+        transparent?: boolean;
+        closable?: boolean;
       };
-      return this.handleCreateSurface(msg.routing.from, rect, zIndex, inputPassthrough, inputMonitor);
+      return this.handleCreateSurface(msg.routing.from, rect, zIndex, inputPassthrough, inputMonitor, transparent, closable);
     });
 
     this.on('destroySurface', async (msg: AbjectMessage) => {
@@ -504,6 +741,40 @@ export class BackendUI extends Abject {
         commands: Array<{ type: string; surfaceId: string; params: unknown }>;
       };
       return this.handleDraw(msg.routing.from, commands);
+    });
+
+    // ── Scene vocabulary: retained 3D nodes riding a window's slab, or
+    // attached to the WORLD (the global scene graph beyond windows) ──
+    this.on('scene', async (msg: AbjectMessage) => {
+      const { surfaceId, world, ops, contributorId } = msg.payload as {
+        surfaceId?: string; world?: boolean; ops: SceneOp[]; contributorId?: AbjectId;
+      };
+      if (world) {
+        return this.handleWorldSceneOps(msg.routing.from, ops);
+      }
+      // contributorId is trusted only because the direct caller must own the
+      // surface (windows relay decoration batches from other abjects).
+      return this.handleSceneOps(msg.routing.from, surfaceId, ops, contributorId);
+    });
+
+    this.on('setSceneTheme', async (msg: AbjectMessage) => {
+      const { theme } = msg.payload as { theme: SceneTheme };
+      if (!theme || typeof theme !== 'object' || !theme.colors) return false;
+      this.sceneTheme = theme;
+      this.sendToFrontend({ type: 'setSceneTheme', theme: theme as unknown as Record<string, unknown> });
+      return true;
+    });
+
+    this.on('setSurfaceTransform', async (msg: AbjectMessage) => {
+      const { surfaceId, rotation, z } = msg.payload as {
+        surfaceId: string; rotation?: [number, number, number]; z?: number;
+      };
+      const state = this.surfaces.get(surfaceId);
+      if (!state) return false;
+      contractRequire(state.objectId === msg.routing.from, 'setSurfaceTransform: caller does not own the surface');
+      state.slabTransform = { rotation, z };
+      this.sendToFrontend({ type: 'setSurfaceTransform', surfaceId, rotation, z });
+      return true;
     });
 
     this.on('moveSurface', async (msg: AbjectMessage) => {
@@ -533,8 +804,8 @@ export class BackendUI extends Abject {
     });
 
     this.on('focus', async (msg: AbjectMessage) => {
-      const { surfaceId } = msg.payload as { surfaceId: string };
-      return this.handleFocus(msg.routing.from, surfaceId);
+      const { surfaceId, glowColor, glowRadius } = msg.payload as { surfaceId: string; glowColor?: string; glowRadius?: number };
+      return this.handleFocus(msg.routing.from, surfaceId, glowColor, glowRadius);
     });
 
     this.on('getDisplayInfo', async () => {
@@ -561,6 +832,15 @@ export class BackendUI extends Abject {
     this.on('showMobileKeyboard', async (msg: AbjectMessage) => {
       const { show } = msg.payload as { show: boolean };
       this.sendToFrontend({ type: 'showMobileKeyboard', show });
+      return true;
+    });
+
+    // An object (e.g. a Chat window) asks the client to open a native file
+    // picker for one of its surfaces. The chosen file comes back as fileUpload
+    // chunks and is delivered to the surface owner as a 'fileUploaded' event.
+    this.on('openFilePicker', async (msg: AbjectMessage) => {
+      const { surfaceId, accept, multiple } = msg.payload as { surfaceId: string; accept?: string; multiple?: boolean };
+      this.sendToFrontend({ type: 'openFilePicker', surfaceId, accept, multiple });
       return true;
     });
 
@@ -593,10 +873,165 @@ export class BackendUI extends Abject {
       return true;
     });
 
+    this.on('clipboardWriteImage', async (msg: AbjectMessage) => {
+      const { image } = msg.payload as { image: string };
+      this.sendToFrontend({ type: 'clipboardWriteImage', image });
+      return true;
+    });
+
     this.on('selectionChanged', async (msg: AbjectMessage) => {
       const { selectedText } = msg.payload as { selectedText: string };
       this.currentSelectedText = selectedText;
       this.sendToFrontend({ type: 'setSelectedText', text: selectedText });
+    });
+
+    // ── Audio playback relay (AudioOutput capability → frontend) ────────
+    this.on('audioPlay', async (msg: AbjectMessage) => {
+      const { playbackId, source, volume, loop, notifyId } = msg.payload as {
+        playbackId: string; source: string; volume?: number; loop?: boolean; notifyId?: AbjectId;
+      };
+      contractRequire(typeof playbackId === 'string' && playbackId.length > 0, 'audioPlay requires playbackId');
+      contractRequire(typeof source === 'string' && source.length > 0, 'audioPlay requires source');
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; audio output unavailable');
+      if (notifyId) this.audioNotify.set(playbackId, notifyId);
+      this.sendToFrontend({ type: 'audioPlay', playbackId, source, volume, loop });
+      return true;
+    });
+
+    this.on('audioControl', async (msg: AbjectMessage) => {
+      const { action, playbackId } = msg.payload as {
+        action: 'pause' | 'resume' | 'stop' | 'stopAll'; playbackId?: string;
+      };
+      this.sendToFrontend({ type: 'audioControl', action, playbackId });
+      if (action === 'stop' && playbackId) this.audioNotify.delete(playbackId);
+      if (action === 'stopAll') this.audioNotify.clear();
+      return true;
+    });
+
+    // ── Video element relay (VideoWidget → frontend) ────────────────────
+    this.on('videoSetup', async (msg: AbjectMessage) => {
+      const { videoId, source, streamId, muted, loop, autoplay, notifyId } = msg.payload as {
+        videoId: string; source?: string; streamId?: string;
+        muted?: boolean; loop?: boolean; autoplay?: boolean; notifyId?: AbjectId;
+      };
+      contractRequire(typeof videoId === 'string' && videoId.length > 0, 'videoSetup requires videoId');
+      contractRequire(!!source || !!streamId, 'videoSetup requires source or streamId');
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; video unavailable');
+      if (notifyId) this.videoNotify.set(videoId, notifyId);
+      this.sendToFrontend({ type: 'videoSetup', videoId, source, streamId, muted, loop, autoplay });
+      return true;
+    });
+
+    this.on('videoControl', async (msg: AbjectMessage) => {
+      const { videoId, action, value } = msg.payload as {
+        videoId: string; action: 'play' | 'pause' | 'seek' | 'setMuted' | 'dispose'; value?: number;
+      };
+      contractRequire(typeof videoId === 'string' && videoId.length > 0, 'videoControl requires videoId');
+      this.sendToFrontend({ type: 'videoControl', videoId, action, value });
+      if (action === 'dispose') this.videoNotify.delete(videoId);
+      return true;
+    });
+
+    // ── Media capture relay (MediaStream capability → frontend) ─────────
+    this.on('mediaCapture', async (msg: AbjectMessage) => {
+      const { audio, video, display } = msg.payload as {
+        audio?: boolean; video?: boolean; display?: boolean;
+      };
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; media capture unavailable');
+      // Long timeout: the browser shows a permission prompt the user must answer.
+      const reply = await this.requestFromFrontend<{
+        streamId?: string; tracks?: Array<{ id: string; kind: string; label: string }>; error?: string;
+      }>({
+        type: 'mediaCaptureRequest',
+        requestId: this.nextRequestId(),
+        audio: audio ?? true,
+        video: video ?? false,
+        display: display ?? false,
+      }, 60000);
+      if (reply.error || !reply.streamId) throw new Error(reply.error ?? 'media capture failed');
+      return { streamId: reply.streamId, tracks: reply.tracks ?? [] };
+    });
+
+    this.on('mediaCaptureFrame', async (msg: AbjectMessage) => {
+      const { streamId } = msg.payload as { streamId: string };
+      contractRequire(typeof streamId === 'string' && streamId.length > 0, 'mediaCaptureFrame requires streamId');
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; frame capture unavailable');
+      const reply = await this.requestFromFrontend<{
+        base64?: string; width?: number; height?: number; error?: string;
+      }>({
+        type: 'mediaCaptureFrameRequest',
+        requestId: this.nextRequestId(),
+        streamId,
+      }, 15000);
+      if (reply.error || !reply.base64) throw new Error(reply.error ?? 'frame capture failed');
+      return { base64: reply.base64, width: reply.width ?? 0, height: reply.height ?? 0 };
+    });
+
+    this.on('mediaRecordStart', async (msg: AbjectMessage) => {
+      const { recordingId, streamId, maxDurationMs, notifyId } = msg.payload as {
+        recordingId: string; streamId: string; maxDurationMs?: number; notifyId?: AbjectId;
+      };
+      contractRequire(typeof recordingId === 'string' && recordingId.length > 0, 'mediaRecordStart requires recordingId');
+      contractRequire(typeof streamId === 'string' && streamId.length > 0, 'mediaRecordStart requires streamId');
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; recording unavailable');
+      if (notifyId) this.recordingNotify.set(recordingId, notifyId);
+      this.sendToFrontend({ type: 'mediaRecordStart', recordingId, streamId, maxDurationMs });
+      return true;
+    });
+
+    this.on('mediaRecordStop', async (msg: AbjectMessage) => {
+      const { recordingId } = msg.payload as { recordingId: string };
+      this.sendToFrontend({ type: 'mediaRecordStop', recordingId });
+      return true;
+    });
+
+    this.on('mediaStreamControl', async (msg: AbjectMessage) => {
+      const { action, streamId, trackId, muted } = msg.payload as {
+        action: 'stopStream' | 'muteTrack'; streamId?: string; trackId?: string; muted?: boolean;
+      };
+      this.sendToFrontend({ type: 'mediaStreamControl', action, streamId, trackId, muted });
+      return true;
+    });
+
+    // ── Speech relay (Speech capability → frontend browser speech APIs) ──
+    this.on('speechSpeak', async (msg: AbjectMessage) => {
+      const { text, voice } = msg.payload as { text: string; voice?: string };
+      contractRequire(typeof text === 'string' && text.length > 0, 'speechSpeak requires text');
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; speech unavailable');
+      // The client replies when the utterance starts, so the timeout covers
+      // voice loading, not the full spoken duration.
+      const reply = await this.requestFromFrontend<{ spoken?: boolean; error?: string }>({
+        type: 'speechSpeak',
+        requestId: this.nextRequestId(),
+        text,
+        voice,
+      }, 20000);
+      if (reply.error) throw new Error(reply.error);
+      return { spoken: reply.spoken === true };
+    });
+
+    this.on('speechRecognize', async (msg: AbjectMessage) => {
+      const { maxDurationMs } = msg.payload as { maxDurationMs?: number };
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; speech recognition unavailable');
+      const windowMs = Math.min(Math.max(maxDurationMs ?? 10000, 1000), 60000);
+      const reply = await this.requestFromFrontend<{
+        text?: string; audioBase64?: string; mimeType?: string; error?: string;
+      }>({
+        type: 'speechRecognizeRequest',
+        requestId: this.nextRequestId(),
+        maxDurationMs: windowMs,
+      }, windowMs + 30000);
+      if (reply.error) throw new Error(reply.error);
+      return { text: reply.text, audioBase64: reply.audioBase64, mimeType: reply.mimeType };
+    });
+
+    this.on('speechVoices', async () => {
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; speech unavailable');
+      const reply = await this.requestFromFrontend<{ voices?: string[] }>({
+        type: 'speechVoicesRequest',
+        requestId: this.nextRequestId(),
+      }, 10000);
+      return reply.voices ?? [];
     });
 
     this.on('openUrl', async (msg: AbjectMessage) => {
@@ -646,6 +1081,8 @@ export class BackendUI extends Abject {
     this.on('objectUnregistered', async (msg: AbjectMessage) => {
       const objectId = msg.payload as AbjectId;
       this.destroySurfacesForObject(objectId);
+      this.destroyWorldSceneForObject(objectId);
+      this.destroyDecorationsForObject(objectId);
     });
 
     this.on('updateAuth', async (msg: AbjectMessage) => {
@@ -952,6 +1389,141 @@ Each draw command has exactly 3 fields: { type, surfaceId, params }
 'shadow' - Set shadow. params: { color, blur, offsetX?, offsetY? }
 'linearGradient'/'radialGradient' - Set gradient fill+stroke
 
+### 3D Scene (retained)
+
+THE DESKTOP IS A NATIVE 3D SCENE (WebGL2-backed) — no Three.js needed; 3D is
+built in. Your surface is a slab in that scene. For anything 3D (spinning
+shapes, lit geometry, depth), attach retained scene nodes — GPU-rendered and
+animated by updating transforms, which beats simulating 3D with projection
+math on a 2D canvas. Nodes travel with the surface (you must own the surface
+— for WidgetManager windows, call 'scene' on the WINDOW instead; windows
+accept scene ops from ANY abject, so you can decorate windows you don't own,
+discovered via WidgetManager listWindows — decoration input routes back to
+the contributor and decorations tear down when the contributor dies):
+
+  await this.call(this.dep('UIServer'), 'scene', { surfaceId, ops: [
+    { op: 'add', id: 'orb', kind: 'mesh',
+      transform: { position: [0, 0, 40], scale: 30 },   // px from slab center, +z toward viewer
+      params: { primitive: 'sphere', color: '$accent' } },
+    { op: 'add', id: 'key', kind: 'light',
+      transform: { position: [120, -200, 300] },
+      params: { lightType: 'point', color: '#ffffff' } },
+  ]});
+
+Kinds: mesh (primitive: plane|box|sphere|cylinder; params color, emissive?,
+opacity?), light (lightType: point|directional; color?, direction?), group.
+transform: { position: [x,y,z], rotation: [rx,ry,rz] radians, scale: n|[x,y,z] }.
+CUSTOM / DEFORMABLE MESHES — when no built-in primitive fits (a wave surface,
+terrain, a generated or morphing shape), give the mesh node its own polygons
+instead of a primitive: params { geometry: { positions: [x,y,z, ...], indices?:
+[...], normals?: [...] }, color, ... }. positions is a flat local-px vertex
+list; indices a flat triangle list (omit for a sequential triangle soup);
+normals auto-compute smooth when omitted. Re-send geometry in an 'update' op to
+DEFORM the mesh — GPU buffers are reused, so animating a heightfield every frame
+is cheap. This is how you render a continuous changing surface rather than a
+grid of discrete primitive tiles:
+  await this.call(this.dep('UIServer'), 'scene', { surfaceId, ops: [
+    { op: 'update', id: 'water', params: { geometry: { positions: nextPositions } } } ]});
+Custom geometry also takes geometry.colors (flat [r,g,b,...] 0..1 per vertex —
+gradients/heatmaps) and geometry.uvs (flat [u,v,...]) for texturing.
+
+PRIMITIVES: plane, box, sphere, cylinder, cone, torus, icosphere.
+MATERIALS: params.metalness/roughness (0..1) give a PBR look (glass, metal,
+glossy water); params.emissive glows; params.texture is a url/data-URI or
+'surface:<surfaceId>' (wrap a window's live 2D content onto geometry);
+params.billboard faces the camera; params.drawMode 'points'|'lines' draws the
+vertices as a cloud/polyline (params.pointSize). INSTANCING: params.instances =
+[{ position, scale?, rotation?, color? }, ...] draws one geometry many times in
+a single call (starfields, particles, swarms, grids). LIGHTS: lightType
+'point'|'directional'|'spot' with color, intensity, range, (spot) angle +
+penumbra, and (directional) castShadow:true — meshes cast shadows on each other,
+frustum auto-fit to the scene. ENVIRONMENT: a kind:'environment' node { ambient, fog:{ color, near,
+far }, bloom:true|{ threshold, intensity } } sets scene-wide mood/depth and a
+glow post-effect on bright/emissive meshes.
+
+ANIMATION — declarative and client-side, so one op animates at the native
+frame rate instead of a transform message per tick:
+  await this.call(this.dep('UIServer'), 'scene', { surfaceId, ops: [
+    { op: 'animate', id: 'orb', params: { preset: 'spin', duration: 4000 } } ]});
+Presets: spin, orbit (center/radius/plane), bob (amplitude), pulse (scale). Or
+a channel: { op:'animate', id, params:{ channel:'position'|'rotation'|'scale'|
+'color'|'emissive'|'opacity', to, from?, duration, easing?, loop?, yoyo?,
+delay?, path?:[[x,y,z],...] } }. Stop with params:{ stop:true }. Animations are
+transient client state — re-issue them after a reconnect if you want them back.
+
+OCCLUSION (window scope): a window's 3D children are clipped to the window's
+content area and sit below the title bar by default — they can't spill across
+the desktop or cover the chrome. Set params.occlude:false to let a node draw on
+top / extend past the window (pop-out 3D, decorations over the chrome). Occluded
+3D draws on top of the window's own 2D background, so an immersive all-3D window
+should BE its 3D content, not hide it behind a full-window opaque backdrop mesh.
+
+INHERITANCE: a child inherits its parent group's material/behaviour params —
+color, emissive, opacity, metalness, roughness, texture, drawMode, pointSize,
+layer, occlude, castShadow — unless it overrides them. primitive/geometry/
+instances are per-node. Transforms already compose down the parent chain.
+
+FOG IS SCENE-RELATIVE: fog.near/far are depth in px BEHIND the content plane
+(the camera-to-content baseline is added automatically), so use SMALL values —
+e.g. near 0, far 400 for a tank ~300px deep. far should roughly match your
+scene's depth; do NOT pass camera-distance values (far 2000+) — fog would never
+show. light range is world-space px (distance from the light to the surface).
+COORDINATES ARE Y-DOWN, the screen convention: +y moves DOWN, +x right, +z
+toward the viewer (this differs from y-up 3D engines). Mouse dx/dy therefore
+map DIRECTLY onto position dx/dy — apply both with the same sign, no flips.
+The camera is a long lens (the desktop UI must stay undistorted), so small
+objects read near-isometric. For visible perspective, go BIG: scale 200+ and
+vary z across the scene — depth shows when it's a meaningful fraction of the
+camera distance (~1.9x viewport height).
+Colors accept '#hex', 'rgb(a)', or theme tokens ('$accent', '$statusError',
+'$windowBg', ...) that re-resolve on every theme change. Nodes are RETAINED
+until { op: 'remove', id }; invalid batches are rejected with the vocabulary.
+Tilt/float the whole slab: this.call(this.dep('UIServer'), 'setSurfaceTransform',
+{ surfaceId, rotation: [0, 0.1, 0], z: 20 }).
+
+WORLD SCOPE — the global scene graph beyond windows. Pass world: true and
+positions become workspace px ([x, y, z], +z toward viewer); no window or
+surface needed. Use for desktop pets, ambient décor, free-floating geometry.
+params.layer: 'back' (default — renders behind all windows) or 'front'
+(above them). Nodes are namespaced to YOUR abject, retained across
+reconnects, and torn down automatically if your abject dies. A pet that
+walks: add a group of meshes once, then update the group's position/rotation
+from a Timer tick:
+
+  await this.call(this.dep('UIServer'), 'scene', { world: true, ops: [
+    { op: 'add', id: 'pet', kind: 'group', transform: { position: [400, 600, 30] } },
+    { op: 'add', id: 'body', parentId: 'pet', kind: 'mesh',
+      transform: { scale: [60, 40, 40] }, params: { primitive: 'sphere', color: '$accent' } },
+    { op: 'add', id: 'head', parentId: 'pet', kind: 'mesh',
+      transform: { position: [40, -20, 0], scale: 28 }, params: { primitive: 'sphere', color: '$accent' } },
+  ]});
+  // each tick:
+  await this.call(this.dep('UIServer'), 'scene', { world: true, ops: [
+    { op: 'update', id: 'pet', transform: { position: [x, y, 30], rotation: [0, heading, wobble] } },
+  ]});
+
+MESH INPUT — scene nodes are full input targets, like widgets. You receive
+'nodeInput' events for meshes you own:
+  this.on('nodeInput', (msg) => {
+    const { type, nodeId, x, y, key, code, button, world } = msg.payload;
+    // type: 'mousedown' | 'mouseup' | 'mousemove' | 'mouseenter' | 'mouseleave'
+    //     | 'focus' | 'blur' | 'keydown' | 'keyup'
+  });
+- Hover: mouseenter/mouseleave fire on hover changes; mousemove streams while
+  the pointer is over the mesh (~60fps, rAF-batched).
+- Drag capture: after mousedown on a mesh, mousemove keeps streaming to that
+  mesh until mouseup, even when the cursor outruns it. To drag a node, apply
+  the input deltas directly — both axes share the screen convention (y-down),
+  so position = [startX + dx, startY + dy, z] with NO sign flips.
+- Selection + keyboard: clicking a mesh SELECTS it ('focus' event); while
+  selected, keydown/keyup events route to you (key, code, modifiers). Focus
+  moves away ('blur') when the user clicks anything else. React to focus by
+  e.g. boosting the node's emissive via a scene update.
+World-scope hits deliver straight to you (x,y in workspace px). Window-scope
+hits deliver to the WINDOW's owner with windowId in the payload (x,y relative
+to the window). Picking is exact 3D ray casting, so it works on rotated and
+animated meshes — click the pet mid-walk.
+
 ### Input Injection
 
 Simulate a mouse click on a surface (mousedown + mouseup):
@@ -1080,6 +1652,7 @@ IMPORTANT:
     });
     newTransport.onClose(() => {
       this.clients.delete(clientId);
+      this.hoverSurfaceByClient.delete(clientId);
       log.info(`Client ${clientId} disconnected (${this.clients.size} remaining)`);
       // Release resize grab if this client owned it
       if (this.mouseGrabClientId === clientId) {
@@ -1193,7 +1766,9 @@ IMPORTANT:
     rect: { x: number; y: number; width: number; height: number },
     zIndex?: number,
     inputPassthrough?: boolean,
-    inputMonitor?: boolean
+    inputMonitor?: boolean,
+    transparent?: boolean,
+    closable?: boolean
   ): string {
     const surfaceId = `surface-${objectId}-${this.surfaceCounter++}`;
     const z = zIndex ?? 0;
@@ -1205,7 +1780,11 @@ IMPORTANT:
       zIndex: z,
       inputPassthrough: inputPassthrough ?? false,
       inputMonitor: inputMonitor ?? false,
+      transparent: transparent ?? false,
+      closable: closable ?? true,
       lastDrawCommands: [],
+      sceneNodes: new Map(),
+      sceneContributors: new Map(),
     });
 
     this.sendToFrontend({
@@ -1215,6 +1794,8 @@ IMPORTANT:
       rect,
       zIndex: z,
       inputPassthrough: inputPassthrough ?? false,
+      transparent: transparent ?? false,
+      closable: closable ?? true,
     });
 
     this.log('debug', 'createSurface', { surfaceId, objectId, rect, zIndex });
@@ -1227,8 +1808,8 @@ IMPORTANT:
       return false;
     }
 
+    if (this.focusedNode?.surfaceId === surfaceId) this.focusedNode = undefined;
     this.surfaces.delete(surfaceId);
-    this.lastDrawHash.delete(surfaceId);
 
     this.sendToFrontend({
       type: 'destroySurface',
@@ -1247,7 +1828,6 @@ IMPORTANT:
     for (const [surfaceId, state] of this.surfaces.entries()) {
       if (state.objectId === objectId) {
         this.surfaces.delete(surfaceId);
-        this.lastDrawHash.delete(surfaceId);
         this.sendToFrontend({ type: 'destroySurface', surfaceId });
         if (this.focusedSurface === surfaceId) this.focusedSurface = undefined;
         count++;
@@ -1265,41 +1845,237 @@ IMPORTANT:
       (cmd) => this.surfaces.get(cmd.surfaceId)?.objectId === objectId
     );
 
-    // Store draw commands per surface (each batch is a full redraw)
-    // and deduplicate: skip surfaces whose draw commands haven't changed
-    const commandsBySurface = new Map<string, Array<{ type: string; surfaceId: string; params: unknown }>>();
+    // Snapshot the latest draw batch per surface so reconnecting clients can
+    // be replayed (handleClientReady reuses state.lastDrawCommands).
+    const touched = new Set<string>();
     for (const cmd of validCommands) {
-      let batch = commandsBySurface.get(cmd.surfaceId);
-      if (!batch) {
-        batch = [];
-        commandsBySurface.set(cmd.surfaceId, batch);
+      const state = this.surfaces.get(cmd.surfaceId);
+      if (!state) continue;
+      if (!touched.has(cmd.surfaceId)) {
+        state.lastDrawCommands = [];
+        touched.add(cmd.surfaceId);
       }
-      batch.push(cmd);
+      state.lastDrawCommands.push(cmd);
     }
 
-    const changedCommands: Array<{ type: string; surfaceId: string; params: unknown }> = [];
-    for (const [surfaceId, batch] of commandsBySurface) {
-      const hash = JSON.stringify(batch);
-      const prevHash = this.lastDrawHash.get(surfaceId);
-      const state = this.surfaces.get(surfaceId);
-      if (state) {
-        state.lastDrawCommands = batch;
-      }
-      if (hash !== prevHash) {
-        this.lastDrawHash.set(surfaceId, hash);
-        changedCommands.push(...batch);
-      }
-    }
-
-    if (changedCommands.length > 0) {
+    if (validCommands.length > 0) {
       this.sendToFrontend({
         type: 'draw',
-        commands: changedCommands,
+        commands: validCommands,
       });
     }
 
     this.log('debug', 'draw', { objectId, commandCount: commands.length });
     return true;
+  }
+
+  /**
+   * Apply a scene-vocabulary op batch to a surface's subtree: validate
+   * loudly (callers self-correct from the error, like the canvas
+   * vocabulary), compact into the retained per-surface node map for
+   * reconnect replay, and broadcast.
+   */
+  private handleSceneOps(objectId: AbjectId, surfaceId: string | undefined, rawOps: SceneOp[], contributorId?: AbjectId): boolean {
+    // Forgiving field aliases (e.g. parent → parentId) before anything else.
+    const ops = normalizeSceneOps(rawOps) as SceneOp[];
+    // Default to the caller's first surface so windowless callers fail loudly
+    // and single-window abjects don't need to track their surfaceId.
+    let state = surfaceId ? this.surfaces.get(surfaceId) : undefined;
+    if (!state) {
+      for (const s of this.surfaces.values()) {
+        if (s.objectId === objectId) { state = s; break; }
+      }
+    }
+    contractRequire(state !== undefined, 'scene: no surface — create a window first');
+    contractRequire(state!.objectId === objectId, 'scene: caller does not own the surface');
+
+    const problems = validateSceneOps(ops);
+    if (problems.length > 0) {
+      throw new Error(
+        `Invalid scene ops (nothing was applied): ${problems.join('; ')}. ` +
+        `Node kinds: ${SCENE_NODE_KINDS.join(', ')}. ` +
+        `Shape: { op: 'add'|'update'|'remove', id, parentId?, kind?, transform: { position?, rotation?, scale? }, params } — ` +
+        `e.g. { op: 'add', id: 'orb', kind: 'mesh', transform: { position: [0, 0, 40], scale: 30 }, params: { primitive: 'sphere', color: '$accent' } }.`
+      );
+    }
+
+    // Compact into retained state: adds insert, updates merge, removes delete.
+    // 'animate' ops are transient client-side animations — forward them but
+    // never merge them into the retained node (their channel/to/duration are
+    // not node params and would corrupt the snapshot + reconnect replay).
+    const foreign = contributorId !== undefined && contributorId !== state!.objectId;
+    for (const op of ops) {
+      if (op.op === 'animate') continue;
+      if (op.op === 'remove') {
+        state!.sceneNodes.delete(op.id);
+        state!.sceneContributors.delete(op.id);
+        continue;
+      }
+      if (op.op === 'add') {
+        state!.sceneNodes.set(op.id, { ...op });
+        if (foreign) state!.sceneContributors.set(op.id, contributorId!);
+        continue;
+      }
+      const existing = state!.sceneNodes.get(op.id);
+      if (!existing) continue;
+      if (op.transform) existing.transform = { ...existing.transform, ...op.transform };
+      if (op.params) mergeSceneParams(existing, op.params);
+      if (op.parentId !== undefined) existing.parentId = op.parentId;
+    }
+
+    this.sendToFrontend({
+      type: 'sceneOps',
+      surfaceId: state!.surfaceId,
+      ops: ops as unknown as Array<Record<string, unknown>>,
+    });
+    this.log('debug', 'sceneOps', { objectId, surfaceId: state!.surfaceId, opCount: ops.length });
+    return true;
+  }
+
+  /**
+   * Apply a WORLD-scope scene-op batch: nodes attach to the global scene
+   * graph (workspace coordinates) rather than a window, scoped to the
+   * calling abject's own namespace. Same validation, retention, and replay
+   * semantics as window subtrees; nodes are torn down when the owner dies.
+   */
+  private handleWorldSceneOps(objectId: AbjectId, rawOps: SceneOp[]): boolean {
+    const ops = normalizeSceneOps(rawOps) as SceneOp[];
+    const problems = validateSceneOps(ops);
+    if (problems.length > 0) {
+      throw new Error(
+        `Invalid world scene ops (nothing was applied): ${problems.join('; ')}. ` +
+        `Node kinds: ${SCENE_NODE_KINDS.join(', ')}. ` +
+        `World positions are workspace px ([x, y, z], +z toward the viewer); params.layer: 'back' (default, behind windows) or 'front'. ` +
+        `e.g. { op: 'add', id: 'pet-body', kind: 'mesh', transform: { position: [400, 600, 30], scale: 40 }, params: { primitive: 'sphere', color: '$accent' } }.`
+      );
+    }
+
+    let nodes = this.worldScenes.get(objectId);
+    if (!nodes) {
+      nodes = new Map();
+      this.worldScenes.set(objectId, nodes);
+    }
+    for (const op of ops) {
+      if (op.op === 'animate') continue;
+      if (op.op === 'remove') {
+        nodes.delete(op.id);
+        continue;
+      }
+      if (op.op === 'add') {
+        nodes.set(op.id, { ...op });
+        continue;
+      }
+      const existing = nodes.get(op.id);
+      if (!existing) continue;
+      if (op.transform) existing.transform = { ...existing.transform, ...op.transform };
+      if (op.params) mergeSceneParams(existing, op.params);
+      if (op.parentId !== undefined) existing.parentId = op.parentId;
+    }
+    if (nodes.size === 0) this.worldScenes.delete(objectId);
+
+    this.sendToFrontend({
+      type: 'sceneOps',
+      surfaceId: '',
+      world: true,
+      ownerId: objectId,
+      ops: ops as unknown as Array<Record<string, unknown>>,
+    });
+    this.log('debug', 'worldSceneOps', { objectId, opCount: ops.length });
+    return true;
+  }
+
+  /**
+   * Deliver a node input event to the node's owner: world-scope straight to
+   * the owning abject (only if it really owns world nodes — no spoofed
+   * routing), window-scope to the window, which relays to its owner —
+   * except decorations (foreign-contributed nodes), which go straight to
+   * their contributor.
+   */
+  private deliverNodeEvent(
+    target: { scope: 'window' | 'world'; surfaceId?: string; ownerId?: AbjectId },
+    payload: Record<string, unknown>,
+  ): void {
+    if (target.scope === 'world' && target.ownerId) {
+      if (this.worldScenes.has(target.ownerId)) {
+        this.send(event(this.id, target.ownerId, 'nodeInput', payload));
+      }
+      return;
+    }
+    if (target.surfaceId) {
+      const state = this.surfaces.get(target.surfaceId);
+      if (state) {
+        // Decorations route straight to their contributor (with the host
+        // window's id attached); the owner's own nodes go through the window.
+        const nodeId = payload.nodeId as string | undefined;
+        const contributor = nodeId ? state.sceneContributors.get(nodeId) : undefined;
+        if (contributor) {
+          this.send(event(this.id, contributor, 'nodeInput', { ...payload, windowId: state.objectId }));
+        } else {
+          this.send(event(this.id, state.objectId, 'nodeInput', payload));
+        }
+      }
+    }
+  }
+
+  /** Move node keyboard focus, bracketing the change with blur/focus events. */
+  private setFocusedNode(target?: { scope: 'window' | 'world'; surfaceId?: string; ownerId?: AbjectId; nodeId: string }): void {
+    const prev = this.focusedNode;
+    if (prev && target && prev.nodeId === target.nodeId
+      && prev.surfaceId === target.surfaceId && prev.ownerId === target.ownerId) {
+      return;
+    }
+    if (prev) {
+      this.deliverNodeEvent(prev, { type: 'blur', nodeId: prev.nodeId, world: prev.scope === 'world' });
+    }
+    this.focusedNode = target;
+    if (target) {
+      this.deliverNodeEvent(target, { type: 'focus', nodeId: target.nodeId, world: target.scope === 'world' });
+    }
+  }
+
+  /**
+   * Tear down decorations a dead abject contributed to OTHER abjects' windows,
+   * so host windows never accumulate orphaned foreign nodes.
+   */
+  private destroyDecorationsForObject(objectId: AbjectId): void {
+    for (const state of this.surfaces.values()) {
+      const dead: string[] = [];
+      for (const [nodeId, contributor] of state.sceneContributors) {
+        if (contributor === objectId) dead.push(nodeId);
+      }
+      if (dead.length === 0) continue;
+      for (const nodeId of dead) {
+        state.sceneNodes.delete(nodeId);
+        state.sceneContributors.delete(nodeId);
+        if (this.focusedNode?.surfaceId === state.surfaceId && this.focusedNode.nodeId === nodeId) {
+          this.focusedNode = undefined;
+        }
+      }
+      this.sendToFrontend({
+        type: 'sceneOps',
+        surfaceId: state.surfaceId,
+        ops: dead.map((id) => ({ op: 'remove', id })),
+      });
+    }
+  }
+
+  /** Tear down an owner's world nodes (owner unregistered/died). */
+  private destroyWorldSceneForObject(objectId: AbjectId): void {
+    if (this.focusedNode?.ownerId === objectId) this.focusedNode = undefined;
+    const nodes = this.worldScenes.get(objectId);
+    if (!nodes || nodes.size === 0) {
+      this.worldScenes.delete(objectId);
+      return;
+    }
+    const removes = [...nodes.keys()].map((id) => ({ op: 'remove', id }));
+    this.worldScenes.delete(objectId);
+    this.sendToFrontend({
+      type: 'sceneOps',
+      surfaceId: '',
+      world: true,
+      ownerId: objectId,
+      ops: removes,
+    });
   }
 
   private handleMoveSurface(
@@ -1371,7 +2147,7 @@ IMPORTANT:
     return true;
   }
 
-  private handleFocus(objectId: AbjectId, surfaceId: string): boolean {
+  private handleFocus(objectId: AbjectId, surfaceId: string, glowColor?: string, glowRadius?: number): boolean {
     const state = this.surfaces.get(surfaceId);
     if (!state || state.objectId !== objectId) {
       return false;
@@ -1379,6 +2155,8 @@ IMPORTANT:
 
     const oldFocus = this.focusedSurface;
     this.focusedSurface = surfaceId;
+    if (glowColor) this.focusGlowColor = glowColor;
+    if (typeof glowRadius === 'number') this.focusGlowRadius = glowRadius;
 
     // Send focus lost to previous owner
     if (oldFocus && oldFocus !== surfaceId) {
@@ -1391,10 +2169,13 @@ IMPORTANT:
     // Send focus gained to new owner
     this.sendFocusEvent(objectId, surfaceId, true);
 
-    // Tell frontend which surface is focused (for keyboard routing)
+    // Tell frontend which surface is focused (for keyboard routing) and the
+    // accent color for the focus-glow halo.
     this.sendToFrontend({
       type: 'setFocused',
       surfaceId,
+      glowColor: this.focusGlowColor,
+      glowRadius: this.focusGlowRadius,
     });
 
     return true;
@@ -1557,6 +2338,10 @@ IMPORTANT:
         break;
       }
 
+      case 'fileUpload':
+        this.handleFileUpload(msg);
+        break;
+
       case 'measureTextReply': {
         const pending = this.pendingRequests.get(msg.requestId!);
         if (pending) {
@@ -1594,6 +2379,64 @@ IMPORTANT:
         break;
       }
 
+      case 'mediaCaptureReply':
+      case 'mediaCaptureFrameReply':
+      case 'speechSpeakReply':
+      case 'speechRecognizeReply':
+      case 'speechVoicesReply': {
+        const pending = this.pendingRequests.get(msg.requestId!);
+        if (pending) {
+          this.pendingRequests.delete(msg.requestId!);
+          pending.resolve(msg);
+        }
+        break;
+      }
+
+      case 'audioEvent': {
+        const notifyId = this.audioNotify.get(msg.playbackId);
+        this.audioNotify.delete(msg.playbackId);
+        if (notifyId) {
+          this.send(event(this.id, notifyId, 'playbackEvent', {
+            playbackId: msg.playbackId,
+            event: msg.event,
+            error: msg.error,
+          }));
+        }
+        break;
+      }
+
+      case 'videoEvent': {
+        // Long-lived mapping: a video emits many events; cleared on dispose.
+        const notifyId = this.videoNotify.get(msg.videoId);
+        if (notifyId) {
+          this.send(event(this.id, notifyId, 'videoEvent', {
+            videoId: msg.videoId,
+            event: msg.event,
+            error: msg.error,
+            duration: msg.duration,
+            currentTime: msg.currentTime,
+            width: msg.width,
+            height: msg.height,
+          }));
+        }
+        break;
+      }
+
+      case 'mediaRecordingComplete': {
+        const notifyId = this.recordingNotify.get(msg.recordingId);
+        this.recordingNotify.delete(msg.recordingId);
+        if (notifyId) {
+          this.send(event(this.id, notifyId, 'recordingReady', {
+            recordingId: msg.recordingId,
+            base64: msg.base64,
+            mimeType: msg.mimeType,
+            durationMs: msg.durationMs,
+            error: msg.error,
+          }));
+        }
+        break;
+      }
+
       case 'fontMetrics': {
         const fmMsg = msg as FontMetricsMsg;
         const hadMetrics = this.fontMetrics.size > 0;
@@ -1614,7 +2457,6 @@ IMPORTANT:
         log.info(`Received font metrics from ${clientId} for ${Object.keys(fmMsg.metrics).length} fonts (additive)`);
         // Only fire fontMetricsChanged on first metrics arrival
         if (!hadMetrics) {
-          this.lastDrawHash.clear();
           const notifiedOwners = new Set<string>();
           for (const state of this.surfaces.values()) {
             if (!notifiedOwners.has(state.objectId)) {
@@ -1633,6 +2475,33 @@ IMPORTANT:
         }
         log.info(`Client ${clientId} ready (${this.clients.size} total)`);
         this.replayStateToClient(clientId);
+        // A ready client means live display info — dependents sizing UI to the
+        // display (e.g. the sidebar dock) re-measure on this signal.
+        this.emitFrontendClientsChanged();
+        break;
+      }
+
+      case 'displayResized': {
+        const m = msg as DisplayResizedMsg;
+        if (m.width > 0 && m.height > 0) {
+          this.lastDisplayInfo = { width: m.width, height: m.height };
+          // Same signal as client-ready: display-sized chrome re-measures.
+          this.emitFrontendClientsChanged();
+          // Let the WindowManager re-fit maximized windows to the new viewport.
+          if (this.windowManagerId) {
+            this.send(event(this.id, this.windowManagerId, 'viewportResized', {
+              width: m.width, height: m.height,
+            }));
+          }
+        }
+        break;
+      }
+
+      case 'closeWindow': {
+        const m = msg as CloseWindowMsg;
+        if (this.windowManagerId) {
+          this.send(event(this.id, this.windowManagerId, 'closeWindow', { surfaceId: m.surfaceId }));
+        }
         break;
       }
 
@@ -1646,6 +2515,47 @@ IMPORTANT:
     }
   }
 
+  /**
+   * Reassemble an uploaded file from its base64 chunks. Once the final chunk
+   * arrives, deliver the whole file to the surface owner as a single
+   * 'fileUploaded' event — buffering here (rather than forwarding each chunk)
+   * keeps the owner's mailbox to one message regardless of file size.
+   */
+  private handleFileUpload(msg: FileUploadMsg): void {
+    let entry = this.fileUploads.get(msg.uploadId);
+    if (!entry) {
+      entry = {
+        surfaceId: msg.surfaceId,
+        name: msg.name,
+        mimeType: msg.mimeType,
+        chunks: new Array<string>(msg.chunkCount).fill(''),
+        received: 0,
+        chunkCount: msg.chunkCount,
+        toFocusedWidget: msg.toFocusedWidget === true,
+      };
+      this.fileUploads.set(msg.uploadId, entry);
+    }
+    if (msg.chunkIndex >= 0 && msg.chunkIndex < entry.chunks.length && entry.chunks[msg.chunkIndex] === '') {
+      entry.chunks[msg.chunkIndex] = msg.base64;
+      entry.received++;
+    }
+    if (entry.received < entry.chunkCount) return;
+
+    this.fileUploads.delete(msg.uploadId);
+    const base64 = entry.chunks.join('');
+    const owner = this.surfaces.get(entry.surfaceId)?.objectId;
+    if (!owner) {
+      log.warn(`fileUpload for unknown surface ${entry.surfaceId}, dropping`);
+      return;
+    }
+    this.send(event(this.id, owner as AbjectId, 'fileUploaded', {
+      name: entry.name,
+      mimeType: entry.mimeType,
+      base64,
+      ...(entry.toFocusedWidget ? { toFocusedWidget: true } : {}),
+    }));
+  }
+
   private async handleFrontendInput(msg: InputMsg, clientId: string): Promise<void> {
     // Track last mouse position and client (global coords) for requestDrag
     if (msg.inputType === 'mousedown' || msg.inputType === 'mousemove') {
@@ -1653,6 +2563,23 @@ IMPORTANT:
       this.lastMouseX = (msg.x ?? 0) + (surfState?.rect.x ?? 0);
       this.lastMouseY = (msg.y ?? 0) + (surfState?.rect.y ?? 0);
       this.lastInputClientId = clientId;
+    }
+
+    // ── Synthesize mouseleave when the pointer changes surface ──
+    // Hit-testing happens client-side per event, so without this a window
+    // never learns the pointer left it (stale hover backplates, stranded
+    // tooltips). Tracked per client so two connected clients don't fight.
+    if (msg.inputType === 'mousemove' && !this.mouseGrabAbject) {
+      const prev = this.hoverSurfaceByClient.get(clientId);
+      if (prev !== msg.surfaceId) {
+        if (prev) {
+          const prevState = this.surfaces.get(prev);
+          if (prevState) {
+            await this.sendInputEvent(prevState.objectId, { type: 'mouseleave', surfaceId: prev });
+          }
+        }
+        this.hoverSurfaceByClient.set(clientId, msg.surfaceId);
+      }
     }
 
     // ── Cursor hint: ask WindowManager which CSS cursor fits the current
@@ -1715,6 +2642,50 @@ IMPORTANT:
         this.mouseGrabClientId = undefined;
         return;
       }
+    }
+
+    // ── 3D scene-node input: mesh nodes are input targets like widgets.
+    // World-scope hits route straight to the owning abject; window-subtree
+    // hits route to the window, which forwards to its owner as 'nodeInput'.
+    if (msg.nodeId) {
+      const target = {
+        scope: (msg.nodeScope ?? 'window') as 'window' | 'world',
+        surfaceId: msg.surfaceId,
+        ownerId: msg.nodeOwnerId as AbjectId | undefined,
+        nodeId: msg.nodeId,
+      };
+      // Selection: a clicked node takes keyboard focus until focus moves.
+      if (msg.inputType === 'mousedown') {
+        this.setFocusedNode(target);
+      }
+      this.deliverNodeEvent(target, {
+        type: msg.inputType,
+        nodeId: msg.nodeId,
+        world: target.scope === 'world',
+        x: msg.x,
+        y: msg.y,
+        button: msg.button,
+        modifiers: msg.modifiers,
+      });
+      return;
+    }
+
+    // A non-node mousedown moves focus away from any selected node.
+    if (msg.inputType === 'mousedown' && this.focusedNode) {
+      this.setFocusedNode(undefined);
+    }
+
+    // Keyboard routes to the selected node while one holds focus.
+    if ((msg.inputType === 'keydown' || msg.inputType === 'keyup') && this.focusedNode) {
+      this.deliverNodeEvent(this.focusedNode, {
+        type: msg.inputType,
+        nodeId: this.focusedNode.nodeId,
+        world: this.focusedNode.scope === 'world',
+        key: msg.key,
+        code: msg.code,
+        modifiers: msg.modifiers,
+      });
+      return;
     }
 
     const inputEvent: InputEvent = {
@@ -1851,6 +2822,8 @@ IMPORTANT:
         rect: { ...state.rect },
         zIndex: state.zIndex,
         inputPassthrough: state.inputPassthrough,
+        transparent: state.transparent,
+        closable: state.closable,
         title: state.title,
       }, clientId);
     }
@@ -1889,6 +2862,43 @@ IMPORTANT:
       this.sendToClient({
         type: 'setFocused',
         surfaceId: this.focusedSurface,
+        glowColor: this.focusGlowColor,
+        glowRadius: this.focusGlowRadius,
+      }, clientId);
+    }
+
+    // 6. Replay the scene: theme, slab transforms, and retained vocab nodes
+    if (this.sceneTheme) {
+      this.sendToClient({
+        type: 'setSceneTheme',
+        theme: this.sceneTheme as unknown as Record<string, unknown>,
+      }, clientId);
+    }
+    for (const state of this.surfaces.values()) {
+      if (state.slabTransform) {
+        this.sendToClient({
+          type: 'setSurfaceTransform',
+          surfaceId: state.surfaceId,
+          rotation: state.slabTransform.rotation,
+          z: state.slabTransform.z,
+        }, clientId);
+      }
+      if (state.sceneNodes.size > 0) {
+        this.sendToClient({
+          type: 'sceneOps',
+          surfaceId: state.surfaceId,
+          ops: [...state.sceneNodes.values()] as unknown as Array<Record<string, unknown>>,
+        }, clientId);
+      }
+    }
+    for (const [ownerId, nodes] of this.worldScenes) {
+      if (nodes.size === 0) continue;
+      this.sendToClient({
+        type: 'sceneOps',
+        surfaceId: '',
+        world: true,
+        ownerId,
+        ops: [...nodes.values()] as unknown as Array<Record<string, unknown>>,
       }, clientId);
     }
 

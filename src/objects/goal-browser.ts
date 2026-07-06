@@ -12,8 +12,7 @@ import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { Goal, GoalId } from './goal-manager.js';
-import type { TreeItem } from './widgets/tree-widget.js';
-import type { IconName } from '../ui/icons.js';
+import { buildGoalRows, type GoalRow, type GoalNode } from './goal-tree.js';
 
 const log = new Log('GoalBrowser');
 
@@ -34,27 +33,14 @@ interface TaskInfo {
   agentName?: string;
 }
 
-const GOAL_STATUS_ICON_NAMES: Record<string, IconName> = {
-  active:    'chevronRight',
-  completed: 'check',
-  failed:    'close',
-};
-
-const TASK_STATUS_ICON_NAMES: Record<string, IconName> = {
-  pending:            'dot',
-  claimed:            'chevronRight',
-  in_progress:        'chevronRight',
-  done:               'check',
-  permanently_failed: 'close',
-};
-
 export class GoalBrowser extends Abject {
   private goalManagerId?: AbjectId;
   private goalObserverId?: AbjectId;
   private widgetManagerId?: AbjectId;
   private windowId?: AbjectId;
   private rootLayoutId?: AbjectId;
-  private treeWidgetId?: AbjectId;
+  private scrollAreaId?: AbjectId;
+  private goalWidgetId?: AbjectId;
   private stopAllBtnId?: AbjectId;
   private clearBtnId?: AbjectId;
 
@@ -186,17 +172,30 @@ Click the arrow to expand/collapse a goal.
       })
     );
 
-    // Tree widget for goals -- add to layout first so it appears above the buttons
-    const { widgetIds: [treeId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', {
-        specs: [{ type: 'tree', windowId: this.windowId, treeItems: [], itemHeight: 22 }],
+    // Scrollable area holds the goal-progress widget. The widget reports its
+    // own natural height (rows word-wrap and vary in height); the ScrollableVBox
+    // scrolls when the tree is taller than the window. Auto-added as expanding,
+    // so it sits above the button bar.
+    this.scrollAreaId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+        parentLayoutId: this.rootLayoutId,
+        autoScroll: false,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 0,
       })
     );
-    this.treeWidgetId = treeId;
 
-    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
-      widgetId: this.treeWidgetId,
-      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    const { widgetIds: [goalWidgetId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [{ type: 'goalProgress', windowId: this.windowId, rows: [] }],
+      })
+    );
+    this.goalWidgetId = goalWidgetId;
+
+    await this.request(request(this.id, this.scrollAreaId, 'addLayoutChild', {
+      widgetId: this.goalWidgetId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: WIN_H },
     }));
 
     // Bottom bar (createNestedHBox auto-adds after the tree)
@@ -240,7 +239,7 @@ Click the arrow to expand/collapse a goal.
     // Subscribe to events
     this.send(request(this.id, this.stopAllBtnId, 'addDependent', {}));
     this.send(request(this.id, this.clearBtnId, 'addDependent', {}));
-    this.send(request(this.id, this.treeWidgetId, 'addDependent', {}));
+    this.send(request(this.id, this.goalWidgetId, 'addDependent', {}));
     this.send(request(this.id, this.goalManagerId!, 'addDependent', {}));
 
     // Populate
@@ -263,7 +262,8 @@ Click the arrow to expand/collapse a goal.
 
     this.windowId = undefined;
     this.rootLayoutId = undefined;
-    this.treeWidgetId = undefined;
+    this.scrollAreaId = undefined;
+    this.goalWidgetId = undefined;
     this.stopAllBtnId = undefined;
     this.clearBtnId = undefined;
     this.goals = [];
@@ -323,125 +323,61 @@ Click the arrow to expand/collapse a goal.
     } catch { return []; }
   }
 
-  // -- Tree building --
+  // -- Row building --
 
-  private buildTreeItems(): TreeItem[] {
-    const items: TreeItem[] = [];
+  /** Map cached Goals into the shared, UI-agnostic node shape. */
+  private toGoalNodes(): GoalNode[] {
+    return this.goals.map(g => {
+      const last = g.progress.length > 0 ? g.progress[g.progress.length - 1] : undefined;
+      return {
+        id: g.id,
+        parentId: g.parentId,
+        title: g.title,
+        description: g.description,
+        status: g.status,
+        latestMessage: last?.message,
+        latestAgent: last?.agentName,
+        error: g.error,
+      };
+    });
+  }
 
-    // Build parent -> children map for proper nesting
-    const childrenOf = new Map<string, Goal[]>();
-    const topLevel: Goal[] = [];
-    for (const goal of this.goals) {
-      if (goal.parentId) {
-        const siblings = childrenOf.get(goal.parentId) ?? [];
-        siblings.push(goal);
-        childrenOf.set(goal.parentId, siblings);
-      } else {
-        topLevel.push(goal);
-      }
-    }
-
-    // Render a goal and its children recursively
-    const renderGoal = (goal: Goal, depth: number): void => {
-      const isExpanded = this.expandedGoals.has(goal.id);
-      const tasks = this.tasksByGoal.get(goal.id) ?? [];
-      const children = childrenOf.get(goal.id) ?? [];
-      const latestProgress = goal.progress.length > 0
-        ? goal.progress[goal.progress.length - 1].message
-        : '';
-      const hasChildren = tasks.length > 0 || children.length > 0
-        || (goal.status === 'active' && !!latestProgress);
-
-      let iconColor: string;
-      switch (goal.status) {
-        case 'active': iconColor = this.theme.statusWarning; break;
-        case 'completed': iconColor = this.theme.statusSuccess; break;
-        case 'failed': iconColor = this.theme.statusError; break;
-        default: iconColor = this.theme.statusNeutral; break;
-      }
-
-      const errorSuffix = goal.status === 'failed' && goal.error
-        ? ` -- ${goal.error.slice(0, 40)}`
-        : '';
-
-      items.push({
-        id: `goal:${goal.id}`,
-        label: goal.title + errorSuffix,
-        iconName: GOAL_STATUS_ICON_NAMES[goal.status],
-        iconColor,
-        depth,
-        expanded: isExpanded,
-        hasChildren,
-      });
-
-      if (!isExpanded) return;
-
-      // User's intent (goal description) — first child when expanded so the
-      // reader sees what the user actually asked for before the planned tasks.
-      if (goal.description && goal.description.trim() && goal.description.trim() !== goal.title.trim()) {
-        items.push({
-          id: `description:${goal.id}`,
-          label: goal.description,
-          iconName: 'info',
-          iconColor: this.theme.textSecondary,
-          depth: depth + 1,
-        });
-      }
-
-      // Task children
-      for (const task of tasks) {
-        const effectiveStatus = task.status === 'pending' && task.claimedBy ? 'claimed' : task.status;
-        const attempts = task.attempts > 0 ? ` (${task.attempts}/${task.maxAttempts})` : '';
-        const desc = task.description.slice(0, 50);
-
-        items.push({
-          id: `task:${task.id}`,
-          label: task.agentName ? `[${task.agentName}] ${desc}${attempts}` : `${desc}${attempts}`,
-          iconName: TASK_STATUS_ICON_NAMES[effectiveStatus] ?? 'dot',
-          iconColor: effectiveStatus === 'done' ? this.theme.statusSuccess
-            : effectiveStatus === 'permanently_failed' ? this.theme.statusError
-            : this.theme.textSecondary,
-          depth: depth + 1,
-        });
-      }
-
-      // Sub-goals nested under this goal
-      for (const child of children) {
-        renderGoal(child, depth + 1);
-      }
-
-      // Progress line at the bottom \u2014 uses a soft dot to flag "in progress".
-      if (goal.status === 'active' && latestProgress) {
-        items.push({
-          id: `progress:${goal.id}`,
-          label: latestProgress,
-          iconName: 'dot',
-          iconColor: this.theme.textTertiary,
-          depth: depth + 1,
-        });
-      }
-    };
-
-    for (const goal of topLevel) {
-      renderGoal(goal, 0);
-    }
-
-    return items;
+  private buildRows(): GoalRow[] {
+    return buildGoalRows({
+      goals: this.toGoalNodes(),
+      isExpanded: (id) => this.expandedGoals.has(id as GoalId),
+      getTasks: (id) => this.tasksByGoal.get(id as GoalId) ?? [],
+    });
   }
 
   private async rebuildTree(): Promise<void> {
-    if (!this.treeWidgetId) return;
-    const items = this.buildTreeItems();
+    if (!this.goalWidgetId) return;
+    const rows = this.buildRows();
     try {
-      await this.request(request(this.id, this.treeWidgetId, 'update', { items }));
+      await this.request(request(this.id, this.goalWidgetId, 'update', { rows }));
     } catch { /* widget may be gone */ }
   }
 
   // -- Event handling --
 
   private async handleChanged(fromId: AbjectId, aspect: string, value?: unknown): Promise<void> {
+    // Goal widget reports its natural height; resize its layout child so the
+    // ScrollableVBox scrolls when the tree outgrows the window.
+    if (fromId === this.goalWidgetId && aspect === 'contentHeight') {
+      if (this.scrollAreaId) {
+        const height = typeof value === 'number' ? value : Number(value);
+        if (Number.isFinite(height) && height > 0) {
+          this.send(request(this.id, this.scrollAreaId, 'updateLayoutChild', {
+            widgetId: this.goalWidgetId,
+            preferredSize: { height },
+          }));
+        }
+      }
+      return;
+    }
+
     // Tree toggle event
-    if (fromId === this.treeWidgetId && aspect === 'toggle') {
+    if (fromId === this.goalWidgetId && aspect === 'toggle') {
       const data = typeof value === 'string' ? JSON.parse(value) : value;
       const rawId = (data as { id: string }).id;
       // Strip the "goal:" prefix

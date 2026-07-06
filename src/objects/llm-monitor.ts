@@ -37,8 +37,24 @@ interface StatsSnapshot {
 /** Per-row widget IDs for in-place updates. Labels order: name, method, provider, time, output. */
 interface RowWidgets {
   requestId: string;
+  containerId: AbjectId;  // the row's HBox; destroying it cascades to labels + btn
   labels: AbjectId[];  // [name, method, provider, time, output]
   btn: AbjectId;
+}
+
+/** Desired state for a single row, diffed against the rows currently rendered. */
+interface RowDesc {
+  id: string;
+  name: string;
+  method: string;
+  provider: string;
+  time: string;
+  output: string;
+  nameColor: string;
+  actionText: string;
+  isKill: boolean;
+  /** Active rows update time/output/color in place when they survive a refresh. */
+  dynamic: boolean;
 }
 
 export class LLMMonitor extends Abject {
@@ -66,24 +82,28 @@ export class LLMMonitor extends Abject {
   private refreshTimer?: ReturnType<typeof setInterval>;
   private refreshing = false;
 
-  // Row tracking for in-place updates
-  private activeRows: RowWidgets[] = [];
-  private historyRows: RowWidgets[] = [];
-  private lastActiveIds: string[] = [];
-  private lastHistoryIds: string[] = [];
+  /**
+   * Debounce for event-driven refreshes. LLM request start/complete events can
+   * arrive in bursts; collapsing them into a single refresh avoids redundant
+   * reconciliation passes against the shared WidgetManager.
+   */
+  private refreshScheduled = false;
+  private refreshDebounceTimer?: ReturnType<typeof setTimeout>;
+  private static readonly REFRESH_DEBOUNCE_MS = 300;
 
   /**
-   * Every widget created inside a tab's ScrollableVBox, tracked per-tab so we
-   * can explicitly destroy each one before tearing down the container on
-   * rebuild. Without this the tab container alone was getting destroyed and
-   * its widget tree was orphaned in WidgetManager — every refresh leaked all
-   * the rows worth of widgets, OOMing after a few hours of LLM activity.
-   *
-   * LayoutAbject also cascades destroy on stop now, so this is belt-and-
-   * suspenders, but it also documents intent and keeps llm-monitor consistent
-   * with the explicit-tracking pattern Settings.clearTabContent uses.
+   * Per-tab rendered rows, in display order (index 0 = Active, 1 = History).
+   * Rows are reconciled incrementally against the latest snapshot: only rows
+   * whose request id appeared/disappeared are created/destroyed, and surviving
+   * active rows get cheap in-place label updates. This bounds WidgetManager
+   * traffic to the handful of rows that actually changed per refresh, instead
+   * of destroying and recreating the entire list on every LLM event.
    */
-  private tabWidgetIds: AbjectId[][] = [[], []];
+  private tabRows: RowWidgets[][] = [[], []];
+  /** Header row container per tab (undefined = not yet built). */
+  private headerIds: (AbjectId | undefined)[] = [undefined, undefined];
+  /** "No active requests" / "No history yet" placeholder per tab (undefined = not shown). */
+  private emptyIds: (AbjectId | undefined)[] = [undefined, undefined];
 
   // Detail window
   private detailWindowId?: AbjectId;
@@ -182,11 +202,7 @@ export class LLMMonitor extends Abject {
         aspect === 'unpaused'
       ) {
         if (this.windowId) {
-          try {
-            await this.refreshView();
-          } catch (err) {
-            log.warn('Failed to refresh LLM monitor:', err);
-          }
+          this.scheduleRefresh();
         }
       }
     });
@@ -235,6 +251,11 @@ export class LLMMonitor extends Abject {
       clearInterval(this.refreshTimer);
       this.refreshTimer = undefined;
     }
+    if (this.refreshDebounceTimer) {
+      clearTimeout(this.refreshDebounceTimer);
+      this.refreshDebounceTimer = undefined;
+    }
+    this.refreshScheduled = false;
 
     await this.hideDetail();
 
@@ -268,11 +289,9 @@ export class LLMMonitor extends Abject {
     this.pauseStatusLabelId = undefined;
     this.killButtons.clear();
     this.viewButtons.clear();
-    this.activeRows = [];
-    this.historyRows = [];
-    this.lastActiveIds = [];
-    this.lastHistoryIds = [];
-    this.tabWidgetIds = [[], []];
+    this.tabRows = [[], []];
+    this.headerIds = [undefined, undefined];
+    this.emptyIds = [undefined, undefined];
     this.refreshing = false;
   }
 
@@ -394,15 +413,32 @@ export class LLMMonitor extends Abject {
     this.activeTabListId = this.tabContents[0];
     this.historyTabListId = this.tabContents[1];
 
-    // Force a full rebuild for initial population
-    this.lastActiveIds = [];
-    this.lastHistoryIds = [];
+    // clearViewTracking() above reset row state, so this first refresh builds
+    // every row from empty via the normal incremental reconcile path.
     await this.refreshView();
   }
 
   /**
-   * Refresh the view. If the row structure (request IDs) hasn't changed,
-   * update labels in-place to avoid flicker. Otherwise do a full rebuild.
+   * Coalesce a burst of LLM events into a single refresh after a short delay.
+   * Direct user actions (button clicks, manual refresh) still call refreshView()
+   * synchronously for immediate feedback.
+   */
+  private scheduleRefresh(): void {
+    if (this.refreshScheduled) return;
+    this.refreshScheduled = true;
+    this.refreshDebounceTimer = setTimeout(() => {
+      this.refreshScheduled = false;
+      this.refreshDebounceTimer = undefined;
+      if (this.windowId) {
+        this.refreshView().catch((err) => log.warn('Failed to refresh LLM monitor:', err));
+      }
+    }, LLMMonitor.REFRESH_DEBOUNCE_MS);
+  }
+
+  /**
+   * Refresh the view by reconciling rendered rows against the latest snapshot.
+   * Only rows that appeared or disappeared are created/destroyed; surviving
+   * active rows get cheap in-place label updates.
    */
   private async refreshView(): Promise<void> {
     if (!this.activeTabListId || !this.historyTabListId || !this.rootLayoutId || !this.windowId) return;
@@ -429,21 +465,134 @@ export class LLMMonitor extends Abject {
     await this.updateStatsLabel(snapshot);
     await this.updatePauseLabel(snapshot);
 
-    // Check if row structure changed
+    const now = Date.now();
     const activeRequests = snapshot?.activeRequests ?? [];
     const history = snapshot?.history ?? [];
-    const newActiveIds = activeRequests.map(r => r.id);
-    const newHistoryIds = history.map(h => h.id);
 
-    const structureChanged =
-      !this.arraysEqual(newActiveIds, this.lastActiveIds) ||
-      !this.arraysEqual(newHistoryIds, this.lastHistoryIds);
+    // Active tab: one row per active request, in arrival order.
+    const activeDesc: RowDesc[] = activeRequests.map((req) => ({
+      id: req.id,
+      name: req.callerName ?? req.callerId.slice(0, 8),
+      method: req.method,
+      provider: req.provider,
+      time: `${Math.round((now - req.startTime) / 1000)}s`,
+      output: `${req.outputChars}`,
+      nameColor: req.streaming ? this.theme.statusSuccess : this.theme.textMeta,
+      actionText: 'Kill',
+      isKill: true,
+      dynamic: true,
+    }));
 
-    if (structureChanged) {
-      await this.rebuildScrollableList(snapshot);
-    } else {
-      await this.updateRowsInPlace(activeRequests, history);
+    // History tab: oldest-first (newest appended at the bottom) so the list is
+    // append-only and can be reconciled incrementally — the LLM object caps and
+    // drops the oldest entry from the front, which maps to removing the top row.
+    const historyDesc: RowDesc[] = history.map((entry) => ({
+      id: entry.id,
+      name: entry.callerName ?? entry.callerId.slice(0, 8),
+      method: entry.method,
+      provider: entry.provider,
+      time: `${(entry.elapsedMs / 1000).toFixed(1)}s`,
+      output: `${entry.outputChars}`,
+      nameColor: entry.error ? this.theme.statusError : this.theme.textHeading,
+      actionText: 'View',
+      isKill: false,
+      dynamic: false,
+    }));
+
+    await this.reconcileTab(0, this.activeTabListId!, activeDesc, true, 'No active requests');
+    await this.reconcileTab(1, this.historyTabListId!, historyDesc, false, 'No history yet');
+  }
+
+  /**
+   * Reconcile one tab's rendered rows against the desired row list. Rows whose
+   * id is gone are destroyed; ids not yet rendered are appended; surviving rows
+   * (matched by id, stable order) are updated in place when dynamic.
+   *
+   * Append-only ordering is safe because both desired lists only ever grow at
+   * the end and shrink from arbitrary positions (active) or the front (history).
+   */
+  private async reconcileTab(
+    tabIndex: number,
+    listId: AbjectId,
+    desired: RowDesc[],
+    alwaysHeader: boolean,
+    emptyText: string,
+  ): Promise<void> {
+    const hasData = desired.length > 0;
+
+    // Header: present for the active tab always; for history only when non-empty.
+    if (alwaysHeader || hasData) {
+      if (this.headerIds[tabIndex] === undefined) {
+        this.headerIds[tabIndex] = await this.addHeaderRow(listId);
+      }
+    } else if (this.headerIds[tabIndex] !== undefined) {
+      await this.destroyWidget(listId, this.headerIds[tabIndex]!);
+      this.headerIds[tabIndex] = undefined;
     }
+
+    // Empty placeholder: shown only when there are no rows.
+    if (!hasData && this.emptyIds[tabIndex] === undefined) {
+      this.emptyIds[tabIndex] = await this.addEmptyLabel(listId, emptyText);
+    } else if (hasData && this.emptyIds[tabIndex] !== undefined) {
+      await this.destroyWidget(listId, this.emptyIds[tabIndex]!);
+      this.emptyIds[tabIndex] = undefined;
+    }
+
+    const rows = this.tabRows[tabIndex];
+    const desiredIds = new Set(desired.map((d) => d.id));
+
+    // Destroy rows whose request is no longer present.
+    const survivors: RowWidgets[] = [];
+    for (const row of rows) {
+      if (desiredIds.has(row.requestId)) {
+        survivors.push(row);
+      } else {
+        await this.destroyRow(listId, row);
+      }
+    }
+    const byId = new Map(survivors.map((r) => [r.requestId, r]));
+
+    // Walk desired order: update survivors in place, append genuinely new rows.
+    const next: RowWidgets[] = [];
+    for (const d of desired) {
+      const existing = byId.get(d.id);
+      if (existing) {
+        if (d.dynamic) await this.updateRowDynamic(existing, d);
+        next.push(existing);
+      } else {
+        next.push(await this.addRequestRow(
+          listId, d.name, d.method, d.provider, d.time, d.output,
+          d.nameColor, d.actionText, d.id, d.isKill,
+        ));
+      }
+    }
+    this.tabRows[tabIndex] = next;
+  }
+
+  /** Update the frequently-changing fields of a surviving active row. */
+  private async updateRowDynamic(row: RowWidgets, d: RowDesc): Promise<void> {
+    try {
+      await this.request(request(this.id, row.labels[0], 'update', { text: d.name, style: { color: d.nameColor } }));
+      await this.request(request(this.id, row.labels[3], 'update', { text: d.time }));
+      await this.request(request(this.id, row.labels[4], 'update', { text: d.output }));
+    } catch { /* widget gone */ }
+  }
+
+  /** Detach a row from its tab list and destroy it (cascades to its labels + button). */
+  private async destroyRow(listId: AbjectId, row: RowWidgets): Promise<void> {
+    this.killButtons.delete(row.btn);
+    this.viewButtons.delete(row.btn);
+    await this.destroyWidget(listId, row.containerId);
+  }
+
+  /** Remove a widget from a layout and destroy it. */
+  private async destroyWidget(listId: AbjectId, widgetId: AbjectId): Promise<void> {
+    try {
+      await this.request(request(this.id, listId, 'removeLayoutChild', { widgetId }));
+    } catch { /* may be gone */ }
+    try {
+      await this.request(request(this.id, widgetId, 'destroy', {}));
+    } catch { /* already gone */ }
   }
 
   private async updateStatsLabel(snapshot: StatsSnapshot | null): Promise<void> {
@@ -471,196 +620,20 @@ export class LLMMonitor extends Abject {
     } catch { /* widget gone */ }
   }
 
-  /**
-   * Update only the dynamic label text (time, output) for existing rows.
-   */
-  private async updateRowsInPlace(
-    activeRequests: LLMActiveRequest[],
-    history: LLMHistoryEntry[],
-  ): Promise<void> {
-    const now = Date.now();
-
-    // Update active rows: time and output change frequently
-    for (let i = 0; i < activeRequests.length && i < this.activeRows.length; i++) {
-      const req = activeRequests[i];
-      const row = this.activeRows[i];
-      const elapsedSec = Math.round((now - req.startTime) / 1000);
-      try {
-        await this.request(request(this.id, row.labels[3], 'update', { text: `${elapsedSec}s` }));
-        await this.request(request(this.id, row.labels[4], 'update', { text: `${req.outputChars}` }));
-      } catch { /* widget gone */ }
-    }
-    // History rows are static, no updates needed
-  }
-
-  /**
-   * Full rebuild of both tab content areas. Called when structure changes.
-   */
-  private async rebuildScrollableList(snapshot: StatsSnapshot | null): Promise<void> {
-    if (!this.activeTabListId || !this.historyTabListId || !this.rootLayoutId || !this.windowId) return;
-
-    this.killButtons.clear();
-    this.viewButtons.clear();
-    this.activeRows = [];
-    this.historyRows = [];
-
-    const now = Date.now();
-    const activeRequests = snapshot?.activeRequests ?? [];
-    const history = snapshot?.history ?? [];
-
-    // Track IDs for next comparison
-    this.lastActiveIds = activeRequests.map(r => r.id);
-    this.lastHistoryIds = history.map(h => h.id);
-
-    // Rebuild Active Requests tab
-    await this.rebuildTabContent(0, async (targetId) => {
-      await this.addHeaderRow(targetId, 0);
-      if (activeRequests.length === 0) {
-        await this.addEmptyLabel(targetId, 0, 'No active requests');
-      } else {
-        for (const req of activeRequests) {
-          const elapsedSec = Math.round((now - req.startTime) / 1000);
-          const row = await this.addRequestRow(
-            targetId,
-            0,
-            req.callerName ?? req.callerId.slice(0, 8),
-            req.method,
-            req.provider,
-            `${elapsedSec}s`,
-            `${req.outputChars}`,
-            req.streaming ? this.theme.statusSuccess : this.theme.textMeta,
-            'Kill',
-            req.id,
-            true,
-          );
-          this.activeRows.push(row);
-        }
-      }
-    });
-
-    // Rebuild Recent History tab
-    await this.rebuildTabContent(1, async (targetId) => {
-      if (history.length > 0) {
-        await this.addHeaderRow(targetId, 1);
-        for (let i = history.length - 1; i >= 0; i--) {
-          const entry = history[i];
-          const timeSec = (entry.elapsedMs / 1000).toFixed(1);
-          const nameColor = entry.error ? this.theme.statusError : this.theme.textHeading;
-          const row = await this.addRequestRow(
-            targetId,
-            1,
-            entry.callerName ?? entry.callerId.slice(0, 8),
-            entry.method,
-            entry.provider,
-            `${timeSec}s`,
-            `${entry.outputChars}`,
-            nameColor,
-            'View',
-            entry.id,
-            false,
-          );
-          this.historyRows.push(row);
-        }
-      } else {
-        await this.addEmptyLabel(targetId, 1, 'No history yet');
-      }
-    });
-  }
-
-  /**
-   * Destroy a tab's ScrollableVBox, recreate it, preserve visibility, and populate.
-   */
-  private async rebuildTabContent(
-    tabIndex: number,
-    populate: (targetLayoutId: AbjectId) => Promise<void>,
-  ): Promise<void> {
-    const oldId = this.tabContents[tabIndex];
-
-    // Destroy every widget we created inside the previous instance of this
-    // tab container. We must do this BEFORE destroying the container so that
-    // the WidgetManager and Theme dependent registrations are cleaned up
-    // cleanly. LayoutAbject's onStop also cascades, but tracking explicitly
-    // makes intent clear and survives any future refactor of cascade order.
-    const prev = this.tabWidgetIds[tabIndex];
-    for (const widgetId of prev) {
-      try {
-        await this.request(request(this.id, widgetId, 'destroy', {}));
-      } catch { /* widget already gone */ }
-    }
-    this.tabWidgetIds[tabIndex] = [];
-
-    // Remove old from layout
-    try {
-      await this.request(request(this.id, this.rootLayoutId!, 'removeLayoutChild', {
-        widgetId: oldId,
-      }));
-    } catch { /* may be gone */ }
-    try {
-      await this.request(request(this.id, oldId, 'destroy', {}));
-    } catch { /* may be gone */ }
-
-    // Create replacement
-    const newId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createScrollableVBox', {
-        windowId: this.windowId!,
-        margins: { top: 4, right: 0, bottom: 0, left: 0 },
-        spacing: 2,
-      })
-    );
-    await this.request(request(this.id, this.rootLayoutId!, 'addLayoutChild', {
-      widgetId: newId,
-      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
-    }));
-
-    // Hide if not the selected tab
-    if (tabIndex !== this.selectedTabIndex) {
-      await this.request(request(this.id, newId, 'update', {
-        style: { visible: false },
-      }));
-    }
-
-    this.tabContents[tabIndex] = newId;
-    if (tabIndex === 0) this.activeTabListId = newId;
-    else this.historyTabListId = newId;
-
-    await populate(newId);
-  }
-
   // -- Row Helpers --
 
-  private async addSectionLabel(targetLayoutId: AbjectId, text: string): Promise<void> {
-    const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', {
-        specs: [
-          { type: 'label', windowId: this.windowId!, text, style: { fontSize: 11, color: this.theme.accent, fontWeight: 'bold' } },
-        ],
-      })
-    );
-    await this.request(request(this.id, targetLayoutId, 'addLayoutChild', {
-      widgetId: labelId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 20 },
-    }));
-  }
-
-  /** Track a widget id for cleanup when the given tab is rebuilt or destroyed. */
-  private trackTab(tabIndex: number, widgetId: AbjectId): AbjectId {
-    this.tabWidgetIds[tabIndex].push(widgetId);
-    return widgetId;
-  }
-
-  private async addHeaderRow(targetLayoutId: AbjectId, tabIndex: number): Promise<void> {
+  private async addHeaderRow(targetLayoutId: AbjectId): Promise<AbjectId> {
     const headerStyle = { color: this.theme.sectionLabel, fontSize: 10, fontWeight: 'bold' };
     const headerTexts = ['Requester', 'Method', 'Provider', 'Time', 'Output', ''];
     const headerWidths: Array<number | undefined> = [undefined, 70, 80, 50, 60, 50];
 
-    const headerRowId = this.trackTab(tabIndex, await this.request<AbjectId>(
+    const headerRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: targetLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
-    ));
+    );
     await this.request(request(this.id, targetLayoutId, 'addLayoutChild', {
       widgetId: headerRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
@@ -674,7 +647,6 @@ export class LLMMonitor extends Abject {
         })),
       })
     );
-    for (const id of headerLabelIds) this.trackTab(tabIndex, id);
 
     for (let h = 0; h < headerLabelIds.length; h++) {
       const width = headerWidths[h];
@@ -684,9 +656,10 @@ export class LLMMonitor extends Abject {
         preferredSize: width ? { width, height: 18 } : { height: 18 },
       }));
     }
+    return headerRowId;
   }
 
-  private async addEmptyLabel(targetLayoutId: AbjectId, tabIndex: number, text: string): Promise<void> {
+  private async addEmptyLabel(targetLayoutId: AbjectId, text: string): Promise<AbjectId> {
     const { widgetIds: [emptyId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
         specs: [
@@ -694,17 +667,16 @@ export class LLMMonitor extends Abject {
         ],
       })
     );
-    this.trackTab(tabIndex, emptyId);
     await this.request(request(this.id, targetLayoutId, 'addLayoutChild', {
       widgetId: emptyId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 26 },
     }));
+    return emptyId;
   }
 
   private async addRequestRow(
     targetLayoutId: AbjectId,
-    tabIndex: number,
     requesterName: string,
     method: string,
     provider: string,
@@ -716,13 +688,13 @@ export class LLMMonitor extends Abject {
     isKill: boolean,
   ): Promise<RowWidgets> {
     const rowH = 26;
-    const rowLayoutId = this.trackTab(tabIndex, await this.request<AbjectId>(
+    const rowLayoutId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: targetLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 4,
       })
-    ));
+    );
     await this.request(request(this.id, targetLayoutId, 'addLayoutChild', {
       widgetId: rowLayoutId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
@@ -741,8 +713,6 @@ export class LLMMonitor extends Abject {
           ],
         })
       );
-    for (const id of [nameId, methodId, providerId, timeId, outputId]) this.trackTab(tabIndex, id);
-
     await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
       widgetId: nameId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
@@ -768,7 +738,6 @@ export class LLMMonitor extends Abject {
         ],
       })
     );
-    this.trackTab(tabIndex, btnId);
     await this.addDep(btnId);
     if (isKill) {
       this.killButtons.set(btnId, requestId);
@@ -781,7 +750,7 @@ export class LLMMonitor extends Abject {
       preferredSize: { width: 50, height: rowH },
     }));
 
-    return { requestId, labels: [nameId, methodId, providerId, timeId, outputId], btn: btnId };
+    return { requestId, containerId: rowLayoutId, labels: [nameId, methodId, providerId, timeId, outputId], btn: btnId };
   }
 
   // -- Detail View --
@@ -826,9 +795,9 @@ export class LLMMonitor extends Abject {
           specs: [
             { type: 'label', windowId: this.detailWindowId, text: summaryText, style: { fontSize: 11, color: this.theme.sectionLabel } },
             { type: 'label', windowId: this.detailWindowId, text: 'Prompt:', style: { fontSize: 11, color: this.theme.accent, fontWeight: 'bold' } },
-            { type: 'textArea', windowId: this.detailWindowId, text: entry.inputMessages || '(no input captured)', style: { fontSize: 11 }, readOnly: true },
+            { type: 'textArea', windowId: this.detailWindowId, text: entry.inputMessages || '(no input captured)', style: { fontSize: 11, wordWrap: true }, readOnly: true },
             { type: 'label', windowId: this.detailWindowId, text: 'Output:', style: { fontSize: 11, color: this.theme.accent, fontWeight: 'bold' } },
-            { type: 'textArea', windowId: this.detailWindowId, text: entry.outputContent || '(no output)', style: { fontSize: 11 }, readOnly: true },
+            { type: 'textArea', windowId: this.detailWindowId, text: entry.outputContent || '(no output)', style: { fontSize: 11, wordWrap: true }, readOnly: true },
           ],
         })
       );
@@ -884,9 +853,6 @@ export class LLMMonitor extends Abject {
     }
 
     if (fromId === this.refreshBtnId) {
-      // Force full rebuild on manual refresh
-      this.lastActiveIds = [];
-      this.lastHistoryIds = [];
       await this.refreshView();
       return;
     }
@@ -943,6 +909,10 @@ export class LLMMonitor extends Abject {
       clearInterval(this.refreshTimer);
       this.refreshTimer = undefined;
     }
+    if (this.refreshDebounceTimer) {
+      clearTimeout(this.refreshDebounceTimer);
+      this.refreshDebounceTimer = undefined;
+    }
   }
 
   protected override askPrompt(_question: string): string {
@@ -955,11 +925,11 @@ export class LLMMonitor extends Abject {
 
 ### Features
 - Real-time view of active LLM requests with kill controls.
-- Recent history of completed requests with View button to inspect prompt and output.
+- Recent history of completed requests (oldest first, newest at the bottom) with View button to inspect prompt and output.
 - Aggregate stats: total requests, input/output chars, errors, average latency.
 - Pause/Unpause buttons to control the LLM object.
-- Flicker-free updates: in-place label updates when row structure hasn't changed.
-- Auto-refreshes every 2 seconds and on LLM state change events.
+- Flicker-free updates: rows are reconciled incrementally, so only changed rows are touched.
+- Auto-refreshes every 2 seconds and on LLM state change events (event-driven refreshes are debounced).
 
 ### Interface ID
 \`abjects:llm-monitor\``;

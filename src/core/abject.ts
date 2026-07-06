@@ -25,7 +25,7 @@ import { INTROSPECT_METHODS, INTROSPECT_EVENTS, formatManifestAsDescription } fr
 import type { InterfaceId } from './types.js';
 import { Log } from './timed-log.js';
 import type { ThemeData } from './theme-data.js';
-import { MIDNIGHT_BLOOM } from './theme-data.js';
+import { ARCANE_GRIMOIRE } from './theme-data.js';
 
 const log = new Log('ABJECT');
 
@@ -412,10 +412,12 @@ export abstract class Abject {
   }
 
   /**
-   * Get the current theme. Returns cached theme or MIDNIGHT_BLOOM default.
-   * WidgetAbject overrides this field directly (set from config).
+   * Get the current theme. Returns cached theme or ARCANE_GRIMOIRE default
+   * (must match DEFAULT_THEME_ID so objects built before the persisted theme
+   * loads don't flash a mismatched palette). WidgetAbject overrides this field
+   * directly (set from config).
    */
-  protected theme: ThemeData = MIDNIGHT_BLOOM;
+  protected theme: ThemeData = ARCANE_GRIMOIRE;
 
   /**
    * Discover the Theme object, fetch the current theme, cache it, and
@@ -500,13 +502,26 @@ You are this object. Your capabilities are exactly what the manifest above descr
   }
 
   /**
+   * Model tier for this object's `ask` answers. Default 'fast' (haiku) — right
+   * for the many objects with small, mechanical APIs where the answer is a
+   * straight reading of the manifest. Override to 'balanced' for objects whose
+   * ask guidance is rich and build-critical — the surfaces agents consult to
+   * BUILD and STYLE apps or DISCOVER capabilities (e.g. WidgetManager, Registry)
+   * — where a shallow haiku synthesis drops nuance and causes downstream
+   * mistakes. Reserve 'smart' for code generation, not Q&A.
+   */
+  protected askTier(): 'smart' | 'balanced' | 'fast' {
+    return 'fast';
+  }
+
+  /**
    * Handle an 'ask' request. Override for custom behavior (e.g., querying
    * Registry to discover which objects can help before answering).
-   * Default: build prompt via askPrompt(), send to LLM via askLlm().
+   * Default: build prompt via askPrompt(), send to LLM via askLlm() at askTier().
    */
   protected async handleAsk(question: string): Promise<string> {
     const prompt = this.askPrompt(question);
-    return this.askLlm(prompt, question);
+    return this.askLlm(prompt, question, this.askTier());
   }
 
   /**
@@ -857,6 +872,26 @@ You are this object. Your capabilities are exactly what the manifest above descr
     return this.request<boolean>(
       request(this.id, wmId, 'showConfirmDialog', opts),
       60000 // 60s timeout for user think time
+    );
+  }
+
+  /**
+   * Show a modal text-input dialog and return the entered string, or null if
+   * the user cancelled. Returns null when there is no UI available.
+   */
+  protected async prompt(opts: {
+    title: string;
+    message: string;
+    defaultValue?: string;
+    placeholder?: string;
+    confirmLabel?: string;
+    cancelLabel?: string;
+  }): Promise<string | null> {
+    const wmId = await this.discoverDep('WidgetManager');
+    if (!wmId) return null; // no UI → nothing to enter
+    return this.request<string | null>(
+      request(this.id, wmId, 'showPromptDialog', opts),
+      120000 // generous timeout for user typing
     );
   }
 

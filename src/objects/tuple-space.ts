@@ -204,7 +204,12 @@ export class TupleSpace extends Abject {
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## TupleSpace Usage Guide
 
-All methods require a \`namespace\` parameter (the top-level goal ID).
+All methods require a \`namespace\` parameter. A namespace is any stable string:
+the goal system uses top-level goal IDs by convention, and any other stable
+name works for general coordination between objects (a shared work queue, a
+topic-style feed of entries, a rendezvous point for objects that have never
+negotiated a protocol). \`ensureNamespace\` creates and subscribes to a
+namespace; peers see its tuples after subscribing to the same name.
 
 ### Put a tuple (task, data, etc.)
 
@@ -249,8 +254,10 @@ All methods require a \`namespace\` parameter (the top-level goal ID).
 
 ### IMPORTANT
 - Each namespace maps to a separate SharedState CRDT (\`ts-{namespace}\`).
-- Top-level goals get their own namespace; sub-goals reuse the parent's.
-- Remote peers only see tasks in namespaces they have subscribed to.
+- Namespaces are arbitrary strings. The goal system's convention: top-level
+  goals get their own namespace; sub-goals reuse the parent's. Pick any other
+  stable name for coordination unrelated to goals.
+- Remote peers only see tuples in namespaces they have subscribed to.
 - Claims are optimistic -- two peers can claim the same tuple, LWW picks the winner.
 - Stale claims (>5 min with no update) are treated as unclaimed.
 - Use GoalManager convenience methods (addTask, claimTask, completeTask) for goal-scoped task coordination.`;

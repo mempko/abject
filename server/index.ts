@@ -31,6 +31,7 @@ import { WindowSwitcherAbject } from '../src/objects/window-switcher.js';
 import { Taskbar } from '../src/objects/taskbar.js';
 import { AppExplorer } from '../src/objects/app-explorer.js';
 import { ObjectBrowser } from '../src/objects/object-browser.js';
+import { MethodInspector } from '../src/objects/method-inspector.js';
 import { ObjectCatalog } from '../src/objects/object-catalog.js';
 import { WidgetManager } from '../src/objects/widget-manager.js';
 import { ThemeAbject } from '../src/objects/theme.js';
@@ -42,6 +43,8 @@ import { GoalManager } from '../src/objects/goal-manager.js';
 import { GoalBrowser } from '../src/objects/goal-browser.js';
 import { KnowledgeBase } from '../src/objects/knowledge-base.js';
 import { KnowledgeBrowser } from '../src/objects/knowledge-browser.js';
+import { FileManager } from '../src/objects/file-manager.js';
+import { FileViewer } from '../src/objects/file-viewer.js';
 import { AgentBrowser } from '../src/objects/agent-browser.js';
 import { AgentCreator } from '../src/objects/agent-creator.js';
 import { Scheduler } from '../src/objects/scheduler.js';
@@ -58,6 +61,7 @@ import type { RestartType } from '../src/runtime/supervisor.js';
 import { WorkspaceManager } from '../src/objects/workspace-manager.js';
 import { WorkspaceRegistry } from '../src/objects/workspace-registry.js';
 import { WorkspaceSwitcher } from '../src/objects/workspace-switcher.js';
+import { Sidebar } from '../src/objects/sidebar.js';
 import { GlobalSettings } from '../src/objects/global-settings.js';
 import { GlobalToolbar } from '../src/objects/global-toolbar.js';
 import { PeerNetwork } from '../src/objects/peer-network.js';
@@ -71,6 +75,9 @@ import { SignalingRelayObject } from '../src/objects/signaling-relay.js';
 import { PeerDiscoveryObject } from '../src/objects/peer-discovery.js';
 import { SharedState } from '../src/objects/capabilities/shared-state.js';
 import { TupleSpace } from '../src/objects/tuple-space.js';
+import { TriggerManager } from '../src/objects/trigger-manager.js';
+import { CollectionStore } from '../src/objects/collection-store.js';
+import { DataBrowser } from '../src/objects/data-browser.js';
 import { FileTransfer } from '../src/objects/capabilities/file-transfer.js';
 import { MediaStreamCapability } from '../src/objects/capabilities/media-stream.js';
 import { WorkspaceShareRegistry, WORKSPACE_SHARE_REGISTRY_ID } from '../src/objects/workspace-share-registry.js';
@@ -78,6 +85,10 @@ import { ShellExecutor } from '../src/objects/capabilities/shell-executor.js';
 import { HostFileSystem } from '../src/objects/capabilities/host-filesystem.js';
 import { WebSearch } from '../src/objects/capabilities/web-search.js';
 import { WebFetch } from '../src/objects/capabilities/web-fetch.js';
+import { StreamClient } from '../src/objects/capabilities/stream-client.js';
+import { AudioOutput } from '../src/objects/capabilities/audio-output.js';
+import { Speech } from '../src/objects/capabilities/speech.js';
+import { createCapabilityInterceptor } from '../src/runtime/capability-interceptor.js';
 import { Screenshot } from '../src/objects/capabilities/screenshot.js';
 import { SkillRegistry } from '../src/objects/skill-registry.js';
 import { SkillBrowser } from '../src/objects/skill-browser.js';
@@ -92,6 +103,9 @@ import { OAuthHelper } from '../src/objects/oauth-helper.js';
 import { RemoteUIAccess } from '../src/objects/remote-ui-access.js';
 import type { UITransportLike } from '../src/network/webrtc-ui-transport.js';
 import { HttpServer } from '../src/objects/http-server.js';
+import { WasmAbject } from '../src/objects/wasm-abject.js';
+import type { WasmAbjectArgs } from '../src/objects/wasm-abject.js';
+import { ingestAllExtensions } from '../src/sandbox/extensions.js';
 import type { MCPBridgeConfig } from '../src/objects/mcp-bridge.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { NodeWebSocketServer } from '../src/network/websocket-server.js';
@@ -457,7 +471,10 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('Timer', () => new Timer());
   runtime.objectFactory.registerConstructor('Clipboard', () => new Clipboard());
   runtime.objectFactory.registerConstructor('Console', () => new Console());
-  runtime.objectFactory.registerConstructor('FileSystem', () => new FileSystem());
+  runtime.objectFactory.registerConstructor('FileSystem', (args?: unknown) => {
+    const opts = args as { workspaceId?: string } | undefined;
+    return new FileSystem(opts?.workspaceId);
+  });
   runtime.objectFactory.registerConstructor('Theme', () => new ThemeAbject());
   runtime.objectFactory.registerConstructor('WindowManager', () => new WindowManager());
   runtime.objectFactory.registerConstructor('WidgetManager', () => new WidgetManager());
@@ -472,6 +489,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('WindowSwitcher', () => new WindowSwitcherAbject());
   runtime.objectFactory.registerConstructor('AppExplorer', () => new AppExplorer());
   runtime.objectFactory.registerConstructor('ObjectBrowser', () => new ObjectBrowser());
+  runtime.objectFactory.registerConstructor('MethodInspector', () => new MethodInspector());
   runtime.objectFactory.registerConstructor('ObjectCatalog', () => new ObjectCatalog());
   runtime.objectFactory.registerConstructor('JobManager', () => new JobManager());
   runtime.objectFactory.registerConstructor('JobBrowser', () => new JobBrowser());
@@ -479,6 +497,8 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('GoalBrowser', () => new GoalBrowser());
   runtime.objectFactory.registerConstructor('KnowledgeBase', () => new KnowledgeBase());
   runtime.objectFactory.registerConstructor('KnowledgeBrowser', () => new KnowledgeBrowser());
+  runtime.objectFactory.registerConstructor('FileManager', () => new FileManager());
+  runtime.objectFactory.registerConstructor('FileViewer', () => new FileViewer());
   runtime.objectFactory.registerConstructor('AgentBrowser', () => new AgentBrowser());
   runtime.objectFactory.registerConstructor('AgentCreator', () => new AgentCreator());
   runtime.objectFactory.registerConstructor('Scheduler', () => new Scheduler());
@@ -495,6 +515,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('WorkspaceManager', () => new WorkspaceManager());
   runtime.objectFactory.registerConstructor('WorkspaceRegistry', () => new WorkspaceRegistry());
   runtime.objectFactory.registerConstructor('WorkspaceSwitcher', () => new WorkspaceSwitcher());
+  runtime.objectFactory.registerConstructor('Sidebar', () => new Sidebar());
   runtime.objectFactory.registerConstructor('GlobalSettings', () => new GlobalSettings());
   runtime.objectFactory.registerConstructor('GlobalToolbar', () => new GlobalToolbar());
   runtime.objectFactory.registerConstructor('PeerNetwork', () => new PeerNetwork());
@@ -514,6 +535,12 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('WebBrowserViewer', () => new WebBrowserViewer());
   runtime.objectFactory.registerConstructor('SharedState', () => new SharedState());
   runtime.objectFactory.registerConstructor('TupleSpace', () => new TupleSpace());
+  runtime.objectFactory.registerConstructor('TriggerManager', () => new TriggerManager());
+  runtime.objectFactory.registerConstructor('CollectionStore', () => new CollectionStore());
+  runtime.objectFactory.registerConstructor('DataBrowser', () => new DataBrowser());
+  runtime.objectFactory.registerConstructor('StreamClient', () => new StreamClient());
+  runtime.objectFactory.registerConstructor('AudioOutput', () => new AudioOutput());
+  runtime.objectFactory.registerConstructor('Speech', () => new Speech());
   runtime.objectFactory.registerConstructor('FileTransfer', () => new FileTransfer());
   runtime.objectFactory.registerConstructor('MediaStream', () => new MediaStreamCapability());
   runtime.objectFactory.registerConstructor('ShellExecutor', () => new ShellExecutor());
@@ -536,6 +563,7 @@ async function main(): Promise<void> {
     return new MCPBridge(config);
   });
   runtime.objectFactory.registerConstructor('HttpServer', () => new HttpServer());
+  runtime.objectFactory.registerConstructor('WasmAbject', (args?: unknown) => new WasmAbject(args as WasmAbjectArgs));
 
   // Mark worker-eligible constructors (only used when workerEnabled).
   // Per-workspace objects use registryHint to discover workspace dependencies.
@@ -546,10 +574,10 @@ async function main(): Promise<void> {
       'Clipboard', 'Console', 'FileSystem',
       'ShellExecutor', 'HostFileSystem',
       'WebSearch', 'WebFetch', 'Screenshot',
-      'Storage', 'HttpServer',
+      'Storage', 'HttpServer', 'StreamClient', 'AudioOutput', 'Speech',
       // Global services
       'GlobalSettings', 'PeerNetwork',
-      'ObjectCatalog', 'ObjectBrowser', 'ProcessExplorer', 'LLMMonitor',
+      'ObjectCatalog', 'ObjectBrowser', 'MethodInspector', 'ProcessExplorer', 'LLMMonitor',
       'ProxyGenerator', 'Negotiator', 'HealthMonitor',
       'SkillRegistry', 'SkillBrowser',
       'MCPRegistryClient', 'ClawHubClient', 'CatalogBrowser',
@@ -560,11 +588,13 @@ async function main(): Promise<void> {
       'GoalManager', 'GoalBrowser', 'GoalObserver',
       'JobManager', 'JobBrowser',
       'KnowledgeBase', 'KnowledgeBrowser',
+      'FileManager', 'FileViewer',
       'AgentAbject', 'ScrumMaster', 'AgentBrowser', 'AgentCreator',
       'ObjectAgent', 'SkillAgent', 'WebAgent',
+      'TriggerManager', 'CollectionStore', 'DataBrowser',
       'Scheduler', 'SchedulerBrowser',
       'ObjectCreator', 'Chat', 'ChatManager', 'ChatBrowser', 'AbjectEditor', 'Taskbar',
-      'ScriptableAbject',
+      'ScriptableAbject', 'WasmAbject',
       // Per-workspace UI
       'WorkspaceBrowser', 'CommandPalette', 'NotificationCenter', 'WindowSwitcher',
     ];
@@ -574,6 +604,16 @@ async function main(): Promise<void> {
   }
 
   log.timed('constructors registered');
+
+  // Ingest WASM packages before anything spawns: bundled native system
+  // packages (native/, shipped with the app) first, then user-installed
+  // extensions (.abjects/extensions/*, which win name collisions). A package
+  // with `replaces` must override its built-in constructor in the Factory
+  // before the first spawn of that name.
+  const wasmExtensions = await ingestAllExtensions(runtime.objectFactory);
+  if (wasmExtensions.length > 0) {
+    log.timed(`WASM extensions ingested (${wasmExtensions.map(e => e.typeName).join(', ')})`);
+  }
 
   // Spawn Supervisor early so it can supervise other objects
   const supervisorId = await factorySpawn('Supervisor');
@@ -607,7 +647,8 @@ async function main(): Promise<void> {
   const timerId = await supervisedSpawn('Timer');
   const clipboardId = await supervisedSpawn('Clipboard');
   const consoleId = await supervisedSpawn('Console');
-  const filesystemId = await supervisedSpawn('FileSystem');
+  // FileSystem is now per-workspace (spawned by WorkspaceManager rooted at
+  // ~/.abject/ws-<id>/files); no global instance.
   const webParserId = await supervisedSpawn('WebParser');
   const webBrowserId = await supervisedSpawn('WebBrowser');
   // WebAgent is per-workspace (spawned by WorkspaceManager), not global
@@ -615,7 +656,10 @@ async function main(): Promise<void> {
   const hostFilesystemId = await supervisedSpawn('HostFileSystem');
   const webSearchId = await supervisedSpawn('WebSearch');
   const webFetchId = await supervisedSpawn('WebFetch');
+  const streamClientId = await supervisedSpawn('StreamClient');
   const screenshotId = await supervisedSpawn('Screenshot');
+  const audioOutputId = await supervisedSpawn('AudioOutput');
+  const speechId = await supervisedSpawn('Speech');
   const httpServerId = await supervisedSpawn('HttpServer');
   const windowManagerId = await supervisedSpawn('WindowManager');
   const widgetManagerId = await supervisedSpawn('WidgetManager');
@@ -647,6 +691,14 @@ async function main(): Promise<void> {
   const peerRouterObj = runtime.objectFactory.getObject(peerRouterId) as unknown as PeerRouter;
   peerRouterObj.setBus(bus);
   bus.addInterceptor(peerRouterObj);
+
+  // Capability enforcement: gates requests from source-backed (scriptable)
+  // objects to capability providers by declared requiredCapabilities. Added
+  // after PeerRouter so remote-inbound messages are re-addressed before the
+  // capability check sees them. Mode follows GlobalSettings (default: warn);
+  // the subscription is wired after GlobalSettings spawns below.
+  const capInterceptor = createCapabilityInterceptor(registryId, bus);
+  bus.addInterceptor(capInterceptor);
 
   if (DEDICATED_WORKERS) {
     // ── P2P Worker mode ──────────────────────────────────────────────
@@ -817,9 +869,24 @@ async function main(): Promise<void> {
   }
 
   const globalSettingsId = await supervisedSpawn('GlobalSettings', 'permanent', systemTypeId('GlobalSettings'));
+
+  // Capability-enforcement mode: register the interceptor's mailbox as a
+  // GlobalSettings dependent (mode-change events land there) and pull the
+  // initial value in case the boot announce fired before the registration.
+  try {
+    bus.send(message.request(capInterceptor.mailboxId, globalSettingsId, 'addDependent', {}));
+    const mode = await bootstrapRequest<'off' | 'warn' | 'enforce'>(
+      globalSettingsId, 'getCapabilityEnforcement', {});
+    if (mode === 'off' || mode === 'warn' || mode === 'enforce') {
+      capInterceptor.setMode(mode);
+    }
+  } catch (err) {
+    alog.warn(`capability enforcement mode fetch failed (staying at default): ${String(err)}`);
+  }
   const peerNetworkId = await supervisedSpawn('PeerNetwork', 'permanent', systemTypeId('PeerNetwork'));
   const globalToolbarId = await supervisedSpawn('GlobalToolbar', 'permanent', systemTypeId('GlobalToolbar'));
   const objectBrowserId = await supervisedSpawn('ObjectBrowser', 'permanent', systemTypeId('ObjectBrowser'));
+  const methodInspectorId = await supervisedSpawn('MethodInspector', 'permanent', systemTypeId('MethodInspector'));
   const processExplorerId = await supervisedSpawn('ProcessExplorer', 'permanent', systemTypeId('ProcessExplorer'));
   const llmMonitorId = await supervisedSpawn('LLMMonitor', 'permanent', systemTypeId('LLMMonitor'));
   const skillRegistryId = await supervisedSpawn('SkillRegistry', 'permanent', systemTypeId('SkillRegistry'));
@@ -834,10 +901,26 @@ async function main(): Promise<void> {
   const negotiatorId = await supervisedSpawn('Negotiator', 'permanent', systemTypeId('Negotiator'));
   const healthMonitorId = await supervisedSpawn('HealthMonitor', 'permanent', systemTypeId('HealthMonitor'));
 
-  // WorkspaceSwitcher is a global UI (never hidden during workspace switch)
+  // Sidebar owns the dock window the rails populate; WorkspaceSwitcher is a
+  // global UI (never hidden during workspace switch)
+  const sidebarId = await supervisedSpawn('Sidebar', 'permanent', systemTypeId('Sidebar'));
   const workspaceSwitcherId = await supervisedSpawn('WorkspaceSwitcher', 'permanent', systemTypeId('WorkspaceSwitcher'));
 
   log.timed('global UI + services spawned');
+
+  // System-scoped WASM extensions spawn as global objects here (after the
+  // peerId is known so they get {peerId}/system/{Name} typeIds). Extensions
+  // that replace a built-in need no spawn of their own — the built-in's
+  // normal spawn already resolved to the WASM implementation.
+  for (const ext of wasmExtensions) {
+    if (ext.scope !== 'system' || ext.replaces) continue;
+    try {
+      await supervisedSpawn(ext.typeName, 'permanent', systemTypeId(ext.typeName));
+      log.timed(`WASM extension '${ext.typeName}' spawned`);
+    } catch (err) {
+      alog.error(`Failed to spawn WASM extension '${ext.typeName}':`, err);
+    }
+  }
 
   // WorkspaceManager spawns per-workspace objects (Settings, Taskbar, Chat, etc.)
   const workspaceManagerId = await supervisedSpawn('WorkspaceManager', 'permanent', systemTypeId('WorkspaceManager'));
@@ -863,13 +946,13 @@ async function main(): Promise<void> {
   // ALL objects are now spawned and init'd — safe to start health monitoring.
   const monitoredIds = [
     httpClientId, llmId, storageId, timerId, clipboardId,
-    consoleId, filesystemId, webParserId, webBrowserId,
+    consoleId, webParserId, webBrowserId,
     shellExecutorId, hostFilesystemId, webSearchId, webFetchId,
     windowManagerId, widgetManagerId,
     identityId, peerRegistryId, remoteRegistryId, peerRouterId,
     signalingRelayId, peerDiscoveryId,
     workspaceShareRegistryId, workspaceBrowserId, objectCatalogId,
-    globalSettingsId, peerNetworkId, globalToolbarId, objectBrowserId, processExplorerId, skillRegistryId, skillBrowserId,
+    globalSettingsId, peerNetworkId, globalToolbarId, objectBrowserId, methodInspectorId, processExplorerId, skillRegistryId, skillBrowserId,
     mcpRegistryClientId, clawHubClientId, catalogBrowserId,
     secretsVaultId, oauthHelperId,
     proxyGenId, negotiatorId,

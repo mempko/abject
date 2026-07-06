@@ -201,6 +201,11 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     return widgetId;
   }
 
+  /** Shared styling for section "cards" (theme-tracked surface + border). */
+  private cardStyle(): { background: string; borderColor: string; radius: number } {
+    return { background: this.theme.buttonBg, borderColor: this.theme.divider, radius: 8 };
+  }
+
   /**
    * Destroy all tab content widgets, remove+destroy the container, then create a fresh container.
    * The window, root layout, and tab bar persist across tab switches.
@@ -506,22 +511,37 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     this.descriptionInputId = this.trackTabWidget(descInputId);
     this.trackTabWidget(tagsLabelId);
     this.tagsInputId = this.trackTabWidget(tagsInputId);
-    // Section header: "Workspace"
+
+    // "Workspace" section card: a styled sub-VBox that sizes to its children.
+    const wsCard = this.trackTabWidget(await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
+        parentLayoutId: cId,
+        margins: { top: 12, right: 14, bottom: 12, left: 14 },
+        spacing: 6,
+        style: this.cardStyle(),
+      })
+    ));
     await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: wsCard,
+      sizePolicy: { vertical: 'preferred', horizontal: 'expanding' },
+    }));
+
+    // Section header: "Workspace"
+    await this.request(request(this.id, wsCard, 'addLayoutChild', {
       widgetId: sectionHeaderId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 24 },
     }));
 
     // Description
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, wsCard, 'addLayoutChild', {
       widgetId: descLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
     }));
 
     // Workspace Name label
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, wsCard, 'addLayoutChild', {
       widgetId: nameLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -529,14 +549,14 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
 
     // Workspace Name input
     await this.request(request(this.id, this.workspaceNameInputId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, wsCard, 'addLayoutChild', {
       widgetId: this.workspaceNameInputId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
 
     // Description label
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, wsCard, 'addLayoutChild', {
       widgetId: descInputLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -544,14 +564,14 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
 
     // Description input
     await this.request(request(this.id, this.descriptionInputId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, wsCard, 'addLayoutChild', {
       widgetId: this.descriptionInputId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
     }));
 
     // Tags label
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, wsCard, 'addLayoutChild', {
       widgetId: tagsLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -559,7 +579,7 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
 
     // Tags input
     await this.request(request(this.id, this.tagsInputId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, wsCard, 'addLayoutChild', {
       widgetId: this.tagsInputId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
@@ -1303,29 +1323,36 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
   private async buildDangerZone(): Promise<void> {
     const cId = this.tabContentContainerId!;
 
-    // Divider + section header + description + delete button row
-    const { widgetIds: [divId, headerLabelId, descId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    // Danger Zone card (danger-tinted border replaces the old divider).
+    const dangerCard = this.trackTabWidget(await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
+        parentLayoutId: cId,
+        margins: { top: 12, right: 14, bottom: 12, left: 14 },
+        spacing: 6,
+        style: { background: this.theme.buttonBg, borderColor: this.theme.destructiveBorder, radius: 8 },
+      })
+    ));
+    await this.request(request(this.id, cId, 'addLayoutChild', {
+      widgetId: dangerCard,
+      sizePolicy: { vertical: 'preferred', horizontal: 'expanding' },
+    }));
+
+    // Section header + description
+    const { widgetIds: [headerLabelId, descId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'divider', windowId: this.windowId },
         { type: 'label', windowId: this.windowId, text: 'Danger Zone', style: { color: this.theme.destructiveText, fontWeight: 'bold', fontSize: 15 } },
         { type: 'label', windowId: this.windowId, text: 'Permanently delete this workspace and all its objects.', style: { color: this.theme.textDescription, fontSize: 12 } },
       ] })
     );
-    this.trackTabWidget(divId);
     this.trackTabWidget(headerLabelId);
     this.trackTabWidget(descId);
 
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: divId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 1 },
-    }));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, dangerCard, 'addLayoutChild', {
       widgetId: headerLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 24 },
     }));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, dangerCard, 'addLayoutChild', {
       widgetId: descId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 18 },
@@ -1334,12 +1361,12 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     // Delete button row (right-aligned)
     const deleteRowId = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: cId,
+        parentLayoutId: dangerCard,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     ));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, dangerCard, 'addLayoutChild', {
       widgetId: deleteRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 36 },

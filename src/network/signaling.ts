@@ -18,7 +18,8 @@ export type SignalingState = 'disconnected' | 'connecting' | 'connected' | 'erro
 export interface SignalingMessage {
   type: 'register' | 'find' | 'found' | 'not-found' | 'unregister'
     | 'sdp-offer' | 'sdp-answer' | 'ice-candidate' | 'error' | 'registered'
-    | 'ping' | 'pong' | 'list-peers' | 'peer-list';
+    | 'ping' | 'pong' | 'list-peers' | 'peer-list'
+    | 'get-ice' | 'ice-servers';
   peerId?: string;
   targetPeerId?: string;
   publicSigningKey?: string;
@@ -28,6 +29,7 @@ export interface SignalingMessage {
   candidate?: RTCIceCandidateInit;
   error?: string;
   peers?: Array<{ peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string }>;
+  iceServers?: RTCIceServer[];
 }
 
 export interface SignalingEvents {
@@ -40,6 +42,7 @@ export interface SignalingEvents {
   onIceCandidate?: (fromPeerId: PeerId, candidate: RTCIceCandidateInit) => void;
   onError?: (error: string) => void;
   onPeerList?: (peers: Array<{ peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string }>) => void;
+  onIceServers?: (iceServers: RTCIceServer[]) => void;
 }
 
 /**
@@ -64,6 +67,8 @@ export class SignalingClient implements SignalingRelay {
   private pingTimer?: ReturnType<typeof setInterval>;
   private static readonly PING_INTERVAL = 120_000; // 2 minutes
   private persistent = false;
+  /** Resolvers awaiting an `ice-servers` reply (see requestIceServers). */
+  private pendingIceResolvers: Array<(servers: RTCIceServer[]) => void> = [];
 
   get connectionState(): SignalingState {
     return this.state;
@@ -193,6 +198,35 @@ export class SignalingClient implements SignalingRelay {
   }
 
   /**
+   * Ask the signaling server for ICE servers (STUN + freshly-minted TURN
+   * credentials). Resolves to an empty array on timeout or if not connected,
+   * so callers can fall back to their own defaults rather than failing.
+   */
+  requestIceServers(timeoutMs = 3000): Promise<RTCIceServer[]> {
+    if (this.state !== 'connected' || !this.socket) {
+      return Promise.resolve([]);
+    }
+    return new Promise<RTCIceServer[]>((resolve) => {
+      let settled = false;
+      const finish = (servers: RTCIceServer[]) => {
+        if (settled) return;
+        settled = true;
+        const idx = this.pendingIceResolvers.indexOf(wrapped);
+        if (idx !== -1) this.pendingIceResolvers.splice(idx, 1);
+        resolve(servers);
+      };
+      const wrapped = (servers: RTCIceServer[]) => finish(servers);
+      this.pendingIceResolvers.push(wrapped);
+      setTimeout(() => finish([]), timeoutMs);
+      try {
+        this.socket!.send(JSON.stringify({ type: 'get-ice' }));
+      } catch {
+        finish([]);
+      }
+    });
+  }
+
+  /**
    * Send an SDP offer to a remote peer via the signaling server.
    */
   sendSdpOffer(fromPeerId: PeerId, targetPeerId: PeerId, sdp: RTCSessionDescriptionInit): void {
@@ -259,6 +293,15 @@ export class SignalingClient implements SignalingRelay {
           this.events.onIceCandidate?.(msg.peerId!, msg.candidate!);
           break;
         case 'error':
+          // An older signaling server that predates `get-ice` answers our
+          // probe with a generic "Unknown message type" error. Treat it as a
+          // benign capability miss: resolve any pending ICE request to empty
+          // (→ STUN fallback) instead of surfacing a scary error to callers.
+          if ((msg.error ?? '').includes('get-ice')) {
+            const resolvers = this.pendingIceResolvers.splice(0);
+            for (const r of resolvers) r([]);
+            break;
+          }
           this.events.onError?.(msg.error ?? 'Unknown signaling error');
           break;
         case 'registered':
@@ -270,6 +313,14 @@ export class SignalingClient implements SignalingRelay {
         case 'peer-list':
           this.events.onPeerList?.(msg.peers ?? []);
           break;
+        case 'ice-servers': {
+          const servers = msg.iceServers ?? [];
+          // Drain pending requestIceServers() promises.
+          const resolvers = this.pendingIceResolvers.splice(0);
+          for (const r of resolvers) r(servers);
+          this.events.onIceServers?.(servers);
+          break;
+        }
       }
     } catch (err) {
       log.error('Failed to parse message:', err);
@@ -291,8 +342,15 @@ export class SignalingClient implements SignalingRelay {
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
-      if (this.endpoint) {
-        this.connect(this.endpoint).catch(console.error);
+      const endpoint = this.endpoint;
+      if (endpoint) {
+        // A reconnect failure is expected (e.g. a signaling server that is
+        // down). Log a quiet one-liner — the backoff schedule already reports
+        // the next attempt — instead of dumping a full stack trace each retry.
+        this.connect(endpoint).catch((err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`Reconnect to ${endpoint} failed: ${msg}`);
+        });
       }
     }, delay);
   }

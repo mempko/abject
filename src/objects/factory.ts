@@ -25,10 +25,30 @@ import { type WorkerPool, workerIndexForId } from '../runtime/worker-pool.js';
 import { ScriptableAbject, mergeScriptableManifest } from './scriptable-abject.js';
 import { Organism, buildOrganismManifest } from './organism.js';
 import type { OrganismSpec } from './organism.js';
+import { WasmAbject, mergeWasmManifest, WASM_ABJECT_CONSTRUCTOR } from './wasm-abject.js';
+import {
+  isWasmSourceRef,
+  storeWasmModule,
+  decodeBase64Module,
+} from '../sandbox/wasm-module-store.js';
 
 const FACTORY_INTERFACE = 'abjects:factory';
 
 export type ObjectFactory = (args?: unknown) => Abject;
+
+/**
+ * A named WASM type: an installed extension module that spawns under a type
+ * name. When the name matches a built-in constructor, the WASM implementation
+ * takes precedence — that's how a compiled module transparently replaces a
+ * TypeScript system object (`replaces` in abject.json).
+ */
+export interface WasmTypeRegistration {
+  manifest: AbjectManifest;
+  /** wasm source ref: `wasm:sha256:<hex>` */
+  source: string;
+  /** 'system' types spawn once at boot; 'workspace' types spawn per workspace. */
+  scope: 'system' | 'workspace';
+}
 
 /**
  * The Factory object creates and manages object lifecycles.
@@ -36,6 +56,7 @@ export type ObjectFactory = (args?: unknown) => Abject;
 export class Factory extends Abject {
   private spawned: Map<AbjectId, Abject> = new Map();
   private constructors: Map<string, ObjectFactory> = new Map();
+  private wasmTypes: Map<string, WasmTypeRegistration> = new Map();
   private _factoryBus?: MessageBusLike;
   private _factoryRegistryId?: AbjectId;
 
@@ -100,7 +121,7 @@ export class Factory extends Abject {
               },
               {
                 name: 'clone',
-                description: 'Clone an existing Abject (new instance with same manifest/source). Searches local registry first, then remote workspace registries. Pass registryHint to control which registry the clone lands in.',
+                description: 'Clone an existing Abject (new instance with same manifest/source). Instances are prototypes: by default the clone carries a deep copy of the original\'s data and diverges from there; pass withData: false for a fresh-data copy of the same behavior. The clone\'s manifest records lineage (clonedFrom, generation). Searches local registry first, then remote workspace registries. Pass registryHint to control which registry the clone lands in.',
                 parameters: [
                   {
                     name: 'objectId',
@@ -108,9 +129,52 @@ export class Factory extends Abject {
                     description: 'The ID of the Abject to clone',
                   },
                   {
+                    name: 'withData',
+                    type: { kind: 'primitive', primitive: 'boolean' },
+                    description: 'Copy the original\'s data into the clone (default true). false gives a fresh instance of the same behavior with empty data.',
+                    optional: true,
+                  },
+                  {
                     name: 'registryHint',
                     type: { kind: 'primitive', primitive: 'string' },
                     description: 'Optional registry ID to register the clone in (e.g. workspace registry). Defaults to global registry.',
+                    optional: true,
+                  },
+                ],
+                returns: { kind: 'reference', reference: 'SpawnResult' },
+              },
+              {
+                name: 'instantiate',
+                description: 'Create a fresh runtime INSTANCE of an existing object\'s type — same manifest/source, a NEW identity, and its own (empty by default) data. Unlike clone, it does NOT copy the source object\'s data and does NOT carry its typeId, so you get a blank new instance of the same kind, not a fork of its current state. Use this to open another live instance/window of an existing source-backed object (e.g. a second editor). Resolves the source object by objectId or typeId across the registryHint, global, and remote registries. The instance is ephemeral (no typeId), so persist any per-instance state under your own document key rather than relying on snapshot/restore.',
+                parameters: [
+                  {
+                    name: 'objectId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'The AbjectId of an existing instance whose type to instantiate (or pass typeId)',
+                    optional: true,
+                  },
+                  {
+                    name: 'typeId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'The durable TypeId of the object type to instantiate (alternative to objectId)',
+                    optional: true,
+                  },
+                  {
+                    name: 'data',
+                    type: { kind: 'object', properties: {} },
+                    description: 'Initial data for the new instance (default empty). NOT copied from the source object.',
+                    optional: true,
+                  },
+                  {
+                    name: 'registryHint',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Registry to resolve the source object in and register the new instance in (e.g. your workspace registry, this.parentId). Searched first.',
+                    optional: true,
+                  },
+                  {
+                    name: 'parentId',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Parent/owner of the new instance (defaults to Factory)',
                     optional: true,
                   },
                 ],
@@ -167,8 +231,18 @@ export class Factory extends Abject {
     });
 
     this.on('clone', async (msg: AbjectMessage) => {
-      const { objectId, registryHint } = msg.payload as { objectId: AbjectId; registryHint?: AbjectId };
-      return this.clone(objectId, registryHint);
+      const { objectId, registryHint, withData } = msg.payload as {
+        objectId: AbjectId; registryHint?: AbjectId; withData?: boolean;
+      };
+      return this.clone(objectId, registryHint, withData ?? true);
+    });
+
+    this.on('instantiate', async (msg: AbjectMessage) => {
+      const req = msg.payload as {
+        objectId?: AbjectId; typeId?: TypeId; data?: Record<string, unknown>;
+        registryHint?: AbjectId; parentId?: AbjectId;
+      };
+      return this.instantiate(req);
     });
 
     this.on('respawn', async (msg: AbjectMessage) => {
@@ -181,6 +255,8 @@ export class Factory extends Abject {
       return this.respawn(objectId, constructorName, parentId, registryId);
     });
 
+    this.on('listWasmTypes', async () => this.listWasmTypes());
+
     this.on('getObjectInfo', async (msg: AbjectMessage) => {
       const { objectId } = msg.payload as { objectId: AbjectId };
       const isWorker = this.workerSpawned.has(objectId);
@@ -192,13 +268,18 @@ export class Factory extends Abject {
     });
   }
 
+  // Spawn/clone/instantiate semantics agents use to create objects correctly.
+  protected override askTier(): 'smart' | 'balanced' | 'fast' {
+    return 'balanced';
+  }
+
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## Factory Usage Guide
 
 ### Methods
 - \`spawn({ manifest, source?, code?, owner?, parentId? })\` — Spawn a new object. If a constructor is registered for the manifest name, uses that. If source is provided and manifest.tags includes 'organism', creates an Organism from a JSON OrganismSpec. If source is provided without the organism tag, creates a ScriptableAbject. Returns { objectId, status }.
 - \`kill({ objectId })\` — Stop and destroy an object. Unregisters from Registry, removes from Supervisor, and stops the object. Returns boolean.
-- \`clone({ objectId, registryHint? })\` — Clone an existing object (new instance with same manifest/source but new ID). Returns { objectId, status }. Works for Organisms -- the clone gets a fresh internal registry, organelles, and interface with new IDs. Searches local registry first, then remote workspace registries. Pass \`registryHint\` (a registry AbjectId) to register the clone in a specific registry (e.g. workspace registry) instead of the global one.
+- \`clone({ objectId, withData?, registryHint? })\` — Clone an existing object (new instance with same manifest/source but new ID). Returns { objectId, status }. Instances are prototypes: the clone carries a deep copy of the original's data by default and then diverges independently; pass \`withData: false\` for a fresh-data copy of the same behavior. The clone's manifest records lineage (\`clonedFrom\`, \`generation\`), so populations of copies stay traceable to their original. Works for Organisms -- the clone gets a fresh internal registry, organelles, and interface with new IDs. Cloning fits source-backed objects (ScriptableAbjects and Organisms); system infrastructure singletons are spawned at bootstrap and are rarely meaningful to clone. Searches local registry first, then remote workspace registries. Pass \`registryHint\` (a registry AbjectId) to register the clone in a specific registry (e.g. workspace registry) instead of the global one.
 - \`respawn({ objectId, constructorName, parentId? })\` — Kill and re-create an object with the same ID. Used by Supervisor for restart.
 - \`registerConstructor(name, factory)\` — Register a constructor function for a named object type.
 
@@ -228,6 +309,11 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
    */
   setRegistryId(id: AbjectId): void {
     this._factoryRegistryId = id;
+    // Keep the base-class registry pointer aligned: it powers discovery-
+    // dependent behavior inherited from Abject (askLlm locating the LLM,
+    // discoverDep). The Runtime constructs Factory directly, so this call
+    // is the only place Factory ever learns which registry it belongs to.
+    this.setRegistryHint(id);
   }
 
   /**
@@ -260,6 +346,28 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
   }
 
   /**
+   * Register a WASM type under a name. Spawns of that name resolve to the
+   * module instead of any registered constructor, so an installed extension
+   * can replace a built-in implementation transparently.
+   */
+  registerWasmType(name: string, registration: WasmTypeRegistration): void {
+    require(name !== '', 'name must not be empty');
+    require(isWasmSourceRef(registration.source), 'registration.source must be a wasm ref');
+    require(registration.manifest?.interface !== undefined, 'registration manifest must declare an interface');
+    this.wasmTypes.set(name, registration);
+    log.info(`WASM type '${name}' registered (${registration.scope}, ${registration.source.slice(0, 30)}...)`);
+  }
+
+  /** Installed WASM types (name + scope), e.g. for WorkspaceManager to spawn
+   *  workspace-scoped extensions alongside the built-in per-workspace set. */
+  listWasmTypes(): Array<{ name: string; scope: 'system' | 'workspace' }> {
+    return Array.from(this.wasmTypes.entries()).map(([name, t]) => ({
+      name,
+      scope: t.scope,
+    }));
+  }
+
+  /**
    * Get a registered constructor by name.
    */
   getConstructor(name: string): ObjectFactory | undefined {
@@ -267,33 +375,126 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
   }
 
   /**
-   * Clone an existing object — creates a new instance with the same manifest/source but a new ID.
+   * Resolve an object's registration by AbjectId OR durable TypeId. Searches,
+   * in order: the caller's registryHint (where workspace/user objects actually
+   * live), the global Factory registry, a typeId->id resolve in each, then
+   * remote workspace registries. This is why a bare global lookup used to miss
+   * live user objects ("not found in any registry") — they register in their
+   * workspace registry, not the global one.
    */
-  async clone(objectId: AbjectId, registryHint?: AbjectId): Promise<SpawnResult> {
+  private async resolveRegistration(idOrTypeId: string, registryHint?: AbjectId): Promise<ObjectRegistration | null> {
+    const registries: AbjectId[] = [];
+    if (registryHint) registries.push(registryHint);
+    if (this._factoryRegistryId && !registries.includes(this._factoryRegistryId)) {
+      registries.push(this._factoryRegistryId);
+    }
+
+    // Direct lookup by AbjectId in each candidate registry.
+    for (const regId of registries) {
+      try {
+        const reg = await this.request<ObjectRegistration | null>(
+          request(this.id, regId, 'lookup', { objectId: idOrTypeId as AbjectId })
+        );
+        if (reg) return reg;
+      } catch { /* registry unreachable */ }
+    }
+
+    // Treat it as a TypeId (scoped, contains '/'): resolve to a live id, then look up.
+    if (idOrTypeId.includes('/')) {
+      for (const regId of registries) {
+        try {
+          const liveId = await this.request<AbjectId | null>(
+            request(this.id, regId, 'resolveType', { typeId: idOrTypeId as TypeId })
+          );
+          if (liveId) {
+            const reg = await this.request<ObjectRegistration | null>(
+              request(this.id, regId, 'lookup', { objectId: liveId })
+            );
+            if (reg) return reg;
+          }
+        } catch { /* registry unreachable */ }
+      }
+    }
+
+    // Fall back to remote workspace registries.
+    return this.findInRemoteRegistries(idOrTypeId as AbjectId);
+  }
+
+  /**
+   * Create a fresh runtime INSTANCE of an existing object's type: same manifest
+   * and source, a NEW identity, and its own (empty by default) data. Unlike
+   * clone(), it does NOT deep-copy the source object's data and does NOT carry
+   * its typeId — so you get a blank new instance of the same kind, not a fork of
+   * the original's current state. Use this for "open another live instance of
+   * this object" (e.g. a second editor window bound to a different document).
+   * The instance is ephemeral (no typeId → not snapshot/restored by typeId);
+   * persist per-instance state under your own document key.
+   */
+  async instantiate(req: {
+    objectId?: AbjectId; typeId?: TypeId; data?: Record<string, unknown>;
+    registryHint?: AbjectId; parentId?: AbjectId;
+  }): Promise<SpawnResult> {
+    require(this._factoryBus !== undefined, 'Factory must have a message bus');
+    require(this._factoryRegistryId !== undefined, 'Factory must have a registry');
+    const key = req.objectId ?? req.typeId;
+    require(typeof key === 'string' && key.length > 0, 'instantiate requires objectId or typeId');
+
+    const reg = await this.resolveRegistration(key as string, req.registryHint);
+    require(reg !== null, `Object '${key}' not found in any registry (cannot instantiate)`);
+    require(
+      !!reg!.source,
+      `Object '${key}' has no source to instantiate. Only source-backed objects (ScriptableAbjects/Organisms) can be instantiated; constructor-backed system objects cannot.`,
+    );
+
+    // Fresh instance: source + manifest, caller's data (default empty), and
+    // deliberately NO typeId so it has its own ephemeral identity rather than
+    // colliding with the source object's durable snapshot key.
+    const spawnReq: SpawnRequest = {
+      manifest: reg!.manifest,
+      source: reg!.source,
+      owner: reg!.owner,
+      data: req.data ?? {},
+    };
+    if (req.registryHint) spawnReq.registryHint = req.registryHint;
+    if (req.parentId) spawnReq.parentId = req.parentId;
+    return this.spawn(spawnReq);
+  }
+
+  /**
+   * Clone an existing object — creates a new instance with the same manifest/source but a new ID.
+   *
+   * Prototype semantics (instances are prototypes, Self-style): by default the
+   * clone carries a deep copy of the original's data and then diverges
+   * independently. Pass withData: false for a fresh instance of the same
+   * behavior with empty data. Every clone records lineage in its manifest:
+   * clonedFrom (the original's typeId when it has one, else its AbjectId) and
+   * generation (parent's generation + 1).
+   */
+  async clone(objectId: AbjectId, registryHint?: AbjectId, withData = true): Promise<SpawnResult> {
     require(this._factoryBus !== undefined, 'Factory must have a message bus');
     require(this._factoryRegistryId !== undefined, 'Factory must have a registry');
 
-    // Search local registry first
-    let reg = await this.request<ObjectRegistration | null>(
-      request(this.id, this._factoryRegistryId!, 'lookup', { objectId })
-    );
-
-    // If not found locally, search remote workspace registries
-    if (!reg) {
-      reg = await this.findInRemoteRegistries(objectId);
-    }
-
+    const reg = await this.resolveRegistration(objectId, registryHint);
     require(reg !== null, `Object '${objectId}' not found in any registry`);
+
+    // Lineage: stamp where this copy came from and its clone generation.
+    const manifest: AbjectManifest = {
+      ...reg!.manifest,
+      lineage: {
+        clonedFrom: (reg!.typeId as string | undefined) ?? (objectId as string),
+        generation: (reg!.manifest.lineage?.generation ?? 0) + 1,
+      },
+    };
 
     // Delegate to spawn with the same manifest and source.
     // Internal data clones with the source — that is the point of having data
     // live inside the object.
-    const spawnReq: SpawnRequest = { manifest: reg!.manifest };
+    const spawnReq: SpawnRequest = { manifest };
     if (reg!.source) {
       spawnReq.source = reg!.source;
       spawnReq.owner = reg!.owner;
     }
-    if (reg!.data !== undefined) {
+    if (withData && reg!.data !== undefined) {
       // Deep-copy via JSON so the clone's data is independent of the original's.
       try {
         spawnReq.data = JSON.parse(JSON.stringify(reg!.data));
@@ -301,6 +502,8 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         // Original had non-serializable data; clone starts empty rather than failing.
         spawnReq.data = {};
       }
+    } else if (!withData) {
+      spawnReq.data = {};
     }
     if (registryHint) {
       spawnReq.registryHint = registryHint;
@@ -355,6 +558,9 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         } catch { /* may not be registered */ }
       }
 
+      // Capture how the object was tracked before the kill below clears it
+      const trackedName = this.workerSpawned.get(objectId);
+
       // Kill old worker instance if tracked
       if (this.workerSpawned.has(objectId)) {
         // Clear timers before killing so they stop firing immediately
@@ -377,11 +583,20 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         this.workerSpawned.delete(objectId);
       }
 
-      // Respawn in worker with same ID, passing constructor args for ScriptableAbjects
+      // Respawn in worker with same ID, passing constructor args for
+      // source-backed objects (ScriptableAbjects and WasmAbjects). Objects
+      // tracked as WasmAbject respawn as WasmAbject regardless of the
+      // constructorName the Supervisor recorded at spawn time (a wasm type
+      // override may have been spawned under a built-in name).
+      if (trackedName === WASM_ABJECT_CONSTRUCTOR
+          || (existingReg?.source && isWasmSourceRef(existingReg.source))) {
+        constructorName = WASM_ABJECT_CONSTRUCTOR;
+      }
       const isScriptable = constructorName === 'ScriptableAbject';
-      if (isScriptable) {
+      const isWasm = constructorName === WASM_ABJECT_CONSTRUCTOR;
+      if (isScriptable || isWasm) {
         if (!existingReg?.source) {
-          throw new Error(`Cannot respawn ScriptableAbject '${objectId}': registration/source not found in Registry`);
+          throw new Error(`Cannot respawn ${constructorName} '${objectId}': registration/source not found in Registry`);
         }
         await this._workerPool.spawnInWorker(objectId, constructorName, {
           constructorArgs: {
@@ -415,7 +630,7 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
       if (effectiveRegistryId) {
         const regPayload: Record<string, unknown> = { objectId, manifest, status };
         if (preservedTypeId) regPayload.typeId = preservedTypeId;
-        if (isScriptable && existingReg) {
+        if ((isScriptable || isWasm) && existingReg) {
           regPayload.source = existingReg.source;
           regPayload.owner = existingReg.owner;
           if (existingReg.data !== undefined) regPayload.data = existingReg.data;
@@ -501,6 +716,31 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
     require(this._factoryBus !== undefined, 'Factory must have a message bus');
     require(req.manifest !== undefined, 'manifest is required');
 
+    // WASM resolution runs before every other dispatch so installed type
+    // overrides win over built-in constructors (that's what `replaces` means).
+    // 1. A registered WASM type under this name supplies manifest + module ref.
+    const wasmType =
+      !req.source && !req.code && !req.codeBase64
+        ? this.wasmTypes.get(req.manifest.name)
+        : undefined;
+    if (wasmType) {
+      req = { ...req, manifest: wasmType.manifest, source: wasmType.source };
+    }
+    // 2. Raw module bytes are ingested into the content-addressed store and
+    //    replaced by their canonical wasm source ref.
+    if (!req.source && (req.code || req.codeBase64)) {
+      const bytes = req.code
+        ? new Uint8Array(req.code)
+        : decodeBase64Module(req.codeBase64!);
+      const ref = await storeWasmModule(bytes);
+      req = { ...req, source: ref };
+    }
+    // 3. A wasm source ref spawns a WasmAbject (worker-hosted when possible).
+    const isWasm = req.source !== undefined && isWasmSourceRef(req.source);
+    if (isWasm && this._workerPool) {
+      return this.spawnWasmInWorker(req);
+    }
+
     // Check if we have a registered factory
     const factory = this.constructors.get(req.manifest.name);
 
@@ -521,7 +761,15 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
 
     let obj: Abject;
 
-    if (factory) {
+    if (isWasm) {
+      // Spawn a WasmAbject inline (no worker pool available)
+      obj = new WasmAbject({
+        manifest: req.manifest,
+        source: req.source!,
+        owner: req.owner,
+        data: req.data,
+      });
+    } else if (factory) {
       // Use registered factory function
       obj = factory(req.constructorArgs);
     } else if (req.source && req.manifest.tags?.includes('organism')) {
@@ -536,9 +784,6 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         req.owner ?? ('' as AbjectId),
         req.data,
       );
-    } else if (req.code) {
-      // TODO: Load WASM object
-      throw new Error('WASM object spawning not yet implemented');
     } else {
       throw new Error(
         `No constructor registered for '${req.manifest.name}' and no code provided`
@@ -580,6 +825,11 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         payload.owner = obj.owner;
         payload.source = obj.source;
         payload.data = obj.dataSnapshot;
+      } else if (obj instanceof WasmAbject) {
+        if (obj.owner) payload.owner = obj.owner;
+        payload.source = obj.source;
+        const data = obj.dataSnapshot;
+        if (data !== undefined) payload.data = data;
       }
       await this.request(
         request(this.id, targetRegistry, 'register', payload)
@@ -624,6 +874,9 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
         payload.source = obj.organismSource;
       } else if (obj instanceof ScriptableAbject) {
         payload.owner = obj.owner;
+        payload.source = obj.source;
+      } else if (obj instanceof WasmAbject) {
+        if (obj.owner) payload.owner = obj.owner;
         payload.source = obj.source;
       }
       await this.request(
@@ -761,6 +1014,77 @@ An Organism is a composite Abject with its own internal registry. Like a biologi
           lastActivity: now,
         },
       };
+      if (req.typeId) regPayload.typeId = req.typeId;
+      if (req.data !== undefined) regPayload.data = req.data;
+      await this.request(
+        request(this.id, targetRegistry, 'register', regPayload)
+      );
+    }
+
+    const now = Date.now();
+    return {
+      objectId,
+      typeId: req.typeId,
+      status: {
+        id: objectId,
+        typeId: req.typeId,
+        state: 'ready',
+        manifest: realManifest,
+        connections: [] as AbjectId[],
+        errorCount: 0,
+        startedAt: now,
+        lastActivity: now,
+      },
+    };
+  }
+
+  /**
+   * Spawn a WasmAbject in a worker thread. Only the wasm source ref crosses
+   * the thread boundary — the worker resolves module bytes from the
+   * content-addressed store on disk.
+   */
+  private async spawnWasmInWorker(req: SpawnRequest): Promise<SpawnResult> {
+    require(this._workerPool !== undefined, 'WorkerPool must be set');
+    require(req.source !== undefined && isWasmSourceRef(req.source), 'wasm source ref is required');
+
+    const objectId = uuidv4() as AbjectId;
+
+    await this._workerPool!.spawnInWorker(objectId, WASM_ABJECT_CONSTRUCTOR, {
+      constructorArgs: {
+        manifest: req.manifest,
+        source: req.source,
+        owner: req.owner ?? '',
+        data: req.data,
+      },
+      registryId: req.registryHint ?? this._factoryRegistryId,
+      parentId: req.parentId ?? this.id,
+    });
+
+    this.workerSpawned.set(objectId, WASM_ABJECT_CONSTRUCTOR);
+
+    // Same merged manifest the worker-side instance declares (introspect + wasm tag)
+    const realManifest = mergeWasmManifest(req.manifest);
+
+    const targetRegistry = req.registryHint ?? (req.skipGlobalRegistry ? undefined : this._factoryRegistryId);
+    if (targetRegistry) this.workerRegistries.set(objectId, targetRegistry);
+    if (targetRegistry) {
+      const now = Date.now();
+      const regPayload: Record<string, unknown> = {
+        objectId,
+        manifest: realManifest,
+        source: req.source,
+        status: {
+          id: objectId,
+          typeId: req.typeId,
+          state: 'ready',
+          manifest: realManifest,
+          connections: [] as AbjectId[],
+          errorCount: 0,
+          startedAt: now,
+          lastActivity: now,
+        },
+      };
+      if (req.owner) regPayload.owner = req.owner;
       if (req.typeId) regPayload.typeId = req.typeId;
       if (req.data !== undefined) regPayload.data = req.data;
       await this.request(

@@ -8,6 +8,7 @@
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
+import { request } from '../../core/message.js';
 
 export interface ImageWidgetConfig extends WidgetConfig {
   url?: string;
@@ -19,12 +20,56 @@ export class ImageWidget extends WidgetAbject {
   private url: string;
   private fit: 'contain' | 'cover' | 'fill';
   private alt: string;
+  /**
+   * The URL actually handed to the draw command. For remote http(s) URLs we
+   * fetch the bytes server-side (HttpClient.getBase64) into a data: URI:
+   * cross-origin images drawn directly taint the surface canvas, which makes
+   * the WebGL texture upload fail and can break the whole desktop. A data:
+   * URI is same-origin and never taints.
+   */
+  private resolvedUrl: string = '';
 
   constructor(config: ImageWidgetConfig) {
     super(config);
     this.url = config.url ?? '';
     this.fit = config.fit ?? 'contain';
     this.alt = config.alt ?? '';
+    // data: and same-origin URLs are safe to draw as-is.
+    if (this.url && !this.isRemoteUrl(this.url)) this.resolvedUrl = this.url;
+  }
+
+  protected override async onInit(): Promise<void> {
+    await super.onInit();
+    if (this.url && this.isRemoteUrl(this.url)) void this.resolveImage(this.url);
+  }
+
+  /** http(s) URL on another origin — must be fetched server-side, not drawn directly. */
+  private isRemoteUrl(url: string): boolean {
+    return /^https?:\/\//i.test(url);
+  }
+
+  /**
+   * Fetch a remote image as a data: URI via HttpClient, then redraw. On any
+   * failure the widget falls back to its alt text rather than tainting the
+   * canvas with a direct cross-origin draw.
+   */
+  private async resolveImage(url: string): Promise<void> {
+    try {
+      const httpId = await this.discoverDep('HttpClient');
+      if (!httpId) return;
+      const res = await this.request<{ dataUri?: string }>(
+        request(this.id, httpId, 'getBase64', { url }),
+        20000,
+      );
+      // Ignore stale responses if the url changed while we were fetching.
+      if (this.url !== url) return;
+      if (res?.dataUri) {
+        this.resolvedUrl = res.dataUri;
+        await this.requestRedraw();
+      }
+    } catch {
+      // Leave resolvedUrl empty; buildDrawCommands shows alt text instead.
+    }
   }
 
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
@@ -45,7 +90,7 @@ export class ImageWidget extends WidgetAbject {
       });
     }
 
-    if (this.url) {
+    if (this.resolvedUrl) {
       // For 'fill' mode, just draw at full widget size.
       // For 'contain' and 'cover', we use full rect since we don't know
       // the image's intrinsic size — the compositor's imageUrl command
@@ -55,7 +100,7 @@ export class ImageWidget extends WidgetAbject {
         surfaceId,
         params: {
           x: ox, y: oy, width: w, height: h,
-          url: this.url,
+          url: this.resolvedUrl,
         },
       });
     } else if (this.alt) {
@@ -93,6 +138,14 @@ export class ImageWidget extends WidgetAbject {
   protected applyUpdate(updates: Record<string, unknown>): void {
     if (updates.url !== undefined) {
       this.url = updates.url as string;
+      if (!this.url || !this.isRemoteUrl(this.url)) {
+        // data: / same-origin — safe to draw directly.
+        this.resolvedUrl = this.url;
+      } else {
+        // Remote — clear the old image and fetch the new one server-side.
+        this.resolvedUrl = '';
+        void this.resolveImage(this.url);
+      }
     }
     if (updates.fit !== undefined) {
       this.fit = updates.fit as 'contain' | 'cover' | 'fill';

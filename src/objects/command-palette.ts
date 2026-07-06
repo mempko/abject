@@ -37,7 +37,14 @@ interface PaletteEntry {
   id: AbjectId;
   name: string;
   description: string;
+  /** Special action entries (e.g. "start a chat") instead of showing an object. */
+  action?: 'chat';
+  /** The typed query, carried on the chat action entry. */
+  query?: string;
 }
+
+/** Sentinel id for the synthetic "Chat about …" entry shown when nothing matches. */
+const CHAT_ENTRY_ID = 'palette:new-chat' as AbjectId;
 
 const PALETTE_WIDTH = 520;
 const PALETTE_HEIGHT = 380;
@@ -52,9 +59,11 @@ export class CommandPaletteAbject extends Abject {
   private searchInputId?: AbjectId;
   private resultsListId?: AbjectId;
 
+  private chatManagerId?: AbjectId;
   private query = '';
   private entries: PaletteEntry[] = [];
   private filtered: PaletteEntry[] = [];
+  private selectedIndex = 0;
   private rebuildScheduled = false;
 
   constructor() {
@@ -88,6 +97,7 @@ export class CommandPaletteAbject extends Abject {
     // WorkspaceRegistry. The registry's chained listSummaries returns
     // workspace-local Abjects merged with the global fallback in one call.
     this.registryId = await this.discoverDep('Registry') ?? undefined;
+    this.chatManagerId = await this.discoverDep('ChatManager') ?? undefined;
   }
 
   private setupHandlers(): void {
@@ -104,11 +114,13 @@ export class CommandPaletteAbject extends Abject {
       const fromId = msg.routing.from;
 
       if (fromId === this.searchInputId && (aspect === 'change' || aspect === 'submit')) {
-        this.query = String(value ?? '');
-        if (aspect === 'submit' && this.filtered.length > 0) {
-          await this.activateEntry(this.filtered[0]);
+        if (aspect === 'submit') {
+          // Launch the highlighted result (Enter), not just the first.
+          const entry = this.filtered[this.selectedIndex] ?? this.filtered[0];
+          if (entry) await this.activateEntry(entry);
           return;
         }
+        this.query = String(value ?? '');
         this.scheduleRebuild();
         return;
       }
@@ -127,12 +139,16 @@ export class CommandPaletteAbject extends Abject {
       }
     });
 
-    // Esc handling — input bubbles keydown when not consumed.
-    this.on('keydown', async (msg: AbjectMessage) => {
+    // Arrow-key navigation. The single-line search input keeps text focus but
+    // doesn't consume the arrows, so the window bubbles them to us here as
+    // 'keyUnhandled'. (Esc dismissal is handled via windowCloseRequested.)
+    this.on('keyUnhandled', async (msg: AbjectMessage) => {
       const { key } = msg.payload as { key?: string };
-      if (key === 'Escape') {
-        await this.closePalette();
-      }
+      if (key !== 'ArrowDown' && key !== 'ArrowUp') return;
+      if (this.filtered.length === 0) return;
+      const delta = key === 'ArrowDown' ? 1 : -1;
+      this.selectedIndex = Math.max(0, Math.min(this.filtered.length - 1, this.selectedIndex + delta));
+      await this.moveSelection();
     });
   }
 
@@ -243,8 +259,32 @@ export class CommandPaletteAbject extends Abject {
   }
 
   private async activateEntry(entry: PaletteEntry): Promise<void> {
+    if (entry.action === 'chat') {
+      await this.startChat(entry.query ?? this.query);
+      await this.closePalette();
+      return;
+    }
     this.send(event(this.id, entry.id, 'show', {}));
     await this.closePalette();
+  }
+
+  /** Spawn a fresh chat conversation seeded with the typed query. */
+  private async startChat(prompt: string): Promise<void> {
+    const text = prompt.trim();
+    if (!text) return;
+    if (!this.chatManagerId) {
+      this.chatManagerId = await this.discoverDep('ChatManager') ?? undefined;
+    }
+    if (!this.chatManagerId) return;
+    try {
+      const res = await this.request<{ conversationId: string; chatId: AbjectId }>(
+        request(this.id, this.chatManagerId, 'newConversation', { title: text.slice(0, 60) }),
+        10000,
+      );
+      if (res?.chatId) {
+        await this.request(request(this.id, res.chatId, 'sendMessage', { message: text }), 10000);
+      }
+    } catch { /* chat manager unavailable */ }
   }
 
   // ── Search / filter ─────────────────────────────────────────────────
@@ -276,11 +316,24 @@ export class CommandPaletteAbject extends Abject {
       this.filtered = this.entries.slice(0, 50);
       return;
     }
-    this.filtered = this.entries
+    const matches = this.entries
       .filter((e) =>
         e.name.toLowerCase().includes(q) ||
         e.description.toLowerCase().includes(q))
       .slice(0, 50);
+    if (matches.length === 0) {
+      // No object matches — offer to start a chat seeded with the query.
+      const text = this.query.trim();
+      this.filtered = [{
+        id: CHAT_ENTRY_ID,
+        name: `💬  Chat about “${text}”`,
+        description: 'Start a new conversation',
+        action: 'chat',
+        query: text,
+      }];
+      return;
+    }
+    this.filtered = matches;
   }
 
   private scheduleRebuild(): void {
@@ -295,11 +348,20 @@ export class CommandPaletteAbject extends Abject {
   private async rebuildResults(): Promise<void> {
     if (!this.resultsListId) return;
     this.applyFilter();
+    this.selectedIndex = 0; // new results → highlight the top match
     try {
       await this.request(request(this.id, this.resultsListId, 'update', {
         items: this.filtered.map(toListItem),
         selectedIndex: this.filtered.length > 0 ? 0 : -1,
       }));
+    } catch { /* widget gone */ }
+  }
+
+  /** Push the current selection to the list (which scrolls it into view). */
+  private async moveSelection(): Promise<void> {
+    if (!this.resultsListId) return;
+    try {
+      await this.request(request(this.id, this.resultsListId, 'update', { selectedIndex: this.selectedIndex }));
     } catch { /* widget gone */ }
   }
 

@@ -152,6 +152,11 @@ export class ObjectCatalog extends Abject {
 
   // ── Ask protocol ─────────────────────────────────────────────────
 
+  // Object-type catalog agents query to discover what they can build/compose.
+  protected override askTier(): 'smart' | 'balanced' | 'fast' {
+    return 'balanced';
+  }
+
   protected override askPrompt(_question: string): string {
     const metaMethods = new Set([
       'describe', 'ask', 'getRegistry', 'ping',

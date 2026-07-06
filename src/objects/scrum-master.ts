@@ -49,6 +49,9 @@ const log = new Log('ScrumMaster');
 
 const SCRUM_MASTER_INTERFACE: InterfaceId = 'abjects:scrum-master';
 
+/** Scratchpad key where a completed sprint's working plan is recorded on the goal. */
+const SCRUM_PLAN_KEY = 'scrum/plan';
+
 /** A single team-member contribution returned by a poll_team ask. */
 interface TeamContribution {
   agentName: string;
@@ -64,6 +67,18 @@ interface StagedTask {
   dependsOnIdx: number[];
   produces?: Array<{ key: string; description: string }>;
   consumes?: string[];
+  /**
+   * Optional concrete target object (UUID or registered name) when the task
+   * operates on an existing Abject. Threaded to the agent's executeTask as
+   * `data.target`. The assigned agent decides what to do with it (e.g.
+   * ObjectCreator treats a known target as a modify loop and preloads its
+   * source). Omit when unknown — the agent resolves the target itself.
+   */
+  target?: string;
+}
+
+function compactLine(value: unknown, max = 220): string {
+  return safeStringify(value, max).replace(/\s+/g, ' ').trim();
 }
 
 export class ScrumMaster extends Abject {
@@ -87,6 +102,8 @@ export class ScrumMaster extends Abject {
     agentId: AbjectId;
     description: string;
     blockers: Set<string>;
+    /** Concrete target object, threaded to executeTask when finally enqueued. */
+    target?: string;
   }>();
 
   /**
@@ -562,11 +579,11 @@ export class ScrumMaster extends Abject {
     // are runtime-configurable (SkillAgent's installed skills, MCPBridge's
     // tool list). The planner should call `poll_team` (which uses the ask
     // protocol) when it needs to know what agents can actually do.
-    const team = await this.request<Array<{ agentId: AbjectId; name: string; description: string }>>(
+    const team = await this.request<Array<{ agentId: AbjectId; name: string; description: string; canExecute?: boolean }>>(
       request(this.id, this.agentAbjectId, 'listAgents', {}),
     );
     const eligibleTeamNames = team
-      .filter(a => a.name !== 'Chat' && a.name !== 'ScrumMaster')
+      .filter(a => a.canExecute !== false && a.name !== 'Chat' && a.name !== 'ScrumMaster')
       .map(a => a.name);
 
     const scratchpad = goal.scratchpad ?? {};
@@ -582,6 +599,20 @@ export class ScrumMaster extends Abject {
     // method" lesson → the recall surfaces it → the planner uses it directly.
     const relevantKnowledge = await this.recallKnowledge(goal.description);
 
+    // Loop backstop: many rounds with accumulating failures is the signature of
+    // retrying the same fix. Surface it deterministically so the planner weighs
+    // fail_goal-with-diagnosis against yet another near-identical retry.
+    const roundsSpent = goal.currentScrumNumber ?? 0;
+    let loopWarning: string | undefined;
+    if (roundsSpent >= 4) {
+      loopWarning =
+        `This goal has already run ${roundsSpent} scrum rounds and accumulated ${failed.length} failed task(s). ` +
+        `If recent rounds kept dispatching the same kind of task against the same target and it keeps failing the same way ` +
+        `(compare the failed[].error messages), another near-identical retry will not help — that is a loop. ` +
+        `Either change strategy decisively, or fail_goal with a precise diagnosis (what recurs, what was tried, what would unblock it). ` +
+        `A clear, actionable failure beats an endless "final attempt" loop.`;
+    }
+
     return {
       success: true,
       data: {
@@ -591,6 +622,7 @@ export class ScrumMaster extends Abject {
           currentScrumNumber: goal.currentScrumNumber,
           status: goal.status,
         },
+        ...(loopWarning ? { loopWarning } : {}),
         completed: completed.map(t => ({
           description: (t.fields.description as string ?? '').slice(0, 300),
           producesKeys: ((t.fields.produces as Array<{ key: string }>) ?? []).map(p => p.key),
@@ -712,6 +744,10 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     const dependsOnIdx = (action.dependsOn as number[] | undefined);
     const produces = action.produces as Array<{ key: string; description: string }> | undefined;
     const consumes = action.consumes as string[] | undefined;
+    // Optional concrete target object (UUID or registered name) when the task
+    // operates on an existing Abject. Threads through to the agent's
+    // executeTask as `data.target`. Accept common aliases the LLM might emit.
+    const target = (action.target ?? action.objectId ?? action.objectName) as string | undefined;
 
     if (!description || !assignedAgentName) {
       return { success: false, error: 'add_task requires description and assignedAgentName' };
@@ -755,9 +791,11 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
       dependsOnIdx: resolvedDeps,
       produces,
       consumes,
+      target,
     });
 
-    log.info(`add_task (staged): "${description.slice(0, 60)}" → ${assignedAgentName} (deps: ${resolvedDeps.length === 0 ? 'none' : resolvedDeps.join(',')}); ${inflight.staged.length} staged total`);
+    const targetNote = target ? ` →${target}` : '';
+    log.info(`add_task (staged): "${description.slice(0, 60)}" → ${assignedAgentName}${targetNote} (deps: ${resolvedDeps.length === 0 ? 'none' : resolvedDeps.join(',')}); ${inflight.staged.length} staged total`);
     return {
       success: true,
       data: {
@@ -801,7 +839,104 @@ Reply PASS if you have no capability that fits the goal. The ScrumMaster uses yo
     await this.request(
       request(this.id, this.goalManagerId, 'completeGoal', { goalId, result: synthesis }),
     );
+    await this.recordCompletionPlan(goalId, synthesis).catch((err) => {
+      log.warn(`recordCompletionPlan failed for ${goalId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+    });
     this.changed('sprintCompleted', { goalId });
+  }
+
+  /**
+   * Record the plan that actually worked on the goal's own scratchpad. This is
+   * the goal's record of how it was achieved; it lives and dies with the goal,
+   * so it never pollutes the shared KnowledgeBase. Reusable cross-goal lessons
+   * (goal-shape → agent/method mappings) are the LLM's deliberate job via the
+   * save_knowledge action; this auto-record is just the local plan.
+   */
+  private async recordCompletionPlan(goalId: string, synthesis: string): Promise<void> {
+    if (!this.goalManagerId) return;
+
+    const goal = await this.request<{
+      title: string; description: string; scratchpad?: Record<string, unknown>;
+    } | null>(
+      request(this.id, this.goalManagerId, 'getGoal', { goalId }),
+      5000,
+    ).catch(() => null);
+    if (!goal) return;
+
+    const tasks = await this.request<Array<{ id: string; fields: Record<string, unknown> }>>(
+      request(this.id, this.goalManagerId, 'getTasksForGoal', { goalId }),
+      5000,
+    ).catch(() => [] as Array<{ id: string; fields: Record<string, unknown> }>);
+
+    const completed = tasks.filter(t => t.fields.status === 'done');
+    const failed = tasks.filter(t => t.fields.status === 'permanently_failed');
+    if (completed.length === 0 && failed.length === 0) return;
+
+    const agentNames = new Map<string, string>();
+    if (this.agentAbjectId) {
+      const team = await this.request<Array<{ agentId: AbjectId; name: string }>>(
+        request(this.id, this.agentAbjectId, 'listAgents', {}),
+        5000,
+      ).catch(() => [] as Array<{ agentId: AbjectId; name: string }>);
+      for (const member of team) agentNames.set(member.agentId, member.name);
+    }
+
+    const describeTask = (task: { id: string; fields: Record<string, unknown> }): string => {
+      const agentId = task.fields.assignedAgentId as string | undefined;
+      const agentName = agentId ? agentNames.get(agentId) ?? agentId.slice(0, 8) : 'unassigned';
+      const description = compactLine(task.fields.description ?? '(no description)', 280);
+      const produces = (task.fields.produces as Array<{ key?: string }> | undefined)
+        ?.map(p => p.key)
+        .filter((key): key is string => typeof key === 'string' && key.length > 0) ?? [];
+      const consumes = (task.fields.consumes as string[] | undefined)
+        ?.filter(key => typeof key === 'string' && key.length > 0) ?? [];
+      const contracts: string[] = [];
+      if (consumes.length > 0) contracts.push(`consumes ${consumes.join(', ')}`);
+      if (produces.length > 0) contracts.push(`produces ${produces.join(', ')}`);
+      return `- ${agentName}: ${description}${contracts.length > 0 ? ` (${contracts.join('; ')})` : ''}`;
+    };
+
+    const completedLines = completed.map(describeTask);
+    const failedLines = failed.map(t => {
+      const base = describeTask(t);
+      const error = compactLine(t.fields.error ?? 'unknown failure', 240);
+      return `${base} [failed: ${error}]`;
+    });
+
+    const scratchpadKeys = Object.keys(goal.scratchpad ?? {})
+      .filter(k => k !== SCRUM_PLAN_KEY)
+      .sort();
+    const participatingAgents = [...new Set(completed
+      .map(t => t.fields.assignedAgentId as string | undefined)
+      .filter((id): id is string => Boolean(id))
+      .map(id => agentNames.get(id) ?? id.slice(0, 8)))];
+
+    const plan = [
+      `Goal shape:\n${goal.description}`,
+      participatingAgents.length > 0
+        ? `Participating agents:\n${participatingAgents.join(', ')}`
+        : 'Participating agents:\n(none)',
+      completedLines.length > 0
+        ? `Working plan:\n${completedLines.join('\n')}`
+        : 'Working plan:\n(no completed worker tasks recorded)',
+      failedLines.length > 0
+        ? `Failures/replans:\n${failedLines.join('\n')}`
+        : 'Failures/replans:\n(none recorded)',
+      scratchpadKeys.length > 0
+        ? `Scratchpad keys produced:\n${scratchpadKeys.map(k => `- ${k}`).join('\n')}`
+        : 'Scratchpad keys produced:\n(none)',
+      `Final answer excerpt:\n${synthesis.slice(0, 1800)}`,
+    ].join('\n\n');
+
+    await this.request(
+      request(this.id, this.goalManagerId, 'writeGoalData', {
+        goalId,
+        key: SCRUM_PLAN_KEY,
+        value: plan,
+      }),
+      5000,
+    );
+    log.info(`recordCompletionPlan: ${goalId.slice(0, 8)} → scratchpad["${SCRUM_PLAN_KEY}"]`);
   }
 
   /**
@@ -1049,6 +1184,7 @@ Rules:
           agentId: inflight.staged[i].assignedAgentId,
           description: inflight.staged[i].description,
           blockers: new Set(blockerSets[i]),
+          target: inflight.staged[i].target,
         });
         log.info(`dispatch: task ${taskIds[i].slice(0, 8)} deferred on ${blockerSets[i].length} dep(s): ${blockerSets[i].map(d => d.slice(0, 8)).join(', ')}`);
       }
@@ -1057,13 +1193,15 @@ Rules:
     // Phase 3: enqueue dependency-free tasks.
     for (let i = 0; i < taskIds.length; i++) {
       if (blockerSets[i].length === 0) {
+        const staged = inflight.staged[i];
         await this.request(
           request(this.id, this.agentAbjectId, 'enqueueTask', {
-            agentId: inflight.staged[i].assignedAgentId,
-            task: inflight.staged[i].description,
+            agentId: staged.assignedAgentId,
+            task: staged.description,
             taskId: taskIds[i],
             goalId,
             dispatchTupleId: taskIds[i],
+            data: staged.target ? { target: staged.target } : undefined,
           }),
         );
       }
@@ -1079,13 +1217,13 @@ Rules:
 
   private async unblockDependents(completedTaskId: string): Promise<void> {
     if (!this.agentAbjectId) return;
-    const newlyReady: Array<{ taskId: string; goalId: string; agentId: AbjectId; description: string }> = [];
+    const newlyReady: Array<{ taskId: string; goalId: string; agentId: AbjectId; description: string; target?: string }> = [];
     for (const [pendingId, info] of this.pendingDeps) {
       if (!info.blockers.has(completedTaskId)) continue;
       info.blockers.delete(completedTaskId);
       if (info.blockers.size === 0) {
         this.pendingDeps.delete(pendingId);
-        newlyReady.push({ taskId: pendingId, goalId: info.goalId, agentId: info.agentId, description: info.description });
+        newlyReady.push({ taskId: pendingId, goalId: info.goalId, agentId: info.agentId, description: info.description, target: info.target });
       }
     }
     for (const t of newlyReady) {
@@ -1097,6 +1235,7 @@ Rules:
           taskId: t.taskId,
           goalId: t.goalId,
           dispatchTupleId: t.taskId,
+          data: t.target ? { target: t.target } : undefined,
         }),
       ).catch(err => log.warn(`enqueueTask(${t.taskId.slice(0, 8)}) failed: ${err instanceof Error ? err.message : String(err)}`));
     }
@@ -1173,11 +1312,12 @@ Restrict via \`members\` when you can narrow the candidate set to a couple of pl
 
 Returns \`{ contributions: [{ agentName, text }, ...] }\`. Each \`text\` is the agent's full reply naming its capabilities and proposed contribution. PASS / empty replies are filtered out.
 
-### \`add_task({ description, assignedAgentName, dependsOn?, produces?, consumes? })\` — STAGE only
+### \`add_task({ description, assignedAgentName, target?, dependsOn?, produces?, consumes? })\` — STAGE only
 Append one task to the current scrum's plan. **This does NOT commit** — it stages the task locally. Call \`dispatch_scrum\` to commit and enqueue all staged tasks at once, or call \`complete_goal\` to abandon them.
 
-- \`description\`: 1-3 sentences. Concrete, atomic, runnable end-to-end through one agent's loop.
+- \`description\`: 1-3 sentences. Concrete, atomic, runnable end-to-end through one agent's loop. **State the OUTCOME, not the implementation.** Describe what must be true when the task is done and let the agent discover how (it asks the live objects for current usage at build time). Do not embed step-by-step code prescriptions or a diagnosis of why a prior round failed — a wrong theory copied into the task description propagates the error into the next round. On a retry, describe the same outcome and, at most, which approach already failed so the agent picks a genuinely different one; never re-stage a task that prescribes the approach a prior round already proved wrong.
 - \`assignedAgentName\`: must match a name in the team roster (from \`review_scrum\`).
+- \`target\`: OPTIONAL. The concrete object the task operates on, when the goal already names an existing Abject (e.g. "fix the GraphViewer window"). **Prefer the registered name (e.g. "GraphViewer") over a raw UUID** — AbjectIds are ephemeral and change every restart, so an id copied from an older goal or memory is often stale and won't resolve, whereas the name is durable. Pass it so the agent works on that object instead of guessing. The agent decides what to do with it — don't try to specify "create" vs "modify"; that's the agent's call. Omit when there's no known target.
 - \`dependsOn\`: array of indices into THIS scrum's prior add_task calls (0-indexed). Omit for default sequential (each task waits on the previous). Pass \`[]\` for parallel-eligible.
 - \`produces\`: \`[{ key, description }, ...]\` — scratchpad keys this task will write.
 - \`consumes\`: \`["key", ...]\` — scratchpad keys this task expects to read (auto-injected into the agent's context).
@@ -1186,6 +1326,8 @@ Returns \`{ position, stagedCount, deps }\`. Multiple add_task calls accumulate.
 
 ### \`complete_goal({ hint?, synthesis? })\` — TERMINAL success
 Mark the goal completed.
+
+**Complete only when the goal's outcome durably holds.** A task's \`done\` is its own report, not proof the goal is achieved. When the latest round resolved the goal with a temporary or runtime-only workaround, left its result unverified, or recommended a durable follow-up, the goal is not finished — stage that follow-up via \`add_task\` + \`dispatch_scrum\` instead of completing here. Reserve \`complete_goal\` for when the user-visible outcome genuinely holds (and would survive a restart).
 
 **Prefer the fast path.** Most of the time you should omit \`synthesis\` and just emit \`{ "action": "complete_goal" }\` (or include a one-sentence \`hint\` that biases the framing). ScrumMaster auto-synthesizes the user-facing markdown from the goal description + scratchpad on the FAST tier (haiku). That's typically 5–10s on haiku vs 60s+ if you generate the synthesis yourself on smart tier — a major speedup since you've already done the hard reasoning.
 
@@ -1205,28 +1347,32 @@ Calling \`complete_goal\` after \`add_task\` cleanly abandons the staged batch (
 ### \`fail_goal({ reason })\` — TERMINAL error
 Declare the goal unreachable. Use when no team member can contribute and replanning won't help.
 
+**Also fail here to break a loop.** When \`review_scrum\` carries a \`loopWarning\` (the goal has run several rounds with accumulating failures) and the recent rounds keep dispatching the same kind of task against the same target with the same failure, another retry will not help. Stop and \`fail_goal\` with a precise diagnosis: the recurring failure, what was already tried across rounds, and the concrete change that would unblock it (often a fix in platform code, or a capability the team genuinely lacks). A clear failure the user can act on beats an endless "final attempt" loop.
+
 ### \`dispatch_scrum\` — TERMINAL success
 Commit the currently-staged batch: addTask each into TupleSpace, enqueue dep-free tasks immediately, defer dependents until upstream completes. Required after one or more \`add_task\` calls. Errors if staged is empty.
 
 ### \`save_knowledge({ title, content, type?, tags? })\`
-Persist a lesson to KnowledgeBase. Future scrums' \`review_scrum\` will surface it via auto-recall. Use this to bank rediscovery work so the team doesn't repeat slow Registry walks every time. Good candidates:
+Persist a genuinely reusable insight to KnowledgeBase. The user browses these entries directly and future scrums auto-recall them in \`review_scrum\`, so each one should read like a standalone fact or lesson that holds on its own, not a log of this sprint.
 
-- **Goal-shape → agent/method mappings**: which agent ended up handling a class of goal, and which method or tool of theirs did the work
-- **Pattern lessons**: when one approach beats another for a particular goal shape, with the reason
-- **User-identity facts learned during a sprint**: identifiers, addresses, account names confirmed by an actual successful task
-- **Constraints discovered**: a permission, dependency, or precondition that mattered
+Save ONLY when this sprint rediscovered something non-obvious that cost real effort and will recur on unrelated future goals. Good candidates:
 
-The point is the lesson should be reusable on the NEXT goal of the same shape. Always describe the lesson in terms of capability/goal-shape, never as a context-free name dump.
+- A capability that was hard to locate: which kind of tool or method turned out to handle a class of work, when that was not obvious from a registry walk.
+- An approach that beat the obvious one, with the reason it won.
+- A constraint that mattered: a permission, dependency, or precondition that was not apparent up front.
+- A user-identity fact confirmed by a successful task: an address, account, or identifier.
 
-Don't save:
-- The synthesis itself (the user already saw it via complete_goal)
-- Task-specific details (those belong in goal scratchpad)
+Most sprints save nothing. When the work was routine or the team found what it needed quickly, skip it. The plan that worked is already recorded on the goal's scratchpad, so this is reserved for lessons worth carrying to a different goal later.
+
+Write the entry as the insight itself. The title states the takeaway (for example "Bulk inbox triage needs an agent that drives a real browser"), phrased so a reader who never saw this sprint understands it. Avoid titles that name this goal or begin with "Goal shape".
+
+Skip:
+- The synthesis the user already saw via \`complete_goal\`
+- The working plan and task-specific details (those live on the goal scratchpad)
 - One-off observations unlikely to recur
 
 \`type\`: 'fact' (durable truth), 'learned' (lesson from outcome), 'insight' (analysis), 'reference' (pointer). Defaults to 'learned'.
-\`tags\`: short keywords for filterable retrieval — pick whatever describes the goal domain (the topic the lesson is about) plus the agent/method involved.
-
-Best timing: just BEFORE \`complete_goal\` on a successful sprint, when you know the lesson actually worked end-to-end.
+\`tags\`: short keywords describing the topic plus any capability involved.
 
 Returns \`{ id, title }\`.
 
@@ -1259,12 +1405,18 @@ Do NOT guess based on agent name alone. The relevant capability may or may not b
 **Subsequent scrum (currentScrumNumber>0):**
 1. \`review_scrum\` to see completed tasks, scratchpad, and \`relevantKnowledge\`.
 2. Decide based on what you see:
-   - User's intent satisfied → if you learned something durable (tool/provider mapping, pattern, user fact), call \`save_knowledge\` first, THEN \`complete_goal\` with a self-contained synthesis built from scratchpad data. **No team poll needed for review-only scrums.**
+   - User's intent durably satisfied AND the outcome holds → if you learned something durable (tool/provider mapping, pattern, user fact), call \`save_knowledge\` first, THEN \`complete_goal\` with a self-contained synthesis built from scratchpad data. **No team poll needed for review-only scrums.** A task reporting \`done\` means that task's work finished — it is the agent's claim, not proof the goal is achieved. Before completing, confirm the goal's user-visible outcome actually holds (e.g. a \`windowVisible: true\` self-report or "should now work" is a claim; for "something is broken / not working" goals, look for evidence the symptom is genuinely gone).
+   - A completed task describes its result as a temporary or runtime workaround, flags it as unverified, notes it would regress on restart, or recommends durable follow-up work → the goal is NOT yet done. Stage that durable follow-up: \`add_task\` to the agent whose capability can change the underlying object itself (its source/definition, so the fix survives a restart), then \`dispatch_scrum\`. Honor an executing agent's own recommendation for a durable fix rather than discarding it at completion — a transient runtime call changes state only until the next restart, while the durable fix changes the thing that was broken.
    - Failed tasks need correction → \`add_task\` with corrective work, possibly polling specific agents first if approach is unclear, then \`dispatch_scrum\`. If a cached \`relevantKnowledge\` entry led the prior round astray, \`forget_knowledge\` it before planning the corrective task.
    - Unreachable → \`fail_goal\`.
 
+**Cross-check work where correctness matters:**
+For goals whose outcome the user will rely on directly — numbers or facts reported back, destructive or irreversible actions, artifacts published somewhere external — stage a follow-up cross-check task in the NEXT round after the producing task completes. Assign the cross-check to a DIFFERENT agent than the one that produced the result, give it \`consumes\` on the produced scratchpad keys, and describe the outcome as independent confirmation (re-fetch the source, recompute the figure, load the published artifact) with a clear pass/fail verdict written to its own \`produces\` key. A failed cross-check is grounds to replan the producing task, and \`complete_goal\` waits until the check passes. Routine goals (a UI built and visibly working, an exploratory question) complete on their own evidence; reserve the cross-check round for results that are costly to get wrong.
+
 **Knowledge as memory across sprints:**
-The whole point of \`save_knowledge\` / \`lookup_knowledge\` / \`forget_knowledge\` is to amortize discovery work. The first goal of any kind may need an exploratory team poll to find which agent owns the relevant capability. Once that's discovered and the goal completes successfully, save the lesson — describe the goal shape, the agent that handled it, and the method that did the work. Every future scrum on a similar goal surfaces the lesson in \`relevantKnowledge\` and the planner skips straight to \`add_task\` with the right assignment — no team poll. When the cached lesson stops being true (the agent renamed, a tool was removed, the user switched providers), \`forget_knowledge\` removes the bad entry so the planner re-discovers via a poll.
+The whole point of \`save_knowledge\` / \`lookup_knowledge\` / \`forget_knowledge\` is to amortize discovery work. The first goal of any kind may need an exploratory team poll to find which agent owns the relevant capability. When a sprint completes, ScrumMaster automatically saves a compact "Scrum plan" lesson with the tasks and agents that actually worked. Use manual \`save_knowledge\` only for extra durable facts the automatic plan lesson would not capture, such as user preferences, provider-specific constraints, or a corrected tool mapping. Every future scrum on a similar goal surfaces prior lessons in \`relevantKnowledge\` and lets the planner choose faster while still staying inside the goal system. When a cached lesson stops being true (the agent renamed, a tool was removed, the user switched providers), \`forget_knowledge\` removes the bad entry so the planner re-discovers via a poll.
+
+Lessons record what WORKED — agent/task mappings, payload shapes, scratchpad conventions. Never save categorical claims that a capability does NOT exist ("there is no X API", "Y is not supported"): the platform evolves, those claims go stale silently, and a recalled negative will override live discovery on every future goal. If a capability seemed absent this sprint, that observation belongs in the synthesis for THIS goal only; the next sprint re-discovers. Likewise, treat recalled lessons containing such negatives as suspect — prefer the live guides.
 
 ## Rules
 
@@ -1276,11 +1428,17 @@ The whole point of \`save_knowledge\` / \`lookup_knowledge\` / \`forget_knowledg
 - Synthesis in \`complete_goal\` MUST be self-contained text. Pull data from scratchpad and inline it. No "see above".
 - All action fields go on the TOP LEVEL of the JSON object. Do NOT wrap them in a \`params\`, \`arguments\`, or \`input\` envelope. Correct: \`{ "action": "add_task", "description": "...", "assignedAgentName": "..." }\`. Wrong: \`{ "action": "add_task", "params": { "description": "..." } }\`.
 
+## Composing UI work: Model and View
+
+UI objects follow Model-View in the original Smalltalk sense (the view both displays and handles interaction; a controller, when present, only selects the kind of view of a model). For a small app one builder authors both halves as separated sections of a single object, which is one \`add_task\` to the creation agent. For a COMPLEX, stateful UI prefer splitting it into two cooperating Abjects: a model object (domain data plus rules plus Design by Contract, exposing domain operations and a getState/changed surface, no UI) and a view object (window/canvas plus interaction that observes the model). Plan that as two \`add_task\` calls, model first, then the view with \`dependsOn\` the model and \`consumes\` its id, so the view is wired to the live model. Describe the OUTCOME and the split, and let the builder choose the rendering vocabulary at build time. The controller role is usually already played by an existing system object (the launcher/window host), so do not plan a separate controller unless the goal genuinely needs multiple coordinated views of one model.
+
 ## Trust poll replies; let runtime decide
 
 When a poll reply confirms an agent owns a tool (browser automation, MCP server, skill, API), trust the reply and plan the task. Real runtime failures arrive in \`failed[]\` on the next scrum, with a concrete error you can replan against — that is your evidence loop. Phrases like "site X blocks bots", "site Y rate-limits aggressively", "the API has restrictive scopes" are training-data guesses; keep them out of task descriptions AND syntheses. The way to find out how an external service reacts is to actually attempt the task and read the real failure.
 
-Concretely: if the goal is "log into LinkedIn / read Gmail / open my bank dashboard" and WebAgent's poll reply names Playwright with persistent profiles, the right plan is a WebAgent task with the appropriate \`pageOptions.profile\` name. Save the OAuth-app / CAPTCHA / device-verification commentary for syntheses where you can quote a real \`failed[]\` entry that mentions them.`;
+Concretely: if the goal is "log into LinkedIn / read Gmail / open my bank dashboard" and WebAgent's poll reply names Playwright with persistent profiles, the right plan is a WebAgent task with the appropriate \`pageOptions.profile\` name. Save the OAuth-app / CAPTCHA / device-verification commentary for syntheses where you can quote a real \`failed[]\` entry that mentions them.
+
+The same discipline applies to the PLATFORM's own capabilities (rendering, UI, storage). The platform evolves past your training data and past saved lessons — the desktop, for example, is a native 3D scene where windows can host real meshes and lights, alongside 2D canvases. Task descriptions state the OUTCOME ("a visibly rotating 3D cube in a window") and direct the builder to the live vocabularies (builders ask the UI objects for current capabilities at build time). Hedges like "X may not be supported" and implementation prescriptions like "use 2D canvas with manual projection math" are training-data guesses — leave them out and let the builder's live discovery decide the approach.`;
   }
 }
 

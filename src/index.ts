@@ -27,6 +27,7 @@ export { Settings, SETTINGS_ID } from './objects/settings.js';
 export { Taskbar, TASKBAR_ID } from './objects/taskbar.js';
 export { AppExplorer, APP_EXPLORER_ID } from './objects/app-explorer.js';
 export { ObjectBrowser, OBJECT_BROWSER_ID } from './objects/object-browser.js';
+export { MethodInspector, METHOD_INSPECTOR_ID } from './objects/method-inspector.js';
 export { ObjectCatalog, OBJECT_CATALOG_ID } from './objects/object-catalog.js';
 export { WidgetManager, WIDGET_MANAGER_ID } from './objects/widget-manager.js';
 export { ModalDialog } from './objects/modal-dialog.js';
@@ -43,8 +44,21 @@ export { Chat, CHAT_ID } from './objects/chat.js';
 export { ChatManager, CHAT_MANAGER_ID } from './objects/chat-manager.js';
 export { ChatBrowser, CHAT_BROWSER_ID } from './objects/chat-browser.js';
 export { AbjectStore, ABJECT_STORE_ID } from './objects/abject-store.js';
+export { WasmAbject, mergeWasmManifest, WASM_ABJECT_CONSTRUCTOR } from './objects/wasm-abject.js';
+export type { WasmAbjectArgs } from './objects/wasm-abject.js';
+export { WasmInstance, extractWasmManifest } from './sandbox/wasm-instance.js';
+export {
+  isWasmSourceRef, storeWasmModule, loadWasmModule, wasmStoreDir,
+  hashFromWasmRef, decodeBase64Module, WASM_SOURCE_PREFIX,
+} from './sandbox/wasm-module-store.js';
+export { WASM_ABI_VERSION, validateWasmModule } from './sandbox/wasm-abi.js';
+export type {
+  OutboundEnvelope, InboundEnvelope, WasmInitInfo, WasmAbjectExports,
+} from './sandbox/wasm-abi.js';
 export { KnowledgeBase, KNOWLEDGE_BASE_ID } from './objects/knowledge-base.js';
 export { KnowledgeBrowser, KNOWLEDGE_BROWSER_ID } from './objects/knowledge-browser.js';
+export { FileManager, FILE_MANAGER_ID } from './objects/file-manager.js';
+export { FileViewer, FILE_VIEWER_ID } from './objects/file-viewer.js';
 export { AgentBrowser, AGENT_BROWSER_ID } from './objects/agent-browser.js';
 export { AgentCreator, AGENT_CREATOR_ID } from './objects/agent-creator.js';
 export { Scheduler, SCHEDULER_ID } from './objects/scheduler.js';
@@ -58,6 +72,7 @@ export { WorkspaceManager, WORKSPACE_MANAGER_ID } from './objects/workspace-mana
 export type { WorkspaceAccessMode, SharedWorkspaceInfo } from './objects/workspace-manager.js';
 export { WorkspaceRegistry, WORKSPACE_REGISTRY_ID } from './objects/workspace-registry.js';
 export { WorkspaceSwitcher, WORKSPACE_SWITCHER_ID } from './objects/workspace-switcher.js';
+export { Sidebar, SIDEBAR_ID, SIDEBAR_WIDTH } from './objects/sidebar.js';
 export { GlobalSettings, GLOBAL_SETTINGS_ID } from './objects/global-settings.js';
 export { GlobalToolbar, GLOBAL_TOOLBAR_ID } from './objects/global-toolbar.js';
 export { PeerNetwork, PEER_NETWORK_ID } from './objects/peer-network.js';
@@ -77,6 +92,7 @@ export { WidgetAbject, buildFont, WIDGET_INTERFACE_DECL } from './objects/widget
 export type { WidgetConfig } from './objects/widgets/widget-abject.js';
 export { WindowAbject } from './objects/widgets/window-abject.js';
 export { LabelWidget } from './objects/widgets/label-widget.js';
+export { ContentBlockWidget } from './objects/widgets/content-block-widget.js';
 export { parseMarkdown, estimateMarkdownHeight } from './objects/widgets/markdown.js';
 export type { ParsedMarkdown, MarkdownBlock, TextSpan, SpanStyle, BlockType } from './objects/widgets/markdown.js';
 export { ButtonWidget } from './objects/widgets/button-widget.js';
@@ -103,7 +119,19 @@ export { ListWidget } from './objects/widgets/list-widget.js';
 export type { ListItem, ListWidgetConfig } from './objects/widgets/list-widget.js';
 export { TreeWidget } from './objects/widgets/tree-widget.js';
 export type { TreeItem, TreeWidgetConfig } from './objects/widgets/tree-widget.js';
+export { GoalProgressWidget } from './objects/widgets/goal-progress-widget.js';
+export type { GoalProgressWidgetConfig } from './objects/widgets/goal-progress-widget.js';
+export { buildGoalRows } from './objects/goal-tree.js';
+export type { GoalRow, GoalRowKind, GoalNode, TaskNode, ColorRole } from './objects/goal-tree.js';
 export { SplitPaneWidget } from './objects/widgets/split-pane-widget.js';
+export { TableWidget } from './objects/widgets/table-widget.js';
+export type { TableColumnSpec, TableWidgetConfig } from './objects/widgets/table-widget.js';
+export { FormWidget } from './objects/widgets/form-widget.js';
+export type { FormSchema, FormFieldSchema, FormWidgetConfig } from './objects/widgets/form-widget.js';
+export { ChartWidget } from './objects/widgets/chart-widget.js';
+export type { ChartWidgetConfig, ChartSeriesSpec, ChartPoint, ChartKind } from './objects/widgets/chart-widget.js';
+export { VideoWidget } from './objects/widgets/video-widget.js';
+export type { VideoWidgetConfig } from './objects/widgets/video-widget.js';
 export type { SplitPaneConfig } from './objects/widgets/split-pane-widget.js';
 export {
   WIDGET_INTERFACE,
@@ -117,6 +145,7 @@ export {
   TITLE_BAR_HEIGHT,
   EDGE_SIZE,
   MIDNIGHT_BLOOM,
+  ARCANE_GRIMOIRE,
 } from './objects/widgets/widget-types.js';
 export type { WidgetType, Rect, WidgetStyle as WidgetAbjectStyle, SizePolicy, LayoutChildConfig, SpacerConfig, ThemeData } from './objects/widgets/widget-types.js';
 
@@ -130,6 +159,10 @@ export { FileSystem, FILESYSTEM_ID } from './objects/capabilities/filesystem.js'
 export { SharedState, SHARED_STATE_ID } from './objects/capabilities/shared-state.js';
 export { TupleSpace, TUPLE_SPACE_ID } from './objects/tuple-space.js';
 export type { TupleEntry, TuplePattern } from './objects/tuple-space.js';
+export { TriggerManager, TRIGGER_MANAGER_ID } from './objects/trigger-manager.js';
+export type { TriggerRule, TriggerAction } from './objects/trigger-manager.js';
+export { CollectionStore, COLLECTION_STORE_ID } from './objects/collection-store.js';
+export { DataBrowser, DATA_BROWSER_ID } from './objects/data-browser.js';
 export { FileTransfer, FILE_TRANSFER_ID } from './objects/capabilities/file-transfer.js';
 export { MediaStreamCapability, MEDIA_STREAM_ID } from './objects/capabilities/media-stream.js';
 export { AgentAbject, AGENT_ABJECT_ID } from './objects/agent-abject.js';
@@ -141,6 +174,9 @@ export { HostFileSystem, HOST_FILESYSTEM_ID } from './objects/capabilities/host-
 export { WebSearch, WEB_SEARCH_ID } from './objects/capabilities/web-search.js';
 export { WebFetch, WEB_FETCH_ID } from './objects/capabilities/web-fetch.js';
 export { Screenshot, SCREENSHOT_ID } from './objects/capabilities/screenshot.js';
+export { StreamClient, STREAM_CLIENT_ID } from './objects/capabilities/stream-client.js';
+export { AudioOutput, AUDIO_OUTPUT_ID, createAudioOutput } from './objects/capabilities/audio-output.js';
+export { Speech, SPEECH_ID, createSpeech } from './objects/capabilities/speech.js';
 export { SkillRegistry, SKILL_REGISTRY_ID } from './objects/skill-registry.js';
 export { SkillAgent, SKILL_AGENT_ID } from './objects/skill-agent.js';
 export { ObjectAgent, OBJECT_AGENT_ID } from './objects/object-agent.js';
@@ -156,6 +192,15 @@ export { OAuthHelper, OAUTH_HELPER_ID } from './objects/oauth-helper.js';
 export type { OAuthProviderConfig, ConnectedAccount } from './objects/oauth-helper.js';
 export { parseSkillMd } from './core/skill-parser.js';
 export type { ParsedSkill } from './core/skill-parser.js';
+export {
+  discoverHostMcpServers,
+  readMcporterServers,
+  readOpenclawSkillEnv,
+  mcporterConfigCandidates,
+  openclawConfigPath,
+  synthesizeHostSkillMd,
+} from './core/host-mcp-import.js';
+export type { HostMcpServer } from './core/host-mcp-import.js';
 export type { SkillInfo, SkillConfig, EnabledSkillSummary, MCPServerMeta } from './core/skill-types.js';
 export { HttpServer, HTTP_SERVER_ID } from './objects/http-server.js';
 export { MCPBridge, MCP_BRIDGE_ID } from './objects/mcp-bridge.js';

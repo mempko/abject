@@ -98,6 +98,14 @@ export class PeerTransport extends Transport {
   private pendingChunks: Map<string, { total: number; parts: Map<number, Uint8Array>; size: number; timer: ReturnType<typeof setTimeout>; warnTimer: ReturnType<typeof setTimeout> }> = new Map();
   private connectionTimer?: ReturnType<typeof setTimeout>;
 
+  // Throttled recv logging — per-message logs at 60fps UI traffic drown the
+  // log, so aggregate and emit a summary at most once per window.
+  private recvLogCount = 0;
+  private recvLogLastEmit = 0;
+  private droppedNoConsumerCount = 0;
+  private droppedNoConsumerLastEmit = 0;
+  private static readonly RECV_LOG_INTERVAL_MS = 5_000;
+
   constructor(config: PeerTransportConfig) {
     super({ ...config, heartbeatInterval: config.heartbeatInterval ?? 10_000 });
     this.localPeerId = config.localPeerId;
@@ -220,6 +228,12 @@ export class PeerTransport extends Transport {
    * Handle an incoming ICE candidate from the signaling server.
    */
   async handleIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
+    // [ICE-DIAG] Log remote candidate type (what the peer is offering).
+    {
+      const c = candidate.candidate ?? '';
+      const typ = /typ (\w+)/.exec(c)?.[1] ?? '?';
+      log.info(`[ICE-DIAG] REMOTE cand from ${this.remotePeerId.slice(0, 12)}: typ=${typ} ${c.slice(0, 80)}`);
+    }
     if (!this.peerConnection ||
         !this.peerConnection.remoteDescription ||
         this.peerConnection.signalingState === 'have-local-offer') {
@@ -307,8 +321,35 @@ export class PeerTransport extends Transport {
 
     if (this.sessionKey) {
       await this.sendEncryptedString(data);
-    } else {
-      this.dataChannel!.send(data);
+    } else if (!this.trySend(data)) {
+      throw new Error('DataChannel send failed (channel closed or native throw)');
+    }
+  }
+
+  /**
+   * Centralized DataChannel send. Re-checks readyState immediately before
+   * the native call and wraps the call in try/catch so a synchronous throw
+   * from libdatachannel (which can otherwise propagate as Napi::Error into
+   * a noexcept native frame and terminate the process) lands on a single
+   * catchable path. Triggers a clean disconnect on any failure.
+   */
+  private trySend(data: string | Uint8Array<ArrayBuffer>): boolean {
+    try {
+      const dc = this.dataChannel;
+      if (!dc || dc.readyState !== 'open') return false;
+      // Branched call: RTCDataChannel.send is overloaded per payload type
+      // and rejects a string | Uint8Array union.
+      if (typeof data === 'string') {
+        dc.send(data);
+      } else {
+        dc.send(data);
+      }
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`DataChannel send failed for ${this.remotePeerId.slice(0, 16)}: ${msg}`);
+      this.handleDisconnect(`Send threw: ${msg}`);
+      return false;
     }
   }
 
@@ -366,7 +407,9 @@ export class PeerTransport extends Transport {
     frame.set(ciphertext, 1 + iv.byteLength);
 
     if (frame.byteLength <= MAX_CHUNK_SIZE) {
-      this.dataChannel!.send(frame);
+      if (!this.trySend(frame)) {
+        throw new Error('DataChannel send failed');
+      }
       return;
     }
 
@@ -382,7 +425,9 @@ export class PeerTransport extends Transport {
       dv.setUint16(5, i, false);
       dv.setUint16(7, total, false);
       chunkFrame.set(slice, 9);
-      this.dataChannel!.send(chunkFrame);
+      if (!this.trySend(chunkFrame)) {
+        throw new Error(`DataChannel send failed mid-chunk (${i + 1}/${total})`);
+      }
     }
     log.info(`sent ${total} chunks (${frame.byteLength} bytes binary) to ${this.remotePeerId.slice(0, 16)}`);
   }
@@ -428,14 +473,28 @@ export class PeerTransport extends Transport {
       iceServers: this.iceServers,
     });
 
+    // [ICE-DIAG] Log the ICE servers actually applied to this connection so we
+    // can confirm TURN creds reached the transport.
+    const turnUrls = this.iceServers.flatMap(s => {
+      const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+      return urls.filter(u => u.startsWith('turn'));
+    });
+    log.info(`[ICE-DIAG] PC for ${this.remotePeerId.slice(0, 12)}: ${this.iceServers.length} iceServers, turn=[${turnUrls.join(',')}], hasUser=${this.iceServers.some(s => !!s.username)}`);
+
     // Forward ICE candidates to the remote peer via signaling
     this.peerConnection.onicecandidate = (event) => {
       if (event.candidate) {
+        // [ICE-DIAG] Log local candidate type (host/srflx/relay).
+        const c = event.candidate.candidate;
+        const typ = /typ (\w+)/.exec(c)?.[1] ?? '?';
+        log.info(`[ICE-DIAG] LOCAL cand to ${this.remotePeerId.slice(0, 12)}: typ=${typ} ${c.slice(0, 80)}`);
         this.signalingClient.sendIceCandidate(
           this.localPeerId,
           this.remotePeerId,
           event.candidate.toJSON(),
         );
+      } else {
+        log.info(`[ICE-DIAG] LOCAL gathering complete for ${this.remotePeerId.slice(0, 12)}`);
       }
     };
 
@@ -535,7 +594,37 @@ export class PeerTransport extends Transport {
       publicSigningKey: this.localPublicSigningKey,
       publicExchangeKey: this.localPublicExchangeKey,
     });
-    this.dataChannel!.send(handshakeMsg);
+    this.trySend(handshakeMsg);
+  }
+
+  /**
+   * Log an inbound routed message, throttled: the first message logs
+   * immediately, then at most one summary line per RECV_LOG_INTERVAL_MS
+   * carrying the count of messages received since the last line.
+   */
+  private logRecv(kind: 'encrypted' | 'unencrypted', message: AbjectMessage): void {
+    this.recvLogCount++;
+    const now = Date.now();
+    if (now - this.recvLogLastEmit < PeerTransport.RECV_LOG_INTERVAL_MS) return;
+    const suppressed = this.recvLogCount - 1;
+    const tail = suppressed > 0 ? ` (+${suppressed} more in last ${Math.round((now - this.recvLogLastEmit) / 1000)}s)` : '';
+    log.info(`recv ${kind} from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} type=${message.header.type} method=${message.routing.method ?? '?'}${tail}`);
+    this.recvLogCount = 0;
+    this.recvLogLastEmit = now;
+  }
+
+  /**
+   * A routed AbjectMessage arrived but no onMessage consumer is wired (e.g. a
+   * RemoteUIAccess transport, which only handles raw UI traffic). The message
+   * is dropped; warn (throttled) so this never becomes a silent black hole.
+   */
+  private logDroppedNoConsumer(message: AbjectMessage): void {
+    this.droppedNoConsumerCount++;
+    const now = Date.now();
+    if (now - this.droppedNoConsumerLastEmit < PeerTransport.RECV_LOG_INTERVAL_MS) return;
+    log.warn(`dropping routed message from ${this.remotePeerId.slice(0, 16)} — no onMessage consumer on this transport (to=${message.routing.to.slice(0, 20)} method=${message.routing.method ?? '?'}, ${this.droppedNoConsumerCount} dropped since last report)`);
+    this.droppedNoConsumerCount = 0;
+    this.droppedNoConsumerLastEmit = now;
   }
 
   /**
@@ -548,7 +637,7 @@ export class PeerTransport extends Transport {
       const parsed = JSON.parse(data);
 
       if (parsed.ping) {
-        this.dataChannel?.send(JSON.stringify({ pong: true, ts: parsed.ts }));
+        this.trySend(JSON.stringify({ pong: true, ts: parsed.ts }));
         return;
       }
       if (parsed.pong) {
@@ -563,8 +652,12 @@ export class PeerTransport extends Transport {
 
       // Pre-handshake unencrypted AbjectMessage
       const message = deserialize(data);
-      log.info(`recv unencrypted from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
-      this.events.onMessage?.(message);
+      this.logRecv('unencrypted', message);
+      if (this.events.onMessage) {
+        this.events.onMessage(message);
+      } else {
+        this.logDroppedNoConsumer(message);
+      }
     } catch (err) {
       log.error('Failed to handle string message:', err);
       this.events.onError?.(err instanceof Error ? err : new Error(String(err)));
@@ -614,8 +707,12 @@ export class PeerTransport extends Transport {
       }
 
       const message = deserialize(msgData);
-      log.info(`recv encrypted from ${this.remotePeerId.slice(0, 16)}: to=${message.routing.to.slice(0, 20)} method=${(message.payload as any)?.method ?? '?'}`);
-      this.events.onMessage?.(message);
+      this.logRecv('encrypted', message);
+      if (this.events.onMessage) {
+        this.events.onMessage(message);
+      } else {
+        this.logDroppedNoConsumer(message);
+      }
     } catch (err) {
       log.error('Failed to handle binary frame:', err);
       this.events.onError?.(err instanceof Error ? err : new Error(String(err)));
@@ -726,9 +823,7 @@ export class PeerTransport extends Transport {
         return;
       }
 
-      if (this.dataChannel?.readyState === 'open') {
-        this.dataChannel.send(JSON.stringify({ ping: true, ts: Date.now() }));
-      }
+      this.trySend(JSON.stringify({ ping: true, ts: Date.now() }));
     }, this.config.heartbeatInterval);
   }
 

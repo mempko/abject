@@ -8,6 +8,7 @@
  */
 
 import { WebSocketServer as WsServer, WebSocket } from 'ws';
+import { createHmac } from 'node:crypto';
 import { Log } from '../src/core/timed-log.js';
 
 interface PeerRecord {
@@ -30,6 +31,14 @@ interface SignalingMessage {
   candidate?: unknown;
   error?: string;
   peers?: Array<{ peerId: string; name: string; publicSigningKey: string; publicExchangeKey: string }>;
+  iceServers?: IceServer[];
+}
+
+/** Mirror of the browser RTCIceServer shape — only the fields we emit. */
+interface IceServer {
+  urls: string | string[];
+  username?: string;
+  credential?: string;
 }
 
 interface FederationConfig {
@@ -46,6 +55,42 @@ interface FederationPeer {
 const DEFAULT_PORT = 7720;
 const STALE_TIMEOUT = 5 * 60 * 1000; // 5 minutes
 const log = new Log('Signaling');
+
+// ── TURN / ICE configuration ────────────────────────────────────────────────
+// When TURN_SECRET is set, the signaling server mints coturn REST-style
+// time-limited credentials (RFC 5766 long-term + `use-auth-secret`) so peers
+// behind symmetric NAT (e.g. cell networks) can relay media through coturn.
+// The shared secret never leaves this box. When TURN is not configured we
+// reply with STUN only, preserving the prior STUN-only behavior.
+const TURN_SECRET = process.env.TURN_SECRET ?? '';
+const TURN_TTL_SECONDS = parseInt(process.env.TURN_TTL ?? String(12 * 3600), 10);
+const STUN_URLS = (process.env.STUN_URLS ?? 'stun:stun.l.google.com:19302')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const TURN_URLS = (process.env.TURN_URLS ?? '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+/**
+ * Mint coturn time-limited credentials. The username encodes an expiry
+ * timestamp (coturn rejects it once expired); the credential is the
+ * base64 HMAC-SHA1 of the username keyed by the shared secret.
+ */
+function mintTurnCredentials(peerId: string): { username: string; credential: string } {
+  const expiry = Math.floor(Date.now() / 1000) + TURN_TTL_SECONDS;
+  const username = `${expiry}:${peerId || 'anon'}`;
+  const credential = createHmac('sha1', TURN_SECRET).update(username).digest('base64');
+  return { username, credential };
+}
+
+/** Build the ICE server list for a given (authenticated) peer. */
+function buildIceServers(peerId: string): IceServer[] {
+  const servers: IceServer[] = [];
+  if (STUN_URLS.length > 0) servers.push({ urls: STUN_URLS });
+  if (TURN_SECRET && TURN_URLS.length > 0) {
+    const { username, credential } = mintTurnCredentials(peerId);
+    servers.push({ urls: TURN_URLS, username, credential });
+  }
+  return servers;
+}
 
 /**
  * Parse and shape-validate an incoming signaling frame.
@@ -137,6 +182,9 @@ export class SignalingServer {
         break;
       case 'list-peers':
         this.handleListPeers(ws, msg);
+        break;
+      case 'get-ice':
+        this.handleGetIce(ws);
         break;
       case 'federate-peers':
         this.handleFederatePeers(ws, msg);
@@ -270,6 +318,16 @@ export class SignalingServer {
         publicExchangeKey: r.publicExchangeKey,
       }));
     this.sendMessage(ws, { type: 'peer-list', peers } as SignalingMessage);
+  }
+
+  /**
+   * Return ICE servers (STUN + freshly-minted TURN credentials) for the
+   * requesting peer. Credentials are bound to the socket's registered peerId
+   * when available; unregistered sockets still get usable creds bound to 'anon'.
+   */
+  private handleGetIce(ws: WebSocket): void {
+    const peerId = this.wsToPeerId.get(ws) ?? '';
+    this.sendMessage(ws, { type: 'ice-servers', iceServers: buildIceServers(peerId) });
   }
 
   private handlePing(ws: WebSocket): void {

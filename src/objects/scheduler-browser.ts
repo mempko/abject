@@ -21,10 +21,6 @@ const SCHEDULER_BROWSER_INTERFACE: InterfaceId = 'abjects:scheduler-browser';
 const WIN_W = 580;
 const WIN_H = 400;
 
-const STATUS_ICONS: Record<string, string> = {
-  enabled:  '\u25B6',  // ▶
-  disabled: '\u25A0',  // ■
-};
 
 export class SchedulerBrowser extends Abject {
   private schedulerId?: AbjectId;
@@ -36,6 +32,7 @@ export class SchedulerBrowser extends Abject {
   private detailLayoutId?: AbjectId;
   private detailTitleId?: AbjectId;
   private detailDescId?: AbjectId;
+  private detailCodeId?: AbjectId;
   private detailMetaId?: AbjectId;
   private toggleBtnId?: AbjectId;
   private deleteBtnId?: AbjectId;
@@ -227,8 +224,12 @@ Use Toggle to enable/disable, Delete to remove.
         specs: [
           { type: 'label', windowId: this.windowId, text: 'Select a schedule',
             style: { fontSize: 14, fontWeight: 'bold', color: this.theme.textHeading, wordWrap: true } },
-          { type: 'label', windowId: this.windowId, text: '',
+          { type: 'markdown', windowId: this.windowId, text: '',
             style: { fontSize: 12, color: this.theme.textPrimary, wordWrap: true, markdown: true } },
+          // Job code goes in its own word-wrapping, monospace text area so long
+          // scripts stay fully readable and scroll internally.
+          { type: 'textArea', windowId: this.windowId, text: '', monospace: true,
+            style: { fontSize: 11, color: this.theme.textPrimary, wordWrap: true }, readOnly: true },
           { type: 'label', windowId: this.windowId, text: '',
             style: { fontSize: 11, color: this.theme.textSecondary, wordWrap: true } },
         ],
@@ -236,12 +237,14 @@ Use Toggle to enable/disable, Delete to remove.
     );
     this.detailTitleId = detailIds[0];
     this.detailDescId = detailIds[1];
-    this.detailMetaId = detailIds[2];
+    this.detailCodeId = detailIds[2];
+    this.detailMetaId = detailIds[3];
 
     await this.request(request(this.id, this.detailLayoutId, 'addLayoutChildren', {
       children: [
         { widgetId: this.detailTitleId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 24 } },
-        { widgetId: this.detailDescId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
+        { widgetId: this.detailDescId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 56 } },
+        { widgetId: this.detailCodeId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
         { widgetId: this.detailMetaId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 40 } },
       ],
     }));
@@ -323,6 +326,7 @@ Use Toggle to enable/disable, Delete to remove.
     this.detailLayoutId = undefined;
     this.detailTitleId = undefined;
     this.detailDescId = undefined;
+    this.detailCodeId = undefined;
     this.detailMetaId = undefined;
     this.toggleBtnId = undefined;
     this.deleteBtnId = undefined;
@@ -348,7 +352,6 @@ Use Toggle to enable/disable, Delete to remove.
   }
 
   private formatListItem(entry: ScheduleEntry): ListItem {
-    const icon = STATUS_ICONS[entry.enabled ? 'enabled' : 'disabled'];
     let timing: string;
     if (entry.intervalMs) {
       timing = this.formatInterval(entry.intervalMs);
@@ -357,10 +360,16 @@ Use Toggle to enable/disable, Delete to remove.
     } else {
       timing = `${String(entry.hour ?? 0).padStart(2, '0')}:${String(entry.minute ?? 0).padStart(2, '0')} ${entry.timezone ?? 'local'}`;
     }
+    // Narrow master-detail list: a status badge reads at a glance, while
+    // Toggle/Delete stay in the detail pane where there is room for them.
     return {
-      label: `${icon} ${entry.description}`,
+      label: entry.description,
       value: entry.id,
       secondary: timing,
+      badge: {
+        text: entry.enabled ? 'On' : 'Off',
+        color: entry.enabled ? this.theme.statusSuccess : this.theme.statusNeutral,
+      },
     };
   }
 
@@ -381,7 +390,7 @@ Use Toggle to enable/disable, Delete to remove.
   private async showDetail(): Promise<void> {
     const entry = this.entries[this.selectedIndex];
     if (!entry) {
-      await this.updateDetail('Select a schedule', '', '');
+      await this.updateDetail('Select a schedule', '', '', '');
       return;
     }
 
@@ -397,21 +406,67 @@ Use Toggle to enable/disable, Delete to remove.
     const lastRun = entry.lastRun > 0 ? new Date(entry.lastRun).toLocaleString() : 'Never';
     const nextRun = entry.nextRun > 0 ? new Date(entry.nextRun).toLocaleString() : 'Unknown';
 
-    const desc = `${timing}\n**Enabled:** ${entry.enabled ? 'Yes' : 'No'}\n\n**Job code:**\n\`\`\`\n${entry.jobCode.slice(0, 300)}\n\`\`\``;
+    const desc = `${timing}\n**Enabled:** ${entry.enabled ? 'Yes' : 'No'}`;
+    const code = entry.jobCode || '(no job code)';
     const meta = `Last run: ${lastRun} | Next run: ${nextRun} | ID: ${entry.id}`;
 
-    await this.updateDetail(entry.description, desc, meta);
+    await this.updateDetail(entry.description, desc, code, meta);
   }
 
-  private async updateDetail(title: string, desc: string, meta: string): Promise<void> {
+  private async updateDetail(title: string, desc: string, code: string, meta: string): Promise<void> {
     if (!this.detailTitleId) return;
     try {
       await Promise.all([
         this.request(request(this.id, this.detailTitleId, 'update', { text: title })),
         this.request(request(this.id, this.detailDescId!, 'update', { text: desc })),
+        this.request(request(this.id, this.detailCodeId!, 'update', { text: code })),
         this.request(request(this.id, this.detailMetaId!, 'update', { text: meta })),
       ]);
     } catch { /* widgets may be gone */ }
+  }
+
+  // -- Actions (shared by detail-pane buttons and inline row actions) --
+
+  private async doToggle(entry: ScheduleEntry): Promise<void> {
+    if (!this.schedulerId) return;
+    const method = entry.enabled ? 'disableSchedule' : 'enableSchedule';
+    try {
+      await this.request(
+        request(this.id, this.schedulerId, method, { scheduleId: entry.id }),
+        5000,
+      );
+      entry.enabled = !entry.enabled;
+      await this.rebuildList();
+      await this.showDetail();
+      await this.notify(`Schedule ${entry.enabled ? 'enabled' : 'disabled'}`, 'success');
+    } catch (err) {
+      log.warn('Failed to toggle schedule:', err);
+      await this.notify('Toggle failed', 'error');
+    }
+  }
+
+  private async doDelete(entry: ScheduleEntry): Promise<void> {
+    if (!this.schedulerId) return;
+    const confirmed = await this.confirm({
+      title: 'Delete Schedule',
+      message: `Delete schedule "${entry.description}"?`,
+      confirmLabel: 'Delete',
+      destructive: true,
+    });
+    if (!confirmed) return;
+    try {
+      await this.request(
+        request(this.id, this.schedulerId, 'removeSchedule', { scheduleId: entry.id }),
+        5000,
+      );
+      this.selectedIndex = -1;
+      await this.loadEntries();
+      await this.updateDetail('Select a schedule', '', '', '');
+      await this.notify('Schedule deleted', 'success');
+    } catch (err) {
+      log.warn('Failed to delete schedule:', err);
+      await this.notify('Delete failed', 'error');
+    }
   }
 
   // -- Events --
@@ -432,21 +487,10 @@ Use Toggle to enable/disable, Delete to remove.
     // Toggle button
     if (fromId === this.toggleBtnId && aspect === 'click') {
       const entry = this.entries[this.selectedIndex];
-      if (!entry || !this.schedulerId) return;
-      const method = entry.enabled ? 'disableSchedule' : 'enableSchedule';
+      if (!entry) return;
       if (this.toggleBtnId) this.send(event(this.id, this.toggleBtnId, 'update', { busy: true }));
       try {
-        await this.request(
-          request(this.id, this.schedulerId, method, { scheduleId: entry.id }),
-          5000,
-        );
-        entry.enabled = !entry.enabled;
-        await this.rebuildList();
-        await this.showDetail();
-        await this.notify(`Schedule ${entry.enabled ? 'enabled' : 'disabled'}`, 'success');
-      } catch (err) {
-        log.warn('Failed to toggle schedule:', err);
-        await this.notify('Toggle failed', 'error');
+        await this.doToggle(entry);
       } finally {
         if (this.toggleBtnId) this.send(event(this.id, this.toggleBtnId, 'update', { busy: false }));
       }
@@ -456,27 +500,10 @@ Use Toggle to enable/disable, Delete to remove.
     // Delete button
     if (fromId === this.deleteBtnId && aspect === 'click') {
       const entry = this.entries[this.selectedIndex];
-      if (!entry || !this.schedulerId) return;
-      const confirmed = await this.confirm({
-        title: 'Delete Schedule',
-        message: `Delete schedule "${entry.description}"?`,
-        confirmLabel: 'Delete',
-        destructive: true,
-      });
-      if (!confirmed) return;
+      if (!entry) return;
       if (this.deleteBtnId) this.send(event(this.id, this.deleteBtnId, 'update', { busy: true }));
       try {
-        await this.request(
-          request(this.id, this.schedulerId, 'removeSchedule', { scheduleId: entry.id }),
-          5000,
-        );
-        this.selectedIndex = -1;
-        await this.loadEntries();
-        await this.updateDetail('Select a schedule', '', '');
-        await this.notify('Schedule deleted', 'success');
-      } catch (err) {
-        log.warn('Failed to delete schedule:', err);
-        await this.notify('Delete failed', 'error');
+        await this.doDelete(entry);
       } finally {
         if (this.deleteBtnId) this.send(event(this.id, this.deleteBtnId, 'update', { busy: false }));
       }

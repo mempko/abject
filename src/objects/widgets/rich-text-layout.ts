@@ -8,6 +8,7 @@
 import type { ParsedMarkdown, MarkdownBlock, TextSpan, SpanStyle, BlockType } from './markdown.js';
 import { parseInline } from './markdown.js';
 import type { ThemeData } from './widget-types.js';
+import { wrapText } from './word-wrap.js';
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -71,8 +72,8 @@ function buildFontForStyle(
   isBold: boolean,
 ): string {
   const family = style === 'code'
-    ? '"JetBrains Mono", "Fira Code", monospace'
-    : '"Inter", system-ui, sans-serif';
+    ? '"Spline Sans Mono", "JetBrains Mono", monospace'
+    : '"Spectral", Georgia, "Times New Roman", serif';
   const size = style === 'code' ? baseFontSize - 1 : Math.round(baseFontSize * headingScale);
   const weight = (style === 'bold' || style === 'bold-italic' || isBold) ? 'bold' : 'normal';
   const italic = (style === 'italic' || style === 'bold-italic') ? 'italic ' : '';
@@ -151,6 +152,7 @@ export async function layoutRichText(
   baseFontSize: number,
   baseFill: string,
   imageResolver?: ImageResolver,
+  maxImageHeight?: number,
 ): Promise<RichTextLayout> {
   const lines: LayoutLine[] = [];
   let y = 0;
@@ -185,7 +187,7 @@ export async function layoutRichText(
 
     if (block.type === 'image' && block.imageUrl) {
       y += 4; // top padding
-      const dims = computeImageDims(block, maxWidth, imageResolver);
+      const dims = computeImageDims(block, maxWidth, imageResolver, maxImageHeight);
       lines.push({
         runs: [],
         y,
@@ -253,26 +255,40 @@ function computeImageDims(
   block: MarkdownBlock,
   maxWidth: number,
   imageResolver: ImageResolver | undefined,
+  maxImageHeight?: number,
 ): { width: number; height: number } {
+  let width: number;
+  let height: number;
+
   // Explicit `|WxH` hint wins; fit to maxWidth if larger.
   if (block.imageWidth && block.imageHeight) {
     if (block.imageWidth > maxWidth) {
       const scale = maxWidth / block.imageWidth;
-      return { width: maxWidth, height: Math.round(block.imageHeight * scale) };
+      width = maxWidth;
+      height = Math.round(block.imageHeight * scale);
+    } else {
+      width = block.imageWidth;
+      height = block.imageHeight;
     }
-    return { width: block.imageWidth, height: block.imageHeight };
-  }
-  // Probed natural dimensions (resolver returns null while loading).
-  if (imageResolver && block.imageUrl) {
-    const probed = imageResolver(block.imageUrl);
+  } else {
+    // Probed natural dimensions (resolver returns null while loading).
+    const probed = imageResolver && block.imageUrl ? imageResolver(block.imageUrl) : null;
     if (probed && probed.width > 0 && probed.height > 0) {
-      const w = Math.min(probed.width, maxWidth);
-      const h = Math.round(probed.height * (w / probed.width));
-      return { width: w, height: h };
+      width = Math.min(probed.width, maxWidth);
+      height = Math.round(probed.height * (width / probed.width));
+    } else {
+      // Placeholder: full width at 16:9 until natural dims are known.
+      width = maxWidth;
+      height = Math.round(maxWidth * 9 / 16);
     }
   }
-  // Placeholder: full width at 16:9 until natural dims are known.
-  return { width: maxWidth, height: Math.round(maxWidth * 9 / 16) };
+
+  // Optional height cap (composer thumbnails) — scale width to preserve aspect.
+  if (maxImageHeight && height > maxImageHeight && height > 0) {
+    width = Math.round(width * (maxImageHeight / height));
+    height = maxImageHeight;
+  }
+  return { width, height };
 }
 
 async function layoutCodeBlock(
@@ -286,32 +302,39 @@ async function layoutCodeBlock(
 ): Promise<void> {
   const codeFontSize = baseFontSize - 1;
   const lineHeight = codeFontSize + 4;
-  const font = `${codeFontSize}px "JetBrains Mono", "Fira Code", monospace`;
+  const font = `${codeFontSize}px "Spline Sans Mono", "JetBrains Mono", monospace`;
   const fill = theme.textPrimary;
   const codeText = block.spans[0]?.text ?? '';
   const codeLines = codeText.split('\n');
+  const indent = 8; // code left padding
+  const availWidth = maxWidth - indent - 8; // leave a small right gutter
   let y = startY;
 
   for (let i = 0; i < codeLines.length; i++) {
-    const text = codeLines[i];
-    const width = text.length > 0 ? await measureFn(text, font) : 0;
-    lines.push({
-      runs: [{
-        text,
-        font,
-        fill,
-        width,
-        sourceStart: block.sourceStart,
-        sourceEnd: block.sourceEnd,
-      }],
-      y,
-      height: lineHeight,
-      indent: 8, // code left padding
-      blockType: 'code-block',
-      blockStart: i === 0,
-      codeBackground: true,
-    });
-    y += lineHeight;
+    // Soft-wrap each source line so long lines stay visible instead of being
+    // clipped at the right edge. Preserves leading indent on the first row.
+    const wrapped = await wrapText(codeLines[i], availWidth, (t) => measureFn(t, font));
+    for (let j = 0; j < wrapped.length; j++) {
+      const text = wrapped[j];
+      const width = text.length > 0 ? await measureFn(text, font) : 0;
+      lines.push({
+        runs: [{
+          text,
+          font,
+          fill,
+          width,
+          sourceStart: block.sourceStart,
+          sourceEnd: block.sourceEnd,
+        }],
+        y,
+        height: lineHeight,
+        indent,
+        blockType: 'code-block',
+        blockStart: i === 0 && j === 0,
+        codeBackground: true,
+      });
+      y += lineHeight;
+    }
   }
 }
 
@@ -319,7 +342,7 @@ function tableFontForSpan(style: SpanStyle, size: number, isHeader: boolean): st
   const italic = (style === 'italic' || style === 'bold-italic') ? 'italic ' : '';
   const weight = (isHeader || style === 'bold' || style === 'bold-italic') ? 'bold' : 'normal';
   // Use monospace for the whole table so fixed-width column padding still aligns.
-  return `${italic}${weight} ${size}px "JetBrains Mono", "Fira Code", monospace`;
+  return `${italic}${weight} ${size}px "Spline Sans Mono", "JetBrains Mono", monospace`;
 }
 
 /** Word-wrap plain text into monospace lines of at most `maxChars`. */

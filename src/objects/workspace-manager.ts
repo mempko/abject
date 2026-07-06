@@ -15,8 +15,10 @@ import {
   SpawnResult,
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
+import type { ThemeData } from '../core/theme-data.js';
 import { require as precondition, invariant } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
+import { SIDEBAR_WIDTH, SIDEBAR_COMPACT_WIDTH } from './sidebar.js';
 import { Log } from '../core/timed-log.js';
 
 const WORKSPACE_MANAGER_INTERFACE = 'abjects:workspace-manager' as InterfaceId;
@@ -50,14 +52,14 @@ const INFRA_OBJECTS = [
   'AbjectStore', 'SharedState', 'TupleSpace', 'FileTransfer', 'MediaStream', 'Theme',
   'GoalManager', 'JobManager', 'AgentAbject', 'ScrumMaster', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
   'AgentCreator', 'Scheduler', 'KnowledgeBase', 'ChatManager',
-  'Console',
+  'Console', 'CollectionStore', 'TriggerManager',
 ] as const;
 
 /** UI objects — deferred for inactive workspaces, spawned on first switch. */
 const UI_OBJECTS = [
   'Settings', 'AppExplorer', 'GoalBrowser', 'JobBrowser', 'KnowledgeBrowser', 'AgentBrowser', 'SchedulerBrowser',
-  'WebBrowserViewer', 'ChatBrowser', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
-  'CommandPalette', 'NotificationCenter', 'WindowSwitcher',
+  'WebBrowserViewer', 'FileManager', 'FileViewer', 'ChatBrowser', 'ObjectCreator', 'AbjectEditor', 'Taskbar',
+  'CommandPalette', 'NotificationCenter', 'WindowSwitcher', 'DataBrowser',
 ] as const;
 
 /** All per-workspace objects in dependency order. */
@@ -118,6 +120,9 @@ export class WorkspaceManager extends Abject {
   private supervisorId?: AbjectId;
   private workspaceSwitcherId?: AbjectId;
   private globalToolbarId?: AbjectId;
+  private sidebarId?: AbjectId;
+  /** Debounce for display-driven sidebar rebuilds (client connect bursts). */
+  private sidebarRefreshTimer?: ReturnType<typeof setTimeout>;
   private uiServerId?: AbjectId;
   private widgetManagerId?: AbjectId;
   private windowManagerId?: AbjectId;
@@ -471,6 +476,20 @@ export class WorkspaceManager extends Abject {
       return this.refreshTaskbar();
     });
 
+    // UIServer dependency events: a frontend client becoming ready makes
+    // display info live, so rebuild the display-sized sidebar dock. Debounced
+    // because connects and reconnects arrive in bursts.
+    this.on('changed', async (msg: AbjectMessage) => {
+      const { aspect } = msg.payload as { aspect: string };
+      if (aspect === 'frontendClientsChanged' && msg.routing.from === this.uiServerId) {
+        if (this.sidebarRefreshTimer) return;
+        this.sidebarRefreshTimer = setTimeout(() => {
+          this.sidebarRefreshTimer = undefined;
+          this.refreshTaskbar().catch(() => {});
+        }, 250);
+      }
+    });
+
     // Handle objectRegistered events from workspace registries
     this.on('objectRegistered', async (msg: AbjectMessage) => {
       const registryId = msg.routing.from;
@@ -507,9 +526,17 @@ export class WorkspaceManager extends Abject {
     this.supervisorId = await this.discoverDep('Supervisor') ?? undefined;
     this.workspaceSwitcherId = await this.discoverDep('WorkspaceSwitcher') ?? undefined;
     this.globalToolbarId = await this.discoverDep('GlobalToolbar') ?? undefined;
+    this.sidebarId = await this.discoverDep('Sidebar') ?? undefined;
     this.uiServerId = await this.discoverDep('UIServer') ?? undefined;
     this.widgetManagerId = await this.discoverDep('WidgetManager') ?? undefined;
     this.windowManagerId = await this.discoverDep('WindowManager') ?? undefined;
+
+    // Re-measure the sidebar dock when a frontend client (re)connects: the
+    // dock is sized to the display, and display info is only live once a
+    // client is ready (a dock built before that uses a stale default size).
+    if (this.uiServerId) {
+      this.send(request(this.id, this.uiServerId, 'addDependent', {}));
+    }
   }
 
   /**
@@ -698,23 +725,64 @@ export class WorkspaceManager extends Abject {
   }
 
   /**
-   * Re-show the active workspace's Taskbar with the current y-offset.
-   * Called by WorkspaceSwitcher after workspace create changes switcher height.
+   * Rebuild the sidebar dock and re-populate its sections (System, Spaces,
+   * Abjects). Called on startup, workspace switch, workspace create, and
+   * whenever a section provider asks for a refresh.
    */
   private async refreshTaskbar(): Promise<boolean> {
     if (!this.activeWorkspaceId) return false;
     const ws = this.workspaces.get(this.activeWorkspaceId);
     if (!ws) return false;
 
-    // Stack order: GlobalToolbar → WorkspaceSwitcher → Taskbar
-    let yOffset = 8;
+    // Resolve the active workspace's theme once and push it into the sidebar
+    // and each section provider's show() so they rebuild with the correct
+    // palette. The sidebar and global providers are outside any workspace, so
+    // they can't resolve the active theme themselves reliably; pushing it here
+    // is deterministic and runs on both startup and every workspace switch
+    // (both flow through refreshTaskbar).
+    let activeTheme: ThemeData | undefined;
+    if (this.widgetManagerId) {
+      try {
+        activeTheme = await this.request<ThemeData>(
+          request(this.id, this.widgetManagerId, 'getActiveTheme', {}));
+      } catch { /* WidgetManager not ready — toolbars fall back to cached theme */ }
+    }
+
+    // Lazy-discover the sidebar (spawn-order race on first boot).
+    if (!this.sidebarId) {
+      this.sidebarId = await this.discoverDep('Sidebar') ?? undefined;
+    }
+    if (!this.sidebarId) return false;
+
+    // Rebuild the dock window, then push the fresh section layout IDs into
+    // each provider. Section order: System → Spaces → Abjects.
+    type SidebarSections = { windowId: AbjectId; system: AbjectId; spaces: AbjectId; abjects: AbjectId; compact: boolean };
+    let sections: SidebarSections | null = null;
+    try {
+      await this.request(request(this.id, this.sidebarId, 'show', { theme: activeTheme }));
+      sections = await this.request<SidebarSections | null>(
+        request(this.id, this.sidebarId, 'getSections', {}));
+    } catch (err) {
+      wsLog.warn('Failed to rebuild sidebar:', err);
+    }
+    if (!sections) return false;
+
+    // Tell WindowManager the reserved dock width so maximized windows re-fit
+    // when the sidebar toggles between compact and full width.
+    if (this.windowManagerId) {
+      this.send(event(this.id, this.windowManagerId, 'workAreaChanged', {
+        left: sections.compact ? SIDEBAR_COMPACT_WIDTH : SIDEBAR_WIDTH,
+      }));
+    }
 
     if (this.globalToolbarId) {
       try {
-        await this.request(request(this.id, this.globalToolbarId, 'show', { yOffset }));
-        const toolbarHeight = await this.request<number>(
-          request(this.id, this.globalToolbarId, 'getHeight', {}));
-        yOffset = yOffset + toolbarHeight + 8;
+        await this.request(request(this.id, this.globalToolbarId, 'show', {
+          theme: activeTheme,
+          windowId: sections.windowId,
+          sectionLayoutId: sections.system,
+          compact: sections.compact,
+        }));
       } catch { /* toolbar not ready */ }
     }
 
@@ -727,18 +795,21 @@ export class WorkspaceManager extends Abject {
             workspaces: this.listWorkspaces(),
             activeWorkspaceId: this.activeWorkspaceId,
             settingsId: settingsEntry?.id,
-            yOffset,
+            theme: activeTheme,
+            windowId: sections.windowId,
+            sectionLayoutId: sections.spaces,
+            compact: sections.compact,
           }));
-        const switcherHeight = await this.request<number>(
-          request(this.id, this.workspaceSwitcherId, 'getHeight', {}));
-        yOffset = yOffset + switcherHeight + 8;
       } catch { /* use default */ }
     }
 
     if (ws.taskbarId) {
       try {
         await this.request(request(this.id, ws.taskbarId, 'show', {
-          yOffset,
+          theme: activeTheme,
+          windowId: sections.windowId,
+          sectionLayoutId: sections.abjects,
+          compact: sections.compact,
         }));
       } catch (err) {
         wsLog.warn('Failed to refresh taskbar:', err);
@@ -1163,10 +1234,26 @@ export class WorkspaceManager extends Abject {
     const wsStorageId = wsStorageResult.objectId;
     log.timed('registry + storage ready');
 
+    // 2b. Spawn workspace-scoped FileSystem (on-disk, rooted at ~/.abject/ws-<id>/files).
+    // workspaceId is carried in constructorArgs so the instance roots itself even
+    // when placed in a worker thread. Not in INFRA_OBJECTS — spawned explicitly here.
+    const wsFileSystemTypeId = this.computeTypeId(workspaceId, 'FileSystem');
+    const wsFileSystemResult = await this.request<SpawnResult>(
+      request(this.id, this.factoryId!, 'spawn', {
+        manifest: { name: 'FileSystem', description: `Workspace filesystem for '${name}'`,
+          version: '2.0.0', requiredCapabilities: [], tags: ['system'] },
+        registryHint: wsRegistryId,
+        constructorArgs: { workspaceId },
+        typeId: wsFileSystemTypeId,
+      })
+    );
+    const wsFileSystemId = wsFileSystemResult.objectId;
+
     // 3. Spawn per-workspace objects (in dependency order)
     // Factory auto-registers each in the workspace registry via registryHint
-    const childIds: AbjectId[] = [wsRegistryId, wsStorageId];
+    const childIds: AbjectId[] = [wsRegistryId, wsStorageId, wsFileSystemId];
     let taskbarId: AbjectId = '' as AbjectId;
+    let abjectStoreId: AbjectId | undefined;
     const uiObjects: Array<{ id: AbjectId; iface: InterfaceId }> = [];
     const childTypeIds = new Map<AbjectId, TypeId>();
 
@@ -1175,6 +1262,7 @@ export class WorkspaceManager extends Abject {
     const storTypeId = this.computeTypeId(workspaceId, 'Storage');
     if (regTypeId) childTypeIds.set(wsRegistryId, regTypeId);
     if (storTypeId) childTypeIds.set(wsStorageId, storTypeId);
+    if (wsFileSystemTypeId) childTypeIds.set(wsFileSystemId, wsFileSystemTypeId);
 
     // Map object names to their interface IDs for UI object tracking
     const uiIfaceMap: Record<string, InterfaceId> = {
@@ -1185,7 +1273,21 @@ export class WorkspaceManager extends Abject {
       ChatBrowser: CHAT_BROWSER_INTERFACE,
     };
 
-    for (const objName of objectsToSpawn) {
+    // Installed workspace-scoped WASM extensions spawn alongside the built-in
+    // per-workspace set. Extensions replacing a built-in are already in
+    // objectsToSpawn under the built-in's name (the Factory resolves the
+    // override), so only genuinely new type names are appended here.
+    let extensionNames: string[] = [];
+    try {
+      const wasmTypes = await this.request<Array<{ name: string; scope: string }>>(
+        request(this.id, this.factoryId!, 'listWasmTypes', {})
+      );
+      extensionNames = wasmTypes
+        .filter((t) => t.scope === 'workspace' && !objectsToSpawn.includes(t.name))
+        .map((t) => t.name);
+    } catch { /* Factory without WASM support */ }
+
+    for (const objName of [...objectsToSpawn, ...extensionNames]) {
       const typeId = this.computeTypeId(workspaceId, objName);
       let result: SpawnResult;
       try {
@@ -1206,6 +1308,10 @@ export class WorkspaceManager extends Abject {
       const objId = result.objectId;
       childIds.push(objId);
       if (typeId) childTypeIds.set(objId, typeId);
+
+      if (objName === 'AbjectStore') {
+        abjectStoreId = objId;
+      }
 
       if (objName === 'Taskbar') {
         taskbarId = objId;
@@ -1246,8 +1352,8 @@ export class WorkspaceManager extends Abject {
     log.timed(`all ${objectsToSpawn.length} objects spawned`);
 
     // 4. Restore persisted user-created abjects for this workspace
-    // AbjectStore is at index 0 in PER_WORKSPACE_OBJECTS, so childIds[2]
-    const abjectStoreId = childIds[2];
+    // abjectStoreId is captured by name during the spawn loop above (don't rely
+    // on a positional index — childIds ordering changes when infra is added).
     if (abjectStoreId) {
       try {
         await this.request(

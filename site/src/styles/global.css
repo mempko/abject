@@ -7,19 +7,20 @@
 
 /* ── Variables ── */
 :root {
-  --bg-deep: #030308;
-  --bg-primary: #08080f;
-  --bg-surface: #0e0e18;
-  --bg-card: #12121e;
-  --bg-card-hover: #1a1a2a;
+  /* Arcane Grimoire palette — matches the app theme. */
+  --bg-deep: #05060a;
+  --bg-primary: #07080e;
+  --bg-surface: #13141f;
+  --bg-card: #1a1b28;
+  --bg-card-hover: #22243a;
 
-  --eldritch: #39ff8e;
-  --eldritch-dim: #2bcc6e;
-  --eldritch-glow: rgba(57, 255, 142, 0.15);
-  --eldritch-glow-strong: rgba(57, 255, 142, 0.3);
-  --void-purple: #9b59ff;
-  --void-purple-glow: rgba(155, 89, 255, 0.15);
-  --ichor: #ff4d6a;
+  --eldritch: #5be5a0;
+  --eldritch-dim: #3fcf8a;
+  --eldritch-glow: rgba(91, 229, 160, 0.15);
+  --eldritch-glow-strong: rgba(91, 229, 160, 0.32);
+  --void-purple: #8b7bff;
+  --void-purple-glow: rgba(139, 123, 255, 0.15);
+  --ichor: #ff5c77;
 
   /* Aliases for backward compat in component styles */
   --accent: var(--eldritch);
@@ -28,16 +29,22 @@
   --accent-glow-strong: var(--eldritch-glow-strong);
   --accent-secondary: var(--void-purple);
 
-  --text-primary: #ececf2;
-  --text-secondary: #c4c4d2;
-  --text-dim: #9a9aae;
-  --text-code: #d8d8e4;
+  --text-primary: #e8e6dc;
+  --text-secondary: #c4c2b8;
+  --text-dim: #9a98a8;
+  --text-code: #c8c4e0;
+  /* Muted diagram ink: dim enough to read as "the dead old way",
+     bright enough to actually read (>=4.5:1 on --bg-primary). */
+  --diagram-muted: #8a8aa0;
+  --diagram-muted-stroke: #6a6a85;
 
-  --border: #1a1a2a;
-  --border-accent: rgba(57, 255, 142, 0.2);
+  --border: #232539;
+  --border-accent: rgba(91, 229, 160, 0.22);
 
-  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  /* Arcane Grimoire typography: characterful serifs + a refined mono. */
+  --font-display: 'Fraunces', 'Spectral', Georgia, serif;
+  --font-body: 'Spectral', Georgia, 'Times New Roman', serif;
+  --font-mono: 'Spline Sans Mono', 'JetBrains Mono', 'Fira Code', monospace;
 
   --max-width: 1100px;
   --section-gap: 6rem;
@@ -86,10 +93,10 @@ body::before {
   z-index: 0;
   pointer-events: none;
   background:
-    radial-gradient(ellipse 80% 60% at 50% 100%, rgba(57, 255, 142, 0.04) 0%, transparent 60%),
-    radial-gradient(ellipse 50% 50% at 10% 80%, rgba(155, 89, 255, 0.035) 0%, transparent 50%),
-    radial-gradient(ellipse 40% 40% at 90% 70%, rgba(57, 255, 142, 0.03) 0%, transparent 50%),
-    radial-gradient(ellipse 60% 30% at 50% 0%, rgba(155, 89, 255, 0.02) 0%, transparent 50%);
+    radial-gradient(ellipse 80% 60% at 50% 100%, rgba(91, 229, 160, 0.05) 0%, transparent 60%),
+    radial-gradient(ellipse 50% 50% at 10% 80%, rgba(139, 123, 255, 0.04) 0%, transparent 50%),
+    radial-gradient(ellipse 40% 40% at 90% 70%, rgba(91, 229, 160, 0.035) 0%, transparent 50%),
+    radial-gradient(ellipse 60% 30% at 50% 0%, rgba(139, 123, 255, 0.025) 0%, transparent 50%);
   animation: abyss-breathe 12s ease-in-out infinite;
 }
 
@@ -108,9 +115,10 @@ body::before {
 
 /* ── Typography ── */
 h1, h2, h3, h4 {
+  font-family: var(--font-display);
   line-height: 1.2;
-  font-weight: 700;
-  letter-spacing: -0.02em;
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
 h1 { font-size: clamp(2.2rem, 5vw, 3.5rem); }

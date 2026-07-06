@@ -132,6 +132,10 @@ Node.js process with worker threads. The **browser client** is the surface: a
 thin Canvas renderer that forwards input and displays composited frames over
 WebSocket. The **signaling server** helps peers find each other in the dark.
 
+For running the signaling server in production behind TLS, and pairing it with a
+TURN relay so peers behind symmetric NAT or cell networks can still connect, see
+[WHISPER.md](WHISPER.md).
+
 ## Architecture
 
 ```
@@ -180,11 +184,15 @@ src/
   protocol/             # Negotiator, Agreement management, HealthMonitor
   llm/                  # Provider interface + implementations (Anthropic, OpenAI, Ollama)
   network/              # Transport abstraction, WebSocket, PeerTransport, SignalingClient, NetworkBridge
-  sandbox/              # WASM loader, capability-enforced imports
+  sandbox/              # WASM abject hosting: ABI, instance wrapper, module store, extension ingest
   ui/                   # App shell, Canvas Compositor, Window Manager
 server/                 # Node.js backend: server entry, signaling server, node worker adapter
 client/                 # Thin browser client: FrontendClient, input forwarding
-workers/                # Web Worker / Worker Thread entry points
+workers/                # Worker thread entry points (shared Abject pool, P2P, UI)
+native/                 # Bundled WASM system packages (e.g. the C++ KnowledgeBase)
+sdk/cpp/                # C++ SDK for writing abjects that compile to WebAssembly
+examples/               # User-loadable WASM abject packages (install with pnpm forge)
+docs/                   # Specifications (WASM_ABI.md)
 ```
 
 ## Design by Contract
@@ -245,8 +253,13 @@ See [PHILOSOPHY.md](PHILOSOPHY.md) for the principles that carry the fire forwar
 | `SIGNALING_PORT` | `7720` | Signaling server port for P2P discovery |
 | `ABJECTS_DATA_DIR` | `.abjects` | Persistent storage directory |
 | `ABJECTS_WORKER_COUNT` | CPU cores - 1 (max 8) | Worker thread pool size |
+| `TURN_SECRET` | - | Shared secret for the signaling server to mint TURN relay credentials (see [WHISPER.md](WHISPER.md)) |
+| `TURN_URLS` | - | TURN URLs advertised to peers for NAT traversal (see [WHISPER.md](WHISPER.md)) |
 
 API keys can also be configured through the Global Settings UI at runtime.
+
+The signaling server and its optional TURN relay have their own environment and
+deployment guide in [WHISPER.md](WHISPER.md).
 
 ### Using with Ollama (Local LLM)
 

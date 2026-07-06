@@ -486,8 +486,12 @@ Goals have automatic lifecycle management:
   // Get completed tasks with results
   const results = await call(await dep('GoalManager'), 'getResultsForGoal', { goalId });
 
-Tasks are routed to agents via the ask protocol. AgentAbject asks each agent
-if it can handle the task, and the most confident agent claims it.
+Tasks are planned and routed by the workspace's planner (ScrumMaster): when a
+top-level goal is created it runs a scrum meeting, polls agents via the ask
+protocol to learn what each can contribute right now, stages tasks with an
+assigned agent, and dispatches them through AgentAbject's per-agent queues.
+When every task in the current round reaches a terminal state, the planner
+reviews results and either plans another round or completes/fails the goal.
 
 ### Goal Scratchpad (shared key-value store)
 
@@ -502,13 +506,13 @@ if it can handle the task, and the most confident agent claims it.
 
 ### IMPORTANT
 - The interface ID is 'abjects:goal-manager'.
-- Goals are automatically created by AgentAbject for every task — you usually don't need to create them manually.
+- Goals are created by their originator (e.g. Chat creates one per user request); the planner owns the goal's lifecycle while a scrum is running it.
 - Sub-goals: pass parentId when creating a goal to link it under a parent.
 - clearCompleted archives (not deletes) completed/failed goals. Archived goals auto-delete after 1 hour.
 - listGoals excludes archived goals by default. Pass includeArchived: true to see them.
 - Tasks are backed by TupleSpace (CRDT-synced) — they persist across restarts and sync across peers.
 - Goals metadata syncs to SharedState for cross-peer visibility.
-- Task types are flexible — AgentAbject uses LLM semantic fallback when no agent declares the exact type.`;
+- Tasks carry the agent the planner assigned them to after polling abilities; there is no task-type matching.`;
   }
 
   protected override async handleAsk(question: string): Promise<string> {

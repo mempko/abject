@@ -6,7 +6,8 @@
  * Handles measureText and displayInfo requests locally.
  */
 
-import { Compositor, DrawCommand } from '../src/ui/compositor.js';
+import { Compositor, DrawCommand, MobileViewState } from '../src/ui/compositor.js';
+import type { SceneOp, SceneTheme } from '../src/ui/gl/scene-types.js';
 import type { AbjectId } from '../src/core/types.js';
 import type {
   BackendToFrontendMsg,
@@ -16,6 +17,18 @@ import type {
   SetSelectedTextMsg,
   StartWindowDragMsg,
   AuthResultMsg,
+  AudioPlayMsg,
+  AudioControlMsg,
+  MediaCaptureRequestMsg,
+  MediaCaptureFrameRequestMsg,
+  MediaRecordStartMsg,
+  MediaRecordStopMsg,
+  MediaStreamControlMsg,
+  SpeechSpeakMsg,
+  SpeechRecognizeRequestMsg,
+  SpeechVoicesRequestMsg,
+  VideoSetupMsg,
+  VideoControlMsg,
 } from '../server/ws-protocol.js';
 import type { AbyssBgControl } from './abyss-bg.js';
 import type { ClientTransport } from './transport.js';
@@ -25,10 +38,10 @@ import type { ClientTransport } from './transport.js';
  */
 /** Fonts to pre-measure for server-side text width computation */
 const MEASURED_FONTS = [
-  '14px "Inter", system-ui, sans-serif',   // WIDGET_FONT
-  '600 13px "Inter", system-ui, sans-serif', // TITLE_FONT
-  '13px "JetBrains Mono", "Fira Code", monospace', // CODE_FONT
-  '14px system-ui',                         // legacy WIDGET_FONT
+  '14px "Spectral", Georgia, "Times New Roman", serif',        // WIDGET_FONT
+  '600 14px "Fraunces", "Spectral", Georgia, serif',           // TITLE_FONT
+  '13px "Spline Sans Mono", "JetBrains Mono", monospace',      // CODE_FONT
+  '14px system-ui',                                            // legacy WIDGET_FONT
 ];
 
 /** ASCII printable range pre-measured for every new font we see. */
@@ -41,11 +54,29 @@ export class FrontendClient {
   private transport: ClientTransport | null = null;
   private focusedSurface?: string;
   private grabbedSurface?: string;
+  /** Currently hovered 3D scene node (mesh), for enter/leave synthesis. */
+  private hoveredNode?: { scope: 'window' | 'world'; surfaceId?: string; ownerId?: string; nodeId: string };
+  /**
+   * Drag capture for 3D nodes: set on node mousedown, released on mouseup.
+   * While set, mousemove streams to this node even when the cursor outruns
+   * the mesh — smooth drags, like window/widget grabs.
+   */
+  private grabbedNode?: { scope: 'window' | 'world'; surfaceId?: string; ownerId?: string; nodeId: string };
   private currentSelectedText = '';
   private authenticated = false;
   private loginFormHandler: ((e: Event) => void) | null = null;
   private pendingMouseMove: FrontendToBackendMsg | null = null;
   private mouseMoveRafId = 0;
+  /** Per-surface accumulated wheel deltas; flushed once per animation frame. */
+  private pendingWheels: Map<string, {
+    surfaceId: string;
+    x: number;
+    y: number;
+    deltaX: number;
+    deltaY: number;
+    modifiers: { shift: boolean; ctrl: boolean; alt: boolean; meta: boolean };
+  }> = new Map();
+  private wheelRafId = 0;
   /** Fonts for which we've already shipped a full ASCII metrics table. */
   private measuredFonts: Set<string> = new Set();
   /** Middle-click-drag pan in progress. */
@@ -53,7 +84,6 @@ export class FrontendClient {
   /** Scrollbar thumb drag in progress. */
   private draggingScrollbar = false;
   private mobileMode = false;
-  private mobileTabTouchStartX?: number;  // track start X for tap vs scroll detection
   private mobileKeyboardProxy?: HTMLInputElement;  // hidden input for virtual keyboard
   // Pinch-zoom state
   private pinchStartDist?: number;
@@ -61,6 +91,25 @@ export class FrontendClient {
   // Two-finger pan state
   private panLastMidX?: number;
   private panLastMidY?: number;
+
+  // ── Single-finger gesture state machine (mobile) ──
+  private static readonly DOUBLE_TAP_MS = 300;
+  private static readonly TAP_SLOP_PX = 10;
+  private static readonly EDGE_SWIPE_TRIGGER_PX = 40;
+  private static readonly LONG_PRESS_MS = 350;
+  private static readonly FLICK_VELOCITY = 0.6;  // px/ms upward to close a card
+  private static readonly CARD_CLOSE_DISTANCE = 120;  // px dragged up to close
+  /** Per-touch gesture descriptor (single finger). */
+  private activeTouch?: {
+    startX: number; startY: number; startTime: number;
+    lastX: number; lastY: number; lastTime: number; lastVy: number;
+    mode: 'undecided' | 'content' | 'pan' | 'edgeSwipe' | 'edgeConsumed' | 'cardPan' | 'cardClose' | 'cardReorder';
+    cardId?: string;
+    longPressTimer?: ReturnType<typeof setTimeout>;
+  };
+  private lastTapTime = 0;
+  private lastTapX = 0;
+  private lastTapY = 0;
   /** Client-side drag state for zero-latency window moves */
   private localDragState?: {
     surfaceId: string;
@@ -75,6 +124,27 @@ export class FrontendClient {
   private lastCanvasY = 0;
   private abyssBg?: AbyssBgControl;
   private resizableSurfaces: Set<string> = new Set();
+  private fileUploadProxy?: HTMLInputElement;
+
+  // ── Audio playback + media capture state (backend-relayed) ────────────
+  private audioPlaybacks: Map<string, HTMLAudioElement> = new Map();
+  private mediaStreams: Map<string, MediaStream> = new Map();
+  /** Hidden playing <video> per video-bearing stream so frames are grabbable. */
+  private mediaVideoEls: Map<string, HTMLVideoElement> = new Map();
+  /** Video-widget elements keyed by videoId; frames composite via the compositor. */
+  private videoWidgetEls: Map<string, HTMLVideoElement> = new Map();
+  /** Per-video throttle stamp for 'time' events (1/sec drives seek bars). */
+  private videoTimeStamps: Map<string, number> = new Map();
+  private mediaRecorders: Map<string, {
+    recorder: MediaRecorder;
+    chunks: Blob[];
+    startedAt: number;
+    timer?: ReturnType<typeof setTimeout>;
+  }> = new Map();
+  /** Surface that requested the file picker; the chosen file routes back to it. */
+  private fileUploadTargetSurface?: string;
+  /** Monotonic counter to give each upload a unique id for chunk reassembly. */
+  private nextUploadSeq = 0;
 
   constructor(canvas: HTMLCanvasElement, abyssBg?: AbyssBgControl) {
     this.canvas = canvas;
@@ -84,6 +154,7 @@ export class FrontendClient {
     this.setupInputListeners();
     this.setupMobileKeyboard();
     this.setupViewportShift();
+    this.setupFileUpload();
   }
 
   private detectMobileMode(): void {
@@ -101,6 +172,23 @@ export class FrontendClient {
       if (this.mobileMode !== wasMobile) {
         this.compositor.setMobileMode(this.mobileMode);
       }
+    });
+
+    // Tell the backend when the viewport changes size (debounced past the
+    // resize-drag stream) so display-sized chrome like the sidebar dock can
+    // follow. Read the dimensions inside the debounce: the compositor's own
+    // resize handler has updated the canvas by then.
+    let resizeNotifyTimer: ReturnType<typeof setTimeout> | undefined;
+    window.addEventListener('resize', () => {
+      if (resizeNotifyTimer) clearTimeout(resizeNotifyTimer);
+      resizeNotifyTimer = setTimeout(() => {
+        resizeNotifyTimer = undefined;
+        this.sendToBackend({
+          type: 'displayResized',
+          width: this.compositor.width,
+          height: this.compositor.height,
+        });
+      }, 250);
     });
   }
 
@@ -211,6 +299,87 @@ export class FrontendClient {
     proxy.value = '';
   }
 
+  /**
+   * Wire the hidden file input (opened on demand by the backend) and canvas
+   * drag-drop. Selected/dropped files are read as base64 and streamed to the
+   * backend in chunks tagged with the target surface.
+   */
+  private setupFileUpload(): void {
+    const proxy = document.getElementById('file-upload-proxy') as HTMLInputElement | null;
+    if (proxy) {
+      this.fileUploadProxy = proxy;
+      proxy.addEventListener('change', () => {
+        const files = proxy.files;
+        const surfaceId = this.fileUploadTargetSurface;
+        if (files && surfaceId) {
+          for (const file of Array.from(files)) {
+            void this.uploadFile(file, surfaceId);
+          }
+        }
+        // Reset so selecting the same file again re-fires change.
+        proxy.value = '';
+        this.fileUploadTargetSurface = undefined;
+      });
+    }
+
+    // Drag-and-drop onto the canvas: route to the surface under the drop point.
+    this.canvas.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+    });
+    this.canvas.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const files = e.dataTransfer?.files;
+      if (!files || files.length === 0) return;
+      const rect = this.canvas.getBoundingClientRect();
+      const surface = this.compositor.surfaceAt(e.clientX - rect.left, e.clientY - rect.top);
+      const surfaceId = surface?.id ?? this.focusedSurface;
+      if (!surfaceId) return;
+      for (const file of Array.from(files)) {
+        void this.uploadFile(file, surfaceId);
+      }
+    });
+  }
+
+  /**
+   * Read a File as base64 and send it to the backend in chunks. When
+   * `toFocusedWidget` is set, the assembled file is routed to the focused
+   * child widget (used for images pasted into a text input) instead of the
+   * surface owner.
+   */
+  private async uploadFile(file: File, surfaceId: string, toFocusedWidget = false): Promise<void> {
+    const buf = await file.arrayBuffer();
+    const base64 = this.arrayBufferToBase64(buf);
+    const uploadId = `${surfaceId}-${this.nextUploadSeq++}`;
+    // ~700 KB of base64 per chunk keeps individual JSON frames modest.
+    const CHUNK = 700_000;
+    const chunkCount = Math.max(1, Math.ceil(base64.length / CHUNK));
+    const mimeType = file.type || 'application/octet-stream';
+    for (let i = 0; i < chunkCount; i++) {
+      this.sendToBackend({
+        type: 'fileUpload',
+        surfaceId,
+        uploadId,
+        name: file.name,
+        mimeType,
+        base64: base64.slice(i * CHUNK, (i + 1) * CHUNK),
+        chunkIndex: i,
+        chunkCount,
+        ...(toFocusedWidget ? { toFocusedWidget: true } : {}),
+      } as FrontendToBackendMsg);
+    }
+  }
+
+  private arrayBufferToBase64(buf: ArrayBuffer): string {
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    const STEP = 0x8000; // avoid call-stack limits in String.fromCharCode.apply
+    for (let i = 0; i < bytes.length; i += STEP) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + STEP));
+    }
+    return btoa(binary);
+  }
+
   /** Focus the hidden input proxy to trigger the mobile virtual keyboard. */
   private focusMobileKeyboard(): void {
     if (!this.mobileMode || !this.mobileKeyboardProxy) return;
@@ -261,6 +430,7 @@ export class FrontendClient {
       // Clear stale surfaces from any previous connection before replaying state
       this.compositor.clearAllSurfaces();
       this.focusedSurface = undefined;
+      this.compositor.setFocusedSurface(undefined);
       this.grabbedSurface = undefined;
       this.localDragState = undefined;
       this.authenticated = false;
@@ -507,6 +677,25 @@ export class FrontendClient {
 
       case 'setFocused':
         this.focusedSurface = msg.surfaceId;
+        if (msg.glowColor) this.compositor.setFocusGlowColor(msg.glowColor);
+        if (typeof msg.glowRadius === 'number') this.compositor.setFocusGlowRadius(msg.glowRadius);
+        this.compositor.setFocusedSurface(msg.surfaceId);
+        break;
+
+      case 'sceneOps':
+        if (msg.world && msg.ownerId) {
+          this.compositor.applyWorldSceneOps(msg.ownerId, msg.ops as unknown as SceneOp[]);
+        } else {
+          this.compositor.applySceneOps(msg.surfaceId, msg.ops as unknown as SceneOp[]);
+        }
+        break;
+
+      case 'setSceneTheme':
+        this.compositor.setSceneTheme(msg.theme as unknown as SceneTheme);
+        break;
+
+      case 'setSurfaceTransform':
+        this.compositor.setSurfaceTransform(msg.surfaceId, { rotation: msg.rotation, z: msg.z });
         break;
 
       case 'measureTextRequest':
@@ -543,6 +732,18 @@ export class FrontendClient {
         );
         break;
 
+      case 'clipboardWriteImage':
+        // Write an image (data:image/* URI) to the OS clipboard via ClipboardItem.
+        (async () => {
+          try {
+            const blob = await (await fetch(msg.image)).blob();
+            await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+          } catch (err) {
+            console.warn('[Frontend] Clipboard image write failed:', err);
+          }
+        })();
+        break;
+
       case 'openUrl':
         window.open((msg as { url: string }).url, '_blank');
         break;
@@ -571,6 +772,15 @@ export class FrontendClient {
         this.canvas.style.cursor = msg.cursor || 'default';
         break;
 
+      case 'openFilePicker':
+        if (this.fileUploadProxy) {
+          this.fileUploadTargetSurface = msg.surfaceId;
+          this.fileUploadProxy.accept = msg.accept ?? '';
+          this.fileUploadProxy.multiple = msg.multiple ?? false;
+          this.fileUploadProxy.click();
+        }
+        break;
+
       case 'captureSurfaceRequest':
         this.handleCaptureSurfaceRequest(msg.requestId!, msg.surfaceId);
         break;
@@ -578,7 +788,532 @@ export class FrontendClient {
       case 'captureDesktopRequest':
         this.handleCaptureDesktopRequest(msg.requestId!);
         break;
+
+      case 'audioPlay':
+        this.handleAudioPlay(msg as AudioPlayMsg);
+        break;
+
+      case 'audioControl':
+        this.handleAudioControl(msg as AudioControlMsg);
+        break;
+
+      case 'mediaCaptureRequest':
+        this.handleMediaCaptureRequest(msg as MediaCaptureRequestMsg);
+        break;
+
+      case 'mediaCaptureFrameRequest':
+        this.handleMediaCaptureFrameRequest(msg as MediaCaptureFrameRequestMsg);
+        break;
+
+      case 'mediaRecordStart':
+        this.handleMediaRecordStart(msg as MediaRecordStartMsg);
+        break;
+
+      case 'mediaRecordStop':
+        this.handleMediaRecordStop(msg as MediaRecordStopMsg);
+        break;
+
+      case 'mediaStreamControl':
+        this.handleMediaStreamControl(msg as MediaStreamControlMsg);
+        break;
+
+      case 'speechSpeak':
+        this.handleSpeechSpeak(msg as SpeechSpeakMsg);
+        break;
+
+      case 'speechRecognizeRequest':
+        this.handleSpeechRecognize(msg as SpeechRecognizeRequestMsg);
+        break;
+
+      case 'speechVoicesRequest':
+        this.handleSpeechVoices(msg as SpeechVoicesRequestMsg);
+        break;
+
+      case 'videoSetup':
+        this.handleVideoSetup(msg as VideoSetupMsg);
+        break;
+
+      case 'videoControl':
+        this.handleVideoControl(msg as VideoControlMsg);
+        break;
     }
+  }
+
+  // ── Audio playback (relayed from the AudioOutput capability) ─────────
+
+  private handleAudioPlay(msg: AudioPlayMsg): void {
+    try {
+      const audio = new Audio(msg.source);
+      audio.volume = Math.max(0, Math.min(1, msg.volume ?? 1));
+      audio.loop = msg.loop ?? false;
+      audio.addEventListener('ended', () => {
+        // Looping audio never fires 'ended'; map cleanup happens on stop.
+        this.audioPlaybacks.delete(msg.playbackId);
+        this.sendToBackend({ type: 'audioEvent', playbackId: msg.playbackId, event: 'ended' });
+      });
+      audio.addEventListener('error', () => {
+        this.audioPlaybacks.delete(msg.playbackId);
+        this.sendToBackend({
+          type: 'audioEvent', playbackId: msg.playbackId, event: 'error',
+          error: audio.error?.message ?? 'audio element error',
+        });
+      });
+      this.audioPlaybacks.set(msg.playbackId, audio);
+      audio.play().catch(err => {
+        this.audioPlaybacks.delete(msg.playbackId);
+        this.sendToBackend({
+          type: 'audioEvent', playbackId: msg.playbackId, event: 'error',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    } catch (err) {
+      this.sendToBackend({
+        type: 'audioEvent', playbackId: msg.playbackId, event: 'error',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private handleAudioControl(msg: AudioControlMsg): void {
+    if (msg.action === 'stopAll') {
+      for (const [id, audio] of this.audioPlaybacks) {
+        audio.pause();
+        audio.src = '';
+        this.audioPlaybacks.delete(id);
+      }
+      return;
+    }
+    const audio = msg.playbackId ? this.audioPlaybacks.get(msg.playbackId) : undefined;
+    if (!audio) return;
+    switch (msg.action) {
+      case 'pause':
+        audio.pause();
+        break;
+      case 'resume':
+        audio.play().catch(() => { /* reported via error listener */ });
+        break;
+      case 'stop':
+        audio.pause();
+        audio.src = '';
+        this.audioPlaybacks.delete(msg.playbackId!);
+        break;
+    }
+  }
+
+  // ── Video widget elements (relayed from VideoWidget) ─────────────────
+  //
+  // The element lives here (hidden in the DOM for autoplay reliability); the
+  // compositor reads its frames into the widget's videoFrame region every
+  // animation frame, so pixels never cross the relay.
+
+  private handleVideoSetup(msg: VideoSetupMsg): void {
+    // Reconfigure: dispose any prior element under the same id first.
+    this.disposeVideoWidgetEl(msg.videoId);
+
+    const video = document.createElement('video');
+    video.muted = msg.muted ?? false;
+    video.loop = msg.loop ?? false;
+    video.playsInline = true;
+    video.crossOrigin = 'anonymous'; // non-CORS sources fail to error, never taint
+    video.style.position = 'fixed';
+    video.style.left = '-10000px';
+    video.style.width = '1px';
+    video.style.height = '1px';
+
+    const sendEvent = (
+      event: 'playing' | 'paused' | 'ended' | 'error' | 'meta' | 'time',
+      extra: { error?: string } = {},
+    ) => {
+      this.sendToBackend({
+        type: 'videoEvent',
+        videoId: msg.videoId,
+        event,
+        duration: Number.isFinite(video.duration) ? video.duration : undefined,
+        currentTime: video.currentTime,
+        width: video.videoWidth || undefined,
+        height: video.videoHeight || undefined,
+        ...extra,
+      });
+    };
+
+    video.addEventListener('loadedmetadata', () => sendEvent('meta'));
+    video.addEventListener('playing', () => sendEvent('playing'));
+    video.addEventListener('pause', () => sendEvent('paused'));
+    video.addEventListener('ended', () => sendEvent('ended'));
+    video.addEventListener('error', () => sendEvent('error', {
+      error: video.error?.message ?? 'video element error',
+    }));
+    video.addEventListener('timeupdate', () => {
+      const now = performance.now();
+      const last = this.videoTimeStamps.get(msg.videoId) ?? 0;
+      if (now - last >= 1000) {
+        this.videoTimeStamps.set(msg.videoId, now);
+        sendEvent('time');
+      }
+    });
+
+    if (msg.streamId) {
+      const stream = this.mediaStreams.get(msg.streamId);
+      if (!stream) {
+        this.sendToBackend({
+          type: 'videoEvent', videoId: msg.videoId, event: 'error',
+          error: `unknown streamId ${msg.streamId} (capture it first via MediaStream)`,
+        });
+        return;
+      }
+      video.srcObject = stream;
+    } else if (msg.source) {
+      video.src = msg.source;
+    }
+
+    document.body.appendChild(video);
+    this.videoWidgetEls.set(msg.videoId, video);
+    this.compositor.registerVideoElement(msg.videoId, video);
+
+    if (msg.autoplay !== false) {
+      video.play().catch(err => {
+        sendEvent('error', { error: err instanceof Error ? err.message : String(err) });
+      });
+    }
+  }
+
+  private handleVideoControl(msg: VideoControlMsg): void {
+    const video = this.videoWidgetEls.get(msg.videoId);
+    if (!video) return;
+    switch (msg.action) {
+      case 'play':
+        video.play().catch(() => { /* reported via error listener */ });
+        break;
+      case 'pause':
+        video.pause();
+        break;
+      case 'seek':
+        if (typeof msg.value === 'number' && Number.isFinite(msg.value)) {
+          video.currentTime = Math.max(0, msg.value);
+        }
+        break;
+      case 'setMuted':
+        video.muted = msg.value === 1;
+        break;
+      case 'dispose':
+        this.disposeVideoWidgetEl(msg.videoId);
+        break;
+    }
+  }
+
+  private disposeVideoWidgetEl(videoId: string): void {
+    const video = this.videoWidgetEls.get(videoId);
+    if (!video) return;
+    this.compositor.unregisterVideoElement(videoId);
+    this.videoWidgetEls.delete(videoId);
+    this.videoTimeStamps.delete(videoId);
+    video.pause();
+    video.srcObject = null;
+    video.removeAttribute('src');
+    video.load();
+    video.remove();
+  }
+
+  // ── Media capture (relayed from the MediaStream capability) ──────────
+
+  private handleMediaCaptureRequest(msg: MediaCaptureRequestMsg): void {
+    (async () => {
+      try {
+        const stream = msg.display
+          ? await navigator.mediaDevices.getDisplayMedia({ video: true })
+          : await navigator.mediaDevices.getUserMedia({ audio: msg.audio, video: msg.video });
+        this.mediaStreams.set(stream.id, stream);
+
+        // Keep a hidden, playing video element for every video-bearing stream
+        // so captureFrame always has a decoded frame to draw.
+        if (stream.getVideoTracks().length > 0) {
+          const video = document.createElement('video');
+          video.muted = true;
+          video.autoplay = true;
+          video.playsInline = true;
+          video.style.position = 'fixed';
+          video.style.left = '-10000px';
+          video.style.width = '1px';
+          video.style.height = '1px';
+          video.srcObject = stream;
+          document.body.appendChild(video);
+          video.play().catch(() => { /* frame grabs will report failure */ });
+          this.mediaVideoEls.set(stream.id, video);
+        }
+
+        this.sendToBackend({
+          type: 'mediaCaptureReply',
+          requestId: msg.requestId,
+          streamId: stream.id,
+          tracks: stream.getTracks().map(t => ({ id: t.id, kind: t.kind, label: t.label })),
+        });
+      } catch (err) {
+        this.sendToBackend({
+          type: 'mediaCaptureReply',
+          requestId: msg.requestId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })();
+  }
+
+  private handleMediaCaptureFrameRequest(msg: MediaCaptureFrameRequestMsg): void {
+    const video = this.mediaVideoEls.get(msg.streamId);
+    if (!video || video.videoWidth === 0) {
+      this.sendToBackend({
+        type: 'mediaCaptureFrameReply', requestId: msg.requestId,
+        error: video ? 'no decoded frame yet' : 'unknown streamId or stream has no video track',
+      });
+      return;
+    }
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(video, 0, 0);
+      const dataUri = canvas.toDataURL('image/png');
+      this.sendToBackend({
+        type: 'mediaCaptureFrameReply',
+        requestId: msg.requestId,
+        base64: dataUri.slice(dataUri.indexOf(',') + 1),
+        width: canvas.width,
+        height: canvas.height,
+      });
+    } catch (err) {
+      this.sendToBackend({
+        type: 'mediaCaptureFrameReply', requestId: msg.requestId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private handleMediaRecordStart(msg: MediaRecordStartMsg): void {
+    const stream = this.mediaStreams.get(msg.streamId);
+    if (!stream) {
+      this.sendToBackend({
+        type: 'mediaRecordingComplete', recordingId: msg.recordingId,
+        error: 'unknown streamId',
+      });
+      return;
+    }
+    try {
+      const hasVideo = stream.getVideoTracks().length > 0;
+      const mimeType = hasVideo ? 'video/webm' : 'audio/webm';
+      const recorder = new MediaRecorder(stream, MediaRecorder.isTypeSupported(mimeType) ? { mimeType } : undefined);
+      const entry = { recorder, chunks: [] as Blob[], startedAt: Date.now(), timer: undefined as ReturnType<typeof setTimeout> | undefined };
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) entry.chunks.push(e.data); };
+      recorder.onstop = () => {
+        if (entry.timer) clearTimeout(entry.timer);
+        this.mediaRecorders.delete(msg.recordingId);
+        const blob = new Blob(entry.chunks, { type: recorder.mimeType || mimeType });
+        const durationMs = Date.now() - entry.startedAt;
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const dataUri = String(reader.result ?? '');
+          this.sendToBackend({
+            type: 'mediaRecordingComplete',
+            recordingId: msg.recordingId,
+            base64: dataUri.slice(dataUri.indexOf(',') + 1),
+            mimeType: blob.type,
+            durationMs,
+          });
+        };
+        reader.onerror = () => {
+          this.sendToBackend({
+            type: 'mediaRecordingComplete', recordingId: msg.recordingId,
+            error: 'failed to encode recording',
+          });
+        };
+        reader.readAsDataURL(blob);
+      };
+      recorder.onerror = () => {
+        if (entry.timer) clearTimeout(entry.timer);
+        this.mediaRecorders.delete(msg.recordingId);
+        this.sendToBackend({
+          type: 'mediaRecordingComplete', recordingId: msg.recordingId,
+          error: 'MediaRecorder error',
+        });
+      };
+      this.mediaRecorders.set(msg.recordingId, entry);
+      recorder.start();
+      if (msg.maxDurationMs && msg.maxDurationMs > 0) {
+        entry.timer = setTimeout(() => {
+          if (recorder.state !== 'inactive') recorder.stop();
+        }, msg.maxDurationMs);
+      }
+    } catch (err) {
+      this.sendToBackend({
+        type: 'mediaRecordingComplete', recordingId: msg.recordingId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private handleMediaRecordStop(msg: MediaRecordStopMsg): void {
+    const entry = this.mediaRecorders.get(msg.recordingId);
+    if (entry && entry.recorder.state !== 'inactive') {
+      entry.recorder.stop();
+    }
+  }
+
+  private handleMediaStreamControl(msg: MediaStreamControlMsg): void {
+    if (msg.action === 'stopStream' && msg.streamId) {
+      const stream = this.mediaStreams.get(msg.streamId);
+      if (stream) {
+        for (const track of stream.getTracks()) track.stop();
+        this.mediaStreams.delete(msg.streamId);
+      }
+      const video = this.mediaVideoEls.get(msg.streamId);
+      if (video) {
+        video.srcObject = null;
+        video.remove();
+        this.mediaVideoEls.delete(msg.streamId);
+      }
+      return;
+    }
+    if (msg.action === 'muteTrack' && msg.trackId) {
+      for (const stream of this.mediaStreams.values()) {
+        for (const track of stream.getTracks()) {
+          if (track.id === msg.trackId) {
+            track.enabled = !(msg.muted ?? true);
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  // ── Speech (relayed from the Speech capability) ───────────────────────
+
+  private handleSpeechSpeak(msg: SpeechSpeakMsg): void {
+    if (!('speechSynthesis' in window)) {
+      this.sendToBackend({
+        type: 'speechSpeakReply', requestId: msg.requestId,
+        error: 'speechSynthesis unavailable in this browser',
+      });
+      return;
+    }
+    try {
+      const utterance = new SpeechSynthesisUtterance(msg.text);
+      if (msg.voice) {
+        const match = window.speechSynthesis.getVoices().find(v => v.name === msg.voice);
+        if (match) utterance.voice = match;
+      }
+      let replied = false;
+      const replyOnce = (payload: { spoken?: boolean; error?: string }) => {
+        if (replied) return;
+        replied = true;
+        this.sendToBackend({ type: 'speechSpeakReply', requestId: msg.requestId, ...payload });
+      };
+      // Reply on start so long passages never block the relay round-trip.
+      utterance.onstart = () => replyOnce({ spoken: true });
+      utterance.onerror = (e) => replyOnce({ error: `speech error: ${e.error ?? 'unknown'}` });
+      // Some engines skip onstart for empty/whitespace text; onend covers it.
+      utterance.onend = () => replyOnce({ spoken: true });
+      window.speechSynthesis.speak(utterance);
+    } catch (err) {
+      this.sendToBackend({
+        type: 'speechSpeakReply', requestId: msg.requestId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private handleSpeechRecognize(msg: SpeechRecognizeRequestMsg): void {
+    const maxMs = msg.maxDurationMs ?? 10000;
+    type RecognitionCtor = new () => {
+      lang: string; interimResults: boolean; maxAlternatives: number;
+      onresult: ((e: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null;
+      onerror: ((e: { error?: string }) => void) | null;
+      onend: (() => void) | null;
+      start(): void; stop(): void;
+    };
+    const w = window as unknown as {
+      SpeechRecognition?: RecognitionCtor; webkitSpeechRecognition?: RecognitionCtor;
+    };
+    const Recognition = w.SpeechRecognition ?? w.webkitSpeechRecognition;
+
+    if (Recognition) {
+      try {
+        const rec = new Recognition();
+        rec.lang = navigator.language || 'en-US';
+        rec.interimResults = false;
+        rec.maxAlternatives = 1;
+        let transcript = '';
+        let replied = false;
+        const replyOnce = (payload: { text?: string; error?: string }) => {
+          if (replied) return;
+          replied = true;
+          this.sendToBackend({ type: 'speechRecognizeReply', requestId: msg.requestId, ...payload });
+        };
+        const timer = setTimeout(() => { try { rec.stop(); } catch { /* already stopped */ } }, maxMs);
+        rec.onresult = (e) => {
+          for (let i = 0; i < e.results.length; i++) {
+            transcript += e.results[i][0]?.transcript ?? '';
+          }
+        };
+        rec.onerror = (e) => {
+          clearTimeout(timer);
+          // 'no-speech' ends with an empty transcript rather than an error.
+          if (e.error === 'no-speech') replyOnce({ text: '' });
+          else replyOnce({ error: `speech recognition error: ${e.error ?? 'unknown'}` });
+        };
+        rec.onend = () => {
+          clearTimeout(timer);
+          replyOnce({ text: transcript.trim() });
+        };
+        rec.start();
+        return;
+      } catch { /* fall through to mic recording */ }
+    }
+
+    // No Web Speech API: record the mic for the window and let the server
+    // route the audio to a transcription provider.
+    (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const recorder = new MediaRecorder(stream,
+          MediaRecorder.isTypeSupported('audio/webm') ? { mimeType: 'audio/webm' } : undefined);
+        const chunks: Blob[] = [];
+        recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+        recorder.onstop = () => {
+          for (const track of stream.getTracks()) track.stop();
+          const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const dataUri = String(reader.result ?? '');
+            this.sendToBackend({
+              type: 'speechRecognizeReply',
+              requestId: msg.requestId,
+              audioBase64: dataUri.slice(dataUri.indexOf(',') + 1),
+              mimeType: blob.type,
+            });
+          };
+          reader.onerror = () => {
+            this.sendToBackend({
+              type: 'speechRecognizeReply', requestId: msg.requestId,
+              error: 'failed to encode recorded audio',
+            });
+          };
+          reader.readAsDataURL(blob);
+        };
+        recorder.start();
+        setTimeout(() => { if (recorder.state !== 'inactive') recorder.stop(); }, maxMs);
+      } catch (err) {
+        this.sendToBackend({
+          type: 'speechRecognizeReply', requestId: msg.requestId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })();
+  }
+
+  private handleSpeechVoices(msg: SpeechVoicesRequestMsg): void {
+    const voices = 'speechSynthesis' in window
+      ? window.speechSynthesis.getVoices().map(v => v.name)
+      : [];
+    this.sendToBackend({ type: 'speechVoicesReply', requestId: msg.requestId, voices });
   }
 
   private handleCreateSurface(msg: CreateSurfaceMsg): void {
@@ -590,6 +1325,8 @@ export class FrontendClient {
       msg.inputPassthrough ?? false,
       false, // inputMonitor
       msg.title,
+      msg.transparent ?? false,
+      msg.closable ?? true,
     );
 
     this.sendToBackend({
@@ -796,8 +1533,10 @@ export class FrontendClient {
       this.canvas.focus();
       const canvasRect = this.canvas.getBoundingClientRect();
 
-      // Two-finger touch: start pinch-zoom
+      // Two-finger touch: start pinch-zoom (not in card overview)
       if (e.touches.length === 2) {
+        this.cancelActiveTouch();
+        if (this.compositor.getMobileView() === MobileViewState.CARD_OVERVIEW) return;
         const t0 = e.touches[0], t1 = e.touches[1];
         this.pinchStartDist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
         this.pinchStartZoom = 1; // relative
@@ -808,15 +1547,7 @@ export class FrontendClient {
 
       const touch = e.touches[0];
       if (!touch) return;
-      const cy = touch.clientY - canvasRect.top;
-      const cx = touch.clientX - canvasRect.left;
-      // Start tab bar scroll gesture if touching the tab bar
-      if (this.compositor.isInMobileTabBar(cy)) {
-        this.mobileTabTouchStartX = cx;
-        this.compositor.mobileTabDragStart(cx);
-        return;
-      }
-      this.handleTouchEvent(touch, 'mousedown');
+      this.onTouchStart(touch, touch.clientX - canvasRect.left, touch.clientY - canvasRect.top);
     }, { passive: false });
 
     this.canvas.addEventListener('touchmove', (e) => {
@@ -845,14 +1576,7 @@ export class FrontendClient {
 
       const touch = e.touches[0];
       if (!touch) return;
-      const cx = touch.clientX - canvasRect.left;
-      const cy = touch.clientY - canvasRect.top;
-      // Continue tab bar scroll gesture
-      if (this.compositor.isInMobileTabBar(cy) || this.compositor.isMobileTabDragging) {
-        this.compositor.mobileTabDragMove(cx);
-        return;
-      }
-      this.handleTouchEvent(touch, 'mousemove');
+      this.onTouchMove(touch, touch.clientX - canvasRect.left, touch.clientY - canvasRect.top);
     }, { passive: false });
 
     this.canvas.addEventListener('touchend', (e) => {
@@ -864,27 +1588,221 @@ export class FrontendClient {
         this.pinchStartZoom = undefined;
         this.panLastMidX = undefined;
         this.panLastMidY = undefined;
-        // If one finger remains, don't generate mouseup
+        // If one finger remains, don't generate a single-finger gesture
         if (e.touches.length === 1) return;
       }
 
       const touch = e.changedTouches[0];
       if (!touch) return;
       const canvasRect = this.canvas.getBoundingClientRect();
-      const cx = touch.clientX - canvasRect.left;
-      const cy = touch.clientY - canvasRect.top;
-      // End tab bar scroll gesture -- if barely moved, treat as tap
-      if (this.compositor.isMobileTabDragging) {
-        const moved = Math.abs(cx - (this.mobileTabTouchStartX ?? cx));
-        this.mobileTabTouchStartX = undefined;
-        this.compositor.mobileTabDragEnd();
-        if (moved < 10) {
-          this.compositor.handleMobileTabTap(cx, cy);
+      this.onTouchEnd(touch, touch.clientX - canvasRect.left, touch.clientY - canvasRect.top);
+    }, { passive: false });
+  }
+
+  private cancelActiveTouch(): void {
+    if (this.activeTouch?.longPressTimer) clearTimeout(this.activeTouch.longPressTimer);
+    this.activeTouch = undefined;
+  }
+
+  /** Begin a single-finger gesture; the mode is chosen by view state + start location. */
+  private onTouchStart(touch: Touch, cx: number, cy: number): void {
+    const now = performance.now();
+    const at = this.activeTouch = {
+      startX: cx, startY: cy, startTime: now,
+      lastX: cx, lastY: cy, lastTime: now, lastVy: 0,
+      mode: 'undecided' as const,
+    } as NonNullable<FrontendClient['activeTouch']>;
+
+    const view = this.compositor.getMobileView();
+
+    if (view === MobileViewState.CARD_OVERVIEW) {
+      at.cardId = this.compositor.cardAt(cx, cy);
+      const id = at.cardId;
+      if (id) {
+        at.longPressTimer = setTimeout(() => {
+          if (this.activeTouch === at && at.mode === 'undecided') {
+            at.mode = 'cardReorder';
+            this.compositor.cardReorderBegin(id);
+          }
+        }, FrontendClient.LONG_PRESS_MS);
+      }
+      return;
+    }
+
+    // Native states: bottom band arms the swipe-up; fit-mode forwards content input.
+    if (this.compositor.isInGestureHandle(cy)) {
+      at.mode = 'edgeSwipe';
+      return;
+    }
+    if (view === MobileViewState.NATIVE_FIT) {
+      at.mode = 'content';
+      this.handleTouchEvent(touch, 'mousedown');
+    }
+    // NATIVE_ZOOMED: stay 'undecided' — pan on move, click on tap.
+  }
+
+  private onTouchMove(touch: Touch, cx: number, cy: number): void {
+    const at = this.activeTouch;
+    if (!at) return;
+    const now = performance.now();
+    const dxStep = cx - at.lastX;
+    const dyStep = cy - at.lastY;
+    at.lastVy = dyStep / Math.max(1, now - at.lastTime);
+    at.lastX = cx; at.lastY = cy; at.lastTime = now;
+    const movedDist = Math.hypot(cx - at.startX, cy - at.startY);
+
+    switch (at.mode) {
+      case 'edgeConsumed':
+        return;
+      case 'edgeSwipe':
+        if (at.startY - cy > FrontendClient.EDGE_SWIPE_TRIGGER_PX) {
+          this.compositor.enterCardOverview();
+          at.mode = 'edgeConsumed';
+        }
+        return;
+      case 'content':
+        this.handleTouchEvent(touch, 'mousemove');
+        return;
+      case 'pan':
+        this.compositor.mobilePan(dxStep, dyStep);
+        return;
+      case 'cardReorder':
+        this.compositor.cardReorder(dxStep);
+        return;
+      case 'cardPan':
+        this.compositor.cardDeckPan(dxStep);
+        return;
+      case 'cardClose':
+        this.compositor.cardCloseDrag(dyStep);
+        return;
+      case 'undecided': {
+        if (movedDist <= FrontendClient.TAP_SLOP_PX) return;
+        if (at.longPressTimer) { clearTimeout(at.longPressTimer); at.longPressTimer = undefined; }
+        if (this.compositor.getMobileView() === MobileViewState.CARD_OVERVIEW) {
+          const dxTotal = cx - at.startX;
+          const dyTotal = cy - at.startY;
+          if (at.cardId && dyTotal < 0 && Math.abs(dyTotal) > Math.abs(dxTotal)
+              && this.compositor.isSurfaceClosable(at.cardId)) {
+            at.mode = 'cardClose';
+            this.compositor.cardCloseDragBegin(at.cardId);
+            this.compositor.cardCloseDrag(dyTotal);
+          } else {
+            at.mode = 'cardPan';
+            this.compositor.cardDeckPan(cx - at.startX);
+          }
+        } else {
+          // NATIVE_ZOOMED → pan
+          at.mode = 'pan';
+          this.compositor.mobilePan(cx - at.startX, cy - at.startY);
         }
         return;
       }
-      this.handleTouchEvent(touch, 'mouseup');
-    }, { passive: false });
+    }
+  }
+
+  private onTouchEnd(touch: Touch, cx: number, cy: number): void {
+    const at = this.activeTouch;
+    this.activeTouch = undefined;
+    if (!at) return;
+    if (at.longPressTimer) clearTimeout(at.longPressTimer);
+
+    const movedDist = Math.hypot(cx - at.startX, cy - at.startY);
+    const isTap = movedDist < FrontendClient.TAP_SLOP_PX && (performance.now() - at.startTime) < 500;
+
+    switch (at.mode) {
+      case 'content':
+        this.handleTouchEvent(touch, 'mouseup');
+        if (isTap) this.maybeDoubleTap(cx, cy);
+        return;
+      case 'edgeSwipe':
+        // Tap (or partial swipe) on the bottom indicator also opens the overview.
+        this.compositor.enterCardOverview();
+        return;
+      case 'pan':
+      case 'edgeConsumed':
+        return;
+      case 'cardReorder':
+        this.compositor.cardReorderEnd();
+        return;
+      case 'cardPan':
+        this.compositor.cardDeckSnap();
+        return;
+      case 'cardClose': {
+        const draggedUp = at.startY - at.lastY;
+        const shouldClose = at.lastVy < -FrontendClient.FLICK_VELOCITY
+          || draggedUp > FrontendClient.CARD_CLOSE_DISTANCE;
+        if (at.cardId && shouldClose) {
+          this.closeWindowForSurface(at.cardId);
+          this.compositor.cardFlickClose(at.cardId);
+        } else if (at.cardId) {
+          this.compositor.cardSnapBack(at.cardId);
+        }
+        return;
+      }
+      case 'undecided': {
+        if (!isTap) return;
+        if (this.compositor.getMobileView() === MobileViewState.CARD_OVERVIEW) {
+          const chip = this.compositor.closeChipAt(cx, cy);
+          if (chip) {
+            this.closeWindowForSurface(chip);
+            this.compositor.cardFlickClose(chip);
+          } else if (at.cardId) {
+            this.compositor.exitCardOverview(at.cardId);
+          } else if (this.compositor.isInGestureHandle(cy)) {
+            // Tap the handle to leave the overview without picking a card.
+            this.compositor.exitCardOverview();
+          }
+        } else {
+          // NATIVE_ZOOMED tap → forward a click, and detect double-tap.
+          this.handleTouchEvent(touch, 'mousedown');
+          this.handleTouchEvent(touch, 'mouseup');
+          this.maybeDoubleTap(cx, cy);
+        }
+        return;
+      }
+    }
+  }
+
+  /** Toggle 1:1 native zoom on a quick second tap near the first. */
+  private maybeDoubleTap(cx: number, cy: number): void {
+    const now = performance.now();
+    if (now - this.lastTapTime < FrontendClient.DOUBLE_TAP_MS
+        && Math.hypot(cx - this.lastTapX, cy - this.lastTapY) < FrontendClient.TAP_SLOP_PX) {
+      this.compositor.mobileToggleNativeZoom(cx, cy);
+      this.lastTapTime = 0; // consume, so a third tap doesn't re-trigger
+    } else {
+      this.lastTapTime = now;
+      this.lastTapX = cx;
+      this.lastTapY = cy;
+    }
+  }
+
+  /** Ask the backend to close the window owning a surface (card flick-up). */
+  private closeWindowForSurface(surfaceId: string): void {
+    this.sendToBackend({ type: 'closeWindow', surfaceId });
+  }
+
+  /** Send a 3D node input event (enter/leave are immediate, not batched). */
+  private sendNodeInput(
+    inputType: 'mouseenter' | 'mouseleave',
+    node: { scope: 'window' | 'world'; surfaceId?: string; ownerId?: string; nodeId: string },
+    wx: number,
+    wy: number,
+    e: MouseEvent,
+  ): void {
+    const nodeSurface = node.surfaceId ? this.compositor.getSurface(node.surfaceId) : undefined;
+    this.sendToBackend({
+      type: 'input',
+      inputType,
+      surfaceId: node.surfaceId,
+      nodeId: node.nodeId,
+      nodeScope: node.scope,
+      nodeOwnerId: node.ownerId,
+      x: nodeSurface ? wx - nodeSurface.rect.x : wx,
+      y: nodeSurface ? wy - nodeSurface.rect.y : wy,
+      button: e.button,
+      modifiers: { shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey },
+    } as unknown as FrontendToBackendMsg);
   }
 
   private handleTouchEvent(
@@ -897,13 +1815,6 @@ export class FrontendClient {
 
     this.lastCanvasX = canvasX;
     this.lastCanvasY = canvasY;
-
-    // In mobile mode, check tab bar taps first
-    if (this.mobileMode && type === 'mousedown') {
-      if (this.compositor.handleMobileTabTap(canvasX, canvasY)) {
-        return; // tab bar consumed the tap
-      }
-    }
 
     // Hit test
     const hitSurface = this.compositor.surfaceAt(canvasX, canvasY);
@@ -939,6 +1850,7 @@ export class FrontendClient {
     if (type === 'mousedown') {
       this.grabbedSurface = surface.id;
       this.focusedSurface = surface.id;
+      this.compositor.setFocusedSurface(surface.id);
     }
     if (type === 'mouseup') {
       this.grabbedSurface = undefined;
@@ -1024,15 +1936,62 @@ export class FrontendClient {
     // Workspace coords (surface.rect is in workspace space, mouse is in viewport)
     const { x: wx, y: wy } = this.compositor.viewportToWorkspace(x, y);
 
-    // Hit test locally — compositor is local
-    const hitSurface = this.compositor.surfaceAt(x, y);
+    // Node drag capture: a held node receives the mouseup wherever it lands.
+    if (type === 'mouseup' && this.grabbedNode) {
+      const held = this.grabbedNode;
+      this.grabbedNode = undefined;
+      const heldSurface = held.surfaceId ? this.compositor.getSurface(held.surfaceId) : undefined;
+      this.sendToBackend({
+        type: 'input',
+        inputType: 'mouseup',
+        surfaceId: held.surfaceId,
+        nodeId: held.nodeId,
+        nodeScope: held.scope,
+        nodeOwnerId: held.ownerId,
+        x: heldSurface ? wx - heldSurface.rect.x : wx,
+        y: heldSurface ? wy - heldSurface.rect.y : wy,
+        button: e.button,
+        modifiers: { shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey },
+      } as unknown as FrontendToBackendMsg);
+      return;
+    }
+
+    // 3D scene-node hit test: mesh nodes are click targets (like widgets).
+    // Only when no drag/grab is in flight — drags belong to their surface.
+    if ((type === 'mousedown' || type === 'mouseup') && !this.grabbedSurface && !this.localDragState) {
+      const node = this.compositor.nodeAt(x, y);
+      if (node) {
+        if (type === 'mousedown') this.grabbedNode = node;
+        const nodeSurface = node.surfaceId ? this.compositor.getSurface(node.surfaceId) : undefined;
+        this.sendToBackend({
+          type: 'input',
+          inputType: type,
+          surfaceId: node.surfaceId,
+          nodeId: node.nodeId,
+          nodeScope: node.scope,
+          nodeOwnerId: node.ownerId,
+          x: nodeSurface ? wx - nodeSurface.rect.x : wx,
+          y: nodeSurface ? wy - nodeSurface.rect.y : wy,
+          button: e.button,
+          modifiers: { shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey },
+        } as unknown as FrontendToBackendMsg);
+        return;
+      }
+    }
+
+    // Hit test locally — compositor is local. surfaceLocalAt returns
+    // projection-correct local coords (slabs may be lifted/tilted in 3D).
+    const hit = this.compositor.surfaceLocalAt(x, y);
+    const hitSurface = hit?.surface;
     const grabbed = this.grabbedSurface
       ? this.compositor.getSurface(this.grabbedSurface)
       : undefined;
     const surface = grabbed ?? hitSurface;
 
-    const localX = surface ? wx - surface.rect.x : wx;
-    const localY = surface ? wy - surface.rect.y : wy;
+    // Grabbed surfaces use rect math (the pointer may be outside the slab
+    // mid-drag); free hits use the exact ray-hit coords.
+    const localX = !grabbed && hit ? hit.x : surface ? wx - surface.rect.x : wx;
+    const localY = !grabbed && hit ? hit.y : surface ? wy - surface.rect.y : wy;
 
     // For resize drags (grabbedSurface set, no local drag), include globalX/globalY
     // to avoid stale local→global reconstruction on the server
@@ -1061,6 +2020,7 @@ export class FrontendClient {
     if (type === 'mousedown' && surface) {
       this.grabbedSurface = surface.id;
       this.focusedSurface = surface.id;
+      this.compositor.setFocusedSurface(surface.id);
     }
 
     if (type === 'mouseup') {
@@ -1104,11 +2064,81 @@ export class FrontendClient {
     this.updateCursor(x, y);
 
     const { x: wx, y: wy } = this.compositor.viewportToWorkspace(x, y);
-    const hitSurface = this.compositor.surfaceAt(x, y);
-    const surface = hitSurface;
 
-    const localX = surface ? wx - surface.rect.x : wx;
-    const localY = surface ? wy - surface.rect.y : wy;
+    // Node drag capture: while a node is held, every mousemove streams to it
+    // regardless of what's under the cursor — drags stay smooth even when the
+    // pointer outruns the mesh. Hover enter/leave is suspended for the drag.
+    if (this.grabbedNode) {
+      const held = this.grabbedNode;
+      const heldSurface = held.surfaceId ? this.compositor.getSurface(held.surfaceId) : undefined;
+      this.pendingMouseMove = {
+        type: 'input',
+        inputType: 'mousemove',
+        surfaceId: held.surfaceId,
+        nodeId: held.nodeId,
+        nodeScope: held.scope,
+        nodeOwnerId: held.ownerId,
+        x: heldSurface ? wx - heldSurface.rect.x : wx,
+        y: heldSurface ? wy - heldSurface.rect.y : wy,
+        button: e.button,
+        modifiers: { shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey },
+      } as unknown as FrontendToBackendMsg;
+      if (!this.mouseMoveRafId) {
+        this.mouseMoveRafId = requestAnimationFrame(() => {
+          this.mouseMoveRafId = 0;
+          if (this.pendingMouseMove) {
+            this.sendToBackend(this.pendingMouseMove);
+            this.pendingMouseMove = null;
+          }
+        });
+      }
+      return;
+    }
+
+    // 3D node hover: meshes receive mousemove like widgets, with synthesized
+    // enter/leave on hover changes (sent immediately; moves are rAF-batched).
+    const node = this.compositor.nodeAt(x, y);
+    if (this.hoveredNode && (!node || node.nodeId !== this.hoveredNode.nodeId
+        || node.surfaceId !== this.hoveredNode.surfaceId || node.ownerId !== this.hoveredNode.ownerId)) {
+      this.sendNodeInput('mouseleave', this.hoveredNode, wx, wy, e);
+      this.hoveredNode = undefined;
+    }
+    if (node && !this.hoveredNode) {
+      this.hoveredNode = node;
+      this.sendNodeInput('mouseenter', node, wx, wy, e);
+    }
+    if (node) {
+      const nodeSurface = node.surfaceId ? this.compositor.getSurface(node.surfaceId) : undefined;
+      this.pendingMouseMove = {
+        type: 'input',
+        inputType: 'mousemove',
+        surfaceId: node.surfaceId,
+        nodeId: node.nodeId,
+        nodeScope: node.scope,
+        nodeOwnerId: node.ownerId,
+        x: nodeSurface ? wx - nodeSurface.rect.x : wx,
+        y: nodeSurface ? wy - nodeSurface.rect.y : wy,
+        button: e.button,
+        modifiers: { shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey },
+      } as unknown as FrontendToBackendMsg;
+      if (!this.mouseMoveRafId) {
+        this.mouseMoveRafId = requestAnimationFrame(() => {
+          this.mouseMoveRafId = 0;
+          if (this.pendingMouseMove) {
+            this.sendToBackend(this.pendingMouseMove);
+            this.pendingMouseMove = null;
+          }
+        });
+      }
+      return;
+    }
+
+    // Projection-correct local coords (slabs may be lifted/tilted in 3D).
+    const hit = this.compositor.surfaceLocalAt(x, y);
+    const surface = hit?.surface;
+
+    const localX = hit ? hit.x : wx;
+    const localY = hit ? hit.y : wy;
 
     this.pendingMouseMove = {
       type: 'input',
@@ -1156,21 +2186,54 @@ export class FrontendClient {
     }
 
     const { x: wx, y: wy } = this.compositor.viewportToWorkspace(x, y);
-    this.sendToBackend({
-      type: 'input',
-      inputType: 'wheel',
-      surfaceId: surface.id,
-      x: wx - surface.rect.x,
-      y: wy - surface.rect.y,
-      deltaX: e.deltaX,
-      deltaY: e.deltaY,
-      modifiers: {
-        shift: e.shiftKey,
-        ctrl: e.ctrlKey,
-        alt: e.altKey,
-        meta: e.metaKey,
-      },
-    });
+    const localX = wx - surface.rect.x;
+    const localY = wy - surface.rect.y;
+    const modifiers = {
+      shift: e.shiftKey,
+      ctrl: e.ctrlKey,
+      alt: e.altKey,
+      meta: e.metaKey,
+    };
+
+    // Trackpads emit wheel events at 60–120Hz. Coalesce into one input per
+    // animation frame so a fast scroll doesn't fan out into a flood of
+    // backend round-trips (and the worker re-renders that come with them).
+    const prev = this.pendingWheels.get(surface.id);
+    if (prev) {
+      prev.deltaX += e.deltaX;
+      prev.deltaY += e.deltaY;
+      prev.x = localX;
+      prev.y = localY;
+      prev.modifiers = modifiers;
+    } else {
+      this.pendingWheels.set(surface.id, {
+        surfaceId: surface.id,
+        x: localX,
+        y: localY,
+        deltaX: e.deltaX,
+        deltaY: e.deltaY,
+        modifiers,
+      });
+    }
+
+    if (!this.wheelRafId) {
+      this.wheelRafId = requestAnimationFrame(() => {
+        this.wheelRafId = 0;
+        for (const w of this.pendingWheels.values()) {
+          this.sendToBackend({
+            type: 'input',
+            inputType: 'wheel',
+            surfaceId: w.surfaceId,
+            x: w.x,
+            y: w.y,
+            deltaX: w.deltaX,
+            deltaY: w.deltaY,
+            modifiers: w.modifiers,
+          });
+        }
+        this.pendingWheels.clear();
+      });
+    }
   }
 
   private handleKeyEvent(e: KeyboardEvent, type: 'keydown' | 'keyup'): void {
@@ -1224,6 +2287,32 @@ export class FrontendClient {
 
   private handlePasteEvent(e: ClipboardEvent): void {
     if (!this.focusedSurface) return;
+
+    // Image paste: route each image file to the focused widget via the chunked
+    // upload transport (tagged toFocusedWidget) so a widget can accept it.
+    const items = e.clipboardData?.items;
+    const imageFiles: File[] = [];
+    if (items) {
+      for (const item of Array.from(items)) {
+        if (item.kind === 'file' && item.type.startsWith('image/')) {
+          const file = item.getAsFile();
+          if (file) imageFiles.push(file);
+        }
+      }
+    }
+    if (imageFiles.length > 0) {
+      e.preventDefault();
+      let n = 0;
+      for (const file of imageFiles) {
+        // Clipboard images often have no name — synthesize a stable one.
+        const named = file.name
+          ? file
+          : new File([file], `pasted-image-${this.nextUploadSeq + n}.${(file.type.split('/')[1] || 'png')}`, { type: file.type });
+        n++;
+        void this.uploadFile(named, this.focusedSurface, true);
+      }
+      return;
+    }
 
     const pasteText = e.clipboardData?.getData('text') ?? '';
     if (!pasteText) return;

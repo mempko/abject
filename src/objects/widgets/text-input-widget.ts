@@ -14,10 +14,14 @@
 
 
 import { event } from '../../core/message.js';
+import type { AbjectMessage } from '../../core/types.js';
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
 import { WidgetStyle, Rect, WIDGET_FONT, CODE_FONT, DEFAULT_LINE_HEIGHT } from './widget-types.js';
 import { wrapText, estimateWrappedLineCount } from './word-wrap.js';
 import { wordBoundaryLeft, wordBoundaryRight, EditHistory, type EditKind } from './text-edit-helpers.js';
+import { parseMarkdown } from './markdown.js';
+import { layoutRichText, type RichTextLayout } from './rich-text-layout.js';
+import { renderRichTextCommands } from './markdown-render.js';
 
 interface InputSnapshot {
   text: string;
@@ -31,6 +35,8 @@ export interface TextInputWidgetConfig extends WidgetConfig {
   wordWrap?: boolean;
   minLines?: number;
   maxLines?: number;
+  /** Minimum height (px) the input reports in markdown auto-grow mode. */
+  minHeight?: number;
 }
 
 export class TextInputWidget extends WidgetAbject {
@@ -51,12 +57,26 @@ export class TextInputWidget extends WidgetAbject {
   private wordWrap: boolean;
   private minLines: number;
   private maxLines: number | undefined;
+  /** Floor for markdown auto-grow, so the composer never shrinks below it. */
+  private mdMinHeight: number;
   private cachedWrappedLines: string[] | null = null;
   private cachedWrapText = '';
   private cachedWrapWidth = 0;
   private cachedWrapFontSize: number | undefined;
   private lastEmittedLineCount = 1;
   private scrollOffset = 0;
+
+  // ── Markdown mode (opt-in via style.markdown) ──────────────────────────
+  // When on, the input renders its raw text as markdown (inline images +
+  // formatting) while editing stays a 1D-cursor edit over the source string.
+  // Image references (`![](abject://…)`) are treated as atomic cursor tokens.
+  private cachedMdLayout: RichTextLayout | null = null;
+  private cachedMdText = '';
+  private cachedMdWidth = 0;
+  private cachedMdFontSize: number | undefined;
+  /** Source ranges of block image references, from the last layout pass. */
+  private imageSpans: Array<{ start: number; end: number }> = [];
+  private lastEmittedMdHeight = 0;
 
   constructor(config: TextInputWidgetConfig) {
     super(config);
@@ -65,7 +85,53 @@ export class TextInputWidget extends WidgetAbject {
     this.wordWrap = config.wordWrap ?? false;
     this.minLines = config.minLines ?? 1;
     this.maxLines = config.maxLines;
+    this.mdMinHeight = config.minHeight ?? (this.minLines * DEFAULT_LINE_HEIGHT + 16);
     this.cursorPos = (config.text ?? '').length;
+
+    // Generic image-accept seam: an image pasted/dropped while this input is
+    // focused arrives here (the focused window forwards it). We store it in the
+    // workspace FileSystem and insert a markdown reference at the cursor, then
+    // notify the owner via an `attach` event so it can track the attachment.
+    this.on('fileUploaded', async (msg: AbjectMessage) => {
+      const { name, mimeType, base64 } = msg.payload as { name: string; mimeType: string; base64: string };
+      await this.handleImageAttachment(name, mimeType ?? '', base64 ?? '');
+      return true;
+    });
+  }
+
+  /**
+   * Insert a pasted/dropped image at the cursor as an inline `data:` URI
+   * reference, and hand the raw bytes to the owner via an `attach` event.
+   *
+   * The widget renders the image inline with a `data:` URI (which needs no
+   * FileSystem access — widgets can't reliably reach one), while the owner
+   * stores the bytes and tracks the attachment for the LLM.
+   */
+  private async handleImageAttachment(name: string, mimeType: string, base64: string): Promise<void> {
+    if (this.disabled || !mimeType.startsWith('image/') || !base64) return;
+
+    const safeName = name || 'image';
+    const dataUri = `data:${mimeType};base64,${base64}`;
+
+    // Insert on its own line so it parses as a block image: a leading newline
+    // when not already at line start, and a trailing newline to terminate it.
+    const pos = this.cursorPos;
+    const before = this.text.substring(0, pos);
+    const after = this.text.substring(pos);
+    const needLeadingNl = before.length > 0 && !before.endsWith('\n');
+    const ref = `${needLeadingNl ? '\n' : ''}![${safeName}](${dataUri})\n`;
+
+    this.recordEdit('paste');
+    this.text = before + ref + after;
+    this.cursorPos = (before + ref).length;
+    this.selAnchor = null;
+    this.invalidateWrapCache();
+
+    // Hand the raw bytes to the owner (it stores them + tracks for the LLM).
+    this.changed('attach', { name: safeName, mimeType, base64 });
+    this.changed('change', this.text);
+    await this.notifySelectionChanged();
+    await this.requestRedraw();
   }
 
   protected override acceptsInputWhenDisabled(): boolean {
@@ -174,6 +240,17 @@ export class TextInputWidget extends WidgetAbject {
 
   private invalidateWrapCache(): void {
     this.cachedWrappedLines = null;
+    this.cachedMdLayout = null;
+  }
+
+  /** Markdown render mode: opt-in, and never for masked (password) inputs. */
+  private isMarkdown(): boolean {
+    return this.style.markdown === true && !this.masked;
+  }
+
+  /** Drop the markdown layout when an image resolves so real dims take effect. */
+  protected override onImageResolved(): void {
+    this.cachedMdLayout = null;
   }
 
   private checkAndEmitResize(wrappedLineCount: number): void {
@@ -191,6 +268,9 @@ export class TextInputWidget extends WidgetAbject {
   // ── Rendering ──────────────────────────────────────────────────────
 
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
+    if (this.isMarkdown()) {
+      return this.buildMarkdownDrawCommands(surfaceId, ox, oy);
+    }
     if (this.wordWrap && !this.masked) {
       return this.buildWrappedDrawCommands(surfaceId, ox, oy);
     }
@@ -563,6 +643,297 @@ export class TextInputWidget extends WidgetAbject {
     return { line: 0, col: 0 };
   }
 
+  // ── Markdown rendering ─────────────────────────────────────────────
+
+  private async getMdLayout(
+    surfaceId: string, maxWidth: number, fontSize: number, fill: string,
+  ): Promise<RichTextLayout> {
+    if (
+      this.cachedMdLayout === null ||
+      this.cachedMdText !== this.text ||
+      this.cachedMdWidth !== maxWidth ||
+      this.cachedMdFontSize !== fontSize
+    ) {
+      const parsed = parseMarkdown(this.text);
+      const measureFn = (t: string, font: string) => this.measureText(surfaceId, t, font);
+      // Cap inline images to a thumbnail height: the composer is for composing,
+      // not full-size viewing, and an uncapped image overflows the input.
+      this.cachedMdLayout = await layoutRichText(
+        parsed, maxWidth, measureFn, this.theme, fontSize, fill, this.imageResolver.resolveDims,
+        TextInputWidget.MD_THUMB_HEIGHT,
+      );
+      this.cachedMdText = this.text;
+      this.cachedMdWidth = maxWidth;
+      this.cachedMdFontSize = fontSize;
+      this.imageSpans = this.cachedMdLayout.lines
+        .filter((l) => l.image)
+        .map((l) => ({ start: l.image!.sourceStart, end: l.image!.sourceEnd }));
+    }
+    return this.cachedMdLayout;
+  }
+
+  /** Upper bound on composer growth so a tall image/long text can't eat the window. */
+  private static readonly MD_MAX_HEIGHT = 360;
+  /** Inline images in the composer render as thumbnails capped to this height. */
+  private static readonly MD_THUMB_HEIGHT = 120;
+
+  private checkAndEmitMdResize(totalHeight: number): void {
+    const preferredHeight = Math.min(
+      TextInputWidget.MD_MAX_HEIGHT,
+      Math.max(
+        this.mdMinHeight, // never shrink below the comfortable empty height
+        Math.round(totalHeight) + 12, // top + bottom padding
+      ),
+    );
+    if (Math.abs(preferredHeight - this.lastEmittedMdHeight) > 1) {
+      this.lastEmittedMdHeight = preferredHeight;
+      this.changed('resize', { preferredHeight });
+    }
+  }
+
+  private async buildMarkdownDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
+    this.lastSurfaceId = surfaceId;
+    const commands: unknown[] = [];
+    const w = this.rect.width;
+    const h = this.rect.height;
+    const style = this.style;
+    const radius = style.radius ?? this.theme.widgetRadius;
+    const focused = this.focused;
+    const textPadding = 8;
+    const fontSize = style.fontSize ?? 14;
+    const fill = style.color ?? this.theme.textSecondary;
+
+    // Border + optional focus glow (mirrors the single-line path).
+    const borderColor = style.borderColor ?? (focused && !this.disabled ? this.theme.inputBorderFocus : this.theme.inputBorder);
+    if (focused && !this.disabled) {
+      commands.push({ type: 'save', surfaceId, params: {} });
+      commands.push({ type: 'shadow', surfaceId, params: { color: this.theme.inputBorderFocus, blur: 6 } });
+      commands.push({
+        type: 'rect', surfaceId,
+        params: { x: ox, y: oy, width: w, height: h, fill: style.background ?? this.theme.inputBg, stroke: borderColor, radius },
+      });
+      commands.push({ type: 'restore', surfaceId, params: {} });
+    }
+    commands.push({
+      type: 'rect', surfaceId,
+      params: { x: ox, y: oy, width: w, height: h, fill: style.background ?? this.theme.inputBg, stroke: borderColor, radius },
+    });
+
+    // Clip to the input bounds.
+    commands.push({ type: 'save', surfaceId, params: {} });
+    commands.push({ type: 'clip', surfaceId, params: { x: ox + 1, y: oy + 1, width: w - 2, height: h - 2 } });
+
+    // Empty input: placeholder (when unfocused), and a cursor when focused.
+    if (!this.text) {
+      if (this.placeholder && !focused) {
+        commands.push({
+          type: 'text', surfaceId,
+          params: {
+            x: ox + textPadding, y: oy + h / 2, text: this.placeholder,
+            font: style.fontSize ? buildFont(style) : WIDGET_FONT,
+            fill: this.theme.textPlaceholder, baseline: 'middle',
+          },
+        });
+      }
+      if (focused) {
+        commands.push({
+          type: 'line', surfaceId,
+          params: { x1: ox + textPadding, y1: oy + 4, x2: ox + textPadding, y2: oy + h - 4, stroke: this.theme.cursor },
+        });
+      }
+      commands.push({ type: 'restore', surfaceId, params: {} });
+      this.checkAndEmitMdResize(fontSize + 8);
+      return commands;
+    }
+
+    const maxWidth = w - textPadding * 2;
+    const layout = await this.getMdLayout(surfaceId, maxWidth, fontSize, fill);
+    this.checkAndEmitMdResize(layout.totalHeight);
+
+    const topPad = 6;
+    const sel = (focused && !this.masked) ? this.getSelection() : null;
+
+    const lineCommands = await renderRichTextCommands(layout, {
+      surfaceId, ox, oy, width: w, height: h,
+      theme: this.theme,
+      drawableUrl: (u) => this.imageResolver.drawableUrl(u),
+      yShift: topPad, textPadding,
+      selection: sel,
+      measure: (t, font) => this.measureText(surfaceId, t, font),
+      inlineCodeBg: false,
+      imagePlaceholder: true,
+    });
+    for (const c of lineCommands) commands.push(c);
+
+    // Cursor.
+    if (focused) {
+      const cur = await this.cursorXYFromSource(layout, surfaceId, ox, oy, topPad, textPadding, this.cursorPos);
+      if (cur) {
+        commands.push({
+          type: 'line', surfaceId,
+          params: { x1: cur.x, y1: cur.top + 2, x2: cur.x, y2: cur.top + cur.height - 2, stroke: this.theme.cursor },
+        });
+      }
+    }
+
+    commands.push({ type: 'restore', surfaceId, params: {} });
+    return commands;
+  }
+
+  /** Source offset where the next line's content begins (Infinity if none). */
+  private nextLineSourceStart(lines: RichTextLayout['lines'], from: number): number {
+    for (let j = from + 1; j < lines.length; j++) {
+      const ln = lines[j];
+      if (ln.image) return ln.image.sourceStart;
+      for (const run of ln.runs) {
+        if (run.text.length > 0) return run.sourceStart;
+      }
+    }
+    return Infinity;
+  }
+
+  /** Map a source offset to a cursor pixel position within the markdown layout. */
+  private async cursorXYFromSource(
+    layout: RichTextLayout, surfaceId: string, ox: number, oy: number,
+    topPad: number, textPadding: number, pos: number,
+  ): Promise<{ x: number; top: number; height: number } | null> {
+    const lines = layout.lines;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const lineTop = oy + topPad + line.y;
+      if (line.image) {
+        if (pos <= line.image.sourceStart) {
+          return { x: ox + textPadding + line.indent, top: lineTop, height: line.height };
+        }
+        if (pos <= line.image.sourceEnd) {
+          return { x: ox + textPadding + line.indent + line.image.width, top: lineTop, height: line.height };
+        }
+        continue;
+      }
+      let runX = ox + textPadding + line.indent;
+      let lastEnd = -1;
+      for (const run of line.runs) {
+        if (run.text.length === 0) { runX += run.width; continue; }
+        if (pos >= run.sourceStart && pos <= run.sourceEnd) {
+          const col = Math.min(pos - run.sourceStart, run.text.length);
+          const before = col > 0 ? await this.measureText(surfaceId, run.text.substring(0, col), run.font) : 0;
+          return { x: runX + before, top: lineTop, height: line.height };
+        }
+        runX += run.width;
+        lastEnd = Math.max(lastEnd, run.sourceEnd);
+      }
+      // The cursor sits in this line's trailing region — characters the layout
+      // trimmed off the visible run (e.g. a just-typed trailing space). Place
+      // it at the line end plus the measured width of those trimmed chars so
+      // the caret advances even though the space isn't painted.
+      if (lastEnd >= 0 && pos > lastEnd && pos <= this.nextLineSourceStart(lines, i)) {
+        const tail = this.text.substring(lastEnd, pos).replace(/\n/g, '');
+        const font = line.runs.length ? line.runs[line.runs.length - 1].font
+          : (this.style.fontSize ? buildFont(this.style) : WIDGET_FONT);
+        const tw = tail.length > 0 ? await this.measureText(surfaceId, tail, font) : 0;
+        return { x: runX + tw, top: lineTop, height: line.height };
+      }
+    }
+    // Fall back to the end of the last line, plus any trailing trimmed chars.
+    const last = lines[lines.length - 1];
+    if (last) {
+      const lineTop = oy + topPad + last.y;
+      let runX = ox + textPadding + last.indent;
+      let lastEnd = -1;
+      if (last.image) {
+        runX += last.image.width;
+        lastEnd = last.image.sourceEnd;
+      } else {
+        for (const run of last.runs) { runX += run.width; lastEnd = Math.max(lastEnd, run.sourceEnd); }
+      }
+      if (lastEnd >= 0 && pos > lastEnd) {
+        const tail = this.text.substring(lastEnd, pos).replace(/\n/g, '');
+        const font = last.runs.length ? last.runs[last.runs.length - 1].font
+          : (this.style.fontSize ? buildFont(this.style) : WIDGET_FONT);
+        if (tail.length > 0) runX += await this.measureText(surfaceId, tail, font);
+      }
+      return { x: runX, top: lineTop, height: last.height };
+    }
+    return { x: ox + textPadding, top: oy + topPad, height: (this.style.fontSize ?? 14) + 4 };
+  }
+
+  /** Map a click to a source offset within the markdown layout. */
+  private async posFromClickMarkdown(clickX: number, clickY: number, surfaceId: string): Promise<number> {
+    const layout = this.cachedMdLayout;
+    if (!layout) return this.cursorPos;
+    const textPadding = 8;
+    const topPad = 6;
+    const localY = clickY - topPad;
+
+    let targetLine = layout.lines[layout.lines.length - 1];
+    for (const line of layout.lines) {
+      if (localY < line.y + line.height) { targetLine = line; break; }
+    }
+    if (!targetLine) return this.text.length;
+
+    if (targetLine.image) {
+      // Atomic: snap to the near edge of the image reference.
+      const mid = textPadding + targetLine.indent + targetLine.image.width / 2;
+      return clickX < mid ? targetLine.image.sourceStart : targetLine.image.sourceEnd;
+    }
+
+    let runX = textPadding + targetLine.indent;
+    for (const run of targetLine.runs) {
+      if (run.text.length === 0) { runX += run.width; continue; }
+      const isLast = run === targetLine.runs[targetLine.runs.length - 1];
+      if (clickX < runX + run.width || isLast) {
+        const localX = Math.max(0, clickX - runX);
+        const col = await this.colFromX(localX, run.text, surfaceId, run.font);
+        return Math.min(run.sourceStart + col, run.sourceEnd);
+      }
+      runX += run.width;
+    }
+    return this.text.length;
+  }
+
+  /** Binary-search the character column closest to a pixel X offset within a run. */
+  private async colFromX(localX: number, lineText: string, surfaceId: string, font: string): Promise<number> {
+    if (localX <= 0 || lineText.length === 0) return 0;
+    const fullWidth = await this.measureText(surfaceId, lineText, font);
+    if (localX >= fullWidth) return lineText.length;
+    let lo = 0, hi = lineText.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      const wmid = await this.measureText(surfaceId, lineText.substring(0, mid), font);
+      if (wmid < localX) lo = mid + 1; else hi = mid;
+    }
+    if (lo > 0) {
+      const wPrev = await this.measureText(surfaceId, lineText.substring(0, lo - 1), font);
+      const wCurr = await this.measureText(surfaceId, lineText.substring(0, lo), font);
+      if (Math.abs(localX - wPrev) < Math.abs(localX - wCurr)) return lo - 1;
+    }
+    return lo;
+  }
+
+  // ── Atomic image-token helpers ─────────────────────────────────────────
+
+  /** Snap a candidate offset out of any image reference it landed inside. */
+  private adjustForImageSpans(target: number, from: number): number {
+    for (const s of this.imageSpans) {
+      if (target > s.start && target < s.end) {
+        return target < from ? s.start : s.end;
+      }
+    }
+    return target;
+  }
+
+  /** Image span the cursor would delete with Backspace at `pos` (start < pos <= end). */
+  private imageSpanBefore(pos: number): { start: number; end: number } | null {
+    for (const s of this.imageSpans) if (pos > s.start && pos <= s.end) return s;
+    return null;
+  }
+
+  /** Image span the cursor would delete with Delete at `pos` (start <= pos < end). */
+  private imageSpanAfter(pos: number): { start: number; end: number } | null {
+    for (const s of this.imageSpans) if (pos >= s.start && pos < s.end) return s;
+    return null;
+  }
+
   protected async processInput(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
     const type = input.type as string;
 
@@ -594,6 +965,10 @@ export class TextInputWidget extends WidgetAbject {
   }
 
   private async posFromClick(clickX: number, clickY: number, surfaceId: string | undefined): Promise<number> {
+    if (this.isMarkdown() && this.cachedMdLayout && surfaceId) {
+      return this.posFromClickMarkdown(clickX, clickY, surfaceId);
+    }
+
     const textPadding = 8;
     const cursorFont = this.style.fontSize ? buildFont(this.style) : WIDGET_FONT;
 
@@ -797,6 +1172,18 @@ export class TextInputWidget extends WidgetAbject {
         await this.notifySelectionChanged();
         await this.requestRedraw();
       } else if (pos > 0) {
+        // Markdown mode: Backspace adjacent to an image reference removes the
+        // whole atomic token in one stroke.
+        const imgSpan = this.isMarkdown() ? this.imageSpanBefore(pos) : null;
+        if (imgSpan) {
+          this.recordEdit('delete');
+          this.text = this.text.substring(0, imgSpan.start) + this.text.substring(imgSpan.end);
+          this.cursorPos = imgSpan.start;
+          this.invalidateWrapCache();
+          this.changed('change', this.text);
+          await this.requestRedraw();
+          return { consumed: true };
+        }
         // Ctrl+Backspace (Alt+Backspace on macOS) deletes a word.
         const wordMod = ctrl || (modifiers?.alt ?? false);
         const target = wordMod ? wordBoundaryLeft(this.text, pos) : pos - 1;
@@ -818,6 +1205,18 @@ export class TextInputWidget extends WidgetAbject {
         await this.notifySelectionChanged();
         await this.requestRedraw();
       } else if (pos < this.text.length) {
+        // Markdown mode: Delete in front of an image reference removes the
+        // whole atomic token.
+        const imgSpan = this.isMarkdown() ? this.imageSpanAfter(pos) : null;
+        if (imgSpan) {
+          this.recordEdit('delete');
+          this.text = this.text.substring(0, imgSpan.start) + this.text.substring(imgSpan.end);
+          this.cursorPos = imgSpan.start;
+          this.invalidateWrapCache();
+          this.changed('change', this.text);
+          await this.requestRedraw();
+          return { consumed: true };
+        }
         // Ctrl+Delete (Alt+Delete on macOS) deletes the next word.
         const wordMod = ctrl || (modifiers?.alt ?? false);
         const target = wordMod ? wordBoundaryRight(this.text, pos) : pos + 1;
@@ -833,7 +1232,9 @@ export class TextInputWidget extends WidgetAbject {
     if (key === 'ArrowLeft') {
       // Ctrl/Alt+Left jumps a word; otherwise a single char.
       const wordMod = ctrl || (modifiers?.alt ?? false);
-      const target = wordMod ? wordBoundaryLeft(this.text, pos) : Math.max(0, pos - 1);
+      let target = wordMod ? wordBoundaryLeft(this.text, pos) : Math.max(0, pos - 1);
+      // Markdown mode: never land inside an image reference token.
+      if (this.isMarkdown()) target = this.adjustForImageSpans(target, pos);
       if (shift) {
         if (this.selAnchor === null) this.selAnchor = pos;
         this.cursorPos = target;
@@ -855,7 +1256,8 @@ export class TextInputWidget extends WidgetAbject {
 
     if (key === 'ArrowRight') {
       const wordMod = ctrl || (modifiers?.alt ?? false);
-      const target = wordMod ? wordBoundaryRight(this.text, pos) : Math.min(this.text.length, pos + 1);
+      let target = wordMod ? wordBoundaryRight(this.text, pos) : Math.min(this.text.length, pos + 1);
+      if (this.isMarkdown()) target = this.adjustForImageSpans(target, pos);
       if (shift) {
         if (this.selAnchor === null) this.selAnchor = pos;
         this.cursorPos = target;
@@ -913,6 +1315,9 @@ export class TextInputWidget extends WidgetAbject {
     }
 
     if (key === 'Home') {
+      // Empty input: nothing to navigate. Let the key bubble so a container
+      // (e.g. a chat transcript) can use it to scroll to the top.
+      if (this.text.length === 0) return { consumed: false };
       if (this.wordWrap && this.cachedWrappedLines && !(ctrl || meta)) {
         // Move to start of current visual line
         const lines = this.cachedWrappedLines;
@@ -944,6 +1349,9 @@ export class TextInputWidget extends WidgetAbject {
     }
 
     if (key === 'End') {
+      // Empty input: nothing to navigate. Let the key bubble so a container
+      // (e.g. a chat transcript) can use it to scroll to the bottom.
+      if (this.text.length === 0) return { consumed: false };
       if (this.wordWrap && this.cachedWrappedLines && !(ctrl || meta)) {
         // Move to end of current visual line
         const lines = this.cachedWrappedLines;
@@ -1004,6 +1412,13 @@ export class TextInputWidget extends WidgetAbject {
     // Escape: let it bubble so the parent Window (e.g. command palette,
     // notification card) can handle it as "dismiss".
     if (key === 'Escape') {
+      return { consumed: false };
+    }
+
+    // Vertical arrows are meaningless in a single-line input — let them bubble
+    // so a parent (e.g. the command palette) can drive list navigation while
+    // the input keeps text focus. (Word-wrap inputs consumed them above.)
+    if (key === 'ArrowUp' || key === 'ArrowDown') {
       return { consumed: false };
     }
 

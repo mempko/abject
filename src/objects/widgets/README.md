@@ -129,7 +129,7 @@ UIServer input event
 
 ### Theme
 
-All widgets read colors from `this.theme` (`ThemeData`). The default `MIDNIGHT_BLOOM` theme provides a dark palette with amber (`#39ff8e`) accents. The `ThemeAbject` broadcasts theme changes to all dependents.
+All widgets read colors from `this.theme` (`ThemeData`). The default `ARCANE_GRIMOIRE` theme provides an ink-void palette with rune-green (`#5be5a0`) and violet sigil (`#8b7bff`) accents. The `ThemeAbject` broadcasts theme changes to all dependents.
 
 ### Focus Management
 

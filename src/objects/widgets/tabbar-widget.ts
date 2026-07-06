@@ -9,7 +9,7 @@
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
-import { lightenColor } from './widget-types.js';
+import { lightenColor, gradientRect } from './widget-types.js';
 
 export interface TabBarConfig extends WidgetConfig {
   tabs?: string[];
@@ -63,22 +63,30 @@ export class TabBarWidget extends WidgetAbject {
       const isActive = i === this.selectedIndex;
       const isHovered = i === this.hoveredIndex && !isActive;
 
-      // Tab background
-      let fill = this.theme.windowBg;
+      // Tab background. The active tab rises out of the bar: top corners
+      // rounded, lit from above by a soft vertical gradient. The gradient
+      // collapses to a flat lighten(8) when the theme's surface treatment
+      // is flat, keeping the active/inactive distinction.
       if (isActive) {
-        fill = lightenColor(this.theme.windowBg, 8);
-      } else if (isHovered) {
-        fill = lightenColor(this.theme.windowBg, 12);
-      }
-
-      commands.push({
-        type: 'rect',
-        surfaceId,
-        params: {
+        const g = this.theme.tokens.surface.gradient;
+        commands.push(...gradientRect(surfaceId, {
           x: tx, y: oy, width: tabWidth, height: h,
-          fill,
-        },
-      });
+          radii: [6, 6, 0, 0],
+          gradient: { x0: 0, y0: oy, x1: 0, y1: oy + h, stops: [
+            { offset: 0, color: lightenColor(this.theme.windowBg, 8 + 6 * g) },
+            { offset: 1, color: lightenColor(this.theme.windowBg, 8 - 2 * g) },
+          ] },
+        }));
+      } else {
+        commands.push({
+          type: 'rect',
+          surfaceId,
+          params: {
+            x: tx, y: oy, width: tabWidth, height: h,
+            fill: isHovered ? lightenColor(this.theme.windowBg, 12) : this.theme.windowBg,
+          },
+        });
+      }
 
       // Check if this tab is being renamed inline
       if (this.editingIndex === i) {

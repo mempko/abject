@@ -29,6 +29,10 @@ const log = new Log('WidgetManager');
 import { ModalDialog } from './modal-dialog.js';
 import { WindowAbject } from './widgets/window-abject.js';
 import { LabelWidget } from './widgets/label-widget.js';
+import { MarkdownWidget } from './widgets/markdown-widget.js';
+import { ContentBlockWidget } from './widgets/content-block-widget.js';
+import { ChartWidget, ChartKind, ChartSeriesSpec } from './widgets/chart-widget.js';
+import { VideoWidget } from './widgets/video-widget.js';
 import { ButtonWidget } from './widgets/button-widget.js';
 import { TextInputWidget, TextInputWidgetConfig } from './widgets/text-input-widget.js';
 import { TextAreaWidget, TextAreaWidgetConfig } from './widgets/text-area-widget.js';
@@ -43,6 +47,10 @@ import { ImageWidget, ImageWidgetConfig } from './widgets/image-widget.js';
 import { ThemeSwatchWidget, ThemeSwatchWidgetConfig } from './widgets/theme-swatch-widget.js';
 import { ListWidget, ListWidgetConfig, ListItem } from './widgets/list-widget.js';
 import { TreeWidget, TreeWidgetConfig, TreeItem } from './widgets/tree-widget.js';
+import { GoalProgressWidget } from './widgets/goal-progress-widget.js';
+import { TableWidget, TableColumnSpec } from './widgets/table-widget.js';
+import { FormWidget, FormSchema } from './widgets/form-widget.js';
+import type { GoalRow } from './goal-tree.js';
 import { SplitPaneWidget, SplitPaneConfig } from './widgets/split-pane-widget.js';
 import { WidgetAbject, WidgetConfig } from './widgets/widget-abject.js';
 import { VBoxLayout } from './widgets/vbox-layout.js';
@@ -52,9 +60,12 @@ import { LayoutAbject, LayoutMargins } from './widgets/layout-abject.js';
 import {
   WidgetType,
   WidgetStyle,
+  LayoutStyle,
   Rect,
   ThemeData,
-  MIDNIGHT_BLOOM,
+  ARCANE_GRIMOIRE,
+  SizeInput,
+  coerceRect,
 } from './widgets/widget-types.js';
 
 export type { WidgetStyle } from './widgets/widget-types.js';
@@ -67,7 +78,7 @@ const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 export class WidgetManager extends Abject {
   private uiServerId?: AbjectId;
   private consoleId?: AbjectId;
-  private defaultTheme: ThemeData = MIDNIGHT_BLOOM;
+  private defaultTheme: ThemeData = ARCANE_GRIMOIRE;
   private workspaceThemes: Map<string, { themeId: AbjectId; theme: ThemeData }> = new Map();
   /**
    * The currently active workspace. System-level widgets (workspace switcher,
@@ -76,6 +87,7 @@ export class WidgetManager extends Abject {
    */
   private activeWorkspaceId?: string;
   private windowManagerId?: AbjectId;
+  private workspaceManagerId?: AbjectId;
 
   // Tracking spawned Abjects (Set<AbjectId>, NOT references — network transparent)
   private spawnedWindows: Set<AbjectId> = new Set();
@@ -99,12 +111,22 @@ export class WidgetManager extends Abject {
   // Maps widget AbjectId → parent WindowAbject AbjectId (for workspace tracing)
   private widgetToWindow: Map<AbjectId, AbjectId> = new Map();
 
+  // ── Tooltip service state ──
+  // One shared tooltip at a time: a tiny chromeless window created after a
+  // hover dwell and destroyed on cancel/auto-hide.
+  private tooltipWindowId?: AbjectId;
+  private tooltipShowTimer?: ReturnType<typeof setTimeout>;
+  private tooltipHideTimer?: ReturnType<typeof setTimeout>;
+  private tooltipSource?: AbjectId;
+  /** Bumped on every schedule/cancel; in-flight shows abort when stale. */
+  private tooltipGeneration = 0;
+
   constructor() {
     super({
       manifest: {
         name: 'WidgetManager',
         description:
-          'Widget factory — spawns WindowAbject and WidgetAbject instances on the bus. Primary API returns AbjectIds for direct message passing. Legacy shim for ScriptableAbjects. Use cases: build windowed apps with buttons/inputs/labels, create a canvas for games or visualizations, layout widgets in vertical/horizontal stacks.',
+          'Widget factory — spawns WindowAbject and WidgetAbject instances on the bus. Primary API returns AbjectIds for direct message passing. Legacy shim for ScriptableAbjects. Windows are slabs in the desktop\'s native WebGL2 3D scene: call(windowId, "scene", { ops }) attaches real 3D meshes/lights to a window, and 2D canvases draw charts/sprites/text. Use cases: build windowed apps with buttons/inputs/labels, render lit spinning/orbiting 3D content via scene nodes, create a canvas for 2D games or visualizations, layout widgets in vertical/horizontal stacks.',
         version: '2.0.0',
         interface: {
             id: WIDGETS_INTERFACE,
@@ -120,13 +142,14 @@ export class WidgetManager extends Abject {
             methods: [
               {
                 name: 'createWindowAbject',
-                description: 'Create a window and return its AbjectId. Example: const winId = await this.call(this.dep("WidgetManager"), "createWindowAbject", { title: "My Window", rect: { x: 100, y: 100, width: 400, height: 300 }, resizable: true })',
+                description: 'Create a window and return its AbjectId. Example: const winId = await this.call(this.dep("WidgetManager"), "createWindowAbject", { title: "My Window", rect: { x: 100, y: 100, w: 400, h: 300 }, resizable: true }). A window with no/zero size is clamped to a visible minimum so it can never be created invisible.',
                 parameters: [
                   { name: 'title', type: { kind: 'primitive', primitive: 'string' }, description: 'Window title' },
                   { name: 'rect', type: { kind: 'reference', reference: 'Rect' }, description: '{ x, y, width, height } — position and size' },
                   { name: 'zIndex', type: { kind: 'primitive', primitive: 'number' }, description: 'Z-index for stacking order', optional: true },
                   { name: 'chromeless', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, no title bar', optional: true },
                   { name: 'resizable', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If true, window is resizable', optional: true },
+                  { name: 'closable', type: { kind: 'primitive', primitive: 'boolean' }, description: 'If false, the mobile card overview cannot close this window (default true)', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -139,22 +162,30 @@ export class WidgetManager extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
+                name: 'listWindows',
+                description: 'List every live window: [{ windowId, ownerId, title, rect }]. Use this to find an EXISTING window (match by title or owner) — e.g. to decorate it with 3D scene nodes via this.call(windowId, "scene", { ops }) without owning or rebuilding it.',
+                parameters: [],
+                returns: { kind: 'array', elementType: { kind: 'object', properties: {} } },
+              },
+              {
                 name: 'createVBox',
-                description: 'Create a vertical box layout inside a window. Returns the layout AbjectId. Add children via this.call(layoutId, "abjects:layout", "addLayoutChild", { widgetId, sizePolicy: { vertical: "fixed" }, preferredSize: { height: 36 } }). Add spacers via this.call(layoutId, "abjects:layout", "addLayoutSpacer", {}).',
+                description: 'Create a vertical box layout inside a window. Returns the layout AbjectId. Add children via this.call(layoutId, "abjects:layout", "addLayoutChild", { widgetId, sizePolicy: { vertical: "fixed" }, preferredSize: { h: 36 } }). Add spacers via this.call(layoutId, "abjects:layout", "addLayoutSpacer", {}).',
                 parameters: [
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
               {
                 name: 'createHBox',
-                description: 'Create a horizontal box layout inside a window. Returns the layout AbjectId. Add children via this.call(layoutId, "abjects:layout", "addLayoutChild", { widgetId, sizePolicy: { horizontal: "expanding" }, preferredSize: { width: 100, height: 36 } }).',
+                description: 'Create a horizontal box layout inside a window. Returns the layout AbjectId. Add children via this.call(layoutId, "abjects:layout", "addLayoutChild", { widgetId, sizePolicy: { horizontal: "expanding" }, preferredSize: { w: 100, h: 36 } }).',
                 parameters: [
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -166,6 +197,7 @@ export class WidgetManager extends Abject {
                   { name: 'autoSize', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Auto-compute preferred height from children (use inside ScrollableVBox)', optional: true },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -177,6 +209,7 @@ export class WidgetManager extends Abject {
                   { name: 'autoSize', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Auto-compute preferred height from children (use inside ScrollableVBox)', optional: true },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -188,6 +221,7 @@ export class WidgetManager extends Abject {
                   { name: 'autoScroll', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Pin to bottom when new content is added (for chat/log views). Default false.', optional: true },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -199,6 +233,7 @@ export class WidgetManager extends Abject {
                   { name: 'autoScroll', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Pin to bottom when new content is added (for chat/log views). Default false.', optional: true },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -209,6 +244,7 @@ export class WidgetManager extends Abject {
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window AbjectId (used as ownerId for removeChild routing)' },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -219,6 +255,7 @@ export class WidgetManager extends Abject {
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Window AbjectId (used as ownerId for removeChild routing)' },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
@@ -230,12 +267,13 @@ export class WidgetManager extends Abject {
                   { name: 'autoScroll', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Pin to bottom when new content is added. Default false.', optional: true },
                   { name: 'margins', type: { kind: 'reference', reference: 'LayoutMargins' }, description: '{ top, right, bottom, left }', optional: true },
                   { name: 'spacing', type: { kind: 'primitive', primitive: 'number' }, description: 'Spacing between children', optional: true },
+                  { name: 'style', type: { kind: 'reference', reference: 'LayoutStyle' }, description: 'Card/panel styling: { background, borderColor, borderWidth, radius }. Omit for an invisible layout. Padding is the layout margins.', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'string' },
               },
               {
                 name: 'createCanvas',
-                description: 'Create a canvas drawing widget inside a window. Returns the canvas widget AbjectId. Draw to it via this.call(canvasId, "draw", { commands: [...] }). Get size via this.call(canvasId, "getCanvasSize", {}). The canvas forwards mouse/keyboard input from the compositor to inputTargetId via an `input` event whose fields land on msg.payload — same shape as a synthetic call(canvasId, "input", payload).',
+                description: 'Create a canvas drawing widget inside a window. Returns the canvas widget AbjectId. Draw to it via this.call(canvasId, "draw", { commands: [...] }). Get size via this.call(canvasId, "getCanvasSize", {}). The canvas forwards mouse/keyboard input from the compositor to inputTargetId via an `input` event whose fields land on msg.payload — same shape as a synthetic call(canvasId, "input", payload). STYLING: draw fill/stroke colors accept theme tokens — "$accent", "$accentSecondary", "$windowBg", "$canvasBg", "$windowBorder", "$textPrimary", "$textSecondary", "$shadowColor" — which resolve to the user\'s desktop theme. Prefer these over hardcoded hex so the app looks cohesive; ask WidgetManager "how do I make this look good?" for the full design guide (palette, depth, typography, spacing, polish) before drawing.',
                 parameters: [
                   { name: 'windowId', type: { kind: 'primitive', primitive: 'string' }, description: 'Parent window AbjectId' },
                   { name: 'inputTargetId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId that receives `input` events for this canvas. Defaults to msg.routing.from (the object that sent createCanvas). Always pass `inputTargetId: this.id` explicitly from a ScriptableAbject — the default works in simple cases but breaks any time createCanvas is called by a helper or proxy on the user object\'s behalf.', optional: true },
@@ -244,7 +282,7 @@ export class WidgetManager extends Abject {
               },
               {
                 name: 'create',
-                description: 'Create one or more widgets in a single request. Each spec has { type, windowId, ...typeSpecificProps }. Supported types: label, button, textInput, textArea, checkbox, progress, divider, select, tabBar, slider, image, list, splitPane. Returns { widgetIds: AbjectId[] } in same order as specs.',
+                description: 'Create one or more widgets in a single request. Each spec has { type, windowId, ...typeSpecificProps }. Supported types: label, markdown, button, textInput, textArea, checkbox, progress, divider, select, tabBar, slider, image, list, splitPane. Returns { widgetIds: AbjectId[] } in same order as specs.',
                 parameters: [
                   { name: 'specs', type: { kind: 'array', elementType: { kind: 'reference', reference: 'WidgetSpec' } }, description: 'Array of widget creation specs. Each spec needs at minimum: { type, windowId }. Additional props depend on type (e.g. text, style, placeholder, checked, options, tabs, etc.)' },
                 ],
@@ -401,6 +439,40 @@ export class WidgetManager extends Abject {
                   },
                 },
               },
+              {
+                name: 'windowCreated',
+                description: 'A window came into existence (any owner). Decorators watch this to attach scene nodes to a host window when it (re)opens.',
+                payload: {
+                  kind: 'object',
+                  properties: {
+                    windowId: { kind: 'primitive', primitive: 'string' },
+                    ownerId: { kind: 'primitive', primitive: 'string' },
+                    title: { kind: 'primitive', primitive: 'string' },
+                  },
+                },
+              },
+              {
+                name: 'windowDestroyed',
+                description: 'A window was destroyed (any owner). Decorators watch this to learn their host is gone; scene nodes on it are already torn down.',
+                payload: {
+                  kind: 'object',
+                  properties: {
+                    windowId: { kind: 'primitive', primitive: 'string' },
+                    ownerId: { kind: 'primitive', primitive: 'string' },
+                  },
+                },
+              },
+              {
+                name: 'windowHelpRequested',
+                description: 'The help (?) button on a window title bar was clicked. The object inspector watches this to open an inspector for the window owner.',
+                payload: {
+                  kind: 'object',
+                  properties: {
+                    windowId: { kind: 'primitive', primitive: 'string' },
+                    ownerId: { kind: 'primitive', primitive: 'string' },
+                  },
+                },
+              },
             ],
           },
         requiredCapabilities: [],
@@ -431,22 +503,43 @@ export class WidgetManager extends Abject {
 
     // Direct factory: create window, return AbjectId (not shim string)
     this.on('createWindowAbject', async (msg: AbjectMessage) => {
-      const { title, rect, zIndex, chromeless, transparent, resizable, draggable } = msg.payload as {
+      const { title, rect, zIndex, chromeless, transparent, resizable, draggable, closable } = msg.payload as {
         title: string;
-        rect: { x: number; y: number; width: number; height: number };
+        rect: { x: number; y: number; width?: number; height?: number; w?: number; h?: number };
         zIndex?: number;
         chromeless?: boolean;
         transparent?: boolean;
         resizable?: boolean;
         draggable?: boolean;
+        closable?: boolean;
       };
-      return this.createWindowDirect(msg.routing.from, title, rect, { chromeless, transparent, resizable, draggable, zIndex });
+      return this.createWindowDirect(msg.routing.from, title, this.normalizeWindowRect(rect), { chromeless, transparent, resizable, draggable, zIndex, closable });
     });
 
     // Direct factory: destroy window by AbjectId (not shim string)
     this.on('destroyWindowAbject', async (msg: AbjectMessage) => {
       const { windowId } = msg.payload as { windowId: AbjectId };
       return this.destroyWindowDirect(windowId);
+    });
+
+    // Discovery: every live window with its owner, title, and rect — lets
+    // any abject find an existing window (e.g. to decorate it with scene
+    // nodes) instead of rebuilding the app behind it.
+    this.on('listWindows', async () => {
+      const out: Array<{ windowId: AbjectId; ownerId: AbjectId; title: string; rect: Rect }> = [];
+      const entries = [...this.windowOwners.entries()];
+      await Promise.all(entries.map(async ([windowId, ownerId]) => {
+        try {
+          const [title, rect] = await Promise.all([
+            this.request<string>(request(this.id, windowId, 'getTitle', {}), 3000),
+            this.request<Rect>(request(this.id, windowId, 'getRect', {}), 3000),
+          ]);
+          out.push({ windowId, ownerId, title, rect });
+        } catch {
+          // window mid-teardown — skip it
+        }
+      }));
+      return out;
     });
 
     // ── Batch widget creation (unified create method) ──
@@ -464,7 +557,9 @@ export class WidgetManager extends Abject {
           wordWrap?: boolean;
           minLines?: number;
           maxLines?: number;
+          minHeight?: number;
           monospace?: boolean;
+          readOnly?: boolean;
           checked?: boolean;
           value?: number;
           options?: string[];
@@ -503,12 +598,15 @@ export class WidgetManager extends Abject {
         windowId: AbjectId;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createLayoutWidget(payload.windowId, new VBoxLayout({
         ownerId: payload.windowId,
         uiServerId: this.uiServerId!,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForWindow(payload.windowId),
       }));
     });
 
@@ -517,12 +615,15 @@ export class WidgetManager extends Abject {
         windowId: AbjectId;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createLayoutWidget(payload.windowId, new HBoxLayout({
         ownerId: payload.windowId,
         uiServerId: this.uiServerId!,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForWindow(payload.windowId),
       }));
     });
 
@@ -532,12 +633,15 @@ export class WidgetManager extends Abject {
         autoSize?: boolean;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createNestedLayout(payload.parentLayoutId, new VBoxLayout({
         ownerId: payload.parentLayoutId,
         uiServerId: this.uiServerId!,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForOwner(payload.parentLayoutId),
       }), payload.autoSize);
     });
 
@@ -547,12 +651,15 @@ export class WidgetManager extends Abject {
         autoSize?: boolean;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createNestedLayout(payload.parentLayoutId, new HBoxLayout({
         ownerId: payload.parentLayoutId,
         uiServerId: this.uiServerId!,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForOwner(payload.parentLayoutId),
       }), payload.autoSize);
     });
 
@@ -562,6 +669,7 @@ export class WidgetManager extends Abject {
         autoScroll?: boolean;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createLayoutWidget(payload.windowId, new ScrollableVBoxLayout({
         ownerId: payload.windowId,
@@ -569,6 +677,8 @@ export class WidgetManager extends Abject {
         autoScroll: payload.autoScroll,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForWindow(payload.windowId),
       }));
     });
 
@@ -579,6 +689,7 @@ export class WidgetManager extends Abject {
         autoScroll?: boolean;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createNestedLayout(payload.parentLayoutId, new ScrollableVBoxLayout({
         ownerId: payload.parentLayoutId,
@@ -586,6 +697,8 @@ export class WidgetManager extends Abject {
         autoScroll: payload.autoScroll,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForOwner(payload.parentLayoutId),
       }), payload.autoSize);
     });
 
@@ -596,12 +709,15 @@ export class WidgetManager extends Abject {
         windowId: AbjectId;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createDetachedLayout(new VBoxLayout({
         ownerId: payload.windowId,
         uiServerId: this.uiServerId!,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForWindow(payload.windowId),
       }));
     });
 
@@ -610,12 +726,15 @@ export class WidgetManager extends Abject {
         windowId: AbjectId;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createDetachedLayout(new HBoxLayout({
         ownerId: payload.windowId,
         uiServerId: this.uiServerId!,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForWindow(payload.windowId),
       }));
     });
 
@@ -625,6 +744,7 @@ export class WidgetManager extends Abject {
         autoScroll?: boolean;
         margins?: Partial<LayoutMargins>;
         spacing?: number;
+        style?: LayoutStyle;
       };
       return this.createDetachedLayout(new ScrollableVBoxLayout({
         ownerId: payload.windowId,
@@ -632,6 +752,8 @@ export class WidgetManager extends Abject {
         autoScroll: payload.autoScroll,
         margins: payload.margins,
         spacing: payload.spacing,
+        style: payload.style,
+        theme: this.getThemeForWindow(payload.windowId),
       }));
     });
 
@@ -673,7 +795,7 @@ export class WidgetManager extends Abject {
         windowId: string;
         id: string;
         type: WidgetType;
-        rect: { x: number; y: number; width: number; height: number };
+        rect: SizeInput;
         text?: string;
         style?: WidgetStyle;
         checked?: boolean;
@@ -682,9 +804,10 @@ export class WidgetManager extends Abject {
         selectedIndex?: number;
         placeholder?: string;
         monospace?: boolean;
+        readOnly?: boolean;
         masked?: boolean;
       };
-      return this.addWidget(msg.routing.from, payload);
+      return this.addWidget(msg.routing.from, { ...payload, rect: coerceRect(payload.rect) });
     });
 
     this.on('updateWidget', async (msg: AbjectMessage) => {
@@ -696,9 +819,10 @@ export class WidgetManager extends Abject {
         value?: number;
         options?: string[];
         selectedIndex?: number;
-        rect?: { x: number; y: number; width: number; height: number };
+        rect?: SizeInput;
         masked?: boolean;
       };
+      if (updates.rect) updates.rect = coerceRect(updates.rect);
       return this.updateWidget(widgetId, updates);
     });
 
@@ -717,6 +841,25 @@ export class WidgetManager extends Abject {
       return this.request<{ width: number; height: number }>(
         request(this.id, this.uiServerId!, 'getDisplayInfo', {})
       );
+    });
+
+    // ── Tooltip service ──
+    // Widgets with a style.tooltip request a tooltip on hover-start (anchored
+    // in screen coordinates) and cancel it on leave/press. The manager owns
+    // the dwell delay, the floating tooltip window, and the auto-hide.
+    this.on('requestTooltip', async (msg: AbjectMessage) => {
+      const { text, x, y } = msg.payload as { text: string; x: number; y: number };
+      if (!text || typeof x !== 'number' || typeof y !== 'number') return false;
+      this.scheduleTooltip(msg.routing.from, text, x, y);
+      return true;
+    });
+
+    this.on('cancelTooltip', async (msg: AbjectMessage) => {
+      // Only the widget whose request is pending/visible may cancel it, so a
+      // stale leave from button A can't kill button B's fresh request.
+      if (this.tooltipSource && msg.routing.from !== this.tooltipSource) return true;
+      await this.hideTooltip();
+      return true;
     });
 
     this.on('raiseWindow', async (msg: AbjectMessage) => {
@@ -795,6 +938,18 @@ export class WidgetManager extends Abject {
       return true;
     });
 
+    /**
+     * Authoritative active-workspace theme. System-level containers that rebuild
+     * their own widgets (global toolbar, workspace switcher) pull this at the
+     * top of show() so they re-skin on startup and workspace switch — they can't
+     * rely on `discoverDep('Theme')` (returns the first registered Theme, not the
+     * active one) and the per-widget `updateTheme` broadcast can't re-resolve the
+     * accent colors they bake into label styles at build time.
+     */
+    this.on('getActiveTheme', async () => {
+      return this.activeTheme();
+    });
+
     this.on('getObjectWorkspace', async (msg: AbjectMessage) => {
       const { objectId } = msg.payload as { objectId: string };
       return this.objectWorkspaces.get(objectId as AbjectId) ?? null;
@@ -817,6 +972,18 @@ export class WidgetManager extends Abject {
           () => this.sendDeferredReply(msg, false),
         );
 
+      return DEFERRED_REPLY;
+    });
+
+    this.on('showPromptDialog', (msg: AbjectMessage) => {
+      const opts = msg.payload as {
+        title: string; message: string; defaultValue?: string; placeholder?: string;
+        confirmLabel?: string; cancelLabel?: string;
+      };
+      this.spawnPromptDialog(opts).then(
+        (value) => this.sendDeferredReply(msg, value),
+        () => this.sendDeferredReply(msg, null),
+      );
       return DEFERRED_REPLY;
     });
 
@@ -859,6 +1026,12 @@ export class WidgetManager extends Abject {
           // the whole frame flips colour together.
           if (changedWorkspaceId === this.activeWorkspaceId) {
             this.broadcastThemeToSystemWidgets(newTheme);
+            // updateTheme can't recolor an explicit style.color (e.g. the
+            // toolbar section labels baked from theme.accent), so ask
+            // WorkspaceManager to rebuild the global toolbars too. Covers the
+            // startup race where a workspace's persisted theme loads after the
+            // first refreshTaskbar.
+            void this.requestTaskbarRefresh();
           }
           return;
         }
@@ -869,6 +1042,54 @@ export class WidgetManager extends Abject {
         const ownerId = this.windowOwners.get(fromId);
         if (ownerId) {
           this.send(event(this.id, ownerId,aspect, { windowId: fromId }));
+        }
+        return;
+      }
+
+      // Forward window geometry changes to the owner. WindowAbject emits a
+      // single 'windowRect' (drag, resize, maximize, programmatic); owners
+      // listen for the split 'windowMoved'/'windowResized' events (e.g. Chat
+      // reflows its bubbles on windowResized). Windows are not widgets, so they
+      // bypass the widget-shim path below and resolve their owner directly.
+      if (aspect === 'windowRect') {
+        const ownerId = this.windowOwners.get(fromId);
+        const { x, y, width, height } = (value ?? {}) as { x: number; y: number; width: number; height: number };
+        if (ownerId) {
+          this.send(event(this.id, ownerId, 'windowMoved', { windowId: fromId, x, y }));
+          this.send(event(this.id, ownerId, 'windowResized', { windowId: fromId, width, height }));
+        }
+        // Keep WindowManager's tracked rect in sync (programmatic resize from owner).
+        if (this.windowManagerId) {
+          const surfaceId = this.windowSurfaces.get(fromId);
+          if (surfaceId) {
+            this.send(event(this.id, this.windowManagerId, 'updateWindowRect', {
+              surfaceId, x, y, width, height,
+            }));
+          }
+        }
+        return;
+      }
+
+      // Help (?) button — re-broadcast to dependents (e.g. the object
+      // inspector) with the window's owner attached, so they can inspect it.
+      // Mirrors the windowCreated/windowDestroyed decorator-broadcast pattern.
+      if (aspect === 'windowHelpRequested') {
+        const ownerId = this.windowOwners.get(fromId);
+        if (ownerId) {
+          this.changed('windowHelpRequested', { windowId: fromId, ownerId });
+        }
+        return;
+      }
+
+      // Forward 3D scene-node input (clicks on meshes in the window's
+      // subtree) to the window's owner, payload intact.
+      if (aspect === 'nodeInput') {
+        const ownerId = this.windowOwners.get(fromId);
+        if (ownerId) {
+          this.send(event(this.id, ownerId, 'nodeInput', {
+            windowId: fromId,
+            ...(value as Record<string, unknown>),
+          }));
         }
         return;
       }
@@ -902,24 +1123,6 @@ export class WidgetManager extends Abject {
       }
 
       // Forward window events
-      if (aspect === 'windowRect') {
-        const { x, y, width, height } = value as { x: number; y: number; width: number; height: number };
-        this.send(
-          event(this.id, ownerId, 'windowMoved', { windowId: windowShimId, x, y })
-        );
-        this.send(
-          event(this.id, ownerId, 'windowResized', { windowId: windowShimId, width, height })
-        );
-        // Keep WindowManager's tracked rect in sync (programmatic resize from owner)
-        if (this.windowManagerId) {
-          const surfaceId = this.windowSurfaces.get(fromId);
-          if (surfaceId) {
-            this.send(event(this.id, this.windowManagerId, 'updateWindowRect', {
-              surfaceId, x, y, width, height,
-            }));
-          }
-        }
-      }
       if (aspect === 'windowMoved') {
         const { x, y } = value as { x: number; y: number };
         this.send(
@@ -987,21 +1190,64 @@ export class WidgetManager extends Abject {
     );
   }
 
+  /** Spawn an ephemeral ModalDialog in text-input mode; resolves to the entered string or null. */
+  private async spawnPromptDialog(opts: {
+    title: string; message: string; defaultValue?: string; placeholder?: string;
+    confirmLabel?: string; cancelLabel?: string;
+  }): Promise<string | null> {
+    const dialog = new ModalDialog();
+    dialog.setWidgetManagerId(this.id);
+    await dialog.init(this.bus, this.id);
+    return this.request<string | null>(
+      request(this.id, dialog.id, 'showPrompt', { ...opts, theme: this.defaultTheme }),
+      120000,
+    );
+  }
+
+  /**
+   * The active workspace's theme — the palette system-level chrome (global
+   * toolbar, workspace switcher, modal dialogs) should wear so it re-skins
+   * together with the active workspace's content. Falls back to the default
+   * theme before any workspace is active.
+   */
+  private activeTheme(): ThemeData {
+    const entry = this.activeWorkspaceId
+      ? this.workspaceThemes.get(this.activeWorkspaceId)
+      : undefined;
+    return entry?.theme ?? this.defaultTheme;
+  }
+
+  /**
+   * Ask WorkspaceManager to rebuild the global toolbars (fire-and-forget so we
+   * never block or deadlock — refreshTaskbar calls back into getActiveTheme).
+   */
+  private async requestTaskbarRefresh(): Promise<void> {
+    if (!this.workspaceManagerId) {
+      this.workspaceManagerId = await this.discoverDep('WorkspaceManager') ?? undefined;
+    }
+    if (this.workspaceManagerId) {
+      try {
+        this.send(request(this.id, this.workspaceManagerId, 'refreshTaskbar', {}));
+      } catch { /* WorkspaceManager not reachable */ }
+    }
+  }
+
   /** Get theme for a window's owner (traces windowOwners → objectWorkspaces → workspace theme). */
   private getThemeForWindow(windowId: AbjectId): ThemeData {
     const ownerId = this.windowOwners.get(windowId);
     if (ownerId) return this.getThemeForOwner(ownerId);
-    return this.defaultTheme;
+    return this.activeTheme();
   }
 
-  /** Get theme for a given owner AbjectId (looks up owner's workspace → workspace theme → default). */
+  /** Get theme for a given owner AbjectId (looks up owner's workspace → workspace theme → active). */
   private getThemeForOwner(ownerId: AbjectId): ThemeData {
     const wsId = this.objectWorkspaces.get(ownerId);
     if (wsId) {
       const entry = this.workspaceThemes.get(wsId);
       if (entry) return entry.theme;
     }
-    return this.defaultTheme;
+    // Untagged (system-level) owners follow the active workspace's theme.
+    return this.activeTheme();
   }
 
   /**
@@ -1021,6 +1267,49 @@ export class WidgetManager extends Abject {
         try { this.send(event(this.id, id, 'updateTheme', theme)); } catch { /* gone */ }
       }
     }
+    this.pushSceneTheme(theme);
+  }
+
+  /**
+   * Push the active theme's palette subset to UIServer for the 3D scene:
+   * slab chrome (shadows, rim glow, corner radius), the depth treatment
+   * intensity, and the `$token` colors that scene-vocabulary materials
+   * re-resolve on every theme change. Same authority and same trigger
+   * points as the 2D system-widget theme broadcast.
+   */
+  private pushSceneTheme(theme: ThemeData): void {
+    if (!this.uiServerId) return;
+    const sceneTheme = {
+      colors: {
+        accent: theme.accent,
+        accentSecondary: theme.accentSecondary,
+        accentTertiary: theme.accentTertiary,
+        windowBg: theme.windowBg,
+        windowBorder: theme.windowBorder,
+        canvasBg: theme.canvasBg,
+        shadowColor: theme.shadowColor,
+        textPrimary: theme.textPrimary,
+        textSecondary: theme.textSecondary,
+        statusSuccess: theme.statusSuccess,
+        statusError: theme.statusError,
+        statusWarning: theme.statusWarning,
+        statusInfo: theme.statusInfo,
+      },
+      windowRadius: theme.windowRadius,
+      surface: { ...theme.tokens.surface },
+      glow: {
+        focusBlur: theme.tokens.glow.focus.blur,
+        focusColor: theme.tokens.glow.focus.color,
+        accentBlur: theme.tokens.glow.accent.blur,
+        accentColor: theme.tokens.glow.accent.color,
+      },
+      shadow: {
+        color: theme.shadowColor,
+        blur: theme.tokens.elevation.level2.blur,
+        offsetY: theme.tokens.elevation.level2.offsetY,
+      },
+    };
+    this.send(request(this.id, this.uiServerId, 'setSceneTheme', { theme: sceneTheme }));
   }
 
   /** Get workspace ID for a widget/window by tracing through windowOwners → objectWorkspaces. */
@@ -1049,8 +1338,68 @@ export class WidgetManager extends Abject {
     } catch { /* logging should never break the caller */ }
   }
 
+  // The richest ask surface in the system — UI/canvas/layout/lifecycle/design
+  // guidance agents rely on to build and STYLE apps. Shallow answers here cause
+  // flat, broken UIs, so synthesize at balanced rather than fast.
+  protected override askTier(): 'smart' | 'balanced' | 'fast' {
+    return 'balanced';
+  }
+
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## WidgetManager Usage Guide
+
+### Choosing widgets vs canvas (read this first)
+
+Reach for composed WIDGETS as the default for application UIs: forms, lists, dashboards,
+settings panels, toolbars, cards, and stat panels. Widgets give you theming, input routing,
+focus, keyboard handling, hit-testing, and live updates for free, so a polished, card-based
+look is a short composition rather than a hand-painted renderer. Style layout containers
+(createVBox/createHBox) with { background, borderColor, borderWidth, radius } to build cards
+and panels, and use the rich \`list\` item fields (badge, detail, actions) for card rows with
+chips and buttons. Prefer this path whenever the screen is made of standard controls and
+content rows.
+
+Reach for the CANVAS when the content is genuinely freeform: charts and graphs, data
+visualizations, games, simulations, particle effects, and pixel-exact or continuously
+animated rendering. These are things widgets do not model, and the 2D canvas (plus the 3D
+scene for lit/animated geometry) is the right tool.
+
+Combine BOTH in one window where it fits: keep the chrome (tabs, toolbars, stat cards,
+buttons, inputs, list rows) as widgets in a layout, and embed a canvas inside that layout for
+the chart or visualization panel. A dashboard whose surrounding UI is widgets and whose one
+analytics panel is a canvas chart is the ideal shape (see "Canvas with Toolbar" below for how
+to add a canvas to a layout).
+
+### Designing apps that look good (read this before drawing)
+
+A working app and a beautiful app differ in craft, not effort. Aim for "looks designed", not
+"looks like a debug view". Principles, in priority order:
+
+1. **Use ONE cohesive palette — derive it from the active theme.** Do NOT pick a different color
+   per element. Canvas draw colors accept theme tokens directly: \`fill: '$accent'\`,
+   \`'$accentSecondary'\`, \`'$accentTertiary'\`, \`'$windowBg'\`, \`'$canvasBg'\`, \`'$windowBorder'\`,
+   \`'$textPrimary'\`, \`'$textSecondary'\`, \`'$shadowColor'\` — they resolve to the user's theme and
+   keep your app cohesive with the desktop. For a fuller palette or computed shades, fetch it once:
+   \`const theme = await this.call(this.dep('WidgetManager'), 'getActiveTheme', {})\` and read
+   \`theme.tokens\`. **Chrome always uses theme tokens** — text, buttons, panels, on-screen keys,
+   borders, backgrounds: these should be \`$accent\`/\`$textPrimary\`/\`$windowBg\` etc. so the app sits
+   in the user's desktop, not a foreign color scheme. Reach for hand-picked hex ONLY for genuine
+   *illustration/content* the theme can't express (a game's character art, a chart's data series, a
+   themed scene) — and even there design a small, consistent palette, never ad-hoc per-element colors.
+2. **Create depth — avoid flat fills.** Back the window with a subtle vertical gradient
+   (\`linearGradient\`) or layered panels rather than one solid color; use rgba/alpha for soft
+   overlays, glows, and muted secondary text. Group related content into cards: a panel rect with a
+   slightly lifted background, rounded corners, and a faint border or shadow.
+3. **Typography hierarchy.** Give titles, body, and captions distinct sizes AND weights (e.g. bold
+   22–34px title, 14–16px body, 11–12px muted caption). Pick a font that fits the app's character
+   and use it consistently. Don't render everything at one size/weight.
+4. **Spacing & alignment.** Consistent padding, generous whitespace, and a clear grid. Align edges;
+   give interactive targets room. Rounded corners (a consistent radius) on cards/buttons.
+5. **Accent with purpose.** The accent color marks the primary action / current selection /
+   highlight — used sparingly. Use semantic colors (success green, error red) only for state.
+6. **Polish.** Show hover/pressed states on interactive elements; a touch of subtle animation
+   (driven by a Timer tick) brings a UI alive. Define your palette and a few small reusable draw
+   helpers (e.g. a text helper, a card helper) up front so styling stays uniform across the app.
 
 ### Quick Reference
 
@@ -1061,6 +1410,156 @@ Layout:   this.call(this.dep('WidgetManager'), 'createVBox', { windowId, margins
 Widgets:  this.call(this.dep('WidgetManager'), 'create', { specs: [{ type, windowId, ... }] })
 Canvas:   this.call(this.dep('WidgetManager'), 'createCanvas', { windowId, inputTargetId: this.id })
 Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', params }] })
+          Two dialects mix freely:
+          High-level shapes: rect, text, line, circle, arc, ellipse, polygon, path, imageUrl, clear,
+          shadow, linearGradient, radialGradient, conicGradient, bezierCurve, quadraticCurve.
+          HTML5 Canvas 2D API: every context method is a command type (params use the MDN argument
+          names: fillRect {x,y,width,height}, fillText {text,x,y}, beginPath {}, moveTo/lineTo {x,y},
+          fill/stroke {}, drawImage {url,dx,dy,...}, save/restore/translate/rotate/scale/transform, ...)
+          and every settable context property is a command taking {value} (fillStyle, font, lineWidth, ...).
+          Commands run in order against a stateful context, so path building works as in a browser.
+          rect: {x, y, width, height, fill?, stroke?, radius?}   text: {x, y, text, fill?, font?, align?}
+          line: {x1, y1, x2, y2, stroke?, lineWidth?}            circle: {cx, cy, radius, fill?, stroke?}
+          Any fill/stroke/color accepts a '#hex'/'rgb(a)' value OR a theme token: '$accent',
+          '$accentSecondary', '$accentTertiary', '$windowBg', '$canvasBg', '$windowBorder',
+          '$textPrimary', '$textSecondary', '$shadowColor' — tokens resolve to the active theme so
+          your canvas stays cohesive with the desktop. Prefer tokens over hardcoded hex.
+          markdown: {x, y, text, maxWidth?, fontSize?, fill?, maxImageHeight?} — render a markdown block
+          (bold, italic, inline code, headings, bullet/numbered lists, links, blockquotes, code blocks, and
+          inline images via ![alt](url) where url is a data:image/* URI, an abject:// ref, or http(s)) onto
+          the canvas at (x,y), wrapping to maxWidth. Same rich renderer as markdown labels, so you get rich
+          text + images inside a pannable/zoomable canvas without hand-rolling a parser. Use this instead of
+          the plain text command whenever node/cell content may contain markdown or images.
+          Invalid batches (unknown type, missing required params) are rejected with an error naming the problem.
+          Ask the canvas widget itself for the full per-command param reference before writing a renderer.
+3D scene: THE DESKTOP IS A NATIVE 3D SCENE (WebGL2-backed) — no Three.js needed; 3D is built in.
+          Every window is a slab in the scene, and real 3D content (meshes with lighting, rotation,
+          depth) renders via RETAINED scene nodes attached to YOUR WINDOW (the window owns the
+          surface, so scene calls go to the windowId, not UIServer). For anything 3D — spinning
+          shapes, orbiting objects, lit geometry — scene nodes are the way: GPU-rendered and
+          animated by updating a node's transform, which beats simulating 3D with projection math
+          on a 2D canvas.
+          this.call(windowId, 'scene', { ops: [{ op: 'add', id: 'cube', kind: 'mesh',
+            transform: { position: [0, 0, 40], rotation: [0.5, 0.8, 0], scale: 60 },
+            params: { primitive: 'box', color: '$accent' } }] })
+          Animate from a Timer tick by updating the transform:
+          this.call(windowId, 'scene', { ops: [{ op: 'update', id: 'cube', transform: { rotation: [rx, ry, 0] } }] })
+          Kinds: mesh (primitive: plane|box|sphere|cylinder), light (lightType: point|directional), group.
+          transform: { position: [x,y,z] px from window center (+z toward viewer), rotation: [rx,ry,rz] radians, scale: n|[x,y,z] }.
+          ARBITRARY/DEFORMABLE MESHES: when no built-in primitive fits (a wave surface, terrain, a
+          generated or morphing shape), a mesh node can carry its own polygons instead of a primitive:
+          params: { geometry: { positions: [x,y,z, ...], indices?: [...], normals?: [...] }, color }.
+          positions are local px (a flat vertex list); indices is a flat triangle list (omit for a
+          sequential triangle soup); normals auto-compute (smooth) when omitted. Re-send geometry in an
+          'update' op each tick to DEFORM it (the GPU buffers are reused, so animating a heightfield
+          every frame is cheap): this.call(windowId, 'scene', { ops: [{ op: 'update', id: 'water',
+          params: { geometry: { positions: nextPositions } } }] }). This is the way to render a
+          continuous, changing surface rather than a grid of discrete primitive tiles.
+          Custom geometry also takes per-vertex colors (geometry.colors: flat [r,g,b,...] 0..1 — gradients,
+          heatmaps, a fluid's color ramp baked into the surface) and uvs (geometry.uvs) for texturing.
+          PRIMITIVES: plane, box, sphere, cylinder, cone, torus, icosphere.
+          MATERIALS: params.metalness and params.roughness (0..1) drive a PBR look (glass, brushed metal,
+          glossy water); params.emissive makes a mesh glow; params.texture is a URL, data-URI, or
+          'surface:<surfaceId>' (wrap another window's live 2D content onto 3D geometry); params.billboard:true
+          makes a mesh always face the camera (labels, sprites); params.drawMode 'points'|'lines' renders the
+          vertices as a particle cloud or polyline (graphs, constellations) with params.pointSize.
+          INSTANCING: params.instances = [{ position:[x,y,z], scale?, rotation?, color? }, ...] draws ONE geometry
+          many times in a single GPU call — the right way to do starfields, particles, swarms, or grids of shapes
+          (re-send instances in an 'update' op to move them).
+          LIGHTS: lightType 'point'|'directional'|'spot' with color, intensity, range (falloff px), for spots
+          angle + penumbra, and castShadow:true on a directional light (meshes cast shadows on each other,
+          frustum auto-fit to the scene). ENVIRONMENT: add a kind:'environment' node with { ambient, fog: { color, near, far },
+          bloom: true|{ threshold, intensity } } for scene-wide mood, depth, and a glow post-effect on bright/
+          emissive meshes (neon, highlights).
+          ANIMATION (declarative — ONE op, runs at native frame rate; do NOT send a transform message every
+          tick): this.call(windowId, 'scene', { ops: [{ op: 'animate', id: 'cube',
+          params: { preset: 'spin', duration: 4000 } }] }). Presets: spin, orbit (center/radius/plane), bob
+          (amplitude), pulse (scale). Or animate any channel explicitly: { op:'animate', id, params:{ channel:
+          'position'|'rotation'|'scale'|'color'|'emissive'|'opacity', to, from?, duration, easing?, loop?, yoyo?,
+          delay?, path?:[[x,y,z],...] } }. Stop with params:{ stop:true }. Animations are client-side and
+          transient — re-issue them after a reconnect if you need them to persist.
+          OCCLUSION (default): 3D nodes attached to a window are CLIPPED to the window's content area and sit
+          BELOW its title bar — they cannot spill across the desktop or cover the chrome, so the window stays
+          movable/closable. To let a node escape the frame (3D that pops OUT of the window, or a decoration
+          drawn over the chrome) set params.occlude:false. NOTE: occluded 3D draws on top of the window's own
+          2D background; for an immersive all-3D scene (fish tank, space view) create the window with the
+          tank/scene as 3D meshes and DON'T expect a separate giant backdrop plane — a full-window opaque mesh
+          just hides everything. A modest backdrop sized to the window (or none) is right.
+          INHERITANCE: a child node inherits its parent group's material/behaviour params — color, emissive,
+          opacity, metalness, roughness, texture, drawMode, pointSize, layer, occlude, castShadow — unless it
+          sets its own. Set color/occlude/castShadow once on a group and the whole subtree follows. Transforms
+          already compose down the parent chain; only primitive/geometry/instances are per-node (never inherited).
+          FOG is SCENE-RELATIVE: fog.near/far are depth in px measured BEHIND the content plane (the
+          camera-to-content baseline is added for you), so use SMALL values — e.g. near 0, far 400 for a tank
+          ~300px deep. Do NOT pass camera-distance values like far 2000+; that puts fog so far back it never
+          shows. far should be roughly the depth of your scene. light range is world-space px (distance from
+          the light). For depth to read, scale and z must be a meaningful fraction of the scene (go big: 100+).
+          COMPOUND SHAPES (a turtle = shell + head + legs, a character, anything with parts): add a
+          'group' node, then add each part with parentId set to the group's id (the field is parentId,
+          NOT parent). Parts inherit the group's transform, so you move/rotate the whole thing by
+          updating ONLY the group each tick — the parts follow. Without parentId the parts detach and
+          pile up at the window center while the group moves invisibly. Each op's only fields are
+          { op, id, parentId?, kind, transform, params } — the shape goes in params.primitive and the
+          color in params.color, never as top-level mesh/material/color fields.
+          COORDINATES ARE Y-DOWN (screen convention): +y moves DOWN, matching input coordinates —
+          mouse dx/dy map directly onto position dx/dy with the SAME sign, no axis flips.
+          The camera is a long lens (desktop UI stays undistorted), so small objects read near-isometric.
+          For visible perspective/foreshortening, go BIG: scale 200+ and vary z (e.g. position z 100-300) —
+          depth must be a meaningful fraction of the scene to show.
+          Colors take '#hex' or theme tokens ('$accent', '$statusError', ...) that re-resolve on theme change.
+          Nodes persist until removed ({ op: 'remove', id }). Tilt/float the whole window with
+          this.call(windowId, 'setSlabTransform', { rotation: [0, 0.1, 0], z: 20 }).
+          WORLD SCOPE: free-floating 3D (desktop pets, ambient décor, draggable objects that live on
+          the desktop itself) needs no window at all —
+          this.call(this.dep('UIServer'), 'scene', { world: true, ops: [...] }) attaches nodes to the
+          GLOBAL scene graph in workspace px; params.layer 'back' (default, behind windows) or 'front'.
+          When the user asks for a standalone 3D object (not an app UI), prefer world scope over
+          creating a window just to host the mesh.
+          DECORATING EXISTING WINDOWS: any abject may attach scene nodes to a window it does NOT
+          own — including built-in app windows. Find the window with
+          this.call(this.dep('WidgetManager'), 'listWindows', {}) → [{ windowId, ownerId, title, rect }]
+          (match by title), then this.call(windowId, 'scene', { ops }) with YOUR nodes. Prefix node
+          ids with your abject's name to avoid colliding with the owner's nodes. Your nodes' nodeInput
+          events route back to YOU (windowId in the payload), and your nodes tear down automatically
+          if your abject dies or the window closes. This is THE way to add visuals to an existing app's
+          window (ornaments, effects, companions) — decorate it; never rebuild the app in a new window.
+          Decoration nodes ride the window's slab: they follow every drag, resize, hide, show, and
+          workspace switch with ZERO tracking code. A separate "overlay window" CANNOT do this —
+          windows have no method to reposition themselves programmatically, and windowMoved/windowResized
+          events go only to a window's own observers — so always decorate the real window instead.
+          Node positions are px from the window CENTER (y-down): the top edge is y = -height/2, so a
+          critter walking the top edge of a 440x520 window sits at position [walkX, -260, 30].
+          HOST LIFECYCLE: observe WidgetManager (addDependent) and watch two changed-events:
+          'windowDestroyed' { windowId, ownerId } tells you your host closed (your nodes are already
+          gone — just stop animating); 'windowCreated' { windowId, ownerId, title } tells you a window
+          (re)opened — re-match by title/ownerId and re-add your nodes. Worked decorator shape:
+            // attach: find host, add nodes at its top edge
+            const wins = await this.call(this.dep('WidgetManager'), 'listWindows', {});
+            const host = wins.find(w => /conversation/i.test(w.title));
+            await this.call(host.windowId, 'scene', { ops: [
+              { op: 'add', id: 'me-critter', kind: 'mesh',
+                transform: { position: [0, -host.rect.height/2, 30], scale: 18 },
+                params: { primitive: 'sphere', color: '$accent' } } ] });
+            // animate: Timer tick updates the transform — the window itself needs no tracking
+            await this.call(host.windowId, 'scene', { ops: [
+              { op: 'update', id: 'me-critter', transform: { position: [x, -host.rect.height/2, 30] } } ] });
+          Edge anchoring note: positions are relative to the window CENTER, so window MOVES are free,
+          and only a RESIZE shifts your edge offset — addDependent on the host window itself to receive
+          its windowResized changed-event and recompute -height/2 then.
+          MESH INPUT: meshes are decorative by default and pass clicks through to the widgets/canvas
+          beneath them. To make a mesh a click/drag/keyboard target, add interactive:true to its params
+          ({ op:'add', kind:'mesh', params:{ ..., interactive:true } }). Interactive meshes are full
+          input targets like widgets. Implement nodeInput(msg) — payload
+          { type, nodeId, x, y, key?, code?, button?, world?, windowId? } where type is
+          'mousedown'|'mouseup'|'mousemove'|'mouseenter'|'mouseleave'|'focus'|'blur'|'keydown'|'keyup'.
+          Clicking a mesh SELECTS it (focus); keyboard then routes to it until the user clicks elsewhere
+          (blur). Hover gives mouseenter/mouseleave plus streaming mousemove. DRAG CAPTURE is built in:
+          after mousedown on a mesh, mousemove keeps streaming to it until mouseup even when the cursor
+          outruns the mesh — drag by applying input deltas directly (y-down on both sides, so
+          position = [startX + dx, startY + dy, z], no sign flips). Window-subtree hits arrive
+          at the window's owner; world hits arrive at the node's owner directly. Picking is real 3D ray
+          casting, so rotated/animated meshes hit correctly.
+          The 2D canvas above is for 2D content (charts, sprites, text); the scene is for 3D.
 Size:     this.call(canvasId, 'getCanvasSize', {})
 Input:    Pass inputTargetId on createCanvas, then implement input(msg) — read msg.payload.{type,x,y,button,code,key}.
           Real compositor events and synthetic call(canvasId, 'input', payload) BOTH put fields on msg.payload.
@@ -1069,11 +1568,83 @@ Events:   this.call(widgetId, 'addDependent', {})   // then implement changed(ms
 Update:   this.call(widgetId, 'update', { text, style, ... })
 Destroy:  this.call(this.dep('WidgetManager'), 'destroyWindowAbject', { windowId })
 
+### Building the window in show() — the async handler model (there is no self-deadlock)
+
+Build your window from inside an async \`show()\` handler and AWAIT each step in order.
+Awaiting an inter-object call from inside your OWN request handler is the correct,
+supported pattern: the runtime delivers the reply while your handler is suspended, so
+the build completes and \`show()\` returns. Awaiting does NOT deadlock your mailbox — every
+built-in window builds exactly this way. When a build call times out, the cause is a wrong
+recipient or a missing await, never the act of awaiting. So when you see a timeout, fix the
+RECIPIENT — do not switch to a detached/fire-and-forget build to "avoid a deadlock"; that
+just hides errors, races the first paint, and leaves windowVisible flapping.
+
+Resolve the factory id ONCE via this.dep('WidgetManager') (cache it in a field). Never pass
+the bare name 'WidgetManager' as a recipient: the bus routes by AbjectId, so a name string is
+delivered nowhere and the call times out. The ids returned by createWindowAbject / createVBox /
+createCanvas ARE resolved AbjectIds — pass them directly. getCanvasSize is safe to await right
+after createCanvas; the widget already exists.
+
+// Canonical await-in-order build:
+async show() {
+  if (this._windowId) {                                    // already open → raise and return
+    await this.call(this._windowId, 'raiseWindow', {}).catch(() => {});
+    return true;
+  }
+  const wm = await this.dep('WidgetManager');              // resolve the factory id once
+  this._windowId = await this.call(wm, 'createWindowAbject', { title: '…', rect: { x: 120, y: 90, w: 1100, h: 720 }, resizable: true });
+  await this.call(this._windowId, 'addDependent', {});     // observe window events (e.g. close)
+  this._layoutId = await this.call(wm, 'createVBox', { windowId: this._windowId, margins: { top: 0, right: 0, bottom: 0, left: 0 }, spacing: 0 });
+  this._canvasId = await this.call(wm, 'createCanvas', { windowId: this._windowId, inputTargetId: this.id });
+  await this.call(this._layoutId, 'addLayoutChild', { widgetId: this._canvasId, sizePolicy: { horizontal: 'expanding', vertical: 'expanding' } });
+  const size = await this.call(this._canvasId, 'getCanvasSize', {});
+  this._cw = size.width; this._ch = size.height;
+  await this._draw();                                       // first paint
+  this._windowVisible = true;
+  return true;
+}
+
+For MARKDOWN or other rich text, prefer a \`label\` widget with style { markdown: true, wordWrap: true }
+(headings, bold, code, lists, links, block images render for free) over hand-writing a parser and
+text-layout engine on a canvas — that keeps your object small and the formatting correct.
+
+### Structure: Model-View (Smalltalk sense)
+
+Keep the domain and the display apart. The MODEL is \`this.data\` (the document, i.e. what the app IS) plus
+pure helpers that hold the rules (validate, compute, apply a change); it never draws. The VIEW is your
+render method (\`_draw\`) which displays the model AND your input handlers which handle interaction with it:
+the view both shows and controls interaction. On input, apply a model helper to \`this.data\`, then redraw.
+Hold window/canvas/layout ids and other transient view state in \`this._\` fields, never in \`this.data\`.
+A controller only appears when one model has more than one view/mode (it picks which view to show); it is
+not the input path. Guard public handlers with \`this.ensure(cond, msg)\` and re-check object invariants
+with \`this.invariant(cond, msg)\` after each mutation.
+
+### Closing and reopening a window — reset ALL window-scoped ids together
+
+When a window closes (the user clicks X, or you call destroyWindowAbject), the window AND every
+layout, canvas, and widget inside it are destroyed — their ids become dead. So your teardown must
+null EVERY id tied to that window in one place, not just some of them. The classic bug: hide()
+nulls \`_windowId\` and \`_canvasId\` but forgets \`_layoutId\`. On reopen, show()'s \`if (!this._layoutId)\`
+guard sees the stale id, SKIPS creating a new layout, and then calls addLayoutChild on the dead
+layout — so the canvas is parented to nothing (blank window) AND the call to the destroyed object
+never replies, blocking for the full request timeout (~30s) before it gives up. That is the
+"window opens blank, then slowly appears" symptom: a stale id from an incomplete teardown.
+
+Two safe patterns:
+- **Full teardown:** one place (hide() AND your windowCloseRequested handler) nulls EVERY window
+  id you stored — window, layouts, canvases, widgets — so the next show() rebuilds from a clean
+  slate. Keep them in one object (e.g. \`this._ui = {}\`) so you can't forget one.
+- **Verify-before-reuse:** in show(), don't trust a stored windowId blindly — a window the user
+  closed is gone. Confirm it still exists (listWindows) before reusing its ids; otherwise rebuild.
+
+Never call a stored id without being sure it's still alive — a call to a destroyed object hangs on
+the request timeout, it doesn't fail fast.
+
 ### Complete Workflow Example
 
 // 1. Create a window
 const winId = await this.call(this.dep('WidgetManager'), 'createWindowAbject', {
-  title: 'My Window', rect: { x: 100, y: 100, width: 400, height: 300 }, resizable: true
+  title: 'My Window', rect: { x: 100, y: 100, w: 400, h: 300 }, resizable: true
 });
 
 // 2. Create a vertical layout
@@ -1094,9 +1665,9 @@ const [labelId, btnId, inputId] = widgetIds;
 // 4. Add widgets to layout (layout manages positioning)
 await this.call(layoutId, 'addLayoutChildren', {
   children: [
-    { widgetId: labelId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 20 } },
-    { widgetId: inputId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 36 } },
-    { widgetId: btnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 100, height: 36 } },
+    { widgetId: labelId, sizePolicy: { vertical: 'fixed' }, preferredSize: { h: 20 } },
+    { widgetId: inputId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { h: 36 } },
+    { widgetId: btnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { w: 100, h: 36 } },
   ]
 });
 
@@ -1133,6 +1704,7 @@ await this.call(this.dep('WidgetManager'), 'destroyWindowAbject', { windowId: wi
 ### Widget Types (used as \`type\` in create() specs)
 
 label - Static text display. Fires 'click' on mousedown (register via addDependent to receive). Param: href — when set, renders as a clickable link (underlined, link color) that opens in the user's browser. Style: { wordWrap: true } for multi-line text. Style: { selectable: true } to allow users to click-drag, double-click, Shift+click, Ctrl+A, and Ctrl+C to select and copy text (read-only). Style: { markdown: true, wordWrap: true } for rich text rendering (bold, italic, inline code, clickable links, headings, bullet lists, code blocks, blockquotes, and block-level images via ![alt](url) — url may be http(s) or a data:image/* base64 URI; add a |WxH hint inside alt like ![chart|480x240](url) so layout knows the size before the image loads).
+markdown - Rich markdown display (a label preconfigured for markdown + wordWrap, so you don't need the style flags). Renders bold, italic, inline code, headings, bullet/numbered lists, links, blockquotes, code blocks, and inline images (![alt](url) where url is a data:image/* base64 URI, an abject:// reference, or http(s); add a |WxH hint in alt like ![chart|480x240](url)). Param: text — the markdown source. Style: { selectable: true } for read-only select/copy; { fontSize, color }. Update content with this.call(id, 'update', { text: '...' }). Use this for any text that may contain markdown or images; for markdown drawn directly onto a canvas (e.g. graph nodes), use the canvas 'markdown' draw command instead.
 button - Clickable button (listen for 'changed' with aspect 'click'). Param: href — when set, clicking also opens the URL in the user's browser. Keyboard: Enter/Space when focused.
 textInput - Single-line text input (aspects: 'change', 'submit')
 textArea - Multi-line text area (params: monospace?)
@@ -1143,9 +1715,16 @@ select - Dropdown select (params: options[], selectedIndex). Keyboard: Enter/Spa
 tabBar - Tab bar (params: tabs[] of labels, selectedIndex). Fires 'change' event with selected index. Keyboard: ArrowLeft/Right to switch tabs.
 slider - Numeric range slider (params: min, max, step, value). Fires 'change' event with numeric value as string. Keyboard: ArrowLeft/Right ±step, Home/End for min/max. Click track or drag thumb.
 image - Image display (params: url, fit 'contain'|'cover'|'fill', alt). Fires 'click' on mousedown (register via addDependent to receive). Param: href — when set, clicking opens the URL in the user's browser. Update URL via this.call(imgId, 'update', { url: '...' }).
-list - Scrollable list (params: items[], selectedIndex?, searchable?, itemHeight?). Fires 'selectionChanged'.
+list - Scrollable list (params: items[], selectedIndex?, searchable?, itemHeight?). Fires 'selectionChanged'. Each item is { label, value, secondary?, iconName?, iconColor? }. RICH CARD ROWS: add any of badge, detail, or actions to an item and it renders as a two-line card row instead of a plain text line. badge: { text, color?, textColor? } is a colored leading chip (e.g. a percentage or status). detail (or secondary) is a muted second line under label. actions: [{ id, label, color?, textColor? }] are right-aligned buttons; clicking one fires a 'changed' event with aspect 'action' and value JSON { index, value, actionId } (row selection is unaffected). Rich rows auto-size to a comfortable height, so itemHeight is optional (set it only to make rows even taller). Example item: { label: 'Bitcoin above $100k by year end', value: 'p1', detail: 'created 2026-01-02  ·  #crypto', badge: { text: '80%', color: '#7ad19a', textColor: '#0f1226' }, actions: [{ id: 'right', label: '✓ Right', color: '#2e6b3c' }, { id: 'wrong', label: '✗ Wrong', color: '#7a2e36' }] }.
 tree - Hierarchical tree view (params: treeItems[], selectedId?, itemHeight?). Items have id, label, icon?, iconColor?, secondary?, depth, expanded?, hasChildren?. Fires 'selectionChanged' and 'toggle'.
 splitPane - Resizable split view (params: orientation?, dividerPosition?, minSize?).
+contentBlock - Auto-height wrapped rich text (a markdown label that measures itself). Give it an expanding width and a provisional fixed height in the layout, register via addDependent, and listen for the 'contentHeight' aspect (value: number) — then call updateLayoutChild on its layout with preferredSize: { h: <that number> }. Use this for chat bubbles, feed entries, and any text whose height you would otherwise have to estimate. Defaults: markdown + wordWrap + selectable on; pass style: { markdown: false } for plain wrapped text. Also fires 'click' like a label.
+goalProgress - Word-wrapping goal/task hierarchy view (params: rows[] built by goal-tree's buildGoalRows). Self-sizes via the 'contentHeight' aspect like contentBlock; fires 'toggle' with { id } when a goal row's expand gutter is clicked. Used by GoalBrowser and Chat's activity bubble; prefer tree for generic hierarchies.
+themeSwatch - Mini window preview of a theme preset (params: themeId, themeName, previewTheme — all required). Fires 'click' with { themeId }. Settings-internal; only useful for theme pickers.
+table - Sortable columnar data grid (params: columns[] of { key, label, width?, align? }, rowsData[] of records keyed by column key, sortable? default true, editable? default false, rowHeight?). Click a header to sort (asc/desc, numeric when values are numbers); columns without width share remaining width. Fires 'rowSelected' with JSON { index, row } (index into the current sorted view, row included so you never re-derive the sort) and, when editable, 'cellEdited' with JSON { index, row, key, value } after a double-click inline edit commits (Enter commits, Escape cancels). Update data with this.call(id, 'update', { rowsData }). Binds naturally to SQL query results: map each result column to { key, label } and pass row objects straight through. Example: { type: 'table', windowId, columns: [{ key: 'name', label: 'Name' }, { key: 'qty', label: 'Qty', width: 60, align: 'right' }], rowsData: [{ name: 'Ash', qty: 3 }] }.
+chart - Declarative data visualization (params: kind 'line'|'bar'|'area'|'pie'|'sparkline', series[] of { name?, points: [{x, y}], color? }, xLabel?, yLabel?, showLegend?, showGrid?, yMin?, yMax?). Colors follow the active theme automatically; give each series a name and set showLegend for a legend row. String x values become category bands (bar charts, labeled buckets); numeric x scales linearly. pie uses series[0] with one point per slice (x is the slice label). Fires 'pointClicked' with JSON { seriesIndex, pointIndex, x, y }. Update live with this.call(id, 'update', { series }). Binds directly to SQL query results: map each row to a point, e.g. rows [[label, total], ...] from query() becomes { type: 'chart', windowId, kind: 'bar', series: [{ points: rows.map(r => ({ x: String(r[0]), y: Number(r[1]) })) }] }. sparkline draws a bare trend line (no axes or grid) sized for stat cards inside styled layout cells.
+form - Schema-driven form (params: schema { properties: { name: { type, title?, description?, enum?, default? } }, required?: string[] }, submitLabel?). One spec builds labeled inputs (string → text input, masked automatically for credential-looking names; number/integer → numeric-validated input; boolean → checkbox; enum → dropdown), a validation status line, and a submit button. Fires 'submit' with a JSON payload of typed values (numbers as numbers, booleans as booleans) only after validation passes; Enter in any text field also submits. It reports its natural height via the 'contentHeight' aspect like contentBlock, so give it an expanding width, a provisional height, and resize on that event. Methods: getValues, setValues { values }. Turn any manifest method's parameters into a form by mapping each parameter to a property; the submit payload is ready to send as the method's payload. Example: { type: 'form', windowId, schema: { properties: { url: { type: 'string', title: 'Feed URL' }, minutes: { type: 'number', default: 30 } }, required: ['url'] }, submitLabel: 'Watch' }.
+video - Video playback (params: source, controls?, muted?, loop?, autoplay? default true). source is an http(s) URL, a data: URI, an abject://<typeId>/<path> file reference, or a live streamId returned by MediaStream capture. Frames composite client-side straight into the window (they never travel through the bus), so playback stays smooth. URL/file sources get a play/pause + seek overlay by default; live streams show a LIVE badge instead (controls default off). Fires 'playing', 'paused', 'ended', and 'error' (message). Update with this.call(id, 'update', { source }) to swap what plays, or { muted }. A window showing a peer's shared camera stream is a video call surface: capture via MediaStream on their side, display the streamId here, and sound follows the stream. Example: { type: 'video', windowId, source: 'https://example.com/clip.mp4' } or { type: 'video', windowId, source: capturedStreamId, muted: true }.
 
 ### Widget Style Properties
 
@@ -1198,6 +1777,31 @@ createDetachedVBox - Detached vertical layout (not auto-added to any parent). Us
 createDetachedHBox - Detached horizontal layout (not auto-added to any parent). Use as a split pane child.
 createDetachedScrollableVBox - Detached scrollable vertical layout (not auto-added to any parent). Use as a split pane child.
 
+### Styled Containers (cards & panels)
+
+Every layout factory accepts an optional \`style\`: { background, borderColor, borderWidth, radius }.
+With a style set, the layout paints a rounded background and/or border spanning its full rect
+before its children draw, so a plain VBox/HBox becomes a card or panel. The layout's \`margins\`
+act as the card's inner padding. With no \`style\`, the layout stays invisible (positioning only).
+Change a card's look at runtime with this.call(layoutId, 'update', { style: { background, borderColor, radius } }).
+Colors follow the active theme on a theme change, so reading colors from the theme keeps a card on-palette.
+
+// A card: a styled VBox holding a title and body
+const card = await this.call(this.dep('WidgetManager'), 'createVBox', {
+  windowId: winId, margins: { top: 14, right: 16, bottom: 14, left: 16 }, spacing: 6,
+  style: { background: '#161a3a', borderColor: '#262c5a', borderWidth: 1, radius: 12 }
+});
+
+// A 4-up stat-card grid: an HBox of styled VBox cards
+const grid = await this.call(this.dep('WidgetManager'), 'createHBox', { windowId: winId, spacing: 12 });
+for (const stat of stats) {
+  const cell = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
+    parentLayoutId: grid, margins: { top: 12, right: 14, bottom: 12, left: 14 }, spacing: 4,
+    style: { background: '#161a3a', borderColor: '#262c5a', radius: 10 }
+  });
+  // add a small label and a large value label as children of \`cell\`
+}
+
 ### Canvas Drawing (games, animations, visualizations)
 
 createCanvas - Drawing area inside a window. Returns canvasId (AbjectId).
@@ -1229,7 +1833,7 @@ await this.call(rootLayout, 'addLayoutChildren', {
 
 // 1. Create window and root vertical layout
 const winId = await this.call(this.dep('WidgetManager'), 'createWindowAbject', {
-  title: 'My App', rect: { x: 80, y: 60, width: 600, height: 500 }, resizable: true
+  title: 'My App', rect: { x: 80, y: 60, w: 600, h: 500 }, resizable: true
 });
 const rootLayout = await this.call(this.dep('WidgetManager'), 'createVBox', {
   windowId: winId, margins: { top: 0, right: 0, bottom: 0, left: 0 }, spacing: 0
@@ -1241,7 +1845,7 @@ const toolbar = await this.call(this.dep('WidgetManager'), 'createNestedHBox', {
 });
 // Make toolbar fixed height (default expanding would split space 50/50 with canvas)
 await this.call(rootLayout, 'updateLayoutChild', {
-  widgetId: toolbar, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 40 }
+  widgetId: toolbar, sizePolicy: { vertical: 'fixed' }, preferredSize: { h: 40 }
 });
 // Create toolbar buttons and add them to the toolbar layout...
 
@@ -1265,9 +1869,8 @@ const { width, height } = await this.call(canvasId, 'getCanvasSize', {});
 //   // Missing: await this.call(rootLayout, 'addLayoutChildren', { children: [{ widgetId: canvasId, ... }] });
 // FIX: Always call addLayoutChildren to add the canvas to your root layout.
 
-// WRONG: Using 'r' instead of 'radius' for circles.
-//   { type: 'circle', params: { cx: 50, cy: 50, r: 10, fill: '#f00' } }  <-- silently draws nothing
-// FIX: { type: 'circle', params: { cx: 50, cy: 50, radius: 10, fill: '#f00' } }
+// Prefer 'radius' for circles ('r' is accepted as a shorthand alias, as are rx/ry/w/h):
+//   { type: 'circle', params: { cx: 50, cy: 50, radius: 10, fill: '#f00' } }
 
 // WRONG: Using 'fontSize' for text.
 //   { type: 'text', params: { text: 'hi', x: 0, y: 0, fontSize: 14 } }  <-- ignored
@@ -1303,7 +1906,7 @@ await this.call(canvasId, 'draw', {
   commands: [
     { type: 'clear', surfaceId: 'c', params: { color: '#1a1a2e' } },
     { type: 'rect', surfaceId: 'c', params: { x: 10, y: 10, width: 50, height: 50, fill: '#ff0' } },
-    { type: 'circle', surfaceId: 'c', params: { cx: 100, cy: 100, radius: 30, fill: '#39ff8e' } },
+    { type: 'circle', surfaceId: 'c', params: { cx: 100, cy: 100, radius: 30, fill: '#5be5a0' } },
   ]
 });
 
@@ -1410,7 +2013,7 @@ Rules for canvas apps:
 
 // Change a child's size policy or preferred size after initial layout:
 await this.call(layoutId, 'updateLayoutChild', {
-  widgetId: childId, sizePolicy: { vertical: 'expanding' }, preferredSize: { height: 200 }
+  widgetId: childId, sizePolicy: { vertical: 'expanding' }, preferredSize: { h: 200 }
 });
 
 ### Utility Methods
@@ -1446,7 +2049,7 @@ const { widgetIds: [header] } = await this.call(this.dep('WidgetManager'), 'crea
   specs: [{ type: 'label', windowId: winId, text: 'Title', style: { fontSize: 18, fontWeight: 'bold' } }]
 });
 await this.call(rootLayout, 'addLayoutChild', {
-  widgetId: header, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 28 }
+  widgetId: header, sizePolicy: { vertical: 'fixed' }, preferredSize: { h: 28 }
 });
 // Scrollable content area (auto-added to parent with expanding policy)
 const scrollArea = await this.call(this.dep('WidgetManager'), 'createNestedScrollableVBox', {
@@ -1464,7 +2067,7 @@ const sidebar = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
 await this.call(hbox, 'updateLayoutChild', {
   widgetId: sidebar,
   sizePolicy: { horizontal: 'fixed' },
-  preferredSize: { width: 200 }
+  preferredSize: { w: 200 }
 });
 const mainArea = await this.call(this.dep('WidgetManager'), 'createNestedVBox', {
   parentLayoutId: hbox, spacing: 4
@@ -1478,7 +2081,7 @@ const { widgetIds: [tabBar] } = await this.call(this.dep('WidgetManager'), 'crea
   specs: [{ type: 'tabBar', windowId: winId, tabs: ['Tab A', 'Tab B', 'Tab C'] }]
 });
 await this.call(rootLayout, 'addLayoutChild', {
-  widgetId: tabBar, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 36 }
+  widgetId: tabBar, sizePolicy: { vertical: 'fixed' }, preferredSize: { h: 36 }
 });
 await this.call(tabBar, 'addDependent', {});
 
@@ -1507,7 +2110,7 @@ for (let i = 1; i < tabContents.length; i++) {
 
 // Add a widget to a layout at runtime:
 await this.call(layoutId, 'addLayoutChild', {
-  widgetId: newWidgetId, sizePolicy: { vertical: 'fixed' }, preferredSize: { height: 36 }
+  widgetId: newWidgetId, sizePolicy: { vertical: 'fixed' }, preferredSize: { h: 36 }
 });
 
 // Remove a widget from its layout (via WidgetManager):
@@ -1671,13 +2274,47 @@ await this.call(timerId, 'addDependent', {});
 
   // ── Factory: createWindowDirect — returns AbjectId ──────────────────
 
+  /**
+   * Normalize a window rect from a caller. Accepts `w`/`h` as aliases for
+   * `width`/`height` (the canvas draw schema uses w/h, so generated code often
+   * carries that habit over to window rects), and enforces a sane minimum so a
+   * window is never created zero-size and invisible — the failure mode where a
+   * game "works" under programmatic verification but shows no window. Missing
+   * x/y default to a cascade-friendly origin.
+   */
+  private normalizeWindowRect(rect: SizeInput | undefined): { x: number; y: number; width: number; height: number } {
+    const c = coerceRect(rect); // resolves w/h or width/height
+    // The clamp guards against the *invisible* window — a caller that gave no
+    // size (or zero, the old w/h-unresolved bug) gets a usable default. But an
+    // explicit small positive size is intentional (e.g. the 56px compact dock
+    // rail), so respect it; only enforce a tiny visible floor so nothing can be
+    // created effectively invisible. Don't bump small-but-deliberate widths up
+    // to the full default.
+    const MIN_VISIBLE = 24;
+    return {
+      x: Number.isFinite(rect?.x) ? c.x : 80,
+      y: Number.isFinite(rect?.y) ? c.y : 60,
+      width: c.width > 0 ? Math.max(c.width, MIN_VISIBLE) : 480,
+      height: c.height > 0 ? Math.max(c.height, MIN_VISIBLE) : 360,
+    };
+  }
+
   private async createWindowDirect(
     owner: AbjectId,
     title: string,
     rect: { x: number; y: number; width: number; height: number },
-    options?: { chromeless?: boolean; transparent?: boolean; resizable?: boolean; draggable?: boolean; zIndex?: number }
+    options?: { chromeless?: boolean; transparent?: boolean; resizable?: boolean; draggable?: boolean; zIndex?: number; closable?: boolean; focusOnCreate?: boolean }
   ): Promise<AbjectId> {
     require(this.uiServerId !== undefined, 'UIServer not set');
+
+    // Keep app windows clear of the left dock. The System/Spaces/Abjects rails
+    // live at x≈8..160; generated objects often request a small x (80, 100),
+    // which opens them tucked under the rails. Nudge the initial position right.
+    // Chromeless windows (the rails themselves, modal backdrops) are exempt.
+    const RESERVED_LEFT = 176;
+    if (!options?.chromeless && rect.x < RESERVED_LEFT) {
+      rect = { ...rect, x: RESERVED_LEFT };
+    }
 
     const ownerTheme = this.getThemeForOwner(owner);
     const win = new WindowAbject({
@@ -1688,6 +2325,8 @@ await this.call(timerId, 'addDependent', {});
       transparent: options?.transparent,
       resizable: options?.resizable,
       draggable: options?.draggable,
+      closable: options?.closable,
+      focusOnCreate: options?.focusOnCreate,
       zIndex: options?.zIndex ?? 100,
       theme: ownerTheme,
     });
@@ -1730,7 +2369,107 @@ await this.call(timerId, 'addDependent', {});
       } catch { /* WindowManager may not be ready */ }
     }
 
+    // Announce to dependents — decorators watch these to find new hosts.
+    this.changed('windowCreated', { windowId: win.id, ownerId: owner, title, rect: { ...rect } });
+
     return win.id;
+  }
+
+  // ── Tooltip service implementation ─────────────────────────────────
+
+  private static readonly TOOLTIP_DELAY_MS = 450;
+  private static readonly TOOLTIP_AUTO_HIDE_MS = 5000;
+  private static readonly TOOLTIP_HEIGHT = 26;
+
+  private scheduleTooltip(source: AbjectId, text: string, x: number, y: number): void {
+    if (this.tooltipShowTimer) clearTimeout(this.tooltipShowTimer);
+    // Replace any visible tooltip immediately; the new one shows after its
+    // own dwell so quick scans across buttons don't strobe tooltips.
+    void this.destroyTooltipWindow();
+    this.tooltipSource = source;
+    const generation = ++this.tooltipGeneration;
+    this.tooltipShowTimer = setTimeout(() => {
+      this.tooltipShowTimer = undefined;
+      this.showTooltipNow(generation, text, x, y).catch(() => {});
+    }, WidgetManager.TOOLTIP_DELAY_MS);
+  }
+
+  private async showTooltipNow(generation: number, text: string, x: number, y: number): Promise<void> {
+    await this.destroyTooltipWindow();
+    const theme = this.activeTheme();
+
+    // Size to the text (estimate fallback when font metrics are not loaded).
+    let textW = text.length * 7.5;
+    try {
+      const measured = await this.request<number>(
+        request(this.id, this.uiServerId!, 'measureText', { surfaceId: '', text })
+      );
+      if (typeof measured === 'number' && measured > 0) textW = measured;
+    } catch { /* keep estimate */ }
+    const h = WidgetManager.TOOLTIP_HEIGHT;
+    const w = Math.min(320, Math.ceil(textW) + 20);
+
+    // Anchor: x is the left edge, y the vertical center. Clamp on-screen.
+    let dx = Math.round(x);
+    let dy = Math.round(y - h / 2);
+    try {
+      const info = await this.request<{ width: number; height: number }>(
+        request(this.id, this.uiServerId!, 'getDisplayInfo', {})
+      );
+      if (info?.width) {
+        dx = Math.max(4, Math.min(dx, info.width - w - 4));
+        dy = Math.max(4, Math.min(dy, info.height - h - 4));
+      }
+    } catch { /* unclamped */ }
+
+    // A cancel may have landed while we awaited the measure/display
+    // round-trips; a stale show must not resurrect a dismissed tooltip.
+    if (generation !== this.tooltipGeneration) return;
+
+    const windowId = await this.createWindowDirect(this.id, 'tooltip',
+      { x: dx, y: dy, width: w, height: h },
+      { chromeless: true, draggable: false, closable: false, zIndex: 9300, focusOnCreate: false });
+    await this.createWidgetFromSpec({
+      type: 'label',
+      windowId,
+      rect: { x: 0, y: 6, width: w, height: h - 10 },
+      text,
+      style: { color: theme.textPrimary, fontSize: 12, align: 'center' },
+    });
+    if (generation !== this.tooltipGeneration) {
+      // Canceled during creation — tear the window straight back down.
+      try { await this.destroyWindowDirect(windowId); } catch { /* gone */ }
+      return;
+    }
+    this.tooltipWindowId = windowId;
+
+    // Backstop: never leave a tooltip stranded (e.g. its widget died before
+    // sending cancel).
+    if (this.tooltipHideTimer) clearTimeout(this.tooltipHideTimer);
+    this.tooltipHideTimer = setTimeout(() => { this.hideTooltip().catch(() => {}); }, WidgetManager.TOOLTIP_AUTO_HIDE_MS);
+  }
+
+  private async hideTooltip(): Promise<void> {
+    this.tooltipGeneration++;
+    if (this.tooltipShowTimer) {
+      clearTimeout(this.tooltipShowTimer);
+      this.tooltipShowTimer = undefined;
+    }
+    if (this.tooltipHideTimer) {
+      clearTimeout(this.tooltipHideTimer);
+      this.tooltipHideTimer = undefined;
+    }
+    this.tooltipSource = undefined;
+    await this.destroyTooltipWindow();
+  }
+
+  private async destroyTooltipWindow(): Promise<void> {
+    const windowId = this.tooltipWindowId;
+    if (!windowId) return;
+    this.tooltipWindowId = undefined;
+    try {
+      await this.destroyWindowDirect(windowId);
+    } catch { /* already gone */ }
   }
 
   // ── Factory: destroyWindowDirect — destroy by AbjectId ─────────────
@@ -1738,6 +2477,7 @@ await this.call(timerId, 'addDependent', {});
   private async destroyWindowDirect(windowId: AbjectId): Promise<boolean> {
     if (!this.spawnedWindows.has(windowId)) return false;
     console.debug(`[WidgetManager] destroyWindowDirect(${windowId})`);
+    const destroyedOwner = this.windowOwners.get(windowId);
 
     // Unregister from WindowManager
     if (this.windowManagerId) {
@@ -1789,6 +2529,10 @@ await this.call(timerId, 'addDependent', {});
         }
       }
     }
+
+    // Announce to dependents — decorators of this window learn their host is
+    // gone and can wait for a windowCreated to re-attach.
+    this.changed('windowDestroyed', { windowId, ownerId: destroyedOwner });
 
     return true;
   }
@@ -1871,7 +2615,9 @@ await this.call(timerId, 'addDependent', {});
     wordWrap?: boolean;
     minLines?: number;
     maxLines?: number;
+    minHeight?: number;
     monospace?: boolean;
+    readOnly?: boolean;
     checked?: boolean;
     value?: number;
     options?: string[];
@@ -1886,6 +2632,7 @@ await this.call(timerId, 'addDependent', {});
     alt?: string;
     items?: ListItem[];
     treeItems?: TreeItem[];
+    rows?: GoalRow[];
     selectedId?: string;
     searchable?: boolean;
     itemHeight?: number;
@@ -1896,6 +2643,26 @@ await this.call(timerId, 'addDependent', {});
     themeName?: string;
     previewTheme?: ThemeData;
     selected?: boolean;
+    columns?: TableColumnSpec[];
+    rowsData?: Record<string, unknown>[];
+    sortable?: boolean;
+    editable?: boolean;
+    rowHeight?: number;
+    schema?: FormSchema;
+    submitLabel?: string;
+    kind?: ChartKind;
+    series?: ChartSeriesSpec[];
+    xLabel?: string;
+    yLabel?: string;
+    showLegend?: boolean;
+    showGrid?: boolean;
+    yMin?: number;
+    yMax?: number;
+    source?: string;
+    controls?: boolean;
+    muted?: boolean;
+    loop?: boolean;
+    autoplay?: boolean;
   }): Promise<AbjectId> {
     const rect = spec.rect ?? { x: 0, y: 0, width: 0, height: 0 };
     const theme = this.getThemeForWindow(spec.windowId);
@@ -1906,6 +2673,14 @@ await this.call(timerId, 'addDependent', {});
         return this.createTypedWidget(spec.windowId, new LabelWidget({
           type: 'label', rect, text: spec.text, style: spec.style, ...base,
         }), rect);
+      case 'markdown':
+        return this.createTypedWidget(spec.windowId, new MarkdownWidget({
+          type: 'markdown', rect, text: spec.text, style: spec.style, ...base,
+        }), rect);
+      case 'contentBlock':
+        return this.createTypedWidget(spec.windowId, new ContentBlockWidget({
+          type: 'contentBlock', rect, text: spec.text, style: spec.style, ...base,
+        }), rect);
       case 'button':
         return this.createTypedWidget(spec.windowId, new ButtonWidget({
           type: 'button', rect, text: spec.text, style: spec.style, ...base,
@@ -1915,12 +2690,13 @@ await this.call(timerId, 'addDependent', {});
           type: 'textInput', rect, text: spec.text, style: spec.style,
           placeholder: spec.placeholder, masked: spec.masked,
           wordWrap: spec.wordWrap, minLines: spec.minLines, maxLines: spec.maxLines,
+          minHeight: spec.minHeight,
           ...base,
         }), rect);
       case 'textArea':
         return this.createTypedWidget(spec.windowId, new TextAreaWidget({
           type: 'textArea', rect, text: spec.text, style: spec.style,
-          monospace: spec.monospace, ...base,
+          monospace: spec.monospace, readOnly: spec.readOnly, ...base,
         }), rect);
       case 'checkbox':
         return this.createTypedWidget(spec.windowId, new CheckboxWidget({
@@ -1973,19 +2749,54 @@ await this.call(timerId, 'addDependent', {});
         } as ThemeSwatchWidgetConfig), rect);
       case 'list':
         return this.createTypedWidget(spec.windowId, new ListWidget({
-          type: 'label' as WidgetType, rect, style: spec.style,
+          type: 'list', rect, style: spec.style,
           items: spec.items, selectedIndex: spec.selectedIndex,
           searchable: spec.searchable, itemHeight: spec.itemHeight, ...base,
         }), rect);
       case 'tree':
         return this.createTypedWidget(spec.windowId, new TreeWidget({
-          type: 'label' as WidgetType, rect, style: spec.style,
+          type: 'tree', rect, style: spec.style,
           items: spec.treeItems, selectedId: spec.selectedId,
           itemHeight: spec.itemHeight, ...base,
         }), rect);
+      case 'goalProgress':
+        return this.createTypedWidget(spec.windowId, new GoalProgressWidget({
+          type: 'goalProgress', rect, style: spec.style,
+          rows: spec.rows, ...base,
+        }), rect);
+      case 'table':
+        return this.createTypedWidget(spec.windowId, new TableWidget({
+          type: 'table', rect, style: spec.style,
+          columns: spec.columns, rowsData: spec.rowsData,
+          sortable: spec.sortable, editable: spec.editable,
+          rowHeight: spec.rowHeight, ...base,
+        }), rect);
+      case 'form':
+        return this.createTypedWidget(spec.windowId, new FormWidget({
+          ownerId: spec.windowId, uiServerId: this.uiServerId!, theme,
+          schema: spec.schema, submitLabel: spec.submitLabel,
+        }), rect);
+      case 'chart':
+        return this.createTypedWidget(spec.windowId, new ChartWidget({
+          type: 'chart', rect, style: spec.style,
+          kind: spec.kind, series: spec.series,
+          xLabel: spec.xLabel, yLabel: spec.yLabel,
+          showLegend: spec.showLegend, showGrid: spec.showGrid,
+          yMin: spec.yMin, yMax: spec.yMax, ...base,
+        }), rect);
+      case 'video':
+        require(typeof spec.source === 'string' && spec.source.length > 0,
+          'video spec requires source (URL, data:/abject:// reference, or a captured streamId)');
+        return this.createTypedWidget(spec.windowId, new VideoWidget({
+          type: 'video', rect, style: spec.style,
+          source: spec.source!,
+          controls: spec.controls, muted: spec.muted,
+          loop: spec.loop, autoplay: spec.autoplay,
+          ...base,
+        }), rect);
       case 'splitPane':
         return this.createTypedWidget(spec.windowId, new SplitPaneWidget({
-          type: 'label' as WidgetType, rect, style: spec.style,
+          type: 'splitPane', rect, style: spec.style,
           orientation: spec.orientation, dividerPosition: spec.dividerPosition,
           minSize: spec.minSize, ...base,
         }), rect);
@@ -2081,6 +2892,7 @@ await this.call(timerId, 'addDependent', {});
       selectedIndex?: number;
       placeholder?: string;
       monospace?: boolean;
+      readOnly?: boolean;
       masked?: boolean;
       tabs?: string[];
       closable?: boolean;
@@ -2117,6 +2929,9 @@ await this.call(timerId, 'addDependent', {});
       case 'label':
         widget = new LabelWidget(baseConfig);
         break;
+      case 'markdown':
+        widget = new MarkdownWidget(baseConfig);
+        break;
       case 'button':
         widget = new ButtonWidget(baseConfig);
         break;
@@ -2131,6 +2946,7 @@ await this.call(timerId, 'addDependent', {});
         widget = new TextAreaWidget({
           ...baseConfig,
           monospace: config.monospace,
+          readOnly: config.readOnly,
         } as TextAreaWidgetConfig);
         break;
       case 'checkbox':

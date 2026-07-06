@@ -133,6 +133,23 @@ export interface AbjectManifest {
   requiredCapabilities: CapabilityRequest[];
   providedCapabilities?: CapabilityId[];
   tags?: string[];
+  /**
+   * Optional display glyph (a single emoji or character) shown next to the
+   * object's name in launchers like the Abjects rail. Objects without one fall
+   * back to a default icon, so older manifests keep working unchanged.
+   */
+  icon?: string;
+  /**
+   * Prototype lineage. Instances are prototypes (Self-style): cloning a live
+   * object records where the copy came from and how many clone hops separate
+   * it from its original ancestor. Absent on objects that were never cloned.
+   */
+  lineage?: {
+    /** typeId (preferred) or AbjectId of the object this was cloned from. */
+    clonedFrom: string;
+    /** 1 for a clone of an original, parent.generation + 1 otherwise. */
+    generation: number;
+  };
 }
 
 // =============================================================================
@@ -224,7 +241,15 @@ export interface DiscoveryQuery {
 
 export interface SpawnRequest {
   manifest: AbjectManifest;
+  /** Raw WASM module bytes; hashed into the module store at spawn time. */
   code?: ArrayBuffer;
+  /** WASM module bytes as base64 — the message-passing-friendly form of `code`. */
+  codeBase64?: string;
+  /**
+   * Behavior source. JS handler-map source for ScriptableAbjects, a JSON
+   * OrganismSpec for Organisms (with the 'organism' tag), or a wasm source
+   * ref (`wasm:sha256:<hex>`) for WasmAbjects.
+   */
   source?: string;
   owner?: AbjectId;
   initialState?: unknown;
@@ -243,23 +268,4 @@ export interface SpawnResult {
   status: AbjectStatus;
 }
 
-// =============================================================================
-// WASM Types
-// =============================================================================
-
-export interface WasmObjectExports {
-  init: (statePtr: number, stateLen: number) => void;
-  handle: (msgPtr: number, msgLen: number) => number;
-  manifest: () => number;
-  memory: WebAssembly.Memory;
-  alloc?: (size: number) => number;
-  dealloc?: (ptr: number, size: number) => void;
-}
-
-export interface WasmImports {
-  abjects: {
-    send: (msgPtr: number, msgLen: number) => void;
-    log: (level: number, msgPtr: number, msgLen: number) => void;
-    get_time: () => number;
-  };
-}
+// WASM abject ABI types live in src/sandbox/wasm-abi.ts (see docs/WASM_ABI.md).

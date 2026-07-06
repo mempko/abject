@@ -72,8 +72,9 @@ export function parseSkillMd(content: string, dirName: string): ParsedSkill {
   if (metadata && typeof metadata === 'object') {
     const m = metadata as Record<string, unknown>;
 
-    // OpenClaw: metadata.openclaw.requires.env (array of strings)
-    const ocMetadata = m.openclaw;
+    // OpenClaw: metadata.openclaw.requires.{bins,env}. "clawdbot" is the same
+    // ecosystem under a different brand name, so accept it as an alias.
+    const ocMetadata = m.openclaw ?? m.clawdbot;
     if (ocMetadata && typeof ocMetadata === 'object') {
       const oc = ocMetadata as Record<string, unknown>;
       const requires = oc.requires;
@@ -90,28 +91,13 @@ export function parseSkillMd(content: string, dirName: string): ParsedSkill {
 
     // Direct: metadata.env (object with env var names as keys)
     // e.g. env.GMAIL_EMAIL: "user@gmail.com" or env.THETAEDGE_API_KEY: { required: true }
-    const envObj = m.env;
-    if (envObj && typeof envObj === 'object' && !Array.isArray(envObj)) {
-      const envRecord = envObj as Record<string, unknown>;
-      const envNames = Object.keys(envRecord);
-      if (envNames.length > 0) {
-        const existing = new Set(result.requiredEnv ?? []);
-        const defaults: Record<string, string> = {};
-        for (const name of envNames) {
-          existing.add(name);
-          // Extract default values (string values in the env block)
-          const val = envRecord[name];
-          if (typeof val === 'string' && val.length > 0) {
-            defaults[name] = val;
-          }
-        }
-        result.requiredEnv = [...existing];
-        if (Object.keys(defaults).length > 0) {
-          result.defaultEnv = defaults;
-        }
-      }
-    }
+    mergeEnvBlock(result, m.env);
   }
+
+  // Top-level `env:` block (the documented MCP-skill format). Handled outside the
+  // metadata branch so MCP skills that follow the documented frontmatter actually
+  // seed their config, not just skills that nest env under metadata.
+  mergeEnvBlock(result, frontmatter.env);
 
   // Detect MCP server type
   const mcpCommand = frontmatter['mcp-command'];
@@ -137,16 +123,43 @@ export function parseSkillMd(content: string, dirName: string): ParsedSkill {
 }
 
 /**
+ * Merge an `env:` frontmatter block (object of env var names → optional default
+ * values) into the parse result, accumulating required env names and string
+ * default values. Safe to call multiple times (e.g. metadata.env then top-level
+ * env); later string defaults win.
+ */
+function mergeEnvBlock(result: ParsedSkill, envObj: unknown): void {
+  if (!envObj || typeof envObj !== 'object' || Array.isArray(envObj)) return;
+  const envRecord = envObj as Record<string, unknown>;
+  const envNames = Object.keys(envRecord);
+  if (envNames.length === 0) return;
+
+  const existing = new Set(result.requiredEnv ?? []);
+  const defaults: Record<string, string> = { ...(result.defaultEnv ?? {}) };
+  for (const name of envNames) {
+    existing.add(name);
+    const val = envRecord[name];
+    if (typeof val === 'string' && val.length > 0) {
+      defaults[name] = val;
+    }
+  }
+  result.requiredEnv = [...existing];
+  if (Object.keys(defaults).length > 0) {
+    result.defaultEnv = defaults;
+  }
+}
+
+/**
  * Detect which ecosystem a skill comes from based on frontmatter fields.
  */
 function detectSource(fm: Record<string, unknown>): 'claude-code' | 'openclaw' | 'mcp' | 'unknown' {
   // MCP server: has mcp-command or type: mcp
   if ('mcp-command' in fm || fm.type === 'mcp') return 'mcp';
 
-  // OpenClaw: has metadata.openclaw
+  // OpenClaw / clawdbot: has metadata.openclaw (or the clawdbot brand alias)
   if (fm.metadata && typeof fm.metadata === 'object') {
     const m = fm.metadata as Record<string, unknown>;
-    if ('openclaw' in m) return 'openclaw';
+    if ('openclaw' in m || 'clawdbot' in m) return 'openclaw';
   }
 
   // Claude Code: has any of these fields

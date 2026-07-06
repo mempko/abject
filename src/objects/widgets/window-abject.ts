@@ -11,15 +11,18 @@ import {
   AbjectMessage,
 } from '../../core/types.js';
 import { Abject } from '../../core/abject.js';
+import { require as contractRequire } from '../../core/contracts.js';
 import { request, event } from '../../core/message.js';
 import {
   Rect,
   ThemeData,
-  MIDNIGHT_BLOOM,
+  ARCANE_GRIMOIRE,
   WINDOW_INTERFACE,
   TITLE_BAR_HEIGHT,
   TITLE_FONT,
   lightenColor,
+  withAlpha,
+  gradientRect,
 } from './widget-types.js';
 import { iconCommands } from '../../ui/icons.js';
 import { Tween, shimmer as motionShimmer } from '../../ui/motion.js';
@@ -34,6 +37,14 @@ export interface WindowConfig {
   draggable?: boolean;
   zIndex?: number;
   theme?: ThemeData;
+  /** Whether the mobile card overview may close this window (default true). */
+  closable?: boolean;
+  /**
+   * Whether the window grabs focus when created (default true). Passive
+   * popups (tooltips) must not steal focus — the focus loss would send a
+   * mouseleave to the hovered widget that summoned them.
+   */
+  focusOnCreate?: boolean;
 }
 
 /**
@@ -46,8 +57,11 @@ export class WindowAbject extends Abject {
   private rect: Rect;
   private chromeless: boolean;
   private transparent: boolean;
+  private closable: boolean;
+  private focusOnCreate: boolean;
   private resizable: boolean;
   private draggable: boolean;
+  private maximized = false;
   private zIndex: number;
   protected override theme: ThemeData;
 
@@ -77,7 +91,7 @@ export class WindowAbject extends Abject {
     super({
       manifest: {
         name: 'Window',
-        description: 'Composite window morph — owns surface, contains child widgets',
+        description: 'Composite window morph — owns surface, contains child widgets. The window is a slab in the desktop\'s native 3D scene: scene({ ops }) attaches retained 3D meshes/lights to it, setSlabTransform tilts/floats it.',
         version: '1.0.0',
         interface: {
             id: WINDOW_INTERFACE,
@@ -116,6 +130,12 @@ export class WindowAbject extends Abject {
                 returns: { kind: 'reference', reference: 'Rect' },
               },
               {
+                name: 'getTitle',
+                description: 'Get window title',
+                parameters: [],
+                returns: { kind: 'primitive', primitive: 'string' },
+              },
+              {
                 name: 'destroy',
                 description: 'Destroy this window and all children',
                 parameters: [],
@@ -128,6 +148,23 @@ export class WindowAbject extends Abject {
                   { name: 'widgetId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId of the widget to focus' },
                   { name: 'parentChildId', type: { kind: 'primitive', primitive: 'string' }, description: 'The window\'s direct child (e.g. layout) that contains widgetId. Defaults to widgetId.', optional: true },
                   { name: 'via', type: { kind: 'primitive', primitive: 'string' }, description: '"keyboard" | "mouse"', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'scene',
+                description: 'Apply retained 3D scene ops to this window\'s subtree. The window is a slab in a 3D scene; mesh/light/group nodes attach to it and travel with it. ANY abject may call this — you do not need to own the window. Decorations from other abjects route their nodeInput back to the contributor and tear down when the contributor dies (prefix your node ids to avoid collisions). Ops: { op: "add"|"update"|"remove"|"animate", id, parentId?, kind: "mesh"|"light"|"group"|"environment", transform: { position?: [x,y,z] px from window center (+z toward viewer, y-DOWN), rotation?: [rx,ry,rz] radians, scale?: n|[x,y,z] }, params }. Mesh params: { primitive: "plane"|"box"|"sphere"|"cylinder"|"cone"|"torus"|"icosphere", color, emissive?, opacity?, metalness?(0..1), roughness?(0..1), texture?(url|dataURI|"surface:<id>"), billboard?, drawMode?("triangles"|"lines"|"points"), pointSize?, occlude?(default true: clipped to the window & below the title bar; false = draw on top / pop out), instances?:[{position,scale?,rotation?,color?},...](draw the mesh many times in one call — particles/fields) } for a built-in shape, OR { geometry: { positions:[x,y,z,...], indices?:[...], normals?:[...], colors?:[r,g,b,...](0..1 per vertex), uvs?:[u,v,...] }, color, ... } for an arbitrary polygonal mesh (re-send geometry in an "update" op to deform it every frame). Light params: { lightType: "point"|"directional"|"spot", color?, intensity?, direction?, range?, angle?, penumbra?, castShadow?(directional — meshes cast shadows on each other) }. Environment params (scene mood): { ambient?, fog?: { color?, near, far }, bloom?: true|{ threshold?, intensity? } (glow on bright/emissive meshes) }. ANIMATE (client-side, one op instead of per-frame updates): { op:"animate", id, params: { preset?:"spin"|"orbit"|"bob"|"pulse", channel?:"position"|"rotation"|"scale"|"color"|"emissive"|"opacity", to?, from?, duration?, easing?, loop?, yoyo?, delay?, path?:[[x,y,z],...], stop?:true } }. Colors accept "#hex" or theme tokens like "$accent". Nodes are RETAINED until removed. OCCLUSION: window 3D children are clipped to the window and sit below the title bar by default (set params.occlude:false to pop out / draw on top). INHERITANCE: children inherit a parent group\'s material params (color, opacity, metalness, roughness, texture, occlude, castShadow, ...) unless they set their own.',
+                parameters: [
+                  { name: 'ops', type: { kind: 'array', elementType: { kind: 'reference', reference: 'SceneOp' } }, description: 'Scene operations (invalid batches rejected with the vocabulary)' },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
+                name: 'setSlabTransform',
+                description: 'Tilt or float this window\'s slab in the 3D scene (visual only — input picking follows automatically).',
+                parameters: [
+                  { name: 'rotation', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'number' } }, description: 'Euler radians [rx, ry, rz]', optional: true },
+                  { name: 'z', type: { kind: 'primitive', primitive: 'number' }, description: 'Lift toward the viewer in px', optional: true },
                 ],
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
@@ -154,6 +191,11 @@ export class WindowAbject extends Abject {
                 payload: { kind: 'object', properties: {} },
               },
               {
+                name: 'windowHelpRequested',
+                description: 'Help (?) button was clicked — owner should reveal the object inspector',
+                payload: { kind: 'object', properties: {} },
+              },
+              {
                 name: 'windowRestored',
                 description: 'Window was restored from minimized state',
                 payload: { kind: 'object', properties: {} },
@@ -171,10 +213,12 @@ export class WindowAbject extends Abject {
     this.rect = { ...config.rect };
     this.chromeless = config.chromeless ?? false;
     this.transparent = config.transparent ?? false;
+    this.closable = config.closable ?? true;
+    this.focusOnCreate = config.focusOnCreate ?? true;
     this.resizable = config.resizable ?? false;
     this.draggable = config.draggable ?? false;
     this.zIndex = config.zIndex ?? 100;
-    this.theme = config.theme ?? MIDNIGHT_BLOOM;
+    this.theme = config.theme ?? ARCANE_GRIMOIRE;
 
     this.setupHandlers();
   }
@@ -234,7 +278,43 @@ export class WindowAbject extends Abject {
     });
 
     this.on('getRect', async () => {
-      return { ...this.rect };
+      // w/h are canonical across the UI; width/height kept for compatibility.
+      return { ...this.rect, w: this.rect.width, h: this.rect.height };
+    });
+
+    this.on('getTitle', async () => {
+      return this.title;
+    });
+
+    // Input on a 3D node in this window's subtree: forward to the window's
+    // owner via the dependent chain (WidgetManager relays 'nodeInput'),
+    // mirroring how widget clicks reach owners.
+    this.on('nodeInput', async (msg: AbjectMessage) => {
+      this.changed('nodeInput', msg.payload);
+      return true;
+    });
+
+    // ── 3D scene: the window owns its surface, so it fronts the scene
+    // vocabulary for its owner AND for decorators — any abject may attach
+    // nodes to this window's subtree. The caller's identity rides along so
+    // UIServer routes the nodes' input back to the contributor and tears the
+    // nodes down if the contributor dies.
+    this.on('scene', async (msg: AbjectMessage) => {
+      const { ops } = msg.payload as { ops: unknown[] };
+      contractRequire(this.surfaceId !== undefined, 'scene: window has no surface yet');
+      return this.request<boolean>(
+        request(this.id, this.uiServerId, 'scene', {
+          surfaceId: this.surfaceId, ops, contributorId: msg.routing.from,
+        })
+      );
+    });
+
+    this.on('setSlabTransform', async (msg: AbjectMessage) => {
+      const { rotation, z } = msg.payload as { rotation?: [number, number, number]; z?: number };
+      contractRequire(this.surfaceId !== undefined, 'setSlabTransform: window has no surface yet');
+      return this.request<boolean>(
+        request(this.id, this.uiServerId, 'setSurfaceTransform', { surfaceId: this.surfaceId, rotation, z })
+      );
     });
 
     this.on('destroy', async () => {
@@ -270,6 +350,36 @@ export class WindowAbject extends Abject {
       await this.handleInputEvent(inputEvent);
     });
 
+    // Owner (e.g. Chat) asks to open a native file picker for this window's
+    // surface. The chosen file comes back as a 'fileUploaded' event below.
+    this.on('openFilePicker', async (msg: AbjectMessage) => {
+      const { accept, multiple } = msg.payload as { accept?: string; multiple?: boolean };
+      if (this.surfaceId) {
+        this.send(request(this.id, this.uiServerId, 'openFilePicker', {
+          surfaceId: this.surfaceId, accept, multiple,
+        }));
+      }
+      return true;
+    });
+
+    // A file picked or dropped onto this window arrives from UIServer (the
+    // surface owner). Re-emit it to the window's owner via the dependency
+    // protocol (WidgetManager forwards 'fileUploaded' to the owner).
+    this.on('fileUploaded', async (msg: AbjectMessage) => {
+      const payload = msg.payload as { name: string; mimeType: string; base64: string; toFocusedWidget?: boolean };
+      // An image pasted into a focused child (e.g. a text input) is delivered
+      // straight to that widget so it can accept the attachment, rather than
+      // bubbling to the window's owner like a picked/dropped file.
+      if (payload.toFocusedWidget && this.focusedChildId) {
+        this.send(event(this.id, this.focusedChildId, 'fileUploaded', {
+          name: payload.name, mimeType: payload.mimeType, base64: payload.base64,
+        }));
+        return true;
+      }
+      this.changed('fileUploaded', payload);
+      return true;
+    });
+
     // Child dirty notification — schedule a frame render
     this.on('childDirty', async () => {
       if (this.destroying) return;
@@ -293,11 +403,10 @@ export class WindowAbject extends Abject {
       const { focused } = msg.payload as { surfaceId: string; focused: boolean };
       this.windowFocused = focused;
 
-      if (focused) {
-        this.startShimmer();
-      } else {
-        this.stopShimmer();
-      }
+      // Focus is shown with a static accent border + a soft compositor halo,
+      // so no continuous shimmer animation is needed (avoids repainting the
+      // focused window every frame). Cancel any legacy tween.
+      this.stopShimmer();
 
       // When window loses focus, send mouseleave to hovered child so it
       // clears hover highlight (the mouse may never
@@ -337,8 +446,18 @@ export class WindowAbject extends Abject {
         this.changed('windowCloseRequested', {});
       } else if (action === 'minimize') {
         this.changed('windowMinimized', {});
+      } else if (action === 'help') {
+        this.changed('windowHelpRequested', {});
       } else if (action === 'restore') {
         this.changed('windowRestored', {});
+        this.scheduleFrame();
+      } else if (action === 'maximize') {
+        this.maximized = true;
+        this.changed('windowMaximized', {});
+        this.scheduleFrame();
+      } else if (action === 'unmaximize') {
+        this.maximized = false;
+        this.changed('windowUnmaximized', {});
         this.scheduleFrame();
       }
     });
@@ -373,6 +492,11 @@ export class WindowAbject extends Abject {
     });
   }
 
+  // Window lifecycle/API (create, layout, close/reopen) agents build against.
+  protected override askTier(): 'smart' | 'balanced' | 'fast' {
+    return 'balanced';
+  }
+
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## WindowAbject Usage Guide
 
@@ -389,6 +513,8 @@ WindowAbject translates these into dependency-protocol events:
 - action: 'close'   → emits 'windowCloseRequested' to dependents
 - action: 'minimize' → emits 'windowMinimized' to dependents
 - action: 'restore'  → emits 'windowRestored' to dependents, then re-renders
+- action: 'maximize'  → marks maximized (renders restore glyph), emits 'windowMaximized'
+- action: 'unmaximize' → clears maximized (renders maximize glyph), emits 'windowUnmaximized'
 
 ### Event Flow
 
@@ -409,9 +535,60 @@ method calls on 'abjects:widgets' interface:
     await this.hide();
   });
 
+### 3D Scene
+
+The window is a slab in a 3D desktop. Attach retained 3D nodes to it:
+
+  await this.call(windowId, 'scene', { ops: [
+    { op: 'add', id: 'orb', kind: 'mesh',
+      transform: { position: [0, 0, 40], scale: 30 },
+      params: { primitive: 'sphere', color: '$accent' } },
+  ] });
+
+Kinds: mesh (primitive: plane|box|sphere|cylinder), light (lightType:
+point|directional), group. Positions are px from the window center
+(+z toward the viewer); colors take '#hex' or theme tokens ('$accent', ...).
+A mesh can carry CUSTOM polygons instead of a primitive for arbitrary or
+deformable surfaces (waves, terrain, generated shapes): params { geometry:
+{ positions: [x,y,z, ...], indices?: [...], normals?: [...], colors?: [r,g,b,...]
+(0..1 per vertex), uvs?: [u,v,...] }, color }. Re-send geometry in an 'update'
+op each tick to deform it (buffers reuse, so per-frame morphing is cheap).
+Primitives: plane, box, sphere, cylinder, cone, torus, icosphere. Material
+params: metalness/roughness (0..1, PBR), emissive (glow), texture (url|dataURI|
+'surface:<id>'), billboard (face camera), drawMode 'points'|'lines' + pointSize.
+Lights: lightType 'point'|'directional'|'spot' with color, intensity, range,
+angle, penumbra. A kind:'environment' node sets { ambient, fog:{color,near,far} (near/far = depth in px behind the content, small e.g. 0..400), bloom }.
+ANIMATE without per-frame messages: { op:'animate', id, params:{ preset:'spin'|
+'orbit'|'bob'|'pulse' } } or { channel:'position'|'rotation'|'scale'|'color'|
+'emissive'|'opacity', to, duration, easing?, loop?, yoyo?, path? }; stop with
+{ stop:true }.
+COORDINATES ARE Y-DOWN (screen convention): +y moves DOWN, the same
+direction as input y — mouse deltas map onto positions with no sign flips.
+Nodes persist until { op: 'remove', id }. Tilt/float the window itself:
+\`call(windowId, 'setSlabTransform', { rotation: [0, 0.1, 0], z: 20 })\`.
+Meshes are DECORATIVE BY DEFAULT and pass clicks through to the widgets/
+canvas beneath them. Add interactive:true to a mesh's params to make it an
+input target; then the window's owner receives 'nodeInput'
+events — payload { type, nodeId, x, y, key?, code?, button?, windowId }
+where type is mousedown|mouseup|mousemove|mouseenter|mouseleave|focus|blur|
+keydown|keyup. Clicking an interactive mesh selects it; keyboard routes to it
+until the user clicks elsewhere. Drag capture is built in: after mousedown on a mesh,
+mousemove streams to it until mouseup — drag = position [startX + dx,
+startY + dy, z], both axes same sign.
+DECORATING: you may attach scene nodes to a window you do NOT own — find it
+via WidgetManager listWindows, then call its 'scene' with your nodes. Your
+nodes' nodeInput events come back to YOU (windowId in the payload), and they
+tear down automatically if your abject dies. Prefix node ids with your name
+to avoid colliding with the window owner's nodes. Decoration nodes ride the
+slab — they follow drags, resizes, hide/show with zero tracking code (the
+top edge is y = -height/2 from center; recompute it on the window's
+windowResized event via addDependent). For host open/close, observe
+WidgetManager's windowCreated/windowDestroyed changed-events and re-attach
+by re-matching title/owner.
+
 ### Interface ID
 
-'abjects:window' — for addChild, removeChild, setTitle, getRect, destroy`;
+'abjects:window' — for addChild, removeChild, setTitle, getRect, destroy, scene, setSlabTransform`;
   }
 
   protected async onInit(): Promise<void> {
@@ -420,6 +597,8 @@ method calls on 'abjects:widgets' interface:
       request(this.id, this.uiServerId, 'createSurface', {
         rect: this.rect,
         zIndex: this.zIndex,
+        transparent: this.transparent,
+        closable: this.closable,
       })
     );
     // Forward title to frontend for mobile tab bar
@@ -427,11 +606,17 @@ method calls on 'abjects:widgets' interface:
       surfaceId: this.surfaceId,
       title: this.title,
     }));
-    await this.request<boolean>(
-      request(this.id, this.uiServerId, 'focus', {
-        surfaceId: this.surfaceId,
-      })
-    );
+    if (this.focusOnCreate) {
+      await this.request<boolean>(
+        request(this.id, this.uiServerId, 'focus', {
+          surfaceId: this.surfaceId,
+          // Accent + corner radius for the compositor's focus-glow halo so it
+          // matches the theme and the window silhouette.
+          glowColor: this.theme.accent,
+          glowRadius: this.theme.windowRadius,
+        })
+      );
+    }
     await this.renderWindow();
   }
 
@@ -524,7 +709,9 @@ method calls on 'abjects:widgets' interface:
       });
       commands.push({ type: 'restore', surfaceId: sid, params: {} });
 
-      // Window background (drawn without shadow)
+      // Window background with its single neutral border. Focus is signalled by
+      // the compositor's accent glow halo (drawn behind the window), so there is
+      // no separate accent border line — that would just duplicate the glow.
       commands.push({
         type: 'rect',
         surfaceId: sid,
@@ -542,57 +729,45 @@ method calls on 'abjects:widgets' interface:
       });
       commands.push({ type: 'restore', surfaceId: sid, params: {} });
 
-      // Accent border — fades when not focused (de-saturation = unfocused signal)
-      const borderAlpha = focused ? 0.22 : 0.06;
-      commands.push({
-        type: 'rect',
-        surfaceId: sid,
-        params: { x: 0, y: 0, width: w, height: h, stroke: `rgba(57, 255, 142, ${borderAlpha})`, radius: this.theme.windowRadius },
-      });
+
     }
 
     if (!this.chromeless) {
-      // Title bar — flat fill (the accent line below carries the visual weight,
-      // so the bar itself stays quiet to avoid competing).
-      commands.push({
-        type: 'rect',
-        surfaceId: sid,
-        params: { x: 0, y: 0, width: w, height: tbh, fill: this.theme.titleBarBg, radius: this.theme.windowRadius },
-      });
-      commands.push({
-        type: 'rect',
-        surfaceId: sid,
-        params: { x: 0, y: tbh - 6, width: w, height: 6, fill: this.theme.titleBarBg },
-      });
+      // Title bar — top corners rounded to match the window shell, flat
+      // bottom edge, with a barely-there vertical gradient lighting the bar
+      // from above. The accent line below carries the visual weight, so the
+      // bar itself stays quiet to avoid competing.
+      commands.push(...gradientRect(sid, {
+        x: 0, y: 0, width: w, height: tbh,
+        radii: [this.theme.windowRadius, this.theme.windowRadius, 0, 0],
+        gradient: { x0: 0, y0: 0, x1: 0, y1: tbh, stops: [
+          { offset: 0, color: lightenColor(this.theme.titleBarBg, 6 * tokens.surface.gradient) },
+          { offset: 1, color: this.theme.titleBarBg },
+        ] },
+      }));
 
-      // Title text — accent glow when focused, desaturated when not (Von Restorff)
+      // Title text — accent glow when focused, desaturated when not (Von
+      // Restorff). A touch of letter spacing gives the title a deliberate,
+      // engraved feel.
       const titleColor = focused ? this.theme.textPrimary : this.theme.textSecondary;
+      commands.push({ type: 'save', surfaceId: sid, params: {} });
+      commands.push({ type: 'letterSpacing', surfaceId: sid, params: { value: '0.4px' } });
       if (focused) {
-        commands.push({ type: 'save', surfaceId: sid, params: {} });
         commands.push({
           type: 'shadow',
           surfaceId: sid,
           params: { color: tokens.glow.accent.color, blur: tokens.glow.accent.blur },
         });
-        commands.push({
-          type: 'text',
-          surfaceId: sid,
-          params: {
-            x: 14, y: tbh / 2,
-            text: this.title, font: TITLE_FONT, fill: titleColor, baseline: 'middle',
-          },
-        });
-        commands.push({ type: 'restore', surfaceId: sid, params: {} });
-      } else {
-        commands.push({
-          type: 'text',
-          surfaceId: sid,
-          params: {
-            x: 14, y: tbh / 2,
-            text: this.title, font: TITLE_FONT, fill: titleColor, baseline: 'middle',
-          },
-        });
       }
+      commands.push({
+        type: 'text',
+        surfaceId: sid,
+        params: {
+          x: 14, y: tbh / 2,
+          text: this.title, font: TITLE_FONT, fill: titleColor, baseline: 'middle',
+        },
+      });
+      commands.push({ type: 'restore', surfaceId: sid, params: {} });
 
       // Close and minimize buttons — vector icons in 24×24 hit boxes (Fitts).
       // Hovered button gets a faint accent-colored backplate.
@@ -601,11 +776,13 @@ method calls on 'abjects:widgets' interface:
       const iconSize = this.theme.titleButtonIconSize;
 
       const closeCx = w - btnMargin - btnSize / 2;
-      const minCx = closeCx - btnSize - btnMargin;
+      const maxCx = closeCx - btnSize - btnMargin;
+      const minCx = maxCx - btnSize - btnMargin;
+      const helpCx = minCx - btnSize - btnMargin;
       const cy = tbh / 2;
 
       const iconColor = focused ? this.theme.textSecondary : this.theme.textTertiary;
-      const drawButton = (cx: number, kind: 'close' | 'minimize') => {
+      const drawButton = (cx: number, kind: 'close' | 'minimize' | 'maximize' | 'restore' | 'help') => {
         commands.push(...iconCommands(kind, {
           surfaceId: sid,
           x: cx - iconSize / 2,
@@ -615,73 +792,33 @@ method calls on 'abjects:widgets' interface:
         }));
       };
 
+      // Left to right: help (?), minimize, maximize/restore, close. Close stays
+      // anchored to the right corner; the maximize button swaps to a "restore"
+      // glyph (overlapping squares) once the window is maximized.
+      drawButton(helpCx, 'help');
       drawButton(minCx, 'minimize');
+      drawButton(maxCx, this.maximized ? 'restore' : 'maximize');
       drawButton(closeCx, 'close');
 
-      // Signature accent line — *the* iconic element of every window.
-      // Focused: full-width gradient (accent → soft → accent) plus a moving
-      //   shimmer highlight that traces left → right. The shimmer is what makes
-      //   the focused window feel "alive" without distracting motion elsewhere.
-      // Unfocused: a single hairline at divider color, no glow.
+      // Title-bar divider — a single quiet hairline separating the title bar
+      // from content. Focus is carried by the accent border + compositor halo,
+      // so this stays calm: a faint accent tint when focused, plain divider when
+      // not (no bright bar, no glow).
       const lineY = tbh;
-      if (focused) {
-        commands.push({ type: 'save', surfaceId: sid, params: {} });
-        commands.push({
-          type: 'shadow',
-          surfaceId: sid,
-          params: { color: tokens.glow.focus.color, blur: tokens.glow.focus.blur, offsetY: 0 },
-        });
-        commands.push({
-          type: 'linearGradient',
-          surfaceId: sid,
-          params: {
-            x0: 0, y0: lineY, x1: w, y1: lineY,
-            stops: [
-              { offset: 0,    color: 'rgba(57, 255, 142, 0.10)' },
-              { offset: 0.5,  color: 'rgba(57, 255, 142, 0.95)' },
-              { offset: 1,    color: 'rgba(57, 255, 142, 0.10)' },
-            ],
-          },
-        });
-        commands.push({
-          type: 'rect',
-          surfaceId: sid,
-          params: { x: 0, y: lineY - 1, width: w, height: 2 },
-        });
-        commands.push({ type: 'restore', surfaceId: sid, params: {} });
-
-        // Shimmer highlight: a small bright spot travelling along the line.
-        // Width is 18% of the window; centered on shimmerPos × w.
-        const shimmerW = Math.max(80, w * 0.18);
-        const shimmerCx = this.shimmerPos * (w + shimmerW) - shimmerW / 2;
-        commands.push({ type: 'save', surfaceId: sid, params: {} });
-        commands.push({
-          type: 'linearGradient',
-          surfaceId: sid,
-          params: {
-            x0: shimmerCx - shimmerW / 2, y0: lineY,
-            x1: shimmerCx + shimmerW / 2, y1: lineY,
-            stops: [
-              { offset: 0,   color: 'rgba(255, 255, 255, 0)' },
-              { offset: 0.5, color: 'rgba(255, 255, 255, 0.8)' },
-              { offset: 1,   color: 'rgba(255, 255, 255, 0)' },
-            ],
-          },
-        });
-        commands.push({
-          type: 'rect',
-          surfaceId: sid,
-          params: { x: shimmerCx - shimmerW / 2, y: lineY - 1, width: shimmerW, height: 2 },
-        });
-        commands.push({ type: 'restore', surfaceId: sid, params: {} });
-      } else {
-        commands.push({
-          type: 'line',
-          surfaceId: sid,
-          params: { x1: 0, y1: lineY, x2: w, y2: lineY, stroke: this.theme.divider, lineWidth: 1 },
-        });
-      }
+      commands.push({
+        type: 'line',
+        surfaceId: sid,
+        params: {
+          x1: 0, y1: lineY, x2: w, y2: lineY,
+          stroke: focused ? withAlpha(this.theme.accent, 0.28) : this.theme.divider,
+          lineWidth: 1,
+        },
+      });
     }
+
+    // (Focused-window outer glow halo is drawn by the compositor behind the
+    // window — see Compositor.drawFocusGlow — so it can extend beyond the window
+    // edges without being clipped by the window surface or covered by content.)
 
     // Resize grip — vector icon in the bottom-right corner
     if (this.resizable) {
@@ -695,10 +832,6 @@ method calls on 'abjects:widgets' interface:
         lineWidth: 1.25,
       }));
     }
-
-    // Suppress unused-import warning for legacy lightenColor (kept for callers
-    // that still import it via this module).
-    void lightenColor;
 
     // Render children in parallel — request draw commands from each child widget (Morphic drawOn:)
     const childResults = await Promise.all(
@@ -1011,6 +1144,12 @@ method calls on 'abjects:widgets' interface:
           // toasts). Esc dismisses them by reusing the existing close path,
           // which WidgetManager forwards to the window's owner.
           this.changed('windowCloseRequested', {});
+        } else {
+          // Bubble any other unhandled key to the window's owner so it can
+          // implement app-level keyboard navigation (e.g. the command palette
+          // moving its selection with the arrow keys). Owners that don't
+          // register a 'keyUnhandled' handler simply ignore it.
+          this.changed('keyUnhandled', { key: e.key, code: e.code, modifiers: e.modifiers });
         }
       }
     } catch {

@@ -7,7 +7,7 @@
     <title>Abject</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Spectral:wght@400;500;600&family=Spline+Sans+Mono:wght@400;600&display=swap" rel="stylesheet">
     <style>
       * {
         margin: 0;
@@ -18,10 +18,11 @@
         width: 100%;
         height: 100%;
         overflow: hidden;
-        background: #030308;
-        font-family: "Inter", system-ui, -apple-system, sans-serif;
+        background: #05060a;
+        font-family: "Spectral", Georgia, "Times New Roman", serif;
       }
-      /* Abyss background layers — hidden until landing */
+      /* Abyss background layers — sigil blooms rising from the void, hidden
+         until landing. Tinted to the Arcane Grimoire rune-green + violet. */
       body::before {
         content: '';
         position: fixed;
@@ -29,10 +30,11 @@
         z-index: 0;
         pointer-events: none;
         background:
-          radial-gradient(ellipse 80% 60% at 50% 100%, rgba(57, 255, 142, 0.04) 0%, transparent 60%),
-          radial-gradient(ellipse 50% 50% at 10% 80%, rgba(155, 89, 255, 0.035) 0%, transparent 50%),
-          radial-gradient(ellipse 40% 40% at 90% 70%, rgba(57, 255, 142, 0.03) 0%, transparent 50%),
-          radial-gradient(ellipse 60% 30% at 50% 0%, rgba(155, 89, 255, 0.02) 0%, transparent 50%);
+          radial-gradient(ellipse 80% 60% at 50% 108%, rgba(91, 229, 160, 0.05) 0%, transparent 60%),
+          radial-gradient(ellipse 50% 50% at 10% 80%, rgba(139, 123, 255, 0.04) 0%, transparent 50%),
+          radial-gradient(ellipse 40% 40% at 90% 70%, rgba(91, 229, 160, 0.035) 0%, transparent 50%),
+          radial-gradient(ellipse 60% 30% at 50% -5%, rgba(139, 123, 255, 0.025) 0%, transparent 50%),
+          radial-gradient(ellipse 130% 95% at 50% 50%, transparent 52%, rgba(0, 0, 0, 0.6) 100%);
         opacity: 0;
         transition: opacity 1.5s ease-in;
       }
@@ -43,6 +45,18 @@
       @keyframes abyss-breathe {
         0%, 100% { opacity: 0.7; }
         50% { opacity: 1; }
+      }
+      /* Film-grain veil — a faint fractal-noise overlay that gives the ink void
+         a tactile, vellum-like texture. Sits above the blooms, below the app. */
+      body::after {
+        content: '';
+        position: fixed;
+        inset: 0;
+        z-index: 0;
+        pointer-events: none;
+        opacity: 0.035;
+        mix-blend-mode: overlay;
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
       }
       #abyss-bg {
         position: fixed;
@@ -74,7 +88,7 @@
         position: fixed;
         inset: 0;
         z-index: 10000;
-        background: #030308;
+        background: #05060a;
         align-items: center;
         justify-content: center;
       }
@@ -82,22 +96,25 @@
         display: flex;
       }
       .login-card {
-        background: #1a1b2e;
+        background: #0f1018;
+        border: 1px solid #1f2030;
         border-radius: 12px;
         padding: 2rem;
         width: 340px;
-        box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+        box-shadow: 0 12px 48px rgba(0,0,0,0.55);
       }
       .login-card h1 {
-        color: #e2e4f0;
-        font-size: 1.25rem;
+        color: #f2f0e6;
+        font-family: "Fraunces", "Spectral", Georgia, serif;
+        font-size: 1.5rem;
         font-weight: 600;
+        letter-spacing: 0.01em;
         margin-bottom: 1.5rem;
         text-align: center;
       }
       .login-card label {
         display: block;
-        color: #9698ae;
+        color: #9a98a8;
         font-size: 0.8rem;
         margin-bottom: 0.3rem;
       }
@@ -105,36 +122,37 @@
         width: 100%;
         padding: 0.55rem 0.75rem;
         margin-bottom: 1rem;
-        background: #13141f;
-        border: 1px solid #2a2c42;
+        background: #07080e;
+        border: 1px solid #1c1d2b;
         border-radius: 6px;
-        color: #e2e4f0;
+        color: #e8e6dc;
         font-size: 0.9rem;
         font-family: inherit;
         outline: none;
-        transition: border-color 0.15s;
+        transition: border-color 0.15s, box-shadow 0.15s;
       }
       .login-card input:focus {
-        border-color: #6366f1;
+        border-color: #5be5a0;
+        box-shadow: 0 0 0 3px rgba(91, 229, 160, 0.12);
       }
       .login-card button {
         width: 100%;
         padding: 0.6rem;
-        background: #6366f1;
+        background: #5be5a0;
         border: none;
         border-radius: 6px;
-        color: #fff;
+        color: #05060a;
         font-size: 0.9rem;
-        font-weight: 500;
+        font-weight: 600;
         font-family: inherit;
         cursor: pointer;
-        transition: background 0.15s;
+        transition: filter 0.15s;
       }
       .login-card button:hover {
-        background: #5254cc;
+        filter: brightness(1.08);
       }
       .login-error {
-        color: #f87171;
+        color: #ff8097;
         font-size: 0.8rem;
         text-align: center;
         margin-bottom: 0.75rem;
@@ -165,22 +183,22 @@
         opacity: 0;
       }
       .connecting-logo {
-        font-family: "JetBrains Mono", "Fira Code", monospace;
+        font-family: "Spline Sans Mono", "JetBrains Mono", monospace;
         font-size: 1.6rem;
-        font-weight: 700;
-        color: #e0e0ea;
+        font-weight: 600;
+        color: #e8e6dc;
         margin-bottom: 1.25rem;
-        text-shadow: 0 0 40px rgba(57, 255, 142, 0.1);
+        text-shadow: 0 0 40px rgba(91, 229, 160, 0.12);
         transition: transform 0.7s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.5s ease-out;
       }
       .connecting-logo .accent {
-        color: #39ff8e;
-        text-shadow: 0 0 30px rgba(57, 255, 142, 0.3);
+        color: #5be5a0;
+        text-shadow: 0 0 30px rgba(91, 229, 160, 0.35);
       }
       .connecting-status {
-        font-family: "JetBrains Mono", "Fira Code", monospace;
+        font-family: "Spline Sans Mono", "JetBrains Mono", monospace;
         font-size: 0.8rem;
-        color: #5a5a70;
+        color: #5e5c70;
         letter-spacing: 0.1em;
         transition: opacity 0.3s ease-out;
       }
@@ -198,7 +216,7 @@
       .connecting-reset {
         margin-top: 2.5rem;
         padding: 0.55rem 1.1rem;
-        font-family: "JetBrains Mono", "Fira Code", monospace;
+        font-family: "Spline Sans Mono", "JetBrains Mono", monospace;
         font-size: 0.78rem;
         letter-spacing: 0.08em;
         color: #cfcfdc;
@@ -214,8 +232,8 @@
         opacity: 1;
       }
       .connecting-reset:hover, .connecting-reset:focus {
-        color: #39ff8e;
-        border-color: rgba(57, 255, 142, 0.5);
+        color: #5be5a0;
+        border-color: rgba(91, 229, 160, 0.5);
         outline: none;
       }
 
@@ -225,7 +243,7 @@
         position: fixed;
         inset: 0;
         z-index: 10001;
-        background: #030308;
+        background: #05060a;
         align-items: center;
         justify-content: center;
         padding: 1.5rem;
@@ -239,26 +257,27 @@
         max-width: 420px;
         width: 100%;
         box-shadow: 0 12px 48px rgba(0,0,0,0.55);
-        font-family: "Inter", system-ui, sans-serif;
+        font-family: "Spectral", Georgia, serif;
       }
       .pair-card .pair-logo {
-        font-family: "JetBrains Mono", "Fira Code", monospace;
+        font-family: "Spline Sans Mono", "JetBrains Mono", monospace;
         font-size: 1.4rem;
-        font-weight: 700;
-        color: #e0e0ea;
+        font-weight: 600;
+        color: #e8e6dc;
         text-align: center;
         margin-bottom: 0.4rem;
       }
-      .pair-card .pair-logo .accent { color: #39ff8e; }
+      .pair-card .pair-logo .accent { color: #5be5a0; }
       .pair-card h2 {
-        color: #e2e4f0;
-        font-size: 1.1rem;
+        color: #f2f0e6;
+        font-family: "Fraunces", "Spectral", Georgia, serif;
+        font-size: 1.25rem;
         font-weight: 600;
         text-align: center;
         margin: 0.6rem 0 0.4rem;
       }
       .pair-card .pair-message {
-        color: #f87171;
+        color: #ff8097;
         font-size: 0.85rem;
         text-align: center;
         margin: 0 0 0.75rem;
@@ -280,11 +299,12 @@
         line-height: 1.5;
       }
       .pair-card .pair-hint code {
-        background: #1a1b2e;
+        background: #14161f;
+        font-family: "Spline Sans Mono", "JetBrains Mono", monospace;
         padding: 0.1rem 0.35rem;
         border-radius: 3px;
         font-size: 0.72rem;
-        color: #b0b2c8;
+        color: #c4c2b8;
       }
       .pair-card .pair-actions {
         display: flex;
@@ -295,10 +315,10 @@
       .pair-card .pair-btn {
         width: 100%;
         padding: 0.75rem;
-        background: #39ff8e;
+        background: #5be5a0;
         border: none;
         border-radius: 8px;
-        color: #06120a;
+        color: #05060a;
         font-size: 0.95rem;
         font-weight: 600;
         font-family: inherit;
@@ -336,7 +356,7 @@
         width: min(70vw, 280px);
         height: min(70vw, 280px);
         transform: translate(-50%, -50%);
-        border: 2px solid #39ff8e;
+        border: 2px solid #5be5a0;
         border-radius: 12px;
         box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55);
         pointer-events: none;
@@ -346,8 +366,8 @@
         top: max(1.5rem, env(safe-area-inset-top));
         left: 50%;
         transform: translateX(-50%);
-        color: #e2e4f0;
-        font-family: "Inter", system-ui, sans-serif;
+        color: #e8e6dc;
+        font-family: "Spectral", Georgia, serif;
         font-size: 0.9rem;
         text-align: center;
         background: rgba(0, 0, 0, 0.5);
@@ -419,6 +439,9 @@
     <div id="app"></div>
     <!-- Hidden input to trigger mobile virtual keyboard -->
     <input id="mobile-keyboard-proxy" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+      style="position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1;" />
+    <!-- Hidden input for file uploads, opened on demand by the backend -->
+    <input id="file-upload-proxy" type="file"
       style="position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1;" />
     <script type="module" src="./index.ts"></script>
   </body>

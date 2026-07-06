@@ -19,7 +19,7 @@ export class NodeStorage extends Storage {
 
   constructor(storagePath?: string) {
     super();
-    this.storagePath = storagePath ?? path.join(process.cwd(), STORAGE_DIR, STORAGE_FILE);
+    this.storagePath = storagePath ?? path.resolve(STORAGE_DIR, STORAGE_FILE);
   }
 
   protected override async onInit(): Promise<void> {

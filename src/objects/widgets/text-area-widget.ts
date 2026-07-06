@@ -24,8 +24,27 @@ interface AreaSnapshot {
   scrollTop: number;
 }
 
+/**
+ * One on-screen row when word-wrap is on. A single hard line (delimited by
+ * `\n` in the model) may span several display rows. `startCol` is the column
+ * offset into the hard line where this row begins, so `text` is exactly
+ * `hardLines[hardLine].substring(startCol, startCol + text.length)` — the
+ * mapping stays exact so cursor/selection/click math round-trips.
+ */
+interface DisplayRow {
+  hardLine: number;
+  startCol: number;
+  text: string;
+}
+
 export interface TextAreaWidgetConfig extends WidgetConfig {
   monospace?: boolean;
+  /**
+   * When true, the area is a viewer: editing keys and paste are blocked, but
+   * navigation, selection, copy, and scrolling all still work and the text is
+   * drawn at full opacity (unlike `disabled`, which also dims it).
+   */
+  readOnly?: boolean;
 }
 
 export class TextAreaWidget extends WidgetAbject {
@@ -34,6 +53,7 @@ export class TextAreaWidget extends WidgetAbject {
   private scrollTop = 0;
   private lineHeight: number;
   private monospace: boolean;
+  private readOnly: boolean;
   private selAnchorLine: number | null = null;
   private selAnchorCol: number | null = null;
   private dragging = false;
@@ -46,12 +66,17 @@ export class TextAreaWidget extends WidgetAbject {
   private lastSurfaceId = '';
   private errorLine = -1; // line index to highlight as error (-1 = none)
 
+  /** Cache for word-wrap layout, keyed by width+font+text so redraws are cheap. */
+  private wrapCacheKey = '';
+  private wrapCacheRows: DisplayRow[] = [];
+
   /** Undo/redo stack. Snapshots full editor state pre-edit. */
   private history = new EditHistory<AreaSnapshot>();
 
   constructor(config: TextAreaWidgetConfig) {
     super(config);
     this.monospace = config.monospace ?? false;
+    this.readOnly = config.readOnly ?? false;
     this.lineHeight = DEFAULT_LINE_HEIGHT;
   }
 
@@ -60,7 +85,8 @@ export class TextAreaWidget extends WidgetAbject {
   }
 
   protected override wantsMobileKeyboard(): boolean {
-    return true;
+    // A read-only viewer never asks for the on-screen keyboard.
+    return !this.readOnly;
   }
 
   /** Capture current state for the undo stack. */
@@ -200,6 +226,98 @@ export class TextAreaWidget extends WidgetAbject {
     }
   }
 
+  // ── Word wrap ──────────────────────────────────────────────────────
+
+  /** True when this area soft-wraps long lines instead of clipping them. */
+  private get wrap(): boolean {
+    return this.style.wordWrap === true;
+  }
+
+  /** Resolve the font used for body text (matches buildDrawCommands). */
+  private bodyFont(): string {
+    return this.monospace ? CODE_FONT : (this.style.fontSize ? buildFont(this.style) : WIDGET_FONT);
+  }
+
+  /**
+   * Lay the text out into wrapped display rows for the given width, caching by
+   * (width, font, text). Word boundaries break first; words wider than the area
+   * fall back to character breaking. Column offsets are preserved exactly so the
+   * cursor/selection/click code can map between model and display coordinates.
+   */
+  private async getDisplayRows(surfaceId: string, maxWidth: number, font: string): Promise<DisplayRow[]> {
+    const key = `${maxWidth} ${font} ${this.text}`;
+    if (key === this.wrapCacheKey && surfaceId === this.lastSurfaceId) return this.wrapCacheRows;
+
+    const rows: DisplayRow[] = [];
+    const hardLines = this.text.split('\n');
+
+    for (let hl = 0; hl < hardLines.length; hl++) {
+      const t = hardLines[hl];
+      if (t === '' || maxWidth <= 0) {
+        rows.push({ hardLine: hl, startCol: 0, text: t });
+        continue;
+      }
+
+      // Break a run of characters that is wider than the area, emitting full
+      // rows and returning the trailing remainder for the caller to continue.
+      const charBreak = async (part: string, partStartCol: number): Promise<{ text: string; startCol: number; width: number }> => {
+        let chunk = '';
+        let chunkStart = partStartCol;
+        for (const ch of Array.from(part)) {
+          const candidate = chunk + ch;
+          const candidateWidth = await this.measureText(surfaceId, candidate, font);
+          if (candidateWidth > maxWidth && chunk !== '') {
+            rows.push({ hardLine: hl, startCol: chunkStart, text: chunk });
+            chunkStart += chunk.length;
+            chunk = ch;
+          } else {
+            chunk = candidate;
+          }
+        }
+        return { text: chunk, startCol: chunkStart, width: await this.measureText(surfaceId, chunk, font) };
+      };
+
+      const parts = t.split(/(\s+)/);
+      let col = 0;
+      let rowStart = 0;
+      let rowText = '';
+      let rowWidth = 0;
+
+      for (const part of parts) {
+        if (part === '') continue;
+        const w = await this.measureText(surfaceId, part, font);
+
+        if (rowText === '') {
+          if (w <= maxWidth) {
+            rowStart = col; rowText = part; rowWidth = w;
+          } else {
+            const rem = await charBreak(part, col);
+            rowStart = rem.startCol; rowText = rem.text; rowWidth = rem.width;
+          }
+        } else if (rowWidth + w <= maxWidth) {
+          rowText += part; rowWidth += w;
+        } else {
+          rows.push({ hardLine: hl, startCol: rowStart, text: rowText });
+          if (w <= maxWidth) {
+            rowStart = col; rowText = part; rowWidth = w;
+          } else {
+            const rem = await charBreak(part, col);
+            rowStart = rem.startCol; rowText = rem.text; rowWidth = rem.width;
+          }
+        }
+        col += part.length;
+      }
+
+      rows.push({ hardLine: hl, startCol: rowStart, text: rowText });
+    }
+
+    if (rows.length === 0) rows.push({ hardLine: 0, startCol: 0, text: '' });
+
+    this.wrapCacheKey = key;
+    this.wrapCacheRows = rows;
+    return rows;
+  }
+
   // ── Rendering ──────────────────────────────────────────────────────
 
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
@@ -246,6 +364,15 @@ export class TextAreaWidget extends WidgetAbject {
     const scrollTop = this.scrollTop;
     const visibleLines = Math.floor(h / lineHeight);
     const sel = this.getSelection();
+
+    if (this.wrap) {
+      await this.buildWrappedContent(commands, surfaceId, ox, oy, w, taFont, textPadding, lineHeight, visibleLines, sel, focused);
+      commands.push({ type: 'restore', surfaceId, params: {} });
+      if (this.disabled) {
+        commands.push({ type: 'restore', surfaceId, params: {} });
+      }
+      return commands;
+    }
 
     // Render visible lines (with selection highlight)
     for (let i = scrollTop; i < Math.min(lines.length, scrollTop + visibleLines); i++) {
@@ -380,6 +507,95 @@ export class TextAreaWidget extends WidgetAbject {
     return commands;
   }
 
+  /** Render path for word-wrap mode: draw soft-wrapped rows, selection, cursor. */
+  private async buildWrappedContent(
+    commands: unknown[],
+    surfaceId: string,
+    ox: number,
+    oy: number,
+    w: number,
+    taFont: string,
+    textPadding: number,
+    lineHeight: number,
+    visibleLines: number,
+    sel: { startLine: number; startCol: number; endLine: number; endCol: number } | null,
+    focused: boolean,
+  ): Promise<void> {
+    const wrapWidth = w - textPadding * 2;
+    const rows = await this.getDisplayRows(surfaceId, wrapWidth, taFont);
+    const maxRowScroll = Math.max(0, rows.length - visibleLines);
+    this.scrollTop = Math.max(0, Math.min(this.scrollTop, maxRowScroll));
+    const scrollTop = this.scrollTop;
+    const measure = (txt: string) => this.measureText(surfaceId, txt, taFont);
+
+    for (let ri = scrollTop; ri < Math.min(rows.length, scrollTop + visibleLines); ri++) {
+      const row = rows[ri];
+      const rowY = oy + (ri - scrollTop) * lineHeight;
+      const rowTextY = rowY + lineHeight * 0.7;
+      const s = row.startCol;
+      const e = row.startCol + row.text.length;
+
+      // Error highlight spans every display row of the flagged hard line.
+      if (row.hardLine === this.errorLine) {
+        commands.push({ type: 'rect', surfaceId, params: { x: ox + 1, y: rowY, width: w - 2, height: lineHeight, fill: 'rgba(224, 85, 97, 0.15)' } });
+        commands.push({ type: 'rect', surfaceId, params: { x: ox + 1, y: rowY, width: 3, height: lineHeight, fill: this.theme.statusError } });
+      }
+
+      // Selection highlight, mapped from the model selection onto this row.
+      if (sel && focused && row.hardLine >= sel.startLine && row.hardLine <= sel.endLine) {
+        const cStart = row.hardLine === sel.startLine ? Math.max(s, sel.startCol) : s;
+        const cEnd = row.hardLine === sel.endLine ? Math.min(e, sel.endCol) : e;
+        // When the selection continues past this hard line, extend the last
+        // display row to the right edge to show the newline is included.
+        const isLastRowOfHard = ri === rows.length - 1 || rows[ri + 1].hardLine !== row.hardLine;
+        const extendFull = row.hardLine < sel.endLine && isLastRowOfHard;
+        if (cEnd >= cStart && (cEnd > cStart || extendFull)) {
+          const pre = row.text.substring(0, cStart - s);
+          const mid = row.text.substring(cStart - s, cEnd - s);
+          const xStart = ox + textPadding + (pre.length > 0 ? await measure(pre) : 0);
+          let width = mid.length > 0 ? await measure(mid) : 0;
+          if (extendFull) width = (ox + w - textPadding) - xStart;
+          if (width > 0) {
+            commands.push({ type: 'rect', surfaceId, params: { x: xStart, y: rowY, width, height: lineHeight, fill: this.theme.selectionBg } });
+          }
+        }
+      }
+
+      if (row.text.length > 0) {
+        commands.push({
+          type: 'text', surfaceId,
+          params: { x: ox + textPadding, y: rowTextY, text: row.text, font: taFont, fill: this.style.color ?? this.theme.textSecondary, baseline: 'alphabetic' },
+        });
+      }
+    }
+
+    // Cursor
+    if (focused) {
+      const cl = this.cursorLine;
+      const cc = this.cursorCol;
+      let idx = -1;
+      for (let ri = 0; ri < rows.length; ri++) {
+        const r = rows[ri];
+        if (r.hardLine !== cl) continue;
+        const rs = r.startCol;
+        const re = r.startCol + r.text.length;
+        if (cc >= rs && cc <= re) {
+          idx = ri;
+          // A column at a wrap boundary belongs to the earlier row unless the
+          // next row on the same hard line starts exactly there.
+          if (cc < re || ri + 1 >= rows.length || rows[ri + 1].hardLine !== cl) break;
+        }
+      }
+      if (idx >= scrollTop && idx < scrollTop + visibleLines) {
+        const r = rows[idx];
+        const pre = r.text.substring(0, cc - r.startCol);
+        const cursorX = ox + textPadding + (pre.length > 0 ? await measure(pre) : 0);
+        const cursorY = oy + (idx - scrollTop) * lineHeight + 2;
+        commands.push({ type: 'line', surfaceId, params: { x1: cursorX, y1: cursorY, x2: cursorX, y2: cursorY + lineHeight - 4, stroke: this.theme.cursor } });
+      }
+    }
+  }
+
   protected async processInput(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
     const type = input.type as string;
 
@@ -415,6 +631,21 @@ export class TextAreaWidget extends WidgetAbject {
     const lineHeight = this.lineHeight;
     const scrollTop = this.scrollTop;
     const lines = this.text.split('\n');
+
+    if (this.wrap && surfaceId) {
+      const taFont = this.bodyFont();
+      const rows = await this.getDisplayRows(surfaceId, this.rect.width - textPadding * 2, taFont);
+      const rowIdx = Math.max(0, Math.min(scrollTop + Math.floor(clickY / lineHeight), rows.length - 1));
+      const row = rows[rowIdx];
+      const clickOffset = clickX - textPadding;
+      let colOffset = 0;
+      if (row.text.length > 0 && clickOffset > 0) {
+        const rowWidth = await this.measureText(surfaceId, row.text, taFont);
+        const avgCharWidth = rowWidth / row.text.length;
+        colOffset = Math.min(Math.round(clickOffset / avgCharWidth), row.text.length);
+      }
+      return { line: row.hardLine, col: row.startCol + Math.max(0, colOffset) };
+    }
 
     const clickLine = Math.max(0, Math.min(
       scrollTop + Math.floor(clickY / lineHeight),
@@ -552,6 +783,9 @@ export class TextAreaWidget extends WidgetAbject {
     const meta = modifiers?.meta ?? false;
 
     const autoScroll = () => {
+      // In wrap mode scrollTop counts display rows, not model lines, so this
+      // line-based math does not apply; the wheel/scrollbar drives scrolling.
+      if (this.wrap) return;
       let scrollTop = this.scrollTop;
       if (line < scrollTop) scrollTop = line;
       if (line >= scrollTop + visibleLines) scrollTop = line - visibleLines + 1;
@@ -596,8 +830,8 @@ export class TextAreaWidget extends WidgetAbject {
       return { consumed: true };
     }
 
-    // When disabled, block all editing keys but allow navigation/selection above
-    if (this.disabled) {
+    // When disabled or read-only, block editing keys but allow navigation/selection above
+    if (this.disabled || this.readOnly) {
       if (key === 'ArrowLeft' || key === 'ArrowRight' || key === 'ArrowUp' || key === 'ArrowDown'
           || key === 'Home' || key === 'End') {
         // fall through to normal handling below
@@ -1016,7 +1250,9 @@ export class TextAreaWidget extends WidgetAbject {
         }
         this.cursorLine = lines.length - 1;
         this.cursorCol = lines[lines.length - 1].length;
-        this.scrollTop = Math.max(0, lines.length - visibleLines);
+        // In wrap mode scrollTop is a display-row index; overshoot and let the
+        // next draw clamp to the true max rather than using the model count.
+        this.scrollTop = this.wrap ? Number.MAX_SAFE_INTEGER : Math.max(0, lines.length - visibleLines);
         await this.notifySelectionChanged();
       } else {
         if (shift) {
@@ -1064,7 +1300,11 @@ export class TextAreaWidget extends WidgetAbject {
   private async handleWheel(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
     const deltaY = (input.deltaY as number) ?? 0;
     const lineHeight = this.lineHeight;
-    const totalLines = this.text.split('\n').length;
+    let totalLines = this.text.split('\n').length;
+    if (this.wrap && this.lastSurfaceId) {
+      const rows = await this.getDisplayRows(this.lastSurfaceId, this.rect.width - 16, this.bodyFont());
+      totalLines = rows.length;
+    }
     const visibleLines = Math.floor(this.rect.height / lineHeight);
     const maxScroll = Math.max(0, totalLines - visibleLines);
 
@@ -1078,7 +1318,7 @@ export class TextAreaWidget extends WidgetAbject {
   }
 
   private async handlePaste(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
-    if (this.disabled) return { consumed: true };
+    if (this.disabled || this.readOnly) return { consumed: true };
     const pasteText = (input.pasteText as string) ?? '';
     if (!pasteText) return { consumed: true };
 
@@ -1133,6 +1373,7 @@ export class TextAreaWidget extends WidgetAbject {
 
   protected applyUpdate(updates: Record<string, unknown>): void {
     if (updates.monospace !== undefined) this.monospace = updates.monospace as boolean;
+    if (updates.readOnly !== undefined) this.readOnly = updates.readOnly as boolean;
     if (updates.errorLine !== undefined) this.errorLine = updates.errorLine as number;
     // When text is set externally, reset cursor to start and clear selection.
     // Also drop the undo history — its snapshots reference the previous text

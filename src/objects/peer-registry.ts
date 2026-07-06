@@ -70,6 +70,10 @@ export class PeerRegistry extends Abject {
   // Signaling relay fallback (peer-based relay when servers are down)
   private signalingRelayRef?: SignalingRelay;
 
+  // Cached ICE servers (STUN + TURN creds) fetched from the signaling server
+  private cachedIceServers?: RTCIceServer[];
+  private cachedIceServersAt = 0;
+
   // Auto-connect state
   private manuallyDisconnected: Set<PeerId> = new Set();
   private autoConnectTimer?: ReturnType<typeof setInterval>;
@@ -714,6 +718,8 @@ export class PeerRegistry extends Abject {
 
     this.setContactState(peerId, 'connecting');
 
+    const iceServers = await this.resolveIceServers();
+
     const transport = new PeerTransport({
       localPeerId: this.localIdentity!.peerId,
       remotePeerId: peerId,
@@ -721,6 +727,7 @@ export class PeerRegistry extends Abject {
       localPublicSigningKey: this.localIdentity!.publicSigningKey,
       localPublicExchangeKey: this.localIdentity!.publicExchangeKey,
       localExchangePrivateKey: this.localIdentity!.exchangePrivateKey!,
+      iceServers,
     });
 
     this.setupTransportEvents(transport, peerId);
@@ -1016,6 +1023,8 @@ export class PeerRegistry extends Abject {
     // Mark known contacts as 'connecting' for accurate UI feedback
     this.setContactState(fromPeerId, 'connecting');
 
+    const iceServers = await this.resolveIceServers();
+
     // Auto-accept connections from known contacts
     let transport = this.transports.get(fromPeerId);
 
@@ -1039,6 +1048,7 @@ export class PeerRegistry extends Abject {
           localPublicSigningKey: this.localIdentity!.publicSigningKey,
           localPublicExchangeKey: this.localIdentity!.publicExchangeKey,
           localExchangePrivateKey: this.localIdentity!.exchangePrivateKey!,
+          iceServers,
         });
         this.setupTransportEvents(newTransport, fromPeerId);
         this.transports.set(fromPeerId, newTransport);
@@ -1057,6 +1067,17 @@ export class PeerRegistry extends Abject {
       log.info(`ICE glare with ${fromPeerId.slice(0, 16)}: they win tiebreak, accepting remote offer`);
       transport.resetForGlare();
       // handleSdpOffer below will create a fresh PeerConnection
+    } else if (transport && transport.signalingState !== 'closed') {
+      // Reconnection: a fresh inbound offer means the remote built a brand-new
+      // RTCPeerConnection (e.g. a mobile client closed and reopened). Any
+      // transport we still hold here is stale — its PeerConnection is in
+      // 'stable'/'have-remote-offer' from the prior session, and renegotiating
+      // it against the peer's new connection never re-establishes ICE/DTLS, so
+      // the DataChannel never opens. Reset it without firing disconnect events
+      // so handleSdpOffer below answers with a fresh PeerConnection on the same
+      // transport object (preserving its event wiring and map entry).
+      log.info(`Reconnect offer from ${fromPeerId.slice(0, 16)} (state=${transport.signalingState}); resetting stale transport`);
+      transport.resetForGlare();
     }
 
     if (!transport) {
@@ -1067,6 +1088,7 @@ export class PeerRegistry extends Abject {
         localPublicSigningKey: this.localIdentity!.publicSigningKey,
         localPublicExchangeKey: this.localIdentity!.publicExchangeKey,
         localExchangePrivateKey: this.localIdentity!.exchangePrivateKey!,
+        iceServers,
       });
       this.setupTransportEvents(transport, fromPeerId);
       this.transports.set(fromPeerId, transport);
@@ -1413,6 +1435,8 @@ export class PeerRegistry extends Abject {
       return false;
     }
 
+    const iceServers = await this.resolveIceServers();
+
     const transport = new PeerTransport({
       localPeerId: this.localIdentity!.peerId,
       remotePeerId: peerId,
@@ -1420,6 +1444,7 @@ export class PeerRegistry extends Abject {
       localPublicSigningKey: this.localIdentity!.publicSigningKey,
       localPublicExchangeKey: this.localIdentity!.publicExchangeKey,
       localExchangePrivateKey: this.localIdentity!.exchangePrivateKey!,
+      iceServers,
     });
 
     this.setupTransportEvents(transport, peerId);
@@ -1468,6 +1493,30 @@ export class PeerRegistry extends Abject {
       if (client.isConnected) return client;
     }
     return undefined;
+  }
+
+  /**
+   * Fetch ICE servers (STUN + TURN relay credentials) from an active
+   * signaling server, cached for ~10 minutes. TURN lets peer DataChannels
+   * form across symmetric NAT / CGNAT where direct hole-punching fails.
+   * Returns undefined when no signaling client is connected, in which case
+   * PeerTransport falls back to its built-in STUN default.
+   */
+  private async resolveIceServers(): Promise<RTCIceServer[] | undefined> {
+    const TEN_MIN = 10 * 60 * 1000;
+    if (this.cachedIceServers && Date.now() - this.cachedIceServersAt < TEN_MIN) {
+      return this.cachedIceServers;
+    }
+    const client = this.getActiveSignalingClient();
+    if (!client) return this.cachedIceServers;
+    try {
+      const servers = await client.requestIceServers();
+      if (servers.length > 0) {
+        this.cachedIceServers = servers;
+        this.cachedIceServersAt = Date.now();
+      }
+    } catch { /* keep prior cache / fall back to default STUN */ }
+    return this.cachedIceServers;
   }
 
   private async loadLocalIdentity(): Promise<void> {

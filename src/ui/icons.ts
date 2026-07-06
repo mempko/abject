@@ -25,6 +25,7 @@ export type IconName =
   | 'check'
   | 'warning'
   | 'info'
+  | 'help'
   | 'dot';
 
 export interface IconDrawOpts {
@@ -261,6 +262,41 @@ const infoIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
   ];
 };
 
+const helpIcon: Renderer = ({ surfaceId, x, y, size, color, lineWidth }) => {
+  // Slightly thinner stroke and a compact glyph so the "?" reads at the same
+  // visual weight as the close (×) and minimize (−) icons, which only span the
+  // middle of the box. A question mark stacks a bowl + stem + dot, so it must
+  // be drawn tighter to avoid looking oversized next to them.
+  const lw = (lineWidth ?? defaultLineWidth(size)) * 0.9;
+  const cx = x + size / 2;
+  const r = size * 0.16;
+  const top = y + size * 0.4;
+  // The hook of the question mark: an open polyline tracing the upper bowl
+  // down into the vertical stem, then a separate dot for the point below.
+  return [
+    {
+      type: 'polygon',
+      surfaceId,
+      params: {
+        points: [
+          { x: cx - r,        y: top - r * 0.35 },
+          { x: cx - r * 0.45, y: top - r },
+          { x: cx + r * 0.55, y: top - r * 0.9 },
+          { x: cx + r,        y: top - r * 0.05 },
+          { x: cx + r * 0.1,  y: top + r * 0.6 },
+          { x: cx,            y: top + r },
+        ],
+        stroke: color,
+        lineWidth: lw,
+        lineCap: 'round',
+        lineJoin: 'round',
+        closePath: false,
+      },
+    },
+    circle(surfaceId, cx, y + size * 0.7, lw * 0.8, color),
+  ];
+};
+
 const dotIcon: Renderer = ({ surfaceId, x, y, size, color }) => {
   return [circle(surfaceId, x + size / 2, y + size / 2, size * 0.18, color)];
 };
@@ -281,5 +317,6 @@ const ICONS: Record<IconName, Renderer> = {
   check: checkIcon,
   warning: warningIcon,
   info: infoIcon,
+  help: helpIcon,
   dot: dotIcon,
 };

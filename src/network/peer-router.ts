@@ -599,7 +599,19 @@ export class PeerRouter extends Abject implements MessageInterceptor {
     // Look up route in routing table
     const route = this.getRoute(recipient);
     if (!route) {
-      // No explicit route — try speculative forwarding before giving up
+      // No explicit route. Speculative forwarding is a best-effort GUESS at
+      // which connected peer holds the recipient. For fire-and-forget events
+      // that's fine (a wrong guess just loses the event). For a REQUEST a wrong
+      // guess is harmful: the guessed peer doesn't have the object, doesn't
+      // reply, and the caller hangs to the full request timeout (~30s) — the
+      // exact symptom when a request targets a stale/destroyed LOCAL id. So we
+      // do NOT speculate on requests; we fall through to 'pass' and let the
+      // bus's local fail-fast answer RECIPIENT_NOT_FOUND instantly. Genuine
+      // cross-peer calls to exposed objects have an ANNOUNCED explicit route
+      // (handled above), so they are unaffected.
+      if (message.header.type === 'request') {
+        return 'pass';
+      }
       const specPeer = this.speculateNextHop(message.routing.from as AbjectId, recipient);
       if (specPeer && this.isPeerConnected(specPeer)) {
         const outMsg = this.filterOutboundReply(message);

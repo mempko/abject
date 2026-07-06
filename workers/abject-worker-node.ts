@@ -28,11 +28,16 @@ import { JobManager } from '../src/objects/job-manager.js';
 import { GoalManager } from '../src/objects/goal-manager.js';
 import { KnowledgeBase } from '../src/objects/knowledge-base.js';
 import { KnowledgeBrowser } from '../src/objects/knowledge-browser.js';
+import { FileManager } from '../src/objects/file-manager.js';
+import { FileViewer } from '../src/objects/file-viewer.js';
 import { AgentBrowser } from '../src/objects/agent-browser.js';
 import { AgentCreator } from '../src/objects/agent-creator.js';
 import { Scheduler } from '../src/objects/scheduler.js';
 import { SchedulerBrowser } from '../src/objects/scheduler-browser.js';
 import { TupleSpace } from '../src/objects/tuple-space.js';
+import { TriggerManager } from '../src/objects/trigger-manager.js';
+import { CollectionStore } from '../src/objects/collection-store.js';
+import { DataBrowser } from '../src/objects/data-browser.js';
 import { GoalBrowser } from '../src/objects/goal-browser.js';
 import { AbjectStore } from '../src/objects/abject-store.js';
 import { Settings } from '../src/objects/settings.js';
@@ -41,6 +46,7 @@ import { NotificationCenter } from '../src/objects/notification-center.js';
 import { WindowSwitcherAbject } from '../src/objects/window-switcher.js';
 import { AppExplorer } from '../src/objects/app-explorer.js';
 import { ObjectBrowser } from '../src/objects/object-browser.js';
+import { MethodInspector } from '../src/objects/method-inspector.js';
 import { ObjectCatalog } from '../src/objects/object-catalog.js';
 import { JobBrowser } from '../src/objects/job-browser.js';
 import { Chat } from '../src/objects/chat.js';
@@ -61,6 +67,9 @@ import { ShellExecutor } from '../src/objects/capabilities/shell-executor.js';
 import { HostFileSystem } from '../src/objects/capabilities/host-filesystem.js';
 import { WebSearch } from '../src/objects/capabilities/web-search.js';
 import { WebFetch } from '../src/objects/capabilities/web-fetch.js';
+import { StreamClient } from '../src/objects/capabilities/stream-client.js';
+import { AudioOutput } from '../src/objects/capabilities/audio-output.js';
+import { Speech } from '../src/objects/capabilities/speech.js';
 import { Screenshot } from '../src/objects/capabilities/screenshot.js';
 import { SkillRegistry } from '../src/objects/skill-registry.js';
 import { SkillBrowser } from '../src/objects/skill-browser.js';
@@ -77,6 +86,8 @@ import { WebAgent } from '../src/objects/web-agent.js';
 import { WorkspaceBrowser } from '../src/objects/workspace-browser.js';
 import { Organism } from '../src/objects/organism.js';
 import type { OrganismSpec } from '../src/objects/organism.js';
+import { WasmAbject } from '../src/objects/wasm-abject.js';
+import type { WasmAbjectArgs } from '../src/objects/wasm-abject.js';
 
 if (!parentPort) {
   throw new Error('abject-worker-node.ts must be run inside a worker_threads Worker');
@@ -95,15 +106,18 @@ constructors.set('Storage', (args?: unknown) => {
   const opts = args as { dbName?: string } | undefined;
   if (opts?.dbName) {
     const wsId = opts.dbName.replace('abjects-storage-', '');
-    const storagePath = path.join(process.cwd(), dataDir, `ws-${wsId}`, 'storage.json');
+    const storagePath = path.resolve(dataDir, `ws-${wsId}`, 'storage.json');
     return new NodeStorage(storagePath);
   }
-  return new NodeStorage(path.join(process.cwd(), dataDir, 'storage.json'));
+  return new NodeStorage(path.resolve(dataDir, 'storage.json'));
 });
 constructors.set('Timer', () => new Timer());
 constructors.set('Clipboard', () => new Clipboard());
 constructors.set('Console', () => new Console());
-constructors.set('FileSystem', () => new FileSystem());
+constructors.set('FileSystem', (args?: unknown) => {
+  const opts = args as { workspaceId?: string } | undefined;
+  return new FileSystem(opts?.workspaceId);
+});
 constructors.set('ProxyGenerator', () => new ProxyGenerator());
 constructors.set('Negotiator', () => new Negotiator());
 constructors.set('HealthMonitor', () => new HealthMonitor());
@@ -115,17 +129,23 @@ constructors.set('NotificationCenter', () => new NotificationCenter());
 constructors.set('WindowSwitcher', () => new WindowSwitcherAbject());
 constructors.set('AppExplorer', () => new AppExplorer());
 constructors.set('ObjectBrowser', () => new ObjectBrowser());
+constructors.set('MethodInspector', () => new MethodInspector());
 constructors.set('ObjectCatalog', () => new ObjectCatalog());
 constructors.set('JobManager', () => new JobManager());
 constructors.set('JobBrowser', () => new JobBrowser());
 constructors.set('GoalManager', () => new GoalManager());
 constructors.set('KnowledgeBase', () => new KnowledgeBase());
 constructors.set('KnowledgeBrowser', () => new KnowledgeBrowser());
+constructors.set('FileManager', () => new FileManager());
+constructors.set('FileViewer', () => new FileViewer());
 constructors.set('AgentBrowser', () => new AgentBrowser());
 constructors.set('AgentCreator', () => new AgentCreator());
 constructors.set('Scheduler', () => new Scheduler());
 constructors.set('SchedulerBrowser', () => new SchedulerBrowser());
 constructors.set('TupleSpace', () => new TupleSpace());
+constructors.set('TriggerManager', () => new TriggerManager());
+constructors.set('CollectionStore', () => new CollectionStore());
+constructors.set('DataBrowser', () => new DataBrowser());
 constructors.set('GoalBrowser', () => new GoalBrowser());
 constructors.set('Chat', (args?: unknown) => new Chat(args as { conversationId?: string; title?: string; rect?: { x: number; y: number; width: number; height: number } } | undefined));
 constructors.set('ChatManager', () => new ChatManager());
@@ -144,10 +164,13 @@ constructors.set('ShellExecutor', () => new ShellExecutor());
 constructors.set('HostFileSystem', () => new HostFileSystem());
 constructors.set('WebSearch', () => new WebSearch());
 constructors.set('WebFetch', () => new WebFetch());
+constructors.set('StreamClient', () => new StreamClient());
+constructors.set('AudioOutput', () => new AudioOutput());
+constructors.set('Speech', () => new Speech());
 constructors.set('Screenshot', () => new Screenshot());
 constructors.set('SkillRegistry', () => {
   const dataDir = process.env.ABJECTS_DATA_DIR ?? '.abjects';
-  return new SkillRegistry(path.join(process.cwd(), dataDir, 'skills'));
+  return new SkillRegistry(path.resolve(dataDir, 'skills'));
 });
 constructors.set('SkillBrowser', () => new SkillBrowser());
 constructors.set('SkillAgent', () => new SkillAgent());
@@ -174,6 +197,7 @@ constructors.set('Organism', (args?: unknown) => {
   const spec = args as OrganismSpec;
   return new Organism(spec);
 });
+constructors.set('WasmAbject', (args?: unknown) => new WasmAbject(args as WasmAbjectArgs));
 
 // Global error handlers — report to main thread before the worker dies
 process.on('uncaughtException', (err) => {

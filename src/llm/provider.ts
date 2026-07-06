@@ -6,7 +6,9 @@ import { require, requireNonEmpty } from '../core/contracts.js';
 
 export interface TextPart { type: 'text'; text: string; }
 export interface ImagePart { type: 'image'; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'; data: string; }
-export type ContentPart = TextPart | ImagePart;
+/** A document (e.g. a PDF) sent as base64. `name` is an optional display label. */
+export interface DocumentPart { type: 'document'; mediaType: 'application/pdf'; data: string; name?: string; }
+export type ContentPart = TextPart | ImagePart | DocumentPart;
 
 export interface LLMMessage {
   role: 'system' | 'user' | 'assistant';
@@ -15,6 +17,13 @@ export interface LLMMessage {
 
 export type ModelTier = 'smart' | 'balanced' | 'fast';
 
+/**
+ * Reasoning-effort control for models that support it (newer Claude models).
+ * Higher levels spend more tokens on thinking/tool-calls; 'high' is the API
+ * default. Providers that don't support effort ignore this.
+ */
+export type EffortLevel = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
 export interface LLMCompletionOptions {
   temperature?: number;
   maxTokens?: number;
@@ -22,6 +31,12 @@ export interface LLMCompletionOptions {
   stream?: boolean;
   tier?: ModelTier;
   model?: string;
+  /**
+   * Override the reasoning effort for this call. When omitted the provider
+   * picks a per-tier default. Use a higher level for genuinely hard steps
+   * (e.g. multi-file code reasoning) than the tier's routine default.
+   */
+  effort?: EffortLevel;
   /**
    * Stable identifier that providers may use to improve prompt-cache routing
    * (e.g. OpenAI's `prompt_cache_key`). Set to a per-conversation or per-task
@@ -109,6 +124,22 @@ export interface LLMCompletionResult {
 export interface LLMStreamChunk {
   content: string;
   done: boolean;
+  /**
+   * Provider stop reason, set on the terminal (done) chunk when known.
+   * 'length'/'max_tokens' means the response was truncated mid-generation —
+   * consumers must not treat truncated output as a complete answer.
+   */
+  stopReason?: string;
+  /**
+   * Token usage, set on the terminal (done) chunk when the provider reports
+   * it in-stream. Lets a streaming-backed complete() still return usage.
+   */
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+  };
 }
 
 export interface FetchResult {
@@ -279,6 +310,33 @@ export interface LLMProvider {
    * the AI tab without per-provider hardcoding.
    */
   describe(): LLMProviderDescription;
+
+  /**
+   * Transcribe audio to text (optional). Providers without a speech-to-text
+   * API leave this unimplemented; callers check supportsSpeech() first.
+   */
+  transcribe?(
+    audio: { base64: string; mimeType: string },
+    options?: { model?: string; language?: string },
+  ): Promise<{ text: string }>;
+
+  /**
+   * Synthesize speech audio from text (optional). Returns encoded audio as
+   * base64 plus its MIME type. Providers without a text-to-speech API leave
+   * this unimplemented; callers check supportsSpeech() first.
+   */
+  synthesize?(
+    text: string,
+    options?: { model?: string; voice?: string },
+  ): Promise<{ base64: string; mimeType: string }>;
+
+  /**
+   * Which speech directions this provider can serve right now. Cheap and
+   * synchronous; a true still allows the call to fail at runtime, and
+   * callers treat failures as a soft signal to fall back (browser speech
+   * APIs on the client, or a clear error).
+   */
+  supportsSpeech?(): { transcribe: boolean; synthesize: boolean };
 }
 
 /**
@@ -304,6 +362,11 @@ export abstract class BaseLLMProvider implements LLMProvider {
 
   async listModels(): Promise<ModelInfo[]> {
     return [];
+  }
+
+  /** Providers opt in by overriding; the default provider has no speech APIs. */
+  supportsSpeech(): { transcribe: boolean; synthesize: boolean } {
+    return { transcribe: false, synthesize: false };
   }
 
   /**
@@ -467,6 +530,100 @@ export function getProviderRegistry(): LLMProviderRegistry {
 export function getTextContent(msg: LLMMessage): string {
   if (typeof msg.content === 'string') return msg.content;
   return msg.content.filter((p): p is TextPart => p.type === 'text').map(p => p.text).join('');
+}
+
+// ── Conversation size utilities ─────────────────────────────────────────────
+// Shared by LLMObject's `compress` method and AgentAbject's conversation
+// budget enforcement.
+
+/** A message shape loose enough for both LLMMessage and agent conversations. */
+export interface SizedMessage {
+  role: string;
+  content: string | ContentPart[];
+}
+
+/**
+ * Truncate a string keeping head and tail with an elision marker. Head gets
+ * the larger share — openings carry instructions/structure; tails carry the
+ * most recent values.
+ */
+export function truncateText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const head = Math.floor(maxChars * 0.7);
+  const tail = maxChars - head;
+  return `${text.slice(0, head)}\n…[${text.length - maxChars} chars elided to fit context budget]…\n${text.slice(-tail)}`;
+}
+
+/** Total text chars in one message (image/document parts count 0). */
+export function messageTextChars(msg: SizedMessage): number {
+  if (typeof msg.content === 'string') return msg.content.length;
+  let total = 0;
+  for (const part of msg.content) {
+    if ('text' in part && typeof part.text === 'string') total += part.text.length;
+  }
+  return total;
+}
+
+/** Total text chars across a conversation. */
+export function conversationTextChars(msgs: SizedMessage[]): number {
+  return msgs.reduce((sum, m) => sum + messageTextChars(m), 0);
+}
+
+/** Shrink one message's text content to roughly `target` chars in place. */
+export function truncateMessageTo(msg: SizedMessage, target: number): void {
+  if (typeof msg.content === 'string') {
+    msg.content = truncateText(msg.content, target);
+    return;
+  }
+  // Multi-part content: shrink the largest text part until the total fits.
+  // Non-text parts (images, documents) are left alone.
+  for (let guard = 0; guard < msg.content.length + 1; guard++) {
+    const total = messageTextChars(msg);
+    if (total <= target) return;
+    let largestIdx = -1;
+    let largestLen = 0;
+    msg.content.forEach((part, i) => {
+      if ('text' in part && typeof part.text === 'string' && part.text.length > largestLen) {
+        largestLen = part.text.length;
+        largestIdx = i;
+      }
+    });
+    if (largestIdx === -1) return;
+    const part = msg.content[largestIdx] as { text: string };
+    part.text = truncateText(part.text, Math.max(1000, largestLen - (total - target)));
+  }
+}
+
+/**
+ * Hard guarantee that a conversation fits `maxChars`: repeatedly
+ * head+tail-truncate the largest message until under budget. Deterministic,
+ * no LLM involved, position-blind, always converges (each pass shrinks the
+ * current largest message toward `floorChars`).
+ */
+export function enforceConversationCharBudget(
+  msgs: SizedMessage[],
+  maxChars: number,
+  floorChars = 4000,
+): void {
+  for (let guard = 0; guard < msgs.length * 2; guard++) {
+    const total = conversationTextChars(msgs);
+    if (total <= maxChars) return;
+
+    let largestIdx = -1;
+    let largestLen = floorChars;
+    msgs.forEach((m, i) => {
+      const len = messageTextChars(m);
+      if (len > largestLen) {
+        largestLen = len;
+        largestIdx = i;
+      }
+    });
+    if (largestIdx === -1) return; // everything at floor — nothing left to shrink
+
+    // Shrink by the overage (plus marker allowance), never below the floor.
+    const target = Math.max(floorChars, largestLen - (total - maxChars) - 200);
+    truncateMessageTo(msgs[largestIdx], target);
+  }
 }
 
 /**

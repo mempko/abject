@@ -5,12 +5,18 @@
  * Consumes mousedown events and fires a 'click' change notification.
  */
 
+import { AbjectId } from '../../core/types.js';
+import { request } from '../../core/message.js';
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
-import { lightenColor, darkenColor } from './widget-types.js';
+import { lightenColor, darkenColor, withAlpha, gradientRect } from './widget-types.js';
 
 export class ButtonWidget extends WidgetAbject {
   private hovered = false;
   private pressed = false;
+
+  // Tooltip service plumbing (only used when style.tooltip is set)
+  private tooltipManagerId?: AbjectId;
+  private tooltipActive = false;
 
   constructor(config: WidgetConfig) {
     super(config);
@@ -88,30 +94,45 @@ export class ButtonWidget extends WidgetAbject {
       commands.push({ type: 'restore', surfaceId, params: {} });
     }
 
-    // Subtle top-to-bottom gradient for depth
-    commands.push({ type: 'save', surfaceId, params: {} });
-    commands.push({
-      type: 'linearGradient',
-      surfaceId,
-      params: { x0: 0, y0: oy, x1: 0, y1: oy + h, stops: [
-        { offset: 0, color: fill },
-        { offset: 1, color: darkenColor(fill, 15) },
-      ] },
-    });
-    commands.push({
-      type: 'rect',
-      surfaceId,
-      params: {
-        x: ox,
-        y: oy,
-        width: w,
-        height: h,
-        fill,
+    if (style.flat) {
+      // Flat variant for sidebar/toolbar rows: a quiet fill with no depth
+      // treatment and no implicit border, so stacked rows read as a list
+      // rather than a pile of raised chips. An explicit borderColor (e.g.
+      // the active-item accent outline) still draws.
+      commands.push({
+        type: 'rect',
+        surfaceId,
+        params: {
+          x: ox, y: oy, width: w, height: h, fill, radius,
+          ...(style.borderColor ? { stroke: style.borderColor } : {}),
+        },
+      });
+    } else {
+      // Soft top-to-bottom gradient for depth — kept gentle (matching the tab
+      // bar treatment) so rows of buttons read as calm surfaces, not pills.
+      // Intensity is theme-driven: tokens.surface.gradient of 0 means flat.
+      const surface = tokens.surface;
+      commands.push(...gradientRect(surfaceId, {
+        x: ox, y: oy, width: w, height: h, radii: radius,
+        gradient: { x0: 0, y0: oy, x1: 0, y1: oy + h, stops: [
+          { offset: 0, color: lightenColor(fill, 4 * surface.gradient) },
+          { offset: 1, color: darkenColor(fill, 6 * surface.gradient) },
+        ] },
         stroke: style.borderColor ?? this.theme.buttonBorder,
-        radius,
-      },
-    });
-    commands.push({ type: 'restore', surfaceId, params: {} });
+      }));
+      // Top bevel derived from the button's own fill, so dark buttons stay
+      // quiet while bright primary buttons still catch a little light.
+      if (surface.bevel > 0) {
+        commands.push({
+          type: 'line',
+          surfaceId,
+          params: {
+            x1: ox + radius, y1: oy + 1, x2: ox + w - radius, y2: oy + 1,
+            stroke: withAlpha(lightenColor(fill, 55), surface.bevel), lineWidth: 1,
+          },
+        });
+      }
+    }
 
     // Truncate text with ellipsis if it exceeds button width (with padding)
     const padding = 8;
@@ -152,6 +173,7 @@ export class ButtonWidget extends WidgetAbject {
   protected async processInput(input: Record<string, unknown>): Promise<{ consumed: boolean }> {
     if (input.type === 'mousedown') {
       this.pressed = true;
+      this.cancelTooltip();
       // Click fires immediately so call sites don't need to wait for mouseup;
       // the visible press animation runs in parallel and is cleared on
       // mouseup or mouseleave below.
@@ -169,6 +191,7 @@ export class ButtonWidget extends WidgetAbject {
     if (input.type === 'mousemove') {
       if (!this.hovered) {
         this.hovered = true;
+        this.requestTooltip(input);
         await this.requestRedraw();
       }
       return { consumed: true };
@@ -177,6 +200,7 @@ export class ButtonWidget extends WidgetAbject {
       const wasInteracting = this.hovered || this.pressed;
       this.hovered = false;
       this.pressed = false;
+      this.cancelTooltip();
       if (wasInteracting) await this.requestRedraw();
       return { consumed: true };
     }
@@ -188,6 +212,43 @@ export class ButtonWidget extends WidgetAbject {
       }
     }
     return { consumed: false };
+  }
+
+  /**
+   * Ask the WidgetManager tooltip service to show style.tooltip after a
+   * dwell, anchored just right of this button. The widget's screen origin is
+   * recovered from the event's global coordinates minus its local ones (the
+   * dispatch chain re-localizes x/y at every layer but passes globalX/globalY
+   * through untouched).
+   */
+  private requestTooltip(input: Record<string, unknown>): void {
+    const text = this.style.tooltip;
+    if (!text || this.disabled) return;
+    const globalX = input.globalX as number | undefined;
+    const globalY = input.globalY as number | undefined;
+    if (globalX === undefined || globalY === undefined) return;
+    const localX = (input.x as number | undefined) ?? 0;
+    const localY = (input.y as number | undefined) ?? 0;
+    const anchorX = globalX - localX + this.rect.width + 8;
+    const anchorY = globalY - localY + this.rect.height / 2;
+    this.tooltipActive = true;
+    void (async () => {
+      if (!this.tooltipManagerId) {
+        this.tooltipManagerId = await this.discoverDep('WidgetManager') ?? undefined;
+      }
+      // Re-check: the hover may have ended while we were discovering.
+      if (this.tooltipManagerId && this.tooltipActive) {
+        this.send(request(this.id, this.tooltipManagerId, 'requestTooltip', { text, x: anchorX, y: anchorY }));
+      }
+    })();
+  }
+
+  private cancelTooltip(): void {
+    if (!this.tooltipActive) return;
+    this.tooltipActive = false;
+    if (this.tooltipManagerId) {
+      this.send(request(this.id, this.tooltipManagerId, 'cancelTooltip', {}));
+    }
   }
 
   protected override suppressGenericFocusRing(): boolean {

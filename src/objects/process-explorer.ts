@@ -560,8 +560,9 @@ export class ProcessExplorer extends Abject {
       const rowLayoutId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, 'createNestedHBox', {
           parentLayoutId: this.scrollableListId,
-          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          margins: { top: 0, right: 6, bottom: 0, left: 6 },
           spacing: 4,
+          style: { background: this.theme.inputBg, borderColor: this.theme.inputBorder, radius: 6 },
         })
       );
       await this.request(request(this.id, this.scrollableListId, 'addLayoutChild', {

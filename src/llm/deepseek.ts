@@ -5,8 +5,8 @@
  * subclass OpenAIProvider with different base URL and tier models.
  */
 
-import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription } from './provider.js';
-import { OpenAIProvider } from './openai.js';
+import { FetchDelegate, ModelTier, ModelInfo, LLMProviderDescription, LLMCompletionOptions } from './provider.js';
+import { OpenAIProvider, OpenAIRequest, OpenAIReasoningProfile } from './openai.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('DEEPSEEK');
@@ -18,11 +18,20 @@ export interface DeepSeekConfig {
   fetchFn?: FetchDelegate;
 }
 
+// The deepseek-reasoner / deepseek-chat aliases stop resolving 2026-07-24 and
+// currently downgrade the smart slot to V4-Flash; use the explicit V4 ids. Pro
+// reasons; Flash serves the non-thinking balanced/fast tiers.
 const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
-  smart: 'deepseek-reasoner',
-  balanced: 'deepseek-chat',
-  fast: 'deepseek-chat',
+  smart: 'deepseek-v4-pro',
+  balanced: 'deepseek-v4-flash',
+  fast: 'deepseek-v4-flash',
 };
+
+/** Reasoning models: the explicit pro id or the legacy reasoner alias. */
+function deepseekReasons(model: string): boolean {
+  const m = model.toLowerCase();
+  return m.includes('reasoner') || m.includes('-pro');
+}
 
 interface DeepSeekModelsResponse {
   data: Array<{ id: string; object?: string }>;
@@ -40,6 +49,20 @@ export class DeepSeekProvider extends OpenAIProvider {
     this.name = 'deepseek';
   }
 
+  protected override reasoningProfile(model: string): OpenAIReasoningProfile {
+    // max_tokens INCLUDES the chain-of-thought (32k default / 64k ceiling).
+    return { supportsEffort: deepseekReasons(model), reasons: deepseekReasons(model), maxOutput: 64000 };
+  }
+
+  protected override applyReasoning(request: OpenAIRequest, model: string, options: LLMCompletionOptions): { reasoningActive: boolean } {
+    // Non-thinking (chat/flash): send nothing. Reasoner accepts reasoning_effort
+    // "high" or "max" only; it ignores sampling params, so we don't add verbosity.
+    if (!deepseekReasons(model)) return { reasoningActive: false };
+    const effort = this.resolveEffort(options);
+    request.reasoning_effort = effort === 'max' || effort === 'xhigh' ? 'max' : 'high';
+    return { reasoningActive: true };
+  }
+
   override async listModels(): Promise<ModelInfo[]> {
     try {
       const response = await this.fetch(`${this.baseUrl}/models`, {
@@ -51,8 +74,8 @@ export class DeepSeekProvider extends OpenAIProvider {
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
       return [
-        { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
-        { id: 'deepseek-chat', name: 'DeepSeek Chat' },
+        { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
+        { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
       ];
     }
   }
@@ -66,8 +89,8 @@ export class DeepSeekProvider extends OpenAIProvider {
       credentialLabel: 'DeepSeek API Key',
       credentialPlaceholder: 'sk-...',
       models: [
-        { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
-        { id: 'deepseek-chat', name: 'DeepSeek Chat' },
+        { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
+        { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
       ],
       defaultTierModels: DEFAULT_TIER_MODELS,
     };

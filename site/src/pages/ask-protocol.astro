@@ -63,6 +63,11 @@ const manifestStructure = `AbjectManifest {
         </p>
       </header>
 
+      <div class="spec-callout">
+        <strong>This is not a proposal.</strong> It is a running system. Objects interview each other,
+        generate proxies, and self-heal today. <a href="/#downloads">Download it</a> and watch.
+      </div>
+
       <!-- Table of Contents -->
       <nav class="spec-toc">
         <h2>Contents</h2>
@@ -141,10 +146,10 @@ const manifestStructure = `AbjectManifest {
                 <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
               </filter>
               <marker id="sa-g" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-                <path d="M 0 0 L 10 5 L 0 10 z" fill="#39ff8e"/>
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#5be5a0"/>
               </marker>
               <marker id="sa-p" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-                <path d="M 0 0 L 10 5 L 0 10 z" fill="#9b59ff"/>
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#8b7bff"/>
               </marker>
               <marker id="sa-d" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
                 <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a5a70"/>
@@ -152,19 +157,19 @@ const manifestStructure = `AbjectManifest {
             </defs>
 
             <!-- Caller -->
-            <rect x="20" y="30" width="120" height="60" rx="8" fill="#12121e" stroke="rgba(57,255,142,0.35)" stroke-width="1.5"/>
-            <text x="80" y="65" text-anchor="middle" fill="#39ff8e" font-weight="600" font-size="14" font-family="monospace">Caller</text>
+            <rect x="20" y="30" width="120" height="60" rx="8" fill="#1a1b28" stroke="rgba(91,229,160,0.35)" stroke-width="1.5"/>
+            <text x="80" y="65" text-anchor="middle" fill="#5be5a0" font-weight="600" font-size="14" font-family="monospace">Caller</text>
 
             <!-- Target -->
-            <rect x="300" y="30" width="120" height="60" rx="8" fill="#12121e" stroke="rgba(155,89,255,0.35)" stroke-width="1.5"/>
-            <text x="360" y="65" text-anchor="middle" fill="#9b59ff" font-weight="600" font-size="14" font-family="monospace">Target</text>
+            <rect x="300" y="30" width="120" height="60" rx="8" fill="#1a1b28" stroke="rgba(139,123,255,0.35)" stroke-width="1.5"/>
+            <text x="360" y="65" text-anchor="middle" fill="#8b7bff" font-weight="600" font-size="14" font-family="monospace">Target</text>
 
             <!-- LLM -->
-            <rect x="580" y="30" width="120" height="60" rx="8" fill="#12121e" stroke="rgba(90,90,112,0.35)" stroke-width="1.5"/>
+            <rect x="580" y="30" width="120" height="60" rx="8" fill="#1a1b28" stroke="rgba(90,90,112,0.35)" stroke-width="1.5"/>
             <text x="640" y="65" text-anchor="middle" fill="#5a5a70" font-weight="600" font-size="14" font-family="monospace">LLM</text>
 
             <!-- Step 1: Caller -> Target (ask request) -->
-            <line x1="140" y1="55" x2="295" y2="55" stroke="#39ff8e" stroke-width="1.5" marker-end="url(#sa-g)" filter="url(#sg)"/>
+            <line x1="140" y1="55" x2="295" y2="55" stroke="#5be5a0" stroke-width="1.5" marker-end="url(#sa-g)" filter="url(#sg)"/>
             <text x="218" y="47" text-anchor="middle" fill="#e0e0ea" font-size="10" font-family="monospace">{"ask({ question })"}</text>
 
             <!-- Step 2: Target -> LLM (with context) -->
@@ -176,12 +181,12 @@ const manifestStructure = `AbjectManifest {
             <text x="498" y="93" text-anchor="middle" fill="#8a8a9e" font-size="10" font-family="monospace">LLM response</text>
 
             <!-- Step 4: Target -> Caller (reply) -->
-            <line x1="295" y1="75" x2="145" y2="75" stroke="#9b59ff" stroke-width="1.5" marker-end="url(#sa-p)" filter="url(#sp)"/>
+            <line x1="295" y1="75" x2="145" y2="75" stroke="#8b7bff" stroke-width="1.5" marker-end="url(#sa-p)" filter="url(#sp)"/>
             <text x="218" y="93" text-anchor="middle" fill="#e0e0ea" font-size="10" font-family="monospace">answer (string)</text>
 
             <!-- Step labels -->
-            <text x="80" y="130" text-anchor="middle" fill="#39ff8e" font-size="11" font-family="monospace" font-weight="600">1. Send question</text>
-            <text x="360" y="130" text-anchor="middle" fill="#9b59ff" font-size="11" font-family="monospace" font-weight="600">2. Assemble context</text>
+            <text x="80" y="130" text-anchor="middle" fill="#5be5a0" font-size="11" font-family="monospace" font-weight="600">1. Send question</text>
+            <text x="360" y="130" text-anchor="middle" fill="#8b7bff" font-size="11" font-family="monospace" font-weight="600">2. Assemble context</text>
             <text x="640" y="130" text-anchor="middle" fill="#5a5a70" font-size="11" font-family="monospace" font-weight="600">3. Generate answer</text>
 
             <!-- Fallback note -->
@@ -226,19 +231,39 @@ const manifestStructure = `AbjectManifest {
 
         <h3>Why Objects Can Answer</h3>
 
+        <p>
+          <code>ask</code> is not a description field. It is a live handler: code that runs when the
+          object is questioned. That is what makes it more than static self-documentation, and it is why an
+          outside LLM reading a fixed blob cannot do the same job.
+        </p>
+
         <div class="spec-grid">
           <div class="spec-card">
-            <h4>They know what they are</h4>
+            <h4>Encapsulation, not a data dump</h4>
             <p>
-              Every object carries a manifest declaring its name, capabilities, methods, and events.
-              This self-description is always available.
+              Like any object, an Abject exposes an interface and hides its internals. It answers
+              <em>as</em> itself. It does not hand out a static snapshot of everything inside.
             </p>
           </div>
           <div class="spec-card">
-            <h4>They know what they do</h4>
+            <h4>The answer depends on who asks</h4>
             <p>
-              Objects that have source code include it. As the code changes, the answers change.
-              There is no external documentation to fall out of sync.
+              The <code>ask</code> handler receives the caller. A scheduler and a human can get different
+              answers to the same question. A fixed description cannot condition on context.
+            </p>
+          </div>
+          <div class="spec-card">
+            <h4>Answering is behavior, not a read</h4>
+            <p>
+              The handler is code: it can consult live state, negotiate, refuse, or even
+              <em>ask the caller back</em>. Two objects interview each other. A description is one-way.
+            </p>
+          </div>
+          <div class="spec-card">
+            <h4>Always live</h4>
+            <p>
+              The answer is computed now, from the object's current manifest and source, not authored
+              once and left to drift. As the object changes, its answers change.
             </p>
           </div>
         </div>
@@ -257,7 +282,9 @@ const manifestStructure = `AbjectManifest {
         </p>
 
         <div class="spec-callout">
-          <strong>Key insight:</strong> The object is its own documentation. Ask it what it does. It knows.
+          <strong>Key insight:</strong> A static description written by an outside LLM is a photograph of
+          one object's surface at one moment. <code>ask</code> is the object's living, two-way,
+          caller-aware behavior, which no photograph can replicate.
         </div>
       </section>
 
@@ -412,8 +439,27 @@ const manifestStructure = `AbjectManifest {
         <p>
           A new generation of protocols has emerged around LLM integration and agent interoperability.
           MCP, A2A, and OpenAI's function calling each address a piece of the puzzle.
-          The Ask Protocol occupies a different position: it is not a tool-calling convention or an agent orchestration layer,
-          but a self-description primitive embedded in the objects themselves.
+          The Ask Protocol occupies a different position: it is not a tool-calling convention or an agent
+          orchestration layer, but a self-description primitive embedded in the objects themselves.
+        </p>
+        <p>
+          In TCP, DNS, MCP, and A2A, capability negotiation serves a higher layer that carries the real
+          payload. The Ask Protocol has no higher layer to serve. In a peer mesh there is no top: the
+          negotiation <em>is</em> the work, objects teaching each other, generating proxies, and recovering
+          from misunderstanding. The payload is mutual understanding itself.
+        </p>
+
+        <div class="spec-callout">
+          <strong>The key distinction:</strong> MCP, A2A, and function calling are plumbing. They define how
+          to call tools, route messages, and negotiate capabilities. The Ask Protocol is not plumbing. It is
+          a cognitive primitive: an object explaining itself in its own words, using its own source as
+          evidence. The plumbing tells you <em>how</em> to call something. Ask tells you <em>what</em> it is
+          and <em>why</em> you would call it.
+        </div>
+
+        <p>
+          The table below is for orientation, not parity. Ask sits at a different layer than these, so read
+          it as "where each one lives," not a feature scorecard.
         </p>
 
         <div class="comparison-table">
@@ -431,14 +477,6 @@ const manifestStructure = `AbjectManifest {
             <div class="comparison-cell">Agent-to-agent task delegation and coordination.</div>
             <div class="comparison-cell">Let models invoke developer-defined functions.</div>
             <div class="comparison-cell highlight-cell">Let objects explain themselves and teach each other.</div>
-          </div>
-
-          <div class="comparison-row">
-            <div class="comparison-cell label-cell">Architecture</div>
-            <div class="comparison-cell">Client-host-server. JSON-RPC. LLM at the center.</div>
-            <div class="comparison-cell">Peer-to-peer. JSON-RPC, gRPC, or HTTP.</div>
-            <div class="comparison-cell">Hub-spoke API. Stateless between calls.</div>
-            <div class="comparison-cell highlight-cell">Peer-to-peer message passing. Every object is both client and server.</div>
           </div>
 
           <div class="comparison-row">
@@ -465,35 +503,15 @@ const manifestStructure = `AbjectManifest {
             <div class="comparison-cell highlight-cell">Yes. Any object can ask any other object. No central coordinator.</div>
           </div>
 
-          <div class="comparison-row">
-            <div class="comparison-cell label-cell">Error Recovery</div>
-            <div class="comparison-cell">JSON-RPC errors + isError flag for LLM self-correction.</div>
-            <div class="comparison-cell">Task state machine (failed state with details).</div>
-            <div class="comparison-cell">Developer-managed. Model retries from error strings.</div>
-            <div class="comparison-cell highlight-cell">Regenerate translator using error history as LLM context. Each failure teaches the next attempt.</div>
-          </div>
-
-          <div class="comparison-row">
-            <div class="comparison-cell label-cell">Governance</div>
-            <div class="comparison-cell">Linux Foundation (AAIF). Anthropic, OpenAI, Google, Microsoft.</div>
-            <div class="comparison-cell">Linux Foundation. Google, IBM, 100+ partners.</div>
-            <div class="comparison-cell">Proprietary API. SDK is open-source.</div>
-            <div class="comparison-cell highlight-cell">Open source (GPL-3.0).</div>
-          </div>
-        </div>
-
-        <div class="spec-callout">
-          <strong>The key distinction:</strong> MCP, A2A, and function calling are all plumbing.
-          They define how to call tools, how to route messages, how to negotiate capabilities.
-          The Ask Protocol is not plumbing. It is a cognitive primitive: the ability for an object to explain itself
-          in its own words, using its own source code as evidence. The plumbing protocols tell you <em>how</em> to call something.
-          The Ask Protocol tells you <em>what</em> something is and <em>why</em> you would call it.
         </div>
 
         <p>
-          These approaches are complementary, not competing. MCP could transport an <code>ask</code> call.
-          A2A could route it between peers. But neither provides the self-description primitive itself.
-          The Ask Protocol is the content; the others are the envelope.
+          These approaches are complementary, not competing. MCP could transport an <code>ask</code> call;
+          A2A could route it between peers. But neither provides the self-description primitive itself: the
+          Ask Protocol is the content, the others are the envelope. Its value is also a <em>whole-system</em>
+          property. It pays off when every participant is an object that can be asked <em>and</em> ask back,
+          not when bolted onto a single server. That bidirectional, system-wide self-knowledge is what a
+          freeform description field cannot give you.
         </p>
       </section>
 
@@ -506,6 +524,12 @@ const manifestStructure = `AbjectManifest {
           TCP/IP, DNS, BGP: these are protocols between machines that identify themselves,
           negotiate capabilities, and exchange structured data.
           The internet is already object-oriented.
+        </p>
+
+        <p>
+          Ask does not replace TCP or DNS. It moves no bytes. It restores their peer, self-identifying
+          nature at the layer of meaning: not "how do I reach you," but "what are you, and why would I
+          call you."
         </p>
 
         <p>

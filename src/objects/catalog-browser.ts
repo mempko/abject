@@ -643,7 +643,7 @@ Browse and install skills and MCP servers from public registries.
     const { widgetIds: [id] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId, 'create', { specs: [
         {
-          type: 'label',
+          type: extraStyle.markdown ? 'markdown' : 'label',
           windowId: this.windowId,
           text,
           style: {

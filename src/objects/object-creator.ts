@@ -13,7 +13,7 @@
  * Three banner-delimited sections below:
  *   1. INFRASTRUCTURE   — types, dep resolution, message wrappers, progress.
  *   2. LOCAL OPERATIONS — tools that touch agent-local state (drafts,
- *                         compile, validate, review, decompose, terminals).
+ *                         compile, validate, review, terminals).
  *   3. AGENT SHELL      — AgentAbject registration, observe/act handlers,
  *                         system prompt, task lifecycle, finalization.
  */
@@ -24,11 +24,24 @@ import { request, event } from '../core/message.js';
 import { IntrospectResult } from '../core/introspect.js';
 import { ScriptableAbject } from './scriptable-abject.js';
 import { systemMessage, userMessage, LLMMessage } from '../llm/provider.js';
+import type { ContentPart } from '../llm/provider.js';
 import type { AgentAction } from './agent-abject.js';
+import { buildOrganismManifest } from './organism.js';
+import type { OrganismSpec, OrganelleSpec } from './organism.js';
 import { Log } from '../core/timed-log.js';
-import { applyDiff, parseSearchReplaceBlocks } from './source-diff.js';
+import { applyDiff, parseSearchReplaceBlocks, levenshtein } from './source-diff.js';
+import * as acorn from 'acorn';
 
 const log = new Log('OBJECT-CREATOR');
+
+/** Minimal structural view of an acorn/ESTree node (acorn's own types omit the
+ *  ESTree node shapes; we read only type/start/end and a few fields). */
+interface AstNode {
+  type: string;
+  start: number;
+  end: number;
+  [key: string]: unknown;
+}
 
 /** Methods provided by the Abject / ScriptableAbject framework; valid on every object. */
 const FRAMEWORK_PROVIDED_METHODS = ScriptableAbject.PROTECTED_HANDLERS;
@@ -71,7 +84,7 @@ interface DepMethodIndex {
 
 /** Output from the static call-name walker. */
 interface CallValidationError {
-  kind: 'unknown-dep' | 'unknown-method';
+  kind: 'unknown-dep' | 'unknown-method' | 'name-string-recipient' | 'hardcoded-id';
   callSite: { line: number; snippet: string };
   depName?: string;
   methodName?: string;
@@ -111,6 +124,13 @@ interface LoopState {
   terminal?: { kind: 'done' | 'fail'; result?: unknown; error?: string };
   spawnedObjectId?: AbjectId;
   deployedViaUpdateSource?: boolean;
+  /**
+   * Snapshot of `draftSource` as it was at the last successful deploy
+   * (deploy_spawn / deploy_update). When `draftSource` differs from this, the
+   * live object is running stale code — the observation flags it and the loop
+   * is told not to finish until it is deployed. Compiling is not deploying.
+   */
+  lastDeployedSource?: string;
 }
 
 /** Per-task bookkeeping: the caller's message to deferred-reply to, plus loop state. */
@@ -123,6 +143,13 @@ interface TaskExtra {
   goalId?: string;
   deferredMsg?: AbjectMessage;
   state: LoopState;
+  /**
+   * Multimodal content (an image part) staged by the previous `act` to ride
+   * into the NEXT observation — e.g. a screenshot captured via
+   * Screenshot.captureWindow, so the agent can visually inspect what it
+   * rendered. Consumed (and cleared) by handleObserve.
+   */
+  lastLlmContent?: ContentPart[];
 }
 
 /**
@@ -151,7 +178,7 @@ export class ObjectCreator extends Abject {
         name: 'ObjectCreator',
         description:
           'Creates new Abjects and modifies existing ones through a ReAct loop over message passing. ' +
-          'Investigates targets and dependencies via the universal ask protocol and describe introspection, drafts code, validates drafts against live manifests, deploys, and verifies behavior. ' +
+          'Learns how to use targets and dependencies primarily through the universal ask protocol (prose usage, examples, design guidance), drafts code, validates drafts against live manifests, deploys, and verifies behavior. ' +
           'Handles any task about building, authoring, fixing, changing, updating, modifying, redesigning, or improving an Abject — including bridges, proxies, relays, wrappers, adapters, and integrations. ' +
           'Diagnostic questions about an object terminate with a written report instead of a modification.',
         version: '2.0.0',
@@ -272,6 +299,7 @@ What I handle:
 - Single-object authoring (new widgets, apps, bridges, proxies, MCP wrappers).
 - Modifying existing Abject source — adding methods, events, manifest entries; fixing handlers; refactoring an Abject's implementation.
 - Investigation that ends in code edits (read source, diagnose, fix).
+- Composing existing source-backed objects into one Organism behind a single membrane interface, and extracting an organelle back out as a standalone object.
 
 What I don't handle:
 - Multi-object autonomous-system composition (agent + scheduler + watcher) — that's AgentCreator.
@@ -288,23 +316,52 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return this.request<T>(request(this.id, target, method, payload), timeoutMs);
   }
 
-  /** Resolve a name or UUID to an AbjectId. */
+  /**
+   * Resolve a reference (live AbjectId, durable TypeId, or registered name) to
+   * the CURRENT live AbjectId.
+   *
+   * An id-shaped string is NOT trusted blindly: AbjectIds are ephemeral and
+   * churn every time AbjectStore restores an object on restart, so a stale id
+   * captured in a prior session (or baked into a goal / KnowledgeBase entry)
+   * must be verified against the live registry before use. If it isn't live,
+   * we fall through to TypeId and name resolution rather than silently adopting
+   * a dead id (which is exactly what made getSource return nothing earlier).
+   */
   private async resolveTarget(nameOrId: string): Promise<AbjectId | undefined> {
     if (!nameOrId) return undefined;
-    if (nameOrId.includes('-') && nameOrId.length > 20) return nameOrId as AbjectId;
-    if (this.registryId) {
-      try {
-        const hits = await this.sendRequest<ObjectRegistration[]>(this.registryId, 'discover', { name: nameOrId });
-        if (hits && hits.length > 0) return hits[0].id;
-      } catch { /* fall through */ }
+    const idShaped = nameOrId.includes('-') && nameOrId.length > 20;
+
+    // Fast path: an id-shaped string that is a live registration.
+    if (idShaped && await this.isLiveRegistration(nameOrId as AbjectId)) {
+      return nameOrId as AbjectId;
     }
-    if (this.systemRegistryId) {
+
+    for (const registryId of [this.registryId, this.systemRegistryId]) {
+      if (!registryId) continue;
+      // Durable TypeId → current AbjectId.
       try {
-        const hits = await this.sendRequest<ObjectRegistration[]>(this.systemRegistryId, 'discover', { name: nameOrId });
+        const live = await this.sendRequest<AbjectId | null>(registryId, 'resolveType', { typeId: nameOrId });
+        if (live) return live;
+      } catch { /* fall through */ }
+      // Registered name → first live AbjectId.
+      try {
+        const hits = await this.sendRequest<ObjectRegistration[]>(registryId, 'discover', { name: nameOrId });
         if (hits && hits.length > 0) return hits[0].id;
       } catch { /* fall through */ }
     }
     return undefined;
+  }
+
+  /** True if `id` is a currently-registered object in either registry. */
+  private async isLiveRegistration(id: AbjectId): Promise<boolean> {
+    for (const registryId of [this.registryId, this.systemRegistryId]) {
+      if (!registryId) continue;
+      try {
+        const reg = await this.sendRequest<ObjectRegistration | null>(registryId, 'lookup', { objectId: id });
+        if (reg) return true;
+      } catch { /* fall through */ }
+    }
+    return false;
   }
 
   /** Report progress to an upstream caller (for GoalManager / JobBrowser visibility). */
@@ -351,10 +408,69 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   }
 
   /** Stage a source draft. */
+  /**
+   * Pull a field from an action, tolerant of the model wrapping args in a
+   * `params`/`arguments`/`input` envelope and of common field aliases. Keeps
+   * a single mis-keyed payload from wasting a whole step on a "missing X" error.
+   */
+  private actionField(action: AgentAction, keys: string[]): unknown {
+    const envelopes = [action, action.params, action.arguments, action.input]
+      .filter((e): e is Record<string, unknown> => !!e && typeof e === 'object');
+    for (const env of envelopes) {
+      for (const k of keys) {
+        const v = env[k];
+        if (v !== undefined && v !== null) return v;
+      }
+    }
+    return undefined;
+  }
+
+  /** Valid action verbs this loop dispatches, for unknown-action recovery. */
+  private static readonly VALID_ACTIONS = [
+    'call', 'draft_manifest', 'draft_source', 'draft_diff', 'read_draft',
+    'replace_handler', 'add_handler', 'remove_handler', 'load_target', 'draft_via_llm',
+    'compile', 'validate_calls', 'review_semantics', 'deploy_spawn', 'deploy_update',
+    'compose_organism', 'extract_organelle',
+    'reply', 'ask_user', 'done', 'fail',
+  ];
+
+  /**
+   * Build a recovery message for an unrecognized action. The most common cause
+   * is the model emitting another object's METHOD as a top-level action verb
+   * (e.g. `writeGoalData`, which is a real GoalManager method) — redirect that
+   * to the `call` action. Otherwise list the valid verbs and suggest the closest.
+   */
+  private unknownActionError(got: string, state: LoopState): string {
+    const valid = ObjectCreator.VALID_ACTIONS;
+
+    // Did the model use a discovered object's method name as the action?
+    // Steer it to the call form against the owning object.
+    const owners: string[] = [];
+    for (const [name, dep] of state.deps) {
+      if (dep.methods.has(got)) owners.push(name);
+    }
+    if (owners.length > 0) {
+      const target = owners[0];
+      return `"${got}" is a method on ${owners.map(o => `"${o}"`).join(' / ')}, not a loop action. ` +
+        `Invoke it with the call action: {"action":"call","target":"${target}","method":"${got}","payload":{ ... }}.`;
+    }
+
+    const lower = (got ?? '').toLowerCase();
+    let suggestion: string | undefined;
+    let best = Infinity;
+    for (const v of valid) {
+      const d = levenshtein(lower, v);
+      if (d < best) { best = d; suggestion = v; }
+    }
+    const hint = suggestion && best <= Math.ceil(suggestion.length / 2) ? ` Did you mean "${suggestion}"?` : '';
+    return `Unknown action "${got}". Valid actions: ${valid.join(', ')}.${hint} ` +
+      `If "${got}" is a method on another object (for example writeGoalData/readGoalData on GoalManager), call it via {"action":"call","target":"<object>","method":"${got}","payload":{ ... }}.`;
+  }
+
   private async opDraftSource(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
-    const source = action.source as string | undefined;
+    const source = this.actionField(action, ['source', 'code', 'draftSource', 'src']) as string | undefined;
     if (typeof source !== 'string' || source.length === 0) {
-      return { ok: false, summary: 'draft_source: missing source', error: 'source must be a non-empty string' };
+      return { ok: false, summary: 'draft_source: missing source', error: 'source must be a non-empty string (pass it as the `source` field)' };
     }
     state.draftSource = source;
     return { ok: true, summary: `draft_source: ${source.split('\n').length} lines staged` };
@@ -373,16 +489,16 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * surrounding context).
    */
   private async opDraftDiff(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
-    const blocksText = action.blocks as string | undefined;
+    const blocksText = this.actionField(action, ['blocks', 'diff', 'search_replace', 'searchReplace', 'patch', 'edits']) as string | undefined;
     if (typeof blocksText !== 'string' || blocksText.length === 0) {
-      return { ok: false, summary: 'draft_diff: missing blocks', error: 'blocks must be a non-empty string of SEARCH/REPLACE blocks' };
+      return { ok: false, summary: 'draft_diff: missing blocks', error: 'blocks must be a non-empty string of SEARCH/REPLACE blocks, passed as the `blocks` field. Format: <<<<<<< SEARCH\\n...\\n=======\\n...\\n>>>>>>> REPLACE. For editing one method, prefer replace_handler({name, body}) — name-addressed, no SEARCH text to match. To rewrite the whole object use draft_source.' };
     }
     const base = state.draftSource ?? state.targetSource;
     if (!base) {
       return {
         ok: false,
         summary: 'draft_diff: no base source',
-        error: 'draft_diff requires an existing source to edit. For modify loops the target source is loaded automatically; for create flows use draft_source instead.',
+        error: 'draft_diff requires an existing source to edit. For modify loops the target source is loaded automatically. If you discovered the goal is about an existing object, call load_target({objectId|targetName}) to adopt it and load its source, then draft_diff. For a brand-new object, use draft_source instead.',
       };
     }
 
@@ -398,12 +514,21 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     const result = applyDiff(base, parsed.blocks);
     if (!result.ok) {
-      const errorLines = result.errors.map((e) => `  - ${e.message}`).join('\n');
+      const errorLines = result.errors.map((e) => {
+        let line = `  - ${e.message}`;
+        // Show the closest region actually in the source so the next attempt can
+        // copy it verbatim instead of guessing at whitespace again.
+        if (e.nearest) {
+          line += `\n    Closest text in source (around line ${e.nearest.line}) — copy this EXACTLY into your SEARCH:\n` +
+            e.nearest.text.split('\n').map((l) => `    | ${l}`).join('\n');
+        }
+        return line;
+      }).join('\n');
       const parseNote = parsed.parseErrors.length > 0 ? `\nParse warnings: ${parsed.parseErrors.join('; ')}` : '';
       return {
         ok: false,
         summary: `draft_diff: ${result.applied}/${parsed.blocks.length} applied, ${result.errors.length} failed`,
-        error: `Some SEARCH/REPLACE blocks could not be applied:\n${errorLines}${parseNote}\n\nFix the failing blocks and call draft_diff again with a fresh blocks payload.`,
+        error: `Some SEARCH/REPLACE blocks could not be applied:\n${errorLines}${parseNote}\n\nFix the failing blocks and call draft_diff again. If the edit is one method, the robust path is read_draft({handler:"<name>"}) to see its exact current text, then replace_handler({name:"<name>", body:"<full method>"}) — no SEARCH matching. For a whole-object rewrite use draft_source.`,
       };
     }
 
@@ -413,6 +538,254 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return {
       ok: true,
       summary: `draft_diff: ${parsed.blocks.length} block${parsed.blocks.length === 1 ? '' : 's'} applied${stackedNote}, source now ${result.source!.split('\n').length} lines${parseNote}`,
+    };
+  }
+
+  // ── Structure-aware editing of the staged handler-map object literal ──────
+  //
+  // Generated objects are a single `({ name(msg){...}, _helper(){...}, prop: v })`
+  // literal, so the natural — and whitespace-proof — edit unit is a top-level
+  // member addressed by NAME. These ops parse that literal and replace / add /
+  // remove one member, avoiding the SEARCH-text matching that makes draft_diff
+  // fragile on large files. read_draft lets the agent edit against ground truth
+  // (the current stage) instead of reconstructing it from memory.
+
+  /**
+   * Parse the top-level members of the `({ ... })` handler map with a real JS
+   * parser (acorn), so regexes, template literals, comments, and nested syntax
+   * are handled exactly — no hand-rolled scanning. Returns the object literal's
+   * brace span (objStart = index of `{`, objEnd = index of `}`) plus each
+   * top-level member's name and [start, end) source span. Returns null when the
+   * source doesn't parse or has no top-level object literal (callers then fall
+   * back to draft_diff / draft_source).
+   */
+  private parseHandlerMembers(source: string): {
+    objStart: number; objEnd: number;
+    members: Array<{ name: string; start: number; end: number }>;
+  } | null {
+    let program: AstNode;
+    try {
+      program = acorn.parse(source, { ecmaVersion: 'latest' }) as unknown as AstNode;
+    } catch {
+      return null;
+    }
+
+    // The handler map is `({ ... })` → an ExpressionStatement whose expression
+    // is the ObjectExpression. Find it among the top-level statements.
+    let obj: AstNode | null = null;
+    for (const stmt of (program.body as AstNode[] | undefined) ?? []) {
+      const expr = stmt.expression as AstNode | undefined;
+      if (stmt.type === 'ExpressionStatement' && expr?.type === 'ObjectExpression') {
+        obj = expr;
+        break;
+      }
+    }
+    if (!obj) return null;
+
+    const members: Array<{ name: string; start: number; end: number }> = [];
+    for (const prop of (obj.properties as AstNode[] | undefined) ?? []) {
+      if (prop.type !== 'Property') continue; // skip SpreadElement etc.
+      let name = '';
+      if (!prop.computed) {
+        const key = prop.key as AstNode | undefined;
+        if (key?.type === 'Identifier') name = String(key.name);
+        else if (key?.type === 'Literal') name = String(key.value);
+      }
+      members.push({ name, start: prop.start, end: prop.end });
+    }
+    // acorn's node.end is one past the last char; the closing `}` sits at end-1.
+    return { objStart: obj.start, objEnd: obj.end - 1, members };
+  }
+
+  private opReadDraft(state: LoopState, action: AgentAction): { ok: boolean; summary: string; error?: string; data?: unknown } {
+    const base = state.draftSource ?? state.targetSource;
+    if (!base) {
+      return { ok: false, summary: 'read_draft: nothing staged', error: 'No staged or target source yet. Use draft_source for a new object, or load_target to adopt an existing one.' };
+    }
+    const numbered = (text: string, startLine = 1): string =>
+      text.split('\n').map((l, i) => `${startLine + i}\t${l}`).join('\n');
+
+    const handler = this.actionField(action, ['handler', 'name', 'method']) as string | undefined;
+    const grep = this.actionField(action, ['grep', 'search', 'pattern']) as string | undefined;
+    const lineRange = this.actionField(action, ['lineRange', 'lines', 'range']);
+
+    if (handler) {
+      const parsed = this.parseHandlerMembers(base);
+      const m = parsed?.members.find(x => x.name === handler);
+      if (!m) {
+        return { ok: false, summary: `read_draft: no handler "${handler}"`, error: `No top-level member named "${handler}". Available: ${parsed ? parsed.members.map(x => x.name).join(', ') : '(could not parse object literal)'}.` };
+      }
+      const startLine = base.slice(0, m.start).split('\n').length;
+      return { ok: true, summary: `read_draft: ${handler}`, data: numbered(base.slice(m.start, m.end), startLine) };
+    }
+
+    if (lineRange) {
+      let a = 0;
+      let b = 0;
+      if (typeof lineRange === 'string') {
+        const mm = lineRange.match(/(\d+)\s*-\s*(\d+)/);
+        if (mm) { a = parseInt(mm[1], 10); b = parseInt(mm[2], 10); }
+      } else if (lineRange && typeof lineRange === 'object') {
+        const lr = lineRange as { start?: number; end?: number };
+        a = lr.start ?? 0; b = lr.end ?? 0;
+      }
+      if (a > 0 && b >= a) {
+        const lines = base.split('\n').slice(a - 1, b);
+        return { ok: true, summary: `read_draft: lines ${a}-${b}`, data: numbered(lines.join('\n'), a) };
+      }
+      return { ok: false, summary: 'read_draft: bad lineRange', error: 'lineRange must be "start-end" or { start, end } with start>=1.' };
+    }
+
+    if (grep) {
+      // Treat the pattern as a regex, but fall back to a literal substring
+      // search when it isn't valid regex — agents routinely pass code snippets
+      // like "_handlePaste(session" whose unbalanced parens aren't valid regex.
+      let test: (line: string) => boolean;
+      try {
+        const re = new RegExp(grep, 'i');
+        test = (line) => re.test(line);
+      } catch {
+        const needle = grep.toLowerCase();
+        test = (line) => line.toLowerCase().includes(needle);
+      }
+      const hits = base.split('\n')
+        .map((l, i) => ({ n: i + 1, l }))
+        .filter(x => test(x.l))
+        .slice(0, 60)
+        .map(x => `${x.n}\t${x.l}`)
+        .join('\n');
+      return { ok: true, summary: `read_draft: grep "${grep}"`, data: hits || '(no matches)' };
+    }
+
+    // Default: a compact outline (member names + line ranges) so the agent can
+    // navigate without pulling the whole file into context, then read one member.
+    const parsed = this.parseHandlerMembers(base);
+    const total = base.split('\n').length;
+    if (!parsed || parsed.members.length === 0) {
+      return { ok: true, summary: `read_draft: ${total} lines`, data: numbered(base) };
+    }
+    const outline = parsed.members.map(m => {
+      const sl = base.slice(0, m.start).split('\n').length;
+      const el = base.slice(0, m.end).split('\n').length;
+      return `  ${m.name}  (lines ${sl}-${el}, ${el - sl + 1} ln)`;
+    }).join('\n');
+    return {
+      ok: true,
+      summary: `read_draft: outline (${parsed.members.length} members, ${total} lines)`,
+      data: `Staged source: ${total} lines, ${parsed.members.length} top-level members. Read one with read_draft({handler:"name"}), or read_draft({lineRange:"a-b"}) / read_draft({grep:"..."}).\n${outline}`,
+    };
+  }
+
+  private opReplaceHandler(state: LoopState, action: AgentAction): { ok: boolean; summary: string; error?: string } {
+    const base = state.draftSource ?? state.targetSource;
+    if (!base) return { ok: false, summary: 'replace_handler: no source', error: 'Nothing staged. Use draft_source for a new object, or load_target to adopt an existing one.' };
+    const name = this.actionField(action, ['name', 'handler', 'method']) as string | undefined;
+    const body = this.actionField(action, ['body', 'source', 'member', 'text', 'code']) as string | undefined;
+    if (!name) return { ok: false, summary: 'replace_handler: missing name', error: 'replace_handler requires {name} — the existing member to replace.' };
+    if (typeof body !== 'string' || !body.trim()) return { ok: false, summary: 'replace_handler: missing body', error: 'replace_handler requires {body} — the FULL member text including its signature, e.g. "openMap(msg) { ... }".' };
+    const parsed = this.parseHandlerMembers(base);
+    if (!parsed) return { ok: false, summary: 'replace_handler: unparseable', error: 'Could not locate the handler-map object literal. Use draft_diff or draft_source instead.' };
+    const m = parsed.members.find(x => x.name === name);
+    if (!m) return { ok: false, summary: `replace_handler: no "${name}"`, error: `No top-level member named "${name}". Available: ${parsed.members.map(x => x.name).join(', ')}. To add a new member use add_handler.` };
+    const next = base.slice(0, m.start) + body.trim() + base.slice(m.end);
+    state.draftSource = next;
+    return { ok: true, summary: `replace_handler: "${name}" replaced, source now ${next.split('\n').length} lines. Run compile next.` };
+  }
+
+  private opAddHandler(state: LoopState, action: AgentAction): { ok: boolean; summary: string; error?: string } {
+    const base = state.draftSource ?? state.targetSource;
+    if (!base) return { ok: false, summary: 'add_handler: no source', error: 'Nothing staged. Use draft_source for a new object, or load_target to adopt an existing one.' };
+    const name = this.actionField(action, ['name', 'handler', 'method']) as string | undefined;
+    const body = this.actionField(action, ['body', 'source', 'member', 'text', 'code']) as string | undefined;
+    if (!name) return { ok: false, summary: 'add_handler: missing name', error: 'add_handler requires {name}.' };
+    if (typeof body !== 'string' || !body.trim()) return { ok: false, summary: 'add_handler: missing body', error: 'add_handler requires {body} — the full member text, e.g. "myMethod(msg) { ... }".' };
+    const parsed = this.parseHandlerMembers(base);
+    if (!parsed) return { ok: false, summary: 'add_handler: unparseable', error: 'Could not locate the handler-map object literal. Use draft_diff or draft_source instead.' };
+    if (parsed.members.some(x => x.name === name)) {
+      return { ok: false, summary: `add_handler: "${name}" exists`, error: `A member named "${name}" already exists — use replace_handler to change it.` };
+    }
+    let j = parsed.objEnd - 1;
+    while (j > parsed.objStart && /\s/.test(base[j])) j--;
+    const needsComma = base[j] !== ',' && base[j] !== '{';
+    const insertion = (needsComma ? ',' : '') + '\n\n  ' + body.trim() + '\n';
+    const next = base.slice(0, parsed.objEnd) + insertion + base.slice(parsed.objEnd);
+    state.draftSource = next;
+    return { ok: true, summary: `add_handler: "${name}" added, source now ${next.split('\n').length} lines. Run compile next.` };
+  }
+
+  private opRemoveHandler(state: LoopState, action: AgentAction): { ok: boolean; summary: string; error?: string } {
+    const base = state.draftSource ?? state.targetSource;
+    if (!base) return { ok: false, summary: 'remove_handler: no source', error: 'Nothing staged. Use draft_source or load_target first.' };
+    const name = this.actionField(action, ['name', 'handler', 'method']) as string | undefined;
+    if (!name) return { ok: false, summary: 'remove_handler: missing name', error: 'remove_handler requires {name}.' };
+    const parsed = this.parseHandlerMembers(base);
+    if (!parsed) return { ok: false, summary: 'remove_handler: unparseable', error: 'Could not locate the handler-map object literal. Use draft_diff or draft_source instead.' };
+    const m = parsed.members.find(x => x.name === name);
+    if (!m) return { ok: false, summary: `remove_handler: no "${name}"`, error: `No top-level member named "${name}". Available: ${parsed.members.map(x => x.name).join(', ')}.` };
+    let s = m.start;
+    let e = m.end;
+    // Absorb one trailing comma, or (for the last member) the preceding comma.
+    let k = e;
+    while (k < parsed.objEnd && /\s/.test(base[k])) k++;
+    if (base[k] === ',') {
+      e = k + 1;
+    } else {
+      let p = s - 1;
+      while (p > parsed.objStart && /\s/.test(base[p])) p--;
+      if (base[p] === ',') s = p;
+    }
+    const next = base.slice(0, s) + base.slice(e);
+    state.draftSource = next;
+    return { ok: true, summary: `remove_handler: "${name}" removed, source now ${next.split('\n').length} lines. Run compile next.` };
+  }
+
+  /**
+   * Adopt an existing object as the loop's modify target. Resolves a UUID or
+   * registered name, loads its current source into `state.targetSource`, and
+   * pivots the loop to a modify (so `draft_diff` has a base and `deploy_update`
+   * has a target). This is how a loop that began as a create — because no
+   * target was supplied at dispatch — recovers once it discovers (via ask /
+   * describe / discover) that the goal is really about an existing Abject.
+   * Idempotent: calling it again with the same target is a no-op refresh.
+   */
+  private async opLoadTarget(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
+    const nameOrId = (action.objectId ?? action.target ?? action.targetName ?? action.objectName) as string | undefined;
+    if (typeof nameOrId !== 'string' || nameOrId.length === 0) {
+      return { ok: false, summary: 'load_target: missing target', error: 'pass {objectId} or {targetName} naming the existing object to modify' };
+    }
+    const resolvedId = await this.resolveTarget(nameOrId);
+    if (!resolvedId) {
+      return {
+        ok: false,
+        summary: `load_target: not found: ${nameOrId}`,
+        error: `Could not resolve target "${nameOrId}". Use call("Registry", "ask", {question: "is there an object that handles X?"}) or call("Registry", "discover", {name: "..."}) to find it first.`,
+      };
+    }
+
+    let source: string | undefined;
+    if (this.registryId) {
+      try {
+        const src = await this.sendRequest<string | null>(this.registryId, 'getSource', { objectId: resolvedId }, 5000);
+        if (typeof src === 'string' && src.length > 0) source = src;
+      } catch { /* best effort */ }
+    }
+
+    state.targetObjectId = resolvedId;
+    state.targetName = nameOrId.includes('-') && nameOrId.length > 20 ? undefined : nameOrId;
+    if (source !== undefined) state.targetSource = source;
+    // Pivot the loop: from here this is a modification of an existing object.
+    if (state.kind === 'create') state.kind = 'modify';
+
+    const label = state.targetName ?? resolvedId.slice(0, 8);
+    if (source === undefined) {
+      return {
+        ok: true,
+        summary: `load_target: ${label} adopted as modify target (no source on file — fetch via call("Registry", "getSource") if needed, or draft fresh source)`,
+      };
+    }
+    return {
+      ok: true,
+      summary: `load_target: ${label} adopted as modify target, ${source.split('\n').length} lines of source loaded (edit with draft_diff, deploy with deploy_update)`,
     };
   }
 
@@ -484,9 +857,36 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     const err = ScriptableAbject.tryCompile(state.draftSource);
     state.lastValidation = { ...(state.lastValidation ?? {}), compile: err ?? '' };
     if (err) {
-      return { ok: false, summary: `compile: ${err.slice(0, 120)}`, error: err };
+      return { ok: false, summary: `compile: ${err.slice(0, 120)}`, error: this.augmentCompileError(state.draftSource, err) };
     }
     return { ok: true, summary: 'compile: OK' };
+  }
+
+  /**
+   * Augment a raw compile error with a precise location. JS engine messages
+   * like "Unexpected token '}'" carry no position for sandboxed source, so we
+   * re-parse with acorn to get the exact line/column of the syntax error and
+   * show the surrounding lines. The original error is always preserved.
+   */
+  private augmentCompileError(source: string, err: string): string {
+    const lines = source.split('\n');
+    let detail = '';
+    try {
+      acorn.parse(source, { ecmaVersion: 'latest' });
+      // acorn parsed cleanly — the vm failure is something other than syntax.
+    } catch (e) {
+      const loc = (e as { loc?: { line: number; column: number } }).loc;
+      if (loc) {
+        const ctxStart = Math.max(0, loc.line - 3);
+        const ctxEnd = Math.min(lines.length, loc.line + 2);
+        const ctx = lines.slice(ctxStart, ctxEnd)
+          .map((l, k) => `  ${ctxStart + k + 1 === loc.line ? '>' : ' '} ${ctxStart + k + 1}: ${l}`)
+          .join('\n');
+        detail = `\n\nSyntax error near line ${loc.line}:${loc.column}:\n${ctx}`;
+      }
+    }
+    detail += `\n\nSource is ${lines.length} lines. The failing line and its surrounding context are shown above; you already have the exact location, so do NOT use read_draft to find it again. Fix it in place: replace_handler to rewrite the single member that contains it, or draft_diff for a one-line change; or regenerate the whole object with draft_source. A syntax error at or near the last line is almost always an unbalanced brace/paren/bracket, so check the object literal's closing.`;
+    return `${err}${detail}`;
   }
 
   /**
@@ -520,6 +920,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     const inlineDepPattern =
       /^(?:await\s+)?this\.(?:dep|find)\s*\(\s*['"]([^'"]+)['"]\s*\)$/;
+    const stringLiteralPattern = /^['"]([^'"]*)['"]$/;
+    // A literal AbjectId (UUID) or scoped TypeId (peer/ws/Name) is a valid
+    // recipient; a bare registered name is not — see name-string-recipient below.
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const callPattern =
       /this\.call\s*\(\s*([^,]+?)\s*,\s*['"]([^'"]+)['"]\s*,/g;
 
@@ -534,6 +938,25 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         depName = inline[1];
       } else if (/^\w+$/.test(rawArg)) {
         depName = varToDep.get(rawArg);
+      } else {
+        // Bare string literal as the recipient. `this.call(target, …)` routes
+        // by AbjectId and the bus does NOT resolve names on the send path, so a
+        // bare name like this.call("WidgetManager", …) is sent to a recipient
+        // that never exists — the request gets no reply and times out. Resolve
+        // it first via this.dep(name)/this.find(name). A literal UUID or scoped
+        // TypeId (containing "/") is a real id, so allow those.
+        const strLit = rawArg.match(stringLiteralPattern);
+        if (strLit) {
+          const literal = strLit[1];
+          const isRoutableId = uuidPattern.test(literal) || literal.includes('/');
+          if (literal.length > 0 && !isRoutableId) {
+            const before = source.slice(0, mc.index);
+            const line = before.split('\n').length;
+            const snippet = source.slice(mc.index, Math.min(source.length, mc.index + mc[0].length + 30));
+            errors.push({ kind: 'name-string-recipient', callSite: { line, snippet }, depName: literal, methodName });
+          }
+          continue;
+        }
       }
       // this._field, function results, and complex expressions: skip silently.
       if (!depName) continue;
@@ -551,6 +974,13 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         errors.push({ kind: 'unknown-dep', callSite: { line, snippet }, depName, methodName });
         continue;
       }
+      // Fail open when the dep's method surface was never introspected. A dep
+      // learned via `ask` (prose usage guide) carries an empty methods map, so
+      // an empty set means "unknown surface", not "no methods" — flagging every
+      // call against it would false-flag legitimate, working calls (the exact
+      // failure mode this validator's doc promises to avoid). Skip; the agent
+      // can `describe` the dep to populate methods and get real checking.
+      if (dep.methods.size === 0) continue;
       if (!dep.methods.has(methodName)) {
         errors.push({
           kind: 'unknown-method',
@@ -562,6 +992,23 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       }
     }
 
+    // Hardcoded AbjectId literals: a baked-in UUID is an ephemeral runtime id
+    // that changes on every restart, so it is stale and unroutable next boot.
+    // There is no legitimate reason for generated source to embed one — ids must
+    // be resolved at runtime (dep/find/discover). Flag each distinct literal.
+    const uuidLiteral = /['"]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})['"]/gi;
+    const seenIds = new Set<string>();
+    let mu: RegExpExecArray | null;
+    while ((mu = uuidLiteral.exec(source)) !== null) {
+      const id = mu[1];
+      if (seenIds.has(id)) continue;
+      seenIds.add(id);
+      const before = source.slice(0, mu.index);
+      const line = before.split('\n').length;
+      const snippet = source.slice(mu.index, Math.min(source.length, mu.index + mu[0].length + 20));
+      errors.push({ kind: 'hardcoded-id', callSite: { line, snippet }, depName: id });
+    }
+
     state.lastValidation = { ...(state.lastValidation ?? {}), calls: errors };
 
     if (errors.length === 0) {
@@ -569,7 +1016,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
 
     const summary = `validate_calls: ${errors.length} issue${errors.length === 1 ? '' : 's'} — ` +
-      errors.slice(0, 3).map(e => `${e.depName ?? '?'}.${e.methodName}`).join(', ') +
+      errors.slice(0, 3).map(e => e.kind === 'hardcoded-id'
+        ? `hardcoded id ${(e.depName ?? '').slice(0, 8)}…`
+        : `${e.depName ?? '?'}.${e.methodName}`).join(', ') +
       (errors.length > 3 ? ', …' : '');
     return { ok: false, summary, issues: errors, error: this.formatCallErrors(errors) };
   }
@@ -677,6 +1126,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         15000,
       ).catch(err => log.warn('deploy_spawn: AbjectStore.save failed:', err instanceof Error ? err.message : String(err)));
     }
+
+    state.lastDeployedSource = state.draftSource;
 
     return {
       ok: true,
@@ -812,6 +1263,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
 
     state.deployedViaUpdateSource = true;
+    state.lastDeployedSource = state.draftSource;
     state.targetObjectId = targetId; // Stamp so finalizeLoop emits objectModified correctly.
     if (targetLabel && !state.targetName) state.targetName = targetLabel;
 
@@ -823,32 +1275,217 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   }
 
   /**
-   * Spawn child goals via AgentAbject's existing decompose machinery. Each
-   * subtask declares produces / consumes contracts; the goal scratchpad
-   * carries handoff data automatically. Used to split "diagnose then modify"
-   * or "investigate then create" into independent sub-loops.
+   * Compose existing source-backed objects into one Organism. Each named
+   * object's manifest and source are captured from its registration and become
+   * an organelle spec; the staged drafts (draft_manifest for the public
+   * surface, draft_source or the explicit interfaceSource for the forwarding
+   * handler map) become the membrane interface organelle; the whole spec
+   * deploys through Factory.spawn with the organism tag. When no membrane is
+   * staged, both parts are drafted via the existing LLM draft machinery with
+   * the organelle manifests as context. The free-living originals keep
+   * running: composition copies them, so the organism's organelles diverge
+   * from their ancestors independently (endosymbiosis by copy, never capture).
    */
-  private async opDecompose(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
-    const subtasks = action.subtasks;
-    if (!Array.isArray(subtasks) || subtasks.length === 0) {
-      return { ok: false, summary: 'decompose: subtasks empty', error: 'subtasks must be a non-empty array' };
+  private async opComposeOrganism(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
+    if (!this.factoryId) return { ok: false, summary: 'compose_organism: Factory unavailable', error: 'Factory not resolved' };
+    if (!this.registryId) return { ok: false, summary: 'compose_organism: Registry unavailable', error: 'Registry not resolved' };
+
+    const name = this.actionField(action, ['name']) as string | undefined;
+    const description = this.actionField(action, ['description']) as string | undefined;
+    const organelleNames = this.actionField(action, ['organelleNames', 'organelles']) as string[] | undefined;
+    const interfaceSource = this.actionField(action, ['interfaceSource']) as string | undefined;
+
+    if (!name || !description) {
+      return { ok: false, summary: 'compose_organism: missing name/description', error: 'pass {name, description, organelleNames: ["A", "B"]}' };
     }
-    // AgentAbject handles decompose at its own level — we just surface the
-    // intent. The loop step that produced this action will be re-dispatched
-    // by AgentAbject as a `decompose` action it natively understands. To
-    // keep our agent's contract simple, we record the intent and let the
-    // outer AgentAbject treat the action as terminal-like (it spawns child
-    // goals and waits). For our purposes, mark the outer loop as paused
-    // until child goals report; AgentAbject's decompose path handles that.
-    state.turnLog.push({
-      turn: state.turn,
-      action: 'decompose',
-      ok: true,
-      summary: `decompose: ${subtasks.length} subtask${subtasks.length === 1 ? '' : 's'} — handled by AgentAbject`,
-    });
+    if (!Array.isArray(organelleNames) || organelleNames.length === 0 || !organelleNames.every(n => typeof n === 'string' && n.length > 0)) {
+      return { ok: false, summary: 'compose_organism: no organelles', error: 'organelleNames must be a non-empty array of registered object names' };
+    }
+
+    // 1. Capture each organelle's manifest + source from its registration.
+    const organelles: OrganelleSpec[] = [];
+    for (const oName of organelleNames) {
+      const id = await this.resolveTarget(oName);
+      if (!id) {
+        return {
+          ok: false,
+          summary: `compose_organism: not found: ${oName}`,
+          error: `"${oName}" is not a registered object. Find the exact name first via call("Registry", "discover", {name: "..."}) or call("Registry", "ask", {question: "..."}).`,
+        };
+      }
+      let reg: ObjectRegistration | null = null;
+      try {
+        reg = await this.sendRequest<ObjectRegistration | null>(this.registryId, 'lookup', { objectId: id }, 10000);
+      } catch { /* handled below */ }
+      if (!reg?.source) {
+        return {
+          ok: false,
+          summary: `compose_organism: no source: ${oName}`,
+          error: `"${oName}" has no source on file. Only source-backed objects (ScriptableAbjects) can become organelles. System objects stay outside the membrane; organelles reach them through the organism's registry fallback.`,
+        };
+      }
+      organelles.push({ name: oName, manifest: reg.manifest, source: reg.source });
+    }
+
+    // 2. Membrane interface. Staged drafts win; an explicit interfaceSource
+    //    overrides the staged source; anything missing is drafted via LLM with
+    //    the organelle surfaces as context.
+    const organelleContext = organelles
+      .map(o => `- ${o.name}: ${o.manifest.description}; methods: ${(o.manifest.interface.methods ?? []).map(m => m.name).join(', ') || '(none declared)'}`)
+      .join('\n');
+    if (!state.draftManifest) {
+      const r = await this.opDraftViaLlm(state, {
+        action: 'draft_via_llm',
+        kind: 'manifest',
+        instructions:
+          `Manifest for "${name}": ${description}. This is the PUBLIC face of an organism (a composite object). ` +
+          `Declare a small curated interface covering the use cases; implementation is forwarded to these internal organelles ` +
+          `(reachable by name through the organism's internal registry):\n${organelleContext}`,
+      } as AgentAction);
+      if (!r.ok) return { ok: false, summary: 'compose_organism: membrane manifest draft failed', error: r.error };
+    }
+    if (interfaceSource) {
+      state.draftSource = interfaceSource;
+    } else if (!state.draftSource) {
+      const publicMethods = (state.draftManifest!.interface.methods ?? []).map(m => m.name).join(', ');
+      const r = await this.opDraftViaLlm(state, {
+        action: 'draft_via_llm',
+        kind: 'source',
+        instructions:
+          `Handler map for the membrane interface organelle of organism "${name}". ` +
+          `Implement each public method (${publicMethods}) as a thin forwarder to the right internal organelle: ` +
+          `await this.call(await this.dep('<OrganelleName>'), '<method>', msg.payload). ` +
+          `Organelles (discoverable by these exact names through the internal registry):\n${organelleContext}\n` +
+          `Keep contracts (this.ensure) at handler entry; keep domain logic in the organelles.`,
+      } as AgentAction);
+      if (!r.ok) return { ok: false, summary: 'compose_organism: membrane source draft failed', error: r.error };
+    }
+
+    const membraneSource = state.draftSource!;
+    const compileErr = ScriptableAbject.tryCompile(membraneSource);
+    if (compileErr) {
+      return {
+        ok: false,
+        summary: `compose_organism: membrane source does not compile: ${compileErr.slice(0, 100)}`,
+        error: `Fix the staged source (replace_handler / draft_diff / draft_source), run compile, then rerun compose_organism. Error: ${compileErr}`,
+      };
+    }
+
+    // 3. Assemble the spec and deploy through Factory (organism tag + JSON
+    //    OrganismSpec source is the established organism spawn path).
+    const spec: OrganismSpec = {
+      name,
+      description,
+      interface: { name: `${name}Interface`, manifest: state.draftManifest!, source: membraneSource },
+      organelles,
+      tags: ['organism'],
+    };
+    const organismSource = JSON.stringify(spec);
+    const manifest = buildOrganismManifest(spec);
+    const spawnReq: SpawnRequest = {
+      manifest,
+      source: organismSource,
+      owner: this.id,
+      parentId: this.id,
+      registryHint: this.registryId,
+    };
+
+    let result: SpawnResult;
+    try {
+      result = await this.sendRequest<SpawnResult>(this.factoryId, 'spawn', spawnReq, 120000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ok: false, summary: `compose_organism: spawn failed: ${msg.slice(0, 120)}`, error: msg };
+    }
+    if (!result?.objectId) {
+      return { ok: false, summary: 'compose_organism: Factory returned no objectId', error: 'unexpected Factory response' };
+    }
+
+    state.spawnedObjectId = result.objectId;
+    // The staged membrane drafts are now live inside the organism.
+    state.lastDeployedSource = state.draftSource;
+
+    // Persist so the organism survives a restart (same path deploy_spawn uses;
+    // Factory re-detects the organism tag + JSON spec on restore).
+    if (this.abjectStoreId) {
+      this.sendRequest<unknown>(
+        this.abjectStoreId,
+        'save',
+        { objectId: result.objectId, manifest, source: organismSource, owner: this.id },
+        15000,
+      ).catch(err => log.warn('compose_organism: AbjectStore.save failed:', err instanceof Error ? err.message : String(err)));
+    }
+
     return {
       ok: true,
-      summary: `decompose: ${subtasks.length} subtask${subtasks.length === 1 ? '' : 's'} requested (AgentAbject will spawn child goals)`,
+      summary: `compose_organism: ${name} spawned as ${result.objectId.slice(0, 8)} with organelles [${organelleNames.join(', ')}] (originals keep running)`,
+      data: { objectId: result.objectId, name, organelles: organelleNames },
+    };
+  }
+
+  /**
+   * Extract one organelle from an organism and deploy it as a standalone
+   * ScriptableAbject, carrying a snapshot of its live data. The organism is
+   * read, never modified: its internal copy keeps running.
+   */
+  private async opExtractOrganelle(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string; data?: unknown }> {
+    if (!this.factoryId) return { ok: false, summary: 'extract_organelle: Factory unavailable', error: 'Factory not resolved' };
+
+    const targetRef = this.actionField(action, ['target', 'objectId', 'organismName', 'targetName']) as string | undefined;
+    const organelleName = this.actionField(action, ['organelleName', 'name']) as string | undefined;
+    if (!targetRef || !organelleName) {
+      return { ok: false, summary: 'extract_organelle: missing args', error: 'pass {target: "<organism name or id>", organelleName: "<name>"}' };
+    }
+
+    const organismId = await this.resolveTarget(targetRef);
+    if (!organismId) {
+      return { ok: false, summary: `extract_organelle: organism not found: ${targetRef}`, error: `Could not resolve "${targetRef}". Discover it via call("Registry", "discover", {name: "..."}).` };
+    }
+
+    let payload: { manifest: AbjectManifest; source: string; data?: Record<string, unknown> };
+    try {
+      payload = await this.sendRequest<{ manifest: AbjectManifest; source: string; data?: Record<string, unknown> }>(
+        organismId, 'getOrganelleSource', { name: organelleName }, 15000,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ok: false, summary: `extract_organelle: ${msg.slice(0, 120)}`, error: msg };
+    }
+
+    const spawnReq: SpawnRequest = {
+      manifest: payload.manifest,
+      source: payload.source,
+      data: payload.data,
+      owner: this.id,
+      parentId: this.id,
+      registryHint: this.registryId,
+    };
+    let result: SpawnResult;
+    try {
+      result = await this.sendRequest<SpawnResult>(this.factoryId, 'spawn', spawnReq, 120000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ok: false, summary: `extract_organelle: spawn failed: ${msg.slice(0, 120)}`, error: msg };
+    }
+    if (!result?.objectId) {
+      return { ok: false, summary: 'extract_organelle: Factory returned no objectId', error: 'unexpected Factory response' };
+    }
+
+    state.spawnedObjectId = result.objectId;
+
+    if (this.abjectStoreId) {
+      this.sendRequest<unknown>(
+        this.abjectStoreId,
+        'save',
+        { objectId: result.objectId, manifest: payload.manifest, source: payload.source, owner: this.id },
+        15000,
+      ).catch(err => log.warn('extract_organelle: AbjectStore.save failed:', err instanceof Error ? err.message : String(err)));
+    }
+
+    return {
+      ok: true,
+      summary: `extract_organelle: ${organelleName} extracted from ${targetRef} as standalone ${result.objectId.slice(0, 8)} (the organism keeps its internal copy)`,
+      data: { objectId: result.objectId, organelleName },
     };
   }
 
@@ -885,9 +1522,11 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   private draftManifestSystemPrompt(): string {
     return [
       'You are drafting an AbjectManifest in JSON. Output ONE ```json code block, nothing else.',
-      'Required shape: { manifest: { name, description, version, interface: { id, name, description, methods, events? }, requiredCapabilities: [], providedCapabilities: [], tags: [] }, usedObjects: string[] }.',
+      'Required shape: { manifest: { name, description, version, icon, interface: { id, name, description, methods, events? }, requiredCapabilities: [], providedCapabilities: [], tags: [] }, usedObjects: string[] }.',
       'Each method has { name, description, parameters: [{ name, type: { kind: "primitive"|"reference"|"array"|"object", … }, description, optional? }], returns }.',
+      'Set `icon` to a single emoji that best represents the object, shown next to its name in launchers (e.g. weather → 🌤, notes → 📝, a game → 🎮, a chart → 📊). Pick something distinctive and relevant.',
       'Use the provided usage guides verbatim — do not invent method names on dependencies.',
+      'Name interface methods for the user-facing use cases they perform (the DCI contexts) rather than generic CRUD. When the object is the model half of a Model-View split, keep its interface to domain operations and a getState/changed surface, with no window/show/draw methods on a model.',
     ].join('\n');
   }
 
@@ -895,9 +1534,23 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return [
       'You are drafting handler-map JavaScript for a ScriptableAbject. Output ONE ```javascript code block.',
       'Format: a single parenthesized object literal: ({ method(msg) { ... }, ... }).',
-      'Each handler takes a single `msg` argument; payload is `msg.payload`. Inter-object work is `await this.call(target, method, payload)` where `target` is `this.dep("Name")` or `this.find("Name")`.',
+      'Each handler takes a single `msg` argument; payload is `msg.payload`. Inter-object work is `await this.call(target, method, payload)` where `target` is a RESOLVED AbjectId.',
+      'In generated handler code, `this.call(target, …)` routes by AbjectId only — the bus does NOT resolve names on the send path. Resolve a dependency to its id first: `const id = await this.dep("Name")` (or `this.find("Name")`), then `await this.call(id, method, payload)` — or inline `await this.call(this.dep("Name"), method, payload)`. NEVER pass a bare name string as the recipient (e.g. `this.call("WidgetManager", …)`); that call is delivered nowhere and times out. (This differs from the ObjectCreator `call` ACTION you use to investigate, which DOES accept a bare name — generated code does not.) Ids returned at runtime (window/canvas/layout ids from create*) are already resolved; pass them directly.',
+      'Build windows/canvas from an async handler and AWAIT each step in order. Awaiting an inter-object call inside your own handler is correct and does NOT deadlock — the reply is delivered while the handler is suspended. A build that times out means a wrong recipient or a missing await, never the awaiting itself; do not detach the build into a fire-and-forget chain to "avoid a deadlock". Ask the window/canvas factory for its build recipe before drafting.',
       'Use ONLY methods listed in the provided dependency manifests / usage guides. Do not invent method names.',
       'Method names that are not in the framework or in a dependency\'s manifest do not exist — pick a real one or restructure.',
+      'When a dependency\'s usage guide documents a higher-level building block that fits the need, compose it rather than re-implementing equivalent behavior from low-level primitives. Reuse the building blocks; drop to primitives only for what the building blocks do not cover.',
+      'Prefer composing high-level building blocks over hand-writing equivalents — e.g. render markdown with a markdown-capable label/widget rather than writing your own parser and text-layout engine on a canvas. This keeps the object small and the formatting correct.',
+      'Keep each object focused. When a single object would grow very large (many hundreds of lines) or bundles a reusable sub-capability (a parser, a layout engine, a data store), split that capability into its own Abject and call it. Smaller, composed objects are easier to verify and keep the build loop fast (a huge source blows the context budget and makes the loop lose track of what it already tried).',
+      // Architecture for objects with a UI: Model-View (Smalltalk sense), DCI, Design by Contract.
+      'Structure any object that has a UI as Model and View, in the original Smalltalk sense.',
+      'MODEL: this.data holds the domain document (the plain data the object IS), and pure helper methods hold the domain rules (validate input, compute results, apply a change to this.data). The model never draws and never references a window, canvas, or widget. Keep transient/view state (window/canvas/layout ids, hover, scroll, cursor, drag, animation clocks) in this._ instance fields, out of this.data.',
+      'VIEW: one render method (e.g. _draw / _render) DISPLAYS the model, and the input/event handlers HANDLE the user\'s interaction with that display. In this sense the view both shows the model and handles interaction; input handling belongs to the view, not to a separate controller. On an interaction, apply the change through a model helper, then re-render. The view carries no domain rules of its own.',
+      'CONTROLLER (only when there is more than one view or mode): a controller selects the KIND of view of the model (which view/mode is shown, switching modes, coordinating multiple views over one model). It is NOT the input path; that is the view\'s job. A single-view object needs no controller, so do not invent one.',
+      'Keep the flow one-directional: interaction in the view leads to a model helper mutating this.data, then a re-display. For any other view or observer, the model announces a change with this.changed(aspect, value); the model never calls into a view.',
+      'DCI: name each user-facing use case as the handler that performs that scenario (the context), and express behavior as small role helpers (what the object DOES), while this.data stays plain data (what the object IS). Prefer scenario names over generic CRUD.',
+      'Design by Contract on every public handler: open with a precondition using this.ensure(condition, message) (the caller\'s obligation); guarantee a result with a postcondition this.ensure(...) before returning; keep object-state invariants in a _checkInvariants() helper that uses this.invariant(condition, message), and call _checkInvariants() after each mutation. this.ensure and this.invariant are provided and throw a clear ContractViolation when the condition is false. Use these, because the sandbox forbids the require() token.',
+      'Make UI look designed, not like a debug view. Before drawing a window/canvas UI, ask the rendering object (the window/canvas factory) "how do I make this look good?" to get its design guide, and use theme colors so the app is cohesive with the user\'s desktop — for canvas draws this means theme tokens like fill: "$accent" / "$textPrimary" / "$windowBg" rather than hardcoded hex. Reserve hand-picked colors for genuine illustration the theme can\'t express.',
     ].join('\n');
   }
 
@@ -905,7 +1558,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return [
       'You are a strict code reviewer for an Abject handler map. You receive: the new object\'s manifest, the drafted source, and for each known dependency its manifest methods + usage guide.',
       'Flag SEMANTIC issues that a static method-name check cannot catch: wrong payload shape, enum-like string values not listed in the usage guide (including MCP toolName values), missing await on consumed results, event handler name / payload shape mismatches, cached dep IDs in state.',
+      'For objects with a UI, also flag STRUCTURAL issues against Model-View (Smalltalk sense) plus Design by Contract: domain rules living in the render/view code instead of the model; the model drawing or referencing a window/canvas/widget; this.data holding transient view state (window/canvas/layout ids, hover, scroll, animation) that belongs in this._ fields; input handling pulled out of the view into a separate "controller" (in this architecture the view handles interaction, and a controller only selects the kind of view of the model); public handlers with no precondition this.ensure(...) check; mutations with no _checkInvariants() / this.invariant(...) follow-up. Note: a view that drives model changes from its input handlers is CORRECT, so do not flag that.',
       'Trust the usage guide. If a value is not listed there, it is wrong — regardless of how reasonable it looks.',
+      'Guide precedence: the dependency that OWNS a call is authoritative for that call. A factory\'s guide also governs the objects it creates (e.g. a window/canvas id returned at runtime — methods documented in the factory\'s guide for those ids are valid). Catalog or registry summaries of OTHER objects are weaker evidence: a registry answer saying "no object has X" does not override a first-party guide that documents X on itself or on the objects it creates.',
       '',
       'Output ONE of:',
       '- The literal string VERIFIED (nothing else) when the drafts are correct.',
@@ -997,6 +1652,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     for (const e of errors) {
       if (e.kind === 'unknown-method') {
         lines.push(`- ${e.depName}.${e.methodName} is not a method. Available: ${(e.availableMethods ?? []).join(', ')}`);
+      } else if (e.kind === 'name-string-recipient') {
+        lines.push(`- this.call("${e.depName}", "${e.methodName}", …) addresses a recipient by name. Message recipients are AbjectIds; the bus does not resolve names on the send path, so this call is delivered nowhere and times out. Resolve the id first: const id = await this.dep("${e.depName}"); await this.call(id, "${e.methodName}", …) — or inline await this.call(this.dep("${e.depName}"), "${e.methodName}", …). (Ids returned at runtime — window/canvas/layout ids from create* — are already resolved and fine to pass directly.)`);
+      } else if (e.kind === 'hardcoded-id') {
+        lines.push(`- Hardcoded AbjectId literal "${e.depName}" at line ${e.callSite.line}. AbjectIds are ephemeral — they change on every restart, so a baked-in id is stale and unroutable next boot (a frequent cause of "works now, broken after restart"). Resolve the object at runtime instead: const id = await this.dep("<Name>") (system/dependency objects), or this.find("<Name>"), or call("Registry", "discover", { name: "<Name>" }). Never store a literal AbjectId in source or this.data.`);
       } else {
         lines.push(`- Dependency "${e.depName}" was not discovered yet. Call describe / ask on it before calling its methods.`);
       }
@@ -1074,6 +1733,15 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     // observation renderer see what's been learned.
     const summary = this.mergeDiscoveryIntoDeps(state, target, resolvedId, method, response);
 
+    // Backfill the dep's structured method surface when it isn't known yet
+    // (e.g. learned via `ask`, which records prose, not methods). One describe
+    // per distinct dep; gives validate_calls real coverage instead of an empty
+    // set. Skipped for describe (already populated) and the modify target's own
+    // id (its source is loaded, not a call dependency).
+    if (method !== 'describe' && resolvedId !== state.targetObjectId) {
+      await this.ensureDepMethods(state, target, resolvedId);
+    }
+
     // Detect deploy lifecycle so finalizeLoop can build the right
     // CreationResult shape and the agent shell can emit objectCreated /
     // objectModified events.
@@ -1084,6 +1752,29 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       summary: summary ?? `call ${target}.${method}: ok`,
       data: response,
     };
+  }
+
+  /**
+   * When a `call` returns image bytes — the shape Screenshot.captureWindow /
+   * captureDesktop reply with ({ imageBase64, width, height }) — feed the
+   * actual pixels to the NEXT think as an image part so the agent can SEE what
+   * it rendered, and scrub the base64 out of the textual action result so a
+   * ~50KB blob never bloats the transcript. The agent verifies layout, color,
+   * spacing, and polish visually instead of guessing from getState numbers.
+   */
+  private captureVisionFromCall(
+    extra: TaskExtra,
+    action: AgentAction,
+    res: { ok: boolean; summary: string; data?: unknown; error?: string },
+  ): void {
+    if (!res.ok || !res.data || typeof res.data !== 'object') return;
+    const img = res.data as { imageBase64?: string; width?: number; height?: number };
+    if (typeof img.imageBase64 !== 'string' || img.imageBase64.length === 0) return;
+
+    const dims = `${img.width ?? '?'}x${img.height ?? '?'}`;
+    extra.lastLlmContent = [{ type: 'image', mediaType: 'image/png', data: img.imageBase64 }];
+    res.data = `Screenshot captured (${dims}). The rendered image is attached to the next observation — inspect it visually: judge centering, alignment, spacing, color cohesion, typographic hierarchy, and overall polish against the goal, and note any specific element that looks off so you can fix it.`;
+    res.summary = `call ${action.target}.${action.method}: screenshot ${dims} (attached for visual review)`;
   }
 
   /**
@@ -1123,20 +1814,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       const ir = response as Partial<IntrospectResult>;
       const manifest = ir.manifest;
       if (!manifest) return null;
-      const methods = new Map<string, MethodSignature>();
-      for (const m of manifest.interface?.methods ?? []) {
-        methods.set(m.name, {
-          name: m.name,
-          description: m.description,
-          params: (m.parameters ?? []).map(p => ({
-            name: p.name,
-            optional: p.optional,
-            typeHint: this.renderTypeHint(p.type),
-          })),
-          returns: this.renderTypeHint(m.returns),
-        });
-      }
-      const events = new Set<string>((manifest.interface?.events ?? []).map(e => e.name));
+      const { methods, events } = this.methodsFromManifest(manifest);
       const key = manifest.name ?? targetName;
       const existing = state.deps.get(key);
       state.deps.set(key, {
@@ -1165,6 +1843,56 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
 
     return null;
+  }
+
+  /** Convert a manifest's interface into the dep-record method/event shape. */
+  private methodsFromManifest(manifest: AbjectManifest): { methods: Map<string, MethodSignature>; events: Set<string> } {
+    const methods = new Map<string, MethodSignature>();
+    for (const m of manifest.interface?.methods ?? []) {
+      methods.set(m.name, {
+        name: m.name,
+        description: m.description,
+        params: (m.parameters ?? []).map(p => ({
+          name: p.name,
+          optional: p.optional,
+          typeHint: this.renderTypeHint(p.type),
+        })),
+        returns: this.renderTypeHint(m.returns),
+      });
+    }
+    const events = new Set<string>((manifest.interface?.events ?? []).map(e => e.name));
+    return { methods, events };
+  }
+
+  /**
+   * Backfill a touched dependency's structured method surface from its live
+   * manifest. The agent often learns a dep via `ask` (prose how-to), which
+   * records a usage guide but leaves `methods` empty — so validate_calls has
+   * nothing to check and either skips (fail-open) or, before that, false-flags.
+   * Here we have the resolved id, so fetch the manifest once via `describe` and
+   * merge the methods in, giving the validator real coverage (it can now catch
+   * genuine wrong-method-name mistakes). Best-effort and idempotent: only
+   * fetches when the dep's method surface is still empty.
+   */
+  private async ensureDepMethods(state: LoopState, depName: string, depId: AbjectId): Promise<void> {
+    if (!depName) return;
+    const existing = state.deps.get(depName);
+    if (existing && existing.methods.size > 0) return; // surface already known
+    let manifest: AbjectManifest | undefined;
+    try {
+      const ir = await this.sendRequest<Partial<IntrospectResult>>(depId, 'describe', {}, 5000);
+      manifest = ir?.manifest as AbjectManifest | undefined;
+    } catch { /* best effort — leave empty, validate_calls fails open */ }
+    if (!manifest?.interface) return;
+    const { methods, events } = this.methodsFromManifest(manifest);
+    if (methods.size === 0) return;
+    state.deps.set(depName, {
+      depName,
+      depId,
+      methods,
+      events: existing?.events && existing.events.size > 0 ? existing.events : events,
+      usageGuide: existing?.usageGuide ?? '',
+    });
   }
 
   /** Best-effort English type rendering for the structured methods block. */
@@ -1411,7 +2139,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
   // ── Observe / Act ─────────────────────────────────────────────────────
 
-  private async handleObserve(taskId: string): Promise<{ observation: string; tier: string }> {
+  private async handleObserve(taskId: string): Promise<{ observation: string; tier: string; llmContent?: ContentPart[] }> {
     // Look up by AgentAbject-assigned ticketId; AgentAbject calls back with the
     // taskId we sent on startTask, so look for an entry whose state matches.
     // Since we keyed by ticketId, find by taskId-in-context: AgentAbject passes
@@ -1421,7 +2149,47 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       return { observation: 'No active task. Reply with done({result: "no task"}).', tier: 'smart' };
     }
     extra.state.turn += 1;
-    return { observation: this.renderObservation(extra.state), tier: 'smart' };
+    const observation = this.renderObservation(extra.state);
+
+    // A screenshot staged by the previous act rides in as an image part, and
+    // judging a rendered image is a reasoning step — force the smart tier so
+    // the visual critique isn't done on a cheaper model.
+    if (extra.lastLlmContent) {
+      const llmContent: ContentPart[] = [
+        { type: 'text', text: observation },
+        ...extra.lastLlmContent,
+      ];
+      extra.lastLlmContent = undefined;
+      return { observation, tier: 'smart', llmContent };
+    }
+
+    return { observation, tier: this.chooseObserveTier(extra.state) };
+  }
+
+  /**
+   * Per-state model tier for the next think decision. Mechanical, error-free
+   * progress — compiling, validating, deploying, and verifying a healthy
+   * object — decides its (trivial) next step on 'balanced'. Anything that needs
+   * real reasoning stays on 'smart': the initial architecture, any code-
+   * producing step (draft_source / draft_diff / replace_/add_/remove_handler),
+   * error diagnosis, or a verification call that surfaced a problem. The OTA
+   * loop floors thinking at balanced, so 'fast' is never used here.
+   */
+  private chooseObserveTier(state: LoopState): 'smart' | 'balanced' {
+    const log = state.turnLog ?? [];
+    const last = log[log.length - 1];
+    if (!last || !last.ok) return 'smart'; // first step, or last action failed → reason / recover
+    const ROUTINE = new Set([
+      'compile', 'validate_calls', 'deploy_spawn', 'deploy_update',
+      'call', 'read_draft', 'getState', 'ask', 'discover', 'load_target',
+    ]);
+    if (!ROUTINE.has(last.action)) return 'smart'; // code generation / design step
+    // A "successful" verification call can still surface a runtime problem —
+    // that needs reasoning even though the action itself succeeded.
+    if (/\b(error|exception|fail|threw|cannot read|undefined|not found|not registered)\b/i.test(last.summary)) {
+      return 'smart';
+    }
+    return 'balanced';
   }
 
   private async handleAct(taskId: string, action: AgentAction, _callerId: AbjectId): Promise<{ success: boolean; data?: unknown; error?: string }> {
@@ -1437,6 +2205,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       switch (action.action) {
         case 'call':
           res = await this.opCall(state, action);
+          this.captureVisionFromCall(extra, action, res);
           break;
         case 'draft_manifest':
           res = await this.opDraftManifest(state, action);
@@ -1446,6 +2215,21 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
           break;
         case 'draft_diff':
           res = await this.opDraftDiff(state, action);
+          break;
+        case 'read_draft':
+          res = this.opReadDraft(state, action);
+          break;
+        case 'replace_handler':
+          res = this.opReplaceHandler(state, action);
+          break;
+        case 'add_handler':
+          res = this.opAddHandler(state, action);
+          break;
+        case 'remove_handler':
+          res = this.opRemoveHandler(state, action);
+          break;
+        case 'load_target':
+          res = await this.opLoadTarget(state, action);
           break;
         case 'draft_via_llm':
           res = await this.opDraftViaLlm(state, action);
@@ -1465,8 +2249,11 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         case 'deploy_update':
           res = await this.opDeployUpdate(state, action);
           break;
-        case 'decompose':
-          res = await this.opDecompose(state, action);
+        case 'compose_organism':
+          res = await this.opComposeOrganism(state, action);
+          break;
+        case 'extract_organelle':
+          res = await this.opExtractOrganelle(state, action);
           break;
         case 'reply':
           res = await this.opReply(state, action, callerId);
@@ -1481,7 +2268,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
           res = this.opFail(state, action);
           break;
         default:
-          res = { ok: false, summary: `unknown action: ${action.action}`, error: `Unknown action: ${action.action}` };
+          res = { ok: false, summary: `unknown action: ${action.action}`, error: this.unknownActionError(action.action, state) };
       }
     } catch (err) {
       res = { ok: false, summary: 'action threw', error: err instanceof Error ? err.message : String(err) };
@@ -1556,8 +2343,23 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     lines.push('DRAFTS');
     lines.push(`  manifest: ${state.draftManifest ? state.draftManifest.name : '(not drafted)'}`);
-    lines.push(`  source:   ${state.draftSource ? `${state.draftSource.split('\n').length} lines` : '(not drafted)'}`);
+    const hasUndeployed = !!state.draftSource && state.draftSource !== state.lastDeployedSource;
+    const deployState = !state.draftSource
+      ? '(not drafted)'
+      : hasUndeployed
+        ? `${state.draftSource.split('\n').length} lines — ⚠️ NOT YET DEPLOYED (live object still runs old code)`
+        : `${state.draftSource.split('\n').length} lines — deployed (live)`;
+    lines.push(`  source:   ${deployState}`);
     lines.push('');
+
+    if (hasUndeployed) {
+      const deployVerb = state.kind === 'create' && !state.spawnedObjectId ? 'deploy_spawn' : 'deploy_update';
+      lines.push('⚠️ UNDEPLOYED EDITS — your staged source differs from what is live. Compiling is NOT deploying.');
+      lines.push(`   Run ${deployVerb} to make these edits live before you finish. Do NOT call done with an undeployed draft —`);
+      lines.push('   the loop would report success while the user still sees the old object.');
+      lines.push('   If your edit touched show() / createCanvas / widget wiring, also hide() then show() the target after deploy so the new wiring takes effect.');
+      lines.push('');
+    }
 
     if (state.lastValidation) {
       lines.push('LAST VALIDATION');
@@ -1567,6 +2369,26 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       if (v.semantics) {
         const errs = v.semantics.issues.filter(i => i.severity === 'error').length;
         lines.push(`  review_semantics: ${v.semantics.verified ? 'VERIFIED' : `${errs} error${errs === 1 ? '' : 's'}`}`);
+      }
+      lines.push('');
+    }
+
+    // Stop-reading steer: read_draft is read-only and makes no progress.
+    // Count how many read_drafts run back-to-back with no productive action
+    // between them; two in a row is already a stall (reading→editing→reading is
+    // fine, this only fires on reading→reading). Point straight at the fix.
+    let consecutiveReads = 0;
+    for (let i = state.turnLog.length - 1; i >= 0; i--) {
+      if (state.turnLog[i].action === 'read_draft') consecutiveReads++;
+      else break;
+    }
+    if (consecutiveReads >= 2) {
+      const compileErr = typeof state.lastValidation?.compile === 'string' && state.lastValidation.compile !== '';
+      lines.push(`⚠️ You have called read_draft ${consecutiveReads}× in a row without changing anything. read_draft is read-only, so it makes no progress.`);
+      if (compileErr) {
+        lines.push('   The compile error above already names the exact failing line and shows its context, so you HAVE the location. Do NOT read_draft again to find it. Fix it now: replace_handler to rewrite the one member that contains it, or draft_diff for a small change, or draft_source to regenerate the whole object.');
+      } else {
+        lines.push('   Act now instead of reading again: compile to validate the draft, then deploy_update — or make a targeted replace_handler / draft_diff edit. One more read will not move the build forward.');
       }
       lines.push('');
     }
@@ -1656,9 +2478,10 @@ Emit EXACTLY ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothi
 
 ## Local operations (no message target)
 
-- \`draft_manifest({manifest, usedObjects?})\` — stage a manifest you've authored. Used before \`deploy_spawn\`.
+- \`load_target({objectId?, targetName?})\` — adopt an EXISTING object as this loop's modify target: resolves the name/UUID, loads its current source into loop state, and switches the loop to a modify. Use this when the loop started without a target (kind \`create\`) but you discovered — via \`call("Registry", "ask"/"discover", …)\` or \`describe\` — that the goal is really about an object that already exists (e.g. "fix the GraphViewer window" → GraphViewer is already registered). After \`load_target\`, inspect with \`read_draft\`, edit with \`replace_handler\` / \`add_handler\` / \`remove_handler\` (or \`draft_diff\` for sub-method edits), then ship with \`deploy_update\` (no need to repeat the id). For a genuinely new object, skip this and use \`draft_source\` instead.
+- \`draft_manifest({manifest, usedObjects?})\` — stage a manifest you've authored. Used before \`deploy_spawn\`. Include an \`icon\` (a single emoji that fits the object, e.g. 🌤 / 📝 / 🎮) — it appears next to the object's name in launchers.
 - \`draft_source({source})\` — stage handler-map source you've authored. The format is a single parenthesized object literal: \`({ method(msg) { ... } })\`. Use this for new objects (create flow).
-- \`draft_diff({blocks})\` — apply SEARCH/REPLACE blocks to the existing source. **Strongly prefer this for any modification of an existing object** — it lets you edit a few lines without re-emitting the whole file. Each block:
+- \`draft_diff({blocks})\` — apply SEARCH/REPLACE blocks to the existing source. Good for small edits that span or sit inside members; for replacing a whole method prefer \`replace_handler\` (no SEARCH matching). Either way you edit without re-emitting the whole file. Each block:
 
   \`\`\`
   <<<<<<< SEARCH
@@ -1669,13 +2492,18 @@ Emit EXACTLY ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothi
   \`\`\`
 
   Multiple blocks may appear in one \`blocks\` payload and are applied in order. SEARCH must match a UNIQUE location in the current source — include 2–3 lines of surrounding context if a snippet would otherwise match in more than one place. Whitespace is forgiven (line-trimmed match), but matching the indentation exactly is safer. Successive \`draft_diff\` calls stack on the prior result, so you can layer fixes. To insert new code, use a SEARCH that matches a nearby anchor and include both the anchor and your insertion in REPLACE.
+- \`read_draft({handler? , lineRange?, grep?})\` — read the CURRENT staged source so you edit against ground truth instead of memory. No args → a compact outline (each top-level member with its line range). \`{handler:"name"}\` → that member's exact current text (line-numbered). \`{lineRange:"a-b"}\` → those lines. \`{grep:"pattern"}\` → matching lines. Editing nothing, read-only. Use it to orient in an EXISTING large object BEFORE editing it (a modify flow): one read of the one member you're about to change. It is NOT for re-reviewing source you just generated: after \`draft_source\`/\`draft_via_llm\`, go straight to \`compile\` (it points to the one broken spot), and only \`read_draft\` the specific member/line a validation error names, once. read_draft is read-only, so repeating it makes no progress; never call it two turns in a row without an edit or a compile between them.
+- \`replace_handler({name, body})\` — replace the ENTIRE top-level member named \`name\` (a method or property of the \`({ … })\` literal) with \`body\` (the full member text, including its signature, e.g. \`"openMap(msg) { … }"\`). Located by name via the object literal's structure — no SEARCH text, whitespace-proof, unaffected by file size. **This is the preferred way to modify one method**; reach for it before \`draft_diff\`. Run \`compile\` after.
+- \`add_handler({name, body})\` — insert a NEW top-level member (full member text). Errors if \`name\` already exists (use replace_handler then). Run \`compile\` after.
+- \`remove_handler({name})\` — delete the top-level member named \`name\` (and its separating comma). Run \`compile\` after.
 - \`draft_via_llm({kind: "manifest" | "source", instructions})\` — ask an LLM to draft for you. It sees current loop state. Use when authoring a brand-new manifest or source from scratch is too large for one think-step. Do NOT use this for modifications of existing objects — use \`draft_diff\` instead, since the LLM consistently truncates "preserve everything else" rewrites.
 - \`compile()\` — run a syntax check on the staged source. Fails fast on parse errors.
 - \`validate_calls()\` — static check: every \`this.call(x, "method", …)\` site is checked against the live manifest of the target dep. Run AFTER compile.
 - \`review_semantics()\` — LLM reviewer reads the drafts plus all known dependency manifests + usage guides and flags semantic issues (wrong payload shape, enum-like values not in the guide, missing await, etc.). May emit follow-up \`questions\` for specific deps.
 - \`deploy_spawn({})\` — deploy the staged drafts as a NEW Abject. Internally messages Factory.spawn with the manifest, source, and the right owner / parent / registryHint. Use for create flows. No payload: the staged drafts are read from loop state.
 - \`deploy_update({objectId?, targetName?})\` — deploy the staged source onto an EXISTING object. Internally hot-swaps the live object via its \`updateSource\` handler, then updates Registry's cached source + manifest, then persists via AbjectStore so the change survives a restart. The target is taken from \`objectId\` (UUID) or \`targetName\` (registered name) in the action payload, or from the task's target if it was started as a modify. If you investigated and discovered you should be modifying an existing object even though the loop kind is \`create\`, pass \`{objectId: "<id>"}\` here.
-- \`decompose({subtasks: [{description, dependsOn?, produces?, consumes?, role?}]})\` — split into sub-goals. Each subtask shares the goal scratchpad via \`produces\` / \`consumes\` contracts. Use for "diagnose then modify" or "investigate then create".
+- \`compose_organism({name, description, organelleNames, interfaceSource?})\` packages EXISTING source-backed objects into ONE Organism: a composite Abject whose organelles (independent internal copies of the named objects) cooperate behind a membrane interface, while external callers see a single object with a single curated surface. The staged drafts define the membrane: \`draft_manifest\` is the organism's public surface and \`draft_source\` (or the explicit \`interfaceSource\`) is the forwarding handler map; when either is missing it is drafted automatically from the organelle manifests. The originals keep running, so remove them afterwards (or tell the user) when the organism replaces them.
+- \`extract_organelle({target, organelleName})\` deploys one organelle of an existing organism as a standalone object, carrying a snapshot of its live data. The organism keeps its internal copy and is never modified. Pass \`organelleName: "__interface__"\` for the membrane itself.
 - \`reply({text})\` — send an intermediate user-visible chat bubble. Loop continues.
 - \`ask_user({question, assumptions?})\` — surface a clarifying question. The user's answer arrives as a new task with the answer in the prompt; finish the current loop with \`done\` after this.
 
@@ -1688,8 +2516,8 @@ Emit EXACTLY ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothi
 
 Investigation:
 - Discover: \`call("Registry", "ask", {question: "which object handles X?"})\`
-- Inspect: \`call("<Name>", "describe", {})\` — returns the manifest.
-- Learn: \`call("<Name>", "ask", {question: "how do I call Y?"})\` — returns prose usage.
+- Learn how to use it (PRIMARY): \`call("<Name>", "ask", {question: "how do I call Y? how do I build a good Z? how do I make it look good?"})\` — returns prose usage, examples, and design guidance. This is how you understand an object.
+- Reflect (raw, rarely needed): \`call("<Name>", "describe", {})\` — the structured manifest only; it does not teach usage, and asking a dependency already fetches its manifest for validation, so you seldom need this.
 - Read source: \`call("Registry", "getSource", {objectId: "<id>"})\`
 - Read state: \`call("<Name>", "getState", {})\`
 - Read logs: \`call("Console", "getObjectLogs", {objectId: "<id-or-name>", count: 20})\`
@@ -1698,6 +2526,13 @@ Deployment (use the local actions — they read your staged drafts and run the p
 - Spawn a new object: \`{ "action": "deploy_spawn" }\` after both \`draft_manifest\` (or \`draft_via_llm({kind: "manifest"})\`) and \`draft_source\` (or \`draft_via_llm({kind: "source"})\`).
 - Update an existing object: \`{ "action": "deploy_update" }\` after \`draft_diff\` (preferred for surgical edits) or after \`draft_source\` (only when wholesale rewrite is intended). If the loop started as a modify, the target source is preloaded into \`state.targetSource\` and the deploy target is set automatically. If the loop started as create but you discovered the user actually wanted to modify an existing object (e.g. "fix the Pong game" → you found Pong already exists), pass the target explicitly: \`{ "action": "deploy_update", "objectId": "<id>" }\` or \`{ "action": "deploy_update", "targetName": "Pong" }\`. **deploy_update hot-swaps source ONLY** — it does not rerun \`show()\` or recreate widgets the object already spawned. If the change touches \`show()\`, \`createCanvas\`, or any other widget wiring, also call \`hide()\` then \`show()\` on the target after deploy_update so the new wiring takes effect, OR tell the user to close and re-open the window. An idempotent \`show()\` will silently keep the OLD widgets otherwise, and your fix won't be observable.
 - Probe: \`call("<Name>", "probe", {})\` — verifies dep references resolve in the deployed object.
+
+Organism composition:
+- Stage the membrane yourself for a curated surface: \`draft_manifest\` (the public methods) and \`draft_source\` (thin forwarders), then \`{ "action": "compose_organism", "name": "...", "description": "...", "organelleNames": ["A", "B"] }\`.
+- Or let compose_organism draft the membrane: pass only name, description, and organelleNames.
+- Reverse: \`{ "action": "extract_organelle", "target": "<organism>", "organelleName": "A" }\` deploys a standalone copy and leaves the organism intact.
+
+ScrumMaster owns multi-task planning. If the assigned creation/modification task is too broad or needs another specialist first, use \`fail({reason})\` with a concise proposed next scrum rather than trying to split the work locally.
 
 ANTI-PATTERNS — do not do these:
 - \`call("Factory", "spawn", ...)\` — you cannot supply the right owner / parentId, and you cannot inline the drafted manifest+source through a JSON action payload. Use \`deploy_spawn\`.
@@ -1708,7 +2543,7 @@ Verification (after deploy):
 - Behavioral test: \`call("<DeployedName>", "<method>", <payload>)\` — invoke a real method and check the response.
 
 Persistence:
-- Goal scratchpad (per-goal handoff): \`call("GoalManager", "writeGoalData", {goalId, key, value})\` / \`readGoalData\`.
+- Goal scratchpad (per-goal handoff): \`call("GoalManager", "writeGoalData", {goalId, key, value})\` / \`readGoalData\`. This is also how you fulfill your task's declared \`produces\` keys — write each one to the scratchpad with this call (it is a GoalManager method invoked via \`call\`, NOT a top-level action verb).
 - KnowledgeBase (cross-session facts): \`call("KnowledgeBase", "remember", {title, content, type, tags})\` / \`recall\`.
 
 # Event emission
@@ -1724,11 +2559,26 @@ this.changed('completed', { resultCount });
 
 \`this.emit(toId, eventName, payload)\` is a separate primitive: it sends a single event to one specific recipient whose id you already hold — the first argument is the recipient, the second is the event name. Choose \`this.changed\` for broadcasting to observers (the typical case); choose \`this.emit\` only when targeting a known recipient.
 
+# Architecture for objects with a UI
+
+Author UI objects as **Model-View in the original Smalltalk sense**, with **DCI** and **Design by Contract**:
+- **Model**: \`this.data\` is the domain document (plain data: what the object IS) and pure helper methods hold the domain rules. The model never draws and never touches a window/canvas/widget. Transient view state (window/canvas/layout ids, hover, scroll, animation) lives in \`this._\` fields, never in \`this.data\`.
+- **View**: one render method displays the model AND the input/event handlers handle the user's interaction with it. The view both shows and controls interaction; on an interaction it applies a model helper then re-renders. No domain rules in the view.
+- **Controller**: only when there is more than one view/mode. It selects the KIND of view of the model (which view, switching modes, coordinating views). It is NOT the input path. A single-view object needs no controller.
+- **DCI**: name handlers for the use case they perform (the context); express behavior as small role helpers; keep \`this.data\` dumb.
+- **Design by Contract**: \`this.ensure(cond, msg)\` for pre/postconditions on every public handler; \`this.invariant(cond, msg)\` inside a \`_checkInvariants()\` helper called after each mutation. Both are provided and throw on failure; the sandbox forbids \`require()\`.
+
+For a complex, stateful UI this Model-View split is often two cooperating Abjects (a model object plus a view object that observes it); for a small app it is two clearly separated sections of one handler map. The detailed drafting rules are applied when you draft source.
+
+# Organisms (composing objects into one)
+
+An Organism is one Abject with an internal registry: organelles (internal ScriptableAbjects) discover each other by name and cooperate behind a membrane interface, and external callers meet a single object with a single curated surface. Reach for \`compose_organism\` when several cooperating objects form one coherent thing and their interplay is an implementation detail: the user should see one name and one interface (a model object plus its view object that always travel together, a pipeline of steps used only as a whole). Keep objects separate when each part is independently useful to the user or to other objects; free-living objects compose through the registry and the ask protocol just fine. Author the membrane thin: each public method forwards to the right organelle via \`await this.call(await this.dep('<OrganelleName>'), '<method>', msg.payload)\`, with contracts at entry and domain logic staying in the organelles. Composition copies the originals (endosymbiosis by copy), so they keep running until deliberately removed; \`extract_organelle\` is the reverse move and leaves the organism intact.
+
 # Discipline
 
 1. **Ask before guessing.** When you don't know whether an object exists, what its API is, what its state means, or what method to call — \`ask\`. The Registry, the target object, or any candidate dep will answer.
-2. **Investigate before drafting.** For modifications: \`describe\` the target, \`ask\` it any open questions, \`getSource\` to see its current code, \`getState\` if relevant. For creations: \`ask\` the Registry for what's available, \`describe\` likely deps, \`ask\` each chosen dep for usage examples. Only draft when the call surface is known.
-3. **Validate before deploying.** After any \`draft_source\`, \`draft_diff\`, or \`draft_via_llm\`: always \`compile\`; then \`validate_calls\`; for non-trivial logic also \`review_semantics\`. Deploy only when compile is clean and validators agree.
+2. **Investigate before drafting — \`ask\` is how you learn to use an object.** \`ask\` returns prose usage: examples, patterns, design guidance, the right way to call something. \`describe\` is programmatic reflection (the raw manifest) — it lists method names/params but does NOT teach usage, so it is rarely what you want, and you almost never need to call it yourself: asking a dependency automatically fetches its manifest for call-validation. So: for CREATIONS, \`ask\` the Registry what's available, then \`ask\` each chosen dependency open questions — "how do I use you?", "how do I build a good X?", "how do I make this look good?" — and only \`draft\` once you understand the surface. For MODIFICATIONS, \`ask\` the target your open questions, \`getSource\` to read its current code, \`getState\` if relevant. Prefer \`ask\` over \`describe\` everywhere; reach for \`describe\` only when you specifically need the raw structured manifest.
+3. **Validate before deploying; compile first, don't re-read.** After any \`draft_source\`, \`draft_diff\`, or \`draft_via_llm\`: go straight to \`compile\` (it localizes the one broken spot far faster than re-reading), then \`validate_calls\`; for non-trivial logic also \`review_semantics\`. Deploy only when compile is clean and validators agree. When compile reports a syntax error it already shows the failing line and context, so fix it with \`replace_handler\`/\`draft_diff\` at that line or regenerate with \`draft_source\`; do NOT \`read_draft\` to relocate it. Reading the draft repeatedly with no edit between reads is a stall that burns your step budget and leaves nothing to verify.
 4. **Verify behavior after deploying — really test what the user asked for.** After deploy, you must exercise the specific behavior the user requested, not just check that the object exists. \`call show\` and reading \`getState\` are not enough by themselves.
 
    For each behavior the user mentioned, send a \`call\` that drives it and check the result via \`getState\` or the response. Examples:
@@ -1744,26 +2594,38 @@ this.changed('completed', { resultCount });
    2. The handler reads fields from \`msg.payload\` (the real shape and the synthetic shape are identical — both wrap fields under \`msg.payload\`). Do NOT add a "top-level fallback" — there is no top-level event shape.
 
    "I called \`getState\` and the numbers look fine" is NOT verification. \`done\` only after at least one synthetic exercise of each user-requested behavior produced the expected change.
+
+   **See what you built — visual work needs a visual check.** \`getState\` proves logic; it says nothing about whether the thing looks right. For ANY object with a window, canvas, or drawn UI — and ALWAYS when the goal mentions look, layout, alignment, spacing, color, "beautiful", "polished", or a redesign — capture a screenshot and inspect it before finishing: \`call("Screenshot", "captureWindow", { objectId: "<the object's id>" })\`. The rendered image is attached to your next observation; judge it against the goal — centering, alignment, spacing (no accidental empty voids), color cohesion, typographic hierarchy, legibility of every state (e.g. used/disabled vs active), and overall polish. If anything looks off, edit, redeploy, and screenshot again. Do NOT declare a visual goal done on the strength of \`getState\` alone — Round-after-round rework happens precisely when an agent reports "looks beautiful" without ever looking. (Make sure the window is actually shown first; capture returns null if there is no visible window.)
+
+   **Verify once, don't grind.** Each behavior needs ONE representative check, not a sweep. A single correct guess and a single wrong guess prove the guess handler; you do not need to play the whole game. Repeating the same \`call\` (e.g. guessing letter after letter, or polling \`getState\` over and over) burns steps and triggers loop-steering without adding confidence. Drive each distinct behavior once, take one screenshot for the visual, then \`done\`.
+
+   **A timeout is a routing/await bug, not a deadlock.** If \`show\`, a window build, or any call times out, the cause is almost always a recipient addressed by a bare name instead of a resolved AbjectId (resolve via \`this.dep(name)\` first), or a result that was never awaited — NOT the act of awaiting inside a handler, which is correct and supported. Do not "fix" a timeout by detaching the build into a fire-and-forget chain; fix the recipient or the missing await. When verifying a window opened, drive \`show\` with a short timeout and then poll \`getState\` for the window/canvas ids, rather than sitting on a long blocking call.
+
+   **Clean up probe artifacts before finishing.** Anything you create purely to explore or verify — probe windows, scratch widgets, throwaway objects — must be destroyed once it has served its purpose (e.g. \`destroyWindowAbject\` for a window you opened to test rendering). The user's desktop should end the loop containing only what they asked for.
 5. **Diagnostic prompts terminate with a report.** If the user asked HOW something works, WHY it's failing, or to EXPLAIN behavior — answer with \`done({result: "<written report>"})\` after enough read-only calls (\`describe\`, \`ask\`, \`getState\`, \`getObjectLogs\`). Do not draft, do not deploy.
 6. **Never invent method names or payload keys.** If a method isn't on the target's \`describe\` output and isn't in its \`ask\` answer, it doesn't exist. Either \`ask\` again with a sharper question, or \`fail\` with a precise reason naming the available alternatives.
 7. **Storage scopes — pick the right one for each piece of data.** The decision rule: *if two people both ran a clone of this object, should they each see the same value?* If yes, the data belongs to the object. If no, it belongs to the user.
 
    - **Same-turn context** — keep it in your response.
-   - **Per-goal handoff between subtasks** — goal scratchpad via \`writeGoalData\` / \`readGoalData\`.
-   - **Internal object data (\`this.data\`)** — state intrinsic to the object's purpose that SHOULD travel with the object when it is cloned, restored from snapshot, or shared with another peer. Examples: a counter the object reports, the contents of a note an object represents, learned parameters, accumulated history that defines the object. ScriptableAbject source code reads and writes \`this.data\` (a plain JSON-serializable object) directly, e.g. \`this.data.count = (this.data.count ?? 0) + 1\`. Persist with \`await this.saveData()\` after mutations you want to survive restart and travel with clones. Hot-reloads (\`updateSource\` / \`deploy_update\`) preserve \`this.data\`.
+   - **Per-goal handoff between subtasks** — goal scratchpad via \`call("GoalManager", "writeGoalData", {goalId, key, value})\` / \`call("GoalManager", "readGoalData", {goalId, key})\` (GoalManager methods, invoked with the \`call\` action — not top-level verbs).
+   - **Shared structured records** — when the data is records other objects or the user may care about later (entries a tracker collects, rows a logger appends, results an analysis produces), prefer the workspace's shared collection store over private \`this.data\`. Discover it via the registry and \`ask\` it for current usage: collections are created with an optional schema, written through insert/update/remove (each write emits a record change event other objects can react to), and read back with find or SQL-style query. Data in a collection is queryable and composable by objects that have never heard of yours; data in \`this.data\` is visible only to your object. Keep \`this.data\` for the object's own document.
+   - **Internal object data (\`this.data\`)** — state intrinsic to the object's purpose that SHOULD travel with the object when it is cloned, restored from snapshot, or shared with another peer. Examples: a counter the object reports, the contents of a note an object represents, learned parameters, accumulated history that defines the object. ScriptableAbject source code reads and writes \`this.data\` (a plain JSON-serializable object) directly, e.g. \`this.data.count = (this.data.count ?? 0) + 1\`. Persist with \`await this.saveData()\` after mutations you want to survive restart and travel with clones. Hot-reloads (\`updateSource\` / \`deploy_update\`) preserve \`this.data\`. Keep \`this.data\` to the DOCUMENT — the content the object represents — and nothing more.
+   - **Transient runtime state stays OUT of \`this.data\`** — window/canvas/layout ids, in-progress edit buffers and cursor position, pan/zoom, selection, drag state, hit-test caches, and anything tied to a currently-open window are ephemeral. Hold them in plain instance fields (\`this._sessions\`, \`this._cursor\`, …), NOT \`this.data\`. Instance fields are not persisted and not cloned, which is exactly right: they are meaningless after a restart and are rebuilt when a window (re)opens. Persisting them instead bloats every snapshot and ties saved documents to dead window ids. (A multi-window editor keeps its per-window sessions in \`this._sessions\`; only the maps/notes/documents go in \`this.data\`.)
+   - **Persist at commit granularity, not per keystroke.** \`saveData()\` snapshots the whole object and re-registers it, so calling it on every keystroke, pointer move, or animation frame is expensive and churns the system (it can visibly thrash other UI). Call \`saveData()\` when a value is actually finalized — an edit committed on Enter/blur, a node added/renamed/deleted — or debounce rapid edits and save once they settle. Mutate \`this.data\` freely in between; just don't persist on every transient change.
    - **External Storage / dependency objects** — use the Storage capability (or a dedicated dependency object) for data that is user-specific, secret, or otherwise should NOT be copied when the object is cloned or shared with another peer. API keys, OAuth tokens, personal preferences, anything tied to *this user on this machine*. Read with \`call(this.dep('Storage'), 'get', {key})\`, write with \`call(this.dep('Storage'), 'set', {key, value})\`.
    - **KnowledgeBase** — durable cross-session user-facing facts the user wants to recall later (notes, preferences, learned facts about the user). Not for per-task state.
 
    When a single object holds both kinds of data — for example, a notes app that holds the notes themselves AND a private API key for an external service — split them: notes go in \`this.data.notes\` (cloneable), API key goes in Storage (not cloneable).
 8. **User credentials are explicit consent.** When the user shares a username, password, API key, bearer token, or other secret in the task and asks you to wire it into an object, embed it in the source. This runtime is the user's own local system; persisted source lives in their \`.abjects\` directory on their own disk and never leaves it. Don't refuse on "plaintext credentials" grounds, don't lecture about secret stores, and don't substitute placeholders that block the integration. Wire the actual value through. If they ever swap to a secrets backend later, that's a separate refactor — not your call here.
-9. **Terminate crisply.** \`done\` carries either a spawned object id, a modified object id, or a written report. \`fail\` carries a precise reason — what couldn't be done, what was tried, what's available instead.
+9. **Deploy before done — compiling is not deploying.** A clean \`compile\` only proves the draft parses; it does NOT change the live object. The single most common silent failure is finishing a task whose best edits were compiled but never deployed — the loop reports success while the user still sees the old object, forcing them to ask again. Before \`done\`, your staged source MUST be live: the observation's DRAFTS line reads "deployed (live)" when it is, or flags "⚠️ NOT YET DEPLOYED" when it isn't. If it is flagged, run \`deploy_update\` (or \`deploy_spawn\` for a new object) — and, if the edit touched \`show()\`/\`createCanvas\`/widget wiring, \`hide()\` then \`show()\` the target — and then re-verify. Never end a multi-task goal by leaving the next task to deploy your work; ship what you edited.
+10. **Terminate crisply.** \`done\` carries either a spawned object id, a modified object id, or a written report — and only after your edits are deployed and verified (functionally, and visually for UI). \`fail\` carries a precise reason — what couldn't be done, what was tried, what's available instead.
 
 # What's in your observation
 
 The TASK section gives the kind, target (if any), and goal.
 The KNOWN OBJECTS section is everything you have learned via \`describe\` / \`ask\` so far. Method names listed there are the only valid names — copy them verbatim.
 The TARGET SOURCE section (modify loops only) shows the current code of the object being edited, preloaded from the Registry. Author SEARCH/REPLACE blocks against the exact text shown here.
-The DRAFTS section shows what manifest / source you have staged.
+The DRAFTS section shows what manifest / source you have staged, and whether that source is deployed (live) or has undeployed edits.
 The LAST VALIDATION section shows the most recent compile / validate_calls / review_semantics result.
 The RECENT TURNS section is your action log so you remember what you have already done.
 

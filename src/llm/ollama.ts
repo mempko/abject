@@ -18,6 +18,7 @@ import {
   defaultIsRetryable,
   getTextContent,
 } from './provider.js';
+import { require } from '../core/contracts.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('OLLAMA');
@@ -124,7 +125,10 @@ export class OllamaProvider extends BaseLLMProvider {
       stream: true,
       options: {
         temperature: options.temperature,
-        num_predict: options.maxTokens,
+        // Reasoning-capable local models emit long <think> traces that share
+        // num_predict with the answer; floor a specified cap so it can't be
+        // starved, and leave it unset (Ollama's unbounded default) otherwise.
+        num_predict: options.maxTokens === undefined ? undefined : Math.max(options.maxTokens, 4096),
         stop: options.stopSequences,
       },
     };
@@ -201,7 +205,10 @@ export class OllamaProvider extends BaseLLMProvider {
       stream: true,
       options: {
         temperature: options.temperature,
-        num_predict: options.maxTokens,
+        // Reasoning-capable local models emit long <think> traces that share
+        // num_predict with the answer; floor a specified cap so it can't be
+        // starved, and leave it unset (Ollama's unbounded default) otherwise.
+        num_predict: options.maxTokens === undefined ? undefined : Math.max(options.maxTokens, 4096),
         stop: options.stopSequences,
       },
     };
@@ -318,8 +325,14 @@ export class OllamaProvider extends BaseLLMProvider {
    */
   private mapMessage(msg: LLMMessage): OllamaMessage {
     if (typeof msg.content === 'string') return { role: msg.role, content: msg.content };
-    const text = getTextContent(msg);
+    let text = getTextContent(msg);
     const images = (msg.content.filter((p): p is ImagePart => p.type === 'image')).map(p => p.data);
+    // Ollama has no document/PDF input — note their presence as text so the
+    // model knows a document was attached even though it can't read the bytes.
+    const docNotes = msg.content
+      .filter((p) => p.type === 'document')
+      .map((p) => `[PDF attachment: ${(p as { name?: string }).name ?? 'document.pdf'} — not viewable by this model]`);
+    if (docNotes.length > 0) text = [text, ...docNotes].filter(Boolean).join('\n');
     const result: OllamaMessage = { role: msg.role, content: text };
     if (images.length > 0) result.images = images;
     return result;

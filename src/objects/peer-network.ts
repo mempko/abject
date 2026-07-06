@@ -46,6 +46,7 @@ export class PeerNetwork extends Abject {
   // Contacts section widgets
   private addContactInputId?: AbjectId;
   private addContactBtnId?: AbjectId;
+  private contactListId?: AbjectId;
   private connectButtons: Map<AbjectId, string> = new Map();
   private removeButtons: Map<AbjectId, string> = new Map();
   private introduceButtons: Map<AbjectId, string> = new Map();
@@ -227,6 +228,19 @@ Interface: abjects:peer-network`;
       // Contacts section
       if (fromId === this.addContactBtnId && aspect === 'click') {
         await this.addContact();
+        return;
+      }
+
+      // Inline contact actions on the rich contacts list
+      if (fromId === this.contactListId && aspect === 'action') {
+        try {
+          const data = JSON.parse(value as string) as { value: string; actionId: string };
+          const peerId = data.value;
+          if (data.actionId === 'connect') await this.toggleConnection(peerId);
+          else if (data.actionId === 'introduce') await this.introduceContact(peerId);
+          else if (data.actionId === 'remove') await this.removeContact(peerId);
+          else if (data.actionId === 'block') await this.blockPeer(peerId);
+        } catch { /* malformed payload */ }
         return;
       }
 
@@ -443,6 +457,7 @@ Interface: abjects:peer-network`;
     this.statusLabelId = undefined;
     this.addContactInputId = undefined;
     this.addContactBtnId = undefined;
+    this.contactListId = undefined;
     this.signalingInputId = undefined;
     this.signalingConnectBtnId = undefined;
     this.connectButtons.clear();
@@ -689,100 +704,42 @@ Interface: abjects:peer-network`;
         preferredSize: { height: 18 },
       }));
     } else {
-      for (const contact of contacts) {
-        const rowId = await this.request<AbjectId>(
-          request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-            parentLayoutId: tab1,
-            margins: { top: 0, right: 0, bottom: 0, left: 0 },
-            spacing: 8,
-          })
-        );
-        await this.request(request(this.id, tab1, 'addLayoutChild', {
-          widgetId: rowId,
-          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-          preferredSize: { height: 30 },
-        }));
-
-        const displayName = contact.name || contact.peerId.slice(0, 12) + '...';
-        const stateColor = contact.state === 'connected' ? this.theme.actionBg
+      // Contacts as a single rich list: state badge + inline actions per row.
+      const items = contacts.map((contact) => {
+        const isConnected = contact.state === 'connected';
+        const stateColor = contact.state === 'connected' ? this.theme.statusSuccess
           : contact.state === 'connecting' ? this.theme.statusWarning
           : this.theme.statusNeutral;
-        const isConnected = contact.state === 'connected';
-
-        // Batch: name label + state label + connect button + delete button + block button
-        const connBtnText = isConnected ? 'Disconnect' : 'Connect';
-        const connBtnStyle = isConnected
-          ? { fontSize: 11 }
-          : { background: '#1e3a2e', borderColor: this.theme.statusSuccess, fontSize: 11 };
-        const specs: Array<Record<string, unknown>> = [
-          { type: 'label', windowId: this.windowId, text: displayName, style: { color: this.theme.textHeading, fontSize: 12, selectable: true } },
-          { type: 'label', windowId: this.windowId, text: contact.state, style: { color: stateColor, fontSize: 11, selectable: true } },
-          { type: 'button', windowId: this.windowId, text: connBtnText, style: connBtnStyle },
+        const actions: Array<{ id: string; label: string; color?: string; textColor?: string }> = [
+          { id: 'connect', label: isConnected ? 'Disconnect' : 'Connect', color: isConnected ? undefined : '#1e3a2e' },
         ];
         if (isConnected) {
-          specs.push({ type: 'button', windowId: this.windowId, text: 'Introduce', style: { background: '#1e2a3a', borderColor: this.theme.statusInfo, fontSize: 11 } });
+          actions.push({ id: 'introduce', label: 'Introduce', color: '#1e2a3a' });
         }
-        specs.push(
-          { type: 'button', windowId: this.windowId, text: 'Remove', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
-          { type: 'button', windowId: this.windowId, text: 'Block', style: { background: this.theme.destructiveBg, color: this.theme.destructiveText, borderColor: this.theme.destructiveText, fontSize: 11 } },
+        actions.push(
+          { id: 'remove', label: 'Remove', color: this.theme.destructiveBg, textColor: this.theme.destructiveText },
+          { id: 'block', label: 'Block', color: this.theme.destructiveBg, textColor: this.theme.destructiveText },
         );
+        return {
+          label: contact.name || contact.peerId.slice(0, 12) + '...',
+          value: contact.peerId,
+          detail: contact.peerId.slice(0, 24),
+          badge: { text: contact.state, color: stateColor },
+          actions,
+        };
+      });
 
-        const { widgetIds: contactRowWidgets } = await this.request<{ widgetIds: AbjectId[] }>(
-          request(this.id, this.widgetManagerId!, 'create', { specs })
-        );
-
-        let idx = 0;
-        const nameId = contactRowWidgets[idx++];
-        const stateId = contactRowWidgets[idx++];
-        const connBtnId = contactRowWidgets[idx++];
-        const introBtnId = isConnected ? contactRowWidgets[idx++] : undefined;
-        const delBtnId = contactRowWidgets[idx++];
-        const blockBtnId = contactRowWidgets[idx++];
-
-        await this.request(request(this.id, rowId, 'addLayoutChild', {
-          widgetId: nameId,
-          sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-          preferredSize: { height: 30 },
-        }));
-        await this.request(request(this.id, rowId, 'addLayoutChild', {
-          widgetId: stateId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 70, height: 30 },
-        }));
-        await this.request(request(this.id, connBtnId, 'addDependent', {}));
-        await this.request(request(this.id, rowId, 'addLayoutChild', {
-          widgetId: connBtnId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 80, height: 28 },
-        }));
-        this.connectButtons.set(connBtnId, contact.peerId);
-
-        if (isConnected && introBtnId) {
-          await this.request(request(this.id, introBtnId, 'addDependent', {}));
-          await this.request(request(this.id, rowId, 'addLayoutChild', {
-            widgetId: introBtnId,
-            sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-            preferredSize: { width: 70, height: 28 },
-          }));
-          this.introduceButtons.set(introBtnId, contact.peerId);
-        }
-
-        await this.request(request(this.id, delBtnId, 'addDependent', {}));
-        await this.request(request(this.id, rowId, 'addLayoutChild', {
-          widgetId: delBtnId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 70, height: 28 },
-        }));
-        this.removeButtons.set(delBtnId, contact.peerId);
-
-        await this.request(request(this.id, blockBtnId, 'addDependent', {}));
-        await this.request(request(this.id, rowId, 'addLayoutChild', {
-          widgetId: blockBtnId,
-          sizePolicy: { horizontal: 'fixed', vertical: 'fixed' },
-          preferredSize: { width: 60, height: 28 },
-        }));
-        this.blockButtons.set(blockBtnId, contact.peerId);
-      }
+      const { widgetIds: [contactListId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'list', windowId: this.windowId, items },
+        ] })
+      );
+      this.contactListId = contactListId;
+      await this.request(request(this.id, this.contactListId, 'addDependent', {}));
+      await this.request(request(this.id, tab1, 'addLayoutChild', {
+        widgetId: this.contactListId,
+        sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+      }));
     }
 
     // ========== TAB 2: SERVERS & PEERS ==========

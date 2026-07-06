@@ -70,7 +70,7 @@ Capabilities are permissions granted to objects. Each has an ID string in the fo
 │                    Browser Main Thread                       │
 │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌───────────────┐  │
 │  │ Message  │ │ Network  │ │   LLM    │ │ UI Compositor │  │
-│  │   Bus    │ │  Layer   │ │ Gateway  │ │   (Canvas)    │  │
+│  │   Bus    │ │  Layer   │ │ Gateway  │ │   (WebGL2 3D) │  │
 │  └────┬─────┘ └────┬─────┘ └────┬─────┘ └───────┬───────┘  │
 └───────┼────────────┼────────────┼───────────────┼──────────┘
         │      postMessage API    │               │
@@ -160,18 +160,19 @@ Integration: MessageBus notifies `'undeliverable'` subscribers when a message ta
 
 ### 3.8 Sandbox Layer (`src/sandbox/`)
 
-Secure WASM execution for user-created objects.
+WASM abject hosting: abjects written in other languages (C++ SDK in `sdk/cpp/`) run as first-class objects. The contract is `docs/WASM_ABI.md`; the object wrapper is `src/objects/wasm-abject.ts` (`WasmAbject extends Abject`, so WASM objects ride the mailbox, Registry, Supervisor, typeIds, and worker placement unchanged).
 
-- **`wasm-loader.ts`** - `WasmObject` wrapper around `WebAssembly.Instance`. String read/write helpers for WASM memory. Bump allocator fallback when module lacks `alloc` export. `loadWasmObject()`, `compileWasmModule()`, `validateWasmModule()` (checks for required `memory` and `handle` exports).
-- **`wasm-imports.ts`** - Capability-enforced import table. `WasmImportContext`: objectId, capabilities, memory accessor, send/log callbacks. Namespaces: `abjects` (send, log, get_time with capability checks), `env` (abort handler for AssemblyScript, seed), `console` (log/warn/error).
-- **`worker-runtime.ts`** - Main thread ↔ Worker bridge via `WorkerRuntime`. `spawn()` sends WASM bytes to worker, resolves on 'ready'. `sendMessage()` posts serialized `AbjectMessage`. Routes worker messages back through MessageBus. Singleton.
+- **`wasm-abi.ts`** - ABI v1 surface: JSON envelope types (guest↔host), length-prefixed buffer codec, `validateWasmModule()` (required exports + kinds).
+- **`wasm-instance.ts`** - `WasmInstance` wrapper around one `WebAssembly.Instance`: compile + validate + ABI-version check, `init()`/`handle()`/`snapshot()` guest calls, capability-gated `abjects` imports (emit/log/time_ms), minimal WASI preview1 shim (stdout→log, clock, random; no fs/sockets), `extractWasmManifest()` for package time.
+- **`wasm-module-store.ts`** - Content-addressed module storage at `$ABJECTS_DATA_DIR/wasm/<sha256>.wasm`; modules referenced everywhere as `wasm:sha256:<hex>` riding the normal `source` field, so AbjectStore snapshots, clone/instantiate, and respawn work unchanged.
+- **`extensions.ts`** - Package scan/ingest: bundled native system packages (`native/`, shipped in the desktop app as `resources/native`) first, then user extensions (`$ABJECTS_DATA_DIR/extensions/`, installed via `pnpm forge`); a package with `replaces` overrides its built-in Factory type.
 
 ### 3.9 UI Layer (`src/ui/`)
 
 Browser application shell and canvas rendering.
 
 - **`app.ts`** - Application shell. Creates canvas element, Compositor, UIServer, Runtime. `App.start()` starts Runtime and sets up input listeners. `createApp()` factory for one-line bootstrap.
-- **`compositor.ts`** - Canvas-based surface compositor. Each surface is an `OffscreenCanvas` with its own 2D context. `requestAnimationFrame` render loop (only renders when `needsRender` flag set). Z-order sorted rendering (bottom-to-top). DPI-aware (`devicePixelRatio` scaling). Draw commands: `rect` (optional rounded corners), `text`, `line`, `image`, `path`, `clear`. Hit testing: `surfaceAt(x, y)` iterates reverse z-order.
+- **`compositor.ts`** - 3D surface compositor (hand-rolled WebGL2, `src/ui/gl/`). Each surface is an `OffscreenCanvas` with its own 2D context — painted by the 2D draw-command vocabulary — uploaded as the texture of a slab in a perspective 3D scene. Slabs get theme-driven shadows, focus rim/bloom + z-lift, and drag tilt. A retained scene vocabulary (mesh/light/group nodes, `$token` theme colors) attaches 3D content to a window's subtree. `requestAnimationFrame` render loop (only renders when `needsRender` flag set). Hit testing: camera-ray picking per slab + per-pixel alpha test.
 
 ## 4. Data Flow Diagrams
 
@@ -265,25 +266,32 @@ HealthMonitor (every 5s):
 ### 4.5 WASM Object Execution Flow
 
 ```
-Main Thread:
-  WorkerRuntime.spawn(objectId, wasmBytes) →
-    postMessage({ type: 'spawn', objectId, wasmCode }) →
+Boot (server/index.ts):
+  ingestAllExtensions(factory) →
+    native/ (bundled) then $ABJECTS_DATA_DIR/extensions/ (user, wins collisions)
+    module bytes → content-addressed store (wasm:sha256:<hex>)
+    factory.registerWasmType(name, { manifest, source, scope })
 
-Worker Thread:
-  onmessage → type 'spawn' →
-    WebAssembly.compile(wasmCode) →
-    createImports(objectId, capabilities) →
-      abjects.send (requires SEND_MESSAGE)
-      abjects.log (requires LOG)
-      abjects.get_time (requires TIME)
-      env.abort (AssemblyScript handler)
-    WebAssembly.instantiate(module, imports) →
-    instance.exports.init(statePtr, stateLen) →
-    postMessage({ type: 'status', objectId, status: 'ready' })
+Spawn (Factory):
+  spawn({ manifest }) → wasmTypes lookup (overrides built-in constructors) →
+    spawnWasmInWorker: WorkerPool worker constructs
+      new WasmAbject({ manifest, source, owner, data })
+    worker reads module bytes from the store on disk (bytes never cross threads)
 
-Messages routed via postMessage bridge:
-  Main → Worker: { type: 'message', objectId, message: serialized }
-  Worker → Main: { type: 'message', objectId, message: serialized }
+Inside the object (WasmAbject.onInit):
+  WasmInstance.create(bytes) →
+    validate exports + abi version → instantiate with
+      abjects.emit / log / time_ms   (capability-gated)
+      wasi_snapshot_preview1 shim    (no fs/sockets)
+    _initialize() (WASI reactor) → abject_init({ objectId, typeId, data })
+
+Message flow (JSON envelopes, docs/WASM_ABI.md):
+  inbound request/event → '*' handler → abject_handle({ kind: 'message' })
+  guest replies sync (reply/error envelope) or defers (later handle call)
+  guest requests: { kind: 'request', to: '@Name' | id } → host this.request()
+    → result envelope back into abject_handle
+  changed / persist / log envelopes → dependents fan-out, Registry data
+    upsert, host logging
 ```
 
 ## 5. Key Design Decisions
@@ -300,12 +308,13 @@ From the source code: "correctness over performance." In a dynamic message-passi
 
 Objects with incompatible interfaces can still communicate. The proxy is a real object in the system - it has a manifest, receives messages, and follows the same protocol. When it fails, the LLM can regenerate it with error context from the previous attempt, progressively improving the translation.
 
-### 5.4 Why Canvas-Based UI (X11 Model)
+### 5.4 Why a 3D-Native UI over Isolated 2D Surfaces (X11 Model)
 
-Each object gets an isolated `OffscreenCanvas` surface. The compositor manages z-ordering and rendering. No DOM manipulation by objects - all rendering through draw commands. This provides:
-- Isolation between objects (each draws to its own canvas)
-- Centralized compositing (one render loop)
-- Familiar model (X11 surface/window semantics)
+Each object gets an isolated `OffscreenCanvas` surface painted via 2D draw commands; the compositor renders every surface as a textured slab in a WebGL2 3D scene (depth, lighting, focus bloom, drag tilt). 3D objects attach to a window's subtree through a retained scene vocabulary (`scene` ops on UIServer) with theme-token colors. No DOM manipulation by objects - all rendering through messages. This provides:
+- Isolation between objects (each rasterizes to its own canvas)
+- Centralized compositing (one render loop, one scene)
+- 2D content as a first-class texture type on 3D surfaces — text keeps the browser's rasterizer
+- Familiar model (X11 surface/window semantics) with a spatial presentation layer
 
 ### 5.5 Why Web Workers and WASM
 

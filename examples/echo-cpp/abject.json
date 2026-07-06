@@ -1,0 +1,8 @@
+{
+  "name": "EchoCpp",
+  "version": "1.0.0",
+  "abi": 1,
+  "scope": "workspace",
+  "wasm": "main.wasm",
+  "build": "bash ../../sdk/cpp/build.sh echo.cpp -o main.wasm"
+}

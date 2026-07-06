@@ -19,7 +19,10 @@ import {
   LLMCompletionResult,
   ModelTier,
   getTextContent,
-
+  truncateText,
+  messageTextChars,
+  conversationTextChars,
+  enforceConversationCharBudget,
   systemMessage,
   userMessage,
 } from '../llm/provider.js';
@@ -27,6 +30,25 @@ import {
 export interface TierConfig {
   provider: string;
   model: string;
+}
+
+export interface CompressOptions {
+  /** Total char budget for the compressed conversation. Default 180000. */
+  targetChars?: number;
+  /** Leading messages kept verbatim (system prompt, task statement). Default 2. */
+  pinnedCount?: number;
+  /** Trailing messages kept verbatim (current working context). Default 4. */
+  keepRecent?: number;
+  /** What the conversation is working on — focuses the distillation. */
+  taskHint?: string;
+}
+
+export interface CompressResult {
+  messages: LLMMessage[];
+  originalChars: number;
+  compressedChars: number;
+  /** Which stages ran: 'distill-oversized', 'distill-middle', 'truncate', or 'none'. */
+  methods: string[];
 }
 
 export type TierRouting = Partial<Record<ModelTier, TierConfig>>;
@@ -226,6 +248,32 @@ export class LLMObject extends Abject {
                 } },
               },
               {
+                name: 'compress',
+                description: 'Shrink an oversized conversation to fit a character budget. Oversized messages are split into chunks and distilled in parallel by a fast-tier model (preserving findings, errors, IDs, and partial results); the conversation middle is summarized next; deterministic head+tail truncation guarantees the budget as a last resort. Returns the compressed messages plus before/after sizes. Use this when a complete/stream call fails with PROMPT_TOO_LONG.',
+                parameters: [
+                  {
+                    name: 'messages',
+                    type: {
+                      kind: 'array',
+                      elementType: { kind: 'reference', reference: 'LLMMessage' },
+                    },
+                    description: 'Conversation messages to compress',
+                  },
+                  {
+                    name: 'options',
+                    type: { kind: 'reference', reference: 'CompressOptions' },
+                    description: 'Optional: targetChars (default 180000), pinnedCount (leading messages kept verbatim, default 2), keepRecent (trailing messages kept verbatim, default 4), taskHint (what the conversation is working on — improves distillation relevance)',
+                    optional: true,
+                  },
+                ],
+                returns: { kind: 'object', properties: {
+                  messages: { kind: 'array', elementType: { kind: 'reference', reference: 'LLMMessage' } },
+                  originalChars: { kind: 'primitive', primitive: 'number' },
+                  compressedChars: { kind: 'primitive', primitive: 'number' },
+                  methods: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } },
+                } },
+              },
+              {
                 name: 'listProviders',
                 description: 'List available LLM providers',
                 parameters: [],
@@ -316,6 +364,46 @@ export class LLMObject extends Abject {
                 parameters: [],
                 returns: { kind: 'reference', reference: 'TierRouting' },
               },
+              {
+                name: 'transcribe',
+                description: 'Transcribe audio to text (speech-to-text). Routes to the first registered provider with a transcription API unless a provider is named.',
+                parameters: [
+                  { name: 'audio', type: { kind: 'object', properties: { base64: { kind: 'primitive', primitive: 'string' }, mimeType: { kind: 'primitive', primitive: 'string' } } }, description: 'Encoded audio: { base64, mimeType }' },
+                  { name: 'provider', type: { kind: 'primitive', primitive: 'string' }, description: 'Provider name (optional; auto-selected when omitted)', optional: true },
+                  { name: 'model', type: { kind: 'primitive', primitive: 'string' }, description: 'Transcription model id (optional)', optional: true },
+                  { name: 'language', type: { kind: 'primitive', primitive: 'string' }, description: 'Spoken language hint (optional)', optional: true },
+                ],
+                returns: { kind: 'object', properties: {
+                  text: { kind: 'primitive', primitive: 'string' },
+                  provider: { kind: 'primitive', primitive: 'string' },
+                } },
+              },
+              {
+                name: 'synthesize',
+                description: 'Synthesize speech audio from text (text-to-speech). Returns encoded audio as { base64, mimeType }. Routes to the first registered provider with a speech API unless a provider is named.',
+                parameters: [
+                  { name: 'text', type: { kind: 'primitive', primitive: 'string' }, description: 'Text to speak' },
+                  { name: 'provider', type: { kind: 'primitive', primitive: 'string' }, description: 'Provider name (optional; auto-selected when omitted)', optional: true },
+                  { name: 'model', type: { kind: 'primitive', primitive: 'string' }, description: 'Speech model id (optional)', optional: true },
+                  { name: 'voice', type: { kind: 'primitive', primitive: 'string' }, description: 'Voice id (optional; provider default when omitted)', optional: true },
+                ],
+                returns: { kind: 'object', properties: {
+                  base64: { kind: 'primitive', primitive: 'string' },
+                  mimeType: { kind: 'primitive', primitive: 'string' },
+                  provider: { kind: 'primitive', primitive: 'string' },
+                } },
+              },
+              {
+                name: 'supportsSpeech',
+                description: 'Which speech directions a registered provider can serve right now',
+                parameters: [],
+                returns: { kind: 'object', properties: {
+                  transcribe: { kind: 'primitive', primitive: 'boolean' },
+                  synthesize: { kind: 'primitive', primitive: 'boolean' },
+                  transcribeProvider: { kind: 'primitive', primitive: 'string' },
+                  synthesizeProvider: { kind: 'primitive', primitive: 'string' },
+                } },
+              },
             ],
             events: [
               { name: 'requestStarted', description: 'Emitted when a new LLM request begins', payload: { kind: 'reference', reference: 'LLMActiveRequest' } },
@@ -335,10 +423,39 @@ export class LLMObject extends Abject {
     this.setupHandlers();
   }
 
+  /**
+   * Hard backstop on prompt size, checked before any provider call. ~600k
+   * chars ≈ 150–200k tokens, at or above every configured model's context
+   * window — anything bigger is a runaway prompt (e.g. an agent embedding a
+   * multi-megabyte scratchpad dump) that would burn a round-trip just to get
+   * an opaque 400 back. Failing locally is free and names the fat messages so
+   * the caller can compact the right thing. Callers are expected to stay far
+   * below this via their own budgets (AgentAbject trims to 180k chars).
+   */
+  private static readonly MAX_PROMPT_CHARS = 600_000;
+
+  private checkPromptSize(messages: LLMMessage[]): void {
+    const sizes = messages.map((msg) => getTextContent(msg).length);
+    const total = sizes.reduce((a, b) => a + b, 0);
+    if (total <= LLMObject.MAX_PROMPT_CHARS) return;
+    const offenders = sizes
+      .map((chars, i) => ({ i, role: messages[i].role, chars }))
+      .sort((a, b) => b.chars - a.chars)
+      .slice(0, 3)
+      .map((o) => `#${o.i} (${o.role}, ${o.chars} chars)`)
+      .join(', ');
+    throw new Error(
+      `PROMPT_TOO_LONG: ${total} chars across ${messages.length} messages exceeds the ` +
+      `${LLMObject.MAX_PROMPT_CHARS}-char limit. Largest messages: ${offenders}. ` +
+      `Call this object's 'compress' method with the same messages to shrink them, or drop oversized content.`
+    );
+  }
+
   private setupHandlers(): void {
     this.on('complete', async (m: AbjectMessage) => {
       require(!this._paused, 'LLM is paused');
       const { messages, options, provider } = m.payload as LLMQueryPayload;
+      this.checkPromptSize(messages);
       return this.complete(messages, options, provider, m.routing.from, m.header.messageId);
     });
 
@@ -354,9 +471,19 @@ export class LLMObject extends Abject {
       return this.analyze(content, task, m.routing.from, m.header.messageId);
     });
 
+    this.on('compress', async (m: AbjectMessage) => {
+      require(!this._paused, 'LLM is paused');
+      const { messages, options } = m.payload as {
+        messages: LLMMessage[];
+        options?: CompressOptions;
+      };
+      return this.compressMessages(messages, options ?? {}, m.routing.from, m.header.messageId);
+    });
+
     this.on('stream', async (m: AbjectMessage) => {
       require(!this._paused, 'LLM is paused');
       const { messages, options, provider: providerName } = m.payload as LLMQueryPayload;
+      this.checkPromptSize(messages);
       const { provider, modelOverride } = this.resolveProviderAndModel(providerName, options?.tier);
       const effectiveOptions = modelOverride
         ? { ...options, model: modelOverride }
@@ -368,7 +495,8 @@ export class LLMObject extends Abject {
       // If provider doesn't support streaming, fall back to complete
       if (!provider.stream) {
         const result = await this.complete(messages, options, providerName, callerId, correlationId);
-        return { content: result.content };
+        // 'length' is the provider-agnostic signal for a truncated response.
+        return { content: result.content, stopReason: result.finishReason === 'length' ? 'max_tokens' : result.finishReason };
       }
 
       const totalChars = messages.reduce((sum, m2) => sum + getTextContent(m2).length, 0);
@@ -404,6 +532,7 @@ export class LLMObject extends Abject {
       }, KEEPALIVE_MS);
 
       let fullContent = '';
+      let stopReason: string | undefined;
       try {
         for await (const chunk of provider.stream(messages, effectiveOptions)) {
           if (activeReq.killed) {
@@ -412,6 +541,7 @@ export class LLMObject extends Abject {
           }
           lastChunkAt = Date.now();
           fullContent += chunk.content;
+          if (chunk.stopReason) stopReason = chunk.stopReason;
           activeReq.outputChars = fullContent.length;
           // Send each chunk as an event back to the requester
           this.send(event(this.id, callerId, 'llmChunk', {
@@ -431,9 +561,9 @@ export class LLMObject extends Abject {
       }
 
       const elapsed = Date.now() - start;
-      log.info(`← ${provider.name} stream | ${fullContent.length} chars | ${elapsed}ms`);
+      log.info(`← ${provider.name} stream | ${fullContent.length} chars | ${elapsed}ms | reason=${stopReason ?? 'unknown'}`);
       this.trackRequestEnd(correlationId, fullContent);
-      return { content: fullContent };
+      return { content: fullContent, stopReason };
     });
 
     this.on('listProviders', async () => {
@@ -478,6 +608,37 @@ export class LLMObject extends Abject {
       this.tierRouting = { ...tierRouting };
       log.info(`Tier routing updated: ${JSON.stringify(this.tierRouting)}`);
       return true;
+    });
+
+    this.on('transcribe', async (m: AbjectMessage) => {
+      const { audio, provider: providerName, model, language } = m.payload as {
+        audio: { base64: string; mimeType: string };
+        provider?: string; model?: string; language?: string;
+      };
+      require(audio !== undefined && typeof audio.base64 === 'string' && audio.base64.length > 0,
+        'audio must carry non-empty base64');
+      require(typeof audio.mimeType === 'string' && audio.mimeType.length > 0,
+        'audio must carry a mimeType');
+      return this.transcribeAudio(audio, providerName, model, language);
+    });
+
+    this.on('synthesize', async (m: AbjectMessage) => {
+      const { text, provider: providerName, model, voice } = m.payload as {
+        text: string; provider?: string; model?: string; voice?: string;
+      };
+      require(typeof text === 'string' && text.length > 0, 'text must be non-empty');
+      return this.synthesizeSpeech(text, providerName, model, voice);
+    });
+
+    this.on('supportsSpeech', async () => {
+      const transcriber = this.findSpeechProvider('transcribe');
+      const synthesizer = this.findSpeechProvider('synthesize');
+      return {
+        transcribe: transcriber !== undefined,
+        synthesize: synthesizer !== undefined,
+        transcribeProvider: transcriber?.name,
+        synthesizeProvider: synthesizer?.name,
+      };
     });
 
     this.on('getTierRouting', async () => {
@@ -706,6 +867,202 @@ export class LLMObject extends Abject {
     } finally {
       if (keepaliveTimer) clearInterval(keepaliveTimer);
     }
+  }
+
+  // ── Conversation compression ──────────────────────────────────────────
+
+  /** Messages with more text than this get split-and-distilled individually. */
+  private static readonly DISTILL_MESSAGE_THRESHOLD = 80_000;
+  /** Chunk size fed to one fast-tier distillation call. */
+  private static readonly DISTILL_CHUNK_CHARS = 50_000;
+  /** Max concurrent distillation calls. */
+  private static readonly DISTILL_CONCURRENCY = 4;
+
+  /**
+   * Shrink a conversation to fit a char budget, preserving meaning where
+   * possible. Three stages, each only running if the previous left the
+   * conversation over budget:
+   *
+   * 1. distill-oversized: each non-system message larger than the threshold
+   *    is split into chunks and distilled in parallel by the fast tier, then
+   *    replaced by its joined summaries. Handles the classic failure (one
+   *    multi-megabyte observation) semantically instead of slicing it.
+   * 2. distill-middle: the block between pinned and recent messages is
+   *    chunked along message boundaries and distilled into synthetic context
+   *    messages, like an agent conversation summary.
+   * 3. truncate: deterministic head+tail truncation of the largest messages
+   *    until the budget holds. No LLM, cannot fail — this is the guarantee.
+   *
+   * System messages are never LLM-distilled (rewriting instructions changes
+   * behavior); if a system prompt is itself oversized, only stage 3 touches it.
+   */
+  async compressMessages(
+    messages: LLMMessage[],
+    options: CompressOptions,
+    callerId?: AbjectId,
+    requestId?: string,
+  ): Promise<CompressResult> {
+    const targetChars = options.targetChars ?? 180_000;
+    const pinnedCount = options.pinnedCount ?? 2;
+    const keepRecent = options.keepRecent ?? 4;
+    const taskHint = options.taskHint ?? '';
+
+    // Work on a deep-enough copy: messages are replaced, never mutated.
+    const out: LLMMessage[] = messages.map((m) => ({
+      ...m,
+      content: typeof m.content === 'string' ? m.content : m.content.map((p) => ({ ...p })),
+    }));
+    const originalChars = conversationTextChars(out);
+    const methods: string[] = [];
+
+    if (originalChars <= targetChars) {
+      return { messages: out, originalChars, compressedChars: originalChars, methods: ['none'] };
+    }
+
+    const baseId = requestId ?? `compress-${this.id.slice(0, 8)}`;
+    let distillSeq = 0;
+
+    // Stage 1: split-and-distill individual oversized messages.
+    {
+      const jobs: Array<() => Promise<void>> = [];
+      out.forEach((m, i) => {
+        if (m.role === 'system') return;
+        const len = messageTextChars(m);
+        if (len <= LLMObject.DISTILL_MESSAGE_THRESHOLD) return;
+        jobs.push(async () => {
+          const text = getTextContent(m);
+          const summary = await this.distillText(text, taskHint, callerId, `${baseId}-m${i}`, () => distillSeq++);
+          const replacement = `[Oversized message (${len} chars) distilled to preserve context budget]\n${summary}`;
+          if (typeof m.content === 'string') {
+            m.content = replacement;
+          } else {
+            // Keep non-text parts (images, documents); replace all text parts
+            // with the single summary.
+            m.content = [
+              { type: 'text', text: replacement },
+              ...m.content.filter((p) => p.type !== 'text'),
+            ];
+          }
+        });
+      });
+      if (jobs.length > 0) {
+        methods.push('distill-oversized');
+        await this.runPool(jobs, LLMObject.DISTILL_CONCURRENCY);
+      }
+    }
+
+    // Stage 2: distill the middle block (between pinned and recent).
+    if (conversationTextChars(out) > targetChars) {
+      const middleEnd = Math.max(pinnedCount, out.length - keepRecent);
+      if (middleEnd > pinnedCount) {
+        const middle = out.slice(pinnedCount, middleEnd);
+        // Chunk along message boundaries.
+        const chunks: LLMMessage[][] = [];
+        let current: LLMMessage[] = [];
+        let currentLen = 0;
+        for (const m of middle) {
+          const len = messageTextChars(m);
+          if (current.length > 0 && currentLen + len > LLMObject.DISTILL_CHUNK_CHARS) {
+            chunks.push(current);
+            current = [];
+            currentLen = 0;
+          }
+          current.push(m);
+          currentLen += len;
+        }
+        if (current.length > 0) chunks.push(current);
+
+        const summaries = new Array<string>(chunks.length);
+        const jobs = chunks.map((chunk, ci) => async () => {
+          const serialized = chunk
+            .map((m, mi) => `---- message ${mi + 1} (${m.role}) ----\n${truncateText(getTextContent(m), LLMObject.DISTILL_CHUNK_CHARS)}`)
+            .join('\n\n');
+          summaries[ci] = await this.distillText(serialized, taskHint, callerId, `${baseId}-c${ci}`, () => distillSeq++);
+        });
+        methods.push('distill-middle');
+        await this.runPool(jobs, LLMObject.DISTILL_CONCURRENCY);
+
+        const synthetic: LLMMessage = {
+          role: 'user',
+          content: `[Earlier context — ${middle.length} messages distilled]\n${summaries.join('\n\n')}`,
+        };
+        out.splice(pinnedCount, middleEnd - pinnedCount, synthetic);
+      }
+    }
+
+    // Stage 3: deterministic guarantee.
+    if (conversationTextChars(out) > targetChars) {
+      methods.push('truncate');
+      enforceConversationCharBudget(out, targetChars);
+    }
+
+    const compressedChars = conversationTextChars(out);
+    log.info(`compress | ${originalChars} → ${compressedChars} chars | ${messages.length} → ${out.length} msgs | stages=${methods.join('+')}`);
+    return { messages: out, originalChars, compressedChars, methods };
+  }
+
+  /**
+   * Distill one text blob via the fast tier. Long blobs are split into
+   * chunks distilled in parallel and joined. Falls back to head+tail
+   * truncation when the fast tier fails — compression must never throw.
+   */
+  private async distillText(
+    text: string,
+    taskHint: string,
+    callerId: AbjectId | undefined,
+    idPrefix: string,
+    nextSeq: () => number,
+  ): Promise<string> {
+    const systemPrompt = `You are compressing part of a working conversation so an agent can keep going without losing its progress. Distil the content below into a tight, factual summary (target: under 2000 chars). Include every one of:
+- findings and discovered facts (IDs, names, states, values)
+- actions attempted and their outcomes (what succeeded, what failed, error messages)
+- partial results that later steps will need
+- decisions made and rejected options
+- blockers and what is still unknown
+Omit: duplicated schema dumps, long method catalogs, decorative headers. Write in neutral prose with bullet points — this is context, not a narrative.`;
+    const hint = taskHint ? `The conversation's task: "${taskHint.slice(0, 400)}"\n\n` : '';
+
+    const chunkSize = LLMObject.DISTILL_CHUNK_CHARS;
+    const chunks: string[] = [];
+    for (let off = 0; off < text.length; off += chunkSize) {
+      chunks.push(text.slice(off, off + chunkSize));
+    }
+
+    const summaries = new Array<string>(chunks.length);
+    const jobs = chunks.map((chunk, i) => async () => {
+      try {
+        const result = await this.complete(
+          [
+            systemMessage(systemPrompt),
+            userMessage(`${hint}Content to distil${chunks.length > 1 ? ` (part ${i + 1}/${chunks.length})` : ''}:\n\n${chunk}`),
+          ],
+          { tier: 'fast', maxTokens: 1024 },
+          undefined,
+          callerId,
+          `${idPrefix}-d${nextSeq()}`,
+        );
+        const summary = result.content?.trim();
+        if (!summary) throw new Error('empty summary');
+        summaries[i] = summary;
+      } catch (err) {
+        log.warn(`distill chunk failed (${err instanceof Error ? err.message : String(err)}) — truncating instead`);
+        summaries[i] = truncateText(chunk, 2000);
+      }
+    });
+    await this.runPool(jobs, LLMObject.DISTILL_CONCURRENCY);
+    return summaries.join('\n\n');
+  }
+
+  /** Run async jobs with bounded concurrency. */
+  private async runPool(jobs: Array<() => Promise<void>>, concurrency: number): Promise<void> {
+    let next = 0;
+    const workers = Array.from({ length: Math.min(concurrency, jobs.length) }, async () => {
+      while (next < jobs.length) {
+        const job = jobs[next++];
+        await job();
+      }
+    });
+    await Promise.all(workers);
   }
 
   /**
@@ -980,10 +1337,92 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     return this.providers.values().next().value;
   }
 
+  /** First registered provider that can serve the given speech direction. */
+  private findSpeechProvider(direction: 'transcribe' | 'synthesize'): LLMProvider | undefined {
+    for (const provider of this.providers.values()) {
+      const support = provider.supportsSpeech?.();
+      if (direction === 'transcribe' && provider.transcribe && support?.transcribe) return provider;
+      if (direction === 'synthesize' && provider.synthesize && support?.synthesize) return provider;
+    }
+    return undefined;
+  }
+
   /**
-   * Resolve the provider and optional model override for a request.
-   * Priority: explicit providerName > tier routing > default provider.
+   * Transcribe audio via the named provider, or the first willing provider
+   * when unnamed. Auto-selection falls through failed candidates so a flaky
+   * provider degrades to the next one.
    */
+  private async transcribeAudio(
+    audio: { base64: string; mimeType: string },
+    providerName?: string,
+    model?: string,
+    language?: string,
+  ): Promise<{ text: string; provider: string }> {
+    const opts = { ...(model ? { model } : {}), ...(language ? { language } : {}) };
+    if (providerName) {
+      const provider = this.providers.get(providerName);
+      require(provider !== undefined, `Provider '${providerName}' not registered`);
+      require(provider!.transcribe !== undefined, `Provider '${providerName}' has no transcription API`);
+      const { text } = await provider!.transcribe!(audio, opts);
+      return { text, provider: provider!.name };
+    }
+
+    const candidates = [...this.providers.values()]
+      .filter(p => p.transcribe && p.supportsSpeech?.().transcribe);
+    if (candidates.length === 0) {
+      throw new Error('No registered provider supports transcription. Configure OpenAI or Gemini.');
+    }
+    const failures: string[] = [];
+    for (const provider of candidates) {
+      try {
+        const start = Date.now();
+        const { text } = await provider.transcribe!(audio, opts);
+        log.info(`← ${provider.name} transcribe | ${Date.now() - start}ms`);
+        return { text, provider: provider.name };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        failures.push(`${provider.name}: ${msg.slice(0, 200)}`);
+      }
+    }
+    throw new Error(`All transcription providers failed. ${failures.join(' | ')}`);
+  }
+
+  /** Synthesize speech via the named provider or the first willing one. */
+  private async synthesizeSpeech(
+    text: string,
+    providerName?: string,
+    model?: string,
+    voice?: string,
+  ): Promise<{ base64: string; mimeType: string; provider: string }> {
+    const opts = { ...(model ? { model } : {}), ...(voice ? { voice } : {}) };
+    if (providerName) {
+      const provider = this.providers.get(providerName);
+      require(provider !== undefined, `Provider '${providerName}' not registered`);
+      require(provider!.synthesize !== undefined, `Provider '${providerName}' has no speech synthesis API`);
+      const result = await provider!.synthesize!(text, opts);
+      return { ...result, provider: provider!.name };
+    }
+
+    const candidates = [...this.providers.values()]
+      .filter(p => p.synthesize && p.supportsSpeech?.().synthesize);
+    if (candidates.length === 0) {
+      throw new Error('No registered provider supports speech synthesis. Configure OpenAI.');
+    }
+    const failures: string[] = [];
+    for (const provider of candidates) {
+      try {
+        const start = Date.now();
+        const result = await provider.synthesize!(text, opts);
+        log.info(`← ${provider.name} synthesize | ${text.length} chars | ${Date.now() - start}ms`);
+        return { ...result, provider: provider.name };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        failures.push(`${provider.name}: ${msg.slice(0, 200)}`);
+      }
+    }
+    throw new Error(`All speech synthesis providers failed. ${failures.join(' | ')}`);
+  }
+
   private resolveProviderAndModel(
     providerName?: string,
     tier?: ModelTier,
@@ -1028,6 +1467,11 @@ Only output the code, no explanations. Use proper formatting and comments.`;
 
     // No code block, return as-is
     return content.trim();
+  }
+
+  // LLM usage/tiers/streaming guidance agents consult when adding AI features.
+  protected override askTier(): 'smart' | 'balanced' | 'fast' {
+    return 'balanced';
   }
 
   protected override askPrompt(_question: string): string {

@@ -11,6 +11,7 @@ import { Abject } from '../../core/abject.js';
 import { Capabilities } from '../../core/capability.js';
 import { require as precondition } from '../../core/contracts.js';
 import { request as createRequest } from '../../core/message.js';
+import { v4 as uuidv4 } from 'uuid';
 import type { PeerId } from '../../core/identity.js';
 
 const MEDIA_STREAM_INTERFACE: InterfaceId = 'abjects:media-stream';
@@ -26,10 +27,24 @@ interface ManagedTrack {
   muted: boolean;
 }
 
+/** Inline recording payloads above this size are rejected (write to a FileSystem instead). */
+const MAX_INLINE_RECORDING_BYTES = 8 * 1024 * 1024;
+
+interface PendingRecording {
+  recordingId: string;
+  streamId: string;
+  startedAt: number;
+}
+
 export class MediaStreamCapability extends Abject {
   private peerRegistryId?: AbjectId;
+  private uiServerId?: AbjectId;
   private localStreams: Map<string, MediaStream> = new Map();
   private tracks: Map<string, ManagedTrack> = new Map();
+  /** Streams captured on the UI client via the UIServer relay (id only; the
+   *  MediaStream object itself lives in the browser). */
+  private relayedStreams: Set<string> = new Set();
+  private pendingRecordings: Map<string, PendingRecording> = new Map();
 
   constructor() {
     super({
@@ -99,6 +114,36 @@ export class MediaStreamCapability extends Abject {
               parameters: [],
               returns: { kind: 'array', elementType: { kind: 'reference', reference: 'ManagedTrack' } },
             },
+            {
+              name: 'record',
+              description: 'Record a captured stream with the client-side MediaRecorder. Returns { recordingId } immediately; a recordingComplete event follows with { recordingId, path?, base64?, mimeType, durationMs } (path when a workspace FileSystem stored it, base64 inline otherwise).',
+              parameters: [
+                { name: 'streamId', type: { kind: 'primitive', primitive: 'string' }, description: 'Stream id from getUserMedia/getDisplayMedia' },
+                { name: 'maxDurationMs', type: { kind: 'primitive', primitive: 'number' }, description: 'Auto-stop after this many milliseconds', optional: true },
+              ],
+              returns: { kind: 'object', properties: { recordingId: { kind: 'primitive', primitive: 'string' } } },
+            },
+            {
+              name: 'stopRecording',
+              description: 'Stop an in-progress recording early; recordingComplete still fires with what was captured',
+              parameters: [
+                { name: 'recordingId', type: { kind: 'primitive', primitive: 'string' }, description: 'Recording id from record' },
+              ],
+              returns: { kind: 'primitive', primitive: 'boolean' },
+            },
+            {
+              name: 'captureFrame',
+              description: 'Grab one still frame of a captured video stream as PNG. Returns { base64, mimeType, width, height }. The result feeds directly into LLM vision via chat/image pipelines, giving agents live camera or screen sight.',
+              parameters: [
+                { name: 'streamId', type: { kind: 'primitive', primitive: 'string' }, description: 'Stream id of a video-bearing capture' },
+              ],
+              returns: { kind: 'object', properties: {
+                base64: { kind: 'primitive', primitive: 'string' },
+                mimeType: { kind: 'primitive', primitive: 'string' },
+                width: { kind: 'primitive', primitive: 'number' },
+                height: { kind: 'primitive', primitive: 'number' },
+              } },
+            },
           ],
           events: [
             {
@@ -124,6 +169,18 @@ export class MediaStreamCapability extends Abject {
               payload: { kind: 'object', properties: {
                 trackId: { kind: 'primitive', primitive: 'string' },
                 muted: { kind: 'primitive', primitive: 'boolean' },
+              } },
+            },
+            {
+              name: 'recordingComplete',
+              description: 'A recording finished (duration reached, stopRecording, or error). Carries path when stored in a workspace FileSystem, base64 inline otherwise, or error on failure.',
+              payload: { kind: 'object', properties: {
+                recordingId: { kind: 'primitive', primitive: 'string' },
+                path: { kind: 'primitive', primitive: 'string' },
+                base64: { kind: 'primitive', primitive: 'string' },
+                mimeType: { kind: 'primitive', primitive: 'string' },
+                durationMs: { kind: 'primitive', primitive: 'number' },
+                error: { kind: 'primitive', primitive: 'string' },
               } },
             },
           ],
@@ -171,10 +228,77 @@ export class MediaStreamCapability extends Abject {
     this.on('listTracks', async () => {
       return Array.from(this.tracks.values());
     });
+
+    this.on('record', async (msg: AbjectMessage) => {
+      const { streamId, maxDurationMs } = msg.payload as {
+        streamId: string; maxDurationMs?: number;
+      };
+      return this.recordImpl(streamId, maxDurationMs);
+    });
+
+    this.on('stopRecording', async (msg: AbjectMessage) => {
+      const { recordingId } = msg.payload as { recordingId: string };
+      precondition(typeof recordingId === 'string' && recordingId.length > 0, 'stopRecording requires recordingId');
+      const uiId = await this.resolveUiServer();
+      if (!uiId || !this.pendingRecordings.has(recordingId)) return false;
+      this.send(createRequest(this.id, uiId, 'mediaRecordStop', { recordingId }));
+      return true;
+    });
+
+    this.on('captureFrame', async (msg: AbjectMessage) => {
+      const { streamId } = msg.payload as { streamId: string };
+      return this.captureFrameImpl(streamId);
+    });
+
+    // Recording completion relayed back from the UI client via the UIServer.
+    this.on('recordingReady', async (msg: AbjectMessage) => {
+      const { recordingId, base64, mimeType, durationMs, error } = msg.payload as {
+        recordingId: string; base64?: string; mimeType?: string; durationMs?: number; error?: string;
+      };
+      const pending = this.pendingRecordings.get(recordingId);
+      if (!pending) return;
+      this.pendingRecordings.delete(recordingId);
+
+      if (error || !base64) {
+        this.changed('recordingComplete', { recordingId, error: error ?? 'recording produced no data' });
+        return;
+      }
+
+      // Prefer the workspace FileSystem: recordings can be large and a path
+      // reference travels well (abject:// refs, attachments, further tooling).
+      const ext = (mimeType ?? '').includes('video') ? 'webm' : (mimeType ?? '').includes('ogg') ? 'ogg' : 'webm';
+      const path = `/recordings/rec-${recordingId}.${ext}`;
+      try {
+        const fsId = await this.discoverDep('FileSystem');
+        if (fsId) {
+          await this.request(createRequest(this.id, fsId, 'writeFileBytes', { path, base64 }));
+          this.changed('recordingComplete', { recordingId, path, mimeType, durationMs });
+          return;
+        }
+      } catch { /* fall through to inline delivery */ }
+
+      const approxBytes = Math.floor(base64.length * 3 / 4);
+      if (approxBytes > MAX_INLINE_RECORDING_BYTES) {
+        this.changed('recordingComplete', {
+          recordingId,
+          error: `recording is ${Math.round(approxBytes / (1024 * 1024))}MB, above the ${MAX_INLINE_RECORDING_BYTES / (1024 * 1024)}MB inline cap, and no workspace FileSystem was reachable to store it`,
+        });
+        return;
+      }
+      this.changed('recordingComplete', { recordingId, base64, mimeType, durationMs });
+    });
   }
 
   protected override async onInit(): Promise<void> {
     this.peerRegistryId = await this.discoverDep('PeerRegistry') ?? undefined;
+    this.uiServerId = await this.discoverDep('UIServer') ?? undefined;
+  }
+
+  private async resolveUiServer(): Promise<AbjectId | undefined> {
+    if (!this.uiServerId) {
+      this.uiServerId = await this.discoverDep('UIServer') ?? undefined;
+    }
+    return this.uiServerId;
   }
 
   // ==========================================================================
@@ -184,9 +308,11 @@ export class MediaStreamCapability extends Abject {
   private async getUserMediaImpl(audio: boolean, video: boolean): Promise<string> {
     precondition(audio || video, 'Must request at least audio or video');
 
-    // getUserMedia is available in browser context
+    // Server-side (the normal case: this object runs in the Node backend):
+    // capture happens on the connected UI client via the UIServer relay. The
+    // stream lives in the browser; we track its id and tracks here.
     if (typeof navigator === 'undefined' || !navigator.mediaDevices) {
-      throw new Error('getUserMedia not available (server-side)');
+      return this.relayCapture(audio, video, false);
     }
 
     const stream = await navigator.mediaDevices.getUserMedia({ audio, video });
@@ -209,7 +335,7 @@ export class MediaStreamCapability extends Abject {
 
   private async getDisplayMediaImpl(): Promise<string> {
     if (typeof navigator === 'undefined' || !navigator.mediaDevices) {
-      throw new Error('getDisplayMedia not available (server-side)');
+      return this.relayCapture(false, true, true);
     }
 
     const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
@@ -228,6 +354,64 @@ export class MediaStreamCapability extends Abject {
     }
 
     return streamId;
+  }
+
+  /** Capture on the UI client through the UIServer relay; returns the stream id. */
+  private async relayCapture(audio: boolean, video: boolean, display: boolean): Promise<string> {
+    const uiId = await this.resolveUiServer();
+    if (!uiId) {
+      throw new Error('Media capture unavailable: no UIServer (and no browser mediaDevices) in this context');
+    }
+    // 65s bus timeout: the client shows a permission prompt the user answers.
+    const reply = await this.request<{ streamId: string; tracks: Array<{ id: string; kind: string; label: string }> }>(
+      createRequest(this.id, uiId, 'mediaCapture', { audio, video, display }),
+      65000,
+    );
+    this.relayedStreams.add(reply.streamId);
+    for (const t of reply.tracks) {
+      this.tracks.set(t.id, {
+        id: t.id,
+        peerId: '',
+        kind: t.kind as 'audio' | 'video',
+        direction: 'local',
+        label: t.label,
+        muted: false,
+      });
+    }
+    return reply.streamId;
+  }
+
+  private async recordImpl(streamId: string, maxDurationMs?: number): Promise<{ recordingId: string }> {
+    precondition(typeof streamId === 'string' && streamId.length > 0, 'record requires streamId');
+    precondition(
+      maxDurationMs === undefined || maxDurationMs > 0,
+      'maxDurationMs must be positive when given',
+    );
+    const uiId = await this.resolveUiServer();
+    if (!uiId) throw new Error('Recording unavailable: no UIServer in this context');
+
+    const recordingId = uuidv4();
+    this.pendingRecordings.set(recordingId, { recordingId, streamId, startedAt: Date.now() });
+    try {
+      await this.request(createRequest(this.id, uiId, 'mediaRecordStart', {
+        recordingId, streamId, maxDurationMs, notifyId: this.id,
+      }));
+    } catch (err) {
+      this.pendingRecordings.delete(recordingId);
+      throw err;
+    }
+    return { recordingId };
+  }
+
+  private async captureFrameImpl(streamId: string): Promise<{ base64: string; mimeType: string; width: number; height: number }> {
+    precondition(typeof streamId === 'string' && streamId.length > 0, 'captureFrame requires streamId');
+    const uiId = await this.resolveUiServer();
+    if (!uiId) throw new Error('Frame capture unavailable: no UIServer in this context');
+    const reply = await this.request<{ base64: string; width: number; height: number }>(
+      createRequest(this.id, uiId, 'mediaCaptureFrame', { streamId }),
+      20000,
+    );
+    return { base64: reply.base64, mimeType: 'image/png', width: reply.width, height: reply.height };
   }
 
   // ==========================================================================
@@ -282,12 +466,32 @@ export class MediaStreamCapability extends Abject {
         }
       }
     }
+    // Relayed (client-held) track: forward the mute to the UI client.
+    const managed = this.tracks.get(trackId);
+    if (managed && this.uiServerId) {
+      this.send(createRequest(this.id, this.uiServerId, 'mediaStreamControl', {
+        action: 'muteTrack', trackId, muted,
+      }));
+      managed.muted = muted;
+      this.changed('trackMuted', { trackId, muted });
+      return true;
+    }
     return false;
   }
 
   private stopStreamImpl(streamId: string): boolean {
     const stream = this.localStreams.get(streamId);
-    if (!stream) return false;
+    if (!stream) {
+      // Relayed (client-held) stream: forward the stop to the UI client.
+      if (this.relayedStreams.has(streamId) && this.uiServerId) {
+        this.send(createRequest(this.id, this.uiServerId, 'mediaStreamControl', {
+          action: 'stopStream', streamId,
+        }));
+        this.relayedStreams.delete(streamId);
+        return true;
+      }
+      return false;
+    }
 
     for (const track of stream.getTracks()) {
       track.stop();
@@ -400,14 +604,29 @@ export class MediaStreamCapability extends Abject {
 
   await call(msId, 'stopStream', { streamId });
 
+### Record a stream (voice notes, dictation, clips)
+
+  const { recordingId } = await call(msId, 'record', { streamId, maxDurationMs: 10000 });
+  // Register with addDependent, then handle the 'recordingComplete' aspect:
+  // { recordingId, path?, base64?, mimeType, durationMs } — path points into the
+  // workspace FileSystem when one is reachable, base64 arrives inline otherwise.
+  await call(msId, 'stopRecording', { recordingId }); // optional early stop
+
+### See through the camera or screen (one still frame)
+
+  const frame = await call(msId, 'captureFrame', { streamId });
+  // frame = { base64, mimeType: 'image/png', width, height }
+  // Feed it to LLM vision (chat image pipelines accept data:image/png;base64,<base64>).
+
 ### Events
 - trackAdded: { peerId, trackId, kind } — remote peer added a media track
 - trackRemoved: { peerId, trackId } — track was removed
 - trackMuted: { trackId, muted } — mute state changed
+- recordingComplete: { recordingId, path?, base64?, mimeType, durationMs, error? }
 
 ### IMPORTANT
-- getUserMedia/getDisplayMedia only work in browser context
-- On server-side, media tracks are still routed but capture is unavailable
+- Capture runs on the connected UI client (browser permission prompts appear there); calls fail with a clear error when no client is connected.
+- A voice loop is pure composition: getUserMedia (audio) then record, send the result to Speech 'recognize', reply through Chat, synthesize, and play via AudioOutput.
 - Tracks are added to existing PeerTransport RTCPeerConnection instances`;
   }
 }

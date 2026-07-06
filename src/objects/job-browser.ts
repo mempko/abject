@@ -12,7 +12,6 @@ import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
 import type { Job } from './job-manager.js';
 import type { ListItem } from './widgets/list-widget.js';
-import type { IconName } from '../ui/icons.js';
 
 const log = new Log('JobBrowser');
 
@@ -22,13 +21,6 @@ const WIN_W = 500;
 const WIN_H = 350;
 
 /** Vector icon names for job statuses; ListWidget renders via ListItem.iconName. */
-const STATUS_ICON_NAMES: Record<string, IconName> = {
-  queued:    'dot',
-  running:   'chevronRight',
-  completed: 'check',
-  failed:    'close',
-};
-
 export class JobBrowser extends Abject {
   private jobManagerId?: AbjectId;
   private widgetManagerId?: AbjectId;
@@ -265,8 +257,17 @@ Job status icons: \u25CB queued, \u25B8 running, \u2713 completed, \u2717 failed
       label: `#${num} ${queueTag}${job.description}${errorSuffix}`,
       value: job.id,
       secondary: elapsed,
-      iconName: STATUS_ICON_NAMES[job.status],
+      badge: this.statusBadge(job.status),
     };
+  }
+
+  private statusBadge(status: string): { text: string; color: string } {
+    switch (status) {
+      case 'running':   return { text: 'Running', color: this.theme.statusInfo };
+      case 'completed': return { text: 'Done',    color: this.theme.statusSuccess };
+      case 'failed':    return { text: 'Failed',  color: this.theme.statusError };
+      default:          return { text: 'Queued',  color: this.theme.statusNeutral };
+    }
   }
 
   private async rebuildList(): Promise<void> {

@@ -17,8 +17,12 @@ import { WidgetAbject, WidgetConfig } from './widget-abject.js';
 import {
   Rect,
   LayoutChildConfig,
+  LayoutStyle,
   SpacerConfig,
+  ThemeData,
   LAYOUT_INTERFACE,
+  SizeInput,
+  resolveWH,
 } from './widget-types.js';
 
 export interface ChildRect {
@@ -106,6 +110,10 @@ export interface LayoutConfig {
   uiServerId: AbjectId;
   margins?: Partial<LayoutMargins>;
   spacing?: number;
+  /** Optional card/panel styling (background, border, radius). Invisible when absent. */
+  style?: LayoutStyle;
+  /** Theme used to resolve default radius and to follow theme changes. */
+  theme?: ThemeData;
 }
 
 /**
@@ -124,10 +132,12 @@ export abstract class LayoutAbject extends WidgetAbject {
 
   constructor(config: LayoutConfig, layoutType: 'vbox' | 'hbox') {
     super({
-      type: 'label', // layouts render nothing themselves
+      type: 'label', // layouts render nothing themselves (unless given a card `style`)
       rect: { x: 0, y: 0, width: 0, height: 0 },
       ownerId: config.ownerId,
       uiServerId: config.uiServerId,
+      style: config.style,
+      theme: config.theme,
     });
 
     // Override manifest for layout
@@ -204,10 +214,11 @@ export abstract class LayoutAbject extends WidgetAbject {
       const { widgetId, sizePolicy, preferredSize, alignment, stretch } = msg.payload as {
         widgetId: AbjectId;
         sizePolicy?: { horizontal?: string; vertical?: string };
-        preferredSize?: { width?: number; height?: number };
+        preferredSize?: SizeInput;
         alignment?: 'left' | 'center' | 'right';
         stretch?: number;
       };
+      const pref = preferredSize ? resolveWH(preferredSize) : undefined;
       const existingIdx = this.layoutChildren.findIndex(
         (c) => !isSpacer(c) && c.widgetId === widgetId
       );
@@ -216,7 +227,7 @@ export abstract class LayoutAbject extends WidgetAbject {
         this.layoutChildren[existingIdx] = {
           widgetId,
           sizePolicy: sizePolicy as LayoutChildConfig['sizePolicy'],
-          preferredSize,
+          preferredSize: pref,
           alignment,
           stretch: stretch ?? 1,
         };
@@ -224,7 +235,7 @@ export abstract class LayoutAbject extends WidgetAbject {
         this.layoutChildren.push({
           widgetId,
           sizePolicy: sizePolicy as LayoutChildConfig['sizePolicy'],
-          preferredSize,
+          preferredSize: pref,
           alignment,
           stretch,
         });
@@ -263,12 +274,13 @@ export abstract class LayoutAbject extends WidgetAbject {
         children: Array<{
           widgetId: AbjectId;
           sizePolicy?: { horizontal?: string; vertical?: string };
-          preferredSize?: { width?: number; height?: number };
+          preferredSize?: SizeInput;
           alignment?: 'left' | 'center' | 'right';
           stretch?: number;
         }>;
       };
       for (const child of children) {
+        const pref = child.preferredSize ? resolveWH(child.preferredSize) : undefined;
         const existingIdx = this.layoutChildren.findIndex(
           (c) => !isSpacer(c) && c.widgetId === child.widgetId
         );
@@ -276,7 +288,7 @@ export abstract class LayoutAbject extends WidgetAbject {
           this.layoutChildren[existingIdx] = {
             widgetId: child.widgetId,
             sizePolicy: child.sizePolicy as LayoutChildConfig['sizePolicy'],
-            preferredSize: child.preferredSize,
+            preferredSize: pref,
             alignment: child.alignment,
             stretch: child.stretch ?? 1,
           };
@@ -284,7 +296,7 @@ export abstract class LayoutAbject extends WidgetAbject {
           this.layoutChildren.push({
             widgetId: child.widgetId,
             sizePolicy: child.sizePolicy as LayoutChildConfig['sizePolicy'],
-            preferredSize: child.preferredSize,
+            preferredSize: pref,
             alignment: child.alignment,
             stretch: child.stretch,
           });
@@ -323,6 +335,24 @@ export abstract class LayoutAbject extends WidgetAbject {
       return true;
     });
 
+    // Forward `removeChild` up the owner chain until it reaches the WINDOW.
+    // A widget placed in this layout may still be a *direct* child of the
+    // window (e.g. a canvas added via createCanvas, which the window sizes to
+    // the full content area and re-fills on every resize). addLayoutChild(ren)
+    // sends `removeChild` to detach it from that full-content path — but a
+    // NESTED layout's owner is its PARENT LAYOUT, not the window, and layouts
+    // had no `removeChild` handler, so the message was silently dropped and the
+    // widget kept being painted full-content over its layout siblings. Bubbling
+    // to `this.ownerId` reaches the window (whose `removeChild` does the real
+    // detach) regardless of nesting depth; the chain terminates at the window.
+    this.on('removeChild', async (msg: AbjectMessage) => {
+      const { widgetId } = msg.payload as { widgetId: AbjectId };
+      this.send(
+        request(this.id, this.ownerId, 'removeChild', { widgetId })
+      );
+      return true;
+    });
+
     this.on('clearLayoutChildren', async () => {
       this.layoutChildren = [];
       this.hoveredLayoutChildId = undefined;
@@ -338,14 +368,15 @@ export abstract class LayoutAbject extends WidgetAbject {
     this.on('updateLayoutChild', async (msg: AbjectMessage) => {
       const { widgetId, preferredSize, sizePolicy, alignment, stretch } = msg.payload as {
         widgetId: AbjectId;
-        preferredSize?: { width?: number; height?: number };
+        preferredSize?: SizeInput;
         sizePolicy?: { horizontal?: string; vertical?: string };
         alignment?: 'left' | 'center' | 'right';
         stretch?: number;
       };
+      const pref = preferredSize ? resolveWH(preferredSize) : undefined;
       for (const child of this.layoutChildren) {
         if (!isSpacer(child) && child.widgetId === widgetId) {
-          if (preferredSize) child.preferredSize = { ...child.preferredSize, ...preferredSize };
+          if (pref) child.preferredSize = { ...child.preferredSize, ...pref };
           if (sizePolicy) child.sizePolicy = { ...child.sizePolicy, ...sizePolicy } as LayoutChildConfig['sizePolicy'];
           if (alignment !== undefined) child.alignment = alignment;
           if (stretch !== undefined) child.stretch = stretch;
@@ -354,6 +385,10 @@ export abstract class LayoutAbject extends WidgetAbject {
       }
       this.layoutDirty = true;
       this.scheduleRelayout();
+      // A child's size change shifts this layout's own preferred height; an
+      // auto-sized nested layout must pass that up or the parent keeps
+      // allocating the stale height (e.g. a collapsed sidebar section).
+      this.notifyParentOfSizeChange().catch(() => {});
       return true;
     });
 
@@ -426,6 +461,31 @@ export abstract class LayoutAbject extends WidgetAbject {
     }
   }
 
+  /**
+   * Build the optional card/panel background command for a styled layout.
+   * Returns null when neither a background nor a border is set, so an
+   * unstyled layout emits nothing and renders byte-for-byte as before. The
+   * rect spans the layout's full outer rect (not the content rect) so the
+   * border frames the margin gutter, which acts as card padding.
+   */
+  protected buildBackgroundCommand(surfaceId: string, ox: number, oy: number): unknown | null {
+    const s = this._renderStyle as LayoutStyle;
+    if (!s.background && !s.borderColor) return null;
+    const params: Record<string, unknown> = {
+      x: ox,
+      y: oy,
+      width: this._renderRect.width,
+      height: this._renderRect.height,
+      radius: s.radius ?? this.theme.widgetRadius,
+    };
+    if (s.background) params.fill = s.background;
+    if (s.borderColor) {
+      params.stroke = s.borderColor;
+      params.lineWidth = s.borderWidth ?? 1;
+    }
+    return { type: 'rect', surfaceId, params };
+  }
+
   protected async buildDrawCommands(surfaceId: string, ox: number, oy: number): Promise<unknown[]> {
     // Flush pending relayout before rendering — the render IS the frame
     // boundary, so all mutations between renders are automatically batched.
@@ -434,6 +494,16 @@ export abstract class LayoutAbject extends WidgetAbject {
     const contentRect = this.getContentRect();
     const childRects = this.calculateChildRects(contentRect);
     const commands: unknown[] = [];
+
+    // Card/panel background (if styled) paints first, behind all children.
+    const bg = this.buildBackgroundCommand(surfaceId, ox, oy);
+    if (bg) commands.push(bg);
+
+    // Forward the viewport clip from a scrolling ancestor down to children
+    // (e.g. labels inside a VBox inside a ScrollableVBox). Subclasses that
+    // own a scrollable viewport (ScrollableVBoxLayout) replace this with
+    // their own clip rect before delegating.
+    const viewportClip = this._renderViewportClip;
 
     // First pass: render all non-expanded children in parallel
     const nonExpanded = childRects.filter((cr) => !this.expandedChildren.has(cr.widgetId));
@@ -445,6 +515,7 @@ export abstract class LayoutAbject extends WidgetAbject {
               surfaceId,
               ox: ox + cr.rect.x,
               oy: oy + cr.rect.y,
+              viewportClip,
             })
           );
         } catch {
@@ -466,6 +537,7 @@ export abstract class LayoutAbject extends WidgetAbject {
               surfaceId,
               ox: ox + cr.rect.x,
               oy: oy + cr.rect.y,
+              viewportClip,
             })
           );
         } catch {

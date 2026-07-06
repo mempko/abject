@@ -49,6 +49,7 @@ interface GeminiRequest {
     temperature?: number;
     maxOutputTokens?: number;
     stopSequences?: string[];
+    thinkingConfig?: { thinkingLevel?: string };
   };
 }
 
@@ -83,11 +84,24 @@ export class GeminiProvider extends BaseLLMProvider {
   readonly name = 'gemini';
   private model: string;
 
+  // Verified ids: bare gemini-3.1-pro / -flash are not callable on v1beta;
+  // -pro-preview and gemini-3.5-flash are the current accepted ids.
   private static readonly TIER_MODELS: Record<ModelTier, string> = {
-    smart: 'gemini-3.1-pro',
-    balanced: 'gemini-3.1-flash',
+    smart: 'gemini-3.1-pro-preview',
+    balanced: 'gemini-3.5-flash',
     fast: 'gemini-3.1-flash-lite',
   };
+
+  // Thinking counts against maxOutputTokens (default is only ~8192), so size it
+  // generously per tier and drive depth with thinkingLevel. Pro can't disable
+  // thinking; flash-lite runs near-minimal.
+  private static readonly TIER_MAX_OUTPUT: Record<ModelTier, number> = {
+    smart: 32768, balanced: 16384, fast: 8192,
+  };
+  private static readonly TIER_THINKING_LEVEL: Record<ModelTier, string> = {
+    smart: 'high', balanced: 'medium', fast: 'minimal',
+  };
+  private static readonly MODEL_MAX_OUTPUT = 65536;
 
   private resolveModel(options?: LLMCompletionOptions): string {
     if (options?.model) return options.model;
@@ -100,11 +114,61 @@ export class GeminiProvider extends BaseLLMProvider {
       baseUrl: config.baseUrl ?? 'https://generativelanguage.googleapis.com',
       fetchFn: config.fetchFn,
     });
-    this.model = config.model ?? 'gemini-3.1-flash';
+    this.model = config.model ?? 'gemini-3.5-flash';
   }
 
   async isAvailable(): Promise<boolean> {
     return !!this.apiKey;
+  }
+
+  /**
+   * Transcription rides generateContent with an inline audio part, which is
+   * JSON in and out, so the existing text-only fetch plumbing serves it.
+   * Synthesis stays unsupported here: Gemini TTS returns raw PCM from a
+   * preview model and would need WAV framing; revisit when it stabilizes.
+   */
+  override supportsSpeech(): { transcribe: boolean; synthesize: boolean } {
+    return { transcribe: !!this.apiKey, synthesize: false };
+  }
+
+  async transcribe(
+    audio: { base64: string; mimeType: string },
+    options?: { model?: string; language?: string },
+  ): Promise<{ text: string }> {
+    require(this.apiKey !== undefined, 'API key is required');
+    require(audio.base64.length > 0, 'audio base64 must be non-empty');
+    const model = options?.model ?? GeminiProvider.TIER_MODELS.fast;
+    const instruction = options?.language
+      ? `Transcribe this audio exactly. The speech is in ${options.language}. Reply with only the transcript, nothing else.`
+      : 'Transcribe this audio exactly. Reply with only the transcript, nothing else.';
+
+    return this.withRetries(async () => {
+      const response = await this.fetch(
+        `${this.baseUrl}/v1beta/models/${model}:generateContent?key=${this.apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{
+              role: 'user',
+              parts: [
+                { text: instruction },
+                { inline_data: { mime_type: audio.mimeType, data: audio.base64 } },
+              ],
+            }],
+          }),
+        },
+        { timeout: 120000 },
+      );
+
+      const data = JSON.parse(response.body) as GeminiResponse;
+      const candidate = data.candidates?.[0];
+      if (!candidate) {
+        throw new Error('No transcription returned');
+      }
+      const text = (candidate.content?.parts ?? []).map(p => p.text ?? '').join('').trim();
+      return { text };
+    }, { label: 'gemini.transcribe' });
   }
 
   async listModels(): Promise<ModelInfo[]> {
@@ -124,8 +188,8 @@ export class GeminiProvider extends BaseLLMProvider {
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
       return [
-        { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro' },
-        { id: 'gemini-3.1-flash', name: 'Gemini 3.1 Flash' },
+        { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro' },
+        { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash' },
         { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
       ];
     }
@@ -140,8 +204,8 @@ export class GeminiProvider extends BaseLLMProvider {
       credentialLabel: 'Google Gemini API Key',
       credentialPlaceholder: 'AIza...',
       models: [
-        { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro' },
-        { id: 'gemini-3.1-flash', name: 'Gemini 3.1 Flash' },
+        { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro' },
+        { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash' },
         { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
       ],
       defaultTierModels: GeminiProvider.TIER_MODELS,
@@ -306,8 +370,17 @@ export class GeminiProvider extends BaseLLMProvider {
 
     const gc: GeminiRequest['generationConfig'] = {};
     if (options.temperature !== undefined) gc.temperature = options.temperature;
-    if (options.maxTokens !== undefined) gc.maxOutputTokens = options.maxTokens;
     if (options.stopSequences) gc.stopSequences = options.stopSequences;
+    const tier = options.tier;
+    if (tier) {
+      gc.maxOutputTokens = Math.min(
+        GeminiProvider.MODEL_MAX_OUTPUT,
+        Math.max(GeminiProvider.TIER_MAX_OUTPUT[tier], options.maxTokens ?? 0),
+      );
+      gc.thinkingConfig = { thinkingLevel: GeminiProvider.TIER_THINKING_LEVEL[tier] };
+    } else if (options.maxTokens !== undefined) {
+      gc.maxOutputTokens = options.maxTokens;
+    }
     if (Object.keys(gc).length > 0) request.generationConfig = gc;
 
     return request;

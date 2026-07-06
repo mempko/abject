@@ -1,14 +1,10 @@
 /**
- * AgentCreator -- orchestrator agent for creating autonomous agents, schedulers,
- * and event watchers.
+ * AgentCreator -- advisory object for autonomous agents, schedulers, and
+ * event watchers.
  *
- * Registers with AgentAbject and claims tasks that involve creating scheduled,
- * autonomous, or event-driven objects.
- *
- * Strategy: decompose the request into sub-tasks via the goal system. Each
- * sub-task includes data.role so the creation agent knows which pattern to follow.
- * AgentAbject's observe phase monitors child goal progress and reports back
- * when sub-tasks complete.
+ * ScrumMaster owns task planning. This object remains available through the
+ * ask protocol for architectural advice, but it is not an executable team
+ * member and should not claim creation tasks.
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
@@ -33,21 +29,15 @@ export class AgentCreator extends Abject {
   private jobManagerId?: AbjectId;
 
   private taskExtras = new Map<string, TaskExtra>();
-  private pendingTickets = new Map<string, {
-    resolve: (v: unknown) => void;
-    reject: (e: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-    timeoutMs: number;
-  }>();
 
   constructor() {
     super({
       manifest: {
         name: 'AgentCreator',
         description:
-          'Orchestrator agent for creating autonomous agents, schedulers, and event watchers. ' +
-          'Decomposes requests into sub-tasks via the goal system. Each sub-task is dispatched ' +
-          'with the right pattern context. Schedulers use JobManager for triggers. ' +
+          'Advisory object for creating autonomous agents, schedulers, and event watchers. ' +
+          'ScrumMaster owns planning and should assign executable creation tasks to ObjectCreator. ' +
+          'Schedulers use JobManager for triggers. ' +
           'Use cases: create scheduled tasks, build autonomous agents, set up event watchers, ' +
           'create recurring automation.',
         version: '1.0.0',
@@ -58,7 +48,7 @@ export class AgentCreator extends Abject {
           methods: [
             {
               name: 'runTask',
-              description: 'Analyze a creation request, decompose, and create the needed objects',
+              description: 'Deprecated executable path. Use the ask protocol for advice; ScrumMaster plans creation tasks.',
               parameters: [
                 { name: 'task', type: { kind: 'primitive', primitive: 'string' }, description: 'Task description' },
               ],
@@ -70,7 +60,7 @@ export class AgentCreator extends Abject {
           ],
         },
         requiredCapabilities: [
-          { capability: Capabilities.LLM_QUERY, reason: 'LLM analysis for request decomposition', required: true },
+          { capability: Capabilities.LLM_QUERY, reason: 'LLM analysis for autonomous-object design advice', required: true },
         ],
         providedCapabilities: [],
         tags: ['system', 'agent', 'creation'],
@@ -85,7 +75,7 @@ export class AgentCreator extends Abject {
     this.jobManagerId = await this.discoverDep('JobManager') ?? undefined;
 
     await this.registerWithAgentAbject();
-    log.info('Registered with AgentAbject');
+    log.info('Registered with AgentAbject as advisory-only');
   }
 
   protected override askPrompt(_question: string): string {
@@ -121,93 +111,38 @@ When invited to a Sprint Plan, describe what I'd build and how I'd compose it ac
         data?: Record<string, unknown>; type: string; approach?: string;
         failureHistory?: Array<{ agent: string; error: string }>;
       };
+      void tupleId;
+      void explicitTaskId;
+      void goalId;
+      void description;
+      void approach;
+      void failureHistory;
 
-      // Use queue-runner-supplied taskId for inFlight match; fall back for legacy.
-      const taskId = explicitTaskId ?? tupleId ?? `ac-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      this.taskExtras.set(taskId, { description, goalId });
-
-      try {
-        const initialMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
-        if (failureHistory && failureHistory.length > 0) {
-          const failSummary = failureHistory.map(f => `- ${f.agent}: ${f.error}`).join('\n');
-          initialMessages.push(
-            { role: 'user', content: `Task: ${description}\n\nPrevious attempts at this task failed:\n${failSummary}\n\nLearn from these failures and take a different approach.` },
-          );
-        }
-        if (approach) {
-          initialMessages.push(
-            { role: 'assistant', content: `I will accomplish this as follows: ${approach}` },
-          );
-        }
-
-        const { ticketId } = await this.request<{ ticketId: string }>(
-          request(this.id, this.agentAbjectId!, 'startTask', {
-            taskId,
-            task: description,
-            systemPrompt: this.buildSystemPrompt(),
-            goalId,
-            dispatchTupleId: tupleId,
-            initialMessages: initialMessages.length > 0 ? initialMessages : undefined,
-            config: {
-              maxSteps: 15,
-              timeout: 600000,
-              queueName: `agent-creator-${taskId}`,
-            },
-          }),
-        );
-        const result = await this.waitForTaskResult(ticketId, 610000);
-        return { success: result.success, result: result.result, error: result.error };
-      } finally {
-        this.taskExtras.delete(taskId);
-      }
+      return {
+        success: false,
+        error: 'AgentCreator is advisory-only. ScrumMaster should plan the creation scrum and assign executable object creation tasks to ObjectCreator.',
+      };
     });
 
     this.on('runTask', async (msg: AbjectMessage) => {
       const { task } = msg.payload as { task: string };
-      const taskId = `ac-run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      this.taskExtras.set(taskId, { description: task });
-
-      try {
-        const { ticketId } = await this.request<{ ticketId: string }>(
-          request(this.id, this.agentAbjectId!, 'startTask', {
-            taskId,
-            task,
-            systemPrompt: this.buildSystemPrompt(),
-            config: {
-              maxSteps: 15,
-              timeout: 600000,
-              queueName: `agent-creator-${taskId}`,
-            },
-          }),
-        );
-        const result = await this.waitForTaskResult(ticketId, 610000);
-        return { success: result.success, result: result.result };
-      } finally {
-        this.taskExtras.delete(taskId);
-      }
+      void task;
+      return {
+        success: false,
+        error: 'AgentCreator is advisory-only. Ask it for design advice, then let ScrumMaster plan executable ObjectCreator tasks.',
+      };
     });
 
-    this.on('taskResult', async (msg: AbjectMessage) => {
-      const payload = msg.payload as { ticketId: string };
-      const pending = this.pendingTickets.get(payload.ticketId);
-      if (pending) {
-        pending.resolve(payload);
-      }
-    });
-
-    // Each callback proves the agent is still working, so reset the inactivity timeout.
     this.on('agentObserve', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
       const { taskId } = msg.payload as { taskId: string; step: number };
       const extra = this.taskExtras.get(taskId);
       if (extra?.lastResult) {
         return { observation: extra.lastResult };
       }
-      return { observation: 'AgentCreator ready. Analyze the request and decompose into sub-tasks.' };
+      return { observation: 'AgentCreator is advisory-only. Executable creation work belongs to ScrumMaster-planned ObjectCreator tasks.' };
     });
 
     this.on('agentAct', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
       const { taskId, action } = msg.payload as { taskId: string; step: number; action: AgentAction };
       const extra = this.taskExtras.get(taskId) ?? {};
       this.taskExtras.set(taskId, extra);
@@ -216,15 +151,11 @@ When invited to a Sprint Plan, describe what I'd build and how I'd compose it ac
     });
 
     this.on('agentPhaseChanged', async (msg: AbjectMessage) => {
-      this.resetPendingTicketTimeouts();
       const { newPhase } = msg.payload as { taskId: string; step: number; oldPhase: string; newPhase: string };
       if (this.jobManagerId) {
         this.send(event(this.id, this.jobManagerId, 'progress', { phase: newPhase }));
       }
     });
-
-    this.on('agentIntermediateAction', async () => { this.resetPendingTicketTimeouts(); });
-    this.on('agentActionResult', async () => { this.resetPendingTicketTimeouts(); });
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -238,9 +169,10 @@ When invited to a Sprint Plan, describe what I'd build and how I'd compose it ac
       name: 'AgentCreator',
       description:
         'Creates new autonomous behavior that requires MULTIPLE cooperating objects: an LLM-driven agent, a recurring scheduler, and/or an event watcher, composed together. ' +
-        'Decomposes the request into sub-tasks that spawn each component Abject (agent plus scheduler plus watcher as needed) through the goal system. ' +
+        'Advises ScrumMaster on how to split creation work into component Abjects (agent plus scheduler plus watcher as needed). ' +
         'Best when the work needs a new LLM decision loop plus infrastructure to trigger or observe it. ' +
         'Single forwarding objects (bridges, proxies, relays, adapters, integrations that move traffic between endpoints) fit a single-object pattern and go to a creation agent that builds single objects, even when the forwarder polls internally. Running an existing agent on a one-off task goes to a runtime interaction agent; source changes to an existing agent go to a creation-and-modification agent; regular widgets or apps without an autonomous loop go to a creation agent; one-shot data fetches go to a runtime interaction agent.',
+      canExecute: false,
       config: {
         maxSteps: 15,
         timeout: 600000,
@@ -248,166 +180,12 @@ When invited to a Sprint Plan, describe what I'd build and how I'd compose it ac
           done: { type: 'success' as const, resultFields: ['result'] },
           fail: { type: 'error' as const, resultFields: ['reason'] },
         },
-        intermediateActions: ['reply', 'decompose'],
+        intermediateActions: ['reply'],
         queueName: `agent-creator-${this.id}`,
       },
     }));
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // System Prompt
-  // ═══════════════════════════════════════════════════════════════════
-
-  private buildSystemPrompt(): string {
-    return `You are AgentCreator, an orchestrator for creating autonomous objects.
-
-## What You Do
-
-You analyze requests and decompose them into sub-tasks. Each sub-task gets dispatched via the goal system and the most capable agent claims it. You monitor progress via the observe phase and report done when everything is created.
-
-## Available Actions
-
-| Action | Fields | Description |
-|--------|--------|-------------|
-| decompose | subtasks | Create sub-tasks dispatched via the goal system. |
-| done | result | All done. Summarize what was created. |
-| fail | reason | Cannot complete. |
-| reply | message | Progress update. |
-
-## How to Decompose
-
-Each subtask has a description and optional data. Tag each with data.role so the creation agent uses the right pattern:
-
-- data.role = "agent" -> Agent Object (registers with AgentAbject, handles tasks autonomously)
-- data.role = "scheduler" -> Scheduler Object (Timer-based, submits Jobs via JobManager when triggers fire)
-- data.role = "watcher" -> Watcher Object (observes other objects, submits Jobs via JobManager on events)
-- No role -> regular object (the creation agent decides the pattern)
-
-Include data.additionalDeps for extra dependencies beyond the pattern base (e.g. ["HttpClient", "WebParser"] for web access).
-
-## Task Dependencies
-
-**Tasks run SEQUENTIALLY by default.** Each task waits for the previous one to finish. This is safest when one task's output feeds another, or when tasks share resources.
-
-- Leave \`dependsOn\` unspecified (or omit it) for the default sequential chain.
-- Set \`dependsOn: [0, 2]\` with 0-based indices for a specific dependency.
-- Set \`dependsOn: []\` (empty array) to explicitly opt into parallel execution, ONLY when you know the tasks are fully independent.
-
-## Scratchpad Contracts for Data Handoff
-
-When a downstream sub-task needs structured data from an upstream one, declare the contract so the data flows reliably even when results are large:
-
-- Add \`produces\` to the upstream subtask: an array of \`{ key, description }\` entries naming the scratchpad keys it will write and describing the value shape.
-- Add \`consumes\` to the downstream subtask: an array of key strings it expects to read.
-
-The downstream agent automatically sees the full values for its consumed keys; the upstream agent is told to write each produced key with \`writeGoalData\` before reporting done. Use contracts when a scheduler needs to know an agent's id, or when task 1 needs structured output from task 0.
-
-Example:
-\`\`\`json
-{ "action": "decompose", "subtasks": [
-  {
-    "description": "Create a BriefingAgent that fetches weather and posts to chat when dispatched a weather task",
-    "data": { "role": "agent" },
-    "produces": [{ "key": "briefing_agent_id", "description": "AbjectId string of the newly created BriefingAgent" }]
-  },
-  {
-    "description": "Create a scheduler that fires every day at 6:30PM PT and submits a Job that dispatches a weather task to the agent at scratchpad key briefing_agent_id",
-    "data": { "role": "scheduler" },
-    "consumes": ["briefing_agent_id"],
-    "dependsOn": [0]
-  }
-], "reasoning": "Scheduler needs the agent's id; passing it via scratchpad contract." }
-\`\`\`
-
-## Examples
-
-"Create an agent that tells me the weather every day at 6:30PM":
-\`\`\`json
-{ "action": "decompose", "subtasks": [
-  { "description": "Create an agent that fetches current weather and top news, registers with AgentAbject for weather/news tasks, and posts results to Chat via addNotification when it executes a task", "data": { "role": "agent", "additionalDeps": ["HttpClient", "WebParser"] } },
-  { "description": "Create a scheduler that fires every day at 6:30PM PT and submits a Job via JobManager that creates a goal with a weather briefing task for agent dispatch", "data": { "role": "scheduler" }, "dependsOn": [0] }
-], "reasoning": "Scheduler depends on agent existing first" }
-\`\`\`
-
-"Create a scheduler that checks news every hour":
-\`\`\`json
-{ "action": "decompose", "subtasks": [
-  { "description": "Create a scheduler that fires every hour and submits a Job via JobManager that creates a goal with a news-checking task", "data": { "role": "scheduler", "additionalDeps": ["HttpClient", "WebParser"] } }
-], "reasoning": "Single scheduler, no separate agent needed" }
-\`\`\`
-
-"Watch the knowledge base and summarize changes":
-\`\`\`json
-{ "action": "decompose", "subtasks": [
-  { "description": "Create a watcher that observes KnowledgeBase for changes and submits a Job via JobManager that creates a summarization task for agent dispatch", "data": { "role": "watcher" } }
-], "reasoning": "Single watcher" }
-\`\`\`
-
-## Rules
-
-- Always decompose on the first step
-- After decomposing, observe will show child goal progress. Wait until all sub-tasks complete, then report done.
-- Each sub-task creates exactly one object
-- Schedulers and watchers MUST use JobManager.submitJob in their trigger handlers, never call GoalManager directly
-- When one sub-task depends on another (e.g. scheduler needs agent to exist), use dependsOn
-- Agents do work, schedulers trigger work. Always decompose timed tasks into separate agent + scheduler sub-tasks. The system has a built-in Scheduler object for all timed triggers.
-- When the request involves a specific time or recurring schedule, create at least two sub-tasks: one for the agent (role=agent) and one for the scheduler (role=scheduler, dependsOn the agent)
-
-## Output Format
-
-Respond with ONE JSON object inside \`\`\`json fenced code markers. Output ONLY the JSON block — no prose around it. Any one-sentence note belongs in the action's \`reasoning\` field; the parser only reads the JSON.`;
-  }
-
-  // ═══════════════════════════════════════════════════════════════════
-  // Ticket waiting
-  // ═══════════════════════════════════════════════════════════════════
-
-  private resetPendingTicketTimeouts(): void {
-    for (const [ticketId, entry] of this.pendingTickets) {
-      clearTimeout(entry.timer);
-      entry.timer = setTimeout(() => {
-        this.pendingTickets.delete(ticketId);
-        if (this.agentAbjectId) {
-          this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
-        }
-        entry.reject(new Error(`Task ${ticketId} timed out after ${entry.timeoutMs}ms of inactivity`));
-      }, entry.timeoutMs);
-    }
-  }
-
-  private waitForTaskResult(ticketId: string, timeout: number): Promise<{ success: boolean; result?: unknown; error?: string }> {
-    return new Promise((resolve, reject) => {
-      const makeTimer = () => setTimeout(() => {
-        this.pendingTickets.delete(ticketId);
-        if (this.agentAbjectId) {
-          this.send(request(this.id, this.agentAbjectId, 'cancelTask', { taskId: ticketId }));
-        }
-        reject(new Error(`Task ${ticketId} timed out after ${timeout}ms of inactivity`));
-      }, timeout);
-
-      const entry = {
-        timer: makeTimer(),
-        timeoutMs: timeout,
-        resolve: (payload: unknown) => {
-          clearTimeout(entry.timer);
-          this.pendingTickets.delete(ticketId);
-          const p = payload as { success?: boolean; result?: unknown; error?: string; state?: { result?: unknown; error?: string } };
-          const success = p.success !== false && !p.error;
-          resolve({
-            success,
-            result: p.result ?? p.state?.result,
-            error: p.error ?? p.state?.error,
-          });
-        },
-        reject: (err: Error) => {
-          clearTimeout(entry.timer);
-          this.pendingTickets.delete(ticketId);
-          reject(err);
-        },
-      };
-      this.pendingTickets.set(ticketId, entry);
-    });
-  }
 }
 
 export const AGENT_CREATOR_ID = 'abjects:agent-creator' as AbjectId;

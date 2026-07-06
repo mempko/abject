@@ -74,6 +74,8 @@ export const INTROSPECT_EVENTS: EventDeclaration[] = [
  * Format a TypeDeclaration to a readable string.
  */
 function formatType(type: TypeDeclaration): string {
+  // Generated manifests can omit or malform a type; never let describe/ask throw.
+  if (!type || typeof type !== 'object') return 'unknown';
   switch (type.kind) {
     case 'primitive':
       return type.primitive ?? 'unknown';
@@ -103,14 +105,18 @@ function formatType(type: TypeDeclaration): string {
  * Format a method declaration to English.
  */
 function formatMethod(m: MethodDeclaration): string {
-  const params = m.parameters
+  // Tolerate a method declared without a parameters array (common in
+  // LLM-generated manifests) — describe/ask must never throw on a malformed
+  // method, or introspecting the object becomes impossible.
+  const parameters = Array.isArray(m.parameters) ? m.parameters : [];
+  const params = parameters
     .map((p) => {
       const opt = p.optional ? '?' : '';
       return `${p.name}${opt}: ${formatType(p.type)}`;
     })
     .join(', ');
   const returns = m.returns ? ` -> ${formatType(m.returns)}` : '';
-  const paramDescs = m.parameters
+  const paramDescs = parameters
     .map((p) => `      ${p.name}: ${p.description}`)
     .join('\n');
   return `    ${m.name}(${params})${returns}\n      ${m.description}${paramDescs ? '\n' + paramDescs : ''}`;
@@ -169,7 +175,7 @@ export function formatManifestAsDescription(manifest: AbjectManifest): string {
   const iface = manifest.interface;
 
   // Filter out meta-protocol methods
-  const userMethods = iface.methods.filter(m => !META_METHODS.has(m.name));
+  const userMethods = (iface.methods ?? []).filter(m => !META_METHODS.has(m.name));
   // Filter out meta-protocol events
   const metaEvents = new Set(['childReady', 'changed', 'sourceUpdated']);
   const userEvents = (iface.events ?? []).filter(e => !metaEvents.has(e.name));

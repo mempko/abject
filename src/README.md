@@ -13,7 +13,7 @@ Main source directory for the Abjects system. All TypeScript modules organized b
 | `protocol/` | Connection negotiation, agreements, health monitoring |
 | `llm/` | LLM provider interface and implementations (Anthropic, OpenAI, Ollama) |
 | `network/` | Transport abstraction, WebSocket, MockTransport |
-| `sandbox/` | WASM loader, capability-enforced imports, WorkerRuntime |
+| `sandbox/` | WASM abject hosting: ABI codec, instance wrapper + WASI shim, content-addressed module store, extension ingest |
 | `ui/` | Application shell, Canvas compositor |
 
 ## Entry Point

@@ -6,6 +6,7 @@
  */
 
 import { WidgetAbject, WidgetConfig, buildFont } from './widget-abject.js';
+import { lightenColor, gradientRect } from './widget-types.js';
 
 export interface CheckboxWidgetConfig extends WidgetConfig {
   checked?: boolean;
@@ -50,20 +51,34 @@ export class CheckboxWidget extends WidgetAbject {
       commands.push({ type: 'restore', surfaceId, params: {} });
     }
 
-    // Checkbox box
-    commands.push({
-      type: 'rect',
-      surfaceId,
-      params: {
-        x: ox,
-        y: boxY,
-        width: boxSize,
-        height: boxSize,
-        fill: this.checked ? (style.background ?? this.theme.checkboxCheckedBg) : 'transparent',
+    // Checkbox box — checked state gets a diagonal accent gradient so the
+    // tick sits on a lit surface rather than a flat chip.
+    if (this.checked) {
+      const checkedBg = style.background ?? this.theme.checkboxCheckedBg;
+      const g = this.theme.tokens.surface.gradient;
+      commands.push(...gradientRect(surfaceId, {
+        x: ox, y: boxY, width: boxSize, height: boxSize, radii: 2,
+        gradient: { x0: ox, y0: boxY, x1: ox + boxSize, y1: boxY + boxSize, stops: [
+          { offset: 0, color: lightenColor(checkedBg, 18 * g) },
+          { offset: 1, color: checkedBg },
+        ] },
         stroke: style.borderColor ?? this.theme.checkboxBorder,
-        radius: 2,
-      },
-    });
+      }));
+    } else {
+      commands.push({
+        type: 'rect',
+        surfaceId,
+        params: {
+          x: ox,
+          y: boxY,
+          width: boxSize,
+          height: boxSize,
+          fill: 'transparent',
+          stroke: style.borderColor ?? this.theme.checkboxBorder,
+          radius: 2,
+        },
+      });
+    }
 
     // Checkmark (polygon)
     if (this.checked) {
