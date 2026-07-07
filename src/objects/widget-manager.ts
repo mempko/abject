@@ -1711,7 +1711,7 @@ textArea - Multi-line text area (params: monospace?)
 checkbox - Toggle checkbox (aspect: 'change', value: boolean). Keyboard: Space when focused.
 progress - Progress bar (update with { value: 0-100 })
 divider - Horizontal divider line
-select - Dropdown select (params: options[], selectedIndex). Keyboard: Enter/Space to open, ArrowUp/Down to navigate, Enter to select, Escape to close.
+select - Dropdown select (params: options[], selectedIndex, searchable?). Keyboard: Enter/Space to open, ArrowUp/Down to navigate, Enter to select, Escape to close. Long lists scroll (mouse wheel) and automatically get a type-to-filter box atop the dropdown; searchable overrides that default.
 tabBar - Tab bar (params: tabs[] of labels, selectedIndex). Fires 'change' event with selected index. Keyboard: ArrowLeft/Right to switch tabs.
 slider - Numeric range slider (params: min, max, step, value). Fires 'change' event with numeric value as string. Keyboard: ArrowLeft/Right ±step, Home/End for min/max. Click track or drag thumb.
 image - Image display (params: url, fit 'contain'|'cover'|'fill', alt). Fires 'click' on mousedown (register via addDependent to receive). Param: href — when set, clicking opens the URL in the user's browser. Update URL via this.call(imgId, 'update', { url: '...' }).
@@ -2715,7 +2715,8 @@ await this.call(timerId, 'addDependent', {});
       case 'select':
         return this.createTypedWidget(spec.windowId, new SelectWidget({
           type: 'select', rect, text: spec.text, style: spec.style,
-          options: spec.options, selectedIndex: spec.selectedIndex, ...base,
+          options: spec.options, selectedIndex: spec.selectedIndex,
+          searchable: spec.searchable, ...base,
         }), rect);
       case 'tabBar':
         return this.createTypedWidget(spec.windowId, new TabBarWidget({

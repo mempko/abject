@@ -613,10 +613,10 @@ export abstract class LayoutAbject extends WidgetAbject {
     const contentRect = this.getContentRect();
     const childRects = this.calculateChildRects(contentRect);
 
-    // Priority: forward mousedown/mousemove to expanded children first.
+    // Priority: forward mousedown/mousemove/wheel to expanded children first.
     // Expanded widgets (e.g. select dropdowns) extend beyond their rect,
     // so they need first crack at events before normal hit-testing.
-    if (this.expandedChildren.size > 0 && (inputType === 'mousedown' || inputType === 'mousemove')) {
+    if (this.expandedChildren.size > 0 && (inputType === 'mousedown' || inputType === 'mousemove' || inputType === 'wheel')) {
       for (const cr of childRects) {
         if (!this.expandedChildren.has(cr.widgetId)) continue;
         try {
