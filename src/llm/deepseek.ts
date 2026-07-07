@@ -63,6 +63,11 @@ export class DeepSeekProvider extends OpenAIProvider {
     return { reasoningActive: true };
   }
 
+  // The DeepSeek chat API is text-only across the catalog
+  protected override modelVision(_modelId: string): boolean | undefined {
+    return false;
+  }
+
   override async listModels(): Promise<ModelInfo[]> {
     try {
       const response = await this.fetch(`${this.baseUrl}/models`, {
@@ -70,12 +75,12 @@ export class DeepSeekProvider extends OpenAIProvider {
         headers: this.buildHeaders(),
       });
       const data = JSON.parse(response.body) as DeepSeekModelsResponse;
-      return data.data.map(m => ({ id: m.id, name: m.id }));
+      return data.data.map(m => ({ id: m.id, name: m.id, vision: false }));
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
       return [
-        { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-        { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+        { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', vision: false },
+        { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', vision: false },
       ];
     }
   }
@@ -89,8 +94,8 @@ export class DeepSeekProvider extends OpenAIProvider {
       credentialLabel: 'DeepSeek API Key',
       credentialPlaceholder: 'sk-...',
       models: [
-        { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-        { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+        { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', vision: false },
+        { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', vision: false },
       ],
       defaultTierModels: DEFAULT_TIER_MODELS,
     };

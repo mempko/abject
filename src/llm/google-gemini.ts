@@ -184,13 +184,15 @@ export class GeminiProvider extends BaseLLMProvider {
         .map(m => ({
           id: m.name.replace(/^models\//, ''),
           name: m.displayName ?? m.name,
+          // Every current Gemini generateContent model is multimodal
+          vision: true,
         }));
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
       return [
-        { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro' },
-        { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash' },
-        { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
+        { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro', vision: true },
+        { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', vision: true },
+        { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', vision: true },
       ];
     }
   }
@@ -204,9 +206,9 @@ export class GeminiProvider extends BaseLLMProvider {
       credentialLabel: 'Google Gemini API Key',
       credentialPlaceholder: 'AIza...',
       models: [
-        { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro' },
-        { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash' },
-        { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
+        { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro', vision: true },
+        { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', vision: true },
+        { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', vision: true },
       ],
       defaultTierModels: GeminiProvider.TIER_MODELS,
     };

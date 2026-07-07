@@ -20,6 +20,7 @@ import type { JobResult } from './job-manager.js';
 import { PROFILE_TAG } from './knowledge-base.js';
 import type { ContentPart } from '../llm/provider.js';
 import { truncateText, conversationTextChars, enforceConversationCharBudget } from '../llm/provider.js';
+import type { TierCapabilities } from './llm-object.js';
 import type { EnabledSkillSummary } from '../core/skill-types.js';
 import { Log } from '../core/timed-log.js';
 
@@ -1820,6 +1821,7 @@ The registered object must implement these handlers to participate in the agent 
         content: `[BUDGET EXHAUSTED — Final Step]\nYou have used all ${task.maxSteps} steps. You MUST respond with a "done" or "fail" action NOW.\nIf you have extracted ANY useful data during this task, respond with:\n\`\`\`json\n{"action": "done", "result": <your best result so far>}\n\`\`\`\nOtherwise respond with:\n\`\`\`json\n{"action": "fail", "reason": "Could not complete task in ${task.maxSteps} steps"}\n\`\`\``,
       });
 
+      const finalTier = await this.applyVisionTiering(entry, 'smart');
       await this.trimConversation(entry);
 
       this.llmId = await this.resolveDep('LLM', this.llmId);
@@ -1827,9 +1829,10 @@ The registered object must implement these handlers to participate in the agent 
         request(this.id, this.llmId, 'complete', {
           messages: task.llmMessages,
           // Thinking / action decisions run on 'smart' regardless of the observe
-          // hint. Fast-tier models drop the JSON action envelope under load,
-          // producing prose that the parser can't accept.
-          options: { tier: 'smart', maxTokens: 16384, cacheKey: entry.state.id },
+          // hint (fast-tier models drop the JSON action envelope under load,
+          // producing prose that the parser can't accept), adjusted for vision
+          // when the conversation carries images.
+          options: { tier: finalTier, maxTokens: 16384, cacheKey: entry.state.id },
         }),
         60000,
       );
@@ -1958,6 +1961,82 @@ The registered object must implement these handlers to participate in the agent 
     return (hint === 'balanced' || hint === 'fast') ? 'balanced' : 'smart';
   }
 
+  // ── Vision-aware tiering ─────────────────────────────────────────────
+
+  /** Cached per-tier capabilities from the LLM service. */
+  private tierCapsCache?: { caps: TierCapabilities; at: number };
+  private static readonly TIER_CAPS_TTL_MS = 60_000;
+
+  /**
+   * Per-tier model capabilities from the LLM service, cached briefly so the
+   * OTA loop doesn't add a bus round-trip to every step. Returns undefined
+   * when the LLM service can't answer (agents then keep current behavior).
+   */
+  protected async tierCapabilities(): Promise<TierCapabilities | undefined> {
+    const now = Date.now();
+    if (this.tierCapsCache && now - this.tierCapsCache.at < AgentAbject.TIER_CAPS_TTL_MS) {
+      return this.tierCapsCache.caps;
+    }
+    try {
+      this.llmId = await this.resolveDep('LLM', this.llmId);
+      const caps = await this.request<TierCapabilities>(
+        request(this.id, this.llmId!, 'describeTiers', {})
+      );
+      this.tierCapsCache = { caps, at: now };
+      return caps;
+    } catch {
+      return this.tierCapsCache?.caps;
+    }
+  }
+
+  private static conversationHasImages(messages: { role: string; content: string | ContentPart[] }[]): boolean {
+    return messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image'));
+  }
+
+  /** Replace image parts with a text note in place; returns how many were replaced. */
+  private static stripImageParts(messages: { role: string; content: string | ContentPart[] }[]): number {
+    let replaced = 0;
+    for (const m of messages) {
+      if (typeof m.content === 'string') continue;
+      m.content = m.content.map(part => {
+        if (part.type !== 'image') return part;
+        replaced++;
+        return {
+          type: 'text',
+          text: '[Image omitted: the model configured for this step is text-only. Work from the text context; mention to the user that the current model cannot see images if the image was essential.]',
+        } as ContentPart;
+      });
+    }
+    return replaced;
+  }
+
+  /**
+   * Adjust the think tier for what the conversation actually carries: when it
+   * holds images and the preferred tier's model is text-only, route to the
+   * other think tier if that one can see; when neither can, replace the image
+   * parts with a text note so a text-only model doesn't reject the request
+   * outright. Unknown capability (vision null/undefined) is treated as capable.
+   */
+  private async applyVisionTiering(entry: TaskEntry, tier: 'smart' | 'balanced'): Promise<'smart' | 'balanced'> {
+    const messages = entry.state.llmMessages;
+    if (!AgentAbject.conversationHasImages(messages)) return tier;
+
+    const caps = await this.tierCapabilities();
+    if (!caps || caps[tier]?.vision !== false) return tier;
+
+    const other: 'smart' | 'balanced' = tier === 'smart' ? 'balanced' : 'smart';
+    if (caps[other] && caps[other]!.vision !== false) {
+      log.info(`Vision routing: '${tier}' model ${caps[tier]?.model} is text-only; thinking on '${other}' for this step`);
+      return other;
+    }
+
+    const replaced = AgentAbject.stripImageParts(messages);
+    if (replaced > 0) {
+      log.warn(`Vision routing: no vision-capable think tier configured; replaced ${replaced} image part(s) with text notes`);
+    }
+    return tier;
+  }
+
   private async think(entry: TaskEntry): Promise<AgentAction> {
     const task = entry.state;
 
@@ -1972,6 +2051,10 @@ The registered object must implement these handlers to participate in the agent 
     // Add last action result
     this.addActionResultToConversation(entry);
 
+    // Vision-aware tiering runs before trim so a text-only path never
+    // carries image bytes into compression either
+    const thinkTier = await this.applyVisionTiering(entry, this.resolveThinkTier(entry.observeTier));
+
     // Trim conversation (may do an LLM-compressor pass when over byte budget)
     await this.trimConversation(entry);
 
@@ -1985,10 +2068,11 @@ The registered object must implement these handlers to participate in the agent 
           messages: task.llmMessages,
           // Thinking is the JSON-action-decision step. Tier comes from the
           // agent's per-state observe hint, floored at 'balanced' (never 'fast'
-          // — haiku drops the action envelope under load). Routine/verification
+          // — haiku drops the action envelope under load), then adjusted for
+          // vision when the conversation carries images. Routine/verification
           // states run on balanced; hard states (code gen, error recovery,
           // planning) stay on smart. Agents that send no hint stay on smart.
-          options: { tier: this.resolveThinkTier(entry.observeTier), maxTokens: 16384, cacheKey: entry.state.id },
+          options: { tier: thinkTier, maxTokens: 16384, cacheKey: entry.state.id },
         }),
         120000,
       );

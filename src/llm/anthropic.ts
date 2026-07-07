@@ -304,7 +304,8 @@ export class AnthropicProvider extends BaseLLMProvider {
         return this.fallbackModels();
       }
       log.info(`listModels: fetched ${rows.length} live Anthropic models`);
-      return rows.map(r => ({ id: r.id, name: r.display_name ?? r.id }));
+      // Every current Claude chat model accepts image input
+      return rows.map(r => ({ id: r.id, name: r.display_name ?? r.id, vision: true }));
     } catch (err) {
       log.warn(`listModels: fetch failed (${err instanceof Error ? err.message : String(err)}); falling back to the hardcoded catalog`);
       return this.fallbackModels();
@@ -313,10 +314,10 @@ export class AnthropicProvider extends BaseLLMProvider {
 
   private fallbackModels(): ModelInfo[] {
     return [
-      { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
-      { id: 'claude-fable-5', name: 'Claude Fable 5' },
-      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
-      { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
+      { id: 'claude-opus-4-8', name: 'Claude Opus 4.8', vision: true },
+      { id: 'claude-fable-5', name: 'Claude Fable 5', vision: true },
+      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', vision: true },
+      { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5', vision: true },
     ];
   }
 

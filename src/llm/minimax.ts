@@ -57,14 +57,20 @@ export class MiniMaxProvider extends OpenAIProvider {
     return { reasoningActive: true };
   }
 
+  // The M-series text API doesn't take image input (vision lives in the
+  // separate VL models, which this chat endpoint doesn't serve)
+  protected override modelVision(_modelId: string): boolean | undefined {
+    return false;
+  }
+
   // MiniMax does not expose a /v1/models discovery endpoint (returns 404),
   // so we return a curated list instead of querying the API.
   override async listModels(): Promise<ModelInfo[]> {
     return [
-      { id: 'MiniMax-M3', name: 'MiniMax M3' },
-      { id: 'MiniMax-M2.7', name: 'MiniMax M2.7' },
-      { id: 'MiniMax-M2.7-highspeed', name: 'MiniMax M2.7 Highspeed' },
-      { id: 'MiniMax-M2', name: 'MiniMax M2' },
+      { id: 'MiniMax-M3', name: 'MiniMax M3', vision: false },
+      { id: 'MiniMax-M2.7', name: 'MiniMax M2.7', vision: false },
+      { id: 'MiniMax-M2.7-highspeed', name: 'MiniMax M2.7 Highspeed', vision: false },
+      { id: 'MiniMax-M2', name: 'MiniMax M2', vision: false },
     ];
   }
 
@@ -77,10 +83,10 @@ export class MiniMaxProvider extends OpenAIProvider {
       credentialLabel: 'MiniMax API Key',
       credentialPlaceholder: 'sk-...',
       models: [
-        { id: 'MiniMax-M3', name: 'MiniMax M3' },
-        { id: 'MiniMax-M2.7', name: 'MiniMax M2.7' },
-        { id: 'MiniMax-M2.7-highspeed', name: 'MiniMax M2.7 Highspeed' },
-        { id: 'MiniMax-M2', name: 'MiniMax M2' },
+        { id: 'MiniMax-M3', name: 'MiniMax M3', vision: false },
+        { id: 'MiniMax-M2.7', name: 'MiniMax M2.7', vision: false },
+        { id: 'MiniMax-M2.7-highspeed', name: 'MiniMax M2.7 Highspeed', vision: false },
+        { id: 'MiniMax-M2', name: 'MiniMax M2', vision: false },
       ],
       defaultTierModels: DEFAULT_TIER_MODELS,
     };

@@ -18,6 +18,7 @@ import {
   LLMCompletionOptions,
   LLMCompletionResult,
   ModelTier,
+  ModelInfo,
   getTextContent,
   truncateText,
   messageTextChars,
@@ -52,6 +53,19 @@ export interface CompressResult {
 }
 
 export type TierRouting = Partial<Record<ModelTier, TierConfig>>;
+
+/**
+ * The effective model behind one tier, with capabilities. `vision` is
+ * tri-state: true = accepts image input, false = text-only, null = unknown
+ * (treat as probably-capable rather than blocking).
+ */
+export interface TierCapability {
+  provider: string;
+  model: string | null;
+  vision: boolean | null;
+}
+
+export type TierCapabilities = Record<ModelTier, TierCapability | null>;
 import { AnthropicProvider } from '../llm/anthropic.js';
 import { OpenAIProvider } from '../llm/openai.js';
 import { ClaudeCliProvider } from '../llm/claude-cli.js';
@@ -365,6 +379,12 @@ export class LLMObject extends Abject {
                 returns: { kind: 'reference', reference: 'TierRouting' },
               },
               {
+                name: 'describeTiers',
+                description: 'Describe the effective model behind each tier (smart/balanced/fast) including capabilities. Returns { smart, balanced, fast } where each entry is { provider, model, vision } — vision is true when the model accepts image input, false when it is text-only, and null when unknown. Consult this before sending image content: pick a tier whose vision is not false, or omit the image.',
+                parameters: [],
+                returns: { kind: 'reference', reference: 'TierCapabilities' },
+              },
+              {
                 name: 'transcribe',
                 description: 'Transcribe audio to text (speech-to-text). Routes to the first registered provider with a transcription API unless a provider is named.',
                 parameters: [
@@ -591,16 +611,12 @@ export class LLMObject extends Abject {
     this.on('listProviderModels', async (m: AbjectMessage) => {
       const { provider: providerName, ollamaUrl } = m.payload as { provider: string; ollamaUrl?: string };
       // For Ollama, allow listing models from a URL even if provider not yet registered
-      if (providerName === 'ollama') {
-        let provider = this.providers.get('ollama') as OllamaProvider | undefined;
-        if (!provider) {
-          provider = new OllamaProvider({ baseUrl: ollamaUrl ?? 'http://localhost:11434' });
-        }
+      if (providerName === 'ollama' && !this.providers.get('ollama')) {
+        const provider = new OllamaProvider({ baseUrl: ollamaUrl ?? 'http://localhost:11434' });
         return provider.listModels();
       }
-      const provider = this.providers.get(providerName);
-      if (!provider) return [];
-      return provider.listModels();
+      if (!this.providers.get(providerName)) return [];
+      return this.getProviderModels(providerName, { refresh: true });
     });
 
     this.on('setTierRouting', async (msg: AbjectMessage) => {
@@ -643,6 +659,10 @@ export class LLMObject extends Abject {
 
     this.on('getTierRouting', async () => {
       return { ...this.tierRouting };
+    });
+
+    this.on('describeTiers', async () => {
+      return this.describeTiers();
     });
 
     this.on('getStats', async () => {
@@ -1423,6 +1443,86 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     throw new Error(`All speech synthesis providers failed. ${failures.join(' | ')}`);
   }
 
+  // ── Tier capabilities ─────────────────────────────────────────────
+
+  /** Cached listModels results per provider, for capability lookups. */
+  private modelListCache: Map<string, ModelInfo[]> = new Map();
+  /** In-flight listModels fetches (dedupes concurrent callers). */
+  private modelListFetches: Map<string, Promise<ModelInfo[]>> = new Map();
+
+  /**
+   * A provider's model list, cached for the session. `refresh` forces a
+   * live re-fetch (used by the Settings-driven listProviderModels path so
+   * newly-available models still show up).
+   */
+  private async getProviderModels(providerName: string, opts: { refresh?: boolean } = {}): Promise<ModelInfo[]> {
+    if (!opts.refresh) {
+      const cached = this.modelListCache.get(providerName);
+      if (cached) return cached;
+    }
+    const provider = this.providers.get(providerName);
+    if (!provider) return [];
+    let inFlight = this.modelListFetches.get(providerName);
+    if (!inFlight) {
+      inFlight = provider.listModels()
+        .then(models => {
+          if (models.length > 0) this.modelListCache.set(providerName, models);
+          return models;
+        })
+        .catch(() => [] as ModelInfo[])
+        .finally(() => { this.modelListFetches.delete(providerName); });
+      this.modelListFetches.set(providerName, inFlight);
+    }
+    return inFlight;
+  }
+
+  /**
+   * Describe the effective model behind each tier with its capabilities.
+   * Mirrors resolveProviderAndModel's routing (tier config first, default
+   * provider as fallback) so agents see exactly what a tiered call will hit.
+   */
+  async describeTiers(): Promise<TierCapabilities> {
+    const out = {} as TierCapabilities;
+    for (const tier of ['smart', 'balanced', 'fast'] as ModelTier[]) {
+      let providerName: string | undefined;
+      let model: string | undefined;
+
+      const config = this.tierRouting[tier];
+      if (config && this.providers.get(config.provider)) {
+        providerName = config.provider;
+        model = config.model;
+      } else {
+        const provider = this.getProvider();
+        if (provider) {
+          providerName = provider.name;
+          model = provider.describe().defaultTierModels[tier] || undefined;
+        }
+      }
+
+      if (!providerName) {
+        out[tier] = null;
+        continue;
+      }
+      out[tier] = {
+        provider: providerName,
+        model: model ?? null,
+        vision: model ? await this.lookupVision(providerName, model) : null,
+      };
+    }
+    return out;
+  }
+
+  /** Vision capability of one provider model; null = unknown. */
+  private async lookupVision(providerName: string, model: string): Promise<boolean | null> {
+    const models = await this.getProviderModels(providerName);
+    const live = models.find(mi => mi.id === model);
+    if (live?.vision !== undefined) return live.vision;
+    // Fall back to the provider's static catalog (covers models the live
+    // list missed, and providers whose live fetch failed)
+    const catalog = this.providers.get(providerName)?.describe().models ?? [];
+    return catalog.find(mi => mi.id === model)?.vision ?? null;
+  }
+
   private resolveProviderAndModel(
     providerName?: string,
     tier?: ModelTier,
@@ -1512,6 +1612,23 @@ The \`options\` object in \`complete\` accepts:
 - temperature: number — controls randomness (0-1)
 - maxTokens: number — limit response length
 - stopSequences: string[] — stop generation at these strings
+
+### Sending Images (vision)
+
+Message content can be an array of parts, mixing text with images:
+
+  { role: 'user', content: [
+    { type: 'text', text: 'What is in this screenshot?' },
+    { type: 'image', mediaType: 'image/png', data: '<base64>' },
+  ]}
+
+Not every configured model can see images. Before sending image content,
+check the tier's capability and pick a tier whose vision is not false —
+or send text only:
+
+  const tiers = await this.call(this.dep('LLM'), 'describeTiers', {});
+  // tiers.smart / tiers.balanced / tiers.fast:
+  //   { provider, model, vision } — vision: true | false (text-only) | null (unknown)
 
 ### Per-Tier Routing
 

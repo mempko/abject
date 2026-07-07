@@ -18,7 +18,7 @@ export { Abject, SimpleAbject, DEFERRED_REPLY } from './core/abject.js';
 export { Registry, REGISTRY_ID } from './objects/registry.js';
 export { Factory, FACTORY_ID } from './objects/factory.js';
 export { LLMObject, LLM_OBJECT_ID } from './objects/llm-object.js';
-export type { TierConfig, TierRouting } from './objects/llm-object.js';
+export type { TierConfig, TierRouting, TierCapability, TierCapabilities } from './objects/llm-object.js';
 export { ObjectCreator, OBJECT_CREATOR_ID } from './objects/object-creator.js';
 export { ProxyGenerator, PROXY_GENERATOR_ID } from './objects/proxy-generator.js';
 export { Negotiator, NEGOTIATOR_ID } from './protocol/negotiator.js';

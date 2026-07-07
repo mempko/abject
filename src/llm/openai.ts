@@ -124,6 +124,19 @@ export class OpenAIProvider extends BaseLLMProvider {
     return options?.tier ? this.tierModels[options.tier] : this.model;
   }
 
+  /**
+   * Whether a model id accepts image input; undefined = unknown. Base =
+   * OpenAI: the modern chat families (GPT-4o/4.1/5.x, o-series) are
+   * multimodal; legacy text models are not. Subclasses override with their
+   * own catalogs (DeepSeek all-text, Grok 4+ multimodal, ...). OpenRouter
+   * overrides listModels entirely and uses live modality data instead.
+   */
+  protected modelVision(modelId: string): boolean | undefined {
+    if (/^(gpt-4o|gpt-4\.1|gpt-4-turbo|gpt-5|o[134])/i.test(modelId)) return true;
+    if (/^(gpt-3\.5|gpt-4-\d|chatgpt)/i.test(modelId)) return false;
+    return undefined;
+  }
+
   // ── Per-tier generation defaults (shared across OpenAI-compatible providers) ──
   // Same philosophy as the Anthropic provider: reasoning tokens share the output
   // cap, so an undersized cap starves the answer (empty / finish_reason=length).
@@ -226,7 +239,7 @@ export class OpenAIProvider extends BaseLLMProvider {
         .filter(id => !excluded.test(id))
         .sort();
       const models = (filtered.length > 0 ? filtered : rows.map(r => r.id))
-        .map(id => ({ id, name: id }));
+        .map(id => ({ id, name: id, vision: this.modelVision(id) }));
       return models;
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
@@ -236,9 +249,9 @@ export class OpenAIProvider extends BaseLLMProvider {
 
   protected fallbackModels(): ModelInfo[] {
     return [
-      { id: 'gpt-5.4', name: 'GPT-5.4' },
-      { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
-      { id: 'gpt-5.4-nano', name: 'GPT-5.4 Nano' },
+      { id: 'gpt-5.4', name: 'GPT-5.4', vision: true },
+      { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini', vision: true },
+      { id: 'gpt-5.4-nano', name: 'GPT-5.4 Nano', vision: true },
     ];
   }
 

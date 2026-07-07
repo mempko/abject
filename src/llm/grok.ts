@@ -63,6 +63,14 @@ export class GrokProvider extends OpenAIProvider {
     return { reasoningActive: effort !== 'none' };
   }
 
+  // Grok 4 and later are multimodal; grok-3 and earlier chat models are text-only
+  protected override modelVision(modelId: string): boolean | undefined {
+    if (/vision/i.test(modelId)) return true;
+    if (/^grok-([4-9]|\d{2})/i.test(modelId)) return true;
+    if (/^grok-[123]/i.test(modelId)) return false;
+    return undefined;
+  }
+
   override async listModels(): Promise<ModelInfo[]> {
     try {
       const response = await this.fetch(`${this.baseUrl}/v1/models`, {
@@ -70,12 +78,12 @@ export class GrokProvider extends OpenAIProvider {
         headers: this.buildHeaders(),
       });
       const data = JSON.parse(response.body) as GrokModelsResponse;
-      return data.data.map(m => ({ id: m.id, name: m.id }));
+      return data.data.map(m => ({ id: m.id, name: m.id, vision: this.modelVision(m.id) }));
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
       return [
-        { id: 'grok-4.3', name: 'Grok 4.3' },
-        { id: 'grok-4', name: 'Grok 4' },
+        { id: 'grok-4.3', name: 'Grok 4.3', vision: true },
+        { id: 'grok-4', name: 'Grok 4', vision: true },
       ];
     }
   }
@@ -89,9 +97,9 @@ export class GrokProvider extends OpenAIProvider {
       credentialLabel: 'xAI Grok API Key',
       credentialPlaceholder: 'xai-...',
       models: [
-        { id: 'grok-4', name: 'Grok 4' },
-        { id: 'grok-4-mini', name: 'Grok 4 Mini' },
-        { id: 'grok-4-fast', name: 'Grok 4 Fast' },
+        { id: 'grok-4', name: 'Grok 4', vision: true },
+        { id: 'grok-4-mini', name: 'Grok 4 Mini', vision: true },
+        { id: 'grok-4-fast', name: 'Grok 4 Fast', vision: true },
       ],
       defaultTierModels: DEFAULT_TIER_MODELS,
     };

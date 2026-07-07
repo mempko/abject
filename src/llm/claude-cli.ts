@@ -240,11 +240,13 @@ export class ClaudeCliProvider extends BaseLLMProvider {
 
   async listModels(): Promise<ModelInfo[]> {
     // The CLI doesn't expose a list endpoint; report the canonical aliases.
+    // vision: false is about the transport, not the models — this provider
+    // flattens prompts to text, so image parts never reach the model.
     return [
-      { id: AUTO_MODEL, name: 'Auto (latest default)' },
-      { id: 'opus',   name: 'Claude Opus (alias)' },
-      { id: 'sonnet', name: 'Claude Sonnet (alias)' },
-      { id: 'haiku',  name: 'Claude Haiku (alias)' },
+      { id: AUTO_MODEL, name: 'Auto (latest default)', vision: false },
+      { id: 'opus',   name: 'Claude Opus (alias)', vision: false },
+      { id: 'sonnet', name: 'Claude Sonnet (alias)', vision: false },
+      { id: 'haiku',  name: 'Claude Haiku (alias)', vision: false },
     ];
   }
 
@@ -261,10 +263,10 @@ export class ClaudeCliProvider extends BaseLLMProvider {
         installHint: 'Install Claude Code: https://docs.anthropic.com/en/docs/claude-code/setup',
       },
       models: [
-        { id: AUTO_MODEL, name: 'Auto (latest default)' },
-        { id: 'opus',     name: 'Claude Opus (alias)' },
-        { id: 'sonnet',   name: 'Claude Sonnet (alias)' },
-        { id: 'haiku',    name: 'Claude Haiku (alias)' },
+        { id: AUTO_MODEL, name: 'Auto (latest default)', vision: false },
+        { id: 'opus',     name: 'Claude Opus (alias)', vision: false },
+        { id: 'sonnet',   name: 'Claude Sonnet (alias)', vision: false },
+        { id: 'haiku',    name: 'Claude Haiku (alias)', vision: false },
       ],
       // CLI providers default to 'auto' — the binary picks its current
       // latest model for each call. Upgrading the binary auto-rolls

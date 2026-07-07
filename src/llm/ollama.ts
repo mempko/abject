@@ -356,10 +356,20 @@ export class OllamaProvider extends BaseLLMProvider {
         models: { name: string }[];
       };
 
-      return data.models.map((m) => ({ id: m.name, name: m.name }));
+      return data.models.map((m) => ({ id: m.name, name: m.name, vision: OllamaProvider.modelVision(m.name) }));
     } catch {
       return [];
     }
+  }
+
+  /**
+   * Vision capability by model-family name. Ollama's /api/tags carries no
+   * capability metadata, so recognize the common vision families and leave
+   * everything else unknown rather than wrongly declaring text-only.
+   */
+  private static modelVision(name: string): boolean | undefined {
+    if (/llava|vision|moondream|bakllava|minicpm-v|-vl|qwen[\d.]*-?vl|pixtral|gemma3|llama4/i.test(name)) return true;
+    return undefined;
   }
 
   override describe(): LLMProviderDescription {

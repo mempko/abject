@@ -76,7 +76,7 @@ const LEGACY_KEY_OLLAMA_MODEL_SMART = 'global-settings:ollamaModelSmart';
 const LEGACY_KEY_OLLAMA_MODEL_BALANCED = 'global-settings:ollamaModelBalanced';
 const LEGACY_KEY_OLLAMA_MODEL_FAST = 'global-settings:ollamaModelFast';
 
-interface ModelInfo { id: string; name: string; }
+interface ModelInfo { id: string; name: string; vision?: boolean; }
 
 /**
  * GlobalSettings object that provides a configuration UI for LLM API keys.
@@ -119,6 +119,17 @@ export class GlobalSettings extends Abject {
   // Per-tier provider + model select widgets
   private tierProviderSelectIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined };
   private tierModelSelectIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined };
+  /** Per-tier capability label ("vision" / "text-only") next to the model dropdown. */
+  private tierCapLabelIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined };
+  /**
+   * The model id each tier is meant to show: the saved routing at build time,
+   * then the user's latest dropdown pick. Dropdowns render by display name,
+   * and the name list changes when a provider's live model fetch lands after
+   * the tab was built from the small fallback catalog. Without this id, that
+   * refresh silently resets the selection to the list's first model (and a
+   * subsequent Save would persist the reset).
+   */
+  private tierDesiredModelIds: Record<ModelTierName, string | null> = { smart: null, balanced: null, fast: null };
 
   private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
@@ -619,6 +630,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
             const id = this.idForLabel(label);
             if (id) void this.refreshProviderModels(id);
           }
+          return;
+        }
+      }
+
+      // Tier model dropdown changed -- record the pick + repaint capability label
+      for (const tier of TIER_NAMES) {
+        if (fromId === this.tierModelSelectIds[tier] && aspect === 'change') {
+          await this.onTierModelChanged(tier);
           return;
         }
       }
@@ -1163,8 +1182,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'label', windowId: this.windowId, text: 'Model Tiers',
           style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
-        { type: 'label', windowId: this.windowId, text: 'Choose a provider and model for each quality tier.',
-          style: { color: this.theme.textDescription, fontSize: 12 } },
+        { type: 'label', windowId: this.windowId,
+          text: 'Choose a provider and model for each quality tier. Screenshots and pasted images go to Smart and Balanced, so pick 👁 vision models there.',
+          style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true } },
       ]})
     );
     await this.request(request(this.id, cId, 'addLayoutChild', {
@@ -1175,7 +1195,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: tierDescId,
       sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 18 },
+      preferredSize: { height: 34 },
     }));
 
     // Per-tier rows: [Label] [Provider dropdown] [Model dropdown]
@@ -1184,6 +1204,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       const tierLabel = TIER_LABELS[i];
       const savedProvider = savedTierRouting[tier].provider as LLMProviderName | null;
       const savedModel = savedTierRouting[tier].model;
+      this.tierDesiredModelIds[tier] = savedModel;
 
       // Row container
       const tierRowId = await this.request<AbjectId>(
@@ -1255,6 +1276,21 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         widgetId: modelSelectId,
         sizePolicy: { horizontal: 'expanding' },
         preferredSize: { height: 32 },
+      }));
+
+      // Capability label for the selected model (vision / text-only)
+      const initialCap = this.capabilityLabelFor(activeProvider, modelOptions[modelIdx] ?? '');
+      const { widgetIds: [capLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: initialCap.text,
+            style: { color: initialCap.color, fontSize: 11 } },
+        ]})
+      );
+      this.tierCapLabelIds[tier] = capLabelId;
+      await this.request(request(this.id, tierRowId, 'addLayoutChild', {
+        widgetId: capLabelId,
+        sizePolicy: { horizontal: 'fixed' },
+        preferredSize: { width: 62, height: 32 },
       }));
     }
 
@@ -1552,6 +1588,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.providerModelsLabelId = undefined;
     this.tierProviderSelectIds = { smart: undefined, balanced: undefined, fast: undefined };
     this.tierModelSelectIds = { smart: undefined, balanced: undefined, fast: undefined };
+    this.tierCapLabelIds = { smart: undefined, balanced: undefined, fast: undefined };
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
     this.authCheckboxId = undefined;
@@ -1819,7 +1856,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     }
     const names = models.slice(0, 6).map(m => m.name);
     const more = models.length > names.length ? `, …(+${models.length - names.length})` : '';
-    return `${models.length} models: ${names.join(', ')}${more}`;
+    const visionCount = models.filter(m => m.vision === true).length;
+    const visionNote = visionCount > 0 ? ` (${visionCount} with vision)` : '';
+    return `${models.length} models${visionNote}: ${names.join(', ')}${more}`;
   }
 
   /** Handle provider-dropdown change: snapshot the current input, then swap panel. */
@@ -1986,12 +2025,68 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       ? modelList.map(m => m.name)
       : ['(no models)'];
 
-    const keepIdx = options.indexOf(currentLabel);
+    // Prefer the tier's intended model id (saved routing / the user's last
+    // pick): the visible label is stale when this refresh replaces a fallback
+    // catalog with the live list, whose display names differ.
+    const desired = this.tierDesiredModelIds[tier];
+    const desiredIdx = desired ? modelList.findIndex(m => m.id === desired) : -1;
+    const keepIdx = desiredIdx >= 0 ? desiredIdx : options.indexOf(currentLabel);
     const selectedIndex = keepIdx >= 0 ? keepIdx : 0;
 
     await this.request(
       request(this.id, modelSelectId, 'update', { options, selectedIndex })
     );
+    await this.updateTierCapabilityLabel(tier, providerName, options[selectedIndex] ?? '');
+  }
+
+  // ── Tier capability display ───────────────────────────────────────
+
+  /**
+   * Capability text + color for a provider model, from the cached model
+   * list's vision flag. Unknown capability renders as empty rather than
+   * guessing.
+   */
+  private capabilityLabelFor(provider: LLMProviderName, modelName: string): { text: string; color: string } {
+    const models = this.providerModelCache.get(provider) ?? [];
+    const info = models.find(m => m.name === modelName);
+    if (info?.vision === true) return { text: '👁 vision', color: this.theme.statusSuccess };
+    if (info?.vision === false) return { text: 'text-only', color: this.theme.textTertiary };
+    return { text: '', color: this.theme.textTertiary };
+  }
+
+  /** Repaint one tier's capability label for the given provider + model name. */
+  private async updateTierCapabilityLabel(tier: ModelTierName, provider: LLMProviderName, modelName: string): Promise<void> {
+    const capLabelId = this.tierCapLabelIds[tier];
+    if (!capLabelId) return;
+    const cap = this.capabilityLabelFor(provider, modelName);
+    try {
+      await this.request(request(this.id, capLabelId, 'update', {
+        text: cap.text,
+        style: { color: cap.color, fontSize: 11 },
+      }));
+    } catch { /* widget gone */ }
+  }
+
+  /**
+   * The user picked a model for a tier: remember the picked id (so later
+   * option-list refreshes keep the selection) and repaint the capability label.
+   */
+  private async onTierModelChanged(tier: ModelTierName): Promise<void> {
+    const providerSelectId = this.tierProviderSelectIds[tier];
+    const modelSelectId = this.tierModelSelectIds[tier];
+    if (!providerSelectId || !modelSelectId) return;
+    try {
+      const providerLabel = await this.request<string>(
+        request(this.id, providerSelectId, 'getValue', {})
+      );
+      const provider = this.idForLabel(providerLabel) ?? this.providerIds()[0];
+      const modelName = await this.request<string>(
+        request(this.id, modelSelectId, 'getValue', {})
+      );
+      const info = (this.providerModelCache.get(provider) ?? []).find(m => m.name === modelName);
+      this.tierDesiredModelIds[tier] = info?.id ?? null;
+      await this.updateTierCapabilityLabel(tier, provider, modelName);
+    } catch { /* widget gone */ }
   }
 
   // ========== AUTH HELPERS ==========
@@ -3242,6 +3337,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
           provider: providerName,
           model: modelInfo ? modelInfo.id : modelName,
         };
+        this.tierDesiredModelIds[tier] = tierRouting[tier].model;
       }
     }
 

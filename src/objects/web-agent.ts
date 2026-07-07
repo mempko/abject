@@ -848,6 +848,37 @@ Set keepPageOpen: false to explicitly close the page when done.
   private static readonly FAST_TIER_REF_THRESHOLD = 30;
   private static readonly FAST_TIER_CHAR_THRESHOLD = 8000;
 
+  /** Cached tier vision capabilities from the LLM service. */
+  private tierVisionCache?: { caps: Record<string, boolean | null>; at: number };
+  private static readonly TIER_VISION_TTL_MS = 60_000;
+
+  /**
+   * Vision capability of the think tiers (smart/balanced), from the LLM
+   * service's describeTiers. null = unknown (treat as capable); undefined
+   * result = the service couldn't answer (keep current behavior).
+   */
+  private async tierVision(): Promise<Record<string, boolean | null> | undefined> {
+    const now = Date.now();
+    if (this.tierVisionCache && now - this.tierVisionCache.at < WebAgent.TIER_VISION_TTL_MS) {
+      return this.tierVisionCache.caps;
+    }
+    try {
+      const llmId = await this.discoverDep('LLM');
+      if (!llmId) return this.tierVisionCache?.caps;
+      const tiers = await this.request<Record<string, { vision: boolean | null } | null>>(
+        request(this.id, llmId, 'describeTiers', {})
+      );
+      const caps: Record<string, boolean | null> = {
+        smart: tiers.smart?.vision ?? null,
+        balanced: tiers.balanced?.vision ?? null,
+      };
+      this.tierVisionCache = { caps, at: now };
+      return caps;
+    } catch {
+      return this.tierVisionCache?.caps;
+    }
+  }
+
   private async handleObserve(taskId: string): Promise<{ observation: string; llmContent?: ContentPart[]; tier?: string }> {
     const extra = this.taskExtras.get(taskId);
     if (!extra?.pageId) return { observation: 'No page open.' };
@@ -864,9 +895,25 @@ Set keepPageOpen: false to explicitly close the page when done.
       // now honored by the OTA loop (floored at balanced), so a simple page
       // decides on 'balanced' and a complex one keeps 'smart' — no regression
       // on hard navigation, savings on easy pages.
-      const tier = (refCount <= WebAgent.FAST_TIER_REF_THRESHOLD && snapshot.length <= WebAgent.FAST_TIER_CHAR_THRESHOLD)
+      let tier = (refCount <= WebAgent.FAST_TIER_REF_THRESHOLD && snapshot.length <= WebAgent.FAST_TIER_CHAR_THRESHOLD)
         ? 'balanced' : 'smart';
-      log.info(`Observe: URL=${url} | ${refCount} elements (ARIA snapshot, ${snapshot.length} chars) tier=${tier}`);
+
+      // Vision-aware routing: only ship a screenshot a model can actually
+      // see. If the complexity-chosen tier is text-only but the other think
+      // tier can see, use that one; if neither can, skip the screenshot
+      // entirely and navigate from the ARIA snapshot alone.
+      let visionAvailable = true;
+      const caps = await this.tierVision();
+      if (caps && caps[tier] === false) {
+        const other = tier === 'balanced' ? 'smart' : 'balanced';
+        if (caps[other] !== false) {
+          log.info(`Observe: '${tier}' tier model is text-only; using '${other}' for vision`);
+          tier = other;
+        } else {
+          visionAvailable = false;
+        }
+      }
+      log.info(`Observe: URL=${url} | ${refCount} elements (ARIA snapshot, ${snapshot.length} chars) tier=${tier} vision=${visionAvailable}`);
 
       // Truncate very large snapshots to stay within token budget
       let truncatedSnapshot = snapshot;
@@ -881,15 +928,24 @@ Set keepPageOpen: false to explicitly close the page when done.
       lines.push('Page structure (ARIA snapshot):');
       lines.push(truncatedSnapshot);
 
+      if (!visionAvailable) {
+        lines.push('');
+        lines.push('Note: no screenshot this step; the configured models are text-only. Navigate using the ARIA snapshot refs.');
+      }
       const observation = lines.join('\n');
 
-      // Take screenshot for vision-enabled LLM observation
-      try {
-        const shot = await this.request<{ dataUri: string }>(
-          request(this.id, this.webBrowserId!, 'screenshotPage', { pageId: extra.pageId })
-        );
-        extra.lastScreenshot = shot.dataUri.replace(/^data:image\/\w+;base64,/, '');
-      } catch { extra.lastScreenshot = undefined; }
+      // Take screenshot for vision-enabled LLM observation. Skipped when no
+      // think tier can see images — the bytes would be stripped anyway.
+      if (visionAvailable) {
+        try {
+          const shot = await this.request<{ dataUri: string }>(
+            request(this.id, this.webBrowserId!, 'screenshotPage', { pageId: extra.pageId })
+          );
+          extra.lastScreenshot = shot.dataUri.replace(/^data:image\/\w+;base64,/, '');
+        } catch { extra.lastScreenshot = undefined; }
+      } else {
+        extra.lastScreenshot = undefined;
+      }
 
       // Return with llmContent for vision support
       if (extra.lastScreenshot) {

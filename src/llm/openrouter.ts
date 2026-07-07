@@ -30,7 +30,7 @@ const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
 };
 
 interface OpenRouterModelsResponse {
-  data: Array<{ id: string; name?: string }>;
+  data: Array<{ id: string; name?: string; architecture?: { input_modalities?: string[] } }>;
 }
 
 export class OpenRouterProvider extends OpenAIProvider {
@@ -73,7 +73,14 @@ export class OpenRouterProvider extends OpenAIProvider {
         headers: this.buildHeaders(),
       });
       const data = JSON.parse(response.body) as OpenRouterModelsResponse;
-      return data.data.map(m => ({ id: m.id, name: m.name ?? m.id }));
+      return data.data.map(m => ({
+        id: m.id,
+        name: m.name ?? m.id,
+        // OpenRouter publishes real modality data per model; missing means unknown
+        vision: m.architecture?.input_modalities
+          ? m.architecture.input_modalities.includes('image')
+          : undefined,
+      }));
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
       return Object.values(DEFAULT_TIER_MODELS).map(id => ({ id, name: id }));

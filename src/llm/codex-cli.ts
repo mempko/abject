@@ -185,11 +185,11 @@ export class CodexCliProvider extends BaseLLMProvider {
 
   async listModels(): Promise<ModelInfo[]> {
     return [
-      { id: AUTO_MODEL,         name: 'Auto (recommended)' },
-      { id: 'gpt-5-codex',      name: 'gpt-5-codex (ChatGPT login)' },
-      { id: 'gpt-5-codex-mini', name: 'gpt-5-codex-mini (ChatGPT login)' },
-      { id: 'gpt-5',            name: 'gpt-5 (API key only)' },
-      { id: 'gpt-5-mini',       name: 'gpt-5-mini (API key only)' },
+      { id: AUTO_MODEL,         name: 'Auto (recommended)', vision: false },
+      { id: 'gpt-5-codex',      name: 'gpt-5-codex (ChatGPT login)', vision: false },
+      { id: 'gpt-5-codex-mini', name: 'gpt-5-codex-mini (ChatGPT login)', vision: false },
+      { id: 'gpt-5',            name: 'gpt-5 (API key only)', vision: false },
+      { id: 'gpt-5-mini',       name: 'gpt-5-mini (API key only)', vision: false },
     ];
   }
 
@@ -210,11 +210,11 @@ export class CodexCliProvider extends BaseLLMProvider {
       // Codex with a ChatGPT account" if picked. "Auto" sidesteps both
       // by letting the binary choose what's valid for the current auth.
       models: [
-        { id: AUTO_MODEL,         name: 'Auto (recommended)' },
-        { id: 'gpt-5-codex',      name: 'gpt-5-codex (ChatGPT login)' },
-        { id: 'gpt-5-codex-mini', name: 'gpt-5-codex-mini (ChatGPT login)' },
-        { id: 'gpt-5',            name: 'gpt-5 (API key only)' },
-        { id: 'gpt-5-mini',       name: 'gpt-5-mini (API key only)' },
+        { id: AUTO_MODEL,         name: 'Auto (recommended)', vision: false },
+        { id: 'gpt-5-codex',      name: 'gpt-5-codex (ChatGPT login)', vision: false },
+        { id: 'gpt-5-codex-mini', name: 'gpt-5-codex-mini (ChatGPT login)', vision: false },
+        { id: 'gpt-5',            name: 'gpt-5 (API key only)', vision: false },
+        { id: 'gpt-5-mini',       name: 'gpt-5-mini (API key only)', vision: false },
       ],
       defaultTierModels: { smart: AUTO_MODEL, balanced: AUTO_MODEL, fast: AUTO_MODEL },
       // One-time migration: codex with a ChatGPT-account login refuses

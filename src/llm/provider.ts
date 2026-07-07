@@ -49,6 +49,13 @@ export interface LLMCompletionOptions {
 export interface ModelInfo {
   id: string;
   name: string;
+  /**
+   * Whether the model accepts image input through this provider (the
+   * transport matters: a CLI provider that can't carry image bytes reports
+   * false even for a vision model). Undefined means unknown — treat as
+   * "probably works" rather than blocking.
+   */
+  vision?: boolean;
 }
 
 /**

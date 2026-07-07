@@ -70,6 +70,12 @@ export class KimiProvider extends OpenAIProvider {
     return { reasoningActive: true };
   }
 
+  // Moonshot marks vision-capable models explicitly ("-vision-" variants);
+  // the K-series and plain moonshot-v1 chat models are text-only
+  protected override modelVision(modelId: string): boolean | undefined {
+    return /vision/i.test(modelId);
+  }
+
   override async listModels(): Promise<ModelInfo[]> {
     try {
       const response = await this.fetch(`${this.baseUrl}/v1/models`, {
@@ -77,14 +83,14 @@ export class KimiProvider extends OpenAIProvider {
         headers: this.buildHeaders(),
       });
       const data = JSON.parse(response.body) as KimiModelsResponse;
-      return data.data.map(m => ({ id: m.id, name: m.id }));
+      return data.data.map(m => ({ id: m.id, name: m.id, vision: this.modelVision(m.id) }));
     } catch (err) {
       log.warn(`Failed to fetch models: ${err instanceof Error ? err.message : String(err)}`);
       return [
-        { id: 'kimi-k2.6', name: 'Kimi K2.6' },
-        { id: 'moonshot-v1-128k', name: 'Moonshot v1 128k' },
-        { id: 'moonshot-v1-32k', name: 'Moonshot v1 32k' },
-        { id: 'moonshot-v1-8k', name: 'Moonshot v1 8k' },
+        { id: 'kimi-k2.6', name: 'Kimi K2.6', vision: false },
+        { id: 'moonshot-v1-128k', name: 'Moonshot v1 128k', vision: false },
+        { id: 'moonshot-v1-32k', name: 'Moonshot v1 32k', vision: false },
+        { id: 'moonshot-v1-8k', name: 'Moonshot v1 8k', vision: false },
       ];
     }
   }
@@ -98,10 +104,10 @@ export class KimiProvider extends OpenAIProvider {
       credentialLabel: 'Kimi (Moonshot) API Key',
       credentialPlaceholder: 'sk-...',
       models: [
-        { id: 'kimi-k2.6', name: 'Kimi K2.6' },
-        { id: 'moonshot-v1-128k', name: 'Moonshot v1 128k' },
-        { id: 'moonshot-v1-32k', name: 'Moonshot v1 32k' },
-        { id: 'moonshot-v1-8k', name: 'Moonshot v1 8k' },
+        { id: 'kimi-k2.6', name: 'Kimi K2.6', vision: false },
+        { id: 'moonshot-v1-128k', name: 'Moonshot v1 128k', vision: false },
+        { id: 'moonshot-v1-32k', name: 'Moonshot v1 32k', vision: false },
+        { id: 'moonshot-v1-8k', name: 'Moonshot v1 8k', vision: false },
       ],
       defaultTierModels: DEFAULT_TIER_MODELS,
     };
