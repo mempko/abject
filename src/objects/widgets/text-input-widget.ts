@@ -736,9 +736,18 @@ export class TextInputWidget extends WidgetAbject {
         });
       }
       if (focused) {
+        // One text line tall (where the first typed character will render),
+        // not the full input height — a tall composer box otherwise shows a
+        // giant caret until the first keystroke.
+        const topPad = 6;
+        const caretH = fontSize + 8;
         commands.push({
           type: 'line', surfaceId,
-          params: { x1: ox + textPadding, y1: oy + 4, x2: ox + textPadding, y2: oy + h - 4, stroke: this.theme.cursor },
+          params: {
+            x1: ox + textPadding, y1: oy + topPad + 2,
+            x2: ox + textPadding, y2: oy + topPad + caretH - 2,
+            stroke: this.theme.cursor,
+          },
         });
       }
       commands.push({ type: 'restore', surfaceId, params: {} });

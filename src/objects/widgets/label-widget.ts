@@ -79,9 +79,23 @@ export class LabelWidget extends WidgetAbject {
    * For word-wrapped text, walks through wrapped lines to find the right position.
    * For markdown text, walks through the rich layout's runs to find the source offset.
    */
+  /**
+   * X offset (from the widget's left edge) where a rendered line starts,
+   * honoring the label's alignment. Selection highlights and click-to-column
+   * mapping must both use this — measuring from the left edge alone puts
+   * them in the wrong place for right/center-aligned labels (e.g. the chat's
+   * right-justified user bubbles).
+   */
+  private lineStartOffset(align: string, w: number, lineWidth: number, textPadding: number): number {
+    if (align === 'right') return w - textPadding - lineWidth;
+    if (align === 'center') return (w - lineWidth) / 2;
+    return textPadding;
+  }
+
   private async posFromClick(clickX: number, clickY: number, surfaceId: string, ox: number, oy: number): Promise<number> {
     const font = buildFont(this.style);
     const textPadding = 4;
+    const align = this.style.align ?? 'left';
 
     // Markdown mode: use cached rich layout to map click to source offset
     if (this.style.markdown && this.cachedRichLayout) {
@@ -98,23 +112,17 @@ export class LabelWidget extends WidgetAbject {
       const yShift = Math.max(0, Math.floor((this.rect.height - totalTextHeight) / 2));
       const lineIndex = Math.max(0, Math.min(Math.floor((clickY - oy - yShift) / lineHeight), lines.length - 1));
 
-      // Find character offset within this line
-      const localX = clickX - ox - textPadding;
+      // Find character offset within this line, honoring alignment
       const lineText = lines[lineIndex];
+      const lineWidth = lineText.length > 0 ? await this.measureText(surfaceId, lineText, font) : 0;
+      const localX = clickX - ox - this.lineStartOffset(align, this.rect.width, lineWidth, textPadding);
       const colPos = await this.colFromX(localX, lineText, surfaceId, font);
 
-      // Convert (lineIndex, colPos) to flat text offset
-      let offset = 0;
-      for (let i = 0; i < lineIndex; i++) {
-        offset += lines[i].length;
-        // Account for the space/newline that was consumed by wrapping
-        // We need to find where this wrapped line starts in the original text
-      }
-      // More accurate: find cumulative character lengths of wrapped lines in original text
       return this.wrappedPosToTextPos(lines, lineIndex, colPos);
     } else {
-      // Single-line
-      const localX = clickX - ox;
+      // Single-line (drawn with 0 padding, aligned within the full width)
+      const lineWidth = this.text.length > 0 ? await this.measureText(surfaceId, this.text, font) : 0;
+      const localX = clickX - ox - this.lineStartOffset(align, this.rect.width, lineWidth, 0);
       return this.colFromX(localX, this.text, surfaceId, font);
     }
   }
@@ -429,25 +437,23 @@ export class LabelWidget extends WidgetAbject {
         if (textY - lineHeight > oy + h) break; // past bottom edge
         if (clip && (lineY + lineHeight < clip.top || lineY > clip.bottom)) continue;
 
-        // Selection highlight for this line
+        // Selection highlight for this line, anchored where the aligned
+        // line actually renders (not the widget's left edge)
         if (selStart && selEnd && i >= selStart.line && i <= selEnd.line) {
-          let selStartX = ox + textPadding;
-          let selEndX = ox + w - textPadding;
+          const lineWidth = lines[i].length > 0
+            ? await this.measureText(surfaceId, lines[i], font) : 0;
+          const lineX = ox + this.lineStartOffset(align, w, lineWidth, textPadding);
+          let selStartX = lineX;
+          let selEndX = lineX + lineWidth;
 
-          if (i === selStart.line && i === selEnd.line) {
+          if (i === selStart.line) {
             const beforeStart = lines[i].substring(0, selStart.col);
-            const beforeEnd = lines[i].substring(0, selEnd.col);
-            selStartX = ox + textPadding + (beforeStart.length > 0
+            selStartX = lineX + (beforeStart.length > 0
               ? await this.measureText(surfaceId, beforeStart, font) : 0);
-            selEndX = ox + textPadding + (beforeEnd.length > 0
-              ? await this.measureText(surfaceId, beforeEnd, font) : 0);
-          } else if (i === selStart.line) {
-            const beforeStart = lines[i].substring(0, selStart.col);
-            selStartX = ox + textPadding + (beforeStart.length > 0
-              ? await this.measureText(surfaceId, beforeStart, font) : 0);
-          } else if (i === selEnd.line) {
+          }
+          if (i === selEnd.line) {
             const beforeEnd = lines[i].substring(0, selEnd.col);
-            selEndX = ox + textPadding + (beforeEnd.length > 0
+            selEndX = lineX + (beforeEnd.length > 0
               ? await this.measureText(surfaceId, beforeEnd, font) : 0);
           }
 
@@ -507,13 +513,16 @@ export class LabelWidget extends WidgetAbject {
       // Single-line rendering
 
       // Selection highlight (single-line). Same focus-gate removal as
-      // the wrapped path above.
+      // the wrapped path above; anchored to the aligned text start.
       if (sel) {
+        const fullWidth = this.text.length > 0
+          ? await this.measureText(surfaceId, this.text, font) : 0;
+        const lineX = ox + this.lineStartOffset(align, w, fullWidth, 0);
         const beforeStart = this.text.substring(0, sel.start);
         const beforeEnd = this.text.substring(0, sel.end);
-        const startX = ox + (beforeStart.length > 0
+        const startX = lineX + (beforeStart.length > 0
           ? await this.measureText(surfaceId, beforeStart, font) : 0);
-        const endX = ox + (beforeEnd.length > 0
+        const endX = lineX + (beforeEnd.length > 0
           ? await this.measureText(surfaceId, beforeEnd, font) : 0);
         if (endX > startX) {
           commands.push({
