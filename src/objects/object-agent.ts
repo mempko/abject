@@ -23,6 +23,13 @@ interface TaskExtra {
   lastResult?: string;
   lastLlmContent?: ContentPart[];
   taskData?: Record<string, unknown>;
+  /**
+   * Goal this task belongs to. Actions must read it from here, not from the
+   * shared `_currentGoalId` field: the queue runner starts the next task
+   * while the previous executeTask handler is still unwinding, and that
+   * handler's cleanup used to wipe the new task's goal context.
+   */
+  goalId?: string;
 }
 
 export class ObjectAgent extends Abject {
@@ -162,7 +169,7 @@ When asked about a task, describe which objects you would message and what you w
 
       // Use queue-runner-supplied taskId for inFlight match; fall back for legacy.
       const taskId = explicitTaskId ?? tupleId ?? `obj-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      this.taskExtras.set(taskId, { taskData: data });
+      this.taskExtras.set(taskId, { taskData: data, goalId });
       this._currentGoalId = goalId;
 
       try {
@@ -207,7 +214,9 @@ When asked about a task, describe which objects you would message and what you w
         return { success: result.success, result: result.result, error: result.error };
       } finally {
         this.taskExtras.delete(taskId);
-        this._currentGoalId = undefined;
+        // Only clear if it's still ours — the queue runner may have started
+        // the next task (which set its own goal) while we were unwinding
+        if (this._currentGoalId === goalId) this._currentGoalId = undefined;
       }
     });
 
@@ -367,6 +376,8 @@ When asked about a task, describe which objects you would message and what you w
   private async handleAct(taskId: string, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string }> {
     const extra = this.taskExtras.get(taskId) ?? {};
     this.taskExtras.set(taskId, extra);
+    // Per-task goal context; the shared field is only a legacy fallback
+    const goalId = extra.goalId ?? this._currentGoalId;
 
     try {
       let result: string;
@@ -432,8 +443,8 @@ When asked about a task, describe which objects you would message and what you w
               // as a markdown bubble. Routes data URI bytes around the LLM —
               // attachMedia skips conversationHistory so neither this agent's
               // LLM nor the chat's LLM ever sees the raw base64.
-              if (this._currentGoalId && this.goalManagerId) {
-                this.deliverScreenshotToChat(this._currentGoalId, img).catch(() => {
+              if (goalId && this.goalManagerId) {
+                this.deliverScreenshotToChat(goalId, img).catch(() => {
                   // Best-effort: chat may have closed, or creator may not be a Chat.
                 });
               }
@@ -448,13 +459,13 @@ When asked about a task, describe which objects you would message and what you w
         }
 
         case 'write_scratchpad': {
-          if (!this._currentGoalId) return { success: false, error: 'write_scratchpad requires an active goal context' };
+          if (!goalId) return { success: false, error: 'write_scratchpad requires an active goal context' };
           if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
           const key = action.key as string;
           if (!key) return { success: false, error: 'write_scratchpad requires "key"' };
           await this.request(
             request(this.id, this.goalManagerId, 'writeGoalData', {
-              goalId: this._currentGoalId, key, value: action.value,
+              goalId, key, value: action.value,
             }),
           );
           result = `Wrote scratchpad key "${key}"`;
@@ -462,12 +473,12 @@ When asked about a task, describe which objects you would message and what you w
         }
 
         case 'read_scratchpad': {
-          if (!this._currentGoalId) return { success: false, error: 'read_scratchpad requires an active goal context' };
+          if (!goalId) return { success: false, error: 'read_scratchpad requires an active goal context' };
           if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
           const key = action.key as string | undefined;
           const value = await this.request(
             request(this.id, this.goalManagerId, 'readGoalData', {
-              goalId: this._currentGoalId, ...(key ? { key } : {}),
+              goalId, ...(key ? { key } : {}),
             }),
           );
           result = typeof value === 'string' ? value : JSON.stringify(value);

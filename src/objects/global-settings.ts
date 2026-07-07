@@ -53,6 +53,9 @@ const STORAGE_KEY_TIER_BALANCED_PROVIDER = 'global-settings:tierBalancedProvider
 const STORAGE_KEY_TIER_BALANCED_MODEL = 'global-settings:tierBalancedModel';
 const STORAGE_KEY_TIER_FAST_PROVIDER = 'global-settings:tierFastProvider';
 const STORAGE_KEY_TIER_FAST_MODEL = 'global-settings:tierFastModel';
+// Optional vision-fallback model: substitutes for a text-only tier model on image-bearing steps
+const STORAGE_KEY_VISION_PROVIDER = 'global-settings:tierVisionProvider';
+const STORAGE_KEY_VISION_MODEL = 'global-settings:tierVisionModel';
 
 /**
  * Provider list, labels, default tier models, credential metadata, and
@@ -130,6 +133,16 @@ export class GlobalSettings extends Abject {
    * subsequent Save would persist the reset).
    */
   private tierDesiredModelIds: Record<ModelTierName, string | null> = { smart: null, balanced: null, fast: null };
+
+  // Optional vision-fallback row: provider dropdown (with a leading 'None'),
+  // model dropdown, capability label, and the intended model id (same
+  // stale-label protection as the tier rows).
+  private visionProviderSelectId?: AbjectId;
+  private visionModelSelectId?: AbjectId;
+  private visionCapLabelId?: AbjectId;
+  private visionDesiredModelId: string | null = null;
+  /** Provider-dropdown label meaning "no vision fallback configured". */
+  private static readonly VISION_NONE_LABEL = 'None';
 
   private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
@@ -324,6 +337,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       balanced: { provider: null, model: null },
       fast: { provider: null, model: null },
     };
+    const visionFallback: { provider: string | null; model: string | null } = { provider: null, model: null };
 
     if (this.storageId) {
       // Per-provider credential keys derived from each description's
@@ -361,6 +375,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       );
       tierRouting.fast.model = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_FAST_MODEL })
+      );
+      visionFallback.provider = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_VISION_PROVIDER })
+      );
+      visionFallback.model = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_VISION_MODEL })
       );
 
       // Apply each provider's optional `modelMigrations` map to saved
@@ -470,7 +490,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const hasAnyConfig = Object.keys(credentials).length > 0;
     const hasTierConfig = tierRouting.smart.provider || tierRouting.balanced.provider || tierRouting.fast.provider;
     if ((hasAnyConfig || hasTierConfig) && this.llmId) {
-      await this.configureProviders(credentials, tierRouting);
+      await this.configureProviders(credentials, tierRouting, visionFallback);
       log.info('Loaded saved provider configuration');
     } else {
       await this.show();
@@ -499,6 +519,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
   private async configureProviders(
     credentials: Partial<Record<LLMProviderName, string>>,
     tierRouting: Record<ModelTierName, { provider: string | null; model: string | null }>,
+    visionFallback?: { provider: string | null; model: string | null },
   ): Promise<void> {
     if (!this.llmId) return;
 
@@ -521,6 +542,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     await this.request(request(this.id, this.llmId, 'configure', {
       credentials: credMap,
       tierRouting: Object.keys(routing).length > 0 ? routing : undefined,
+      // null clears a previously-set fallback; undefined leaves it untouched
+      visionFallback: visionFallback === undefined
+        ? undefined
+        : (visionFallback.provider && visionFallback.model
+          ? { provider: visionFallback.provider, model: visionFallback.model }
+          : null),
     }));
   }
 
@@ -640,6 +667,18 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
           await this.onTierModelChanged(tier);
           return;
         }
+      }
+
+      // Vision-fallback row dropdowns
+      if (fromId === this.visionProviderSelectId && aspect === 'change') {
+        await this.refreshVisionModelOptions();
+        const provider = await this.visionSelectedProvider();
+        if (provider) void this.refreshProviderModels(provider);
+        return;
+      }
+      if (fromId === this.visionModelSelectId && aspect === 'change') {
+        await this.onVisionModelChanged();
+        return;
       }
 
       // Auth checkbox toggled
@@ -961,6 +1000,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       balanced: { provider: null, model: null },
       fast: { provider: null, model: null },
     };
+    const savedVisionFallback: { provider: string | null; model: string | null } = { provider: null, model: null };
     if (this.storageId) {
       savedTierRouting.smart.provider = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_SMART_PROVIDER })
@@ -979,6 +1019,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       );
       savedTierRouting.fast.model = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_FAST_MODEL })
+      );
+      savedVisionFallback.provider = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_VISION_PROVIDER })
+      );
+      savedVisionFallback.model = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_VISION_MODEL })
       );
     }
 
@@ -1183,7 +1229,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         { type: 'label', windowId: this.windowId, text: 'Model Tiers',
           style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
         { type: 'label', windowId: this.windowId,
-          text: 'Choose a provider and model for each quality tier. Screenshots and pasted images go to Smart and Balanced, so pick 👁 vision models there.',
+          text: 'Choose a provider and model for each quality tier. Screenshots and pasted images need a 👁 vision model; the optional Vision row is the fallback used for image steps when a tier\'s model is text-only.',
           style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true } },
       ]})
     );
@@ -1195,7 +1241,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     await this.request(request(this.id, cId, 'addLayoutChild', {
       widgetId: tierDescId,
       sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 34 },
+      preferredSize: { height: 50 },
     }));
 
     // Per-tier rows: [Label] [Provider dropdown] [Model dropdown]
@@ -1289,6 +1335,99 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       this.tierCapLabelIds[tier] = capLabelId;
       await this.request(request(this.id, tierRowId, 'addLayoutChild', {
         widgetId: capLabelId,
+        sizePolicy: { horizontal: 'fixed' },
+        preferredSize: { width: 62, height: 32 },
+      }));
+    }
+
+    // ── Vision fallback row ──
+    // Optional substitute model for image-bearing steps when a tier's model
+    // is text-only. 'None' disables it. Same row shape as the tiers.
+    {
+      this.visionDesiredModelId = savedVisionFallback.model;
+
+      const visionRowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+          parentLayoutId: cId,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 8,
+        })
+      );
+      await this.request(request(this.id, cId, 'addLayoutChild', {
+        widgetId: visionRowId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 32 },
+      }));
+
+      const { widgetIds: [visionLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: 'Vision',
+            style: { color: this.theme.textHeading, fontSize: 13 } },
+        ]})
+      );
+      await this.request(request(this.id, visionRowId, 'addLayoutChild', {
+        widgetId: visionLabelId,
+        sizePolicy: { horizontal: 'fixed' },
+        preferredSize: { width: 65, height: 32 },
+      }));
+
+      const providerIds = this.providerIds();
+      const savedProvider = savedVisionFallback.provider;
+      const providerOptions = [GlobalSettings.VISION_NONE_LABEL, ...this.providerLabels()];
+      const savedProviderIdx = savedProvider ? providerIds.indexOf(savedProvider) : -1;
+      const { widgetIds: [visionProviderSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'select', windowId: this.windowId,
+            options: providerOptions,
+            selectedIndex: savedProviderIdx >= 0 ? savedProviderIdx + 1 : 0 },
+        ]})
+      );
+      this.visionProviderSelectId = visionProviderSelectId;
+      await this.request(request(this.id, visionProviderSelectId, 'addDependent', {}));
+      await this.request(request(this.id, visionRowId, 'addLayoutChild', {
+        widgetId: visionProviderSelectId,
+        sizePolicy: { horizontal: 'fixed' },
+        preferredSize: { width: 120, height: 32 },
+      }));
+
+      const visionActiveProvider = savedProviderIdx >= 0 ? (savedProvider as LLMProviderName) : null;
+      const visionModelList = visionActiveProvider ? (this.providerModelCache.get(visionActiveProvider) ?? []) : [];
+      const visionModelOptions = visionActiveProvider
+        ? (visionModelList.length > 0 ? visionModelList.map(m => m.name) : ['(no models)'])
+        : ['(none)'];
+      let visionModelIdx = 0;
+      if (savedVisionFallback.model && visionModelList.length > 0) {
+        const idx = visionModelList.findIndex(m => m.id === savedVisionFallback.model);
+        if (idx >= 0) visionModelIdx = idx;
+      }
+
+      const { widgetIds: [visionModelSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'select', windowId: this.windowId,
+            options: visionModelOptions,
+            selectedIndex: visionModelIdx },
+        ]})
+      );
+      this.visionModelSelectId = visionModelSelectId;
+      await this.request(request(this.id, visionModelSelectId, 'addDependent', {}));
+      await this.request(request(this.id, visionRowId, 'addLayoutChild', {
+        widgetId: visionModelSelectId,
+        sizePolicy: { horizontal: 'expanding' },
+        preferredSize: { height: 32 },
+      }));
+
+      const visionCap = visionActiveProvider
+        ? this.capabilityLabelFor(visionActiveProvider, visionModelOptions[visionModelIdx] ?? '')
+        : { text: '', color: this.theme.textTertiary };
+      const { widgetIds: [visionCapLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId, text: visionCap.text,
+            style: { color: visionCap.color, fontSize: 11 } },
+        ]})
+      );
+      this.visionCapLabelId = visionCapLabelId;
+      await this.request(request(this.id, visionRowId, 'addLayoutChild', {
+        widgetId: visionCapLabelId,
         sizePolicy: { horizontal: 'fixed' },
         preferredSize: { width: 62, height: 32 },
       }));
@@ -1392,6 +1531,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     for (const tier of TIER_NAMES) {
       const p = savedTierRouting[tier].provider;
       if (p && this.providerDescById.has(p)) toPrefetch.add(p);
+    }
+    if (savedVisionFallback.provider && this.providerDescById.has(savedVisionFallback.provider)) {
+      toPrefetch.add(savedVisionFallback.provider);
     }
     for (const p of toPrefetch) {
       void this.refreshProviderModels(p);
@@ -1589,6 +1731,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.tierProviderSelectIds = { smart: undefined, balanced: undefined, fast: undefined };
     this.tierModelSelectIds = { smart: undefined, balanced: undefined, fast: undefined };
     this.tierCapLabelIds = { smart: undefined, balanced: undefined, fast: undefined };
+    this.visionProviderSelectId = undefined;
+    this.visionModelSelectId = undefined;
+    this.visionCapLabelId = undefined;
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
     this.authCheckboxId = undefined;
@@ -1685,6 +1830,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       this.saveBtnId, this.providerSelectorId, this.credentialInputId, this.credentialToggleId,
       ...Object.values(this.tierProviderSelectIds),
       ...Object.values(this.tierModelSelectIds),
+      this.visionProviderSelectId,
+      this.visionModelSelectId,
     ];
     for (const id of ids) {
       if (id) {
@@ -1840,6 +1987,15 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const tierProvider = this.idForLabel(label);
         if (tierProvider === name) {
           await this.refreshTierModelOptions(tier);
+        }
+      } catch { /* widget gone */ }
+    }
+
+    // Same for the vision-fallback row
+    if (this.visionProviderSelectId) {
+      try {
+        if (await this.visionSelectedProvider() === name) {
+          await this.refreshVisionModelOptions();
         }
       } catch { /* widget gone */ }
     }
@@ -2063,6 +2219,80 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       await this.request(request(this.id, capLabelId, 'update', {
         text: cap.text,
         style: { color: cap.color, fontSize: 11 },
+      }));
+    } catch { /* widget gone */ }
+  }
+
+  // ── Vision-fallback row ───────────────────────────────────────────
+
+  /** The vision row's selected provider id, or null when set to 'None'. */
+  private async visionSelectedProvider(): Promise<LLMProviderName | null> {
+    if (!this.visionProviderSelectId) return null;
+    const label = await this.request<string>(
+      request(this.id, this.visionProviderSelectId, 'getValue', {})
+    );
+    if (label === GlobalSettings.VISION_NONE_LABEL) return null;
+    return this.idForLabel(label) ?? null;
+  }
+
+  /** Rebuild the vision row's model options after its provider changed or models arrived. */
+  private async refreshVisionModelOptions(): Promise<void> {
+    if (!this.visionModelSelectId) return;
+    const provider = await this.visionSelectedProvider();
+
+    if (!provider) {
+      await this.request(
+        request(this.id, this.visionModelSelectId, 'update', { options: ['(none)'], selectedIndex: 0 })
+      );
+      await this.updateVisionCapLabel('', this.theme.textTertiary);
+      return;
+    }
+
+    const currentLabel = await this.request<string>(
+      request(this.id, this.visionModelSelectId, 'getValue', {})
+    );
+    const modelList = this.providerModelCache.get(provider) ?? [];
+    const options = modelList.length > 0 ? modelList.map(m => m.name) : ['(no models)'];
+
+    // Same intended-id preservation as the tier rows, then a vision-friendly
+    // default: this row exists to pick a vision model, so land on the first
+    // one rather than the list head when there is no better selection.
+    const desiredIdx = this.visionDesiredModelId
+      ? modelList.findIndex(m => m.id === this.visionDesiredModelId)
+      : -1;
+    let keepIdx = desiredIdx >= 0 ? desiredIdx : options.indexOf(currentLabel);
+    if (keepIdx < 0) keepIdx = modelList.findIndex(m => m.vision === true);
+    const selectedIndex = keepIdx >= 0 ? keepIdx : 0;
+
+    await this.request(
+      request(this.id, this.visionModelSelectId, 'update', { options, selectedIndex })
+    );
+    const cap = this.capabilityLabelFor(provider, options[selectedIndex] ?? '');
+    await this.updateVisionCapLabel(cap.text, cap.color);
+  }
+
+  /** The user picked a vision-fallback model: remember the id + repaint the label. */
+  private async onVisionModelChanged(): Promise<void> {
+    if (!this.visionModelSelectId) return;
+    const provider = await this.visionSelectedProvider();
+    if (!provider) return;
+    try {
+      const modelName = await this.request<string>(
+        request(this.id, this.visionModelSelectId, 'getValue', {})
+      );
+      const info = (this.providerModelCache.get(provider) ?? []).find(m => m.name === modelName);
+      this.visionDesiredModelId = info?.id ?? null;
+      const cap = this.capabilityLabelFor(provider, modelName);
+      await this.updateVisionCapLabel(cap.text, cap.color);
+    } catch { /* widget gone */ }
+  }
+
+  private async updateVisionCapLabel(text: string, color: string): Promise<void> {
+    if (!this.visionCapLabelId) return;
+    try {
+      await this.request(request(this.id, this.visionCapLabelId, 'update', {
+        text,
+        style: { color, fontSize: 11 },
       }));
     } catch { /* widget gone */ }
   }
@@ -3341,6 +3571,26 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }
     }
 
+    // Read the optional vision-fallback row
+    const visionFallback: { provider: string | null; model: string | null } = { provider: null, model: null };
+    if (this.visionProviderSelectId && this.visionModelSelectId) {
+      const provider = await this.visionSelectedProvider();
+      if (provider) {
+        const modelName = await this.request<string>(
+          request(this.id, this.visionModelSelectId, 'getValue', {})
+        );
+        if (modelName && modelName !== '(no models)' && modelName !== '(none)') {
+          const modelList = this.providerModelCache.get(provider) ?? [];
+          const modelInfo = modelList.find(m => m.name === modelName);
+          visionFallback.provider = provider;
+          visionFallback.model = modelInfo ? modelInfo.id : modelName;
+          this.visionDesiredModelId = visionFallback.model;
+        }
+      } else {
+        this.visionDesiredModelId = null;
+      }
+    }
+
     // Validate: at least one tier must have a valid config
     const hasAnyTier = TIER_NAMES.some(t => tierRouting[t].provider && tierRouting[t].model);
     if (!hasAnyTier) {
@@ -3362,6 +3612,19 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const tierLabel = TIER_LABELS[TIER_NAMES.indexOf(tier)];
         await this.setStatus(
           `${tierLabel} tier uses ${desc.label} but no API key provided.`,
+          this.theme.statusErrorBright,
+        );
+        await this.setSaveControlsDisabled(false);
+        return;
+      }
+    }
+
+    // Same credential check for the vision fallback's provider
+    if (visionFallback.provider) {
+      const desc = this.descById(visionFallback.provider);
+      if (desc && desc.credentialMode === 'apiKey' && !this.credentialValues[visionFallback.provider]) {
+        await this.setStatus(
+          `Vision fallback uses ${desc.label} but no API key provided.`,
           this.theme.statusErrorBright,
         );
         await this.setSaveControlsDisabled(false);
@@ -3391,10 +3654,25 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
       // Persist tier routing
       await this.persistTierRouting(tierRouting);
+
+      // Persist the vision fallback ('None' clears the saved keys)
+      if (visionFallback.provider && visionFallback.model) {
+        await this.request(request(this.id, this.storageId, 'set', {
+          key: STORAGE_KEY_VISION_PROVIDER, value: visionFallback.provider,
+        }));
+        await this.request(request(this.id, this.storageId, 'set', {
+          key: STORAGE_KEY_VISION_MODEL, value: visionFallback.model,
+        }));
+      } else {
+        try {
+          await this.request(request(this.id, this.storageId, 'delete', { key: STORAGE_KEY_VISION_PROVIDER }));
+          await this.request(request(this.id, this.storageId, 'delete', { key: STORAGE_KEY_VISION_MODEL }));
+        } catch { /* nothing saved yet */ }
+      }
     }
 
-    // Configure all providers and tier routing
-    await this.configureProviders(this.credentialValues, tierRouting);
+    // Configure all providers, tier routing, and the vision fallback
+    await this.configureProviders(this.credentialValues, tierRouting, visionFallback);
 
     log.info('Saved provider settings with per-tier routing');
     await this.setStatus('Settings saved!');
@@ -3408,6 +3686,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     for (const tier of TIER_NAMES) {
       const p = tierRouting[tier].provider;
       if (p && this.providerDescById.has(p)) prefetch.add(p);
+    }
+    if (visionFallback.provider && this.providerDescById.has(visionFallback.provider)) {
+      prefetch.add(visionFallback.provider);
     }
     for (const p of prefetch) {
       void this.refreshProviderModels(p, { force: true });

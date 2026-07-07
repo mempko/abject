@@ -25,6 +25,13 @@ const SKILL_AGENT_INTERFACE: InterfaceId = 'abjects:skill-agent';
 
 interface TaskExtra {
   lastResult?: string;
+  /**
+   * Goal this task belongs to. Actions must read it from here, not from the
+   * shared `_currentGoalId` field: the queue runner starts the next task
+   * while the previous executeTask handler is still unwinding, and that
+   * handler's cleanup used to wipe the new task's goal context.
+   */
+  goalId?: string;
 }
 
 export class SkillAgent extends Abject {
@@ -175,7 +182,7 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
       // SkillAgent's TaskExtra, and AgentAbject's queue inFlight slot share
       // one ID. Falls back to a fresh `skill-exec-${...}` for legacy callers.
       const taskId = explicitTaskId ?? tupleId ?? `skill-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      this.taskExtras.set(taskId, {});
+      this.taskExtras.set(taskId, { goalId });
       this._currentGoalId = goalId;
 
       try {
@@ -213,7 +220,9 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         return { success: result.success, result: result.result, error: result.error };
       } finally {
         this.taskExtras.delete(taskId);
-        this._currentGoalId = undefined;
+        // Only clear if it's still ours — the queue runner may have started
+        // the next task (which set its own goal) while we were unwinding
+        if (this._currentGoalId === goalId) this._currentGoalId = undefined;
       }
     });
 
@@ -399,6 +408,8 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
   private async handleAct(taskId: string, action: AgentAction): Promise<{ success: boolean; data?: unknown; error?: string }> {
     const extra = this.taskExtras.get(taskId) ?? {};
     this.taskExtras.set(taskId, extra);
+    // Per-task goal context; the shared field is only a legacy fallback
+    const goalId = extra.goalId ?? this._currentGoalId;
 
     try {
       let result: string;
@@ -597,13 +608,13 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         }
 
         case 'write_scratchpad': {
-          if (!this._currentGoalId) return { success: false, error: 'write_scratchpad requires an active goal context' };
+          if (!goalId) return { success: false, error: 'write_scratchpad requires an active goal context' };
           if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
           const key = action.key as string;
           if (!key) return { success: false, error: 'write_scratchpad requires "key"' };
           await this.request(
             request(this.id, this.goalManagerId, 'writeGoalData', {
-              goalId: this._currentGoalId, key, value: action.value,
+              goalId, key, value: action.value,
             }),
           );
           result = `Wrote scratchpad key "${key}"`;
@@ -611,12 +622,12 @@ When invited to contribute to a Sprint Plan, describe the specific task I could 
         }
 
         case 'read_scratchpad': {
-          if (!this._currentGoalId) return { success: false, error: 'read_scratchpad requires an active goal context' };
+          if (!goalId) return { success: false, error: 'read_scratchpad requires an active goal context' };
           if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
           const key = action.key as string | undefined;
           const value = await this.request(
             request(this.id, this.goalManagerId, 'readGoalData', {
-              goalId: this._currentGoalId, ...(key ? { key } : {}),
+              goalId, ...(key ? { key } : {}),
             }),
           );
           result = typeof value === 'string' ? value : JSON.stringify(value);

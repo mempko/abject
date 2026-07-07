@@ -38,6 +38,13 @@ interface WebTaskExtra {
   lastScreenshot?: string;  // raw base64 (no data URI prefix)
   keepPageOpen?: boolean;          // don't close page after task completes
   pageOpenedByThisTask?: boolean;  // tracks if WE opened it (for cleanup on error)
+  /**
+   * Goal this task belongs to. Actions must read it from here, not from the
+   * shared `_currentGoalId` field: the queue runner starts the next task
+   * while the previous executeTask handler is still unwinding, and that
+   * handler's cleanup used to wipe the new task's goal context.
+   */
+  goalId?: string;
 }
 
 // ─── WebAgent ───────────────────────────────────────────────────────
@@ -524,7 +531,7 @@ Set keepPageOpen: false to explicitly close the page when done.
       const profile = profileFromData ?? profileFromDescription;
       const pageOptions: WebTaskExtra['pageOptions'] = profile ? { profile } : undefined;
 
-      const extra: WebTaskExtra = { startUrl, pageOptions };
+      const extra: WebTaskExtra = { startUrl, pageOptions, goalId };
       this.taskExtras.set(taskId, extra);
 
       if (profile) {
@@ -595,7 +602,9 @@ Set keepPageOpen: false to explicitly close the page when done.
         }
         throw err; // Re-throw so AgentAbject's dispatchToAgent records the failure
       } finally {
-        this._currentGoalId = undefined;
+        // Only clear if it's still ours — the queue runner may have started
+        // the next task (which set its own goal) while we were unwinding
+        if (this._currentGoalId === goalId) this._currentGoalId = undefined;
       }
     });
 
@@ -872,6 +881,8 @@ Set keepPageOpen: false to explicitly close the page when done.
         smart: tiers.smart?.vision ?? null,
         balanced: tiers.balanced?.vision ?? null,
       };
+      // Present only when a vision-fallback model is configured
+      if (tiers.visionFallback) caps.fallback = tiers.visionFallback.vision ?? null;
       this.tierVisionCache = { caps, at: now };
       return caps;
     } catch {
@@ -900,8 +911,10 @@ Set keepPageOpen: false to explicitly close the page when done.
 
       // Vision-aware routing: only ship a screenshot a model can actually
       // see. If the complexity-chosen tier is text-only but the other think
-      // tier can see, use that one; if neither can, skip the screenshot
-      // entirely and navigate from the ARIA snapshot alone.
+      // tier can see, use that one; a configured vision-fallback model also
+      // counts (the think loop reroutes image steps to it). Only when nothing
+      // can see is the screenshot skipped and navigation goes by the ARIA
+      // snapshot alone.
       let visionAvailable = true;
       const caps = await this.tierVision();
       if (caps && caps[tier] === false) {
@@ -909,6 +922,8 @@ Set keepPageOpen: false to explicitly close the page when done.
         if (caps[other] !== false) {
           log.info(`Observe: '${tier}' tier model is text-only; using '${other}' for vision`);
           tier = other;
+        } else if ('fallback' in caps && caps.fallback !== false) {
+          log.info(`Observe: think tiers are text-only; image steps will run on the vision fallback`);
         } else {
           visionAvailable = false;
         }
@@ -981,6 +996,8 @@ Set keepPageOpen: false to explicitly close the page when done.
     const webId = this.webBrowserId!;
     const pageId = extra.pageId;
     const ref = action.ref as string | undefined;
+    // Per-task goal context; the shared field is only a legacy fallback
+    const goalId = extra.goalId ?? this._currentGoalId;
 
     // Log the action with its key parameter
     const actionParam = ref ?? action.selector ?? action.url ?? action.key ?? action.script?.toString().slice(0, 40) ?? '';
@@ -1082,10 +1099,10 @@ Set keepPageOpen: false to explicitly close the page when done.
           const shot = await this.request<{ dataUri: string; width: number; height: number }>(
             request(this.id, webId, 'screenshotPage', { pageId })
           );
-          if (this._currentGoalId && this.goalManagerId) {
+          if (goalId && this.goalManagerId) {
             try {
               const goal = await this.request<{ createdBy?: AbjectId } | null>(
-                request(this.id, this.goalManagerId, 'getGoal', { goalId: this._currentGoalId }),
+                request(this.id, this.goalManagerId, 'getGoal', { goalId }),
                 5000,
               );
               if (goal?.createdBy) {
@@ -1101,25 +1118,25 @@ Set keepPageOpen: false to explicitly close the page when done.
         }
 
         case 'write_scratchpad': {
-          if (!this._currentGoalId) return { success: false, error: 'write_scratchpad requires an active goal context' };
+          if (!goalId) return { success: false, error: 'write_scratchpad requires an active goal context' };
           if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
           const key = action.key as string;
           if (!key) return { success: false, error: 'write_scratchpad requires "key"' };
           await this.request(
             request(this.id, this.goalManagerId, 'writeGoalData', {
-              goalId: this._currentGoalId, key, value: action.value,
+              goalId, key, value: action.value,
             }),
           );
           return { success: true, data: `Wrote scratchpad key "${key}"` };
         }
 
         case 'read_scratchpad': {
-          if (!this._currentGoalId) return { success: false, error: 'read_scratchpad requires an active goal context' };
+          if (!goalId) return { success: false, error: 'read_scratchpad requires an active goal context' };
           if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
           const key = action.key as string | undefined;
           const value = await this.request(
             request(this.id, this.goalManagerId, 'readGoalData', {
-              goalId: this._currentGoalId, ...(key ? { key } : {}),
+              goalId, ...(key ? { key } : {}),
             }),
           );
           return { success: true, data: value };

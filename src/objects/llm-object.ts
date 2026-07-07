@@ -65,7 +65,16 @@ export interface TierCapability {
   vision: boolean | null;
 }
 
-export type TierCapabilities = Record<ModelTier, TierCapability | null>;
+export interface TierCapabilities {
+  smart: TierCapability | null;
+  balanced: TierCapability | null;
+  fast: TierCapability | null;
+  /**
+   * Optional vision substitute: the model to use for an image-bearing step
+   * when the requested tier's model is text-only. Null when not configured.
+   */
+  visionFallback: TierCapability | null;
+}
 import { AnthropicProvider } from '../llm/anthropic.js';
 import { OpenAIProvider } from '../llm/openai.js';
 import { ClaudeCliProvider } from '../llm/claude-cli.js';
@@ -147,6 +156,8 @@ export class LLMObject extends Abject {
   private providers: Map<string, LLMProvider> = new Map();
   private defaultProvider?: string;
   private tierRouting: TierRouting = {};
+  /** Optional vision substitute for image-bearing steps on text-only tiers. */
+  private visionFallback?: TierConfig;
   private httpClientId?: AbjectId;
 
   // Stats and request tracking
@@ -380,7 +391,7 @@ export class LLMObject extends Abject {
               },
               {
                 name: 'describeTiers',
-                description: 'Describe the effective model behind each tier (smart/balanced/fast) including capabilities. Returns { smart, balanced, fast } where each entry is { provider, model, vision } — vision is true when the model accepts image input, false when it is text-only, and null when unknown. Consult this before sending image content: pick a tier whose vision is not false, or omit the image.',
+                description: 'Describe the effective model behind each tier (smart/balanced/fast) including capabilities. Returns { smart, balanced, fast, visionFallback } where each entry is { provider, model, vision } — vision is true when the model accepts image input, false when it is text-only, and null when unknown. visionFallback is the optional substitute model for image-bearing steps when a tier is text-only (null when not configured); to use it, pass its provider in the request payload and its model in options.model. Consult this before sending image content: pick a tier whose vision is not false, use the fallback, or omit the image.',
                 parameters: [],
                 returns: { kind: 'reference', reference: 'TierCapabilities' },
               },
@@ -520,7 +531,7 @@ export class LLMObject extends Abject {
       }
 
       const totalChars = messages.reduce((sum, m2) => sum + getTextContent(m2).length, 0);
-      log.info(`→ ${provider.name} stream | ${messages.length} msgs | ${totalChars} chars | model=${modelOverride ?? 'provider-default'}`);
+      log.info(`→ ${provider.name} stream | ${messages.length} msgs | ${totalChars} chars | model=${effectiveOptions?.model ?? 'provider-default'}`);
       const start = Date.now();
 
       const activeReq = await this.trackRequestStart(
@@ -603,6 +614,7 @@ export class LLMObject extends Abject {
       const config = msg.payload as {
         credentials?: Record<string, string>;
         tierRouting?: TierRouting;
+        visionFallback?: TierConfig | null;
       };
       await this.configure(config);
       return true;
@@ -620,9 +632,13 @@ export class LLMObject extends Abject {
     });
 
     this.on('setTierRouting', async (msg: AbjectMessage) => {
-      const { tierRouting } = msg.payload as { tierRouting: TierRouting };
+      const { tierRouting, visionFallback } = msg.payload as {
+        tierRouting: TierRouting;
+        visionFallback?: TierConfig | null;
+      };
       this.tierRouting = { ...tierRouting };
-      log.info(`Tier routing updated: ${JSON.stringify(this.tierRouting)}`);
+      if (visionFallback !== undefined) this.visionFallback = visionFallback ?? undefined;
+      log.info(`Tier routing updated: ${JSON.stringify(this.tierRouting)} visionFallback=${JSON.stringify(this.visionFallback ?? null)}`);
       return true;
     });
 
@@ -787,6 +803,7 @@ export class LLMObject extends Abject {
   async configure(config: {
     credentials?: Record<string, string>;
     tierRouting?: TierRouting;
+    visionFallback?: TierConfig | null;
   }): Promise<void> {
     const fetchFn = this.httpClientId ? this.createFetchDelegate() : undefined;
     const credentials = config.credentials ?? {};
@@ -831,6 +848,12 @@ export class LLMObject extends Abject {
       this.tierRouting = { ...config.tierRouting };
       log.info(`Tier routing configured: ${JSON.stringify(this.tierRouting)}`);
     }
+
+    // Vision fallback: undefined leaves it untouched, null clears it
+    if (config.visionFallback !== undefined) {
+      this.visionFallback = config.visionFallback ?? undefined;
+      log.info(`Vision fallback configured: ${JSON.stringify(this.visionFallback ?? null)}`);
+    }
   }
 
   /**
@@ -849,7 +872,7 @@ export class LLMObject extends Abject {
       : options;
 
     const totalChars = messages.reduce((sum, m2) => sum + getTextContent(m2).length, 0);
-    log.info(`→ ${provider.name} | ${messages.length} msgs | ${totalChars} chars | tier=${options?.tier ?? 'default'} model=${modelOverride ?? 'provider-default'} maxTokens=${options?.maxTokens ?? 'default'}`);
+    log.info(`→ ${provider.name} | ${messages.length} msgs | ${totalChars} chars | tier=${options?.tier ?? 'default'} model=${effectiveOptions?.model ?? 'provider-default'} maxTokens=${options?.maxTokens ?? 'default'}`);
     const start = Date.now();
 
     // Track active request
@@ -1483,6 +1506,18 @@ Only output the code, no explanations. Use proper formatting and comments.`;
    */
   async describeTiers(): Promise<TierCapabilities> {
     const out = {} as TierCapabilities;
+
+    // The optional vision substitute, only when its provider is registered
+    out.visionFallback = null;
+    if (this.visionFallback && this.providers.get(this.visionFallback.provider)) {
+      const { provider, model } = this.visionFallback;
+      out.visionFallback = {
+        provider,
+        model,
+        vision: await this.lookupVision(provider, model),
+      };
+    }
+
     for (const tier of ['smart', 'balanced', 'fast'] as ModelTier[]) {
       let providerName: string | undefined;
       let model: string | undefined;
@@ -1629,6 +1664,12 @@ or send text only:
   const tiers = await this.call(this.dep('LLM'), 'describeTiers', {});
   // tiers.smart / tiers.balanced / tiers.fast:
   //   { provider, model, vision } — vision: true | false (text-only) | null (unknown)
+  // tiers.visionFallback: optional substitute model for image steps when the
+  // tier is text-only (null when not configured). To route a call to it:
+  //   await this.call(this.dep('LLM'), 'complete', {
+  //     messages, provider: tiers.visionFallback.provider,
+  //     options: { tier: 'smart', model: tiers.visionFallback.model },
+  //   });
 
 ### Per-Tier Routing
 

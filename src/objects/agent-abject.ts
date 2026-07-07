@@ -1821,7 +1821,7 @@ The registered object must implement these handlers to participate in the agent 
         content: `[BUDGET EXHAUSTED — Final Step]\nYou have used all ${task.maxSteps} steps. You MUST respond with a "done" or "fail" action NOW.\nIf you have extracted ANY useful data during this task, respond with:\n\`\`\`json\n{"action": "done", "result": <your best result so far>}\n\`\`\`\nOtherwise respond with:\n\`\`\`json\n{"action": "fail", "reason": "Could not complete task in ${task.maxSteps} steps"}\n\`\`\``,
       });
 
-      const finalTier = await this.applyVisionTiering(entry, 'smart');
+      const finalRoute = await this.applyVisionTiering(entry, 'smart');
       await this.trimConversation(entry);
 
       this.llmId = await this.resolveDep('LLM', this.llmId);
@@ -1832,7 +1832,13 @@ The registered object must implement these handlers to participate in the agent 
           // hint (fast-tier models drop the JSON action envelope under load,
           // producing prose that the parser can't accept), adjusted for vision
           // when the conversation carries images.
-          options: { tier: finalTier, maxTokens: 16384, cacheKey: entry.state.id },
+          ...(finalRoute.provider ? { provider: finalRoute.provider } : {}),
+          options: {
+            tier: finalRoute.tier,
+            ...(finalRoute.model ? { model: finalRoute.model } : {}),
+            maxTokens: 16384,
+            cacheKey: entry.state.id,
+          },
         }),
         60000,
       );
@@ -2011,30 +2017,41 @@ The registered object must implement these handlers to participate in the agent 
   }
 
   /**
-   * Adjust the think tier for what the conversation actually carries: when it
-   * holds images and the preferred tier's model is text-only, route to the
-   * other think tier if that one can see; when neither can, replace the image
-   * parts with a text note so a text-only model doesn't reject the request
-   * outright. Unknown capability (vision null/undefined) is treated as capable.
+   * How to route a think step given what the conversation actually carries.
+   * `tier` always rides along (it also sets the provider's effort/token
+   * defaults); `provider`+`model` are set only when the step must run on the
+   * configured vision-fallback model instead of the tier's own model.
    */
-  private async applyVisionTiering(entry: TaskEntry, tier: 'smart' | 'balanced'): Promise<'smart' | 'balanced'> {
+  private async applyVisionTiering(
+    entry: TaskEntry,
+    tier: 'smart' | 'balanced',
+  ): Promise<{ tier: 'smart' | 'balanced'; provider?: string; model?: string }> {
     const messages = entry.state.llmMessages;
-    if (!AgentAbject.conversationHasImages(messages)) return tier;
+    if (!AgentAbject.conversationHasImages(messages)) return { tier };
 
     const caps = await this.tierCapabilities();
-    if (!caps || caps[tier]?.vision !== false) return tier;
+    if (!caps || caps[tier]?.vision !== false) return { tier };
 
+    // The preferred tier is text-only: try the other think tier first
     const other: 'smart' | 'balanced' = tier === 'smart' ? 'balanced' : 'smart';
     if (caps[other] && caps[other]!.vision !== false) {
       log.info(`Vision routing: '${tier}' model ${caps[tier]?.model} is text-only; thinking on '${other}' for this step`);
-      return other;
+      return { tier: other };
     }
 
+    // Then the configured vision fallback model
+    const fb = caps.visionFallback;
+    if (fb && fb.model && fb.vision !== false) {
+      log.info(`Vision routing: no vision-capable think tier; using vision fallback ${fb.provider}/${fb.model} for this step`);
+      return { tier, provider: fb.provider, model: fb.model };
+    }
+
+    // Nothing can see: strip the images so a text-only model doesn't reject the request
     const replaced = AgentAbject.stripImageParts(messages);
     if (replaced > 0) {
-      log.warn(`Vision routing: no vision-capable think tier configured; replaced ${replaced} image part(s) with text notes`);
+      log.warn(`Vision routing: no vision-capable think tier or fallback configured; replaced ${replaced} image part(s) with text notes`);
     }
-    return tier;
+    return { tier };
   }
 
   private async think(entry: TaskEntry): Promise<AgentAction> {
@@ -2053,7 +2070,7 @@ The registered object must implement these handlers to participate in the agent 
 
     // Vision-aware tiering runs before trim so a text-only path never
     // carries image bytes into compression either
-    const thinkTier = await this.applyVisionTiering(entry, this.resolveThinkTier(entry.observeTier));
+    const route = await this.applyVisionTiering(entry, this.resolveThinkTier(entry.observeTier));
 
     // Trim conversation (may do an LLM-compressor pass when over byte budget)
     await this.trimConversation(entry);
@@ -2069,10 +2086,17 @@ The registered object must implement these handlers to participate in the agent 
           // Thinking is the JSON-action-decision step. Tier comes from the
           // agent's per-state observe hint, floored at 'balanced' (never 'fast'
           // — haiku drops the action envelope under load), then adjusted for
-          // vision when the conversation carries images. Routine/verification
-          // states run on balanced; hard states (code gen, error recovery,
-          // planning) stay on smart. Agents that send no hint stay on smart.
-          options: { tier: thinkTier, maxTokens: 16384, cacheKey: entry.state.id },
+          // vision when the conversation carries images (possibly routing to
+          // the configured vision-fallback model via provider+model override).
+          // Routine/verification states run on balanced; hard states (code
+          // gen, error recovery, planning) stay on smart.
+          ...(route.provider ? { provider: route.provider } : {}),
+          options: {
+            tier: route.tier,
+            ...(route.model ? { model: route.model } : {}),
+            maxTokens: 16384,
+            cacheKey: entry.state.id,
+          },
         }),
         120000,
       );
