@@ -529,7 +529,11 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * a single mis-keyed payload from wasting a whole step on a "missing X" error.
    */
   private actionField(action: AgentAction, keys: string[]): unknown {
-    const envelopes = [action, action.params, action.arguments, action.input]
+    // `payload`/`args` are included because the `call` action nests its fields
+    // under `payload`, and models carry that habit to local actions — emitting
+    // e.g. {"action":"draft_diff","payload":{"blocks":"..."}}. Reading the
+    // wrapper here lets those flat-vs-nested variants both resolve.
+    const envelopes = [action, action.payload, action.params, action.arguments, action.args, action.input]
       .filter((e): e is Record<string, unknown> => !!e && typeof e === 'object');
     for (const env of envelopes) {
       for (const k of keys) {
@@ -585,7 +589,11 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   private async opDraftSource(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
     const source = this.actionField(action, ['source', 'code', 'draftSource', 'src']) as string | undefined;
     if (typeof source !== 'string' || source.length === 0) {
-      return { ok: false, summary: 'draft_source: missing source', error: 'source must be a non-empty string (pass it as the `source` field)' };
+      const editingExisting = !!state.targetSource;
+      const steer = editingExisting
+        ? ' You are modifying an existing object, so a whole-object draft_source is rarely needed — and a large source often gets truncated out of the action (the model runs out of output length). Prefer a TARGETED edit: replace_handler({name, body}) to swap one method (name-addressed, no SEARCH matching), or draft_diff for a small span. Only fall back to draft_source for a genuine full rewrite.'
+        : ' If the source is large and keeps getting dropped, draft it out-of-band with draft_via_llm({kind:"source"}) instead of inlining it in the action.';
+      return { ok: false, summary: 'draft_source: missing source', error: `source must be a non-empty string (pass it as the \`source\` field).${steer}` };
     }
     state.draftSource = source;
     return { ok: true, summary: `draft_source: ${source.split('\n').length} lines staged` };
@@ -603,8 +611,40 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * or wrong snippet), or SEARCH matches multiple locations (need more
    * surrounding context).
    */
+  /**
+   * Coerce whatever the model passed for `blocks` into SEARCH/REPLACE text.
+   * Accepts a ready-made string, an array of block strings, or structured
+   * edits ({search, replace} objects — the shape a model naturally reaches for)
+   * either as a single object or an array. Returns '' when nothing usable.
+   */
+  private normalizeDiffBlocks(raw: unknown): string {
+    const toBlock = (o: Record<string, unknown>): string | null => {
+      const search = o.search ?? o.find ?? o.old ?? o.before ?? o.from ?? o.original;
+      const replace = o.replace ?? o.replacement ?? o.new ?? o.after ?? o.to ?? o.updated;
+      if (typeof search === 'string' && typeof replace === 'string') {
+        return `<<<<<<< SEARCH\n${search}\n=======\n${replace}\n>>>>>>> REPLACE`;
+      }
+      return null;
+    };
+    if (typeof raw === 'string') return raw;
+    if (Array.isArray(raw)) {
+      const parts: string[] = [];
+      for (const item of raw) {
+        if (typeof item === 'string') parts.push(item);
+        else if (item && typeof item === 'object') {
+          const b = toBlock(item as Record<string, unknown>);
+          if (b) parts.push(b);
+        }
+      }
+      return parts.join('\n');
+    }
+    if (raw && typeof raw === 'object') return toBlock(raw as Record<string, unknown>) ?? '';
+    return '';
+  }
+
   private async opDraftDiff(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
-    const blocksText = this.actionField(action, ['blocks', 'diff', 'search_replace', 'searchReplace', 'patch', 'edits']) as string | undefined;
+    const rawBlocks = this.actionField(action, ['blocks', 'diff', 'search_replace', 'searchReplace', 'patch', 'edits']);
+    const blocksText = this.normalizeDiffBlocks(rawBlocks);
     if (typeof blocksText !== 'string' || blocksText.length === 0) {
       return { ok: false, summary: 'draft_diff: missing blocks', error: 'blocks must be a non-empty string of SEARCH/REPLACE blocks, passed as the `blocks` field. Format: <<<<<<< SEARCH\\n...\\n=======\\n...\\n>>>>>>> REPLACE. For editing one method, prefer replace_handler({name, body}) — name-addressed, no SEARCH text to match. To rewrite the whole object use draft_source.' };
     }
@@ -2606,7 +2646,7 @@ Emit EXACTLY ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothi
 
 - \`load_target({objectId?, targetName?})\` — adopt an EXISTING object as this loop's modify target: resolves the name/UUID, loads its current source into loop state, and switches the loop to a modify. Use this when the loop started without a target (kind \`create\`) but you discovered — via \`call("Registry", "ask"/"discover", …)\` or \`describe\` — that the goal is really about an object that already exists (e.g. "fix the GraphViewer window" → GraphViewer is already registered). After \`load_target\`, inspect with \`read_draft\`, edit with \`replace_handler\` / \`add_handler\` / \`remove_handler\` (or \`draft_diff\` for sub-method edits), then ship with \`deploy_update\` (no need to repeat the id). For a genuinely new object, skip this and use \`draft_source\` instead.
 - \`draft_manifest({manifest, usedObjects?})\` — stage a manifest you've authored. Used before \`deploy_spawn\`. Shape: \`{ name, description, version, icon, interface: { id, name, description, methods, events? }, requiredCapabilities: [], providedCapabilities: [], tags: [] }\`. \`methods\` and \`events\` are arrays of OBJECTS, never bare name strings: each method is \`{ name, description, parameters: [{ name, type: { kind: "primitive"|"reference"|"array"|"object", … }, description, optional? }], returns? }\` and each event is \`{ name, description, payload }\`. Emitting a plain string like \`"show"\` leaves the method nameless in the Explorer — always use the object form. Include an \`icon\` (a single emoji that fits the object, e.g. 🌤 / 📝 / 🎮) — it appears next to the object's name in launchers.
-- \`draft_source({source})\` — stage handler-map source you've authored. The format is a single parenthesized object literal: \`({ method(msg) { ... } })\`. Use this for new objects (create flow).
+- \`draft_source({source})\` — stage handler-map source you've authored. The format is a single parenthesized object literal: \`({ method(msg) { ... } })\`. Use this for NEW objects (create flow) or a genuine full rewrite. When MODIFYING an existing object, prefer \`replace_handler\`/\`draft_diff\` — re-emitting a large whole-object source in one action risks being truncated by the output-length limit (the source silently gets dropped and the action fails with "missing source").
 - \`draft_diff({blocks})\` — apply SEARCH/REPLACE blocks to the existing source. Good for small edits that span or sit inside members; for replacing a whole method prefer \`replace_handler\` (no SEARCH matching). Either way you edit without re-emitting the whole file. Each block:
 
   \`\`\`
