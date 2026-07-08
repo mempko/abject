@@ -18,7 +18,7 @@
  *                         system prompt, task lifecycle, finalization.
  */
 
-import { AbjectId, AbjectManifest, AbjectMessage, InterfaceId, ObjectRegistration, SpawnRequest, SpawnResult } from '../core/types.js';
+import { AbjectId, AbjectManifest, AbjectMessage, InterfaceId, InterfaceDeclaration, MethodDeclaration, EventDeclaration, ParameterDeclaration, TypeDeclaration, ObjectRegistration, SpawnRequest, SpawnResult } from '../core/types.js';
 import { Abject, DEFERRED_REPLY } from '../core/abject.js';
 import { request, event } from '../core/message.js';
 import { IntrospectResult } from '../core/introspect.js';
@@ -48,6 +48,121 @@ const FRAMEWORK_PROVIDED_METHODS = ScriptableAbject.PROTECTED_HANDLERS;
 
 export const OBJECT_CREATOR_ID = 'abjects:object-creator' as AbjectId;
 const OBJECT_CREATOR_INTERFACE = 'abjects:object-creator' as InterfaceId;
+
+// ── Manifest normalization ────────────────────────────────────────────────
+// LLMs frequently draft an interface with `methods`/`events` as bare string
+// arrays (e.g. ["show","hide"]) or partial objects, but the schema wants
+// MethodDeclaration/EventDeclaration objects. Left unnormalized, every
+// downstream `.name` is undefined and the Abject Explorer / introspect render
+// "undefined" for every method and event. Coerce to well-formed shapes so a
+// name always survives, whatever the model emitted.
+
+/** Coerce a type hint (already a TypeDeclaration, or a string like "string"/"Foo[]"/"object"). */
+function coerceType(x: unknown): TypeDeclaration | undefined {
+  if (x && typeof x === 'object' && typeof (x as { kind?: unknown }).kind === 'string') {
+    return x as TypeDeclaration;
+  }
+  if (typeof x === 'string') {
+    const t = x.trim();
+    const lower = t.toLowerCase();
+    if (!t || lower === 'void' || lower === 'any' || lower === 'unknown') return undefined;
+    if (lower === 'string' || lower === 'number' || lower === 'boolean' || lower === 'null' || lower === 'undefined') {
+      return { kind: 'primitive', primitive: lower as NonNullable<TypeDeclaration['primitive']> };
+    }
+    if (t.endsWith('[]')) return { kind: 'array', elementType: coerceType(t.slice(0, -2)) };
+    if (lower === 'object') return { kind: 'object' };
+    return { kind: 'reference', reference: t };
+  }
+  return undefined;
+}
+
+/** Coerce a parameter entry (a ParameterDeclaration, or a string like "url" / "url: string"). */
+function coerceParam(p: unknown): ParameterDeclaration | null {
+  if (typeof p === 'string') {
+    const [rawName, ...rest] = p.split(':');
+    const name = rawName.trim();
+    if (!name) return null;
+    return { name, type: coerceType(rest.join(':')) ?? { kind: 'object' }, description: '' };
+  }
+  if (p && typeof p === 'object') {
+    const o = p as Record<string, unknown>;
+    const name = typeof o.name === 'string' ? o.name.trim() : '';
+    if (!name) return null;
+    return {
+      name,
+      type: coerceType(o.type) ?? { kind: 'object' },
+      description: typeof o.description === 'string' ? o.description : '',
+      ...(o.optional === true ? { optional: true } : {}),
+    };
+  }
+  return null;
+}
+
+/** Coerce a method entry (a MethodDeclaration, or a bare method-name string). */
+function coerceMethod(m: unknown): MethodDeclaration | null {
+  if (typeof m === 'string') {
+    const name = m.trim();
+    return name ? { name, description: '', parameters: [] } : null;
+  }
+  if (m && typeof m === 'object') {
+    const o = m as Record<string, unknown>;
+    const name = typeof o.name === 'string' ? o.name.trim() : '';
+    if (!name) return null;
+    const rawParams = Array.isArray(o.parameters) ? o.parameters : Array.isArray(o.params) ? o.params : [];
+    const method: MethodDeclaration = {
+      name,
+      description: typeof o.description === 'string' ? o.description : '',
+      parameters: rawParams.map(coerceParam).filter((x): x is ParameterDeclaration => x !== null),
+    };
+    const returns = coerceType(o.returns);
+    if (returns) method.returns = returns;
+    return method;
+  }
+  return null;
+}
+
+/** Coerce an event entry (an EventDeclaration, or a bare event-name string). */
+function coerceEvent(e: unknown): EventDeclaration | null {
+  if (typeof e === 'string') {
+    const name = e.trim();
+    return name ? { name, description: '', payload: { kind: 'object' } } : null;
+  }
+  if (e && typeof e === 'object') {
+    const o = e as Record<string, unknown>;
+    const name = typeof o.name === 'string' ? o.name.trim() : '';
+    if (!name) return null;
+    return {
+      name,
+      description: typeof o.description === 'string' ? o.description : '',
+      payload: coerceType(o.payload) ?? { kind: 'object' },
+    };
+  }
+  return null;
+}
+
+/**
+ * Normalize a drafted manifest's interface in place so method/event names are
+ * never undefined, regardless of whether the model emitted strings or objects.
+ * Also backfills a missing interface id/name/description from the manifest.
+ */
+function normalizeDraftManifest(manifest: AbjectManifest): AbjectManifest {
+  const iface = manifest.interface as InterfaceDeclaration | undefined;
+  if (!iface || typeof iface !== 'object') return manifest;
+
+  iface.methods = (Array.isArray(iface.methods) ? iface.methods : [])
+    .map(coerceMethod)
+    .filter((x): x is MethodDeclaration => x !== null);
+  iface.events = (Array.isArray(iface.events) ? iface.events : [])
+    .map(coerceEvent)
+    .filter((x): x is EventDeclaration => x !== null);
+
+  const slug = String(manifest.name ?? 'object').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'object';
+  if (typeof iface.id !== 'string' || !iface.id) iface.id = `abjects:${slug}` as InterfaceId;
+  if (typeof iface.name !== 'string' || !iface.name) iface.name = `${manifest.name ?? 'Object'}Interface`;
+  if (typeof iface.description !== 'string') iface.description = manifest.description ?? '';
+
+  return manifest;
+}
 
 // ════════════════════════════════════════════════════════════════════════
 // 1. INFRASTRUCTURE
@@ -399,7 +514,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     if (!manifest || typeof manifest !== 'object' || !manifest.name || !manifest.interface) {
       return { ok: false, summary: 'draft_manifest: malformed', error: 'manifest must be an AbjectManifest with name and interface' };
     }
-    state.draftManifest = manifest;
+    state.draftManifest = normalizeDraftManifest(manifest);
     const usedObjects = action.usedObjects;
     if (Array.isArray(usedObjects)) {
       state.usedObjects = usedObjects.filter((x): x is string => typeof x === 'string');
@@ -831,7 +946,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
         if (!manifest?.name || !manifest?.interface) {
           return { ok: false, summary: 'draft_via_llm manifest: malformed JSON', error: 'parsed JSON missing name or interface' };
         }
-        state.draftManifest = manifest;
+        state.draftManifest = normalizeDraftManifest(manifest);
         if (Array.isArray(parsed.usedObjects)) {
           state.usedObjects = parsed.usedObjects.filter((x): x is string => typeof x === 'string');
         }
@@ -2479,7 +2594,7 @@ Emit EXACTLY ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothi
 ## Local operations (no message target)
 
 - \`load_target({objectId?, targetName?})\` — adopt an EXISTING object as this loop's modify target: resolves the name/UUID, loads its current source into loop state, and switches the loop to a modify. Use this when the loop started without a target (kind \`create\`) but you discovered — via \`call("Registry", "ask"/"discover", …)\` or \`describe\` — that the goal is really about an object that already exists (e.g. "fix the GraphViewer window" → GraphViewer is already registered). After \`load_target\`, inspect with \`read_draft\`, edit with \`replace_handler\` / \`add_handler\` / \`remove_handler\` (or \`draft_diff\` for sub-method edits), then ship with \`deploy_update\` (no need to repeat the id). For a genuinely new object, skip this and use \`draft_source\` instead.
-- \`draft_manifest({manifest, usedObjects?})\` — stage a manifest you've authored. Used before \`deploy_spawn\`. Include an \`icon\` (a single emoji that fits the object, e.g. 🌤 / 📝 / 🎮) — it appears next to the object's name in launchers.
+- \`draft_manifest({manifest, usedObjects?})\` — stage a manifest you've authored. Used before \`deploy_spawn\`. Shape: \`{ name, description, version, icon, interface: { id, name, description, methods, events? }, requiredCapabilities: [], providedCapabilities: [], tags: [] }\`. \`methods\` and \`events\` are arrays of OBJECTS, never bare name strings: each method is \`{ name, description, parameters: [{ name, type: { kind: "primitive"|"reference"|"array"|"object", … }, description, optional? }], returns? }\` and each event is \`{ name, description, payload }\`. Emitting a plain string like \`"show"\` leaves the method nameless in the Explorer — always use the object form. Include an \`icon\` (a single emoji that fits the object, e.g. 🌤 / 📝 / 🎮) — it appears next to the object's name in launchers.
 - \`draft_source({source})\` — stage handler-map source you've authored. The format is a single parenthesized object literal: \`({ method(msg) { ... } })\`. Use this for new objects (create flow).
 - \`draft_diff({blocks})\` — apply SEARCH/REPLACE blocks to the existing source. Good for small edits that span or sit inside members; for replacing a whole method prefer \`replace_handler\` (no SEARCH matching). Either way you edit without re-emitting the whole file. Each block:
 
