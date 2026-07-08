@@ -216,6 +216,48 @@ export interface AudioControlMsg extends WsEnvelope {
   playbackId?: string;
 }
 
+/**
+ * One voice of a synthesized Web Audio graph (server -> client). Each voice is
+ * an oscillator or a white-noise source, optionally band-limited by a biquad
+ * filter, shaped by an attack/hold/release gain envelope, and scheduled at a
+ * start offset. This lets Abjects synthesize tones, drones, and SFX without a
+ * DOM/AudioContext of their own — the sandboxed backend can't run Web Audio.
+ */
+export interface AudioVoiceSpec {
+  /** 'osc' (default) is a periodic oscillator; 'noise' is a white-noise buffer. */
+  source?: 'osc' | 'noise';
+  /** Oscillator waveform (osc only). Default 'sine'. */
+  wave?: 'sine' | 'square' | 'sawtooth' | 'triangle';
+  /** Oscillator base frequency in Hz (osc only). Default 220. */
+  freq?: number;
+  /** Exponential frequency glide to `to` Hz over `time` seconds from voice start (osc only). */
+  freqRamp?: { to: number; time: number };
+  /** Optional biquad filter applied to the source. */
+  filter?: { type: 'lowpass' | 'highpass' | 'bandpass' | 'notch'; freq: number; q?: number };
+  /** Peak gain 0..1. Default 0.2. */
+  gain?: number;
+  /** Attack ramp seconds to peak. Default 0.01. */
+  attack?: number;
+  /** Seconds held at peak before release. Default = duration. */
+  hold?: number;
+  /** Release ramp seconds to silence. Default 0.1. */
+  release?: number;
+  /** Start offset in seconds from playback start. Default 0. */
+  start?: number;
+  /** Sustain seconds (ignored when the graph loops). Default 0.3. */
+  duration?: number;
+}
+
+export interface AudioGraphMsg extends WsEnvelope {
+  type: 'audioGraph';
+  playbackId: string;
+  voices: AudioVoiceSpec[];
+  /** Master gain 0..1. Default 1. */
+  volume?: number;
+  /** When true, voices sustain at peak until stopped instead of running their envelope once. */
+  loop?: boolean;
+}
+
 export interface MediaCaptureRequestMsg extends WsEnvelope {
   type: 'mediaCaptureRequest';
   requestId: string;
@@ -366,6 +408,7 @@ export type BackendToFrontendMsg =
   | SetSurfaceTransformMsg
   | AudioPlayMsg
   | AudioControlMsg
+  | AudioGraphMsg
   | MediaCaptureRequestMsg
   | MediaCaptureFrameRequestMsg
   | MediaRecordStartMsg

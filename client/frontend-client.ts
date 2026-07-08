@@ -20,6 +20,7 @@ import type {
   AuthResultMsg,
   AudioPlayMsg,
   AudioControlMsg,
+  AudioGraphMsg,
   MediaCaptureRequestMsg,
   MediaCaptureFrameRequestMsg,
   MediaRecordStartMsg,
@@ -148,6 +149,9 @@ export class FrontendClient {
 
   // ── Audio playback + media capture state (backend-relayed) ────────────
   private audioPlaybacks: Map<string, HTMLAudioElement> = new Map();
+  /** Synthesized Web Audio graphs (from audioGraph). Value stops+tears down the graph. */
+  private audioGraphs: Map<string, (immediate?: boolean) => void> = new Map();
+  private sharedAudioCtx?: AudioContext;
   private mediaStreams: Map<string, MediaStream> = new Map();
   /** Hidden playing <video> per video-bearing stream so frames are grabbable. */
   private mediaVideoEls: Map<string, HTMLVideoElement> = new Map();
@@ -847,6 +851,10 @@ export class FrontendClient {
         this.handleAudioControl(msg as AudioControlMsg);
         break;
 
+      case 'audioGraph':
+        this.handleAudioGraph(msg as AudioGraphMsg);
+        break;
+
       case 'mediaCaptureRequest':
         this.handleMediaCaptureRequest(msg as MediaCaptureRequestMsg);
         break;
@@ -931,6 +939,18 @@ export class FrontendClient {
         audio.src = '';
         this.audioPlaybacks.delete(id);
       }
+      for (const [id, stop] of this.audioGraphs) {
+        stop(true);
+        this.audioGraphs.delete(id);
+      }
+      return;
+    }
+    // A synthesized graph shares the playbackId namespace with element playback.
+    const graphStop = msg.playbackId ? this.audioGraphs.get(msg.playbackId) : undefined;
+    if (graphStop) {
+      // Envelope release on stop; hard-cut on pause (no resume for graphs).
+      graphStop(msg.action === 'pause');
+      if (msg.action !== 'pause') this.audioGraphs.delete(msg.playbackId!);
       return;
     }
     const audio = msg.playbackId ? this.audioPlaybacks.get(msg.playbackId) : undefined;
@@ -947,6 +967,130 @@ export class FrontendClient {
         audio.src = '';
         this.audioPlaybacks.delete(msg.playbackId!);
         break;
+    }
+  }
+
+  /**
+   * Build and play a synthesized Web Audio graph (oscillators + white noise,
+   * optional biquad filter, attack/hold/release gain envelope). Abjects run in
+   * a sandboxed backend with no AudioContext, so they describe the graph
+   * declaratively and it is materialized here. Non-looping graphs report
+   * 'ended' once every voice has finished; looping graphs sustain until stopped.
+   */
+  private handleAudioGraph(msg: AudioGraphMsg): void {
+    try {
+      const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!Ctor) throw new Error('Web Audio API unavailable');
+      if (!this.sharedAudioCtx || this.sharedAudioCtx.state === 'closed') {
+        this.sharedAudioCtx = new Ctor();
+      }
+      const ctx = this.sharedAudioCtx;
+      // Autoplay policy: contexts start suspended until a user gesture. Best-effort resume.
+      if (ctx.state === 'suspended') void ctx.resume();
+
+      const master = ctx.createGain();
+      master.gain.value = Math.max(0, Math.min(1, msg.volume ?? 1));
+      master.connect(ctx.destination);
+
+      const loop = msg.loop ?? false;
+      const t0 = ctx.currentTime;
+      const sources: AudioScheduledSourceNode[] = [];
+      const gains: GainNode[] = [];
+      let latestEnd = t0;
+
+      for (const v of msg.voices.slice(0, 32)) {
+        const start = t0 + Math.max(0, v.start ?? 0);
+        const attack = Math.max(0, v.attack ?? 0.01);
+        const duration = Math.max(0.01, v.duration ?? 0.3);
+        const release = Math.max(0, v.release ?? 0.1);
+        const hold = Math.max(0, v.hold ?? duration);
+        const peak = Math.max(0, Math.min(1, v.gain ?? 0.2));
+
+        let node: AudioScheduledSourceNode;
+        if ((v.source ?? 'osc') === 'noise') {
+          const seconds = loop ? 2 : Math.max(0.2, attack + hold + release);
+          const frames = Math.max(1, Math.floor(ctx.sampleRate * seconds));
+          const buffer = ctx.createBuffer(1, frames, ctx.sampleRate);
+          const data = buffer.getChannelData(0);
+          for (let i = 0; i < frames; i++) data[i] = Math.random() * 2 - 1;
+          const noise = ctx.createBufferSource();
+          noise.buffer = buffer;
+          noise.loop = loop;
+          node = noise;
+        } else {
+          const osc = ctx.createOscillator();
+          osc.type = v.wave ?? 'sine';
+          const freq = Math.max(1, v.freq ?? 220);
+          osc.frequency.setValueAtTime(freq, start);
+          if (v.freqRamp && v.freqRamp.to > 0) {
+            osc.frequency.exponentialRampToValueAtTime(Math.max(1, v.freqRamp.to), start + Math.max(0.001, v.freqRamp.time));
+          }
+          node = osc;
+        }
+
+        let tail: AudioNode = node;
+        if (v.filter) {
+          const filter = ctx.createBiquadFilter();
+          filter.type = v.filter.type;
+          filter.frequency.setValueAtTime(Math.max(1, v.filter.freq), start);
+          if (v.filter.q !== undefined) filter.Q.setValueAtTime(Math.max(0.0001, v.filter.q), start);
+          tail.connect(filter);
+          tail = filter;
+        }
+
+        const gain = ctx.createGain();
+        gain.gain.setValueAtTime(0, start);
+        gain.gain.linearRampToValueAtTime(peak, start + attack);
+        if (!loop) {
+          const releaseStart = start + attack + hold;
+          gain.gain.setValueAtTime(peak, releaseStart);
+          gain.gain.linearRampToValueAtTime(0, releaseStart + release);
+        }
+        tail.connect(gain);
+        gain.connect(master);
+
+        node.start(start);
+        const voiceEnd = start + attack + hold + release;
+        if (!loop) {
+          node.stop(voiceEnd);
+          if (voiceEnd > latestEnd) latestEnd = voiceEnd;
+        }
+        sources.push(node);
+        gains.push(gain);
+      }
+
+      let ended = false;
+      const teardown = () => {
+        if (ended) return;
+        ended = true;
+        this.audioGraphs.delete(msg.playbackId);
+        try { master.disconnect(); } catch { /* already gone */ }
+        this.sendToBackend({ type: 'audioEvent', playbackId: msg.playbackId, event: 'ended' });
+      };
+
+      // stop(immediate): pause = hard cut; otherwise a short release ramp.
+      this.audioGraphs.set(msg.playbackId, (immediate?: boolean) => {
+        const now = ctx.currentTime;
+        const rel = immediate ? 0 : 0.08;
+        for (const g of gains) {
+          try {
+            g.gain.cancelScheduledValues(now);
+            g.gain.setValueAtTime(g.gain.value, now);
+            g.gain.linearRampToValueAtTime(0, now + rel);
+          } catch { /* node finished */ }
+        }
+        for (const s of sources) { try { s.stop(now + rel + 0.01); } catch { /* already stopped */ } }
+      });
+
+      if (!loop) {
+        const ms = Math.max(0, (latestEnd - t0) * 1000) + 60;
+        window.setTimeout(teardown, ms);
+      }
+    } catch (err) {
+      this.sendToBackend({
+        type: 'audioEvent', playbackId: msg.playbackId, event: 'error',
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 

@@ -25,6 +25,7 @@ import type {
   FileUploadMsg,
   CloseWindowMsg,
   DisplayResizedMsg,
+  AudioVoiceSpec,
 } from './ws-protocol.js';
 import { validateSceneOps, normalizeSceneOps, SCENE_NODE_KINDS, type SceneOp, type SceneTheme } from '../src/ui/gl/scene-types.js';
 import type { AuthConfig, SessionStore } from './auth.js';
@@ -590,6 +591,18 @@ export class BackendUI extends Abject {
                 returns: { kind: 'primitive', primitive: 'boolean' },
               },
               {
+                name: 'audioGraph',
+                description: 'Relay: synthesize and play a Web Audio oscillator/noise graph on the connected frontend (used by the AudioOutput capability; call AudioOutput.playGraph/playTone, not this)',
+                parameters: [
+                  { name: 'playbackId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-chosen playback id' },
+                  { name: 'voices', type: { kind: 'array', elementType: { kind: 'reference', reference: 'AudioVoiceSpec' } }, description: 'Oscillator/noise voices to synthesize' },
+                  { name: 'volume', type: { kind: 'primitive', primitive: 'number' }, description: 'Master gain 0..1', optional: true },
+                  { name: 'loop', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Sustain voices until stopped', optional: true },
+                  { name: 'notifyId', type: { kind: 'primitive', primitive: 'string' }, description: 'AbjectId to notify of ended/error via playbackEvent', optional: true },
+                ],
+                returns: { kind: 'primitive', primitive: 'boolean' },
+              },
+              {
                 name: 'videoSetup',
                 description: 'Relay: create a client-side video element for a video widget (used by VideoWidget; frames composite client-side into videoFrame regions)',
                 parameters: [
@@ -941,6 +954,18 @@ export class BackendUI extends Abject {
       this.sendToFrontend({ type: 'audioControl', action, playbackId });
       if (action === 'stop' && playbackId) this.audioNotify.delete(playbackId);
       if (action === 'stopAll') this.audioNotify.clear();
+      return true;
+    });
+
+    this.on('audioGraph', async (msg: AbjectMessage) => {
+      const { playbackId, voices, volume, loop, notifyId } = msg.payload as {
+        playbackId: string; voices: AudioVoiceSpec[]; volume?: number; loop?: boolean; notifyId?: AbjectId;
+      };
+      contractRequire(typeof playbackId === 'string' && playbackId.length > 0, 'audioGraph requires playbackId');
+      contractRequire(Array.isArray(voices) && voices.length > 0, 'audioGraph requires a non-empty voices array');
+      if (!this.hasReadyClient) throw new Error('No frontend client connected; audio output unavailable');
+      if (notifyId) this.audioNotify.set(playbackId, notifyId);
+      this.sendToFrontend({ type: 'audioGraph', playbackId, voices, volume, loop });
       return true;
     });
 

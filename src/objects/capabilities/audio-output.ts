@@ -54,6 +54,28 @@ interface Playback {
   startedAt: number;
 }
 
+type OscWave = 'sine' | 'square' | 'sawtooth' | 'triangle';
+
+/**
+ * One voice of a synthesized audio graph. Mirrors the frontend's AudioVoiceSpec
+ * (server/ws-protocol.ts) — the spec is relayed through the UIServer to the
+ * client, which materializes the Web Audio nodes. Kept as a local type so this
+ * capability does not import server-side wire types.
+ */
+interface AudioVoiceSpec {
+  source?: 'osc' | 'noise';
+  wave?: OscWave;
+  freq?: number;
+  freqRamp?: { to: number; time: number };
+  filter?: { type: 'lowpass' | 'highpass' | 'bandpass' | 'notch'; freq: number; q?: number };
+  gain?: number;
+  attack?: number;
+  hold?: number;
+  release?: number;
+  start?: number;
+  duration?: number;
+}
+
 export class AudioOutput extends Abject {
   private uiServerId?: AbjectId;
   private playbacks: Map<string, Playback> = new Map();
@@ -77,6 +99,27 @@ export class AudioOutput extends Abject {
                 { name: 'source', type: { kind: 'primitive', primitive: 'string' }, description: 'Audio source (URL, data: URI, or abject:// reference)' },
                 { name: 'volume', type: { kind: 'primitive', primitive: 'number' }, description: 'Volume 0..1 (default 1)', optional: true },
                 { name: 'loop', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Loop until stopped (default false)', optional: true },
+              ],
+              returns: { kind: 'object', properties: { playbackId: { kind: 'primitive', primitive: 'string' } } },
+            },
+            {
+              name: 'playTone',
+              description: 'Synthesize and play a single tone; returns { playbackId }. Use this for beeps, blips, and simple SFX without any audio file.',
+              parameters: [
+                { name: 'frequency', type: { kind: 'primitive', primitive: 'number' }, description: 'Pitch in Hz (e.g. 440 = A4)' },
+                { name: 'wave', type: { kind: 'primitive', primitive: 'string' }, description: "'sine' | 'square' | 'sawtooth' | 'triangle' (default 'sine')", optional: true },
+                { name: 'duration', type: { kind: 'primitive', primitive: 'number' }, description: 'Seconds (default 0.2)', optional: true },
+                { name: 'volume', type: { kind: 'primitive', primitive: 'number' }, description: 'Peak gain 0..1 (default 0.2)', optional: true },
+              ],
+              returns: { kind: 'object', properties: { playbackId: { kind: 'primitive', primitive: 'string' } } },
+            },
+            {
+              name: 'playGraph',
+              description: 'Synthesize and play a multi-voice Web Audio graph (oscillators and/or white noise, optional biquad filter, attack/hold/release envelope, frequency glide); returns { playbackId }. Use loop:true for sustained ambience (drones, hums) and stop() it later. Abjects have no AudioContext of their own, so describe sound declaratively here instead of building Web Audio directly.',
+              parameters: [
+                { name: 'voices', type: { kind: 'array', elementType: { kind: 'reference', reference: 'AudioVoiceSpec' } }, description: 'Voices: each { source?: "osc"|"noise", wave?, freq?, freqRamp?: {to,time}, filter?: {type,freq,q}, gain?, attack?, hold?, release?, start?, duration? }' },
+                { name: 'volume', type: { kind: 'primitive', primitive: 'number' }, description: 'Master gain 0..1 (default 1)', optional: true },
+                { name: 'loop', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Sustain voices at peak until stopped (default false)', optional: true },
               ],
               returns: { kind: 'object', properties: { playbackId: { kind: 'primitive', primitive: 'string' } } },
             },
@@ -149,6 +192,23 @@ export class AudioOutput extends Abject {
         source: string; volume?: number; loop?: boolean;
       };
       return this.playImpl(source, volume, loop);
+    });
+
+    this.on('playTone', async (msg: AbjectMessage) => {
+      const { frequency, wave, duration, volume } = msg.payload as {
+        frequency: number; wave?: OscWave; duration?: number; volume?: number;
+      };
+      require(typeof frequency === 'number' && frequency > 0, 'playTone requires a positive frequency');
+      return this.playGraphImpl([{
+        source: 'osc', wave, freq: frequency, gain: volume ?? 0.2, duration, attack: 0.01, release: 0.08,
+      }]);
+    });
+
+    this.on('playGraph', async (msg: AbjectMessage) => {
+      const { voices, volume, loop } = msg.payload as {
+        voices: AudioVoiceSpec[]; volume?: number; loop?: boolean;
+      };
+      return this.playGraphImpl(voices, volume, loop);
     });
 
     this.on('pause', async (msg: AbjectMessage) => {
@@ -239,6 +299,34 @@ export class AudioOutput extends Abject {
     return { playbackId };
   }
 
+  private async playGraphImpl(voices: AudioVoiceSpec[], volume?: number, loop?: boolean): Promise<{ playbackId: string }> {
+    require(Array.isArray(voices) && voices.length > 0, 'playGraph requires a non-empty voices array');
+    require(volume === undefined || (volume >= 0 && volume <= 1), 'volume must be between 0 and 1');
+    if (!this.uiServerId) {
+      this.uiServerId = await this.discoverDep('UIServer') ?? undefined;
+    }
+    require(this.uiServerId !== undefined, 'UIServer not discovered; audio output unavailable');
+
+    const playbackId = uuidv4();
+    await this.request(request(this.id, this.uiServerId!, 'audioGraph', {
+      playbackId,
+      voices,
+      volume: volume === undefined ? undefined : Math.max(0, Math.min(1, volume)),
+      loop: loop ?? false,
+      notifyId: this.id,
+    }));
+
+    this.playbacks.set(playbackId, {
+      playbackId,
+      source: `synth graph (${voices.length} voice${voices.length === 1 ? '' : 's'})`,
+      state: 'playing',
+      loop: loop ?? false,
+      startedAt: Date.now(),
+    });
+    this.checkInvariants();
+    return { playbackId };
+  }
+
   private async controlImpl(action: 'pause' | 'resume' | 'stop', playbackId: string): Promise<boolean> {
     require(typeof playbackId === 'string' && playbackId.length > 0, `${action} requires playbackId`);
     const playback = this.playbacks.get(playbackId);
@@ -303,6 +391,30 @@ export class AudioOutput extends Abject {
 
 ### Play a file stored in a workspace FileSystem
   await call(audioId, 'play', { source: 'abject://<typeId>/sounds/alert.ogg' });
+
+### Synthesize sound with no audio file (tones and SFX)
+Abjects run in a sandboxed backend with NO AudioContext of their own, so never
+construct oscillators/AudioContext in handler code. Describe the sound here and
+this object synthesizes it on the client:
+  // a quick beep
+  await call(audioId, 'playTone', { frequency: 660, wave: 'square', duration: 0.15, volume: 0.3 });
+  // a richer one-shot SFX (a falling "blip" with a filtered noise tick)
+  await call(audioId, 'playGraph', { voices: [
+    { source: 'osc', wave: 'triangle', freq: 900, freqRamp: { to: 300, time: 0.12 }, gain: 0.25, duration: 0.12 },
+    { source: 'noise', filter: { type: 'bandpass', freq: 1800, q: 2 }, gain: 0.15, duration: 0.05 },
+  ] });
+
+### Sustained ambience (drones/hums) — loop, then stop
+  const { playbackId } = await call(audioId, 'playGraph', {
+    loop: true, volume: 0.5,
+    voices: [
+      { source: 'osc', wave: 'sine', freq: 55, gain: 0.2 },
+      { source: 'osc', wave: 'sine', freq: 82.5, gain: 0.12 },
+      { source: 'noise', filter: { type: 'lowpass', freq: 400 }, gain: 0.05 },
+    ],
+  });
+  // later, to silence it:
+  await call(audioId, 'stop', { playbackId });
 
 ### React to completion
 Register with addDependent and handle 'changed' events:
