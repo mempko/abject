@@ -342,6 +342,22 @@ export class PeerTransport extends Transport {
   }
 
   private sendChain: Promise<void> = Promise.resolve();
+
+  /**
+   * Serialize inbound handling. onmessage fires in channel order, but decrypt
+   * and decode are async, so without this chain two in-flight frames could
+   * reach the stateful wire decoder out of arrival order and desync its
+   * string-intern table ('wire string ref N out of range'). The mirror image
+   * of enqueueSend.
+   */
+  private enqueueRecv(task: () => Promise<void>): void {
+    this.recvChain = this.recvChain.then(task).catch((err) => {
+      log.error('Failed to handle inbound frame:', err);
+      this.events.onError?.(err instanceof Error ? err : new Error(String(err)));
+    });
+  }
+
+  private recvChain: Promise<void> = Promise.resolve();
   /** Wire codec pair for AbjectMessage frames, per-connection like the session key. */
   private wireEnc = new WireEncoder();
   private wireDec = new WireDecoder();
@@ -591,15 +607,19 @@ export class PeerTransport extends Transport {
 
     dc.onmessage = (event) => {
       const d = event.data as unknown;
+      // onmessage fires in channel order, but handling is async (AES-GCM
+      // decrypt has no cross-call ordering guarantee). The wire codec is
+      // stateful, so decode must happen in arrival order — serialize handling
+      // through the receive chain, mirroring enqueueSend on the send side.
       if (typeof d === 'string') {
-        this.handleIncomingString(d);
+        this.enqueueRecv(() => this.handleIncomingString(d));
       } else if (d instanceof ArrayBuffer) {
-        this.handleIncomingBinary(new Uint8Array(d));
+        this.enqueueRecv(() => this.handleIncomingBinary(new Uint8Array(d)));
       } else if (ArrayBuffer.isView(d)) {
-        this.handleIncomingBinary(new Uint8Array((d as ArrayBufferView).buffer, (d as ArrayBufferView).byteOffset, (d as ArrayBufferView).byteLength));
+        this.enqueueRecv(() => this.handleIncomingBinary(new Uint8Array((d as ArrayBufferView).buffer, (d as ArrayBufferView).byteOffset, (d as ArrayBufferView).byteLength)));
       } else if (d && typeof (d as { arrayBuffer?: () => Promise<ArrayBuffer> }).arrayBuffer === 'function') {
         // Blob fallback (some WebRTC stacks deliver binary as Blob)
-        void (d as Blob).arrayBuffer().then((ab) => this.handleIncomingBinary(new Uint8Array(ab)));
+        this.enqueueRecv(async () => this.handleIncomingBinary(new Uint8Array(await (d as Blob).arrayBuffer())));
       } else {
         log.warn(`unexpected DataChannel message type: ${typeof d}`);
       }
