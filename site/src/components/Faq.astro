@@ -1,12 +1,20 @@
 ---
 const questions = [
   {
+    q: 'Why is it called Abject?',
+    a: 'After "abject-oriented programming," a beloved old satire of how object-oriented code actually turns out. Abject is object-oriented programming that admits what it is: objects written by fallible people (and now fallible machines), expected to misbehave, and therefore surrounded by contracts, sandboxes, and supervisors. The name is a joke at software\'s expense, not a prophecy.',
+  },
+  {
     q: 'Do I have to know how to code?',
     a: 'No. Describe what you want and an abject appears, window and all. Every abject carries its own source code, so the curious can always open the hood, but you never have to. If you can complain, you can program.',
   },
   {
     q: 'Do I need an API key or an AI subscription?',
     a: 'Abject needs a mind to borrow, and it is flexible about whose. Bring an Anthropic or OpenAI API key, run a local Ollama model (free, private, and entirely on your hardware), or reuse the Claude Code or Codex subscription you already pay for. On first boot the app asks you which mind to summon.',
+  },
+  {
+    q: 'Does an LLM read every message?',
+    a: 'No. Messages between abjects are ordinary typed payloads on a message bus: fast, deterministic, and LLM-free. The LLM is a service an abject calls when it actually needs to think: negotiating a protocol with a stranger, generating a new object, or answering a question in plain English. The rest of the time it is just objects passing messages, the way software has done since Smalltalk.',
   },
   {
     q: 'Is it safe to let this thing touch my machine?',
@@ -25,8 +33,8 @@ const questions = [
 
 <section id="faq" class="faq-section">
   <div class="container">
-    <h2 class="section-title">Questions from the Mortals</h2>
-    <p class="faq-subtitle">Reasonable things to ask before inviting an organism onto your computer.</p>
+    <h2 class="section-title">Fair Questions</h2>
+    <p class="faq-subtitle">Reasonable things to ask before installing software that talks back.</p>
 
     <div class="faq-list">
       {questions.map((item) => (

@@ -15,7 +15,7 @@
 
     <!-- Zone B2: Goal Hierarchy Diagram -->
     <div class="goal-diagram">
-      <p class="diagram-label diagram-label-new">The Descent</p>
+      <p class="diagram-label diagram-label-new">The Goal Tree</p>
       <svg class="diagram-svg diagram-svg-new" viewBox="0 0 700 440" xmlns="http://www.w3.org/2000/svg">
         <defs>
           <filter id="em-gd-glow">
@@ -125,8 +125,8 @@
 
       <div class="step">
         <div class="step-label">I</div>
-        <h3 class="step-title">The Descent</h3>
-        <p class="step-tagline">A goal descends through the layers of what must be done.</p>
+        <h3 class="step-title">The Planning</h3>
+        <p class="step-tagline">A goal becomes a first round of tasks.</p>
         <p>User states a goal. The ScrumMaster opens the first scrum: it reviews the goal, polls available workers about what they can do, then stages a round of tasks and dispatches them into TupleSpace. The goal tree syncs across peers via CRDT. Tasks the planner couldn't anticipate get added in later scrums as the system learns what the work actually needs.</p>
       </div>
 
@@ -138,9 +138,9 @@
 
       <div class="step">
         <div class="step-label">II</div>
-        <h3 class="step-title">The Reaching</h3>
-        <p class="step-tagline">Abjects sense what they were made for.</p>
-        <p>The ScrumMaster polls registered workers through the ask protocol: "Can you do this? How?" Workers that can't help reply PASS; the planner assigns each task to the most fitting candidate. Tasks land in TupleSpace, which syncs across peers via CRDT over WebRTC. Optimistic claims with LWW, no locks. Not every hand that reaches needs a brain behind it.</p>
+        <h3 class="step-title">The Volunteering</h3>
+        <p class="step-tagline">Workers raise their hands for what they were made for.</p>
+        <p>The ScrumMaster polls registered workers through the ask protocol: "Can you do this? How?" Workers that can't help reply PASS; the planner assigns each task to the most fitting candidate. Tasks land in TupleSpace, which syncs across peers via CRDT over WebRTC. Optimistic claims with LWW, no locks. Not every volunteer needs a brain: some workers just run code.</p>
       </div>
 
       <div class="step-connector">
@@ -164,9 +164,9 @@
 
       <div class="step">
         <div class="step-label">IV</div>
-        <h3 class="step-title">The Scar</h3>
+        <h3 class="step-title">The Retrospective</h3>
         <p class="step-tagline">Failure is not the end. It is context for the next scrum.</p>
-        <p>Failed tasks attach their error and the worker that failed them to the goal's history. There is no per-task retry budget; the next scrum reads the failure and decides what to do about it: schedule a corrective task, route the work to a different abject, or fail the goal entirely. A GoalObserver watches from outside and auto-fails goals that go silent for too long. Nothing is patched into amnesia; every scar is a fact the next round can reason about.</p>
+        <p>Failed tasks attach their error and the worker that failed them to the goal's history. There is no per-task retry budget; the next scrum reads the failure and decides what to do about it: schedule a corrective task, route the work to a different abject, or fail the goal entirely. A GoalObserver watches from outside and auto-fails goals that go silent for too long. Nothing is patched into amnesia; every failure is a fact the next round can reason about. It is, as far as we know, the only retrospective anyone has ever enjoyed.</p>
       </div>
 
     </div>
@@ -430,7 +430,7 @@
     <!-- Zone E: Closing -->
     <div class="emergence-closing">
       <p class="closing-line">Four primitives. That's all it takes. A goal tree that decomposes work recursively. A shared TupleSpace where tasks are visible to every worker on every peer. Optimistic claims that resolve themselves without locks. A planner that runs in rounds, reads what each round produced (including the failures), and decides what to plan next.</p>
-      <p class="closing-line closing-vivid">From these, something unreasonable emerges: workers on different continents converging on the same objective without ever speaking to each other directly. Plans that rewrite themselves after each round, routing around damage like a river finding its way around a rock. Other frameworks coordinate agents. Abject grows organisms.</p>
+      <p class="closing-line closing-vivid">From these, something unreasonable emerges: workers on different continents converging on the same objective without ever speaking to each other directly. Plans that rewrite themselves after each round, routing around damage like a river finding its way around a rock. Other frameworks coordinate agents. Abject posts the job and lets whoever shows up claim it.</p>
       <p class="closing-definition"><em>emergence</em> (n.) - complex behavior that arises from simple local interactions. No conductor. No score. The music plays itself.</p>
     </div>
 

@@ -9,7 +9,7 @@
     </h1>
     <p class="hero-desc">
       Abject is an open-source desktop platform for local-first <em>AI objects</em>
-      that explain themselves, find each other, and heal themselves when they break.
+      that explain themselves, find each other, and repair themselves when they break.
       An <em>abject</em> is not an app. It is a small living object (a window, an agent,
       a tool, a peer) that carries its own description, talks to its neighbors through
       messages, and answers for itself in plain English.
@@ -43,7 +43,7 @@
       </div>
       <div class="hero-glyph">
         <span class="glyph-icon">{'{'}!{'}'}</span>
-        <span class="glyph-text">Networks that heal their own wounds</span>
+        <span class="glyph-text">Objects that repair their own plumbing</span>
       </div>
       <div class="hero-glyph">
         <span class="glyph-icon">{'{'}*{'}'}</span>
@@ -51,7 +51,9 @@
       </div>
     </div>
     <p class="hero-tagline">
-      abject <span class="dim">(n.)</span> AI Object. The word also means &lsquo;hopeless dread&rsquo;. Both meanings fit.
+      abject <span class="dim">(n.)</span> 1. an AI object. 2. &lsquo;utterly hopeless&rsquo;.
+      Named for <a href="https://typicalprogrammer.com/introduction-to-abject-oriented-programming" target="_blank" rel="noopener">abject-oriented programming</a>,
+      the methodology every codebase eventually practices. We decided to do it on purpose.
     </p>
   </div>
 </section>
@@ -124,12 +126,28 @@
     font-family: var(--font-mono);
     font-size: 0.9rem;
     color: var(--text-secondary);
+    max-width: 560px;
+    margin-left: auto;
+    margin-right: auto;
     margin-bottom: 2.5rem;
     font-style: italic;
+    line-height: 1.7;
   }
 
   .hero-tagline .dim {
     opacity: 0.6;
+  }
+
+  .hero-tagline a {
+    color: var(--eldritch-dim);
+    border-bottom: 1px solid rgba(43, 204, 110, 0.3);
+    padding-bottom: 1px;
+    transition: color 0.2s, border-color 0.2s;
+  }
+
+  .hero-tagline a:hover {
+    color: var(--eldritch);
+    border-bottom-color: var(--eldritch);
   }
 
   .hero-ask {

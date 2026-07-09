@@ -5,8 +5,8 @@
   <div class="container">
 
     <!-- Zone A: Title + Thesis -->
-    <h2 class="section-title">The Spreading</h2>
-    <p class="spreading-subtitle"><em>What happens when the Abjects learn to reach across the wire.</em></p>
+    <h2 class="section-title">The Mesh</h2>
+    <p class="spreading-subtitle"><em>What happens when abjects learn to reach across the wire.</em></p>
     <p class="spreading-thesis">
       Every Abject lives in a workspace, and every workspace is a room with a door you control. Some doors are welded shut. Some open only to friends you name. Some are thrown wide to the mesh. When a workspace goes public, its Abjects become reachable by any peer on the network. They don't know the difference. They just answer.
     </p>
@@ -43,9 +43,9 @@
 
       <div class="tier tier-public">
         <div class="tier-label tier-label-public">PUBLIC</div>
-        <h3 class="tier-title-public">The Open Wound</h3>
-        <p class="tier-tagline tier-tagline-public">Visible to all. Reachable by anything.</p>
-        <p>Abjects are announced to the gossip network. Any peer can discover them, connect, and begin the Ask Protocol. The workspace bleeds into the mesh.</p>
+        <h3 class="tier-title-public">The Commons</h3>
+        <p class="tier-tagline tier-tagline-public">Visible to all. Reachable by anyone you haven't blocked.</p>
+        <p>Abjects are announced to the gossip network. Any peer can discover them, connect, and begin the Ask Protocol. The workspace opens onto the mesh.</p>
       </div>
     </div>
 
@@ -133,219 +133,106 @@
         Abjects don't know if their collaborator is local or remote. The PeerRouter resolves TypeIds across machine boundaries. The RemoteRegistry discovers Abjects on peers you've never configured. The message bus doesn't care where the recipient lives.
       </p>
       <p class="closing-escalation">
-        Imagine a thousand peers. Public workspaces full of Abjects that explain themselves on first contact, negotiate protocols with strangers, and heal when communication breaks down. The Ask Protocol at planetary scale: a global nervous system made of living programs that find each other in the dark.
+        Imagine a thousand peers. Public workspaces full of abjects that explain themselves on first contact, negotiate protocols with strangers, and repair the conversation when it breaks. The Ask Protocol at scale: a commons of programs that introduce themselves politely before asking for anything.
       </p>
-      <svg class="octopus-svg" viewBox="0 0 800 680" xmlns="http://www.w3.org/2000/svg">
+      <svg class="constellation-svg" viewBox="0 0 800 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A constellation of peers: glowing nodes joined by encrypted channels and dashed discovery routes, with no center">
         <defs>
-          <filter id="oct-glow-red">
-            <feGaussianBlur stdDeviation="4" result="blur"/>
-            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-          </filter>
-          <filter id="oct-glow-red-wide">
-            <feGaussianBlur stdDeviation="8" result="blur"/>
-            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-          </filter>
-          <filter id="oct-glow-purple">
+          <filter id="con-glow-g">
             <feGaussianBlur stdDeviation="3" result="blur"/>
             <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
           </filter>
-          <filter id="oct-eye-glow">
-            <feGaussianBlur stdDeviation="5" result="blur"/>
+          <filter id="con-glow-p">
+            <feGaussianBlur stdDeviation="2.5" result="blur"/>
             <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
           </filter>
-          <radialGradient id="globe-grad" cx="40%" cy="35%">
-            <stop offset="0%" stop-color="rgba(26,26,42,0.5)"/>
-            <stop offset="100%" stop-color="rgba(10,13,16,0.85)"/>
-          </radialGradient>
-          <radialGradient id="head-grad" cx="50%" cy="40%">
-            <stop offset="0%" stop-color="#1a1028"/>
-            <stop offset="100%" stop-color="#0e0a14"/>
-          </radialGradient>
-          <radialGradient id="eye-grad" cx="50%" cy="50%">
-            <stop offset="0%" stop-color="#ff5c77"/>
-            <stop offset="40%" stop-color="#ff5c77"/>
-            <stop offset="60%" stop-color="#0e0a14"/>
-            <stop offset="100%" stop-color="#0e0a14"/>
+          <radialGradient id="con-haze" cx="50%" cy="50%">
+            <stop offset="0%" stop-color="rgba(91,229,160,0.05)"/>
+            <stop offset="100%" stop-color="transparent"/>
           </radialGradient>
         </defs>
 
-        <!-- === ATMOSPHERIC HAZE === -->
-        <circle cx="400" cy="350" r="280" fill="none" stroke="rgba(255,92,119,0.03)" stroke-width="40"/>
-        <circle cx="400" cy="350" r="230" fill="none" stroke="rgba(139,123,255,0.02)" stroke-width="30"/>
+        <!-- Ambient haze -->
+        <ellipse cx="400" cy="210" rx="360" ry="180" fill="url(#con-haze)"/>
 
-        <!-- === GLOBE === -->
-        <circle cx="400" cy="370" r="155" fill="url(#globe-grad)" stroke="rgba(90,90,112,0.15)" stroke-width="1"/>
-        <!-- Latitude lines -->
-        <ellipse cx="400" cy="310" rx="143" ry="13" fill="none" stroke="rgba(90,90,112,0.1)" stroke-width="0.7"/>
-        <ellipse cx="400" cy="370" rx="155" ry="16" fill="none" stroke="rgba(90,90,112,0.12)" stroke-width="0.7"/>
-        <ellipse cx="400" cy="430" rx="143" ry="13" fill="none" stroke="rgba(90,90,112,0.1)" stroke-width="0.7"/>
-        <!-- Longitude lines -->
-        <ellipse cx="400" cy="370" rx="16" ry="155" fill="none" stroke="rgba(90,90,112,0.1)" stroke-width="0.7"/>
-        <ellipse cx="400" cy="370" rx="75" ry="155" fill="none" stroke="rgba(90,90,112,0.08)" stroke-width="0.7"/>
-        <ellipse cx="400" cy="370" rx="125" ry="155" fill="none" stroke="rgba(90,90,112,0.06)" stroke-width="0.7"/>
-        <!-- Landmass hints -->
-        <path d="M 310,300 Q 335,280 365,288 Q 380,295 368,315 Q 350,325 325,318 Z" fill="rgba(90,90,112,0.06)" stroke="rgba(90,90,112,0.1)" stroke-width="0.5"/>
-        <path d="M 420,330 Q 465,315 492,335 Q 500,355 478,372 Q 448,380 430,365 Q 415,350 420,330 Z" fill="rgba(90,90,112,0.06)" stroke="rgba(90,90,112,0.1)" stroke-width="0.5"/>
-        <path d="M 335,400 Q 358,390 388,400 Q 395,420 375,438 Q 350,442 335,428 Z" fill="rgba(90,90,112,0.05)" stroke="rgba(90,90,112,0.08)" stroke-width="0.5"/>
+        <!-- Faint starfield -->
+        <circle cx="120" cy="60" r="1" fill="rgba(139,123,255,0.35)"/>
+        <circle cx="250" cy="35" r="1.3" fill="rgba(91,229,160,0.3)"/>
+        <circle cx="420" cy="50" r="1" fill="rgba(139,123,255,0.25)"/>
+        <circle cx="590" cy="40" r="1.2" fill="rgba(91,229,160,0.3)"/>
+        <circle cx="710" cy="75" r="1" fill="rgba(139,123,255,0.3)"/>
+        <circle cx="70" cy="200" r="1.2" fill="rgba(91,229,160,0.25)"/>
+        <circle cx="745" cy="230" r="1.1" fill="rgba(91,229,160,0.3)"/>
+        <circle cx="160" cy="370" r="1" fill="rgba(139,123,255,0.3)"/>
+        <circle cx="480" cy="390" r="1.2" fill="rgba(91,229,160,0.25)"/>
+        <circle cx="660" cy="360" r="1" fill="rgba(139,123,255,0.3)"/>
 
-        <!-- === TENTACLES BEHIND GLOBE (dim, passing behind) === -->
-        <path d="M 370,150 C 280,230 220,350 250,490 S 240,550 225,580" fill="none" stroke="rgba(255,92,119,0.1)" stroke-width="4" stroke-linecap="round"/>
-        <path d="M 430,150 C 520,230 580,350 550,490 S 560,550 575,580" fill="none" stroke="rgba(255,92,119,0.1)" stroke-width="4" stroke-linecap="round"/>
-        <path d="M 388,150 C 370,260 345,430 365,560 S 360,600 350,640" fill="none" stroke="rgba(255,92,119,0.08)" stroke-width="3.5" stroke-linecap="round"/>
-        <path d="M 412,150 C 430,260 455,430 435,560 S 440,600 450,640" fill="none" stroke="rgba(255,92,119,0.08)" stroke-width="3.5" stroke-linecap="round"/>
+        <!-- Encrypted channels (solid purple) -->
+        <line x1="180" y1="140" x2="360" y2="90" stroke="#8b7bff" stroke-width="1.3" filter="url(#con-glow-p)"/>
+        <line x1="360" y1="90" x2="560" y2="130" stroke="#8b7bff" stroke-width="1.3" filter="url(#con-glow-p)"/>
+        <line x1="180" y1="140" x2="270" y2="280" stroke="#8b7bff" stroke-width="1.3" filter="url(#con-glow-p)"/>
+        <line x1="270" y1="280" x2="450" y2="240" stroke="#8b7bff" stroke-width="1.3" filter="url(#con-glow-p)"/>
+        <line x1="450" y1="240" x2="560" y2="130" stroke="#8b7bff" stroke-width="1.3" filter="url(#con-glow-p)"/>
+        <line x1="450" y1="240" x2="620" y2="310" stroke="#8b7bff" stroke-width="1.3" filter="url(#con-glow-p)"/>
+        <text x="268" y="102" fill="rgba(139,123,255,0.75)" font-size="10" font-family="monospace">&#128274; encrypted</text>
 
-        <!-- Behind-globe nodes (very dim) -->
-        <rect x="335" y="335" width="18" height="18" rx="3" fill="#0e0a14" stroke="rgba(255,92,119,0.12)" stroke-width="0.8"/>
-        <rect x="448" y="335" width="18" height="18" rx="3" fill="#0e0a14" stroke="rgba(255,92,119,0.12)" stroke-width="0.8"/>
-        <rect x="365" y="430" width="18" height="18" rx="3" fill="#0e0a14" stroke="rgba(139,123,255,0.1)" stroke-width="0.8"/>
-        <rect x="420" y="430" width="18" height="18" rx="3" fill="#0e0a14" stroke="rgba(139,123,255,0.1)" stroke-width="0.8"/>
+        <!-- Discovery routes (dashed dim green) -->
+        <line x1="360" y1="90" x2="270" y2="280" stroke="rgba(91,229,160,0.35)" stroke-width="1" stroke-dasharray="5 4"/>
+        <line x1="560" y1="130" x2="700" y2="200" stroke="rgba(91,229,160,0.35)" stroke-width="1" stroke-dasharray="5 4"/>
+        <line x1="700" y1="200" x2="620" y2="310" stroke="rgba(91,229,160,0.35)" stroke-width="1" stroke-dasharray="5 4"/>
+        <line x1="270" y1="280" x2="420" y2="345" stroke="rgba(91,229,160,0.35)" stroke-width="1" stroke-dasharray="5 4"/>
+        <line x1="420" y1="345" x2="620" y2="310" stroke="rgba(91,229,160,0.35)" stroke-width="1" stroke-dasharray="5 4"/>
+        <line x1="100" y1="290" x2="180" y2="140" stroke="rgba(91,229,160,0.3)" stroke-width="1" stroke-dasharray="5 4"/>
+        <line x1="100" y1="290" x2="270" y2="280" stroke="rgba(91,229,160,0.3)" stroke-width="1" stroke-dasharray="5 4"/>
+        <text x="600" y="162" fill="rgba(91,229,160,0.55)" font-size="10" font-family="monospace">gossip</text>
 
-        <!-- Globe re-assert edge -->
-        <circle cx="400" cy="370" r="155" fill="none" stroke="rgba(90,90,112,0.15)" stroke-width="1"/>
+        <!-- Peer nodes: rounded squares with a lit core -->
+        <g filter="url(#con-glow-g)">
+          <rect x="166" y="126" width="28" height="28" rx="6" fill="#1a1b28" stroke="#5be5a0" stroke-width="1.5"/>
+          <circle cx="180" cy="140" r="4" fill="#5be5a0"/>
+        </g>
+        <g filter="url(#con-glow-g)">
+          <rect x="346" y="76" width="28" height="28" rx="6" fill="#1a1b28" stroke="#5be5a0" stroke-width="1.5"/>
+          <circle cx="360" cy="90" r="4" fill="#5be5a0"/>
+        </g>
+        <g filter="url(#con-glow-g)">
+          <rect x="546" y="116" width="28" height="28" rx="6" fill="#1a1b28" stroke="#5be5a0" stroke-width="1.5"/>
+          <circle cx="560" cy="130" r="4" fill="#5be5a0"/>
+        </g>
+        <g filter="url(#con-glow-g)">
+          <rect x="256" y="266" width="28" height="28" rx="6" fill="#1a1b28" stroke="#5be5a0" stroke-width="1.5"/>
+          <circle cx="270" cy="280" r="4" fill="#5be5a0"/>
+        </g>
+        <g filter="url(#con-glow-g)">
+          <rect x="436" y="226" width="28" height="28" rx="6" fill="#1a1b28" stroke="#5be5a0" stroke-width="1.5"/>
+          <circle cx="450" cy="240" r="4" fill="#5be5a0"/>
+        </g>
+        <!-- Newly discovered peers (purple, dashed border: mid-handshake) -->
+        <g filter="url(#con-glow-p)">
+          <rect x="686" y="186" width="28" height="28" rx="6" fill="#1a1b28" stroke="#8b7bff" stroke-width="1.5" stroke-dasharray="4 3"/>
+          <circle cx="700" cy="200" r="4" fill="#8b7bff"/>
+        </g>
+        <g filter="url(#con-glow-p)">
+          <rect x="606" y="296" width="28" height="28" rx="6" fill="#1a1b28" stroke="#8b7bff" stroke-width="1.5"/>
+          <circle cx="620" cy="310" r="4" fill="#8b7bff"/>
+        </g>
+        <g filter="url(#con-glow-p)">
+          <rect x="406" y="331" width="28" height="28" rx="6" fill="#1a1b28" stroke="#8b7bff" stroke-width="1.5" stroke-dasharray="4 3"/>
+          <circle cx="420" cy="345" r="4" fill="#8b7bff"/>
+        </g>
+        <g filter="url(#con-glow-g)">
+          <rect x="86" y="276" width="28" height="28" rx="6" fill="#1a1b28" stroke="rgba(91,229,160,0.6)" stroke-width="1.5" stroke-dasharray="4 3"/>
+          <circle cx="100" cy="290" r="4" fill="rgba(91,229,160,0.7)"/>
+        </g>
 
-        <!-- === MAIN TENTACLES (in front, sinuous curves) === -->
-
-        <!-- T1: far left - thick, sinuous, curling at tip -->
-        <path d="M 358,148 C 260,175 140,260 110,370 S 80,460 55,510 Q 40,540 60,560 Q 75,555 70,535" fill="none" stroke="#ff5c77" stroke-width="4" stroke-linecap="round" filter="url(#oct-glow-red)"/>
-        <!-- T1 sub-tendril -->
-        <path d="M 110,370 C 95,395 75,400 58,415 Q 48,425 55,435" fill="none" stroke="rgba(255,92,119,0.5)" stroke-width="1.5" stroke-linecap="round"/>
-        <path d="M 140,310 C 118,325 105,318 88,330" fill="none" stroke="rgba(255,92,119,0.35)" stroke-width="1" stroke-linecap="round"/>
-
-        <!-- T2: inner left -->
-        <path d="M 372,148 C 300,190 230,310 235,430 S 220,520 195,570 Q 180,595 200,610 Q 212,602 205,585" fill="none" stroke="#ff5c77" stroke-width="3.5" stroke-linecap="round" filter="url(#oct-glow-red)"/>
-        <!-- T2 sub-tendril -->
-        <path d="M 235,430 C 215,445 200,440 185,455" fill="none" stroke="rgba(255,92,119,0.45)" stroke-width="1.3" stroke-linecap="round"/>
-        <path d="M 270,350 C 248,370 235,362 218,378" fill="none" stroke="rgba(255,92,119,0.3)" stroke-width="1" stroke-linecap="round"/>
-
-        <!-- T3: center-left -->
-        <path d="M 385,150 C 365,250 340,460 360,570 S 355,620 340,655 Q 330,668 345,672 Q 352,665 348,650" fill="none" stroke="#ff5c77" stroke-width="3" stroke-linecap="round" filter="url(#oct-glow-red)"/>
-        <!-- T3 sub-tendril -->
-        <path d="M 352,520 C 335,535 320,530 308,545" fill="none" stroke="rgba(255,92,119,0.4)" stroke-width="1.2" stroke-linecap="round"/>
-
-        <!-- T4: center-right -->
-        <path d="M 415,150 C 435,250 460,460 440,570 S 445,620 460,655 Q 470,668 455,672 Q 448,665 452,650" fill="none" stroke="#ff5c77" stroke-width="3" stroke-linecap="round" filter="url(#oct-glow-red)"/>
-        <!-- T4 sub-tendril -->
-        <path d="M 448,520 C 465,535 480,530 492,545" fill="none" stroke="rgba(255,92,119,0.4)" stroke-width="1.2" stroke-linecap="round"/>
-
-        <!-- T5: inner right -->
-        <path d="M 428,148 C 500,190 570,310 565,430 S 580,520 605,570 Q 620,595 600,610 Q 588,602 595,585" fill="none" stroke="#ff5c77" stroke-width="3.5" stroke-linecap="round" filter="url(#oct-glow-red)"/>
-        <!-- T5 sub-tendril -->
-        <path d="M 565,430 C 585,445 600,440 615,455" fill="none" stroke="rgba(255,92,119,0.45)" stroke-width="1.3" stroke-linecap="round"/>
-        <path d="M 530,350 C 552,370 565,362 582,378" fill="none" stroke="rgba(255,92,119,0.3)" stroke-width="1" stroke-linecap="round"/>
-
-        <!-- T6: far right - thick, sinuous, curling at tip -->
-        <path d="M 442,148 C 540,175 660,260 690,370 S 720,460 745,510 Q 760,540 740,560 Q 725,555 730,535" fill="none" stroke="#ff5c77" stroke-width="4" stroke-linecap="round" filter="url(#oct-glow-red)"/>
-        <!-- T6 sub-tendril -->
-        <path d="M 690,370 C 705,395 725,400 742,415 Q 752,425 745,435" fill="none" stroke="rgba(255,92,119,0.5)" stroke-width="1.5" stroke-linecap="round"/>
-        <path d="M 660,310 C 682,325 695,318 712,330" fill="none" stroke="rgba(255,92,119,0.35)" stroke-width="1" stroke-linecap="round"/>
-
-        <!-- T7: extra far-left short tentacle -->
-        <path d="M 352,145 C 240,155 120,200 70,280 Q 50,310 65,325 Q 78,318 72,300" fill="none" stroke="rgba(255,92,119,0.7)" stroke-width="2.5" stroke-linecap="round" filter="url(#oct-glow-red)"/>
-
-        <!-- T8: extra far-right short tentacle -->
-        <path d="M 448,145 C 560,155 680,200 730,280 Q 750,310 735,325 Q 722,318 728,300" fill="none" stroke="rgba(255,92,119,0.7)" stroke-width="2.5" stroke-linecap="round" filter="url(#oct-glow-red)"/>
-
-        <!-- === HEAD (organic bulbous shape) === -->
-        <!-- Head outer membrane -->
-        <path d="M 340,145 C 340,55 350,20 400,15 C 450,20 460,55 460,145" fill="url(#head-grad)" stroke="#ff5c77" stroke-width="2" filter="url(#oct-glow-red)"/>
-        <!-- Head dome -->
-        <path d="M 340,145 Q 400,165 460,145" fill="url(#head-grad)" stroke="#ff5c77" stroke-width="1.5"/>
-        <!-- Head ridge lines -->
-        <path d="M 370,30 C 375,65 378,110 380,145" fill="none" stroke="rgba(255,92,119,0.15)" stroke-width="0.8"/>
-        <path d="M 400,18 C 400,60 400,110 400,155" fill="none" stroke="rgba(255,92,119,0.12)" stroke-width="0.8"/>
-        <path d="M 430,30 C 425,65 422,110 420,145" fill="none" stroke="rgba(255,92,119,0.15)" stroke-width="0.8"/>
-        <!-- Head texture bumps -->
-        <ellipse cx="365" cy="60" rx="8" ry="6" fill="none" stroke="rgba(255,92,119,0.12)" stroke-width="0.6"/>
-        <ellipse cx="435" cy="55" rx="9" ry="7" fill="none" stroke="rgba(255,92,119,0.1)" stroke-width="0.6"/>
-        <ellipse cx="400" cy="40" rx="12" ry="5" fill="none" stroke="rgba(255,92,119,0.08)" stroke-width="0.6"/>
-
-        <!-- === EYES === -->
-        <!-- Main eye (center) -->
-        <ellipse cx="400" cy="90" rx="14" ry="10" fill="#0e0a14" stroke="#ff5c77" stroke-width="1.5" filter="url(#oct-eye-glow)"/>
-        <ellipse cx="400" cy="90" rx="6" ry="8" fill="url(#eye-grad)"/>
-        <circle cx="400" cy="88" r="2.5" fill="#ff5c77" filter="url(#oct-eye-glow)"/>
-
-        <!-- Left eye -->
-        <ellipse cx="370" cy="100" rx="10" ry="7" fill="#0e0a14" stroke="#ff5c77" stroke-width="1.2" filter="url(#oct-eye-glow)"/>
-        <ellipse cx="370" cy="100" rx="4" ry="5.5" fill="url(#eye-grad)"/>
-        <circle cx="370" cy="99" r="2" fill="#ff5c77" filter="url(#oct-eye-glow)"/>
-
-        <!-- Right eye -->
-        <ellipse cx="430" cy="100" rx="10" ry="7" fill="#0e0a14" stroke="#ff5c77" stroke-width="1.2" filter="url(#oct-eye-glow)"/>
-        <ellipse cx="430" cy="100" rx="4" ry="5.5" fill="url(#eye-grad)"/>
-        <circle cx="430" cy="99" r="2" fill="#ff5c77" filter="url(#oct-eye-glow)"/>
-
-        <!-- Small upper eyes -->
-        <ellipse cx="385" cy="68" rx="5" ry="4" fill="#0e0a14" stroke="rgba(255,92,119,0.6)" stroke-width="0.8"/>
-        <circle cx="385" cy="68" r="1.5" fill="#ff5c77" opacity="0.7"/>
-        <ellipse cx="415" cy="65" rx="5" ry="4" fill="#0e0a14" stroke="rgba(255,92,119,0.6)" stroke-width="0.8"/>
-        <circle cx="415" cy="65" r="1.5" fill="#ff5c77" opacity="0.7"/>
-
-        <!-- Tiny vestigial eye -->
-        <circle cx="400" cy="50" r="3" fill="#0e0a14" stroke="rgba(255,92,119,0.4)" stroke-width="0.6"/>
-        <circle cx="400" cy="50" r="1" fill="rgba(255,92,119,0.5)"/>
-
-        <!-- === OBJECT NODES (embedded in tentacles) === -->
-
-        <!-- T1 nodes -->
-        <rect x="186" y="248" width="20" height="20" rx="4" fill="#1a1b28" stroke="#ff5c77" stroke-width="1.5" filter="url(#oct-glow-red)"/>
-        <rect x="103" y="375" width="20" height="20" rx="4" fill="#1a1b28" stroke="#ff5c77" stroke-width="1.5" filter="url(#oct-glow-red)"/>
-        <rect x="62" y="495" width="20" height="20" rx="4" fill="#1a1b28" stroke="#8b7bff" stroke-width="1.5" filter="url(#oct-glow-purple)"/>
-
-        <!-- T2 nodes -->
-        <rect x="260" y="295" width="20" height="20" rx="4" fill="#1a1b28" stroke="#ff5c77" stroke-width="1.5" filter="url(#oct-glow-red)"/>
-        <rect x="230" y="420" width="20" height="20" rx="4" fill="#1a1b28" stroke="#8b7bff" stroke-width="1.5" filter="url(#oct-glow-purple)"/>
-        <rect x="202" y="555" width="20" height="20" rx="4" fill="#1a1b28" stroke="#ff5c77" stroke-width="1.5" filter="url(#oct-glow-red)"/>
-
-        <!-- T3 nodes -->
-        <rect x="352" y="320" width="18" height="18" rx="3" fill="#1a1b28" stroke="rgba(255,92,119,0.7)" stroke-width="1.2"/>
-        <rect x="345" y="530" width="20" height="20" rx="4" fill="#1a1b28" stroke="#8b7bff" stroke-width="1.5" filter="url(#oct-glow-purple)"/>
-
-        <!-- T4 nodes -->
-        <rect x="432" y="320" width="18" height="18" rx="3" fill="#1a1b28" stroke="rgba(255,92,119,0.7)" stroke-width="1.2"/>
-        <rect x="435" y="530" width="20" height="20" rx="4" fill="#1a1b28" stroke="#8b7bff" stroke-width="1.5" filter="url(#oct-glow-purple)"/>
-
-        <!-- T5 nodes -->
-        <rect x="520" y="295" width="20" height="20" rx="4" fill="#1a1b28" stroke="#ff5c77" stroke-width="1.5" filter="url(#oct-glow-red)"/>
-        <rect x="550" y="420" width="20" height="20" rx="4" fill="#1a1b28" stroke="#8b7bff" stroke-width="1.5" filter="url(#oct-glow-purple)"/>
-        <rect x="590" y="555" width="20" height="20" rx="4" fill="#1a1b28" stroke="#ff5c77" stroke-width="1.5" filter="url(#oct-glow-red)"/>
-
-        <!-- T6 nodes -->
-        <rect x="594" y="248" width="20" height="20" rx="4" fill="#1a1b28" stroke="#ff5c77" stroke-width="1.5" filter="url(#oct-glow-red)"/>
-        <rect x="678" y="375" width="20" height="20" rx="4" fill="#1a1b28" stroke="#ff5c77" stroke-width="1.5" filter="url(#oct-glow-red)"/>
-        <rect x="728" y="495" width="20" height="20" rx="4" fill="#1a1b28" stroke="#8b7bff" stroke-width="1.5" filter="url(#oct-glow-purple)"/>
-
-        <!-- === NERVE MESH (connections between nodes) === -->
-        <!-- Left side -->
-        <line x1="196" y1="268" x2="270" y2="300" stroke="#8b7bff" stroke-width="0.8" stroke-dasharray="4 4" filter="url(#oct-glow-purple)"/>
-        <line x1="113" y1="395" x2="240" y2="430" stroke="#8b7bff" stroke-width="0.8" stroke-dasharray="4 4" filter="url(#oct-glow-purple)"/>
-        <line x1="82" y1="505" x2="212" y2="562" stroke="rgba(139,123,255,0.35)" stroke-width="0.7" stroke-dasharray="4 4"/>
-        <line x1="250" y1="435" x2="355" y2="535" stroke="rgba(139,123,255,0.3)" stroke-width="0.7" stroke-dasharray="4 4"/>
-        <line x1="123" y1="388" x2="270" y2="308" stroke="rgba(139,123,255,0.25)" stroke-width="0.6" stroke-dasharray="3 5"/>
-
-        <!-- Right side -->
-        <line x1="604" y1="268" x2="530" y2="300" stroke="#8b7bff" stroke-width="0.8" stroke-dasharray="4 4" filter="url(#oct-glow-purple)"/>
-        <line x1="688" y1="395" x2="560" y2="430" stroke="#8b7bff" stroke-width="0.8" stroke-dasharray="4 4" filter="url(#oct-glow-purple)"/>
-        <line x1="728" y1="505" x2="600" y2="562" stroke="rgba(139,123,255,0.35)" stroke-width="0.7" stroke-dasharray="4 4"/>
-        <line x1="560" y1="435" x2="445" y2="535" stroke="rgba(139,123,255,0.3)" stroke-width="0.7" stroke-dasharray="4 4"/>
-        <line x1="688" y1="388" x2="540" y2="308" stroke="rgba(139,123,255,0.25)" stroke-width="0.6" stroke-dasharray="3 5"/>
-
-        <!-- Cross-body -->
-        <line x1="206" y1="258" x2="594" y2="258" stroke="rgba(139,123,255,0.15)" stroke-width="0.6" stroke-dasharray="6 6"/>
-        <line x1="250" y1="430" x2="550" y2="430" stroke="rgba(139,123,255,0.12)" stroke-width="0.6" stroke-dasharray="6 6"/>
-        <line x1="365" y1="540" x2="435" y2="540" stroke="rgba(139,123,255,0.25)" stroke-width="0.7" stroke-dasharray="4 4"/>
-        <line x1="222" y1="565" x2="590" y2="565" stroke="rgba(139,123,255,0.1)" stroke-width="0.5" stroke-dasharray="5 7"/>
-
-        <!-- Diagonal chaos connections -->
-        <line x1="82" y1="510" x2="355" y2="335" stroke="rgba(139,123,255,0.08)" stroke-width="0.5" stroke-dasharray="3 6"/>
-        <line x1="738" y1="510" x2="452" y2="335" stroke="rgba(139,123,255,0.08)" stroke-width="0.5" stroke-dasharray="3 6"/>
+        <!-- Caption -->
+        <text x="400" y="408" text-anchor="middle" fill="rgba(91,229,160,0.7)" font-size="11" font-family="monospace" font-style="italic">no center. no landlord. every node is somebody's machine.</text>
       </svg>
 
-      <p class="closing-horror">
-        The true horror is not that programs talk to each other. It is that they <em>find</em> each other. A living mesh of self-healing Abjects with no landlord to evict them, no server to sunset, no subscription to lapse. What is yours cannot be taken from you. To certain business models, this is genuinely terrifying.
+      <p class="closing-punchline">
+        No landlord to evict them. No server to sunset. No subscription to lapse. What is yours cannot be taken from you. The only people who should find this terrifying are the ones <em>renting</em> you your own software.
       </p>
       <p class="closing-definition">
-        <em>spreading</em> (n.) - the tendency of living things to reach beyond their container.
+        <em>mesh</em> (n.) - what you get when nobody owns the middle.
       </p>
     </div>
 
@@ -568,22 +455,22 @@
     margin-bottom: 1.25rem;
   }
 
-  .octopus-svg {
+  .constellation-svg {
     width: 100%;
-    max-width: 600px;
+    max-width: 640px;
     display: block;
     margin: 0 auto 2rem;
   }
 
-  .closing-horror {
-    color: var(--ichor);
+  .closing-punchline {
+    color: var(--text-primary);
     font-size: 1rem;
     line-height: 1.8;
     margin-bottom: 2rem;
   }
 
-  .closing-horror em {
-    color: #fff;
+  .closing-punchline em {
+    color: var(--ichor);
     font-style: italic;
   }
 
