@@ -28,14 +28,30 @@
         The window opens because it was asked to.
       </p>
     </div>
-    <p class="hero-desc">
-      An <em>abject</em> is not an app. It is a small living object (a window, an agent,
-      a tool, a peer) that carries its own description, talks to its neighbors through
-      messages, and answers for itself in plain English.
-      Ask any abject what it is, and it will tell you. Politely.
-      Engineers will recognize the species: an actor, but one you can interview.
-      <a href="/ask-protocol" class="thesis-link">Read the Ask Protocol &rarr;</a>
-    </p>
+    <h2 class="section-title hero-desc-heading">What are Abjects?</h2>
+    <div class="ask-demo">
+      <p class="ask-call">
+        <span class="ask-you">you</span><span class="ask-op">&gt;</span><code class="ask-code">{'ask({ question: "what are you?" })'}</code><span class="ask-cursor" aria-hidden="true"></span>
+      </p>
+      <div class="ask-reply">
+        <div class="ask-reply-bar">
+          <span class="ask-reply-title"><span class="ask-reply-icon">💬</span> reply from: abject</span>
+          <span class="ask-reply-controls" aria-hidden="true">?&ensp;&minus;&ensp;&times;</span>
+        </div>
+        <div class="ask-reply-body">
+          <p>
+            Not an app. A small living object: a window, an agent, a tool, a peer.
+            I carry my own description, talk to my neighbors through messages, and
+            answer for myself in plain English. Which is what I am doing right now.
+            Politely.
+          </p>
+          <p>
+            Engineers will recognize my species: an actor, but one you can interview.
+            <a href="/ask-protocol" class="thesis-link">Read the Ask Protocol &rarr;</a>
+          </p>
+        </div>
+      </div>
+    </div>
     <div class="hero-glyphs">
       <div class="hero-glyph">
         <span class="glyph-icon">{'{'}?{'}'}</span>
@@ -57,6 +73,21 @@
   </div>
 </section>
 
+<script>
+  const demo = document.querySelector('.ask-demo');
+  if (demo && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    demo.setAttribute('data-armed', '');
+    new IntersectionObserver((entries, obs) => {
+      for (const e of entries) {
+        if (e.isIntersecting) {
+          demo.classList.add('play');
+          obs.disconnect();
+        }
+      }
+    }, { threshold: 0.5 }).observe(demo);
+  }
+</script>
+
 <style>
   .hero {
     position: relative;
@@ -64,6 +95,7 @@
     display: flex;
     align-items: center;
     padding-top: 64px;
+    padding-bottom: 0;
     overflow: hidden;
   }
 
@@ -81,7 +113,8 @@
   .hero-content {
     position: relative;
     text-align: center;
-    padding: 4rem 0;
+    padding-top: 4rem;
+    padding-bottom: 0;
   }
 
   .hero-label {
@@ -124,12 +157,143 @@
     line-height: 1.7;
   }
 
-  .hero-desc {
+  .hero-desc-heading {
+    margin-top: var(--section-gap);
+    margin-bottom: 0;
+  }
+
+  /* ── The ask demo: the section performs the protocol it describes ── */
+  .ask-demo {
     max-width: 620px;
-    margin: 3rem auto 2rem;
+    margin: 2rem auto 2.5rem;
+    text-align: left;
+  }
+
+  .ask-call {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.95rem;
+    margin-bottom: 0.9rem;
+  }
+
+  .ask-you {
+    color: var(--void-purple);
+  }
+
+  .ask-op {
+    color: var(--text-dim);
+  }
+
+  .ask-code {
+    display: inline-block;
+    color: var(--eldritch);
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 1em;
+  }
+
+  .ask-cursor {
+    display: inline-block;
+    width: 0.55em;
+    height: 1.1em;
+    background: var(--eldritch);
+    box-shadow: 0 0 8px var(--eldritch-glow-strong);
+    animation: cursor-blink 1.1s steps(1) infinite;
+  }
+
+  @keyframes cursor-blink {
+    50% { opacity: 0; }
+  }
+
+  .ask-reply {
+    background: var(--bg-card);
+    border: 1px solid var(--border-accent);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 0 24px var(--eldritch-glow);
+  }
+
+  .ask-reply-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.5rem 0.9rem;
+    background: rgba(18, 18, 30, 0.75);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .ask-reply-title {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
     color: var(--text-secondary);
-    font-size: 1.1rem;
+    letter-spacing: 0.06em;
+  }
+
+  .ask-reply-icon {
+    font-size: 0.85em;
+    margin-right: 0.15rem;
+  }
+
+  .ask-reply-controls {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    letter-spacing: 0.05em;
+    user-select: none;
+  }
+
+  .ask-reply-body {
+    padding: 1.35rem 1.6rem;
+  }
+
+  .ask-reply-body p {
+    color: var(--text-secondary);
+    font-size: 1.05rem;
     line-height: 1.8;
+    margin-bottom: 0.9rem;
+  }
+
+  .ask-reply-body p:last-child {
+    margin-bottom: 0;
+  }
+
+  /* Orchestrated reveal: armed by JS only when motion is welcome.
+     Without JS (or with reduced motion) everything is simply visible. */
+  .ask-demo[data-armed] .ask-code {
+    width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+
+  .ask-demo[data-armed].play .ask-code {
+    animation: ask-type 1.3s steps(34, end) 0.3s forwards;
+  }
+
+  .ask-demo[data-armed] .ask-reply {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  .ask-demo[data-armed].play .ask-reply {
+    animation: reply-in 0.55s ease 1.85s forwards;
+  }
+
+  @keyframes ask-type {
+    from { width: 0; }
+    to { width: 34ch; }
+  }
+
+  @keyframes reply-in {
+    to { opacity: 1; transform: none; }
+  }
+
+  @media (max-width: 480px) {
+    .ask-call {
+      font-size: 0.78rem;
+    }
   }
 
   .hero-tagline {
@@ -139,7 +303,7 @@
     max-width: 560px;
     margin-left: auto;
     margin-right: auto;
-    margin-bottom: 2.5rem;
+    margin-bottom: 0;
     font-style: italic;
     line-height: 1.7;
   }

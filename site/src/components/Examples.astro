@@ -1,34 +1,14 @@
 ---
 const examples = [
   {
-    glyph: '{¤}',
-    title: 'Friday, 2 AM. Your agent is still reading.',
-    body: 'You went to bed. An abject pulled 47 papers from your RSS feeds, ranked them against your open projects, drafted a one-page summary, and pinned it to the canvas. The tokens came from your local Ollama. No surprise bill. No surprise rate limit at hour three. Wake up. Coffee. Read.',
-  },
-  {
     glyph: '{☾}',
     title: 'Say "show me when the sun sets." A countdown appears.',
     body: 'A small window with an animated sun sliding toward the horizon, counting down the minutes, refreshing itself from live weather data. Nobody wrote an app for this. Nobody ever will. That is the point: it took one sentence, and now it exists, and it is yours.',
   },
   {
-    glyph: '{↻}',
-    title: 'Your scraper crashed. Twenty seconds later, the work routes around it.',
-    body: 'The failed task attaches its error to the goal\'s history. The next planning round reads what just broke, picks a different abject, and stages the retry. No 30-minute chain running off a cliff. The plan rewrites itself round by round.',
-  },
-  {
-    glyph: '{✉}',
-    title: 'Your inbox gets sorted before you wake up.',
-    body: 'Every morning at eight, an abject reads the night\'s email, separates the clutter from the things that matter, and messages your phone: may I delete these? It waits for your yes. Then, and only then, the junk dies. An assistant with initiative and manners.',
-  },
-  {
-    glyph: '{△}',
-    title: 'Click. Your friend\'s cursor is on your canvas.',
-    body: 'She\'s in Berlin. You\'re in Brooklyn. Both on Wi-Fi. Pin a note; she draws an arrow to it; you watch her cursor move in real time. End-to-end encrypted WebRTC, ECDH key exchange, AES-256-GCM. The signaling relay never sees a byte.',
-  },
-  {
-    glyph: '{∇}',
-    title: 'Twenty words. A new program appears.',
-    body: '"Watch ~/Downloads. When a PDF lands, rename it by its title, move it to ~/Papers/{year}." You say it once. The system understands the goal, writes the object, and gives it a face. A new window opens. It is already running.',
+    glyph: '{◉}',
+    title: 'Ten years of notes. A graph view, no app switch.',
+    body: 'Thousands of notes in a TiddlyWiki. One sentence, and an abject builds a client that renders them as an explorable graph. Your friends switched note apps to get that feature. You keep your wiki and grow the feature instead. Software that is personal, connected, and yours.',
   },
   {
     glyph: '{∿}',
@@ -36,9 +16,19 @@ const examples = [
     body: 'Correlation measures break on non-linear data, but saying so convinces nobody. Ask for a simulation instead: a curve, a noise slider, a live correlation readout. Your friend drags the slider and gets the intuition in a minute. A computer used to compute, not to consume.',
   },
   {
-    glyph: '{◉}',
-    title: 'Ten years of notes. A graph view, no app switch.',
-    body: 'Thousands of notes in a TiddlyWiki. One sentence, and an abject builds a client that renders them as an explorable graph. Your friends switched note apps to get that feature. You keep your wiki and grow the feature instead. Software that is personal, connected, and yours.',
+    glyph: '{¤}',
+    title: 'Friday, 2 AM. Your agent is still reading.',
+    body: 'You went to bed. An abject pulled the night\'s papers from your RSS feeds, ranked them against your open projects, drafted a one-page summary, and pinned it to the canvas. The tokens came from your local Ollama. No surprise bill. No surprise rate limit at hour three. Wake up. Coffee. Read.',
+  },
+  {
+    glyph: '{$}',
+    title: 'You have a theory about the economy. Now it runs.',
+    body: 'Explain your causal model in chat: rate hikes squeeze debt servicing, people borrow more, until they can\'t. Agents build the simulation, fetch decades of Federal Reserve data, fit the parameters, and report how well your idea tracks reality. A dashboard with sliders appears. Your hunch is now an instrument.',
+  },
+  {
+    glyph: '{✉}',
+    title: 'Your inbox gets sorted before you wake up.',
+    body: 'Every morning at eight, an abject reads the night\'s email, separates the clutter from the things that matter, and messages your phone: may I delete these? It waits for your yes. Then, and only then, the junk dies. An assistant with initiative and manners.',
   },
 ];
 ---
@@ -46,7 +36,7 @@ const examples = [
 <section id="examples" class="examples-section">
   <div class="container">
     <h2 class="section-title">What People Build</h2>
-    <p class="examples-subtitle">A handful of things abjects are good at. Some of these you can do elsewhere; all of them, here, you own. The last two are real sessions from the author's machine, not pitches.</p>
+    <p class="examples-subtitle">A handful of things abjects are good at. The first three are running in the screenshots above, on the author's machine. Some of these you can do elsewhere; all of them, here, you own.</p>
 
     <div class="examples-grid">
       {examples.map((e) => (

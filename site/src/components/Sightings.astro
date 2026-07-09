@@ -1,0 +1,175 @@
+---
+const spotlight = {
+  src: '/gallery/desktop.webp',
+  alt: 'A full Abject desktop: a chat window creating a weather abject, a Seattle tide schedule widget, and a large colorful graph of wiki notes, with a sidebar of running abjects',
+  caption: 'One desktop, mid-conversation: a weather abject being spoken into existence while the tide schedule and a map of 427 wiki notes keep running.',
+};
+
+const shots = [
+  {
+    src: '/gallery/space.webp',
+    alt: 'A NASA Live Viewer window showing current imagery of the Sun and Earth side by side, above a chat window answering a weather question',
+    caption: 'A NASA viewer streaming the Sun, Earth, and Moon, refreshing itself every minute.',
+  },
+  {
+    src: '/gallery/tides.webp',
+    alt: 'A Seattle tide schedule widget with two days of tide charts next to a chat window answering "when is low tide in seattle tomorrow?" with NOAA data',
+    caption: '"When is low tide in Seattle tomorrow?" The answer arrived with a live NOAA widget that stayed.',
+  },
+  {
+    src: '/gallery/menagerie.webp',
+    alt: 'Four windows at once: a weather report for Seattle and Chicago, a fish tank with swimming fish, a Seattle sunset tracker counting down, and the Abject Explorer listing objects',
+    caption: 'Weather, a sunset countdown, a fish tank that wants feeding, and the Explorer that browses them all.',
+  },
+  {
+    src: '/gallery/telegram.webp',
+    alt: 'An Abject chat window that fetched Chicago weather side by side with the Telegram app showing the same weather report delivered as a message',
+    caption: '"Get the weather in Chicago and send it to Telegram." The reply landed on a phone.',
+  },
+];
+---
+
+<section id="sightings" class="sightings-section">
+  <div class="container">
+    <h2 class="section-title">Sightings</h2>
+    <p class="sightings-subtitle">
+      Screenshots from a real, living desktop, taken while posting progress. Nothing staged.
+    </p>
+
+    <figure class="sighting sighting-spotlight">
+      <button class="sighting-frame" type="button" data-full={spotlight.src} aria-label="Enlarge screenshot">
+        <img src={spotlight.src} alt={spotlight.alt} loading="lazy" decoding="async" />
+      </button>
+      <figcaption>{spotlight.caption}</figcaption>
+    </figure>
+
+    <div class="sightings-grid">
+      {shots.map((s) => (
+        <figure class="sighting">
+          <button class="sighting-frame" type="button" data-full={s.src} aria-label="Enlarge screenshot">
+            <img src={s.src} alt={s.alt} loading="lazy" decoding="async" />
+          </button>
+          <figcaption>{s.caption}</figcaption>
+        </figure>
+      ))}
+    </div>
+  </div>
+
+  <dialog class="sighting-lightbox">
+    <img src="" alt="Enlarged screenshot" />
+  </dialog>
+</section>
+
+<script>
+  const box = document.querySelector('.sighting-lightbox') as HTMLDialogElement | null;
+  const boxImg = box?.querySelector('img');
+  if (box && boxImg) {
+    for (const btn of document.querySelectorAll('.sighting-frame')) {
+      btn.addEventListener('click', () => {
+        boxImg.src = (btn as HTMLElement).dataset.full ?? '';
+        box.showModal();
+      });
+    }
+    box.addEventListener('click', () => box.close());
+  }
+</script>
+
+<style>
+  .sightings-section {
+    background: transparent;
+  }
+
+  .sightings-subtitle {
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 1rem;
+    max-width: 640px;
+    margin: -1.5rem auto 2.5rem;
+    line-height: 1.7;
+  }
+
+  .sighting {
+    margin: 0 0 1.25rem;
+  }
+
+  .sighting-frame {
+    display: block;
+    width: 100%;
+    padding: 0;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    cursor: zoom-in;
+    transition: border-color 0.3s, box-shadow 0.3s, transform 0.3s;
+  }
+
+  .sighting-frame:hover,
+  .sighting-frame:focus-visible {
+    border-color: var(--border-accent);
+    box-shadow: 0 0 24px var(--eldritch-glow);
+    transform: translateY(-2px);
+  }
+
+  .sighting-frame img {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+
+  .sighting figcaption {
+    margin-top: 0.6rem;
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    color: var(--text-dim);
+    line-height: 1.6;
+    text-align: center;
+  }
+
+  .sighting-spotlight {
+    max-width: 900px;
+    margin: 0 auto 1.5rem;
+  }
+
+  .sightings-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1.5rem 1.25rem;
+    max-width: 900px;
+    margin: 0 auto;
+  }
+
+  .sightings-grid .sighting-frame img {
+    aspect-ratio: 16 / 11;
+    object-fit: cover;
+    object-position: top left;
+  }
+
+  .sighting-lightbox {
+    max-width: min(94vw, 1500px);
+    padding: 0;
+    border: 1px solid var(--border-accent);
+    border-radius: 12px;
+    background: var(--bg-deep);
+    cursor: zoom-out;
+  }
+
+  .sighting-lightbox::backdrop {
+    background: rgba(5, 6, 10, 0.85);
+  }
+
+  .sighting-lightbox img {
+    display: block;
+    max-width: 100%;
+    max-height: 90vh;
+    width: auto;
+    height: auto;
+    margin: 0 auto;
+  }
+
+  @media (max-width: 768px) {
+    .sightings-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>
