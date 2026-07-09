@@ -984,6 +984,7 @@ ${scratchpadBlock}${hintBlock}
 Rules:
 - The user only sees this text. They do not see the scratchpad, task list, or any internal artifacts.
 - INLINE the actual data from the scratchpad. Lists, tables, full content, all of it. Do not say "see above" or reference internal artifacts.
+- When the work created or modified objects, open with how the user reaches the result: a window they can open now, or — for objects with no visual surface — say plainly that nothing appears on screen and they use it by asking in chat; offer building a window as a natural next step.
 - Markdown formatting is fine and encouraged.
 - If the scratchpad is empty or the goal couldn't be resolved, say so plainly.
 - Do not include action JSON or any meta-commentary about the scrum process.
@@ -1340,7 +1341,7 @@ When to INCLUDE synthesis inline:
 - The user asked a question the data alone doesn't answer cleanly
 - The synthesis is short (1–2 sentences) and you've already composed it during your reasoning
 
-Either way, the synthesis (whether yours or auto-generated) is the user's ONLY view. Inline data from scratchpad. Don't say "see above" — there is no above.
+Either way, the synthesis (whether yours or auto-generated) is the user's ONLY view. Inline data from scratchpad. Don't say "see above" — there is no above. And "deployed" is invisible to the user unless something appears on screen: when the round shipped objects without a window, make sure the synthesis says so plainly and points at the chat/message path for using them (a \`hint\` like "headless — usable via chat only, offer a window" is enough).
 
 Calling \`complete_goal\` after \`add_task\` cleanly abandons the staged batch (nothing was committed yet).
 

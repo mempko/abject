@@ -144,8 +144,24 @@ function coerceEvent(e: unknown): EventDeclaration | null {
  * Normalize a drafted manifest's interface in place so method/event names are
  * never undefined, regardless of whether the model emitted strings or objects.
  * Also backfills a missing interface id/name/description from the manifest.
+ * Tolerates the plural `interfaces: [...]` form (the shape system manifests
+ * use in source) by adopting the first entry and folding the rest's
+ * methods/events into it.
  */
 function normalizeDraftManifest(manifest: AbjectManifest): AbjectManifest {
+  const plural = (manifest as unknown as Record<string, unknown>).interfaces;
+  if (!manifest.interface && Array.isArray(plural) && plural.length > 0) {
+    const [first, ...rest] = plural.filter((x): x is InterfaceDeclaration => !!x && typeof x === 'object');
+    if (first) {
+      for (const extra of rest) {
+        if (Array.isArray(extra.methods)) first.methods = [...(first.methods ?? []), ...extra.methods];
+        if (Array.isArray(extra.events)) first.events = [...(first.events ?? []), ...extra.events];
+      }
+      manifest.interface = first;
+      delete (manifest as unknown as Record<string, unknown>).interfaces;
+    }
+  }
+
   const iface = manifest.interface as InterfaceDeclaration | undefined;
   if (!iface || typeof iface !== 'object') return manifest;
 
@@ -510,12 +526,22 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
   /** Stage a manifest draft. The agent typically writes one before drafting source. */
   private async opDraftManifest(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
-    const manifest = action.manifest as AbjectManifest | undefined;
-    if (!manifest || typeof manifest !== 'object' || !manifest.name || !manifest.interface) {
-      return { ok: false, summary: 'draft_manifest: malformed', error: 'manifest must be an AbjectManifest with name and interface' };
+    const manifest = this.actionField(action, ['manifest', 'draftManifest']) as AbjectManifest | undefined;
+    if (!manifest || typeof manifest !== 'object') {
+      const got = Object.keys(action).filter(k => k !== 'action' && k !== 'reasoning').join(', ') || '(none)';
+      return {
+        ok: false,
+        summary: 'draft_manifest: missing manifest',
+        error: `No manifest object found in the action (got fields: ${got}). Pass it as the \`manifest\` field: {"action":"draft_manifest","manifest":{ name, description, version, icon, interface: { id, name, description, methods, events? }, requiredCapabilities: [], tags: [] },"usedObjects":[...]}`,
+      };
     }
-    state.draftManifest = normalizeDraftManifest(manifest);
-    const usedObjects = action.usedObjects;
+    normalizeDraftManifest(manifest);
+    if (!manifest.name || !manifest.interface) {
+      const missing = [!manifest.name && 'name', !manifest.interface && 'interface'].filter(Boolean).join(' and ');
+      return { ok: false, summary: 'draft_manifest: malformed', error: `manifest is missing ${missing}. Required shape: { name, description, version, interface: { id, name, description, methods, events? }, requiredCapabilities: [], tags: [] }` };
+    }
+    state.draftManifest = manifest;
+    const usedObjects = this.actionField(action, ['usedObjects', 'dependencies', 'deps']);
     if (Array.isArray(usedObjects)) {
       state.usedObjects = usedObjects.filter((x): x is string => typeof x === 'string');
     }
@@ -904,7 +930,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * Idempotent: calling it again with the same target is a no-op refresh.
    */
   private async opLoadTarget(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
-    const nameOrId = (action.objectId ?? action.target ?? action.targetName ?? action.objectName) as string | undefined;
+    const nameOrId = this.actionField(action, ['objectId', 'target', 'targetName', 'objectName', 'name']) as string | undefined;
     if (typeof nameOrId !== 'string' || nameOrId.length === 0) {
       return { ok: false, summary: 'load_target: missing target', error: 'pass {objectId} or {targetName} naming the existing object to modify' };
     }
@@ -952,8 +978,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    */
   private async opDraftViaLlm(state: LoopState, action: AgentAction): Promise<{ ok: boolean; summary: string; error?: string }> {
     if (!this.llmId) return { ok: false, summary: 'draft_via_llm: LLM unavailable', error: 'LLM not resolved' };
-    const kind = action.kind as 'manifest' | 'source' | undefined;
-    const instructions = (action.instructions as string | undefined) ?? '';
+    const kind = this.actionField(action, ['kind', 'type']) as 'manifest' | 'source' | undefined;
+    const instructions = (this.actionField(action, ['instructions', 'prompt', 'guidance']) as string | undefined) ?? '';
     if (kind !== 'manifest' && kind !== 'source') {
       return { ok: false, summary: 'draft_via_llm: kind must be manifest or source', error: 'kind missing or invalid' };
     }
@@ -983,10 +1009,11 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       try {
         const parsed = JSON.parse(jsonStr) as { manifest?: AbjectManifest; usedObjects?: string[] };
         const manifest = parsed.manifest ?? (parsed as unknown as AbjectManifest);
+        if (manifest && typeof manifest === 'object') normalizeDraftManifest(manifest);
         if (!manifest?.name || !manifest?.interface) {
           return { ok: false, summary: 'draft_via_llm manifest: malformed JSON', error: 'parsed JSON missing name or interface' };
         }
-        state.draftManifest = normalizeDraftManifest(manifest);
+        state.draftManifest = manifest;
         if (Array.isArray(parsed.usedObjects)) {
           state.usedObjects = parsed.usedObjects.filter((x): x is string => typeof x === 'string');
         }
@@ -1315,8 +1342,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     // fall back to the kind:modify state target.
     let targetId: AbjectId | undefined;
     let targetLabel: string | undefined;
-    const explicitId = action.objectId;
-    const explicitName = action.targetName ?? action.targetObjectName;
+    const explicitId = this.actionField(action, ['objectId']);
+    const explicitName = this.actionField(action, ['targetName', 'targetObjectName', 'target']);
     if (typeof explicitId === 'string' && explicitId.length > 0) {
       const resolved = await this.resolveTarget(explicitId);
       if (!resolved) return { ok: false, summary: `deploy_update: target not found: ${explicitId}`, error: `Could not resolve target "${explicitId}"` };
@@ -1646,7 +1673,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
   /** Send an intermediate user-visible chat bubble. Loop continues. */
   private async opReply(_state: LoopState, action: AgentAction, callerId?: AbjectId): Promise<{ ok: boolean; summary: string }> {
-    const text = (action.text as string | undefined) ?? '';
+    const text = (this.actionField(action, ['text', 'message', 'content']) as string | undefined) ?? '';
     if (callerId && callerId !== this.id && text) {
       this.send(event(this.id, callerId, 'agentIntermediateAction', {
         action: { action: 'reply', text },
@@ -1663,7 +1690,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * a new task with the answer in the prompt.
    */
   private async opAskUser(_state: LoopState, action: AgentAction, callerId?: AbjectId): Promise<{ ok: boolean; summary: string }> {
-    const question = (action.question as string | undefined) ?? '';
+    const question = (this.actionField(action, ['question', 'text', 'message']) as string | undefined) ?? '';
     if (callerId && callerId !== this.id && question) {
       this.send(event(this.id, callerId, 'agentIntermediateAction', {
         action: { action: 'reply', text: question },
@@ -1835,12 +1862,13 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   // ── Terminals ─────────────────────────────────────────────────────────
 
   private opDone(state: LoopState, action: AgentAction): { ok: boolean; summary: string; terminal: true } {
-    state.terminal = { kind: 'done', result: action.result };
+    state.terminal = { kind: 'done', result: action.result ?? this.actionField(action, ['result', 'report']) };
     return { ok: true, summary: 'done', terminal: true };
   }
 
   private opFail(state: LoopState, action: AgentAction): { ok: boolean; summary: string; terminal: true } {
-    const reason = typeof action.reason === 'string' ? action.reason : 'unspecified';
+    const rawReason = this.actionField(action, ['reason', 'error', 'message']);
+    const reason = typeof rawReason === 'string' ? rawReason : 'unspecified';
     state.terminal = { kind: 'fail', error: reason };
     return { ok: true, summary: `fail: ${reason.slice(0, 120)}`, terminal: true };
   }
@@ -2643,6 +2671,8 @@ Emit EXACTLY ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothi
 \`target\` is either a UUID, a registered object name (e.g. "Registry", "ChatManager", "TelegramBridge"), or a system-service name (e.g. "Console", "GoalManager", "KnowledgeBase"). \`payload\` defaults to {}. \`timeout\` defaults to 30000ms; raise for long operations like Factory.spawn.
 
 ## Local operations (no message target)
+
+Local-operation fields sit at the TOP LEVEL of the action, beside \`"action"\` — only \`call\` has a \`payload\` wrapper. So \`draft_manifest\` is \`{"action":"draft_manifest","manifest":{...}}\`, \`draft_source\` is \`{"action":"draft_source","source":"..."}\`, and so on.
 
 - \`load_target({objectId?, targetName?})\` — adopt an EXISTING object as this loop's modify target: resolves the name/UUID, loads its current source into loop state, and switches the loop to a modify. Use this when the loop started without a target (kind \`create\`) but you discovered — via \`call("Registry", "ask"/"discover", …)\` or \`describe\` — that the goal is really about an object that already exists (e.g. "fix the GraphViewer window" → GraphViewer is already registered). After \`load_target\`, inspect with \`read_draft\`, edit with \`replace_handler\` / \`add_handler\` / \`remove_handler\` (or \`draft_diff\` for sub-method edits), then ship with \`deploy_update\` (no need to repeat the id). For a genuinely new object, skip this and use \`draft_source\` instead.
 - \`draft_manifest({manifest, usedObjects?})\` — stage a manifest you've authored. Used before \`deploy_spawn\`. Shape: \`{ name, description, version, icon, interface: { id, name, description, methods, events? }, requiredCapabilities: [], providedCapabilities: [], tags: [] }\`. \`methods\` and \`events\` are arrays of OBJECTS, never bare name strings: each method is \`{ name, description, parameters: [{ name, type: { kind: "primitive"|"reference"|"array"|"object", … }, description, optional? }], returns? }\` and each event is \`{ name, description, payload }\`. Emitting a plain string like \`"show"\` leaves the method nameless in the Explorer — always use the object form. Include an \`icon\` (a single emoji that fits the object, e.g. 🌤 / 📝 / 🎮) — it appears next to the object's name in launchers.
