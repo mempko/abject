@@ -846,6 +846,20 @@ export class PeerTransport extends Transport {
     // Import remote exchange key and derive session key
     const remoteExchangeKey = await importExchangePublicKey(msg.publicExchangeKey);
     this.sessionKey = await deriveSessionKey(this.localExchangePrivateKey, remoteExchangeKey);
+
+    // Reset the wire codec pair for this session. The codec is stateful and the
+    // two peers share a growing intern table that must start empty together.
+    // On reconnect a PeerTransport is reused (resetForGlare + handleSdpOffer)
+    // while the remote side builds a fresh one, so a stale table here would
+    // send string-refs the remote's empty decoder can't resolve ("wire string
+    // ref N out of range"), desyncing every frame. The handshake is the one
+    // sync point that runs on both peers for every session; reset here so both
+    // start from empty tables in lockstep. (Receive ordering — see enqueueRecv
+    // — guarantees this runs before any encrypted frame of the new session is
+    // decoded.)
+    this.wireEnc = new WireEncoder();
+    this.wireDec = new WireDecoder();
+
     this.handshakeState = 'encrypted';
     log.info(`Handshake complete with ${this.remotePeerId.slice(0, 16)}, AES-256-GCM session established`);
 
