@@ -26,17 +26,32 @@ import Footer from '../components/Footer.astro';
       <section class="about-section">
         <h2>Why This Exists</h2>
         <p>
+          Most people never use a computer to compute. They read, they watch, they scroll:
+          consumption, inside sealed apps somebody else wrote. That is not a law of nature;
+          it is an information monopoly. Software stayed hard to make, so making it stayed
+          a profession. LLMs just cracked that open. For the first time, anyone who can say
+          what they want can have software that is personal, connected, and theirs. Abject
+          exists so that happens on your machine, under your control, with nobody collecting rent.
+        </p>
+        <p>
           Every popular AI agent framework today puts a single planner on top and tools beneath.
           That works for short demos and breaks on the things you actually want it to do for weeks
           at a time. Hierarchies snap; meshes route around damage. The internet has known this
           for fifty years.
         </p>
         <p>
-          Abject is what happens when you take the message-passing object pattern that already
-          runs the world (TCP/IP, Smalltalk, Erlang, the cells in your body) and add a small
-          new primitive: every object can explain itself to any other object in plain English.
-          The LLM is just a service one object asks when it needs to think. The architecture is
-          older than the LLM.
+          There is also a longer bet here. Sixty years of software has been pyramid building:
+          applications on frameworks on libraries on operating systems, each layer taxed by the
+          one below, complexity growing until the parts no longer fit in a context window. Most
+          of the industry is using LLMs to stack the pyramid faster. Abject uses them to start
+          from a smaller foundation instead: message-passing objects, with the LLM handling the
+          ambiguity that rigid interfaces never could.
+        </p>
+        <p>
+          So Abject takes the pattern that already runs the world (TCP/IP, Smalltalk, Erlang,
+          the cells in your body) and adds one small primitive: every object can explain itself
+          to any other object in plain English. The LLM is just a service one object asks when
+          it needs to think. The architecture is older than the LLM.
         </p>
         <p>
           The result is a system you own. Your machine runs your agents. Your tokens come from
@@ -53,6 +68,14 @@ import Footer from '../components/Footer.astro';
           a software engineer who has spent years building open-source distributed systems.
         </p>
         <p>
+          The motivation predates the project. Max came to the United States in the late 80s
+          as a refugee from the Donbas, in the former Soviet Union. The first computer was a
+          hand-me-down from a friend of his father's; the programming education was standing in
+          bookstores memorizing tech books there was no money to buy. Somewhere in there he found
+          Engelbart and Kay and the idea that a computer is a rocketship for the mind.
+          Abject is that idea, paid forward.
+        </p>
+        <p>
           Before Abject came <a href="https://firestr.com" target="_blank" rel="noopener">Fire★</a>,
           a peer-to-peer platform for creating and sharing distributed applications, written in C++ and Lua,
           released under the GNU GPL. Fire★ called what it did <em>Grass Computing</em>:
@@ -60,6 +83,15 @@ import Footer from '../components/Footer.astro';
           the vision works. It also proved that the vision needs an LLM to negotiate between objects
           built by people who never met. That gap is what Abject closes.
         </p>
+      </section>
+
+      <section class="about-section">
+        <h2>The Ideas, Longform</h2>
+        <ul class="about-list">
+          <li><strong><a href="https://blog.mempko.com/an-abject-horror/" target="_blank" rel="noopener">An Abject Horror</a>.</strong> The announcement: why agents are the wrong abstraction, and what a self-aware object runtime is.</li>
+          <li><strong><a href="https://blog.mempko.com/entering-the-architecture-age/" target="_blank" rel="noopener">Entering the Architecture Age</a>.</strong> The software pyramid, the Window Tax, and why the big idea is messaging.</li>
+          <li><strong><a href="https://blog.mempko.com/let-the-information-monopolies-crumble/" target="_blank" rel="noopener">Let the Information Monopolies Crumble!</a></strong> The human case: computers are for computing, and everyone should get to.</li>
+        </ul>
       </section>
 
       <section class="about-section">

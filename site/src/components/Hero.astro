@@ -7,21 +7,13 @@
     <h1>
       An <span class="accent">Abject-Oriented</span> OS
     </h1>
-    <p class="hero-desc">
-      Abject is an open-source desktop platform for local-first <em>AI objects</em>
-      that explain themselves, find each other, and repair themselves when they break.
-      An <em>abject</em> is not an app. It is a small living object (a window, an agent,
-      a tool, a peer) that carries its own description, talks to its neighbors through
-      messages, and answers for itself in plain English.
+    <p class="hero-hook">
+      Describe what you want. An <em>abject</em> appears, window and all,
+      and it keeps working after you stop talking to it.
     </p>
-    <p class="hero-persona">
-      For anyone, not just developers. Describe what you want and an abject appears,
-      window and all. It keeps working after you stop talking to it.
-      No cloud. No surprise rate-limits. No code required.
-    </p>
-    <p class="hero-ask">
-      Ask any abject what it is, and it will tell you. Politely.
-      <a href="/ask-protocol" class="thesis-link">Read the Ask Protocol &rarr;</a>
+    <p class="hero-sub">
+      For anyone, not just developers. Free, open source, and local-first:
+      your machine, your data, no cloud, no code required.
     </p>
     <div class="hero-actions">
       <a href="#downloads" class="btn btn-primary">Download</a>
@@ -36,6 +28,13 @@
         The window opens because it was asked to.
       </p>
     </div>
+    <p class="hero-desc">
+      An <em>abject</em> is not an app. It is a small living object (a window, an agent,
+      a tool, a peer) that carries its own description, talks to its neighbors through
+      messages, and answers for itself in plain English.
+      Ask any abject what it is, and it will tell you. Politely.
+      <a href="/ask-protocol" class="thesis-link">Read the Ask Protocol &rarr;</a>
+    </p>
     <div class="hero-glyphs">
       <div class="hero-glyph">
         <span class="glyph-icon">{'{'}?{'}'}</span>
@@ -52,8 +51,7 @@
     </div>
     <p class="hero-tagline">
       abject <span class="dim">(n.)</span> 1. an AI object. 2. &lsquo;utterly hopeless&rsquo;.
-      Named for <a href="https://typicalprogrammer.com/introduction-to-abject-oriented-programming" target="_blank" rel="noopener">abject-oriented programming</a>,
-      the methodology every codebase eventually practices. We decided to do it on purpose.
+      Anyone who has maintained object-oriented code knows the two meanings are compatible.
     </p>
   </div>
 </section>
@@ -105,21 +103,32 @@
     text-shadow: 0 0 30px var(--eldritch-glow-strong);
   }
 
-  .hero-desc {
-    max-width: 620px;
-    margin: 0 auto 1.5rem;
-    color: var(--text-secondary);
-    font-size: 1.15rem;
-    line-height: 1.8;
+  .hero-hook {
+    max-width: 640px;
+    margin: 0 auto 1rem;
+    color: var(--text-primary);
+    font-size: 1.3rem;
+    line-height: 1.6;
   }
 
-  .hero-persona {
+  .hero-hook em {
+    color: var(--eldritch);
+  }
+
+  .hero-sub {
     max-width: 620px;
-    margin: 0 auto 1.5rem;
-    color: var(--text-primary);
+    margin: 0 auto 2rem;
+    color: var(--text-secondary);
     font-size: 1rem;
     line-height: 1.7;
-    text-align: center;
+  }
+
+  .hero-desc {
+    max-width: 620px;
+    margin: 3rem auto 2rem;
+    color: var(--text-secondary);
+    font-size: 1.1rem;
+    line-height: 1.8;
   }
 
   .hero-tagline {
@@ -136,29 +145,6 @@
 
   .hero-tagline .dim {
     opacity: 0.6;
-  }
-
-  .hero-tagline a {
-    color: var(--eldritch-dim);
-    border-bottom: 1px solid rgba(43, 204, 110, 0.3);
-    padding-bottom: 1px;
-    transition: color 0.2s, border-color 0.2s;
-  }
-
-  .hero-tagline a:hover {
-    color: var(--eldritch);
-    border-bottom-color: var(--eldritch);
-  }
-
-  .hero-ask {
-    color: var(--text-secondary);
-    font-style: italic;
-    font-size: 1.05rem;
-    margin-bottom: 1.5rem;
-  }
-
-  .hero-ask .thesis-link {
-    margin-left: 0.25rem;
   }
 
   .hero-actions {
@@ -234,7 +220,7 @@
   }
 
   .hero-demo {
-    margin-top: 3rem;
+    margin-top: 0;
     max-width: 900px;
     margin-left: auto;
     margin-right: auto;

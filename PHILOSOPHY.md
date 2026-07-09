@@ -19,15 +19,15 @@ identity. Every channel is encrypted. Trust is verified, not assumed.
 
 The registry is an object. The factory is an object. The thing that
 makes objects is an object. There is no privileged system layer;
-only objects passing messages in the dark.
+just objects passing messages.
 
-## 4. Objects heal themselves.
+## 4. Objects repair themselves.
 
 When communication breaks down, the system does not give up. An LLM
 examines both sides, generates a translator, and re-establishes
 connection. Break the translator; it regenerates. Nothing stays broken.
 
-## 5. Untrusted code runs in cages.
+## 5. Untrusted code runs in a sandbox.
 
 WASM sandboxes with capability-gated imports. Objects cannot see or
 touch anything they haven't been explicitly granted access to.
@@ -50,5 +50,6 @@ Three commands. One system. No configuration required to start creating.
 ## 9. Have fun.
 
 Software that takes itself too seriously is software nobody wants to use.
-The name is a double entendre. The website has tentacles. The objects
-refuse to die. This is deliberate.
+The name is a joke at software's expense, the commands are incantations,
+and the objects refuse to die. This is deliberate. The horror is thematic.
+The containment is real.

@@ -1,14 +1,41 @@
-# An {abject} Horror
+# Abject: An Abject-Oriented OS
 
 **[abject.world](https://abject.world)**
 
 ## The Things That Think
 
-> A grass computing platform where objects communicate via message passing,
-> negotiate protocols through an artificial intelligence, and regenerate
-> when broken. The successor to Fire★.
+> A self-aware object runtime and grass computing platform: objects
+> communicate via message passing, negotiate protocols through an
+> artificial intelligence, and regenerate when broken. The successor to Fire★.
 >
-> *abject (n.) - AI Object. Also: cosmic dread. Both apply.*
+> *abject (n.) 1. an AI object. 2. 'utterly hopeless'. Anyone who has
+> maintained object-oriented code knows the two meanings are compatible.*
+
+## Why
+
+Most people never use a computer to compute. They read, watch, and scroll
+inside sealed apps somebody else wrote, because software stayed hard to
+make and making it stayed a profession. LLMs just cracked that open. Abject
+is where that matters: anyone who can say what they want gets software that
+is personal, connected, and theirs, running on their machine, under their
+control, with nobody collecting rent.
+
+Underneath is a blunt technical position: AI agents are the wrong
+abstraction. Agent frameworks are hierarchies; MCP and A2A are plumbing
+between things that shouldn't need plumbing. The abstraction that scales is
+the one that already runs the world: objects passing messages (cells, the
+internet). What was missing, and what LLMs finally provide, is a way for
+objects to understand each other without rigid schemas.
+
+The longform version lives on the blog:
+
+- [An Abject Horror](https://blog.mempko.com/an-abject-horror/): the
+  announcement. Why agents are the wrong abstraction, and what a
+  self-aware object runtime is.
+- [Entering the Architecture Age](https://blog.mempko.com/entering-the-architecture-age/):
+  the software pyramid, the Window Tax, and why the big idea is messaging.
+- [Let the Information Monopolies Crumble!](https://blog.mempko.com/let-the-information-monopolies-crumble/):
+  the human case. Computers are for computing, and everyone should get to.
 
 ## The Ask Protocol
 
@@ -20,12 +47,17 @@ reads its own manifest and source, then answers in natural language.
 - **ProxyGenerator** asks both sides what they expect, then writes a living translator between them.
 - **Chat** lets users ask Abjects about themselves directly. The Abject answers from its own source.
 
-## What Lurks Inside
+Ordinary messages never touch an LLM: they are typed payloads on a message
+bus, fast and deterministic. The LLM is a service an Abject calls when it
+actually needs to think (negotiating with a stranger, generating a new
+object, answering a question in plain English).
+
+## The Standard Bestiary
 
 - **Self-Healing Proxies**: Error rates above 10% trigger LLM proxy regeneration with traffic still flowing. Unknown messages trigger renegotiation. Hot-swap without disruption. Break them. They always grow back.
-- **The Negotiator**: An alien intelligence bridges incompatible minds. It reads both manifests, generates a real proxy Abject. Not a shim. A living translator.
-- **Everything is Alive**: The registry is an Abject. The factory is an Abject. Even the thing that makes Abjects is an Abject. There is no privileged layer. Only Abjects passing messages in the dark.
-- **Containment Protocols**: Untrusted code runs inside a WASM cage. Capability-gated imports. No ambient authority. Abjects cannot touch anything they haven't been explicitly allowed to reach.
+- **The Negotiator**: Bridges incompatible interfaces. It reads both manifests, generates a real proxy Abject. Not a shim. A living translator.
+- **Everything is an Abject**: The registry is an Abject. The factory is an Abject. Even the thing that makes Abjects is an Abject. There is no privileged layer. Just Abjects passing messages.
+- **Containment Protocols**: Untrusted code runs inside a WASM sandbox. Capability-gated imports. No ambient authority. Abjects cannot touch anything they haven't been explicitly allowed to reach.
 - **True Names**: Every peer has a true name: a SHA-256 hash of its public key. ECDSA/ECDH identity. AES-256-GCM encrypted WebRTC channels. Trust is verified, not assumed.
 - **Nothing Truly Dies**: Erlang-style supervision with state snapshots. Kill an Abject; it comes back knowing what it knew.
 
@@ -44,18 +76,19 @@ a mind, silent otherwise.
 ## Emergence
 
 A Goal, and a planner that keeps re-planning. The **ScrumMaster** runs each
-goal as a sprint of recurring scrums: every round it reviews what the previous
-round produced, stages a batch of tasks, dispatches them into a shared
-**TupleSpace**, and waits for the round to complete before deciding what to
-plan next. Tasks are visible to every Abject on every connected peer. Anything
-that can do the work claims it — agents thinking with an LLM, abjects running
-deterministic code, abjects another agent spawned five minutes ago.
+goal as a series of scrums: every round it reviews what the previous round
+produced, asks the team what each agent can do (the Ask Protocol; agents
+answer with an approach or PASS), stages a batch of tasks each assigned to
+the best-fit agent, and records them in a shared **TupleSpace**. When every
+task in the round reaches a terminal state, the planner reviews and decides:
+complete the goal, plan another scrum, or fail it. Some agents think with an
+LLM; some just run code; some were spawned by another agent five minutes ago.
 
-- **Iterative Decomposition**: The plan is not decided up front. Each scrum reads the prior round's results (including failures) and rewrites what comes next. Sub-goals get their own scrum loops. The plan adapts as the system discovers what the work actually needs.
-- **Cross-Machine Coordination**: Goals and TupleSpace tuples are CRDTs that sync across peers through encrypted WebRTC channels with no central server. Kill a peer and the goal survives on every other peer that subscribed. Stale claims expire after 5 minutes and become reclaimable.
+- **Iterative Decomposition**: The plan is not decided up front. Each scrum reads the prior round's results (including failures) and rewrites what comes next. The plan adapts as the system discovers what the work actually needs.
+- **Cross-Machine Coordination**: Goals and TupleSpace tuples are CRDTs that sync across peers through encrypted WebRTC channels with no central server. Kill a peer and the goal survives on every other peer that subscribed.
 - **Failure as Context**: There is no fixed retry budget. A failed task ends with its error attached to the goal's history; the next scrum reads that history and decides whether to schedule a corrective task, route the work to a different abject, or fail the goal. A separate **GoalObserver** watches from outside and auto-fails goals that go silent for too long.
 
-## The Spreading
+## The Mesh
 
 Every Abject lives in a workspace. Workspaces control visibility: who can see,
 who can reach, who can speak.
@@ -64,7 +97,7 @@ who can reach, who can speak.
 |------|------|----------|
 | **Local** | The Sealed Vault | No routes exposed. Nothing enters. Nothing leaves. |
 | **Private** | The Inner Circle | Shared with those you name. Encrypted WebRTC, ECDH key agreement, AES-256-GCM. |
-| **Public** | The Open Wound | Visible to all. Any peer can discover, connect, and begin the Ask Protocol. |
+| **Public** | The Commons | Visible to all. Any peer can discover, connect, and begin the Ask Protocol. |
 
 ## Summon the System
 
@@ -77,8 +110,8 @@ who can reach, who can speak.
 
 ```bash
 # Clone the repository
-git clone https://github.com/mempko/abjects
-cd abjects
+git clone https://github.com/mempko/abject
+cd abject
 
 # Install dependencies
 pnpm conjure
@@ -104,8 +137,7 @@ Three processes. One living system.
 
 ### Incarnation (Desktop App)
 
-Give the organism a body. Package Abjects as a standalone desktop app for
-Linux, Windows, or macOS.
+Package Abject as a standalone desktop app for Linux, Windows, or macOS.
 
 ```bash
 # Build desktop app for your platform
@@ -130,7 +162,8 @@ macOS).
 The **backend** is the depths: all Abjects live here, passing messages in a
 Node.js process with worker threads. The **browser client** is the surface: a
 thin Canvas renderer that forwards input and displays composited frames over
-WebSocket. The **signaling server** helps peers find each other in the dark.
+WebSocket. The **signaling server** introduces peers to each other; it never
+sees a byte of the conversation.
 
 For running the signaling server in production behind TLS, and pairing it with a
 TURN relay so peers behind symmetric NAT or cell networks can still connect, see
@@ -224,7 +257,7 @@ function send(message: AbjectMessage): void {
 | **WebBrowser** | Headless browser automation (Playwright, server-only) |
 | **WebParser** | HTML parsing and content extraction (linkedom, server-only) |
 
-## From Fire to the Abyss
+## From the Ashes of Fire★
 
 > Abject grew from the ashes of **Fire★** (firestr.com), a peer-to-peer
 > platform for creating and sharing distributed applications. Fire★ called it

@@ -1,6 +1,6 @@
 # WHISPER.md - The Whisper Signaling Server (+ TURN relay)
 
-`whisper` is the signaling server. It is how peers find each other in the dark:
+`whisper` is the signaling server. It is how peers find each other:
 it registers peers by their true name (PeerId), answers "where is peer X?"
 queries, and relays the WebRTC handshake (SDP offers/answers and ICE
 candidates) between them. No application message content passes through it.

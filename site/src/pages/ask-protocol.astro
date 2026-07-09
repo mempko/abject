@@ -113,6 +113,15 @@ const manifestStructure = `AbjectManifest {
           query any other object about its behavior. No shared documentation, no schema registry,
           no out-of-band coordination. The knowledge lives where the behavior lives: in the object itself.
         </p>
+
+        <p>
+          Concretely: an email object holding a dinner invitation for Friday at 7pm asks a
+          calendar object it has never met, <em>"can you help me with this?"</em> The calendar
+          object answers describing how it handles scheduling; an LLM generates the glue code
+          on the fly; the event is created. No API documentation, no SDK, no integration sprint.
+          Two objects that have never seen each other before, cooperating through natural-language
+          negotiation.
+        </p>
       </section>
 
       <!-- Section 2: Message Format & Flow -->
@@ -169,7 +178,7 @@ const manifestStructure = `AbjectManifest {
             <text x="640" y="65" text-anchor="middle" fill="#5a5a70" font-weight="600" font-size="14" font-family="monospace">LLM</text>
 
             <!-- Step 1: Caller -> Target (ask request) -->
-            <line x1="140" y1="55" x2="295" y2="55" stroke="#5be5a0" stroke-width="1.5" marker-end="url(#sa-g)" filter="url(#sg)"/>
+            <line x1="140" y1="55" x2="295" y2="55" stroke="#5be5a0" stroke-width="1.5" marker-end="url(#sa-g)"/>
             <text x="218" y="47" text-anchor="middle" fill="#e0e0ea" font-size="10" font-family="monospace">{"ask({ question })"}</text>
 
             <!-- Step 2: Target -> LLM (with context) -->
@@ -181,7 +190,7 @@ const manifestStructure = `AbjectManifest {
             <text x="498" y="93" text-anchor="middle" fill="#8a8a9e" font-size="10" font-family="monospace">LLM response</text>
 
             <!-- Step 4: Target -> Caller (reply) -->
-            <line x1="295" y1="75" x2="145" y2="75" stroke="#8b7bff" stroke-width="1.5" marker-end="url(#sa-p)" filter="url(#sp)"/>
+            <line x1="295" y1="75" x2="145" y2="75" stroke="#8b7bff" stroke-width="1.5" marker-end="url(#sa-p)"/>
             <text x="218" y="93" text-anchor="middle" fill="#e0e0ea" font-size="10" font-family="monospace">answer (string)</text>
 
             <!-- Step labels -->
@@ -384,6 +393,13 @@ const manifestStructure = `AbjectManifest {
           REST, GraphQL, and gRPC are the dominant protocols for service communication on the web.
           All three require a human in the loop to read documentation, write integration code, and update it when things change.
         </p>
+        <p>
+          The dream of self-describing services is old: CORBA in the 1990s, SOAP and WSDL in the
+          2000s, UPnP after that. All of them collapsed under rigid schemas, verbose contracts,
+          and version incompatibilities. Natural language succeeds where schemas failed because
+          it is inherently flexible: an LLM handles ambiguity, paraphrase, and partial information
+          in a way WSDL negotiation never could.
+        </p>
 
         <div class="comparison-table">
           <div class="comparison-header">
@@ -524,6 +540,13 @@ const manifestStructure = `AbjectManifest {
           TCP/IP, DNS, BGP: these are protocols between machines that identify themselves,
           negotiate capabilities, and exchange structured data.
           The internet is already object-oriented.
+        </p>
+
+        <p>
+          Biology arrived at the same design first. Cells coordinate by passing chemical
+          messages, and they do it without a central specification document: a white blood
+          cell meeting a pathogen does not look up an API, it reads the signals on the surface
+          and responds. That is the posture the Ask Protocol gives networked objects.
         </p>
 
         <p>
