@@ -22,7 +22,9 @@
       Underneath is a blunt position: agents are the wrong abstraction. Agent frameworks
       are hierarchies, and MCP and A2A are plumbing between things that shouldn't need plumbing.
       Abject has no line to plumb across: every piece, agents, tools, even the registry that
-      finds them, is an autonomous object passing messages. That is the architecture that
+      finds them, is an autonomous object passing messages. Engineers know this shape by name:
+      the actor model. Abjects are actors, mailbox and all, with one requirement Erlang never
+      imposed: every actor answers <em>ask</em>. That is the architecture that
       already runs the world. Since ARPANET's first message in 1969, every atom of the
       internet has been replaced and it has never once shut down. Hierarchies snap;
       meshes route around damage.

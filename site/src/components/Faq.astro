@@ -17,6 +17,10 @@ const questions = [
     a: 'No. Messages between abjects are ordinary typed payloads on a message bus: fast, deterministic, and LLM-free. The LLM is a service an abject calls when it actually needs to think: negotiating a protocol with a stranger, generating a new object, or answering a question in plain English. The rest of the time it is just objects passing messages, the way software has done since Smalltalk.',
   },
   {
+    q: 'Why LLMs? Why not just actors?',
+    a: 'Abjects ARE actors. Each one has a mailbox and handles messages one at a time, exactly as Erlang or Akka would. The distinction is a single requirement: every actor must implement an ask handler, and that is the only handler that may need an LLM. Classic actor systems compose only when their developers agreed on message shapes beforehand; ask lets actors that have never met interview each other and generate their own glue. So: an actor system where every actor can be asked. A simple idea with some crazy cool benefits.',
+  },
+  {
     q: 'Is it safe to let this thing touch my machine?',
     a: 'Abjects reach only what you grant. Files, shell, network, and clipboard are permission-gated capabilities: an abject born without one cannot use it, no matter how politely it asks. Untrusted code runs sandboxed, and everything lives on your machine. The horror is thematic. The containment is real.',
   },

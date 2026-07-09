@@ -45,7 +45,7 @@ const manifestStructure = `AbjectManifest {
 }`;
 ---
 
-<Layout title="The Ask Protocol - Technical Specification" description="Technical specification for the Ask Protocol: the object-oriented primitive that lets networked objects describe themselves, teach each other, and recover from misunderstanding.">
+<Layout title="The Ask Protocol - Technical Specification" description="Technical specification for the Ask Protocol: an actor system where every actor can be interviewed. Objects describe themselves, teach each other, and recover from misunderstanding.">
   <Header />
   <main class="spec">
     <div class="spec-container">
@@ -106,6 +106,16 @@ const manifestStructure = `AbjectManifest {
           <p>
             This is the entire protocol. Its power comes from what you build on top of it.
           </p>
+        </div>
+
+        <div class="spec-callout">
+          <strong>If you know the actor model, you already know most of this.</strong> An Abject
+          is an actor: an address, a mailbox, private state, handlers that process one message at
+          a time. The whole system is an actor system, and ordinary messages are handled the way
+          Erlang or Akka would handle them: typed payloads, deterministic dispatch, no LLM anywhere
+          in the path. The Ask Protocol adds exactly one requirement: <em>every actor must implement
+          <code>ask</code></em>, and that is the one handler that may consult an LLM. One sentence
+          summarizes the system: an actor system where every actor can be interviewed.
         </div>
 
         <p>
@@ -387,6 +397,23 @@ const manifestStructure = `AbjectManifest {
       <!-- Section 5: Comparison -->
       <section id="comparison">
         <h2><span class="section-num">5</span> Comparison with Existing Approaches</h2>
+
+        <h3>Actor Systems</h3>
+        <p>
+          The closest relative is not a web protocol at all. Abjects <em>are</em> actors in the
+          classic Hewitt/Erlang sense: address, mailbox, private state, sequential message handling,
+          supervision on failure. If you have written Erlang/OTP or Akka, the runtime will feel
+          familiar, down to the bounded mailboxes and the supervisor that restarts a crashed object.
+        </p>
+        <p>
+          What the actor model has always left outside the system is the moment two actors meet
+          without a shared, pre-agreed message vocabulary. Erlang solves it socially: developers read
+          each other's docs, agree on message shapes, and ship matching code. The Ask Protocol moves
+          that step into the runtime. Because every actor answers <code>ask</code>, a stranger actor
+          is not opaque; it can be interviewed, and the glue code that developers used to write by
+          hand is generated from its answers. The LLM enters only there, at the meeting point.
+          Everything downstream of the introduction is ordinary actor-model message passing.
+        </p>
 
         <h3>Web Protocols</h3>
         <p>
