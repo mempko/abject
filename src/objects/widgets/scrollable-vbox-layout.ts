@@ -8,7 +8,7 @@
 
 import { AbjectId, AbjectMessage } from '../../core/types.js';
 import { request } from '../../core/message.js';
-import { Rect, gradientRect } from './widget-types.js';
+import { Rect, gradientRect, DEFAULT_CHILD_HEIGHT } from './widget-types.js';
 import { VBoxLayout } from './vbox-layout.js';
 import { LayoutConfig, ChildRect, isSpacer } from './layout-abject.js';
 
@@ -58,7 +58,7 @@ export class ScrollableVBoxLayout extends VBoxLayout {
       if (isSpacer(child)) continue;
       const vPolicy = child.sizePolicy?.vertical ?? 'preferred';
       if (vPolicy === 'fixed' || vPolicy === 'preferred') {
-        total += child.preferredSize?.height ?? 0;
+        total += child.preferredSize?.height ?? DEFAULT_CHILD_HEIGHT;
         count++;
       }
     }

@@ -1702,6 +1702,12 @@ await this.call(layoutId, 'addLayoutChildren', {
   ]
 });
 
+// ⚠️ EVERY child needs sizePolicy + preferredSize. Children default to the
+// 'preferred' policy, and a child without preferredSize renders at a minimal
+// fallback size (24px tall / 100px wide) — a bare { widgetId } entry gives a
+// squeezed, overlapping UI. In a VBox give each child a height (h); in an
+// HBox give each child a width (w) or horizontal: 'expanding' to share the row.
+
 // Add a spacer to push widgets apart:
 await this.call(layoutId, 'addLayoutSpacer', {});
 

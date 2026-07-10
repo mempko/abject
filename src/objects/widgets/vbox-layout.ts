@@ -7,7 +7,7 @@
  */
 
 import { AbjectId } from '../../core/types.js';
-import { Rect, LayoutChildConfig, SpacerConfig } from './widget-types.js';
+import { Rect, LayoutChildConfig, SpacerConfig, DEFAULT_CHILD_HEIGHT } from './widget-types.js';
 import { LayoutAbject, LayoutConfig, ChildRect, isSpacer } from './layout-abject.js';
 
 export class VBoxLayout extends LayoutAbject {
@@ -25,7 +25,7 @@ export class VBoxLayout extends LayoutAbject {
     let total = 0;
     for (const child of children) {
       if (isSpacer(child)) continue;
-      total += child.preferredSize?.height ?? 0;
+      total += child.preferredSize?.height ?? DEFAULT_CHILD_HEIGHT;
     }
     // Add spacing between children
     if (children.length > 1) {
@@ -54,7 +54,7 @@ export class VBoxLayout extends LayoutAbject {
       } else {
         const vPolicy = child.sizePolicy?.vertical ?? 'preferred';
         if (vPolicy === 'fixed' || vPolicy === 'preferred') {
-          fixedHeight += child.preferredSize?.height ?? 0;
+          fixedHeight += child.preferredSize?.height ?? DEFAULT_CHILD_HEIGHT;
         } else {
           // expanding
           totalStretch += child.stretch ?? 1;
@@ -85,7 +85,7 @@ export class VBoxLayout extends LayoutAbject {
       // Calculate height
       let height: number;
       if (vPolicy === 'fixed' || vPolicy === 'preferred') {
-        height = child.preferredSize?.height ?? 0;
+        height = child.preferredSize?.height ?? DEFAULT_CHILD_HEIGHT;
       } else {
         const stretch = child.stretch ?? 1;
         height = totalStretch > 0

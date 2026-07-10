@@ -309,6 +309,16 @@ export class ObjectCreator extends Abject {
 
   /** Active tasks keyed by the taskId we hand to AgentAbject. */
   private tasks = new Map<string, TaskExtra>();
+
+  /**
+   * Cached vision availability from the LLM service (see refreshVisionCapability).
+   * true/unknown = the visual-verification loop works; false = every configured
+   * model is text-only, so screenshots can be captured but never inspected —
+   * the loop must say so instead of pretending to look.
+   */
+  private visionCapable: boolean | undefined;
+  private visionCheckedAt = 0;
+  private static readonly VISION_TTL_MS = 60_000;
   /** Reverse index: AgentAbject's ticketId → our taskId, for taskResult lookup. */
   private taskIdByTicket = new Map<string, string>();
 
@@ -397,6 +407,9 @@ export class ObjectCreator extends Abject {
   protected override async onInit(): Promise<void> {
     this.llmId = await this.requireDep('LLM');
     this.registryId = await this.requireDep('Registry');
+    // Prime the vision check so the (synchronous) prompt builder has an
+    // answer by the time the first task starts.
+    void this.refreshVisionCapability();
     this.factoryId = await this.requireDep('Factory');
     this.systemRegistryId = (await this.discoverDep('SystemRegistry')) ?? undefined;
     this.abjectStoreId = (await this.discoverDep('AbjectStore')) ?? undefined;
@@ -434,6 +447,25 @@ export class ObjectCreator extends Abject {
     return this.tasks.size > 0
       ? `authoring/modifying objects (${this.tasks.size} task${this.tasks.size === 1 ? '' : 's'} in flight)`
       : undefined;
+  }
+
+  /**
+   * Refresh the cached vision answer from the LLM service. Models can be
+   * reconfigured at any time, so re-check on a short TTL. Errors leave the
+   * cache as-is and an unknown capability stays optimistic — only a definite
+   * "every configured model is text-only" (getVisionModel → null) flips the
+   * loop into no-vision mode.
+   */
+  private async refreshVisionCapability(): Promise<boolean | undefined> {
+    const now = Date.now();
+    if (now - this.visionCheckedAt < ObjectCreator.VISION_TTL_MS) return this.visionCapable;
+    this.visionCheckedAt = now;
+    try {
+      if (!this.llmId) return this.visionCapable;
+      const vm = await this.sendRequest<{ tier: string } | null>(this.llmId, 'getVisionModel', {}, 10000);
+      this.visionCapable = vm !== null;
+    } catch { /* keep previous answer */ }
+    return this.visionCapable;
   }
 
   protected override askPrompt(_question: string): string {
@@ -1343,12 +1375,12 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
 
     const collisionNote = state.nameCollisionId
-      ? ` — WARNING: another live object already holds the name "${state.draftManifest.name}" (${state.nameCollisionId.slice(0, 8)}). Name-based calls resolve to THAT older object; your own calls to "${state.draftManifest.name}" are auto-routed to the new instance. Decide what to do about the duplicate: usually the older object should have been modified instead of spawning a twin, or it should be destroyed.`
+      ? ` — WARNING: another live object already holds the name "${state.draftManifest.name}" (${state.nameCollisionId}). Name-based calls resolve to THAT older object; your own calls to "${state.draftManifest.name}" are auto-routed to the new instance. Decide what to do about the duplicate: usually the older object should have been modified instead of spawning a twin, or it should be destroyed.`
       : '';
 
     return {
       ok: true,
-      summary: `deploy_spawn: ${state.draftManifest.name} spawned as ${result.objectId.slice(0, 8)}${collisionNote}`,
+      summary: `deploy_spawn: ${state.draftManifest.name} spawned as ${result.objectId}${collisionNote}`,
       data: { objectId: result.objectId, manifest: state.draftManifest },
     };
   }
@@ -1486,7 +1518,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     return {
       ok: true,
-      summary: `deploy_update: ${targetLabel ?? targetId.slice(0, 8)} updated (${state.draftSource.split('\n').length} lines)`,
+      summary: `deploy_update: ${targetLabel ?? targetId} updated (${state.draftSource.split('\n').length} lines)`,
       data: { objectId: targetId },
     };
   }
@@ -1635,7 +1667,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     return {
       ok: true,
-      summary: `compose_organism: ${name} spawned as ${result.objectId.slice(0, 8)} with organelles [${organelleNames.join(', ')}] (originals keep running)`,
+      summary: `compose_organism: ${name} spawned as ${result.objectId} with organelles [${organelleNames.join(', ')}] (originals keep running)`,
       data: { objectId: result.objectId, name, organelles: organelleNames },
     };
   }
@@ -1701,7 +1733,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     return {
       ok: true,
-      summary: `extract_organelle: ${organelleName} extracted from ${targetRef} as standalone ${result.objectId.slice(0, 8)} (the organism keeps its internal copy)`,
+      summary: `extract_organelle: ${organelleName} extracted from ${targetRef} as standalone ${result.objectId} (the organism keeps its internal copy)`,
       data: { objectId: result.objectId, organelleName },
     };
   }
@@ -1921,7 +1953,12 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     const target = action.target as string | undefined;
     const method = action.method as string | undefined;
     const payload = (action.payload as Record<string, unknown> | undefined) ?? {};
-    const timeout = typeof action.timeout === 'number' ? action.timeout : 30000;
+    // `ask` answers are LLM-synthesized by the target (WidgetManager's build
+    // guide runs at the smart tier and regularly takes 30-60s+). A 30s default
+    // made agents lose the guide exactly when they needed it and build UIs
+    // from memory instead.
+    const defaultTimeout = method === 'ask' ? 120000 : 30000;
+    const timeout = typeof action.timeout === 'number' ? action.timeout : defaultTimeout;
 
     if (!target || typeof target !== 'string') {
       return { ok: false, summary: 'call: missing target', error: 'target is required and must be a string (UUID or registered name)' };
@@ -1984,7 +2021,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     return {
       ok: true,
       summary: (summary ?? `call ${target}.${method}: ok`)
-        + (pinnedToSpawn ? ` [routed to just-spawned ${resolvedId.slice(0, 8)}]` : ''),
+        + (pinnedToSpawn ? ` [routed to just-spawned ${resolvedId}]` : ''),
       data: response,
     };
   }
@@ -1997,19 +2034,48 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * ~50KB blob never bloats the transcript. The agent verifies layout, color,
    * spacing, and polish visually instead of guessing from getState numbers.
    */
-  private captureVisionFromCall(
+  private async captureVisionFromCall(
     extra: TaskExtra,
     action: AgentAction,
     res: { ok: boolean; summary: string; data?: unknown; error?: string },
-  ): void {
-    if (!res.ok || !res.data || typeof res.data !== 'object') return;
-    const img = res.data as { imageBase64?: string; width?: number; height?: number };
-    if (typeof img.imageBase64 !== 'string' || img.imageBase64.length === 0) return;
+  ): Promise<void> {
+    if (!res.ok) return;
+    const method = String(action.method ?? '');
+    const img = (res.data && typeof res.data === 'object')
+      ? res.data as { imageBase64?: string; width?: number; height?: number; error?: string }
+      : undefined;
 
-    const dims = `${img.width ?? '?'}x${img.height ?? '?'}`;
-    extra.lastLlmContent = [{ type: 'image', mediaType: 'image/png', data: img.imageBase64 }];
-    res.data = `Screenshot captured (${dims}). The rendered image is attached to the next observation — inspect it visually: judge centering, alignment, spacing, color cohesion, typographic hierarchy, and overall polish against the goal, and note any specific element that looks off so you can fix it.`;
-    res.summary = `call ${action.target}.${action.method}: screenshot ${dims} (attached for visual review)`;
+    if (img && typeof img.imageBase64 === 'string' && img.imageBase64.length > 0) {
+      const dims = `${img.width ?? '?'}x${img.height ?? '?'}`;
+
+      // An image is only worth attaching if some configured model can see it.
+      // Otherwise AgentAbject strips it to a text note downstream and the
+      // agent is left guessing — say plainly that visual inspection is
+      // impossible in this configuration instead.
+      if (await this.refreshVisionCapability() === false) {
+        res.data = `Screenshot captured (${dims}), which proves a visible window exists — but every configured LLM model is text-only, so YOU CANNOT SEE IT and neither visual inspection nor visual verification is possible. Verify what you can through code review (every layout child needs sizePolicy + preferredSize) and state/method checks, and say in your final result that the UI was not visually inspected because no vision-capable model is configured.`;
+        res.summary = `call ${action.target}.${action.method}: screenshot ${dims} captured but NOT inspectable (no vision-capable model configured)`;
+        return;
+      }
+
+      extra.lastLlmContent = [{ type: 'image', mediaType: 'image/png', data: img.imageBase64 }];
+      res.data = `Screenshot captured (${dims}). The rendered image is attached to the next observation — inspect it visually: judge centering, alignment, spacing, color cohesion, typographic hierarchy, and overall polish against the goal, and note any specific element that looks off so you can fix it.`;
+      res.summary = `call ${action.target}.${action.method}: screenshot ${dims} (attached for visual review)`;
+      return;
+    }
+
+    // A capture call that produced no image bytes is a FAILED verification,
+    // even though the message round-trip succeeded. Historically this came
+    // back as a bare `null` inside an ok result, agents read it as success,
+    // and "verified" UIs shipped that no one had ever seen. Make the summary
+    // unmissable and point at the fix.
+    if (/capture/i.test(method)) {
+      const why = img?.error ?? 'the capture returned no image';
+      res.ok = false;
+      res.error = why;
+      res.data = undefined;
+      res.summary = `call ${action.target}.${action.method}: NO IMAGE — ${why}. You have NOT seen the UI; do not claim visual verification. Pass the FULL owner objectId or the windowId from show(), or use Screenshot.listWindows to find the window.`;
+    }
   }
 
   /**
@@ -2440,7 +2506,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       switch (action.action) {
         case 'call':
           res = await this.opCall(state, action);
-          this.captureVisionFromCall(extra, action, res);
+          await this.captureVisionFromCall(extra, action, res);
           break;
         case 'draft_manifest':
           res = await this.opDraftManifest(state, action);
@@ -2536,7 +2602,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     lines.push('TASK');
     lines.push(`  kind:   ${state.kind}`);
     if (state.targetName || state.targetObjectId) {
-      lines.push(`  target: ${state.targetName ?? '?'}${state.targetObjectId ? ` (${state.targetObjectId.slice(0, 8)})` : ''}`);
+      // Full id, never truncated: agents copy ids straight out of this text
+      // into call payloads (e.g. Screenshot.captureWindow), and a shortened
+      // id silently matches nothing.
+      lines.push(`  target: ${state.targetName ?? '?'}${state.targetObjectId ? ` (${state.targetObjectId})` : ''}`);
     } else {
       lines.push(`  target: (new object)`);
     }
@@ -2548,7 +2617,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       lines.push('  (none yet — use call(<name>, "describe") or call(<name>, "ask", {question}) to discover)');
     } else {
       for (const dep of state.deps.values()) {
-        lines.push(`  ### ${dep.depName}${dep.depId ? ` (${dep.depId.slice(0, 8)})` : ''}`);
+        lines.push(`  ### ${dep.depName}${dep.depId ? ` (${dep.depId})` : ''}`);
         if (dep.methods.size > 0) {
           lines.push('  Methods:');
           for (const m of dep.methods.values()) {
@@ -2597,8 +2666,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
 
     if (state.nameCollisionId) {
-      lines.push(`⚠️ NAME COLLISION — a pre-existing live object (${state.nameCollisionId.slice(0, 8)}) also answers to "${state.draftManifest?.name}".`);
-      lines.push(`   Name-based routing resolves to that OLDER object, so verifying "by name" would test the wrong instance. Your call actions targeting the name are auto-routed to the instance you spawned (${state.spawnedObjectId?.slice(0, 8) ?? '?'}).`);
+      lines.push(`⚠️ NAME COLLISION — a pre-existing live object (${state.nameCollisionId}) also answers to "${state.draftManifest?.name}".`);
+      lines.push(`   Name-based routing resolves to that OLDER object, so verifying "by name" would test the wrong instance. Your call actions targeting the name are auto-routed to the instance you spawned (${state.spawnedObjectId ?? '?'}).`);
       lines.push('   Before finishing, resolve the duplicate: if the older object is a stale/previous version of the same thing, destroy it or fold your changes into it — the user should not end up with two identically-named objects.');
       lines.push('');
     }
@@ -2692,6 +2761,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   // ── System prompt ─────────────────────────────────────────────────────
 
   private buildSystemPrompt(): string {
+    // Keep the cached vision answer fresh for the next build; this call is
+    // TTL-gated and non-blocking (the current build uses the cached value).
+    void this.refreshVisionCapability();
     return `You are ObjectCreator, a code-writing agent inside the Abjects distributed message-passing system. You create new Abjects, modify existing ones, and answer diagnostic questions about Abjects.
 
 # The system
@@ -2847,7 +2919,9 @@ An Organism is one Abject with an internal registry: organelles (internal Script
 
    "I called \`getState\` and the numbers look fine" is NOT verification. \`done\` only after at least one synthetic exercise of each user-requested behavior produced the expected change.
 
-   **See what you built — visual work needs a visual check.** \`getState\` proves logic; it says nothing about whether the thing looks right. For ANY object with a window, canvas, or drawn UI — and ALWAYS when the goal mentions look, layout, alignment, spacing, color, "beautiful", "polished", or a redesign — capture a screenshot and inspect it before finishing: \`call("Screenshot", "captureWindow", { objectId: "<the object's id>" })\`. The rendered image is attached to your next observation; judge it against the goal — centering, alignment, spacing (no accidental empty voids), color cohesion, typographic hierarchy, legibility of every state (e.g. used/disabled vs active), and overall polish. If anything looks off, edit, redeploy, and screenshot again. Do NOT declare a visual goal done on the strength of \`getState\` alone — Round-after-round rework happens precisely when an agent reports "looks beautiful" without ever looking. (Make sure the window is actually shown first; capture returns null if there is no visible window.)
+   ${this.visionCapable === false
+    ? `**Visual verification is UNAVAILABLE in this configuration.** Every LLM model currently configured is text-only — screenshots can be captured (proving a window exists) but neither you nor any tier can see them, so never describe or judge how a UI looks. Verify what you can without eyes: review the layout code (every layout child needs sizePolicy + preferredSize; every widget must be added to a layout), check behavior via \`getState\` and method calls, and state plainly in your final result that the UI was NOT visually inspected because no vision-capable model is configured — the user can enable one to get visual verification.`
+    : `**See what you built — visual work needs a visual check.** \`getState\` proves logic; it says nothing about whether the thing looks right. For ANY object with a window, canvas, or drawn UI — and ALWAYS when the goal mentions look, layout, alignment, spacing, color, "beautiful", "polished", or a redesign — capture a screenshot and inspect it before finishing: \`call("Screenshot", "captureWindow", { objectId: "<the object's FULL id — never truncate>" })\`. The rendered image is attached to your next observation; judge it against the goal — centering, alignment, spacing (no accidental empty voids), color cohesion, typographic hierarchy, legibility of every state (e.g. used/disabled vs active), and overall polish. If anything looks off, edit, redeploy, and screenshot again. Do NOT declare a visual goal done on the strength of \`getState\` alone — Round-after-round rework happens precisely when an agent reports "looks beautiful" without ever looking. (Make sure the window is actually shown first. A capture that comes back with NO IMAGE means the verification did NOT happen — fix the capture — pass the full owner id or the windowId from show(), or find the window via Screenshot.listWindows — and only claim visual results after you have actually seen an image.)`}
 
    **Verify once, don't grind.** Each behavior needs ONE representative check, not a sweep. A single correct guess and a single wrong guess prove the guess handler; you do not need to play the whole game. Repeating the same \`call\` (e.g. guessing letter after letter, or polling \`getState\` over and over) burns steps and triggers loop-steering without adding confidence. Drive each distinct behavior once, take one screenshot for the visual, then \`done\`.
 

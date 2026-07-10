@@ -396,6 +396,18 @@ export class LLMObject extends Abject {
                 returns: { kind: 'reference', reference: 'TierCapabilities' },
               },
               {
+                name: 'getVisionModel',
+                description: 'The first configured model that accepts image input, searched in tier order (smart, balanced, fast) and then the vision fallback. Returns { tier, provider, model, vision } or null when every configured model is text-only. Consult this BEFORE building a workflow around screenshots or image analysis: null means images sent to the LLM are silently replaced with text notes, so visual verification is impossible until a vision-capable model is configured.',
+                parameters: [],
+                returns: {
+                  kind: 'union',
+                  variants: [
+                    { kind: 'reference', reference: 'TierCapability' },
+                    { kind: 'primitive', primitive: 'null' },
+                  ],
+                },
+              },
+              {
                 name: 'transcribe',
                 description: 'Transcribe audio to text (speech-to-text). Routes to the first registered provider with a transcription API unless a provider is named.',
                 parameters: [
@@ -679,6 +691,10 @@ export class LLMObject extends Abject {
 
     this.on('describeTiers', async () => {
       return this.describeTiers();
+    });
+
+    this.on('getVisionModel', async () => {
+      return this.getVisionModel();
     });
 
     this.on('getStats', async () => {
@@ -1497,6 +1513,27 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       this.modelListFetches.set(providerName, inFlight);
     }
     return inFlight;
+  }
+
+  /**
+   * The first model that can accept image input, searched in tier order
+   * (smart → balanced → fast) and then the configured vision fallback.
+   * `vision: null` (unknown) counts as capable, matching AgentAbject's
+   * image-step routing. Returns null when every configured model is
+   * text-only — callers should then skip screenshot-based verification
+   * and say so instead of shipping images that get stripped to text notes.
+   */
+  async getVisionModel(): Promise<{ tier: string; provider: string; model: string | null; vision: boolean | null } | null> {
+    const caps = await this.describeTiers();
+    for (const tier of ['smart', 'balanced', 'fast'] as const) {
+      const c = caps[tier];
+      if (c && c.vision !== false) return { tier, provider: c.provider, model: c.model, vision: c.vision };
+    }
+    const fb = caps.visionFallback;
+    if (fb && fb.vision !== false) {
+      return { tier: 'visionFallback', provider: fb.provider, model: fb.model, vision: fb.vision };
+    }
+    return null;
   }
 
   /**

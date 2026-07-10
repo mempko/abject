@@ -7,7 +7,7 @@
  */
 
 import { AbjectId } from '../../core/types.js';
-import { Rect, LayoutChildConfig, SpacerConfig } from './widget-types.js';
+import { Rect, LayoutChildConfig, SpacerConfig, DEFAULT_CHILD_HEIGHT, DEFAULT_CHILD_WIDTH } from './widget-types.js';
 import { LayoutAbject, LayoutConfig, ChildRect, isSpacer } from './layout-abject.js';
 
 export class HBoxLayout extends LayoutAbject {
@@ -25,7 +25,7 @@ export class HBoxLayout extends LayoutAbject {
     let maxHeight = 0;
     for (const child of children) {
       if (isSpacer(child)) continue;
-      maxHeight = Math.max(maxHeight, child.preferredSize?.height ?? 0);
+      maxHeight = Math.max(maxHeight, child.preferredSize?.height ?? DEFAULT_CHILD_HEIGHT);
     }
     return maxHeight + this.margins.top + this.margins.bottom;
   }
@@ -50,7 +50,7 @@ export class HBoxLayout extends LayoutAbject {
       } else {
         const hPolicy = child.sizePolicy?.horizontal ?? 'preferred';
         if (hPolicy === 'fixed' || hPolicy === 'preferred') {
-          fixedWidth += child.preferredSize?.width ?? 0;
+          fixedWidth += child.preferredSize?.width ?? DEFAULT_CHILD_WIDTH;
         } else {
           // expanding
           totalStretch += child.stretch ?? 1;
@@ -81,7 +81,7 @@ export class HBoxLayout extends LayoutAbject {
       // Calculate width
       let width: number;
       if (hPolicy === 'fixed' || hPolicy === 'preferred') {
-        width = child.preferredSize?.width ?? 0;
+        width = child.preferredSize?.width ?? DEFAULT_CHILD_WIDTH;
       } else {
         const stretch = child.stretch ?? 1;
         width = totalStretch > 0

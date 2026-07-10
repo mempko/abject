@@ -71,6 +71,18 @@ export function coerceRect(r: SizeInput | undefined): { x: number; y: number; wi
   return { x: r?.x ?? 0, y: r?.y ?? 0, width: s.width ?? 0, height: s.height ?? 0 };
 }
 
+/**
+ * Main-axis fallback for a fixed/preferred layout child that supplied no
+ * preferredSize. Layout children default to the 'preferred' policy, so a bare
+ * { widgetId } entry used to resolve to 0px — every such sibling rendered
+ * invisible, stacked at the container origin (the classic LLM-built "crunched
+ * window"). A small visible default turns that authoring mistake into a
+ * squeezed-but-readable UI instead of a blank one. Explicit sizes are still
+ * the correct way to lay out children.
+ */
+export const DEFAULT_CHILD_HEIGHT = 24;
+export const DEFAULT_CHILD_WIDTH = 100;
+
 // ── Draw commands ──────────────────────────────────────────────────────────
 
 /**
