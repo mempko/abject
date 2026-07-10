@@ -23,7 +23,7 @@ interface WebTaskOptions {
   maxSteps?: number;
   startUrl?: string;
   timeout?: number;
-  pageOptions?: { userAgent?: string; viewport?: { width: number; height: number }; profile?: string };
+  pageOptions?: { userAgent?: string; viewport?: { width: number; height: number }; profile?: string; headful?: boolean; channel?: string };
   responseSchema?: Record<string, unknown>;
   pageId?: string;         // reuse an existing open page
   keepPageOpen?: boolean;  // don't close page after task completes
@@ -33,7 +33,7 @@ interface WebTaskOptions {
 interface WebTaskExtra {
   startUrl?: string;
   pageId?: string;
-  pageOptions?: { userAgent?: string; viewport?: { width: number; height: number }; profile?: string };
+  pageOptions?: { userAgent?: string; viewport?: { width: number; height: number }; profile?: string; headful?: boolean; channel?: string };
   responseSchema?: Record<string, unknown>;
   lastScreenshot?: string;  // raw base64 (no data URI prefix)
   keepPageOpen?: boolean;          // don't close page after task completes
@@ -63,6 +63,8 @@ export class WebAgent extends Abject {
   /** Kept-open pages: pageId → idle timeout handle. */
   private keptOpenPages = new Map<string, ReturnType<typeof setTimeout>>();
   private static readonly PAGE_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+  /** How long request_human waits for the user to finish a takeover. */
+  private static readonly HUMAN_HANDOFF_TIMEOUT_MS = 5 * 60 * 1000;
 
   /** Pending ticket promises: ticketId → resolve/reject. */
   private pendingTickets = new Map<string, {
@@ -217,7 +219,7 @@ export class WebAgent extends Abject {
 
 ### What I Handle
 I am the agent for tasks that require a REAL WEB BROWSER with interactive navigation.
-I open a headless browser, navigate to URLs, and use an LLM-driven loop to complete web tasks.
+I open a browser, navigate to URLs, and use an LLM-driven loop to complete web tasks. The browser engine runs headless, but the user is never locked out: a live viewer window on their desktop shows my pages, and I can hand them direct control of a page at any point (their real mouse and keyboard are replayed into it).
 
 Examples of tasks I handle well:
 - Filling out forms, clicking buttons, navigating multi-page workflows
@@ -226,12 +228,20 @@ Examples of tasks I handle well:
 - Taking screenshots of web pages
 - Searching the web via a search engine
 - Any task that requires interactive browser navigation (clicks, scrolls, form fills)
+- Opening a site and handing the user live control so they can click around themselves
+
+### Interactive browsing with the user — YES, I support it
+When the user wants to see a live page or drive it themselves ("open X and let me click around", "let me log in myself", "show me the site so I can poke at it"), the answer is YES. My \`request_human\` action opens a live viewer window on the user's desktop, focused on my page, with a prompt to take control. While they are in control, their mouse movements, clicks, scrolling, typing, and pastes are replayed into the real page as trusted input; the view refreshes continuously. When they hand back, I continue the task with whatever they did (logins, cookies, navigation) intact.
+
+Concrete task shape for "open <url> and let the user click around":
+  runTask({ task: 'Navigate to <url>, then use request_human with wait: "takeover" to hand the user live control of the page so they can explore. As soon as they take control, finish with done and keepPageOpen: true — do not wait for them to hand back.', options: { startUrl: '<url>', keepPageOpen: true } })
+The page survives after the task, and the user can re-take control from the viewer window whenever they like. The viewer also gives them back/forward/reload buttons.
 
 ### My Scope
 
 I handle tasks that require navigating a real website or web page — URLs, DOM, clicks, form fills, JavaScript-rendered content. My browser runs in its own context, separate from the Abjects system running here: it reaches the public web, and the in-process Registry, Factory, and message bus live elsewhere.
 
-Answer YES when the task is about a URL, a website, or public web content: filling forms, clicking through multi-page flows, logging into a site, scraping JS-rendered pages, taking screenshots of a page, or searching the web.
+Answer YES when the task is about a URL, a website, or public web content: filling forms, clicking through multi-page flows, logging into a site, scraping JS-rendered pages, taking screenshots of a page, searching the web, or opening a page and handing the user live control of it (see "Interactive browsing with the user" above).
 
 Answer PASS for simple data fetches (weather APIs, RSS, JSON endpoints) since HttpClient handles those faster.
 
@@ -270,7 +280,7 @@ Without a profile name (\`pageOptions.profile\` omitted), I run ephemeral — ev
 
 ### Bootstrapping a profile (one-time login)
 
-The browser is headless and I drive the login MYSELF — the user stays in chat. The screenshot they see is a still image (an artifact, not a live browser), so for any login-required site the flow is:
+I can drive the login myself with provided credentials, or hand the user the live page to log in themselves (request_human, see above). For the credentials path:
 
 1. Ask the user for credentials (preferring SecretsVault for storage), or use credentials you already have.
 2. Run a bootstrap runTask against the profile: I open the login page, \`fill\` the email/password fields, \`click\` Sign In.
@@ -278,11 +288,11 @@ The browser is headless and I drive the login MYSELF — the user stays in chat.
 
 Once the bootstrap succeeds, every future task that names the same profile is already authenticated.
 
-If the user asks for "a visible browser window so I can log in myself", explain that the headless model is how a server-side agent works and offer the bootstrap-with-credentials path above instead.
+If the user wants to log in themselves, or a human-verification challenge blocks me mid-task, I hand them the live page: my request_human action opens the visual browser viewer where their real mouse and keyboard are replayed into my page. Whatever they complete lands in the same profile, and I continue when they hand control back.
 
 ### Capability over reputation
 
-When asked whether I can handle a specific site (LinkedIn, Gmail, X/Twitter, banks, etc.), the answer is "yes — give me a profile name and credentials and I'll try". Persistent profiles, real user-agent strings, and a real Chromium build cover the vast majority of sites, including the ones with reputations for hostility. Treat predictions like "site X blocks headless browsers", "CAPTCHA within seconds", "device verification will defeat this" as training-data speculation, not evidence — keep them out of poll replies. If a real attempt actually fails, I'll report the concrete error and we can decide what to do then. Until that real failure exists, the right reply is "yes, with the \`linkedin\` profile — let's try."
+When asked whether I can handle a specific site (LinkedIn, Gmail, X/Twitter, banks, etc.), the answer is "yes — give me a profile name and credentials and I'll try". Persistent profiles, real user-agent strings, a real browser build, and a headful mode with human takeover for anti-bot challenges cover the vast majority of sites, including the ones with reputations for hostility. When a site throws a Cloudflare/CAPTCHA/human-verification wall, I upgrade to a real headful browser and hand the live page to the user to clear it — so those walls are a step in the flow, not a dead end. Treat predictions like "site X blocks headless browsers", "device verification will defeat this" as training-data speculation, not evidence — keep them out of poll replies. If a real attempt actually fails, I'll report the concrete error and we can decide what to do then. Until that real failure exists, the right reply is "yes, with the \`linkedin\` profile — let's try."
 
 ### Run a Full Web Task (free-text result)
 
@@ -535,7 +545,14 @@ Set keepPageOpen: false to explicitly close the page when done.
         ?? (data?.pageOptions as { profile?: string } | undefined)?.profile;
       const profileFromDescription = extractProfileName(description);
       const profile = profileFromData ?? profileFromDescription;
-      const pageOptions: WebTaskExtra['pageOptions'] = profile ? { profile } : undefined;
+      // A planner may pre-select a real (headful) browser for known anti-bot /
+      // login sites; otherwise the page opens headless and request_human
+      // upgrades it on demand.
+      const headful = (data?.headful as boolean | undefined)
+        ?? (data?.pageOptions as { headful?: boolean } | undefined)?.headful;
+      const pageOptions: WebTaskExtra['pageOptions'] = (profile || headful)
+        ? { ...(profile ? { profile } : {}), ...(headful ? { headful: true } : {}) }
+        : undefined;
 
       const extra: WebTaskExtra = { startUrl, pageOptions, goalId };
       this.taskExtras.set(taskId, extra);
@@ -667,6 +684,46 @@ Set keepPageOpen: false to explicitly close the page when done.
 
     this.on('agentIntermediateAction', async () => { this.resetPendingTicketTimeouts(); });
     this.on('agentActionResult', async () => { this.resetPendingTicketTimeouts(); });
+  }
+
+  /**
+   * Ensure the task's page is running in a real (headful) browser before a
+   * human takes over — headless Chromium fails anti-bot fingerprints even when
+   * a human clicks the challenge. If the page is already headful, no-op.
+   * Otherwise reopen it headful, preserving the profile and re-navigating to
+   * the current URL, and update the task's pageId. Best-effort: on any failure
+   * the original page is kept so the takeover still proceeds (just headless).
+   */
+  private async reopenPageHeadful(extra: WebTaskExtra): Promise<void> {
+    const webId = this.webBrowserId;
+    if (!webId || !extra.pageId) return;
+    if (extra.pageOptions?.headful) return; // already a real browser
+
+    let currentUrl = extra.startUrl;
+    try {
+      const info = await this.request<{ url: string }>(
+        request(this.id, webId, 'getUrl', { pageId: extra.pageId })
+      );
+      if (info?.url && info.url !== 'about:blank') currentUrl = info.url;
+    } catch { /* fall back to startUrl */ }
+
+    const oldPageId = extra.pageId;
+    const newOptions = { ...(extra.pageOptions ?? {}), headful: true };
+    // Close the headless page first so a persistent profile context is idle and
+    // can relaunch headful under the same on-disk profile (cookies survive).
+    try { await this.request(request(this.id, webId, 'closePage', { pageId: oldPageId })); } catch { /* already gone */ }
+
+    const { pageId: newPageId } = await this.request<{ pageId: string }>(
+      request(this.id, webId, 'openPage', { options: newOptions })
+    );
+    extra.pageId = newPageId;
+    extra.pageOptions = newOptions;
+    if (currentUrl) {
+      try {
+        await this.request(request(this.id, webId, 'navigateTo', { pageId: newPageId, url: currentUrl }));
+      } catch { /* the user can navigate once they have control */ }
+    }
+    log.info(`reopened page headful for human takeover (${oldPageId} → ${newPageId})`);
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1123,6 +1180,65 @@ Set keepPageOpen: false to explicitly close the page when done.
           return { success: true, data: `Screenshot attached (${shot.width}x${shot.height})` };
         }
 
+        case 'request_human': {
+          // Hand the page to the human: open the visual browser viewer and
+          // prompt them to take control. Blocks (with the agentAct heartbeat
+          // keeping the ticket alive) until the user hands control back,
+          // dismisses, or the handoff times out.
+          const viewerId = await this.discoverDep('WebBrowserViewer');
+          if (!viewerId) {
+            return {
+              success: false,
+              error: 'No human is available at a screen right now (no viewer in this workspace). Use "fail" with a reason describing exactly what the user must do.',
+            };
+          }
+          const reason = (action.reason as string | undefined)
+            ?? 'The page needs a human — take control, complete the step shown, then hand back';
+          const waitFor = action.wait === 'takeover' ? 'takeover' : 'handback';
+
+          // A handback handoff means a challenge only a human can pass (e.g.
+          // Cloudflare Turnstile). Those fail on headless Chromium no matter who
+          // clicks, so upgrade the page to a real headful browser first. Casual
+          // co-browsing (takeover) doesn't need it and must not disrupt the
+          // page the user asked to see, unless the caller explicitly requests it.
+          if (waitFor === 'handback' || action.headful === true) {
+            try { await this.reopenPageHeadful(extra); } catch (err) {
+              log.info(`reopenPageHeadful failed, proceeding headless: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+          const humanPageId = extra.pageId ?? pageId;
+
+          if (goalId && this.goalManagerId) {
+            this.send(event(this.id, this.goalManagerId, 'updateProgress', {
+              goalId,
+              message: waitFor === 'takeover'
+                ? 'The page is ready for you in the web viewer — take control when you like…'
+                : 'Waiting for you in the web viewer — take control, finish the step, then hand back…',
+              phase: 'waiting_for_human',
+              agentName: 'WebAgent',
+            }));
+          }
+          const handoff = await this.request<{ completed: boolean; reason?: string }>(
+            request(this.id, viewerId, 'requestControl', {
+              pageId: humanPageId, reason, timeoutMs: WebAgent.HUMAN_HANDOFF_TIMEOUT_MS,
+              resolveOn: waitFor,
+            }),
+            WebAgent.HUMAN_HANDOFF_TIMEOUT_MS + 30_000,
+          );
+          if (!handoff.completed) {
+            return {
+              success: false,
+              error: `Human handoff not completed (${handoff.reason ?? 'no reason given'}). Use "fail" with a reason describing exactly what the user must do.`,
+            };
+          }
+          return {
+            success: true,
+            data: waitFor === 'takeover'
+              ? 'The user has taken control and is browsing the page. Finish the task now with done and keepPageOpen: true — do not wait for them.'
+              : 'The user took control and handed the page back. Re-observe the page and retry the blocked step.',
+          };
+        }
+
         case 'write_scratchpad': {
           if (!goalId) return { success: false, error: 'write_scratchpad requires an active goal context' };
           if (!this.goalManagerId) return { success: false, error: 'GoalManager not available' };
@@ -1224,6 +1340,15 @@ Respond with ONE action as a JSON object in a \`\`\`json code block. Output ONLY
   For multi-statement scripts, wrap in an IIFE: (() => { ...code...; return result; })()
   For APIs or plain-text endpoints, use fetch: { "action": "extract", "script": "fetch('https://api.example.com/data').then(r => r.json())" }
 
+### Human handoff (live takeover)
+- request_human: Open a live viewer on the user's desktop and ask them to take control of your page. Their real mouse and keyboard are replayed into the page as trusted input. Two modes via "wait":
+  1. wait: "handback" (default) — for a step only a human can complete: interactive verification challenges ("verify you are human" checkboxes, image puzzles), on-page consent screens, or a login they prefer to do themselves. The action returns when the user hands control back; then re-observe the page and retry the blocked step ONCE before deciding the outcome.
+     { "action": "request_human", "reason": "Complete the human-verification checkbox, then hand control back" }
+  2. wait: "takeover" — when the task itself is to give the user the live page ("open X and let me click around", "let me explore it"). Navigate to the target first, then hand over; the action returns AS SOON AS the user takes control, and you should immediately call "done" with keepPageOpen: true — the user keeps browsing while you finish, and the viewer stays available to them.
+     { "action": "request_human", "reason": "The page is yours — explore freely", "wait": "takeover" }
+  The reason is shown to the user next to the live page; write it as a short, concrete instruction. Your page and profile stay intact — whatever the user completes (cookies, session, navigation) persists. If no human is available, the action fails and you should fall back to "fail" with a reason as described below.
+  Note on anti-bot challenges: a headless browser fails Cloudflare Turnstile and similar checks even when a human clicks them. For that reason, a handback request_human automatically upgrades the page to a real (headful) browser and re-navigates to the current URL before handing over, so the human's click actually passes. This upgrade happens on the browser-check page (before you fill any form), so prefer calling request_human the moment such a check appears rather than after filling fields you'd lose to the reload.
+
 ### Scrum escalation
 If the browser task is too broad, belongs to another specialist, or needs multiple independent work streams, do not split it yourself. Use fail with a concise reason and, when useful, a proposed split. ScrumMaster will review the failure and plan the next scrum with the team.
 
@@ -1263,8 +1388,10 @@ If you land on a sign-in or "session expired" page and the task expects you to b
 
 For 2FA / OTP / device-approval mid-flow with no code supplied, call "fail" with reason \`otp_required: ask the user for the code, then re-run with the same profile\`. Pass \`keepPageOpen: true\` so the page survives until the user supplies the code.
 
+If a human-verification challenge blocks you (a "verify you are human" checkbox, an image puzzle, a browser check that fails when you interact with it), use \`request_human\` — the user completes it live in your own page and profile, then you continue.
+
 ## What the User Sees
-The page screenshot you produce with \`attach_screenshot\` (and on "done") is a still image — it informs the user but they cannot click or type into it. They are in chat. Drive every browser action yourself; when input is genuinely missing (credentials, OTP), end with a "fail" whose reason names exactly what to ask the user for. Phrases like "complete the login interactively" or "click the Sign In button on the screen" do not belong in your output, because the user has no way to act on the image.
+The page screenshot you produce with \`attach_screenshot\` (and on "done") is a still image — it informs the user but they cannot click or type into it. They are in chat. Drive every browser action yourself. When the user should interact with the live page — because a step needs a human (verification challenge, on-screen approval) or because the task asks to let them browse it themselves — use \`request_human\`: it opens a live view where the user CAN click and type in your page, and returns when they finish. When the missing piece is information rather than interaction (credentials, OTP codes), end with a "fail" whose reason names exactly what to ask the user for.
 
 ## Rules
 1. Use "ref" from the ARIA snapshot to target elements. The ref (e.g. "e5") comes from [ref=eN] annotations.
@@ -1291,23 +1418,30 @@ export const WEB_AGENT_ID = 'abjects:web-agent' as AbjectId;
 function extractProfileName(description: string): string | undefined {
   if (!description) return undefined;
 
+  // Ordered strongest-signal first. Explicit assignment and "named/called X"
+  // beat the loose "persistent X profile" form, so "a persistent real-browser
+  // profile named 'luma'" resolves to luma, not the descriptor real-browser.
   const patterns: RegExp[] = [
     // pageOptions.profile = 'linkedin' / profile: "linkedin" / profile=linkedin
     /\bprofile\s*[=:]\s*['"`]?([A-Za-z0-9][\w.-]{0,63})['"`]?/i,
-    // "the 'linkedin' profile" / "named 'linkedin' Playwright profile"
+    // "profile named 'linkedin'" / "profile called linkedin" / "profile 'linkedin'"
+    /\bprofile\s+(?:named|called)\s+['"`]?([A-Za-z0-9][\w.-]{0,63})['"`]?/i,
+    /\bprofile\s+['"`]([A-Za-z0-9][\w.-]{0,63})['"`]/i,
+    // "named 'linkedin' (Playwright )profile" / "called linkedin profile"
+    /\b(?:named|called)\s+['"`]?([A-Za-z0-9][\w.-]{0,63})['"`]?\s+(?:persistent\s+|real[- ]?browser\s+|Playwright\s+)?profile\b/i,
+    // "the 'linkedin' profile" (quoted name directly before "profile")
     /['"`]([A-Za-z0-9][\w.-]{0,63})['"`]\s+(?:Playwright\s+)?profile\b/i,
-    // "(persistent|named|the) `linkedin` (Playwright )?profile"
-    /\b(?:persistent|named|the)\s+['"`]?([A-Za-z0-9][\w.-]{0,63})['"`]?\s+(?:Playwright\s+)?profile\b/i,
-    // "profile named 'linkedin'" / "profile 'linkedin'"
-    /\bprofile\s+(?:named\s+)?['"`]([A-Za-z0-9][\w.-]{0,63})['"`]/i,
+    // Loosest, lowest priority: "(persistent|the) linkedin profile"
+    /\b(?:persistent|the)\s+['"`]?([A-Za-z0-9][\w.-]{0,63})['"`]?\s+profile\b/i,
   ];
 
   for (const re of patterns) {
     const m = description.match(re);
     if (m && m[1]) {
       const name = m[1].trim();
-      // Skip generic words so we don't latch onto "the persistent BROWSER profile".
-      if (!/^(browser|playwright|persistent|named|the|a|this|that|new)$/i.test(name)) {
+      // Skip generic/descriptor words so we don't latch onto phrasings like
+      // "the persistent real-browser profile named X".
+      if (!/^(browser|real|real-browser|headful|headless|playwright|persistent|named|called|the|a|this|that|new)$/i.test(name)) {
         return name;
       }
     }
