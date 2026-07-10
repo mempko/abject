@@ -157,21 +157,13 @@ export class JobManager extends Abject {
   }
 
   private setupHandlers(): void {
-    // Reset call-level timeout on callee progress AND forward upstream to job submitter
-    this.on('progress', (msg: AbjectMessage) => {
-      // Broadcast to all active queues — progress is a heartbeat/timeout-reset signal
-      for (const q of this.queues.values()) {
-        if (q.currentCallMsgId) {
-          this.resetRequestTimeout(q.currentCallMsgId);
-        }
-        if (q.currentJobCallerId) {
-          this.send(
-            event(this.id, q.currentJobCallerId, 'progress',
-              msg.payload ?? {})
-          );
-        }
-      }
-    });
+    // NOTE: no custom 'progress' handler here. A previous version registered
+    // one to forward heartbeats to job submitters, but Abject.init() registers
+    // the base 'progress' handler AFTER the constructor runs setupHandlers(),
+    // and on() is last-write-wins — so it was silently dead code. The base
+    // handler now covers both needs: it resets our outbound call timers and
+    // bubbles progress to every requester still waiting on a deferred reply
+    // (which is exactly the submitJob callers tracked per queue).
 
     this.on('submitJob', async (msg: AbjectMessage) => {
       const { description, code, queue: queueName, context: userContext } = msg.payload as {

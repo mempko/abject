@@ -254,6 +254,15 @@ interface LoopState {
 
   terminal?: { kind: 'done' | 'fail'; result?: unknown; error?: string };
   spawnedObjectId?: AbjectId;
+  /**
+   * Set when deploy_spawn found ANOTHER live object already holding the
+   * draft's name. Registry uniquifies duplicate registration names, so
+   * name-based discovery keeps resolving to this pre-existing object — a
+   * verification call routed by name would exercise the wrong instance and
+   * report a false positive. opCall pins name calls to spawnedObjectId and
+   * the observation warns until the duplicate is dealt with.
+   */
+  nameCollisionId?: AbjectId;
   deployedViaUpdateSource?: boolean;
   /**
    * Snapshot of `draftSource` as it was at the last successful deploy
@@ -419,6 +428,12 @@ export class ObjectCreator extends Abject {
         log.warn('Failed to register with AgentAbject:', err instanceof Error ? err.message : String(err));
       }
     }
+  }
+
+  protected override askBusyStatus(): string | undefined {
+    return this.tasks.size > 0
+      ? `authoring/modifying objects (${this.tasks.size} task${this.tasks.size === 1 ? '' : 's'} in flight)`
+      : undefined;
   }
 
   protected override askPrompt(_question: string): string {
@@ -1311,9 +1326,29 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     state.lastDeployedSource = state.draftSource;
 
+    // Detect a live name collision. Registry uniquifies duplicate registration
+    // names (Name → Name-2), so discover({name}) keeps resolving to the
+    // PRE-EXISTING holder — verification calls routed by name would exercise
+    // the old instance and report false positives (e.g. show() → 'Already
+    // open'). Record it so opCall pins name calls to the new instance and the
+    // observation tells the agent to resolve the duplicate.
+    for (const registryId of [this.registryId, this.systemRegistryId]) {
+      if (!registryId) continue;
+      try {
+        const hits = await this.sendRequest<ObjectRegistration[]>(
+          registryId, 'discover', { name: state.draftManifest.name }, 10000);
+        const other = (hits ?? []).find(h => h.id !== result.objectId);
+        if (other) { state.nameCollisionId = other.id; break; }
+      } catch { /* best effort */ }
+    }
+
+    const collisionNote = state.nameCollisionId
+      ? ` — WARNING: another live object already holds the name "${state.draftManifest.name}" (${state.nameCollisionId.slice(0, 8)}). Name-based calls resolve to THAT older object; your own calls to "${state.draftManifest.name}" are auto-routed to the new instance. Decide what to do about the duplicate: usually the older object should have been modified instead of spawning a twin, or it should be destroyed.`
+      : '';
+
     return {
       ok: true,
-      summary: `deploy_spawn: ${state.draftManifest.name} spawned as ${result.objectId.slice(0, 8)}`,
+      summary: `deploy_spawn: ${state.draftManifest.name} spawned as ${result.objectId.slice(0, 8)}${collisionNote}`,
       data: { objectId: result.objectId, manifest: state.draftManifest },
     };
   }
@@ -1779,6 +1814,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
     }
     lines.push('');
     lines.push('Available dependencies (authoritative — method names below are the ONLY valid names):');
+    lines.push('The same goes for string enums INSIDE payloads (widget/type names, kinds, modes): use exactly the vocabulary the dependency\'s guide documents. Do not substitute names remembered from other toolkits — an unknown enum value fails at runtime, often mid-build, and is not caught by validators.');
     lines.push(this.formatStructuredDeps(state.deps));
     if (instructions) {
       lines.push('');
@@ -1894,7 +1930,19 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       return { ok: false, summary: 'call: missing method', error: 'method is required and must be a string' };
     }
 
-    const resolvedId = await this.resolveTarget(target);
+    // Calls addressed by the draft's NAME must hit the instance this task
+    // spawned. Name discovery returns the oldest registration, so when a
+    // pre-existing object holds the same name, a name-routed verification
+    // call would silently exercise the stale duplicate and pass on its
+    // behavior (e.g. show() → 'Already open') instead of the new code's.
+    let resolvedId: AbjectId | undefined;
+    let pinnedToSpawn = false;
+    if (state.spawnedObjectId && state.draftManifest?.name === target) {
+      resolvedId = state.spawnedObjectId;
+      pinnedToSpawn = true;
+    } else {
+      resolvedId = await this.resolveTarget(target);
+    }
     if (!resolvedId) {
       return {
         ok: false,
@@ -1935,7 +1983,8 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     return {
       ok: true,
-      summary: summary ?? `call ${target}.${method}: ok`,
+      summary: (summary ?? `call ${target}.${method}: ok`)
+        + (pinnedToSpawn ? ` [routed to just-spawned ${resolvedId.slice(0, 8)}]` : ''),
       data: response,
     };
   }
@@ -2544,6 +2593,13 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       lines.push(`   Run ${deployVerb} to make these edits live before you finish. Do NOT call done with an undeployed draft —`);
       lines.push('   the loop would report success while the user still sees the old object.');
       lines.push('   If your edit touched show() / createCanvas / widget wiring, also hide() then show() the target after deploy so the new wiring takes effect.');
+      lines.push('');
+    }
+
+    if (state.nameCollisionId) {
+      lines.push(`⚠️ NAME COLLISION — a pre-existing live object (${state.nameCollisionId.slice(0, 8)}) also answers to "${state.draftManifest?.name}".`);
+      lines.push(`   Name-based routing resolves to that OLDER object, so verifying "by name" would test the wrong instance. Your call actions targeting the name are auto-routed to the instance you spawned (${state.spawnedObjectId?.slice(0, 8) ?? '?'}).`);
+      lines.push('   Before finishing, resolve the duplicate: if the older object is a stale/previous version of the same thing, destroy it or fold your changes into it — the user should not end up with two identically-named objects.');
       lines.push('');
     }
 

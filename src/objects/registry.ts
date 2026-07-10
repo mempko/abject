@@ -16,7 +16,7 @@ import {
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import type { MessageBusLike } from '../runtime/message-bus.js';
-import { require, invariant } from '../core/contracts.js';
+import { require, invariant, requireNonEmpty } from '../core/contracts.js';
 import { request, event } from '../core/message.js';
 import { Capabilities } from '../core/capability.js';
 import { Log } from '../core/timed-log.js';
@@ -151,6 +151,26 @@ export class Registry extends Abject {
                 },
               },
               {
+                name: 'search',
+                description: 'Find objects by a text query matched against name, description, tags, and method names (case-insensitive substring). Returns a small ranked list of {id, name, typeId?, description, matchedOn}. The cheapest way to locate an object when you know roughly what it is called or does.',
+                parameters: [
+                  {
+                    name: 'query',
+                    type: { kind: 'primitive', primitive: 'string' },
+                    description: 'Text to match, e.g. an object name ("FedCreditSim") or a capability ("play sound")',
+                  },
+                  {
+                    name: 'limit',
+                    type: { kind: 'primitive', primitive: 'number' },
+                    description: 'Maximum results (default 10)',
+                  },
+                ],
+                returns: {
+                  kind: 'array',
+                  elementType: { kind: 'reference', reference: 'SearchHit' },
+                },
+              },
+              {
                 name: 'updateManifest',
                 description: 'Update an Abject\'s manifest and re-index it',
                 parameters: [
@@ -251,10 +271,11 @@ If a caller is asking you ("what is the AbjectId for X?", "which object can do Y
 
 ### Discovery methods (ordered by preference for LLM-driven callers)
 1. \`ask({ question })\` — **preferred.** Ask me a question in natural language. I answer directly using the catalog.
-2. \`listSummaries()\` — Lightweight list of \`{ id, name, typeId?, description, methods[], tags? }\` for every registered object. Cheap and LLM-friendly.
-3. \`discover({ name?, interface?, capability?, tags? })\` — Structured query, returns full \`ObjectRegistration[]\`. Heavy — each entry includes every method's parameter and return schema. Use only when a caller truly needs the full manifest shape.
-4. \`lookup({ objectId })\` — Full \`ObjectRegistration\` for one object. Use when you already have an AbjectId and need the full manifest.
-5. \`list()\` — Full \`ObjectRegistration[]\` of every object. Heavy. Intended for UI/catalog tooling (AppExplorer, ProcessExplorer), NOT for LLM-driven discovery. Do not suggest this to agents — recommend \`ask\` or \`listSummaries\` instead.
+2. \`search({ query, limit? })\` — Compact text search over names, descriptions, tags, and method names (case-insensitive substring). Returns a small ranked list of \`{ id, name, typeId?, description, matchedOn }\`. The cheapest programmatic way to locate an object by rough name or capability.
+3. \`listSummaries()\` — Lightweight list of \`{ id, name, typeId?, description, methods[], tags? }\` for every registered object. Cheap and LLM-friendly.
+4. \`discover({ name?, interface?, capability?, tags? })\` — Structured query, returns full \`ObjectRegistration[]\`. Heavy — each entry includes every method's parameter and return schema. Use only when a caller truly needs the full manifest shape.
+5. \`lookup({ objectId })\` — Full \`ObjectRegistration\` for one object. Use when you already have an AbjectId and need the full manifest.
+6. \`list()\` — Full \`ObjectRegistration[]\` of every object. Heavy. Intended for UI/catalog tooling (AppExplorer, ProcessExplorer), NOT for LLM-driven discovery. Do not suggest this to agents — recommend \`ask\`, \`search\`, or \`listSummaries\` instead.
 
 ### Subscription & mutation
 - \`subscribe()\` / \`unsubscribe()\` — Receive \`objectRegistered\` / \`objectUnregistered\` events.
@@ -327,6 +348,46 @@ Each line shows one registered object: id, name, description, and non-meta metho
       const query = msg.payload as DiscoveryQuery;
       const results = await this.handleDiscover(query);
       return this.filterForCaller(results, msg.routing.from);
+    });
+
+    // Compact text search: the cheap "where is X / who does Y" lookup agents
+    // reach for first. discover/list return full manifests (huge for LLM
+    // callers) and discover matches names exactly — this matches substrings
+    // across name/description/tags/methods and returns one line per hit.
+    this.on('search', async (msg: AbjectMessage) => {
+      this.reconcileDeadEntries();
+      const { query, limit } = msg.payload as { query?: string; limit?: number };
+      requireNonEmpty(query ?? '', 'query');
+      const max = typeof limit === 'number' && limit > 0 ? Math.min(limit, 50) : 10;
+      const q = query!.toLowerCase();
+      const hits: Array<{ rank: number; hit: { id: AbjectId; name: string; typeId?: TypeId; description: string; matchedOn: string } }> = [];
+      for (const reg of this.filterForCaller(this.listObjects(), msg.routing.from)) {
+        const m = reg.manifest;
+        const name = (reg.name ?? m.name) ?? '';
+        const tags = (m.tags ?? []).join(' ');
+        const methods = m.interface.methods
+          .filter((method) => !Registry.META_METHODS.has(method.name))
+          .map((method) => method.name);
+        let rank: number | undefined;
+        let matchedOn: string | undefined;
+        if (name.toLowerCase().includes(q)) { rank = 0; matchedOn = 'name'; }
+        else if (tags.toLowerCase().includes(q)) { rank = 1; matchedOn = 'tags'; }
+        else if ((m.description ?? '').toLowerCase().includes(q)) { rank = 2; matchedOn = 'description'; }
+        else if (methods.some((mn) => mn.toLowerCase().includes(q))) { rank = 3; matchedOn = 'methods'; }
+        if (rank === undefined) continue;
+        hits.push({
+          rank,
+          hit: {
+            id: reg.id,
+            name,
+            typeId: reg.typeId,
+            description: (m.description ?? '').slice(0, 160),
+            matchedOn: matchedOn!,
+          },
+        });
+      }
+      hits.sort((a, b) => a.rank - b.rank || a.hit.name.localeCompare(b.hit.name));
+      return hits.slice(0, max).map((h) => h.hit);
     });
 
     this.on('subscribe', async (msg: AbjectMessage) => {

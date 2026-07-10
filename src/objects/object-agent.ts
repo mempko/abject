@@ -88,6 +88,12 @@ export class ObjectAgent extends Abject {
     log.info('Registered with AgentAbject');
   }
 
+  protected override askBusyStatus(): string | undefined {
+    return this.taskExtras.size > 0
+      ? `executing ${this.taskExtras.size} task${this.taskExtras.size === 1 ? '' : 's'}`
+      : undefined;
+  }
+
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## ObjectAgent — General-Purpose Object Interaction Agent
 

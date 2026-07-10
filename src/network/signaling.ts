@@ -338,7 +338,11 @@ export class SignalingClient implements SignalingRelay {
     const label = this.persistent
       ? `${this.reconnectAttempts}`
       : `${this.reconnectAttempts}/${this.maxReconnectAttempts}`;
-    log.info(`Reconnecting in ${delay}ms (attempt ${label})`);
+    // A persistently-down server (e.g. whisper not running locally) retries
+    // forever at the backoff cap; keep the first few attempts and a periodic
+    // heartbeat instead of a log line per minute for the whole session.
+    const quiet = this.persistent && this.reconnectAttempts > 3 && this.reconnectAttempts % 30 !== 0;
+    if (!quiet) log.info(`Reconnecting to ${this.endpoint} in ${delay}ms (attempt ${label})`);
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
@@ -348,8 +352,10 @@ export class SignalingClient implements SignalingRelay {
         // down). Log a quiet one-liner — the backoff schedule already reports
         // the next attempt — instead of dumping a full stack trace each retry.
         this.connect(endpoint).catch((err) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          log.warn(`Reconnect to ${endpoint} failed: ${msg}`);
+          if (!quiet) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.warn(`Reconnect to ${endpoint} failed: ${msg}`);
+          }
         });
       }
     }, delay);

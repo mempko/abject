@@ -780,14 +780,26 @@ reviews results and either plans another round or completes/fails the goal.
       };
       const goal = this.goals.get(goalId);
       if (!goal || goal.status !== 'active') return;
-      log.info(`updateProgress ${goalId.slice(0, 8)} phase=${phase ?? '?'} agent=${agentName ?? '?'}: ${message.slice(0, 80)}`);
 
-      goal.progress.push({
-        timestamp: Date.now(),
-        agentName: agentName ?? 'Unknown',
-        message,
-        phase,
-      });
+      // Heartbeats arrive at ~1Hz with identical text ("working"). Collapse
+      // consecutive repeats into the prior entry instead of growing the
+      // progress array (and the goalUpdated payload shipped to every
+      // dependent) without bound, and only log actual transitions.
+      const last = goal.progress[goal.progress.length - 1];
+      const isRepeat = !!last && last.message === message && last.phase === phase
+        && last.agentName === (agentName ?? 'Unknown');
+      if (isRepeat) {
+        last.timestamp = Date.now();
+      } else {
+        log.info(`updateProgress ${goalId.slice(0, 8)} phase=${phase ?? '?'} agent=${agentName ?? '?'}: ${message.slice(0, 80)}`);
+        goal.progress.push({
+          timestamp: Date.now(),
+          agentName: agentName ?? 'Unknown',
+          message,
+          phase,
+        });
+        if (goal.progress.length > 200) goal.progress.splice(0, goal.progress.length - 200);
+      }
       goal.updatedAt = Date.now();
 
       this.changed('goalUpdated', {

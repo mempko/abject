@@ -90,6 +90,20 @@ export abstract class Abject {
    */
   private _handlingRequestSenders: Set<import('./types.js').AbjectId> = new Set();
 
+  /**
+   * Tracks senders of requests whose handler returned DEFERRED_REPLY and whose
+   * real reply is still outstanding (keyed by original message id). Without
+   * this, a deferred request (e.g. JobManager.submitJob) leaves
+   * _handlingRequestSenders the instant the handler returns, so downstream
+   * progress never bubbles to the waiting requester and its stall timer fires
+   * mid-flight on perfectly healthy long-running work.
+   */
+  private _deferredRequestSenders: Map<string, import('./types.js').AbjectId> = new Map();
+
+  /** Throttle state for the progress-bubble log line. */
+  private _progressLogAt = 0;
+  private _progressLogSkipped = 0;
+
   constructor(options: AbjectOptions) {
     require(options.manifest !== undefined, 'manifest is required');
     requireNonEmpty(options.manifest.name, 'manifest.name');
@@ -246,6 +260,16 @@ export abstract class Abject {
     this.on('ask', (msg: AbjectMessage) => {
       const { question } = msg.payload as { question: string };
 
+      // Busy fast-path: an ask must never wait behind in-flight LLM work.
+      // Pollers (e.g. ScrumMaster's poll_team, 45s) time out while a working
+      // agent's own LLM turns run 30-60s+, turning "busy" into a spurious
+      // failure. Answer immediately from the manifest with a busy note; the
+      // manifest is exactly what the LLM answer would be grounded in anyway.
+      const busy = this.askBusyStatus();
+      if (busy !== undefined) {
+        return `[Currently busy: ${busy}] Answering from my manifest without LLM synthesis.\n\n${formatManifestAsDescription(this.manifest)}`;
+      }
+
       // Fire off the LLM work async, send deferred reply when done
       this.handleAsk(question).then(
         (result) => { try { this.sendDeferredReply(msg, result); } catch { /* stopped */ } },
@@ -259,10 +283,25 @@ export abstract class Abject {
     // progress upstream to whoever called us. This makes any progress event
     // anywhere in the call tree reset every ancestor's stall timer.
     this.on('progress', (msg: AbjectMessage) => {
+      // Upstream = senders of requests we're actively handling PLUS senders
+      // still waiting on a deferred reply (e.g. a submitted job that is
+      // running in the background). Both hold live stall timers on us.
+      const upstreams = new Set(this._handlingRequestSenders);
+      for (const sender of this._deferredRequestSenders.values()) upstreams.add(sender);
       const pendingCount = this.pendingReplies.size;
-      const upstreamCount = this._handlingRequestSenders.size;
+      const upstreamCount = upstreams.size;
       if (pendingCount > 0 || upstreamCount > 0) {
-        log.info(`[${this.manifest.name}:${this.id.slice(0, 8)}] PROGRESS from=${msg.routing.from.slice(0, 8)} resetting=${pendingCount} bubble_to=${upstreamCount}`);
+        // Progress heartbeats arrive at 1Hz per hop; log at most one line per
+        // 30s per object and fold the suppressed count into it.
+        const now = Date.now();
+        if (now - this._progressLogAt >= 30000) {
+          const skipped = this._progressLogSkipped > 0 ? ` (+${this._progressLogSkipped} in last 30s)` : '';
+          log.info(`[${this.manifest.name}:${this.id.slice(0, 8)}] PROGRESS from=${msg.routing.from.slice(0, 8)} resetting=${pendingCount} bubble_to=${upstreamCount}${skipped}`);
+          this._progressLogAt = now;
+          this._progressLogSkipped = 0;
+        } else {
+          this._progressLogSkipped++;
+        }
       }
       // Reset stall timers for every outbound request we're awaiting
       for (const id of this.pendingReplies.keys()) {
@@ -271,7 +310,7 @@ export abstract class Abject {
       // Bubble: forward a progress event to every upstream request sender,
       // skipping the sender of this progress event to avoid ping-pong loops.
       const from = msg.routing.from;
-      for (const upstream of this._handlingRequestSenders) {
+      for (const upstream of upstreams) {
         if (upstream === from) continue;
         try {
           this.send(event(this.id, upstream, 'progress', msg.payload ?? {}));
@@ -515,6 +554,17 @@ You are this object. Your capabilities are exactly what the manifest above descr
   }
 
   /**
+   * When this returns a status string, the object is too busy to synthesize
+   * an LLM answer for `ask`; callers get an immediate manifest-derived reply
+   * prefixed with the status instead of queuing behind in-flight LLM work.
+   * Agents override this while executing a task so capability polls never
+   * time out just because the agent is thinking. Default: never busy.
+   */
+  protected askBusyStatus(): string | undefined {
+    return undefined;
+  }
+
+  /**
    * Handle an 'ask' request. Override for custom behavior (e.g., querying
    * Registry to discover which objects can help before answering).
    * Default: build prompt via askPrompt(), send to LLM via askLlm() at askTier().
@@ -574,6 +624,7 @@ You are this object. Your capabilities are exactly what the manifest above descr
       pending.reject(new Error('Object stopped'));
     }
     this.pendingReplies.clear();
+    this._deferredRequestSenders.clear();
 
     // Always unregister from bus immediately — this is safe and idempotent.
     if (this._bus) {
@@ -853,6 +904,7 @@ You are this object. Your capabilities are exactly what the manifest above descr
    * Send a deferred reply to a request whose auto-reply was suppressed via DEFERRED_REPLY.
    */
   protected sendDeferredReply(originalMessage: AbjectMessage, result: unknown): void {
+    this._deferredRequestSenders.delete(originalMessage.header.messageId);
     this.send(reply(originalMessage, result !== undefined ? result : null));
   }
 
@@ -1010,6 +1062,10 @@ You are this object. Your capabilities are exactly what the manifest above descr
 
           if (isRequest(message) && val !== DEFERRED_REPLY) {
             this.send(reply(message, val !== undefined ? val : null));
+          } else if (isRequest(message) && val === DEFERRED_REPLY) {
+            // Keep bubbling progress to the requester until the deferred
+            // reply actually goes out (see sendDeferredReply).
+            this._deferredRequestSenders.set(message.header.messageId, message.routing.from);
           }
 
           try { this.checkInvariants(); } catch (err) {
@@ -1070,10 +1126,10 @@ You are this object. Your capabilities are exactly what the manifest above descr
     } else {
       // Sync handler — reply immediately
       this._handlerCount--;
-      // Note: for DEFERRED_REPLY the work is async via sendDeferredReply,
-      // but we still clear here since the handler invocation itself returned.
-      // Progress events from the deferred work won't bubble through this Abject,
-      // which is acceptable -- the work runs independently.
+      // Note: for DEFERRED_REPLY the work is async via sendDeferredReply, but
+      // the handler invocation itself returned so the handling slot is freed.
+      // The requester stays reachable for progress bubbling via
+      // _deferredRequestSenders until the deferred reply goes out.
       cleanupHandling();
 
       if (this._stoppedDuringHandler) {
@@ -1089,6 +1145,10 @@ You are this object. Your capabilities are exactly what the manifest above descr
 
       if (isRequest(message) && result !== DEFERRED_REPLY) {
         this.send(reply(message, result !== undefined ? result : null));
+      } else if (isRequest(message) && result === DEFERRED_REPLY) {
+        // Keep bubbling progress to the requester until the deferred reply
+        // actually goes out (see sendDeferredReply).
+        this._deferredRequestSenders.set(message.header.messageId, message.routing.from);
       }
 
       try { this.checkInvariants(); } catch (err) {

@@ -72,6 +72,37 @@ export type { WidgetStyle } from './widgets/widget-types.js';
 
 const WIDGETS_INTERFACE: InterfaceId = 'abjects:widgets';
 
+/** Canonical `create({specs})` widget types, kept in sync with the dispatch in createWidgetFromSpec. */
+const VALID_WIDGET_TYPES = [
+  'label', 'markdown', 'contentBlock', 'button', 'textInput', 'textArea',
+  'checkbox', 'progress', 'divider', 'select', 'tabBar', 'slider', 'image',
+  'themeSwatch', 'list', 'tree', 'goalProgress', 'table', 'form', 'chart',
+  'video', 'splitPane',
+] as const;
+
+/**
+ * Synonyms from other UI toolkits, auto-mapped to canonical widget types.
+ * LLM-built objects regularly guess Qt/HTML names; mapping them beats
+ * aborting a whole window build over vocabulary.
+ */
+const WIDGET_TYPE_ALIASES: Record<string, string> = {
+  comboBox: 'select', combobox: 'select', dropdown: 'select', combo: 'select', picker: 'select',
+  lineEdit: 'textInput', lineedit: 'textInput', textField: 'textInput', textfield: 'textInput',
+  input: 'textInput', textbox: 'textInput', textBox: 'textInput', entry: 'textInput',
+  textEdit: 'textArea', textedit: 'textArea', multilineInput: 'textArea', textarea: 'textArea',
+  text: 'label', heading: 'label',
+  checkBox: 'checkbox', toggle: 'checkbox', switch: 'checkbox',
+  progressBar: 'progress', progressbar: 'progress',
+  separator: 'divider', hr: 'divider', rule: 'divider',
+  img: 'image', picture: 'image',
+  range: 'slider',
+  listView: 'list', listview: 'list', listbox: 'list', listBox: 'list',
+  treeView: 'tree', treeview: 'tree',
+  tabs: 'tabBar', tabbar: 'tabBar', tabBox: 'tabBar',
+  dataTable: 'table', datagrid: 'table', grid: 'table',
+  graph: 'chart',
+};
+
 /**
  * WidgetManager — spawns window and widget Abjects, returns their IDs.
  */
@@ -2668,7 +2699,14 @@ await this.call(timerId, 'addDependent', {});
     const theme = this.getThemeForWindow(spec.windowId);
     const base = { ownerId: spec.windowId, uiServerId: this.uiServerId!, theme, href: spec.href };
 
-    switch (spec.type) {
+    // LLM-built objects often reach for vocabulary from other UI toolkits
+    // (Qt/HTML names). Accept common synonyms rather than failing an entire
+    // window build over a spelling difference — one unknown type in the first
+    // create({specs}) batch aborts the caller's show() and leaves an empty
+    // window on screen.
+    const type = WIDGET_TYPE_ALIASES[spec.type] ?? spec.type;
+
+    switch (type) {
       case 'label':
         return this.createTypedWidget(spec.windowId, new LabelWidget({
           type: 'label', rect, text: spec.text, style: spec.style, ...base,
@@ -2802,7 +2840,10 @@ await this.call(timerId, 'addDependent', {});
           minSize: spec.minSize, ...base,
         }), rect);
       default:
-        throw new Error(`Unknown widget type in create: ${spec.type}`);
+        throw new Error(
+          `Unknown widget type in create: ${spec.type}. Valid types: ${VALID_WIDGET_TYPES.join(', ')}. ` +
+          `Common synonyms are auto-mapped (comboBox/dropdown→select, lineEdit/textField→textInput, textEdit→textArea, progressBar→progress, range→slider).`,
+        );
     }
   }
 

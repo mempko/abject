@@ -206,6 +206,12 @@ export class WebAgent extends Abject {
     this.setupHandlers();
   }
 
+  protected override askBusyStatus(): string | undefined {
+    return this.taskExtras.size > 0
+      ? `browsing (${this.taskExtras.size} task${this.taskExtras.size === 1 ? '' : 's'} in flight)`
+      : undefined;
+  }
+
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## WebAgent — Autonomous Web Browsing Agent
 

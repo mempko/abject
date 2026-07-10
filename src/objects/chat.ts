@@ -186,7 +186,26 @@ export class Chat extends Abject {
     parentId?: string;
     latestMessage?: string;
     latestAgent?: string;
+    /** Final synthesized result (set on goalCompleted) / error (on goalFailed).
+     * Surfaced through agentObserve so a step that timed out still sees the
+     * outcome once it lands, instead of re-planning duplicate goals. */
+    result?: unknown;
+    error?: string;
   }>();
+
+  /**
+   * Rolling record of finished goals (newest last, capped). Fed into the
+   * planning prompt and observations so the LLM knows what has already been
+   * accomplished this session and does not re-create equivalent goals after
+   * a transient wait failure.
+   */
+  private recentGoalOutcomes: Array<{
+    goalId: string;
+    title: string;
+    status: 'completed' | 'failed';
+    finishedAt: number;
+    resultPreview?: string;
+  }> = [];
 
   /** Task info per goal, fetched from GoalManager. */
   private liveTasks = new Map<string, Array<{
@@ -751,6 +770,8 @@ export class Chat extends Abject {
             const wasDone = entry?.status === 'completed' || entry?.status === 'failed';
             if (entry) {
               entry.status = 'completed';
+              entry.result = data.result;
+              this.recordGoalOutcome(data.goalId, entry.title, 'completed', data.result);
               this.scheduleActivityRefresh();
             }
             // Resolve any waitForGoalCompletion promise for this goal — Chat's
@@ -777,7 +798,9 @@ export class Chat extends Abject {
             const wasDone = entry?.status === 'completed' || entry?.status === 'failed';
             if (entry) {
               entry.status = 'failed';
+              entry.error = data.error;
               if (data.error) entry.latestMessage = data.error;
+              this.recordGoalOutcome(data.goalId, entry.title, 'failed', data.error);
               this.scheduleActivityRefresh();
             }
             const pending = this.pendingGoalCompletions.get(data.goalId);
@@ -857,7 +880,11 @@ export class Chat extends Abject {
     // ── AgentAbject callback handlers ──
 
     this.on('agentObserve', async (_msg: AbjectMessage) => {
-      return { observation: '' };
+      // Surface live goal state to the planning LLM. This matters most after
+      // a goal action "failed" from a transient wait timeout: the goal keeps
+      // running (or completes) in the background, and without this the LLM
+      // only ever sees the stale failure and re-creates duplicate goals.
+      return { observation: this.buildGoalStateObservation() };
     });
 
     this.on('agentAct', (msg: AbjectMessage) => {
@@ -902,11 +929,28 @@ export class Chat extends Abject {
       }
     });
 
-    this.on('agentActionResult', async (_msg: AbjectMessage) => {
+    this.on('agentActionResult', async (msg: AbjectMessage) => {
       // Goal-shaped actions surface their success/failure through
       // goalCompleted / goalFailed events into the liveGoals tree.
       // Non-goal actions (remember, reply, done) are reflected in the
-      // chat history directly. Nothing to render here.
+      // chat history directly.
+      //
+      // One case deserves a visible note: the goal action's wait failed
+      // (usually a stall-timer timeout) while the goal itself is still
+      // running. Silently re-planning here is how duplicate goals happen,
+      // and the user has no way to see it — so say it in the thread.
+      const { action, result } = msg.payload as {
+        action?: { action?: string; title?: string };
+        result?: { success?: boolean; error?: string };
+      };
+      if (action?.action !== 'goal' || result?.success !== false) return;
+      const goalId = this._currentGoalId;
+      const entry = goalId ? this.liveGoals.get(goalId) : undefined;
+      if (!entry || entry.status !== 'active') return;
+      const note = `Lost contact with goal "${entry.title}" (${result.error ?? 'wait failed'}), but it is still running — tracking it rather than starting over.`;
+      try {
+        await this.appendBubble('system', 'Chat', note, false);
+      } catch { /* best effort */ }
     });
   }
 
@@ -953,6 +997,46 @@ export class Chat extends Abject {
     } catch (err) {
       log.warn(`[Chat] deliverLateGoalOutcome failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /** Record a finished goal for planning context (newest last, capped at 8). */
+  private recordGoalOutcome(goalId: string, title: string, status: 'completed' | 'failed', outcome?: unknown): void {
+    const text = typeof outcome === 'string' ? outcome : outcome !== undefined ? JSON.stringify(outcome) : undefined;
+    this.recentGoalOutcomes = this.recentGoalOutcomes.filter(g => g.goalId !== goalId);
+    this.recentGoalOutcomes.push({
+      goalId,
+      title,
+      status,
+      finishedAt: Date.now(),
+      resultPreview: text ? text.slice(0, 400) : undefined,
+    });
+    if (this.recentGoalOutcomes.length > 8) this.recentGoalOutcomes.shift();
+  }
+
+  /**
+   * Live goal state for the planning LLM's observation. Covers the case
+   * where a goal action's wait failed but the goal itself kept running or
+   * has since finished: the observation carries the authoritative status
+   * (and the full result on completion) so the LLM continues from reality
+   * instead of re-creating equivalent goals.
+   */
+  private buildGoalStateObservation(): string {
+    const lines: string[] = [];
+    for (const [goalId, g] of this.liveGoals) {
+      if (g.status === 'active') {
+        const detail = [g.latestAgent && `agent: ${g.latestAgent}`, g.latestMessage]
+          .filter(Boolean).join(' — ');
+        lines.push(`- STILL RUNNING: goal "${g.title}" (${goalId.slice(0, 8)})${detail ? ` — ${detail}` : ''}. Do NOT create a duplicate goal for this work; it will complete or fail on its own.`);
+      } else if (g.status === 'completed') {
+        const result = typeof g.result === 'string' ? g.result : g.result !== undefined ? JSON.stringify(g.result) : '';
+        const capped = result.length > 6000 ? `${result.slice(0, 6000)}\n…(truncated)` : result;
+        lines.push(`- COMPLETED: goal "${g.title}" (${goalId.slice(0, 8)}). This work is DONE — even if an earlier step reported a wait timeout, do not redo it.${capped ? ` Result:\n${capped}` : ''}`);
+      } else {
+        lines.push(`- FAILED: goal "${g.title}" (${goalId.slice(0, 8)})${g.error ? ` — ${g.error}` : ''}`);
+      }
+    }
+    if (lines.length === 0) return '';
+    return `Current goal state (authoritative — trust this over earlier step results):\n${lines.join('\n')}`;
   }
 
   /** Reset all pending ticket timeouts (called on progress events). */
@@ -1214,9 +1298,15 @@ export class Chat extends Abject {
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
     });
     const isoDate = now.toISOString().slice(0, 10);
+    const recentGoalsBlock = this.recentGoalOutcomes.length === 0 ? '' : `
+
+## Recently Finished Goals (this session)
+
+Work already done — check here BEFORE creating a goal, and build on these outcomes instead of repeating them:
+${this.recentGoalOutcomes.map(g => `- [${g.status}] "${g.title}"${g.resultPreview ? ` — ${g.resultPreview}` : ''}`).join('\n')}`;
     return `You are Chat Agent, a helpful assistant inside the Abjects system. You help users by creating goals and routing tasks to specialized agents.
 
-Current date: ${dateLine} (${isoDate}). When the user mentions relative times ("today", "tomorrow", "next week", "in 3 days"), resolve them against this date.
+Current date: ${dateLine} (${isoDate}). When the user mentions relative times ("today", "tomorrow", "next week", "in 3 days"), resolve them against this date.${recentGoalsBlock}
 
 ## System Architecture
 

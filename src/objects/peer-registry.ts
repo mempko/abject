@@ -60,6 +60,8 @@ export class PeerRegistry extends Abject {
   private blockedPeers: Set<PeerId> = new Set();
   private transports: Map<PeerId, PeerTransport> = new Map();
   private signalingClients: Map<string, SignalingClient> = new Map();
+  /** Per-URL throttle for disconnect/error log lines (a down server repeats them forever). */
+  private signalingIssueLogAt: Map<string, number> = new Map();
   private savedSignalingUrls: Set<string> = new Set();
   /** URLs the user explicitly removed — prevents gossip from re-adding them. */
   private removedSignalingUrls: Set<string> = new Set();
@@ -844,6 +846,15 @@ export class PeerRegistry extends Abject {
     this.connectSignalingImpl(url).catch(() => {});
   }
 
+  /** True at most once per URL per 5 minutes — gates repeat disconnect/error logs. */
+  private shouldLogSignalingIssue(url: string): boolean {
+    const now = Date.now();
+    const last = this.signalingIssueLogAt.get(url) ?? 0;
+    if (now - last < 300_000) return false;
+    this.signalingIssueLogAt.set(url, now);
+    return true;
+  }
+
   private async connectSignalingImpl(url: string): Promise<boolean> {
     if (this.signalingClients.has(url)) return true;
 
@@ -869,7 +880,7 @@ export class PeerRegistry extends Abject {
         this.changed('signalingStateChanged', { url, status: 'connected' });
       },
       onDisconnect: (reason) => {
-        log.info(`Disconnected from signaling: ${reason}`);
+        if (this.shouldLogSignalingIssue(url)) log.info(`Disconnected from signaling ${url}: ${reason}`);
         this.changed('signalingStateChanged', { url, status: 'disconnected' });
       },
       onPeerFound: (peerId, publicSigningKey, publicExchangeKey, name) => {
@@ -926,7 +937,9 @@ export class PeerRegistry extends Abject {
         this.autoConnectSignalingPeers(url, client);
       },
       onError: (error) => {
-        log.error(`Signaling error: ${error}`);
+        // Errors from a down server repeat on every reconnect attempt for
+        // the whole session — throttle to one line per URL per 5 minutes.
+        if (this.shouldLogSignalingIssue(url)) log.error(`Signaling error (${url}): ${error}`);
       },
     });
 
