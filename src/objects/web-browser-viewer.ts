@@ -450,6 +450,9 @@ export class WebBrowserViewer extends Abject {
       } catch { /* WebBrowser may not be available */ }
     }
 
+    // Nav buttons start disabled — enabled only when the user takes control
+    await this.updateNavButtons();
+
     // Start refresh timer
     await this.startRefreshTimer(REFRESH_INTERVAL_MS);
 
@@ -555,6 +558,12 @@ export class WebBrowserViewer extends Abject {
       return;
     }
 
+    // TabBar close button (×) — confirm, then close the underlying browser page
+    if (fromId === this.tabBarId && aspect === 'close') {
+      await this.confirmClosePage(value as number);
+      return;
+    }
+
     if (aspect === 'click') {
       if (fromId === this.backBtnId || fromId === this.fwdBtnId || fromId === this.reloadBtnId) {
         const nav = fromId === this.backBtnId ? 'back' : fromId === this.fwdBtnId ? 'forward' : 'reload';
@@ -593,8 +602,42 @@ export class WebBrowserViewer extends Abject {
     }
   }
 
+  /**
+   * Confirm and close the browser page behind a tab. Navigation and closing a
+   * page are actions on the (possibly agent-driven) session, so we ask first.
+   */
+  private async confirmClosePage(idx: number): Promise<void> {
+    const page = this.pages[idx];
+    if (!page || !this.webBrowserId || !this.widgetManagerId) return;
+    const label = page.title || page.url || `page ${idx + 1}`;
+    let confirmed = false;
+    try {
+      confirmed = await this.request<boolean>(
+        request(this.id, this.widgetManagerId, 'showConfirmDialog', {
+          title: 'Close page?',
+          message: `Close "${label}"? This ends the browser page and any automation using it loses it.`,
+          confirmLabel: 'Close page',
+          cancelLabel: 'Cancel',
+          destructive: true,
+        })
+      );
+    } catch { confirmed = false; }
+    if (!confirmed) return;
+
+    try {
+      await this.request(request(this.id, this.webBrowserId, 'closePage', { pageId: page.pageId }));
+    } catch { /* already gone */ }
+    // The WebBrowser pageClosed event also refreshes, but do it now so the tab
+    // disappears immediately.
+    if (idx < this.selectedPageIndex && this.selectedPageIndex > 0) this.selectedPageIndex--;
+    this.lastShotDataUri = undefined;
+    await this.refreshPageList();
+    await this.refreshScreenshot();
+  }
+
   /** Back/forward/reload on the selected page via the browser's history. */
   private async navigateSelectedPage(nav: 'back' | 'forward' | 'reload'): Promise<void> {
+    if (!this.controlMode) return; // navigation is a control action
     const page = this.pages[this.selectedPageIndex];
     if (!page || !this.webBrowserId) return;
     try {
@@ -664,9 +707,23 @@ export class WebBrowserViewer extends Abject {
     }
   }
 
+  /** Enable the back/forward/reload buttons only while the user is in control —
+   *  navigating the page is a control action. */
+  private async updateNavButtons(): Promise<void> {
+    const disabled = !this.controlMode;
+    for (const id of [this.backBtnId, this.fwdBtnId, this.reloadBtnId]) {
+      if (!id) continue;
+      try {
+        await this.request(request(this.id, id, 'update', { disabled }));
+      } catch { /* widget gone */ }
+    }
+  }
+
   /** Sync the control button, banner, and status label to takeover state. */
   private async updateControlUi(): Promise<void> {
     if (!this.windowId) return;
+
+    await this.updateNavButtons();
 
     if (this.controlBtnId) {
       try {
