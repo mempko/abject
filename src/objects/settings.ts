@@ -513,9 +513,13 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     this.tagsInputId = this.trackTabWidget(tagsInputId);
 
     // "Workspace" section card: a styled sub-VBox that sizes to its children.
+    // autoSize is required inside a ScrollableVBox so the card reports its
+    // preferred height; without it the card collapses and the Save row and
+    // Danger Zone below stack on top of it.
     const wsCard = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedVBox', {
         parentLayoutId: cId,
+        autoSize: true,
         margins: { top: 12, right: 14, bottom: 12, left: 14 },
         spacing: 6,
         style: this.cardStyle(),
@@ -1324,9 +1328,11 @@ Access tab: set access mode (public/private) and manage the peer whitelist.
     const cId = this.tabContentContainerId!;
 
     // Danger Zone card (danger-tinted border replaces the old divider).
+    // autoSize so the card reports its preferred height inside the ScrollableVBox.
     const dangerCard = this.trackTabWidget(await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedVBox', {
         parentLayoutId: cId,
+        autoSize: true,
         margins: { top: 12, right: 14, bottom: 12, left: 14 },
         spacing: 6,
         style: { background: this.theme.buttonBg, borderColor: this.theme.destructiveBorder, radius: 8 },
