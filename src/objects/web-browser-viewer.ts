@@ -104,6 +104,12 @@ export class WebBrowserViewer extends Abject {
   private refreshing = false;
   private lastShotDataUri?: string;
   private lastCanvasSize = { width: 0, height: 0 };
+  /** Geometry + control-mode of the last drawn frame. When these are
+   *  unchanged, the new screenshot fully overwrites the old one in place, so
+   *  we skip the background clear — the previous frame stays on screen until
+   *  the new one paints (content-level double buffering, no blank flash). */
+  private lastDrawRect?: { drawX: number; drawY: number; drawW: number; drawH: number };
+  private lastDrawControlMode = false;
 
   // ── Human takeover state ──
   private controlMode = false;
@@ -450,8 +456,10 @@ export class WebBrowserViewer extends Abject {
       } catch { /* WebBrowser may not be available */ }
     }
 
-    // Nav buttons start disabled — enabled only when the user takes control
+    // Nav buttons start disabled — enabled only when the user takes control.
+    // Toolbar starts hidden until refreshPageList finds an open page.
     await this.updateNavButtons();
+    await this.updateToolbarVisibility();
 
     // Start refresh timer
     await this.startRefreshTimer(REFRESH_INTERVAL_MS);
@@ -508,6 +516,8 @@ export class WebBrowserViewer extends Abject {
     this.selectedPageIndex = 0;
     this.lastTransform = undefined;
     this.lastShotDataUri = undefined;
+    this.lastDrawRect = undefined;
+    this.lastDrawControlMode = false;
 
     this.changed('visibility', false);
     return true;
@@ -715,6 +725,18 @@ export class WebBrowserViewer extends Abject {
       if (!id) continue;
       try {
         await this.request(request(this.id, id, 'update', { disabled }));
+      } catch { /* widget gone */ }
+    }
+  }
+
+  /** Show the toolbar (nav + take control) only when a page is open — there is
+   *  nothing to navigate or control otherwise. */
+  private async updateToolbarVisibility(): Promise<void> {
+    const visible = this.pages.length > 0;
+    for (const id of [this.backBtnId, this.fwdBtnId, this.reloadBtnId, this.controlBtnId]) {
+      if (!id) continue;
+      try {
+        await this.request(request(this.id, id, 'update', { visible }));
       } catch { /* widget gone */ }
     }
   }
@@ -988,6 +1010,9 @@ export class WebBrowserViewer extends Abject {
     await this.updateUrlLabel();
 
     await this.updateStatusLabel();
+
+    // Toolbar is only meaningful when a page is open
+    await this.updateToolbarVisibility();
   }
 
   private async updateStatusLabel(): Promise<void> {
@@ -1039,6 +1064,7 @@ export class WebBrowserViewer extends Abject {
       // Show placeholder
       this.lastTransform = undefined;
       this.lastShotDataUri = undefined;
+      this.lastDrawRect = undefined; // next screenshot repaints over the text
       await this.drawPlaceholder();
       return;
     }
@@ -1093,39 +1119,40 @@ export class WebBrowserViewer extends Abject {
         drawY = 0;
       }
 
+      const dw = Math.floor(drawW), dh = Math.floor(drawH);
+
       // Remember the fit transform so control-mode input can be mapped back
       // into page coordinates
-      this.lastTransform = {
-        drawX, drawY,
-        drawW: Math.floor(drawW), drawH: Math.floor(drawH),
-        shotW: shot.width, shotH: shot.height,
-      };
+      this.lastTransform = { drawX, drawY, drawW: dw, drawH: dh, shotW: shot.width, shotH: shot.height };
 
-      await this.request(
-        request(this.id, this.canvasId!, 'draw', {
-          commands: [
-            { type: 'clear', params: { color: '#1a1a2e' } },
-            {
-              type: 'imageUrl',
-              params: {
-                x: drawX, y: drawY,
-                width: Math.floor(drawW), height: Math.floor(drawH),
-                url: shot.dataUri,
-              },
-            },
-            ...(this.controlMode ? [{
-              type: 'rect',
-              params: {
-                x: drawX, y: drawY,
-                width: Math.floor(drawW), height: Math.floor(drawH),
-                stroke: '#e8b45a', lineWidth: 2,
-              },
-            }] : []),
-          ],
-        })
-      );
+      // Clear only when the geometry or control border changes. On an unchanged
+      // rect the opaque screenshot overwrites the previous frame pixel-for-pixel,
+      // so skipping the clear removes the background-flash that caused flicker.
+      const rectChanged = !this.lastDrawRect
+        || this.lastDrawRect.drawX !== drawX || this.lastDrawRect.drawY !== drawY
+        || this.lastDrawRect.drawW !== dw || this.lastDrawRect.drawH !== dh;
+      const controlChanged = this.lastDrawControlMode !== this.controlMode;
+
+      const commands: unknown[] = [];
+      if (rectChanged || controlChanged) {
+        commands.push({ type: 'clear', params: { color: '#1a1a2e' } });
+      }
+      commands.push({
+        type: 'imageUrl',
+        params: { x: drawX, y: drawY, width: dw, height: dh, url: shot.dataUri },
+      });
+      if (this.controlMode) {
+        commands.push({
+          type: 'rect',
+          params: { x: drawX, y: drawY, width: dw, height: dh, stroke: '#e8b45a', lineWidth: 2 },
+        });
+      }
+
+      await this.request(request(this.id, this.canvasId!, 'draw', { commands }));
       this.lastShotDataUri = shot.dataUri;
       this.lastCanvasSize = { width: cw, height: ch };
+      this.lastDrawRect = { drawX, drawY, drawW: dw, drawH: dh };
+      this.lastDrawControlMode = this.controlMode;
     } catch {
       // Screenshot failed. If a frame is already on screen, keep it — a
       // transient failure (page mid-navigation) must not flash a placeholder.
