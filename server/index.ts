@@ -55,6 +55,7 @@ import { ChatBrowser } from '../src/objects/chat-browser.js';
 import { AgentAbject } from '../src/objects/agent-abject.js';
 import { ScrumMaster } from '../src/objects/scrum-master.js';
 import { GoalObserver } from '../src/objects/goal-observer.js';
+import { TaskReviewer } from '../src/objects/task-reviewer.js';
 import { AbjectStore } from '../src/objects/abject-store.js';
 import { Supervisor } from '../src/runtime/supervisor.js';
 import type { RestartType } from '../src/runtime/supervisor.js';
@@ -510,6 +511,7 @@ async function main(): Promise<void> {
   runtime.objectFactory.registerConstructor('AgentAbject', () => new AgentAbject());
   runtime.objectFactory.registerConstructor('ScrumMaster', () => new ScrumMaster());
   runtime.objectFactory.registerConstructor('GoalObserver', () => new GoalObserver());
+  runtime.objectFactory.registerConstructor('TaskReviewer', () => new TaskReviewer());
   runtime.objectFactory.registerConstructor('AbjectStore', () => new AbjectStore());
   runtime.objectFactory.registerConstructor('Supervisor', () => new Supervisor());
   runtime.objectFactory.registerConstructor('Taskbar', () => new Taskbar());
@@ -586,7 +588,7 @@ async function main(): Promise<void> {
       // Per-workspace objects
       'AbjectStore', 'Theme', 'Settings', 'AppExplorer',
       'TupleSpace', 'SharedState',
-      'GoalManager', 'GoalBrowser', 'GoalObserver',
+      'GoalManager', 'GoalBrowser', 'GoalObserver', 'TaskReviewer',
       'JobManager', 'JobBrowser',
       'KnowledgeBase', 'KnowledgeBrowser',
       'FileManager', 'FileViewer',

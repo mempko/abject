@@ -40,6 +40,7 @@ export { GoalManager, GOAL_MANAGER_ID } from './objects/goal-manager.js';
 export type { Goal, GoalId, ProgressEntry } from './objects/goal-manager.js';
 export { GoalBrowser, GOAL_BROWSER_ID } from './objects/goal-browser.js';
 export { GoalObserver, GOAL_OBSERVER_ID } from './objects/goal-observer.js';
+export { TaskReviewer, TASK_REVIEWER_ID } from './objects/task-reviewer.js';
 export { Chat, CHAT_ID } from './objects/chat.js';
 export { ChatManager, CHAT_MANAGER_ID } from './objects/chat-manager.js';
 export { ChatBrowser, CHAT_BROWSER_ID } from './objects/chat-browser.js';

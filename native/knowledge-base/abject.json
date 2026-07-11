@@ -1,6 +1,6 @@
 {
   "name": "KnowledgeBaseCpp",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "abi": 1,
   "wasm": "main.wasm",
   "scope": "workspace",
@@ -72,6 +72,15 @@
               "optional": true,
               "type": {
                 "kind": "array"
+              }
+            },
+            {
+              "description": "Who authored this: 'user' | 'agent' | 'reviewer' | 'scrum' (default 'agent')",
+              "name": "origin",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
               }
             }
           ],
@@ -260,10 +269,81 @@
                 "kind": "primitive",
                 "primitive": "number"
               }
+            },
+            {
+              "description": "Include archived entries (default false)",
+              "name": "includeArchived",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "boolean"
+              }
             }
           ],
           "returns": {
             "kind": "array"
+          }
+        },
+        {
+          "description": "List tags in use across active (non-archived) entries with usage counts, most-used first. Lets agents discover the tag vocabulary instead of guessing.",
+          "name": "listTags",
+          "parameters": [
+            {
+              "description": "Max tags (default 50)",
+              "name": "limit",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "number"
+              }
+            }
+          ],
+          "returns": {
+            "kind": "array"
+          }
+        },
+        {
+          "description": "Record that entries genuinely helped a task (reviewer feedback). Bumps usefulCount, which protects entries from staleness eviction.",
+          "name": "markUseful",
+          "parameters": [
+            {
+              "description": "Entry IDs that proved useful",
+              "name": "ids",
+              "type": {
+                "kind": "array"
+              }
+            }
+          ],
+          "returns": {
+            "kind": "object",
+            "properties": {}
+          }
+        },
+        {
+          "description": "Archive an entry (hidden from recall/match, restorable) or restore it with archived: false",
+          "name": "archive",
+          "parameters": [
+            {
+              "description": "Entry ID",
+              "name": "id",
+              "type": {
+                "kind": "primitive",
+                "primitive": "string"
+              }
+            },
+            {
+              "description": "Target state (default true)",
+              "name": "archived",
+              "optional": true,
+              "type": {
+                "kind": "primitive",
+                "primitive": "boolean"
+              }
+            }
+          ],
+          "returns": {
+            "kind": "object",
+            "properties": {}
           }
         }
       ],
@@ -275,6 +355,6 @@
       "system",
       "knowledge"
     ],
-    "version": "3.0.0"
+    "version": "3.1.0"
   }
 }

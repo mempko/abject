@@ -25,6 +25,12 @@ export interface Job {
   description: string;
   code: string;
   callerId: AbjectId;
+  /**
+   * Message id of the submitJob request. Carried into the direct jobFailed
+   * caller notification so the caller can reject exactly the pending
+   * request this job answers, instead of every pending JobManager request.
+   */
+  requestMessageId?: string;
   /** Extra values bound into the sandbox context alongside call/dep/find. */
   context?: Record<string, unknown>;
   status: 'queued' | 'running' | 'completed' | 'failed';
@@ -203,6 +209,7 @@ export class JobManager extends Abject {
         description,
         code,
         callerId,
+        requestMessageId: msg.header.messageId,
         context: sanitisedContext,
         status: 'queued',
         queuedAt: Date.now(),
@@ -326,7 +333,7 @@ export class JobManager extends Abject {
         } catch (err) {
           job.status = 'failed';
           job.error = err instanceof Error ? err.message : String(err);
-          this.changed('jobFailed', { jobId, description: job.description, queue: job.queue, error: job.error });
+          this.changed('jobFailed', { jobId, description: job.description, queue: job.queue, error: job.error, requestMessageId: job.requestMessageId });
           await this.log('error', `Job failed: ${job.description}`, { jobId, queue: job.queue, error: job.error });
 
           // Notify the caller directly so it can recover immediately
@@ -338,6 +345,7 @@ export class JobManager extends Abject {
                 description: job.description,
                 queue: job.queue,
                 error: job.error,
+                requestMessageId: job.requestMessageId,
               }));
             } catch { /* caller may be gone */ }
           }

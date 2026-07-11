@@ -2,10 +2,12 @@
 // KnowledgeBase system object.
 //
 // Same message surface and semantics: remember (dedup by normalized
-// title+type), recall (BM25 full-text, title-boosted, snippets + scores,
-// previews mode), match (exact lookup), get/forget/update/list, the
+// title+type, optional origin provenance), recall (BM25 full-text,
+// title-boosted, snippets + scores, previews mode), match (exact lookup),
+// get/forget/update/list, markUseful/archive curation, the
 // entryAdded/entryUpdated/entryRemoved events, cross-peer merge through
-// SharedState, and periodic distillation.
+// SharedState, and periodic distillation (stale entries are archived, not
+// deleted; only the archive itself is bounded by hard deletes).
 //
 // Differences from the TS version, by design of the WASM environment:
 // - Persistence goes through the workspace Storage abject by message passing
@@ -41,33 +43,75 @@ static constexpr int64_t SYNC_THROTTLE_MS = 2000;
 static constexpr int64_t DAY_MS = 24LL * 60 * 60 * 1000;
 static constexpr int64_t DISTILL_INTERVAL_MS = 30LL * 60 * 1000;
 static constexpr size_t MAX_ENTRIES = 1000;
+static constexpr size_t MAX_ARCHIVED = 2000;
 static constexpr int64_t STALE_NEVER_ACCESSED_DAYS = 7;
 static constexpr int64_t STALE_INACTIVE_DAYS = 30;
+static constexpr int64_t ARCHIVED_PURGE_DAYS = 180;
 
 // ── Entry model (JSON shape identical to the TS KnowledgeEntry) ─────────
+
+static bool valid_origin(const std::string& o) {
+  return o == "user" || o == "agent" || o == "reviewer" || o == "scrum";
+}
+
+// Type-checked payload access. This build has no exceptions (JSON_NOEXCEPTION
+// maps throw to abort), so json::value()'s typed get on a present-but-
+// mistyped key would trap the whole module. LLM callers routinely send
+// null or stringified values for advertised optional params; wrong types
+// must fall back to the default, never abort.
+static std::string str_or(const json& p, const char* key, const std::string& dflt) {
+  return (p.contains(key) && p[key].is_string()) ? p[key].get<std::string>() : dflt;
+}
+static bool bool_or(const json& p, const char* key, bool dflt) {
+  if (!p.contains(key)) return dflt;
+  const json& v = p[key];
+  if (v.is_boolean()) return v.get<bool>();
+  if (v.is_string()) {
+    const std::string s = v.get<std::string>();
+    if (s == "true") return true;
+    if (s == "false") return false;
+  }
+  return dflt;
+}
+static int64_t int_or(const json& p, const char* key, int64_t dflt) {
+  return (p.contains(key) && p[key].is_number()) ? p[key].get<int64_t>() : dflt;
+}
 
 struct Entry {
   std::string id;
   std::string title;
   std::string content;
-  std::string type;  // learned | fact | insight | reference
+  std::string type;    // learned | fact | insight | reference
   std::vector<std::string> tags;
+  std::string origin = "agent";  // user | agent | reviewer | scrum
   std::string created_by;
   int64_t created_at = 0;
   int64_t updated_at = 0;
   int64_t access_count = 0;
   int64_t last_accessed_at = 0;
+  /// Times a reviewer judged this entry to have actually helped a task.
+  int64_t useful_count = 0;
+  int64_t last_useful_at = 0;
+  /// Archived entries are hidden from recall/match but restorable.
+  bool archived = false;
 
   json to_json() const {
     return {{"id", id},           {"title", title},
             {"content", content}, {"type", type},
-            {"tags", tags},       {"createdBy", created_by},
+            {"tags", tags},       {"origin", origin},
+            {"createdBy", created_by},
             {"createdAt", created_at},
             {"updatedAt", updated_at},
             {"accessCount", access_count},
-            {"lastAccessedAt", last_accessed_at}};
+            {"lastAccessedAt", last_accessed_at},
+            {"usefulCount", useful_count},
+            {"lastUsefulAt", last_useful_at},
+            {"archived", archived}};
   }
 
+  /// Provenance/usefulness fields default when absent so entries from
+  /// sources that predate them (legacy Storage arrays, older peers syncing
+  /// over SharedState) round-trip correctly.
   static Entry from_json(const json& j) {
     Entry e;
     e.id = j.value("id", std::string());
@@ -79,11 +123,16 @@ struct Entry {
         if (t.is_string()) e.tags.push_back(t.get<std::string>());
       }
     }
-    e.created_by = j.value("createdBy", std::string());
-    e.created_at = j.value("createdAt", static_cast<int64_t>(0));
-    e.updated_at = j.value("updatedAt", static_cast<int64_t>(0));
-    e.access_count = j.value("accessCount", static_cast<int64_t>(0));
-    e.last_accessed_at = j.value("lastAccessedAt", static_cast<int64_t>(0));
+    e.origin = str_or(j, "origin", "agent");
+    if (!valid_origin(e.origin)) e.origin = "agent";
+    e.created_by = str_or(j, "createdBy", "");
+    e.created_at = int_or(j, "createdAt", 0);
+    e.updated_at = int_or(j, "updatedAt", 0);
+    e.access_count = int_or(j, "accessCount", 0);
+    e.last_accessed_at = int_or(j, "lastAccessedAt", 0);
+    e.useful_count = int_or(j, "usefulCount", 0);
+    e.last_useful_at = int_or(j, "lastUsefulAt", 0);
+    e.archived = j.contains("archived") && j["archived"].is_boolean() && j["archived"].get<bool>();
     return e;
   }
 };
@@ -161,7 +210,7 @@ class KnowledgeBase final : public Object {
         "'learned' (behavioral lessons), 'fact' (discovered facts), "
         "'insight' (agent analysis), 'reference' (pointers to resources). "
         "Knowledge persists across restarts and syncs across peers.",
-        "3.0.0", "abjects:knowledge-base");
+        "3.1.0", "abjects:knowledge-base");
 
     m.method("remember",
              "Store a knowledge entry. Deduplicates by normalized title+type "
@@ -170,6 +219,8 @@ class KnowledgeBase final : public Object {
         .param("content", "string", "The knowledge content (markdown)")
         .param("type", "string", "Entry type: 'learned' | 'fact' | 'insight' | 'reference'")
         .param("tags", "array", "Tags for search/filtering", true)
+        .param("origin", "string",
+               "Who authored this: 'user' | 'agent' | 'reviewer' | 'scrum' (default 'agent')", true)
         .returns("object");
     m.method("recall",
              "Search knowledge entries by query (BM25-ranked full text, "
@@ -204,7 +255,26 @@ class KnowledgeBase final : public Object {
     m.method("list", "List knowledge entries, optionally filtered by type")
         .param("type", "string", "Filter by type", true)
         .param("limit", "number", "Max results (default 50)", true)
+        .param("includeArchived", "boolean", "Include archived entries (default false)", true)
         .returns("array");
+    m.method("listTags",
+             "List tags in use across active (non-archived) entries with "
+             "usage counts, most-used first. Lets agents discover the tag "
+             "vocabulary instead of guessing.")
+        .param("limit", "number", "Max tags (default 50)", true)
+        .returns("array");
+    m.method("markUseful",
+             "Record that entries genuinely helped a task (reviewer "
+             "feedback). Bumps usefulCount, which protects entries from "
+             "staleness eviction.")
+        .param("ids", "array", "Entry IDs that proved useful")
+        .returns("object");
+    m.method("archive",
+             "Archive an entry (hidden from recall/match, restorable) or "
+             "restore it with archived: false")
+        .param("id", "string", "Entry ID")
+        .param("archived", "boolean", "Target state (default true)", true)
+        .returns("object");
 
     m.event("entryAdded", "A knowledge entry was added");
     m.event("entryUpdated", "A knowledge entry was updated");
@@ -332,12 +402,77 @@ class KnowledgeBase final : public Object {
       const json& p = req.payload();
       const std::string type = p.value("type", std::string());
       const size_t max = std::min<int64_t>(p.value("limit", static_cast<int64_t>(50)), 200);
+      const bool include_archived = bool_or(p, "includeArchived", false);
 
-      std::vector<const Entry*> results = filtered_by_recency(type, {});
+      std::vector<const Entry*> results = filtered_by_recency(type, {}, include_archived);
       if (results.size() > max) results.resize(max);
       json out = json::array();
       for (const Entry* e : results) out.push_back(e->to_json());
       req.reply(std::move(out));
+    });
+
+    on("listTags", [this](Request& req) {
+      const json& p = req.payload();
+      const size_t max = static_cast<size_t>(std::min<int64_t>(int_or(p, "limit", 50), 200));
+      std::map<std::string, int64_t> counts;
+      for (const auto& [id, e] : entries_) {
+        if (e.archived) continue;
+        for (const auto& t : e.tags) counts[t]++;
+      }
+      std::vector<std::pair<std::string, int64_t>> sorted(counts.begin(), counts.end());
+      std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+        if (a.second != b.second) return a.second > b.second;
+        return a.first < b.first;
+      });
+      if (sorted.size() > max) sorted.resize(max);
+      json out = json::array();
+      for (const auto& [tag, count] : sorted) {
+        out.push_back({{"tag", tag}, {"count", count}});
+      }
+      req.reply(out);
+    });
+
+    on("markUseful", [this](Request& req) {
+      const json& p = req.payload();
+      if (!p.contains("ids") || !p["ids"].is_array() || p["ids"].empty()) {
+        req.error("CONTRACT_VIOLATION", "ids must be a non-empty array");
+        return;
+      }
+      const int64_t now = static_cast<int64_t>(now_ms());
+      int64_t marked = 0;
+      for (const auto& v : p["ids"]) {
+        if (!v.is_string()) continue;
+        auto it = entries_.find(v.get<std::string>());
+        if (it == entries_.end()) continue;
+        it->second.useful_count++;
+        it->second.last_useful_at = now;
+        persist_entry(it->second);
+        changed("entryUpdated", it->second.to_json());
+        marked++;
+      }
+      if (marked > 0) request_sync();
+      log(LogLevel::Info, "markUseful: " + std::to_string(marked) + "/" +
+                              std::to_string(p["ids"].size()) + " entries");
+      req.reply({{"marked", marked}});
+    });
+
+    on("archive", [this](Request& req) {
+      const json& p = req.payload();
+      const std::string id = p.value("id", std::string());
+      if (id.empty()) { req.error("CONTRACT_VIOLATION", "id must not be empty"); return; }
+      auto it = entries_.find(id);
+      if (it == entries_.end()) {
+        req.reply({{"success", false}, {"error", "No entry with id \"" + id + "\""}});
+        return;
+      }
+      Entry& e = it->second;
+      e.archived = bool_or(p, "archived", true);
+      e.updated_at = static_cast<int64_t>(now_ms());
+      save_entry(e);
+      changed("entryUpdated", e.to_json());
+      log(LogLevel::Info,
+          std::string(e.archived ? "Archived" : "Restored") + ": \"" + e.title + "\"");
+      req.reply({{"success", true}});
     });
 
     // SharedState sync: merge remote entries that are new or newer.
@@ -385,13 +520,28 @@ class KnowledgeBase final : public Object {
         if (t.is_string()) tags.push_back(t.get<std::string>());
       }
     }
+    std::string origin = str_or(p, "origin", "agent");
+    if (!valid_origin(origin)) origin = "agent";
 
     const int64_t now = static_cast<int64_t>(now_ms());
 
-    // Dedup by normalized title+type: update the existing entry if found.
-    if (Entry* existing = find_by_title_and_type(title, type)) {
+    // Dedup by normalized title+type: update the existing entry if found. A
+    // re-remembered archived entry revives; its origin is preserved so a
+    // reviewer refresh can never downgrade a user-authored entry.
+    // User-authored entries are dedup-updatable only by user-origin writes:
+    // an agent/reviewer remember whose title happens to collide must not
+    // replace the user's content (it would keep origin 'user', making the
+    // corruption look user-authored and eviction-protected). Such writes
+    // fall through and create a separate entry instead.
+    Entry* existing = find_by_title_and_type(title, type);
+    if (existing && existing->origin == "user" && origin != "user") {
+      log(LogLevel::Info, "Remember: title collides with user entry; creating separate " + origin + " entry");
+      existing = nullptr;
+    }
+    if (existing) {
       existing->content = content;
       if (p.contains("tags")) existing->tags = tags;
+      existing->archived = false;
       existing->updated_at = now;
       index_.add(existing->id, existing->title, existing->content, existing->tags);
       save_entry(*existing);
@@ -408,11 +558,15 @@ class KnowledgeBase final : public Object {
     e.content = content;
     e.type = type;
     e.tags = std::move(tags);
+    e.origin = std::move(origin);
     e.created_by = req.from();
     e.created_at = now;
     e.updated_at = now;
     e.access_count = 0;
     e.last_accessed_at = now;
+    e.useful_count = 0;
+    e.last_useful_at = 0;
+    e.archived = false;
 
     index_.add(e.id, e.title, e.content, e.tags);
     json entry_json = e.to_json();
@@ -450,13 +604,14 @@ class KnowledgeBase final : public Object {
         auto it = entries_.find(hit.id);
         if (it == entries_.end()) continue;
         const Entry& e = it->second;
+        if (e.archived) continue;
         if (!type.empty() && e.type != type) continue;
         if (!tag_filter.empty() && !has_any_tag(e, tag_filter)) continue;
         rows.push_back({&e, kb::make_snippet(e.content, query_terms), hit.score, true});
         if (rows.size() >= max) break;
       }
     } else {
-      for (const Entry* e : filtered_by_recency(type, tag_filter)) {
+      for (const Entry* e : filtered_by_recency(type, tag_filter, false)) {
         rows.push_back({e, clip_utf8(e->content, 160), 0, false});
         if (rows.size() >= max) break;
       }
@@ -527,6 +682,7 @@ class KnowledgeBase final : public Object {
 
     std::vector<const Entry*> results;
     for (const Entry* e : sorted_by_recency()) {
+      if (e->archived) continue;
       if (!matches(*e)) continue;
       results.push_back(e);
       if (results.size() >= max) break;
@@ -615,9 +771,11 @@ class KnowledgeBase final : public Object {
   }
 
   std::vector<const Entry*> filtered_by_recency(const std::string& type,
-                                                const std::vector<std::string>& tags) const {
+                                                const std::vector<std::string>& tags,
+                                                bool include_archived) const {
     std::vector<const Entry*> out;
     for (const Entry* e : sorted_by_recency()) {
+      if (!include_archived && e->archived) continue;
       if (!type.empty() && e->type != type) continue;
       if (!tags.empty() && !has_any_tag(*e, tags)) continue;
       out.push_back(e);
@@ -689,65 +847,108 @@ class KnowledgeBase final : public Object {
     if (now - last_distill_ms_ >= DISTILL_INTERVAL_MS) distill();
   }
 
+  /// An entry the automated cleanup must never touch: user-authored entries
+  /// (origin 'user'), user facts (tagged 'user'/'person'), and entries a
+  /// reviewer has confirmed useful.
   bool is_protected(const Entry& e) const {
-    if (e.type != "fact") return false;
-    for (const auto& t : e.tags) {
-      if (t == "user" || t == "person") return true;
+    if (e.origin == "user") return true;
+    if (e.type == "fact") {
+      for (const auto& t : e.tags) {
+        if (t == "user" || t == "person") return true;
+      }
     }
-    return false;
+    return e.useful_count > 0;
   }
 
-  /// Evict stale, low-value, and ephemeral entries. User facts protected.
+  /// Archive (not delete): hidden from recall/match, restorable.
+  void archive_entry(Entry& e, const char* why) {
+    log(LogLevel::Info,
+        std::string("Distill: archiving \"") + e.title + "\" (" + why + ")");
+    e.archived = true;
+    e.updated_at = static_cast<int64_t>(now_ms());
+    persist_entry(e);
+  }
+
+  /// Periodic cleanup: archive stale, low-value entries and cap the active
+  /// store. Nothing is hard-deleted except archived entries that outlive the
+  /// purge window, keeping the store bounded.
   void distill() {
     const int64_t now = static_cast<int64_t>(now_ms());
     last_distill_ms_ = now;
 
-    std::vector<std::string> evicted;
-    for (const auto& [id, e] : entries_) {
-      if (is_protected(e)) continue;
+    size_t archived_count = 0;
+    for (auto& [_, e] : entries_) {
+      if (e.archived || is_protected(e)) continue;
       const int64_t age_days = (now - e.created_at) / DAY_MS;
       const int64_t last_access_days =
           e.last_accessed_at > 0 ? (now - e.last_accessed_at) / DAY_MS : age_days;
 
+      // Archive 'learned' entries never surfaced after 7 days
       if (e.type == "learned" && e.access_count == 0 && age_days > STALE_NEVER_ACCESSED_DAYS) {
-        evicted.push_back(id);
+        archive_entry(e, "never accessed in 7d");
+        archived_count++;
         continue;
       }
+      // Archive 'learned' or 'reference' entries inactive for 30 days
       if ((e.type == "learned" || e.type == "reference") &&
           last_access_days > STALE_INACTIVE_DAYS) {
-        evicted.push_back(id);
+        archive_entry(e, "inactive 30d");
+        archived_count++;
       }
     }
-    for (const auto& id : evicted) {
-      log(LogLevel::Info, "Distill: evicting \"" + entries_[id].title + "\"");
+
+    // Cap the ACTIVE store by archiving the least useful entries first
+    // (usefulCount, then accessCount). Protected entries are exempt.
+    size_t active_count = 0;
+    for (const auto& [_, e] : entries_) {
+      if (!e.archived) active_count++;
+    }
+    if (active_count > MAX_ENTRIES) {
+      std::vector<Entry*> candidates;
+      for (auto& [_, e] : entries_) {
+        if (!e.archived && !is_protected(e)) candidates.push_back(&e);
+      }
+      std::sort(candidates.begin(), candidates.end(), [](const Entry* a, const Entry* b) {
+        return a->useful_count != b->useful_count ? a->useful_count < b->useful_count
+                                                  : a->access_count < b->access_count;
+      });
+      size_t excess = active_count - MAX_ENTRIES;
+      for (Entry* e : candidates) {
+        if (excess == 0) break;
+        archive_entry(*e, "active-store cap");
+        archived_count++;
+        excess--;
+      }
+    }
+
+    // Bound the archive itself: hard-delete archived entries past the purge
+    // window, oldest first when over the archive cap. User-authored entries
+    // are never purged.
+    std::vector<const Entry*> archived;
+    for (const auto& [_, e] : entries_) {
+      if (e.archived && e.origin != "user") archived.push_back(&e);
+    }
+    std::sort(archived.begin(), archived.end(), [](const Entry* a, const Entry* b) {
+      return a->updated_at < b->updated_at;
+    });
+    std::vector<std::string> purge_ids;
+    for (const Entry* e : archived) {
+      const int64_t archived_days = (now - e->updated_at) / DAY_MS;
+      const bool over_cap = archived.size() - purge_ids.size() > MAX_ARCHIVED;
+      if (archived_days > ARCHIVED_PURGE_DAYS || over_cap) purge_ids.push_back(e->id);
+    }
+    for (const auto& id : purge_ids) {
+      log(LogLevel::Info, "Distill: purging archived \"" + entries_[id].title + "\"");
       index_.remove(id);
       entries_.erase(id);
       unpersist_entry(id);
     }
 
-    // Cap total entries by evicting the lowest-accessCount non-user entries.
-    if (entries_.size() > MAX_ENTRIES) {
-      std::vector<const Entry*> candidates;
-      for (const auto& [_, e] : entries_) {
-        if (!is_protected(e)) candidates.push_back(&e);
-      }
-      std::sort(candidates.begin(), candidates.end(), [](const Entry* a, const Entry* b) {
-        return a->access_count < b->access_count;
-      });
-      size_t i = 0;
-      while (entries_.size() > MAX_ENTRIES && i < candidates.size()) {
-        const std::string id = candidates[i++]->id;
-        log(LogLevel::Info, "Distill: cap evict \"" + entries_[id].title + "\"");
-        index_.remove(id);
-        entries_.erase(id);
-        unpersist_entry(id);
-      }
-    }
-
-    if (!evicted.empty()) {
+    if (archived_count > 0 || !purge_ids.empty()) {
       request_sync();
-      log(LogLevel::Info, "Distill: evicted " + std::to_string(evicted.size()) +
-                              " entries, " + std::to_string(entries_.size()) + " remaining");
+      log(LogLevel::Info, "Distill: archived " + std::to_string(archived_count) +
+                              ", purged " + std::to_string(purge_ids.size()) + ", " +
+                              std::to_string(entries_.size()) + " entries total");
     }
   }
 };

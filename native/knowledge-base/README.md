@@ -19,7 +19,8 @@ pnpm smelt   # forge --build-only: recompile, validate, re-embed the manifest
 
 - A compiled-language abject replacing a built-in system object with zero
   changes anywhere else: same manifest surface (`remember`, `recall`,
-  `match`, `get`, `forget`, `update`, `list`), same events, same discovery.
+  `match`, `get`, `forget`, `update`, `list`, `markUseful`, `archive`),
+  same events, same discovery.
 - All capability access by message passing: persistence goes through the
   workspace `Storage` abject (one key per entry), cross-peer sync through
   `SharedState`, exactly like every other object. No filesystem, no SQLite.

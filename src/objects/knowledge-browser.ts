@@ -3,8 +3,10 @@
  * agent knowledge base.
  *
  * Split-pane layout: search input + list on the left, detail view on the
- * right. Tab bar for type filtering. Search triggers FTS5 full-text
- * recall on the KnowledgeBase (searches content, not just titles).
+ * right. Tab bar for type filtering, toolbar row with a 'Show archived'
+ * toggle and a Curate button (asks the reviewer to run a background
+ * curation pass). Search triggers FTS5 full-text recall on the
+ * KnowledgeBase (searches content, not just titles).
  */
 
 import { AbjectId, AbjectMessage, InterfaceId } from '../core/types.js';
@@ -46,13 +48,18 @@ export class KnowledgeBrowser extends Abject {
   private metaLabelId?: AbjectId;
   private contentLabelId?: AbjectId;
   private deleteBtnId?: AbjectId;
+  private restoreBtnId?: AbjectId;
+  private buttonRowId?: AbjectId;
   private emptyLabelId?: AbjectId;
+  private archivedToggleId?: AbjectId;
+  private curateBtnId?: AbjectId;
 
   private entries: KnowledgeEntry[] = [];
   private filteredEntries: KnowledgeEntry[] = [];
   private selectedId?: string;
   private activeTab = 0;
   private searchQuery = '';
+  private showArchived = false;
 
   constructor() {
     super({
@@ -159,6 +166,44 @@ export class KnowledgeBrowser extends Abject {
       preferredSize: { height: 32 },
     }));
 
+    // Toolbar: 'Show archived' toggle (left) + Curate button (right)
+    const toolbarRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+
+    await this.request(request(this.id, this.rootLayoutId, 'updateLayoutChild', {
+      widgetId: toolbarRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 30 },
+    }));
+
+    const { widgetIds: [archToggleId, curateId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', {
+        specs: [
+          { type: 'checkbox', windowId: this.windowId, checked: this.showArchived, text: 'Show archived' },
+          { type: 'button', windowId: this.windowId, text: 'Curate' },
+        ],
+      })
+    );
+    this.archivedToggleId = archToggleId;
+    this.curateBtnId = curateId;
+
+    await this.request(request(this.id, toolbarRowId, 'addLayoutChild', {
+      widgetId: this.archivedToggleId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: 140, height: 24 },
+    }));
+    await this.request(request(this.id, toolbarRowId, 'addLayoutSpacer', {}));
+    await this.request(request(this.id, toolbarRowId, 'addLayoutChild', {
+      widgetId: this.curateBtnId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: 80, height: 26 },
+    }));
+
     // Split pane: left (search+list) | right (detail)
     const { widgetIds: [splitId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', {
@@ -239,7 +284,10 @@ export class KnowledgeBrowser extends Abject {
           // 6: delete button
           { type: 'button', windowId: this.windowId, text: 'Forget',
             style: { color: this.theme.statusError } },
-          // 7: empty state
+          // 7: restore button (archived entries only)
+          { type: 'button', windowId: this.windowId, text: 'Restore',
+            style: { color: this.theme.statusSuccess } },
+          // 8: empty state
           { type: 'label', windowId: this.windowId, text: 'Select an entry to view details',
             style: { fontSize: 12, color: this.theme.textTertiary, align: 'center' } },
         ],
@@ -253,7 +301,24 @@ export class KnowledgeBrowser extends Abject {
     const dividerId = detailIds[4];
     this.contentLabelId = detailIds[5];
     this.deleteBtnId = detailIds[6];
-    this.emptyLabelId = detailIds[7];
+    this.restoreBtnId = detailIds[7];
+    this.emptyLabelId = detailIds[8];
+
+    // Button row (Forget + Restore side by side)
+    this.buttonRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createDetachedHBox', {
+        windowId: this.windowId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+
+    await this.request(request(this.id, this.buttonRowId, 'addLayoutChildren', {
+      children: [
+        { widgetId: this.deleteBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 80, height: 30 } },
+        { widgetId: this.restoreBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 80, height: 30 } },
+      ],
+    }));
 
     await this.request(request(this.id, this.detailLayoutId, 'addLayoutChildren', {
       children: [
@@ -264,7 +329,7 @@ export class KnowledgeBrowser extends Abject {
         { widgetId: this.metaLabelId, sizePolicy: { vertical: 'preferred', horizontal: 'expanding' } },
         { widgetId: dividerId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 1 } },
         { widgetId: this.contentLabelId, sizePolicy: { vertical: 'expanding', horizontal: 'expanding' } },
-        { widgetId: this.deleteBtnId, sizePolicy: { vertical: 'fixed', horizontal: 'fixed' }, preferredSize: { width: 80, height: 30 } },
+        { widgetId: this.buttonRowId, sizePolicy: { vertical: 'fixed', horizontal: 'expanding' }, preferredSize: { height: 30 } },
       ],
     }));
 
@@ -277,6 +342,9 @@ export class KnowledgeBrowser extends Abject {
     this.send(request(this.id, this.searchInputId, 'addDependent', {}));
     this.send(request(this.id, this.listWidgetId, 'addDependent', {}));
     this.send(request(this.id, this.deleteBtnId, 'addDependent', {}));
+    this.send(request(this.id, this.restoreBtnId, 'addDependent', {}));
+    this.send(request(this.id, this.archivedToggleId, 'addDependent', {}));
+    this.send(request(this.id, this.curateBtnId, 'addDependent', {}));
     if (this.knowledgeBaseId) {
       this.send(request(this.id, this.knowledgeBaseId, 'addDependent', {}));
     }
@@ -330,12 +398,17 @@ export class KnowledgeBrowser extends Abject {
     this.metaLabelId = undefined;
     this.contentLabelId = undefined;
     this.deleteBtnId = undefined;
+    this.restoreBtnId = undefined;
+    this.buttonRowId = undefined;
     this.emptyLabelId = undefined;
+    this.archivedToggleId = undefined;
+    this.curateBtnId = undefined;
     this.entries = [];
     this.filteredEntries = [];
     this.selectedId = undefined;
     this.activeTab = 0;
     this.searchQuery = '';
+    this.showArchived = false;
     this.changed('visibility', false);
     return true;
   }
@@ -365,6 +438,7 @@ export class KnowledgeBrowser extends Abject {
           request(this.id, this.knowledgeBaseId, 'list', {
             type: typeFilter,
             limit: 200,
+            ...(this.showArchived ? { includeArchived: true } : {}),
           })
         );
       }
@@ -385,15 +459,57 @@ export class KnowledgeBrowser extends Abject {
 
     const items: ListItem[] = this.filteredEntries.map(entry => {
       const tagStr = entry.tags.length > 0 ? entry.tags.slice(0, 3).join(', ') : '';
+      // Compact second line: origin badge text + usefulness + tags
+      const parts: string[] = [entry.origin];
+      if (entry.usefulCount > 0) parts.push(`useful ×${entry.usefulCount}`);
+      if (tagStr) parts.push(tagStr);
       return {
         label: entry.title,
         value: entry.id,
-        secondary: tagStr,
-        badge: { text: entry.type, color: this.typeColor(entry.type) },
+        secondary: parts.join('  ·  '),
+        badge: entry.archived
+          ? { text: 'archived', color: this.theme.textTertiary }
+          : { text: entry.type, color: this.typeColor(entry.type) },
       };
     });
 
     await this.request(request(this.id, this.listWidgetId, 'update', { items }));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Curation
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Ask the reviewer to run a knowledge curation pass. The reply arrives
+   * immediately ({ started, message? }); curation itself runs in the
+   * background and results land via the KnowledgeBase entry-change events
+   * this browser already subscribes to.
+   */
+  private async runCurate(): Promise<void> {
+    if (!this.curateBtnId) return;
+
+    this.send(event(this.id, this.curateBtnId, 'update', { busy: true }));
+    try {
+      const reviewerId = await this.discoverDep('TaskReviewer');
+      if (!reviewerId) {
+        await this.notify('Reviewer not available', 'warning');
+        return;
+      }
+
+      const reply = await this.request<{ started: boolean; message?: string }>(
+        request(this.id, reviewerId, 'curate', {})
+      );
+      await this.notify(
+        reply.message ?? (reply.started ? 'Curation started' : 'Curation did not start'),
+        reply.started ? 'info' : 'warning'
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await this.notify(`Curate failed: ${msg.slice(0, 80)}`, 'error');
+    } finally {
+      this.send(event(this.id, this.curateBtnId, 'update', { busy: false }));
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -412,6 +528,8 @@ export class KnowledgeBrowser extends Abject {
       this.request(request(this.id, this.metaLabelId!, 'update', { style: { visible: detailVis } })),
       this.request(request(this.id, this.contentLabelId!, 'update', { style: { visible: detailVis } })),
       this.request(request(this.id, this.deleteBtnId!, 'update', { style: { visible: detailVis } })),
+      // Restore stays hidden until showDetail() reveals it for archived entries
+      this.request(request(this.id, this.restoreBtnId!, 'update', { style: { visible: false } })),
     ]);
   }
 
@@ -422,20 +540,28 @@ export class KnowledgeBrowser extends Abject {
     const created = new Date(entry.createdAt).toLocaleDateString();
     const updated = new Date(entry.updatedAt).toLocaleDateString();
     const tagsStr = entry.tags.length > 0 ? entry.tags.join(', ') : 'none';
+    const usefulStr = entry.usefulCount > 0 ? `  |  Useful ×${entry.usefulCount}` : '';
 
     await Promise.all([
-      this.request(request(this.id, this.titleLabelId!, 'update', { text: entry.title })),
+      this.request(request(this.id, this.titleLabelId!, 'update', {
+        text: entry.title,
+        // Archived entries render dimmed
+        style: { color: entry.archived ? this.theme.textTertiary : this.theme.textHeading, visible: true },
+      })),
       this.request(request(this.id, this.typeLabelId!, 'update', {
-        text: entry.type,
-        style: { color: typeColor, visible: true },
+        text: entry.archived ? `${entry.type}  ·  archived` : entry.type,
+        style: { color: entry.archived ? this.theme.textTertiary : typeColor, visible: true },
       })),
       this.request(request(this.id, this.tagsLabelId!, 'update', {
         text: `Tags: ${tagsStr}`,
         style: { visible: true },
       })),
       this.request(request(this.id, this.metaLabelId!, 'update', {
-        text: `Created ${created}  |  Updated ${updated}  |  Accessed ${entry.accessCount} times`,
+        text: `Origin: ${entry.origin}  |  Created ${created}  |  Updated ${updated}  |  Accessed ${entry.accessCount} times${usefulStr}`,
         style: { visible: true },
+      })),
+      this.request(request(this.id, this.restoreBtnId!, 'update', {
+        style: { visible: entry.archived },
       })),
       this.request(request(this.id, this.contentLabelId!, 'update', {
         text: entry.content,
@@ -476,6 +602,53 @@ export class KnowledgeBrowser extends Abject {
       this.selectedId = undefined;
       await this.showEmptyState(true);
       await this.loadEntries();
+      return;
+    }
+
+    // Show-archived toggle. CheckboxWidget emits the string 'true'/'false',
+    // not a boolean; accept both shapes.
+    if (fromId === this.archivedToggleId && aspect === 'change') {
+      this.showArchived = value === true || value === 'true';
+      this.selectedId = undefined;
+      await this.showEmptyState(true);
+      await this.loadEntries();
+      return;
+    }
+
+    // Curate button -- ask the reviewer to run a curation pass
+    if (fromId === this.curateBtnId && aspect === 'click') {
+      await this.runCurate();
+      return;
+    }
+
+    // Restore button -- un-archive the selected entry
+    if (fromId === this.restoreBtnId && aspect === 'click') {
+      if (!this.selectedId || !this.knowledgeBaseId) return;
+
+      const entry = this.filteredEntries.find(e => e.id === this.selectedId);
+      this.send(event(this.id, this.restoreBtnId, 'update', { busy: true }));
+      try {
+        const res = await this.request<{ success?: boolean; error?: string }>(
+          request(this.id, this.knowledgeBaseId, 'archive', { id: this.selectedId, archived: false })
+        );
+        if (res && res.success === false) {
+          throw new Error(res.error ?? 'entry no longer exists');
+        }
+        await this.notify(entry ? `Restored "${entry.title}"` : 'Entry restored', 'success');
+        await this.loadEntries();
+        const restored = this.filteredEntries.find(e => e.id === this.selectedId);
+        if (restored) {
+          await this.showDetail(restored);
+        } else {
+          this.selectedId = undefined;
+          await this.showEmptyState(true);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await this.notify(`Restore failed: ${msg.slice(0, 80)}`, 'error');
+      } finally {
+        this.send(event(this.id, this.restoreBtnId, 'update', { busy: false }));
+      }
       return;
     }
 

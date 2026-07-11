@@ -331,14 +331,20 @@ export class Scheduler extends Abject {
     });
 
     // When a job we submitted fails, JobManager sends a direct jobFailed
-    // event. Reject any pending submitJob request so the scheduler's tick
-    // unblocks immediately instead of waiting for the 300s stall timer.
+    // event carrying the submitJob request's message id. Reject exactly that
+    // pending request so the tick unblocks immediately; rejecting every
+    // pending JobManager request would take down unrelated in-flight jobs
+    // when multiple schedules fire together.
     this.on('jobFailed', async (msg: AbjectMessage) => {
-      const { error } = msg.payload as { jobId: string; error?: string };
-      this.rejectPendingRequestsTo(
-        msg.routing.from,
-        new Error(error ?? 'Job failed'),
-      );
+      const { error, requestMessageId } = msg.payload as {
+        jobId: string; error?: string; requestMessageId?: string;
+      };
+      const err = new Error(error ?? 'Job failed');
+      if (requestMessageId) {
+        this.rejectPendingRequest(requestMessageId, err);
+        return;
+      }
+      this.rejectPendingRequestsTo(msg.routing.from, err);
     });
   }
 

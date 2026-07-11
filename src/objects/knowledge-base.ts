@@ -43,18 +43,33 @@ export const PROFILE_TAG = 'profile';
 
 export type KnowledgeType = 'learned' | 'fact' | 'insight' | 'reference';
 
+/**
+ * Who authored an entry. Curation policy keys off this: 'user' entries are
+ * never auto-evicted or auto-merged; only 'agent'/'reviewer' entries are
+ * eligible for automated consolidation.
+ */
+export type KnowledgeOrigin = 'user' | 'agent' | 'reviewer' | 'scrum';
+
 export interface KnowledgeEntry {
   id: string;
   title: string;
   content: string;
   type: KnowledgeType;
   tags: string[];
+  origin: KnowledgeOrigin;
   createdBy: string;
   createdAt: number;
   updatedAt: number;
   accessCount: number;
   lastAccessedAt: number;
+  /** Times a reviewer judged this entry to have actually helped a task. */
+  usefulCount: number;
+  lastUsefulAt: number;
+  /** Archived entries are hidden from recall/match but restorable. */
+  archived: boolean;
 }
+
+const KNOWLEDGE_ORIGINS: readonly KnowledgeOrigin[] = ['user', 'agent', 'reviewer', 'scrum'];
 
 /** A recall result: the full entry plus ranking metadata for query searches. */
 export interface RecallResult extends KnowledgeEntry {
@@ -102,6 +117,7 @@ export class KnowledgeBase extends Abject {
                 { name: 'content', type: { kind: 'primitive', primitive: 'string' }, description: 'The knowledge content (markdown)' },
                 { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: "Entry type: 'learned' | 'fact' | 'insight' | 'reference'" },
                 { name: 'tags', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Tags for search/filtering', optional: true },
+                { name: 'origin', type: { kind: 'primitive', primitive: 'string' }, description: "Who authored this: 'user' | 'agent' | 'reviewer' | 'scrum' (default 'agent')", optional: true },
               ],
               returns: { kind: 'object', properties: { id: { kind: 'primitive', primitive: 'string' } } },
             },
@@ -159,8 +175,37 @@ export class KnowledgeBase extends Abject {
               parameters: [
                 { name: 'type', type: { kind: 'primitive', primitive: 'string' }, description: 'Filter by type', optional: true },
                 { name: 'limit', type: { kind: 'primitive', primitive: 'number' }, description: 'Max results (default 50)', optional: true },
+                { name: 'includeArchived', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Include archived entries (default false)', optional: true },
               ],
               returns: { kind: 'array', elementType: { kind: 'reference', reference: 'KnowledgeEntry' } },
+            },
+            {
+              name: 'listTags',
+              description: 'List tags in use across active (non-archived) entries with usage counts, most-used first. Lets agents discover the tag vocabulary instead of guessing.',
+              parameters: [
+                { name: 'limit', type: { kind: 'primitive', primitive: 'number' }, description: 'Max tags (default 50)', optional: true },
+              ],
+              returns: { kind: 'array', elementType: { kind: 'object', properties: {
+                tag: { kind: 'primitive', primitive: 'string' },
+                count: { kind: 'primitive', primitive: 'number' },
+              } } },
+            },
+            {
+              name: 'markUseful',
+              description: 'Record that entries genuinely helped a task (reviewer feedback). Bumps usefulCount, which protects entries from staleness eviction.',
+              parameters: [
+                { name: 'ids', type: { kind: 'array', elementType: { kind: 'primitive', primitive: 'string' } }, description: 'Entry IDs that proved useful' },
+              ],
+              returns: { kind: 'object', properties: { marked: { kind: 'primitive', primitive: 'number' } } },
+            },
+            {
+              name: 'archive',
+              description: 'Archive an entry (hidden from recall/match, restorable) or restore it with archived: false',
+              parameters: [
+                { name: 'id', type: { kind: 'primitive', primitive: 'string' }, description: 'Entry ID' },
+                { name: 'archived', type: { kind: 'primitive', primitive: 'boolean' }, description: 'Target state (default true)', optional: true },
+              ],
+              returns: { kind: 'object', properties: { success: { kind: 'primitive', primitive: 'boolean' } } },
             },
           ],
           events: [
@@ -289,7 +334,11 @@ export class KnowledgeBase extends Abject {
         createdAt INTEGER NOT NULL,
         updatedAt INTEGER NOT NULL,
         accessCount INTEGER NOT NULL DEFAULT 0,
-        lastAccessedAt INTEGER NOT NULL DEFAULT 0
+        lastAccessedAt INTEGER NOT NULL DEFAULT 0,
+        origin TEXT NOT NULL DEFAULT 'agent',
+        usefulCount INTEGER NOT NULL DEFAULT 0,
+        lastUsefulAt INTEGER NOT NULL DEFAULT 0,
+        archived INTEGER NOT NULL DEFAULT 0
       );
       CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
         title, content, tags,
@@ -311,6 +360,17 @@ export class KnowledgeBase extends Abject {
       END;
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     `);
+    // Migrate pre-provenance databases in place. ADD COLUMN throws when the
+    // column already exists, which is the signal to stop probing.
+    const migrations = [
+      `ALTER TABLE entries ADD COLUMN origin TEXT NOT NULL DEFAULT 'agent'`,
+      `ALTER TABLE entries ADD COLUMN usefulCount INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE entries ADD COLUMN lastUsefulAt INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE entries ADD COLUMN archived INTEGER NOT NULL DEFAULT 0`,
+    ];
+    for (const sql of migrations) {
+      try { db.exec(sql); } catch { /* column already present */ }
+    }
     this.db = db;
   }
 
@@ -334,7 +394,7 @@ export class KnowledgeBase extends Abject {
         const exists = this.db.prepare(`SELECT 1 FROM entries WHERE id = ?`);
         for (const entry of stored) {
           if (!entry?.id || exists.get(entry.id)) continue;
-          this.writeEntryToDb(entry);
+          this.writeEntryToDb(this.normalizeEntry(entry));
           imported++;
         }
       }
@@ -349,7 +409,7 @@ export class KnowledgeBase extends Abject {
   private loadEntriesFromDb(): void {
     if (!this.db) return;
     const rows = this.db.prepare(
-      `SELECT id, title, content, type, tags, createdBy, createdAt, updatedAt, accessCount, lastAccessedAt FROM entries`
+      `SELECT id, title, content, type, tags, createdBy, createdAt, updatedAt, accessCount, lastAccessedAt, origin, usefulCount, lastUsefulAt, archived FROM entries`
     ).all() as Array<Record<string, unknown>>;
     for (const r of rows) {
       const entry = this.rowToEntry(r);
@@ -366,12 +426,28 @@ export class KnowledgeBase extends Abject {
       content: String(r.content),
       type: String(r.type) as KnowledgeType,
       tags: Array.isArray(tags) ? tags : [],
+      origin: KNOWLEDGE_ORIGINS.includes(r.origin as KnowledgeOrigin) ? (r.origin as KnowledgeOrigin) : 'agent',
       createdBy: String(r.createdBy ?? ''),
       createdAt: Number(r.createdAt ?? 0),
       updatedAt: Number(r.updatedAt ?? 0),
       accessCount: Number(r.accessCount ?? 0),
       lastAccessedAt: Number(r.lastAccessedAt ?? 0),
+      usefulCount: Number(r.usefulCount ?? 0),
+      lastUsefulAt: Number(r.lastUsefulAt ?? 0),
+      archived: Boolean(Number(r.archived ?? 0)),
     };
+  }
+
+  /**
+   * Fill provenance/usefulness defaults on entries from sources that predate
+   * them (legacy Storage arrays, older peers syncing over SharedState).
+   */
+  private normalizeEntry(e: KnowledgeEntry): KnowledgeEntry {
+    if (!KNOWLEDGE_ORIGINS.includes(e.origin)) e.origin = 'agent';
+    e.usefulCount = Number(e.usefulCount ?? 0);
+    e.lastUsefulAt = Number(e.lastUsefulAt ?? 0);
+    e.archived = Boolean(e.archived);
+    return e;
   }
 
   /** Insert or update an entry row. */
@@ -379,8 +455,8 @@ export class KnowledgeBase extends Abject {
     if (!this.db) return;
     try {
       this.db.prepare(`
-        INSERT INTO entries(id, title, content, type, tags, createdBy, createdAt, updatedAt, accessCount, lastAccessedAt)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO entries(id, title, content, type, tags, createdBy, createdAt, updatedAt, accessCount, lastAccessedAt, origin, usefulCount, lastUsefulAt, archived)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           title = excluded.title,
           content = excluded.content,
@@ -388,10 +464,15 @@ export class KnowledgeBase extends Abject {
           tags = excluded.tags,
           updatedAt = excluded.updatedAt,
           accessCount = excluded.accessCount,
-          lastAccessedAt = excluded.lastAccessedAt
+          lastAccessedAt = excluded.lastAccessedAt,
+          origin = excluded.origin,
+          usefulCount = excluded.usefulCount,
+          lastUsefulAt = excluded.lastUsefulAt,
+          archived = excluded.archived
       `).run(
         e.id, e.title, e.content, e.type, JSON.stringify(e.tags), e.createdBy,
         e.createdAt, e.updatedAt, e.accessCount, e.lastAccessedAt,
+        e.origin, e.usefulCount, e.lastUsefulAt, e.archived ? 1 : 0,
       );
     } catch (err) {
       log.warn(`DB write failed for "${e.title}": ${err instanceof Error ? err.message : String(err)}`);
@@ -570,8 +651,8 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
 
   private setupHandlers(): void {
     this.on('remember', async (msg: AbjectMessage) => {
-      const { title, content, type, tags } = msg.payload as {
-        title: string; content: string; type: KnowledgeType; tags?: string[];
+      const { title, content, type, tags, origin } = msg.payload as {
+        title: string; content: string; type: KnowledgeType; tags?: string[]; origin?: KnowledgeOrigin;
       };
       requireNonEmpty(title, 'title');
       requireNonEmpty(content, 'content');
@@ -579,12 +660,24 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
         type === 'learned' || type === 'fact' || type === 'insight' || type === 'reference',
         `Invalid knowledge type: ${type}`,
       );
+      const entryOrigin: KnowledgeOrigin =
+        origin && KNOWLEDGE_ORIGINS.includes(origin) ? origin : 'agent';
 
-      // Dedup by normalized title+type: update existing if found
+      // Dedup by normalized title+type: update existing if found. A
+      // re-remembered archived entry revives; its origin is preserved so a
+      // reviewer refresh can never downgrade a user-authored entry.
+      // User-authored entries are dedup-updatable only by user-origin
+      // writes: an agent/reviewer remember whose title happens to collide
+      // must not replace the user's content (it would keep origin 'user',
+      // making the corruption look user-authored and eviction-protected).
+      // Such writes fall through and create a separate entry instead.
       const existing = this.findByTitleAndType(title, type);
-      if (existing) {
+      if (existing && existing.origin === 'user' && entryOrigin !== 'user') {
+        log.info(`Remember: title collides with user entry "${existing.title}"; creating separate ${entryOrigin} entry`);
+      } else if (existing) {
         existing.content = content;
         existing.tags = tags ?? existing.tags;
+        existing.archived = false;
         existing.updatedAt = Date.now();
         this.writeEntryToDb(existing);
         this.syncToSharedState();
@@ -599,11 +692,15 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
         content,
         type,
         tags: tags ?? [],
+        origin: entryOrigin,
         createdBy: msg.routing.from,
         createdAt: Date.now(),
         updatedAt: Date.now(),
         accessCount: 0,
         lastAccessedAt: Date.now(),
+        usefulCount: 0,
+        lastUsefulAt: 0,
+        archived: false,
       };
 
       this.entries.set(entry.id, entry);
@@ -629,7 +726,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
         results = [];
         for (const r of ranked) {
           const entry = this.entries.get(r.id);
-          if (!entry) continue;
+          if (!entry || entry.archived) continue;
           if (type && entry.type !== type) continue;
           if (tags?.length && !tags.some(t => entry.tags.includes(t))) continue;
           results.push({
@@ -643,6 +740,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
         // No query: return recent entries filtered by type/tags
         results = [...this.entries.values()]
           .filter(e => {
+            if (e.archived) return false;
             if (type && e.type !== type) return false;
             if (tags?.length && !tags.some(t => e.tags.includes(t))) return false;
             return true;
@@ -694,7 +792,7 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       }
 
       const results = [...this.entries.values()]
-        .filter(e => test(e.title) || test(e.content) || e.tags.some(t => test(t)))
+        .filter(e => !e.archived && (test(e.title) || test(e.content) || e.tags.some(t => test(t))))
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .slice(0, max);
 
@@ -768,13 +866,64 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
     });
 
     this.on('list', async (msg: AbjectMessage) => {
-      const { type, limit } = msg.payload as { type?: KnowledgeType; limit?: number };
+      const { type, limit, includeArchived } = msg.payload as {
+        type?: KnowledgeType; limit?: number; includeArchived?: boolean;
+      };
       const max = Math.min(limit ?? 50, 200);
 
       return [...this.entries.values()]
-        .filter(e => !type || e.type === type)
+        .filter(e => (includeArchived || !e.archived) && (!type || e.type === type))
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .slice(0, max);
+    });
+
+    this.on('listTags', async (msg: AbjectMessage) => {
+      const { limit } = (msg.payload ?? {}) as { limit?: number };
+      const max = Math.min(limit ?? 50, 200);
+      const counts = new Map<string, number>();
+      for (const e of this.entries.values()) {
+        if (e.archived) continue;
+        for (const t of e.tags) {
+          counts.set(t, (counts.get(t) ?? 0) + 1);
+        }
+      }
+      return [...counts.entries()]
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .slice(0, max)
+        .map(([tag, count]) => ({ tag, count }));
+    });
+
+    this.on('markUseful', async (msg: AbjectMessage) => {
+      const { ids } = msg.payload as { ids: string[] };
+      precondition(Array.isArray(ids) && ids.length > 0, 'ids must be a non-empty array');
+      const now = Date.now();
+      let marked = 0;
+      for (const id of ids) {
+        const entry = this.entries.get(id);
+        if (!entry) continue;
+        entry.usefulCount++;
+        entry.lastUsefulAt = now;
+        this.writeEntryToDb(entry);
+        this.changed('entryUpdated', entry);
+        marked++;
+      }
+      if (marked > 0) this.syncToSharedState();
+      log.info(`markUseful: ${marked}/${ids.length} entries`);
+      return { marked };
+    });
+
+    this.on('archive', async (msg: AbjectMessage) => {
+      const { id, archived } = msg.payload as { id: string; archived?: boolean };
+      requireNonEmpty(id, 'id');
+      const entry = this.entries.get(id);
+      if (!entry) return { success: false, error: `No entry with id "${id}"` };
+      entry.archived = archived ?? true;
+      entry.updatedAt = Date.now();
+      this.writeEntryToDb(entry);
+      this.syncToSharedState();
+      this.changed('entryUpdated', entry);
+      log.info(`${entry.archived ? 'Archived' : 'Restored'}: "${entry.title}"`);
+      return { success: true };
     });
 
     // ── SharedState sync listener ──
@@ -792,8 +941,9 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
       for (const re of remote) {
         const local = this.entries.get(re.id);
         if (!local || re.updatedAt > local.updatedAt) {
-          this.entries.set(re.id, re);
-          this.writeEntryToDb(re);
+          const normalized = this.normalizeEntry(re);
+          this.entries.set(normalized.id, normalized);
+          this.writeEntryToDb(normalized);
           merged++;
         }
       }
@@ -823,67 +973,98 @@ Ephemeral problems (runtime errors, connection failures, debugging context) belo
   // ─── Distillation ──────────────────────────────────────────────
 
   private static readonly MAX_ENTRIES = 1000;
+  private static readonly MAX_ARCHIVED = 2000;
   private static readonly STALE_NEVER_ACCESSED_DAYS = 7;
   private static readonly STALE_INACTIVE_DAYS = 30;
+  private static readonly ARCHIVED_PURGE_DAYS = 180;
 
   /**
-   * Periodic cleanup: evict stale, low-value, and ephemeral entries.
-   * User facts (tagged 'user' or 'person') are always protected.
+   * An entry the automated cleanup must never touch: user-authored entries
+   * (origin 'user'), user facts (tagged 'user'/'person'), and entries a
+   * reviewer has confirmed useful.
+   */
+  private isProtected(entry: KnowledgeEntry): boolean {
+    if (entry.origin === 'user') return true;
+    if (entry.type === 'fact' && entry.tags.some(t => t === 'user' || t === 'person')) return true;
+    if (entry.usefulCount > 0) return true;
+    return false;
+  }
+
+  /** Archive (not delete): hidden from recall/match, restorable in the browser. */
+  private archiveEntry(entry: KnowledgeEntry, why: string): void {
+    log.info(`Distill: archiving "${entry.title}" (${why})`);
+    entry.archived = true;
+    entry.updatedAt = Date.now();
+    this.writeEntryToDb(entry);
+  }
+
+  /**
+   * Periodic cleanup: archive stale, low-value entries and cap the active
+   * store. Nothing is hard-deleted except archived entries that outlive the
+   * purge window, keeping the store bounded.
    */
   private distill(): void {
     const now = Date.now();
     const dayMs = 24 * 60 * 60 * 1000;
-    const evicted: string[] = [];
+    let archivedCount = 0;
 
-    for (const [id, entry] of this.entries) {
-      // Protect user facts
-      if (entry.type === 'fact' && entry.tags.some(t => t === 'user' || t === 'person')) continue;
+    for (const entry of this.entries.values()) {
+      if (entry.archived || this.isProtected(entry)) continue;
 
       const ageDays = (now - entry.createdAt) / dayMs;
       const lastAccessDays = entry.lastAccessedAt
         ? (now - entry.lastAccessedAt) / dayMs
         : ageDays;
 
-      // Evict 'learned' entries never accessed after 7 days
+      // Archive 'learned' entries never surfaced after 7 days
       if (entry.type === 'learned' && entry.accessCount === 0 && ageDays > KnowledgeBase.STALE_NEVER_ACCESSED_DAYS) {
-        evicted.push(id);
+        this.archiveEntry(entry, `never accessed in ${KnowledgeBase.STALE_NEVER_ACCESSED_DAYS}d`);
+        archivedCount++;
         continue;
       }
 
-      // Evict 'learned' or 'reference' entries inactive for 30 days
+      // Archive 'learned' or 'reference' entries inactive for 30 days
       if ((entry.type === 'learned' || entry.type === 'reference') && lastAccessDays > KnowledgeBase.STALE_INACTIVE_DAYS) {
-        evicted.push(id);
-        continue;
+        this.archiveEntry(entry, `inactive ${KnowledgeBase.STALE_INACTIVE_DAYS}d`);
+        archivedCount++;
       }
     }
 
-    // Evict collected entries
-    for (const id of evicted) {
-      const entry = this.entries.get(id);
-      if (entry) {
-        log.info(`Distill: evicting "${entry.title}" (type=${entry.type}, accessCount=${entry.accessCount})`);
-        this.entries.delete(id);
-        this.deleteEntryFromDb(id);
+    // Cap the ACTIVE store by archiving the least useful entries first
+    // (usefulCount, then accessCount). Protected entries are exempt.
+    const active = [...this.entries.values()].filter(e => !e.archived);
+    if (active.length > KnowledgeBase.MAX_ENTRIES) {
+      const candidates = active
+        .filter(e => !this.isProtected(e))
+        .sort((a, b) => (a.usefulCount - b.usefulCount) || (a.accessCount - b.accessCount));
+      let excess = active.length - KnowledgeBase.MAX_ENTRIES;
+      while (excess > 0 && candidates.length > 0) {
+        this.archiveEntry(candidates.shift()!, 'active-store cap');
+        archivedCount++;
+        excess--;
       }
     }
 
-    // Cap total entries by evicting lowest-accessCount non-user entries
-    if (this.entries.size > KnowledgeBase.MAX_ENTRIES) {
-      const sorted = [...this.entries.values()]
-        .filter(e => !(e.type === 'fact' && e.tags.some(t => t === 'user' || t === 'person')))
-        .sort((a, b) => a.accessCount - b.accessCount);
-
-      while (this.entries.size > KnowledgeBase.MAX_ENTRIES && sorted.length > 0) {
-        const entry = sorted.shift()!;
-        log.info(`Distill: cap evict "${entry.title}" (accessCount=${entry.accessCount})`);
+    // Bound the archive itself: hard-delete archived entries past the purge
+    // window, oldest first when over the archive cap.
+    const archived = [...this.entries.values()]
+      .filter(e => e.archived && e.origin !== 'user')
+      .sort((a, b) => a.updatedAt - b.updatedAt);
+    let purged = 0;
+    for (const entry of archived) {
+      const archivedDays = (now - entry.updatedAt) / dayMs;
+      const overCap = archived.length - purged > KnowledgeBase.MAX_ARCHIVED;
+      if (archivedDays > KnowledgeBase.ARCHIVED_PURGE_DAYS || overCap) {
+        log.info(`Distill: purging archived "${entry.title}"`);
         this.entries.delete(entry.id);
         this.deleteEntryFromDb(entry.id);
+        purged++;
       }
     }
 
-    if (evicted.length > 0) {
+    if (archivedCount > 0 || purged > 0) {
       this.syncToSharedState();
-      log.info(`Distill: evicted ${evicted.length} entries, ${this.entries.size} remaining`);
+      log.info(`Distill: archived ${archivedCount}, purged ${purged}, ${this.entries.size} entries total`);
     }
   }
 

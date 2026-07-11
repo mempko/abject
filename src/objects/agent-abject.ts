@@ -157,6 +157,22 @@ interface TaskEntry {
   incomingGoalId?: string;
   /** Cached skill instructions appended to system prompt. */
   skillPromptSuffix?: string;
+  /**
+   * KnowledgeBase entries injected into this task's system prompt at init.
+   * The post-task reviewer reads these to judge which entries actually
+   * helped (markUseful), closing the usefulness feedback loop.
+   */
+  injectedKnowledge?: Array<{ id: string; title: string }>;
+  /** Compact "tag (count), ..." line of the KB's tag vocabulary at init. */
+  knownTagsLine?: string;
+  /**
+   * Set when the state machine has actually exited. Cancellation flips
+   * state.phase to 'error' while the loop may still be parked in an await,
+   * so phase alone can't authorize releasing or reviewing the entry; a
+   * released-under-running-machine entry makes the zombie's next step throw
+   * and re-fire terminal signals for a deleted task.
+   */
+  finished?: boolean;
   /** TupleSpace tuple id of the goal task this entry is executing (when dispatched). Enables scratchpad contract injection for the current task. */
   dispatchTupleId?: string;
   /** Consecutive LLM responses that failed to parse into a valid action. Reset on every successful parse. */
@@ -206,6 +222,58 @@ function resolveConfig(partial?: AgentConfig): ResolvedAgentConfig {
   };
 }
 
+/**
+ * Injection-time hygiene for always-injected profile facts. A fact whose
+ * content reads like an instruction to the model (rather than a statement
+ * about the user) is a memory-poisoning vector: an agent that "remembered"
+ * text from a hostile web page would otherwise smuggle directives into every
+ * future system prompt. The stored entry is left untouched so the user can
+ * inspect and restore or delete it in the knowledge browser.
+ */
+const SUSPICIOUS_FACT_PATTERNS: RegExp[] = [
+  /ignore\s+(all\s+|any\s+)?(previous|prior|above|earlier)\s+(instructions|prompts|rules)/i,
+  /disregard\s+(your|the|all)\s+(instructions|system\s+prompt|rules|guidelines)/i,
+  /you\s+(must|should|will)\s+now\s+/i,
+  /new\s+(system\s+)?instructions?\s*:/i,
+  /\bsystem\s+prompt\b/i,
+  /do\s+not\s+(tell|inform|reveal|mention)\s+(the\s+)?user/i,
+  /\bexfiltrat/i,
+  /always\s+(respond|reply|answer)\s+with\b/i,
+];
+
+function sanitizeInjectedFact(content: string): string {
+  for (const pattern of SUSPICIOUS_FACT_PATTERNS) {
+    if (pattern.test(content)) {
+      return '[BLOCKED: this entry looks like an instruction rather than a fact about the user; inspect it in the knowledge browser]';
+    }
+  }
+  return content;
+}
+
+/**
+ * Flatten a task's LLM conversation into one reviewable string. Non-text
+ * content parts collapse to type markers; the middle is elided when the
+ * whole transcript exceeds the cap so head (task setup) and tail (outcome)
+ * both survive.
+ */
+const TRANSCRIPT_CHAR_CAP = 40000;
+
+function flattenTranscript(messages: { role: string; content: string | ContentPart[] }[]): string {
+  const lines = messages.map(m => {
+    const text = typeof m.content === 'string'
+      ? m.content
+      : m.content.map(p => (p.type === 'text' ? p.text : `[${p.type}]`)).join(' ');
+    return `[${m.role}] ${text}`;
+  });
+  let out = lines.join('\n\n');
+  if (out.length > TRANSCRIPT_CHAR_CAP) {
+    const head = out.slice(0, TRANSCRIPT_CHAR_CAP * 0.6);
+    const tail = out.slice(-TRANSCRIPT_CHAR_CAP * 0.35);
+    out = `${head}\n\n[... transcript middle elided ...]\n\n${tail}`;
+  }
+  return out;
+}
+
 /** Merge per-task overrides into resolved registration config. */
 function mergeConfig(base: ResolvedAgentConfig, override?: Partial<AgentConfig>): ResolvedAgentConfig {
   if (!override) return base;
@@ -236,6 +304,19 @@ export class AgentAbject extends Abject {
   /** Last time we forwarded a low-level progress signal as GoalManager.updateProgress per goal. */
   private lastGoalProgressTs = new Map<string, number>();
   private static readonly GOAL_PROGRESS_THROTTLE_MS = 1000;
+
+  /**
+   * Always-injected profile block: total char budget and per-entry slice.
+   * Bounded by budget (not count) so the block can't balloon, with worth-
+   * ranked selection so identity facts outlive over-tagged trivia.
+   */
+  private static readonly PROFILE_BLOCK_CHAR_BUDGET = 4000;
+  private static readonly PROFILE_ENTRY_CHAR_CAP = 400;
+
+  /** submit_job pipelines may legitimately run many bus calls; give them room. */
+  private static readonly SUBMIT_JOB_TIMEOUT_MS = 300000;
+  /** Cap on a job result entering the conversation; jobs should aggregate. */
+  private static readonly SUBMIT_JOB_RESULT_CAP = 20000;
 
   /** Active task entry during LLM streaming -- links llmChunk events to the right ticket. */
   private activeStreamEntry?: TaskEntry;
@@ -368,6 +449,29 @@ export class AgentAbject extends Abject {
                 step: { kind: 'primitive', primitive: 'number' },
                 goalId: { kind: 'primitive', primitive: 'string' },
               } } },
+            },
+            {
+              name: 'getTaskTranscript',
+              description: 'Fetch a finished task\'s full record for post-task review: the flattened LLM conversation, outcome, and which knowledge entries were injected at init. Only terminal (done/error) tasks have a stable transcript.',
+              parameters: [
+                { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Task ID' },
+              ],
+              returns: { kind: 'object', properties: {
+                taskId: { kind: 'primitive', primitive: 'string' },
+                agentName: { kind: 'primitive', primitive: 'string' },
+                task: { kind: 'primitive', primitive: 'string' },
+                phase: { kind: 'primitive', primitive: 'string' },
+                goalId: { kind: 'primitive', primitive: 'string' },
+                transcript: { kind: 'primitive', primitive: 'string' },
+              } },
+            },
+            {
+              name: 'releaseTask',
+              description: 'Drop a terminal task\'s entry (transcript and state) after review, freeing memory. No-op for in-flight tasks.',
+              parameters: [
+                { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Task ID' },
+              ],
+              returns: { kind: 'object', properties: { released: { kind: 'primitive', primitive: 'boolean' } } },
             },
             {
               name: 'getAgentState',
@@ -993,6 +1097,42 @@ The registered object must implement these handlers to participate in the agent 
         }));
     });
 
+    // ── Post-task review support ──
+    this.on('getTaskTranscript', async (msg: AbjectMessage) => {
+      const { taskId } = msg.payload as { taskId: string };
+      const entry = this.taskEntries.get(taskId);
+      // A terminal phase alone is not enough: a cancelled task's machine may
+      // still be running (phase flipped mid-await). Only finished entries
+      // have a stable transcript.
+      if (!entry || !entry.finished) return null;
+      return {
+        taskId: entry.state.id,
+        agentId: entry.agentId,
+        agentName: this.registeredAgents.get(entry.agentId)?.name ?? 'unknown',
+        task: entry.state.task,
+        phase: entry.state.phase,
+        steps: entry.state.step,
+        result: entry.state.result,
+        error: entry.state.error,
+        goalId: entry.goalId ?? entry.incomingGoalId ?? null,
+        injectedKnowledge: entry.injectedKnowledge ?? [],
+        transcript: flattenTranscript(entry.state.llmMessages),
+      };
+    });
+
+    this.on('releaseTask', async (msg: AbjectMessage) => {
+      const { taskId } = msg.payload as { taskId: string };
+      const entry = this.taskEntries.get(taskId);
+      if (!entry) return { released: false };
+      if (!entry.finished || (entry.state.phase !== 'done' && entry.state.phase !== 'error')) {
+        return { released: false };
+      }
+      this.taskEntries.delete(taskId);
+      const idx = this.taskOrder.indexOf(taskId);
+      if (idx >= 0) this.taskOrder.splice(idx, 1);
+      return { released: true };
+    });
+
     this.on('getAgentState', async (msg: AbjectMessage) => {
       const { agentId } = msg.payload as { agentId: AbjectId };
       const agent = this.registeredAgents.get(agentId);
@@ -1150,16 +1290,24 @@ The registered object must implement these handlers to participate in the agent 
 
     // ── JobManager failure notification ──
     // When a job we submitted fails, JobManager sends us a direct jobFailed
-    // event. Immediately reject any pending request to JobManager so the
-    // dispatch / step execution unblocks instead of waiting for its stall
-    // timer to expire.
+    // event carrying the submitJob request's message id. Reject exactly that
+    // pending request so the step unblocks immediately. Rejecting every
+    // pending JobManager request here (the old behavior) took down other
+    // agents' unrelated in-flight phase jobs: one agent's failed submit_job
+    // pipeline surfaced its error inside a different agent's task.
     this.on('jobFailed', async (msg: AbjectMessage) => {
-      const { jobId, error } = msg.payload as { jobId: string; error?: string };
-      const jobMgrId = msg.routing.from;
-      const rejected = this.rejectPendingRequestsTo(
-        jobMgrId,
-        new Error(error ?? `Job ${jobId} failed`),
-      );
+      const { jobId, error, requestMessageId } = msg.payload as {
+        jobId: string; error?: string; requestMessageId?: string;
+      };
+      const err = new Error(error ?? `Job ${jobId} failed`);
+      if (requestMessageId) {
+        if (this.rejectPendingRequest(requestMessageId, err)) {
+          log.info(`[${this.manifest.name}] jobFailed ${jobId} — rejected its pending request`);
+        }
+        return;
+      }
+      // Compatibility fallback for jobFailed events without a request id.
+      const rejected = this.rejectPendingRequestsTo(msg.routing.from, err);
       if (rejected > 0) {
         log.info(`[${this.manifest.name}] jobFailed ${jobId} — rejected ${rejected} pending request(s)`);
       }
@@ -1261,11 +1409,17 @@ The registered object must implement these handlers to participate in the agent 
       phase: newPhase,
     }));
 
-    // Update goal progress via GoalManager
+    // Update goal progress via GoalManager. Prefer the action's reasoning —
+    // the same rich text JobManager shows as the job description — over the
+    // bare verb, so the goal tree reads "Sanitize the control characters in
+    // the report field" instead of "shell...".
     if (entry.goalId && this.goalManagerId) {
       const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Agent';
+      const reasoning = typeof entry.state.action?.reasoning === 'string'
+        ? entry.state.action.reasoning.trim()
+        : '';
       const msg = newPhase === 'acting' && entry.state.action?.action
-        ? `${entry.state.action.action}...`
+        ? (reasoning ? reasoning.slice(0, 140) : `${entry.state.action.action}...`)
         : `${newPhase} (step ${entry.state.step + 1}/${entry.state.maxSteps})`;
       this.send(event(this.id, this.goalManagerId, 'updateProgress', {
         goalId: entry.goalId,
@@ -1422,13 +1576,23 @@ The registered object must implement these handlers to participate in the agent 
       lastAction: entry.state.action,
     }));
 
+    entry.finished = true;
     this.changed('taskCompleted', {
       taskId: entry.state.id,
       agentId: entry.agentId,
+      agentName: this.registeredAgents.get(entry.agentId)?.name ?? 'unknown',
+      goalId: entry.goalId ?? entry.incomingGoalId ?? null,
+      steps: entry.state.step,
       success,
       result: success ? entry.state.result : undefined,
       error: success ? undefined : entry.state.error,
     });
+
+    // Bound the task graveyard: keep only the most recent terminal entries so
+    // long-lived workspaces stop accumulating dead transcripts. The reviewer
+    // releases entries earlier via releaseTask; this is the backstop when no
+    // reviewer is running. In-flight entries are never pruned.
+    this.pruneTerminalEntries();
 
     // ── Queue runner ──
     // Clear inFlight for this agent and pop the next pending task, if any.
@@ -1578,7 +1742,7 @@ The registered object must implement these handlers to participate in the agent 
                 task.lastResult = undefined;
                 task.action = entry.pendingActions.shift();
                 log.info(`[${agentName}] Step ${task.step + 1} — draining batched action: ${task.action?.action} (${entry.pendingActions.length} left)`);
-                // Terminals, replan, remember, and ask_user were filtered out
+                // Terminals, replan, remember, recall, submit_job, and ask_user were filtered out
                 // at parse time, so only intermediate and plain actions reach
                 // this point.
                 if (task.action && this.isIntermediateAction(entry, task.action)) {
@@ -1644,6 +1808,11 @@ The registered object must implement these handlers to participate in the agent 
               reflection += '\nRe-evaluate and pick a different action that addresses what went wrong. If the task is genuinely outside your capability, emit a `fail` action with a clear reason.';
 
               task.llmMessages.push({ role: 'user', content: reflection });
+              // Consume the pending observation/result so the next think()
+              // doesn't re-append them (and the batch-drain guard doesn't
+              // read a stale failure).
+              task.observation = undefined;
+              task.lastResult = undefined;
               task.step++;
               if (task.step >= task.maxSteps) {
                 await this.handleMaxStepsReached(entry, agentName, setPhase);
@@ -1681,6 +1850,150 @@ The registered object must implement these handlers to participate in the agent 
                   content: `[Remember Error] ${err instanceof Error ? err.message : String(err)}`,
                 });
               }
+              // Consume the pending observation/result so the next think()
+              // doesn't re-append them.
+              task.observation = undefined;
+              task.lastResult = undefined;
+              task.step++;
+              if (task.step >= task.maxSteps) {
+                await this.handleMaxStepsReached(entry, agentName, setPhase);
+                break;
+              }
+              break; // re-enter thinking
+            }
+
+            // ── recall: read from KnowledgeBase, continue thinking. The
+            // write-side `remember` has been a runtime verb all along;
+            // without a matching read verb, agents with fixed vocabularies
+            // were told about the KB's lookup modes but had no action that
+            // could reach them.
+            if (task.action.action === 'recall') {
+              try {
+                const kbId = await this.discoverDep('KnowledgeBase');
+                if (kbId) {
+                  const id = task.action.id as string | undefined;
+                  const pattern = task.action.pattern as string | undefined;
+                  const query = task.action.query as string | undefined;
+                  const tags = task.action.tags as string[] | undefined;
+                  const limit = Math.min(typeof task.action.limit === 'number' ? task.action.limit : 5, 10);
+
+                  let rendered: string;
+                  if (id) {
+                    const e = await this.request<{ title?: string; type?: string; content?: string } | null>(
+                      request(this.id, kbId, 'get', { id }), 10000);
+                    rendered = e
+                      ? `**${e.title}** (${e.type}): ${(e.content ?? '').slice(0, 4000)}`
+                      : `No entry with id "${id}".`;
+                  } else if (pattern) {
+                    const hits = await this.request<Array<{ id: string; title: string; type: string; content: string }>>(
+                      request(this.id, kbId, 'match', { pattern, limit }), 10000);
+                    rendered = hits.length > 0
+                      ? hits.map(h => `- ${h.id} [${h.type}] ${h.title}: ${h.content.slice(0, 300)}`).join('\n')
+                      : `No entries match pattern "${pattern}".`;
+                  } else if (query || tags?.length) {
+                    const hits = await this.request<Array<{ id: string; title: string; type: string; snippet?: string }>>(
+                      request(this.id, kbId, 'recall', { query, tags, limit, previews: true }), 10000);
+                    rendered = hits.length > 0
+                      ? hits.map(h => `- ${h.id} [${h.type}] ${h.title}: ${h.snippet ?? ''}`).join('\n')
+                      : 'No matching entries. Try different terms, or a `pattern` for exact names.';
+                  } else {
+                    rendered = 'recall needs one of: query (keywords), pattern (exact/regex), id (full entry), or tags.';
+                  }
+                  task.llmMessages.push({ role: 'user', content: `[Recall] ${rendered}` });
+                } else {
+                  task.llmMessages.push({ role: 'user', content: '[Recall] KnowledgeBase not available.' });
+                }
+              } catch (err) {
+                task.llmMessages.push({
+                  role: 'user',
+                  content: `[Recall Error] ${err instanceof Error ? err.message : String(err)}`,
+                });
+              }
+              task.observation = undefined;
+              task.lastResult = undefined;
+              task.step++;
+              if (task.step >= task.maxSteps) {
+                await this.handleMaxStepsReached(entry, agentName, setPhase);
+                break;
+              }
+              break; // re-enter thinking
+            }
+
+            // ── submit_job: run a mechanical pipeline through JobManager,
+            // continue thinking with the result. A runtime-level verb (like
+            // `remember`): every agent has it without implementing anything,
+            // and it is pure message passing — one submitJob request whose
+            // sandboxed code interacts with the world only via call/dep/find
+            // bus messages. This is how a 30-call chain costs one think step.
+            if (task.action.action === 'submit_job') {
+              const code = task.action.code as string | undefined;
+              const description = (task.action.description as string) ?? 'agent pipeline';
+              if (!code || code.trim().length === 0) {
+                task.llmMessages.push({
+                  role: 'user',
+                  content: '[Job Error] submit_job requires a non-empty "code" field containing the JavaScript to run.',
+                });
+              } else {
+                try {
+                  const jmId = this.jobManagerId ?? await this.discoverDep('JobManager') ?? undefined;
+                  if (jmId) {
+                    // submit_job runs inside the thinking phase, so without
+                    // this the goal tree shows "thinking" for the whole
+                    // (possibly minutes-long) pipeline. Surface the job's
+                    // own description instead.
+                    if (entry.goalId && this.goalManagerId) {
+                      this.send(event(this.id, this.goalManagerId, 'updateProgress', {
+                        goalId: entry.goalId,
+                        message: description.slice(0, 140),
+                        phase: 'acting',
+                        agentName,
+                      }));
+                    }
+                    // submitJob replies with a JobResult envelope even for
+                    // failed jobs; unwrap it so the conversation carries the
+                    // job's actual return value, not the envelope.
+                    const jobReply = await this.request<{ status?: string; result?: unknown; error?: string }>(
+                      request(this.id, jmId, 'submitJob', {
+                        description,
+                        code,
+                        // Dedicated queue per agent: pipeline jobs never
+                        // interleave with the OTA loop's own phase jobs.
+                        queue: `pipeline-${entry.agentId.slice(0, 8)}`,
+                      }),
+                      AgentAbject.SUBMIT_JOB_TIMEOUT_MS,
+                    );
+                    if (jobReply?.status === 'failed') {
+                      log.info(`[${agentName}] submit_job "${description.slice(0, 60)}" failed: ${jobReply.error}`);
+                      task.llmMessages.push({ role: 'user', content: `[Job Error] ${jobReply.error ?? 'job failed'}` });
+                    } else {
+                      const value = jobReply?.result;
+                      let rendered = value === undefined || value === null
+                        ? '(no result — return a value from the job code)'
+                        : typeof value === 'string' ? value : JSON.stringify(value);
+                      if (rendered.length > AgentAbject.SUBMIT_JOB_RESULT_CAP) {
+                        rendered = rendered.slice(0, AgentAbject.SUBMIT_JOB_RESULT_CAP)
+                          + `\n[... job result truncated at ${AgentAbject.SUBMIT_JOB_RESULT_CAP} chars — aggregate inside the job next time ...]`;
+                      }
+                      log.info(`[${agentName}] submit_job "${description.slice(0, 60)}" completed (${rendered.length} chars)`);
+                      task.llmMessages.push({ role: 'user', content: `[Job Result] ${rendered}` });
+                    }
+                  } else {
+                    task.llmMessages.push({ role: 'user', content: '[Job Error] JobManager not available.' });
+                  }
+                } catch (err) {
+                  task.llmMessages.push({
+                    role: 'user',
+                    content: `[Job Error] ${err instanceof Error ? err.message : String(err)}`,
+                  });
+                }
+              }
+              // Consume the pending observation/result: submit_job chains
+              // re-enter thinking repeatedly, and without this each round
+              // re-appends the same observation and the previous action's
+              // stale result (and a stale failure would falsely trigger the
+              // batch-discard guard).
+              task.observation = undefined;
+              task.lastResult = undefined;
               task.step++;
               if (task.step >= task.maxSteps) {
                 await this.handleMaxStepsReached(entry, agentName, setPhase);
@@ -2332,22 +2645,56 @@ The registered object must implement these handlers to participate in the agent 
     try {
       const knowledgeBaseId = await this.discoverDep('KnowledgeBase');
       if (knowledgeBaseId) {
-        type KEntry = { title: string; type: string; content: string };
-        const [profile, matched] = await Promise.all([
+        type KEntry = { id: string; title: string; type: string; content: string; origin?: string; usefulCount?: number; updatedAt?: number };
+        const [profileAll, matched, tagList] = await Promise.all([
           this.request<KEntry[] | null>(
-            request(this.id, knowledgeBaseId, 'recall', { tags: [PROFILE_TAG], limit: 10 }),
+            request(this.id, knowledgeBaseId, 'recall', { tags: [PROFILE_TAG], limit: 50 }),
             5000,
           ).catch(() => null),
           this.request<KEntry[] | null>(
             request(this.id, knowledgeBaseId, 'recall', { query: entry.state.task, limit: 5 }),
             5000,
           ).catch(() => null),
+          this.request<Array<{ tag: string; count: number }> | null>(
+            request(this.id, knowledgeBaseId, 'listTags', { limit: 20 }),
+            5000,
+          ).catch(() => null),
         ]);
+        if (tagList && tagList.length > 0) {
+          entry.knownTagsLine = tagList.map(t => `${t.tag} (${t.count})`).join(', ');
+        }
 
-        if (profile && profile.length > 0) {
+        // The profile block is bounded by a char budget, not a raw count,
+        // and selection is by worth rather than recency: user-authored
+        // facts always make the cut, then reviewer-confirmed-useful ones,
+        // then the freshest. Otherwise agents that over-tag 'profile'
+        // (project trivia included) crowd the user's actual identity facts
+        // out of every future prompt.
+        const ranked = [...(profileAll ?? [])].sort((a, b) => {
+          const aUser = a.origin === 'user' ? 1 : 0;
+          const bUser = b.origin === 'user' ? 1 : 0;
+          if (aUser !== bUser) return bUser - aUser;
+          const useful = (b.usefulCount ?? 0) - (a.usefulCount ?? 0);
+          if (useful !== 0) return useful;
+          return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
+        });
+        const profile: KEntry[] = [];
+        let budget = AgentAbject.PROFILE_BLOCK_CHAR_BUDGET;
+        for (const e of ranked) {
+          const line = `- **${e.title}**: ${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PROFILE_ENTRY_CHAR_CAP))}\n`;
+          if (line.length > budget) break;
+          budget -= line.length;
+          profile.push(e);
+        }
+
+        if (profile.length > 0) {
           let block = '\n\n## About the User\nDurable facts about the user. Apply them without asking the user to repeat them.\n';
           for (const e of profile) {
-            block += `- **${e.title}**: ${e.content.slice(0, 2000)}\n`;
+            block += `- **${e.title}**: ${sanitizeInjectedFact(e.content.slice(0, AgentAbject.PROFILE_ENTRY_CHAR_CAP))}\n`;
+          }
+          const omitted = (profileAll?.length ?? 0) - profile.length;
+          if (omitted > 0) {
+            block += `(${omitted} more profile fact${omitted === 1 ? '' : 's'} exist — recall with tags: ["${PROFILE_TAG}"] when you need the full set.)\n`;
           }
           prompt += block;
         }
@@ -2357,10 +2704,16 @@ The registered object must implement these handlers to participate in the agent 
         if (relevant.length > 0) {
           let kb = '\n\n## Relevant Knowledge\nPrevious agents have learned the following. Use remember(title, content, type, tags) to save new insights.\n';
           for (const e of relevant) {
-            kb += `- **${e.title}** (${e.type}): ${e.content.slice(0, 2000)}\n`;
+            kb += `- **${e.title}** (${e.type}): ${sanitizeInjectedFact(e.content.slice(0, 2000))}\n`;
           }
           prompt += kb;
         }
+
+        // Record what was injected so the post-task reviewer can judge which
+        // entries actually helped (KnowledgeBase.markUseful).
+        entry.injectedKnowledge = [...(profile ?? []), ...relevant]
+          .filter(e => e.id)
+          .map(e => ({ id: e.id, title: e.title }));
       }
     } catch { /* best effort */ }
 
@@ -2387,10 +2740,39 @@ When to remember (durable knowledge for future unrelated tasks):
 - User preferences or personal facts they share (location, name, job, etc.) — tag these with "profile" so they are always available in future tasks, even ones whose wording does not mention them
 - Stable system architecture insights or validated patterns
 - Useful API details or capabilities that are unlikely to change
+
+The "profile" tag is reserved for WHO THE USER IS: name, location, role, preferences, accounts they use. Facts ABOUT their projects, writings, or interests are still worth remembering, with topical tags — keyword recall surfaces them when relevant. Every profile-tagged entry competes for a small always-injected block in every future prompt, so tagging trivia "profile" crowds out the user's actual identity.
 Ephemeral problems (runtime errors, connection failures, config issues, workarounds being tried) belong in the goal scratchpad, not the knowledge base. They are relevant to the current goal only.
 After remembering, you will be prompted to continue with the task.
 
-Looking things up mid-task: the KnowledgeBase offers three lookup modes. Use 'recall' with previews: true for keyword search (results carry an id, title, and snippet), 'match' with a pattern for exact identifiers and names, and 'get' with an id to fetch one full entry. Scan previews first, refine your query terms when results are thin, and fetch full entries only for the results you will actually use.`;
+**recall** action (look things up mid-task, available alongside your other actions):
+\`\`\`json
+{ "action": "recall", "query": "keywords to search" }
+\`\`\`
+Variants: \`{ "action": "recall", "pattern": "ExactName|other" }\` for exact identifiers, \`{ "action": "recall", "id": "<entry id>" }\` to fetch one full entry, \`{ "action": "recall", "tags": ["profile"] }\` to list by tag. Keyword results are compact previews (id, title, snippet); refine your terms when results are thin, then fetch the full entries you will actually use by id. Recall when a task resembles previous work, when you are unsure of user preferences or conventions, and before re-deriving anything the system may already know.`;
+
+    if (entry.knownTagsLine) {
+      prompt += `\nTags currently in use (with entry counts) — reuse these when remembering, and filter by them when recalling: ${entry.knownTagsLine}`;
+    }
+
+    // Guidance on the built-in submit_job verb. Safe to state for every
+    // agent because the verb is handled by the runtime itself (like
+    // `remember`), not by the agent's own action switch.
+    prompt += `\n\n## Mechanical pipelines (submit_job)
+
+**submit_job** action (built-in, available alongside your other actions):
+\`\`\`json
+{ "action": "submit_job", "description": "what it does", "code": "<javascript>" }
+\`\`\`
+The code runs in a sandboxed job. Inside it you have \`call(id, method, payload)\` to message any object, \`dep(name)\` (resolve an object by name, throws if missing), and \`find(name)\` (resolve or null). \`return\` a value and it comes back as this single action's result.
+
+Use it when your next chunk of work is a mechanical multi-step sequence with no judgment needed between steps: fetch N items, transform each, aggregate; poll-then-collect; bulk reads. One job costs one step, however many calls it makes, where doing the same through individual actions costs a step each. Example:
+\`\`\`json
+{ "action": "submit_job", "description": "summarize open goals", "code": "const gm = await dep('GoalManager'); const goals = await call(gm, 'listGoals', {}); return goals.filter(g => g.status === 'active').map(g => g.title);" }
+\`\`\`
+Keep the return value small — aggregate or summarize inside the job instead of returning raw bulk data (results are truncated past 20k chars). Use your regular actions when each step's outcome should change what you do next; use one job when it wouldn't. Your own domain actions (browsing, shell, drafting) stay as actions — the job sandbox has no browser, no shell, and no filesystem, only object messaging.
+
+Object names in job code must be EXACT registered object names as they appear in your context (goals, scratchpad, registry listings) — a skill, service, or server name is not an object name. When unsure a name exists, use \`find(name)\` and handle null instead of \`dep(name)\`, which fails the whole job. Anything you reach through a dedicated action of yours (like a tool-call action) has no object of that name on the bus; keep using your action for it.`;
 
     if (entry.goalId) {
       prompt += `
@@ -2791,7 +3173,7 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       const a = r.action;
       if (a.action.startsWith('_')) continue;
       const isTerminal = !!entry.config.terminalActions[a.action];
-      const isSteering = ['replan', 'remember', 'ask_user'].includes(a.action);
+      const isSteering = ['replan', 'remember', 'recall', 'ask_user', 'submit_job'].includes(a.action);
       if (isTerminal || isSteering) {
         droppedSpecials.push(a.action);
         continue;
@@ -2912,6 +3294,39 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
    * downstream calls. Throttled per-goal so streaming LLM chunks don't
    * flood the bus.
    */
+  /** Most recent terminal (done/error) task entries retained for review. */
+  private static readonly MAX_TERMINAL_ENTRIES = 200;
+
+  /**
+   * Drop the oldest terminal task entries beyond the retention cap.
+   * taskOrder is newest-first (createTask unshifts), so walk it from the
+   * tail. Non-terminal entries are always kept.
+   */
+  private pruneTerminalEntries(): void {
+    let terminal = 0;
+    for (const id of this.taskOrder) {
+      const e = this.taskEntries.get(id);
+      if (e?.finished) terminal++;
+    }
+    if (terminal <= AgentAbject.MAX_TERMINAL_ENTRIES) return;
+
+    for (let i = this.taskOrder.length - 1; i >= 0 && terminal > AgentAbject.MAX_TERMINAL_ENTRIES; i--) {
+      const id = this.taskOrder[i];
+      const e = this.taskEntries.get(id);
+      if (!e) {
+        this.taskOrder.splice(i, 1);
+        continue;
+      }
+      // Only entries whose state machine has exited are prunable; a
+      // cancelled-but-still-running machine still touches its entry.
+      if (e.finished) {
+        this.taskEntries.delete(id);
+        this.taskOrder.splice(i, 1);
+        terminal--;
+      }
+    }
+  }
+
   protected override onProgressBubble(_msg: AbjectMessage): void {
     if (!this.goalManagerId) return;
     const now = Date.now();
@@ -2920,8 +3335,8 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       // every late LLM chunk or background bubble would re-fire `phase=done` on
       // GoalManager forever, filling the log and blasting UNDELIVERABLE events
       // at every stale dependent (e.g. Chat instances from previous workspace
-      // sessions). taskEntries is currently never pruned, so the loop runs over
-      // an ever-growing graveyard.
+      // sessions). Terminal entries are bounded by pruneTerminalEntries and
+      // released early by the reviewer, so this loop stays small.
       if (entry.state.phase === 'done' || entry.state.phase === 'error') continue;
       const goalId = entry.goalId ?? entry.incomingGoalId;
       if (!goalId) continue;
@@ -2929,9 +3344,14 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       if (now - last < AgentAbject.GOAL_PROGRESS_THROTTLE_MS) continue;
       this.lastGoalProgressTs.set(goalId, now);
       try {
+        // Echo the current action's reasoning when there is one — a bare
+        // "working" carries no information across a minutes-long step.
+        const reasoning = typeof entry.state.action?.reasoning === 'string'
+          ? entry.state.action.reasoning.trim().slice(0, 140)
+          : '';
         this.send(event(this.id, this.goalManagerId, 'updateProgress', {
           goalId,
-          message: 'working',
+          message: reasoning || 'working',
           phase: entry.state.phase ?? 'acting',
           agentName: this.registeredAgents.get(entry.agentId)?.name ?? 'agent',
         }));

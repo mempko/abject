@@ -901,6 +901,22 @@ You are this object. Your capabilities are exactly what the manifest above descr
   }
 
   /**
+   * Reject exactly one pending request reply by its message id. Precise
+   * counterpart to rejectPendingRequestsTo for signals that identify the
+   * specific request that can no longer be answered (e.g. JobManager's
+   * jobFailed carrying the submitJob request's message id) — rejecting by
+   * target would take down unrelated in-flight requests to the same object.
+   */
+  protected rejectPendingRequest(messageId: string, error: Error): boolean {
+    const entry = this.pendingReplies.get(messageId);
+    if (!entry) return false;
+    clearTimeout(entry.timeout);
+    this.pendingReplies.delete(messageId);
+    entry.reject(error);
+    return true;
+  }
+
+  /**
    * Send a deferred reply to a request whose auto-reply was suppressed via DEFERRED_REPLY.
    */
   protected sendDeferredReply(originalMessage: AbjectMessage, result: unknown): void {

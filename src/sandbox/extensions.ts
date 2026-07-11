@@ -154,6 +154,17 @@ export interface IngestedExtension {
   version: string;
 }
 
+/** Numeric dotted-version compare: negative when a < b. */
+function compareVersions(a: string, b: string): number {
+  const pa = a.split('.').map(n => parseInt(n, 10) || 0);
+  const pb = b.split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
 /**
  * Ingest installed extensions: store module bytes content-addressed and
  * register each as a WASM type with the Factory. Call during bootstrap,
@@ -161,29 +172,42 @@ export interface IngestedExtension {
  */
 /**
  * Ingest the bundled native packages, then the user-installed extensions.
- * The Factory keeps the LAST registration per type name, so a user-installed
- * package overrides a bundled one of the same name; the returned list is
- * deduplicated the same way.
+ * A user-installed package overrides a bundled one of the same type name
+ * only when its version is the same or newer; a stale older copy left in
+ * the extensions dir is skipped with a warning instead of silently
+ * downgrading the type (a stale KnowledgeBaseCpp once shadowed the bundled
+ * module's whole new method surface this way).
  */
 export async function ingestAllExtensions(factory: Factory): Promise<IngestedExtension[]> {
   const ingested: IngestedExtension[] = [];
+  const registered = new Map<string, string>();  // typeName → version
   const builtinDir = findBuiltinNativeDir();
   if (builtinDir) {
-    ingested.push(...await ingestExtensions(factory, builtinDir));
+    ingested.push(...await ingestExtensions(factory, builtinDir, registered));
   }
-  ingested.push(...await ingestExtensions(factory, extensionsDir()));
+  ingested.push(...await ingestExtensions(factory, extensionsDir(), registered));
   return [...new Map(ingested.map((e) => [e.typeName, e])).values()];
 }
 
 export async function ingestExtensions(
   factory: Factory,
   dir: string = extensionsDir(),
+  registered?: Map<string, string>,
 ): Promise<IngestedExtension[]> {
   const packages = await scanExtensions(dir);
   const ingested: IngestedExtension[] = [];
 
   for (const pkg of packages) {
     try {
+      const claimedType = pkg.replaces ?? pkg.name;
+      const existing = registered?.get(claimedType);
+      if (existing && compareVersions(pkg.version, existing) < 0) {
+        log.warn(
+          `skipping '${pkg.name}' v${pkg.version} in ${dir}: type '${claimedType}' is already ` +
+          `registered at v${existing}. Remove the stale package to silence this warning.`,
+        );
+        continue;
+      }
       const bytes = new Uint8Array(await fs.readFile(pkg.wasmPath));
       const source = await storeWasmModule(bytes);
       const typeName = pkg.replaces ?? pkg.name;
@@ -194,6 +218,7 @@ export async function ingestExtensions(
         scope: pkg.scope,
       });
 
+      registered?.set(typeName, pkg.version);
       ingested.push({ typeName, scope: pkg.scope, replaces: pkg.replaces, version: pkg.version });
       log.info(
         `installed '${pkg.name}' v${pkg.version} as ${pkg.scope} type '${typeName}'` +

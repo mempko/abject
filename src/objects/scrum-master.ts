@@ -1051,7 +1051,7 @@ Rules:
       return { success: false, error: 'save_knowledge requires title and content' };
     }
     const result = await this.request<{ id?: string; title?: string }>(
-      request(this.id, kbId, 'remember', { title, content, type, tags }),
+      request(this.id, kbId, 'remember', { title, content, type, tags, origin: 'scrum' }),
       5000,
     );
     log.info(`save_knowledge: "${title.slice(0, 60)}" (id=${(result.id ?? '?').slice(0, 8)}, type=${type}, tags=[${tags.join(',')}])`);

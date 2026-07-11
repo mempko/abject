@@ -51,7 +51,8 @@ const wsLog = new Log('WORKSPACE-MANAGER');
 const INFRA_OBJECTS = [
   'AbjectStore', 'SharedState', 'TupleSpace', 'FileTransfer', 'MediaStream', 'Theme',
   'GoalManager', 'JobManager', 'AgentAbject', 'ScrumMaster', 'GoalObserver', 'WebAgent', 'SkillAgent', 'ObjectAgent',
-  'AgentCreator', 'Scheduler', 'KnowledgeBase', 'ChatManager',
+  // TaskReviewer discovers KnowledgeBase, so it spawns after it.
+  'AgentCreator', 'Scheduler', 'KnowledgeBase', 'TaskReviewer', 'ChatManager',
   'Console', 'CollectionStore', 'TriggerManager',
 ] as const;
 
