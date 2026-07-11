@@ -1126,40 +1126,54 @@ export class Compositor {
           const cached = this.imageCache.get(p.url);
           if (cached && cached.loaded) {
             blitImage(ctx, cached.img, p);
-          } else if (!cached) {
-            // Evict oldest entries if cache is full
-            if (this.imageCache.size >= Compositor.IMAGE_CACHE_MAX) {
-              const firstKey = this.imageCache.keys().next().value!;
-              this.imageCache.delete(firstKey);
-            }
-            const entry = { img: new Image(), loaded: false };
-            this.imageCache.set(p.url, entry);
-            const savedTransform = ctx.getTransform();
-            const drawToSurface = (image: HTMLImageElement) => {
-              entry.img = image;
-              entry.loaded = true;
-              const surf = this.surfaces.get(sid);
-              if (surf) {
-                surf.ctx.save();
-                surf.ctx.setTransform(savedTransform);
-                blitImage(surf.ctx, image, p);
-                surf.ctx.restore();
-                surf.dirty = true;
+          } else {
+            // Cache miss (including the not-yet-loaded case): show the previous
+            // frame for this surface while the new image decodes, so a surface
+            // that continually swaps images never flashes its background. Live
+            // screenshots are interned to abx:/blob: URLs and land here (not the
+            // data: fast path), so this fallback is what prevents the grey blink
+            // between viewer updates.
+            const live = this.liveDataImages.get(sid);
+            if (live) blitImage(ctx, live.img, p);
+
+            if (!cached) {
+              // Evict oldest entries if cache is full
+              if (this.imageCache.size >= Compositor.IMAGE_CACHE_MAX) {
+                const firstKey = this.imageCache.keys().next().value!;
+                this.imageCache.delete(firstKey);
               }
-              this.needsRender = true;
-            };
-            // Load with CORS so the decoded pixels can be uploaded to WebGL.
-            // We deliberately do NOT retry without crossOrigin on failure: a
-            // non-CORS image taints the surface canvas, and a tainted canvas
-            // makes texImage2D throw, which would break the whole desktop.
-            // Cross-origin images that need to display must be fetched
-            // server-side (HttpClient.getBase64) and drawn as data: URIs.
-            entry.img.crossOrigin = 'anonymous';
-            entry.img.onload = () => drawToSurface(entry.img);
-            entry.img.onerror = () => this.imageCache.delete(p.url);
-            entry.img.src = p.url;
+              const entry = { img: new Image(), loaded: false };
+              this.imageCache.set(p.url, entry);
+              const savedTransform = ctx.getTransform();
+              const drawToSurface = (image: HTMLImageElement) => {
+                entry.img = image;
+                entry.loaded = true;
+                // Remember this as the surface's live frame so the next swap can
+                // fall back to it instead of the background.
+                this.liveDataImages.set(sid, { img: image, width: image.naturalWidth, height: image.naturalHeight });
+                const surf = this.surfaces.get(sid);
+                if (surf) {
+                  surf.ctx.save();
+                  surf.ctx.setTransform(savedTransform);
+                  blitImage(surf.ctx, image, p);
+                  surf.ctx.restore();
+                  surf.dirty = true;
+                }
+                this.needsRender = true;
+              };
+              // Load with CORS so the decoded pixels can be uploaded to WebGL.
+              // We deliberately do NOT retry without crossOrigin on failure: a
+              // non-CORS image taints the surface canvas, and a tainted canvas
+              // makes texImage2D throw, which would break the whole desktop.
+              // Cross-origin images that need to display must be fetched
+              // server-side (HttpClient.getBase64) and drawn as data: URIs.
+              entry.img.crossOrigin = 'anonymous';
+              entry.img.onload = () => drawToSurface(entry.img);
+              entry.img.onerror = () => this.imageCache.delete(p.url);
+              entry.img.src = p.url;
+            }
+            // If cached but not yet loaded, the live frame above bridges the gap.
           }
-          // If cached but not yet loaded, skip — will render on next frame when load completes
         }
         break;
       }
