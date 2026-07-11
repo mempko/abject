@@ -1901,17 +1901,25 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   }
 
   private formatCallErrors(errors: CallValidationError[]): string {
-    const lines = ['validate_calls flagged the following — fix using ONLY methods listed in the dependency manifests:'];
+    // One dependency used at many call sites produces many identical flags;
+    // collapse them so the LLM sees "(N call sites)" instead of N copies.
+    const counts = new Map<string, number>();
     for (const e of errors) {
+      let line: string;
       if (e.kind === 'unknown-method') {
-        lines.push(`- ${e.depName}.${e.methodName} is not a method. Available: ${(e.availableMethods ?? []).join(', ')}`);
+        line = `- ${e.depName}.${e.methodName} is not a method. Available: ${(e.availableMethods ?? []).join(', ')}`;
       } else if (e.kind === 'name-string-recipient') {
-        lines.push(`- this.call("${e.depName}", "${e.methodName}", …) addresses a recipient by name. Message recipients are AbjectIds; the bus does not resolve names on the send path, so this call is delivered nowhere and times out. Resolve the id first: const id = await this.dep("${e.depName}"); await this.call(id, "${e.methodName}", …) — or inline await this.call(this.dep("${e.depName}"), "${e.methodName}", …). (Ids returned at runtime — window/canvas/layout ids from create* — are already resolved and fine to pass directly.)`);
+        line = `- this.call("${e.depName}", "${e.methodName}", …) addresses a recipient by name. Message recipients are AbjectIds; the bus does not resolve names on the send path, so this call is delivered nowhere and times out. Resolve the id first: const id = await this.dep("${e.depName}"); await this.call(id, "${e.methodName}", …) — or inline await this.call(this.dep("${e.depName}"), "${e.methodName}", …). (Ids returned at runtime — window/canvas/layout ids from create* — are already resolved and fine to pass directly.)`;
       } else if (e.kind === 'hardcoded-id') {
-        lines.push(`- Hardcoded AbjectId literal "${e.depName}" at line ${e.callSite.line}. AbjectIds are ephemeral — they change on every restart, so a baked-in id is stale and unroutable next boot (a frequent cause of "works now, broken after restart"). Resolve the object at runtime instead: const id = await this.dep("<Name>") (system/dependency objects), or this.find("<Name>"), or call("Registry", "discover", { name: "<Name>" }). Never store a literal AbjectId in source or this.data.`);
+        line = `- Hardcoded AbjectId literal "${e.depName}" at line ${e.callSite.line}. AbjectIds are ephemeral — they change on every restart, so a baked-in id is stale and unroutable next boot (a frequent cause of "works now, broken after restart"). Resolve the object at runtime instead: const id = await this.dep("<Name>") (system/dependency objects), or this.find("<Name>"), or call("Registry", "discover", { name: "<Name>" }). Never store a literal AbjectId in source or this.data.`;
       } else {
-        lines.push(`- Dependency "${e.depName}" was not discovered yet. Call describe / ask on it before calling its methods.`);
+        line = `- Dependency "${e.depName}" was not discovered yet. Call describe / ask on it before calling its methods.`;
       }
+      counts.set(line, (counts.get(line) ?? 0) + 1);
+    }
+    const lines = ['validate_calls flagged the following — fix using ONLY methods listed in the dependency manifests:'];
+    for (const [line, n] of counts) {
+      lines.push(n > 1 ? `${line} (${n} call sites)` : line);
     }
     return lines.join('\n');
   }
@@ -2786,7 +2794,9 @@ So when a goal needs a capability the browser would normally supply (playing sou
 
 # Response format
 
-Emit EXACTLY ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothing else in the response.
+Emit ONE JSON action per turn, wrapped in a \`\`\`json code block. Nothing else in the response.
+
+When several actions are fully independent of each other — e.g. several discovery \`ask\`/\`describe\` calls to different objects — you may emit them as multiple \`\`\`json blocks in one response. They execute strictly in order without you seeing intermediate results, a failure cancels the ones after it, and at most 5 are honored. Batch only actions whose payloads are already fully known; anything that depends on an earlier action's result belongs in a later turn. Emit \`done\`, \`fail\`, \`replan\`, \`remember\`, and \`ask_user\` alone, as the only action in the response.
 
 # Actions
 

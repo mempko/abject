@@ -668,9 +668,11 @@ Stay within skill execution: run shell commands, call MCP tools, make HTTP reque
 
 ## Output Format
 
-You MUST respond with EXACTLY ONE JSON object inside \`\`\`json fenced code markers.
+Respond with ONE JSON action object inside \`\`\`json fenced code markers.
 Do NOT use XML, function_calls tags, tool_call tags, or any other format.
 Output ONLY the JSON block — no prose around it. Any one-sentence note belongs in the action's \`reasoning\` field; the parser only reads the JSON.
+
+When several actions are fully independent of each other (e.g. reading three unrelated files), you may emit them as multiple \`\`\`json blocks in one response. They execute strictly in order without you seeing intermediate results, a failure cancels the ones after it, and at most 5 are honored. Batch only actions whose inputs are already fully known. Emit \`done\` and \`fail\` alone, as the only action in the response.
 
 Example response:
 

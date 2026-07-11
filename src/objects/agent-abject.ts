@@ -165,6 +165,8 @@ interface TaskEntry {
   emptyResponses?: number;
   /** Consecutive truncated terminal responses (cut off mid-generation). Reset on every complete response. */
   truncationRetries?: number;
+  /** Actions 2..N from a multi-action LLM response, drained in order by the thinking phase without an LLM round-trip between them. Replaced on every parse; discarded on failure or max-steps. */
+  pendingActions?: AgentAction[];
 }
 
 // ─── AgentAbject ─────────────────────────────────────────────────────
@@ -1556,6 +1558,44 @@ The registered object must implement these handlers to participate in the agent 
           }
 
           case 'thinking': {
+            // ── Batch drain ──
+            // A multi-action LLM response queued actions 2..N; execute them
+            // in order without an LLM round-trip between them. A mid-batch
+            // failure discards the rest so the model reassesses with the
+            // real results in front of it.
+            if (entry.pendingActions?.length) {
+              if (task.lastResult && !task.lastResult.success) {
+                task.llmMessages.push({
+                  role: 'user',
+                  content: `[Batch] Discarded ${entry.pendingActions.length} remaining batched action(s) because the action before them failed (see the failure result below). Reassess before re-emitting them.`,
+                });
+                entry.pendingActions = undefined;
+                // fall through to the normal LLM think
+              } else {
+                // Record the finished action's result now — the next drained
+                // action overwrites lastResult before any think() runs.
+                this.addActionResultToConversation(entry);
+                task.lastResult = undefined;
+                task.action = entry.pendingActions.shift();
+                log.info(`[${agentName}] Step ${task.step + 1} — draining batched action: ${task.action?.action} (${entry.pendingActions.length} left)`);
+                // Terminals, replan, remember, and ask_user were filtered out
+                // at parse time, so only intermediate and plain actions reach
+                // this point.
+                if (task.action && this.isIntermediateAction(entry, task.action)) {
+                  this.emitIntermediateAction(entry);
+                  task.step++;
+                  if (task.step >= task.maxSteps) {
+                    await this.handleMaxStepsReached(entry, agentName, setPhase);
+                    break;
+                  }
+                  setPhase('observing');
+                  break;
+                }
+                setPhase('acting');
+                break;
+              }
+            }
+
             log.info(`[${agentName}] Step ${task.step + 1} — thinking (awaiting LLM)`);
             const thinkResult = await this.executeStep(
               entry,
@@ -1814,6 +1854,10 @@ The registered object must implement these handlers to participate in the agent 
     const task = entry.state;
     log.info(`[${agentName}] Max steps (${task.maxSteps}) reached — attempting forced final LLM call`);
 
+    // The budget is spent — any still-queued batched actions must not drain,
+    // and the forced-final parse below must not enqueue new ones.
+    entry.pendingActions = undefined;
+
     // Try one final LLM call to synthesize accumulated data
     try {
       task.llmMessages.push({
@@ -1846,6 +1890,7 @@ The registered object must implement these handlers to participate in the agent 
       task.llmMessages.push({ role: 'assistant', content: llmResult.content });
 
       const parsed = this.parseAction(entry, llmResult.content);
+      entry.pendingActions = undefined; // only a terminal matters here
       log.info(`[${agentName}] Forced final LLM response: ${parsed.action}`);
 
       const terminal = this.isTerminalAction(entry, parsed);
@@ -2629,14 +2674,22 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       if (r && !parsed) { parsed = r.action; repaired = r.repaired; }
     };
 
+    // Every parse replaces the batch queue — a stale queue from a previous
+    // turn must never drain against a newer LLM decision.
+    entry.pendingActions = undefined;
+
     // 1. String-aware balanced-brace extraction — the robust primary path.
     //    Handles action JSON whose string values contain ``` code fences or
     //    `{`/`}` characters, which the lazy ```json fence regex below would
     //    mis-cut at the first inner fence (turning a complete reply into a
     //    truncated one). Skipped strings/escapes mean inner fences and braces
     //    don't confuse the scan.
-    const balanced = this.extractBalancedJson(content);
+    //    The LLM may batch several independent actions in one response; the
+    //    first is returned as usual and the rest queue for the drain path.
+    const balancedObjects = this.extractAllBalancedJson(content);
+    const balanced = balancedObjects[0] ?? null;
     if (balanced) take(this.tryParseActionJson(balanced));
+    const primaryFromBalancedScan = parsed !== null;
 
     // 2. Fenced ```json block (lazy — fine once balanced extraction has had
     //    first refusal, used mainly when there is no balanced object to find).
@@ -2674,6 +2727,13 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
       const reparse = this.validateActionContent(entry, parsed);
       if (reparse) return reparse;
       entry.parseFailures = 0;
+
+      // Queue any additional batched actions for the drain path. Only a
+      // clean, complete first parse qualifies — a truncated or repaired
+      // response means the tail is untrustworthy.
+      if (!streamTruncated && !repaired && primaryFromBalancedScan && balancedObjects.length > 1) {
+        this.queueBatchedActions(entry, parsed, balancedObjects.slice(1));
+      }
       return parsed;
     }
 
@@ -2708,6 +2768,63 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
     return { action: '_reparse_abort', reasoning: reason };
   }
 
+  /** Maximum actions honored from a single LLM response (the first + queued extras). */
+  private static readonly MAX_BATCH_ACTIONS = 5;
+
+  /**
+   * Queue actions 2..N of a multi-action LLM response for the thinking-phase
+   * drain. Terminals and conversation-steering verbs (replan / remember /
+   * ask_user) are excluded — they only make sense once the model has seen the
+   * batch results — as are duplicates, unparseable extras, and anything past
+   * MAX_BATCH_ACTIONS. Meaningful exclusions are surfaced to the model as
+   * [Batch] notes so a dropped `done` is never a silent no-op.
+   */
+  private queueBatchedActions(entry: TaskEntry, first: AgentAction, extraRaw: string[]): void {
+    const queue: AgentAction[] = [];
+    const seen = new Set<string>([JSON.stringify(first)]);
+    const droppedSpecials: string[] = [];
+    let overflow = 0;
+
+    for (const raw of extraRaw) {
+      const r = this.tryParseActionJson(raw);
+      if (!r || r.repaired) continue; // extras get no repair attempts
+      const a = r.action;
+      if (a.action.startsWith('_')) continue;
+      const isTerminal = !!entry.config.terminalActions[a.action];
+      const isSteering = ['replan', 'remember', 'ask_user'].includes(a.action);
+      if (isTerminal || isSteering) {
+        droppedSpecials.push(a.action);
+        continue;
+      }
+      const key = JSON.stringify(a);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (1 + queue.length >= AgentAbject.MAX_BATCH_ACTIONS) {
+        overflow++;
+        continue;
+      }
+      queue.push(a);
+    }
+
+    if (droppedSpecials.length > 0) {
+      entry.state.llmMessages.push({
+        role: 'user',
+        content: `[Batch] Your response included "${droppedSpecials.join('", "')}" after other actions. It was not executed — you emitted it before seeing the results of the actions ahead of it. Review those results first, then emit it alone.`,
+      });
+    }
+    if (overflow > 0) {
+      entry.state.llmMessages.push({
+        role: 'user',
+        content: `[Batch] ${overflow} action(s) beyond the limit of ${AgentAbject.MAX_BATCH_ACTIONS} per response were discarded — re-emit them next turn if still needed.`,
+      });
+    }
+    if (queue.length > 0) {
+      entry.pendingActions = queue;
+      const agentName = this.registeredAgents.get(entry.agentId)?.name ?? 'Unknown';
+      log.info(`[${agentName}] Multi-action response: executing "${first.action}" now, ${queue.length} more queued (${queue.map(a => a.action).join(', ')})`);
+    }
+  }
+
   /**
    * Extract the first complete, brace-balanced JSON object from `content`,
    * scanning string literals so that `{`, `}`, and ``` code fences appearing
@@ -2717,27 +2834,44 @@ This task belongs to a goal whose id is \`${entry.goalId}\` — you never need t
    * which the caller's later fallbacks handle).
    */
   private extractBalancedJson(content: string): string | null {
-    const start = content.indexOf('{');
-    if (start === -1) return null;
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    for (let i = start; i < content.length; i++) {
-      const ch = content[i];
-      if (escaped) { escaped = false; continue; }
-      if (inString) {
-        if (ch === '\\') escaped = true;
-        else if (ch === '"') inString = false;
-        continue;
+    return this.extractAllBalancedJson(content, 1)[0] ?? null;
+  }
+
+  /**
+   * Extract every complete, brace-balanced top-level JSON object from
+   * `content`, in order, using the same string/escape-aware scan as
+   * extractBalancedJson. A trailing object whose braces never balance
+   * (truncated mid-stream) is omitted. `limit` bounds how many objects are
+   * collected.
+   */
+  private extractAllBalancedJson(content: string, limit = Infinity): string[] {
+    const objects: string[] = [];
+    let start = content.indexOf('{');
+    while (start !== -1 && objects.length < limit) {
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      let end = -1;
+      for (let i = start; i < content.length; i++) {
+        const ch = content[i];
+        if (escaped) { escaped = false; continue; }
+        if (inString) {
+          if (ch === '\\') escaped = true;
+          else if (ch === '"') inString = false;
+          continue;
+        }
+        if (ch === '"') inString = true;
+        else if (ch === '{') depth++;
+        else if (ch === '}') {
+          depth--;
+          if (depth === 0) { end = i; break; }
+        }
       }
-      if (ch === '"') inString = true;
-      else if (ch === '{') depth++;
-      else if (ch === '}') {
-        depth--;
-        if (depth === 0) return content.slice(start, i + 1);
-      }
+      if (end === -1) break;
+      objects.push(content.slice(start, end + 1));
+      start = content.indexOf('{', end + 1);
     }
-    return null;
+    return objects;
   }
 
   private tryParseActionJson(raw: string): { action: AgentAction; repaired: boolean } | null {
