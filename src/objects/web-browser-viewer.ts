@@ -1100,23 +1100,33 @@ export class WebBrowserViewer extends Abject {
         return;
       }
 
-      // Scale to fit while preserving aspect ratio
+      // Available draw area. In control mode reserve a small frame around the
+      // image for the takeover border, so the border (a) stays fully on-canvas
+      // instead of being clipped at the edges, and (b) sits OUTSIDE the image
+      // rect the compositor re-blits asynchronously — otherwise that blit
+      // repaints over the border every frame and it flickers.
+      const FRAME = this.controlMode ? 4 : 0;
+      const availW = cw - FRAME * 2;
+      const availH = ch - FRAME * 2;
+      if (availW <= 0 || availH <= 0) return;
+
+      // Scale to fit within the available area, preserving aspect ratio
       const imgAspect = shot.width / shot.height;
-      const canvasAspect = cw / ch;
+      const availAspect = availW / availH;
       let drawW: number, drawH: number, drawX: number, drawY: number;
 
-      if (imgAspect > canvasAspect) {
-        // Image wider than canvas — fit to width
-        drawW = cw;
-        drawH = cw / imgAspect;
-        drawX = 0;
-        drawY = Math.floor((ch - drawH) / 2);
+      if (imgAspect > availAspect) {
+        // Image wider — fit to width
+        drawW = availW;
+        drawH = availW / imgAspect;
+        drawX = FRAME;
+        drawY = FRAME + Math.floor((availH - drawH) / 2);
       } else {
-        // Image taller than canvas — fit to height
-        drawH = ch;
-        drawW = ch * imgAspect;
-        drawX = Math.floor((cw - drawW) / 2);
-        drawY = 0;
+        // Image taller — fit to height
+        drawH = availH;
+        drawW = availH * imgAspect;
+        drawX = FRAME + Math.floor((availW - drawW) / 2);
+        drawY = FRAME;
       }
 
       const dw = Math.floor(drawW), dh = Math.floor(drawH);
@@ -1142,9 +1152,14 @@ export class WebBrowserViewer extends Abject {
         params: { x: drawX, y: drawY, width: dw, height: dh, url: shot.dataUri },
       });
       if (this.controlMode) {
+        // Border stroke centered in the reserved frame, just outside the image:
+        // fully on-canvas, and clear of the image rect the compositor re-blits.
         commands.push({
           type: 'rect',
-          params: { x: drawX, y: drawY, width: dw, height: dh, stroke: '#e8b45a', lineWidth: 2 },
+          params: {
+            x: drawX - 2, y: drawY - 2, width: dw + 4, height: dh + 4,
+            stroke: '#e8b45a', lineWidth: 2,
+          },
         });
       }
 
