@@ -202,8 +202,14 @@ export class ScrollableVBoxLayout extends VBoxLayout {
       normalChildren.map(async (child) => {
         const childOy = oy + child.rect.y - this.scrollTop;
         const childBottom = childOy + child.rect.height;
-        // Skip fully off-screen children
-        if (childBottom < clipTop || childOy > clipBottom) return null;
+        // Skip fully off-screen children — but ALWAYS render a zero-height
+        // child. Self-sizing widgets (e.g. the goal-progress tree) start at
+        // height 0 and only learn their real height by drawing once and
+        // reporting it back via `contentHeight`. If such a child sits at the
+        // scroll bottom (childOy ≈ clipBottom, childBottom == childOy), the
+        // off-screen test would cull it, so it never draws, never measures, and
+        // stays collapsed forever. Rendering a 0-height child costs ~nothing.
+        if (child.rect.height > 0 && (childBottom < clipTop || childOy > clipBottom)) return null;
         try {
           return await this.request<unknown[]>(
             request(this.id, child.widgetId, 'render', {
