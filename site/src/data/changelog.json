@@ -5,11 +5,11 @@
     "title": "New blood: WASM, a binary wire, and a learning loop",
     "summary": "The 0.8 line let Abjects be written in any language, made every remote byte binary, and started teaching the agents to learn from their own work. It also brought the biggest Settings and authoring-loop overhaul yet.",
     "highlights": [
-      "WASM Abject hosting: ABI v1, a C++ SDK, pnpm forge packaging, and a native C++ KnowledgeBase shipping as a bundled system package — objects in any language that compiles to WebAssembly",
+      "WASM Abject hosting: ABI v1, a C++ SDK, pnpm forge packaging, and a native C++ KnowledgeBase shipping as a bundled system package; Abjects can now be written in any language that compiles to WebAssembly",
       "Binary wire protocol for all remote traffic, with interning, frame acknowledgment flow control, and content-addressed image blobs",
       "Connective tissue for the object system: triggers, SQL-backed collections, full-text knowledge search, streams, audio, speech, and video, and prototype cloning",
       "A learning loop: TaskReviewer grades finished work, knowledge entries carry provenance and usefulness, and every agent can recall and remember",
-      "Vision awareness end to end: per-model vision capability tracking, a configurable vision-fallback model, and screenshots that verifiers can actually judge — including real 3D scene content",
+      "Vision awareness end to end: per-model vision capability tracking, a configurable vision-fallback model, and screenshots that verifiers can actually judge, including real 3D scene content",
       "Web Viewer human takeover: pass captchas and log in yourself, then hand the page back to the agent",
       "Meta Model API provider (Muse Spark 1.1), an explicit Code tier for code generation, and savable tier presets with built-ins derived from every provider's defaults",
       "Authoring loops that finish: progress-aware step-budget extensions, draft persistence across task retries, and advisory (non-blocking) semantic review",
@@ -53,7 +53,7 @@
     "title": "The desktop grows a third dimension",
     "summary": "The compositor was rebuilt on WebGL2: every window is now a slab in a native 3D scene, and objects can attach real lit geometry to their windows. The same release brought workspace files, a mobile gesture UI, and a unified sidebar.",
     "highlights": [
-      "Native 3D desktop: a WebGL2 compositor with a retained scene vocabulary — meshes, PBR materials, lights, fog, per-vertex colors, textures, instancing, bloom, and shadow maps",
+      "Native 3D desktop: a WebGL2 compositor with a retained scene vocabulary of meshes, PBR materials, lights, fog, per-vertex colors, textures, instancing, bloom, and shadow maps",
       "Arbitrary, dynamically-updatable polygonal meshes for deformable surfaces like water and terrain",
       "Workspace files: disk-backed FileSystem, an upload pipeline, and a File Manager",
       "Mobile: a WebOS-style gesture UI with a card overview",
@@ -72,7 +72,7 @@
     "version": "0.5.0",
     "date": "2026-05-31",
     "title": "A face, a phone, and a scrum team",
-    "summary": "Abject got its visual identity — themes, icons, motion, a command palette — and its agents got a proper team structure: a dedicated ScrumMaster plans work across specialists instead of every agent splitting tasks itself. Your phone joined too.",
+    "summary": "Abject got its visual identity (themes, icons, motion, a command palette) and its agents got a proper team structure: a dedicated ScrumMaster plans work across specialists instead of every agent splitting tasks itself. Your phone joined too.",
     "highlights": [
       "Eight built-in themes with an Appearance tab and user-registered themes; Arcane Grimoire became the default look",
       "Design tokens, vector icons, motion, a command palette, notifications, and full text-editing parity across widgets",
@@ -99,7 +99,7 @@
       "OpenRouter, DeepSeek, Grok, Gemini, Kimi, and MiniMax joined Anthropic, OpenAI, and Ollama as providers",
       "ClawHub and MCP registry catalogs for discovering skills, with a secrets vault and OAuth flows for the ones that need accounts",
       "ObjectCreator rewritten on AgentAbject, editing existing objects with SEARCH/REPLACE diffs instead of full rewrites",
-      "A scrollable workspace with pan gestures and scrollbars — the desktop stopped ending at the screen edge",
+      "A scrollable workspace with pan gestures and scrollbars; the desktop stopped ending at the screen edge",
       "Multiple chat conversations per workspace, and a per-object Console for debugging",
       "The background renders on a budget: cached glow sprites, throttled idle framerates, pausing when hidden"
     ],
@@ -118,13 +118,13 @@
       "MCP bridge: connect external MCP servers over stdio JSON-RPC, with tool-input validation and parameter schemas surfaced to agents",
       "Organisms: compose cooperating objects into one creature with a single public surface",
       "ScriptableAbject handlers run sandboxed, with scope guidance in every ask answer",
-      "Progress-based timeouts — long work stays alive as long as it reports progress — and failure history passed to retries so agents learn from mistakes",
+      "Progress-based timeouts (long work stays alive as long as it reports progress) and failure history passed to retries so agents learn from mistakes",
       "Structured YES / PARTIAL / NO dispatch verdicts, sequential-by-default task execution, and a preference for configured tools over generic automation",
       "Prompt caching for Anthropic and OpenAI; Opus 4.7 as the smart tier",
       "Chat grew bubbles, a live goal tree, and a streaming indicator"
     ],
     "fixes": [
-      "P2P shared state scoped to public workspaces only — private stays private",
+      "P2P shared state scoped to public workspaces only; private stays private",
       "Data-flow truncations between agents, and duplicate schedules on add and load",
       "Mailbox drops surfaced loudly; signaling peer binding and WASM target validation hardened"
     ]
@@ -135,7 +135,7 @@
     "title": "Agents that know their limits",
     "summary": "The agent system grew up: work routes through a shared TupleSpace, agents answer for themselves whether they can do a task, and a permissions system puts the user in charge of what they touch.",
     "highlights": [
-      "Per-tier LLM routing — smart, balanced, and fast tiers each pick their own provider and model",
+      "Per-tier LLM routing: smart, balanced, and fast tiers each pick their own provider and model",
       "ObjectAgent and TupleSpace routing: all agent work flows through one dispatchable space",
       "Ask-based self-selection: the dispatcher polls agents about a task and routes to whoever credibly says yes",
       "A permissions system: a Settings tab, runtime prompts for unlisted paths and commands, and per-skill trust",
@@ -153,7 +153,7 @@
     "version": "0.1.0",
     "date": "2026-03-31",
     "title": "First light",
-    "summary": "The founding release: a desktop where everything — the registry, the factory, the windows, the chat — is an object with a mailbox, and new objects are spoken into existence.",
+    "summary": "The founding release: a desktop where everything (the registry, the factory, the windows, the chat) is an object with a mailbox, and new objects are spoken into existence.",
     "highlights": [
       "The Abject runtime: message passing, mailboxes, a Registry, a Factory, and Design by Contract everywhere",
       "Speak objects into existence: a three-phase LLM pipeline drafts a manifest, writes the code, and deploys a live object",
@@ -165,7 +165,7 @@
       "abject.world itself went live"
     ],
     "fixes": [
-      "Deadlocks, re-entrant message handling, and window destroy races — the runtime's first hard lessons",
+      "Deadlocks, re-entrant message handling, and window destroy races: the runtime's first hard lessons",
       "Timeout cascades during long LLM operations",
       "Ctrl+click window dragging and same-z-index raise ordering"
     ]

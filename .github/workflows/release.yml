@@ -79,7 +79,7 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           # release.mjs writes the drafted release notes into the tag
-          # annotation — use it as the release body. Bare annotations
+          # annotation; use it as the release body. Bare annotations
           # (old tags carried just "vX.Y.Z") fall back to auto-notes.
           git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}" || true
           notes="$(git tag -l --format='%(contents)' "$tag")"

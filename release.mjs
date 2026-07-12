@@ -61,7 +61,7 @@ const subjects = capture(`git log --format=%s ${logRange}`)
 
 // ── Draft release notes with claude -p ───────────────────────────────────
 // Returns { title, summary, highlights[], fixes[] }. Falls back to the raw
-// commit subjects if claude is unavailable or emits something unparseable —
+// commit subjects if claude is unavailable or emits something unparseable;
 // a release must never be blocked on the drafting step.
 function draftNotes() {
   if (subjects.length === 0) {
@@ -78,7 +78,7 @@ function draftNotes() {
     '  "highlights": ["<major user-visible changes, most important first, max 10>"],',
     '  "fixes": ["<notable bug fixes, max 6>"] }',
     '',
-    'Voice: sincere and concrete, plain language, no hype. Group related commits into one bullet. Skip internal chores (CI, lint, version bumps).',
+    'Voice: sincere and concrete, plain language, no hype. Never use em-dashes; use colons, semicolons, or parentheses instead. Group related commits into one bullet. Skip internal chores (CI, lint, version bumps).',
     '',
     'Commits:',
     ...subjects.map(s => `- ${s}`),
@@ -109,7 +109,7 @@ function draftNotes() {
 const notes = draftNotes();
 const date = new Date().toISOString().slice(0, 10);
 
-console.log(`\nRelease notes for v${version} — "${notes.title}"`);
+console.log(`\nRelease notes for v${version}: "${notes.title}"`);
 if (notes.summary) console.log(`  ${notes.summary}`);
 for (const h of notes.highlights) console.log(`  • ${h}`);
 for (const f of notes.fixes) console.log(`  fix: ${f}`);
@@ -142,7 +142,7 @@ run('git add package.json ' + CHANGELOG_PATH);
 run(`git commit -m "Release v${version}"`);
 
 const tagMessage = [
-  `Abject v${version} — ${notes.title}`,
+  `Abject v${version}: ${notes.title}`,
   '',
   notes.summary,
   '',
