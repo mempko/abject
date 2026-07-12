@@ -49,6 +49,13 @@ const FRAMEWORK_PROVIDED_METHODS = ScriptableAbject.PROTECTED_HANDLERS;
 export const OBJECT_CREATOR_ID = 'abjects:object-creator' as AbjectId;
 const OBJECT_CREATOR_INTERFACE = 'abjects:object-creator' as InterfaceId;
 
+/**
+ * Goal-scratchpad key where a task that ends WITHOUT deploying persists its
+ * staged draft, so the follow-up task in the same goal resumes from the
+ * authored source instead of re-writing it from the failure prose.
+ */
+const GOAL_DRAFT_KEY = 'objectcreator:staged-draft';
+
 // ── Manifest normalization ────────────────────────────────────────────────
 // LLMs frequently draft an interface with `methods`/`events` as bare string
 // arrays (e.g. ["show","hide"]) or partial objects, but the schema wants
@@ -1257,7 +1264,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
    * guides + drafts; returns VERIFIED or a structured issue list with optional
    * follow-up questions for specific deps. Balanced tier, 4k tokens.
    */
-  private async opReviewSemantics(state: LoopState): Promise<{ ok: boolean; summary: string; error?: string; result?: SemanticReviewResult }> {
+  private async opReviewSemantics(state: LoopState): Promise<{ ok: boolean; summary: string; error?: string; data?: string; result?: SemanticReviewResult }> {
     if (!state.draftSource) {
       return { ok: false, summary: 'review_semantics: no source drafted', error: 'call draft_source, draft_diff, or draft_via_llm first' };
     }
@@ -1300,10 +1307,17 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
     state.lastValidation = { ...(state.lastValidation ?? {}), semantics: result };
     const errs = result.issues.filter(i => i.severity === 'error').length;
+    const warns = result.issues.filter(i => i.severity === 'warning').length;
     const summary = result.verified
-      ? 'review_semantics: VERIFIED'
+      ? `review_semantics: VERIFIED${warns > 0 ? ` (${warns} advisory warning${warns === 1 ? '' : 's'})` : ''}`
       : `review_semantics: ${errs} error${errs === 1 ? '' : 's'}, ${result.questions.length} question${result.questions.length === 1 ? '' : 's'}`;
-    return { ok: result.verified, summary, result, error: result.verified ? undefined : this.formatSemanticIssues(result) };
+    // Warnings on a verified draft are advisory: the action SUCCEEDS (so a
+    // batched deploy behind it still runs) and the findings ride along as
+    // data for the agent to weigh — fix the cheap ones, ship, note the rest.
+    const advisory = result.verified && warns > 0
+      ? `Advisory findings (verified — deploy proceeds; address these where cheap, otherwise note them in your report):\n${this.formatSemanticIssues(result)}`
+      : undefined;
+    return { ok: result.verified, summary, result, data: advisory, error: result.verified ? undefined : this.formatSemanticIssues(result) };
   }
 
   /**
@@ -1811,6 +1825,9 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       'You are a strict code reviewer for an Abject handler map. You receive: the new object\'s manifest, the drafted source, and for each known dependency its manifest methods + usage guide.',
       'Flag SEMANTIC issues that a static method-name check cannot catch: wrong payload shape, enum-like string values not listed in the usage guide (including MCP toolName values), missing await on consumed results, event handler name / payload shape mismatches, cached dep IDs in state.',
       'For objects with a UI, also flag STRUCTURAL issues against Model-View (Smalltalk sense) plus Design by Contract: domain rules living in the render/view code instead of the model; the model drawing or referencing a window/canvas/widget; this.data holding transient view state (window/canvas/layout ids, hover, scroll, animation) that belongs in this._ fields; input handling pulled out of the view into a separate "controller" (in this architecture the view handles interaction, and a controller only selects the kind of view of the model); public handlers with no precondition this.ensure(...) check; mutations with no _checkInvariants() / this.invariant(...) follow-up. Note: a view that drives model changes from its input handlers is CORRECT, so do not flag that.',
+      'SEVERITY CALIBRATION — this decides whether a deploy proceeds, so apply it exactly:',
+      '- "error" is reserved for code that will MISBEHAVE AT RUNTIME: a payload shape or method/enum value the usage guide contradicts, a missing await whose result is consumed, an event name/shape mismatch, or logic that defeats the stated requirements (e.g. physics constants that make a game unplayable).',
+      '- Structural and craftsmanship findings — Model-View layering, Design by Contract coverage (this.ensure preconditions, _checkInvariants follow-ups), naming, style — are ALWAYS "warning". They are guidance toward a well-crafted object, never grounds to hold a runtime-correct draft back from deploying.',
       'Trust the usage guide. If a value is not listed there, it is wrong — regardless of how reasonable it looks.',
       'Guide precedence: the dependency that OWNS a call is authoritative for that call. A factory\'s guide also governs the objects it creates (e.g. a window/canvas id returned at runtime — methods documented in the factory\'s guide for those ids are valid). Catalog or registry summaries of OTHER objects are weaker evidence: a registry answer saying "no object has X" does not override a first-party guide that documents X on itself or on the objects it creates.',
       '',
@@ -2313,6 +2330,22 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
       const finalResult = this.finalizeLoop(extra.state, success, result, error);
 
+      // Preserve authored-but-undeployed work across the task boundary. A
+      // step-budget death (or any failure) that leaves a staged draft would
+      // otherwise force the follow-up task to re-author hundreds of lines
+      // from the failure prose alone; persisting the draft lets it resume.
+      if (extra.goalId) {
+        if (!finalResult.success && extra.state.draftSource
+            && extra.state.draftSource !== extra.state.lastDeployedSource) {
+          const saved = await this.persistDraftToGoal(extra);
+          if (saved) {
+            finalResult.error = `${finalResult.error ?? 'Task failed'} [The staged draft (manifest + source) is preserved in the goal scratchpad under '${GOAL_DRAFT_KEY}'; the next ObjectCreator task in this goal adopts it automatically — plan a finish-and-deploy task, not a rewrite.]`;
+          }
+        } else if (finalResult.success) {
+          void this.clearPersistedDraft(extra.goalId);
+        }
+      }
+
       // Emit lifecycle events
       if (finalResult.success) {
         if (extra.state.kind === 'create' && finalResult.objectId) {
@@ -2402,6 +2435,13 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       turnLog: [],
     };
 
+    // Resume authored work from a prior task in this goal, if any: a
+    // persisted draft means a previous loop ended before deploying, and
+    // adopting it turns "re-author from failure prose" into "finish and ship".
+    if (args.goalId && args.kind !== 'investigate') {
+      await this.loadPersistedDraft(args.goalId, state);
+    }
+
     const taskId = args.explicitTaskId ?? `oc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const taskExtra: TaskExtra = {
       taskId,
@@ -2427,7 +2467,11 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
           goalId: args.goalId,
           dispatchTupleId: args.dispatchTupleId,
           config: {
-            maxSteps: 30,
+            // Authoring loops legitimately need more room than generic
+            // call-orchestration tasks: discovery + drafting + validate
+            // cycles + deploy + behavioral/visual verification. AgentAbject
+            // additionally grants progress-aware extensions at the cap.
+            maxSteps: 45,
             timeout: 600000,
             queueName: `object-creator-${this.id}`,
           },
@@ -2444,6 +2488,77 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       };
       if (args.deferredMsg) this.sendDeferredReply(args.deferredMsg, result);
     }
+  }
+
+  // ── Draft persistence across task boundaries ──────────────────────────
+
+  /**
+   * Persist the staged (undeployed) draft to the goal scratchpad so the next
+   * ObjectCreator task in this goal resumes it instead of re-authoring.
+   */
+  private async persistDraftToGoal(extra: TaskExtra): Promise<boolean> {
+    const s = extra.state;
+    if (!extra.goalId || !s.draftSource || !this.goalManagerId) return false;
+    try {
+      const payload = {
+        savedAt: Date.now(),
+        taskId: extra.taskId,
+        kind: s.kind,
+        targetName: s.targetName ?? s.draftManifest?.name,
+        targetObjectId: s.targetObjectId,
+        manifest: s.draftManifest,
+        source: s.draftSource,
+      };
+      await this.sendRequest(this.goalManagerId, 'writeGoalData', {
+        goalId: extra.goalId, key: GOAL_DRAFT_KEY, value: JSON.stringify(payload),
+      }, 10000);
+      log.info(`Preserved undeployed draft (${s.draftSource.split('\n').length} lines) in goal ${extra.goalId.slice(0, 8)} scratchpad`);
+      return true;
+    } catch (err) {
+      log.warn(`Failed to persist draft to goal scratchpad: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  }
+
+  /** A successful (deployed) result makes any persisted draft stale — clear it. */
+  private async clearPersistedDraft(goalId: string): Promise<void> {
+    if (!this.goalManagerId) return;
+    try {
+      await this.sendRequest(this.goalManagerId, 'writeGoalData', {
+        goalId, key: GOAL_DRAFT_KEY, value: '',
+      }, 10000);
+    } catch { /* best effort */ }
+  }
+
+  /**
+   * Adopt a draft persisted by a prior task in this goal. The observation's
+   * DRAFTS section then shows it (flagged as not yet deployed) and a turn-log
+   * entry steers the loop to finish + deploy rather than re-author.
+   */
+  private async loadPersistedDraft(goalId: string, state: LoopState): Promise<void> {
+    if (!this.goalManagerId) return;
+    try {
+      const raw = await this.sendRequest<string | null>(this.goalManagerId, 'readGoalData', {
+        goalId, key: GOAL_DRAFT_KEY,
+      }, 10000);
+      if (!raw || typeof raw !== 'string') return;
+      const payload = JSON.parse(raw) as {
+        taskId?: string; kind?: string; targetName?: string;
+        manifest?: AbjectManifest; source?: string;
+      };
+      if (!payload.source) return;
+      // A draft authored for a DIFFERENT named target is not ours to adopt.
+      if (payload.targetName && state.targetName && payload.targetName !== state.targetName) return;
+      state.draftSource = payload.source;
+      if (payload.manifest && !state.draftManifest) state.draftManifest = payload.manifest;
+      state.turnLog.push({
+        turn: 0,
+        action: 'resume_draft',
+        ok: true,
+        summary: `Adopted the staged draft a previous task in this goal persisted before it ended (${payload.source.split('\n').length} lines${payload.manifest ? `, manifest ${payload.manifest.name}` : ''}). It is staged but NOT deployed: address the findings named in the task description, compile, validate, then deploy and verify — no re-authoring needed.`,
+      });
+      log.info(`Resumed persisted draft for goal ${goalId.slice(0, 8)} (${payload.source.split('\n').length} lines)`);
+    } catch { /* absence of a persisted draft is the normal case */ }
   }
 
   // ── Observe / Act ─────────────────────────────────────────────────────
@@ -2687,7 +2802,10 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       if (v.calls) lines.push(`  validate_calls:   ${v.calls.length} issue${v.calls.length === 1 ? '' : 's'}`);
       if (v.semantics) {
         const errs = v.semantics.issues.filter(i => i.severity === 'error').length;
-        lines.push(`  review_semantics: ${v.semantics.verified ? 'VERIFIED' : `${errs} error${errs === 1 ? '' : 's'}`}`);
+        const warns = v.semantics.issues.filter(i => i.severity === 'warning').length;
+        lines.push(`  review_semantics: ${v.semantics.verified
+          ? `VERIFIED${warns > 0 ? ` (${warns} advisory warning${warns === 1 ? '' : 's'} — deployable)` : ''}`
+          : `${errs} error${errs === 1 ? '' : 's'}`}`);
       }
       lines.push('');
     }
@@ -2914,7 +3032,9 @@ An Organism is one Abject with an internal registry: organelles (internal Script
 2. **Investigate before drafting — \`ask\` is how you learn to use an object.** \`ask\` returns prose usage: examples, patterns, design guidance, the right way to call something. \`describe\` is programmatic reflection (the raw manifest) — it lists method names/params but does NOT teach usage, so it is rarely what you want, and you almost never need to call it yourself: asking a dependency automatically fetches its manifest for call-validation. So: for CREATIONS, \`ask\` the Registry what's available, then \`ask\` each chosen dependency open questions — "how do I use you?", "how do I build a good X?", "how do I make this look good?" — and only \`draft\` once you understand the surface. For MODIFICATIONS, \`ask\` the target your open questions, \`getSource\` to read its current code, \`getState\` if relevant. Prefer \`ask\` over \`describe\` everywhere; reach for \`describe\` only when you specifically need the raw structured manifest.
 
    **Let the goal's named requirements drive OPEN questions before you commit to an approach.** When the goal names a quality or capability — a presentation style ("3D", "animated"), an input modality (mouse, voice), sound, persistence, networking — your first question to the providing dependency is "what do you offer for <that requirement>?", asked before you settle on how to build it. A modify loop makes this easy to skip: the existing source suggests an approach, and questions shaped as "confirm the commands I already plan to use" get exactly the narrow answer they asked for, leaving a purpose-built capability undiscovered while you hand-roll an imitation on the surface the old code happened to use. One open capability question per named requirement is cheap; rework after shipping the imitation is not.
-3. **Validate before deploying; compile first, don't re-read.** After any \`draft_source\`, \`draft_diff\`, or \`draft_via_llm\`: go straight to \`compile\` (it localizes the one broken spot far faster than re-reading), then \`validate_calls\`; for non-trivial logic also \`review_semantics\`. Deploy only when compile is clean and validators agree. When compile reports a syntax error it already shows the failing line and context, so fix it with \`replace_handler\`/\`draft_diff\` at that line or regenerate with \`draft_source\`; do NOT \`read_draft\` to relocate it. Reading the draft repeatedly with no edit between reads is a stall that burns your step budget and leaves nothing to verify.
+3. **Validate before deploying; compile first, don't re-read.** After any \`draft_source\`, \`draft_diff\`, or \`draft_via_llm\`: go straight to \`compile\` (it localizes the one broken spot far faster than re-reading), then \`validate_calls\`; for non-trivial logic also \`review_semantics\`. When compile reports a syntax error it already shows the failing line and context, so fix it with \`replace_handler\`/\`draft_diff\` at that line or regenerate with \`draft_source\`; do NOT \`read_draft\` to relocate it. Reading the draft repeatedly with no edit between reads is a stall that burns your step budget and leaves nothing to verify.
+
+   **Once compile is clean and validate_calls reports zero issues, review_semantics is ADVISORY — ship and verify live instead of polishing blind.** Fix its findings when they name a real wrong-payload/wrong-method bug, but cap yourself at TWO review_semantics rounds: a deployed object answering real calls teaches you more per step than a third blind review pass, and behavioral verification catches what matters. Budget the endgame explicitly — deploy + behavioral checks + a screenshot need ~5 steps, so start deploying while you still have them. A task that dies polishing an undeployed draft delivered nothing.
 4. **Verify behavior after deploying — really test what the user asked for.** After deploy, you must exercise the specific behavior the user requested, not just check that the object exists. \`call show\` and reading \`getState\` are not enough by themselves.
 
    For each behavior the user mentioned, send a \`call\` that drives it and check the result via \`getState\` or the response. Examples:
@@ -2935,7 +3055,7 @@ An Organism is one Abject with an internal registry: organelles (internal Script
 
    ${this.visionCapable === false
     ? `**Visual verification is UNAVAILABLE in this configuration.** Every LLM model currently configured is text-only — screenshots can be captured (proving a window exists) but neither you nor any tier can see them, so never describe or judge how a UI looks. Verify what you can without eyes: review the layout code (every layout child needs sizePolicy + preferredSize; every widget must be added to a layout), check behavior via \`getState\` and method calls, and state plainly in your final result that the UI was NOT visually inspected because no vision-capable model is configured — the user can enable one to get visual verification.`
-    : `**See what you built — visual work needs a visual check.** \`getState\` proves logic; it says nothing about whether the thing looks right. For ANY object with a window, canvas, or drawn UI — and ALWAYS when the goal mentions look, layout, alignment, spacing, color, "beautiful", "polished", or a redesign — capture a screenshot and inspect it before finishing: \`call("Screenshot", "captureWindow", { objectId: "<the object's FULL id — never truncate>" })\`. The rendered image is attached to your next observation; judge it against the goal — centering, alignment, spacing (no accidental empty voids), color cohesion, typographic hierarchy, legibility of every state (e.g. used/disabled vs active), and overall polish. If anything looks off, edit, redeploy, and screenshot again. Do NOT declare a visual goal done on the strength of \`getState\` alone — Round-after-round rework happens precisely when an agent reports "looks beautiful" without ever looking. (Make sure the window is actually shown first. A capture that comes back with NO IMAGE means the verification did NOT happen — fix the capture — pass the full owner id or the windowId from show(), or find the window via Screenshot.listWindows — and only claim visual results after you have actually seen an image.)`}
+    : `**See what you built — visual work needs a visual check.** \`getState\` proves logic; it says nothing about whether the thing looks right. For ANY object with a window, canvas, or drawn UI — and ALWAYS when the goal mentions look, layout, alignment, spacing, color, "beautiful", "polished", or a redesign — capture a screenshot and inspect it before finishing: \`call("Screenshot", "captureWindow", { objectId: "<the object's FULL id — never truncate>" })\`. The capture shows the window as composited on screen, INCLUDING its 3D scene nodes — so for a 3D goal, judge the meshes/lighting/depth in the image itself (an empty court where meshes should be means the scene did not render). It is a screen crop, so raise the window first if another window overlaps it. The rendered image is attached to your next observation; judge it against the goal — centering, alignment, spacing (no accidental empty voids), color cohesion, typographic hierarchy, legibility of every state (e.g. used/disabled vs active), and overall polish. If anything looks off, edit, redeploy, and screenshot again. Do NOT declare a visual goal done on the strength of \`getState\` alone — Round-after-round rework happens precisely when an agent reports "looks beautiful" without ever looking. (Make sure the window is actually shown first. A capture that comes back with NO IMAGE means the verification did NOT happen — fix the capture — pass the full owner id or the windowId from show(), or find the window via Screenshot.listWindows — and only claim visual results after you have actually seen an image.)`}
 
    **Verify once, don't grind.** Each behavior needs ONE representative check, not a sweep. A single correct guess and a single wrong guess prove the guess handler; you do not need to play the whole game. Repeating the same \`call\` (e.g. guessing letter after letter, or polling \`getState\` over and over) burns steps and triggers loop-steering without adding confidence. Drive each distinct behavior once, take one screenshot for the visual, then \`done\`.
 

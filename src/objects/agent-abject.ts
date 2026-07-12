@@ -59,6 +59,8 @@ export interface AgentTaskState {
   actionHistory?: string[];
   /** Signatures already nudged about, so the loop-detection steer fires once per pattern. */
   nudgedSignatures?: string[];
+  /** Step-budget extensions granted so far (progress-aware; capped at MAX_STEP_EXTENSIONS). */
+  extensionsGranted?: number;
 }
 
 export interface AgentTaskOptions {
@@ -189,6 +191,15 @@ interface TaskEntry {
 
 export const AGENT_ABJECT_ID = 'abjects:agent-abject' as AbjectId;
 const AGENT_INTERFACE: InterfaceId = 'abjects:agent-abject';
+
+/**
+ * Progress-aware step-budget extensions: a task that hits maxSteps while its
+ * recent actions show real forward progress gets STEP_EXTENSION more steps,
+ * up to MAX_STEP_EXTENSIONS times. A stuck task (repeated failures, one
+ * signature spinning) earns nothing and dies at the cap.
+ */
+const STEP_EXTENSION = 10;
+const MAX_STEP_EXTENSIONS = 2;
 
 const DEFAULT_CONFIG: ResolvedAgentConfig = {
   maxSteps: 25,
@@ -391,7 +402,7 @@ export class AgentAbject extends Abject {
             },
             {
               name: 'startTask',
-              description: 'Start a task on a registered agent. Returns a ticketId immediately; result arrives via taskResult event. Default maxSteps is 25. When the step limit is reached, the agent makes one final LLM call to return collected data, then salvages the last successful result, or errors. Pass config.maxSteps to override.',
+              description: 'Start a task on a registered agent. Returns a ticketId immediately; result arrives via taskResult event. Default maxSteps is 25. When the step limit is reached and the recent action window shows real progress (mostly-successful, distinct actions), the budget auto-extends by 10 steps up to twice; a stuck task gets no extension. At the final limit the agent makes one last LLM call to return collected data, then salvages the last successful result, or errors. Pass config.maxSteps to override.',
               parameters: [
                 { name: 'agentId', type: { kind: 'primitive', primitive: 'string' }, description: 'Target agent (defaults to caller if registered)', optional: true },
                 { name: 'taskId', type: { kind: 'primitive', primitive: 'string' }, description: 'Caller-provided task ID', optional: true },
@@ -2165,6 +2176,34 @@ The registered object must implement these handlers to participate in the agent 
     setPhase: (p: AgentPhase) => void,
   ): Promise<void> {
     const task = entry.state;
+
+    // ── Progress-aware extension ──
+    // The budget is a runaway guard, not a ceiling on legitimate work. When
+    // the recent action window shows real forward progress — mostly
+    // successful actions across several DISTINCT signatures, not one action
+    // spinning — grant a bounded extension instead of killing a task
+    // mid-delivery. actionHistory signatures end in ':ok' on success (see
+    // actionSignature), so the window doubles as the progress record.
+    const history = task.actionHistory ?? [];
+    const okSignatures = history.filter((s) => s.endsWith(':ok'));
+    const distinctOk = new Set(okSignatures).size;
+    const progressing = history.length >= 6
+      && okSignatures.length * 2 >= history.length
+      && distinctOk >= 3;
+    const granted = task.extensionsGranted ?? 0;
+    if (progressing && granted < MAX_STEP_EXTENSIONS) {
+      task.extensionsGranted = granted + 1;
+      task.maxSteps += STEP_EXTENSION;
+      entry.pendingActions = undefined;
+      log.info(`[${agentName}] Step budget reached with recent progress (${okSignatures.length}/${history.length} ok, ${distinctOk} distinct) — extending by ${STEP_EXTENSION} (extension ${task.extensionsGranted}/${MAX_STEP_EXTENSIONS}, cap now ${task.maxSteps})`);
+      task.llmMessages.push({
+        role: 'user',
+        content: `[Budget extended] You hit the step limit, but your recent steps show real progress, so the budget grew by ${STEP_EXTENSION} steps (extension ${task.extensionsGranted} of ${MAX_STEP_EXTENSIONS}; cap now ${task.maxSteps}). Spend them FINISHING, not exploring: ship what is staged, run the single most important verification, and terminate with done/fail. Anything polish-grade still open belongs in your final report, not another editing round.`,
+      });
+      setPhase('observing');
+      return;
+    }
+
     log.info(`[${agentName}] Max steps (${task.maxSteps}) reached — attempting forced final LLM call`);
 
     // The budget is spent — any still-queued batched actions must not drain,

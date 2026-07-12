@@ -617,10 +617,20 @@ export class Compositor {
 
   /**
    * Capture a surface as a base64-encoded PNG.
+   *
+   * Preferred path: crop the surface's on-screen region out of the composited
+   * GL frame. The surface's own 2D canvas holds only widget/canvas content —
+   * 3D scene nodes render onto the GL canvas and never touch it — so a GL
+   * crop is the only capture that shows what the user actually sees (meshes,
+   * lights, bloom, slab chrome). Falls back to the plain 2D surface canvas
+   * when the window is off-screen, on another workspace, or in mobile mode.
    */
   async captureSurface(surfaceId: string): Promise<{ imageBase64: string; width: number; height: number } | null> {
     const surface = this.surfaces.get(surfaceId);
     if (!surface || !surface.drawn) return null;
+
+    const glShot = await this.captureSurfaceFromFrame(surface);
+    if (glShot) return glShot;
 
     try {
       // convertToBlob throws on a canvas tainted by a cross-origin image.
@@ -633,6 +643,73 @@ export class Compositor {
         imageBase64: btoa(binary),
         width: surface.rect.width,
         height: surface.rect.height,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Crop the surface's projected screen region out of a freshly rendered GL
+   * frame. Returns null when the crop would mislead — window mostly
+   * off-screen, filtered by workspace, mobile layout — so the caller can fall
+   * back to the 2D surface canvas.
+   */
+  private async captureSurfaceFromFrame(surface: Surface): Promise<{ imageBase64: string; width: number; height: number } | null> {
+    if (this.renderer.isContextLost || this.mobileMode) return null;
+    if (!surface.visible || this.isWorkspaceFiltered(surface)) return null;
+
+    try {
+      // The GL drawing buffer is invalidated after compositing, so render
+      // synchronously and read back in the same task (same as captureDesktop).
+      this.render();
+
+      // Project the rect's corners (z=0 content plane) to screen px. Slab
+      // tilt/lift and popped-out (occlude:false) nodes reach past the flat
+      // rect; the pad absorbs the usual amount.
+      const { x, y, width, height } = surface.rect;
+      const corners: Array<[number, number]> = [[x, y], [x + width, y], [x, y + height], [x + width, y + height]];
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const [cx, cy] of corners) {
+        const p = mat4TransformPoint(this.viewProj, vec3(cx, cy, 0));
+        const sx = ((p.x + 1) / 2) * this.width;
+        const sy = ((1 - p.y) / 2) * this.height;
+        minX = Math.min(minX, sx); maxX = Math.max(maxX, sx);
+        minY = Math.min(minY, sy); maxY = Math.max(maxY, sy);
+      }
+      const PAD = 12;
+      minX -= PAD; minY -= PAD; maxX += PAD; maxY += PAD;
+
+      const cropX = Math.max(0, minX);
+      const cropY = Math.max(0, minY);
+      const cropW = Math.min(this.width, maxX) - cropX;
+      const cropH = Math.min(this.height, maxY) - cropY;
+      if (cropW < 8 || cropH < 8) return null;
+      // A mostly off-screen window would capture mostly backdrop — mislead.
+      const visibleFrac = (cropW * cropH) / Math.max(1, (maxX - minX) * (maxY - minY));
+      if (visibleFrac < 0.5) return null;
+
+      const dpr = this.canvas.width / Math.max(1, this.width);
+      const outW = Math.max(1, Math.round(cropW * dpr));
+      const outH = Math.max(1, Math.round(cropH * dpr));
+      const out = new OffscreenCanvas(outW, outH);
+      const ctx = out.getContext('2d');
+      if (!ctx) return null;
+      ctx.drawImage(
+        this.canvas,
+        cropX * dpr, cropY * dpr, cropW * dpr, cropH * dpr,
+        0, 0, outW, outH,
+      );
+
+      const blob = await out.convertToBlob({ type: 'image/png' });
+      const buffer = await blob.arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      return {
+        imageBase64: btoa(binary),
+        width: Math.round(cropW),
+        height: Math.round(cropH),
       };
     } catch {
       return null;

@@ -2125,7 +2125,7 @@ IMPORTANT:
       throw new Error(
         `Invalid scene ops (nothing was applied): ${problems.join('; ')}. ` +
         `Node kinds: ${SCENE_NODE_KINDS.join(', ')}. ` +
-        `Shape: { op: 'add'|'update'|'remove', id, parentId?, kind?, transform: { position?, rotation?, scale? }, params } — ` +
+        `Shape: { op: 'add'|'update'|'remove'|'animate', id, parentId?, kind?, transform: { position?, rotation?, scale? }, params } — ` +
         `e.g. { op: 'add', id: 'orb', kind: 'mesh', transform: { position: [0, 0, 40], scale: 30 }, params: { primitive: 'sphere', color: '$accent' } }.`
       );
     }

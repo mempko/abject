@@ -195,6 +195,7 @@ Use listWindows to get surfaceIds, then click/type/keyPress to interact.
 - captureWindow accepts either the owning object's FULL AbjectId or a windowId; truncated ids never match.
 - When nothing can be captured, captureWindow returns { error: "..." } explaining why — a result WITHOUT imageBase64 means you have NOT seen the window; do not treat it as visual confirmation.
 - Screenshots capture the current rendered state; ensure the target has drawn before capturing.
+- captureWindow captures the window's region AS COMPOSITED ON SCREEN — widgets, 2D canvas content, AND the window's 3D scene nodes (meshes/lights/bloom) all appear, so it verifies 3D rendering. Because it is a screen crop, a window overlapping the target shows up too: raise the target first (WidgetManager.raiseWindow { windowId }) for a clean capture. When the window is scrolled mostly off-screen the capture falls back to the window's own 2D content, WITHOUT 3D nodes — bring it on-screen to verify 3D.
 - Click/type/keyPress are on UIServer, not Screenshot. Use both together for visual interaction.`;
   }
 }
