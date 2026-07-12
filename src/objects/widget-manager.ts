@@ -1488,7 +1488,7 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
             params: { primitive: 'box', color: '$accent' } }] })
           Animate from a Timer tick by updating the transform:
           this.call(windowId, 'scene', { ops: [{ op: 'update', id: 'cube', transform: { rotation: [rx, ry, 0] } }] })
-          Kinds: mesh (primitive: plane|box|sphere|cylinder), light (lightType: point|directional), group.
+          Kinds: mesh, light, group, environment (full param details below).
           transform: { position: [x,y,z] px from window center (+z toward viewer), rotation: [rx,ry,rz] radians, scale: n|[x,y,z] }.
           ARBITRARY/DEFORMABLE MESHES: when no built-in primitive fits (a wave surface, terrain, a
           generated or morphing shape), a mesh node can carry its own polygons instead of a primitive:
@@ -1512,13 +1512,18 @@ Draw:     this.call(canvasId, 'draw', { commands: [{ type, surfaceId: 'c', param
           (re-send instances in an 'update' op to move them).
           LIGHTS: lightType 'point'|'directional'|'spot' with color, intensity, range (falloff px), for spots
           angle + penumbra, and castShadow:true on a directional light (meshes cast shadows on each other,
-          frustum auto-fit to the scene). ENVIRONMENT: add a kind:'environment' node with { ambient, fog: { color, near, far },
-          bloom: true|{ threshold, intensity } } for scene-wide mood, depth, and a glow post-effect on bright/
-          emissive meshes (neon, highlights).
+          frustum auto-fit to the scene). ENVIRONMENT: add a kind:'environment' node with
+          { ambient?, fog?: { color, near, far }, bloom?: true|{ threshold, intensity } } for scene-wide
+          mood, depth, and a glow post-effect on bright/emissive meshes (neon, highlights).
+          ambient is a COLOR ('#hex' or $token — e.g. '#1e293b'), NOT a number: carry the ambient
+          light's brightness in the color's lightness. A numeric ambient fails validation and the
+          WHOLE ops batch is rejected (scene ops validate atomically — one bad node and nothing renders).
           ANIMATION (declarative — ONE op, runs at native frame rate; do NOT send a transform message every
           tick): this.call(windowId, 'scene', { ops: [{ op: 'animate', id: 'cube',
-          params: { preset: 'spin', duration: 4000 } }] }). Presets: spin, orbit (center/radius/plane), bob
-          (amplitude), pulse (scale). Or animate any channel explicitly: { op:'animate', id, params:{ channel:
+          params: { preset: 'spin', duration: 4000 } }] }). Presets (extras ride in params beside preset):
+          spin (axis: 'x'|'y'|'z', default y), orbit (center: [x,y,z] default current position, radius default 100,
+          plane: 'xy'|'xz'|'yz' default 'xz'), bob (amplitude, default 20), pulse (scale factor, default 1.15).
+          Or animate any channel explicitly: { op:'animate', id, params:{ channel:
           'position'|'rotation'|'scale'|'color'|'emissive'|'opacity', to, from?, duration, easing?, loop?, yoyo?,
           delay?, path?:[[x,y,z],...] } }. Stop with params:{ stop:true }. Animations are client-side and
           transient — re-issue them after a reconnect if you need them to persist.
@@ -1632,7 +1637,7 @@ after createCanvas; the widget already exists.
 // Canonical await-in-order build:
 async show() {
   if (this._windowId) {                                    // already open → raise and return
-    await this.call(this._windowId, 'raiseWindow', {}).catch(() => {});
+    await this.call(this.dep('WidgetManager'), 'raiseWindow', { windowId: this._windowId }).catch(() => {});
     return true;
   }
   const wm = await this.dep('WidgetManager');              // resolve the factory id once
@@ -1720,6 +1725,8 @@ await this.call(layoutId, 'addLayoutChildren', {
 // fallback size (24px tall / 100px wide) — a bare { widgetId } entry gives a
 // squeezed, overlapping UI. In a VBox give each child a height (h); in an
 // HBox give each child a width (w) or horizontal: 'expanding' to share the row.
+// Size fields accept BOTH spellings everywhere: { w, h } and { width, height }
+// are interchangeable in preferredSize and in window rects.
 
 // Add a spacer to push widgets apart:
 await this.call(layoutId, 'addLayoutSpacer', {});
@@ -1753,28 +1760,33 @@ await this.call(this.dep('WidgetManager'), 'destroyWindowAbject', { windowId: wi
 
 ### Widget Types (used as \`type\` in create() specs)
 
+All the per-type fields below (\`options\`, \`items\`, \`tabs\`, \`min\`, \`url\`, ...) go at the TOP LEVEL
+of the spec object next to \`type\` and \`windowId\` — there is no \`params\` wrapper in widget specs
+(\`{ type: 'select', windowId, options: [...] }\`, never \`{ type: 'select', params: { options } }\`).
+Event values arrive in your \`changed(msg)\` handler as \`msg.payload.value\`.
+
 label - Static text display. Fires 'click' on mousedown (register via addDependent to receive). Param: href — when set, renders as a clickable link (underlined, link color) that opens in the user's browser. Style: { wordWrap: true } for multi-line text. Style: { selectable: true } to allow users to click-drag, double-click, Shift+click, Ctrl+A, and Ctrl+C to select and copy text (read-only). Style: { markdown: true, wordWrap: true } for rich text rendering (bold, italic, inline code, clickable links, headings, bullet lists, code blocks, blockquotes, and block-level images via ![alt](url) — url may be http(s) or a data:image/* base64 URI; add a |WxH hint inside alt like ![chart|480x240](url) so layout knows the size before the image loads).
 markdown - Rich markdown display (a label preconfigured for markdown + wordWrap, so you don't need the style flags). Renders bold, italic, inline code, headings, bullet/numbered lists, links, blockquotes, code blocks, and inline images (![alt](url) where url is a data:image/* base64 URI, an abject:// reference, or http(s); add a |WxH hint in alt like ![chart|480x240](url)). Param: text — the markdown source. Style: { selectable: true } for read-only select/copy; { fontSize, color }. Update content with this.call(id, 'update', { text: '...' }). Use this for any text that may contain markdown or images; for markdown drawn directly onto a canvas (e.g. graph nodes), use the canvas 'markdown' draw command instead.
 button - Clickable button (listen for 'changed' with aspect 'click'). Param: href — when set, clicking also opens the URL in the user's browser. Keyboard: Enter/Space when focused.
 textInput - Single-line text input (aspects: 'change', 'submit')
-textArea - Multi-line text area (params: monospace?)
-checkbox - Toggle checkbox (aspect: 'change', value: boolean). Keyboard: Space when focused.
+textArea - Multi-line text area (spec field: monospace?)
+checkbox - Toggle checkbox (aspect: 'change', value: the STRING 'true' or 'false' — compare value === 'true', not a boolean). Keyboard: Space when focused.
 progress - Progress bar (update with { value: 0-100 })
 divider - Horizontal divider line
-select - Dropdown select (params: options[], selectedIndex, searchable?). Keyboard: Enter/Space to open, ArrowUp/Down to navigate, Enter to select, Escape to close. Long lists scroll (mouse wheel) and automatically get a type-to-filter box atop the dropdown; searchable overrides that default.
-tabBar - Tab bar (params: tabs[] of labels, selectedIndex). Fires 'change' event with selected index. Keyboard: ArrowLeft/Right to switch tabs.
-slider - Numeric range slider (params: min, max, step, value). Fires 'change' event with numeric value as string. Keyboard: ArrowLeft/Right ±step, Home/End for min/max. Click track or drag thumb.
-image - Image display (params: url, fit 'contain'|'cover'|'fill', alt). Fires 'click' on mousedown (register via addDependent to receive). Param: href — when set, clicking opens the URL in the user's browser. Update URL via this.call(imgId, 'update', { url: '...' }).
-list - Scrollable list (params: items[], selectedIndex?, searchable?, itemHeight?). Fires 'selectionChanged'. Each item is { label, value, secondary?, iconName?, iconColor? }. RICH CARD ROWS: add any of badge, detail, or actions to an item and it renders as a two-line card row instead of a plain text line. badge: { text, color?, textColor? } is a colored leading chip (e.g. a percentage or status). detail (or secondary) is a muted second line under label. actions: [{ id, label, color?, textColor? }] are right-aligned buttons; clicking one fires a 'changed' event with aspect 'action' and value JSON { index, value, actionId } (row selection is unaffected). Rich rows auto-size to a comfortable height, so itemHeight is optional (set it only to make rows even taller). Example item: { label: 'Bitcoin above $100k by year end', value: 'p1', detail: 'created 2026-01-02  ·  #crypto', badge: { text: '80%', color: '#7ad19a', textColor: '#0f1226' }, actions: [{ id: 'right', label: '✓ Right', color: '#2e6b3c' }, { id: 'wrong', label: '✗ Wrong', color: '#7a2e36' }] }.
-tree - Hierarchical tree view (params: treeItems[], selectedId?, itemHeight?). Items have id, label, icon?, iconColor?, secondary?, depth, expanded?, hasChildren?. Fires 'selectionChanged' and 'toggle'.
-splitPane - Resizable split view (params: orientation?, dividerPosition?, minSize?).
+select - Dropdown select (options: string[], selectedIndex, searchable?). Fires 'change' with the selected option's string. Keyboard: Enter/Space to open, ArrowUp/Down to navigate, Enter to select, Escape to close. Long lists scroll (mouse wheel) and automatically get a type-to-filter box atop the dropdown; searchable overrides that default.
+tabBar - Tab bar (tabs: string[] of labels, selectedIndex). Fires 'change' with the selected index as a NUMBER. Keyboard: ArrowLeft/Right to switch tabs.
+slider - Numeric range slider (spec fields: min, max, step, value). Fires 'change' event with numeric value as string. Keyboard: ArrowLeft/Right ±step, Home/End for min/max. Click track or drag thumb.
+image - Image display (spec fields: url, fit 'contain'|'cover'|'fill', alt). Fires 'click' on mousedown (register via addDependent to receive). Param: href — when set, clicking opens the URL in the user's browser. Update URL via this.call(imgId, 'update', { url: '...' }).
+list - Scrollable list (items[], selectedIndex?, searchable?, itemHeight?). Fires 'selectionChanged' with value a JSON string { index, value, label, via } (JSON.parse it). Each item is { label, value, secondary?, iconName?, iconColor? }. RICH CARD ROWS: add any of badge, detail, or actions to an item and it renders as a two-line card row instead of a plain text line. badge: { text, color?, textColor? } is a colored leading chip (e.g. a percentage or status). detail (or secondary) is a muted second line under label. actions: [{ id, label, color?, textColor? }] are right-aligned buttons; clicking one fires a 'changed' event with aspect 'action' and value JSON { index, value, actionId } (row selection is unaffected). Rich rows auto-size to a comfortable height, so itemHeight is optional (set it only to make rows even taller). Example item: { label: 'Bitcoin above $100k by year end', value: 'p1', detail: 'created 2026-01-02  ·  #crypto', badge: { text: '80%', color: '#7ad19a', textColor: '#0f1226' }, actions: [{ id: 'right', label: '✓ Right', color: '#2e6b3c' }, { id: 'wrong', label: '✗ Wrong', color: '#7a2e36' }] }.
+tree - Hierarchical tree view (treeItems[], selectedId?, itemHeight?). Items have id, label, icon?, iconColor?, secondary?, depth, expanded?, hasChildren?. Fires 'selectionChanged' (value: JSON string { id, label }) and 'toggle' (value: JSON string { id }).
+splitPane - Resizable split view (orientation?, dividerPosition?, minSize?).
 contentBlock - Auto-height wrapped rich text (a markdown label that measures itself). Give it an expanding width and a provisional fixed height in the layout, register via addDependent, and listen for the 'contentHeight' aspect (value: number) — then call updateLayoutChild on its layout with preferredSize: { h: <that number> }. Use this for chat bubbles, feed entries, and any text whose height you would otherwise have to estimate. Defaults: markdown + wordWrap + selectable on; pass style: { markdown: false } for plain wrapped text. Also fires 'click' like a label.
-goalProgress - Word-wrapping goal/task hierarchy view (params: rows[] built by goal-tree's buildGoalRows). Self-sizes via the 'contentHeight' aspect like contentBlock; fires 'toggle' with { id } when a goal row's expand gutter is clicked. Used by GoalBrowser and Chat's activity bubble; prefer tree for generic hierarchies.
-themeSwatch - Mini window preview of a theme preset (params: themeId, themeName, previewTheme — all required). Fires 'click' with { themeId }. Settings-internal; only useful for theme pickers.
-table - Sortable columnar data grid (params: columns[] of { key, label, width?, align? }, rowsData[] of records keyed by column key, sortable? default true, editable? default false, rowHeight?). Click a header to sort (asc/desc, numeric when values are numbers); columns without width share remaining width. Fires 'rowSelected' with JSON { index, row } (index into the current sorted view, row included so you never re-derive the sort) and, when editable, 'cellEdited' with JSON { index, row, key, value } after a double-click inline edit commits (Enter commits, Escape cancels). Update data with this.call(id, 'update', { rowsData }). Binds naturally to SQL query results: map each result column to { key, label } and pass row objects straight through. Example: { type: 'table', windowId, columns: [{ key: 'name', label: 'Name' }, { key: 'qty', label: 'Qty', width: 60, align: 'right' }], rowsData: [{ name: 'Ash', qty: 3 }] }.
-chart - Declarative data visualization (params: kind 'line'|'bar'|'area'|'pie'|'sparkline', series[] of { name?, points: [{x, y}], color? }, xLabel?, yLabel?, showLegend?, showGrid?, yMin?, yMax?). Colors follow the active theme automatically; give each series a name and set showLegend for a legend row. String x values become category bands (bar charts, labeled buckets); numeric x scales linearly. pie uses series[0] with one point per slice (x is the slice label). Fires 'pointClicked' with JSON { seriesIndex, pointIndex, x, y }. Update live with this.call(id, 'update', { series }). Binds directly to SQL query results: map each row to a point, e.g. rows [[label, total], ...] from query() becomes { type: 'chart', windowId, kind: 'bar', series: [{ points: rows.map(r => ({ x: String(r[0]), y: Number(r[1]) })) }] }. sparkline draws a bare trend line (no axes or grid) sized for stat cards inside styled layout cells.
-form - Schema-driven form (params: schema { properties: { name: { type, title?, description?, enum?, default? } }, required?: string[] }, submitLabel?). One spec builds labeled inputs (string → text input, masked automatically for credential-looking names; number/integer → numeric-validated input; boolean → checkbox; enum → dropdown), a validation status line, and a submit button. Fires 'submit' with a JSON payload of typed values (numbers as numbers, booleans as booleans) only after validation passes; Enter in any text field also submits. It reports its natural height via the 'contentHeight' aspect like contentBlock, so give it an expanding width, a provisional height, and resize on that event. Methods: getValues, setValues { values }. Turn any manifest method's parameters into a form by mapping each parameter to a property; the submit payload is ready to send as the method's payload. Example: { type: 'form', windowId, schema: { properties: { url: { type: 'string', title: 'Feed URL' }, minutes: { type: 'number', default: 30 } }, required: ['url'] }, submitLabel: 'Watch' }.
-video - Video playback (params: source, controls?, muted?, loop?, autoplay? default true). source is an http(s) URL, a data: URI, an abject://<typeId>/<path> file reference, or a live streamId returned by MediaStream capture. Frames composite client-side straight into the window (they never travel through the bus), so playback stays smooth. URL/file sources get a play/pause + seek overlay by default; live streams show a LIVE badge instead (controls default off). Fires 'playing', 'paused', 'ended', and 'error' (message). Update with this.call(id, 'update', { source }) to swap what plays, or { muted }. A window showing a peer's shared camera stream is a video call surface: capture via MediaStream on their side, display the streamId here, and sound follows the stream. Example: { type: 'video', windowId, source: 'https://example.com/clip.mp4' } or { type: 'video', windowId, source: capturedStreamId, muted: true }.
+goalProgress - Word-wrapping goal/task hierarchy view (spec field: rows[] built by goal-tree's buildGoalRows). Self-sizes via the 'contentHeight' aspect like contentBlock; fires 'toggle' with { id } when a goal row's expand gutter is clicked. Used by GoalBrowser and Chat's activity bubble; prefer tree for generic hierarchies.
+themeSwatch - Mini window preview of a theme preset (spec fields: themeId, themeName, previewTheme — all required). Fires 'click' with { themeId }. Settings-internal; only useful for theme pickers.
+table - Sortable columnar data grid (spec fields: columns[] of { key, label, width?, align? }, rowsData[] of records keyed by column key, sortable? default true, editable? default false, rowHeight?). Click a header to sort (asc/desc, numeric when values are numbers); columns without width share remaining width. Fires 'rowSelected' with JSON { index, row } (index into the current sorted view, row included so you never re-derive the sort) and, when editable, 'cellEdited' with JSON { index, row, key, value } after a double-click inline edit commits (Enter commits, Escape cancels). Update data with this.call(id, 'update', { rowsData }). Binds naturally to SQL query results: map each result column to { key, label } and pass row objects straight through. Example: { type: 'table', windowId, columns: [{ key: 'name', label: 'Name' }, { key: 'qty', label: 'Qty', width: 60, align: 'right' }], rowsData: [{ name: 'Ash', qty: 3 }] }.
+chart - Declarative data visualization (spec fields: kind 'line'|'bar'|'area'|'pie'|'sparkline', series[] of { name?, points: [{x, y}], color? }, xLabel?, yLabel?, showLegend?, showGrid?, yMin?, yMax?). Colors follow the active theme automatically; give each series a name and set showLegend for a legend row. String x values become category bands (bar charts, labeled buckets); numeric x scales linearly. pie uses series[0] with one point per slice (x is the slice label). Fires 'pointClicked' with JSON { seriesIndex, pointIndex, x, y }. Update live with this.call(id, 'update', { series }). Binds directly to SQL query results: map each row to a point, e.g. rows [[label, total], ...] from query() becomes { type: 'chart', windowId, kind: 'bar', series: [{ points: rows.map(r => ({ x: String(r[0]), y: Number(r[1]) })) }] }. sparkline draws a bare trend line (no axes or grid) sized for stat cards inside styled layout cells.
+form - Schema-driven form (spec fields: schema { properties: { name: { type, title?, description?, enum?, default? } }, required?: string[] }, submitLabel?). One spec builds labeled inputs (string → text input, masked automatically for credential-looking names; number/integer → numeric-validated input; boolean → checkbox; enum → dropdown), a validation status line, and a submit button. Fires 'submit' with a JSON payload of typed values (numbers as numbers, booleans as booleans) only after validation passes; Enter in any text field also submits. It reports its natural height via the 'contentHeight' aspect like contentBlock, so give it an expanding width, a provisional height, and resize on that event. Methods: getValues, setValues { values }. Turn any manifest method's parameters into a form by mapping each parameter to a property; the submit payload is ready to send as the method's payload. Example: { type: 'form', windowId, schema: { properties: { url: { type: 'string', title: 'Feed URL' }, minutes: { type: 'number', default: 30 } }, required: ['url'] }, submitLabel: 'Watch' }.
+video - Video playback (spec fields: source, controls?, muted?, loop?, autoplay? default true). source is an http(s) URL, a data: URI, an abject://<typeId>/<path> file reference, or a live streamId returned by MediaStream capture. Frames composite client-side straight into the window (they never travel through the bus), so playback stays smooth. URL/file sources get a play/pause + seek overlay by default; live streams show a LIVE badge instead (controls default off). Fires 'playing', 'paused', 'ended', and 'error' (message). Update with this.call(id, 'update', { source }) to swap what plays, or { muted }. A window showing a peer's shared camera stream is a video call surface: capture via MediaStream on their side, display the streamId here, and sound follows the stream. Example: { type: 'video', windowId, source: 'https://example.com/clip.mp4' } or { type: 'video', windowId, source: capturedStreamId, muted: true }.
 
 ### Widget Style Properties
 
@@ -1859,11 +1871,13 @@ createCanvas - Drawing area inside a window. Returns canvasId (AbjectId).
 IMPORTANT: All canvas operations use this.call(). There are no shorthand methods.
 - Draw: this.call(canvasId, 'draw', { commands: [...] })
 - Get size: this.call(canvasId, 'getCanvasSize', {})
-- Receive input: this.call(canvasId, 'addDependent', {})
+- Receive input: pass inputTargetId: this.id to createCanvas — the canvas then sends every
+  mouse/keyboard event to that object as an 'input' EVENT (implement input(msg)). addDependent
+  on a canvas is NOT the input mechanism (it only subscribes to rare 'changed' events).
 Methods like drawCanvas(), addCanvasInputListener(), getCanvasSize() on WidgetManager do NOT exist.
 
 const canvasId = await this.call(this.dep('WidgetManager'), 'createCanvas', {
-  windowId: winId
+  windowId: winId, inputTargetId: this.id
 });
 
 // When combining canvas with a layout (e.g. toolbar + canvas):
@@ -1899,8 +1913,8 @@ await this.call(rootLayout, 'updateLayoutChild', {
 });
 // Create toolbar buttons and add them to the toolbar layout...
 
-// 3. Create canvas and ADD IT TO THE LAYOUT
-const canvasId = await this.call(this.dep('WidgetManager'), 'createCanvas', { windowId: winId });
+// 3. Create canvas (inputTargetId routes its input events to you) and ADD IT TO THE LAYOUT
+const canvasId = await this.call(this.dep('WidgetManager'), 'createCanvas', { windowId: winId, inputTargetId: this.id });
 await this.call(rootLayout, 'addLayoutChildren', {
   children: [{
     widgetId: canvasId,
@@ -1908,8 +1922,7 @@ await this.call(rootLayout, 'addLayoutChildren', {
   }]
 });
 
-// 4. Register for input and get initial size
-await this.call(canvasId, 'addDependent', {});
+// 4. Get initial size (input already routes to you via inputTargetId — implement input(msg))
 const { width, height } = await this.call(canvasId, 'getCanvasSize', {});
 
 ### Common Canvas Mistakes (AVOID THESE)
@@ -1950,6 +1963,11 @@ const { width, height } = await this.call(canvasId, 'getCanvasSize', {});
 // translate: { x, y }  |  rotate: { angle }  |  scale: { x, y }
 // globalAlpha: { alpha }  |  shadow: { color, blur, offsetX?, offsetY? }
 // setLineDash: { segments: [dashLength, gapLength] }
+// linearGradient: { x0, y0, x1, y1, stops: [{offset, color}, ...] } — becomes the fill for subsequent shapes until changed
+// radialGradient: { cx0, cy0, r0, cx1, cy1, r1, stops: [...] }  |  conicGradient: { startAngle, cx, cy, stops: [...] }
+// bezierCurve: { x0, y0, cp1x, cp1y, cp2x, cp2y, x1, y1, fill?, stroke? }
+// quadraticCurve: { x0, y0, cpx, cpy, x1, y1, fill?, stroke? }
+// surfaceId: any string works ('c' by convention — it is rewritten internally); include it on every command.
 
 // Draw using standard draw commands (coordinates are canvas-local, starting at 0,0):
 await this.call(canvasId, 'draw', {
@@ -2072,8 +2090,9 @@ getDisplayInfo - Returns { width, height } of the display area
 
 ### Window Close, Minimize, and Restore Events
 
-Windows with title bars have close (X) and minimize (_) buttons. WidgetManager forwards
-these events to the window's owner as method calls on 'abjects:widgets':
+Windows with title bars have close (X) and minimize (_) buttons. WidgetManager sends
+these to the window's OWNER as messages named exactly as below — implement handlers with
+these names in your handler map (owners receive them automatically, no addDependent needed):
 
 - 'windowCloseRequested' — close button clicked. Payload: { windowId }. Owner should call hide() or destroyWindowAbject.
 - 'windowMinimized' — window was minimized to taskbar. Payload: { windowId }. Informational only.
@@ -2177,19 +2196,26 @@ await this.call(this.dep('WidgetManager'), 'raiseWindow', { windowId: winId });
 
 ### Animation Pattern
 
-// Use Timer to drive a canvas animation loop:
-const timerId = this.dep('Timer');
-const intervalId = await this.call(timerId, 'setInterval', { ms: 16 }); // ~60fps
-await this.call(timerId, 'addDependent', {});
+// Use Timer to drive a canvas animation loop. Timer's API (exactly this — there is no
+// clearInterval method and no 'tick' event):
+//   setInterval({ intervalMs, data? }) → timerId (string)
+//   setTimeout({ delayMs, data? }) → timerId (string)
+//   clearTimer({ timerId }) → boolean
+// When a timer fires, Timer sends a 'timerFired' EVENT to the object that created the
+// timer (no addDependent needed). Implement a timerFired handler and dispatch on data:
+this._timerId = await this.call(this.dep('Timer'), 'setInterval', { intervalMs: 16, data: { type: 'animate' } }); // ~60fps
 
-// In your 'changed' handler:
-// if (fromId === timerId && aspect === 'tick') {
-//   this.updateState();
-//   await this._draw(); // redraw canvas
-// }
+async timerFired(msg) {
+  const { timerId, data } = msg.payload;
+  if (data && data.type === 'animate') {
+    this.updateState();
+    await this._draw(); // redraw canvas
+  }
+}
 
 // Stop animation:
-// await this.call(timerId, 'clearInterval', { intervalId });
+// await this.call(this.dep('Timer'), 'clearTimer', { timerId: this._timerId });
+// this._timerId = null;
 
 ### UI Design Best Practices
 
