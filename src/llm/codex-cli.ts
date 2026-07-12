@@ -216,7 +216,7 @@ export class CodexCliProvider extends BaseLLMProvider {
         { id: 'gpt-5',            name: 'gpt-5 (API key only)', vision: false },
         { id: 'gpt-5-mini',       name: 'gpt-5-mini (API key only)', vision: false },
       ],
-      defaultTierModels: { smart: AUTO_MODEL, balanced: AUTO_MODEL, fast: AUTO_MODEL },
+      defaultTierModels: { smart: AUTO_MODEL, balanced: AUTO_MODEL, fast: AUTO_MODEL, code: AUTO_MODEL },
       // One-time migration: codex with a ChatGPT-account login refuses
       // the API-only `gpt-5` / `gpt-5-mini` model names. Rewrite any
       // saved tier-routing model that still uses those to 'auto', which

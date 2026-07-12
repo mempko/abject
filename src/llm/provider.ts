@@ -15,7 +15,7 @@ export interface LLMMessage {
   content: string | ContentPart[];
 }
 
-export type ModelTier = 'smart' | 'balanced' | 'fast';
+export type ModelTier = 'smart' | 'balanced' | 'fast' | 'code';
 
 /**
  * Reasoning-effort control for models that support it (newer Claude models).
@@ -106,7 +106,7 @@ export interface LLMProviderDescription {
    * other selection exists. Use empty strings when the provider has no
    * stable defaults (Ollama).
    */
-  defaultTierModels: { smart: string; balanced: string; fast: string };
+  defaultTierModels: Record<ModelTier, string>;
   /**
    * Declarative migration map for saved tier-routing model ids — `{ from
    * → to }`. Applied once at GlobalSettings init. Useful when an upstream
@@ -407,7 +407,7 @@ export abstract class BaseLLMProvider implements LLMProvider {
       credentialLabel: `${this.name} API Key`,
       credentialPlaceholder: '',
       models: [],
-      defaultTierModels: { smart: '', balanced: '', fast: '' },
+      defaultTierModels: { smart: '', balanced: '', fast: '', code: '' },
     };
   }
 

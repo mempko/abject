@@ -242,6 +242,7 @@ export { GrokProvider } from './llm/grok.js';
 export { GeminiProvider } from './llm/google-gemini.js';
 export { KimiProvider } from './llm/kimi.js';
 export { MiniMaxProvider } from './llm/minimax.js';
+export { MetaProvider } from './llm/meta.js';
 
 // Export network
 export { Transport } from './network/transport.js';

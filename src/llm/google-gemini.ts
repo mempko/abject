@@ -90,16 +90,17 @@ export class GeminiProvider extends BaseLLMProvider {
     smart: 'gemini-3.1-pro-preview',
     balanced: 'gemini-3.5-flash',
     fast: 'gemini-3.1-flash-lite',
+    code: 'gemini-3.1-pro-preview',
   };
 
   // Thinking counts against maxOutputTokens (default is only ~8192), so size it
   // generously per tier and drive depth with thinkingLevel. Pro can't disable
   // thinking; flash-lite runs near-minimal.
   private static readonly TIER_MAX_OUTPUT: Record<ModelTier, number> = {
-    smart: 32768, balanced: 16384, fast: 8192,
+    smart: 32768, balanced: 16384, fast: 8192, code: 32768,
   };
   private static readonly TIER_THINKING_LEVEL: Record<ModelTier, string> = {
-    smart: 'high', balanced: 'medium', fast: 'minimal',
+    smart: 'high', balanced: 'medium', fast: 'minimal', code: 'high',
   };
   private static readonly MODEL_MAX_OUTPUT = 65536;
 

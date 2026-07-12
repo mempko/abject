@@ -2360,8 +2360,10 @@ The registered object must implement these handlers to participate in the agent 
    * OTA loop: cheap mechanical/verification steps run on balanced, hard ones
    * (drafting code, diagnosing errors, planning) stay on smart.
    */
-  private resolveThinkTier(hint?: string): 'smart' | 'balanced' {
-    return (hint === 'balanced' || hint === 'fast') ? 'balanced' : 'smart';
+  private resolveThinkTier(hint?: string): 'smart' | 'balanced' | 'code' {
+    if (hint === 'balanced' || hint === 'fast') return 'balanced';
+    if (hint === 'code') return 'code';
+    return 'smart';
   }
 
   // ── Vision-aware tiering ─────────────────────────────────────────────
@@ -2421,16 +2423,17 @@ The registered object must implement these handlers to participate in the agent 
    */
   private async applyVisionTiering(
     entry: TaskEntry,
-    tier: 'smart' | 'balanced',
-  ): Promise<{ tier: 'smart' | 'balanced'; provider?: string; model?: string }> {
+    tier: 'smart' | 'balanced' | 'code',
+  ): Promise<{ tier: 'smart' | 'balanced' | 'code'; provider?: string; model?: string }> {
     const messages = entry.state.llmMessages;
     if (!AgentAbject.conversationHasImages(messages)) return { tier };
 
     const caps = await this.tierCapabilities();
     if (!caps || caps[tier]?.vision !== false) return { tier };
 
-    // The preferred tier is text-only: try the other think tier first
-    const other: 'smart' | 'balanced' = tier === 'smart' ? 'balanced' : 'smart';
+    // The preferred tier is text-only: try another think tier first (a
+    // text-only code tier hands image-bearing steps to smart).
+    const other: 'smart' | 'balanced' = tier === 'balanced' ? 'smart' : tier === 'code' ? 'smart' : 'balanced';
     if (caps[other] && caps[other]!.vision !== false) {
       log.info(`Vision routing: '${tier}' model ${caps[tier]?.model} is text-only; thinking on '${other}' for this step`);
       return { tier: other };

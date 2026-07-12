@@ -25,6 +25,7 @@ const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
   smart: 'deepseek-v4-pro',
   balanced: 'deepseek-v4-flash',
   fast: 'deepseek-v4-flash',
+  code: 'deepseek-v4-pro',
 };
 
 /** Reasoning models: the explicit pro id or the legacy reasoner alias. */

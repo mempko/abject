@@ -129,6 +129,7 @@ export class AnthropicProvider extends BaseLLMProvider {
     smart: 'claude-opus-4-8',
     balanced: 'claude-sonnet-4-6',
     fast: 'claude-haiku-4-5-20251001',
+    code: 'claude-opus-4-8',
   };
 
   override resolveModel(options?: LLMCompletionOptions): string {
@@ -148,12 +149,14 @@ export class AnthropicProvider extends BaseLLMProvider {
     smart: 'high',
     balanced: 'medium',
     fast: 'low',
+    code: 'high',
   };
 
   private static readonly TIER_MAX_TOKENS: Record<ModelTier, number> = {
     smart: 64000,
     balanced: 32000,
     fast: 12000,
+    code: 64000,
   };
 
   /** Floor on max_tokens whenever thinking is active, so the answer always
@@ -165,6 +168,7 @@ export class AnthropicProvider extends BaseLLMProvider {
     smart: 12000,
     balanced: 8000,
     fast: 0, // disabled — the fast tier answers directly
+    code: 12000,
   };
 
   private static profileForModel(model: string): ModelThinkingProfile {
@@ -207,9 +211,9 @@ export class AnthropicProvider extends BaseLLMProvider {
       effort = options.effort ?? (tier ? AnthropicProvider.TIER_EFFORT[tier] : undefined);
     }
 
-    // Only the smart/balanced tiers reason; the fast tier and untiered utility
+    // The smart/balanced/code tiers reason; the fast tier and untiered utility
     // calls answer directly (preserving legacy behavior for the latter).
-    const wantThink = tier === 'smart' || tier === 'balanced';
+    const wantThink = tier === 'smart' || tier === 'balanced' || tier === 'code';
 
     // thinking field + whether the model will actually produce thinking.
     let thinking: AnthropicThinking | undefined;

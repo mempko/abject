@@ -25,6 +25,7 @@ const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
   smart: 'kimi-k2.6',
   balanced: 'moonshot-v1-32k',
   fast: 'moonshot-v1-8k',
+  code: 'kimi-k2.6',
 };
 
 /** k2.5+ / k2-thinking reason via a thinking param; moonshot-v1-* do not. */

@@ -69,6 +69,7 @@ export interface TierCapabilities {
   smart: TierCapability | null;
   balanced: TierCapability | null;
   fast: TierCapability | null;
+  code: TierCapability | null;
   /**
    * Optional vision substitute: the model to use for an image-bearing step
    * when the requested tier's model is text-only. Null when not configured.
@@ -85,6 +86,7 @@ import { DeepSeekProvider } from '../llm/deepseek.js';
 import { GrokProvider } from '../llm/grok.js';
 import { GeminiProvider } from '../llm/google-gemini.js';
 import { KimiProvider } from '../llm/kimi.js';
+import { MetaProvider } from '../llm/meta.js';
 import { MiniMaxProvider } from '../llm/minimax.js';
 import type { HttpRequest, HttpResponse } from './capabilities/http-client.js';
 
@@ -393,7 +395,7 @@ export class LLMObject extends Abject {
               },
               {
                 name: 'describeTiers',
-                description: 'Describe the effective model behind each tier (smart/balanced/fast) including capabilities. Returns { smart, balanced, fast, visionFallback } where each entry is { provider, model, vision } — vision is true when the model accepts image input, false when it is text-only, and null when unknown. visionFallback is the optional substitute model for image-bearing steps when a tier is text-only (null when not configured); to use it, pass its provider in the request payload and its model in options.model. Consult this before sending image content: pick a tier whose vision is not false, use the fallback, or omit the image.',
+                description: 'Describe the effective model behind each tier (smart/balanced/fast/code) including capabilities. Returns { smart, balanced, fast, code, visionFallback } where each entry is { provider, model, vision } — vision is true when the model accepts image input, false when it is text-only, and null when unknown. visionFallback is the optional substitute model for image-bearing steps when a tier is text-only (null when not configured); to use it, pass its provider in the request payload and its model in options.model. Consult this before sending image content: pick a tier whose vision is not false, use the fallback, or omit the image.',
                 parameters: [],
                 returns: { kind: 'reference', reference: 'TierCapabilities' },
               },
@@ -844,6 +846,7 @@ export class LLMObject extends Abject {
       ['gemini',     (apiKey) => new GeminiProvider({ apiKey, fetchFn })],
       ['kimi',       (apiKey) => new KimiProvider({ apiKey, fetchFn })],
       ['minimax',    (apiKey) => new MiniMaxProvider({ apiKey, fetchFn })],
+      ['meta',       (apiKey) => new MetaProvider({ apiKey, fetchFn })],
     ];
     for (const [id, make] of apiKeyFactories) {
       const cred = credentials[id];
@@ -1225,6 +1228,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     new GeminiProvider({ apiKey: '' }),
     new KimiProvider({ apiKey: '' }),
     new MiniMaxProvider({ apiKey: '' }),
+    new MetaProvider({ apiKey: '' }),
   ].map(p => ({ id: p.describe().id, describe: () => p.describe() }));
 
   /**
@@ -1577,11 +1581,12 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       };
     }
 
-    for (const tier of ['smart', 'balanced', 'fast'] as ModelTier[]) {
+    for (const tier of ['smart', 'balanced', 'fast', 'code'] as ModelTier[]) {
       let providerName: string | undefined;
       let model: string | undefined;
 
-      const config = this.tierRouting[tier];
+      // Mirror resolveProviderAndModel: an unrouted code tier rides smart.
+      const config = this.tierRouting[tier] ?? (tier === 'code' ? this.tierRouting.smart : undefined);
       if (config && this.providers.get(config.provider)) {
         providerName = config.provider;
         model = config.model;
@@ -1628,14 +1633,17 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       return { provider: provider! };
     }
 
-    // Tier routing: look up per-tier provider+model
-    if (tier && this.tierRouting[tier]) {
-      const config = this.tierRouting[tier]!;
+    // Tier routing: look up per-tier provider+model. The code tier falls
+    // back to the smart tier's routing when unconfigured — code generation
+    // wants the strongest model, and smart is where users put it.
+    const effectiveTier = tier === 'code' && !this.tierRouting.code ? 'smart' : tier;
+    if (effectiveTier && this.tierRouting[effectiveTier]) {
+      const config = this.tierRouting[effectiveTier]!;
       const provider = this.providers.get(config.provider);
       if (provider) {
         return { provider, modelOverride: config.model };
       }
-      log.warn(`Tier '${tier}' routes to provider '${config.provider}' which is not registered, falling back to default`);
+      log.warn(`Tier '${effectiveTier}' routes to provider '${config.provider}' which is not registered, falling back to default`);
     }
 
     // Fall back to default provider
@@ -1702,7 +1710,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
 ### Completion Options
 
 The \`options\` object in \`complete\` accepts:
-- tier: 'smart' | 'balanced' | 'fast' — model quality tier (default: 'balanced')
+- tier: 'smart' | 'balanced' | 'fast' | 'code' — model quality tier (default: 'balanced'). 'code' is the code-generation tier; when unrouted it rides the smart tier's routing.
 - temperature: number — controls randomness (0-1)
 - maxTokens: number — limit response length
 - stopSequences: string[] — stop generation at these strings
@@ -1732,7 +1740,7 @@ or send text only:
 
 ### Per-Tier Routing
 
-Each tier (smart, balanced, fast) can route to a different provider and model.
+Each tier (smart, balanced, fast, code) can route to a different provider and model. The code tier serves code generation; unrouted, it falls back to smart.
 This is configured via the Settings UI or the \`setTierRouting\` method:
 
   await this.call(this.dep('LLM'), 'setTierRouting', {

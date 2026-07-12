@@ -117,6 +117,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     smart: 'gpt-5.4',
     balanced: 'gpt-5.4-mini',
     fast: 'gpt-5.4-nano',
+    code: 'gpt-5.4',
   };
 
   override resolveModel(options?: LLMCompletionOptions): string {
@@ -147,12 +148,14 @@ export class OpenAIProvider extends BaseLLMProvider {
     smart: 'high',
     balanced: 'medium',
     fast: 'low',
+    code: 'high',
   };
 
   protected static readonly TIER_MAX_TOKENS: Record<ModelTier, number> = {
     smart: 32000,
     balanced: 16000,
     fast: 4000,
+    code: 32000,
   };
 
   /** Floor on the output cap whenever reasoning is active, so the answer fits. */

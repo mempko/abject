@@ -25,6 +25,7 @@ const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
   smart: 'MiniMax-M3',
   balanced: 'MiniMax-M2.7',
   fast: 'MiniMax-M2.7-highspeed',
+  code: 'MiniMax-M3',
 };
 
 /** M2.x / M3 reason (always-on, not effort-tunable); abab models do not. */

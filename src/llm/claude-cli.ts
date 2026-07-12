@@ -271,7 +271,7 @@ export class ClaudeCliProvider extends BaseLLMProvider {
       // CLI providers default to 'auto' — the binary picks its current
       // latest model for each call. Upgrading the binary auto-rolls
       // these routes onto the new default with no settings changes.
-      defaultTierModels: { smart: AUTO_MODEL, balanced: AUTO_MODEL, fast: AUTO_MODEL },
+      defaultTierModels: { smart: AUTO_MODEL, balanced: AUTO_MODEL, fast: AUTO_MODEL, code: AUTO_MODEL },
     };
   }
 

@@ -53,6 +53,8 @@ const STORAGE_KEY_TIER_BALANCED_PROVIDER = 'global-settings:tierBalancedProvider
 const STORAGE_KEY_TIER_BALANCED_MODEL = 'global-settings:tierBalancedModel';
 const STORAGE_KEY_TIER_FAST_PROVIDER = 'global-settings:tierFastProvider';
 const STORAGE_KEY_TIER_FAST_MODEL = 'global-settings:tierFastModel';
+const STORAGE_KEY_TIER_CODE_PROVIDER = 'global-settings:tierCodeProvider';
+const STORAGE_KEY_TIER_CODE_MODEL = 'global-settings:tierCodeModel';
 // Optional vision-fallback model: substitutes for a text-only tier model on image-bearing steps
 const STORAGE_KEY_VISION_PROVIDER = 'global-settings:tierVisionProvider';
 const STORAGE_KEY_VISION_MODEL = 'global-settings:tierVisionModel';
@@ -66,9 +68,25 @@ const STORAGE_KEY_VISION_MODEL = 'global-settings:tierVisionModel';
  */
 type LLMProviderName = string;
 
-type ModelTierName = 'smart' | 'balanced' | 'fast';
-const TIER_LABELS: string[] = ['Smart', 'Balanced', 'Fast'];
-const TIER_NAMES: ModelTierName[] = ['smart', 'balanced', 'fast'];
+type ModelTierName = 'smart' | 'balanced' | 'fast' | 'code';
+const TIER_LABELS: string[] = ['Smart', 'Balanced', 'Fast', 'Code'];
+const TIER_NAMES: ModelTierName[] = ['smart', 'balanced', 'fast', 'code'];
+
+/** Per-tier storage keys, so every load/persist path loops instead of hardcoding tiers. */
+const TIER_STORAGE_KEYS: Record<ModelTierName, { provider: string; model: string }> = {
+  smart:    { provider: STORAGE_KEY_TIER_SMART_PROVIDER,    model: STORAGE_KEY_TIER_SMART_MODEL },
+  balanced: { provider: STORAGE_KEY_TIER_BALANCED_PROVIDER, model: STORAGE_KEY_TIER_BALANCED_MODEL },
+  fast:     { provider: STORAGE_KEY_TIER_FAST_PROVIDER,     model: STORAGE_KEY_TIER_FAST_MODEL },
+  code:     { provider: STORAGE_KEY_TIER_CODE_PROVIDER,     model: STORAGE_KEY_TIER_CODE_MODEL },
+};
+
+/** Saved tier presets: name → full tier routing + optional vision fallback. */
+const STORAGE_KEY_TIER_PRESETS = 'global-settings:tierPresets';
+
+interface TierPreset {
+  routing: Partial<Record<ModelTierName, { provider: string; model: string }>>;
+  vision: { provider: string; model: string } | null;
+}
 
 // Legacy keys for migration
 const LEGACY_KEY_ANTHROPIC = 'settings:anthropicApiKey';
@@ -120,10 +138,10 @@ export class GlobalSettings extends Abject {
   private cliRefreshBtnId?: AbjectId;
 
   // Per-tier provider + model select widgets
-  private tierProviderSelectIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined };
-  private tierModelSelectIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined };
+  private tierProviderSelectIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
+  private tierModelSelectIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
   /** Per-tier capability label ("vision" / "text-only") next to the model dropdown. */
-  private tierCapLabelIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined };
+  private tierCapLabelIds: Record<ModelTierName, AbjectId | undefined> = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
   /**
    * The model id each tier is meant to show: the saved routing at build time,
    * then the user's latest dropdown pick. Dropdowns render by display name,
@@ -132,7 +150,7 @@ export class GlobalSettings extends Abject {
    * refresh silently resets the selection to the list's first model (and a
    * subsequent Save would persist the reset).
    */
-  private tierDesiredModelIds: Record<ModelTierName, string | null> = { smart: null, balanced: null, fast: null };
+  private tierDesiredModelIds: Record<ModelTierName, string | null> = { smart: null, balanced: null, fast: null, code: null };
 
   // Optional vision-fallback row: provider dropdown (with a leading 'None'),
   // model dropdown, capability label, and the intended model id (same
@@ -143,6 +161,16 @@ export class GlobalSettings extends Abject {
   private visionDesiredModelId: string | null = null;
   /** Provider-dropdown label meaning "no vision fallback configured". */
   private static readonly VISION_NONE_LABEL = 'None';
+
+  // Tier presets: a named bundle of tier routing + vision fallback. Built-in
+  // presets are derived from each provider's defaultTierModels; user-saved
+  // presets persist in storage and are listed first.
+  private presetSelectId?: AbjectId;
+  private presetNameInputId?: AbjectId;
+  private presetApplyBtnId?: AbjectId;
+  private presetSaveBtnId?: AbjectId;
+  private presetDeleteBtnId?: AbjectId;
+  private savedPresets: Record<string, TierPreset> = {};
 
   private saveBtnId?: AbjectId;
   private statusLabelId?: AbjectId;
@@ -308,7 +336,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.dep('GlobalSettings'), 'hide', {});
 
 ### What It Manages
-- AI tab: Anthropic/OpenAI API keys, Ollama URL, per-tier model routing (smart/balanced/fast)
+- AI tab: per-provider API keys (self-described by each provider), Ollama URL, per-tier model routing (smart/balanced/fast/code — code is the code-generation tier and rides smart when unrouted), an optional vision fallback, and tier PRESETS (apply/save/delete a named tier configuration; built-in presets derive from each provider's defaults)
 - Auth tab: optional HTTP basic auth for the UI server
 - Permissions tab: filesystem paths, shell commands, and web domain allow/deny lists
 
@@ -336,6 +364,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       smart: { provider: null, model: null },
       balanced: { provider: null, model: null },
       fast: { provider: null, model: null },
+      code: { provider: null, model: null },
     };
     const visionFallback: { provider: string | null; model: string | null } = { provider: null, model: null };
 
@@ -358,24 +387,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }
 
       // Load per-tier routing
-      tierRouting.smart.provider = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_SMART_PROVIDER })
-      );
-      tierRouting.smart.model = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_SMART_MODEL })
-      );
-      tierRouting.balanced.provider = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_BALANCED_PROVIDER })
-      );
-      tierRouting.balanced.model = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_BALANCED_MODEL })
-      );
-      tierRouting.fast.provider = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_FAST_PROVIDER })
-      );
-      tierRouting.fast.model = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_FAST_MODEL })
-      );
+      for (const tier of TIER_NAMES) {
+        tierRouting[tier].provider = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].provider })
+        );
+        tierRouting[tier].model = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].model })
+        );
+      }
       visionFallback.provider = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_VISION_PROVIDER })
       );
@@ -388,11 +407,6 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       // name (e.g. codex no longer accepts `gpt-5` under ChatGPT login —
       // migrates to `auto`). Self-described per provider, no special
       // casing here.
-      const tierModelKeys: Record<ModelTierName, string> = {
-        smart:    STORAGE_KEY_TIER_SMART_MODEL,
-        balanced: STORAGE_KEY_TIER_BALANCED_MODEL,
-        fast:     STORAGE_KEY_TIER_FAST_MODEL,
-      };
       for (const tier of TIER_NAMES) {
         const providerId = tierRouting[tier].provider;
         if (!providerId) continue;
@@ -404,7 +418,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         if (migrated && migrated !== saved) {
           tierRouting[tier].model = migrated;
           try {
-            await this.request(request(this.id, this.storageId, 'set', { key: tierModelKeys[tier], value: migrated }));
+            await this.request(request(this.id, this.storageId, 'set', { key: TIER_STORAGE_KEYS[tier].model, value: migrated }));
           } catch { /* best-effort migration */ }
           log.info(`Migrated ${providerId} ${tier} tier model "${saved}" → "${migrated}"`);
         }
@@ -439,7 +453,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }
 
       // Legacy migration: old single-provider setting to per-tier routing
-      const hasTierRouting = tierRouting.smart.provider || tierRouting.balanced.provider || tierRouting.fast.provider;
+      const hasTierRouting = TIER_NAMES.some(t => tierRouting[t].provider);
       if (!hasTierRouting) {
         const oldProvider = await this.request<string | null>(
           request(this.id, this.storageId, 'get', { key: LEGACY_KEY_PROVIDER })
@@ -488,7 +502,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
     // Configure all providers and tier routing
     const hasAnyConfig = Object.keys(credentials).length > 0;
-    const hasTierConfig = tierRouting.smart.provider || tierRouting.balanced.provider || tierRouting.fast.provider;
+    const hasTierConfig = TIER_NAMES.some(t => tierRouting[t].provider);
     if ((hasAnyConfig || hasTierConfig) && this.llmId) {
       await this.configureProviders(credentials, tierRouting, visionFallback);
       log.info('Loaded saved provider configuration');
@@ -501,14 +515,10 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     tierRouting: Record<ModelTierName, { provider: string | null; model: string | null }>,
   ): Promise<void> {
     if (!this.storageId) return;
-    const keys: [string, string | null][] = [
-      [STORAGE_KEY_TIER_SMART_PROVIDER, tierRouting.smart.provider],
-      [STORAGE_KEY_TIER_SMART_MODEL, tierRouting.smart.model],
-      [STORAGE_KEY_TIER_BALANCED_PROVIDER, tierRouting.balanced.provider],
-      [STORAGE_KEY_TIER_BALANCED_MODEL, tierRouting.balanced.model],
-      [STORAGE_KEY_TIER_FAST_PROVIDER, tierRouting.fast.provider],
-      [STORAGE_KEY_TIER_FAST_MODEL, tierRouting.fast.model],
-    ];
+    const keys: [string, string | null][] = TIER_NAMES.flatMap((tier): [string, string | null][] => [
+      [TIER_STORAGE_KEYS[tier].provider, tierRouting[tier].provider],
+      [TIER_STORAGE_KEYS[tier].model, tierRouting[tier].model],
+    ]);
     for (const [key, value] of keys) {
       if (value) {
         await this.request(request(this.id, this.storageId, 'set', { key, value }));
@@ -678,6 +688,20 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }
       if (fromId === this.visionModelSelectId && aspect === 'change') {
         await this.onVisionModelChanged();
+        return;
+      }
+
+      // Tier preset buttons
+      if (fromId === this.presetApplyBtnId && aspect === 'click') {
+        await this.onPresetApply();
+        return;
+      }
+      if (fromId === this.presetSaveBtnId && aspect === 'click') {
+        await this.onPresetSave();
+        return;
+      }
+      if (fromId === this.presetDeleteBtnId && aspect === 'click') {
+        await this.onPresetDelete();
         return;
       }
 
@@ -999,27 +1023,18 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       smart: { provider: null, model: null },
       balanced: { provider: null, model: null },
       fast: { provider: null, model: null },
+      code: { provider: null, model: null },
     };
     const savedVisionFallback: { provider: string | null; model: string | null } = { provider: null, model: null };
     if (this.storageId) {
-      savedTierRouting.smart.provider = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_SMART_PROVIDER })
-      );
-      savedTierRouting.smart.model = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_SMART_MODEL })
-      );
-      savedTierRouting.balanced.provider = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_BALANCED_PROVIDER })
-      );
-      savedTierRouting.balanced.model = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_BALANCED_MODEL })
-      );
-      savedTierRouting.fast.provider = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_FAST_PROVIDER })
-      );
-      savedTierRouting.fast.model = await this.request<string | null>(
-        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_FAST_MODEL })
-      );
+      for (const tier of TIER_NAMES) {
+        savedTierRouting[tier].provider = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].provider })
+        );
+        savedTierRouting[tier].model = await this.request<string | null>(
+          request(this.id, this.storageId, 'get', { key: TIER_STORAGE_KEYS[tier].model })
+        );
+      }
       savedVisionFallback.provider = await this.request<string | null>(
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_VISION_PROVIDER })
       );
@@ -1027,6 +1042,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         request(this.id, this.storageId, 'get', { key: STORAGE_KEY_VISION_MODEL })
       );
     }
+
+    this.savedPresets = await this.loadSavedPresets();
 
     // Populate cache with defaults synchronously so the UI can render now.
     // Live per-provider fetches run lazily (when the user looks at a provider
@@ -1229,7 +1246,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         { type: 'label', windowId: this.windowId, text: 'Model Tiers',
           style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
         { type: 'label', windowId: this.windowId,
-          text: 'Choose a provider and model for each quality tier. Screenshots and pasted images need a 👁 vision model; the optional Vision row is the fallback used for image steps when a tier\'s model is text-only.',
+          text: 'Choose a provider and model for each quality tier. Code is the code-generation tier (agents draft source on it; leave it matching Smart unless you want a dedicated coding model). Screenshots and pasted images need a 👁 vision model; the optional Vision row is the fallback used for image steps when a tier\'s model is text-only.',
           style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true } },
       ]})
     );
@@ -1430,6 +1447,97 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         widgetId: visionCapLabelId,
         sizePolicy: { horizontal: 'fixed' },
         preferredSize: { width: 62, height: 32 },
+      }));
+    }
+
+    // ── Tier presets row ──
+    // [Preset] [dropdown: saved + built-in] [Apply] [Delete], then
+    // [Name] [text input] [Save Preset]. Built-ins are derived from each
+    // provider's defaultTierModels, so every provider ships a starter preset.
+    {
+      const { widgetIds: [presetHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
+        request(this.id, this.widgetManagerId!, 'create', { specs: [
+          { type: 'label', windowId: this.windowId,
+            text: 'Presets — apply a saved or built-in tier configuration, or save the current one under a name.',
+            style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true } },
+        ]})
+      );
+      await this.request(request(this.id, cId, 'addLayoutChild', {
+        widgetId: presetHeaderId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 34 },
+      }));
+
+      const presetRowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+          parentLayoutId: cId,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 8,
+        })
+      );
+      await this.request(request(this.id, cId, 'addLayoutChild', {
+        widgetId: presetRowId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 32 },
+      }));
+
+      const { widgetIds: [presetLabelId, presetSelectId, applyBtnId, deleteBtnId] } =
+        await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs: [
+            { type: 'label', windowId: this.windowId, text: 'Preset',
+              style: { color: this.theme.textHeading, fontSize: 13 } },
+            { type: 'select', windowId: this.windowId,
+              options: this.presetOptionNames(), selectedIndex: 0 },
+            { type: 'button', windowId: this.windowId, text: 'Apply', style: { fontSize: 12 } },
+            { type: 'button', windowId: this.windowId, text: 'Delete', style: { fontSize: 12 } },
+          ]})
+        );
+      this.presetSelectId = presetSelectId;
+      this.presetApplyBtnId = applyBtnId;
+      this.presetDeleteBtnId = deleteBtnId;
+      await this.request(request(this.id, presetSelectId, 'addDependent', {}));
+      await this.request(request(this.id, applyBtnId, 'addDependent', {}));
+      await this.request(request(this.id, deleteBtnId, 'addDependent', {}));
+      await this.request(request(this.id, presetRowId, 'addLayoutChildren', {
+        children: [
+          { widgetId: presetLabelId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 65, height: 32 } },
+          { widgetId: presetSelectId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 32 } },
+          { widgetId: applyBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 32 } },
+          { widgetId: deleteBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 32 } },
+        ],
+      }));
+
+      const nameRowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+          parentLayoutId: cId,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 8,
+        })
+      );
+      await this.request(request(this.id, cId, 'addLayoutChild', {
+        widgetId: nameRowId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 32 },
+      }));
+
+      const { widgetIds: [nameLabelId, nameInputId, savePresetBtnId] } =
+        await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs: [
+            { type: 'label', windowId: this.windowId, text: 'Name',
+              style: { color: this.theme.textHeading, fontSize: 13 } },
+            { type: 'textInput', windowId: this.windowId, placeholder: 'e.g. Everyday / Cheap / Coding' },
+            { type: 'button', windowId: this.windowId, text: 'Save Preset', style: { fontSize: 12 } },
+          ]})
+        );
+      this.presetNameInputId = nameInputId;
+      this.presetSaveBtnId = savePresetBtnId;
+      await this.request(request(this.id, savePresetBtnId, 'addDependent', {}));
+      await this.request(request(this.id, nameRowId, 'addLayoutChildren', {
+        children: [
+          { widgetId: nameLabelId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 65, height: 32 } },
+          { widgetId: nameInputId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 32 } },
+          { widgetId: savePresetBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 110, height: 32 } },
+        ],
       }));
     }
 
@@ -1728,12 +1836,17 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.credentialInputId = undefined;
     this.credentialToggleId = undefined;
     this.providerModelsLabelId = undefined;
-    this.tierProviderSelectIds = { smart: undefined, balanced: undefined, fast: undefined };
-    this.tierModelSelectIds = { smart: undefined, balanced: undefined, fast: undefined };
-    this.tierCapLabelIds = { smart: undefined, balanced: undefined, fast: undefined };
+    this.tierProviderSelectIds = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
+    this.tierModelSelectIds = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
+    this.tierCapLabelIds = { smart: undefined, balanced: undefined, fast: undefined, code: undefined };
     this.visionProviderSelectId = undefined;
     this.visionModelSelectId = undefined;
     this.visionCapLabelId = undefined;
+    this.presetSelectId = undefined;
+    this.presetNameInputId = undefined;
+    this.presetApplyBtnId = undefined;
+    this.presetSaveBtnId = undefined;
+    this.presetDeleteBtnId = undefined;
     this.saveBtnId = undefined;
     this.statusLabelId = undefined;
     this.authCheckboxId = undefined;
@@ -1832,12 +1945,200 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       ...Object.values(this.tierModelSelectIds),
       this.visionProviderSelectId,
       this.visionModelSelectId,
+      this.presetSelectId,
+      this.presetApplyBtnId,
+      this.presetSaveBtnId,
+      this.presetDeleteBtnId,
     ];
     for (const id of ids) {
       if (id) {
         try { await this.request(request(this.id, id, 'update', { style })); } catch { /* widget gone */ }
       }
     }
+  }
+
+  // ========== TIER PRESETS ==========
+
+  /**
+   * Built-in starter presets, one per provider, derived from each
+   * description's defaultTierModels — no per-provider knowledge here. The
+   * vision fallback is the provider's first vision-capable catalog model.
+   */
+  private builtinPresets(): Array<{ name: string; preset: TierPreset }> {
+    const out: Array<{ name: string; preset: TierPreset }> = [];
+    for (const desc of this.providerDescriptions) {
+      const d = desc.defaultTierModels;
+      if (!d || !d.smart) continue;
+      const routing: TierPreset['routing'] = {};
+      for (const tier of TIER_NAMES) {
+        routing[tier] = { provider: desc.id, model: d[tier] || d.smart };
+      }
+      const visionModel = desc.models.find(m => m.vision === true);
+      out.push({
+        name: `${desc.label} defaults`,
+        preset: { routing, vision: visionModel ? { provider: desc.id, model: visionModel.id } : null },
+      });
+    }
+    return out;
+  }
+
+  /** Dropdown options: user-saved presets first, then the built-ins. */
+  private presetOptionNames(): string[] {
+    const names = [...Object.keys(this.savedPresets).sort(), ...this.builtinPresets().map(b => b.name)];
+    return names.length > 0 ? names : ['(no presets)'];
+  }
+
+  /** Saved presets win a name collision with a built-in. */
+  private resolvePreset(name: string): TierPreset | undefined {
+    return this.savedPresets[name] ?? this.builtinPresets().find(b => b.name === name)?.preset;
+  }
+
+  private async loadSavedPresets(): Promise<Record<string, TierPreset>> {
+    if (!this.storageId) return {};
+    try {
+      const raw = await this.request<string | null>(
+        request(this.id, this.storageId, 'get', { key: STORAGE_KEY_TIER_PRESETS })
+      );
+      if (!raw || typeof raw !== 'string') return {};
+      const parsed = JSON.parse(raw) as Record<string, TierPreset>;
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  private async persistSavedPresets(): Promise<void> {
+    if (!this.storageId) return;
+    await this.request(request(this.id, this.storageId, 'set', {
+      key: STORAGE_KEY_TIER_PRESETS, value: JSON.stringify(this.savedPresets),
+    }));
+  }
+
+  private async refreshPresetOptions(): Promise<void> {
+    if (!this.presetSelectId) return;
+    try {
+      await this.request(request(this.id, this.presetSelectId, 'update', {
+        options: this.presetOptionNames(), selectedIndex: 0,
+      }));
+    } catch { /* widget gone */ }
+  }
+
+  /** Read the tier + vision dropdowns as a preset (current UI state). */
+  private async readCurrentTierSelections(): Promise<TierPreset> {
+    const routing: TierPreset['routing'] = {};
+    for (const tier of TIER_NAMES) {
+      const providerSelectId = this.tierProviderSelectIds[tier];
+      const modelSelectId = this.tierModelSelectIds[tier];
+      if (!providerSelectId || !modelSelectId) continue;
+      const providerLabel = await this.request<string>(
+        request(this.id, providerSelectId, 'getValue', {})
+      );
+      const providerName = this.idForLabel(providerLabel);
+      const modelName = await this.request<string>(
+        request(this.id, modelSelectId, 'getValue', {})
+      );
+      if (providerName && modelName && modelName !== '(no models)') {
+        const modelList = this.providerModelCache.get(providerName) ?? [];
+        const info = modelList.find(m => m.name === modelName);
+        routing[tier] = { provider: providerName, model: info ? info.id : modelName };
+      }
+    }
+    let vision: TierPreset['vision'] = null;
+    if (this.visionProviderSelectId && this.visionModelSelectId) {
+      const provider = await this.visionSelectedProvider();
+      if (provider) {
+        const modelName = await this.request<string>(
+          request(this.id, this.visionModelSelectId, 'getValue', {})
+        );
+        if (modelName && modelName !== '(no models)' && modelName !== '(none)') {
+          const modelList = this.providerModelCache.get(provider) ?? [];
+          const info = modelList.find(m => m.name === modelName);
+          vision = { provider, model: info ? info.id : modelName };
+        }
+      }
+    }
+    return { routing, vision };
+  }
+
+  /**
+   * Point every tier/vision dropdown at the preset's routing, then run the
+   * normal save path (persist + configure + status toast) so applying a
+   * preset behaves exactly like picking the values by hand and hitting Save.
+   */
+  private async applyTierPreset(preset: TierPreset): Promise<void> {
+    const providerIds = this.providerIds();
+    const providerLabels = this.providerLabels();
+    for (const tier of TIER_NAMES) {
+      const entry = preset.routing[tier];
+      const providerSelectId = this.tierProviderSelectIds[tier];
+      if (!entry || !providerSelectId) continue;
+      const pIdx = providerIds.indexOf(entry.provider);
+      if (pIdx < 0) continue; // provider not known in this build — leave the tier as-is
+      await this.request(request(this.id, providerSelectId, 'update', {
+        options: providerLabels, selectedIndex: pIdx,
+      }));
+      this.tierDesiredModelIds[tier] = entry.model;
+      await this.refreshTierModelOptions(tier);
+      void this.refreshProviderModels(entry.provider);
+    }
+    if (this.visionProviderSelectId) {
+      const providerOptions = [GlobalSettings.VISION_NONE_LABEL, ...providerLabels];
+      const vIdx = preset.vision ? providerIds.indexOf(preset.vision.provider) : -1;
+      await this.request(request(this.id, this.visionProviderSelectId, 'update', {
+        options: providerOptions, selectedIndex: vIdx >= 0 ? vIdx + 1 : 0,
+      }));
+      this.visionDesiredModelId = vIdx >= 0 ? (preset.vision?.model ?? null) : null;
+      await this.refreshVisionModelOptions();
+    }
+    await this.saveSettings();
+  }
+
+  private async onPresetApply(): Promise<void> {
+    if (!this.presetSelectId) return;
+    const name = await this.request<string>(
+      request(this.id, this.presetSelectId, 'getValue', {})
+    );
+    const preset = name ? this.resolvePreset(name) : undefined;
+    if (!preset) {
+      await this.setStatus('Pick a preset to apply.', this.theme.statusWarning);
+      return;
+    }
+    await this.applyTierPreset(preset);
+  }
+
+  private async onPresetSave(): Promise<void> {
+    if (!this.presetNameInputId) return;
+    const name = (await this.request<string>(
+      request(this.id, this.presetNameInputId, 'getValue', {})
+    ))?.trim();
+    if (!name) {
+      await this.setStatus('Give the preset a name first.', this.theme.statusWarning);
+      return;
+    }
+    const preset = await this.readCurrentTierSelections();
+    if (Object.keys(preset.routing).length === 0) {
+      await this.setStatus('Configure at least one tier before saving a preset.', this.theme.statusWarning);
+      return;
+    }
+    this.savedPresets[name] = preset;
+    await this.persistSavedPresets();
+    await this.refreshPresetOptions();
+    await this.setStatus(`Preset '${name}' saved.`, this.theme.statusSuccess);
+  }
+
+  private async onPresetDelete(): Promise<void> {
+    if (!this.presetSelectId) return;
+    const name = await this.request<string>(
+      request(this.id, this.presetSelectId, 'getValue', {})
+    );
+    if (!name || !this.savedPresets[name]) {
+      await this.setStatus('Only saved presets can be deleted (built-ins stay).', this.theme.statusWarning);
+      return;
+    }
+    delete this.savedPresets[name];
+    await this.persistSavedPresets();
+    await this.refreshPresetOptions();
+    await this.setStatus(`Preset '${name}' deleted.`, this.theme.statusSuccess);
   }
 
   // ========== TIER MODEL REFRESH ==========
@@ -3544,6 +3845,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       smart: { provider: null, model: null },
       balanced: { provider: null, model: null },
       fast: { provider: null, model: null },
+      code: { provider: null, model: null },
     };
 
     for (const tier of TIER_NAMES) {

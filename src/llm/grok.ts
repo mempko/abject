@@ -26,6 +26,7 @@ const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
   smart: 'grok-4.3',
   balanced: 'grok-4.3',
   fast: 'grok-4.3',
+  code: 'grok-4.3',
 };
 
 /** grok-4.1 and newer accept reasoning_effort; grok-4 / grok-4-0709 / grok-4-fast reject it. */

@@ -1049,7 +1049,7 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
       const resp = await this.sendRequest<{ content: string }>(
         this.llmId,
         'complete',
-        { messages: [systemMessage(sys), userMessage(user)] as LLMMessage[], options: { tier: 'smart', maxTokens: 16384, cacheKey: state.goal.slice(0, 64) } },
+        { messages: [systemMessage(sys), userMessage(user)] as LLMMessage[], options: { tier: 'code', maxTokens: 16384, cacheKey: state.goal.slice(0, 64) } },
         300000,
       );
       raw = resp.content ?? '';
@@ -2593,21 +2593,38 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   /**
    * Per-state model tier for the next think decision. Mechanical, error-free
    * progress — compiling, validating, deploying, and verifying a healthy
-   * object — decides its (trivial) next step on 'balanced'. Anything that needs
-   * real reasoning stays on 'smart': the initial architecture, any code-
-   * producing step (draft_source / draft_diff / replace_/add_/remove_handler),
-   * error diagnosis, or a verification call that surfaced a problem. The OTA
-   * loop floors thinking at balanced, so 'fast' is never used here.
+   * object — decides its (trivial) next step on 'balanced'. Steps in the
+   * code pipeline — writing/editing source, or fixing what compile /
+   * validate_calls / review_semantics flagged — run on 'code' (the explicit
+   * code-generation tier; it rides smart when unrouted). Everything else
+   * that needs real reasoning — the initial architecture, runtime error
+   * diagnosis, a verification call that surfaced a problem — stays on
+   * 'smart'. The OTA loop floors thinking at balanced, so 'fast' is never
+   * used here.
    */
-  private chooseObserveTier(state: LoopState): 'smart' | 'balanced' {
+  private chooseObserveTier(state: LoopState): 'smart' | 'balanced' | 'code' {
     const log = state.turnLog ?? [];
     const last = log[log.length - 1];
-    if (!last || !last.ok) return 'smart'; // first step, or last action failed → reason / recover
+    if (!last) return 'smart'; // first step → architecture / investigation
+    const CODE_PIPELINE = new Set([
+      'draft_source', 'draft_diff', 'draft_via_llm',
+      'replace_handler', 'add_handler', 'remove_handler',
+      'compile', 'validate_calls', 'review_semantics', 'read_draft',
+    ]);
+    if (!last.ok) {
+      // A failed code-pipeline step gets fixed by writing code; other
+      // failures need diagnostic reasoning first.
+      return CODE_PIPELINE.has(last.action) ? 'code' : 'smart';
+    }
     const ROUTINE = new Set([
       'compile', 'validate_calls', 'deploy_spawn', 'deploy_update',
       'call', 'read_draft', 'getState', 'ask', 'discover', 'load_target',
     ]);
-    if (!ROUTINE.has(last.action)) return 'smart'; // code generation / design step
+    if (!ROUTINE.has(last.action)) {
+      // Just drafted/edited successfully → the next step continues the code
+      // work (more edits, or deciding validation) on the code tier.
+      return CODE_PIPELINE.has(last.action) ? 'code' : 'smart';
+    }
     // A "successful" verification call can still surface a runtime problem —
     // that needs reasoning even though the action itself succeeded.
     if (/\b(error|exception|fail|threw|cannot read|undefined|not found|not registered)\b/i.test(last.summary)) {

@@ -383,7 +383,7 @@ export class OllamaProvider extends BaseLLMProvider {
       // Ollama models are entirely user-installed and discovered live
       // via /api/tags. No useful static seed.
       models: [],
-      defaultTierModels: { smart: '', balanced: '', fast: '' },
+      defaultTierModels: { smart: '', balanced: '', fast: '', code: '' },
     };
   }
 

@@ -27,6 +27,7 @@ const DEFAULT_TIER_MODELS: Record<ModelTier, string> = {
   smart: 'anthropic/claude-opus-4.8',
   balanced: 'openai/gpt-5.4-mini',
   fast: 'meta-llama/llama-3.3-70b-instruct',
+  code: 'anthropic/claude-opus-4.8',
 };
 
 interface OpenRouterModelsResponse {
