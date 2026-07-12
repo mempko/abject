@@ -2593,42 +2593,37 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
   /**
    * Per-state model tier for the next think decision. Mechanical, error-free
    * progress — compiling, validating, deploying, and verifying a healthy
-   * object — decides its (trivial) next step on 'balanced'. Steps in the
-   * code pipeline — writing/editing source, or fixing what compile /
-   * validate_calls / review_semantics flagged — run on 'code' (the explicit
-   * code-generation tier; it rides smart when unrouted). Everything else
-   * that needs real reasoning — the initial architecture, runtime error
-   * diagnosis, a verification call that surfaced a problem — stays on
-   * 'smart'. The OTA loop floors thinking at balanced, so 'fast' is never
-   * used here.
+   * object — decides its (trivial) next step on 'balanced'. Every other
+   * think step of a CREATE/MODIFY loop runs on 'code' (the explicit
+   * code-generation tier; it rides smart when unrouted): the tier must be
+   * chosen BEFORE the step runs, and any non-routine authoring step may emit
+   * source inline — a single think call routinely batches draft_manifest +
+   * draft_source + compile, so a reactive after-the-fact heuristic misses
+   * exactly the call that writes the code. INVESTIGATE loops reason on
+   * 'smart'; screenshot critique is forced to 'smart' upstream (a text-only
+   * code model can't judge an image). The OTA loop floors thinking at
+   * balanced, so 'fast' is never used here.
    */
   private chooseObserveTier(state: LoopState): 'smart' | 'balanced' | 'code' {
+    const reasoningTier = state.kind === 'investigate' ? 'smart' : 'code';
     const log = state.turnLog ?? [];
     const last = log[log.length - 1];
-    if (!last) return 'smart'; // first step → architecture / investigation
-    const CODE_PIPELINE = new Set([
-      'draft_source', 'draft_diff', 'draft_via_llm',
-      'replace_handler', 'add_handler', 'remove_handler',
-      'compile', 'validate_calls', 'review_semantics', 'read_draft',
-    ]);
-    if (!last.ok) {
-      // A failed code-pipeline step gets fixed by writing code; other
-      // failures need diagnostic reasoning first.
-      return CODE_PIPELINE.has(last.action) ? 'code' : 'smart';
-    }
-    const ROUTINE = new Set([
-      'compile', 'validate_calls', 'deploy_spawn', 'deploy_update',
-      'call', 'read_draft', 'getState', 'ask', 'discover', 'load_target',
-    ]);
-    if (!ROUTINE.has(last.action)) {
-      // Just drafted/edited successfully → the next step continues the code
-      // work (more edits, or deciding validation) on the code tier.
-      return CODE_PIPELINE.has(last.action) ? 'code' : 'smart';
-    }
-    // A "successful" verification call can still surface a runtime problem —
+    if (!last || !last.ok) return reasoningTier; // first step, or recovering from a failure
+    // Only successes whose NEXT step is predictable-mechanical earn the cheap
+    // tier. For authoring loops that is the validation/deploy pipeline
+    // (compile→validate→deploy→verify decisions). Discovery and read
+    // successes do NOT qualify: the think right after "discovery finished" is
+    // typically the one that architects and DRAFTS the source (batched
+    // draft_manifest + draft_source + compile in one response) — routing it
+    // to balanced writes the whole object on the mid-tier model.
+    const MECHANICAL = state.kind === 'investigate'
+      ? new Set(['call', 'read_draft', 'getState', 'ask', 'discover'])
+      : new Set(['compile', 'validate_calls', 'deploy_spawn', 'deploy_update']);
+    if (!MECHANICAL.has(last.action)) return reasoningTier;
+    // A "successful" mechanical step can still surface a runtime problem —
     // that needs reasoning even though the action itself succeeded.
     if (/\b(error|exception|fail|threw|cannot read|undefined|not found|not registered)\b/i.test(last.summary)) {
-      return 'smart';
+      return reasoningTier;
     }
     return 'balanced';
   }
