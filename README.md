@@ -34,6 +34,9 @@ The longform version lives on the blog:
   self-aware object runtime is.
 - [Entering the Architecture Age](https://blog.mempko.com/entering-the-architecture-age/):
   the software pyramid, the Window Tax, and why the big idea is messaging.
+- [A Love Letter to Object Orientation](https://blog.mempko.com/a-love-letter-to-object-orientation/):
+  why "the internet is an object-oriented system" is not a metaphor. Alan
+  Kay's big idea was messaging, not classes.
 - [Let the Information Monopolies Crumble!](https://blog.mempko.com/let-the-information-monopolies-crumble/):
   the human case. Computers are for computing, and everyone should get to.
 
