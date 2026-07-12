@@ -194,6 +194,8 @@ export class GlobalSettings extends Abject {
   // Permissions tab
   private permissionsContainerId?: AbjectId;
   private platformLabelId?: AbjectId;
+  private permSubTabBarId?: AbjectId;
+  private permCategoryCardIds: (AbjectId | undefined)[] = [];
   // Filesystem
   private fsReadOnlyCheckboxId?: AbjectId;
   private fsPathInputId?: AbjectId;
@@ -339,7 +341,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 ### What It Manages
 - AI tab: per-provider API keys (self-described by each provider), Ollama URL, per-tier model routing (smart/balanced/fast/code — code is the code-generation tier and rides smart when unrouted), an optional vision fallback, and tier PRESETS (apply/save/delete a named tier configuration; built-in presets derive from each provider's defaults)
 - Auth tab: optional HTTP basic auth for the UI server
-- Permissions tab: filesystem paths, shell commands, and web domain allow/deny lists
+- Permissions tab: category sub-tabs — Filesystem (allowed paths, read-only mode), Shell (enable + command allow/deny), Web (enable + domain allow/deny), Objects (capability enforcement mode)
 - Skills & MCP tab: installed skills (SKILL.md files) and the skills/MCP catalog browser
 
 ### IMPORTANT
@@ -629,6 +631,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
         const idx = value as number;
         this.activeTab = idx === 0 ? 'ai' : idx === 1 ? 'auth' : idx === 2 ? 'permissions' : 'skills';
         await this.switchTab();
+        return;
+      }
+
+      if (fromId === this.permSubTabBarId && aspect === 'change') {
+        await this.switchPermCategory(value as number);
         return;
       }
 
@@ -976,9 +983,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
 
-    // Permissions container (scrollable VBox, initially hidden)
+    // Permissions container (plain VBox, initially hidden): the active
+    // category card expands to fill the viewport (its lists stretch), and
+    // the Save Permissions row stays pinned at the bottom.
     this.permissionsContainerId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
         parentLayoutId: this.rootLayoutId,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
@@ -1037,11 +1046,14 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
    * the card's layout id — add the section's rows to IT, not to the tab
    * container. autoSize lets the ScrollableVBox measure the card.
    */
-  private async sectionCard(parentId: AbjectId, title: string, description: string, descriptionHeight = 18): Promise<AbjectId> {
+  private async sectionCard(parentId: AbjectId, title: string, description: string, descriptionHeight = 18, expanding = false): Promise<AbjectId> {
+    // autoSize cards hug their content (right inside a ScrollableVBox);
+    // expanding cards fill the parent's remaining space (right in a plain
+    // VBox viewport where inner lists should stretch on resize).
     const cardId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedVBox', {
         parentLayoutId: parentId,
-        autoSize: true,
+        ...(expanding ? {} : { autoSize: true }),
         margins: { top: 14, right: 16, bottom: 14, left: 16 },
         spacing: 8,
         style: { background: this.theme.inputBg, borderColor: this.theme.windowBorder, borderWidth: 1, radius: 10 },
@@ -1405,7 +1417,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
     // ── 3 · Model Tiers (card) ──
     const tiersCard = await this.sectionCard(cId, '3 · Model Tiers',
-      'Choose a provider and model for each quality tier. Code is the code-generation tier (agents draft source on it; leave it matching Smart unless you want a dedicated coding model). Screenshots and pasted images need a 👁 vision model; the optional Vision row is the fallback used for image steps when a tier\'s model is text-only.', 68);
+      'Choose a provider and model for each quality tier. Code is the code-generation tier (agents draft source on it; leave it matching Smart unless you want a dedicated coding model). Screenshots and pasted images need a 👁 vision model; the optional Vision row is the fallback used for image steps when a tier\'s model is text-only.', 86);
 
     // Per-tier rows: [Label] [Provider dropdown] [Model dropdown]
     for (let i = 0; i < TIER_NAMES.length; i++) {
@@ -1855,6 +1867,8 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.authContainerId = undefined;
     this.skillsContainerId = undefined;
     this.permissionsContainerId = undefined;
+    this.permSubTabBarId = undefined;
+    this.permCategoryCardIds = [];
     this.platformLabelId = undefined;
     this.fsReadOnlyCheckboxId = undefined;
     this.fsPathInputId = undefined;
@@ -2763,7 +2777,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }
     }
 
-    // Platform info label
+    // Platform info (shown inside the Shell card)
     let platformText = 'Platform: unknown';
     try {
       const shellId = await this.discoverDep('ShellExecutor');
@@ -2775,136 +2789,65 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }
     } catch { /* ShellExecutor not available */ }
 
-    const { widgetIds: [platLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    // ── Category sub-tabs: one card per permission domain ──
+    const { widgetIds: [permTabBarId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: platformText,
-          style: { color: this.theme.textDescription, fontSize: 12 } },
+        { type: 'tabBar', windowId: this.windowId,
+          tabs: ['Filesystem', 'Shell', 'Web', 'Objects'],
+          closable: false,
+          selectedIndex: 0 },
       ]})
     );
-    this.platformLabelId = platLabelId;
+    this.permSubTabBarId = permTabBarId;
+    await this.request(request(this.id, this.permSubTabBarId, 'addDependent', {}));
     await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: this.platformLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
+      widgetId: this.permSubTabBarId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 34 },
     }));
 
-    // ── Filesystem section ──
-    const { widgetIds: [fsHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Filesystem',
-          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
-      ]})
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: fsHeaderId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 24 },
-    }));
+    // ── Filesystem card ──
+    const fsCard = await this.sectionCard(cId, 'Filesystem',
+      'Where agents may read and write files. Paths outside the allowed list prompt you for approval; read-only mode blocks every write.', 34, true);
 
-    // Read-only checkbox
     const { widgetIds: [fsRoCheckId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'checkbox', windowId: this.windowId, checked: this.fsReadOnly, text: 'Read-only mode' },
+        { type: 'checkbox', windowId: this.windowId, checked: this.fsReadOnly, text: 'Read-only mode (block all writes)' },
       ]})
     );
     this.fsReadOnlyCheckboxId = fsRoCheckId;
     await this.request(request(this.id, this.fsReadOnlyCheckboxId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, fsCard, 'addLayoutChild', {
       widgetId: this.fsReadOnlyCheckboxId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 28 },
     }));
 
-    // Allowed paths label
-    const { widgetIds: [fsPathLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    {
+      const ed = await this.stringListEditor(fsCard, 'Allowed paths', '/path/to/directory', this.fsAllowedPaths);
+      this.fsPathInputId = ed.inputId;
+      this.fsAddBtnId = ed.addBtnId;
+      this.fsPathListId = ed.listId;
+      this.fsRemoveBtnId = ed.removeBtnId;
+    }
+
+    // ── Shell card ──
+    const shellCard = await this.sectionCard(cId, 'Shell',
+      'Which shell commands agents may run. Commands not on the allowed list prompt you for approval; denied commands are always refused.', 34, true);
+
+    const { widgetIds: [platLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Allowed paths (will prompt if not listed)',
-          style: { color: this.theme.textHeading, fontSize: 13 } },
+        { type: 'label', windowId: this.windowId, text: platformText,
+          style: { color: this.theme.textTertiary, fontSize: 11 } },
       ]})
     );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: fsPathLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-
-    // Path input + Add button row
-    const fsAddRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: cId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: fsAddRowId,
+    this.platformLabelId = platLabelId;
+    await this.request(request(this.id, shellCard, 'addLayoutChild', {
+      widgetId: this.platformLabelId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
+      preferredSize: { height: 16 },
     }));
 
-    const { widgetIds: [fsPathInId, fsAddId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'textInput', windowId: this.windowId, placeholder: '/path/to/directory' },
-        { type: 'button', windowId: this.windowId, text: 'Add' },
-      ]})
-    );
-    this.fsPathInputId = fsPathInId;
-    this.fsAddBtnId = fsAddId;
-    await this.request(request(this.id, this.fsPathInputId, 'addDependent', {}));
-    await this.request(request(this.id, fsAddRowId, 'addLayoutChild', {
-      widgetId: this.fsPathInputId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-    await this.request(request(this.id, this.fsAddBtnId, 'addDependent', {}));
-    await this.request(request(this.id, fsAddRowId, 'addLayoutChild', {
-      widgetId: this.fsAddBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 56, height: 32 },
-    }));
-
-    // Path list
-    const { widgetIds: [fsListId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'list', windowId: this.windowId, items: toListItems(this.fsAllowedPaths), searchable: false,
-          style: { height: 80 } },
-      ]})
-    );
-    this.fsPathListId = fsListId;
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: this.fsPathListId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 80 },
-    }));
-
-    // Remove button
-    const { widgetIds: [fsRemId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'button', windowId: this.windowId, text: 'Remove Selected' },
-      ]})
-    );
-    this.fsRemoveBtnId = fsRemId;
-    await this.request(request(this.id, this.fsRemoveBtnId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: this.fsRemoveBtnId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-      preferredSize: { width: 130, height: 28 },
-    }));
-
-    // ── Shell section ──
-    const { widgetIds: [shellHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Shell Execution',
-          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
-      ]})
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: shellHeaderId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 24 },
-    }));
-
-    // Shell enabled checkbox
     const { widgetIds: [shellEnCheckId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'checkbox', windowId: this.windowId, checked: this.shellEnabled, text: 'Enable shell execution' },
@@ -2912,178 +2855,31 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     );
     this.shellEnabledCheckboxId = shellEnCheckId;
     await this.request(request(this.id, this.shellEnabledCheckboxId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, shellCard, 'addLayoutChild', {
       widgetId: this.shellEnabledCheckboxId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 28 },
     }));
 
-    // Allowed commands label
-    const { widgetIds: [shellAllowLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Allowed commands (will prompt if not listed)',
-          style: { color: this.theme.textHeading, fontSize: 13 } },
-      ]})
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: shellAllowLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
+    {
+      const ed = await this.stringListEditor(shellCard, 'Allowed commands', 'e.g. git, ls, npm', this.shellAllowedCmds);
+      this.shellCmdInputId = ed.inputId;
+      this.shellAddBtnId = ed.addBtnId;
+      this.shellCmdListId = ed.listId;
+      this.shellRemoveBtnId = ed.removeBtnId;
+    }
+    {
+      const ed = await this.stringListEditor(shellCard, 'Denied commands (always refused)', 'e.g. rm, sudo', this.shellDeniedCmds);
+      this.shellDeniedInputId = ed.inputId;
+      this.shellDeniedAddBtnId = ed.addBtnId;
+      this.shellDeniedListId = ed.listId;
+      this.shellDeniedRemoveBtnId = ed.removeBtnId;
+    }
 
-    // Allowed commands input + Add row
-    const shellAddRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: cId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: shellAddRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
+    // ── Web card ──
+    const webCard = await this.sectionCard(cId, 'Web',
+      'Which domains agents may reach over HTTP. An empty allowed list permits every domain except the denied ones.', 34, true);
 
-    const { widgetIds: [shellCmdInId, shellAddId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'textInput', windowId: this.windowId, placeholder: 'e.g. git, ls, npm' },
-        { type: 'button', windowId: this.windowId, text: 'Add' },
-      ]})
-    );
-    this.shellCmdInputId = shellCmdInId;
-    this.shellAddBtnId = shellAddId;
-    await this.request(request(this.id, this.shellCmdInputId, 'addDependent', {}));
-    await this.request(request(this.id, shellAddRowId, 'addLayoutChild', {
-      widgetId: this.shellCmdInputId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-    await this.request(request(this.id, this.shellAddBtnId, 'addDependent', {}));
-    await this.request(request(this.id, shellAddRowId, 'addLayoutChild', {
-      widgetId: this.shellAddBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 56, height: 32 },
-    }));
-
-    // Allowed commands list
-    const { widgetIds: [shellListId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'list', windowId: this.windowId, items: toListItems(this.shellAllowedCmds), searchable: false,
-          style: { height: 80 } },
-      ]})
-    );
-    this.shellCmdListId = shellListId;
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: this.shellCmdListId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 80 },
-    }));
-
-    // Allowed commands remove button
-    const { widgetIds: [shellRemId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'button', windowId: this.windowId, text: 'Remove Selected' },
-      ]})
-    );
-    this.shellRemoveBtnId = shellRemId;
-    await this.request(request(this.id, this.shellRemoveBtnId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: this.shellRemoveBtnId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-      preferredSize: { width: 130, height: 28 },
-    }));
-
-    // Denied commands label
-    const { widgetIds: [shellDenyLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Denied commands',
-          style: { color: this.theme.textHeading, fontSize: 13 } },
-      ]})
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: shellDenyLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-
-    // Denied commands input + Add row
-    const shellDenyAddRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: cId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: shellDenyAddRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-
-    const { widgetIds: [shellDenyInId, shellDenyAddId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'textInput', windowId: this.windowId, placeholder: 'e.g. rm, sudo' },
-        { type: 'button', windowId: this.windowId, text: 'Add' },
-      ]})
-    );
-    this.shellDeniedInputId = shellDenyInId;
-    this.shellDeniedAddBtnId = shellDenyAddId;
-    await this.request(request(this.id, this.shellDeniedInputId, 'addDependent', {}));
-    await this.request(request(this.id, shellDenyAddRowId, 'addLayoutChild', {
-      widgetId: this.shellDeniedInputId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-    await this.request(request(this.id, this.shellDeniedAddBtnId, 'addDependent', {}));
-    await this.request(request(this.id, shellDenyAddRowId, 'addLayoutChild', {
-      widgetId: this.shellDeniedAddBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 56, height: 32 },
-    }));
-
-    // Denied commands list
-    const { widgetIds: [shellDenyListId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'list', windowId: this.windowId, items: toListItems(this.shellDeniedCmds), searchable: false,
-          style: { height: 80 } },
-      ]})
-    );
-    this.shellDeniedListId = shellDenyListId;
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: this.shellDeniedListId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 80 },
-    }));
-
-    // Denied commands remove button
-    const { widgetIds: [shellDenyRemId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'button', windowId: this.windowId, text: 'Remove Selected' },
-      ]})
-    );
-    this.shellDeniedRemoveBtnId = shellDenyRemId;
-    await this.request(request(this.id, this.shellDeniedRemoveBtnId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: this.shellDeniedRemoveBtnId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-      preferredSize: { width: 130, height: 28 },
-    }));
-
-    // ── Web (HTTP) section ──
-    const { widgetIds: [webHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Web / HTTP',
-          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
-      ]})
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: webHeaderId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 24 },
-    }));
-
-    // Web enabled checkbox
     const { widgetIds: [webEnCheckId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'checkbox', windowId: this.windowId, checked: this.webEnabled, text: 'Enable HTTP requests' },
@@ -3091,193 +2887,70 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     );
     this.webEnabledCheckboxId = webEnCheckId;
     await this.request(request(this.id, this.webEnabledCheckboxId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, webCard, 'addLayoutChild', {
       widgetId: this.webEnabledCheckboxId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 28 },
     }));
 
-    // Capability enforcement mode (bus-level check for created objects)
-    const { widgetIds: [capEnfLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId,
-          text: 'Capability enforcement for created objects (warn logs, enforce blocks)',
-          style: { color: this.theme.textHeading, fontSize: 13 } },
-      ]})
+    {
+      const ed = await this.stringListEditor(webCard, 'Allowed domains (empty = allow all)', 'e.g. api.example.com', this.webAllowedDomains);
+      this.webDomainInputId = ed.inputId;
+      this.webAddBtnId = ed.addBtnId;
+      this.webDomainListId = ed.listId;
+      this.webRemoveBtnId = ed.removeBtnId;
+    }
+    {
+      const ed = await this.stringListEditor(webCard, 'Denied domains (always refused)', 'e.g. evil.example.com', this.webDeniedDomains);
+      this.webDeniedInputId = ed.inputId;
+      this.webDeniedAddBtnId = ed.addBtnId;
+      this.webDeniedListId = ed.listId;
+      this.webDeniedRemoveBtnId = ed.removeBtnId;
+    }
+
+    // ── Objects card (capability enforcement) ──
+    const objectsCard = await this.sectionCard(cId, 'Objects',
+      'Created objects declare the capabilities they need. Choose how strictly those declarations are enforced: off runs no checks, warn logs undeclared use, enforce blocks it.', 34, true);
+
+    const capRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: objectsCard,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
     );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: capEnfLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
+    await this.request(request(this.id, objectsCard, 'addLayoutChild', {
+      widgetId: capRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 30 },
     }));
     const capModes = ['off', 'warn', 'enforce'];
-    const { widgetIds: [capEnfSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
+    const { widgetIds: [capLabelId, capEnfSelectId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: 'Enforcement',
+          style: { color: this.theme.textHeading, fontSize: 13 } },
         { type: 'select', windowId: this.windowId, options: capModes,
           selectedIndex: Math.max(0, capModes.indexOf(this.capabilityEnforcement)) },
       ]})
     );
     this.capEnforceSelectId = capEnfSelectId;
     await this.request(request(this.id, this.capEnforceSelectId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, capRowId, 'addLayoutChild', {
+      widgetId: capLabelId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 100, height: 30 },
+    }));
+    await this.request(request(this.id, capRowId, 'addLayoutChild', {
       widgetId: this.capEnforceSelectId,
-      sizePolicy: { vertical: 'fixed' },
+      sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 160, height: 30 },
     }));
 
-    // Allowed domains label
-    const { widgetIds: [webAllowLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Allowed domains (empty = allow all)',
-          style: { color: this.theme.textHeading, fontSize: 13 } },
-      ]})
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: webAllowLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
+    // Only the selected category's card is visible.
+    this.permCategoryCardIds = [fsCard, shellCard, webCard, objectsCard];
+    await this.switchPermCategory(0);
 
-    // Allowed domains input + Add row
-    const webAddRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: cId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: webAddRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-
-    const { widgetIds: [webDomInId, webAddId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'textInput', windowId: this.windowId, placeholder: 'e.g. api.example.com' },
-        { type: 'button', windowId: this.windowId, text: 'Add' },
-      ]})
-    );
-    this.webDomainInputId = webDomInId;
-    this.webAddBtnId = webAddId;
-    await this.request(request(this.id, this.webDomainInputId, 'addDependent', {}));
-    await this.request(request(this.id, webAddRowId, 'addLayoutChild', {
-      widgetId: this.webDomainInputId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-    await this.request(request(this.id, this.webAddBtnId, 'addDependent', {}));
-    await this.request(request(this.id, webAddRowId, 'addLayoutChild', {
-      widgetId: this.webAddBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 56, height: 32 },
-    }));
-
-    // Allowed domains list
-    const { widgetIds: [webListId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'list', windowId: this.windowId, items: toListItems(this.webAllowedDomains), searchable: false,
-          style: { height: 80 } },
-      ]})
-    );
-    this.webDomainListId = webListId;
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: this.webDomainListId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 80 },
-    }));
-
-    // Allowed domains remove button
-    const { widgetIds: [webRemId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'button', windowId: this.windowId, text: 'Remove Selected' },
-      ]})
-    );
-    this.webRemoveBtnId = webRemId;
-    await this.request(request(this.id, this.webRemoveBtnId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: this.webRemoveBtnId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-      preferredSize: { width: 130, height: 28 },
-    }));
-
-    // Denied domains label
-    const { widgetIds: [webDenyLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Denied domains',
-          style: { color: this.theme.textHeading, fontSize: 13 } },
-      ]})
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: webDenyLabelId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 20 },
-    }));
-
-    // Denied domains input + Add row
-    const webDenyAddRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: cId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: webDenyAddRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-
-    const { widgetIds: [webDenyInId, webDenyAddId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'textInput', windowId: this.windowId, placeholder: 'e.g. evil.example.com' },
-        { type: 'button', windowId: this.windowId, text: 'Add' },
-      ]})
-    );
-    this.webDeniedInputId = webDenyInId;
-    this.webDeniedAddBtnId = webDenyAddId;
-    await this.request(request(this.id, this.webDeniedInputId, 'addDependent', {}));
-    await this.request(request(this.id, webDenyAddRowId, 'addLayoutChild', {
-      widgetId: this.webDeniedInputId,
-      sizePolicy: { horizontal: 'expanding' },
-      preferredSize: { height: 32 },
-    }));
-    await this.request(request(this.id, this.webDeniedAddBtnId, 'addDependent', {}));
-    await this.request(request(this.id, webDenyAddRowId, 'addLayoutChild', {
-      widgetId: this.webDeniedAddBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 56, height: 32 },
-    }));
-
-    // Denied domains list
-    const { widgetIds: [webDenyListId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'list', windowId: this.windowId, items: toListItems(this.webDeniedDomains), searchable: false,
-          style: { height: 80 } },
-      ]})
-    );
-    this.webDeniedListId = webDenyListId;
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: this.webDeniedListId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 80 },
-    }));
-
-    // Denied domains remove button
-    const { widgetIds: [webDenyRemId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'button', windowId: this.windowId, text: 'Remove Selected' },
-      ]})
-    );
-    this.webDeniedRemoveBtnId = webDenyRemId;
-    await this.request(request(this.id, this.webDeniedRemoveBtnId, 'addDependent', {}));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: this.webDeniedRemoveBtnId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
-      preferredSize: { width: 130, height: 28 },
-    }));
-
-    // ── Save button ──
+    // ── Save button (always visible, below the active card) ──
     const permsSaveRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
         parentLayoutId: cId,
@@ -3290,9 +2963,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 36 },
     }));
-
     await this.request(request(this.id, permsSaveRowId, 'addLayoutSpacer', {}));
-
     const { widgetIds: [permsSaveId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'button', windowId: this.windowId, text: 'Save Permissions',
@@ -3306,6 +2977,101 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 150, height: 36 },
     }));
+  }
+
+  /** Show one permission-category card, hide the rest. */
+  private async switchPermCategory(index: number): Promise<void> {
+    for (let i = 0; i < this.permCategoryCardIds.length; i++) {
+      const cardId = this.permCategoryCardIds[i];
+      if (!cardId) continue;
+      try {
+        await this.request(request(this.id, cardId, 'update', { style: { visible: i === index } }));
+      } catch { /* widget gone */ }
+    }
+  }
+
+  /**
+   * A labeled add/remove string-list editor: label, input + Add row, a list
+   * whose rows carry an inline Remove action, and a Remove Selected button.
+   * Returns the widget ids — the changed() handlers key on the fields the
+   * caller stores them in.
+   */
+  private async stringListEditor(
+    cardId: AbjectId,
+    label: string,
+    placeholder: string,
+    items: string[],
+  ): Promise<{ inputId: AbjectId; addBtnId: AbjectId; listId: AbjectId; removeBtnId: AbjectId }> {
+    const { widgetIds: [labelId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: label,
+          style: { color: this.theme.textHeading, fontSize: 13 } },
+      ]})
+    );
+    await this.request(request(this.id, cardId, 'addLayoutChild', {
+      widgetId: labelId,
+      sizePolicy: { vertical: 'fixed' },
+      preferredSize: { height: 20 },
+    }));
+
+    const addRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: cardId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, cardId, 'addLayoutChild', {
+      widgetId: addRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+
+    const { widgetIds: [inputId, addBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'textInput', windowId: this.windowId, placeholder },
+        { type: 'button', windowId: this.windowId, text: 'Add' },
+      ]})
+    );
+    await this.request(request(this.id, inputId, 'addDependent', {}));
+    await this.request(request(this.id, addBtnId, 'addDependent', {}));
+    await this.request(request(this.id, addRowId, 'addLayoutChild', {
+      widgetId: inputId,
+      sizePolicy: { horizontal: 'expanding' },
+      preferredSize: { height: 32 },
+    }));
+    await this.request(request(this.id, addRowId, 'addLayoutChild', {
+      widgetId: addBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 56, height: 32 },
+    }));
+
+    const { widgetIds: [listId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'list', windowId: this.windowId, items: toListItems(items), searchable: false,
+          style: { height: 80 } },
+      ]})
+    );
+    await this.request(request(this.id, listId, 'addDependent', {}));
+    await this.request(request(this.id, cardId, 'addLayoutChild', {
+      widgetId: listId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+      preferredSize: { height: 80 },
+    }));
+
+    const { widgetIds: [removeBtnId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Remove Selected', style: { fontSize: 12 } },
+      ]})
+    );
+    await this.request(request(this.id, removeBtnId, 'addDependent', {}));
+    await this.request(request(this.id, cardId, 'addLayoutChild', {
+      widgetId: removeBtnId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
+      preferredSize: { width: 130, height: 28 },
+    }));
+
+    return { inputId, addBtnId, listId, removeBtnId };
   }
 
   /**

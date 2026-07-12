@@ -214,7 +214,14 @@ export class SelectWidget extends WidgetAbject {
       },
     });
 
-    // Selected text
+    // Selected text — clipped to the widget minus the arrow zone, so a long
+    // value can't paint over the arrow or bleed onto neighboring widgets.
+    commands.push({ type: 'save', surfaceId, params: {} });
+    commands.push({
+      type: 'clip',
+      surfaceId,
+      params: { x: ox, y: oy, width: Math.max(0, w - 26), height: h },
+    });
     commands.push({
       type: 'text',
       surfaceId,
@@ -227,6 +234,7 @@ export class SelectWidget extends WidgetAbject {
         baseline: 'middle',
       },
     });
+    commands.push({ type: 'restore', surfaceId, params: {} });
 
     // Down arrow (polygon triangle)
     commands.push({
