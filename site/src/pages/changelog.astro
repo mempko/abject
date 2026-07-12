@@ -1,0 +1,192 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+import changelog from '../data/changelog.json';
+
+interface Entry {
+  version: string;
+  date: string;
+  title: string;
+  summary: string;
+  highlights: string[];
+  fixes: string[];
+}
+
+const entries = changelog as Entry[];
+---
+
+<Layout
+  title="Changelog - Abject"
+  description="Every major Abject release: what arrived, what got fixed, and how the organism grew."
+>
+  <Header />
+  <main class="changelog">
+    <div class="changelog-container">
+
+      <header class="changelog-hero">
+        <p class="changelog-eyebrow">// CHANGELOG</p>
+        <h1>How the Organism Grew</h1>
+        <p class="changelog-thesis">
+          Every major release, newest first: what arrived, what got fixed, and what it
+          taught us. Patch releases fold into the entry above them.
+        </p>
+      </header>
+
+      {entries.map((entry) => (
+        <article class="release" id={`v${entry.version}`}>
+          <header class="release-header">
+            <a class="release-version" href={`#v${entry.version}`}>v{entry.version}</a>
+            <time class="release-date" datetime={entry.date}>{entry.date}</time>
+          </header>
+          <h2 class="release-title">{entry.title}</h2>
+          <p class="release-summary">{entry.summary}</p>
+
+          {entry.highlights.length > 0 && (
+            <>
+              <h3 class="release-list-label">Highlights</h3>
+              <ul class="release-list">
+                {entry.highlights.map((item) => <li>{item}</li>)}
+              </ul>
+            </>
+          )}
+
+          {entry.fixes.length > 0 && (
+            <>
+              <h3 class="release-list-label release-list-label-fixes">Fixes</h3>
+              <ul class="release-list release-list-fixes">
+                {entry.fixes.map((item) => <li>{item}</li>)}
+              </ul>
+            </>
+          )}
+        </article>
+      ))}
+
+      <p class="changelog-tail">
+        The full commit history lives on
+        <a href="https://github.com/mempko/abject/releases" target="_blank" rel="noopener">GitHub Releases</a>.
+      </p>
+
+    </div>
+  </main>
+  <Footer />
+</Layout>
+
+<style>
+  .changelog {
+    padding: 140px 24px 80px;
+    position: relative;
+    z-index: 1;
+  }
+
+  .changelog-container {
+    max-width: 720px;
+    margin: 0 auto;
+  }
+
+  .changelog-hero {
+    margin-bottom: 56px;
+  }
+
+  .changelog-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    letter-spacing: 0.12em;
+    color: var(--eldritch);
+    margin-bottom: 12px;
+  }
+
+  .changelog-hero h1 {
+    font-size: clamp(2rem, 5vw, 2.8rem);
+    line-height: 1.15;
+    margin-bottom: 16px;
+  }
+
+  .changelog-thesis {
+    color: var(--text-secondary);
+    font-size: 1.05rem;
+    line-height: 1.7;
+  }
+
+  .release {
+    position: relative;
+    padding: 28px 0 36px;
+    border-top: 1px solid var(--border);
+  }
+
+  .release-header {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    margin-bottom: 10px;
+  }
+
+  .release-version {
+    font-family: var(--font-mono);
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--eldritch);
+    text-decoration: none;
+  }
+
+  .release-version:hover {
+    text-decoration: underline;
+  }
+
+  .release-date {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    opacity: 0.7;
+  }
+
+  .release-title {
+    font-size: 1.5rem;
+    color: var(--text-primary);
+    margin-bottom: 10px;
+  }
+
+  .release-summary {
+    color: var(--text-secondary);
+    line-height: 1.7;
+    margin-bottom: 18px;
+  }
+
+  .release-list-label {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--eldritch-dim);
+    margin: 18px 0 8px;
+  }
+
+  .release-list {
+    margin: 0;
+    padding-left: 20px;
+    color: var(--text-secondary);
+    line-height: 1.65;
+  }
+
+  .release-list li {
+    margin-bottom: 6px;
+  }
+
+  .release-list li::marker {
+    color: var(--eldritch-dim);
+  }
+
+  .release-list-fixes li::marker {
+    color: var(--text-secondary);
+  }
+
+  .changelog-tail {
+    border-top: 1px solid var(--border);
+    padding-top: 28px;
+    color: var(--text-secondary);
+  }
+
+  .changelog-tail a {
+    color: var(--eldritch-dim);
+  }
+</style>

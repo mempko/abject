@@ -1,0 +1,173 @@
+[
+  {
+    "version": "0.8.14",
+    "date": "2026-07-12",
+    "title": "New blood: WASM, a binary wire, and a learning loop",
+    "summary": "The 0.8 line let Abjects be written in any language, made every remote byte binary, and started teaching the agents to learn from their own work. It also brought the biggest Settings and authoring-loop overhaul yet.",
+    "highlights": [
+      "WASM Abject hosting: ABI v1, a C++ SDK, pnpm forge packaging, and a native C++ KnowledgeBase shipping as a bundled system package — objects in any language that compiles to WebAssembly",
+      "Binary wire protocol for all remote traffic, with interning, frame acknowledgment flow control, and content-addressed image blobs",
+      "Connective tissue for the object system: triggers, SQL-backed collections, full-text knowledge search, streams, audio, speech, and video, and prototype cloning",
+      "A learning loop: TaskReviewer grades finished work, knowledge entries carry provenance and usefulness, and every agent can recall and remember",
+      "Vision awareness end to end: per-model vision capability tracking, a configurable vision-fallback model, and screenshots that verifiers can actually judge — including real 3D scene content",
+      "Web Viewer human takeover: pass captchas and log in yourself, then hand the page back to the agent",
+      "Meta Model API provider (Muse Spark 1.1), an explicit Code tier for code generation, and savable tier presets with built-ins derived from every provider's defaults",
+      "Authoring loops that finish: progress-aware step-budget extensions, draft persistence across task retries, and advisory (non-blocking) semantic review",
+      "Settings redesigned: a card-based AI tab in setup order, category sub-tabs for Permissions, and a dedicated Skills & MCP tab",
+      "UI Abjects are now authored with MVC (in the original Smalltalk sense), DCI, and Design by Contract"
+    ],
+    "fixes": [
+      "Peer-transport wire codec desync after reconnects, and out-of-order inbound handling",
+      "Agent orchestration losses: dropped goal completions, false-positive verifications, and capability polls timing out behind busy agents",
+      "Zero-height self-sizing widgets being culled before they could measure (invisible chat goal trees)",
+      "Long model names bleeding out of Settings dropdowns; window screenshots missing 3D scene content",
+      "The scene-op error hint omitting 'animate', teaching agents a valid op was unsupported"
+    ]
+  },
+  {
+    "version": "0.7.0",
+    "date": "2026-06-29",
+    "title": "Self-repair, taught properly",
+    "summary": "A craftsmanship release: the object-creation loop learned to edit code structurally instead of by guesswork, every window got a live method inspector, and P2P grew a TURN relay so peers reach each other from anywhere.",
+    "highlights": [
+      "Structure-aware editing: ObjectCreator reads drafts by handler, replaces whole methods by name, and parses handler maps with a real parser instead of regexes",
+      "MethodInspector: every window's ? button opens a live, two-pane inspector for the object that owns it",
+      "TURN relay fallback so WebRTC connects across symmetric NAT and cell networks",
+      "Host MCP import: MCP servers configured in mcporter or OpenClaw appear as skills automatically",
+      "Styled containers and rich list cards across the built-in apps; one shared markdown renderer everywhere, including a canvas markdown draw command",
+      "Image paste into chat, and canvases that accept pasted or dropped images",
+      "Theme $tokens usable directly in canvas draw commands, plus a 'designing apps that look good' guide agents actually receive",
+      "User-profile facts injected into every agent's context; per-surface and per-step model tiering to spend smart-model tokens only where they matter"
+    ],
+    "fixes": [
+      "P2P reconnection replacing stale transports, and trickled ICE candidates dropped mid-negotiation",
+      "Window resize events never reaching window owners; wrong window closing from ScriptableAbjects",
+      "Registry re-registration leaking uniquified names and flickering the sidebar",
+      "Runaway retry loops in object creation; oscillation false-positives on legitimate edits",
+      "A 30-second hang reopening windows caused by speculative request forwarding to peers"
+    ]
+  },
+  {
+    "version": "0.6.0",
+    "date": "2026-06-13",
+    "title": "The desktop grows a third dimension",
+    "summary": "The compositor was rebuilt on WebGL2: every window is now a slab in a native 3D scene, and objects can attach real lit geometry to their windows. The same release brought workspace files, a mobile gesture UI, and a unified sidebar.",
+    "highlights": [
+      "Native 3D desktop: a WebGL2 compositor with a retained scene vocabulary — meshes, PBR materials, lights, fog, per-vertex colors, textures, instancing, bloom, and shadow maps",
+      "Arbitrary, dynamically-updatable polygonal meshes for deformable surfaces like water and terrain",
+      "Workspace files: disk-backed FileSystem, an upload pipeline, and a File Manager",
+      "Mobile: a WebOS-style gesture UI with a card overview",
+      "One collapsible sidebar dock replacing three separate rails, with object icons and command-palette keyboard navigation",
+      "The recipientGone protocol: widgets whose owner dies now clean themselves up instead of haunting the message bus",
+      "Canvas draw commands validate loudly and document their whole vocabulary in the error"
+    ],
+    "fixes": [
+      "Corrupted snapshots dropped on restore instead of wedging boot; manifests validated on save",
+      "Fog made scene-relative, fixing the flat-blue fish tank",
+      "Layout children detached from window full-content sizing at any nesting depth",
+      "KnowledgeBase pollution from routine chatter, and lost Chat fact capture"
+    ]
+  },
+  {
+    "version": "0.5.0",
+    "date": "2026-05-31",
+    "title": "A face, a phone, and a scrum team",
+    "summary": "Abject got its visual identity — themes, icons, motion, a command palette — and its agents got a proper team structure: a dedicated ScrumMaster plans work across specialists instead of every agent splitting tasks itself. Your phone joined too.",
+    "highlights": [
+      "Eight built-in themes with an Appearance tab and user-registered themes; Arcane Grimoire became the default look",
+      "Design tokens, vector icons, motion, a command palette, notifications, and full text-editing parity across widgets",
+      "Scrum-shaped orchestration: a ScrumMaster Abject runs planning rounds, dispatches to specialist agents, and reviews outcomes",
+      "Remote UI access: pair a phone by QR code and use your desktop's objects from anywhere, over P2P",
+      "Claude and Codex CLI backends alongside API providers, with self-describing provider metadata driving the Settings UI",
+      "Objects carry their own data: this.data persists, travels with clones, and survives hot reloads",
+      "Per-workspace persistent web-browsing profiles, screenshots delivered inline into chat, and one-shot schedules",
+      "The site grew an About page, an Examples section, and real search-engine manners (sitemap, OG cards)"
+    ],
+    "fixes": [
+      "CLI subprocess idle timeouts that reset on token activity, and bounded retries with backoff across all providers",
+      "Streaming keepalives that survive the whole stream, not just its start",
+      "Agent decompose races and refusal-prone skill prompts",
+      "QR pairing scan reliability and pairing UI stability"
+    ]
+  },
+  {
+    "version": "0.4.0",
+    "date": "2026-04-27",
+    "title": "A bigger toolbox",
+    "summary": "Six new LLM providers, a skills catalog with a secrets vault, and an ObjectCreator rebuilt on the shared agent runtime with surgical SEARCH/REPLACE editing.",
+    "highlights": [
+      "OpenRouter, DeepSeek, Grok, Gemini, Kimi, and MiniMax joined Anthropic, OpenAI, and Ollama as providers",
+      "ClawHub and MCP registry catalogs for discovering skills, with a secrets vault and OAuth flows for the ones that need accounts",
+      "ObjectCreator rewritten on AgentAbject, editing existing objects with SEARCH/REPLACE diffs instead of full rewrites",
+      "A scrollable workspace with pan gestures and scrollbars — the desktop stopped ending at the screen edge",
+      "Multiple chat conversations per workspace, and a per-object Console for debugging",
+      "The background renders on a budget: cached glow sprites, throttled idle framerates, pausing when hidden"
+    ],
+    "fixes": [
+      "Dispatch payloads surviving free-form LLM text; event delivery and progress propagation hardening",
+      "Recurring work routed to the Scheduler primitive instead of spawning agent after agent",
+      "Settings window sized so the AI tab actually fits"
+    ]
+  },
+  {
+    "version": "0.3.0",
+    "date": "2026-04-17",
+    "title": "Doors to the outside world",
+    "summary": "MCP arrived: Abjects can now speak to external tool servers as easily as to each other. Inside, agents learned to report progress honestly, retry with memory of their failures, and stop timing out on long work.",
+    "highlights": [
+      "MCP bridge: connect external MCP servers over stdio JSON-RPC, with tool-input validation and parameter schemas surfaced to agents",
+      "Organisms: compose cooperating objects into one creature with a single public surface",
+      "ScriptableAbject handlers run sandboxed, with scope guidance in every ask answer",
+      "Progress-based timeouts — long work stays alive as long as it reports progress — and failure history passed to retries so agents learn from mistakes",
+      "Structured YES / PARTIAL / NO dispatch verdicts, sequential-by-default task execution, and a preference for configured tools over generic automation",
+      "Prompt caching for Anthropic and OpenAI; Opus 4.7 as the smart tier",
+      "Chat grew bubbles, a live goal tree, and a streaming indicator"
+    ],
+    "fixes": [
+      "P2P shared state scoped to public workspaces only — private stays private",
+      "Data-flow truncations between agents, and duplicate schedules on add and load",
+      "Mailbox drops surfaced loudly; signaling peer binding and WASM target validation hardened"
+    ]
+  },
+  {
+    "version": "0.2.0",
+    "date": "2026-04-09",
+    "title": "Agents that know their limits",
+    "summary": "The agent system grew up: work routes through a shared TupleSpace, agents answer for themselves whether they can do a task, and a permissions system puts the user in charge of what they touch.",
+    "highlights": [
+      "Per-tier LLM routing — smart, balanced, and fast tiers each pick their own provider and model",
+      "ObjectAgent and TupleSpace routing: all agent work flows through one dispatchable space",
+      "Ask-based self-selection: the dispatcher polls agents about a task and routes to whoever credibly says yes",
+      "A permissions system: a Settings tab, runtime prompts for unlisted paths and commands, and per-skill trust",
+      "KnowledgeBase and KnowledgeBrowser: durable cross-session memory with a UI",
+      "Screenshot capability with UI input injection, so agents can see and verify what they build",
+      "WebAgent upgraded to accessibility-tree observation; goal-oriented Chat with task dependencies and reflection"
+    ],
+    "fixes": [
+      "OpenAI provider using max_completion_tokens and surfacing error bodies",
+      "Title-bar stacking from a stale canvas transform; markdown links in non-wrapping labels",
+      "Electron builds bundling the Playwright headless shell, and the app actually exiting when its window closes"
+    ]
+  },
+  {
+    "version": "0.1.0",
+    "date": "2026-03-31",
+    "title": "First light",
+    "summary": "The founding release: a desktop where everything — the registry, the factory, the windows, the chat — is an object with a mailbox, and new objects are spoken into existence.",
+    "highlights": [
+      "The Abject runtime: message passing, mailboxes, a Registry, a Factory, and Design by Contract everywhere",
+      "Speak objects into existence: a three-phase LLM pipeline drafts a manifest, writes the code, and deploys a live object",
+      "The ask protocol: every object answers plain-English questions about what it is and how to use it",
+      "An X11-style windowing system built from object widgets: windows, layouts, taskbar, themes, and a canvas",
+      "Chat, JobManager, and the first agent workflows; multi-workspace support with worker-thread parallelism",
+      "P2P foundations: cryptographic identity, a signaling server, WebRTC transports, and workspace sharing",
+      "Persistent storage so objects survive restarts, plus provider-aware LLM settings with Ollama support",
+      "abject.world itself went live"
+    ],
+    "fixes": [
+      "Deadlocks, re-entrant message handling, and window destroy races — the runtime's first hard lessons",
+      "Timeout cascades during long LLM operations",
+      "Ctrl+click window dragging and same-z-index raise ordering"
+    ]
+  }
+]
