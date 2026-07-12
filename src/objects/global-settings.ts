@@ -179,9 +179,10 @@ export class GlobalSettings extends Abject {
 
   // Tab state
   private tabBarId?: AbjectId;
-  private activeTab: 'ai' | 'auth' | 'permissions' = 'ai';
+  private activeTab: 'ai' | 'auth' | 'permissions' | 'skills' = 'ai';
   private aiContainerId?: AbjectId;
   private authContainerId?: AbjectId;
+  private skillsContainerId?: AbjectId;
 
   // Auth widgets
   private authCheckboxId?: AbjectId;
@@ -339,6 +340,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 - AI tab: per-provider API keys (self-described by each provider), Ollama URL, per-tier model routing (smart/balanced/fast/code — code is the code-generation tier and rides smart when unrouted), an optional vision fallback, and tier PRESETS (apply/save/delete a named tier configuration; built-in presets derive from each provider's defaults)
 - Auth tab: optional HTTP basic auth for the UI server
 - Permissions tab: filesystem paths, shell commands, and web domain allow/deny lists
+- Skills & MCP tab: installed skills (SKILL.md files) and the skills/MCP catalog browser
 
 ### IMPORTANT
 - API keys are stored in global Storage (persisted across restarts).
@@ -625,7 +627,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       // Tab bar changed
       if (fromId === this.tabBarId && aspect === 'change') {
         const idx = value as number;
-        this.activeTab = idx === 0 ? 'ai' : idx === 1 ? 'auth' : 'permissions';
+        this.activeTab = idx === 0 ? 'ai' : idx === 1 ? 'auth' : idx === 2 ? 'permissions' : 'skills';
         await this.switchTab();
         return;
       }
@@ -935,9 +937,9 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const { widgetIds: [tabBarId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
         { type: 'tabBar', windowId: this.windowId,
-          tabs: ['AI', 'Auth', 'Permissions'],
+          tabs: ['AI', 'Auth', 'Permissions', 'Skills & MCP'],
           closable: false,
-          selectedIndex: this.activeTab === 'ai' ? 0 : this.activeTab === 'auth' ? 1 : 2 },
+          selectedIndex: this.activeTab === 'ai' ? 0 : this.activeTab === 'auth' ? 1 : this.activeTab === 'permissions' ? 2 : 3 },
       ]})
     );
     this.tabBarId = tabBarId;
@@ -987,6 +989,19 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
     }));
 
+    // Skills & MCP container (scrollable VBox, initially hidden)
+    this.skillsContainerId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedScrollableVBox', {
+        parentLayoutId: this.rootLayoutId,
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, this.rootLayoutId, 'addLayoutChild', {
+      widgetId: this.skillsContainerId,
+      sizePolicy: { vertical: 'expanding', horizontal: 'expanding' },
+    }));
+
     // Status label at bottom (always visible)
     const { widgetIds: [statusLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
       request(this.id, this.widgetManagerId!, 'create', { specs: [
@@ -1007,11 +1022,95 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     await this.buildAuthTab();
     // Build Permissions tab content
     await this.buildPermissionsTab();
+    // Build Skills & MCP tab content
+    await this.buildSkillsTab();
     // Show correct tab
     await this.switchTab();
 
     this.changed('visibility', true);
     return true;
+  }
+
+  /**
+   * A styled card for one settings section: rounded panel with an
+   * accent-colored numbered title and a wrap-friendly description. Returns
+   * the card's layout id — add the section's rows to IT, not to the tab
+   * container. autoSize lets the ScrollableVBox measure the card.
+   */
+  private async sectionCard(parentId: AbjectId, title: string, description: string, descriptionHeight = 18): Promise<AbjectId> {
+    const cardId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedVBox', {
+        parentLayoutId: parentId,
+        autoSize: true,
+        margins: { top: 14, right: 16, bottom: 14, left: 16 },
+        spacing: 8,
+        style: { background: this.theme.inputBg, borderColor: this.theme.windowBorder, borderWidth: 1, radius: 10 },
+      })
+    );
+    const { widgetIds: [titleId, descId] } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'label', windowId: this.windowId, text: title,
+          style: { color: this.theme.accent, fontWeight: 'bold', fontSize: 14 } },
+        { type: 'label', windowId: this.windowId, text: description,
+          style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true } },
+      ]})
+    );
+    await this.request(request(this.id, cardId, 'addLayoutChild', {
+      widgetId: titleId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 20 },
+    }));
+    await this.request(request(this.id, cardId, 'addLayoutChild', {
+      widgetId: descId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: descriptionHeight },
+    }));
+    return cardId;
+  }
+
+  /** Build Skills & MCP tab content into skillsContainerId. */
+  private async buildSkillsTab(): Promise<void> {
+    const cId = this.skillsContainerId!;
+
+    const card = await this.sectionCard(cId, 'Skills & MCP',
+      'Skills teach agents new abilities (SKILL.md files in ~/.abject/skills/); MCP servers connect external tools and services. Manage what is installed, or browse the catalog to add more.', 34);
+
+    const skillRowId = await this.request<AbjectId>(
+      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+        parentLayoutId: card,
+        margins: { top: 4, right: 0, bottom: 0, left: 0 },
+        spacing: 8,
+      })
+    );
+    await this.request(request(this.id, card, 'addLayoutChild', {
+      widgetId: skillRowId,
+      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+      preferredSize: { height: 36 },
+    }));
+
+    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
+      request(this.id, this.widgetManagerId!, 'create', { specs: [
+        { type: 'button', windowId: this.windowId, text: 'Installed Skills',
+          style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+        { type: 'button', windowId: this.windowId, text: 'Browse Skills & MCP',
+          style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
+      ]})
+    );
+    this.skillBrowserBtnId = widgetIds[0];
+    this.catalogBrowserBtnId = widgetIds[1];
+    await this.request(request(this.id, this.skillBrowserBtnId, 'addDependent', {}));
+    await this.request(request(this.id, this.catalogBrowserBtnId, 'addDependent', {}));
+    await this.request(request(this.id, skillRowId, 'addLayoutChild', {
+      widgetId: this.skillBrowserBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 150, height: 36 },
+    }));
+    await this.request(request(this.id, skillRowId, 'addLayoutChild', {
+      widgetId: this.catalogBrowserBtnId,
+      sizePolicy: { horizontal: 'fixed' },
+      preferredSize: { width: 180, height: 36 },
+    }));
+    await this.request(request(this.id, skillRowId, 'addLayoutSpacer', {}));
   }
 
   /** Build AI tab content into aiContainerId. */
@@ -1050,36 +1149,19 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // or hits Save) to avoid blocking the window paint.
     this.populateDefaultModelCache();
 
-    // ── Credentials section ──
-    const { widgetIds: [credHeaderId, credDescId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Credentials',
-          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
-        { type: 'label', windowId: this.windowId,
-          text: 'Pick a provider to enter or update its API key. Configured keys persist across restarts.',
-          style: { color: this.theme.textDescription, fontSize: 12 } },
-      ]})
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: credHeaderId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 24 },
-    }));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: credDescId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 18 },
-    }));
+    // ── 1 · Credentials (card) ──
+    const credCard = await this.sectionCard(cId, '1 · Credentials',
+      'Pick a provider and enter its API key. Configured keys persist across restarts.');
 
     // Provider selector row
     const providerSelectRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: cId,
+        parentLayoutId: credCard,
         margins: { top: 4, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, credCard, 'addLayoutChild', {
       widgetId: providerSelectRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
@@ -1120,7 +1202,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       ]})
     );
     this.credentialLabelId = credentialLabelId;
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, credCard, 'addLayoutChild', {
       widgetId: this.credentialLabelId,
       sizePolicy: { vertical: 'fixed' },
       preferredSize: { height: 20 },
@@ -1129,12 +1211,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     // Credential input row (input + Show/Hide toggle)
     const credentialRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: cId,
+        parentLayoutId: credCard,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, credCard, 'addLayoutChild', {
       widgetId: credentialRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 32 },
@@ -1175,12 +1257,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     const isCli = this.isCliProvider(this.activeAiProvider);
     const cliRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: cId,
+        parentLayoutId: credCard,
         margins: { top: 0, right: 0, bottom: 0, left: 0 },
         spacing: 8,
       })
     );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, credCard, 'addLayoutChild', {
       widgetId: cliRowId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: isCli ? 28 : 0 },
@@ -1234,32 +1316,96 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       ]})
     );
     this.providerModelsLabelId = providerModelsLabelId;
-    await this.request(request(this.id, cId, 'addLayoutChild', {
+    await this.request(request(this.id, credCard, 'addLayoutChild', {
       widgetId: this.providerModelsLabelId,
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: 18 },
     }));
 
-    // ── Model Tiers section ──
-    const { widgetIds: [tierHeaderId, tierDescId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Model Tiers',
-          style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 15 } },
-        { type: 'label', windowId: this.windowId,
-          text: 'Choose a provider and model for each quality tier. Code is the code-generation tier (agents draft source on it; leave it matching Smart unless you want a dedicated coding model). Screenshots and pasted images need a 👁 vision model; the optional Vision row is the fallback used for image steps when a tier\'s model is text-only.',
-          style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true } },
-      ]})
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: tierHeaderId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 24 },
-    }));
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: tierDescId,
-      sizePolicy: { vertical: 'fixed' },
-      preferredSize: { height: 50 },
-    }));
+    // ── 2 · Preset (card) ──
+    // [Preset] [dropdown: saved + built-in] [Apply] [Delete], then
+    // [Name] [text input] [Save Preset]. Built-ins are derived from each
+    // provider's defaultTierModels, so every provider ships a starter preset.
+    {
+      const presetCard = await this.sectionCard(cId, '2 · Preset',
+        'Start from a preset — a built-in provider default or one you saved — then fine-tune the tiers below. You can also save the current tier setup under a name.', 34);
+
+      const presetRowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+          parentLayoutId: presetCard,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 8,
+        })
+      );
+      await this.request(request(this.id, presetCard, 'addLayoutChild', {
+        widgetId: presetRowId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 32 },
+      }));
+
+      const { widgetIds: [presetLabelId, presetSelectId, applyBtnId, deleteBtnId] } =
+        await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs: [
+            { type: 'label', windowId: this.windowId, text: 'Preset',
+              style: { color: this.theme.textHeading, fontSize: 13 } },
+            { type: 'select', windowId: this.windowId,
+              options: this.presetOptionNames(), selectedIndex: 0 },
+            { type: 'button', windowId: this.windowId, text: 'Apply', style: { fontSize: 12 } },
+            { type: 'button', windowId: this.windowId, text: 'Delete', style: { fontSize: 12 } },
+          ]})
+        );
+      this.presetSelectId = presetSelectId;
+      this.presetApplyBtnId = applyBtnId;
+      this.presetDeleteBtnId = deleteBtnId;
+      await this.request(request(this.id, presetSelectId, 'addDependent', {}));
+      await this.request(request(this.id, applyBtnId, 'addDependent', {}));
+      await this.request(request(this.id, deleteBtnId, 'addDependent', {}));
+      await this.request(request(this.id, presetRowId, 'addLayoutChildren', {
+        children: [
+          { widgetId: presetLabelId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 65, height: 32 } },
+          { widgetId: presetSelectId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 32 } },
+          { widgetId: applyBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 32 } },
+          { widgetId: deleteBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 32 } },
+        ],
+      }));
+
+      const nameRowId = await this.request<AbjectId>(
+        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
+          parentLayoutId: presetCard,
+          margins: { top: 0, right: 0, bottom: 0, left: 0 },
+          spacing: 8,
+        })
+      );
+      await this.request(request(this.id, presetCard, 'addLayoutChild', {
+        widgetId: nameRowId,
+        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
+        preferredSize: { height: 32 },
+      }));
+
+      const { widgetIds: [nameLabelId, nameInputId, savePresetBtnId] } =
+        await this.request<{ widgetIds: AbjectId[] }>(
+          request(this.id, this.widgetManagerId!, 'create', { specs: [
+            { type: 'label', windowId: this.windowId, text: 'Name',
+              style: { color: this.theme.textHeading, fontSize: 13 } },
+            { type: 'textInput', windowId: this.windowId, placeholder: 'e.g. Everyday / Cheap / Coding' },
+            { type: 'button', windowId: this.windowId, text: 'Save Preset', style: { fontSize: 12 } },
+          ]})
+        );
+      this.presetNameInputId = nameInputId;
+      this.presetSaveBtnId = savePresetBtnId;
+      await this.request(request(this.id, savePresetBtnId, 'addDependent', {}));
+      await this.request(request(this.id, nameRowId, 'addLayoutChildren', {
+        children: [
+          { widgetId: nameLabelId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 65, height: 32 } },
+          { widgetId: nameInputId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 32 } },
+          { widgetId: savePresetBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 110, height: 32 } },
+        ],
+      }));
+    }
+
+    // ── 3 · Model Tiers (card) ──
+    const tiersCard = await this.sectionCard(cId, '3 · Model Tiers',
+      'Choose a provider and model for each quality tier. Code is the code-generation tier (agents draft source on it; leave it matching Smart unless you want a dedicated coding model). Screenshots and pasted images need a 👁 vision model; the optional Vision row is the fallback used for image steps when a tier\'s model is text-only.', 68);
 
     // Per-tier rows: [Label] [Provider dropdown] [Model dropdown]
     for (let i = 0; i < TIER_NAMES.length; i++) {
@@ -1272,12 +1418,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       // Row container
       const tierRowId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-          parentLayoutId: cId,
+          parentLayoutId: tiersCard,
           margins: { top: 0, right: 0, bottom: 0, left: 0 },
           spacing: 8,
         })
       );
-      await this.request(request(this.id, cId, 'addLayoutChild', {
+      await this.request(request(this.id, tiersCard, 'addLayoutChild', {
         widgetId: tierRowId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: 32 },
@@ -1365,12 +1511,12 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
       const visionRowId = await this.request<AbjectId>(
         request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-          parentLayoutId: cId,
+          parentLayoutId: tiersCard,
           margins: { top: 0, right: 0, bottom: 0, left: 0 },
           spacing: 8,
         })
       );
-      await this.request(request(this.id, cId, 'addLayoutChild', {
+      await this.request(request(this.id, tiersCard, 'addLayoutChild', {
         widgetId: visionRowId,
         sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
         preferredSize: { height: 32 },
@@ -1450,97 +1596,6 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       }));
     }
 
-    // ── Tier presets row ──
-    // [Preset] [dropdown: saved + built-in] [Apply] [Delete], then
-    // [Name] [text input] [Save Preset]. Built-ins are derived from each
-    // provider's defaultTierModels, so every provider ships a starter preset.
-    {
-      const { widgetIds: [presetHeaderId] } = await this.request<{ widgetIds: AbjectId[] }>(
-        request(this.id, this.widgetManagerId!, 'create', { specs: [
-          { type: 'label', windowId: this.windowId,
-            text: 'Presets — apply a saved or built-in tier configuration, or save the current one under a name.',
-            style: { color: this.theme.textDescription, fontSize: 12, wordWrap: true } },
-        ]})
-      );
-      await this.request(request(this.id, cId, 'addLayoutChild', {
-        widgetId: presetHeaderId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 34 },
-      }));
-
-      const presetRowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-          parentLayoutId: cId,
-          margins: { top: 0, right: 0, bottom: 0, left: 0 },
-          spacing: 8,
-        })
-      );
-      await this.request(request(this.id, cId, 'addLayoutChild', {
-        widgetId: presetRowId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 32 },
-      }));
-
-      const { widgetIds: [presetLabelId, presetSelectId, applyBtnId, deleteBtnId] } =
-        await this.request<{ widgetIds: AbjectId[] }>(
-          request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: 'Preset',
-              style: { color: this.theme.textHeading, fontSize: 13 } },
-            { type: 'select', windowId: this.windowId,
-              options: this.presetOptionNames(), selectedIndex: 0 },
-            { type: 'button', windowId: this.windowId, text: 'Apply', style: { fontSize: 12 } },
-            { type: 'button', windowId: this.windowId, text: 'Delete', style: { fontSize: 12 } },
-          ]})
-        );
-      this.presetSelectId = presetSelectId;
-      this.presetApplyBtnId = applyBtnId;
-      this.presetDeleteBtnId = deleteBtnId;
-      await this.request(request(this.id, presetSelectId, 'addDependent', {}));
-      await this.request(request(this.id, applyBtnId, 'addDependent', {}));
-      await this.request(request(this.id, deleteBtnId, 'addDependent', {}));
-      await this.request(request(this.id, presetRowId, 'addLayoutChildren', {
-        children: [
-          { widgetId: presetLabelId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 65, height: 32 } },
-          { widgetId: presetSelectId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 32 } },
-          { widgetId: applyBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 32 } },
-          { widgetId: deleteBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 70, height: 32 } },
-        ],
-      }));
-
-      const nameRowId = await this.request<AbjectId>(
-        request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-          parentLayoutId: cId,
-          margins: { top: 0, right: 0, bottom: 0, left: 0 },
-          spacing: 8,
-        })
-      );
-      await this.request(request(this.id, cId, 'addLayoutChild', {
-        widgetId: nameRowId,
-        sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-        preferredSize: { height: 32 },
-      }));
-
-      const { widgetIds: [nameLabelId, nameInputId, savePresetBtnId] } =
-        await this.request<{ widgetIds: AbjectId[] }>(
-          request(this.id, this.widgetManagerId!, 'create', { specs: [
-            { type: 'label', windowId: this.windowId, text: 'Name',
-              style: { color: this.theme.textHeading, fontSize: 13 } },
-            { type: 'textInput', windowId: this.windowId, placeholder: 'e.g. Everyday / Cheap / Coding' },
-            { type: 'button', windowId: this.windowId, text: 'Save Preset', style: { fontSize: 12 } },
-          ]})
-        );
-      this.presetNameInputId = nameInputId;
-      this.presetSaveBtnId = savePresetBtnId;
-      await this.request(request(this.id, savePresetBtnId, 'addDependent', {}));
-      await this.request(request(this.id, nameRowId, 'addLayoutChildren', {
-        children: [
-          { widgetId: nameLabelId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 65, height: 32 } },
-          { widgetId: nameInputId, sizePolicy: { horizontal: 'expanding' }, preferredSize: { height: 32 } },
-          { widgetId: savePresetBtnId, sizePolicy: { horizontal: 'fixed' }, preferredSize: { width: 110, height: 32 } },
-        ],
-      }));
-    }
-
     // Save button row (HBox: spacer + button)
     const saveRowId = await this.request<AbjectId>(
       request(this.id, this.widgetManagerId!, 'createNestedHBox', {
@@ -1569,67 +1624,6 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
       widgetId: this.saveBtnId,
       sizePolicy: { horizontal: 'fixed' },
       preferredSize: { width: 130, height: 36 },
-    }));
-
-    // ── Skills section ──
-    const { widgetIds: [skillsSectionLabelId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Skills', style: { color: this.theme.textHeading, fontWeight: 'bold', fontSize: 14 } },
-      ]})
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: skillsSectionLabelId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 24 },
-    }));
-
-    const { widgetIds: [skillsDescId] } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'label', windowId: this.windowId, text: 'Manage SKILL.md files in ~/.abject/skills/', style: { fontSize: 12, color: this.theme.textDescription } },
-      ]})
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: skillsDescId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 18 },
-    }));
-
-    // Skill Browser button row
-    const skillRowId = await this.request<AbjectId>(
-      request(this.id, this.widgetManagerId!, 'createNestedHBox', {
-        parentLayoutId: cId,
-        margins: { top: 0, right: 0, bottom: 0, left: 0 },
-        spacing: 8,
-      })
-    );
-    await this.request(request(this.id, cId, 'addLayoutChild', {
-      widgetId: skillRowId,
-      sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
-      preferredSize: { height: 36 },
-    }));
-    await this.request(request(this.id, skillRowId, 'addLayoutSpacer', {}));
-
-    const { widgetIds } = await this.request<{ widgetIds: AbjectId[] }>(
-      request(this.id, this.widgetManagerId!, 'create', { specs: [
-        { type: 'button', windowId: this.windowId, text: 'Installed Skills',
-          style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
-        { type: 'button', windowId: this.windowId, text: 'Browse Skills & MCP',
-          style: { background: this.theme.actionBg, color: this.theme.actionText, borderColor: this.theme.actionBorder } },
-      ]})
-    );
-    this.skillBrowserBtnId = widgetIds[0];
-    this.catalogBrowserBtnId = widgetIds[1];
-    await this.request(request(this.id, this.skillBrowserBtnId, 'addDependent', {}));
-    await this.request(request(this.id, this.catalogBrowserBtnId, 'addDependent', {}));
-    await this.request(request(this.id, skillRowId, 'addLayoutChild', {
-      widgetId: this.skillBrowserBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 150, height: 36 },
-    }));
-    await this.request(request(this.id, skillRowId, 'addLayoutChild', {
-      widgetId: this.catalogBrowserBtnId,
-      sizePolicy: { horizontal: 'fixed' },
-      preferredSize: { width: 180, height: 36 },
     }));
 
     // Kick off background live fetches for providers the user is currently
@@ -1859,6 +1853,7 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
     this.tabBarId = undefined;
     this.aiContainerId = undefined;
     this.authContainerId = undefined;
+    this.skillsContainerId = undefined;
     this.permissionsContainerId = undefined;
     this.platformLabelId = undefined;
     this.fsReadOnlyCheckboxId = undefined;
@@ -1894,10 +1889,11 @@ It is a singleton (not per-workspace) and persists settings in global Storage.
 
   /** Show/hide tab containers based on activeTab. */
   private async switchTab(): Promise<void> {
-    if (!this.aiContainerId || !this.authContainerId || !this.permissionsContainerId) return;
+    if (!this.aiContainerId || !this.authContainerId || !this.permissionsContainerId || !this.skillsContainerId) return;
     await this.request(request(this.id, this.aiContainerId, 'update', { style: { visible: this.activeTab === 'ai' } }));
     await this.request(request(this.id, this.authContainerId, 'update', { style: { visible: this.activeTab === 'auth' } }));
     await this.request(request(this.id, this.permissionsContainerId, 'update', { style: { visible: this.activeTab === 'permissions' } }));
+    await this.request(request(this.id, this.skillsContainerId, 'update', { style: { visible: this.activeTab === 'skills' } }));
   }
 
   // ========== HELPERS ==========
