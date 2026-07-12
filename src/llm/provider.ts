@@ -299,6 +299,14 @@ export interface LLMProvider {
   ): Promise<LLMCompletionResult>;
 
   /**
+   * The model id a request with these options would run on — the same
+   * resolution complete()/stream() apply (explicit option, tier default,
+   * configured default). Used by request tracking/monitoring to attribute
+   * a request to a concrete model.
+   */
+  resolveModel(options?: LLMCompletionOptions): string;
+
+  /**
    * Stream a completion (optional).
    */
   stream?(
@@ -366,6 +374,15 @@ export abstract class BaseLLMProvider implements LLMProvider {
     messages: LLMMessage[],
     options?: LLMCompletionOptions
   ): Promise<LLMCompletionResult>;
+
+  /**
+   * Base resolution: an explicit option wins; otherwise the provider's own
+   * default applies (CLI providers pick their binary's default). Providers
+   * with tier routing override with their real resolution.
+   */
+  resolveModel(options?: LLMCompletionOptions): string {
+    return options?.model ?? 'default';
+  }
 
   async listModels(): Promise<ModelInfo[]> {
     return [];

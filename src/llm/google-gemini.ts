@@ -103,7 +103,7 @@ export class GeminiProvider extends BaseLLMProvider {
   };
   private static readonly MODEL_MAX_OUTPUT = 65536;
 
-  private resolveModel(options?: LLMCompletionOptions): string {
+  override resolveModel(options?: LLMCompletionOptions): string {
     if (options?.model) return options.model;
     return options?.tier ? GeminiProvider.TIER_MODELS[options.tier] : this.model;
   }

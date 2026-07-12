@@ -69,7 +69,7 @@ export class OllamaProvider extends BaseLLMProvider {
   private model: string | undefined;
   private tierModels: Partial<Record<ModelTier, string>> = {};
 
-  private resolveModel(options?: LLMCompletionOptions): string {
+  override resolveModel(options?: LLMCompletionOptions): string {
     if (options?.model) return options.model;
     const tier = options?.tier;
     if (tier && this.tierModels[tier]) return this.tierModels[tier]!;

@@ -131,7 +131,7 @@ export class AnthropicProvider extends BaseLLMProvider {
     fast: 'claude-haiku-4-5-20251001',
   };
 
-  private resolveModel(options?: LLMCompletionOptions): string {
+  override resolveModel(options?: LLMCompletionOptions): string {
     if (options?.model) return options.model;
     return options?.tier ? AnthropicProvider.TIER_MODELS[options.tier] : this.model;
   }

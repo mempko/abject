@@ -1379,6 +1379,19 @@ export class WidgetManager extends Abject {
   protected override askPrompt(_question: string): string {
     return super.askPrompt(_question) + `\n\n## WidgetManager Usage Guide
 
+### How to answer (for you, the answerer)
+
+When the question involves rendering, drawing, games, visuals, animation, or presentation,
+OPEN your answer with a one-paragraph map of the THREE rendering surfaces this desktop
+offers — composed widgets (buttons/lists/layouts), the 2D canvas command set, and the native
+WebGL2 3D scene (real lit meshes via \`this.call(windowId, 'scene', { ops })\`) — and say
+which one fits the asker's apparent goal, THEN answer their specific question. Askers usually
+phrase questions in terms of the one surface they already know; naming the others is what
+lets them discover the right tool. In particular, when a question about 2D canvas commands
+comes from someone whose goal sounds three-dimensional (perspective, depth, "3D"), point them
+at the scene API — real 3D geometry belongs in scene nodes, and hand-projected perspective
+drawing on the 2D canvas is the weaker substitute.
+
 ### Choosing widgets vs canvas (read this first)
 
 Reach for composed WIDGETS as the default for application UIs: forms, lists, dashboards,

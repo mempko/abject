@@ -2,7 +2,7 @@
  * LLMMonitor -- real-time viewer for LLM request activity, history, and stats.
  *
  * Shows active requests and recent history with requester, method, provider,
- * elapsed time, and output characters. Provides controls to kill requests,
+ * model, elapsed time, and output characters. Provides controls to kill requests,
  * pause/unpause the LLM object, and view full prompt/output of any request.
  * Accessible from the GlobalToolbar.
  */
@@ -22,7 +22,7 @@ const log = new Log('LLMMonitor');
 
 const LLM_MONITOR_INTERFACE: InterfaceId = 'abjects:llm-monitor';
 
-const WIN_W = 760;
+const WIN_W = 880;
 const WIN_H = 500;
 const DETAIL_W = 650;
 const DETAIL_H = 500;
@@ -39,19 +39,19 @@ interface StatsSnapshot {
  * entry of the sorted desired list, and cells update in place (diffed against
  * `desc`). This makes arbitrary ordering (newest-on-top, column sorts) free —
  * no layout reordering, no widget churn beyond count changes.
- * Labels order: name, method, provider, started, time, output.
+ * Labels order: name, method, provider, model, started, time, output.
  */
 interface RowWidgets {
   requestId: string;
   containerId: AbjectId;  // the row's HBox; destroying it cascades to labels + btn
-  labels: AbjectId[];  // [name, method, provider, started, time, output]
+  labels: AbjectId[];  // [name, method, provider, model, started, time, output]
   btn: AbjectId;
   /** Last rendered desc; cells whose value is unchanged are not re-sent. */
   desc?: RowDesc;
 }
 
 /** Sortable columns, in header order. */
-type SortCol = 'name' | 'method' | 'provider' | 'started' | 'time' | 'output';
+type SortCol = 'name' | 'method' | 'provider' | 'model' | 'started' | 'time' | 'output';
 
 /** Desired state for a single row, diffed against the slot currently rendered. */
 interface RowDesc {
@@ -59,6 +59,7 @@ interface RowDesc {
   name: string;
   method: string;
   provider: string;
+  model: string;
   started: string;
   time: string;
   output: string;
@@ -73,6 +74,7 @@ const HEADER_COLUMNS: Array<{ col: SortCol; text: string; width?: number }> = [
   { col: 'name', text: 'Requester' },
   { col: 'method', text: 'Method', width: 70 },
   { col: 'provider', text: 'Provider', width: 80 },
+  { col: 'model', text: 'Model', width: 120 },
   { col: 'started', text: 'Started', width: 62 },
   { col: 'time', text: 'Time', width: 50 },
   { col: 'output', text: 'Output', width: 60 },
@@ -525,6 +527,7 @@ export class LLMMonitor extends Abject {
         name: req.callerName ?? req.callerId.slice(0, 8),
         method: req.method,
         provider: req.provider,
+        model: req.model ?? '',
         started: this.formatClock(req.startTime),
         time: `${elapsedSec}s`,
         output: `${req.outputChars}`,
@@ -535,6 +538,7 @@ export class LLMMonitor extends Abject {
           name: (req.callerName ?? req.callerId).toLowerCase(),
           method: req.method,
           provider: req.provider,
+          model: req.model ?? '',
           started: req.startTime,
           time: elapsedSec,
           output: req.outputChars,
@@ -547,6 +551,7 @@ export class LLMMonitor extends Abject {
       name: entry.callerName ?? entry.callerId.slice(0, 8),
       method: entry.method,
       provider: entry.provider,
+      model: entry.model ?? '',
       started: this.formatClock(entry.startTime),
       time: `${(entry.elapsedMs / 1000).toFixed(1)}s`,
       output: `${entry.outputChars}`,
@@ -557,6 +562,7 @@ export class LLMMonitor extends Abject {
         name: (entry.callerName ?? entry.callerId).toLowerCase(),
         method: entry.method,
         provider: entry.provider,
+        model: entry.model ?? '',
         started: entry.startTime,
         time: entry.elapsedMs,
         output: entry.outputChars,
@@ -659,14 +665,17 @@ export class LLMMonitor extends Abject {
       if (!prev || prev.provider !== d.provider) {
         await this.request(request(this.id, row.labels[2], 'update', { text: d.provider }));
       }
+      if (!prev || prev.model !== d.model) {
+        await this.request(request(this.id, row.labels[3], 'update', { text: d.model }));
+      }
       if (!prev || prev.started !== d.started) {
-        await this.request(request(this.id, row.labels[3], 'update', { text: d.started }));
+        await this.request(request(this.id, row.labels[4], 'update', { text: d.started }));
       }
       if (!prev || prev.time !== d.time) {
-        await this.request(request(this.id, row.labels[4], 'update', { text: d.time }));
+        await this.request(request(this.id, row.labels[5], 'update', { text: d.time }));
       }
       if (!prev || prev.output !== d.output) {
-        await this.request(request(this.id, row.labels[5], 'update', { text: d.output }));
+        await this.request(request(this.id, row.labels[6], 'update', { text: d.output }));
       }
       // Rebind the action button when the slot now shows a different request.
       // isKill/actionText are constant within a tab, so only the id mapping moves.
@@ -825,13 +834,14 @@ export class LLMMonitor extends Abject {
       preferredSize: { height: rowH },
     }));
 
-    const { widgetIds: [nameId, methodId, providerId, startedId, timeId, outputId] } =
+    const { widgetIds: [nameId, methodId, providerId, modelId, startedId, timeId, outputId] } =
       await this.request<{ widgetIds: AbjectId[] }>(
         request(this.id, this.widgetManagerId!, 'create', {
           specs: [
             { type: 'label', windowId: this.windowId!, text: d.name, style: { fontSize: 12, color: d.nameColor } },
             { type: 'label', windowId: this.windowId!, text: d.method, style: { fontSize: 11, color: this.theme.sectionLabel } },
             { type: 'label', windowId: this.windowId!, text: d.provider, style: { fontSize: 11, color: this.theme.sectionLabel } },
+            { type: 'label', windowId: this.windowId!, text: d.model, style: { fontSize: 11, color: this.theme.sectionLabel } },
             { type: 'label', windowId: this.windowId!, text: d.started, style: { fontSize: 11, color: this.theme.textMeta } },
             { type: 'label', windowId: this.windowId!, text: d.time, style: { fontSize: 11, color: this.theme.textMeta } },
             { type: 'label', windowId: this.windowId!, text: d.output, style: { fontSize: 11, color: this.theme.textMeta } },
@@ -843,7 +853,7 @@ export class LLMMonitor extends Abject {
       sizePolicy: { vertical: 'fixed', horizontal: 'expanding' },
       preferredSize: { height: rowH },
     }));
-    for (const [wid, w] of [[methodId, 70], [providerId, 80], [startedId, 62], [timeId, 50], [outputId, 60]] as const) {
+    for (const [wid, w] of [[methodId, 70], [providerId, 80], [modelId, 120], [startedId, 62], [timeId, 50], [outputId, 60]] as const) {
       await this.request(request(this.id, rowLayoutId, 'addLayoutChild', {
         widgetId: wid,
         sizePolicy: { vertical: 'fixed', horizontal: 'fixed' },
@@ -878,7 +888,7 @@ export class LLMMonitor extends Abject {
     return {
       requestId: d.id,
       containerId: rowLayoutId,
-      labels: [nameId, methodId, providerId, startedId, timeId, outputId],
+      labels: [nameId, methodId, providerId, modelId, startedId, timeId, outputId],
       btn: btnId,
       desc: d,
     };
@@ -916,9 +926,10 @@ export class LLMMonitor extends Abject {
     );
 
     const timeSec = (entry.elapsedMs / 1000).toFixed(1);
+    const modelPart = entry.model ? ` | Model: ${entry.model}` : '';
     const summaryText = entry.error
-      ? `Provider: ${entry.provider} | Time: ${timeSec}s | Error: ${entry.error}`
-      : `Provider: ${entry.provider} | Time: ${timeSec}s | Chars: ${entry.inputChars} > ${entry.outputChars}`;
+      ? `Provider: ${entry.provider}${modelPart} | Time: ${timeSec}s | Error: ${entry.error}`
+      : `Provider: ${entry.provider}${modelPart} | Time: ${timeSec}s | Chars: ${entry.inputChars} > ${entry.outputChars}`;
 
     const { widgetIds: [summaryId, promptLabelId, promptAreaId, outputLabelId, outputAreaId] } =
       await this.request<{ widgetIds: AbjectId[] }>(
@@ -1064,7 +1075,7 @@ export class LLMMonitor extends Abject {
 ### Features
 - Real-time view of active LLM requests with kill controls.
 - Recent history of completed requests (newest on top by default) with View button to inspect prompt and output.
-- Columns: Requester, Method, Provider, Started (wall-clock HH:MM:SS), Time (elapsed), Output. Click any column header to sort by it; clicking again flips the direction (▼/▲ marks the active column).
+- Columns: Requester, Method, Provider, Model (the concrete model id the request ran on), Started (wall-clock HH:MM:SS), Time (elapsed), Output. Click any column header to sort by it; clicking again flips the direction (▼/▲ marks the active column).
 - Aggregate stats: total requests, input/output chars, errors, average latency.
 - Pause/Unpause buttons to control the LLM object.
 - Flicker-free updates: rows are fixed slots whose cells update in place, so re-sorting or new arrivals never rebuild the list.

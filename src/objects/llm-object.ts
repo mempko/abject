@@ -115,6 +115,7 @@ export interface LLMActiveRequest {
   callerName?: string;
   method: string;
   provider: string;
+  model: string;
   startTime: number;
   inputChars: number;
   outputChars: number;
@@ -129,6 +130,7 @@ export interface LLMHistoryEntry {
   callerName?: string;
   method: string;
   provider: string;
+  model: string;
   startTime: number;
   elapsedMs: number;
   inputChars: number;
@@ -547,7 +549,8 @@ export class LLMObject extends Abject {
       const start = Date.now();
 
       const activeReq = await this.trackRequestStart(
-        correlationId, callerId, 'stream', provider.name, totalChars, true, messages,
+        correlationId, callerId, 'stream', provider.name,
+        this.modelFor(provider, effectiveOptions), totalChars, true, messages,
       );
 
       // Keep-alive heartbeat sent every 30s for the entire stream lifetime.
@@ -894,7 +897,7 @@ export class LLMObject extends Abject {
     // Track active request
     const trackId = requestId ?? `internal-${Date.now()}`;
     if (callerId) {
-      await this.trackRequestStart(trackId, callerId, 'complete', provider.name, totalChars, false, messages);
+      await this.trackRequestStart(trackId, callerId, 'complete', provider.name, this.modelFor(provider, effectiveOptions), totalChars, false, messages);
     }
 
     // Send keep-alive progress events every 30s so upstream timeouts don't fire
@@ -1265,11 +1268,25 @@ Only output the code, no explanations. Use proper formatting and comments.`;
     );
   }
 
+  /**
+   * The model a request will run on, for tracking. Never throws — an
+   * unconfigured provider (which would fail the request itself anyway)
+   * reports the explicit option or 'unknown'.
+   */
+  private modelFor(provider: LLMProvider, options?: LLMCompletionOptions): string {
+    try {
+      return provider.resolveModel(options);
+    } catch {
+      return options?.model ?? 'unknown';
+    }
+  }
+
   private async trackRequestStart(
     requestId: string,
     callerId: AbjectId,
     method: string,
     providerName: string,
+    model: string,
     inputChars: number,
     streaming: boolean,
     messages?: LLMMessage[],
@@ -1281,6 +1298,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       callerName,
       method,
       provider: providerName,
+      model,
       startTime: Date.now(),
       inputChars,
       outputChars: 0,
@@ -1320,6 +1338,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       callerName: req.callerName,
       method: req.method,
       provider: req.provider,
+      model: req.model,
       startTime: req.startTime,
       elapsedMs: elapsed,
       inputChars: req.inputChars,
@@ -1337,6 +1356,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       callerName: req.callerName,
       method: req.method,
       provider: req.provider,
+      model: req.model,
       elapsedMs: elapsed,
       inputChars: req.inputChars,
       outputChars: outChars,
@@ -1360,6 +1380,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       callerName: req.callerName,
       method: req.method,
       provider: req.provider,
+      model: req.model,
       startTime: req.startTime,
       elapsedMs: elapsed,
       inputChars: req.inputChars,
@@ -1377,6 +1398,7 @@ Only output the code, no explanations. Use proper formatting and comments.`;
       callerName: req.callerName,
       method: req.method,
       provider: req.provider,
+      model: req.model,
       elapsedMs: elapsed,
       error,
     });

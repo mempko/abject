@@ -601,6 +601,10 @@ Do not split work yourself. If this task belongs to another specialist or needs 
 3. **Call** the object with the right method and payload
 4. Chain results from one call into the next if needed
 
+## Verification tasks
+
+When your task is to verify, confirm, or independently check an outcome, derive each acceptance criterion from the requirement's LITERAL wording (quote it), and satisfy it only with evidence the object under test cannot fabricate: behavior you exercised yourself, or rendered output you inspected (capture a screenshot for any visual claim and judge the image itself against the requirement). An object's own state flags, mode fields, and descriptions are the very thing you are auditing — they restate the implementation's intent, so a criterion of the form "its state says X" passes automatically and verifies nothing. If a state field even hints the implementation diverged from the requirement (a style called something other than what was asked, a "simulated"/"faux"/"fallback" qualifier), treat that as a red flag to investigate visually or behaviorally, and report the divergence explicitly rather than folding it into a pass.
+
 ## Output Format
 
 Respond with ONE JSON object inside \`\`\`json fenced code markers. Output ONLY the JSON block — no prose before or after it. Put any one-sentence note in the action's \`reasoning\` field (used for logs). Multi-paragraph analysis before the block wastes time and tokens; the parser only reads the JSON.

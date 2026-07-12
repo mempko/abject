@@ -119,7 +119,7 @@ export class OpenAIProvider extends BaseLLMProvider {
     fast: 'gpt-5.4-nano',
   };
 
-  protected resolveModel(options?: LLMCompletionOptions): string {
+  override resolveModel(options?: LLMCompletionOptions): string {
     if (options?.model) return options.model;
     return options?.tier ? this.tierModels[options.tier] : this.model;
   }
