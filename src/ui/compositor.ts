@@ -868,6 +868,19 @@ export class Compositor {
    * in the scene tree — they are transient client state, re-issued by the
    * owner after a reconnect if persistence is wanted.
    */
+  /**
+   * Whether changes under this scene key can currently reach pixels: world
+   * keys always render (desktop-level decor); window subtrees render only
+   * when their surface is visible and on the active workspace. Unknown keys
+   * count as renderable so we never suppress a legitimate first paint.
+   */
+  private isSurfaceKeyRenderable(surfaceKey: string): boolean {
+    if (surfaceKey.startsWith('world:')) return true;
+    const surface = this.surfaces.get(surfaceKey);
+    if (!surface) return true;
+    return surface.visible && !this.isWorkspaceFiltered(surface);
+  }
+
   private applyOps(surfaceKey: string, ops: SceneOp[]): void {
     const rest: SceneOp[] = [];
     for (const op of ops) {
@@ -878,7 +891,11 @@ export class Compositor {
     if (rest.length > 0) this.sceneStore.apply(surfaceKey, rest);
     // Pick up bloom config from any 'environment' node (global post-effect).
     for (const op of rest) this.syncBloomFrom(surfaceKey, op);
-    this.needsRender = true;
+    // Only wake the render loop for changes that can reach pixels. A 30-60fps
+    // animation stream aimed at a hidden window or an inactive workspace
+    // still mutates the retained store (so the next reveal is correct) but
+    // must not keep every visible workspace rendering at full rate.
+    if (this.isSurfaceKeyRenderable(surfaceKey)) this.needsRender = true;
   }
 
   /** Update the global bloom config when an 'environment' node changes. */
@@ -2437,6 +2454,10 @@ export class Compositor {
     for (const [key, entry] of this.nodeAnims) {
       const node = this.sceneStore.getNode(entry.surfaceKey, entry.id);
       if (!node) { this.nodeAnims.delete(key); continue; }
+      // Looping presets on hidden windows / inactive workspaces must not
+      // keep the frame loop alive. Keep the entry (time-based anims resume
+      // at the current phase on reveal) but neither step nor mark active.
+      if (!this.isSurfaceKeyRenderable(entry.surfaceKey)) continue;
       const live: NodeAnim[] = [];
       for (const a of entry.anims) {
         const done = this.applyAnim(node, a, now);

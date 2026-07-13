@@ -563,7 +563,11 @@ export class LLMObject extends Abject {
       // (2) mid-stream subprocess stalls that haven't yet hit the provider's
       // 180s idle-kill timer. Keeping the keepalive running through the whole
       // stream fills both gaps for ~one event/30s of overhead.
-      const KEEPALIVE_MS = 30000;
+      // Must beat the 30s default no-progress request timeout with margin:
+      // a heartbeat cadence EQUAL to the timeout loses the race every time
+      // (the timer fires at 30.000s; the first beat lands at 30.00x plus bus
+      // hops), which killed every ask whose LLM synthesis ran past ~29s.
+      const KEEPALIVE_MS = 10000;
       let lastChunkAt = start;
       const keepaliveTimer: ReturnType<typeof setInterval> = setInterval(() => {
         const sinceChunk = Date.now() - lastChunkAt;
@@ -904,7 +908,11 @@ export class LLMObject extends Abject {
     }
 
     // Send keep-alive progress events every 30s so upstream timeouts don't fire
-    const KEEPALIVE_MS = 30000;
+    // Must beat the 30s default no-progress request timeout with margin:
+      // a heartbeat cadence EQUAL to the timeout loses the race every time
+      // (the timer fires at 30.000s; the first beat lands at 30.00x plus bus
+      // hops), which killed every ask whose LLM synthesis ran past ~29s.
+      const KEEPALIVE_MS = 10000;
     let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
     if (callerId) {
       keepaliveTimer = setInterval(() => {

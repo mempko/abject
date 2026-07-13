@@ -2330,18 +2330,21 @@ When invited to a Sprint Plan, describe the concrete authoring or modification I
 
       const finalResult = this.finalizeLoop(extra.state, success, result, error);
 
-      // Preserve authored-but-undeployed work across the task boundary. A
-      // step-budget death (or any failure) that leaves a staged draft would
-      // otherwise force the follow-up task to re-author hundreds of lines
-      // from the failure prose alone; persisting the draft lets it resume.
-      if (extra.goalId) {
-        if (!finalResult.success && extra.state.draftSource
-            && extra.state.draftSource !== extra.state.lastDeployedSource) {
+      // Preserve authored-but-undeployed work across the task boundary.
+      // What matters is DEPLOYMENT, not the terminal verb: a step-limit
+      // forced-final often ends in `done` with a clean draft that never
+      // shipped (the first slide-deck rework lost a compile-clean 211-line
+      // draft exactly this way, because the old logic cleared the scratchpad
+      // on any success). Persist whenever the staged source differs from
+      // what is live; clear only when the draft actually shipped.
+      if (extra.goalId && extra.state.draftSource) {
+        const undeployed = extra.state.draftSource !== extra.state.lastDeployedSource;
+        if (undeployed) {
           const saved = await this.persistDraftToGoal(extra);
-          if (saved) {
+          if (saved && !finalResult.success) {
             finalResult.error = `${finalResult.error ?? 'Task failed'} [The staged draft (manifest + source) is preserved in the goal scratchpad under '${GOAL_DRAFT_KEY}'; the next ObjectCreator task in this goal adopts it automatically — plan a finish-and-deploy task, not a rewrite.]`;
           }
-        } else if (finalResult.success) {
+        } else {
           void this.clearPersistedDraft(extra.goalId);
         }
       }
