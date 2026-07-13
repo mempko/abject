@@ -13,7 +13,7 @@ import {
 } from '../core/types.js';
 import { Abject } from '../core/abject.js';
 import { require as precondition, invariant } from '../core/contracts.js';
-import { request } from '../core/message.js';
+import { request, event } from '../core/message.js';
 import { Log } from '../core/timed-log.js';
 
 const log = new Log('ABJECT-STORE');
@@ -70,6 +70,12 @@ export class AbjectStore extends Abject {
   private workspaceId?: string;
   private peerId?: string;
   private snapshots: Map<string, AbjectSnapshot> = new Map();
+
+  // Debounced Storage write state (see schedulePersist).
+  private static readonly PERSIST_DEBOUNCE_MS = 500;
+  private persistTimer?: ReturnType<typeof setTimeout>;
+  private persistInFlight?: Promise<void>;
+  private persistDirty = false;
 
   constructor() {
     super({
@@ -193,6 +199,26 @@ export class AbjectStore extends Abject {
     await this.loadFromStorage();
   }
 
+  protected override async onStop(): Promise<void> {
+    await super.onStop();
+    // Flush a pending debounced write so no snapshot changes are lost at
+    // shutdown. Status is already 'stopped' so request() would refuse — post
+    // the write as a fire-and-forget event straight to the bus.
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = undefined;
+    }
+    if (this.persistDirty && this.storageId) {
+      this.persistDirty = false;
+      try {
+        this.bus.send(event(this.id, this.storageId, 'set', {
+          key: STORAGE_KEY,
+          value: Array.from(this.snapshots.values()),
+        }));
+      } catch { /* best effort at shutdown */ }
+    }
+  }
+
   /**
    * Lazily discover our workspace ID from WidgetManager.
    * Called at use-time (not init-time) because WorkspaceManager assigns
@@ -246,6 +272,33 @@ export class AbjectStore extends Abject {
       );
     } catch (err) {
       log.warn('Failed to persist to storage:', err);
+    }
+  }
+
+  /**
+   * Debounced full-store write. Every save/remove rewrites the whole
+   * snapshot array (every user object's source + data), so back-to-back
+   * saves — e.g. several objects persisting within the same second — must
+   * coalesce into one Storage round trip instead of one each.
+   */
+  private schedulePersist(): void {
+    this.persistDirty = true;
+    if (this.persistTimer) return;
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = undefined;
+      void this.flushPersist();
+    }, AbjectStore.PERSIST_DEBOUNCE_MS);
+  }
+
+  private async flushPersist(): Promise<void> {
+    if (this.persistInFlight) await this.persistInFlight;
+    if (!this.persistDirty) return;
+    this.persistDirty = false;
+    this.persistInFlight = this.persistToStorage();
+    try {
+      await this.persistInFlight;
+    } finally {
+      this.persistInFlight = undefined;
     }
   }
 
@@ -307,7 +360,7 @@ export class AbjectStore extends Abject {
 
     // Key by typeId for durable identity (survives restart with new objectId)
     this.snapshots.set(typeId, snapshot);
-    await this.persistToStorage();
+    this.schedulePersist();
 
     // Register the object in the workspace registry so it appears in AppExplorer/Taskbar
     if (this.registryId) {
@@ -355,7 +408,7 @@ export class AbjectStore extends Abject {
       }
     }
     if (existed) {
-      await this.persistToStorage();
+      this.schedulePersist();
       log.info(`Removed snapshot for ${objectId}`);
     }
     return existed;

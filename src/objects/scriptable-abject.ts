@@ -128,6 +128,13 @@ export class ScriptableAbject extends Abject {
   private _userProps: Set<string> = new Set();
   private _depCache: Record<string, AbjectId> = {};
 
+  // Coalesced saveData state: at most one save in flight, one queued.
+  private static readonly SAVE_MIN_INTERVAL_MS = 1000;
+  private _saveTail: Promise<void> = Promise.resolve();
+  private _pendingSave?: { promise: Promise<void>; resolve: () => void; reject: (err: unknown) => void };
+  private _lastSaveStart = 0;
+  private _storeId?: AbjectId;
+
   constructor(
     manifest: AbjectManifest,
     source: string,
@@ -630,6 +637,13 @@ export class ScriptableAbject extends Abject {
    * Persist the current internal data through AbjectStore so it survives
    * restart and is included in clones / snapshots / remote shares.
    * Throws ContractViolation if `data` contains values JSON cannot serialize.
+   *
+   * Calls are coalesced: at most one save is in flight and one is queued.
+   * Generated source often calls saveData inside animation ticks (30+/sec);
+   * without coalescing each call is a Registry discover + AbjectStore save +
+   * full-store Storage write, which floods the workspace and starves every
+   * other object's requests. The returned promise resolves once a save that
+   * includes the caller's data mutations has been persisted.
    */
   async saveData(): Promise<void> {
     let serialized: string;
@@ -648,14 +662,49 @@ export class ScriptableAbject extends Abject {
         'Top-level this.data must be a plain object, not a function or undefined.'
       );
     }
+
+    // Join the queued save if one exists — it has not started yet, so it
+    // will pick up the caller's mutations when it reads this._data.
+    if (this._pendingSave) return this._pendingSave.promise;
+
+    let resolve!: () => void;
+    let reject!: (err: unknown) => void;
+    const promise = new Promise<void>((res, rej) => { resolve = res; reject = rej; });
+    this._pendingSave = { promise, resolve, reject };
+
+    this._saveTail = this._saveTail.then(async () => {
+      const wait = ScriptableAbject.SAVE_MIN_INTERVAL_MS - (Date.now() - this._lastSaveStart);
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      const ticket = this._pendingSave;
+      if (!ticket) return; // already flushed by onStop
+      // Clear before reading _data: mutations after this point need a new save.
+      this._pendingSave = undefined;
+      this._lastSaveStart = Date.now();
+      try {
+        await this.persistDataNow();
+        ticket.resolve();
+      } catch (err) {
+        ticket.reject(err);
+      }
+    });
+    return promise;
+  }
+
+  /**
+   * The actual AbjectStore round trip. Only called from the coalesced
+   * saveData chain (and the final flush in onStop).
+   */
+  private async persistDataNow(): Promise<void> {
     try {
-      const storeId = await this.discoverDep('AbjectStore');
-      if (!storeId) {
+      if (!this._storeId) {
+        this._storeId = await this.discoverDep('AbjectStore') ?? undefined;
+      }
+      if (!this._storeId) {
         log.warn(`saveData: AbjectStore not available for '${this.manifest.name}' (${this.id}); data not persisted`);
         return;
       }
       await this.request(
-        request(this.id, storeId, 'save', {
+        request(this.id, this._storeId, 'save', {
           objectId: this.id,
           manifest: this.manifest,
           source: this._source,
@@ -664,9 +713,34 @@ export class ScriptableAbject extends Abject {
         })
       );
     } catch (err) {
+      // The cached id may be stale (store respawned) — rediscover next time.
+      this._storeId = undefined;
       log.warn(`saveData: failed to persist for '${this.manifest.name}':`, err);
       throw err;
     }
+  }
+
+  protected override async onStop(): Promise<void> {
+    await super.onStop();
+    // Flush a queued save so the last data mutations survive shutdown.
+    // Status is already 'stopped' here, so request() would refuse and a
+    // reply could never be dispatched back to us — post the save as a
+    // fire-and-forget event straight to the bus instead.
+    const ticket = this._pendingSave;
+    if (!ticket) return;
+    this._pendingSave = undefined;
+    try {
+      if (this._storeId) {
+        this.bus.send(event(this.id, this._storeId, 'save', {
+          objectId: this.id,
+          manifest: this.manifest,
+          source: this._source,
+          owner: this._owner,
+          data: this._data,
+        }));
+      }
+    } catch { /* best effort at shutdown */ }
+    ticket.resolve();
   }
 
   private compileAndInstall(source: string): void {
