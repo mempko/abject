@@ -116,13 +116,11 @@ for (const f of notes.fixes) console.log(`  fix: ${f}`);
 console.log('');
 
 // ── Update the site changelog ─────────────────────────────────────────────
-// Same MAJOR.MINOR as the newest entry → the entry absorbs the patch (its
-// version/date/notes refresh in place, so the page always shows the latest
-// of the current line). A new MAJOR.MINOR gets a fresh entry on top.
+// Every version gets its own entry. Re-releasing the same version refreshes
+// its entry in place; anything else goes on top.
 const changelog = JSON.parse(readFileSync(CHANGELOG_PATH, 'utf-8'));
 const entry = { version, date, title: notes.title, summary: notes.summary, highlights: notes.highlights, fixes: notes.fixes };
-const minorOf = (v) => v.split('.').slice(0, 2).join('.');
-if (changelog.length > 0 && minorOf(changelog[0].version) === minorOf(version)) {
+if (changelog.length > 0 && changelog[0].version === version) {
   changelog[0] = entry;
 } else {
   changelog.unshift(entry);

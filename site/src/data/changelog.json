@@ -15,6 +15,31 @@
     ]
   },
   {
+    "version": "0.8.14",
+    "date": "2026-07-12",
+    "title": "New blood: WASM, a binary wire, and a learning loop",
+    "summary": "The 0.8 line let Abjects be written in any language, made every remote byte binary, and started teaching the agents to learn from their own work. It also brought the biggest Settings and authoring-loop overhaul yet.",
+    "highlights": [
+      "WASM Abject hosting: ABI v1, a C++ SDK, pnpm forge packaging, and a native C++ KnowledgeBase shipping as a bundled system package; Abjects can now be written in any language that compiles to WebAssembly",
+      "Binary wire protocol for all remote traffic, with interning, frame acknowledgment flow control, and content-addressed image blobs",
+      "Connective tissue for the object system: triggers, SQL-backed collections, full-text knowledge search, streams, audio, speech, and video, and prototype cloning",
+      "A learning loop: TaskReviewer grades finished work, knowledge entries carry provenance and usefulness, and every agent can recall and remember",
+      "Vision awareness end to end: per-model vision capability tracking, a configurable vision-fallback model, and screenshots that verifiers can actually judge, including real 3D scene content",
+      "Web Viewer human takeover: pass captchas and log in yourself, then hand the page back to the agent",
+      "Meta Model API provider (Muse Spark 1.1), an explicit Code tier for code generation, and savable tier presets with built-ins derived from every provider's defaults",
+      "Authoring loops that finish: progress-aware step-budget extensions, draft persistence across task retries, and advisory (non-blocking) semantic review",
+      "Settings redesigned: a card-based AI tab in setup order, category sub-tabs for Permissions, and a dedicated Skills & MCP tab",
+      "UI Abjects are now authored with MVC (in the original Smalltalk sense), DCI, and Design by Contract"
+    ],
+    "fixes": [
+      "Peer-transport wire codec desync after reconnects, and out-of-order inbound handling",
+      "Agent orchestration losses: dropped goal completions, false-positive verifications, and capability polls timing out behind busy agents",
+      "Zero-height self-sizing widgets being culled before they could measure (invisible chat goal trees)",
+      "Long model names bleeding out of Settings dropdowns; window screenshots missing 3D scene content",
+      "The scene-op error hint omitting 'animate', teaching agents a valid op was unsupported"
+    ]
+  },
+  {
     "version": "0.7.0",
     "date": "2026-06-29",
     "title": "Self-repair, taught properly",
